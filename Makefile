@@ -64,6 +64,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/syscall/embx.c \
              kernel/process/process.c \
              kernel/process/ksync.c \
+             kernel/process/debug.c \
 			 kernel/tty/tty.c \
              kernel/acpi/acpi.c \
              kernel/drivers/char/serial.c \
@@ -117,6 +118,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/gfx/compositor.c \
              kernel/lib/kstring.c \
              kernel/lib/errno.c \
+             kernel/lib/ksym.c \
              kernel/lib/kprintf.c
 
 LINKER      = kernel/linker.ld
@@ -124,15 +126,30 @@ STAGE1_BIN  = boot/stage1/boot.bin
 STAGE2_BIN  = boot/stage2/stage2.bin
 KERNEL_ELF  = kernel/kernel.elf
 # Stripped copy that actually goes into the boot image. The full kernel.elf
-# carries ~490 KB of .debug_*/.symtab that stage2's real-mode loader would
-# otherwise stream into 0x10000.. -- past 0xA0000 (video RAM) at sector 1152
-# and into the VGA option-ROM window at sector 1408, where int 0x13 writes
-# fail (-> disk_error hang) or scribble the VESA framebuffer vbe_init just set.
-# strip removes the non-allocated sections; PT_LOAD offsets and e_entry are
-# untouched, so load_elf still parses it identically. Keep kernel.elf (with
-# symbols) for gdb. See boot ceiling note in memory.
+# carries ~490 KB of .debug_*/.symtab; stripping keeps the boot image small and
+# the boot-time staging copy short, and the debug info lives in the separate
+# .embdbg sidecar below instead. (Historically strip was MANDATORY: the old
+# stage2 staged the ELF at 0x10000 and a kernel past ~576 KB streamed into
+# 0xA0000 video RAM / the option-ROM window -> disk_error hang or a scribbled
+# framebuffer. stage2 now stages the ELF above 1 MB via unreal mode, so that
+# ceiling is lifted -- see boot/stage2/stage2.asm KERNEL_STAGE_PHYS -- but a
+# smaller boot image is still worth keeping.) strip removes the non-allocated
+# sections; PT_LOAD offsets and e_entry are untouched, so load_elf parses it
+# identically. Keep kernel.elf (with symbols) for gdb + the .embdbg producer.
 STRIP       = x86_64-elf-strip
 KERNEL_BIN  = kernel/kernel.strip.elf
+
+# The kernel's own .embdbg panic-symbol sidecar (EMBDBG_Specification.md §7),
+# produced from kernel.elf's DWARF by the EmbDBG tool. Function addresses come
+# from the (unstripped) kernel.elf; the stripped kernel that actually boots has
+# the same vaddrs, so the sidecar symbolizes it. Tolerant: if the tool is not
+# present the build still proceeds (an empty file -> symbolizer disabled, the
+# panic dump falls back to hex, exactly as before).
+EMBDBG      ?= /home/motsou/EmbCC/embdbg
+build/kernel.embdbg: $(KERNEL_ELF) | $(BUILD)
+	@if [ -x "$(EMBDBG)" ]; then \
+	   echo "  EMBDBG   $@"; $(EMBDBG) $< emit-kernel $@; \
+	 else echo "  (embdbg tool absent -> no kernel panic symbols)"; : > $@; fi
 
 
 # ---- Userland ---------------------------------------------------------------
@@ -651,12 +668,13 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) > $(IMG)
 	truncate -s 1M $(IMG)
 	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
-	video_ceiling=$$(( (0xA0000 - 0x10000) / 512 )); \
-	echo "Kernel is $$kernel_sectors sectors (video-RAM ceiling $$video_ceiling); stage2 loads exact size"; \
-	if [ $$kernel_sectors -ge $$video_ceiling ]; then \
-	  echo "*** WARNING: stripped kernel exceeds the 0xA0000 real-mode load ceiling;"; \
-	  echo "*** stage2 will overflow into video RAM/option-ROM. Move to an unreal-mode"; \
-	  echo "*** high load (>1 MB) before the kernel grows further."; \
+	kernel_top=$$(( 0x100000 + $$(stat -c%s $(KERNEL_BIN)) )); \
+	stage_base=$$(( 0x1000000 )); \
+	echo "Kernel is $$kernel_sectors sectors; stage2 stages the ELF at 0x1000000 (16 MB, unreal-mode high load)"; \
+	if [ $$kernel_top -ge $$stage_base ]; then \
+	  echo "*** WARNING: the kernel's final image (ends ~0x$$(printf %X $$kernel_top)) now reaches the"; \
+	  echo "*** 0x1000000 (16 MB) staging base -- the staged ELF would overwrite the running kernel."; \
+	  echo "*** Raise KERNEL_STAGE_PHYS in boot/stage2/stage2.asm above the kernel's top."; \
 	fi
 # Create the 64 MB data disk only if it doesn't already exist
 $(DISK):
@@ -727,7 +745,7 @@ STAGED_APPS ?=
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/libembk.so build/libtcc1.o build/emlink_dynstubs.o
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so build/libtcc1.o build/emlink_dynstubs.o
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is

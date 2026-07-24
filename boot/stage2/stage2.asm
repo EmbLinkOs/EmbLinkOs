@@ -5,6 +5,13 @@
 %define KERNEL_LOAD_SECTORS 1024
 %endif
 %define KERNEL_VIRTUAL_BASE 0xFFFFFFFF80000000
+; Physical address the kernel ELF is STAGED at before load_elf copies its
+; PT_LOAD segments down to their higher-half homes. It MUST be above 1 MB: the
+; kernel ELF outgrew the low sub-640 KB window (staged at 0x10000 it ran past
+; 0xA0000, the VGA memory hole, and through the stage2 boot stack at 0x80000).
+; 16 MB is clear of the VGA hole, the final kernel image (~0x100000..~0x200000)
+; and the page tables, and is within the first 1 GB the loader identity-maps.
+%define KERNEL_STAGE_PHYS 0x1000000
 ; Transient stack for stage2 ITSELF (used while parsing/copying the kernel ELF).
 ; Placed in low conventional memory below the kernel load address (0x100000) so it
 ; can never collide with the kernel image no matter how large the kernel grows.
@@ -31,14 +38,24 @@ start:
     call e820_query
     call enable_a20
 
-    ; Load kernel one sector at a time, starting at LBA 9.
+    ; --- Stage the kernel ELF above 1 MB --------------------------------
+    ; Each sector is read by INT 13h into a small fixed bounce at phys 0x10000,
+    ; then copied up to KERNEL_STAGE_PHYS (16 MB) through a flat "unreal mode"
+    ; FS segment. This replaces the old scheme that loaded the whole ELF at
+    ; 0x10000 -- which now overruns the 0xA0000 VGA hole and the 0x80000 boot
+    ; stack. load_elf (long mode, first 1 GB identity-mapped) then copies the
+    ; PT_LOAD segments from KERNEL_STAGE_PHYS to their higher-half addresses
+    ; exactly as before.
+    call enter_unreal               ; FS -> flat 4 GB segment, still real mode
+
     mov word  [dap + 2], 1          ; 1 sector per read
-    mov word  [dap + 4], 0x0000     ; offset
-    mov word  [dap + 6], 0x1000     ; segment (= phys 0x10000)
+    mov word  [dap + 4], 0x0000     ; bounce offset
+    mov word  [dap + 6], 0x1000     ; bounce segment (= phys 0x10000)
     mov dword [dap + 8], 9          ; initial LBA
     mov dword [dap + 12], 0
 
-    mov cx, KERNEL_LOAD_SECTORS
+    mov dword [stage_ptr], KERNEL_STAGE_PHYS
+    mov word  [sectors_left], KERNEL_LOAD_SECTORS
 
 .read_loop:
     mov si, dap
@@ -47,12 +64,23 @@ start:
     int 0x13
     jc disk_error_S2
 
+    ; Copy the 512 bytes just read (phys 0x10000) up to [stage_ptr] via flat FS.
+    mov esi, 0x10000
+    mov edi, [stage_ptr]
+    mov ecx, 128                    ; 128 dwords = 512 bytes
+.copy_up:
+    mov eax, [fs:esi]
+    mov [fs:edi], eax
+    add esi, 4
+    add edi, 4
+    dec ecx
+    jnz .copy_up
+    mov [stage_ptr], edi            ; advance the high staging pointer
 
-    add word  [dap + 6], 0x20
-    add dword [dap + 8], 1
+    add dword [dap + 8], 1          ; next LBA
     adc dword [dap + 12], 0
-
-    loop .read_loop
+    dec word [sectors_left]
+    jnz .read_loop
 
     xor ax, ax
     mov es, ax
@@ -93,7 +121,35 @@ disk_error_S2:
 enable_a20:
     mov ax, 0x2401          ; Prepare to enable A20 line
     int 0x15                ; Call BIOS interrupt to enable A20
-    ret                     
+    ret
+
+; Make FS a flat 4 GB segment while staying in real mode ("unreal mode"), so the
+; kernel-staging copy can address physical memory past 1 MB with 32-bit offsets.
+; Only FS is flattened -- DS/ES/SS keep their real-mode bases, so INT 13h and
+; every [label] access are unaffected, and the BIOS disk service does not touch
+; FS, so its flat descriptor cache survives each INT 13h call. A20 must already
+; be enabled (it is: enable_a20 runs first) for the >1 MB addresses to be live.
+enter_unreal:
+    cli
+    push eax
+    push bx
+    lgdt [gdt_descriptor]           ; the 32-bit GDT (gdt_data = flat 4 GB)
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax                    ; enter protected mode (CS not reloaded)
+    mov bx, 0x10                    ; flat 4 GB data selector
+    mov fs, bx                      ; FS descriptor cache becomes flat
+    mov eax, cr0
+    and al, 0xFE
+    mov cr0, eax                    ; back to real mode; FS cache stays flat
+    pop bx
+    pop eax
+    sti
+    ret
+
+; Staging state for the kernel load loop (DS-relative, DS base 0).
+stage_ptr:    dd 0                  ; running physical dest above 1 MB
+sectors_left: dw 0
 
 gdt_start:
 
@@ -676,7 +732,7 @@ long_mode_start:
     mov rsi, msg_longmode     
     call print_string_64
 
-    ;load the kernel from memory (it should have been loaded by stage 2 at 0x10000)
+    ;load the kernel: stage2 staged the ELF at KERNEL_STAGE_PHYS (16 MB)
     call load_elf
 
     ;jmp to the kernel entry point 
@@ -686,7 +742,7 @@ load_elf:
     ; This is where you would parse the ELF header, load the program segments into memory,
     ; and then return the entry point address in RAX
 
-    mov rsi, 0x10000         ; Address where the ELF file is loaded
+    mov rsi, KERNEL_STAGE_PHYS   ; where stage2 staged the ELF (16 MB, identity-mapped)
 
     ; verify ELF magic number
     cmp dword [rsi], 0x464C457F ; "\x7FELF" in little-endian
