@@ -131,28 +131,117 @@ static void icmp_input(uint32_t src_ip, const uint8_t *msg, uint32_t len) {
 }
 
 /* ---- IPv4 --------------------------------------------------------------- */
-int net_send_ip(uint32_t dst_ip, uint8_t proto, const void *payload, uint32_t len) {
+/* Core IPv4 output. `src_ip` may be 0 (unconfigured, e.g. DHCP DISCOVER). A dst
+ * of 255.255.255.255 goes out as an Ethernet broadcast with no ARP; otherwise
+ * next hop is the host itself (on-subnet) or the default gateway. */
+static int ip_output(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                     const void *payload, uint32_t len) {
     uint8_t pkt[ETH_FRAME_MAX - ETH_HLEN];
     if (sizeof(struct ip_hdr) + len > sizeof(pkt)) return -1;
 
     struct ip_hdr *ip = (struct ip_hdr *)pkt;
     memset(ip, 0, sizeof(*ip));
-    ip->ver_ihl = 0x45;
+    ip->ver_ihl   = 0x45;
     ip->total_len = htons(sizeof(struct ip_hdr) + len);
-    ip->ttl = 64;
-    ip->proto = proto;
-    ip->src = htonl(g_netif.ip);
-    ip->dst = htonl(dst_ip);
-    ip->checksum = 0;
-    ip->checksum = net_checksum(ip, sizeof(*ip));
+    ip->ttl       = 64;
+    ip->proto     = proto;
+    ip->src       = htonl(src_ip);
+    ip->dst       = htonl(dst_ip);
+    ip->checksum  = net_checksum(ip, sizeof(*ip));
     memcpy(pkt + sizeof(*ip), payload, len);
 
-    /* Next hop: on-subnet -> the host itself, else the default gateway. */
-    uint32_t nexthop = ((dst_ip & g_netif.netmask) == (g_netif.ip & g_netif.netmask))
-                       ? dst_ip : g_netif.gateway;
     uint8_t mac[ETH_ALEN];
-    if (!arp_resolve(nexthop, mac)) return -1;
+    if (dst_ip == 0xFFFFFFFFu) {
+        memcpy(mac, BCAST, ETH_ALEN);
+    } else {
+        uint32_t nexthop = ((dst_ip & g_netif.netmask) == (g_netif.ip & g_netif.netmask))
+                           ? dst_ip : g_netif.gateway;
+        if (!arp_resolve(nexthop, mac)) return -1;
+    }
     return net_tx_eth(mac, ETH_P_IP, pkt, sizeof(struct ip_hdr) + len);
+}
+
+int net_send_ip(uint32_t dst_ip, uint8_t proto, const void *payload, uint32_t len) {
+    return ip_output(g_netif.ip, dst_ip, proto, payload, len);
+}
+
+/* ---- UDP ---------------------------------------------------------------- */
+/* UDP checksum over the pseudo-header + segment (RFC 768). */
+static uint16_t udp_checksum(uint32_t src, uint32_t dst, const uint8_t *seg, uint32_t seg_len) {
+    uint32_t sum = 0;
+    uint32_t s = htonl(src), d = htonl(dst);
+    const uint16_t *ph = (const uint16_t *)&s; sum += ph[0]; sum += ph[1];
+    ph = (const uint16_t *)&d;                 sum += ph[0]; sum += ph[1];
+    sum += htons(IP_PROTO_UDP);
+    sum += htons((uint16_t)seg_len);
+    const uint16_t *p = (const uint16_t *)seg;
+    uint32_t n = seg_len;
+    while (n > 1) { sum += *p++; n -= 2; }
+    if (n) sum += *(const uint8_t *)p;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    uint16_t c = (uint16_t)~sum;
+    return c ? c : 0xFFFF;                      /* 0 means "none"; send 0xFFFF */
+}
+
+int net_send_udp(uint32_t src_ip, uint16_t src_port,
+                 uint32_t dst_ip, uint16_t dst_port,
+                 const void *payload, uint32_t len) {
+    uint8_t seg[ETH_FRAME_MAX - ETH_HLEN - sizeof(struct ip_hdr)];
+    uint32_t seg_len = sizeof(struct udp_hdr) + len;
+    if (seg_len > sizeof(seg)) return -1;
+    struct udp_hdr *u = (struct udp_hdr *)seg;
+    u->src_port = htons(src_port);
+    u->dst_port = htons(dst_port);
+    u->len      = htons((uint16_t)seg_len);
+    u->checksum = 0;
+    memcpy(seg + sizeof(*u), payload, len);
+    u->checksum = udp_checksum(src_ip, dst_ip, seg, seg_len);
+    return ip_output(src_ip, dst_ip, IP_PROTO_UDP, seg, seg_len);
+}
+
+/* Single-slot receive capture -- enough for the sequential request/reply flows
+ * of DHCP (and later DNS). Armed on a local port; udp_input fills it. */
+#define UDP_CAP_MAX 1024
+static volatile struct {
+    bool     armed;
+    uint16_t port;
+    uint32_t from_ip;
+    uint8_t  buf[UDP_CAP_MAX];
+    uint32_t len;
+    volatile bool got;
+} g_udp;
+
+static void udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
+    if (seg_len < sizeof(struct udp_hdr)) return;
+    const struct udp_hdr *u = (const struct udp_hdr *)seg;
+    uint32_t dlen = ntohs(u->len);
+    if (dlen < sizeof(*u) || dlen > seg_len) dlen = seg_len;
+    const uint8_t *data = seg + sizeof(*u);
+    uint32_t datalen = dlen - sizeof(*u);
+    if (g_udp.armed && !g_udp.got && ntohs(u->dst_port) == g_udp.port) {
+        uint32_t k = datalen < UDP_CAP_MAX ? datalen : UDP_CAP_MAX;
+        memcpy((void *)g_udp.buf, data, k);
+        g_udp.len = k;
+        g_udp.from_ip = src_ip;
+        g_udp.got = true;
+    }
+}
+
+static void udp_arm(uint16_t port) {
+    g_udp.port = port; g_udp.len = 0; g_udp.from_ip = 0; g_udp.got = false; g_udp.armed = true;
+}
+/* Poll (bounded) for the armed datagram; returns bytes into `out`, or -1. */
+static int udp_collect(uint8_t *out, uint32_t cap, uint32_t *from_ip) {
+    for (int i = 0; i < 400000 && !g_udp.got; i++) { virtio_net_poll(); schedule(); }
+    int rc = -1;
+    if (g_udp.got) {
+        uint32_t k = g_udp.len < cap ? g_udp.len : cap;
+        memcpy(out, (void *)g_udp.buf, k);
+        if (from_ip) *from_ip = g_udp.from_ip;
+        rc = (int)k;
+    }
+    g_udp.armed = false;
+    return rc;
 }
 
 static void ip_input(const uint8_t *pkt, uint32_t len) {
@@ -161,13 +250,23 @@ static void ip_input(const uint8_t *pkt, uint32_t len) {
     if ((ip->ver_ihl >> 4) != 4) return;
     uint32_t ihl = (ip->ver_ihl & 0x0F) * 4;
     if (ihl < sizeof(struct ip_hdr) || ihl > len) return;
-    if (ntohl(ip->dst) != g_netif.ip) return;   /* not for us (M1: no forwarding) */
+
+    /* Accept: unicast to us, the limited broadcast, or -- while we are still
+     * unconfigured mid-DHCP (ip == 0) -- anything. No forwarding (M1). */
+    uint32_t dst = ntohl(ip->dst);
+    if (dst != g_netif.ip && dst != 0xFFFFFFFFu && g_netif.ip != 0) return;
 
     uint32_t src = ntohl(ip->src);
     const uint8_t *payload = pkt + ihl;
+    /* Trust the IP total length over the frame length: a minimum-size Ethernet
+     * frame is zero-padded to 60 bytes, so `len - ihl` would include padding. */
     uint32_t plen = len - ihl;
-    if (ip->proto == IP_PROTO_ICMP) icmp_input(src, payload, plen);
-    /* UDP/TCP: M2/M3 */
+    uint32_t total = ntohs(ip->total_len);
+    if (total >= ihl && total <= len) plen = total - ihl;
+
+    if (ip->proto == IP_PROTO_ICMP)      icmp_input(src, payload, plen);
+    else if (ip->proto == IP_PROTO_UDP)  udp_input(src, payload, plen);
+    /* TCP: M3 */
 }
 
 /* ---- Ethernet RX demux (driver -> here) --------------------------------- */
@@ -206,7 +305,124 @@ bool net_ping(uint32_t dst_ip) {
     return g_ping.got;
 }
 
+/* ---- DHCP client (RFC 2131): DISCOVER -> OFFER -> REQUEST -> ACK --------- */
+#define DHCP_SERVER_PORT 67
+#define DHCP_CLIENT_PORT 68
+#define DHCP_MAGIC       0x63825363u
+#define DHCP_XID         0x454D4231u        /* "EMB1" -- any fixed value the reply echoes */
+
+#define DHCP_DISCOVER 1
+#define DHCP_OFFER    2
+#define DHCP_REQUEST  3
+#define DHCP_ACK      5
+
+#define DHCPOPT_MASK      1
+#define DHCPOPT_ROUTER    3
+#define DHCPOPT_DNS       6
+#define DHCPOPT_REQIP     50
+#define DHCPOPT_MSGTYPE   53
+#define DHCPOPT_SERVERID  54
+#define DHCPOPT_PARAMLIST 55
+#define DHCPOPT_END       255
+
+struct dhcp_hdr {
+    uint8_t  op, htype, hlen, hops;
+    uint32_t xid;
+    uint16_t secs, flags;
+    uint32_t ciaddr, yiaddr, siaddr, giaddr;
+    uint8_t  chaddr[16];
+    uint8_t  sname[64];
+    uint8_t  file[128];
+    uint32_t magic;                          /* network order 0x63825363 */
+    /* options follow */
+} __attribute__((packed));
+
+static uint32_t rd_be32(const uint8_t *p) { return IPV4(p[0], p[1], p[2], p[3]); }
+
+/* Find option `code` in the TLV blob; returns its value pointer (+ *outlen). */
+static const uint8_t *dhcp_opt(const uint8_t *o, uint32_t len, uint8_t code, uint8_t *outlen) {
+    uint32_t i = 0;
+    while (i < len) {
+        uint8_t c = o[i++];
+        if (c == 0) continue;                /* pad */
+        if (c == DHCPOPT_END || i >= len) break;
+        uint8_t l = o[i++];
+        if (i + l > len) break;
+        if (c == code) { if (outlen) *outlen = l; return &o[i]; }
+        i += l;
+    }
+    return 0;
+}
+
+static int dhcp_build(uint8_t *buf, uint8_t type, uint32_t req_ip, uint32_t server_id) {
+    struct dhcp_hdr *h = (struct dhcp_hdr *)buf;
+    memset(h, 0, sizeof(*h));
+    h->op = 1; h->htype = 1; h->hlen = 6;
+    h->xid = htonl(DHCP_XID);
+    h->flags = htons(0x8000);                /* ask the server to broadcast the reply */
+    memcpy(h->chaddr, g_netif.mac, ETH_ALEN);
+    h->magic = htonl(DHCP_MAGIC);
+    uint8_t *o = buf + sizeof(*h);
+    *o++ = DHCPOPT_MSGTYPE; *o++ = 1; *o++ = type;
+    if (type == DHCP_REQUEST) {
+        *o++ = DHCPOPT_REQIP;    *o++ = 4;
+        *o++ = req_ip >> 24; *o++ = req_ip >> 16; *o++ = req_ip >> 8; *o++ = req_ip;
+        *o++ = DHCPOPT_SERVERID; *o++ = 4;
+        *o++ = server_id >> 24; *o++ = server_id >> 16; *o++ = server_id >> 8; *o++ = server_id;
+    }
+    *o++ = DHCPOPT_PARAMLIST; *o++ = 4;
+    *o++ = DHCPOPT_MASK; *o++ = DHCPOPT_ROUTER; *o++ = DHCPOPT_DNS; *o++ = DHCPOPT_MSGTYPE;
+    *o++ = DHCPOPT_END;
+    return (int)(o - buf);
+}
+
+/* Send one DHCP message and capture the reply of expected type. Returns the
+ * reply length, or -1. `in` must hold >= sizeof(dhcp_hdr) + options. */
+static int dhcp_xact(uint8_t type, uint32_t req_ip, uint32_t server_id,
+                     uint8_t *in, uint32_t incap, uint8_t expect) {
+    static uint8_t out[512];
+    udp_arm(DHCP_CLIENT_PORT);
+    int n = dhcp_build(out, type, req_ip, server_id);
+    if (net_send_udp(0, DHCP_CLIENT_PORT, 0xFFFFFFFFu, DHCP_SERVER_PORT, out, n) < 0) return -1;
+    int r = udp_collect(in, incap, 0);
+    if (r < (int)sizeof(struct dhcp_hdr)) return -1;
+    const struct dhcp_hdr *h = (const struct dhcp_hdr *)in;
+    if (h->op != 2 || ntohl(h->xid) != DHCP_XID) return -1;
+    uint8_t ol;
+    const uint8_t *mt = dhcp_opt(in + sizeof(*h), r - sizeof(*h), DHCPOPT_MSGTYPE, &ol);
+    if (!mt || mt[0] != expect) return -1;
+    return r;
+}
+
+bool net_dhcp(void) {
+    static uint8_t in[1024];
+
+    int r = dhcp_xact(DHCP_DISCOVER, 0, 0, in, sizeof(in), DHCP_OFFER);
+    if (r < 0) return false;
+    const struct dhcp_hdr *off = (const struct dhcp_hdr *)in;
+    uint32_t yiaddr = ntohl(off->yiaddr);
+    uint8_t ol;
+    const uint8_t *sid = dhcp_opt(in + sizeof(*off), r - sizeof(*off), DHCPOPT_SERVERID, &ol);
+    uint32_t server_id = sid ? rd_be32(sid) : ntohl(off->siaddr);
+
+    r = dhcp_xact(DHCP_REQUEST, yiaddr, server_id, in, sizeof(in), DHCP_ACK);
+    if (r < 0) return false;
+    const struct dhcp_hdr *ack = (const struct dhcp_hdr *)in;
+    const uint8_t *mask = dhcp_opt(in + sizeof(*ack), r - sizeof(*ack), DHCPOPT_MASK,   &ol);
+    const uint8_t *rtr  = dhcp_opt(in + sizeof(*ack), r - sizeof(*ack), DHCPOPT_ROUTER, &ol);
+    const uint8_t *dns  = dhcp_opt(in + sizeof(*ack), r - sizeof(*ack), DHCPOPT_DNS,    &ol);
+
+    g_netif.ip      = ntohl(ack->yiaddr);
+    g_netif.netmask = mask ? rd_be32(mask) : IPV4(255, 255, 255, 0);
+    g_netif.gateway = rtr  ? rd_be32(rtr)  : ((g_netif.ip & g_netif.netmask) | 2);
+    g_netif.dns     = dns  ? rd_be32(dns)  : 0;
+    g_netif.dhcp    = true;
+    return true;
+}
+
 /* ---- bring-up ----------------------------------------------------------- */
+#define IPQ(ip) (uint8_t)((ip) >> 24), (uint8_t)((ip) >> 16), (uint8_t)((ip) >> 8), (uint8_t)(ip)
+
 static void net_rx_thread(void) {
     for (;;) { virtio_net_poll(); schedule(); }
 }
@@ -217,12 +433,18 @@ void net_init(void) {
         kprintf("net: no NIC -- networking disabled\n");
         return;
     }
-    /* Static config for M1 (matches QEMU user-mode net / SLIRP). DHCP is M2. */
-    g_netif.ip      = IPV4(10, 0, 2, 15);
-    g_netif.netmask = IPV4(255, 255, 255, 0);
-    g_netif.gateway = IPV4(10, 0, 2, 2);
+    process_create_kthread(net_rx_thread, 0);   /* background RX poller */
     g_netif.up = true;
-    kprintf("net: up  ip 10.0.2.15/24  gw 10.0.2.2\n");
 
-    process_create_kthread(net_rx_thread, 0);
+    /* Lease an address (M2). Fall back to the M1 static config so the stack is
+     * still usable if no DHCP server answers. */
+    if (net_dhcp()) {
+        kprintf("net: DHCP lease  ip %u.%u.%u.%u  gw %u.%u.%u.%u  dns %u.%u.%u.%u\n",
+                IPQ(g_netif.ip), IPQ(g_netif.gateway), IPQ(g_netif.dns));
+    } else {
+        g_netif.ip      = IPV4(10, 0, 2, 15);
+        g_netif.netmask = IPV4(255, 255, 255, 0);
+        g_netif.gateway = IPV4(10, 0, 2, 2);
+        kprintf("net: DHCP failed -- static 10.0.2.15/24 gw 10.0.2.2\n");
+    }
 }

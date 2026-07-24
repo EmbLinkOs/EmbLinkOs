@@ -76,13 +76,22 @@ struct icmp_hdr {
     uint16_t id, seq;                 /* network order */
 } __attribute__((packed));
 
+/* ---- UDP ---------------------------------------------------------------- */
+struct udp_hdr {
+    uint16_t src_port, dst_port;      /* network order */
+    uint16_t len;                     /* network order: header + data */
+    uint16_t checksum;
+} __attribute__((packed));
+
 /* ---- the single network interface (M1: one NIC, static config) ---------- */
 struct netif {
     bool     up;
+    bool     dhcp;                    /* true once a DHCP lease configured us */
     uint8_t  mac[ETH_ALEN];
     uint32_t ip;                      /* HOST order */
     uint32_t netmask;                 /* HOST order */
     uint32_t gateway;                 /* HOST order */
+    uint32_t dns;                     /* HOST order (from DHCP option 6) */
 };
 
 extern struct netif g_netif;
@@ -104,6 +113,16 @@ bool arp_resolve(uint32_t ip, uint8_t mac_out[ETH_ALEN]);
 
 /* IPv4: send `payload` (an ICMP/UDP/... message) to `dst_ip` (HOST order). */
 int  net_send_ip(uint32_t dst_ip, uint8_t proto, const void *payload, uint32_t len);
+
+/* UDP: send a datagram. src_ip may be 0 (unconfigured, e.g. DHCP DISCOVER);
+ * dst_ip 255.255.255.255 goes out as an Ethernet broadcast (no ARP). */
+int  net_send_udp(uint32_t src_ip, uint16_t src_port,
+                  uint32_t dst_ip, uint16_t dst_port,
+                  const void *payload, uint32_t len);
+
+/* DHCP: run DISCOVER/OFFER/REQUEST/ACK and, on success, configure g_netif
+ * (ip/netmask/gateway/dns) and set g_netif.dhcp. Returns true on a lease. */
+bool net_dhcp(void);
 
 /* ICMP: send one echo request to `dst_ip` and wait for the matching reply.
  * Returns true on a reply (the M1 witness). */

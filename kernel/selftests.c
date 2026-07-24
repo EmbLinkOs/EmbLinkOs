@@ -886,6 +886,25 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test dhcp") == 0) {
+        /* NETWORKING M2 witness: run the DHCP DORA on demand and show the lease.
+         * Under QEMU user-mode net, SLIRP is the DHCP server (10.0.2.2) and hands
+         * out 10.0.2.15 / gw 10.0.2.2 / dns 10.0.2.3 -- self-contained. */
+        if (!g_netif.up) {
+            kprintf("\n[cmd] test dhcp: NIC not up (boot with -netdev user -device virtio-net)\n");
+            return 1;
+        }
+        kprintf("[dhcp] requesting a lease (DISCOVER -> OFFER -> REQUEST -> ACK)...\n");
+        int ok = net_dhcp() ? 1 : 0;
+        if (ok)
+            kprintf("[dhcp] leased ip %u.%u.%u.%u  gw %u.%u.%u.%u  dns %u.%u.%u.%u\n",
+                    (uint8_t)(g_netif.ip>>24),(uint8_t)(g_netif.ip>>16),(uint8_t)(g_netif.ip>>8),(uint8_t)g_netif.ip,
+                    (uint8_t)(g_netif.gateway>>24),(uint8_t)(g_netif.gateway>>16),(uint8_t)(g_netif.gateway>>8),(uint8_t)g_netif.gateway,
+                    (uint8_t)(g_netif.dns>>24),(uint8_t)(g_netif.dns>>16),(uint8_t)(g_netif.dns>>8),(uint8_t)g_netif.dns);
+        kprintf("[cmd] test dhcp: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test capgate") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
         const char *gp = "/data/apps/capgpu/capgpu.elf";
