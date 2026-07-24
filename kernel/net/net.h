@@ -124,6 +124,11 @@ int  net_send_udp(uint32_t src_ip, uint16_t src_port,
  * (ip/netmask/gateway/dns) and set g_netif.dhcp. Returns true on a lease. */
 bool net_dhcp(void);
 
+/* DNS: resolve `name` to an IPv4 address (HOST order) via the DHCP-learned
+ * resolver (g_netif.dns), UDP/53. Returns true and fills *out_ip on the first
+ * A record. Needs a reachable resolver (SLIRP forwards to the host's). */
+bool net_resolve(const char *name, uint32_t *out_ip);
+
 /* ICMP: send one echo request to `dst_ip` and wait for the matching reply.
  * Returns true on a reply (the M1 witness). */
 bool net_ping(uint32_t dst_ip);

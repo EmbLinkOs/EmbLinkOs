@@ -905,6 +905,30 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test dns") == 0) {
+        /* NETWORKING: resolve a name via the DHCP-learned resolver (UDP/53).
+         * SLIRP forwards to the host's resolver, so this needs the host to have
+         * outbound DNS -- unlike DHCP/ping it is NOT purely local. */
+        if (!g_netif.up)  { kprintf("\n[cmd] test dns: NIC not up\n"); return 1; }
+        if (!g_netif.dns) { kprintf("\n[cmd] test dns: no resolver (DHCP gave none)\n"); return 1; }
+        const char *names[] = { "example.com", "dns.google" };
+        int ok = 0;
+        for (int i = 0; i < 2 && !ok; i++) {
+            uint32_t ip = 0;
+            kprintf("[dns] resolving %s ...\n", names[i]);
+            if (net_resolve(names[i], &ip)) {
+                kprintf("[dns] %s -> %u.%u.%u.%u\n", names[i],
+                        (uint8_t)(ip>>24),(uint8_t)(ip>>16),(uint8_t)(ip>>8),(uint8_t)ip);
+                ok = 1;
+            } else {
+                kprintf("[dns] %s: no answer\n", names[i]);
+            }
+        }
+        if (!ok) kprintf("[dns] no resolution (needs outbound DNS via SLIRP/host)\n");
+        kprintf("[cmd] test dns: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test capgate") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
         const char *gp = "/data/apps/capgpu/capgpu.elf";
