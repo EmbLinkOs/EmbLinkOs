@@ -37,6 +37,7 @@
 #include "mm/kheap.h"
 
 #include "acpi/acpi.h"
+#include "net/net.h"
 #include "block/block.h"
 #include "block/partition.h"
 #include "fs/fat32.h"
@@ -1945,6 +1946,11 @@ void kernel_main(void) {
     }
 
     kworker_init();
+
+    // --- Networking (M1): virtio-net + Ethernet/ARP/IPv4/ICMP. After PCI is
+    // enumerated and the scheduler is live (net_init spawns an RX poll kthread).
+    // Static config for now; `test net` pings the gateway. No ring-3 surface yet.
+    net_init();
 
     // Land the user in the graphical HOME launcher: a ring-3 app that takes the
     // whole screen as the compositor's desktop layer and launches other apps

@@ -82,6 +82,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
              kernel/drivers/bus/pci.c \
+             kernel/net/virtio_net.c \
+             kernel/net/net.c \
              kernel/drivers/usb/usb.c \
              kernel/drivers/usb/usb_core.c \
              kernel/drivers/usb/xhci.c \
@@ -616,6 +618,12 @@ home: build/home.elf
 DRIVES = -drive format=raw,file=$(IMG),if=ide,index=0 \
          -drive format=raw,file=$(DISK),if=ide,index=1
 
+# Networking (M1): QEMU user-mode net (SLIRP) + a virtio-net NIC. No host setup
+# -- SLIRP is the guest's 10.0.2.0/24 with gateway .2 and DNS .3, and answers
+# ARP + ICMP, so `test net` pings the gateway out of the box. Appended to the
+# run targets below. Add hostfwd=tcp::HOST-:GUEST here once TCP (M3) lands.
+NET = -netdev user,id=net0 -device virtio-net,netdev=net0
+
 # `make` builds a COMPLETE, CURRENT system: the boot image AND the userland
 # image. embkfs.img was deliberately absent here before, so a plain `make` could
 # exit 0 having never built the apps it packs -- `make && make run-*` would then
@@ -830,7 +838,7 @@ run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
 	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
-	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi
+	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi $(NET)
 	@echo "--- grading the post-COW image ---"
 	python3 embkfs_mkfs/verify_embkfs.py $(EMBKFS_SCRATCH)
 
@@ -846,7 +854,7 @@ run-embkfs: $(IMG) $(DISK) embkfs.img
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
-	    -serial stdio -no-reboot -no-shutdown
+	    -serial stdio -no-reboot -no-shutdown $(NET)
 
 # --- run-ui: boot to a window, then the live EmbLink UI app ------------------
 # Boots EmbLinkOS with a real display; uidemo.elf (the ring-3 UI toolkit, font
@@ -864,7 +872,7 @@ run-ui: $(IMG) embkfs.img
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
-	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4
+	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4 $(NET)
 
 # Boots to the window-compositor demo: two kernel-composited windows (one
 # hosting the EmUI toolkit, one drawn directly) over a desktop with title-bar
@@ -876,7 +884,7 @@ run-wm: $(IMG) embkfs.img
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
-	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4
+	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4 $(NET)
 
 # Encrypted EMBKFS test volume (v2.2 Phase 4). Passphrase is the fixed test
 # string "correcthorsebattery" -- NEVER a real credential, just a KAT-style

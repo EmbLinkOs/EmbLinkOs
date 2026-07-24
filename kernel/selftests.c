@@ -5,6 +5,7 @@
 #include "include/errno.h"
 #include "fs/embkfs/embkfs.h"
 #include "block/block.h"   /* blkstat request counters (test ioperf) */
+#include "net/net.h"       /* g_netif, net_ping (test net) */
 #include "arch/x86_64/syscall/usercopy.h"   /* transient-EFAULT retry counters */
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
@@ -864,6 +865,24 @@ int selftests_handle_command(const char *cmd)
         }
 
         kprintf("[cmd] test faultkill: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test net") == 0) {
+        /* NETWORKING M1 witness: the OS ARP-resolves the gateway and completes an
+         * ICMP echo round trip over virtio-net (virtio-net -> eth -> ARP -> IPv4
+         * -> ICMP). Self-contained under QEMU user-mode net: SLIRP answers ARP
+         * for 10.0.2.2 and replies to the ping. Needs `-device virtio-net`. */
+        if (!g_netif.up) {
+            kprintf("\n[cmd] test net: NIC not up (boot with -netdev user -device virtio-net)\n");
+            return 1;
+        }
+        kprintf("[net] pinging gateway 10.0.2.2 ...\n");
+        int ok = 0;
+        for (int i = 0; i < 3 && !ok; i++)
+            if (net_ping(g_netif.gateway)) ok = 1;
+            else kprintf("[net] attempt %d: no reply\n", i + 1);
+        kprintf("[cmd] test net: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
     }
 
