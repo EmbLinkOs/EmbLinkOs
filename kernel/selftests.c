@@ -16,6 +16,11 @@
 #include "drivers/timer/rtc.h"
 #include "arch/x86_64/syscall/usermode.h"
 #include "process/process.h"
+#include "process/debug.h"    /* test debug: the live-debugging contract */
+#include "process/ksync.h"
+#include "mm/vmm.h"
+#include "mm/pmm.h"
+#include "lib/ksym.h"         /* test debugsym: the panic symbolizer */
 #include "tty/tty.h"
 #include "drivers/input/keyboard.h"
 #include "process/ksync.h"
@@ -429,6 +434,10 @@ static void selftests_print_commands(void)
     kprintf("  test tcc real\n");
     kprintf("  test tcc dyn\n");
     kprintf("  test tcc tally\n");
+    kprintf("  test embcc\n");
+    kprintf("  test embcc self\n");
+    kprintf("  test embcc asm\n");
+    kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
     kprintf("  test embbuild self\n");
     kprintf("  test embbuild shell\n");
@@ -667,6 +676,197 @@ int selftests_handle_command(const char *cmd)
  * twice with DIFFERENT seeds and check both: without GPU it must be refused,
  * with GPU it must be granted. One direction alone proves nothing (a gate that
  * always denies passes the first; one that never gates passes the second). */
+    if (strcmp(cmd, "test suspend") == 0) {
+        /* EmbDBG v2 control: prove suspend/resume FREEZE a thread. The witness
+         * (process_test_suspend, in process.c beside the round-robin one) uses
+         * the proven selftest scheduler harness — adopt self, a timer-preempted
+         * spinner, hlt-based tick waits — so it observes real preemption, not a
+         * fragile yield loop. */
+        int rc = process_test_suspend();
+        kprintf("\n[cmd] test suspend: %s\n", rc == 0 ? "OK" : "FAIL");
+        return rc == 0 ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test debugsym") == 0) {
+        /* EMBDBG_Specification.md §8 M2: the kernel loaded its OWN .embdbg at
+         * boot; prove the symbolizer turns a raw kernel address into
+         * func (file:line). Take the addresses of a few kernel functions and
+         * check ksym names them with a source line — the same ksym_symbolize
+         * isr_handler now uses, so a real panic backtrace is proven too. */
+        if (!ksym_ready()) {
+            kprintf("\n[cmd] test debugsym: kernel symbols not loaded "
+                    "(/system/kernel.embdbg missing?)\n");
+            return 1;
+        }
+        struct { void *fn; const char *name; } cases[] = {
+            { (void *)&kprintf,   "kprintf" },
+            { (void *)&vfs_open,  "vfs_open" },
+            { (void *)&ksym_load, "ksym_load" },
+        };
+        int ok = 1;
+        for (int i = 0; i < 3; i++) {
+            char sym[176];
+            ksym_symbolize((uint64_t)(uintptr_t)cases[i].fn, sym, sizeof sym);
+            kprintf("[debugsym] %p -> %s\n", cases[i].fn, sym);
+            size_t nl = strlen(cases[i].name);
+            if (strncmp(sym, cases[i].name, nl) != 0) {
+                kprintf("[debugsym] FAIL: expected symbol '%s'\n", cases[i].name); ok = 0;
+            }
+            int has_line = 0;
+            for (const char *p = sym; *p; p++) if (*p == '(') { has_line = 1; break; }
+            if (!has_line) { kprintf("[debugsym] FAIL: no (file:line) for %s\n", cases[i].name); ok = 0; }
+        }
+        kprintf("[cmd] test debugsym: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test debug") == 0) {
+        /* EMBDBG_Specification.md §8 M1: prove the whole live-debugging kernel
+         * contract with a raw breakpoint — no .embdbg, no userspace debugger.
+         * The selftest IS the debugger: it spawns a target BORN STOPPED under
+         * SPAWN_ACTION_DEBUG, plants 0xCC, continues, catches #BP via the §6.6
+         * exception routing, reads registers + memory across address spaces,
+         * single-steps, and rides the target to a DBG_EV_EXITED. Driving the
+         * session directly (not via the syscalls) keeps the witness in-kernel;
+         * the syscall handlers are thin marshalling over this same logic. */
+        const char *tp = "/data/apps/hello/hello.elf";
+        struct vfs_stat st;
+        if (vfs_stat(tp, &st) != 0) { kprintf("\n[cmd] test debug: %s not on image\n", tp); return 1; }
+        char *a[] = { (char *)tp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        struct spawn_file_action acts[1];
+        memset(acts, 0, sizeof acts);
+        acts[0].kind = SPAWN_ACTION_DEBUG;
+
+        int ok = 1;
+        int pid = process_create_caps(tp, a, 1, env, acts, 1, EMBK_CAP_INHERIT);
+        if (pid < 0) { kprintf("[debug] FAIL: spawn-under-debug rc=%d\n", pid); return 1; }
+        struct process *tgt = process_find((uint32_t)pid);
+        struct debug_session *s = tgt ? tgt->debug_session : (struct debug_session *)0;
+        if (!s) { kprintf("[debug] FAIL: no debug session on the child\n"); return 1; }
+
+        /* (1) Born stopped at entry. */
+        if (!s->stopped || s->event.reason != DBG_EV_STEP) {
+            kprintf("[debug] FAIL: child not born-stopped (stopped=%d reason=%u)\n",
+                    s->stopped, s->event.reason); ok = 0;
+        }
+        uint64_t entry = s->event.pc;
+        kprintf("[debug] born stopped at entry 0x%lx\n", entry);
+
+        /* Reach the target's entry byte through ITS pml4 + the direct map. */
+        uint64_t phys = vmm_get_phys_in(tgt->pml4_phys, entry & ~0xFFFULL);
+        if (!phys) { kprintf("[debug] FAIL: entry unmapped in target\n"); return 1; }
+        volatile uint8_t *entb = (volatile uint8_t *)(uintptr_t)(P2V(phys) + (entry & 0xFFF));
+        uint8_t orig = *entb;
+
+        /* (2) Plant 0xCC (a software breakpoint — debugger-side). */
+        *entb = 0xCC;
+
+        /* (3) Continue: wake the born-stopped thread; it runs to _start and
+         * immediately traps on our 0xCC. */
+        sched_lock(); s->stopped = 0; wait_queue_wake_one(&s->target_wq); sched_unlock();
+
+        /* (4) Wait for the stop. */
+        sched_lock();
+        while (!s->stopped) { sched_block_current_locked(&s->debugger_wq); sched_lock(); }
+        sched_unlock();
+
+        if (s->event.reason != DBG_EV_BREAKPOINT || s->event.pc != entry) {
+            kprintf("[debug] FAIL: expected #BP at 0x%lx, got reason=%u pc=0x%lx\n",
+                    entry, s->event.reason, s->event.pc); ok = 0;
+        } else {
+            kprintf("[debug] #BP delivered at 0x%lx (was a panic before)\n", s->event.pc);
+        }
+        /* (5) Registers: RIP is one past the 0xCC. */
+        if (!s->stopped_frame || s->stopped_frame->rip != entry + 1) {
+            kprintf("[debug] FAIL: frame rip=0x%lx want 0x%lx\n",
+                    s->stopped_frame ? s->stopped_frame->rip : 0, entry + 1); ok = 0;
+        }
+        /* (6) Memory: read the byte back cross-address-space -> our 0xCC. */
+        uint8_t seen = *entb;
+        if (seen != 0xCC) { kprintf("[debug] FAIL: planted byte reads 0x%02x\n", seen); ok = 0; }
+        else kprintf("[debug] regs + cross-AS memory read OK\n");
+
+        /* (7) Restore the original byte, rewind RIP over the trap. */
+        *entb = orig;
+        s->stopped_frame->rip = entry;
+
+        /* (8) Single-step one instruction (TF). */
+        sched_lock();
+        s->stopped_frame->eflags |= 0x100ULL;   /* TF */
+        s->stopped = 0; wait_queue_wake_one(&s->target_wq);
+        sched_unlock();
+        sched_lock();
+        while (!s->stopped) { sched_block_current_locked(&s->debugger_wq); sched_lock(); }
+        sched_unlock();
+        if (s->event.reason != DBG_EV_STEP) {
+            kprintf("[debug] FAIL: single-step reason=%u\n", s->event.reason); ok = 0;
+        } else {
+            kprintf("[debug] single-step -> #DB at 0x%lx\n", s->event.pc);
+        }
+
+        /* (9) Continue to completion; ride the exit event. */
+        sched_lock();
+        if (s->stopped_frame) s->stopped_frame->eflags &= ~0x100ULL;  /* clear TF */
+        s->stopped = 0; wait_queue_wake_one(&s->target_wq);
+        sched_unlock();
+        sched_lock();
+        while (!s->stopped) { sched_block_current_locked(&s->debugger_wq); sched_lock(); }
+        sched_unlock();
+        if (s->event.reason != DBG_EV_EXITED) {
+            kprintf("[debug] FAIL: expected EXITED, got reason=%u\n", s->event.reason); ok = 0;
+        } else {
+            kprintf("[debug] target exited under debug, code=%u\n", s->event.error_code);
+        }
+
+        tgt->debug_session = NULL;      /* detach before the zombie is reaped */
+        s->used = 0;
+        (void)process_wait((uint32_t)pid);
+
+        kprintf("[cmd] test debug: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test faultkill") == 0) {
+        /* CRASH RESILIENCE: a ring-3 fault must terminate only the faulting
+         * process, not halt the machine (isr_handler's §6.6 non-debugged arm).
+         * The proof is twofold: (1) the spawned crasher comes back with a
+         * PROCESS_EXIT_FAULT code -- it was killed BY the fault, not a clean
+         * exit -- and (2) this selftest keeps running to observe it, TWICE, so
+         * the recoverable-path panic_lock release is exercised (a second crash
+         * would deadlock on a never-released lock, so the second round is the
+         * real test of the fix, not a duplicate). */
+        const char *cp = "/data/apps/crasher/crasher.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cp, &st) != 0) {
+            kprintf("\n[cmd] test faultkill: %s not on image\n", cp); return 1;
+        }
+        char *a[]   = { (char *)cp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+
+        int ok = 1;
+        for (int round = 1; round <= 2; round++) {
+            int pid = process_create_env(cp, a, 1, env, NULL, 0);
+            if (pid < 0) { kprintf("[faultkill] FAIL: spawn rc=%d\n", pid); return 1; }
+            /* If we return from this wait at all, the kernel did NOT halt. */
+            int code = process_wait((uint32_t)pid);
+            int is_fault = (code < 0) && (((-code) & ~0xff) == 0x100);
+            int vec = (-code) & 0xff;
+            if (!is_fault) {
+                kprintf("[faultkill] FAIL round %d: pid %d exit=%d, expected a fault code\n",
+                        round, pid, code);
+                ok = 0;
+            } else {
+                kprintf("[faultkill] round %d: pid %d killed by vector %d (%s), kernel survived\n",
+                        round, pid, vec,
+                        vec == 14 ? "#PF" : vec == 0 ? "#DE" : "fault");
+            }
+        }
+
+        kprintf("[cmd] test faultkill: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test capgate") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
         const char *gp = "/data/apps/capgpu/capgpu.elf";
@@ -845,9 +1045,14 @@ int selftests_handle_command(const char *cmd)
         WANT(embk_caps_attenuate(shell, CAP(EMBK_CAP_GPU), &out) != 0,
              "shell{FS,NET} must REFUSE {GPU} though init held it -- monotonicity");
 
-        /* EMBK_CAP_ALL really is bits 1..9 and nothing else (no bit 0, no id>9) */
+        /* EMBK_CAP_ALL really is bits 1..MAX_ID and nothing else (no bit 0,
+         * no id>MAX). cap_id 10 (DEBUG) is now a real class and IS in ALL; the
+         * first id past MAX is what must be refused. */
         WANT((EMBK_CAP_ALL & 1ULL) == 0, "cap_id 0 must never be in ALL");
-        WANT(embk_caps_attenuate(EMBK_CAP_ALL, EMBK_CAP_BIT(10), &out) != 0,
+        WANT(embk_caps_attenuate(EMBK_CAP_ALL, CAP(EMBK_CAP_DEBUG), &out) == 0
+             && out == CAP(EMBK_CAP_DEBUG),
+             "cap_id 10 (DEBUG) is a real class, granted from ALL");
+        WANT(embk_caps_attenuate(EMBK_CAP_ALL, EMBK_CAP_BIT(EMBK_CAP_MAX_ID + 1), &out) != 0,
              "an unknown cap id (>MAX) is not in ALL, so it is refused");
 
         /* --- integration: a real child is born with exactly its grant --- */
@@ -2324,6 +2529,304 @@ int selftests_handle_command(const char *cmd)
  *
  * Header-free again, and for the same reason as `test tcc compile`: /include
  * does not exist. main() needs no declaration to be defined. */
+
+/* EmbCC, THE SELF-HOSTED COMPILER, ON THE OS (EmbCC M3 fixed point, host
+ * half done in EmbCC's tree). embcc.elf here was itself COMPILED BY EmbCC
+ * and LINKED BY EmbLD on the host -- the compiler and linker are both
+ * EmbLink's own. This runs that self-built compiler on the OS: it compiles
+ * the M1 program (source -> object, exercising the whole frontend, the
+ * x86-64 codegen, the integrated assembler, and the ELF object writer),
+ * then tcc LINKS the EmbCC-produced object against the real crt0/syscalls/
+ * libc, and the kernel runs the result. Exit 42 can only appear if a
+ * compiler built by EmbCC really compiled, and its object was real enough
+ * for a DIFFERENT linker (tcc) to bind and run. Header-free for the same
+ * reason as the tcc tests: /include is flat. */
+    if (strcmp(cmd, "test embcc") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc: VFS not registered\n"); return 1; }
+        struct vfs_stat est;
+        if (vfs_stat("/data/apps/embcc/embcc.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc: /data/apps/embcc/embcc.elf not on image\n");
+            return 1; }
+
+        static const char src[] =
+            "/* Compiled BY EmbCC, ON EmbLink. EmbCC itself was built by EmbCC.\n"
+            "   No #include: the root is flat; a defined main needs none. */\n"
+            "static int twice(int x) { return x + x; }\n"
+            "int main(void) { return twice(21); }\n";
+        {
+            int fd = vfs_open("/data/tmp/e.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { kprintf("test embcc: cannot write /e.c\n"); return 1; }
+            size_t w = 0;
+            vfs_fd_write(fd, src, sizeof src - 1, &w);
+            vfs_close(fd);
+        }
+        (void)vfs_unlink_path("/data/tmp/e.o");
+        (void)vfs_unlink_path("/data/tmp/e.elf");
+
+        /* 1. EmbCC compiles: source -> object. */
+        char *a[] = { "/data/apps/embcc/embcc.elf", "-c", "/data/tmp/e.c",
+                      "-o", "/data/tmp/e.o" };
+        char *env[] = { "HOME=/", NULL };
+        kprintf("[embcc -c] %s %s %s %s\n", a[1], a[2], a[3], a[4]);
+        int pid = process_create_env("/data/apps/embcc/embcc.elf", a, 5, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embcc -c] exit=%d\n", code);
+
+        unsigned char hdr[20] = {0};
+        struct vfs_stat st;
+        int have = (vfs_stat("/data/tmp/e.o", &st) == 0);
+        if (have) {
+            int fd = vfs_open("/data/tmp/e.o", O_RDONLY, 0);
+            if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+        }
+        int is_elf = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
+        int is_64  = is_elf && hdr[4] == 2;
+        int is_rel = is_elf && hdr[16] == 1;
+        kprintf("[embcc -c] /e.o: %s, %llu bytes; ELF=%d 64-bit=%d ET_REL=%d\n",
+                have ? "written" : "MISSING",
+                have ? (unsigned long long)st.size : 0ULL, is_elf, is_64, is_rel);
+
+        /* 2. tcc links the EmbCC object against the real runtime. */
+        int rcode = -1, is_exec = 0;
+        if (is_elf && is_64 && is_rel) {
+            char *b[] = { "/data/apps/tcc/tcc.elf", "-static", "-nostdlib",
+                          "/data/tmp/e.o", "/system/abi/crt0.o",
+                          "/system/abi/syscalls.o", "-L/system/abi", "-lc",
+                          "-o", "/data/tmp/e.elf" };
+            kprintf("[embcc link] tcc %s %s %s %s %s %s %s %s %s\n",
+                    b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]);
+            int lp = process_create_env("/data/apps/tcc/tcc.elf", b, 10, env, NULL, 0);
+            int lcode = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            kprintf("[embcc link] exit=%d\n", lcode);
+            unsigned char eh[20] = {0};
+            struct vfs_stat es;
+            int ehave = (vfs_stat("/data/tmp/e.elf", &es) == 0);
+            if (ehave) {
+                int fd = vfs_open("/data/tmp/e.elf", O_RDONLY, 0);
+                if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, eh, sizeof eh, &r); vfs_close(fd); }
+            }
+            is_exec = ehave && eh[0] == 0x7f && eh[1] == 'E' && eh[16] == 2;
+            kprintf("[embcc link] /e.elf: %s, %llu bytes; ET_EXEC=%d\n",
+                    ehave ? "written" : "MISSING",
+                    ehave ? (unsigned long long)es.size : 0ULL, is_exec);
+
+            /* 3. Run the produced binary. Exit 42 is the whole claim. */
+            if (is_exec) {
+                char *c[] = { "/data/tmp/e.elf", NULL };
+                int p2 = process_create_env("/data/tmp/e.elf", c, 1, env, NULL, 0);
+                rcode = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+                kprintf("[embcc link] /e.elf ran: exit=%d (want 42)\n", rcode);
+            }
+        }
+
+        int ok = (pid >= 0 && code == 0 && is_elf && is_64 && is_rel &&
+                  is_exec && rcode == 42);
+        kprintf("\n[cmd] test embcc: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* THE SELF-HOSTING FIXED POINT, ON THE OS (EmbCC M3 acceptance stage 3).
+ *
+ * embcc.elf was compiled by the host's gcc-built embcc and linked by EmbLD;
+ * the REFERENCE objects under /data/src/embcc/ref/ are that same gcc-built
+ * embcc's output for the same twelve sources. Here the SELF-BUILT compiler
+ * recompiles those sources ON the OS and each object is compared to its
+ * reference BYTE FOR BYTE. Identical output means a compiler and the
+ * compiler it produced agree exactly -- the classic fixed point, which
+ * catches whole classes of codegen bugs nothing else will. STT_FILE is the
+ * basename, so the object depends on content, not on the /data/src path.
+ *
+ * The include order mirrors the host's self-host build exactly: EmbCC's own
+ * freestanding headers first (so <stdarg.h> is EmbCC's char* va_list, not
+ * newlib's), then newlib's ABI headers. */
+    if (strcmp(cmd, "test embcc self") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc self: VFS not registered\n"); return 1; }
+        struct vfs_stat est;
+        if (vfs_stat("/data/apps/embcc/embcc.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc self: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/embcc/ref/sema.o", &est) != 0) {
+            kprintf("\n[cmd] test embcc self: reference objects not on image "
+                    "(build with EMBK_EMBCC_ROOT set)\n"); return 1; }
+
+        static const char *const units[] = {
+            "driver/main",  "driver/util", "lex/lex",     "parse/parse",
+            "sema/sema",    "sema/type",   "ir/irgen",    "codegen/codegen",
+            "asm/emit",     "cpp/predef",  "cpp/cpp",     "elf/write",
+        };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int nunits = (int)(sizeof units / sizeof units[0]);
+        int nmatch = 0;
+
+        for (int u = 0; u < nunits; u++) {
+            char src[96], ref[96], out[96], base[32];
+            /* basename after the last '/' */
+            const char *slash = units[u];
+            for (const char *q = units[u]; *q; q++) if (*q == '/') slash = q + 1;
+            snprintf(base, sizeof base, "%s", slash);
+            snprintf(src, sizeof src, "/data/src/embcc/%s.c", units[u]);
+            snprintf(ref, sizeof ref, "/data/src/embcc/ref/%s.o", base);
+            snprintf(out, sizeof out, "/data/tmp/%s.o", base);
+            (void)vfs_unlink_path(out);
+
+            char *a[] = { (char *)"/data/apps/embcc/embcc.elf", (char *)"-c",
+                          src, (char *)"-I", (char *)"/data/apps/embcc/include",
+                          (char *)"-I", (char *)"/system/abi/include",
+                          (char *)"-o", out };
+            int pid = process_create_env("/data/apps/embcc/embcc.elf", a, 9, env, NULL, 0);
+            int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+
+            /* Compare the fresh object to the reference, byte for byte. */
+            struct vfs_stat so, sr;
+            int have_o = (vfs_stat(out, &so) == 0);
+            int have_r = (vfs_stat(ref, &sr) == 0);
+            int match = 0;
+            if (code == 0 && have_o && have_r && so.size == sr.size) {
+                int fo = vfs_open(out, O_RDONLY, 0);
+                int fr = vfs_open(ref, O_RDONLY, 0);
+                match = (fo >= 0 && fr >= 0);
+                static unsigned char bo[4096], br[4096];
+                while (match) {
+                    size_t ro = 0, rr = 0;
+                    vfs_fd_read(fo, bo, sizeof bo, &ro);
+                    vfs_fd_read(fr, br, sizeof br, &rr);
+                    if (ro != rr) { match = 0; break; }
+                    if (ro == 0) break;              /* both hit EOF together */
+                    if (memcmp(bo, br, ro) != 0) { match = 0; break; }
+                }
+                if (fo >= 0) vfs_close(fo);
+                if (fr >= 0) vfs_close(fr);
+            }
+            kprintf("[embcc self] %-9s compile=%d  %llu vs %llu bytes  %s\n",
+                    base, code,
+                    have_o ? (unsigned long long)so.size : 0ULL,
+                    have_r ? (unsigned long long)sr.size : 0ULL,
+                    match ? "MATCH" : "DIFFER");
+            if (match) nmatch++;
+        }
+
+        kprintf("\n[embcc self] %d/%d objects byte-identical to the reference\n",
+                nmatch, nunits);
+        kprintf("[cmd] test embcc self: %s\n", nmatch == nunits ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* EmbCC INLINE ASM, exercised for real (EmbCC's inline-asm milestone). The
+ * program below makes EmbLinkOS syscalls DIRECTLY through `int $0x80`
+ * stubs that EmbCC compiled from fixed-register extended asm — write(1,...)
+ * then exit(42). If the trap byte, the a/D/S/d register loads, and the "=a"
+ * result readback are all right, the line appears on the console AND the
+ * process exits 42. Header-free (the stubs are inlined) so no include search
+ * is needed; linked by tcc against crt0 for _start only — the program needs
+ * no libc, it is its own syscall layer. */
+/* THE emlibc RIM, COMPILED BY EmbCC, RUNNING ON THE OS (EmbCC inline-asm
+ * milestone capstone). rimtest.elf is crt0.c + syscalls.c (EmbLinkOS's
+ * newlib retargeting -- _start, the syscall stubs, sbrk/write/exit) AND a
+ * printf-and-return-42 program, ALL compiled by EmbCC and linked by EmbLD
+ * against newlib's libc.a. Running it exercises the EmbCC-compiled rim end
+ * to end: EmbCC's _start hands off to start_c -> main, printf reaches the
+ * console through EmbCC's _write stub (int $0x80), and main's `return 42`
+ * exits through EmbCC's _exit stub. The line below AND exit 42 can only
+ * appear if the rim EmbCC compiled actually works. */
+    if (strcmp(cmd, "test embcc rim") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc rim: VFS not registered\n"); return 1; }
+        struct vfs_stat rst;
+        if (vfs_stat("/data/apps/rimtest/rimtest.elf", &rst) != 0) {
+            kprintf("\n[cmd] test embcc rim: rimtest.elf not on image\n");
+            return 1; }
+        kprintf("[embcc rim] running rimtest.elf (%llu bytes; EmbCC crt0 + "
+                "syscalls + prog, EmbLD-linked). Expect a line, then exit 42:\n",
+                (unsigned long long)rst.size);
+        char *env[] = { (char *)"HOME=/", NULL };
+        /* CONTROL FIRST (gcc-compiled rim, same program): a rimtest hang
+         * must not hide this result. If it exits 42 while the EmbCC-rim one
+         * hangs/faults, the bug is in EmbCC's compilation of the rim. */
+        int ctl = -1;
+        if (vfs_stat("/data/apps/rimctl/rimctl.elf", &rst) == 0) {
+            char *b[] = { (char *)"/data/apps/rimctl/rimctl.elf", NULL };
+            int p2 = process_create_env("/data/apps/rimctl/rimctl.elf", b, 1,
+                                        env, NULL, 0);
+            ctl = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+            kprintf("[embcc rim] gcc-rim  exit=%d (want 42) [control]\n", ctl);
+        }
+        char *a[] = { (char *)"/data/apps/rimtest/rimtest.elf", NULL };
+        int pid = process_create_env("/data/apps/rimtest/rimtest.elf", a, 1,
+                                     env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embcc rim] EmbCC-rim exit=%d (want 42)\n", code);
+        kprintf("\n[cmd] test embcc rim: %s (EmbCC-rim=%d gcc-rim=%d)\n",
+                code == 42 ? "OK" : "FAIL", code, ctl);
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embcc asm") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc asm: VFS not registered\n"); return 1; }
+        struct vfs_stat est;
+        if (vfs_stat("/data/apps/embcc/embcc.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc asm: embcc.elf not on image\n"); return 1; }
+
+        static const char src[] =
+            "typedef long i64;\n"
+            "static i64 sys3(i64 n,i64 a1,i64 a2,i64 a3){ i64 r;\n"
+            "  __asm__ volatile(\"int $0x80\":\"=a\"(r)\n"
+            "    :\"a\"(n),\"D\"(a1),\"S\"(a2),\"d\"(a3):\"rcx\",\"r11\",\"memory\"); return r; }\n"
+            "static i64 sys1(i64 n,i64 a1){ i64 r;\n"
+            "  __asm__ volatile(\"int $0x80\":\"=a\"(r)\n"
+            "    :\"a\"(n),\"D\"(a1):\"rcx\",\"r11\",\"memory\"); return r; }\n"
+            "int main(void){\n"
+            "  const char m[]=\"embcc inline-asm syscall ok\\n\";\n"
+            "  sys3(1,1,(i64)m,sizeof(m)-1);   /* write(1,m,len) */\n"
+            "  sys1(2,42);                       /* exit(42) */\n"
+            "  return 0;\n"
+            "}\n";
+        {
+            int fd = vfs_open("/data/tmp/asm.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { kprintf("test embcc asm: cannot write asm.c\n"); return 1; }
+            size_t w = 0;
+            vfs_fd_write(fd, src, sizeof src - 1, &w);
+            vfs_close(fd);
+        }
+        (void)vfs_unlink_path("/data/tmp/asm.o");
+        (void)vfs_unlink_path("/data/tmp/asm.elf");
+
+        char *env[] = { (char *)"HOME=/", NULL };
+        char *a[] = { (char *)"/data/apps/embcc/embcc.elf", (char *)"-c",
+                      (char *)"/data/tmp/asm.c", (char *)"-o",
+                      (char *)"/data/tmp/asm.o" };
+        int pid = process_create_env("/data/apps/embcc/embcc.elf", a, 5, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embcc asm] compile exit=%d\n", code);
+
+        int is_exec = 0, rcode = -1;
+        struct vfs_stat st;
+        if (code == 0 && vfs_stat("/data/tmp/asm.o", &st) == 0) {
+            char *b[] = { (char *)"/data/apps/tcc/tcc.elf", (char *)"-static",
+                          (char *)"-nostdlib", (char *)"/data/tmp/asm.o",
+                          (char *)"/system/abi/crt0.o",
+                          (char *)"/system/abi/syscalls.o", (char *)"-L/system/abi",
+                          (char *)"-lc", (char *)"-o", (char *)"/data/tmp/asm.elf" };
+            int lp = process_create_env("/data/apps/tcc/tcc.elf", b, 10, env, NULL, 0);
+            int lcode = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            kprintf("[embcc asm] link exit=%d\n", lcode);
+            unsigned char eh[20] = {0};
+            if (vfs_stat("/data/tmp/asm.elf", &st) == 0) {
+                int fd = vfs_open("/data/tmp/asm.elf", O_RDONLY, 0);
+                if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, eh, sizeof eh, &r); vfs_close(fd); }
+                is_exec = eh[0] == 0x7f && eh[1] == 'E' && eh[16] == 2;
+            }
+            if (is_exec) {
+                kprintf("[embcc asm] running (expect a line below, then exit 42):\n");
+                char *c[] = { (char *)"/data/tmp/asm.elf", NULL };
+                int p2 = process_create_env("/data/tmp/asm.elf", c, 1, env, NULL, 0);
+                rcode = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+                kprintf("[embcc asm] exit=%d (want 42)\n", rcode);
+            }
+        }
+
+        int ok = (code == 0 && is_exec && rcode == 42);
+        kprintf("\n[cmd] test embcc asm: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test tcc link") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test tcc link: VFS not registered\n"); return 1; }
 

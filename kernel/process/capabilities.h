@@ -36,12 +36,20 @@
 #define EMBK_CAP_SERIAL      7
 #define EMBK_CAP_RAWDISK     8
 #define EMBK_CAP_KERNEL_EXT  9
-#define EMBK_CAP_MAX_ID      9
+/* cap_id 10 — the authority to debug: read/write another process's registers
+ * and memory, plant breakpoints, single-step (EMBDBG_Specification.md §6.1).
+ * Strictly more powerful than any resource class, so it is its own capability,
+ * held by init/kernel threads and attenuated down the tree like every other.
+ * This is the FIRST capability the kernel actually GATES a syscall on — the
+ * debug syscalls (69-75) refuse without it — which is the "coarse gate governs
+ * which handles a parent installs" step the header note below anticipated. */
+#define EMBK_CAP_DEBUG      10
+#define EMBK_CAP_MAX_ID      10
 
 #define EMBK_CAP_BIT(id)  (1ULL << (id))
 
-/* Bits 1..9 set — the maximal set the kernel roots authority at (held by init,
- * and by every kernel thread, which IS the kernel). */
+/* Bits 1..MAX_ID set — the maximal set the kernel roots authority at (held by
+ * init, and by every kernel thread, which IS the kernel). */
 #define EMBK_CAP_ALL  ((((1ULL << (EMBK_CAP_MAX_ID + 1)) - 1)) & ~1ULL)
 
 /* Spawn sentinel: "give the child the parent's whole set" (inherit, no

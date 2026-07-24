@@ -104,4 +104,37 @@ uint64_t vmm_alloc_kernel_stack(uint64_t size);
 // `size` must be the same value passed to the matching alloc call.
 void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size);
 
+/* ---- EmbDBG v2: page-table introspection (vmmap / pagewalk) --------------
+ * Read-only walkers over an arbitrary address space's PML4, for the debugger's
+ * Virtual Memory + Page Table views. Both take vmm_lock (like vmm_get_phys_in),
+ * so they're a coherent read against concurrent mappers on other cores. */
+
+/* One VA->PA walk, capturing every level's raw entry so the caller can decode
+ * the Present/Writable/User/Dirty/Accessed/NX/Huge bits itself. levels[0]=PML4E,
+ * [1]=PDPTE, [2]=PDE, [3]=PTE. Only the first `levels_read` are valid (the walk
+ * stops at the first not-present entry or a huge-page leaf). */
+struct vmm_walk_result {
+    uint8_t  mapped;        /* leaf present -> phys valid */
+    uint64_t phys;          /* translated physical address (frame | offset) */
+    uint64_t entry[4];      /* raw 64-bit entry at each level walked */
+    int      index[4];      /* the index selected at each level */
+    int      levels_read;   /* how many of entry[]/index[] are valid (1..4) */
+    uint8_t  huge;          /* leaf was a huge page */
+    int      huge_level;    /* level of the huge leaf (1=1GiB PDPTE, 2=2MiB PDE), else -1 */
+};
+void vmm_walk(uint64_t pml4_phys, uint64_t virt, struct vmm_walk_result *out);
+
+/* One coalesced run of contiguous pages sharing the same P/W/U/NX identity, for
+ * vmmap. `flags` is a representative leaf entry (decode its permission bits). */
+struct vmm_region {
+    uint64_t start;   /* first VA of the run */
+    uint64_t end;     /* one past the last VA */
+    uint64_t flags;   /* representative PTE flags (P/W/U/NX etc.) */
+    uint8_t  huge;    /* run is backed by huge pages */
+};
+/* Enumerate the USER half (PML4 entries 0..255) of `pml4_phys` into `out`,
+ * coalescing contiguous same-identity pages into regions. Returns the region
+ * count (<= max). Ascending VA order. */
+int vmm_enum_user_regions(uint64_t pml4_phys, struct vmm_region *out, int max);
+
 #endif

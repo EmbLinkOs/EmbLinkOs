@@ -68,7 +68,13 @@ void idt_init(void) {
     idt_set_entry(0,  (uint64_t)isr0,  0x8E);
     idt_set_entry(1,  (uint64_t)isr1,  0x8E);
     idt_set_entry(2,  (uint64_t)isr2,  0x8E);
-    idt_set_entry(3,  (uint64_t)isr3,  0x8E);
+    /* DPL=3 (0xEE, not 0x8E): vector 3 is INT3, the software breakpoint a
+     * debugged ring-3 program executes (EMBDBG_Specification.md §6.3). A gate
+     * with DPL<CPL turns a ring-3 `int3` into #GP instead of #BP — which is
+     * exactly what happened before this. Only vector 3 needs it: CPU-raised
+     * #DB/#PF/etc. ignore gate DPL, so single-step and fault delivery are
+     * unaffected, and no OTHER software `int N` becomes reachable from ring 3. */
+    idt_set_entry(3,  (uint64_t)isr3,  0xEE);
     idt_set_entry(4,  (uint64_t)isr4,  0x8E);
     idt_set_entry(5,  (uint64_t)isr5,  0x8E);
     idt_set_entry(6,  (uint64_t)isr6,  0x8E);

@@ -50,6 +50,12 @@
                                                // child receives it at its first free slot. The
                                                // bootstrap for two-process channel tests.
 #define SPAWN_ACTION_INSTALL_OBJ     4         // install a byte-stream obj-handle (a pipe end)
+#define SPAWN_ACTION_DEBUG           6         // born under debug, stopped before _start
+                                               // (EMBDBG_Specification.md §6.2). Needs the
+                                               // spawner to hold EMBK_CAP_DEBUG; the child is
+                                               // created and parked, and the child handle
+                                               // sys_spawn returns doubles as the debug handle.
+                                               // (id 6, not 5 -- SET_CAPS took 5 below.)
 #define SPAWN_ACTION_SET_CAPS        5         // attenuate the child's capability set: `flags`
                                                // carries the requested cap bitmask (capabilities.h
                                                // cap IDs). Enforced <= the spawning process's own

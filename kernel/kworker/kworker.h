@@ -18,6 +18,8 @@ void kworker_init(void);
 
 void kworker_defer_obj_put_locked(struct vnode vn);
 
-
+/* EmbDBG v2 Kernel Object Explorer: how many deferred-teardown items are queued
+ * right now (g_head - g_tail). A racy debug sample; no lock. */
+uint32_t kworker_pending(void);
 
 #endif   /* __KWORKER_H__ */

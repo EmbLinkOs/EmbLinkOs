@@ -167,6 +167,25 @@ int epfs_vfs_register(const char *path) {
     return vfs_mount(path, &epfs_vfs_ops, &g_epfs_mount_sentinel, EPFS_ROOT_INO);
 }
 
+/* EmbDBG v2 VFS Explorer: ops table address for fs-type naming (see vfs.c). */
+const void *epfs_vfs_ops_ptr(void) { return &epfs_vfs_ops; }
+
+/* EmbDBG v2 IPC Explorer: list every published endpoint node. No dedicated lock
+ * on g_nodes (mutated only under g_sched_lock during listen/unlink); a read
+ * snapshot is advisory. */
+int epfs_endpoints_snapshot(struct epfs_ep_info *out, int max) {
+    int n = 0;
+    for (int i = 0; i < EPFS_MAX_NODES && n < max; i++) {
+        if (!g_nodes[i].used || g_nodes[i].type != EPFS_ENDPOINT) continue;
+        int k = 0;
+        while (g_nodes[i].name[k] && k < 31) { out[n].name[k] = g_nodes[i].name[k]; k++; }
+        out[n].name[k] = '\0';
+        out[n].endpoint = (uint64_t)g_nodes[i].endpoint;
+        n++;
+    }
+    return n;
+}
+
 /* ---- direct (non-VFS-op) accessors the IPC endpoint layer needs ---------
  * chan_listen/connect resolve the PARENT directory via vfs_resolve (a
  * generic VFS call) and then need the fs-specific create_endpoint/lookup

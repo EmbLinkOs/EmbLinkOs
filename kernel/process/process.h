@@ -12,6 +12,8 @@
                             * object-handle table (handle.h forward-declares
                             * struct process, so no cycle) */
 
+struct debug_session;      /* process/debug.h — a pointer only, see cap_set */
+
 /* Raised from 16/16 once ring-3 processes could genuinely have more than one
  * thread each (Phase 5, below) — 16 was sized for "one process, one thread"
  * plus a handful of kthreads, and stopped being enough headroom the moment a
@@ -221,6 +223,28 @@ struct thread {
     uint8_t  priority;
     uint32_t ticks_since_scheduled;
 
+    /* EmbDBG v2 control: frozen by `process/thread suspend`. schedule_locked()
+     * never picks a suspended thread (whatever its state), so it stops making
+     * progress until `resume` clears this. Not a state (state stays READY/
+     * RUNNING/BLOCKED) — a filter on top of it, so suspend/resume compose with
+     * blocking/waking without new transitions. */
+    bool suspended;
+
+    /* EmbDBG v2 instrumentation. dispatch_count: times this thread was picked
+     * to RUN (a coarse "how much CPU has it seen"). migrations: times it was
+     * dispatched on a DIFFERENT core than last (SMP thread-migration history).
+     * last_ran_cpu: the core it last ran on, -1 if never. Updated in the
+     * schedule_locked switch commit, under g_sched_lock. */
+    uint64_t dispatch_count;
+    uint32_t migrations;
+    int      last_ran_cpu;
+
+    /* EmbDBG v2 lifetime history: lapic ticks when this thread was created
+     * (thread_init_for) and when it died (thread_zombie_locked). exit_tick == 0
+     * means still alive. Boot threads born before the lapic timer runs read 0. */
+    uint64_t born_tick;
+    uint64_t exit_tick;
+
     struct process *proc;         /* owning process -- never NULL */
     struct thread *proc_thread_next; /* intrusive link in proc->thread_list */
 
@@ -320,8 +344,15 @@ struct process {
      * for kernel threads; a child's set is `embk_caps_attenuate`d from its
      * parent's at spawn, so it is always a subset of the parent's. This is the
      * grantor set EMBX §6 step 9 checks a binary's declaration against; nothing
-     * gates a syscall on it yet. */
+     * gates a syscall on it yet (except the debug syscalls — cap_id 10). */
     uint64_t cap_set;
+
+    /* Live-debugging session (EMBDBG_Specification.md §6). Non-NULL while this
+     * process is being debugged: isr_handler routes its faults here instead of
+     * panicking, and process_exit_self posts its exit here. Owned by the
+     * debugger that spawned it under SPAWN_ACTION_DEBUG. NULL for the common
+     * case — one pointer compare on the fault path. */
+    struct debug_session *debug_session;
 
     /* Intrusive list of this process's OWN currently-live (non-zombie)
      * children, head = child_list, linked through each child's child_next.
@@ -366,6 +397,12 @@ struct process {
     struct wait_queue join_wait;
 
     int exit_code;             /**< Exit code once every thread has exited (meaningful only then) */
+
+    /* EmbDBG v2 lifetime history: lapic ticks when this process was created
+     * (process_alloc) and when its LAST thread exited (thread_zombie_locked).
+     * exit_tick == 0 means still alive. */
+    uint64_t born_tick;
+    uint64_t exit_tick;
 
     /* How many of this process's threads are still schedulable (anything
      * but UNUSED). The process itself becomes a candidate for the
@@ -619,6 +656,13 @@ void process_kill(uint32_t pid);
  */
 __attribute__((noreturn)) void process_exit_self(int code);
 
+/* Exit code posted when a process is terminated by an unhandled CPU fault
+ * (isr_handler, EMBDBG_Specification.md §6.6 non-debugged arm), rather than by a
+ * normal exit or process_kill()'s -1. Negative and distinct, with the CPU
+ * exception vector in the low byte so a waiter (or a log) can tell WHICH fault
+ * killed the process -- e.g. a page fault (vector 14) -> -(0x100|14) = -270. */
+#define PROCESS_EXIT_FAULT(vec)  (-(0x100 | ((int)(vec) & 0xff)))
+
 /**
  * @brief Create an in-kernel "thread": ring 0, sharing the kernel's own
  * address space, scheduled by the exact same round-robin/preemption/kill/
@@ -726,6 +770,7 @@ struct thread *process_create_idle_for_cpu(uint32_t cpu_index);
  * @{
  */
 int process_test_roundrobin(void);
+int process_test_suspend(void);     /* EmbDBG v2: prove suspend/resume freeze */
 int process_test_fpu(void);
 int process_test_kill(void);
 int process_test_reap(void);
@@ -792,6 +837,168 @@ struct process_info {
  * process, for `ps`. Returns the number of entries written (<= max).
  */
 int process_list(struct process_info *out, int max);
+
+/** Snapshot of one thread, for the kernel-aware `threads`/`scheduler` views
+ * (EmbDBG v2). A value copy, like process_info — no live TCB pointer escapes
+ * the sched-locked walk. `tid` is the thread_table index (globally unique,
+ * MAX_THREADS ceiling). */
+struct thread_info {
+    uint32_t tid;
+    uint32_t pid;              /* owning process, 0 if none */
+    enum process_state state;
+    int running_cpu;           /* cpu_table[] index while RUNNING, else -1 */
+    int pinned_cpu;            /* -1 = any core, else pinned there */
+    uint8_t priority;          /* 0 = highest band */
+    bool is_kthread;
+    bool blocked_on_wq;        /* BLOCKED with a real wait_queue (vs. born-stopped) */
+    bool suspended;            /* frozen by suspend (EmbDBG v2 control) */
+    uint64_t dispatch_count;   /* times this thread has been picked to RUN */
+    uint32_t migrations;       /* times dispatched on a different core than before */
+    int      last_ran_cpu;     /* core it last ran on, -1 if never */
+    uint64_t born_tick;        /* lapic ticks at creation */
+    uint64_t exit_tick;        /* lapic ticks at death, 0 if alive */
+};
+
+/** Fill `out` (capacity `max`) with a snapshot of every non-UNUSED thread, for
+ * `threads`/`scheduler`. Returns the count written (<= max). Self-locking. */
+int thread_list(struct thread_info *out, int max);
+
+/** Detailed single-process view for `process inspect <pid>` (EmbDBG v2). A value
+ * snapshot -- no live pointers escape. Pair with a thread_info[] the caller
+ * supplies for this process's threads. `found` is false if no such pid. */
+struct process_detail {
+    bool found;
+    uint32_t pid;
+    uint32_t parent_pid;       /* 0 if no live parent */
+    enum process_state state;  /* main-thread state, ZOMBIE if reaped */
+    uint8_t priority;
+    int exit_code;             /* meaningful when exited */
+    bool is_kthread;
+    uint64_t cap_set;          /* capability bitmask */
+    int live_thread_count;
+    uint64_t born_tick;        /* lapic ticks at creation */
+    uint64_t exit_tick;        /* lapic ticks when last thread died, 0 if alive */
+    uint64_t heap_brk;         /* current program break (user procs) */
+    uint64_t heap_mapped_top;  /* top of heap-backed mapping */
+    uint64_t pml4_phys;        /* address-space root (for vmmap/pagewalk) */
+    int thread_count;          /* entries written to the caller's threads[] */
+};
+/** Fill `out` + up to `max_threads` of pid's threads into `threads`. Returns 0
+ * if the pid exists (out->found true), -1 otherwise. Self-locking. */
+int process_inspect(uint32_t pid, struct process_detail *out,
+                    struct thread_info *threads, int max_threads);
+
+/** Detailed single-thread view for `thread inspect <tid>` (EmbDBG v2). Adds the
+ * register/stack anchors the thread_info summary omits, plus the SAVED kernel
+ * context (ctx_rip/ctx_rbp) so a caller can walk this thread's kernel stack --
+ * but ONLY when `walkable` (the thread is not currently RUNNING, so its saved
+ * ctx is a real parked frame rather than stale live registers). A value
+ * snapshot; no live TCB pointer escapes. */
+struct thread_detail {
+    bool found;
+    uint32_t tid;
+    uint32_t pid;
+    bool is_kthread;
+    enum process_state state;
+    int running_cpu;
+    int pinned_cpu;
+    uint8_t priority;
+    bool suspended;
+    bool blocked_on_wq;
+    uint64_t dispatch_count;
+    uint32_t migrations;
+    int last_ran_cpu;
+    uint64_t born_tick;
+    uint64_t exit_tick;        /* 0 if alive */
+    uint64_t entry_point;      /* ring-3 user entry, or the kthread fn */
+    uint64_t user_rsp;         /* user stack pointer (ring-3 threads) */
+    uint64_t kstack_top;       /* top of this thread's kernel stack */
+    uint64_t fs_base;          /* %fs base == TLS base (0 if none) */
+    uint64_t ctx_rip;          /* saved resume RIP (meaningful iff walkable) */
+    uint64_t ctx_rbp;          /* saved frame base for the stack walk */
+    bool walkable;             /* ctx is a real parked frame (state != RUNNING) */
+};
+/** Snapshot thread `tid` (a thread_table index) into `out`. Returns 0 if the
+ * slot is live (out->found true), -1 otherwise. Self-locking. */
+int thread_inspect(uint32_t tid, struct thread_detail *out);
+
+/** One open file descriptor of a process, for the VFS Explorer `files` view. */
+struct fd_snap_info {
+    int      fd;         /* the fd number (table index + FD_BASE) */
+    uint8_t  backing;    /* enum fd_backing */
+    int      flags;      /* open flags (O_RDONLY..) */
+    uint64_t ino;        /* vnode inode id (FD_BACKING_VNODE) */
+    uint64_t pos;        /* file offset (FD_BACKING_VNODE) */
+    uint8_t  vtype;      /* vnode type VFS_DT_* (FD_BACKING_VNODE) */
+    int      pipe_side;  /* 0=read,1=write for FD_BACKING_PIPE, else -1 */
+};
+/** Snapshot pid's open fds into `out` (capacity `max`); returns the count, or
+ * -1 if no such pid. Self-locking (g_sched_lock). */
+int process_fds_snapshot(uint32_t pid, struct fd_snap_info *out, int max);
+
+/* ---- EmbDBG v2 Handle Explorer / IPC Explorer ----------------------------
+ * Snapshots of the per-process handle tables. obj_handles[] is the typed
+ * capability table (kind + live object pointer + surface map window);
+ * handles[] (proc_handle) is the ring-3 pid->real-pid map for wait/kill.
+ * All copy scalar slot values under g_sched_lock -- the raw obj pointer is
+ * shown but never dereferenced here (that needs the object's own lock). */
+struct obj_handle_snap {
+    int      id;         /* slot index */
+    uint8_t  kind;       /* enum handle_kind */
+    uint64_t obj;        /* raw kernel object pointer */
+    uint64_t map_base;   /* surface: user VA it's mapped at, else 0 */
+    uint64_t map_bytes;
+};
+int process_obj_handles_snapshot(uint32_t pid, struct obj_handle_snap *out, int max);
+
+struct proc_handle_snap { int id; uint32_t pid; };
+int process_pid_handles_snapshot(uint32_t pid, struct proc_handle_snap *out, int max);
+
+/* Every live obj_handle across ALL processes, tagged with its owner pid -- the
+ * IPC Explorer walks this and dedups by `obj` (an object mapped/held by N
+ * processes shows up N times). Returns the count (<= max). */
+struct ipc_handle_snap {
+    uint32_t owner_pid;
+    int      id;
+    uint8_t  kind;
+    uint64_t obj;
+    uint64_t map_base;
+    uint64_t map_bytes;
+};
+int ipc_handles_snapshot(struct ipc_handle_snap *out, int max);
+
+/* ---- EmbDBG v2 scheduler instrumentation snapshots ----------------------
+ * Read the context-switch counters and recent-switch ring the scheduler keeps.
+ * Both self-lock (g_sched_lock), so they're safe to call from shell context. */
+struct sched_stats_snapshot {
+    uint64_t total;                /* context switches, all cores, all time */
+    uint32_t ncpu;                 /* meaningful entries in per_cpu[] */
+    uint64_t per_cpu[MAX_CPUS];    /* switches ONTO each core */
+};
+void sched_stats_snapshot(struct sched_stats_snapshot *out);
+
+#define SCHED_TIMELINE_MAX 32      /* display cap for `scheduler timeline` */
+struct sched_event_view {
+    uint64_t ts;                   /* lapic ticks at the switch */
+    uint32_t from_tid;             /* thread_table index switched away from */
+    uint32_t to_tid;               /* thread_table index switched to */
+    uint16_t cpu;                  /* core the switch happened on */
+    uint8_t  migrated;             /* 1 if `to` last ran on a different core */
+};
+/** Copy up to `max` of the most recent switches, OLDEST-first, into out[].
+ * Returns the number copied. Self-locking. */
+int sched_timeline_snapshot(struct sched_event_view *out, int max);
+
+/* EmbDBG v2 control (freeze/unfreeze). Suspend sets the `suspended` filter the
+ * scheduler skips; resume clears it. A pinned context (a core's adopted idle/
+ * shell) is REFUSED — freezing it would strand that core's liveness fallback.
+ * process_* affect every thread of the pid; thread_* affect one thread_table
+ * index. Return the number of threads changed, or -1 if the pid/tid is absent
+ * or entirely protected. Self-locking. */
+int process_suspend(uint32_t pid);
+int process_resume(uint32_t pid);
+int thread_suspend(uint32_t tid);
+int thread_resume(uint32_t tid);
 
 /* Self-locking liveness probe: 1 if `pid` exists with a live thread, else 0.
  * A snapshot (inherently racy); used by sys_proc_alive so the home launcher

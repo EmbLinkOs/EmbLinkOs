@@ -728,6 +728,11 @@ def discover_userland_objects(build_dir="build"):
         if name == "init.elf":
             continue                                          # already added first
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+    # The kernel's own .embdbg (EMBDBG_Specification.md §7): a LINE+FUNCS sidecar
+    # the kernel loads at boot so isr_handler symbolizes a panic to func:line.
+    kdbg = _read_file(f"{build_dir}/kernel.embdbg")
+    if kdbg is not None:
+        objects.append((b"system/kernel.embdbg", L.DT_REG, L.S_IFREG | L.PERM_FILE, kdbg))
     so = _read_file(f"{build_dir}/libembk.so")
     if so is not None:
         objects.append((b"system/lib/libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
@@ -780,6 +785,25 @@ def discover_userland_objects(build_dir="build"):
     # header-free toys. ~140 files, ~1.1 MB.
     objects.extend(_tree_objects(NEWLIB_INC, b"system/abi/include/", ".h"))
     objects.extend(_tree_objects(TCC_INC, b"data/apps/tcc/include/", ".h"))
+
+    # EmbCC self-hosting fixed point (EmbCC M3, `test embcc self`): its OWN
+    # source tree (preserving src/ subdirs so the relative quote-includes
+    # resolve), its freestanding headers (-> the compiler's default include
+    # dir beside the binary), and the REFERENCE objects the host's gcc-built
+    # embcc produced from the same sources. The on-OS embcc recompiles the
+    # sources and the kernel compares each object to its reference byte for
+    # byte. Env-gated on EMBK_EMBCC_ROOT so a checkout without it just omits
+    # the capability (honest), never fakes it.
+    EMBCC_ROOT = os.environ.get("EMBK_EMBCC_ROOT", "")
+    if EMBCC_ROOT:
+        objects.extend(_tree_objects(EMBCC_ROOT + "/src",
+                                     b"data/src/embcc/", ".c"))
+        objects.extend(_tree_objects(EMBCC_ROOT + "/src",
+                                     b"data/src/embcc/", ".h"))
+        objects.extend(_tree_objects(EMBCC_ROOT + "/include",
+                                     b"data/apps/embcc/include/", ".h"))
+        objects.extend(_tree_objects(EMBCC_ROOT + "/ref",
+                                     b"data/src/embcc/ref/", ".o"))
 
     # The EmUI toolkit HEADERS + one real app's source (clockw), so on-OS tcc can
     # COMPILE + DYNAMIC-LINK a GUI app against /system/lib/libembk.so -- the "GUI

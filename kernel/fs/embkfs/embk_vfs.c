@@ -466,3 +466,7 @@ static const struct vfs_ops embkfs_vfs_ops = {
 int embkfs_vfs_register(const char *path, struct embkfs_volume *vol) {
     return vfs_mount(path, &embkfs_vfs_ops, vol, EMBKFS_ROOT_OBJECT_ID);
 }
+
+/* EmbDBG v2 VFS Explorer: the ops table address, so vfs.c can name a mount's fs
+ * by comparing its ops pointer (the table is static/private otherwise). */
+const void *embkfs_vfs_ops_ptr(void) { return &embkfs_vfs_ops; }

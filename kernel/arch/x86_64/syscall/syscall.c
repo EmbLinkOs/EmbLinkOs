@@ -13,6 +13,7 @@
 #include "include/types.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "process/debug.h"   /* sys_debug_* handlers for the table below */
 #include "tty/tty.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"
@@ -1589,6 +1590,15 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_key_mods       66
 #define SYS_tty_mode       67
 #define SYS_getcaps        68
+/* The live-debugging contract (EMBDBG_Specification.md §6.4). Handlers live in
+ * process/debug.c; must match include/debug_abi.h and the userspace mirror. */
+#define SYS_debug_attach   69
+#define SYS_debug_wait     70
+#define SYS_debug_cont     71
+#define SYS_debug_regs     72
+#define SYS_debug_mem      73
+#define SYS_debug_hwbp     74
+#define SYS_debug_detach   75
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1660,6 +1670,13 @@ static syscall_handler_t syscall_table[] = {
     [SYS_key_mods]       = sys_key_mods,
     [SYS_tty_mode]       = sys_tty_mode,
     [SYS_getcaps]        = sys_getcaps,
+    [SYS_debug_attach]   = sys_debug_attach,
+    [SYS_debug_wait]     = sys_debug_wait,
+    [SYS_debug_cont]     = sys_debug_cont,
+    [SYS_debug_regs]     = sys_debug_regs,
+    [SYS_debug_mem]      = sys_debug_mem,
+    [SYS_debug_hwbp]     = sys_debug_hwbp,
+    [SYS_debug_detach]   = sys_debug_detach,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

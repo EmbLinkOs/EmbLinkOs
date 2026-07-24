@@ -1,15 +1,22 @@
 #include <stdint.h>
 #include "drivers/char/serial.h"
 #include "arch/x86_64/cpu/spinlock.h"
+#include "process/process.h"   /* current_thread, struct process/thread */
+#include "process/debug.h"     /* debug_on_exception (§6.6 exception routing) */
+#include "lib/ksym.h"          /* the panic symbolizer (§7) */
 
-/* Guards the exception dump below. Deliberately never unlocked: if a
- * second core also faults while this one is dumping/halted, it should
- * just wait here forever rather than interleave its own dump into this
- * one byte-by-byte (serial_write_* has no locking of its own -- observed
- * directly as two simultaneous double faults on different cores producing
- * an unreadable interleaved crash dump under -smp 4). One core's crash
- * report is what matters; a second one competing for the same UART just
- * needs to not corrupt the first. */
+/* Serializes the exception dump so two faulting cores don't interleave their
+ * reports byte-by-byte over the lockless UART (observed directly as two
+ * simultaneous double faults under -smp 4 producing an unreadable dump).
+ *
+ * Held with two DIFFERENT lifetimes depending on how the fault ends:
+ *  - RECOVERABLE (a ring-3 fault -> kill just that process): released after the
+ *    dump, because the kernel keeps running and the NEXT app crash must be able
+ *    to take this lock too. Never-releasing it here would deadlock the second
+ *    crash.
+ *  - TERMINAL (a ring-0/kernel fault -> halt): never released. A second core
+ *    that faults while this one is dumping/halted just waits here forever rather
+ *    than corrupt the one crash report that matters. */
 static spinlock_t panic_lock = SPINLOCK_INIT;
 
 
@@ -58,9 +65,10 @@ static const char *exception_messages[] = {
 };
 
 
-void isr_handler(struct registers *regs) {
-    spin_lock(&panic_lock);   // never released -- see panic_lock's own comment
-
+/* The register + fault-cause + symbolized-backtrace dump. Factored out of
+ * isr_handler so both the recoverable (kill-the-process) and terminal (halt)
+ * paths report identically. Caller holds panic_lock; this does no locking. */
+static void dump_fault(struct registers *regs) {
     serial_write_string("\n=== Exception ===\n");
     serial_write_string("Vector: ");
     serial_write_hex(regs->vector);
@@ -120,11 +128,77 @@ void isr_handler(struct registers *regs) {
         serial_write_string("\n");
     }
 
-    serial_write_string("system halted.\n");
-
-    // In a real kernel, you would likely halt the system or attempt recovery here
-    while (1) {
-            __asm__ volatile ("cli; hlt");
+    /* Symbolized RIP + rbp-chain backtrace (EMBDBG_Specification.md §7). Once
+     * the kernel's own .embdbg is loaded, a hex RIP becomes func (file:line)
+     * and the call path is named frame by frame — the whole point of the
+     * format's cheapest consumer. Guarded to kernel addresses; the walk reads
+     * only kernel VAs and is capped, so a bad frame ends the walk rather than
+     * faulting the panic path into a second fault. */
+    if (ksym_ready() && regs->rip >= 0xffffffff80000000ULL) {
+        char sym[176];
+        ksym_symbolize(regs->rip, sym, sizeof sym);
+        serial_write_string("\n--- backtrace ---\n  ");
+        serial_write_string(sym);
+        serial_write_string("   <-- faulting\n");
+        uint64_t rbp = regs->rbp;
+        for (int i = 0; i < 24; i++) {
+            if (rbp < 0xffff800000000000ULL || (rbp & 0x7)) break;
+            uint64_t ret  = *(volatile uint64_t *)(uintptr_t)(rbp + 8);
+            uint64_t next = *(volatile uint64_t *)(uintptr_t)(rbp);
+            if (ret < 0xffffffff80000000ULL) break;   /* left kernel .text */
+            ksym_symbolize(ret, sym, sizeof sym);
+            serial_write_string("  ");
+            serial_write_string(sym);
+            serial_write_string("\n");
+            if (next <= rbp) break;                    /* chain must climb */
+            rbp = next;
         }
-    
+        serial_write_string("--- end backtrace ---\n");
+    }
+}
+
+
+void isr_handler(struct registers *regs) {
+    /* EMBDBG_Specification.md §6.6 — the debug pre-dispatch, BEFORE either final
+     * path below. For the debug-relevant vectors, a fault from a thread whose
+     * process has a debug session is delivered to the debugger as a STOP EVENT:
+     * the faulting thread is parked, the debugger is woken, and when it resumes
+     * us debug_on_exception returns 1 and we iretq back to ring 3. struct
+     * registers has the same layout as struct regs, so the cast is exact. */
+    switch (regs->vector) {
+    case 0: case 1: case 3: case 6: case 13: case 14: {
+        struct thread *t = current_thread;
+        if (t && t->proc && t->proc->debug_session &&
+            debug_on_exception(t, (struct regs *)regs)) {
+            return;   /* handled: parked + resumed -> iretq back to userspace */
+        }
+        break;
+    }
+    default: break;
+    }
+
+    /* A fault from ring 3 (CPL == 3) with no debugger attached is the faulting
+     * PROCESS's bug, not the kernel's: kill just that process and let the kernel
+     * keep running -- a userspace crash must never take down the machine. The
+     * faulting instruction was user code, so this thread holds no kernel locks;
+     * process_exit_self() zombies it and schedules away, exactly as an abnormal
+     * sys_exit would. A ring-0 fault still halts below: a corrupt kernel cannot
+     * safely continue. EMBDBG_Specification.md §6.6, the non-debugged arm. */
+    int user_fault = ((regs->cs & 0x3) == 0x3) && current_thread && current_thread->proc;
+
+    spin_lock(&panic_lock);
+    dump_fault(regs);
+
+    if (user_fault) {
+        serial_write_string("ring-3 fault -> terminating pid ");
+        serial_write_hex(current_thread->proc->pid);
+        serial_write_string("; kernel continues.\n");
+        spin_unlock(&panic_lock);     /* recoverable: MUST release (see panic_lock) */
+        process_exit_self(PROCESS_EXIT_FAULT(regs->vector));   /* noreturn */
+    }
+
+    serial_write_string("kernel-mode fault -- system halted.\n");
+    while (1) {
+        __asm__ volatile ("cli; hlt");
+    }
 }

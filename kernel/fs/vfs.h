@@ -168,6 +168,21 @@ struct vfs_mount {
 };
 
 
+/* ---- EmbDBG v2 VFS Explorer: read-only mount-table snapshot ---------- */
+struct vfs_mount_info {
+    char        at[64];     /* mount point path */
+    uint64_t    root_ino;   /* fs-private root inode id */
+    const char *fs;         /* "embkfs" / "fat32" / "epfs" / "?" */
+};
+/* Copy every live mount into `out` (capacity `max`); returns the count. The fs
+ * op-tables are static per-fs, so vfs.c names each by comparing the mount's ops
+ * pointer against the *_vfs_ops_ptr() accessors below. */
+int vfs_mounts_snapshot(struct vfs_mount_info *out, int max);
+/* Per-fs ops-table addresses (defined in each fs .c) -- for the classifier. */
+const void *embkfs_vfs_ops_ptr(void);
+const void *fat32_vfs_ops_ptr(void);
+const void *epfs_vfs_ops_ptr(void);
+
 /* ---- public VFS surface (what the rest of the kernel calls) --------- */
 void vfs_init(void);
 
