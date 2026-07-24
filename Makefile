@@ -415,6 +415,14 @@ build/crasher.o: user/bin/crasher.c | $(BUILD)
 build/crasher.elf: build/crt0.o build/syscalls.o build/crasher.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/crasher.o -lc -lgcc -o $@
 
+# httpget -- the M4 ring-3 networking witness. Static newlib; resolves + connects
+# + GETs over the BSD-sockets shim (embk_socket.h -> native socket syscalls).
+# `test netuser` spawns it with/without CAP_NETWORK. Auto-discovered by mkfs.
+build/httpget.o: user/bin/httpget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/httpget.elf: build/crt0.o build/syscalls.o build/httpget.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpget.o -lc -lgcc -o $@
+
 build/capspawn.o: user/bin/capspawn.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capspawn.elf: build/crt0.o build/syscalls.o build/capspawn.o user/lib/newlib.ld
@@ -587,7 +595,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -752,7 +760,7 @@ endif
 
 EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf \
+               build/crasher.elf build/httpget.elf \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)

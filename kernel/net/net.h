@@ -175,6 +175,7 @@ int  net_tcp_connect(uint32_t dst_ip, uint16_t dst_port);   /* active open, bloc
 int  net_tcp_send(int conn, const void *data, uint32_t len);/* send + wait for ACK */
 int  net_tcp_recv(int conn, void *buf, uint32_t cap);       /* bytes, or 0 at peer FIN/EOF */
 void net_tcp_close(int conn);                               /* FIN handshake, then free */
+void net_tcp_abort(int conn);                               /* free the TCB WITHOUT blocking (reap path) */
 
 /* ---- internal cross-layer hooks (each module -> its neighbour) ----------
  * These are how the layers hand a packet up (input) or down (output) across

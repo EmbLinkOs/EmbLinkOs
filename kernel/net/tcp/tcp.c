@@ -228,6 +228,14 @@ int net_tcp_recv(int conn, void *buf, uint32_t cap) {
     return (int)k;                               /* 0 = EOF (peer FIN, no data left) */
 }
 
+/* Non-blocking teardown for the fd reap path (runs under g_sched_lock, where the
+ * polling close() below cannot). Drops the TCB; the peer times its side out. */
+void net_tcp_abort(int conn) {
+    if (conn < 0 || conn >= TCP_CONNS) return;
+    tcbs[conn].state = TCP_CLOSED;
+    tcbs[conn].in_use = false;
+}
+
 void net_tcp_close(int conn) {
     if (conn < 0 || conn >= TCP_CONNS || !tcbs[conn].in_use) return;
     struct tcb *t = &tcbs[conn];

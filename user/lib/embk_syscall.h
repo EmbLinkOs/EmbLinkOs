@@ -99,6 +99,11 @@
 /* tty_mode(mode) -- set TTY mode; returns old mode. */
 #define EMBK_SYS_tty_mode       67
 #define EMBK_SYS_getcaps        68
+/* (69-75 are the live-debugging contract; see kernel debug_abi.h.) */
+/* Networking (M4): the ring-3 socket surface, gated on EMBK_CAP_NETWORK. */
+#define EMBK_SYS_net_socket     76
+#define EMBK_SYS_net_connect    77
+#define EMBK_SYS_net_resolve    78
 
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back

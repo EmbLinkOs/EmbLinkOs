@@ -25,6 +25,7 @@
 #include "ipc/endpoint.h"
 #include "fs/fd.h"
 #include "fs/vfs.h"
+#include "net/net.h"   /* sys_net_resolve -> net_resolve; socket fds via fd.h */
 #include <stdint.h>
 
 // Heap bounce buffer bounds for sys_read/sys_write. _MAX is the real throughput
@@ -1519,6 +1520,39 @@ static int64_t sys_getcaps(struct regs *r) {
     return (int64_t)process_current_caps();
 }
 
+/* ---- Networking (M4): the ring-3 socket surface -------------------------
+ * A socket is an fd backed by a TCP connection (FD_BACKING_SOCKET, fd.c).
+ * socket() claims an unconnected one, connect() runs the active open, and
+ * read()/write()/close() on the fd route to net_tcp_recv/send/close. The
+ * capability gates socket creation and name resolution -- once a process holds
+ * a socket fd, read/write are scoped to it (the same open-vs-read/write rule
+ * the filesystem gate uses). IPs cross the boundary in HOST order. */
+static int64_t sys_net_socket(struct regs *r) {
+    (void)r;
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    return fd_alloc_socket(current_process);
+}
+
+static int64_t sys_net_connect(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    return fd_socket_connect(current_process, (int)r->rdi,
+                             (uint32_t)r->rsi, (uint16_t)r->rdx);
+}
+
+static int64_t sys_net_resolve(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    char name[256];
+    int len = copy_string_from_user(name, (const char *)r->rdi, sizeof(name));
+    if (len < 0) return len;
+    uint32_t ip = 0;
+    if (!net_resolve(name, &ip)) return -EMBK_ECONNREFUSED;   /* no A record / no answer */
+    if (copy_to_user((void *)r->rsi, &ip, sizeof(ip)) != EMBK_OK) return -EMBK_EFAULT;
+    return 0;
+}
+
 /* --- The table: index = syscall number --- */
 typedef int64_t (*syscall_handler_t)(struct regs *);
 
@@ -1599,6 +1633,10 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_debug_mem      73
 #define SYS_debug_hwbp     74
 #define SYS_debug_detach   75
+/* Networking (M4): the ring-3 socket surface, CAP_NETWORK-gated. */
+#define SYS_net_socket     76
+#define SYS_net_connect    77
+#define SYS_net_resolve    78
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1670,6 +1708,9 @@ static syscall_handler_t syscall_table[] = {
     [SYS_key_mods]       = sys_key_mods,
     [SYS_tty_mode]       = sys_tty_mode,
     [SYS_getcaps]        = sys_getcaps,
+    [SYS_net_socket]     = sys_net_socket,
+    [SYS_net_connect]    = sys_net_connect,
+    [SYS_net_resolve]    = sys_net_resolve,
     [SYS_debug_attach]   = sys_debug_attach,
     [SYS_debug_wait]     = sys_debug_wait,
     [SYS_debug_cont]     = sys_debug_cont,

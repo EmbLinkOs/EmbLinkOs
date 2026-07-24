@@ -54,6 +54,7 @@ enum fd_backing {
     FD_BACKING_CONSOLE,       /**< the kernel console (keyboard in, kputchar out) */
     FD_BACKING_PIPE,          /**< one end of a kernel pipe (kernel/ipc/pipe.c) */
     FD_BACKING_NULLDEV,       /**< /dev/null: EOF source / discard sink (stateless) */
+    FD_BACKING_SOCKET,        /**< a TCP connection (kernel/net/tcp) -- M4 network fd */
 };
 
 struct pipe;   /* opaque -- defined in kernel/ipc/pipe.c; the fd layer only
@@ -111,6 +112,7 @@ struct fd_entry {
     union {
         struct { struct vnode vn; uint64_t pos; } file;  /**< FD_BACKING_VNODE */
         struct { struct pipe *p; int side; } pipe;       /**< FD_BACKING_PIPE (side: 0=read, 1=write) */
+        struct { int conn; } sock;                       /**< FD_BACKING_SOCKET (TCP conn index; -1 until connect) */
         /* FD_BACKING_CONSOLE is stateless -- no arm needed. */
     } u;
 };
@@ -141,6 +143,14 @@ int fd_open_into(struct process *target, int target_fd, const char *path, int fl
  * reference (ref bumped under the lock); the parent's obj-handle stays alive
  * and must be released separately for EOF. side: 0=read, 1=write. */
 int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side);
+
+/* Network sockets (M4). fd_alloc_socket() claims a free fd backed by an
+ * unconnected TCP socket (conn = -1) in `p`; fd_socket_connect() runs the
+ * active open on that fd's connection. read/write/close on the fd then route to
+ * net_tcp_recv/send/close via sock_fd_ops. Both live here because the socket
+ * fd internals (like pipe's) are private to fd.c. */
+int fd_alloc_socket(struct process *p);
+int fd_socket_connect(struct process *p, int fd, uint32_t ip_host, uint16_t port);
 
 /* Give a new process its stdin/stdout/stderr (fds 0/1/2): inherit from the
  * spawning parent per-backing, or default to the console. process_create()

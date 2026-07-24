@@ -266,6 +266,21 @@ static inline unsigned long embk_getcaps(void) {
     return (unsigned long)embk_syscall0(EMBK_SYS_getcaps);
 }
 
+/* ---- Networking (M4): the native socket surface -------------------------
+ * Gated on EMBK_CAP_NETWORK. A socket is a REAL fd, so read()/write()/close()
+ * work on it directly (which is what the BSD sockets shim in <embk_socket.h>
+ * maps onto for ports). IPs are HOST order: 10.0.2.15 == 0x0A00020F. */
+static inline int embk_net_socket(void) {          /* -> fd, or -errno */
+    return (int)embk_syscall0(EMBK_SYS_net_socket);
+}
+static inline int embk_net_connect(int fd, unsigned int ip_host, unsigned short port) {
+    return (int)embk_syscall3(EMBK_SYS_net_connect, fd, (int64_t)ip_host, (int64_t)port);
+}
+static inline int embk_net_resolve(const char *name, unsigned int *out_ip) {
+    return (int)embk_syscall2(EMBK_SYS_net_resolve,
+                              (int64_t)(long)name, (int64_t)(long)out_ip);
+}
+
 /* Fill `a` as a SET_CAPS action requesting `cap_mask` for the child. Add it to
  * the actions array you pass to embk_spawn; the kernel enforces the mask is a
  * subset of THIS process's caps and refuses (-EMBK_EPERM) otherwise. */

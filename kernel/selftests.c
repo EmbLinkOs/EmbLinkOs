@@ -968,6 +968,34 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test netuser") == 0) {
+        /* NETWORKING M4: ring-3 networking through the socket syscalls, AND the
+         * CAP_NETWORK gate. httpget resolves + connects + GETs FROM USER SPACE
+         * via the BSD-sockets shim. With CAP_NETWORK it exits 0 (got HTTP/1.x);
+         * without it, sys_net_* return -EPERM so it exits nonzero. */
+        const char *hp = "/data/apps/httpget/httpget.elf";
+        struct vfs_stat st;
+        if (vfs_stat(hp, &st) != 0) { kprintf("\n[cmd] test netuser: %s not on image\n", hp); return 1; }
+        char *a[]   = { (char *)hp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int ok = 1;
+
+        /* (1) WITH the network cap: the ring-3 HTTP round trip succeeds -> 0. */
+        int p1 = process_create_caps(hp, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_NETWORK));
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[netuser] with NETWORK cap: httpget exit=%d (0 = HTTP round trip)\n", c1);
+        if (c1 != 0) { kprintf("[netuser] FAIL: ring-3 HTTP GET did not succeed\n"); ok = 0; }
+
+        /* (2) WITHOUT it (seed {FILESYSTEM}): socket/resolve refused -> nonzero. */
+        int p2 = process_create_caps(hp, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        kprintf("[netuser] no NETWORK cap:   httpget exit=%d (!=0 = refused)\n", c2);
+        if (c2 == 0) { kprintf("[netuser] FAIL: a process WITHOUT NETWORK reached the network\n"); ok = 0; }
+
+        kprintf("[cmd] test netuser: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test capgate") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
         const char *gp = "/data/apps/capgpu/capgpu.elf";
