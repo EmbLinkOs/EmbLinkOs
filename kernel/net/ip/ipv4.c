@@ -60,5 +60,5 @@ void ip_input(const uint8_t *pkt, uint32_t len) {
 
     if (ip->proto == IP_PROTO_ICMP)      icmp_input(src, payload, plen);
     else if (ip->proto == IP_PROTO_UDP)  udp_input(src, payload, plen);
-    /* TCP: M3 */
+    else if (ip->proto == IP_PROTO_TCP)  tcp_input(src, payload, plen);
 }

@@ -91,6 +91,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/net/udp/udp.c \
              kernel/net/dhcp/dhcp.c \
              kernel/net/dns/dns.c \
+             kernel/net/tcp/tcp.c \
              kernel/drivers/usb/usb.c \
              kernel/drivers/usb/usb_core.c \
              kernel/drivers/usb/xhci.c \

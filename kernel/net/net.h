@@ -93,6 +93,25 @@ struct udp_hdr {
     uint16_t checksum;
 } __attribute__((packed));
 
+/* ---- TCP ---------------------------------------------------------------- */
+struct tcp_hdr {
+    uint16_t src_port, dst_port;      /* network order */
+    uint32_t seq;                     /* network order */
+    uint32_t ack;                     /* network order */
+    uint8_t  data_off;                /* high 4 bits = header length in 32-bit words */
+    uint8_t  flags;                   /* TCP_* below */
+    uint16_t window;                  /* network order */
+    uint16_t checksum;
+    uint16_t urgent;
+} __attribute__((packed));
+
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_PSH 0x08
+#define TCP_ACK 0x10
+#define TCP_URG 0x20
+
 /* ---- the single network interface (M1: one NIC, static config) ---------- */
 struct netif {
     bool     up;
@@ -108,6 +127,12 @@ extern struct netif g_netif;
 
 /* Internet checksum (RFC 1071): ones-complement sum over `len` bytes. */
 uint16_t net_checksum(const void *data, uint32_t len);
+
+/* Transport (UDP/TCP) checksum: the RFC 768/793 pseudo-header (src, dst, proto,
+ * length) folded together with the `seg` bytes. Returns the raw folded ~sum;
+ * UDP applies its own "0 -> 0xFFFF" rule, TCP stores it as-is. */
+uint16_t net_l4_checksum(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                         const void *seg, uint32_t seg_len);
 
 /* ---- stack entry points ------------------------------------------------- */
 void net_init(void);                          /* bring up the NIC + static config */
@@ -143,6 +168,14 @@ bool net_resolve(const char *name, uint32_t *out_ip);
  * Returns true on a reply (the M1 witness). */
 bool net_ping(uint32_t dst_ip);
 
+/* TCP client (M3): a blocking, stop-and-wait API that drives virtio_net_poll()
+ * while it waits -- consistent with the rest of the synchronous stack. Returns
+ * a small connection index (>= 0) or -1. Not the ring-3 surface (that is M4). */
+int  net_tcp_connect(uint32_t dst_ip, uint16_t dst_port);   /* active open, blocks to ESTABLISHED */
+int  net_tcp_send(int conn, const void *data, uint32_t len);/* send + wait for ACK */
+int  net_tcp_recv(int conn, void *buf, uint32_t cap);       /* bytes, or 0 at peer FIN/EOF */
+void net_tcp_close(int conn);                               /* FIN handshake, then free */
+
 /* ---- internal cross-layer hooks (each module -> its neighbour) ----------
  * These are how the layers hand a packet up (input) or down (output) across
  * .c files; they are not part of any ring-3 surface. Ownership:
@@ -157,6 +190,7 @@ int  ip_output(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,       /* UDP/ICM
 void ip_input(const uint8_t *pkt, uint32_t len);                      /* eth demux -> IP */
 void icmp_input(uint32_t src_ip, const uint8_t *msg, uint32_t len);   /* IP demux -> ICMP */
 void udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len);/* IP demux -> UDP */
+void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len);/* IP demux -> TCP */
 
 /* UDP single-slot receive capture, driven by DHCP/DNS: arm on a local port,
  * then poll (bounded) for the reply. */

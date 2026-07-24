@@ -7,22 +7,6 @@
 #include "include/kstring.h"
 #include "process/process.h"   /* schedule */
 
-static uint16_t udp_checksum(uint32_t src, uint32_t dst, const uint8_t *seg, uint32_t seg_len) {
-    uint32_t sum = 0;
-    uint32_t s = htonl(src), d = htonl(dst);
-    const uint16_t *ph = (const uint16_t *)&s; sum += ph[0]; sum += ph[1];
-    ph = (const uint16_t *)&d;                 sum += ph[0]; sum += ph[1];
-    sum += htons(IP_PROTO_UDP);
-    sum += htons((uint16_t)seg_len);
-    const uint16_t *p = (const uint16_t *)seg;
-    uint32_t n = seg_len;
-    while (n > 1) { sum += *p++; n -= 2; }
-    if (n) sum += *(const uint8_t *)p;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    uint16_t c = (uint16_t)~sum;
-    return c ? c : 0xFFFF;                      /* 0 means "none"; send 0xFFFF */
-}
-
 int net_send_udp(uint32_t src_ip, uint16_t src_port,
                  uint32_t dst_ip, uint16_t dst_port,
                  const void *payload, uint32_t len) {
@@ -35,7 +19,8 @@ int net_send_udp(uint32_t src_ip, uint16_t src_port,
     u->len      = htons((uint16_t)seg_len);
     u->checksum = 0;
     memcpy(seg + sizeof(*u), payload, len);
-    u->checksum = udp_checksum(src_ip, dst_ip, seg, seg_len);
+    uint16_t c = net_l4_checksum(src_ip, dst_ip, IP_PROTO_UDP, seg, seg_len);
+    u->checksum = c ? c : 0xFFFF;               /* 0 means "none"; send 0xFFFF */
     return ip_output(src_ip, dst_ip, IP_PROTO_UDP, seg, seg_len);
 }
 

@@ -37,6 +37,24 @@ uint16_t net_checksum(const void *data, uint32_t len) {
     return (uint16_t)~sum;
 }
 
+/* Transport checksum shared by UDP and TCP: pseudo-header (src, dst, proto, len)
+ * folded with the segment bytes. Returns the raw folded ~sum. */
+uint16_t net_l4_checksum(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                         const void *seg, uint32_t seg_len) {
+    uint32_t sum = 0;
+    uint32_t s = htonl(src_ip), d = htonl(dst_ip);
+    const uint16_t *ph = (const uint16_t *)&s; sum += ph[0]; sum += ph[1];
+    ph = (const uint16_t *)&d;                 sum += ph[0]; sum += ph[1];
+    sum += htons(proto);
+    sum += htons((uint16_t)seg_len);
+    const uint16_t *p = (const uint16_t *)seg;
+    uint32_t n = seg_len;
+    while (n > 1) { sum += *p++; n -= 2; }
+    if (n) sum += *(const uint8_t *)p;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
 /* Driver -> stack: one received Ethernet frame, routed up by ethertype. */
 void net_rx(const uint8_t *frame, uint32_t len) {
     if (len < ETH_HLEN) return;

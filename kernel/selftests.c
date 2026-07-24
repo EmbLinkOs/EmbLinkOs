@@ -929,6 +929,45 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test tcp") == 0) {
+        /* NETWORKING M3 witness: the full client path -- DNS resolve, TCP 3-way
+         * handshake to :80, an HTTP/1.0 GET, receive the response, clean close.
+         * SLIRP forwards outbound TCP to the host, so this needs outbound :80. */
+        if (!g_netif.up) { kprintf("\n[cmd] test tcp: NIC not up\n"); return 1; }
+        const char *host = "example.com";
+        uint32_t ip = 0;
+        if (!net_resolve(host, &ip)) {
+            kprintf("\n[cmd] test tcp: DNS failed for %s\n", host); return 1;
+        }
+        kprintf("[tcp] %s -> %u.%u.%u.%u, connecting :80 ...\n", host, IP_OCTETS(ip));
+        int c = net_tcp_connect(ip, 80);
+        if (c < 0) { kprintf("[tcp] connect failed\n[cmd] test tcp: FAIL\n"); return 1; }
+        kprintf("[tcp] connected (conn %d), sending GET\n", c);
+
+        char req[160];
+        int rl = snprintf(req, sizeof req,
+                          "GET / HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", host);
+        net_tcp_send(c, req, rl);
+
+        static char resp[4096];
+        int total = 0;
+        for (;;) {
+            int n = net_tcp_recv(c, resp + total, sizeof(resp) - 1 - total);
+            if (n <= 0) break;
+            total += n;
+            if (total >= (int)sizeof(resp) - 1) break;
+        }
+        resp[total] = 0;
+        net_tcp_close(c);
+
+        int ok = (total >= 12 && strncmp(resp, "HTTP/1", 6) == 0);
+        int nl = 0; while (nl < total && resp[nl] != '\r' && resp[nl] != '\n') nl++;
+        resp[nl] = 0;
+        kprintf("[tcp] received %d bytes; status: %s\n", total, resp);
+        kprintf("[cmd] test tcp: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test capgate") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
         const char *gp = "/data/apps/capgpu/capgpu.elf";
