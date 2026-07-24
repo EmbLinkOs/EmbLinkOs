@@ -20,6 +20,16 @@ static inline uint32_t ntohl(uint32_t v) { return __builtin_bswap32(v); }
 #define IPV4(a, b, c, d) \
     (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
 
+/* The four octets of a HOST-order IPv4 address, for kprintf("%u.%u.%u.%u"). */
+#define IP_OCTETS(ip) \
+    (uint8_t)((ip) >> 24), (uint8_t)((ip) >> 16), (uint8_t)((ip) >> 8), (uint8_t)(ip)
+
+/* Read/write an IPv4 address (HOST order) as 4 wire-order bytes, and read a
+ * big-endian 16-bit field. Shared so no module re-rolls its own. */
+static inline uint32_t net_ip_rd(const uint8_t *b)   { return IPV4(b[0], b[1], b[2], b[3]); }
+static inline void     net_ip_wr(uint32_t ip, uint8_t *b) { b[0]=ip>>24; b[1]=ip>>16; b[2]=ip>>8; b[3]=ip; }
+static inline uint16_t net_rd16be(const uint8_t *b)  { return ((uint16_t)b[0] << 8) | b[1]; }
+
 #define ETH_ALEN 6
 #define ETH_HLEN 14
 #define ETH_FRAME_MAX 1514            /* 14 header + 1500 MTU */
@@ -132,6 +142,26 @@ bool net_resolve(const char *name, uint32_t *out_ip);
 /* ICMP: send one echo request to `dst_ip` and wait for the matching reply.
  * Returns true on a reply (the M1 witness). */
 bool net_ping(uint32_t dst_ip);
+
+/* ---- internal cross-layer hooks (each module -> its neighbour) ----------
+ * These are how the layers hand a packet up (input) or down (output) across
+ * .c files; they are not part of any ring-3 surface. Ownership:
+ *   ETH_BCAST, net_rx  -> net.c        arp_input       -> ethernet/arp.c
+ *   ip_output/ip_input -> ip/ipv4.c    icmp_input      -> ip/icmp.c
+ *   udp_input          -> udp/udp.c    udp_arm/collect -> udp/udp.c            */
+extern const uint8_t ETH_BCAST[ETH_ALEN];
+
+void arp_input(const uint8_t *pkt, uint32_t len);                     /* eth demux -> ARP */
+int  ip_output(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,       /* UDP/ICMP -> IP  */
+               const void *payload, uint32_t len);
+void ip_input(const uint8_t *pkt, uint32_t len);                      /* eth demux -> IP */
+void icmp_input(uint32_t src_ip, const uint8_t *msg, uint32_t len);   /* IP demux -> ICMP */
+void udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len);/* IP demux -> UDP */
+
+/* UDP single-slot receive capture, driven by DHCP/DNS: arm on a local port,
+ * then poll (bounded) for the reply. */
+void udp_arm(uint16_t port);
+int  udp_collect(uint8_t *out, uint32_t cap, uint32_t *from_ip);
 
 /* ---- driver interface (virtio_net.c) ------------------------------------ */
 bool virtio_net_init(uint8_t mac_out[ETH_ALEN]);   /* probe + bring up; fills MAC */

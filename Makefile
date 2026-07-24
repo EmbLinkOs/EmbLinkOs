@@ -82,8 +82,15 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
              kernel/drivers/bus/pci.c \
-             kernel/net/virtio_net.c \
              kernel/net/net.c \
+             kernel/net/virtio_net.c \
+             kernel/net/ethernet/eth.c \
+             kernel/net/ethernet/arp.c \
+             kernel/net/ip/ipv4.c \
+             kernel/net/ip/icmp.c \
+             kernel/net/udp/udp.c \
+             kernel/net/dhcp/dhcp.c \
+             kernel/net/dns/dns.c \
              kernel/drivers/usb/usb.c \
              kernel/drivers/usb/usb_core.c \
              kernel/drivers/usb/xhci.c \
