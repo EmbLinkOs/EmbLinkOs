@@ -852,6 +852,13 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"data/apps/emlibc_embxapp/emlibc_embxapp.embx",
                         L.DT_REG, L.S_IFREG | L.PERM_FILE, ex))
 
+    # mathself: an EMBX whose MATH (math.c + all fdlibm) is EmbCC-compiled --
+    # verifies EmbCC's FP codegen computes real fdlibm correctly on the metal.
+    ms = _read_file("build/mathself.embx")
+    if ms is not None:
+        objects.append((b"data/apps/mathself/mathself.embx",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, ms))
+
     # emlibc LINK INPUTS for on-OS EMBX emission: crt0 + an app object + the
     # static library, so the on-image EmbLD (embld.elf) can LINK and EMIT a
     # native .embx on the metal -- no host toolchain in the loop. x86-64 has
@@ -886,10 +893,20 @@ def discover_userland_objects(build_dir="build"):
                      ("user/emlibc/rim/syscalls.c",   b"data/src/emlibc/syscalls.c"),
                      ("user/emlibc/rim/errno.c",      b"data/src/emlibc/errno.c"),
                      ("user/emlibc/process/process.c",b"data/src/emlibc/process.c"),
-                     ("user/lib/embk_syscall.h",      b"data/src/emlibc/include/embk_syscall.h")):
+                     ("user/lib/embk_syscall.h",      b"data/src/emlibc/include/embk_syscall.h"),
+                     ("user/emlibc/math/math.c",      b"data/src/emlibc/math.c"),
+                     ("user/bin/mathself.c",          b"data/src/emlibc/mathself.c")):
         blob = _read_file(src)
         if blob is not None:
             objects.append((dst, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
+    # ...and the lifted fdlibm tree (.c + its two headers), so EmbCC can compile
+    # the FP math on the OS -- folding math into the self-host set (loop closes
+    # INCLUDING floating point). `test emlibc math selfhost`.
+    objects.extend(_tree_objects("user/emlibc/math/fdlibm",
+                                 b"data/src/emlibc/fdlibm/", ".c"))
+    objects.extend(_tree_objects("user/emlibc/math/fdlibm",
+                                 b"data/src/emlibc/fdlibm/", ".h"))
 
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the

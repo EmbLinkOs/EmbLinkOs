@@ -538,6 +538,22 @@ build/emlibc_embxapp.embx: build/emlibc_crt0.o build/emlibc_embxapp.o build/libe
 	$(HOST_EMBLD) --embx --cap filesystem -o $@ \
 	    build/emlibc_crt0.o build/emlibc_embxapp.o build/libemlibc.a $(LIBGCC_A)
 
+# mathself.embx -- the FP math (math.c + all 31 fdlibm) compiled by EmbCC, the
+# rest gcc, linked by EmbLD. Verifies EmbCC's float codegen computes real
+# fdlibm correctly on the metal (`test mathself`). Built only when the host
+# EmbCC + EmbLD are present; absent otherwise (honest, never faked).
+HOST_EMBCC    := $(EMBCC_ROOT)/embcc
+EMLIBC_EC_INC := -I$(EMLIBC_DIR)/include -I$(EMBCC_ROOT)/include -Iuser/lib -I$(EMLIBC_FD_DIR)
+build/mathself.embx: user/bin/mathself.c $(EMLIBC_DIR)/math/math.c $(EMLIBC_FD_SRCS) \
+                     build/emlibc_crt0.o build/libemlibc.a $(HOST_EMBCC) $(HOST_EMBLD)
+	@rm -rf build/mathself.d && mkdir -p build/mathself.d
+	$(HOST_EMBCC) -c user/bin/mathself.c $(EMLIBC_EC_INC) -o build/mathself.d/mathself.o
+	$(HOST_EMBCC) -c $(EMLIBC_DIR)/math/math.c $(EMLIBC_EC_INC) -o build/mathself.d/math.o
+	@for f in $(EMLIBC_FD_SRCS); do $(HOST_EMBCC) -c $$f $(EMLIBC_EC_INC) \
+	    -o build/mathself.d/$$(basename $$f .c).o || exit 1; done
+	$(HOST_EMBLD) --embx --cap filesystem -o $@ \
+	    build/emlibc_crt0.o build/mathself.d/*.o build/libemlibc.a
+
 build/capspawn.o: user/bin/capspawn.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capspawn.elf: build/crt0.o build/syscalls.o build/capspawn.o user/lib/newlib.ld
@@ -710,7 +726,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -876,7 +892,7 @@ endif
 EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf \
-               build/emlibc_demo.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) \
+               build/emlibc_demo.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)

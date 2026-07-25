@@ -30,6 +30,12 @@ typedef uint32_t __uint32_t;
 #endif
 #include "math_config.h"
 
+/* Prototypes fdlibm cores call but that aren't in emlibc's <math.h>: expm1
+ * (fdlibm/s_expm1.c) and the legacy finite() (emlibc glue). EmbCC correctly
+ * rejects implicit declarations (C99), so declare them here. */
+extern double expm1(double x);
+extern int    finite(double x);
+
 /* Most routines need to check whether a float is finite, infinite, or not a
    number, and many need to know whether the result of an operation will
    overflow.  These conditions depend on whether the largest exponent is

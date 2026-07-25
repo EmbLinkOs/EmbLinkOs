@@ -225,11 +225,13 @@ static int dec_exp10(double v)
 static int build_f(char *out, double v, int prec)
 {
     double scale = 1.0; for (int i = 0; i < prec; i++) scale *= 10.0;
-    unsigned long long ip = (unsigned long long)v;
+    /* signed long long, not unsigned: SSE2 has no unsigned-64<->double convert
+     * (EmbCC rejects it), and every %f integer/fraction part fits in 63 bits. */
+    long long ip = (long long)v;
     double frac = v - (double)ip;
-    unsigned long long fp = (unsigned long long)(frac * scale + 0.5);
-    if (fp >= (unsigned long long)scale) { fp -= (unsigned long long)scale; ip++; }
-    int n = f_uint(out, ip);
+    long long fp = (long long)(frac * scale + 0.5);
+    if (fp >= (long long)scale) { fp -= (long long)scale; ip++; }
+    int n = f_uint(out, (unsigned long long)ip);
     if (prec > 0) {
         out[n++] = '.';
         char t[24]; int fl = f_uint(t, fp);

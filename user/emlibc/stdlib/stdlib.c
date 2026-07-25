@@ -10,7 +10,10 @@
 #include <stdint.h>
 
 extern void  *emlibc_sbrk(long incr);
-extern void   emlibc_stdio_flush_all(void);   /* stdio.c */
+/* WEAK: exit()/abort() flush the streams, but a program that never touches
+ * stdio should not have to link it. Weak-undef resolves to 0 (embld + gcc), so
+ * the null-guarded calls below skip flushing when stdio isn't in the link. */
+extern void   emlibc_stdio_flush_all(void) __attribute__((weak));   /* stdio.c */
 extern void   _exit(int code);                 /* rim/syscalls.c */
 extern char **environ;
 
@@ -97,7 +100,7 @@ int atexit(void (*fn)(void))
 void exit(int code)
 {
     for (int i = g_natexit - 1; i >= 0; i--) if (g_atexit[i]) g_atexit[i]();
-    emlibc_stdio_flush_all();
+    if (emlibc_stdio_flush_all) emlibc_stdio_flush_all();
     _exit(code);
     for (;;) { }
 }
@@ -106,7 +109,7 @@ void _Exit(int code) { _exit(code); for (;;) { } }   /* no flush, no handlers */
 
 void abort(void)
 {
-    emlibc_stdio_flush_all();
+    if (emlibc_stdio_flush_all) emlibc_stdio_flush_all();
     _exit(134);                                       /* 128 + SIGABRT */
     for (;;) { }
 }

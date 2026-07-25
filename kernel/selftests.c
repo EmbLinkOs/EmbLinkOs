@@ -439,6 +439,8 @@ static void selftests_print_commands(void)
     kprintf("  test embcc self\n");
     kprintf("  test embcc selfhost\n");
     kprintf("  test embld\n");
+    kprintf("  test emlibc math selfhost\n");
+    kprintf("  test mathself\n");
     kprintf("  test emlibc\n");
     kprintf("  test emlibc math\n");
     kprintf("  test emlibc caps\n");
@@ -1208,6 +1210,130 @@ int selftests_handle_command(const char *cmd)
         } else { kprintf("[emmath] /data/tmp/math.out missing\n"); ok = 0; }
 
         kprintf("[cmd] test emlibc math: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc math selfhost") == 0) {
+        /* THE LOOP CLOSES INCLUDING FLOATING POINT. The OS compiles emlibc's
+         * FP math with EmbCC -- the glue math.c AND all 31 lifted fdlibm files
+         * (the newlib-grade ~1-ulp library) -- plus the libc closure and the
+         * app, links them with EmbLD into a native EMBX, and runs it. Every
+         * object, FP included, produced by the owned toolchain on the metal. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test emlibc math selfhost: VFS not registered\n"); return 1; }
+        const char *cc = "/data/apps/embcc/embcc.elf";
+        const char *ld = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cc, &st) != 0) { kprintf("\n[cmd] test emlibc math selfhost: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat(ld, &st) != 0) { kprintf("\n[cmd] test emlibc math selfhost: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/emlibc/fdlibm/e_exp.c", &st) != 0) {
+            kprintf("\n[cmd] test emlibc math selfhost: fdlibm sources not on image\n"); return 1; }
+
+        char *env[] = { (char *)"HOME=/", NULL };
+        /* non-fdlibm units live flat in /data/src/emlibc/; fdlibm in fdlibm/. */
+        static const char *const flat[] = {
+            "crt0", "string", "stdlib", "stdio", "syscalls", "errno", "math", "mathself",
+        };
+        static const char *const fd[] = {
+            "e_acos","e_asin","e_atan2","e_cosh","e_exp","e_fmod","e_hypot","e_log",
+            "e_log10","e_pow","e_rem_pio2","e_sinh","k_cos","k_rem_pio2","k_sin","k_tan",
+            "s_atan","s_cbrt","s_ceil","s_copysign","s_cos","s_expm1","s_fabs","s_floor",
+            "s_frexp","s_ldexp","s_scalbn","s_sin","s_tan","s_tanh","s_trunc",
+        };
+        int nflat = (int)(sizeof flat / sizeof flat[0]);
+        int nfd   = (int)(sizeof fd / sizeof fd[0]);
+        int built = 0, total = nflat + nfd;
+
+        /* One uniform include set for every unit (the extra -I is harmless for
+         * files that don't include fdlibm.h). */
+        for (int u = 0; u < total; u++) {
+            int isfd = u >= nflat;
+            const char *base = isfd ? fd[u - nflat] : flat[u];
+            char src[96], obj[96];
+            if (isfd) snprintf(src, sizeof src, "/data/src/emlibc/fdlibm/%s.c", base);
+            else      snprintf(src, sizeof src, "/data/src/emlibc/%s.c", base);
+            snprintf(obj, sizeof obj, "/data/tmp/ms_%s.o", base);
+            (void)vfs_unlink_path(obj);
+            char *ca[] = { (char *)cc, (char *)"-c", src,
+                           (char *)"-I", (char *)"/data/src/emlibc/include",
+                           (char *)"-I", (char *)"/data/apps/embcc/include",
+                           (char *)"-I", (char *)"/data/src/emlibc/fdlibm",
+                           (char *)"-o", obj };
+            int p = process_create_env(cc, ca, 11, env, NULL, 0);
+            if ((p >= 0 ? process_wait((uint32_t)p) : -1) == 0 && vfs_stat(obj, &st) == 0)
+                built++;
+        }
+        kprintf("[mathsh] embcc built %d/%d FP units (libc + math.c + 31 fdlibm + app)\n", built, total);
+        int ok = (built == total);
+
+        /* Link them all into a native EMBX (crt0 first for the entry). */
+        const char *out = "/data/tmp/mathsh.embx";
+        (void)vfs_unlink_path(out);
+        (void)vfs_unlink_path("/data/tmp/mathself.out");
+        if (ok) {
+            char *la[80]; int n = 0;
+            la[n++] = (char *)ld; la[n++] = (char *)"--embx";
+            la[n++] = (char *)"--cap"; la[n++] = (char *)"filesystem";
+            la[n++] = (char *)"-o"; la[n++] = (char *)out;
+            static char paths[64][40];
+            int pi = 0;
+            la[n++] = (char *)"/data/tmp/ms_crt0.o";                 /* entry first */
+            for (int u = 0; u < total; u++) {
+                const char *base = (u >= nflat) ? fd[u - nflat] : flat[u];
+                if (strcmp(base, "crt0") == 0) continue;             /* already added */
+                snprintf(paths[pi], sizeof paths[pi], "/data/tmp/ms_%s.o", base);
+                la[n++] = paths[pi++];
+            }
+            int lp = process_create_caps(ld, la, n, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+            int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            int have = (vfs_stat(out, &st) == 0);
+            kprintf("[mathsh] embld linked %d objects -> exit=%d, %s (%llu bytes)\n",
+                    n - 6, lc, have ? "EMBX" : "MISSING", have ? (unsigned long long)st.size : 0ULL);
+            if (!(lc == 0 && have)) ok = 0;
+        }
+
+        /* Run it -- correct fdlibm @ 1e-12 => exit 42. */
+        if (ok) {
+            char *ra[] = { (char *)out, NULL };
+            int rp = process_create_caps(out, ra, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+            int rc = rp >= 0 ? process_wait((uint32_t)rp) : -1;
+            char head[32] = {0}; size_t got = 0;
+            if (vfs_stat("/data/tmp/mathself.out", &st) == 0) {
+                int fd2 = vfs_open("/data/tmp/mathself.out", O_RDONLY, 0);
+                if (fd2 >= 0) { vfs_fd_read(fd2, head, sizeof head - 1, &got); vfs_close(fd2); }
+                if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            }
+            kprintf("[mathsh] OS-built FP math ran: exit=%d (want 42), \"%s\"\n", rc, head);
+            if (rc != 42) ok = 0;
+        }
+
+        kprintf("[cmd] test emlibc math selfhost: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test mathself") == 0) {
+        /* EmbCC's FP codegen, verified on the metal: an EMBX whose math.c + all
+         * 31 fdlibm files were compiled by EmbCC (rest gcc), linked by EmbLD.
+         * If EmbCC's floating point is correct, the app passes real fdlibm at
+         * 1e-12 relative tolerance and exits 42. */
+        const char *mp = "/data/apps/mathself/mathself.embx";
+        struct vfs_stat st;
+        if (vfs_stat(mp, &st) != 0) { kprintf("\n[cmd] test mathself: %s not on image\n", mp); return 1; }
+        (void)vfs_unlink_path("/data/tmp/mathself.out");
+        char *a[]   = { (char *)mp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pid  = process_create_caps(mp, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[mathself] EmbCC-compiled fdlibm exit=%d (want 42 -- correct @ 1e-12)\n", code);
+        int ok = (code == 42);
+        char head[32] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/mathself.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/mathself.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            kprintf("[mathself] witness: \"%s\"\n", head);
+            if (memcmp(head, "math self OK", 12) != 0) ok = 0;
+        } else { kprintf("[mathself] witness missing\n"); ok = 0; }
+        kprintf("[cmd] test mathself: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

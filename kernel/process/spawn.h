@@ -9,7 +9,13 @@
  * (spawn returned E2BIG on the shell's own rebuild). Kernel-stack cost of
  * the bump: +1 KB in sys_spawn's argv_buf + 128 B of pointer arrays --
  * well inside the guarded kernel stacks. */
-#define SPAWN_ARGV_MAX             32          // max argv[] entries (incl. the NULL terminator)
+#define SPAWN_ARGV_MAX             64          // max argv[] entries (incl. the NULL terminator).
+                                               // 32 -> 64 for on-OS self-host of the FP math:
+                                               // linking the whole libc + fdlibm tree + app is
+                                               // ~38 object paths in one embld argv. The real
+                                               // limit is the child's 4 KiB argv/envp page, still
+                                               // checked at runtime in process_create_env
+                                               // (STACK_ROOM_NEEDED); this only sizes the arrays.
 #define SPAWN_ARGV_BYTES_MAX       2048        // total bytes of argv[] strings (incl. NUL terminators)
 
 /* ENVIRONMENT -- passed EXPLICITLY at spawn, exactly like argv, and never

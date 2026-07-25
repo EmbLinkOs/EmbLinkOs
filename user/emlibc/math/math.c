@@ -30,6 +30,8 @@ int __em_isnan(double x)    { di_t v; v.d = x; return ((v.u >> 52) & 0x7ff) == 0
 int __em_isinf(double x)    { di_t v; v.d = x; return (v.u & 0x7fffffffffffffffULL) == 0x7ff0000000000000ULL; }
 int __em_isfinite(double x) { di_t v; v.d = x; return ((v.u >> 52) & 0x7ff) != 0x7ff; }
 int __em_signbit(double x)  { di_t v; v.d = x; return (int)(v.u >> 63); }
+/* legacy finite() -- fdlibm's s_ldexp.c reaches for it. */
+int finite(double x)        { return __em_isfinite(x); }
 
 /* ---- hardware sqrt (exact); __ieee754_sqrt is what fdlibm's asin/acos/hypot call ---- */
 double sqrt(double x)         { double r; __asm__ ("sqrtsd %1, %0" : "=x"(r) : "x"(x)); return r; }
