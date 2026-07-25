@@ -200,58 +200,117 @@ static void emit_pad(emit_fn emit, void *ctx, char c, int n, int *count)
     while (n > 0) { int k = n < 16 ? n : 16; emit(ctx, b, (size_t)k); *count += k; n -= k; }
 }
 
-struct fmt_flags2 { int prec, has_prec, plus, space; };
-
-/* Floating-point conversions (%f/%e/%g). Self-contained -- IEEE-754 bit tests
- * for the sign/nan/inf, integer+fraction split for the digits -- so pulling
- * printf never drags in libm. Pragmatic for typical magnitudes (< ~1e18); a
- * production formatter would use a correctly-rounded dtoa. */
-static void fmt_double(emit_fn emit, void *ctx, double v, char conv,
-                       const struct fmt_flags2 *f, int *count)
+/* Floating-point conversions (%f/%e/%g) with field width + flags. Self-
+ * contained -- IEEE-754 bit tests for sign/nan/inf, integer+fraction split for
+ * the digits -- so pulling printf never drags in libm. The mantissa is built
+ * into a buffer, then padded/signed by the caller. Pragmatic for typical
+ * magnitudes (< ~1e18); a production formatter would use a correctly-rounded
+ * dtoa. Rounding carry into an extra digit at the %e boundary is not handled. */
+static int f_uint(char *out, unsigned long long v)
 {
-    union { double d; unsigned long long u; } b; b.d = v;
-    int neg = (int)(b.u >> 63);
-    if (neg) { v = -v; b.d = v; }
-    const char *sign = neg ? "-" : (f->plus ? "+" : (f->space ? " " : ""));
-    for (const char *s = sign; *s; s++) { emit(ctx, s, 1); (*count)++; }
-
-    if (((b.u >> 52) & 0x7ff) == 0x7ff) {                 /* nan / inf */
-        const char *s = (b.u & 0xfffffffffffffULL) ? "nan" : "inf";
-        emit(ctx, s, 3); *count += 3; return;
-    }
-    int prec = f->has_prec ? f->prec : 6;
-
-    int e10 = 0;
-    if ((conv == 'e' || conv == 'E') && v != 0.0) {       /* normalize to d.dddEsdd */
-        while (v >= 10.0) { v /= 10.0; e10++; }
-        while (v <  1.0)  { v *= 10.0; e10--; }
-    }
-
-    /* value * 10^prec, rounded, split into integer + fraction digit runs */
+    char t[24]; int n = 0;
+    if (v == 0) { out[0] = '0'; return 1; }
+    while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    for (int i = 0; i < n; i++) out[i] = t[n - 1 - i];
+    return n;
+}
+static int dec_exp10(double v)
+{
+    int e = 0; if (v == 0.0) return 0;
+    while (v >= 10.0) { v /= 10.0; e++; }
+    while (v <  1.0)  { v *= 10.0; e--; }
+    return e;
+}
+/* v >= 0 -> "iii.fff" with `prec` fractional digits. */
+static int build_f(char *out, double v, int prec)
+{
     double scale = 1.0; for (int i = 0; i < prec; i++) scale *= 10.0;
     unsigned long long ip = (unsigned long long)v;
     double frac = v - (double)ip;
     unsigned long long fp = (unsigned long long)(frac * scale + 0.5);
     if (fp >= (unsigned long long)scale) { fp -= (unsigned long long)scale; ip++; }
-
-    char tmp[40]; int dl;
-    char *dg = u_to_str(ip, 10, 0, tmp, &dl);
-    emit(ctx, dg, (size_t)dl); *count += dl;
+    int n = f_uint(out, ip);
     if (prec > 0) {
-        emit(ctx, ".", 1); (*count)++;
-        char t2[40]; int fl;
-        char *fd = u_to_str(fp, 10, 0, t2, &fl);
-        for (int z = fl; z < prec; z++) { emit(ctx, "0", 1); (*count)++; }
-        emit(ctx, fd, (size_t)fl); *count += fl;
+        out[n++] = '.';
+        char t[24]; int fl = f_uint(t, fp);
+        for (int z = fl; z < prec; z++) out[n++] = '0';
+        for (int i = 0; i < fl; i++) out[n++] = t[i];
     }
-    if (conv == 'e' || conv == 'E') {                     /* exponent suffix */
-        char ec[8]; int p = 0;
-        ec[p++] = (conv == 'E') ? 'E' : 'e';
-        ec[p++] = (e10 < 0) ? '-' : '+';
-        int ae = e10 < 0 ? -e10 : e10;
-        ec[p++] = (char)('0' + (ae / 10) % 10);
-        ec[p++] = (char)('0' + ae % 10);
-        emit(ctx, ec, (size_t)p); *count += p;
+    return n;
+}
+/* v >= 0 -> "d.ddde+XX" with `prec` mantissa-fraction digits. */
+static int build_e(char *out, double v, int prec, char ec)
+{
+    int e = 0;
+    if (v != 0.0) { while (v >= 10.0) { v /= 10.0; e++; } while (v < 1.0) { v *= 10.0; e--; } }
+    int n = build_f(out, v, prec);
+    out[n++] = ec;
+    out[n++] = (e < 0) ? '-' : '+';
+    int ae = e < 0 ? -e : e;
+    if (ae >= 100) { out[n++] = (char)('0' + ae / 100); ae %= 100; }
+    out[n++] = (char)('0' + (ae / 10) % 10);
+    out[n++] = (char)('0' + ae % 10);
+    return n;
+}
+/* Strip trailing fractional zeros (and a bare '.') from a %g mantissa. */
+static int strip_zeros(char *s, int n)
+{
+    int epos = -1;
+    for (int i = 0; i < n; i++) if (s[i] == 'e' || s[i] == 'E') { epos = i; break; }
+    int mend = (epos < 0) ? n : epos, dot = -1;
+    for (int i = 0; i < mend; i++) if (s[i] == '.') { dot = i; break; }
+    if (dot < 0) return n;
+    int j = mend - 1;
+    while (j > dot && s[j] == '0') j--;
+    if (j == dot) j--;                       /* drop the '.' too */
+    int keep = j + 1;
+    if (epos >= 0) { int el = n - epos; for (int k = 0; k < el; k++) s[keep + k] = s[epos + k]; return keep + el; }
+    return keep;
+}
+
+static void fmt_double(emit_fn emit, void *ctx, double v, char conv,
+                       const struct fmt_flags *f, int *count)
+{
+    union { double d; unsigned long long u; } b; b.d = v;
+    int neg = (int)(b.u >> 63);
+    if (neg) { v = -v; b.d = v; }
+    char sign = neg ? '-' : (f->plus ? '+' : (f->space ? ' ' : 0));
+
+    char body[560]; int n = 0; int is_special = 0;
+    if (((b.u >> 52) & 0x7ff) == 0x7ff) {
+        int up = (conv < 'a');                          /* upper conv -> NAN/INF */
+        const char *s = (b.u & 0xfffffffffffffULL) ? (up ? "NAN" : "nan")
+                                                    : (up ? "INF" : "inf");
+        while (*s) body[n++] = *s++;
+        is_special = 1;
+    } else {
+        int prec = f->has_prec ? f->prec : 6;
+        char c = (conv == 'F') ? 'f' : (conv == 'E') ? 'e' : (conv == 'G') ? 'g' : conv;
+        if (c == 'f')      n = build_f(body, v, prec);
+        else if (c == 'e') n = build_e(body, v, prec, (conv == 'E') ? 'E' : 'e');
+        else {                                          /* %g / %G */
+            int P = f->has_prec ? (f->prec ? f->prec : 1) : 6;
+            int X = dec_exp10(v);
+            if (X >= -4 && X < P) n = build_f(body, v, P - 1 - X);
+            else                  n = build_e(body, v, P - 1, (conv == 'G') ? 'E' : 'e');
+            if (!f->hash) n = strip_zeros(body, n);
+        }
+    }
+
+    int total = (sign ? 1 : 0) + n;
+    int pad = f->width - total; if (pad < 0) pad = 0;
+    if (f->minus) {
+        if (sign) { emit(ctx, &sign, 1); (*count)++; }
+        emit(ctx, body, (size_t)n); *count += n;
+        emit_pad(emit, ctx, ' ', pad, count);
+    } else if (f->zero && !is_special) {                /* zero-pad after the sign */
+        if (sign) { emit(ctx, &sign, 1); (*count)++; }
+        emit_pad(emit, ctx, '0', pad, count);
+        emit(ctx, body, (size_t)n); *count += n;
+    } else {
+        emit_pad(emit, ctx, ' ', pad, count);
+        if (sign) { emit(ctx, &sign, 1); (*count)++; }
+        emit(ctx, body, (size_t)n); *count += n;
     }
 }
 
@@ -339,13 +398,9 @@ static int em_vformat(emit_fn emit, void *ctx, const char *fmt, va_list ap)
             prefix[prefixn++] = '0'; prefix[prefixn++] = 'x';
             break;
         }
-        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
-            /* %g routes to %f here (pragmatic); %f/%e are real. */
-            char cv = (c == 'g') ? 'f' : (c == 'G') ? 'f' : c;
-            struct fmt_flags2 ff = { f.prec, f.has_prec, f.plus, f.space };
-            fmt_double(emit, ctx, va_arg(ap, double), cv, &ff, &count);
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G':
+            fmt_double(emit, ctx, va_arg(ap, double), c, &f, &count);
             continue;
-        }
         default:
             /* A conversion emlibc does not implement: echo it literally rather
              * than printing a fabricated value. */

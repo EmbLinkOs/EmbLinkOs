@@ -29,14 +29,13 @@ int main(void)
 
     FILE *f = fopen("/data/tmp/math.out", "w");
     if (f) {
-        fprintf(f, "sqrt2=%.6f sin30=%.4f e=%.6f 2^10=%.1f atan2=%.6f pass=%d\n",
-                sqrt(2.0), sin(M_PI / 6.0), exp(1.0), pow(2.0, 10.0),
-                atan2(1.0, 1.0), ok);
+        /* also exercises the formatter: %g (pi), %e (big), field width (pad) */
+        fprintf(f, "sqrt2=%.6f pi=%g big=%.2e pad=[%8.2f] neg=%+.1f pass=%d\n",
+                sqrt(2.0), M_PI, 6.022e23, 3.14159, -2.5, ok);
         fclose(f);
     }
 
-    /* also prove %e works */
-    printf("emlibc math: sqrt2=%.9f  6.022e23=%.3e  ok=%d\n",
-           sqrt(2.0), 6.022e23, ok);
+    printf("emlibc math: sqrt2=%.9f  6.022e23=%.3e  pi=%g  [%10.3f]  ok=%d\n",
+           sqrt(2.0), 6.022e23, M_PI, 2.5, ok);
     return ok ? 42 : 1;
 }
