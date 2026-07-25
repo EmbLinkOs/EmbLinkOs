@@ -444,6 +444,7 @@ static void selftests_print_commands(void)
     kprintf("  test emlibc embx\n");
     kprintf("  test embld embx\n");
     kprintf("  test embcc embx\n");
+    kprintf("  test emlibc selfhost\n");
     kprintf("  test embcc asm\n");
     kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
@@ -1387,6 +1388,84 @@ int selftests_handle_command(const char *cmd)
         }
 
         kprintf("[cmd] test embcc embx: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc selfhost") == 0) {
+        /* THE FINALE (EMLIBC_Requirements.md §6 step 5): EmbCC compiles emlibc's
+         * OWN sources. The OS builds its libc from scratch with the owned
+         * compiler -- crt0 + every libemlibc unit -- links them with EmbLD into
+         * a native EMBX, and runs an app against the self-compiled libc. The
+         * closed loop: a compiler, a libc it built, a linker, a format, a
+         * loader, an OS -- one system, beholden to nothing external. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test emlibc selfhost: VFS not registered\n"); return 1; }
+        const char *cc = "/data/apps/embcc/embcc.elf";
+        const char *ld = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cc, &st) != 0) { kprintf("\n[cmd] test emlibc selfhost: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat(ld, &st) != 0) { kprintf("\n[cmd] test emlibc selfhost: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/emlibc/stdio.c", &st) != 0) {
+            kprintf("\n[cmd] test emlibc selfhost: emlibc sources not on image\n"); return 1; }
+
+        char *env[] = { (char *)"HOME=/", NULL };
+        /* crt0 + the six libemlibc units + the app -- all compiled by EmbCC. */
+        static const char *const units[] = {
+            "crt0", "string", "stdlib", "stdio", "syscalls", "errno", "process", "embxapp",
+        };
+        int nunits = (int)(sizeof units / sizeof units[0]);
+        int built = 0;
+        for (int u = 0; u < nunits; u++) {
+            char src[64], obj[64];
+            snprintf(src, sizeof src, "/data/src/emlibc/%s.c", units[u]);
+            snprintf(obj, sizeof obj, "/data/tmp/self_%s.o", units[u]);
+            (void)vfs_unlink_path(obj);
+            char *ca[] = { (char *)cc, (char *)"-c", src,
+                           (char *)"-I", (char *)"/data/src/emlibc/include",
+                           (char *)"-I", (char *)"/data/apps/embcc/include",
+                           (char *)"-o", obj };
+            int p = process_create_env(cc, ca, 9, env, NULL, 0);
+            if ((p >= 0 ? process_wait((uint32_t)p) : -1) == 0 && vfs_stat(obj, &st) == 0)
+                built++;
+        }
+        kprintf("[emself] embcc built %d/%d emlibc units (crt0 + libc + app)\n", built, nunits);
+        int ok = (built == nunits);
+
+        /* Link the self-compiled objects into a native EMBX (crt0 first). */
+        const char *out = "/data/tmp/emself.embx";
+        (void)vfs_unlink_path(out);
+        (void)vfs_unlink_path("/data/tmp/embxapp.out");
+        if (ok) {
+            char *la[] = { (char *)ld, (char *)"--embx", (char *)"--cap", (char *)"filesystem",
+                           (char *)"-o", (char *)out,
+                           (char *)"/data/tmp/self_crt0.o",   (char *)"/data/tmp/self_embxapp.o",
+                           (char *)"/data/tmp/self_string.o", (char *)"/data/tmp/self_stdlib.o",
+                           (char *)"/data/tmp/self_stdio.o",  (char *)"/data/tmp/self_syscalls.o",
+                           (char *)"/data/tmp/self_errno.o",  (char *)"/data/tmp/self_process.o" };
+            int lp = process_create_caps(ld, la, 14, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+            int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            int have = (vfs_stat(out, &st) == 0);
+            kprintf("[emself] embld linked the self-compiled libc: exit=%d, %s (%llu bytes)\n",
+                    lc, have ? "EMBX written" : "MISSING", have ? (unsigned long long)st.size : 0ULL);
+            if (!(lc == 0 && have)) ok = 0;
+        }
+
+        /* Run the app against the EmbCC-built emlibc. */
+        if (ok) {
+            char *ra[] = { (char *)out, NULL };
+            uint64_t grantor = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+            int rp = process_create_caps(out, ra, 1, env, NULL, 0, grantor);
+            int rc = rp >= 0 ? process_wait((uint32_t)rp) : -1;
+            char head[64] = {0}; size_t got = 0;
+            if (vfs_stat("/data/tmp/embxapp.out", &st) == 0) {
+                int fd = vfs_open("/data/tmp/embxapp.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            }
+            kprintf("[emself] app on EmbCC-built emlibc: exit=%d (want 42), reports \"%s\"\n", rc, head);
+            if (rc != 42) ok = 0;
+        }
+
+        kprintf("[cmd] test emlibc selfhost: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

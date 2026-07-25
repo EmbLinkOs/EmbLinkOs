@@ -50,7 +50,7 @@ size_t strlen(const char *s)          { const char *p = s; while (*p) p++; retur
 size_t strnlen(const char *s, size_t m){ size_t i = 0; while (i < m && s[i]) i++; return i; }
 
 char *strcpy(char *restrict d, const char *restrict s)
-{ char *r = d; while ((*d++ = *s++)) ; return r; }
+{ char *r = d; while ((*d++ = *s++)) { } return r; }
 
 char *strncpy(char *restrict d, const char *restrict s, size_t n)
 {
@@ -61,7 +61,7 @@ char *strncpy(char *restrict d, const char *restrict s, size_t n)
 }
 
 char *strcat(char *restrict d, const char *restrict s)
-{ char *r = d; while (*d) d++; while ((*d++ = *s++)) ; return r; }
+{ char *r = d; while (*d) d++; while ((*d++ = *s++)) { } return r; }
 
 char *strncat(char *restrict d, const char *restrict s, size_t n)
 {

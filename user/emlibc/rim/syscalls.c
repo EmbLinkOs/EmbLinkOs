@@ -71,9 +71,11 @@ int chdir(const char *path)
 {
     char tmp[EM_PATH_MAX];
     const char *ap = path_abs(path, tmp, sizeof tmp);
-    /* Confirm it exists and is a directory by asking the kernel to stat it. */
-    struct { uint64_t size; uint32_t mode; uint32_t type; uint8_t pad[16]; } st;
-    int64_t r = embk_syscall2(EMBK_SYS_stat, (int64_t)ap, (int64_t)&st);
+    /* Confirm it exists by asking the kernel to stat it. We only need the
+     * return code, so a byte buffer for the kernel's vfs_stat output suffices
+     * (no block-scope struct type -- emlibc stays in EmbCC's subset). */
+    unsigned char stbuf[128];
+    int64_t r = embk_syscall2(EMBK_SYS_stat, (int64_t)ap, (int64_t)stbuf);
     if (embk_is_err(r)) return (int)fail_long(r);
     if (strlen(ap) >= sizeof g_cwd) { errno = ENAMETOOLONG; return -1; }
     strcpy(g_cwd, ap);

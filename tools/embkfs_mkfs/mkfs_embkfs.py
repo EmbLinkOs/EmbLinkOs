@@ -875,6 +875,22 @@ def discover_userland_objects(build_dir="build"):
     objects.extend(_tree_objects("user/emlibc/include",
                                  b"data/src/emlibc/include/", ".h"))
 
+    # ...and emlibc's OWN sources (flattened) + the shared syscall header, so
+    # the OS can SELF-HOST the libc: embcc compiles crt0 + every libemlibc unit,
+    # embld links them, and an app runs against the self-compiled libc. The §6
+    # step-5 finale -- `test emlibc selfhost`.
+    for src, dst in (("user/lib/crt0.c",              b"data/src/emlibc/crt0.c"),
+                     ("user/emlibc/string/string.c",  b"data/src/emlibc/string.c"),
+                     ("user/emlibc/stdlib/stdlib.c",  b"data/src/emlibc/stdlib.c"),
+                     ("user/emlibc/stdio/stdio.c",    b"data/src/emlibc/stdio.c"),
+                     ("user/emlibc/rim/syscalls.c",   b"data/src/emlibc/syscalls.c"),
+                     ("user/emlibc/rim/errno.c",      b"data/src/emlibc/errno.c"),
+                     ("user/emlibc/process/process.c",b"data/src/emlibc/process.c"),
+                     ("user/lib/embk_syscall.h",      b"data/src/emlibc/include/embk_syscall.h")):
+        blob = _read_file(src)
+        if blob is not None:
+            objects.append((dst, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the
     # quote-includes ("sval/sval.h", "value/value.h") resolve with a single
