@@ -440,6 +440,7 @@ static void selftests_print_commands(void)
     kprintf("  test embcc selfhost\n");
     kprintf("  test embld\n");
     kprintf("  test emlibc\n");
+    kprintf("  test emlibc caps\n");
     kprintf("  test embcc asm\n");
     kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
@@ -1171,6 +1172,42 @@ int selftests_handle_command(const char *cmd)
         } else { kprintf("[emlibc] /data/tmp/emlibc.out missing\n"); ok = 0; }
 
         kprintf("[cmd] test emlibc: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc caps") == 0) {
+        /* emlibc surfaces the part newlib CANNOT express: capabilities +
+         * handle-based spawn. The demo (linked against emlibc, not newlib) is
+         * spawned holding FILESYSTEM|NETWORK. As the parent it reads its own
+         * caps, then spawns ITSELF as a child ATTENUATED to FILESYSTEM only;
+         * the child confirms it lost NETWORK and proves it cannot grant NETWORK
+         * (which it lacks) to a grandchild -- the kernel refuses. Exit 42 iff
+         * both held; a disk witness carries the child's findings to serial. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test emlibc caps: VFS not registered\n"); return 1; }
+        const char *cp = "/data/apps/emlibc_caps/emlibc_caps.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cp, &st) != 0) { kprintf("\n[cmd] test emlibc caps: %s not on image\n", cp); return 1; }
+        (void)vfs_unlink_path("/data/tmp/emcaps.out");
+        char *a[]   = { (char *)cp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid  = process_create_caps(cp, a, 1, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[emcaps] parent(fs+net) -> child(fs only): exit=%d (want 42)\n", code);
+
+        int ok = (code == 42);
+        char head[64] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/emcaps.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/emcaps.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            kprintf("[emcaps] child witness: \"%s\"\n", head);
+            /* the child was born WITHOUT network and could not grant it back */
+            if (memcmp(head, "child: fs=1 net=0 overreach=refused", 35) != 0) {
+                kprintf("[emcaps] invariant NOT demonstrated\n"); ok = 0; }
+        } else { kprintf("[emcaps] /data/tmp/emcaps.out missing\n"); ok = 0; }
+
+        kprintf("[cmd] test emlibc caps: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

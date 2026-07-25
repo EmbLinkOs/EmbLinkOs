@@ -458,7 +458,7 @@ EMLIBC_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone -mno-sse -mn
                  -fno-stack-protector -O2 -Wall -Wextra $(EMLIBC_INC)
 
 EMLIBC_OBJS := build/emlibc_string.o build/emlibc_stdlib.o build/emlibc_stdio.o \
-               build/emlibc_syscalls.o build/emlibc_errno.o
+               build/emlibc_syscalls.o build/emlibc_errno.o build/emlibc_process.o
 
 build/emlibc_string.o: $(EMLIBC_DIR)/string/string.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
@@ -469,6 +469,8 @@ build/emlibc_stdio.o: $(EMLIBC_DIR)/stdio/stdio.c | $(BUILD)
 build/emlibc_syscalls.o: $(EMLIBC_DIR)/rim/syscalls.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_errno.o: $(EMLIBC_DIR)/rim/errno.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_process.o: $(EMLIBC_DIR)/process/process.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 
 build/libemlibc.a: $(EMLIBC_OBJS)
@@ -486,6 +488,14 @@ build/emlibc_demo.o: user/bin/emlibc_demo.c | $(BUILD)
 build/emlibc_demo.elf: build/emlibc_crt0.o build/emlibc_demo.o build/libemlibc.a user/lib/newlib.ld
 	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
 	    build/emlibc_crt0.o build/emlibc_demo.o -Lbuild -lemlibc -lgcc -o $@
+
+# emlibc_caps -- the part newlib cannot express: capability inspection +
+# handle-based spawn with attenuation. Also emlibc-linked, not newlib.
+build/emlibc_caps.o: user/bin/emlibc_caps.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_caps.elf: build/emlibc_crt0.o build/emlibc_caps.o build/libemlibc.a user/lib/newlib.ld
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+	    build/emlibc_crt0.o build/emlibc_caps.o -Lbuild -lemlibc -lgcc -o $@
 
 build/capspawn.o: user/bin/capspawn.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
@@ -659,7 +669,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/emlibc_demo.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -825,7 +835,7 @@ endif
 EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf \
-               build/emlibc_demo.elf \
+               build/emlibc_demo.elf build/emlibc_caps.elf \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
