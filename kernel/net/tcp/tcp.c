@@ -14,6 +14,7 @@
 
 #include "net/net.h"
 #include "include/kstring.h"
+#include "include/kprintf.h"   /* cwnd ramp log */
 #include "process/process.h"   /* schedule */
 
 #define TCP_CONNS   4
@@ -39,6 +40,8 @@ struct tcb {
     uint32_t snd_nxt;      /* next seq to send */
     uint32_t rcv_nxt;      /* next seq we expect */
     uint32_t snd_wnd;      /* peer's advertised receive window (bytes we may keep in flight) */
+    uint32_t cwnd;         /* congestion window (Tahoe slow-start / congestion avoidance) */
+    uint32_t ssthresh;     /* slow-start threshold */
     bool     peer_fin;     /* saw the peer's FIN */
     bool     reset;        /* saw RST */
     uint8_t  rxbuf[TCP_RXBUF];
@@ -327,20 +330,25 @@ int net_tcp_send(int conn, const void *data, uint32_t len) {
         net_unlock(); return -1;
     }
 
-    /* WINDOWED send: keep up to the peer's advertised window in flight instead of
-     * one segment per RTT. We window directly over the caller's buffer (send is
-     * synchronous, so `data` stays valid), advancing snd_una on cumulative ACKs
-     * and, on a stall, retransmitting go-back-N from snd_una. `snd_una == snd_nxt`
-     * at entry (the previous send/handshake drained), so base is snd_nxt. */
+    /* WINDOWED + CONGESTION-CONTROLLED send. We window directly over the caller's
+     * buffer (send is synchronous, so `data` stays valid). The bytes in flight are
+     * capped by min(peer's advertised window, cwnd) -- cwnd is TCP Tahoe: it opens
+     * exponentially (slow start) up to ssthresh, then linearly (congestion
+     * avoidance), and on a retransmit timeout it drops to one MSS with ssthresh =
+     * cwnd/2. On this lossless link cwnd just ramps to the flow-control window and
+     * stays; the machinery is here for correctness on a real path. `snd_una ==
+     * snd_nxt` at entry (the previous send drained), so base is snd_nxt. */
     const uint8_t *p = (const uint8_t *)data;
     uint32_t base = t->snd_nxt;
     int failed = 0, retransmits = 0, stalls = 0;
+    if (t->cwnd == 0) { t->cwnd = 4 * TCP_MSS; t->ssthresh = 65535; }   /* IW = 4*MSS */
 
     while (!failed) {
         if (t->snd_una - base >= len) break;            /* everything acked -> done */
 
-        /* Fill the window with back-to-back segments (the pipelining). */
-        uint32_t wnd = t->snd_wnd ? t->snd_wnd : TCP_MSS;   /* 0 -> probe with one seg */
+        /* Effective window = min(peer receive window, congestion window). */
+        uint32_t wnd = t->snd_wnd ? t->snd_wnd : TCP_MSS;
+        if (t->cwnd < wnd) wnd = t->cwnd;
         for (;;) {
             uint32_t off = t->snd_nxt - base;
             uint32_t inflight = t->snd_nxt - t->snd_una;
@@ -358,14 +366,23 @@ int net_tcp_send(int conn, const void *data, uint32_t len) {
         uint32_t una_before = t->snd_una;
         net_yield();
         if (t->reset) { failed = 1; break; }
-        if (t->snd_una != una_before) {
+        if (t->snd_una != una_before) {                 /* forward progress */
             stalls = 0;
-        } else if (++stalls >= SPIN_MAX) {              /* timed out with no progress */
+            if (t->cwnd < t->ssthresh) t->cwnd += TCP_MSS;               /* slow start */
+            else t->cwnd += (TCP_MSS * TCP_MSS) / t->cwnd + 1;           /* congestion avoidance */
+            if (t->cwnd > 65535) t->cwnd = 65535;
+        } else if (++stalls >= SPIN_MAX) {              /* timed out: Tahoe back-off */
             if (++retransmits > RETRIES) { failed = 1; break; }
-            t->snd_nxt = t->snd_una;                    /* go-back-N: resend the window */
+            t->ssthresh = t->cwnd / 2;
+            if (t->ssthresh < 2 * TCP_MSS) t->ssthresh = 2 * TCP_MSS;
+            t->cwnd = TCP_MSS;                          /* restart slow start */
+            t->snd_nxt = t->snd_una;                    /* go-back-N: resend from snd_una */
             stalls = 0;
         }
     }
+    if (len > 8192)
+        kprintf("[tcp] sent %u bytes, cwnd ramped to %u (ssthresh %u)\n",
+                (unsigned)len, (unsigned)t->cwnd, (unsigned)t->ssthresh);
 
     uint32_t done = t->snd_una - base;
     int ret = (failed && done == 0) ? -1 : (int)(done < len ? done : len);
