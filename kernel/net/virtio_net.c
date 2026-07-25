@@ -20,6 +20,7 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "arch/x86_64/cpu/spinlock.h"
+#include "arch/x86_64/irq/irq.h"   /* irq_register for the RX MSI-X interrupt */
 
 /* ---- virtio PCI capability + common-config layout (as virtio_gpu.c) ------ */
 #define VIRTIO_PCI_CAP_COMMON_CFG 1
@@ -32,7 +33,10 @@
 #define VC_DRIVER_FEATURE        0x0C
 #define VC_NUM_QUEUES            0x12
 #define VC_DEVICE_STATUS         0x14
+#define VC_MSIX_CONFIG           0x10
 #define VC_QUEUE_SELECT          0x16
+#define VC_QUEUE_MSIX_VECTOR     0x1A
+#define VIRTIO_MSI_NO_VECTOR     0xFFFF
 #define VC_QUEUE_SIZE            0x18
 #define VC_QUEUE_ENABLE          0x1C
 #define VC_QUEUE_NOTIFY_OFF      0x1E
@@ -159,6 +163,13 @@ static void vnet_rx_post(uint16_t i) {
     __sync_synchronize();
 }
 
+/* RX interrupt handler: just wake the RX kthread, which does the drain+deliver
+ * under net_lock (an ISR cannot take a sleeping lock). MSI-X needs no device-side
+ * ACK; the IRQ dispatcher sends the LAPIC EOI. */
+static void virtio_net_isr(void) {
+    net_signal_rx();
+}
+
 static bool vnet_init_transport(const struct pci_device *dev) {
     struct vnet_state *s = &g_vnet;
 
@@ -233,6 +244,28 @@ static bool vnet_init_transport(const struct pci_device *dev) {
 
     /* Fill the receive ring before going live. */
     for (uint16_t i = 0; i < RX_BUFS && i < s->rxq.size; i++) vnet_rx_post(i);
+
+    /* Best-effort RX interrupt via MSI-X: the device signals table entry 0 (set
+     * to our IDT vector by pci_enable_msix) when it completes an RX buffer, and
+     * the ISR wakes the RX kthread. If MSI-X is unavailable/rejected we stay on
+     * the 10 ms timer tick -- correct, just higher latency. RX interrupts are not
+     * suppressed (avail.flags == 0), so the device signals every RX completion. */
+    uint8_t line = pci_read8(dev->bus, dev->device, dev->function, PCI_INTERRUPT_LINE);
+    if (line < 16) {
+        uint8_t vector = (uint8_t)(32 + line);
+        irq_register(line, virtio_net_isr);
+        if (pci_enable_msix(dev->bus, dev->device, dev->function, vector, 0)) {
+            vw16(c, VC_MSIX_CONFIG, VIRTIO_MSI_NO_VECTOR);
+            vw16(c, VC_QUEUE_SELECT, 0);                  /* the RX queue */
+            vw16(c, VC_QUEUE_MSIX_VECTOR, 0);             /* -> MSI-X table entry 0 */
+            if (vr16(c, VC_QUEUE_MSIX_VECTOR) == 0)
+                kprintf("virtio-net: RX interrupt via MSI-X (vector %u)\n", (unsigned)vector);
+            else
+                kprintf("virtio-net: MSI-X vector rejected; tick-driven RX\n");
+        } else {
+            kprintf("virtio-net: no MSI-X; tick-driven RX\n");
+        }
+    }
 
     vw8(c, VC_DEVICE_STATUS, vr8(c, VC_DEVICE_STATUS) | VIRTIO_STATUS_DRIVER_OK);
     vnet_notify(&s->rxq, 0);
