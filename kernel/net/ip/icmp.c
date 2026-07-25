@@ -45,8 +45,7 @@ bool net_ping(uint32_t dst_ip) {
         g_ping.waiting = false; net_unlock(); return false;
     }
     for (int i = 0; i < 400000 && !g_ping.got; i++) {
-        virtio_net_poll();
-        schedule();
+        net_yield();
     }
     g_ping.waiting = false;
     bool got = g_ping.got;

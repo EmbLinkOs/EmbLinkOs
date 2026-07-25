@@ -198,9 +198,17 @@ extern const uint8_t ETH_BCAST[ETH_ALEN];
 
 /* The big net lock (net.c): sleeping, owner-recursive. Taken by the public entry
  * points so all shared state (tcbs, arp cache, capture) is serialised across
- * cores; held across the blocking poll+schedule loops, hence sched-backed. */
+ * cores. net_yield() is the blocking-wait step: it drains RX under the lock then
+ * RELEASES across schedule() so a blocked client does not camp the whole stack. */
 void net_lock(void);
 void net_unlock(void);
+void net_yield(void);      /* poll-drain (locked) + release + schedule + reacquire */
+
+/* Contention instrumentation (the EMBKFS rule: measure before splitting further).
+ * `contended` = acquisitions that actually had to block on another owner. */
+struct net_lockstat { uint64_t acquires, recursive, contended; };
+void net_lockstat_get(struct net_lockstat *out);
+void net_lockstat_reset(void);
 
 void arp_input(const uint8_t *pkt, uint32_t len);                     /* eth demux -> ARP */
 int  ip_output(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,       /* UDP/ICMP -> IP  */

@@ -29,29 +29,36 @@ const uint8_t ETH_BCAST[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 /* ---- the big net lock ---------------------------------------------------
  * One sleeping, owner-recursive lock serialising ALL shared net-stack state
  * (the TCBs, the ARP cache, the UDP/ping capture) across cores. Modelled on the
- * EMBKFS big lock (embkfs.c). It MUST be a sleeping, sched-backed lock, not a
- * spinlock, because the blocking client calls hold it across their poll +
- * schedule() loops; and it MUST be owner-recursive, because a client holding it
- * drives virtio_net_poll(), which re-enters net_rx() on the SAME thread. Every
- * path through the stack runs under a public entry point (net_rx, net_tcp_*,
- * net_ping, net_dhcp, net_resolve, arp_resolve), so wrapping just those is
- * enough -- the internal helpers inherit the lock and touch shared state safely.
- * Coarse on purpose (correct before fast): a client holds it for the whole
- * request, so two cores doing net serialise. A finer split is a later, measured
- * move -- but nothing races now. (net_tcp_abort deliberately does NOT take this:
- * it runs from the fd reap path under g_sched_lock and only flips one bool.) */
+ * EMBKFS big lock (embkfs.c). It MUST be sleeping/sched-backed (a spinlock could
+ * not survive the schedule() below) and OWNER-RECURSIVE, because a client
+ * holding it drives virtio_net_poll(), which re-enters net_rx() on the same
+ * thread. Every path runs under a public entry point, so wrapping just those is
+ * enough -- the internal helpers inherit it.
+ *
+ * FINER HOLD (not a finer lock): the blocking client calls no longer HOLD the
+ * lock while they wait. They hold it only for a state check and the atomic RX
+ * drain, and net_yield() RELEASES it across schedule() -- so a process blocked
+ * in accept()/recv() no longer camps the whole stack, and other connections make
+ * progress on other cores. Same one lock, held for finer-grained intervals. The
+ * lockstat below measures whether it is actually contended (the EMBKFS rule:
+ * measure before splitting further). (net_tcp_abort still does NOT take it: it
+ * runs from the fd reap path under g_sched_lock and only flips one bool.) */
 static int               g_net_busy = 0;
 static struct thread    *g_net_owner = 0;
 static int               g_net_depth = 0;
 static struct wait_queue g_net_wq;
+static struct net_lockstat g_net_stat;
 
 void net_lock(void) {
     sched_lock();
     if (g_net_busy && g_net_owner == current_thread) {
         g_net_depth++;
+        g_net_stat.recursive++;
         sched_unlock();
         return;
     }
+    g_net_stat.acquires++;
+    if (g_net_busy) g_net_stat.contended++;      /* had to block -> real contention */
     while (g_net_busy) {
         sched_block_current_locked(&g_net_wq);   /* returns UNLOCKED */
         sched_lock();
@@ -60,6 +67,23 @@ void net_lock(void) {
     g_net_owner = current_thread;
     g_net_depth = 1;
     sched_unlock();
+}
+
+/* One wait step for a blocking client: drain+deliver the RX ring UNDER the lock
+ * (so no packet strands), then release the lock across schedule() so other cores
+ * and connections progress, and reacquire before the caller re-checks state.
+ * At the outermost hold (depth 1) this genuinely releases; a nested caller
+ * (e.g. an ARP resolve inside a connect) stays held, which is brief and rare. */
+void net_yield(void) {
+    virtio_net_poll();     /* atomic drain under the held lock */
+    net_unlock();          /* release across the yield -- the anti-camping move */
+    schedule();
+    net_lock();            /* reacquire; the caller re-checks state next iteration */
+}
+
+void net_lockstat_get(struct net_lockstat *out) { if (out) *out = g_net_stat; }
+void net_lockstat_reset(void) {
+    g_net_stat.acquires = 0; g_net_stat.recursive = 0; g_net_stat.contended = 0;
 }
 
 void net_unlock(void) {

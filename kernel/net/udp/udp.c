@@ -142,8 +142,7 @@ int net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t
             got = (int)k;
             break;
         }
-        virtio_net_poll();
-        schedule();
+        net_yield();
     }
     net_unlock();
     return got;
@@ -167,7 +166,7 @@ void udp_arm(uint16_t port) {
 }
 
 int udp_collect(uint8_t *out, uint32_t cap, uint32_t *from_ip) {
-    for (int i = 0; i < 400000 && !g_udp.got; i++) { virtio_net_poll(); schedule(); }
+    for (int i = 0; i < 400000 && !g_udp.got; i++) { net_yield(); }
     int rc = -1;
     if (g_udp.got) {
         uint32_t k = g_udp.len < cap ? g_udp.len : cap;

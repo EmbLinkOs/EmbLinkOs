@@ -212,8 +212,7 @@ static bool poll_until(struct tcb *t, int want_state_reached) {
     for (int i = 0; i < SPIN_MAX; i++) {
         if (t->reset) return false;
         if (want_state_reached && t->state == want_state_reached) return true;
-        virtio_net_poll();
-        schedule();
+        net_yield();
     }
     return false;
 }
@@ -283,8 +282,7 @@ int net_tcp_accept(int listen_conn) {
             lis->accept_n--;
             break;
         }
-        virtio_net_poll();
-        schedule();
+        net_yield();
     }
     net_unlock();
     return child;
@@ -311,7 +309,7 @@ int net_tcp_send(int conn, const void *data, uint32_t len) {
             for (int i = 0; i < SPIN_MAX; i++) {
                 if (t->reset) { failed = 1; break; }
                 if (SEQ_GEQ(t->snd_una, seq + chunk)) { acked = 1; break; }
-                virtio_net_poll(); schedule();
+                net_yield();
             }
         }
         if (!acked) failed = 1;
@@ -330,7 +328,7 @@ int net_tcp_recv(int conn, void *buf, uint32_t cap) {
 
     for (int i = 0; i < SPIN_MAX && t->rx_len == 0; i++) {
         if (t->peer_fin || t->reset || t->state == TCP_CLOSED) break;
-        virtio_net_poll(); schedule();
+        net_yield();
     }
     uint32_t k = t->rx_len < cap ? t->rx_len : cap;
     if (k) {
@@ -367,7 +365,7 @@ void net_tcp_close(int conn) {
         for (int i = 0; i < SPIN_MAX; i++) {
             if (t->state == TCP_CLOSED || t->state == TCP_TIME_WAIT ||
                 t->state == TCP_FIN_WAIT_2 || t->reset) break;
-            virtio_net_poll(); schedule();
+            net_yield();
         }
     }
     t->in_use = false;

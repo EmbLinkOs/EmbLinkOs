@@ -886,6 +886,28 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test netlock") == 0) {
+        /* NET LOCK -- the finer HOLD. Each blocking call now holds net_lock only
+         * for a state check + the atomic RX drain, releasing across every
+         * schedule() (net_yield), so a blocked client no longer camps the stack.
+         * Exercise it with a few pings and report contention: at smp=1 contended
+         * stays 0; at smp>1 it goes >0 because the RX kthread genuinely SHARES the
+         * lock between the ping's yields -- the anti-camping property, visible.
+         * The hard assertion is just that the stack still works under the finer
+         * hold (the EMBKFS rule: measure, but correctness first). */
+        if (!g_netif.up) { kprintf("\n[cmd] test netlock: NIC not up\n"); return 1; }
+        net_lockstat_reset();
+        int ok = 0;
+        for (int i = 0; i < 3; i++) if (net_ping(g_netif.gateway)) ok++;
+        struct net_lockstat s; net_lockstat_get(&s);
+        kprintf("[netlock] pings ok=%d/3; net_lock acquires=%llu recursive=%llu contended=%llu\n",
+                ok, (unsigned long long)s.acquires, (unsigned long long)s.recursive,
+                (unsigned long long)s.contended);
+        int pass = (ok >= 1);
+        kprintf("[cmd] test netlock: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test dhcp") == 0) {
         /* NETWORKING M2 witness: run the DHCP DORA on demand and show the lease.
          * Under QEMU user-mode net, SLIRP is the DHCP server (10.0.2.2) and hands
