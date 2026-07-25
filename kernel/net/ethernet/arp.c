@@ -55,14 +55,16 @@ void arp_input(const uint8_t *pkt, uint32_t len) {
 }
 
 bool arp_resolve(uint32_t ip, uint8_t mac_out[ETH_ALEN]) {
-    if (arp_cache_get(ip, mac_out)) return true;
-    for (int attempt = 0; attempt < 4; attempt++) {
+    net_lock();                                 /* recursive when called mid-send */
+    bool ok = arp_cache_get(ip, mac_out);
+    for (int attempt = 0; attempt < 4 && !ok; attempt++) {
         arp_send(ARP_OP_REQUEST, ip, ETH_BCAST);
-        for (int i = 0; i < 200000; i++) {
+        for (int i = 0; i < 200000 && !ok; i++) {
             virtio_net_poll();                  /* drive RX while we wait */
-            if (arp_cache_get(ip, mac_out)) return true;
+            if (arp_cache_get(ip, mac_out)) { ok = true; break; }
             schedule();
         }
     }
-    return false;
+    net_unlock();
+    return ok;
 }

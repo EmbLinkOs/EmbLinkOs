@@ -26,6 +26,52 @@ struct netif g_netif;
 
 const uint8_t ETH_BCAST[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
+/* ---- the big net lock ---------------------------------------------------
+ * One sleeping, owner-recursive lock serialising ALL shared net-stack state
+ * (the TCBs, the ARP cache, the UDP/ping capture) across cores. Modelled on the
+ * EMBKFS big lock (embkfs.c). It MUST be a sleeping, sched-backed lock, not a
+ * spinlock, because the blocking client calls hold it across their poll +
+ * schedule() loops; and it MUST be owner-recursive, because a client holding it
+ * drives virtio_net_poll(), which re-enters net_rx() on the SAME thread. Every
+ * path through the stack runs under a public entry point (net_rx, net_tcp_*,
+ * net_ping, net_dhcp, net_resolve, arp_resolve), so wrapping just those is
+ * enough -- the internal helpers inherit the lock and touch shared state safely.
+ * Coarse on purpose (correct before fast): a client holds it for the whole
+ * request, so two cores doing net serialise. A finer split is a later, measured
+ * move -- but nothing races now. (net_tcp_abort deliberately does NOT take this:
+ * it runs from the fd reap path under g_sched_lock and only flips one bool.) */
+static int               g_net_busy = 0;
+static struct thread    *g_net_owner = 0;
+static int               g_net_depth = 0;
+static struct wait_queue g_net_wq;
+
+void net_lock(void) {
+    sched_lock();
+    if (g_net_busy && g_net_owner == current_thread) {
+        g_net_depth++;
+        sched_unlock();
+        return;
+    }
+    while (g_net_busy) {
+        sched_block_current_locked(&g_net_wq);   /* returns UNLOCKED */
+        sched_lock();
+    }
+    g_net_busy = 1;
+    g_net_owner = current_thread;
+    g_net_depth = 1;
+    sched_unlock();
+}
+
+void net_unlock(void) {
+    sched_lock();
+    if (--g_net_depth == 0) {
+        g_net_busy = 0;
+        g_net_owner = 0;
+        wait_queue_wake_one(&g_net_wq);
+    }
+    sched_unlock();
+}
+
 /* Internet checksum (RFC 1071 / BSD in_cksum): the result is stored directly
  * into a header's checksum field (byte order works out either way). */
 uint16_t net_checksum(const void *data, uint32_t len) {
@@ -62,13 +108,28 @@ void net_rx(const uint8_t *frame, uint32_t len) {
     uint16_t et = ntohs(e->ethertype);
     const uint8_t *payload = frame + ETH_HLEN;
     uint32_t plen = len - ETH_HLEN;
+    net_lock();                          /* protects arp cache / tcbs / capture */
     if (et == ETH_P_ARP)     arp_input(payload, plen);
     else if (et == ETH_P_IP) ip_input(payload, plen);
+    net_unlock();
 }
 
 /* ---- bring-up ----------------------------------------------------------- */
 static void net_rx_thread(void) {
-    for (;;) { virtio_net_poll(); schedule(); }
+    /* Hold net_lock across the drain so a packet is removed from the virtqueue
+     * and delivered to the stack ATOMICALLY. Without this the kthread could pull
+     * a packet off the ring (under the driver's rx spinlock) and THEN block on
+     * net_lock because a client owns it -- stranding that packet while the client
+     * polls the now-empty ring forever (a real -smp>1 deadlock). Every other
+     * virtio_net_poll() caller is a client wait loop that already holds net_lock,
+     * so only ONE thread ever drains at a time and it always delivers what it
+     * took. Released before schedule() -- never held across the yield. */
+    for (;;) {
+        net_lock();
+        virtio_net_poll();
+        net_unlock();
+        schedule();
+    }
 }
 
 void net_init(void) {

@@ -36,17 +36,20 @@ bool net_ping(uint32_t dst_ip) {
     echo.h.seq = htons(++seq);
     for (uint32_t i = 0; i < sizeof(echo.data); i++) echo.data[i] = (uint8_t)i;
 
+    net_lock();
     g_ping.id = 0x1234; g_ping.seq = seq; g_ping.got = false; g_ping.waiting = true;
     echo.h.checksum = 0;
     echo.h.checksum = net_checksum(&echo, sizeof(echo));
 
     if (net_send_ip(dst_ip, IP_PROTO_ICMP, &echo, sizeof(echo)) < 0) {
-        g_ping.waiting = false; return false;
+        g_ping.waiting = false; net_unlock(); return false;
     }
     for (int i = 0; i < 400000 && !g_ping.got; i++) {
         virtio_net_poll();
         schedule();
     }
     g_ping.waiting = false;
-    return g_ping.got;
+    bool got = g_ping.got;
+    net_unlock();
+    return got;
 }

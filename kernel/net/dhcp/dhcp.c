@@ -90,26 +90,32 @@ static int dhcp_xact(uint8_t type, uint32_t req_ip, uint32_t server_id,
 
 bool net_dhcp(void) {
     static uint8_t in[1024];
+    net_lock();
+    bool ok = false;
 
     int r = dhcp_xact(DHCP_DISCOVER, 0, 0, in, sizeof(in), DHCP_OFFER);
-    if (r < 0) return false;
-    const struct dhcp_hdr *off = (const struct dhcp_hdr *)in;
-    uint32_t yiaddr = ntohl(off->yiaddr);
-    uint8_t ol;
-    const uint8_t *sid = dhcp_opt(in + sizeof(*off), r - sizeof(*off), DHCPOPT_SERVERID, &ol);
-    uint32_t server_id = sid ? net_ip_rd(sid) : ntohl(off->siaddr);
+    if (r >= 0) {
+        const struct dhcp_hdr *off = (const struct dhcp_hdr *)in;
+        uint32_t yiaddr = ntohl(off->yiaddr);
+        uint8_t ol;
+        const uint8_t *sid = dhcp_opt(in + sizeof(*off), r - sizeof(*off), DHCPOPT_SERVERID, &ol);
+        uint32_t server_id = sid ? net_ip_rd(sid) : ntohl(off->siaddr);
 
-    r = dhcp_xact(DHCP_REQUEST, yiaddr, server_id, in, sizeof(in), DHCP_ACK);
-    if (r < 0) return false;
-    const struct dhcp_hdr *ack = (const struct dhcp_hdr *)in;
-    const uint8_t *mask = dhcp_opt(in + sizeof(*ack), r - sizeof(*ack), DHCPOPT_MASK,   &ol);
-    const uint8_t *rtr  = dhcp_opt(in + sizeof(*ack), r - sizeof(*ack), DHCPOPT_ROUTER, &ol);
-    const uint8_t *dns  = dhcp_opt(in + sizeof(*ack), r - sizeof(*ack), DHCPOPT_DNS,    &ol);
+        r = dhcp_xact(DHCP_REQUEST, yiaddr, server_id, in, sizeof(in), DHCP_ACK);
+        if (r >= 0) {
+            const struct dhcp_hdr *ack = (const struct dhcp_hdr *)in;
+            const uint8_t *mask = dhcp_opt(in + sizeof(*ack), r - sizeof(*ack), DHCPOPT_MASK,   &ol);
+            const uint8_t *rtr  = dhcp_opt(in + sizeof(*ack), r - sizeof(*ack), DHCPOPT_ROUTER, &ol);
+            const uint8_t *dns  = dhcp_opt(in + sizeof(*ack), r - sizeof(*ack), DHCPOPT_DNS,    &ol);
 
-    g_netif.ip      = ntohl(ack->yiaddr);
-    g_netif.netmask = mask ? net_ip_rd(mask) : IPV4(255, 255, 255, 0);
-    g_netif.gateway = rtr  ? net_ip_rd(rtr)  : ((g_netif.ip & g_netif.netmask) | 2);
-    g_netif.dns     = dns  ? net_ip_rd(dns)  : 0;
-    g_netif.dhcp    = true;
-    return true;
+            g_netif.ip      = ntohl(ack->yiaddr);
+            g_netif.netmask = mask ? net_ip_rd(mask) : IPV4(255, 255, 255, 0);
+            g_netif.gateway = rtr  ? net_ip_rd(rtr)  : ((g_netif.ip & g_netif.netmask) | 2);
+            g_netif.dns     = dns  ? net_ip_rd(dns)  : 0;
+            g_netif.dhcp    = true;
+            ok = true;
+        }
+    }
+    net_unlock();
+    return ok;
 }

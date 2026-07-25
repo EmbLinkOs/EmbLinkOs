@@ -23,7 +23,7 @@ static uint32_t dns_skip_name(const uint8_t *msg, uint32_t len, uint32_t off) {
     return 0;
 }
 
-bool net_resolve(const char *name, uint32_t *out_ip) {
+static bool dns_resolve_locked(const char *name, uint32_t *out_ip) {
     if (!g_netif.dns || !name || !out_ip) return false;
     static uint16_t dns_seq = 0x1000;
     uint16_t id = ++dns_seq;
@@ -83,4 +83,11 @@ bool net_resolve(const char *name, uint32_t *out_ip) {
         off += rdlen;
     }
     return false;
+}
+
+bool net_resolve(const char *name, uint32_t *out_ip) {
+    net_lock();
+    bool ok = dns_resolve_locked(name, out_ip);
+    net_unlock();
+    return ok;
 }

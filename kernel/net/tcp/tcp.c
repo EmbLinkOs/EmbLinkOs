@@ -162,9 +162,10 @@ int net_tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     static uint16_t next_port = 40000;
     static uint32_t next_isn  = 0x1000;
 
+    net_lock();
     int idx = -1;
     for (int i = 0; i < TCP_CONNS; i++) if (!tcbs[i].in_use) { idx = i; break; }
-    if (idx < 0) return -1;
+    if (idx < 0) { net_unlock(); return -1; }
 
     struct tcb *t = &tcbs[idx];
     memset(t, 0, sizeof(*t));
@@ -175,24 +176,30 @@ int net_tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     t->snd_una = t->snd_nxt = next_isn;
     t->state = TCP_SYN_SENT;
 
+    int rc = -1;
     for (int r = 0; r < RETRIES; r++) {
         tcp_seg(t, TCP_SYN, t->snd_una, 0, 0);   /* (re)send SYN at the ISN */
         t->snd_nxt = t->snd_una + 1;             /* SYN consumes one seq */
-        if (poll_until(t, TCP_ESTABLISHED)) return idx;
+        if (poll_until(t, TCP_ESTABLISHED)) { rc = idx; break; }
         if (t->reset) break;
     }
-    t->in_use = false;
-    return -1;
+    if (rc < 0) t->in_use = false;
+    net_unlock();
+    return rc;
 }
 
 int net_tcp_send(int conn, const void *data, uint32_t len) {
-    if (conn < 0 || conn >= TCP_CONNS || !tcbs[conn].in_use) return -1;
+    if (conn < 0 || conn >= TCP_CONNS) return -1;
+    net_lock();
     struct tcb *t = &tcbs[conn];
-    if (t->state != TCP_ESTABLISHED && t->state != TCP_CLOSE_WAIT) return -1;
+    if (!t->in_use || (t->state != TCP_ESTABLISHED && t->state != TCP_CLOSE_WAIT)) {
+        net_unlock(); return -1;
+    }
 
     const uint8_t *p = (const uint8_t *)data;
     uint32_t sent = 0;
-    while (sent < len) {
+    int failed = 0;
+    while (sent < len && !failed) {
         uint32_t chunk = len - sent; if (chunk > TCP_MSS) chunk = TCP_MSS;
         uint32_t seq = t->snd_nxt;
         int acked = 0;
@@ -200,20 +207,24 @@ int net_tcp_send(int conn, const void *data, uint32_t len) {
             tcp_seg(t, TCP_PSH | TCP_ACK, seq, p + sent, chunk);
             if (r == 0) t->snd_nxt = seq + chunk;
             for (int i = 0; i < SPIN_MAX; i++) {
-                if (t->reset) return sent ? (int)sent : -1;
+                if (t->reset) { failed = 1; break; }
                 if (SEQ_GEQ(t->snd_una, seq + chunk)) { acked = 1; break; }
                 virtio_net_poll(); schedule();
             }
         }
-        if (!acked) return sent ? (int)sent : -1;
-        sent += chunk;
+        if (!acked) failed = 1;
+        else sent += chunk;
     }
-    return (int)sent;
+    int ret = (failed && sent == 0) ? -1 : (int)sent;
+    net_unlock();
+    return ret;
 }
 
 int net_tcp_recv(int conn, void *buf, uint32_t cap) {
-    if (conn < 0 || conn >= TCP_CONNS || !tcbs[conn].in_use) return -1;
+    if (conn < 0 || conn >= TCP_CONNS) return -1;
+    net_lock();
     struct tcb *t = &tcbs[conn];
+    if (!t->in_use) { net_unlock(); return -1; }
 
     for (int i = 0; i < SPIN_MAX && t->rx_len == 0; i++) {
         if (t->peer_fin || t->reset || t->state == TCP_CLOSED) break;
@@ -225,6 +236,7 @@ int net_tcp_recv(int conn, void *buf, uint32_t cap) {
         if (k < t->rx_len) memmove(t->rxbuf, t->rxbuf + k, t->rx_len - k);
         t->rx_len -= k;
     }
+    net_unlock();
     return (int)k;                               /* 0 = EOF (peer FIN, no data left) */
 }
 
@@ -237,8 +249,10 @@ void net_tcp_abort(int conn) {
 }
 
 void net_tcp_close(int conn) {
-    if (conn < 0 || conn >= TCP_CONNS || !tcbs[conn].in_use) return;
+    if (conn < 0 || conn >= TCP_CONNS) return;
+    net_lock();
     struct tcb *t = &tcbs[conn];
+    if (!t->in_use) { net_unlock(); return; }
 
     if (t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT) {
         int last = (t->state == TCP_CLOSE_WAIT);
@@ -255,4 +269,5 @@ void net_tcp_close(int conn) {
         }
     }
     t->in_use = false;
+    net_unlock();
 }

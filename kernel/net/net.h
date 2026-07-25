@@ -185,6 +185,12 @@ void net_tcp_abort(int conn);                               /* free the TCB WITH
  *   udp_input          -> udp/udp.c    udp_arm/collect -> udp/udp.c            */
 extern const uint8_t ETH_BCAST[ETH_ALEN];
 
+/* The big net lock (net.c): sleeping, owner-recursive. Taken by the public entry
+ * points so all shared state (tcbs, arp cache, capture) is serialised across
+ * cores; held across the blocking poll+schedule loops, hence sched-backed. */
+void net_lock(void);
+void net_unlock(void);
+
 void arp_input(const uint8_t *pkt, uint32_t len);                     /* eth demux -> ARP */
 int  ip_output(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,       /* UDP/ICMP -> IP  */
                const void *payload, uint32_t len);
