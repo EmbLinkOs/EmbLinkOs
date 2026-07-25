@@ -10,17 +10,32 @@ graphical desktop (`home.elf`), runs multiple windowed apps with a real
 compositor, and has a from-scratch UI toolkit (**EmUI**) that friends can
 build apps against without touching kernel code.
 
-**It also compiles C on itself — real C, headers and all.** A C compiler (TCC)
-runs as a normal process and builds working programs without ever leaving the
-OS: `#include <stdio.h>` resolves against the on-image newlib headers, `-lc`
-links the real `libc.a`, and the result runs. The OS has even **rebuilt one of
-its own tools from source** (`tally`, compiled and linked on-OS, then run
-through the shell's live pipeline against the original as an A/B oracle). It
-hosts **C++/libstdc++**, **CPython 3.14** and **git 2.49** too, none of them
-forks. All of that on an OS that is deliberately **not POSIX**: there is no
-`fork`/`exec` here, which is exactly why the compiler is TCC (one
-self-contained binary) and not GCC (a driver that fork/execs `cc1`/`as`/`ld`,
-and so is structurally impossible here). See [docs/PORTS.md](docs/PORTS.md).
+**It owns its whole toolchain — and builds its own native binaries on itself.**
+EmbLinkOS has a from-scratch C compiler, **EmbCC**, that **self-hosts on the
+metal**: it compiles its own source on the OS to byte-identical objects, links
+them with its own linker (**EmbLD**), and emits the OS's own executable format,
+**EMBX** — an ELF alternative that carries a capability table the kernel loader
+enforces (a process is born holding exactly the capabilities its binary
+declares). It has its own C library, **emlibc** (non-POSIX, linked *instead of*
+newlib, with real ~1-ulp `fdlibm` floating-point math), and EmbCC compiles
+emlibc's own sources on the OS **floating point and all** — closing the loop:
+compiler + the libc it built + linker + format + loader, one owned system,
+running on the finished OS. See
+[docs/EMLIBC_Requirements.md](docs/EMLIBC_Requirements.md) and
+[docs/EMBX_Specification_v2.md](docs/EMBX_Specification_v2.md).
+
+**It also ports the mature toolchains — the porting lane.** A C compiler (TCC)
+runs as a normal process and builds real `#include`-using programs against the
+on-image newlib headers and `libc.a`, entirely on the metal — it has even
+**rebuilt one of its own tools from source** (`tally`, compiled and linked
+on-OS, then A/B-checked against the original through the shell's live pipeline).
+It hosts **C++/libstdc++**, **CPython 3.14** and **git 2.49**, none a fork — all
+on an OS that is deliberately **not POSIX**: there is no `fork`/`exec` here,
+which is why the ported compiler is TCC (one self-contained binary) and not GCC
+(a driver that fork/execs `cc1`/`as`/`ld`). And it is **on the network**: a
+from-scratch TCP/IP stack (virtio-net → Ethernet/ARP/IPv4/ICMP/UDP/DHCP/DNS/TCP)
+lets `wget` resolve a host and download a real file off the internet to disk.
+See [docs/PORTS.md](docs/PORTS.md).
 
 ## What it is
 
@@ -30,9 +45,11 @@ EmbLinkOS starts from a 512-byte boot sector and works its way up: real mode
 interrupts and APIC, a preemptive SMP scheduler with ring-3 processes and
 threads, a custom journaling-and-more filesystem (EMBKFS) with encryption and
 snapshots, USB (xHCI/EHCI/UHCI/OHCI) keyboard and mass storage, a GPU driver
-(virtio-gpu/Bochs DISPI/VBE) with a window compositor on top, a newlib-based
-userland with an in-kernel dynamic linker, and EmUI — a SwiftUI-flavored UI
-toolkit apps are built against.
+(virtio-gpu/Bochs DISPI/VBE) with a window compositor on top, a from-scratch
+TCP/IP stack, a userland with an in-kernel dynamic linker, and EmUI — a
+SwiftUI-flavored UI toolkit apps are built against. It also owns its **whole
+toolchain** — a self-hosting compiler (EmbCC), its own libc (emlibc) and its own
+executable format (EMBX) — which it uses to rebuild its userland on itself.
 
 ## Features
 
@@ -83,13 +100,33 @@ toolkit apps are built against.
 - A newlib-based libc port (freestanding, static-newlib, and
   dynamically-linked-against-`libembk.so` build modes) — see
   [user/README.md](user/README.md).
-- **A C compiler on the OS** — TCC compiles, assembles and links real
+- **Its own toolchain, self-hosting on the OS** — **EmbCC** (from-scratch C
+  compiler) + **EmbLD** (integrated linker) compile and link *on the metal*:
+  EmbCC recompiles its own 14 sources to byte-identical objects (`test embcc
+  self`) and EmbLD relinks them into a working `embcc` (`test embcc selfhost`).
+  The output is **EMBX**, the OS's native executable format, which carries a
+  capability table the loader enforces — `embld --embx` emits it, on the host or
+  on the OS (`test embld embx`), and the loader births a process with exactly
+  its declared caps (`test emlibc embx`). See
+  [docs/EMBX_Specification_v2.md](docs/EMBX_Specification_v2.md).
+- **Its own C library, emlibc** — non-POSIX, linked *instead of* newlib (zero
+  newlib symbols), with a capability/handle-spawn surface newlib can't express
+  and real ~1-ulp `fdlibm` math. EmbCC compiles all of emlibc — floating point
+  included — on the OS (`test emlibc selfhost`, `test emlibc math selfhost`),
+  closing the compiler+libc+linker+format+loader loop. See
+  [docs/EMLIBC_Requirements.md](docs/EMLIBC_Requirements.md).
+- **A ported C compiler on the OS** — TCC compiles, assembles and links real
   `#include`-using programs against the on-image newlib headers and `libc.a`,
   entirely on the metal (`test tcc real` → `exit=42`, byte-exact stdio output;
   `test tcc tally` → the OS rebuilds its own `tally` tool from source and runs
   it through the shell's pipeline).
 - **C++/libstdc++, CPython 3.14, git 2.49** run as ordinary processes —
   see [docs/PORTS.md](docs/PORTS.md).
+- **Networking** — a from-scratch stack (`kernel/net/`): virtio-net driver +
+  Ethernet/ARP/IPv4/ICMP, UDP/DHCP/DNS, windowed TCP with congestion control,
+  ring-3 sockets (native CAP_NETWORK handles + a BSD-sockets shim). `wget`
+  resolves a host and downloads a real file off the internet to disk
+  (`test wget`).
 - A structured, Nushell-flavored **shell** with typed pipelines —
   see [docs/SHELL.md](docs/SHELL.md).
 - **Interruption** (Ctrl-C) without signals: a routed, capability-scoped

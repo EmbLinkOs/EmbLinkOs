@@ -1,9 +1,13 @@
 # EMBX (EmbLink Binary eXecutable) — Specification v2
 
-**Status:** design, byte-exact. The APP contract now has a working loader
-(kernel/arch/x86_64/syscall/embx.{h,c}) + producer (tools/embx/mkembx.py); the
-capability contract (§5) is live end to end. Amended 2026-07-24 with four review
-fixes -- see the ✎ markers.
+**Status:** design, byte-exact — and now **produced by the toolchain itself**.
+The APP contract has a working loader (kernel/arch/x86_64/syscall/embx.{h,c}) and
+two producers: the reference `tools/embx/mkembx.py` **and EmbLD's native emitter**
+(`embld --embx --cap NAME`, byte-identical to the reference), which runs on the
+host and **on the OS** (`test embld embx`). EmbCC compiles a program from source,
+EmbLD emits it as EMBX, and the loader births it holding exactly its declared
+caps (`test embcc embx`) — the capability contract (§5) is live end to end, from
+source, on the metal. Amended 2026-07-24 with four review fixes -- see the ✎ markers.
 **Supersedes:** `EMBX_Specification_v1.md` (retained as the wishlist that produced
 the capability question — see §11).
 **Governing decision:** EmbCC `docs/DECISIONS.md` D-003, **reopened**. Building

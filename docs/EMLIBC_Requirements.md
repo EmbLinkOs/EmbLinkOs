@@ -1,16 +1,39 @@
 # emlibc — Requirements
 
-*The C library native to EmbLinkOS: shaped to the OS, not to POSIX. This is a
-**requirements** document — what emlibc must be and must provide — not an
-implementation. It is written now, before the code, for the same reason
-`docs/BUILD.md` preceded EmbBuild and `EMBX_Specification_v2.md` preceded the
-EMBX loader: the reasoning should survive the gap between deciding and building.*
+*The C library native to EmbLinkOS: shaped to the OS, not to POSIX. This began
+as a **requirements** document — what emlibc must be and must provide — written
+before the code, for the same reason `docs/BUILD.md` preceded EmbBuild and
+`EMBX_Specification_v2.md` preceded the EMBX loader: the reasoning should survive
+the gap between deciding and building. **The code now exists** — the sections
+below are the design record it was built to, still accurate; this header tracks
+what shipped.*
 
-**Status:** requirements, no implementation. Current userland links **newlib**
-(rebuilt as newlib-c99); emlibc replaces it *incrementally*, not in a flag day.
+**Status: IMPLEMENTED and self-hosting.** `user/emlibc/` is a real libc a program
+links **instead of newlib** (built `-nostdinc`; nm-proven zero newlib symbols).
+Shipped and each proven by a live `test`:
+- **The rim** (§2): `crt0` + `syscalls` (thin `int 0x80` retarget) + errno map —
+  `test emlibc` runs a program on emlibc alone (exit 42 + its own buffered stdio).
+- **The agnostic bulk** (§4): `string`, `stdlib` (malloc/qsort/strtol/env),
+  `stdio` (buffered streams + the printf family incl. `%f/%e/%g` + field width),
+  and **`math.h`** — REAL fdlibm lifted (`user/emlibc/math/fdlibm/`, Sun's freely-
+  licensed ~1-ulp library, notice preserved), verified at 1e-12 (`test emlibc math`).
+- **The capability + handle-spawn surface** (§3, the part newlib can't express):
+  `<process.h>` — `em_getcaps`, `em_spawn`→handle, attenuation; `test emlibc caps`
+  shows a child born with fewer caps, unable to grant back what it lacks.
+- **EMBX-native output** (§5): EmbLD emits `.embx` with a declared capability
+  table; an emlibc program ships as EMBX and is born with exactly its declared
+  caps (`test emlibc embx`, `test embld embx`, `test embcc embx`).
+- **Self-host** (§6 step 5): **EmbCC compiles emlibc's own sources on the OS** —
+  the whole libc, floating point included — links with EmbLD, runs
+  (`test emlibc selfhost`, `test emlibc math selfhost`). The closed loop:
+  compiler + libc it built + linker + format + loader, one owned system.
+
+newlib stays the default for the other userland and the porting lane; emlibc
+replaced it **incrementally, never a flag day**, exactly as required.
+
 **Paired with** EmbCC (the native compiler) and **EMBX** (the native format):
 the three are one decision — own the toolchain's output as fully as the kernel
-and filesystem are already owned.
+and filesystem are already owned. That decision is now realized end to end.
 
 ---
 

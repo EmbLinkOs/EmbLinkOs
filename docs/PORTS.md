@@ -22,6 +22,27 @@ disagreement with tcc — see the section below.
 CPython and git use it for real (git names temp files with it), so without
 RDRAND they fail loudly rather than silently doing something unsafe.
 
+## Ports vs. the native toolchain
+
+This doc is about *ported* (foreign, mature) software — the porting lane. The OS
+also has a **native lane it owns from scratch**, which is not covered here:
+
+- **EmbCC** — a from-scratch C compiler that **self-hosts on the OS** (recompiles
+  its own source to byte-identical objects) and **EmbLD**, its integrated linker.
+- **emlibc** — the OS's own non-POSIX C library, linked *instead of* newlib
+  (zero newlib symbols), with a capability/handle-spawn surface and real ~1-ulp
+  `fdlibm` math — see [EMLIBC_Requirements.md](EMLIBC_Requirements.md).
+- **EMBX** — the OS's own executable format, carrying a capability table the
+  kernel loader enforces — see [EMBX_Specification_v2.md](EMBX_Specification_v2.md).
+
+EmbCC compiles all of emlibc (floating point included) on the OS and EmbLD emits
+it as EMBX — the whole compiler + libc + linker + format + loader loop, owned
+and running on the metal (`test emlibc math selfhost`). So there are **two**
+compilers on the OS: the ported **TCC** (builds foreign, newlib-linked C — the
+rows above) and the native **EmbCC** (builds the OS's own emlibc/EMBX binaries).
+This is the same deliberate dual-lane design as EMBKFS (native) vs FAT32
+(foreign): own your own, port the rest.
+
 ---
 
 ## The design constraint everything bends around: there is no `exec`

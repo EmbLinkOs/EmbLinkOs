@@ -695,6 +695,65 @@ newlib-based libc port.*
 
 ---
 
+### Phase 23 — Networking: a from-scratch TCP/IP stack ✅
+
+A whole network stack, hand-written in `kernel/net/` (split per-protocol, one
+concern per file). virtio-net driver (mirrors the virtio-gpu transport, split
+virtqueues, KV2P DMA, MSI-X RX interrupt) under Ethernet/ARP/IPv4/ICMP, then
+UDP + a DHCP client (real DORA lease at boot) + a minimal DNS resolver, then
+TCP: a windowed sender with Tahoe congestion control, listen/accept passive
+open, RST/ICMP-unreachable for closed ports. SMP-safe (one sleeping owner-
+recursive `net_lock`), event-driven RX (the recursion that made per-conn locks
+deadlock is gone). Exposed to ring 3 two ways: **native CAP_NETWORK socket
+handles** (a socket is a real fd) + a **BSD-sockets shim** for ports. Proof:
+`test net` pings the gateway, `test dhcp`/`test dns`/`test tcp`/`test netuser`/
+`test netudp` up the ladder, and **`wget` downloads a real file off the internet
+to disk** (`test wget` → `HTTP 200`, HTML written to `/wget.out`, read back).
+
+### Phase 24 — Crash resilience, the capability model, and EMBX ✅
+
+- **Crash resilience**: a ring-3 fault kills only the faulting process
+  (`process_exit_self(PROCESS_EXIT_FAULT)`), it no longer halts the machine;
+  the panic path releases its lock on the recoverable branch.
+- **Capabilities** (`kernel/process/capabilities.h`): coarse resource-class
+  authority (cap_id == bit), seeded `EMBK_CAP_ALL` for init, **attenuated at
+  spawn** (a child's set is a subset of its parent's, or `-EPERM`), the monotonic
+  invariant enforced by one pure function. `sys_getcaps` (#68), a `SET_CAPS`
+  spawn action, and the first real gate (a GPU surface needs `CAP_GPU`).
+- **EMBX**, the OS's own executable format (`docs/EMBX_Specification_v2.md`,
+  `kernel/arch/x86_64/syscall/embx.{h,c}`): a byte-exact container that carries
+  what ELF cannot — a **capability table** the loader checks against the
+  spawner's set (§6 step 9) before the first page is mapped, so a process is born
+  holding exactly its declared caps. A dual loader (sniff the magic → EMBX or
+  ELF). `test embx` loads a native `.embx` and proves the born set.
+
+### Phase 25 — The owned toolchain, self-hosting on the metal ✅
+
+The OS now owns and rebuilds its whole toolchain, on itself:
+
+- **EmbCC + EmbLD** (sibling repo `EmbCC/`, adopted, not depended on): a
+  from-scratch C compiler that **self-hosts on the OS** — recompiles its own 14
+  sources to byte-identical objects (`test embcc self` 14/14) — and an integrated
+  linker cross-built into an OS binary that relinks them into a working `embcc`
+  (`test embcc selfhost`; no TCC in the loop).
+- **EMBX-native output**: EmbLD emits `.embx` directly (`embld --embx --cap NAME`,
+  byte-identical to the reference producer), on the host **and on the OS**
+  (`test embld embx`). EmbCC compiles a program from source, EmbLD emits it as
+  EMBX, the loader runs it born with its declared caps (`test embcc embx`).
+- **emlibc**, the OS's own non-POSIX C library (`user/emlibc/`, see
+  `docs/EMLIBC_Requirements.md`): linked *instead of* newlib (nm-proven zero
+  newlib symbols) — rim (crt0/syscalls/errno) + string/stdlib/stdio (printf incl.
+  `%f/%e/%g`) + a capability/handle-spawn surface (`<process.h>`) + real ~1-ulp
+  **fdlibm** math (`user/emlibc/math/fdlibm/`, lifted, notice preserved).
+- **Self-host, floating point included**: EmbCC compiles all of emlibc's own
+  sources on the OS, EmbLD links them, and the result runs — `test emlibc
+  selfhost`, and `test emlibc math selfhost` builds 39 FP units (libc + the whole
+  fdlibm tree + app) on the metal and passes real math at 1e-12. **The loop is
+  closed: compiler + the libc it built + linker + format + loader, one owned
+  system.** (`SPAWN_ARGV_MAX` 32→64 to fit a 39-object link in one argv.)
+
+---
+
 ## Major To-Do Buckets (Rough Priority)
 
 Full detail lives in `TODO.md`, organized by subsystem. Rough priority order:
