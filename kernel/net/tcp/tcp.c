@@ -122,6 +122,29 @@ static int tcp_seg(struct tcb *t, uint8_t flags, uint32_t seq,
     return ip_output(t->local_ip, t->remote_ip, IP_PROTO_TCP, seg, sizeof(*th) + len);
 }
 
+/* Send a bare RST to the peer for a segment that matched no connection, so it
+ * fails fast instead of retrying/timing out (RFC 793 "reset generation"). If the
+ * offending segment carried an ACK, RST.seq = its ack; otherwise RST carries an
+ * ACK of its sequence space (seq + data + SYN). */
+static void tcp_send_rst(uint32_t peer_ip, uint16_t peer_port, uint16_t local_port,
+                         uint8_t in_flags, uint32_t in_seq, uint32_t in_ack, uint32_t in_datalen) {
+    struct tcp_hdr th;
+    memset(&th, 0, sizeof th);
+    th.src_port = htons(local_port);
+    th.dst_port = htons(peer_port);
+    th.data_off = (sizeof(struct tcp_hdr) / 4) << 4;
+    if (in_flags & TCP_ACK) {
+        th.seq   = htonl(in_ack);
+        th.flags = TCP_RST;
+    } else {
+        th.seq   = 0;
+        th.ack   = htonl(in_seq + in_datalen + ((in_flags & TCP_SYN) ? 1 : 0));
+        th.flags = TCP_RST | TCP_ACK;
+    }
+    th.checksum = net_l4_checksum(g_netif.ip, peer_ip, IP_PROTO_TCP, &th, sizeof th);
+    ip_output(g_netif.ip, peer_ip, IP_PROTO_TCP, &th, sizeof th);
+}
+
 void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
     if (seg_len < sizeof(struct tcp_hdr)) return;
     const struct tcp_hdr *th = (const struct tcp_hdr *)seg;
@@ -140,8 +163,12 @@ void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
          * be a new client arriving at one of our listeners (passive open). */
         if ((flags & (TCP_SYN | TCP_ACK)) == TCP_SYN) {
             struct tcb *lis = tcb_find_listener(dport);
-            if (lis) tcp_accept_syn(lis, src_ip, sport, seq);
+            if (lis) { tcp_accept_syn(lis, src_ip, sport, seq); return; }
         }
+        /* Nothing here (closed port, or a stray segment). RST the peer so it
+         * fails fast -- but never answer a RST with a RST. */
+        if (!(flags & TCP_RST))
+            tcp_send_rst(src_ip, sport, dport, flags, seq, ack, datalen);
         return;
     }
 

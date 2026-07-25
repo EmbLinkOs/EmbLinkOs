@@ -79,6 +79,8 @@ struct ip_hdr {
 /* ---- ICMP --------------------------------------------------------------- */
 #define ICMP_ECHO_REQUEST 8
 #define ICMP_ECHO_REPLY   0
+#define ICMP_DEST_UNREACH 3
+#define ICMP_PORT_UNREACH 3   /* code within DEST_UNREACH */
 
 struct icmp_hdr {
     uint8_t  type, code;
@@ -215,8 +217,12 @@ int  ip_output(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,       /* UDP/ICM
                const void *payload, uint32_t len);
 void ip_input(const uint8_t *pkt, uint32_t len);                      /* eth demux -> IP */
 void icmp_input(uint32_t src_ip, const uint8_t *msg, uint32_t len);   /* IP demux -> ICMP */
-void udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len);/* IP demux -> UDP */
+bool udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len);/* IP demux -> UDP; true if delivered */
 void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len);/* IP demux -> TCP */
+
+/* ICMP dest/port-unreachable back to `dst_ip`, quoting the offending datagram's
+ * IP header + first 8 bytes (RFC 792). Sent by ip/ipv4.c when UDP has no socket. */
+void icmp_send_unreachable(uint32_t dst_ip, const uint8_t *orig_ip_pkt, uint32_t orig_len);
 
 /* UDP single-slot receive capture, driven by DHCP/DNS: arm on a local port,
  * then poll (bounded) for the reply. */

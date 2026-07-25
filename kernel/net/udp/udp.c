@@ -52,8 +52,11 @@ struct udp_sock {
 };
 static struct udp_sock udp_socks[UDP_SOCKS];
 
-void udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
-    if (seg_len < sizeof(struct udp_hdr)) return;
+/* Returns true if the datagram had a consumer (a bound socket or the kernel's
+ * armed DHCP/DNS capture); false means the port is closed, and ip_input will
+ * answer with an ICMP port-unreachable. */
+bool udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
+    if (seg_len < sizeof(struct udp_hdr)) return true;   /* malformed: swallow */
     const struct udp_hdr *u = (const struct udp_hdr *)seg;
     uint32_t dlen = ntohs(u->len);
     if (dlen < sizeof(*u) || dlen > seg_len) dlen = seg_len;
@@ -72,18 +75,22 @@ void udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
                 d->len = (uint16_t)k; d->src_ip = src_ip; d->src_port = ntohs(u->src_port);
                 s->q_n++;
             }
-            return;
+            return true;                             /* the port is open */
         }
     }
 
     /* Else the kernel single-slot capture (DHCP/DNS). */
-    if (g_udp.armed && !g_udp.got && dport == g_udp.port) {
-        uint32_t k = datalen < UDP_CAP_MAX ? datalen : UDP_CAP_MAX;
-        memcpy((void *)g_udp.buf, data, k);
-        g_udp.len = k;
-        g_udp.from_ip = src_ip;
-        g_udp.got = true;
+    if (g_udp.armed && dport == g_udp.port) {
+        if (!g_udp.got) {
+            uint32_t k = datalen < UDP_CAP_MAX ? datalen : UDP_CAP_MAX;
+            memcpy((void *)g_udp.buf, data, k);
+            g_udp.len = k;
+            g_udp.from_ip = src_ip;
+            g_udp.got = true;
+        }
+        return true;
     }
+    return false;                                    /* closed port -> unreachable */
 }
 
 int net_udp_open(void) {

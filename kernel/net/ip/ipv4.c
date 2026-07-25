@@ -59,6 +59,13 @@ void ip_input(const uint8_t *pkt, uint32_t len) {
     if (total >= ihl && total <= len) plen = total - ihl;
 
     if (ip->proto == IP_PROTO_ICMP)      icmp_input(src, payload, plen);
-    else if (ip->proto == IP_PROTO_UDP)  udp_input(src, payload, plen);
+    else if (ip->proto == IP_PROTO_UDP) {
+        /* No bound socket for a UNICAST datagram -> ICMP port-unreachable, quoting
+         * this packet's IP header + 8 bytes. Never for broadcasts (RFC 1122). */
+        if (!udp_input(src, payload, plen) && dst == g_netif.ip) {
+            uint32_t quote = (ihl + 8 <= len) ? ihl + 8 : len;
+            icmp_send_unreachable(src, pkt, quote);
+        }
+    }
     else if (ip->proto == IP_PROTO_TCP)  tcp_input(src, payload, plen);
 }
