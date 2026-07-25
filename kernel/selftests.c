@@ -1081,6 +1081,39 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test wget") == 0) {
+        /* THE PAYOFF: the OS downloads a real file from the internet TO DISK.
+         * wget (ring 3) resolves example.com, GETs http://example.com/, and
+         * writes the body to /wget.out -- networking meets the filesystem. Needs
+         * CAP_NETWORK + CAP_FILESYSTEM and outbound HTTP (SLIRP). */
+        const char *wp = "/data/apps/wget/wget.elf";
+        struct vfs_stat st;
+        if (vfs_stat(wp, &st) != 0) { kprintf("\n[cmd] test wget: %s not on image\n", wp); return 1; }
+        char *a[]   = { (char *)wp, (char *)"-O", (char *)"/wget.out",
+                        (char *)"http://example.com/", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(wp, a, 4, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[wget] exit=%d\n", code);
+
+        int ok = (code == 0);
+        if (ok) {                                  /* verify the downloaded file on disk */
+            struct vfs_stat fs;
+            if (vfs_stat("/wget.out", &fs) != 0) { kprintf("[wget] /wget.out missing\n"); ok = 0; }
+            else {
+                char head[8] = {0}; size_t got = 0;
+                int fd = vfs_open("/wget.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                kprintf("[wget] downloaded %lu bytes to /wget.out, starts '%c'\n",
+                        (unsigned long)fs.size, got ? head[0] : '?');
+                if (fs.size < 100 || head[0] != '<') { kprintf("[wget] not a valid HTML download?\n"); ok = 0; }
+            }
+        }
+        kprintf("[cmd] test wget: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test capgate") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
         const char *gp = "/data/apps/capgpu/capgpu.elf";
