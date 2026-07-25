@@ -443,6 +443,7 @@ static void selftests_print_commands(void)
     kprintf("  test emlibc caps\n");
     kprintf("  test emlibc embx\n");
     kprintf("  test embld embx\n");
+    kprintf("  test embcc embx\n");
     kprintf("  test embcc asm\n");
     kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
@@ -1315,6 +1316,77 @@ int selftests_handle_command(const char *cmd)
         }
 
         kprintf("[cmd] test embld embx: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embcc embx") == 0) {
+        /* THE WHOLE ARTIFACT, PRODUCED BY THE OWNED TOOLCHAIN ON THE OS, FROM
+         * SOURCE. EmbCC compiles the emlibc app .c (against emlibc's headers +
+         * embcc's own freestanding stddef/stdarg -- NO newlib), EmbLD links it
+         * with the emlibc rim + libemlibc.a and EMITS a native EMBX declaring
+         * {FILESYSTEM}, and the kernel loads + runs it. Compiler + libc + linker
+         * + format + loader, every stage owned, every stage on the metal. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc embx: VFS not registered\n"); return 1; }
+        const char *cc = "/data/apps/embcc/embcc.elf";
+        const char *ld = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cc, &st) != 0) { kprintf("\n[cmd] test embcc embx: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat(ld, &st) != 0) { kprintf("\n[cmd] test embcc embx: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/emlibc/embxapp.c", &st) != 0) {
+            kprintf("\n[cmd] test embcc embx: emlibc source not on image\n"); return 1; }
+
+        char *env[] = { (char *)"HOME=/", NULL };
+        const char *obj = "/data/tmp/embxapp.cc.o";
+        const char *out = "/data/tmp/cc.embx";
+        (void)vfs_unlink_path(obj);
+        (void)vfs_unlink_path(out);
+        (void)vfs_unlink_path("/data/tmp/embxapp.out");
+
+        /* (1) EmbCC compiles the app against emlibc headers (not newlib) */
+        char *ca[] = { (char *)cc, (char *)"-c", (char *)"/data/src/emlibc/embxapp.c",
+                       (char *)"-I", (char *)"/data/src/emlibc/include",
+                       (char *)"-I", (char *)"/data/apps/embcc/include",
+                       (char *)"-o", (char *)obj };
+        int cp = process_create_env(cc, ca, 9, env, NULL, 0);
+        int cc_code = cp >= 0 ? process_wait((uint32_t)cp) : -1;
+        int have_o = (vfs_stat(obj, &st) == 0);
+        kprintf("[embccembx] embcc compiled emlibc app: exit=%d, %s\n",
+                cc_code, have_o ? "object written" : "MISSING");
+        int ok = (cc_code == 0 && have_o);
+
+        /* (2) EmbLD links the embcc object + rim + libemlibc.a -> native EMBX */
+        if (ok) {
+            char *la[] = { (char *)ld, (char *)"--embx", (char *)"--cap", (char *)"filesystem",
+                           (char *)"-o", (char *)out,
+                           (char *)"/data/src/emlibc/crt0.o",
+                           (char *)obj,
+                           (char *)"/data/src/emlibc/libemlibc.a" };
+            int lp = process_create_caps(ld, la, 9, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+            int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            int have_x = (vfs_stat(out, &st) == 0);
+            kprintf("[embccembx] embld --embx linked it: exit=%d, %s (%llu bytes)\n",
+                    lc, have_x ? "EMBX written" : "MISSING",
+                    have_x ? (unsigned long long)st.size : 0ULL);
+            if (!(lc == 0 && have_x)) ok = 0;
+        }
+
+        /* (3) the kernel loads + runs the OS-built-from-source binary */
+        if (ok) {
+            char *ra[] = { (char *)out, NULL };
+            uint64_t grantor = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+            int rp = process_create_caps(out, ra, 1, env, NULL, 0, grantor);
+            int rc = rp >= 0 ? process_wait((uint32_t)rp) : -1;
+            char head[64] = {0}; size_t got = 0;
+            if (vfs_stat("/data/tmp/embxapp.out", &st) == 0) {
+                int fd = vfs_open("/data/tmp/embxapp.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            }
+            kprintf("[embccembx] ran it: exit=%d (want 42), reports \"%s\"\n", rc, head);
+            if (rc != 42) ok = 0;
+        }
+
+        kprintf("[cmd] test embcc embx: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

@@ -864,6 +864,17 @@ def discover_userland_objects(build_dir="build"):
         if blob is not None:
             objects.append((dst, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
 
+    # ...and the SOURCE + emlibc's public headers, so the OS can COMPILE the app
+    # with embcc (against emlibc's headers + embcc's own freestanding stddef/
+    # stdarg, NOT newlib), then link+emit with embld -- the whole artifact
+    # produced by the owned toolchain on the metal. `test embcc embx` proves it.
+    app_c = _read_file("user/bin/emlibc_embxapp.c")
+    if app_c is not None:
+        objects.append((b"data/src/emlibc/embxapp.c",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, app_c))
+    objects.extend(_tree_objects("user/emlibc/include",
+                                 b"data/src/emlibc/include/", ".h"))
+
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the
     # quote-includes ("sval/sval.h", "value/value.h") resolve with a single
