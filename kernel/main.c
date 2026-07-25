@@ -24,6 +24,7 @@
 #include "arch/x86_64/cpu/gdt.h"
 #include "arch/x86_64/cpu/percpu.h"
 #include "arch/x86_64/smp/smp.h"
+#include "arch/x86_64/boot/bootinfo.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/syscall/syscall.h"
 #include "arch/x86_64/irq/pic.h"
@@ -1685,6 +1686,10 @@ static void kernel_handle_line_command(const char *cmd)
 void kernel_main(void) {
     // --- Core init ---
     serial_init();
+    bootinfo_capture();   // read stage2's boot-device record (boot drive + MBR
+                          // disk signature) NOW, via KP2V of low memory, before
+                          // the PMM can hand that frame out. embkfs_init() later
+                          // uses it to make "/" follow the disk we booted from.
     gdt_init_bsp();   // this_cpu()/percpu_init_topology() aren't usable yet
                       // (need ACPI+LAPIC below) -- operates on cpu_table[0]
                       // (the BSP) directly, see gdt_init_bsp()'s comment.

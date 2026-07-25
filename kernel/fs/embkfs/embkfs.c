@@ -1,6 +1,8 @@
 #include "fs/embkfs/embkfs.h"
 #include "fs/embkfs/crc32c.h"
 #include "block/block.h"
+#include "block/partition.h"   /* embk_partition_parent — reach a volume's disk MBR */
+#include "arch/x86_64/boot/bootinfo.h"  /* bootinfo_boot_disk_sig — root-follows-boot */
 #include "include/kmalloc.h"   /* kmalloc / kfree — the Phase 8 heap */
 #include "include/kprintf.h"
 #include "include/errno.h"
@@ -7504,6 +7506,13 @@ void embkfs_init(void)
      * boot", normally the internal disk. */
     for (uint32_t i = 0; i < embk_block_count() && g_embkfs_volume_count < EMBKFS_MAX_VOLUMES; i++) {
         struct embk_block_device *d = embk_block_get(i);
+        /* Skip a whole disk that carries a partition table: its filesystems live
+         * in its partitions (which are separate block devices, probed by their
+         * own name below). Probing the whole disk otherwise matches a partition's
+         * tail backup superblock at the wrong offset and -- worse -- self-heals a
+         * bogus "primary superblock" by WRITING over the MBR / boot code. */
+        if (embk_block_is_partitioned(d))
+            continue;
         struct embkfs_volume *slot = &g_embkfs_volumes[g_embkfs_volume_count];
         if (embkfs_mount(d, slot) != EMBK_OK)
             continue;
@@ -7515,6 +7524,48 @@ void embkfs_init(void)
     if (g_embkfs_volume_count == 0) {
         kprintf("EMBKFS: no volume found on any block device\n");
         return;
+    }
+
+    /* Root-follows-boot-device: promote the EMBKFS on the disk we actually
+     * booted from to slot 0 ("/"), rather than leaving root as whichever volume
+     * merely enumerated first (ATA/AHCI before USB). stage2 stashed the boot
+     * disk's MBR signature (bootinfo); match it against each volume's underlying
+     * disk. Silent no-op when the signature is unknown (the unpartitioned
+     * two-image IDE boot disk reports 0) or nothing matches -- the enumeration
+     * default (slot 0) then stands, so the existing single-disk path is
+     * unchanged. Preserves the "slot 0 == primary" invariant below by SWAPPING
+     * rather than repointing, so main.c's per-volume /sdX registration (which
+     * treats index 0 as embk_live) needs no change. */
+    uint32_t boot_sig;
+    if (g_embkfs_volume_count > 1 && bootinfo_boot_disk_sig(&boot_sig)) {
+        for (uint32_t i = 1; i < g_embkfs_volume_count; i++) {
+            struct embk_block_device *disk =
+                embk_partition_parent(g_embkfs_volumes[i].dev);
+            uint8_t mbr[512];
+            if (!disk || embk_block_read(disk, 0, 1, mbr) != EMBK_OK)
+                continue;
+            uint32_t sig =  (uint32_t)mbr[0x1B8]
+                         | ((uint32_t)mbr[0x1B9] << 8)
+                         | ((uint32_t)mbr[0x1BA] << 16)
+                         | ((uint32_t)mbr[0x1BB] << 24);
+            if (sig != boot_sig)
+                continue;
+            /* Every pointer in the struct targets the heap (bitmap / free_ext /
+             * rcache bufs), never the struct itself, so a byte move keeps them
+             * valid; nothing outside holds a &volume yet (vfs registration runs
+             * later, off embkfs_live_volume()). Heap temp -- the struct is
+             * multi-KB, too big for the kernel stack. */
+            struct embkfs_volume *tmp = kmalloc(sizeof *tmp);
+            if (tmp) {
+                *tmp                 = g_embkfs_volumes[0];
+                g_embkfs_volumes[0]  = g_embkfs_volumes[i];
+                g_embkfs_volumes[i]  = *tmp;
+                kfree(tmp);
+                kprintf("EMBKFS: boot-device match -- %s promoted to primary (/)\n",
+                        g_embkfs_volumes[0].dev->name);
+            }
+            break;
+        }
     }
 
     g_embkfs_live = &g_embkfs_volumes[0];

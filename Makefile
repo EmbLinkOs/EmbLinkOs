@@ -57,6 +57,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/cpu/spinlock.c \
              kernel/arch/x86_64/cpu/rwlock.c \
              kernel/arch/x86_64/smp/smp.c \
+             kernel/arch/x86_64/boot/bootinfo.c \
              kernel/arch/x86_64/syscall/syscall.c \
              kernel/arch/x86_64/syscall/usercopy.c \
              kernel/arch/x86_64/syscall/usermode.c \
@@ -1194,6 +1195,39 @@ run-usb-embkfs: $(IMG) $(DISK) usbdisk_embkfs.img
 	    -drive id=usbembkfs,file=usbdisk_embkfs.img,format=raw,if=none \
 	    -device usb-storage,bus=xhci.0,drive=usbembkfs \
 	    -serial stdio -no-reboot -no-shutdown
+
+# ── Single bootable medium: boot + kernel + EMBKFS on ONE device ─────────────
+# The whole system on one image, the way a USB stick or a single physical disk
+# must carry it -- the IDE path splits boot ($(IMG)) and data (embkfs.img) across
+# two -drive lines, but a stick is ONE device. `dd if=usb.img of=/dev/sdX` makes
+# a bootable stick for real hardware; `make run-usb` boots this same file in
+# QEMU. Built from the same stage1/stage2/kernel + embkfs.img the two-image path
+# uses; see tools/mkbootdisk.sh for the on-disk layout.
+usb.img: $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) embkfs.img tools/mkbootdisk.sh
+	tools/mkbootdisk.sh $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) embkfs.img $@
+
+# Boot ENTIRELY from the USB stick -- no IDE boot disk at all. SeaBIOS boots the
+# xHCI mass-storage device (bootindex=0); stage1/stage2 read the kernel off it
+# via INT 13h (BIOS USB legacy emulation), then the kernel re-reads the SAME
+# stick through its own xHCI MSC driver and mounts the EMBKFS in partition 1 at
+# "/". Both I/O worlds -- BIOS, then the native driver -- on one device, which is
+# the real end-to-end USB-boot test.
+run-usb: usb.img
+	qemu-system-x86_64 \
+	    -device qemu-xhci,id=xhci \
+	    -drive id=usbboot,file=usb.img,format=raw,if=none \
+	    -device usb-storage,bus=xhci.0,drive=usbboot,bootindex=0 \
+	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
+
+# Same combined image, but booted as a plain IDE/SATA disk (bootindex on the disk
+# itself). Proves the ONE-image layout also boots a normal disk end-to-end -- the
+# partition scanner finds the EMBKFS partition and mounts it at "/", no second
+# -drive line. This is "a disk with our EMBKFS" from the goal, distinct from USB.
+run-usb-ide: usb.img
+	qemu-system-x86_64 \
+	    -drive id=bootdisk,file=usb.img,format=raw,if=none \
+	    -device ide-hd,drive=bootdisk,bootindex=0 \
+	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
 
 # Two independent EMBKFS volumes mounted at once (sdb -> "/", sdc -> "/sdc"),
 # both on plain IDE -- exercises embkfs_init()'s multi-volume mount table

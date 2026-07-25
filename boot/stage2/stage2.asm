@@ -20,14 +20,35 @@
 %define BOOT_STACK_TOP_PHYS 0x80000
 %define BOOT_STACK_TOP_VIRT (KERNEL_VIRTUAL_BASE + BOOT_STACK_TOP_PHYS)
 
+; Boot-info record handed to the kernel (arch/x86_64/boot/bootinfo.{c,h}). Fixed
+; low-memory address in the free gap between the VBE block (~0x5000) and the e820
+; buffer (0x7000). MUST match BOOTINFO_PHYS / BOOTINFO_MAGIC in bootinfo.h.
+%define BOOTINFO_PHYS  0x6F00
+%define BOOTINFO_MAGIC 0x4B534442   ; 'BDSK'
+
 start:
-    
+
     cli
     xor ax, ax
     mov ds, ax
     mov es, ax
     mov ss, ax
     mov sp, 0x7C00
+    ; stage1 handed us the BIOS boot drive in DL. Save it before vbe_init /
+    ; e820_query (their INT 10h/15h calls may clobber DL) so the kernel-load
+    ; reads come off the drive we actually booted from, not a hardcoded 0x80.
+    mov [boot_drive], dl
+
+    ; Hand the kernel a boot-info record (see arch/x86_64/boot/bootinfo.h): the
+    ; MBR disk signature (the 4 bytes at 0x1B8 of the boot sector, still resident
+    ; at 0x7C00 -- the stack grows DOWN from 0x7C00 and never touches it) plus the
+    ; boot drive. The kernel uses the signature to pick which EMBKFS volume is "/"
+    ; when several disks each carry one: the volume on the disk we booted from.
+    mov eax, [0x7C00 + 0x1B8]       ; MBR disk signature
+    mov [BOOTINFO_PHYS + 4], eax
+    mov al, [boot_drive]
+    mov [BOOTINFO_PHYS + 8], al
+    mov dword [BOOTINFO_PHYS], BOOTINFO_MAGIC   ; validity mark, written LAST
     sti
 
     mov si, msg_stage2
@@ -58,11 +79,22 @@ start:
     mov word  [sectors_left], KERNEL_LOAD_SECTORS
 
 .read_loop:
+    mov cx, 3                   ; per-sector read attempts (CX is reused as the
+                                ; dword counter in the copy-up loop below, but
+                                ; only after the read has succeeded)
+.try_read:
     mov si, dap
     mov ah, 0x42
-    mov dl, 0x80
+    mov dl, [boot_drive]        ; the drive stage1 booted from, not a fixed 0x80
     int 0x13
-    jc disk_error_S2
+    jnc .read_ok
+    dec cx
+    jz disk_error_S2            ; out of retries for this sector
+    xor ah, ah                  ; reset disk system, then retry the same LBA
+    mov dl, [boot_drive]
+    int 0x13
+    jmp .try_read
+.read_ok:
 
     ; Copy the 512 bytes just read (phys 0x10000) up to [stage_ptr] via flat FS.
     mov esi, 0x10000
@@ -102,6 +134,10 @@ dap:
     dw 0x0000                ; Starting head
     dw 0x1000                ; Starting segment (loads to 0x10000)
     dq 9                     ; Starting LBA (sector 10, 0-indexed = LDA 9)
+
+; BIOS boot drive, saved from DL at stage2 entry (handed over by stage1). All
+; INT 13h kernel-load reads use this so a USB / non-0x80 boot works.
+boot_drive db 0x80
 
 
 no_lba_support:
