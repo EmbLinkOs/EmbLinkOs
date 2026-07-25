@@ -439,6 +439,7 @@ static void selftests_print_commands(void)
     kprintf("  test embcc self\n");
     kprintf("  test embcc selfhost\n");
     kprintf("  test embld\n");
+    kprintf("  test emlibc\n");
     kprintf("  test embcc asm\n");
     kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
@@ -1139,6 +1140,38 @@ int selftests_handle_command(const char *cmd)
         }
         kprintf("[cmd] test wget: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test emlibc") == 0) {
+        /* emlibc phase 1: the OS runs a program that links its OWN non-POSIX C
+         * library INSTEAD of newlib (built -nostdinc, no -lc, no newlib
+         * crt0/syscalls -- proven at build time: zero newlib symbols). The
+         * program exercises emlibc's string/stdlib/stdio and exits 42; it also
+         * writes one line through emlibc's OWN buffered file stream, which we
+         * read back here as a serial-visible witness of the formatter + rim. */
+        const char *ep = "/data/apps/emlibc_demo/emlibc_demo.elf";
+        struct vfs_stat st;
+        if (vfs_stat(ep, &st) != 0) { kprintf("\n[cmd] test emlibc: %s not on image\n", ep); return 1; }
+        (void)vfs_unlink_path("/data/tmp/emlibc.out");
+        char *a[]   = { (char *)ep, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pid  = process_create_caps(ep, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[emlibc] emlibc_demo exit=%d (want 42 -- linked emlibc, NOT newlib)\n", code);
+
+        int ok = (code == 42);
+        char head[64] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/emlibc.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/emlibc.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;   /* kprintf has no %.*s */
+            kprintf("[emlibc] its own stdio wrote: \"%s\"\n", head);
+            if (!(got >= 15 && memcmp(head, "emlibc wrote 42", 15) == 0)) {
+                kprintf("[emlibc] stream witness mismatch\n"); ok = 0; }
+        } else { kprintf("[emlibc] /data/tmp/emlibc.out missing\n"); ok = 0; }
+
+        kprintf("[cmd] test emlibc: %s\n", ok ? "OK" : "FAIL");
+        return 1;
     }
 
     if (strcmp(cmd, "test capgate") == 0) {
