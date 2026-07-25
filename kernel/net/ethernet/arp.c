@@ -59,9 +59,10 @@ bool arp_resolve(uint32_t ip, uint8_t mac_out[ETH_ALEN]) {
     bool ok = arp_cache_get(ip, mac_out);
     for (int attempt = 0; attempt < 4 && !ok; attempt++) {
         arp_send(ARP_OP_REQUEST, ip, ETH_BCAST);
-        for (int i = 0; i < 200000 && !ok; i++) {
+        uint64_t deadline = net_ticks() + NET_RTX_TICKS;   /* one ARP-request interval */
+        while (!ok && net_ticks() < deadline) {
             if (arp_cache_get(ip, mac_out)) { ok = true; break; }
-            net_yield();                        /* drain RX, release the lock, yield */
+            net_wait();                         /* sleep until a reply or the tick */
         }
     }
     net_unlock();

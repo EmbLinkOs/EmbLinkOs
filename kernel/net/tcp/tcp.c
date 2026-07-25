@@ -243,10 +243,11 @@ void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
 
 /* ---- blocking client API ------------------------------------------------ */
 static bool poll_until(struct tcb *t, int want_state_reached) {
-    for (int i = 0; i < SPIN_MAX; i++) {
+    uint64_t deadline = net_ticks() + NET_RTX_TICKS;   /* one SYN-retransmit interval */
+    while (net_ticks() < deadline) {
         if (t->reset) return false;
         if (want_state_reached && t->state == want_state_reached) return true;
-        net_yield();
+        net_wait();
     }
     return false;
 }
@@ -309,14 +310,15 @@ int net_tcp_accept(int listen_conn) {
     if (!lis->in_use || lis->state != TCP_LISTEN) { net_unlock(); return -1; }
 
     int child = -1;
-    for (int i = 0; i < SPIN_MAX && child < 0; i++) {
+    uint64_t deadline = net_ticks() + NET_TMO_TICKS;
+    while (child < 0 && net_ticks() < deadline) {
         if (lis->accept_n > 0) {
             child = lis->accept_q[0];
             for (int j = 1; j < lis->accept_n; j++) lis->accept_q[j - 1] = lis->accept_q[j];
             lis->accept_n--;
             break;
         }
-        net_yield();
+        net_wait();
     }
     net_unlock();
     return child;
@@ -340,8 +342,9 @@ int net_tcp_send(int conn, const void *data, uint32_t len) {
      * snd_nxt` at entry (the previous send drained), so base is snd_nxt. */
     const uint8_t *p = (const uint8_t *)data;
     uint32_t base = t->snd_nxt;
-    int failed = 0, retransmits = 0, stalls = 0;
+    int failed = 0, retransmits = 0;
     if (t->cwnd == 0) { t->cwnd = 4 * TCP_MSS; t->ssthresh = 65535; }   /* IW = 4*MSS */
+    uint64_t last_progress = net_ticks();
 
     while (!failed) {
         if (t->snd_una - base >= len) break;            /* everything acked -> done */
@@ -361,23 +364,23 @@ int net_tcp_send(int conn, const void *data, uint32_t len) {
             t->snd_nxt += chunk;
         }
 
-        /* Wait for ACK progress; one net_yield drains the whole RX ring, so a
-         * burst of cumulative ACKs can advance snd_una several segments at once. */
+        /* Sleep for ACK progress; RX delivery (or the 10 ms tick) wakes us, and
+         * one drain can advance snd_una several segments at once. */
         uint32_t una_before = t->snd_una;
-        net_yield();
+        net_wait();
         if (t->reset) { failed = 1; break; }
         if (t->snd_una != una_before) {                 /* forward progress */
-            stalls = 0;
+            last_progress = net_ticks();
             if (t->cwnd < t->ssthresh) t->cwnd += TCP_MSS;               /* slow start */
             else t->cwnd += (TCP_MSS * TCP_MSS) / t->cwnd + 1;           /* congestion avoidance */
             if (t->cwnd > 65535) t->cwnd = 65535;
-        } else if (++stalls >= SPIN_MAX) {              /* timed out: Tahoe back-off */
+        } else if (net_ticks() - last_progress > NET_RTX_TICKS) {        /* timed out: Tahoe */
             if (++retransmits > RETRIES) { failed = 1; break; }
             t->ssthresh = t->cwnd / 2;
             if (t->ssthresh < 2 * TCP_MSS) t->ssthresh = 2 * TCP_MSS;
             t->cwnd = TCP_MSS;                          /* restart slow start */
             t->snd_nxt = t->snd_una;                    /* go-back-N: resend from snd_una */
-            stalls = 0;
+            last_progress = net_ticks();
         }
     }
     if (len > 8192)
@@ -396,9 +399,10 @@ int net_tcp_recv(int conn, void *buf, uint32_t cap) {
     struct tcb *t = &tcbs[conn];
     if (!t->in_use) { net_unlock(); return -1; }
 
-    for (int i = 0; i < SPIN_MAX && t->rx_len == 0; i++) {
+    uint64_t deadline = net_ticks() + NET_TMO_TICKS;
+    while (t->rx_len == 0 && net_ticks() < deadline) {
         if (t->peer_fin || t->reset || t->state == TCP_CLOSED) break;
-        net_yield();
+        net_wait();
     }
     uint32_t k = t->rx_len < cap ? t->rx_len : cap;
     if (k) {
@@ -432,10 +436,11 @@ void net_tcp_close(int conn) {
         t->snd_nxt = seq + 1;                    /* FIN consumes one seq */
         /* Best-effort wait for the close to settle (not required for correctness
          * on our side; SLIRP tears down regardless). */
-        for (int i = 0; i < SPIN_MAX; i++) {
+        uint64_t deadline = net_ticks() + NET_RTX_TICKS;
+        while (net_ticks() < deadline) {
             if (t->state == TCP_CLOSED || t->state == TCP_TIME_WAIT ||
                 t->state == TCP_FIN_WAIT_2 || t->reset) break;
-            net_yield();
+            net_wait();
         }
     }
     t->in_use = false;

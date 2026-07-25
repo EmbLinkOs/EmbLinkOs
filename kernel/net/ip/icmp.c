@@ -59,8 +59,9 @@ bool net_ping(uint32_t dst_ip) {
     if (net_send_ip(dst_ip, IP_PROTO_ICMP, &echo, sizeof(echo)) < 0) {
         g_ping.waiting = false; net_unlock(); return false;
     }
-    for (int i = 0; i < 400000 && !g_ping.got; i++) {
-        net_yield();
+    uint64_t deadline = net_ticks() + NET_TMO_TICKS;
+    while (!g_ping.got && net_ticks() < deadline) {
+        net_wait();
     }
     g_ping.waiting = false;
     bool got = g_ping.got;

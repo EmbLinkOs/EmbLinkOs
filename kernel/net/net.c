@@ -46,8 +46,17 @@ const uint8_t ETH_BCAST[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 static int               g_net_busy = 0;
 static struct thread    *g_net_owner = 0;
 static int               g_net_depth = 0;
-static struct wait_queue g_net_wq;
+static struct wait_queue g_net_wq;         /* threads waiting to ACQUIRE net_lock */
 static struct net_lockstat g_net_stat;
+
+/* Event-driven RX (replaces busy-polling). The RX kthread sleeps on g_net_rx_wq
+ * until the NIC interrupt (or the 10 ms timer tick) wakes it, then delivers and
+ * wakes g_net_event_wq -- where blocking clients sleep instead of polling. The
+ * timer tick also bumps g_net_ticks (clients time out in ticks) and wakes both
+ * queues, so a missed IRQ or wakeup degrades to 10 ms latency, never a hang. */
+static struct wait_queue g_net_rx_wq;      /* the RX kthread waits here */
+static struct wait_queue g_net_event_wq;   /* blocking clients wait here */
+static volatile uint64_t g_net_ticks;      /* 10 ms ticks, for client timeouts */
 
 void net_lock(void) {
     sched_lock();
@@ -80,6 +89,42 @@ void net_yield(void) {
     schedule();
     net_lock();            /* reacquire; the caller re-checks state next iteration */
 }
+
+/* Monitor wait: a blocking client SLEEPS (no polling) until an event. It fully
+ * releases net_lock -- so the RX kthread can take it to deliver -- blocks on the
+ * event queue, and reacquires on wake, restoring its recursion depth (a nested
+ * caller, e.g. an ARP resolve inside a connect, must release too or the reply it
+ * waits for could never be delivered). The release + block are atomic under
+ * sched_lock, so a wake between them cannot be lost. Woken by RX delivery or the
+ * timer tick. */
+void net_wait(void) {
+    sched_lock();
+    int depth = g_net_depth;
+    g_net_busy = 0; g_net_owner = 0; g_net_depth = 0;
+    wait_queue_wake_one(&g_net_wq);              /* hand net_lock to any acquirer */
+    sched_block_current_locked(&g_net_event_wq); /* sleep; returns with sched_lock RELEASED */
+    net_lock();                                  /* reacquire (depth -> 1) */
+    if (depth > 1) { sched_lock(); g_net_depth = depth; sched_unlock(); }
+}
+
+/* Wake the RX kthread (from the NIC ISR) and any blocking clients. */
+void net_signal_rx(void) {
+    sched_lock();
+    wait_queue_wake_one(&g_net_rx_wq);
+    sched_unlock();
+}
+
+/* 10 ms tick (from the LAPIC timer handler): advance the net clock and wake the
+ * RX kthread (drain fallback) + all blocking clients (timeout re-check). */
+void net_tick(void) {
+    sched_lock();
+    g_net_ticks++;
+    wait_queue_wake_one(&g_net_rx_wq);
+    wait_queue_wake_all(&g_net_event_wq);
+    sched_unlock();
+}
+
+uint64_t net_ticks(void) { return g_net_ticks; }
 
 void net_lockstat_get(struct net_lockstat *out) { if (out) *out = g_net_stat; }
 void net_lockstat_reset(void) {
@@ -139,20 +184,19 @@ void net_rx(const uint8_t *frame, uint32_t len) {
 }
 
 /* ---- bring-up ----------------------------------------------------------- */
+/* The RX kthread is now the SOLE deliverer: it drains + delivers under net_lock,
+ * wakes any blocking clients, then SLEEPS on g_net_rx_wq until the NIC ISR or the
+ * timer tick signals RX again. Because clients no longer poll/deliver themselves,
+ * the poll-recursion that entangled the lock is gone. The tick wakes it every
+ * 10 ms too, so a missed IRQ just means ~10 ms latency, never a stall. */
 static void net_rx_thread(void) {
-    /* Hold net_lock across the drain so a packet is removed from the virtqueue
-     * and delivered to the stack ATOMICALLY. Without this the kthread could pull
-     * a packet off the ring (under the driver's rx spinlock) and THEN block on
-     * net_lock because a client owns it -- stranding that packet while the client
-     * polls the now-empty ring forever (a real -smp>1 deadlock). Every other
-     * virtio_net_poll() caller is a client wait loop that already holds net_lock,
-     * so only ONE thread ever drains at a time and it always delivers what it
-     * took. Released before schedule() -- never held across the yield. */
     for (;;) {
         net_lock();
-        virtio_net_poll();
+        virtio_net_poll();          /* drain + deliver everything pending */
         net_unlock();
-        schedule();
+        sched_lock();
+        wait_queue_wake_all(&g_net_event_wq);   /* clients re-check their state */
+        sched_block_current_locked(&g_net_rx_wq);   /* sleep; returns sched_lock RELEASED */
     }
 }
 

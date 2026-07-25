@@ -137,7 +137,8 @@ int net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t
     if (!udp_socks[us].in_use) { net_unlock(); return -1; }
     struct udp_sock *s = &udp_socks[us];
     int got = -1;
-    for (int i = 0; i < 400000; i++) {
+    uint64_t deadline = net_ticks() + NET_TMO_TICKS;
+    while (net_ticks() < deadline) {
         if (s->q_n > 0) {
             struct udp_dgram *d = &s->q[s->q_head];
             uint32_t k = d->len < cap ? d->len : cap;
@@ -149,7 +150,7 @@ int net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t
             got = (int)k;
             break;
         }
-        net_yield();
+        net_wait();
     }
     net_unlock();
     return got;
@@ -173,7 +174,8 @@ void udp_arm(uint16_t port) {
 }
 
 int udp_collect(uint8_t *out, uint32_t cap, uint32_t *from_ip) {
-    for (int i = 0; i < 400000 && !g_udp.got; i++) { net_yield(); }
+    uint64_t deadline = net_ticks() + NET_TMO_TICKS;
+    while (!g_udp.got && net_ticks() < deadline) { net_wait(); }
     int rc = -1;
     if (g_udp.got) {
         uint32_t k = g_udp.len < cap ? g_udp.len : cap;

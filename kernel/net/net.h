@@ -206,6 +206,18 @@ void net_lock(void);
 void net_unlock(void);
 void net_yield(void);      /* poll-drain (locked) + release + schedule + reacquire */
 
+/* Event-driven RX: clients SLEEP instead of polling. net_wait() releases net_lock
+ * and blocks until RX delivery or the 10 ms tick wakes it, then reacquires (a
+ * depth-safe monitor wait). net_signal_rx() is called from the NIC ISR; net_tick()
+ * from the LAPIC timer; net_ticks() is the 10 ms clock clients time out against. */
+void net_wait(void);
+void net_signal_rx(void);
+void net_tick(void);
+uint64_t net_ticks(void);
+
+#define NET_TMO_TICKS  300   /* give-up timeout, 10 ms ticks -> ~3 s   */
+#define NET_RTX_TICKS   50   /* retransmit interval, ~500 ms           */
+
 /* Contention instrumentation (the EMBKFS rule: measure before splitting further).
  * `contended` = acquisitions that actually had to block on another owner. */
 struct net_lockstat { uint64_t acquires, recursive, contended; };
