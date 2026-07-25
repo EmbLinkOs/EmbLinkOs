@@ -852,6 +852,18 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"data/apps/emlibc_embxapp/emlibc_embxapp.embx",
                         L.DT_REG, L.S_IFREG | L.PERM_FILE, ex))
 
+    # emlibc LINK INPUTS for on-OS EMBX emission: crt0 + an app object + the
+    # static library, so the on-image EmbLD (embld.elf) can LINK and EMIT a
+    # native .embx on the metal -- no host toolchain in the loop. x86-64 has
+    # native 64-bit divide, so no libgcc is needed: crt0 + app + libemlibc.a
+    # is the whole link line. `test embld embx` proves it.
+    for src, dst in (("build/emlibc_crt0.o",      b"data/src/emlibc/crt0.o"),
+                     ("build/emlibc_embxapp.o",   b"data/src/emlibc/embxapp.o"),
+                     ("build/libemlibc.a",        b"data/src/emlibc/libemlibc.a")):
+        blob = _read_file(src)
+        if blob is not None:
+            objects.append((dst, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the
     # quote-includes ("sval/sval.h", "value/value.h") resolve with a single

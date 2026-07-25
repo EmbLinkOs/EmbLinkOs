@@ -442,6 +442,7 @@ static void selftests_print_commands(void)
     kprintf("  test emlibc\n");
     kprintf("  test emlibc caps\n");
     kprintf("  test emlibc embx\n");
+    kprintf("  test embld embx\n");
     kprintf("  test embcc asm\n");
     kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
@@ -1252,6 +1253,68 @@ int selftests_handle_command(const char *cmd)
         } else { kprintf("[embx] /data/tmp/embxapp.out missing\n"); ok = 0; }
 
         kprintf("[cmd] test emlibc embx: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embld embx") == 0) {
+        /* THE OS EMITS ITS OWN NATIVE BINARY. EmbLD runs on the metal
+         * (embld.elf) and now carries the EMBX emitter -- so the OS LINKS
+         * emlibc objects (crt0 + app + libemlibc.a; x86-64 native divide, no
+         * libgcc) and EMITS a native .embx declaring {FILESYSTEM}, entirely
+         * on-image, no host toolchain. Then it LOADS AND RUNS that freshly
+         * produced binary. Compiler/linker/format/loader, all on the OS. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embld embx: VFS not registered\n"); return 1; }
+        const char *ld = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(ld, &st) != 0) { kprintf("\n[cmd] test embld embx: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/emlibc/libemlibc.a", &st) != 0) {
+            kprintf("\n[cmd] test embld embx: emlibc link inputs not on image\n"); return 1; }
+
+        const char *out = "/data/tmp/onos.embx";
+        (void)vfs_unlink_path(out);
+        (void)vfs_unlink_path("/data/tmp/embxapp.out");
+        char *env[] = { (char *)"HOME=/", NULL };
+
+        /* (1) link + emit a native EMBX on the OS */
+        char *la[] = { (char *)ld, (char *)"--embx", (char *)"--cap", (char *)"filesystem",
+                       (char *)"-o", (char *)out,
+                       (char *)"/data/src/emlibc/crt0.o",
+                       (char *)"/data/src/emlibc/embxapp.o",
+                       (char *)"/data/src/emlibc/libemlibc.a" };
+        int lp = process_create_caps(ld, la, 9, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+        int have = (vfs_stat(out, &st) == 0);
+        kprintf("[embldembx] on-OS embld --embx: exit=%d, %s (%llu bytes)\n",
+                lc, have ? "wrote .embx" : "MISSING", have ? (unsigned long long)st.size : 0ULL);
+
+        int ok = (lc == 0) && have;
+        if (have) {                              /* confirm it is really EMBX */
+            unsigned char m[8] = {0}; size_t g = 0;
+            int fd = vfs_open(out, O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, m, sizeof m, &g); vfs_close(fd); }
+            int magic = (g >= 5 && m[0] == 0x7F && m[1] == 'E' && m[2] == 'M' && m[3] == 'B' && m[4] == 'X');
+            kprintf("[embldembx] output magic: %s\n", magic ? "EMBX" : "not EMBX");
+            if (!magic) ok = 0;
+        }
+
+        /* (2) load + run the OS-produced binary */
+        if (ok) {
+            char *ra[] = { (char *)out, NULL };
+            uint64_t grantor = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+            int rp = process_create_caps(out, ra, 1, env, NULL, 0, grantor);
+            int rc = rp >= 0 ? process_wait((uint32_t)rp) : -1;
+            kprintf("[embldembx] ran the OS-built EMBX: exit=%d (want 42, born {filesystem})\n", rc);
+            if (rc != 42) ok = 0;
+            char head[64] = {0}; size_t got = 0;
+            if (vfs_stat("/data/tmp/embxapp.out", &st) == 0) {
+                int fd = vfs_open("/data/tmp/embxapp.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                if (got && head[got - 1] == '\n') head[got - 1] = 0;
+                kprintf("[embldembx] it reports: \"%s\"\n", head);
+            }
+        }
+
+        kprintf("[cmd] test embld embx: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
