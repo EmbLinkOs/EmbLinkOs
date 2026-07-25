@@ -437,6 +437,8 @@ static void selftests_print_commands(void)
     kprintf("  test tcc tally\n");
     kprintf("  test embcc\n");
     kprintf("  test embcc self\n");
+    kprintf("  test embcc selfhost\n");
+    kprintf("  test embld\n");
     kprintf("  test embcc asm\n");
     kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
@@ -506,6 +508,31 @@ static void run_embkfs_all(void)
     if (rc_pv != EMBK_OK)    kprintf("\n[cmd] embkfs provenance failed: %s\n", embk_strerror(rc_pv));
     if (rc_vb != EMBK_OK)    kprintf("\n[cmd] embkfs verifyboot failed: %s\n", embk_strerror(rc_vb));
     if (rc_ns != EMBK_OK)    kprintf("\n[cmd] embkfs ns failed: %s\n", embk_strerror(rc_ns));
+}
+
+/* Byte-for-byte compare of two files already on the VFS. Returns 1 if both
+ * open, are the same length, and every byte matches; 0 otherwise. Used by the
+ * EmbCC self-hosting checks (object determinism + the on-OS linked stage2). */
+static int vfs_files_identical(const char *a, const char *b)
+{
+    struct vfs_stat sa, sb;
+    if (vfs_stat(a, &sa) != 0 || vfs_stat(b, &sb) != 0) return 0;
+    if (sa.size != sb.size) return 0;
+    int fa = vfs_open(a, O_RDONLY, 0);
+    int fb = vfs_open(b, O_RDONLY, 0);
+    int eq = (fa >= 0 && fb >= 0);
+    static unsigned char ba[4096], bb[4096];
+    while (eq) {
+        size_t ra = 0, rb = 0;
+        vfs_fd_read(fa, ba, sizeof ba, &ra);
+        vfs_fd_read(fb, bb, sizeof bb, &rb);
+        if (ra != rb) { eq = 0; break; }
+        if (ra == 0) break;                 /* both hit EOF together */
+        if (memcmp(ba, bb, ra) != 0) { eq = 0; break; }
+    }
+    if (fa >= 0) vfs_close(fa);
+    if (fb >= 0) vfs_close(fb);
+    return eq;
 }
 
 int selftests_handle_command(const char *cmd)
@@ -2898,7 +2925,8 @@ int selftests_handle_command(const char *cmd)
         static const char *const units[] = {
             "driver/main",  "driver/util", "lex/lex",     "parse/parse",
             "sema/sema",    "sema/type",   "ir/irgen",    "codegen/codegen",
-            "asm/emit",     "cpp/predef",  "cpp/cpp",     "elf/write",
+            "debug/dwarf",  "asm/emit",    "asm/topasm",  "cpp/predef",
+            "cpp/cpp",      "elf/write",
         };
         char *env[] = { (char *)"HOME=/", NULL };
         int nunits = (int)(sizeof units / sizeof units[0]);
@@ -2954,6 +2982,120 @@ int selftests_handle_command(const char *cmd)
         kprintf("\n[embcc self] %d/%d objects byte-identical to the reference\n",
                 nmatch, nunits);
         kprintf("[cmd] test embcc self: %s\n", nmatch == nunits ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embld") == 0) {
+        /* Smoke test: EmbLD -- the linker -- cross-built INTO an EmbLinkOS
+         * binary, runs on the metal. With no inputs it prints usage and
+         * returns 2; a clean exit (not a fault) is the signal embld.elf
+         * loaded and executed. This is the linker JOINING embcc on the OS. */
+        const char *lp = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(lp, &st) != 0) {
+            kprintf("\n[cmd] test embld: embld.elf not on image\n"); return 1; }
+        char *a[]   = { (char *)lp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pid  = process_create_env(lp, a, 1, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embld] %s ran, exit=%d (2 = usage; it loaded + executed)\n", lp, code);
+        kprintf("[cmd] test embld: %s\n", code == 2 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embcc selfhost") == 0) {
+        /* THE CLOSED LOOP, ON THE OS. The OS compiles its OWN compiler's 14
+         * sources with embcc (stage1) AND links them with embld -- both
+         * running on the metal, no host toolchain, no tcc in the loop -- into
+         * embcc-stage2, then proves (a) stage2 is byte-identical to the
+         * compiler that built it and (b) stage2 is itself a working compiler
+         * that reproduces a reference object. EmbCC compiling AND linking
+         * itself, here, is what "self-hosting on the OS" finally means. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc selfhost: VFS not registered\n"); return 1; }
+        struct vfs_stat st;
+        const char *embcc = "/data/apps/embcc/embcc.elf";
+        const char *embld = "/data/apps/embld/embld.elf";
+        if (vfs_stat(embcc, &st) != 0) { kprintf("\n[cmd] test embcc selfhost: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat(embld, &st) != 0) { kprintf("\n[cmd] test embcc selfhost: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/embcc/ref/lex.o", &st) != 0) {
+            kprintf("\n[cmd] test embcc selfhost: sources/refs not on image "
+                    "(build with EMBK_EMBCC_ROOT set)\n"); return 1; }
+
+        char *env[] = { (char *)"HOME=/", NULL };
+
+        /* (1) compile all 14 sources with the on-OS embcc -> /data/tmp/<base>.o */
+        static const char *const units[] = {
+            "driver/main",  "driver/util", "lex/lex",     "parse/parse",
+            "sema/sema",    "sema/type",   "ir/irgen",    "codegen/codegen",
+            "debug/dwarf",  "asm/emit",    "asm/topasm",  "cpp/predef",
+            "cpp/cpp",      "elf/write",
+        };
+        int nunits = (int)(sizeof units / sizeof units[0]);
+        int compiled = 0;
+        for (int u = 0; u < nunits; u++) {
+            char src[96], out[96], base[32];
+            const char *slash = units[u];
+            for (const char *q = units[u]; *q; q++) if (*q == '/') slash = q + 1;
+            snprintf(base, sizeof base, "%s", slash);
+            snprintf(src, sizeof src, "/data/src/embcc/%s.c", units[u]);
+            snprintf(out, sizeof out, "/data/tmp/%s.o", base);
+            (void)vfs_unlink_path(out);
+            char *a[] = { (char *)embcc, (char *)"-c", src,
+                          (char *)"-I", (char *)"/data/apps/embcc/include",
+                          (char *)"-I", (char *)"/system/abi/include",
+                          (char *)"-o", out };
+            int pid = process_create_env(embcc, a, 9, env, NULL, 0);
+            if ((pid >= 0 ? process_wait((uint32_t)pid) : -1) == 0 && vfs_stat(out, &st) == 0)
+                compiled++;
+        }
+        kprintf("[selfhost] embcc compiled %d/%d sources on the OS\n", compiled, nunits);
+
+        /* (2) link them with embld: crt0, syscalls, the 14 objects in the SAME
+         * alphabetical-basename order the host used for the ref objects, then
+         * libc.a. Same linker, same inputs, same order => same bytes. */
+        const char *stage2 = "/data/tmp/embcc-stage2.elf";
+        (void)vfs_unlink_path(stage2);
+        char *la[] = {
+            (char *)embld, (char *)"-o", (char *)stage2,
+            (char *)"/system/abi/crt0.o", (char *)"/system/abi/syscalls.o",
+            (char *)"/data/tmp/codegen.o", (char *)"/data/tmp/cpp.o",
+            (char *)"/data/tmp/dwarf.o",   (char *)"/data/tmp/emit.o",
+            (char *)"/data/tmp/irgen.o",   (char *)"/data/tmp/lex.o",
+            (char *)"/data/tmp/main.o",    (char *)"/data/tmp/parse.o",
+            (char *)"/data/tmp/predef.o",  (char *)"/data/tmp/sema.o",
+            (char *)"/data/tmp/topasm.o",  (char *)"/data/tmp/type.o",
+            (char *)"/data/tmp/util.o",    (char *)"/data/tmp/write.o",
+            (char *)"/system/abi/libc.a",
+        };
+        int lac = (int)(sizeof la / sizeof la[0]);
+        int lpid  = process_create_env(embld, la, lac, env, NULL, 0);
+        int lcode = lpid >= 0 ? process_wait((uint32_t)lpid) : -1;
+        int have2 = (vfs_stat(stage2, &st) == 0);
+        kprintf("[selfhost] embld link exit=%d, stage2 %s (%llu bytes)\n",
+                lcode, have2 ? "written" : "MISSING",
+                have2 ? (unsigned long long)st.size : 0ULL);
+
+        /* (3) stage2 byte-identical to the compiler that built it -- embcc.elf,
+         * itself EmbLD-linked (on the host) from the same objects. */
+        int same = have2 && vfs_files_identical(stage2, embcc);
+        kprintf("[selfhost] stage2 vs embcc.elf: %s\n", same ? "BYTE-IDENTICAL" : "DIFFER");
+
+        /* (4) stage2 is a WORKING compiler: run it to recompile one source and
+         * check the object matches the reference byte for byte. */
+        (void)vfs_unlink_path("/data/tmp/lex-s2.o");
+        char *ca[] = { (char *)stage2, (char *)"-c", (char *)"/data/src/embcc/lex/lex.c",
+                       (char *)"-I", (char *)"/data/apps/embcc/include",
+                       (char *)"-I", (char *)"/system/abi/include",
+                       (char *)"-o", (char *)"/data/tmp/lex-s2.o" };
+        int cpid  = have2 ? process_create_env(stage2, ca, 9, env, NULL, 0) : -1;
+        int ccode = cpid >= 0 ? process_wait((uint32_t)cpid) : -1;
+        int works = (ccode == 0) &&
+                    vfs_files_identical("/data/tmp/lex-s2.o", "/data/src/embcc/ref/lex.o");
+        kprintf("[selfhost] stage2 recompiled lex.c: exit=%d, object vs ref: %s\n",
+                ccode, works ? "MATCH" : "DIFFER");
+
+        int ok = (compiled == nunits) && same && works;
+        kprintf("[cmd] test embcc selfhost: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
