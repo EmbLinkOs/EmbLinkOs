@@ -200,6 +200,61 @@ static void emit_pad(emit_fn emit, void *ctx, char c, int n, int *count)
     while (n > 0) { int k = n < 16 ? n : 16; emit(ctx, b, (size_t)k); *count += k; n -= k; }
 }
 
+struct fmt_flags2 { int prec, has_prec, plus, space; };
+
+/* Floating-point conversions (%f/%e/%g). Self-contained -- IEEE-754 bit tests
+ * for the sign/nan/inf, integer+fraction split for the digits -- so pulling
+ * printf never drags in libm. Pragmatic for typical magnitudes (< ~1e18); a
+ * production formatter would use a correctly-rounded dtoa. */
+static void fmt_double(emit_fn emit, void *ctx, double v, char conv,
+                       const struct fmt_flags2 *f, int *count)
+{
+    union { double d; unsigned long long u; } b; b.d = v;
+    int neg = (int)(b.u >> 63);
+    if (neg) { v = -v; b.d = v; }
+    const char *sign = neg ? "-" : (f->plus ? "+" : (f->space ? " " : ""));
+    for (const char *s = sign; *s; s++) { emit(ctx, s, 1); (*count)++; }
+
+    if (((b.u >> 52) & 0x7ff) == 0x7ff) {                 /* nan / inf */
+        const char *s = (b.u & 0xfffffffffffffULL) ? "nan" : "inf";
+        emit(ctx, s, 3); *count += 3; return;
+    }
+    int prec = f->has_prec ? f->prec : 6;
+
+    int e10 = 0;
+    if ((conv == 'e' || conv == 'E') && v != 0.0) {       /* normalize to d.dddEsdd */
+        while (v >= 10.0) { v /= 10.0; e10++; }
+        while (v <  1.0)  { v *= 10.0; e10--; }
+    }
+
+    /* value * 10^prec, rounded, split into integer + fraction digit runs */
+    double scale = 1.0; for (int i = 0; i < prec; i++) scale *= 10.0;
+    unsigned long long ip = (unsigned long long)v;
+    double frac = v - (double)ip;
+    unsigned long long fp = (unsigned long long)(frac * scale + 0.5);
+    if (fp >= (unsigned long long)scale) { fp -= (unsigned long long)scale; ip++; }
+
+    char tmp[40]; int dl;
+    char *dg = u_to_str(ip, 10, 0, tmp, &dl);
+    emit(ctx, dg, (size_t)dl); *count += dl;
+    if (prec > 0) {
+        emit(ctx, ".", 1); (*count)++;
+        char t2[40]; int fl;
+        char *fd = u_to_str(fp, 10, 0, t2, &fl);
+        for (int z = fl; z < prec; z++) { emit(ctx, "0", 1); (*count)++; }
+        emit(ctx, fd, (size_t)fl); *count += fl;
+    }
+    if (conv == 'e' || conv == 'E') {                     /* exponent suffix */
+        char ec[8]; int p = 0;
+        ec[p++] = (conv == 'E') ? 'E' : 'e';
+        ec[p++] = (e10 < 0) ? '-' : '+';
+        int ae = e10 < 0 ? -e10 : e10;
+        ec[p++] = (char)('0' + (ae / 10) % 10);
+        ec[p++] = (char)('0' + ae % 10);
+        emit(ctx, ec, (size_t)p); *count += p;
+    }
+}
+
 static int em_vformat(emit_fn emit, void *ctx, const char *fmt, va_list ap)
 {
     int count = 0;
@@ -284,9 +339,16 @@ static int em_vformat(emit_fn emit, void *ctx, const char *fmt, va_list ap)
             prefix[prefixn++] = '0'; prefix[prefixn++] = 'x';
             break;
         }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+            /* %g routes to %f here (pragmatic); %f/%e are real. */
+            char cv = (c == 'g') ? 'f' : (c == 'G') ? 'f' : c;
+            struct fmt_flags2 ff = { f.prec, f.has_prec, f.plus, f.space };
+            fmt_double(emit, ctx, va_arg(ap, double), cv, &ff, &count);
+            continue;
+        }
         default:
-            /* Unhandled conversion (e.g. %f): echo it literally rather than
-             * printing a fabricated value. */
+            /* A conversion emlibc does not implement: echo it literally rather
+             * than printing a fabricated value. */
             emit(ctx, "%", 1); count++;
             if (c) { emit(ctx, p, 1); count++; }
             continue;

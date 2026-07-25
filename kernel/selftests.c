@@ -440,6 +440,7 @@ static void selftests_print_commands(void)
     kprintf("  test embcc selfhost\n");
     kprintf("  test embld\n");
     kprintf("  test emlibc\n");
+    kprintf("  test emlibc math\n");
     kprintf("  test emlibc caps\n");
     kprintf("  test emlibc embx\n");
     kprintf("  test embld embx\n");
@@ -1176,6 +1177,37 @@ int selftests_handle_command(const char *cmd)
         } else { kprintf("[emlibc] /data/tmp/emlibc.out missing\n"); ok = 0; }
 
         kprintf("[cmd] test emlibc: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc math") == 0) {
+        /* emlibc's <math.h>: the OS-agnostic transcendentals (§4), plus %f/%e
+         * in its printf. The emlibc-linked demo checks sqrt/sin/exp/log/pow/
+         * atan2/... against known values within 1e-6 and exits 42 iff all pass;
+         * a formatted witness (its OWN %f output) is read back from disk. */
+        const char *mp = "/data/apps/emlibc_math/emlibc_math.elf";
+        struct vfs_stat st;
+        if (vfs_stat(mp, &st) != 0) { kprintf("\n[cmd] test emlibc math: %s not on image\n", mp); return 1; }
+        (void)vfs_unlink_path("/data/tmp/math.out");
+        char *a[]   = { (char *)mp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pid  = process_create_caps(mp, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[emmath] emlibc_math exit=%d (want 42 -- all checks within 1e-6)\n", code);
+
+        int ok = (code == 42);
+        char head[96] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/math.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/math.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            kprintf("[emmath] its own %%f witness: \"%s\"\n", head);
+            /* sqrt(2) formatted to 6 places is the anchor */
+            if (memcmp(head, "sqrt2=1.414214", 14) != 0) {
+                kprintf("[emmath] float formatting/precision off\n"); ok = 0; }
+        } else { kprintf("[emmath] /data/tmp/math.out missing\n"); ok = 0; }
+
+        kprintf("[cmd] test emlibc math: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
