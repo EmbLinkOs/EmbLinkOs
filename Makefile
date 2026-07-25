@@ -461,9 +461,20 @@ EMLIBC_INC    := -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include -Iuse
 EMLIBC_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
                  -fno-stack-protector -O2 -Wall -Wextra $(EMLIBC_INC)
 
+# emlibc's math = a thin glue (emlibc_math.o) over LIFTED fdlibm (Sun's freely-
+# licensed ~1-ulp library, the source newlib's libm is built from). The fdlibm
+# tree is vendored verbatim (only its include lines adapted), so it compiles -w
+# (we do not "fix" third-party warnings) with an extra -I for its own headers.
+EMLIBC_FD_DIR  := $(EMLIBC_DIR)/math/fdlibm
+EMLIBC_FD_SRCS := $(wildcard $(EMLIBC_FD_DIR)/*.c)
+EMLIBC_FD_OBJS := $(patsubst $(EMLIBC_FD_DIR)/%.c,build/emlibc_fd_%.o,$(EMLIBC_FD_SRCS))
+EMLIBC_FD_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
+                    -O2 -w -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include \
+                    -Iuser/lib -I$(EMLIBC_FD_DIR)
+
 EMLIBC_OBJS := build/emlibc_string.o build/emlibc_stdlib.o build/emlibc_stdio.o \
                build/emlibc_syscalls.o build/emlibc_errno.o build/emlibc_process.o \
-               build/emlibc_math.o
+               build/emlibc_math.o $(EMLIBC_FD_OBJS)
 
 build/emlibc_string.o: $(EMLIBC_DIR)/string/string.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
@@ -479,6 +490,8 @@ build/emlibc_process.o: $(EMLIBC_DIR)/process/process.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_math.o: $(EMLIBC_DIR)/math/math.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_fd_%.o: $(EMLIBC_FD_DIR)/%.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_FD_CFLAGS) -c $< -o $@
 
 build/libemlibc.a: $(EMLIBC_OBJS)
 	x86_64-elf-ar rcs $@ $(EMLIBC_OBJS)
