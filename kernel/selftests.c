@@ -1230,8 +1230,12 @@ int selftests_handle_command(const char *cmd)
 
         char *env[] = { (char *)"HOME=/", NULL };
         /* non-fdlibm units live flat in /data/src/emlibc/; fdlibm in fdlibm/. */
+        /* No stdio: mathself uses the raw open/write rim, not streams, and
+         * stdlib's exit() calls emlibc_stdio_flush_all only if it's linked
+         * (WEAK ref -> 0 otherwise; EmbCC now emits the weak undefined). So a
+         * program that never touches stdio doesn't drag it in. */
         static const char *const flat[] = {
-            "crt0", "string", "stdlib", "stdio", "syscalls", "errno", "math", "mathself",
+            "crt0", "string", "stdlib", "syscalls", "errno", "math", "mathself",
         };
         static const char *const fd[] = {
             "e_acos","e_asin","e_atan2","e_cosh","e_exp","e_fmod","e_hypot","e_log",
@@ -3410,9 +3414,9 @@ int selftests_handle_command(const char *cmd)
 
         static const char *const units[] = {
             "driver/main",  "driver/util", "lex/lex",     "parse/parse",
-            "sema/sema",    "sema/type",   "ir/irgen",    "codegen/codegen",
-            "debug/dwarf",  "asm/emit",    "asm/topasm",  "cpp/predef",
-            "cpp/cpp",      "elf/write",
+            "sema/sema",    "sema/type",   "ir/irgen",    "opt/opt",
+            "codegen/codegen", "debug/dwarf", "asm/emit",  "asm/topasm",
+            "cpp/predef",   "cpp/cpp",     "elf/write",
         };
         char *env[] = { (char *)"HOME=/", NULL };
         int nunits = (int)(sizeof units / sizeof units[0]);
@@ -3512,9 +3516,9 @@ int selftests_handle_command(const char *cmd)
         /* (1) compile all 14 sources with the on-OS embcc -> /data/tmp/<base>.o */
         static const char *const units[] = {
             "driver/main",  "driver/util", "lex/lex",     "parse/parse",
-            "sema/sema",    "sema/type",   "ir/irgen",    "codegen/codegen",
-            "debug/dwarf",  "asm/emit",    "asm/topasm",  "cpp/predef",
-            "cpp/cpp",      "elf/write",
+            "sema/sema",    "sema/type",   "ir/irgen",    "opt/opt",
+            "codegen/codegen", "debug/dwarf", "asm/emit",  "asm/topasm",
+            "cpp/predef",   "cpp/cpp",     "elf/write",
         };
         int nunits = (int)(sizeof units / sizeof units[0]);
         int compiled = 0;
@@ -3547,8 +3551,9 @@ int selftests_handle_command(const char *cmd)
             (char *)"/data/tmp/codegen.o", (char *)"/data/tmp/cpp.o",
             (char *)"/data/tmp/dwarf.o",   (char *)"/data/tmp/emit.o",
             (char *)"/data/tmp/irgen.o",   (char *)"/data/tmp/lex.o",
-            (char *)"/data/tmp/main.o",    (char *)"/data/tmp/parse.o",
-            (char *)"/data/tmp/predef.o",  (char *)"/data/tmp/sema.o",
+            (char *)"/data/tmp/main.o",    (char *)"/data/tmp/opt.o",
+            (char *)"/data/tmp/parse.o",   (char *)"/data/tmp/predef.o",
+            (char *)"/data/tmp/sema.o",
             (char *)"/data/tmp/topasm.o",  (char *)"/data/tmp/type.o",
             (char *)"/data/tmp/util.o",    (char *)"/data/tmp/write.o",
             (char *)"/system/abi/libc.a",
