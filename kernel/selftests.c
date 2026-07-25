@@ -1037,6 +1037,25 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test httpdbig") == 0) {
+        /* THROUGHPUT / windowed TCP: httpd serves ONE 64 KB body on :8080 in a
+         * single write() -- net_tcp_send pipelines it across the peer's window
+         * (many segments in flight, not one-per-RTT). The host curls it and
+         * checks it received all 65536 bytes. */
+        const char *hp = "/data/apps/httpd/httpd.elf";
+        struct vfs_stat st;
+        if (vfs_stat(hp, &st) != 0) { kprintf("\n[cmd] test httpdbig: %s not on image\n", hp); return 1; }
+        char *a[]   = { (char *)hp, (char *)"8080", (char *)"1", (char *)"65536", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        kprintf("[httpdbig] serving a 64 KB body on :8080 -- curl the forwarded port...\n");
+        int p1 = process_create_caps(hp, a, 4, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_NETWORK));
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[httpdbig] server exit=%d\n", c1);
+        int ok = (c1 == 0);
+        kprintf("[cmd] test httpdbig: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test netudp") == 0) {
         /* NETWORKING M5: ring-3 UDP. udptest resolves a name by speaking DNS
          * itself over a SOCK_DGRAM socket (sendto/recvfrom) FROM USER SPACE.

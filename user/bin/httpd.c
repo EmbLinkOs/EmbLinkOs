@@ -16,8 +16,9 @@
 
 int main(int argc, char **argv)
 {
-    int port  = (argc > 1) ? atoi(argv[1]) : 8080;
-    int count = (argc > 2) ? atoi(argv[2]) : 1;
+    int port   = (argc > 1) ? atoi(argv[1]) : 8080;
+    int count  = (argc > 2) ? atoi(argv[2]) : 1;
+    int bodysz = (argc > 3) ? atoi(argv[3]) : 0;   /* >0: serve that many bytes (windowed) */
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) { printf("httpd: socket failed (%d)\n", lfd); return 2; }
@@ -31,8 +32,20 @@ int main(int argc, char **argv)
     if (listen(lfd, 4) != 0) { printf("httpd: listen failed\n"); return 4; }
     printf("httpd: listening on :%d\n", port);
 
-    const char *body =
-        "<html><body><h1>Served by EmbLinkOS</h1></body></html>\n";
+    /* The body: a small page by default, or -- to exercise the windowed sender --
+     * `bodysz` bytes of a repeating pattern sent in ONE write(), which net_tcp_send
+     * pipelines across the peer's window. */
+    static char big[65536];
+    const char *body;
+    int blen;
+    if (bodysz > 0) {
+        if (bodysz > (int)sizeof big) bodysz = sizeof big;
+        for (int i = 0; i < bodysz; i++) big[i] = (char)('A' + (i % 26));
+        body = big; blen = bodysz;
+    } else {
+        body = "<html><body><h1>Served by EmbLinkOS</h1></body></html>\n";
+        blen = (int)strlen(body);
+    }
 
     for (int i = 0; i < count; i++) {
         int cfd = accept(lfd, 0, 0);
@@ -47,14 +60,14 @@ int main(int argc, char **argv)
             printf("httpd: request: %s\n", req);
         }
 
-        char resp[256];
-        int rl = snprintf(resp, sizeof resp,
+        char hdr[160];
+        int hl = snprintf(hdr, sizeof hdr,
             "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n"
-            "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
-            (int)strlen(body), body);
-        send(cfd, resp, rl, 0);
+            "Content-Length: %d\r\nConnection: close\r\n\r\n", blen);
+        send(cfd, hdr, hl, 0);
+        send(cfd, body, blen, 0);            /* windowed if blen is large */
         close(cfd);
-        printf("httpd: served connection %d\n", i);
+        printf("httpd: served connection %d (%d body bytes)\n", i, blen);
     }
     close(lfd);
     printf("httpd: done\n");

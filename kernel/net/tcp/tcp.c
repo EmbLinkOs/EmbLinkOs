@@ -38,6 +38,7 @@ struct tcb {
     uint32_t snd_una;      /* oldest unacked seq */
     uint32_t snd_nxt;      /* next seq to send */
     uint32_t rcv_nxt;      /* next seq we expect */
+    uint32_t snd_wnd;      /* peer's advertised receive window (bytes we may keep in flight) */
     bool     peer_fin;     /* saw the peer's FIN */
     bool     reset;        /* saw RST */
     uint8_t  rxbuf[TCP_RXBUF];
@@ -146,9 +147,12 @@ void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
 
     if (flags & TCP_RST) { t->reset = true; t->state = TCP_CLOSED; return; }
 
-    /* Advance snd_una on a valid ACK (any state past SYN). */
+    /* Advance snd_una on a valid ACK, and track the peer's advertised window so
+     * the sender can keep multiple segments in flight (windowed throughput). */
     if ((flags & TCP_ACK) && SEQ_GT(ack, t->snd_una) && SEQ_LEQ(ack, t->snd_nxt))
         t->snd_una = ack;
+    if (flags & TCP_ACK)
+        t->snd_wnd = ntohs(th->window);
 
     switch (t->state) {
     case TCP_SYN_SENT:
@@ -296,26 +300,48 @@ int net_tcp_send(int conn, const void *data, uint32_t len) {
         net_unlock(); return -1;
     }
 
+    /* WINDOWED send: keep up to the peer's advertised window in flight instead of
+     * one segment per RTT. We window directly over the caller's buffer (send is
+     * synchronous, so `data` stays valid), advancing snd_una on cumulative ACKs
+     * and, on a stall, retransmitting go-back-N from snd_una. `snd_una == snd_nxt`
+     * at entry (the previous send/handshake drained), so base is snd_nxt. */
     const uint8_t *p = (const uint8_t *)data;
-    uint32_t sent = 0;
-    int failed = 0;
-    while (sent < len && !failed) {
-        uint32_t chunk = len - sent; if (chunk > TCP_MSS) chunk = TCP_MSS;
-        uint32_t seq = t->snd_nxt;
-        int acked = 0;
-        for (int r = 0; r < RETRIES && !acked; r++) {
-            tcp_seg(t, TCP_PSH | TCP_ACK, seq, p + sent, chunk);
-            if (r == 0) t->snd_nxt = seq + chunk;
-            for (int i = 0; i < SPIN_MAX; i++) {
-                if (t->reset) { failed = 1; break; }
-                if (SEQ_GEQ(t->snd_una, seq + chunk)) { acked = 1; break; }
-                net_yield();
-            }
+    uint32_t base = t->snd_nxt;
+    int failed = 0, retransmits = 0, stalls = 0;
+
+    while (!failed) {
+        if (t->snd_una - base >= len) break;            /* everything acked -> done */
+
+        /* Fill the window with back-to-back segments (the pipelining). */
+        uint32_t wnd = t->snd_wnd ? t->snd_wnd : TCP_MSS;   /* 0 -> probe with one seg */
+        for (;;) {
+            uint32_t off = t->snd_nxt - base;
+            uint32_t inflight = t->snd_nxt - t->snd_una;
+            if (off >= len || inflight >= wnd) break;
+            uint32_t chunk = len - off;
+            if (chunk > TCP_MSS) chunk = TCP_MSS;
+            if (inflight + chunk > wnd) chunk = wnd - inflight;
+            if (chunk == 0) break;
+            tcp_seg(t, TCP_PSH | TCP_ACK, t->snd_nxt, p + off, chunk);
+            t->snd_nxt += chunk;
         }
-        if (!acked) failed = 1;
-        else sent += chunk;
+
+        /* Wait for ACK progress; one net_yield drains the whole RX ring, so a
+         * burst of cumulative ACKs can advance snd_una several segments at once. */
+        uint32_t una_before = t->snd_una;
+        net_yield();
+        if (t->reset) { failed = 1; break; }
+        if (t->snd_una != una_before) {
+            stalls = 0;
+        } else if (++stalls >= SPIN_MAX) {              /* timed out with no progress */
+            if (++retransmits > RETRIES) { failed = 1; break; }
+            t->snd_nxt = t->snd_una;                    /* go-back-N: resend the window */
+            stalls = 0;
+        }
     }
-    int ret = (failed && sent == 0) ? -1 : (int)sent;
+
+    uint32_t done = t->snd_una - base;
+    int ret = (failed && done == 0) ? -1 : (int)(done < len ? done : len);
     net_unlock();
     return ret;
 }
