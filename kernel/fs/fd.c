@@ -1019,6 +1019,38 @@ int fd_socket_connect(struct process *p, int fd, uint32_t ip_host, uint16_t port
     return EMBK_OK;
 }
 
+int fd_socket_bind(struct process *p, int fd, uint16_t port) {
+    if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry *e = &p->fds[fd - FD_BASE];
+    if (!e->used || e->backing != FD_BACKING_SOCKET) return -EMBK_EBADF;
+    e->u.sock.bind_port = port;
+    return EMBK_OK;
+}
+
+int fd_socket_listen(struct process *p, int fd) {
+    if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry *e = &p->fds[fd - FD_BASE];
+    if (!e->used || e->backing != FD_BACKING_SOCKET) return -EMBK_EBADF;
+    if (e->u.sock.bind_port == 0) return -EMBK_EINVAL;      /* bind() first */
+    int lc = net_tcp_listen(e->u.sock.bind_port);
+    if (lc < 0) return -EMBK_EMFILE;
+    e->u.sock.conn = lc;                                    /* fd now backs the listener */
+    return EMBK_OK;
+}
+
+int fd_socket_accept(struct process *p, int fd) {
+    if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry *le = &p->fds[fd - FD_BASE];
+    if (!le->used || le->backing != FD_BACKING_SOCKET || le->u.sock.conn < 0) return -EMBK_EBADF;
+    /* net_tcp_accept blocks (polls) -- do NOT hold fdlock across it. */
+    int child = net_tcp_accept(le->u.sock.conn);
+    if (child < 0) return -EMBK_EIO;
+    int nfd = fd_alloc_socket(p);                          /* a fresh fd for the connection */
+    if (nfd < 0) { net_tcp_abort(child); return nfd; }
+    p->fds[nfd - FD_BASE].u.sock.conn = child;
+    return nfd;
+}
+
 int vfs_fd_run_selftests(void)
 {
     const char *path = "/fd_selftest.tmp";

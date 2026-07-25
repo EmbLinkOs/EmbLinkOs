@@ -1553,6 +1553,24 @@ static int64_t sys_net_resolve(struct regs *r) {
     return 0;
 }
 
+/* Server side: bind a local port, listen, and accept (returns a NEW socket fd
+ * for the connection). All CAP_NETWORK-gated, same as the client calls. */
+static int64_t sys_net_bind(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    return fd_socket_bind(current_process, (int)r->rdi, (uint16_t)r->rsi);
+}
+static int64_t sys_net_listen(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    return fd_socket_listen(current_process, (int)r->rdi);   /* r->rsi = backlog, ignored */
+}
+static int64_t sys_net_accept(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    return fd_socket_accept(current_process, (int)r->rdi);
+}
+
 /* --- The table: index = syscall number --- */
 typedef int64_t (*syscall_handler_t)(struct regs *);
 
@@ -1637,6 +1655,9 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_net_socket     76
 #define SYS_net_connect    77
 #define SYS_net_resolve    78
+#define SYS_net_bind       79
+#define SYS_net_listen     80
+#define SYS_net_accept     81
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1711,6 +1732,9 @@ static syscall_handler_t syscall_table[] = {
     [SYS_net_socket]     = sys_net_socket,
     [SYS_net_connect]    = sys_net_connect,
     [SYS_net_resolve]    = sys_net_resolve,
+    [SYS_net_bind]       = sys_net_bind,
+    [SYS_net_listen]     = sys_net_listen,
+    [SYS_net_accept]     = sys_net_accept,
     [SYS_debug_attach]   = sys_debug_attach,
     [SYS_debug_wait]     = sys_debug_wait,
     [SYS_debug_cont]     = sys_debug_cont,

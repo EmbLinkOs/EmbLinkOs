@@ -280,6 +280,16 @@ static inline int embk_net_resolve(const char *name, unsigned int *out_ip) {
     return (int)embk_syscall2(EMBK_SYS_net_resolve,
                               (int64_t)(long)name, (int64_t)(long)out_ip);
 }
+/* Server side: bind a local port, listen, accept (returns a new socket fd). */
+static inline int embk_net_bind(int fd, unsigned short port) {
+    return (int)embk_syscall2(EMBK_SYS_net_bind, fd, (int64_t)port);
+}
+static inline int embk_net_listen(int fd, int backlog) {
+    return (int)embk_syscall2(EMBK_SYS_net_listen, fd, backlog);
+}
+static inline int embk_net_accept(int fd) {
+    return (int)embk_syscall1(EMBK_SYS_net_accept, fd);
+}
 
 /* Fill `a` as a SET_CAPS action requesting `cap_mask` for the child. Add it to
  * the actions array you pass to embk_spawn; the kernel enforces the mask is a

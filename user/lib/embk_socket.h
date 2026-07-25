@@ -52,6 +52,25 @@ static inline long recv(int fd, void *buf, unsigned long n, int flags) {
     (void)flags; return read(fd, buf, (size_t)n);
 }
 
+/* Server side. accept() returns a NEW fd for the connection; the peer address
+ * is not reported (M5) -- if `addr` is given, its port/addr are zeroed. */
+static inline int bind(int fd, const struct sockaddr *addr, unsigned len) {
+    (void)len;
+    const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+    return embk_net_bind(fd, ntohs(in->sin_port));
+}
+static inline int listen(int fd, int backlog) {
+    return embk_net_listen(fd, backlog);
+}
+static inline int accept(int fd, struct sockaddr *addr, unsigned *len) {
+    if (addr && len && *len >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *in = (struct sockaddr_in *)addr;
+        memset(in, 0, sizeof(*in)); in->sin_family = AF_INET;
+        *len = sizeof(*in);
+    }
+    return embk_net_accept(fd);
+}
+
 /* Resolve a hostname to a network-order in_addr (a gethostbyname in miniature). */
 static inline int emb_resolve(const char *name, struct in_addr *out) {
     unsigned int ip_host = 0;

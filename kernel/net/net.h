@@ -172,6 +172,8 @@ bool net_ping(uint32_t dst_ip);
  * while it waits -- consistent with the rest of the synchronous stack. Returns
  * a small connection index (>= 0) or -1. Not the ring-3 surface (that is M4). */
 int  net_tcp_connect(uint32_t dst_ip, uint16_t dst_port);   /* active open, blocks to ESTABLISHED */
+int  net_tcp_listen(uint16_t port);                         /* passive open -> a listen conn index */
+int  net_tcp_accept(int listen_conn);                       /* block for a client -> its conn index */
 int  net_tcp_send(int conn, const void *data, uint32_t len);/* send + wait for ACK */
 int  net_tcp_recv(int conn, void *buf, uint32_t cap);       /* bytes, or 0 at peer FIN/EOF */
 void net_tcp_close(int conn);                               /* FIN handshake, then free */

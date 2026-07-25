@@ -104,6 +104,9 @@
 #define EMBK_SYS_net_socket     76
 #define EMBK_SYS_net_connect    77
 #define EMBK_SYS_net_resolve    78
+#define EMBK_SYS_net_bind       79
+#define EMBK_SYS_net_listen     80
+#define EMBK_SYS_net_accept     81
 
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back

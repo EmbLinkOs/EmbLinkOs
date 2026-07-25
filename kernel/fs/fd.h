@@ -112,7 +112,7 @@ struct fd_entry {
     union {
         struct { struct vnode vn; uint64_t pos; } file;  /**< FD_BACKING_VNODE */
         struct { struct pipe *p; int side; } pipe;       /**< FD_BACKING_PIPE (side: 0=read, 1=write) */
-        struct { int conn; } sock;                       /**< FD_BACKING_SOCKET (TCP conn index; -1 until connect) */
+        struct { int conn; uint16_t bind_port; } sock;   /**< FD_BACKING_SOCKET (conn: TCP index, -1 until connect/listen; bind_port for a server) */
         /* FD_BACKING_CONSOLE is stateless -- no arm needed. */
     } u;
 };
@@ -151,6 +151,13 @@ int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int s
  * fd internals (like pipe's) are private to fd.c. */
 int fd_alloc_socket(struct process *p);
 int fd_socket_connect(struct process *p, int fd, uint32_t ip_host, uint16_t port);
+
+/* Server side: bind records the local port on the socket; listen puts it into
+ * TCP LISTEN; accept blocks for a client and installs the new connection onto a
+ * fresh fd in `p`, returning that fd (the classic BSD accept). */
+int fd_socket_bind(struct process *p, int fd, uint16_t port);
+int fd_socket_listen(struct process *p, int fd);
+int fd_socket_accept(struct process *p, int fd);
 
 /* Give a new process its stdin/stdout/stderr (fds 0/1/2): inherit from the
  * spawning parent per-backing, or default to the console. process_create()

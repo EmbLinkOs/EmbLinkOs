@@ -996,6 +996,25 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test httpd") == 0) {
+        /* NETWORKING M5: the OS as a SERVER. Spawn httpd (bind/listen/accept,
+         * CAP_NETWORK) to serve ONE connection on :8080, then block until it
+         * exits. A client -- the host, via SLIRP hostfwd tcp::5599-:8080 --
+         * connects and gets the page; httpd serves it and exits 0. */
+        const char *hp = "/data/apps/httpd/httpd.elf";
+        struct vfs_stat st;
+        if (vfs_stat(hp, &st) != 0) { kprintf("\n[cmd] test httpd: %s not on image\n", hp); return 1; }
+        char *a[]   = { (char *)hp, (char *)"8080", (char *)"1", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        kprintf("[httpd] spawning server on :8080 -- curl the forwarded host port now...\n");
+        int p1 = process_create_caps(hp, a, 3, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_NETWORK));
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[httpd] server exit=%d (0 = served a connection)\n", c1);
+        int ok = (c1 == 0);
+        kprintf("[cmd] test httpd: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test capgate") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
         const char *gp = "/data/apps/capgpu/capgpu.elf";

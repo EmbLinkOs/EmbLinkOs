@@ -21,11 +21,13 @@
 #define TCP_MSS     1400       /* conservative; avoids IP fragmentation */
 #define SPIN_MAX    600000     /* poll iterations before a retransmit/timeout */
 #define RETRIES     6
+#define TCP_ACCEPT_MAX 8       /* pending established conns a LISTEN queues */
 
 enum tcp_state {
     TCP_CLOSED = 0, TCP_SYN_SENT, TCP_ESTABLISHED,
     TCP_FIN_WAIT_1, TCP_FIN_WAIT_2, TCP_CLOSING,
     TCP_CLOSE_WAIT, TCP_LAST_ACK, TCP_TIME_WAIT,
+    TCP_LISTEN, TCP_SYN_RECEIVED,          /* server side (passive open) */
 };
 
 struct tcb {
@@ -40,6 +42,11 @@ struct tcb {
     bool     reset;        /* saw RST */
     uint8_t  rxbuf[TCP_RXBUF];
     uint32_t rx_len;
+    /* server side: a LISTEN tcb queues established children here; a child points
+     * back at its listener so it can enqueue itself on the final ACK. */
+    int      accept_q[TCP_ACCEPT_MAX];
+    int      accept_n;
+    int      parent_listener;   /* child: index of its LISTEN tcb; else -1 */
 };
 
 static struct tcb tcbs[TCP_CONNS];
@@ -53,11 +60,44 @@ static struct tcb tcbs[TCP_CONNS];
 static struct tcb *tcb_find(uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) {
     for (int i = 0; i < TCP_CONNS; i++) {
         struct tcb *t = &tcbs[i];
-        if (t->in_use && t->local_port == local_port &&
+        if (t->in_use && t->state != TCP_LISTEN && t->local_port == local_port &&
             t->remote_ip == remote_ip && t->remote_port == remote_port)
             return t;
     }
     return 0;
+}
+
+static int tcp_seg(struct tcb *t, uint8_t flags, uint32_t seq,
+                   const uint8_t *data, uint32_t len);   /* defined below */
+
+/* A LISTEN tcb bound to `local_port` (server side, passive open). */
+static struct tcb *tcb_find_listener(uint16_t local_port) {
+    for (int i = 0; i < TCP_CONNS; i++)
+        if (tcbs[i].in_use && tcbs[i].state == TCP_LISTEN && tcbs[i].local_port == local_port)
+            return &tcbs[i];
+    return 0;
+}
+
+/* An incoming SYN reached a listener: spin up a child connection in
+ * SYN_RECEIVED and answer with SYN-ACK. The child enqueues itself on the
+ * listener's accept queue once the final ACK completes the handshake. */
+static void tcp_accept_syn(struct tcb *lis, uint32_t src_ip, uint16_t sport, uint32_t syn_seq) {
+    static uint32_t srv_isn = 0x50000000u;
+    int idx = -1;
+    for (int i = 0; i < TCP_CONNS; i++) if (!tcbs[i].in_use) { idx = i; break; }
+    if (idx < 0) return;                          /* no room -- client resends its SYN */
+    struct tcb *t = &tcbs[idx];
+    memset(t, 0, sizeof(*t));
+    t->in_use = true;
+    t->local_ip = g_netif.ip;   t->local_port = lis->local_port;
+    t->remote_ip = src_ip;      t->remote_port = sport;
+    t->rcv_nxt = syn_seq + 1;                     /* SYN consumes one seq */
+    srv_isn += 0x7C31;
+    t->snd_una = t->snd_nxt = srv_isn;
+    t->state = TCP_SYN_RECEIVED;
+    t->parent_listener = (int)(lis - tcbs);
+    tcp_seg(t, TCP_SYN | TCP_ACK, t->snd_una, 0, 0);
+    t->snd_nxt = t->snd_una + 1;                  /* our SYN consumes one seq */
 }
 
 /* Send one segment carrying `flags` and `len` data bytes at sequence `seq`. A
@@ -94,7 +134,15 @@ void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
     uint32_t datalen = seg_len - doff;
 
     struct tcb *t = tcb_find(dport, src_ip, sport);
-    if (!t) return;                       /* no such connection (M3: active opens only) */
+    if (!t) {
+        /* No established/handshaking connection for this 4-tuple. A bare SYN may
+         * be a new client arriving at one of our listeners (passive open). */
+        if ((flags & (TCP_SYN | TCP_ACK)) == TCP_SYN) {
+            struct tcb *lis = tcb_find_listener(dport);
+            if (lis) tcp_accept_syn(lis, src_ip, sport, seq);
+        }
+        return;
+    }
 
     if (flags & TCP_RST) { t->reset = true; t->state = TCP_CLOSED; return; }
 
@@ -112,6 +160,18 @@ void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
         }
         return;
 
+    case TCP_SYN_RECEIVED:
+        /* The client's ACK completes the passive handshake -> ESTABLISHED, and
+         * the connection joins its listener's accept queue. */
+        if (!((flags & TCP_ACK) && ack == t->snd_nxt)) return;
+        t->state = TCP_ESTABLISHED;
+        if (t->parent_listener >= 0) {
+            struct tcb *lis = &tcbs[t->parent_listener];
+            if (lis->in_use && lis->state == TCP_LISTEN && lis->accept_n < TCP_ACCEPT_MAX)
+                lis->accept_q[lis->accept_n++] = (int)(t - tcbs);
+        }
+        /* fall through: this same segment may already carry request bytes. */
+        /* fall through */
     case TCP_ESTABLISHED:
     case TCP_FIN_WAIT_1:
     case TCP_FIN_WAIT_2:
@@ -186,6 +246,48 @@ int net_tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     if (rc < 0) t->in_use = false;
     net_unlock();
     return rc;
+}
+
+/* Passive open: put a TCB into LISTEN on `port`. Returns the listen conn index
+ * (a "listening socket") or -1. Non-blocking. */
+int net_tcp_listen(uint16_t port) {
+    net_lock();
+    int idx = -1;
+    for (int i = 0; i < TCP_CONNS; i++) if (!tcbs[i].in_use) { idx = i; break; }
+    if (idx < 0) { net_unlock(); return -1; }
+    struct tcb *t = &tcbs[idx];
+    memset(t, 0, sizeof(*t));
+    t->in_use = true;
+    t->state = TCP_LISTEN;
+    t->local_ip = g_netif.ip;
+    t->local_port = port;
+    t->parent_listener = -1;
+    net_unlock();
+    return idx;
+}
+
+/* Block until a connection has completed its handshake on this listener, then
+ * hand back its conn index (an ESTABLISHED connection ready to read/write).
+ * Returns -1 on a bad listener or if none arrived within the bound. */
+int net_tcp_accept(int listen_conn) {
+    if (listen_conn < 0 || listen_conn >= TCP_CONNS) return -1;
+    net_lock();
+    struct tcb *lis = &tcbs[listen_conn];
+    if (!lis->in_use || lis->state != TCP_LISTEN) { net_unlock(); return -1; }
+
+    int child = -1;
+    for (int i = 0; i < SPIN_MAX && child < 0; i++) {
+        if (lis->accept_n > 0) {
+            child = lis->accept_q[0];
+            for (int j = 1; j < lis->accept_n; j++) lis->accept_q[j - 1] = lis->accept_q[j];
+            lis->accept_n--;
+            break;
+        }
+        virtio_net_poll();
+        schedule();
+    }
+    net_unlock();
+    return child;
 }
 
 int net_tcp_send(int conn, const void *data, uint32_t len) {
