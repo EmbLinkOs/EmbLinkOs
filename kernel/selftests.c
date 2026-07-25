@@ -441,6 +441,7 @@ static void selftests_print_commands(void)
     kprintf("  test embld\n");
     kprintf("  test emlibc\n");
     kprintf("  test emlibc caps\n");
+    kprintf("  test emlibc embx\n");
     kprintf("  test embcc asm\n");
     kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
@@ -1208,6 +1209,49 @@ int selftests_handle_command(const char *cmd)
         } else { kprintf("[emcaps] /data/tmp/emcaps.out missing\n"); ok = 0; }
 
         kprintf("[cmd] test emlibc caps: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc embx") == 0) {
+        /* THE CONVERGENCE: an emlibc program, linked by EmbLD into a NATIVE
+         * EMBX that DECLARES {FILESYSTEM} in its capability table, loaded by the
+         * kernel's EMBX loader. The whole owned stack in one artifact -- emlibc
+         * (libc) + EmbLD (EMBX emitter) + EMBX (format) + the loader.
+         *
+         * The capability comes from the BINARY, not the spawn call: the grantor
+         * here holds FILESYSTEM|NETWORK, but the process is born with EXACTLY
+         * its DECLARED {FILESYSTEM} -- it does NOT get NETWORK even though the
+         * grantor had it, because EMBX grants the declared set, never the
+         * grantor's. (The refusal path -- declared NOT a subset of the grantor
+         * -- is exercised by `test embx` with capchild.embx.) */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test emlibc embx: VFS not registered\n"); return 1; }
+        const char *xp = "/data/apps/emlibc_embxapp/emlibc_embxapp.embx";
+        struct vfs_stat st;
+        if (vfs_stat(xp, &st) != 0) {
+            kprintf("\n[cmd] test emlibc embx: %s not on image "
+                    "(build with EMBCC_ROOT's embld)\n", xp); return 1; }
+        char *a[]   = { (char *)xp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+
+        (void)vfs_unlink_path("/data/tmp/embxapp.out");
+        uint64_t grantor = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid  = process_create_caps(xp, a, 1, env, NULL, 0, grantor);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embx] native EMBX loaded; grantor=fs+net -> exit=%d (want 42)\n", code);
+
+        int ok = (code == 42);
+        char head[64] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/embxapp.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/embxapp.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            kprintf("[embx] the EMBX process reports: \"%s\"\n", head);
+            /* born with the DECLARED set only: filesystem yes, network withheld */
+            if (memcmp(head, "embx: born caps=0x2 fs=1 net=0", 30) != 0) {
+                kprintf("[embx] born set != declared {filesystem}\n"); ok = 0; }
+        } else { kprintf("[embx] /data/tmp/embxapp.out missing\n"); ok = 0; }
+
+        kprintf("[cmd] test emlibc embx: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

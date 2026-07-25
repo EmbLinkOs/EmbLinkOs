@@ -843,6 +843,15 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"data/apps/capchildx/capchild.embx",
                         L.DT_REG, L.S_IFREG | L.PERM_FILE, cx))
 
+    # The emlibc convergence artifact: an emlibc program linked by EmbLD into a
+    # NATIVE EMBX declaring {FILESYSTEM}. Present only when the host embld built
+    # it (EMBCC_ROOT); absent otherwise, never faked. `test emlibc embx` loads
+    # it and checks the process is born with exactly its DECLARED capability.
+    ex = _read_file("build/emlibc_embxapp.embx")
+    if ex is not None:
+        objects.append((b"data/apps/emlibc_embxapp/emlibc_embxapp.embx",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, ex))
+
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the
     # quote-includes ("sval/sval.h", "value/value.h") resolve with a single
