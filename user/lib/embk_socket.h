@@ -14,7 +14,9 @@
 
 #define AF_INET      2
 #define SOCK_STREAM  1
+#define SOCK_DGRAM   2
 #define IPPROTO_TCP  6
+#define IPPROTO_UDP  17
 #define INADDR_ANY   0u
 
 typedef uint32_t in_addr_t;
@@ -37,8 +39,8 @@ static inline uint32_t htonl(uint32_t v) {
 static inline uint32_t ntohl(uint32_t v) { return htonl(v); }
 
 static inline int socket(int family, int type, int proto) {
-    (void)family; (void)type; (void)proto;       /* TCP stream is all M4 offers */
-    return embk_net_socket();
+    (void)family; (void)proto;                    /* SOCK_STREAM (TCP) or SOCK_DGRAM (UDP) */
+    return embk_net_socket(type);
 }
 static inline int connect(int fd, const struct sockaddr *addr, unsigned len) {
     (void)len;
@@ -69,6 +71,27 @@ static inline int accept(int fd, struct sockaddr *addr, unsigned *len) {
         *len = sizeof(*in);
     }
     return embk_net_accept(fd);
+}
+
+/* UDP datagrams (SOCK_DGRAM). */
+static inline long sendto(int fd, const void *buf, unsigned long len, int flags,
+                          const struct sockaddr *dest, unsigned addrlen) {
+    (void)flags; (void)addrlen;
+    const struct sockaddr_in *in = (const struct sockaddr_in *)dest;
+    return embk_net_sendto(fd, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port), buf, len);
+}
+static inline long recvfrom(int fd, void *buf, unsigned long len, int flags,
+                            struct sockaddr *src, unsigned *addrlen) {
+    (void)flags;
+    unsigned int ip = 0; unsigned short port = 0;
+    int n = embk_net_recvfrom(fd, buf, len, &ip, &port);
+    if (n >= 0 && src && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *in = (struct sockaddr_in *)src;
+        memset(in, 0, sizeof(*in));
+        in->sin_family = AF_INET; in->sin_port = htons(port); in->sin_addr.s_addr = htonl(ip);
+        *addrlen = sizeof(*in);
+    }
+    return n;
 }
 
 /* Resolve a hostname to a network-order in_addr (a gethostbyname in miniature). */

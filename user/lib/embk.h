@@ -270,8 +270,8 @@ static inline unsigned long embk_getcaps(void) {
  * Gated on EMBK_CAP_NETWORK. A socket is a REAL fd, so read()/write()/close()
  * work on it directly (which is what the BSD sockets shim in <embk_socket.h>
  * maps onto for ports). IPs are HOST order: 10.0.2.15 == 0x0A00020F. */
-static inline int embk_net_socket(void) {          /* -> fd, or -errno */
-    return (int)embk_syscall0(EMBK_SYS_net_socket);
+static inline int embk_net_socket(int type) {      /* type: 1=stream(TCP) 2=dgram(UDP); -> fd */
+    return (int)embk_syscall1(EMBK_SYS_net_socket, type);
 }
 static inline int embk_net_connect(int fd, unsigned int ip_host, unsigned short port) {
     return (int)embk_syscall3(EMBK_SYS_net_connect, fd, (int64_t)ip_host, (int64_t)port);
@@ -289,6 +289,17 @@ static inline int embk_net_listen(int fd, int backlog) {
 }
 static inline int embk_net_accept(int fd) {
     return (int)embk_syscall1(EMBK_SYS_net_accept, fd);
+}
+/* UDP datagrams. sendto: ip HOST order. recvfrom: out_ip/out_port may be 0. */
+static inline int embk_net_sendto(int fd, unsigned int ip_host, unsigned short port,
+                                  const void *data, unsigned long len) {
+    return (int)embk_syscall5(EMBK_SYS_net_sendto, fd, (int64_t)ip_host, (int64_t)port,
+                              (int64_t)(long)data, (int64_t)len);
+}
+static inline int embk_net_recvfrom(int fd, void *buf, unsigned long cap,
+                                    unsigned int *out_ip, unsigned short *out_port) {
+    return (int)embk_syscall5(EMBK_SYS_net_recvfrom, fd, (int64_t)(long)buf, (int64_t)cap,
+                              (int64_t)(long)out_ip, (int64_t)(long)out_port);
 }
 
 /* Fill `a` as a SET_CAPS action requesting `cap_mask` for the child. Add it to

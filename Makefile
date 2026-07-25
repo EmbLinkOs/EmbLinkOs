@@ -431,6 +431,13 @@ build/httpd.o: user/bin/httpd.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD
 build/httpd.elf: build/crt0.o build/syscalls.o build/httpd.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpd.o -lc -lgcc -o $@
 
+# udptest -- the M5 ring-3 UDP witness: a userspace DNS resolver over a
+# SOCK_DGRAM socket (sendto/recvfrom). Auto-discovered by mkfs.
+build/udptest.o: user/bin/udptest.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/udptest.elf: build/crt0.o build/syscalls.o build/udptest.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/udptest.o -lc -lgcc -o $@
+
 build/capspawn.o: user/bin/capspawn.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capspawn.elf: build/crt0.o build/syscalls.o build/capspawn.o user/lib/newlib.ld
@@ -603,7 +610,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -768,7 +775,7 @@ endif
 
 EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)

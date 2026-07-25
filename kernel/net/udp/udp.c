@@ -34,6 +34,24 @@ static volatile struct {
     volatile bool got;
 } g_udp;
 
+/* ---- ring-3 UDP sockets -------------------------------------------------
+ * Per-socket bound port + a small receive queue. The single-slot capture above
+ * stays for the kernel's own DHCP/DNS; a bound ring-3 socket takes precedence in
+ * the demux. Every public entry takes the big net lock (owner-recursive), so the
+ * table is SMP-safe like the rest of the stack. */
+#define UDP_SOCKS     8
+#define UDP_QUEUE     4
+#define UDP_DGRAM_MAX 1472       /* 1500 MTU - 20 IP - 8 UDP */
+
+struct udp_dgram { uint32_t src_ip; uint16_t src_port; uint16_t len; uint8_t data[UDP_DGRAM_MAX]; };
+struct udp_sock {
+    bool in_use;
+    uint16_t port;               /* bound local port (0 = unbound) */
+    struct udp_dgram q[UDP_QUEUE];
+    int q_head, q_n;
+};
+static struct udp_sock udp_socks[UDP_SOCKS];
+
 void udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
     if (seg_len < sizeof(struct udp_hdr)) return;
     const struct udp_hdr *u = (const struct udp_hdr *)seg;
@@ -41,13 +59,107 @@ void udp_input(uint32_t src_ip, const uint8_t *seg, uint32_t seg_len) {
     if (dlen < sizeof(*u) || dlen > seg_len) dlen = seg_len;
     const uint8_t *data = seg + sizeof(*u);
     uint32_t datalen = dlen - sizeof(*u);
-    if (g_udp.armed && !g_udp.got && ntohs(u->dst_port) == g_udp.port) {
+    uint16_t dport = ntohs(u->dst_port);
+
+    /* Ring-3 bound sockets first. (Runs under net_lock via net_rx.) */
+    for (int i = 0; i < UDP_SOCKS; i++) {
+        struct udp_sock *s = &udp_socks[i];
+        if (s->in_use && s->port == dport) {
+            if (s->q_n < UDP_QUEUE) {                /* else drop -- UDP is lossy */
+                struct udp_dgram *d = &s->q[(s->q_head + s->q_n) % UDP_QUEUE];
+                uint32_t k = datalen < UDP_DGRAM_MAX ? datalen : UDP_DGRAM_MAX;
+                memcpy(d->data, data, k);
+                d->len = (uint16_t)k; d->src_ip = src_ip; d->src_port = ntohs(u->src_port);
+                s->q_n++;
+            }
+            return;
+        }
+    }
+
+    /* Else the kernel single-slot capture (DHCP/DNS). */
+    if (g_udp.armed && !g_udp.got && dport == g_udp.port) {
         uint32_t k = datalen < UDP_CAP_MAX ? datalen : UDP_CAP_MAX;
         memcpy((void *)g_udp.buf, data, k);
         g_udp.len = k;
         g_udp.from_ip = src_ip;
         g_udp.got = true;
     }
+}
+
+int net_udp_open(void) {
+    net_lock();
+    int idx = -1;
+    for (int i = 0; i < UDP_SOCKS; i++) if (!udp_socks[i].in_use) { idx = i; break; }
+    if (idx >= 0) { memset(&udp_socks[idx], 0, sizeof(udp_socks[idx])); udp_socks[idx].in_use = true; }
+    net_unlock();
+    return idx;
+}
+
+int net_udp_bind(int us, uint16_t port) {
+    if (us < 0 || us >= UDP_SOCKS) return -1;
+    net_lock();
+    int rc = -1;
+    if (udp_socks[us].in_use) {
+        bool taken = false;
+        for (int i = 0; i < UDP_SOCKS; i++)
+            if (i != us && udp_socks[i].in_use && port != 0 && udp_socks[i].port == port) taken = true;
+        if (!taken) { udp_socks[us].port = port; rc = 0; }
+    }
+    net_unlock();
+    return rc;
+}
+
+int net_udp_sendto(int us, uint32_t dst_ip, uint16_t dst_port, const void *data, uint32_t len) {
+    if (us < 0 || us >= UDP_SOCKS) return -1;
+    net_lock();
+    int rc = -1;
+    if (udp_socks[us].in_use) {
+        if (udp_socks[us].port == 0) {               /* auto-assign an ephemeral source port */
+            static uint16_t eph = 49152;
+            udp_socks[us].port = eph++; if (eph == 0) eph = 49152;
+        }
+        rc = net_send_udp(g_netif.ip, udp_socks[us].port, dst_ip, dst_port, data, len);
+    }
+    net_unlock();
+    return rc;
+}
+
+int net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t *src_port) {
+    if (us < 0 || us >= UDP_SOCKS) return -1;
+    net_lock();
+    if (!udp_socks[us].in_use) { net_unlock(); return -1; }
+    struct udp_sock *s = &udp_socks[us];
+    int got = -1;
+    for (int i = 0; i < 400000; i++) {
+        if (s->q_n > 0) {
+            struct udp_dgram *d = &s->q[s->q_head];
+            uint32_t k = d->len < cap ? d->len : cap;
+            memcpy(buf, d->data, k);
+            if (src_ip)   *src_ip = d->src_ip;
+            if (src_port) *src_port = d->src_port;
+            s->q_head = (s->q_head + 1) % UDP_QUEUE;
+            s->q_n--;
+            got = (int)k;
+            break;
+        }
+        virtio_net_poll();
+        schedule();
+    }
+    net_unlock();
+    return got;
+}
+
+void net_udp_close(int us) {
+    if (us < 0 || us >= UDP_SOCKS) return;
+    net_lock();
+    udp_socks[us].in_use = false;
+    net_unlock();
+}
+
+/* Lock-free free for the fd reap path (under g_sched_lock; a single bool write). */
+void net_udp_abort(int us) {
+    if (us < 0 || us >= UDP_SOCKS) return;
+    udp_socks[us].in_use = false;
 }
 
 void udp_arm(uint16_t port) {

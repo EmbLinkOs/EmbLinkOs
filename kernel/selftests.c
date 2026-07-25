@@ -1015,6 +1015,31 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test netudp") == 0) {
+        /* NETWORKING M5: ring-3 UDP. udptest resolves a name by speaking DNS
+         * itself over a SOCK_DGRAM socket (sendto/recvfrom) FROM USER SPACE.
+         * With CAP_NETWORK it exits 0; without it, socket() is refused -> !=0. */
+        const char *up = "/data/apps/udptest/udptest.elf";
+        struct vfs_stat st;
+        if (vfs_stat(up, &st) != 0) { kprintf("\n[cmd] test netudp: %s not on image\n", up); return 1; }
+        char *a[]   = { (char *)up, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int ok = 1;
+
+        int p1 = process_create_caps(up, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_NETWORK));
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[netudp] with NETWORK cap: udptest exit=%d (0 = resolved over UDP)\n", c1);
+        if (c1 != 0) { kprintf("[netudp] FAIL: ring-3 UDP DNS did not resolve\n"); ok = 0; }
+
+        int p2 = process_create_caps(up, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        kprintf("[netudp] no NETWORK cap:   udptest exit=%d (!=0 = refused)\n", c2);
+        if (c2 == 0) { kprintf("[netudp] FAIL: a process WITHOUT NETWORK sent UDP\n"); ok = 0; }
+
+        kprintf("[cmd] test netudp: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test capgate") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
         const char *gp = "/data/apps/capgpu/capgpu.elf";

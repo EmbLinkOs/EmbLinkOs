@@ -1528,9 +1528,10 @@ static int64_t sys_getcaps(struct regs *r) {
  * a socket fd, read/write are scoped to it (the same open-vs-read/write rule
  * the filesystem gate uses). IPs cross the boundary in HOST order. */
 static int64_t sys_net_socket(struct regs *r) {
-    (void)r;
     int cg = cap_gate(EMBK_CAP_NETWORK);
     if (cg) return cg;
+    /* type: 2 = SOCK_DGRAM (UDP); anything else = SOCK_STREAM (TCP). */
+    if ((int)r->rdi == 2) return fd_alloc_udp(current_process);
     return fd_alloc_socket(current_process);
 }
 
@@ -1569,6 +1570,32 @@ static int64_t sys_net_accept(struct regs *r) {
     int cg = cap_gate(EMBK_CAP_NETWORK);
     if (cg) return cg;
     return fd_socket_accept(current_process, (int)r->rdi);
+}
+
+/* UDP datagram send/receive over a SOCK_DGRAM fd. Payloads bounce through a
+ * kernel buffer (<= one datagram); recvfrom optionally reports the source. */
+static int64_t sys_net_sendto(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    uint32_t len = (uint32_t)r->r8;
+    if (len > 1472) len = 1472;
+    uint8_t kbuf[1472];
+    if (len && copy_from_user(kbuf, (const void *)r->r10, len) != EMBK_OK) return -EMBK_EFAULT;
+    return fd_udp_sendto(current_process, (int)r->rdi, (uint32_t)r->rsi, (uint16_t)r->rdx, kbuf, len);
+}
+static int64_t sys_net_recvfrom(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    uint32_t cap = (uint32_t)r->rdx;
+    if (cap > 1472) cap = 1472;
+    uint8_t kbuf[1472];
+    uint32_t src_ip = 0; uint16_t src_port = 0;
+    int n = fd_udp_recvfrom(current_process, (int)r->rdi, kbuf, cap, &src_ip, &src_port);
+    if (n < 0) return n;
+    if (n && copy_to_user((void *)r->rsi, kbuf, (size_t)n) != EMBK_OK) return -EMBK_EFAULT;
+    if (r->r10 && copy_to_user((void *)r->r10, &src_ip, sizeof(src_ip)) != EMBK_OK) return -EMBK_EFAULT;
+    if (r->r8  && copy_to_user((void *)r->r8, &src_port, sizeof(src_port)) != EMBK_OK) return -EMBK_EFAULT;
+    return n;
 }
 
 /* --- The table: index = syscall number --- */
@@ -1658,6 +1685,8 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_net_bind       79
 #define SYS_net_listen     80
 #define SYS_net_accept     81
+#define SYS_net_sendto     82
+#define SYS_net_recvfrom   83
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1735,6 +1764,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_net_bind]       = sys_net_bind,
     [SYS_net_listen]     = sys_net_listen,
     [SYS_net_accept]     = sys_net_accept,
+    [SYS_net_sendto]     = sys_net_sendto,
+    [SYS_net_recvfrom]   = sys_net_recvfrom,
     [SYS_debug_attach]   = sys_debug_attach,
     [SYS_debug_wait]     = sys_debug_wait,
     [SYS_debug_cont]     = sys_debug_cont,

@@ -179,6 +179,15 @@ int  net_tcp_recv(int conn, void *buf, uint32_t cap);       /* bytes, or 0 at pe
 void net_tcp_close(int conn);                               /* FIN handshake, then free */
 void net_tcp_abort(int conn);                               /* free the TCB WITHOUT blocking (reap path) */
 
+/* Ring-3 UDP sockets (M5): a datagram socket with a bound local port and a small
+ * receive queue. Returns a socket index (>= 0) or -1. Under the big net lock. */
+int  net_udp_open(void);
+int  net_udp_bind(int us, uint16_t port);
+int  net_udp_sendto(int us, uint32_t dst_ip, uint16_t dst_port, const void *data, uint32_t len);
+int  net_udp_recvfrom(int us, void *buf, uint32_t cap, uint32_t *src_ip, uint16_t *src_port);
+void net_udp_close(int us);
+void net_udp_abort(int us);                                 /* lock-free free (fd reap path) */
+
 /* ---- internal cross-layer hooks (each module -> its neighbour) ----------
  * These are how the layers hand a packet up (input) or down (output) across
  * .c files; they are not part of any ring-3 surface. Ownership:
