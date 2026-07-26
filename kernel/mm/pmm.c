@@ -2,6 +2,7 @@
 #include "drivers/char/serial.h"
 #include "arch/x86_64/smp/smp.h"
 #include "arch/x86_64/cpu/spinlock.h"
+#include "arch/x86_64/boot/boot_protocol.h"
 
 /* Guards pmm_bitmap/free_pages/used_pages -- unused until SMP (Phase 3,
  * docs/architecture/process-and-scheduling.md), same "add the lock, don't
@@ -43,8 +44,7 @@ static inline int bitmap_test(uint64_t page_index) {
 
 
 void pmm_print_map(void) {
-    uint32_t count = *(uint32_t *)KP2V(E820_COUNT_ADDR);
-    struct e820_entry *entries = (struct e820_entry *)KP2V(E820_ENTRIES_ADDR);
+    uint32_t count = boot_mmap_count();
 
     serial_write_string("\n=== E820 Memory Map ===\n");
     serial_write_string("entries: ");
@@ -53,7 +53,7 @@ void pmm_print_map(void) {
 
     uint64_t total_usable = 0;
     for (uint32_t i = 0; i < count; i++) {
-        struct e820_entry *entry = &entries[i];
+        const struct boot_mmap_entry *entry = boot_mmap_at(i);
 
         serial_write_string("[");
         serial_write_hex(i);
@@ -93,23 +93,27 @@ void pmm_init(void) {
     // For now, we just print the memory map. In a real implementation, we would initialize our physical memory manager here.
     pmm_print_map();
 
-    uint32_t count = *(uint32_t *)KP2V(E820_COUNT_ADDR); // Get the number of E820 entries
-    struct e820_entry *entries = (struct e820_entry *)KP2V(E820_ENTRIES_ADDR); // Get pointer to the E820 entries
+    uint32_t count = boot_mmap_count(); // number of memory-map entries
 
     // step 1: find the highest addressable memory to determine how many pages we need to manage
     uint64_t highest_address = 0;
     for (uint32_t i = 0; i < count; i++) {
+        // Fetch each entry by index through the boot protocol: it applies
+        // mmap_stride, so this is correct even if the entry grows later. NEVER
+        // index a base pointer as entries[i] -- that assumes stride==sizeof and,
+        // as it did here, silently skipped entry 0 and ran one past the end.
+        const struct boot_mmap_entry *e = boot_mmap_at(i);
         // only consider usable regions for determining the highest address, since we won't be managing reserved or bad memory
-        if (entries[i].type != E820_USABLE) {
+        if (e->type != E820_USABLE) {
             continue;
         }
-
-        uint64_t end = entries[i].base + entries[i].length;
+        uint64_t end = e->base + e->length;
         if (end > highest_address) {
             highest_address = end;
         }
     }
 
+    
     // step 2: Parse E820 map and mark usable pages as free
     
     total_pages = highest_address  / PAGE_SIZE; 
@@ -140,13 +144,14 @@ void pmm_init(void) {
 
     // step 5: Now go through the E820 map again and mark usable pages as free in our bitmap
     for (uint32_t i = 0; i < count; i++) {
+        const struct boot_mmap_entry *e = boot_mmap_at(i);
 
-        if(entries[i].type != E820_USABLE) {
+        if (e->type != E820_USABLE) {
             continue; // Skip non-usable regions
         }
 
-        uint64_t start_page = entries[i].base / PAGE_SIZE;
-        uint64_t end_page = (entries[i].base + entries[i].length) / PAGE_SIZE;
+        uint64_t start_page = e->base / PAGE_SIZE;
+        uint64_t end_page = (e->base + e->length) / PAGE_SIZE;
 
         for (uint64_t p = start_page; p < end_page && p < total_pages; p++) {
             if (bitmap_test(p)) {

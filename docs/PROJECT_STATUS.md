@@ -754,6 +754,41 @@ The OS now owns and rebuilds its whole toolchain, on itself:
 
 ---
 
+### Phase 26 — Boot: firmware-agnostic protocol, USB/disk boot, UEFI, EmbBoot ✅
+
+The OS now boots under **both firmwares from its own code**, off **one medium**:
+
+- **Boot protocol** (`kernel/arch/x86_64/boot/boot_protocol.{c,h}`): one struct
+  passed to the kernel in `RDI` (relayed by `kentry.asm`), replacing three
+  fixed-physical-address conventions (fb `0x6000`, boot device `0x6F00`, e820
+  `0x7000`). Offsets pinned by `_Static_assert`; carries the memory map, GOP/VBE
+  framebuffer, boot-device id, and the ACPI RSDP. Both loaders fill the same
+  struct, so one kernel runs under either firmware.
+- **USB / single-disk boot** (was HDD-only): `tools/mkbootdisk.sh` builds ONE
+  partitioned image — kernel in the MBR gap, EMBKFS root in partition 1 — so
+  `dd usb.img → /dev/sdX` boots the whole system off a stick or disk. The kernel
+  reaches it over the xHCI mass-storage block path; root **follows the boot
+  device** (MBR-signature match). `make run-usb` / `run-usb-ide`. Fixed a latent
+  bug: a whole disk with a partition table was probed as a bare EMBKFS and
+  self-healed a bogus superblock *over the MBR* (`embk_block_is_partitioned`
+  guard); stage1/2 gained INT 13h retry.
+- **UEFI** (from-scratch, no GNU-EFI): a hand-written PE32+ EFI application
+  (`boot/uefi/`) built with the same `x86_64-elf-gcc` (host `objcopy -O
+  efi-app-x86_64` for the ELF→PE step). GOP → framebuffer, GetMemoryMap →
+  `boot_mmap`, loads the kernel, builds identity + higher-half page tables,
+  ExitBootServices, and jumps — reaching the **home desktop under OVMF**. ACPI
+  RSDP comes from the EFI configuration table; the ATA IRQ needed an `nIEN`
+  clear (OVMF hands IDE over in a polling/IRQ-disabled state). `make run-uefi` /
+  `run-uefi-cow`.
+- **EmbBoot** ([EMBBOOT_Design.md](EMBBOOT_Design.md)): the UEFI loader is
+  growing into a menu-driven boot manager. **M1 done** — a text menu
+  (`boot/uefi/menu.{c,h}` + `console.{c,h}`) with the six design entries, only
+  "Boot EmbLinkOS" live; arrows/numbers/Enter + a timeout auto-boot. M2–M5
+  (`.embfw` payload format, verification, Recovery/Diagnostics, Boot Manager)
+  are designed, not built. BIOS boot is unaffected throughout.
+
+---
+
 ## Major To-Do Buckets (Rough Priority)
 
 Full detail lives in `TODO.md`, organized by subsystem. Rough priority order:
@@ -803,7 +838,9 @@ Full detail lives in `TODO.md`, organized by subsystem. Rough priority order:
    unbuilt — see Phase 20 above and the arch doc §8/§17 for why (measure
    the global lock first, don't shard speculatively).
 2. **Syscall fast-path**: STAR/LSTAR/SFMASK for `syscall`/`sysret`.
-3. **Bootloader v2**: ELF-aware loading, UEFI support, USB/CD boot.
+3. **Bootloader v2**: ~~UEFI support~~ ✅ (from-scratch loader) and ~~USB boot~~ ✅
+   (one partitioned medium) are DONE — see Phase 26. Still open: ELF-aware BIOS
+   loading (stage2 loads a fixed sector count), CD/El Torito, and EmbBoot M2–M5.
 4. **Slab allocator**: fixed-size pools on top of the heap (currently
    linked-list first-fit only).
 
@@ -1076,6 +1113,11 @@ make run-usb-ehci        # EHCI + usb-storage (high speed)
 make run-usb-xhci        # xHCI + usb-kbd
 make embkfs.img          # build every userland app + libembk.so, pack an EMBKFS image
 make run-embkfs-cow      # boot a pristine EMBKFS image, then grade the post-boot copy
+make usb.img             # ONE partitioned bootable medium: kernel + EMBKFS root
+make run-usb             # BIOS-boot that medium from a USB stick (qemu-xhci, bootindex)
+make run-usb-ide         # boot the same one-image medium as a plain IDE/SATA disk
+make run-uefi            # UEFI boot under OVMF via our own EFI loader (-> desktop)
+make run-uefi-cow        # UEFI twin of run-embkfs-cow (COW EMBKFS scratch, virtio-vga)
 make run-ui              # boot to a shell; `run /uidemo.elf` launches the EmUI toolkit live
 make run-wm              # boot to the window-compositor demo (two composited windows)
 make scene-test backend-test font-test layout-test reactive-test declare-test  # host-run UI unit tests, no QEMU

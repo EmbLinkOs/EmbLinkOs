@@ -31,7 +31,9 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 | # | Layer | Component | Status |
 |---|-------|-----------|--------|
 | 1 | Boot / firmware | Two-stage BIOS bootloader (LBA via INT 13h ext.), E820 map, ELF kernel loader → higher half | ✅ Built |
-| | | UEFI bootloader | ⏳ Later |
+| | | From-scratch UEFI loader (own PE32+ EFI app: GOP, GetMemoryMap, page tables, ExitBootServices) → higher half | ✅ Built |
+| | | Firmware-agnostic **boot protocol** (one struct in `RDI`, both loaders fill it) + USB/disk boot (one partitioned medium) | ✅ Built |
+| | | **EmbBoot** boot-manager menu (UEFI) — M1 skeleton | ✅ Built *(`.embfw`/verify 🎯 Designed — [EMBBOOT_Design.md](EMBBOOT_Design.md))* |
 | 2 | Kernel core (ring 0) | GDT/IDT/TSS, exception handlers | ✅ Built |
 | | | APIC (8259 PIC retired), ACPI/MADT | ✅ Built |
 | | | Bitmap PMM | ✅ Built |
@@ -193,7 +195,7 @@ Smaller open items: pipe file-action API shape (at ABI design), init/PID 1 model
 
 ## 7. Deferred / Later (off the near-term critical path)
 
-UEFI bootloader · buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · NVMe · USB isochronous transfers / xHCI hub support · lazy PLT binding for the dynamic linker (relocations are currently eager-only) · ARM64 portability · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib) · a real scrollback/line-editing TTY.
+buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · NVMe · USB isochronous transfers / xHCI hub support · lazy PLT binding for the dynamic linker (relocations are currently eager-only) · ARM64 portability · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib) · a real scrollback/line-editing TTY.
 
 *(GUI stack and SMP have shipped — see §2 rows 2 and 10 — and are removed from this list.)*
 

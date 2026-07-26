@@ -24,7 +24,7 @@
 #include "arch/x86_64/cpu/gdt.h"
 #include "arch/x86_64/cpu/percpu.h"
 #include "arch/x86_64/smp/smp.h"
-#include "arch/x86_64/boot/bootinfo.h"
+#include "arch/x86_64/boot/boot_protocol.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/syscall/syscall.h"
 #include "arch/x86_64/irq/pic.h"
@@ -1683,13 +1683,16 @@ static void kernel_handle_line_command(const char *cmd)
         kprintf("\n[cmd] unknown command: %s\n", cmd);
 }
 
-void kernel_main(void) {
+void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
+                                        * pointer the loader left in RDI, relayed
+                                        * by kentry.asm as the first argument. */
     // --- Core init ---
-    serial_init();
-    bootinfo_capture();   // read stage2's boot-device record (boot drive + MBR
-                          // disk signature) NOW, via KP2V of low memory, before
-                          // the PMM can hand that frame out. embkfs_init() later
-                          // uses it to make "/" follow the disk we booted from.
+     serial_init();
+    boot_protocol_capture(bp_phys);   /* FIRST -- pmm_init reads through it */
+    boot_protocol_dump();
+
+    pmm_init();
+    
     gdt_init_bsp();   // this_cpu()/percpu_init_topology() aren't usable yet
                       // (need ACPI+LAPIC below) -- operates on cpu_table[0]
                       // (the BSP) directly, see gdt_init_bsp()'s comment.

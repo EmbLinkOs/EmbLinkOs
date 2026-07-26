@@ -83,8 +83,9 @@ they currently point at the original author's home directory).
 | Tool | What it's for |
 |---|---|
 | `x86_64-elf-gcc`, `-ld`, `-strip` | The cross compiler. Never use your host's `gcc` — it targets your host OS's ABI/libc, not this OS's. |
-| `nasm` | Assembles the bootloader and a handful of kernel `.asm` files. |
+| `nasm` | Assembles the BIOS bootloader and a handful of kernel `.asm` files. |
 | `qemu-system-x86_64` | Every `make run-*` target boots here. |
+| OVMF (`/usr/share/OVMF/OVMF_CODE_4M.fd`) | Only for the UEFI targets (`make run-uefi` / `run-uefi-cow`). Debian/Ubuntu: `apt install ovmf`. The UEFI loader (`boot/uefi/`) itself builds with the same `x86_64-elf-gcc`; the host `objcopy` does the ELF→PE step (`-O efi-app-x86_64`), so a binutils with the `pei-x86-64` target is needed for that step. |
 | `gdb` | Source-level debugging via `make debug` + `.gdbinit` (auto-attaches to `:1234`, breaks at `kernel_main`). |
 | `python3` | The EMBKFS image builder/verifier (`tools/embkfs_mkfs/`) — a from-scratch, dependency-free filesystem format with a Python reference implementation used both to build test images and to independently verify what the kernel writes. |
 | `python3` + Pillow (`pip install pillow` or `python3-pil`) | Only for `make showcase`/`showcase-v2` — converts the EmUI toolkit's rendered PPM output to PNG. Not required for building/booting the OS. |

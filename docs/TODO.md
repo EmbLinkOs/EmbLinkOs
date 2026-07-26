@@ -26,9 +26,22 @@ left to do.
   actual kernel data. Goes away with ELF-aware loading.
 
 ### General
-- [ ] No USB/CD boot — hard disk only.
-- [ ] No error recovery on failed disk reads (just halts).
-- [ ] BIOS only — no UEFI support.
+- [x] ~~No USB/CD boot — hard disk only.~~ — **USB / single-disk boot shipped.**
+  `tools/mkbootdisk.sh` lays the kernel + an EMBKFS partition on ONE partitioned
+  medium; `dd usb.img → /dev/sdX` boots the whole system off that stick (or disk).
+  `make run-usb` / `run-usb-ide`. The kernel reaches it via the xHCI mass-storage
+  block path (fixed the ATA `nIEN` clear so the completion IRQ fires). **CD /
+  El Torito is still open** (ISO9660 + 2048-byte sectors + boot catalog).
+- [x] ~~No error recovery on failed disk reads (just halts).~~ — stage1/stage2 now
+  reset + retry (3×) a failed INT 13h read before giving up (flaky-USB spin-up).
+- [x] ~~BIOS only — no UEFI support.~~ — **from-scratch UEFI loader** (`boot/uefi/`,
+  own PE32+ EFI app, no GNU-EFI) boots to the desktop under OVMF; both firmwares
+  hand the kernel the same `boot_protocol`. `make run-uefi` / `run-uefi-cow`.
+- [ ] **EmbBoot** (UEFI boot manager, [EMBBOOT_Design.md](EMBBOOT_Design.md)):
+  M1 (menu) done. Open: M2 `.embfw` payload format + kernel-on-ESP; M3 verify
+  (HMAC v1 → Ed25519 v2); M4 Recovery + Diagnostics; M5 Boot Manager + self-update.
+- [ ] Hardcoded kernel LBA start (sector 9) still stands for the BIOS path — a
+  real filesystem-aware BIOS backend is EmbBoot §11 (stage1.5 / 64-bit core).
 
 ---
 
@@ -425,7 +438,9 @@ left to do.
   no final text-mode-at-0xB8000 fallback if VBE itself is entirely absent
   (still `.vbe_failed` → hang, unchanged from before).
   - Refs: VBE 3.0 (Function 15h DDC), EDID 1.4 (VESA E-EDID).
-- [ ] UEFI GOP path (modern alternative to VBE; needs the UEFI bootloader).
+- [x] ~~UEFI GOP path (modern alternative to VBE; needs the UEFI bootloader).~~ —
+  the UEFI loader queries GOP and hands the framebuffer to the kernel via
+  `boot_protocol.fb_*` (the kernel's `framebuffer.c` uses it as the fallback mode).
 - [x] ~~GPU acceleration~~ — done: `gpu.c` probes PCI for a GPU driver before
   `fb_init`; `bochs_vbe.c` does runtime DISPI modeset, `virtio_gpu.c` drives
   an accelerated guest-memory scan-out (TRANSFER_TO_HOST_2D + RESOURCE_FLUSH

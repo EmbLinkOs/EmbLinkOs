@@ -20,8 +20,10 @@ section .text
 global _start
 extern kernel_main
 _start:
+    mov r12, rdi                 ; stash the boot protocol pointer
     mov rsp, boot_stack_top      ; switch to the kernel-owned stack
     xor rbp, rbp                 ; terminate stack-trace/frame chain
+    mov rdi, r12                 ; restore as kernel_main's first argument
     call kernel_main
 .halt:                           ; kernel_main should never return; park the CPU
     cli
