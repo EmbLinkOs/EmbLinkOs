@@ -2,7 +2,7 @@
 #include "fs/embkfs/crc32c.h"
 #include "block/block.h"
 #include "block/partition.h"   /* embk_partition_parent — reach a volume's disk MBR */
-#include "arch/x86_64/boot/bootinfo.h"  /* bootinfo_boot_disk_sig — root-follows-boot */
+#include "arch/x86_64/boot/boot_protocol.h"  /* bootinfo_boot_disk_sig — root-follows-boot */
 #include "include/kmalloc.h"   /* kmalloc / kfree — the Phase 8 heap */
 #include "include/kprintf.h"
 #include "include/errno.h"

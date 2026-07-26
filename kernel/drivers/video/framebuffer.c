@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include "drivers/video/font_8x16.h"
 #include "arch/x86_64/cpu/spinlock.h"
+#include "arch/x86_64/boot/boot_protocol.h"
 
 
 static fb_info_t fb;
@@ -138,12 +139,17 @@ void fb_init(void) {
         serial_write_string("FB mode from GPU driver\n");
     }
 
+
     if (!have_mode) {
-        // Fall back to the VBE mode the stage2 loader programmed (info block
-        // copied to physical 0x6000).
-        fb_info_t *src = (fb_info_t *)KP2V(VBE_INFO_ADDRESS);
-        fb = *src;
-        serial_write_string("FB mode from VBE\n");
+        /* Fall back to the mode the loader programmed, via the boot protocol. */
+        const struct boot_protocol *bp = boot_protocol_get();
+        fb.address = bp->fb_addr;
+        fb.width   = bp->fb_width;
+        fb.height  = bp->fb_height;
+        fb.pitch   = bp->fb_pitch;
+        fb.bpp     = bp->fb_bpp;
+        fb.format  = bp->fb_format;
+        serial_write_string("FB mode from boot protocol\n");
     }
 
     fb_bypp = fb.bpp / 8;

@@ -5,15 +5,10 @@
 #include <stdint.h>
 
 
-// E820 entry as written in stage 2 of the bootloader
-
-struct e820_entry {
-    uint64_t base;
-    uint64_t length;
-    uint32_t type;
-    uint32_t acpi_attr;
-} __attribute__((packed)) ;
-
+// The memory map now arrives via the boot protocol (struct boot_mmap_entry in
+// arch/x86_64/boot/boot_protocol.h), not a fixed buffer stage2 writes. The old
+// `struct e820_entry` and the E820_*_ADDR buffer pointers below are retired --
+// only the TYPE constants survive, because boot_mmap_entry.type reuses them.
 
 // Memory map types from Bios
 
@@ -37,11 +32,6 @@ struct e820_entry {
 // Kernel range conversions(for kernel symbols like kernel_end, )
 #define KV2P(addr)((uint64_t)(addr) - KERNEL_VIRTUAL_BASE) 
 #define KP2V(addr)((uint64_t)(addr) + KERNEL_VIRTUAL_BASE) 
-
-// Memory map BUFFER
-
-#define E820_COUNT_ADDR   0X7000
-#define E820_ENTRIES_ADDR 0X7004
 
 #define PAGE_SIZE 4096
 

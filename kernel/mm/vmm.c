@@ -1,5 +1,6 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
+#include "arch/x86_64/boot/boot_protocol.h"   /* memory map now arrives via the boot protocol */
 #include "drivers/char/serial.h"
 #include "arch/x86_64/cpu/spinlock.h"
 #include <stdint.h>
@@ -520,15 +521,20 @@ void vmm_init(void) {
     // Map all usable physical RAM E820 using 2 MB pages
     // for simplicity, we map from 0 to the highest usable address
     // ... etc 1GB
-    uint32_t e820_count = *(uint32_t *)KP2V(E820_COUNT_ADDR);
-    struct e820_entry *e820_entries = (struct e820_entry *)KP2V(E820_ENTRIES_ADDR);
+    // Read the memory map through the boot protocol (same source pmm_init uses),
+    // NOT the retired fixed 0x7000 e820 buffer -- stage2 no longer writes there.
+    // Safe here: this whole scan finishes before the get_or_create_table calls
+    // below allocate any page, so the entries at mmap_phys can't be reused
+    // mid-read (the ordering constraint documented in boot_protocol.h).
+    uint32_t mmap_count = boot_mmap_count();
 
     uint64_t highest_phys = 0;
-    for (uint64_t i = 0; i < e820_count; i++) {
-        if (e820_entries[i].type != E820_USABLE) {
+    for (uint32_t i = 0; i < mmap_count; i++) {
+        const struct boot_mmap_entry *e = boot_mmap_at(i);
+        if (e->type != E820_USABLE) {
             continue;
         }
-        uint64_t end = e820_entries[i].base + e820_entries[i].length;
+        uint64_t end = e->base + e->length;
         if (end > highest_phys) {
             highest_phys = end;
         }

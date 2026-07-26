@@ -20,11 +20,34 @@
 %define BOOT_STACK_TOP_PHYS 0x80000
 %define BOOT_STACK_TOP_VIRT (KERNEL_VIRTUAL_BASE + BOOT_STACK_TOP_PHYS)
 
-; Boot-info record handed to the kernel (arch/x86_64/boot/bootinfo.{c,h}). Fixed
-; low-memory address in the free gap between the VBE block (~0x5000) and the e820
-; buffer (0x7000). MUST match BOOTINFO_PHYS / BOOTINFO_MAGIC in bootinfo.h.
-%define BOOTINFO_PHYS  0x6F00
-%define BOOTINFO_MAGIC 0x4B534442   ; 'BDSK'
+; Boot protocol record handed to the kernel in RDI (see
+; kernel/arch/x86_64/boot/boot_protocol.h). Offsets are hand-maintained here
+; and machine-checked by _Static_asserts there -- change one, change both.
+%define BOOT_PROTOCOL_PHYS   0x1000
+%define BOOT_PROTOCOL_SIZE   0x48
+%define BOOT_MMAP_PHYS       0x2000
+%define BOOT_MMAP_MAX        256      ; 256*24 = 6 KiB, ends at 0x3800,
+                                      ; well clear of the VBE blocks at 0x5000
+%define BP_MAGIC_LO          0x4E494C45   ; "ELIN"
+%define BP_MAGIC_HI          0x4F52504B   ; "KPRO"
+%define BP_VERSION           1
+%define BP_FW_BIOS           1
+
+%define BP_OFF_MAGIC         0x00
+%define BP_OFF_VERSION       0x08
+%define BP_OFF_SIZE          0x0C
+%define BP_OFF_FIRMWARE      0x10
+%define BP_OFF_MMAP_COUNT    0x14
+%define BP_OFF_MMAP_PHYS     0x18
+%define BP_OFF_MMAP_STRIDE   0x20
+%define BP_OFF_DISK_SIG      0x24
+%define BP_OFF_FB_ADDR       0x28
+%define BP_OFF_FB_WIDTH      0x30
+%define BP_OFF_FB_HEIGHT     0x34
+%define BP_OFF_FB_PITCH      0x38
+%define BP_OFF_FB_BPP        0x3C
+%define BP_OFF_FB_FORMAT     0x40
+%define BP_OFF_BOOT_DRIVE    0x44
 
 start:
 
@@ -37,26 +60,24 @@ start:
     ; stage1 handed us the BIOS boot drive in DL. Save it before vbe_init /
     ; e820_query (their INT 10h/15h calls may clobber DL) so the kernel-load
     ; reads come off the drive we actually booted from, not a hardcoded 0x80.
-    mov [boot_drive], dl
+     mov [boot_drive], dl
 
-    ; Hand the kernel a boot-info record (see arch/x86_64/boot/bootinfo.h): the
-    ; MBR disk signature (the 4 bytes at 0x1B8 of the boot sector, still resident
-    ; at 0x7C00 -- the stack grows DOWN from 0x7C00 and never touches it) plus the
-    ; boot drive. The kernel uses the signature to pick which EMBKFS volume is "/"
-    ; when several disks each carry one: the volume on the disk we booted from.
-    mov eax, [0x7C00 + 0x1B8]       ; MBR disk signature
-    mov [BOOTINFO_PHYS + 4], eax
+    call zero_boot_protocol
+
+    ; MBR disk signature -- 0x7C00 is still resident (the stack grows DOWN
+    ; from 0x7C00 and never touches it).
+    mov eax, [0x7C00 + 0x1B8]
+    mov [BOOT_PROTOCOL_PHYS + BP_OFF_DISK_SIG], eax
     mov al, [boot_drive]
-    mov [BOOTINFO_PHYS + 8], al
-    mov dword [BOOTINFO_PHYS], BOOTINFO_MAGIC   ; validity mark, written LAST
+    mov [BOOT_PROTOCOL_PHYS + BP_OFF_BOOT_DRIVE], al
     sti
 
     mov si, msg_stage2
     call print_string
 
     call vbe_init
-
     call e820_query
+    call finish_boot_protocol     ; magic written LAST, after every field
     call enable_a20
 
     ; --- Stage the kernel ELF above 1 MB --------------------------------
@@ -125,6 +146,33 @@ start:
     mov cr0, eax
 
     jmp 0x08:protected_mode
+
+zero_boot_protocol:
+    pusha
+    cld
+    xor ax, ax
+    mov es, ax
+    mov di, BOOT_PROTOCOL_PHYS
+    mov cx, BOOT_PROTOCOL_SIZE
+    xor al, al
+    rep stosb                 ; we are claiming this memory -- don't inherit junk
+    popa
+    ret
+
+finish_boot_protocol:
+    pusha
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_VERSION],     BP_VERSION
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_SIZE],        BOOT_PROTOCOL_SIZE
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_FIRMWARE],    BP_FW_BIOS
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_MMAP_PHYS],   BOOT_MMAP_PHYS
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_MMAP_PHYS+4], 0
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_MMAP_STRIDE], 24
+    ; magic last: a torn record then fails the check instead of half-passing
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_MAGIC],   BP_MAGIC_LO
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_MAGIC+4], BP_MAGIC_HI
+    popa
+    ret
+
 
 ;Disk address packet for LBA read
 dap:
@@ -245,70 +293,65 @@ gdt64_descriptor:
     dd gdt64_start           ; Base
 
 e820_query:
-    ; This function will query the memory map using BIOS interrupt 0x15, function 0xE820
+    pusha
+    cld
+    xor ax, ax
+    mov es, ax
 
-    pusha                    
-    
-    mov di, 0x7004            ; Buffer to store the memory map entry 
-    xor ebx, ebx              ; Set EBX to 0 for the first call
-    xor bp, bp                ; Clear BP to use as a counter for the number of entries
-    mov edx, 0x534D4150       ; 'SMAP' signature
-    mov eax, 0xE820           ; E820 function number
-    mov [es:di + 20], dword 1 ; Force a valid ACPI 3.X entry
-    mov ecx, 24               ; Size of the buffer for each entry (20 bytes for the entry + 4 bytes for the ACPI 3.X flag)
-    int 0x15                  ; Call BIOS interrupt
-    jc .failed                ; If carry flag is set, there are no more entries / don't support E820
-
-    cmp eax, 0x534D4150       ; Check if the returned signature is correct
+    mov di, BOOT_MMAP_PHYS
+    xor ebx, ebx              ; continuation value, 0 on the first call
+    xor bp, bp                ; entries accepted so far
+    mov edx, 0x534D4150       ; 'SMAP'
+    mov eax, 0xE820
+    mov [es:di + 20], dword 1 ; force a valid ACPI 3.x attribute word
+    mov ecx, 24
+    int 0x15
+    jc .failed
+    cmp eax, 0x534D4150
     jne .failed
-
-    test ebx, ebx              ; Check if EBX is zero, which indicates the last entry / or none since it the first call
-    je .failed
+    test ebx, ebx
+    je .failed                ; a one-entry map is not a usable map
     jmp .got_entry
 
 .next_entry:
-    mov eax, 0xE820           ; 
-    mov [es:di + 20], dword 1 
-    mov ecx, 24  
-    mov edx, 0x534D4150             
-    int 0x15                  ; Call BIOS interrupt
-    jc .done                  ; If carry flag is set, there are no more entries 
-
+    mov eax, 0xE820
+    mov [es:di + 20], dword 1
+    mov ecx, 24
+    mov edx, 0x534D4150
+    int 0x15
+    jc .done                  ; CF on a FOLLOW-UP call = end of list
     mov eax, 0x534D4150
 
 .got_entry:
-    jcxz .skip_entry ; If EBX is zero, skip processing this entry since it indicates the last entry \
-    cmp cl, 20              ; Check if the returned entry size is at least 20 bytes (the size of the standard E820 entry)
-    jbe .accept
-    test dword [es:di + 20], 1 ; Check if the ACPI 3.X flag is set, which indicates that the entry is valid even if it's larger than 20 bytes
-    je .skip_entry       ; If the ACPI 3.X flag is not set, skip this entry since it's not valid
+    jcxz .skip_entry          ; BIOS stored nothing
+    cmp cl, 20
+    jbe .no_attr              ; 20-byte reply: no ACPI 3.x attribute word
+    test byte [es:di + 20], 1 ; bit 0 clear = "ignore this entry"
+    je .skip_entry
+.no_attr:
+    mov ecx, [es:di + 8]      ; length low
+    or  ecx, [es:di + 12]     ; length high
+    jz .skip_entry            ; zero-length descriptor
 
-.accept:
-    ; At this point, we have a valid memory map entry in the buffer at es:
-    mov ecx, [es:di + 8]    ; check lehgth low
-    or ecx, [es:di + 12]    ; check length high
-    jz .skip_entry       ; If the length is zero, skip this entry since it doesn't describe any usable memory
+    inc bp
+    cmp bp, BOOT_MMAP_MAX
+    jae .done                 ; buffer full -- stop rather than overrun
+    add di, 24                ; commit: next BIOS write lands after this one
 
-    inc bp                  ; Increment the entry counter
-    add di, 24              ; Move to the next entry (size of the buffer for each entry)
-
-.skip_entry:
-    test ebx, ebx          ; Check if EBX is zero, which indicates the last entry / or none since it the first call
-    jne .next_entry 
-
+.skip_entry:                  ; di NOT advanced -- next reply overwrites it
+    test ebx, ebx
+    jne .next_entry
 
 .done:
-    mov [0x7000], bp        ; Store the number of valid entries in a known location for later use
-    clc                     ; Clear carry flag to indicate success
-    popa       
-    ret
-
-.failed:
-    mov [0x7000], 0         
-    stc                     ; Set carry flag to indicate failure              
+    movzx eax, bp
+    mov [BOOT_PROTOCOL_PHYS + BP_OFF_MMAP_COUNT], eax
     popa
     ret
 
+.failed:
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_MMAP_COUNT], 0
+    popa
+    ret
 
 ; ---------------------------------------------------------------------------
 ; VBE mode selection: EDID native resolution (best-effort) -> exact-match
@@ -562,55 +605,46 @@ vbe_init:
 
 
 
-    ; Step 4: Copy field to 0x6000
-    ; ModeInfoBlock    ofsets:
-    ; 0x00 = Mode Attributes (16 bits)
-    ; 0x10 = PBytesPerScanLine (16 bits pitch)
-    ; 0x12 = XResolution (16 bits width)
-    ; 0x14 = YResolution (16 bits height
-    ; 0x19 = BitsPerPixel (8 bits depth)
-    ; 0x28 = PhysBasePtr (32 bits framebuffer address)
-
-    mov esi, 0x5200          ; Address of VBE mode info buffer
+    ; Publish the mode the loader just programmed into the BOOT PROTOCOL, so the
+    ; kernel's framebuffer.c can fall back to it when no GPU driver claims a mode.
+    ; (Replaces the old fixed 0x6000 fb-info block -- the protocol is now the one
+    ; and only channel; see kernel/arch/x86_64/boot/boot_protocol.h.)
+    ; VBE ModeInfoBlock offsets:
+    ;   0x10 BytesPerScanLine (pitch)   0x12 XResolution (width)
+    ;   0x14 YResolution (height)       0x19 BitsPerPixel
+    ;   0x20 RedFieldPosition           0x28 PhysBasePtr (LFB)
+    mov esi, 0x5200          ; VBE mode info buffer (filled by 0x4F01 above)
 
     xor eax, eax
-    mov eax, [esi + 0x28]  
-    mov [0x6000], eax       ; lower 32 bits of PhysBasePtr
-    mov dword [0x6004], 0   ; higher 32 bits of PhysBasePtr (set to 0)
+    mov eax, [esi + 0x28]                                   ; PhysBasePtr (LFB)
+    mov [BOOT_PROTOCOL_PHYS + BP_OFF_FB_ADDR], eax
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_FB_ADDR + 4], 0  ; high 32 bits = 0
 
-    ;width
     xor eax, eax
-    mov ax, [esi + 0x12]
-    mov [0x6008], eax
+    mov ax, [esi + 0x12]                                    ; width
+    mov [BOOT_PROTOCOL_PHYS + BP_OFF_FB_WIDTH], eax
 
-    ;height
     xor eax, eax
-    mov ax, [esi + 0x14]
-    mov [0x600C], eax
+    mov ax, [esi + 0x14]                                    ; height
+    mov [BOOT_PROTOCOL_PHYS + BP_OFF_FB_HEIGHT], eax
 
-    ;pitch
     xor eax, eax
-    mov ax, [esi + 0x10]
-    mov [0x6010], eax
+    mov ax, [esi + 0x10]                                    ; pitch (bytes/line)
+    mov [BOOT_PROTOCOL_PHYS + BP_OFF_FB_PITCH], eax
 
-    ;depth bpp
     xor eax, eax
-    mov al, [esi + 0x19]
-    mov [0x6014], eax
+    mov al, [esi + 0x19]                                    ; bpp
+    mov [BOOT_PROTOCOL_PHYS + BP_OFF_FB_BPP], eax
 
-   
-    ; Format - read from VBE mode info buffer
+    ; RedFieldPosition: 0 => red in the low byte (RGB), otherwise BGR.
     xor eax, eax
-    mov al, [esi + 0x20] ; read field position 0x20
+    mov al, [esi + 0x20]
     cmp al, 0
     je .rgb
-    mov dword [0x6018], 1 ; 32-bit 
-
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_FB_FORMAT], 1    ; FB_FORMAT_BGR
     ret
-
 .rgb:
-    mov dword [0x6018], 0 
-
+    mov dword [BOOT_PROTOCOL_PHYS + BP_OFF_FB_FORMAT], 0    ; FB_FORMAT_RGB
     ret
 
 
@@ -771,8 +805,10 @@ long_mode_start:
     ;load the kernel: stage2 staged the ELF at KERNEL_STAGE_PHYS (16 MB)
     call load_elf
 
-    ;jmp to the kernel entry point 
-    jmp rax ;
+    mov rdi, BOOT_PROTOCOL_PHYS   ; SysV: first integer argument (load_elf left
+                                  ; the ELF entry point in rax, untouched here)
+    ;jmp to the kernel entry point
+    jmp rax
 
 load_elf:
     ; This is where you would parse the ELF header, load the program segments into memory,

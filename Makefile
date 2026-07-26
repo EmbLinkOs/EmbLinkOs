@@ -57,7 +57,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/cpu/spinlock.c \
              kernel/arch/x86_64/cpu/rwlock.c \
              kernel/arch/x86_64/smp/smp.c \
-             kernel/arch/x86_64/boot/bootinfo.c \
+             kernel/arch/x86_64/boot/boot_protocol.c \
              kernel/arch/x86_64/syscall/syscall.c \
              kernel/arch/x86_64/syscall/usercopy.c \
              kernel/arch/x86_64/syscall/usermode.c \
