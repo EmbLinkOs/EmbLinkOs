@@ -710,10 +710,21 @@ void ata_init(void) {
     kprintf("ATA: Bus Master IDE I/O base at 0x%X\n", (unsigned int)bmide_base);
 
     if (drive_count == 0) {
-        kprintf("ATA: no drives detected.\n");   
+        kprintf("ATA: no drives detected.\n");
     } else {
         kprintf("ATA: %u drive(s) detected.\n", (unsigned int)drive_count);
     }
+
+    // Clear nIEN (device-control bit 1) on BOTH channels so the drives raise
+    // their completion interrupts. Writing 0 to the control port = nIEN 0, no
+    // reset. BIOS/SeaBIOS leaves nIEN=0, but UEFI firmware (OVMF) drives IDE by
+    // POLLING with nIEN SET and hands the controller over that way -- so without
+    // this the DMA-completion IRQ never fires and ata_wait_irq() spins to its
+    // ~2.7h timeout, indistinguishable from a dead hang. Per channel, not per
+    // drive: the control register belongs to the channel.
+    outb(ATA_PRIMARY_CTRL, 0x00);
+    outb(ATA_SECONDARY_CTRL, 0x00);
+
     // Install IRQ handlers, routing both channels via IOAPIC. Without routing
     // IRQ15 too, any transfer targeting a secondary-channel drive (index 2/3)
     // would wait on a completion interrupt that never arrives -- it would
