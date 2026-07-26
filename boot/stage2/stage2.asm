@@ -24,7 +24,8 @@
 ; kernel/arch/x86_64/boot/boot_protocol.h). Offsets are hand-maintained here
 ; and machine-checked by _Static_asserts there -- change one, change both.
 %define BOOT_PROTOCOL_PHYS   0x1000
-%define BOOT_PROTOCOL_SIZE   0x48
+%define BOOT_PROTOCOL_SIZE   0x50   ; grew by acpi_rsdp (+0x48); stays 0 under
+                                    ; BIOS so the kernel uses its legacy RSDP scan
 %define BOOT_MMAP_PHYS       0x2000
 %define BOOT_MMAP_MAX        256      ; 256*24 = 6 KiB, ends at 0x3800,
                                       ; well clear of the VBE blocks at 0x5000

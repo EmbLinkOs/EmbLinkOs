@@ -76,6 +76,11 @@ uint8_t bootinfo_boot_drive(void)
     return g_valid ? g_bp.boot_drive : 0xFF;
 }
 
+uint64_t boot_acpi_rsdp(void)
+{
+    return g_valid ? g_bp.acpi_rsdp : 0;
+}
+
 void boot_protocol_dump(void)
 {
     if (!g_valid) {
@@ -92,6 +97,7 @@ void boot_protocol_dump(void)
             (unsigned long)g_bp.fb_addr, (unsigned)g_bp.fb_width,
             (unsigned)g_bp.fb_height, (unsigned)g_bp.fb_pitch,
             (unsigned)g_bp.fb_bpp, (unsigned)g_bp.fb_format);
-    kprintf("bootproto: boot drive 0x%X, MBR disk sig 0x%X\n",
-            (unsigned)g_bp.boot_drive, (unsigned)g_bp.boot_disk_sig);
+    kprintf("bootproto: boot drive 0x%X, MBR disk sig 0x%X, acpi rsdp %lx\n",
+            (unsigned)g_bp.boot_drive, (unsigned)g_bp.boot_disk_sig,
+            (unsigned long)g_bp.acpi_rsdp);
 }

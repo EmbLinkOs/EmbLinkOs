@@ -63,7 +63,11 @@ struct boot_protocol {
 
     uint8_t  boot_drive;     /* +0x44  BIOS DL, 0xFF = unknown               */
     uint8_t  _reserved[3];   /* +0x45                                        */
-};                           /*  size  0x48                                  */
+
+    uint64_t acpi_rsdp;      /* +0x48  ACPI RSDP phys, 0 = unknown (BIOS: the
+                              *        kernel falls back to the legacy scan;
+                              *        UEFI: from the EFI configuration table) */
+};                           /*  size  0x50                                  */
 
 /* Why mmap_stride exists when the loader normalizes every entry to
  * sizeof(struct boot_mmap_entry) anyway: it lets the ENTRY grow later
@@ -75,7 +79,7 @@ struct boot_protocol {
 #define BOOT_MMAP_STRIDE_MIN  24
 
 _Static_assert(sizeof(struct boot_mmap_entry) == 24, "mmap entry is 24 bytes");
-_Static_assert(sizeof(struct boot_protocol)   == 0x48, "boot_protocol is 0x48");
+_Static_assert(sizeof(struct boot_protocol)   == 0x50, "boot_protocol is 0x50");
 _Static_assert(offsetof(struct boot_protocol, magic)         == 0x00, "off");
 _Static_assert(offsetof(struct boot_protocol, version)       == 0x08, "off");
 _Static_assert(offsetof(struct boot_protocol, size)          == 0x0C, "off");
@@ -91,6 +95,7 @@ _Static_assert(offsetof(struct boot_protocol, fb_pitch)      == 0x38, "off");
 _Static_assert(offsetof(struct boot_protocol, fb_bpp)        == 0x3C, "off");
 _Static_assert(offsetof(struct boot_protocol, fb_format)     == 0x40, "off");
 _Static_assert(offsetof(struct boot_protocol, boot_drive)    == 0x44, "off");
+_Static_assert(offsetof(struct boot_protocol, acpi_rsdp)     == 0x48, "off");
 
 /* Capture the record into a kernel-owned copy. Call ONCE, as the first thing
  * in kernel_main -- before pmm_init, which now reads its map through here.
@@ -114,5 +119,10 @@ const struct boot_mmap_entry *boot_mmap_at(uint32_t index);
  * these two need no change). */
 bool    bootinfo_boot_disk_sig(uint32_t *out);
 uint8_t bootinfo_boot_drive(void);
+
+/* ACPI RSDP physical address the loader found (0 = unknown -> caller scans the
+ * legacy BIOS memory areas instead). Set under UEFI, where that scan finds
+ * nothing because the RSDP is in the EFI configuration table. */
+uint64_t boot_acpi_rsdp(void);
 
 #endif /* _ARCH_X86_64_BOOT_PROTOCOL_H_ */

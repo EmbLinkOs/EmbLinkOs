@@ -1229,6 +1229,53 @@ run-usb-ide: usb.img
 	    -device ide-hd,drive=bootdisk,bootindex=0 \
 	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
 
+# ── UEFI boot: our own minimal EFI loader (boot/uefi/), no GNU-EFI ──────────
+# A hand-written PE32+ EFI application built with the SAME x86_64-elf-gcc as the
+# kernel (objcopy -O pei-x86-64 for the ELF->PE step, since only the host objcopy
+# speaks pei). It does stage2's job in the UEFI world: GOP for the framebuffer,
+# GetMemoryMap -> boot_mmap, loads the EMBEDDED kernel to its fixed physical
+# address, builds the identity + higher-half page tables, ExitBootServices, then
+# enters the kernel with RDI = &boot_protocol (firmware = BOOT_FW_UEFI).
+UEFI_CFLAGS = -ffreestanding -fpic -fno-stack-protector -mno-red-zone \
+              -fno-asynchronous-unwind-tables -Wall -c
+BOOTX64 = build/BOOTX64.EFI
+OVMF_CODE = /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
+
+build/uefi_crt0.o: boot/uefi/crt0.S | $(BUILD)
+	$(CC) -c $< -o $@
+
+build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h | $(BUILD)
+	$(CC) $(UEFI_CFLAGS) $< -o $@
+
+# Embeds the current kernel; depends on it so a kernel change rebuilds the .efi.
+build/uefi_kernel_blob.o: boot/uefi/kernel_blob.S $(KERNEL_BIN) | $(BUILD)
+	$(CC) -DKERNEL_BLOB_PATH='"$(KERNEL_BIN)"' -c $< -o $@
+
+build/uefi_loader.so: build/uefi_crt0.o build/uefi_loader.o build/uefi_kernel_blob.o boot/uefi/efi.lds
+	$(CC) -nostdlib -shared -Bsymbolic -T boot/uefi/efi.lds \
+	    build/uefi_crt0.o build/uefi_loader.o build/uefi_kernel_blob.o -o $@
+
+# ELF -> PE32+ EFI application. The efi-app-x86_64 pseudo-target sets the EFI
+# subsystem and PE layout correctly. Host objcopy: the cross one lacks pei.
+$(BOOTX64): build/uefi_loader.so
+	objcopy -O efi-app-x86_64 -j .text -j .data -j .reloc $< $@
+
+# GPT + ESP disk carrying /EFI/BOOT/BOOTX64.EFI.
+uefi.img: $(BOOTX64) tools/mkuefidisk.sh
+	tools/mkuefidisk.sh $(BOOTX64) $@
+
+# Boot under OVMF. VARS must be a writable per-run copy. The kernel's EMBKFS root
+# rides a second drive for the MVP (kernel probes every block device for it).
+run-uefi: uefi.img embkfs.img
+	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
+	qemu-system-x86_64 \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
+	    -drive format=raw,file=uefi.img,if=ide,index=0 \
+	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
+
 # Two independent EMBKFS volumes mounted at once (sdb -> "/", sdc -> "/sdc"),
 # both on plain IDE -- exercises embkfs_init()'s multi-volume mount table
 # without needing USB. Pair with `test embkfs multivol` at the shell.

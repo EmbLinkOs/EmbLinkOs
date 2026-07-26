@@ -2,6 +2,7 @@
 #include "drivers/char/serial.h"
 #include "mm/pmm.h"
 #include "include/kprintf.h"
+#include "arch/x86_64/boot/boot_protocol.h"   /* boot_acpi_rsdp — UEFI RSDP */
 #include <stdint.h>
 
 
@@ -52,6 +53,21 @@ static struct rsdp *scan_for_rsdp(uint64_t phys_start, uint64_t phys_end) {
 
 
 static struct rsdp *find_rsdp() {
+    // 0. The boot loader may have handed us the RSDP directly. Under UEFI it
+    //    lives in the EFI configuration table, NOT the legacy BIOS memory the
+    //    scans below cover -- so without this, a UEFI boot finds no ACPI at all
+    //    (no HPET/IOAPIC, a bogus timer calibration, and a downstream hang).
+    uint64_t rp = boot_acpi_rsdp();
+    if (rp) {
+        struct rsdp *r = (struct rsdp *)P2V(rp);
+        const char target[8] = {'R', 'S', 'D', ' ', 'P', 'T', 'R', ' '};
+        bool ok = true;
+        for (int i = 0; i < 8; i++) if (((const char *)r)[i] != target[i]) { ok = false; break; }
+        if (ok && checksum_ok(r, 20))
+            return r;
+        kprintf("ACPI: loader RSDP at %p invalid, falling back to scan\n", (void *)rp);
+    }
+
     // 1. First try the EBDA (Extended BIOS Data Area) which is often at 0x80000 or 0x90000 0x40E in the BIOS data area contains the segment base of the EBDA. The EBDA is typically 1KB in size, so we scan that range.
     uint16_t ebda_segment = *((uint16_t *)P2V(0x40E)); // EBDA segment is stored at 0x40E in the BIOS data area
     uint64_t ebda_phys = ((uint64_t)ebda_segment) << 4; // Convert segment to physical address
