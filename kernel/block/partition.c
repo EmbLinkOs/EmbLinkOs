@@ -359,6 +359,30 @@ int embk_partition_scan(struct embk_block_device *disk) {
     return registered;
 }
 
+bool embk_block_is_partitioned(struct embk_block_device *disk) {
+    if (!disk) return false;
+    // True if we registered at least one partition whose parent is this disk.
+    // The partition scan runs before filesystem probing, so this reflects the
+    // final table: a partitioned disk's sector 0 is an MBR, not a filesystem
+    // superblock, so no whole-disk filesystem probe should touch it.
+    for (uint32_t i = 0; i < BLOCK_MAX_DEVICES; i++) {
+        if (partitions[i].in_use && partitions[i].parent == disk)
+            return true;
+    }
+    return false;
+}
+
+struct embk_block_device *embk_partition_parent(struct embk_block_device *dev) {
+    if (!dev) return NULL;
+    // A partition device is one of ours in the pool; its parent is the disk it
+    // delegates to. Anything not in the pool is already a whole disk.
+    for (uint32_t i = 0; i < BLOCK_MAX_DEVICES; i++) {
+        if (partitions[i].in_use && &partitions[i].dev == dev)
+            return partitions[i].parent;
+    }
+    return dev;
+}
+
 void embk_partition_scan_all(void) {
     // Snapshot the count first: embk_partition_scan appends partition devices to
     // the registry, and we must not scan those (a partition has no sub-MBR).

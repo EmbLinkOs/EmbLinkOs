@@ -320,6 +320,132 @@ uint64_t vmm_get_phys_in(uint64_t pml4_phys, uint64_t virt_addr) {
     return result;
 }
 
+/* ---- EmbDBG v2 page-table introspection ---------------------------------
+ * Physical-frame masks for the two huge-page sizes (the frame field is wider
+ * than a 4K PTE's because the low address bits are the in-page offset). */
+#define VMM_HUGE_1G_MASK 0x000fffffc0000000ULL   /* PDPTE (1 GiB) frame bits */
+#define VMM_HUGE_2M_MASK 0x000fffffffe00000ULL   /* PDE   (2 MiB) frame bits */
+
+void vmm_walk(uint64_t pml4_phys, uint64_t virt, struct vmm_walk_result *out) {
+    out->mapped = false;
+    out->phys = 0;
+    out->levels_read = 0;
+    out->huge = false;
+    out->huge_level = -1;
+    for (int i = 0; i < 4; i++) { out->entry[i] = 0; out->index[i] = 0; }
+    out->index[0] = (int)pml4_index(virt);
+    out->index[1] = (int)pdpt_index(virt);
+    out->index[2] = (int)pd_index(virt);
+    out->index[3] = (int)pt_index(virt);
+
+    spin_lock(&vmm_lock);
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    uint64_t e = pml4[out->index[0]];
+    out->entry[0] = e; out->levels_read = 1;
+    if (!(e & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+
+    uint64_t *pdpt = vmm_table(e & VMM_ADDR_MASK);
+    e = pdpt[out->index[1]];
+    out->entry[1] = e; out->levels_read = 2;
+    if (!(e & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    if (e & VMM_HUGE) {   /* 1 GiB page terminates here */
+        out->huge = true; out->huge_level = 1; out->mapped = true;
+        out->phys = (e & VMM_HUGE_1G_MASK) | (virt & 0x3fffffffULL);
+        spin_unlock(&vmm_lock); return;
+    }
+
+    uint64_t *pd = vmm_table(e & VMM_ADDR_MASK);
+    e = pd[out->index[2]];
+    out->entry[2] = e; out->levels_read = 3;
+    if (!(e & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    if (e & VMM_HUGE) {   /* 2 MiB page terminates here */
+        out->huge = true; out->huge_level = 2; out->mapped = true;
+        out->phys = (e & VMM_HUGE_2M_MASK) | (virt & 0x1fffffULL);
+        spin_unlock(&vmm_lock); return;
+    }
+
+    uint64_t *pt = vmm_table(e & VMM_ADDR_MASK);
+    e = pt[out->index[3]];
+    out->entry[3] = e; out->levels_read = 4;
+    if (!(e & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    out->mapped = true;
+    out->phys = (e & VMM_ADDR_MASK) | (virt & 0xfffULL);
+    spin_unlock(&vmm_lock);
+}
+
+/* Permission/identity bits that define a "region": pages differing only in
+ * Accessed/Dirty/PAT still belong to the same run. */
+#define VMM_REGION_ID (VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NX)
+
+int vmm_enum_user_regions(uint64_t pml4_phys, struct vmm_region *out, int max) {
+    if (max <= 0) return 0;
+    int n = 0;
+    bool have_cur = false;
+    struct vmm_region cur = {0};
+
+    spin_lock(&vmm_lock);
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    /* User half only: PML4 indices 0..255 (VAs below the canonical hole). */
+    for (int i4 = 0; i4 < 256 && n < max; i4++) {
+        uint64_t e4 = pml4[i4];
+        if (!(e4 & VMM_PRESENT)) continue;
+        uint64_t *pdpt = vmm_table(e4 & VMM_ADDR_MASK);
+        for (int i3 = 0; i3 < 512 && n < max; i3++) {
+            uint64_t e3 = pdpt[i3];
+            if (!(e3 & VMM_PRESENT)) continue;
+            uint64_t base3 = ((uint64_t)i4 << 39) | ((uint64_t)i3 << 30);
+            if (e3 & VMM_HUGE) {                         /* 1 GiB leaf */
+                uint64_t sz = 1ULL << 30;
+                if (have_cur && cur.huge && cur.end == base3 &&
+                    (cur.flags & VMM_REGION_ID) == (e3 & VMM_REGION_ID)) {
+                    cur.end += sz;
+                } else {
+                    if (have_cur) out[n++] = cur;
+                    cur = (struct vmm_region){ base3, base3 + sz, e3, true };
+                    have_cur = true;
+                }
+                continue;
+            }
+            uint64_t *pd = vmm_table(e3 & VMM_ADDR_MASK);
+            for (int i2 = 0; i2 < 512 && n < max; i2++) {
+                uint64_t e2 = pd[i2];
+                if (!(e2 & VMM_PRESENT)) continue;
+                uint64_t base2 = base3 | ((uint64_t)i2 << 21);
+                if (e2 & VMM_HUGE) {                     /* 2 MiB leaf */
+                    uint64_t sz = 1ULL << 21;
+                    if (have_cur && cur.huge && cur.end == base2 &&
+                        (cur.flags & VMM_REGION_ID) == (e2 & VMM_REGION_ID)) {
+                        cur.end += sz;
+                    } else {
+                        if (have_cur) out[n++] = cur;
+                        cur = (struct vmm_region){ base2, base2 + sz, e2, true };
+                        have_cur = true;
+                    }
+                    continue;
+                }
+                uint64_t *pt = vmm_table(e2 & VMM_ADDR_MASK);
+                for (int i1 = 0; i1 < 512 && n < max; i1++) {
+                    uint64_t e1 = pt[i1];
+                    if (!(e1 & VMM_PRESENT)) continue;
+                    uint64_t va = base2 | ((uint64_t)i1 << 12);
+                    uint64_t sz = 1ULL << 12;
+                    if (have_cur && !cur.huge && cur.end == va &&
+                        (cur.flags & VMM_REGION_ID) == (e1 & VMM_REGION_ID)) {
+                        cur.end += sz;
+                    } else {
+                        if (have_cur) out[n++] = cur;
+                        cur = (struct vmm_region){ va, va + sz, e1, false };
+                        have_cur = true;
+                    }
+                }
+            }
+        }
+    }
+    if (have_cur && n < max) out[n++] = cur;
+    spin_unlock(&vmm_lock);
+    return n;
+}
+
 /* Existing public one becomes the kernel-space wrapper. */
 uint64_t vmm_get_phys(uint64_t virt_addr) {
     return vmm_get_phys_in(kernel_pml4_phys, virt_addr);

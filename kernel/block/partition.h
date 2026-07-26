@@ -24,4 +24,17 @@ int embk_partition_scan(struct embk_block_device *disk);
 // the disks that existed when it was called (it never recurses into partitions).
 void embk_partition_scan_all(void);
 
+// If `dev` is a partition device this returns its parent whole disk; otherwise
+// it returns `dev` itself. Lets a filesystem that mounted a partition reach the
+// disk's own sector 0 (e.g. to read the MBR disk signature) without knowing
+// whether it mounted a partition or a bare disk.
+struct embk_block_device *embk_partition_parent(struct embk_block_device *dev);
+
+// True if `disk` has at least one registered partition (i.e. sector 0 is an MBR,
+// not a bare filesystem). A whole-disk filesystem probe must SKIP such a disk:
+// its filesystems live in the partitions, and probing the whole disk can match a
+// partition's tail structures at the wrong offset -- and, worse, trigger a
+// self-heal WRITE over the MBR / boot code. Call after embk_partition_scan_all().
+bool embk_block_is_partitioned(struct embk_block_device *disk);
+
 #endif /* _PARTITION_H_ */

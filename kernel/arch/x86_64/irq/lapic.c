@@ -8,6 +8,8 @@
 #include "drivers/timer/pit.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/cpu/percpu.h"
+
+void net_tick(void);   /* kernel/net/net.c -- 10 ms net clock, wired from the tick */
 #include <stdint.h>
 
 
@@ -280,6 +282,8 @@ void lapic_timer_handler(void){
      * calls schedule() below on its OWN tick -- that part doesn't change. */
     if (this_cpu_is_bsp()) {
         lapic_ticks++; // Increment the LAPIC timer tick count
+        net_tick();    // 10 ms net clock: drive event-driven RX + client timeouts
+                       // (a no-op with empty queues before the net stack is up)
     }
     lapic_send_eoi(); // Acknowledge the timer interrupt BEFORE any reschedule
                       // below, so the LAPIC can keep delivering interrupts to

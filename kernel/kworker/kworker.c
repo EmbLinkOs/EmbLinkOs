@@ -23,6 +23,10 @@ void kworker_defer_obj_put_locked(struct vnode vn) {
                                            * same shape as keyboard_deliver */
 }
 
+uint32_t kworker_pending(void) {
+    return (g_head - g_tail) % DEFERRED_VN_MAX;   /* modular ring occupancy */
+}
+
 
 static void kworker_main(void) {
     while (1) {

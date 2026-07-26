@@ -10,12 +10,14 @@
 #include "include/errno.h"
 #include "include/kstring.h"
 #include "arch/x86_64/syscall/elf.h"
+#include "arch/x86_64/syscall/embx.h"   /* EMBX loader dispatch */
 #include "arch/x86_64/cpu/gdt.h"
 #include "arch/x86_64/cpu/fsbase.h"   /* fsbase_set() -- the thread pointer, reinstalled per switch */
 #include "arch/x86_64/cpu/kcontext.h"
 #include "arch/x86_64/irq/lapic.h"
 #include "arch/x86_64/cpu/spinlock.h"
 #include "process/ksync.h"       /* mutex_init for each process's fd_lock */
+#include "process/debug.h"       /* debug_session_spawn, debug_notify_exit */
 
 #include <stdint.h>
 
@@ -116,10 +118,17 @@ static struct process *process_alloc(void) {
             process_table[i].pid = next_pid++;
             process_table[i].live_thread_count = 0;
             process_table[i].thread_list = NULL;
+            /* EmbDBG v2 lifetime: stamp creation; clear exit (slots are reused). */
+            process_table[i].born_tick = lapic_timer_get_ticks();
+            process_table[i].exit_tick = 0;
             /* MUST be reset: slots are REUSED after reaping, so a stale `true`
              * from the previous occupant would make this process born cancelled
              * -- every blocking syscall failing -ECANCELED before it ran a line. */
             process_table[i].cancelled = false;
+            /* Default to kernel authority. Overwritten by process_create_caps
+             * for user processes (attenuated from the parent); left as-is for
+             * kernel threads, which ARE the kernel and hold the full set. */
+            process_table[i].cap_set = EMBK_CAP_ALL;
             /* -1, not the zeroed-by-memset 0: 0 is a VALID cpu_table[]
              * index (the BSP) -- meaningless until live_thread_count hits
              * 0 for the first time (see the field's comment), but starting
@@ -206,6 +215,12 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
     t->proc = proc;
     t->priority = PRIORITY_NORMAL;
     t->ticks_since_scheduled = 0;
+    t->suspended = false;         /* slots are reused -- a stale true would freeze a fresh thread */
+    t->dispatch_count = 0;
+    t->migrations = 0;
+    t->last_ran_cpu = -1;         /* never run yet */
+    t->born_tick = lapic_timer_get_ticks();  /* 0 for pre-timer boot threads */
+    t->exit_tick = 0;             /* still alive */
     t->wait_next = NULL;
     t->wait_queue = NULL;
     t->exit_code = 0;
@@ -427,6 +442,24 @@ int process_alive(uint32_t pid) {
     return alive;
 }
 
+/* The grantor set at a spawn: the current process's capabilities, or full
+ * kernel authority when there is no current process (the boot CPU creating
+ * init). The EMBX loader will read this as "what may I grant this binary". */
+uint64_t process_current_caps(void) {
+    return current_thread ? current_process->cap_set : EMBK_CAP_ALL;
+}
+
+/* Capabilities of `pid`, or 0 (no authority) if there is no such live slot.
+ * Reads under g_sched_lock like process_alive, since the table is shared. */
+uint64_t process_caps_by_pid(uint32_t pid) {
+    if (pid == 0) return 0;
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    uint64_t caps = p ? p->cap_set : 0;
+    spin_unlock(&g_sched_lock);
+    return caps;
+}
+
 /* Is `p->parent` still genuinely alive, i.e. still the SAME process that
  * created `p`, not a different one that happens to have been allocated
  * into the same now-recycled process_table slot? `p->parent` is a raw
@@ -485,6 +518,13 @@ static void child_list_remove(struct process *parent, struct process *child) {
 static struct process *thread_zombie_locked(struct thread *t) {
     struct process *proc = t->proc;
 
+    /* EmbDBG v2 lifetime: this is THE funnel every thread death passes through
+     * (direct exit, kill, and the schedule_locked ZOMBIE-prev path all reach
+     * here), so stamping exit_tick once here covers them all. Idempotent: a
+     * second call (already unlinked) just overwrites with the same-ish tick. */
+    if (t->exit_tick == 0)
+        t->exit_tick = lapic_timer_get_ticks();
+
     bool was_linked = false;
     struct thread **link = &proc->thread_list;
     while (*link) {
@@ -505,6 +545,10 @@ static struct process *thread_zombie_locked(struct thread *t) {
              * running_cpu -- see process.h's comment on this field for
              * why process_wait() needs this mirror at all. */
             proc->running_cpu = t->running_cpu;
+            /* EmbDBG v2 lifetime: the process itself is now exiting (its last
+             * thread just died) -- stamp the process-level death here. */
+            if (proc->exit_tick == 0)
+                proc->exit_tick = lapic_timer_get_ticks();
         }
         /* Phase 5: wake anyone thread_join()-ing a sibling of this process
          * -- including the common case where THIS thread isn't the last
@@ -953,6 +997,348 @@ int process_list(struct process_info *out, int max) {
     return n;
 }
 
+int process_inspect(uint32_t pid, struct process_detail *out,
+                    struct thread_info *threads, int max_threads) {
+    spin_lock(&g_sched_lock);
+    struct process *p = NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_table[i].pid == pid) { p = &process_table[i]; break; }
+    }
+    if (!p) {
+        spin_unlock(&g_sched_lock);
+        out->found = false;
+        return -1;
+    }
+
+    uint64_t kpml4 = vmm_get_kernel_pml4();
+    out->found = true;
+    out->pid = p->pid;
+    out->parent_pid = parent_is_alive(p) ? p->parent->pid : 0;
+    /* Same derivation as process_list: the main (first) thread carries the
+     * process's live state/priority; a fully-reaped zombie has no thread_list. */
+    out->state = p->thread_list ? p->thread_list->state : PROCESS_ZOMBIE;
+    out->priority = p->thread_list ? p->thread_list->priority : 0;
+    out->exit_code = p->exit_code;
+    out->is_kthread = (p->pml4_phys == kpml4);
+    out->cap_set = p->cap_set;
+    out->live_thread_count = p->live_thread_count;
+    out->born_tick = p->born_tick;
+    out->exit_tick = p->exit_tick;
+    out->heap_brk = p->heap_brk;
+    out->heap_mapped_top = p->heap_mapped_top;
+    out->pml4_phys = p->pml4_phys;
+
+    int n = 0;
+    for (struct thread *t = p->thread_list; t && n < max_threads;
+         t = t->proc_thread_next) {
+        int idx = (int)(t - thread_table);
+        threads[n].tid = (uint32_t)idx;
+        threads[n].pid = p->pid;
+        threads[n].state = t->state;
+        threads[n].running_cpu = t->running_cpu;
+        threads[n].pinned_cpu = t->pinned_cpu;
+        threads[n].priority = t->priority;
+        threads[n].is_kthread = out->is_kthread;
+        threads[n].blocked_on_wq = (t->wait_queue != NULL);
+        threads[n].suspended = t->suspended;
+        threads[n].dispatch_count = t->dispatch_count;
+        threads[n].migrations = t->migrations;
+        threads[n].last_ran_cpu = t->last_ran_cpu;
+        threads[n].born_tick = t->born_tick;
+        threads[n].exit_tick = t->exit_tick;
+        n++;
+    }
+    out->thread_count = n;
+    spin_unlock(&g_sched_lock);
+    return 0;
+}
+
+int thread_inspect(uint32_t tid, struct thread_detail *out) {
+    if (tid >= MAX_THREADS) {
+        out->found = false;
+        return -1;
+    }
+    spin_lock(&g_sched_lock);
+    struct thread *t = &thread_table[tid];
+    if (t->state == PROCESS_UNUSED) {
+        spin_unlock(&g_sched_lock);
+        out->found = false;
+        return -1;
+    }
+    uint64_t kpml4 = vmm_get_kernel_pml4();
+    out->found = true;
+    out->tid = tid;
+    out->pid = t->proc ? t->proc->pid : 0;
+    out->is_kthread = t->proc ? (t->proc->pml4_phys == kpml4) : true;
+    out->state = t->state;
+    out->running_cpu = t->running_cpu;
+    out->pinned_cpu = t->pinned_cpu;
+    out->priority = t->priority;
+    out->suspended = t->suspended;
+    out->blocked_on_wq = (t->wait_queue != NULL);
+    out->dispatch_count = t->dispatch_count;
+    out->migrations = t->migrations;
+    out->last_ran_cpu = t->last_ran_cpu;
+    out->born_tick = t->born_tick;
+    out->exit_tick = t->exit_tick;
+    out->entry_point = t->entry_point;
+    out->user_rsp = t->user_rsp;
+    out->kstack_top = t->kstack_top;
+    out->fs_base = t->fs_base;
+    out->ctx_rip = t->ctx.rip;
+    out->ctx_rbp = t->ctx.rbp;
+    /* Only a NOT-running thread has a meaningful saved context: a RUNNING thread's
+     * ctx is stale (its live registers are on a CPU, not in the TCB), so walking
+     * it would symbolize wherever it was LAST parked, not where it is now. */
+    out->walkable = (t->state != PROCESS_RUNNING);
+    spin_unlock(&g_sched_lock);
+    return 0;
+}
+
+int process_fds_snapshot(uint32_t pid, struct fd_snap_info *out, int max) {
+    spin_lock(&g_sched_lock);
+    struct process *p = NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_table[i].pid == pid) { p = &process_table[i]; break; }
+    }
+    if (!p) { spin_unlock(&g_sched_lock); return -1; }
+
+    int n = 0;
+    for (int i = 0; i < FD_MAX_OPEN && n < max; i++) {
+        struct fd_entry *f = &p->fds[i];
+        if (!f->used) continue;
+        out[n].fd = i + FD_BASE;
+        out[n].backing = (uint8_t)f->backing;
+        out[n].flags = f->flags;
+        out[n].ino = 0;
+        out[n].pos = 0;
+        out[n].vtype = 0;
+        out[n].pipe_side = -1;
+        if (f->backing == FD_BACKING_VNODE) {
+            out[n].ino = f->u.file.vn.ino;
+            out[n].vtype = f->u.file.vn.type;
+            out[n].pos = f->u.file.pos;
+        } else if (f->backing == FD_BACKING_PIPE) {
+            out[n].pipe_side = f->u.pipe.side;
+        }
+        n++;
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
+}
+
+int process_obj_handles_snapshot(uint32_t pid, struct obj_handle_snap *out, int max) {
+    spin_lock(&g_sched_lock);
+    struct process *p = NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (process_table[i].pid == pid) { p = &process_table[i]; break; }
+    if (!p) { spin_unlock(&g_sched_lock); return -1; }
+    int n = 0;
+    for (int i = 0; i < OBJ_HANDLE_MAX && n < max; i++) {
+        struct obj_handle *h = &p->obj_handles[i];
+        if (!h->used) continue;
+        out[n].id = i;
+        out[n].kind = (uint8_t)h->kind;
+        out[n].obj = (uint64_t)h->obj;
+        out[n].map_base = h->map_base;
+        out[n].map_bytes = h->map_bytes;
+        n++;
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
+}
+
+int process_pid_handles_snapshot(uint32_t pid, struct proc_handle_snap *out, int max) {
+    spin_lock(&g_sched_lock);
+    struct process *p = NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (process_table[i].pid == pid) { p = &process_table[i]; break; }
+    if (!p) { spin_unlock(&g_sched_lock); return -1; }
+    int n = 0;
+    for (int i = 0; i < PROC_HANDLE_MAX && n < max; i++) {
+        if (!p->handles[i].used) continue;
+        out[n].id = i;
+        out[n].pid = p->handles[i].pid;
+        n++;
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
+}
+
+int ipc_handles_snapshot(struct ipc_handle_snap *out, int max) {
+    spin_lock(&g_sched_lock);
+    int n = 0;
+    for (int pi = 0; pi < MAX_PROCESSES && n < max; pi++) {
+        struct process *p = &process_table[pi];
+        if (p->pid == 0) continue;
+        for (int i = 0; i < OBJ_HANDLE_MAX && n < max; i++) {
+            struct obj_handle *h = &p->obj_handles[i];
+            if (!h->used) continue;
+            out[n].owner_pid = p->pid;
+            out[n].id = i;
+            out[n].kind = (uint8_t)h->kind;
+            out[n].obj = (uint64_t)h->obj;
+            out[n].map_base = h->map_base;
+            out[n].map_bytes = h->map_bytes;
+            n++;
+        }
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
+}
+
+/* Snapshot every live thread for the kernel-aware `threads`/`scheduler` views
+ * (EmbDBG v2). Same sched-locked value-copy discipline as process_list: walk
+ * the table under g_sched_lock, copy scalars out, print outside the lock. */
+/* ---- EmbDBG v2 scheduler instrumentation -------------------------------
+ * A context-switch counter (global + per-CPU) and a small ring of the most
+ * recent switches, so `scheduler stats` / `scheduler timeline` can show real
+ * history instead of just a live snapshot. All writes happen from
+ * sched_record_switch(), called at the switch-commit in schedule_locked()
+ * with g_sched_lock held -- so the ring and counters need no extra locking.
+ * Reads (the snapshot getters below) also take g_sched_lock. */
+#define SCHED_EVENT_RING 64  /* power of two; recent-switch history depth */
+
+struct sched_event {
+    uint64_t ts;        /* lapic_timer_get_ticks() at the switch */
+    uint32_t from_tid;  /* thread_table index we switched away from */
+    uint32_t to_tid;    /* thread_table index we switched to */
+    uint16_t cpu;       /* core the switch happened on */
+    uint8_t  migrated;  /* 1 if `to` ran on a different core last time */
+};
+
+static uint64_t          g_ctxsw_total;               /* all cores, all time */
+static uint64_t          g_ctxsw_per_cpu[MAX_CPUS];   /* switches ONTO each core */
+static struct sched_event g_sched_ring[SCHED_EVENT_RING];
+static uint64_t          g_sched_ring_head;           /* # events ever recorded */
+
+/* Record one context switch (prev -> next on `cpu`). g_sched_lock held. */
+static void sched_record_switch(struct thread *prev, struct thread *next, int cpu)
+{
+    g_ctxsw_total++;
+    if (cpu >= 0 && cpu < MAX_CPUS)
+        g_ctxsw_per_cpu[cpu]++;
+
+    bool migrated = (next->last_ran_cpu >= 0 && next->last_ran_cpu != cpu);
+    next->dispatch_count++;
+    if (migrated)
+        next->migrations++;
+    next->last_ran_cpu = cpu;
+
+    struct sched_event *e = &g_sched_ring[g_sched_ring_head & (SCHED_EVENT_RING - 1)];
+    e->ts       = lapic_timer_get_ticks();
+    e->from_tid = (uint32_t)(prev - thread_table);
+    e->to_tid   = (uint32_t)(next - thread_table);
+    e->cpu      = (uint16_t)cpu;
+    e->migrated = migrated ? 1 : 0;
+    g_sched_ring_head++;
+}
+
+int thread_list(struct thread_info *out, int max) {
+    uint64_t kpml4 = vmm_get_kernel_pml4();
+    spin_lock(&g_sched_lock);
+    int n = 0;
+    for (int i = 0; i < MAX_THREADS && n < max; i++) {
+        struct thread *t = &thread_table[i];
+        if (t->state == PROCESS_UNUSED) {
+            continue;
+        }
+        out[n].tid = (uint32_t)i;
+        out[n].pid = t->proc ? t->proc->pid : 0;
+        out[n].state = t->state;
+        out[n].running_cpu = t->running_cpu;
+        out[n].pinned_cpu = t->pinned_cpu;
+        out[n].priority = t->priority;
+        out[n].is_kthread = t->proc ? (t->proc->pml4_phys == kpml4) : true;
+        out[n].blocked_on_wq = (t->wait_queue != NULL);
+        out[n].suspended = t->suspended;
+        out[n].dispatch_count = t->dispatch_count;
+        out[n].migrations = t->migrations;
+        out[n].last_ran_cpu = t->last_ran_cpu;
+        out[n].born_tick = t->born_tick;
+        out[n].exit_tick = t->exit_tick;
+        n++;
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
+}
+
+/* EmbDBG v2: snapshot the context-switch counters. Self-locks g_sched_lock so
+ * the total and per-CPU array are read as a coherent set (a switch mid-copy
+ * would otherwise skew total vs. per_cpu). */
+void sched_stats_snapshot(struct sched_stats_snapshot *out) {
+    spin_lock(&g_sched_lock);
+    out->total = g_ctxsw_total;
+    out->ncpu = cpu_count <= MAX_CPUS ? cpu_count : MAX_CPUS;
+    for (uint32_t i = 0; i < MAX_CPUS; i++)
+        out->per_cpu[i] = g_ctxsw_per_cpu[i];
+    spin_unlock(&g_sched_lock);
+}
+
+/* EmbDBG v2: snapshot the recent-switch ring, OLDEST-first. When the ring has
+ * wrapped we only have the last SCHED_EVENT_RING switches; return the newest
+ * `max` of whatever is available, in chronological order. */
+int sched_timeline_snapshot(struct sched_event_view *out, int max) {
+    if (max <= 0)
+        return 0;
+    spin_lock(&g_sched_lock);
+    uint64_t total = g_sched_ring_head;                 /* events ever recorded */
+    uint64_t have  = total < SCHED_EVENT_RING ? total : SCHED_EVENT_RING;
+    uint64_t want  = have < (uint64_t)max ? have : (uint64_t)max;
+    /* The `want` newest events end at index (head-1); walk forward from
+     * (head - want) so out[0] is the oldest of the window. */
+    uint64_t start = total - want;
+    int n = 0;
+    for (uint64_t k = 0; k < want; k++) {
+        struct sched_event *e = &g_sched_ring[(start + k) & (SCHED_EVENT_RING - 1)];
+        out[n].ts       = e->ts;
+        out[n].from_tid = e->from_tid;
+        out[n].to_tid   = e->to_tid;
+        out[n].cpu      = e->cpu;
+        out[n].migrated = e->migrated;
+        n++;
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
+}
+
+/* --- EmbDBG v2 control: freeze/unfreeze via the scheduler's suspended filter.
+ * A pinned context (a core's adopted idle/shell) is left alone — freezing it
+ * would remove that core's guaranteed fallback. Under g_sched_lock. --- */
+static int set_process_suspended(uint32_t pid, bool val) {
+    if (pid == 0) return -1;
+    spin_lock(&g_sched_lock);
+    struct process *p = NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (process_table[i].pid == pid) { p = &process_table[i]; break; }
+    if (!p) { spin_unlock(&g_sched_lock); return -1; }
+    int n = 0;
+    for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
+        if (t->pinned_cpu >= 0) continue;              /* protect the fallback */
+        if (t->suspended != val) { t->suspended = val; n++; }
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
+}
+int process_suspend(uint32_t pid) { return set_process_suspended(pid, true); }
+int process_resume(uint32_t pid)  { return set_process_suspended(pid, false); }
+
+static int set_thread_suspended(uint32_t tid, bool val) {
+    if (tid >= MAX_THREADS) return -1;
+    spin_lock(&g_sched_lock);
+    struct thread *t = &thread_table[tid];
+    if (t->state == PROCESS_UNUSED || t->pinned_cpu >= 0) {
+        spin_unlock(&g_sched_lock);
+        return -1;
+    }
+    int n = (t->suspended != val) ? 1 : 0;
+    t->suspended = val;
+    spin_unlock(&g_sched_lock);
+    return n;
+}
+int thread_suspend(uint32_t tid) { return set_thread_suspended(tid, true); }
+int thread_resume(uint32_t tid)  { return set_thread_suspended(tid, false); }
+
 /* --------------------------------------------------------------------
  * Ring-3 process handle table (process.h's comment on PROC_HANDLE_MAX).
  * -------------------------------------------------------------------- */
@@ -1032,6 +1418,11 @@ int process_handle_reap_dead(struct process *owner) {
 __attribute__((noreturn))
 void process_exit_self(int code) {
     current_process->exit_code = code;
+    /* If a debugger is attached, its sys_debug_wait must observe the exit as a
+     * DBG_EV_EXITED rather than the child just vanishing (§6.5). Posted before
+     * we zombie-and-switch-away, so the event and status are recorded while the
+     * process is still fully valid. */
+    debug_notify_exit(current_process, code);
     current_thread->state = PROCESS_ZOMBIE;
     schedule();
 
@@ -1049,10 +1440,23 @@ int process_create(const char *path, char *const argv[], int argc,
     return process_create_env(path, argv, argc, NULL, actions, n_count);
 }
 
-/* Create a new process from an ELF executable */
+/* Inherit the parent's whole capability set (no attenuation) -- the default
+ * every existing spawn site gets. Attenuating spawns call process_create_caps
+ * directly with a subset. */
 int process_create_env(const char *path, char *const argv[], int argc,
                        char *const envp[],
                        const struct spawn_file_action *actions, int n_count) {
+    return process_create_caps(path, argv, argc, envp, actions, n_count,
+                               EMBK_CAP_INHERIT);
+}
+
+/* Create a new process from an ELF executable, WITH an explicit capability
+ * request. process_create_env() below is the requested_caps == EMBK_CAP_INHERIT
+ * wrapper. */
+int process_create_caps(const char *path, char *const argv[], int argc,
+                       char *const envp[],
+                       const struct spawn_file_action *actions, int n_count,
+                       uint64_t requested_caps) {
     /* Count + budget-check envp BEFORE any allocation, so an over-budget request
      * costs nothing and, more importantly, is REJECTED rather than truncated:
      * a child silently missing half its environment is a bug that surfaces far
@@ -1079,6 +1483,23 @@ int process_create_env(const char *path, char *const argv[], int argc,
      * pid to 0; they don't need to touch parent/parent_pid). */
     proc->parent = current_thread ? current_process : NULL;
     proc->parent_pid = current_thread ? current_process->pid : 0;
+
+    /* Attenuate from the parent (EMBX §6 step 9, kernel side). The grantor is
+     * the spawning process; with no current process this is the kernel creating
+     * init, which holds EMBK_CAP_ALL. A request for anything the parent does not
+     * hold is refused HERE -- before the address space exists and before we are
+     * on the parent's child_list -- so the failure path is just "release the
+     * slot", identical to the ENOMEM path below. */
+    {
+        uint64_t parent_caps = current_thread ? current_process->cap_set
+                                              : EMBK_CAP_ALL;
+        uint64_t granted;
+        if (embk_caps_attenuate(parent_caps, requested_caps, &granted) != 0) {
+            proc->pid = 0;                 /* undo process_alloc()'s reservation */
+            return -EMBK_EPERM;            /* asked for a capability not held */
+        }
+        proc->cap_set = granted;
+    }
     proc->zombie_next = NULL;
     proc->zombie_head = NULL;
     proc->child_list = NULL;
@@ -1119,11 +1540,28 @@ int process_create_env(const char *path, char *const argv[], int argc,
      * elf_load maps into pml4 and copies through P2V). stash the entry point for the trampoline jump to*/
 
     uint64_t entry_point = 0;
-    int rc = elf_load_from_file(path, pml4, &entry_point);
+    /* Dispatch on the image format. An EMBX binary carries its OWN declared
+     * capability set, checked against this (parent) process's set inside the
+     * loader (EMBX §6 step 9) -- so it OVERRIDES the caller-attenuated cap_set
+     * set above: the binary declares what it needs, the parent grants or the
+     * load fails. An ELF has no declaration and keeps the cap_set from the
+     * requested_caps attenuation above (ring 1's SET_CAPS action, or INHERIT). */
+    uint8_t magic8[8] = {0};
+    { int mfd = vfs_open(path, O_RDONLY, 0);
+      if (mfd >= 0) { size_t g = 0; vfs_fd_read(mfd, magic8, sizeof magic8, &g); vfs_close(mfd); } }
+    int rc;
+    if (embx_is_magic(magic8)) {
+        uint64_t parent_caps = current_thread ? current_process->cap_set : EMBK_CAP_ALL;
+        uint64_t granted = 0;
+        rc = embx_load_from_file(path, pml4, parent_caps, &entry_point, &granted);
+        if (rc == EMBK_OK) proc->cap_set = granted;   /* declared + granted */
+    } else {
+        rc = elf_load_from_file(path, pml4, &entry_point);
+    }
     if (rc != EMBK_OK) {
         vmm_destroy_address_space(pml4);
         proc->pid = 0;
-        return rc;  // ELF load failed
+        return rc;  // image load failed (ELF/EMBX, incl. -EMBK_EPERM for a cap denial)
     }
 
     fds_init_stdio(proc);
@@ -1131,6 +1569,7 @@ int process_create_env(const char *path, char *const argv[], int argc,
     /* 2.5. Apply file_actions -- give the child its fds before it ever runs.
      * proc->fds[] is guaranteed empty here (see fd_open_into()'s comment),
      * so there's nothing to close/overwrite first. */
+    int want_debug = 0;   /* SPAWN_ACTION_DEBUG seen -> born stopped (below) */
     for (int i = 0; i < n_count; i++) {
         const struct spawn_file_action *act = &actions[i];
         if (act->kind == SPAWN_ACTION_OPEN) {
@@ -1217,6 +1656,21 @@ int process_create_env(const char *path, char *const argv[], int argc,
                 proc->pid = 0;
                 return irc;
             }
+        } else if (act->kind == SPAWN_ACTION_SET_CAPS) {
+            /* Not a file action -- the capability request was already extracted
+             * by sys_spawn and applied via requested_caps at creation. Skip it
+             * here so it is neither an error nor double-handled. */
+        } else if (act->kind == SPAWN_ACTION_DEBUG) {
+            /* Born under debug (§6.2). Only note it here; the session is
+             * created and the child parked at the very end, once its thread and
+             * entry state exist. Requires the SPAWNER to hold EMBK_CAP_DEBUG. */
+            if (!current_process ||
+                !(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_DEBUG))) {
+                vmm_destroy_address_space(pml4);
+                proc->pid = 0;
+                return -EMBK_EPERM;
+            }
+            want_debug = 1;
         } else {
             vmm_destroy_address_space(pml4);
             proc->pid = 0;
@@ -1343,7 +1797,25 @@ int process_create_env(const char *path, char *const argv[], int argc,
     t->argv_uva = argv_array_child_uva;
     t->envp_uva = envp_array_child_uva;   /* 0 == no environment; see spawn.h */
 
-    t->state = PROCESS_READY;
+    if (want_debug) {
+        /* Born stopped BEFORE _start (§6.2): create the session and park the
+         * never-run thread on it, instead of making it READY. sys_debug_cont
+         * wakes it to run process_trampoline -> _start. The debugger got the
+         * child handle from sys_spawn; that IS the debug handle. */
+        struct debug_session *s =
+            debug_session_spawn(current_process, proc, t);
+        if (!s) {
+            /* No session slot -- fail the spawn cleanly rather than run a
+             * child the debugger asked to hold. */
+            vmm_destroy_address_space(pml4);
+            proc->pid = 0;
+            return -EMBK_ENOMEM;
+        }
+        proc->debug_session = s;
+        /* t->state was left BLOCKED by debug_session_spawn's wait_queue_block. */
+    } else {
+        t->state = PROCESS_READY;
+    }
     return (int)proc->pid;
 }
 
@@ -1631,6 +2103,14 @@ static void schedule_locked(void) {
         if (t->pinned_cpu >= 0) {
             continue;
         }
+        /* A suspended thread (EmbDBG v2 control) is frozen by intent, not
+         * starved — the same reasoning that exempts the idles above. Aging it
+         * would walk its priority up to REALTIME while frozen and, on resume,
+         * let it starve everything below it (the shell that issued `resume`
+         * included). Freeze means freeze: no run, no aging. */
+        if (t->suspended) {
+            continue;
+        }
         if (++t->ticks_since_scheduled >= PRIORITY_AGE_TICKS) {
             if (t->priority > PRIORITY_REALTIME) {
                 t->priority--;
@@ -1696,6 +2176,15 @@ static void schedule_locked(void) {
              * this is a liveness invariant, not a preference. */
             if (candidate->pinned_cpu >= 0 &&
                 candidate->pinned_cpu != (int)this_cpu()->cpu_index) {
+                continue;
+            }
+            /* A suspended thread (process/thread suspend, EmbDBG v2 control) is
+             * frozen: never a scheduling candidate, whatever its state. This
+             * includes the current thread if it was suspended while RUNNING —
+             * the scan then skips it and this core switches to its pinned idle
+             * (never suspendable), so a fully-frozen core still has something to
+             * run. Resume just clears the flag and it is a candidate again. */
+            if (candidate->suspended) {
                 continue;
             }
             /* candidate == current_thread ADDS the self-fallback that lets
@@ -1808,6 +2297,9 @@ static void schedule_locked(void) {
     next->state = PROCESS_RUNNING;  // Mark the next thread as RUNNING
     next->running_cpu = (int)this_cpu()->cpu_index;
     next->ticks_since_scheduled = 0;  // it's getting CPU time now; aging clock resets
+    /* EmbDBG v2: log this switch (counter + ring + per-thread dispatch/migration).
+     * prev is the outgoing thread; reads next->last_ran_cpu before updating it. */
+    sched_record_switch(prev, next, next->running_cpu);
     this_cpu()->cur_thread = next;   /* WRITE the per-CPU field directly:
                                       * `current_thread` is a read-only accessor
                                       * now. Safe here -- g_sched_lock is held,
@@ -2322,6 +2814,49 @@ int process_test_roundrobin(void) {
 
     selftest_release_self(self, did_adopt);
     return ok ? 0 : -1;
+}
+
+/* EmbDBG v2 control: prove suspend/resume actually FREEZE a thread. Same shape
+ * as process_test_roundrobin (a busy kthread spinning a counter with NO yield,
+ * so only timer preemption can give it CPU) — but here we SUSPEND it midway
+ * and watch the counter stop dead, then resume and watch it climb again. A
+ * suspended thread getting ANY forward progress would fail this. */
+static volatile uint64_t g_susp_counter;
+static volatile bool     g_susp_stop;
+static void susp_spinner(void) { while (!g_susp_stop) { g_susp_counter++; } process_exit_self(0); }
+
+int process_test_suspend(void) {
+    bool did_adopt;
+    struct thread *self = selftest_acquire_self(&did_adopt);
+    if (!self) return -1;
+
+    g_susp_counter = 0; g_susp_stop = false;
+    struct thread *t = process_create_kthread(susp_spinner, NULL);
+    if (!t) { selftest_release_self(self, did_adopt); return -1; }
+    uint32_t spid = t->proc->pid;
+
+    uint64_t b0 = g_susp_counter; selftest_wait_ticks(20);
+    uint64_t before = g_susp_counter - b0;             /* runs -> climbs */
+
+    process_suspend(spid);
+    selftest_wait_ticks(10);                            /* let a tick deschedule it */
+    uint64_t d0 = g_susp_counter; selftest_wait_ticks(20);
+    uint64_t during = g_susp_counter - d0;             /* frozen -> must be 0 */
+    bool susp = t->suspended;
+
+    process_resume(spid);
+    uint64_t a0 = g_susp_counter; selftest_wait_ticks(20);
+    uint64_t after = g_susp_counter - a0;              /* runs again -> climbs */
+
+    g_susp_stop = true;
+    process_resume(spid);                               /* runnable so it sees the flag */
+    selftest_wait_ticks(8);
+
+    selftest_release_self(self, did_adopt);
+
+    kprintf("process_test_suspend: before=%lu  during=%lu(frozen)  after=%lu  flag=%d\n",
+            (unsigned long)before, (unsigned long)during, (unsigned long)after, susp);
+    return (before > 0 && during == 0 && after > 0 && susp) ? 0 : -1;
 }
 
 /* --------------------------------------------------------------------

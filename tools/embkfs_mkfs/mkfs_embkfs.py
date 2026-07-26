@@ -69,6 +69,7 @@ NOW_NS = int(time.time() * 1_000_000_000)
 # Empty (env unset -> no libc.a packed) is honest: tcc can still compile (-c),
 # it just cannot link, which is exactly the truth of that image.
 NEWLIB_LIBC = os.environ.get("EMBK_NEWLIB_LIBC", "")
+NEWLIB_LIBM = os.environ.get("EMBK_NEWLIB_LIBM", "")   # libm.a: cosf/sinf for EmUI apps
 
 # The HEADER trees tcc searches ON the OS (same Makefile-owns-the-path rule as
 # NEWLIB_LIBC above):
@@ -262,7 +263,8 @@ def build_extent_items(oid: int, blk: int, data: bytes, gen: int) -> list:
 
 
 def build_superblock(total_blocks: int, free_blocks: int, generation: int,
-                     uuid16: bytes, root_block: int, root_csum: int) -> bytes:
+                     uuid16: bytes, root_block: int, root_csum: int,
+                     feat_incompat: int = 0) -> bytes:
     """
     Build the superblock block (4 KiB): body per spec §5.2 plus the trailing
     checksum over all preceding bytes. The rest of the block is reserved (zero).
@@ -279,6 +281,7 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
         generation=generation,
         root_ptr32=root_ptr,
         checkpoint_ptr32=checkpoint_ptr,
+        feat_incompat=feat_incompat,
     )
 
     sb_csum = crc32c(body)
@@ -336,15 +339,19 @@ def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
 
     # free_blocks hint: block 0 (reserved null-pointer sentinel) + superblock +
     # every metadata block (root + leaves) + backup superblock, plus all file
-    # data blocks. Block 0 is never written but counted used so the kernel's
-    # allocator oracle (which reserves it) agrees with this hint.
-    used = 3 + n_meta + sum(nblocks for (_n, _s, nblocks, _z, _c) in file_layouts)
+    # data blocks -- and, since v2.3, the snapshot registry block. Block 0 is
+    # never written but counted used so the kernel's allocator oracle (which
+    # reserves it) agrees with this hint. The registry is counted for exactly
+    # the same reason: embkfs_bitmap_build() marks it, so if this hint did not,
+    # every mount would print an allocator MISMATCH.
+    used = 4 + n_meta + sum(nblocks for (_n, _s, nblocks, _z, _c) in file_layouts)
     free_blocks = total_blocks - used
 
     superblock = build_superblock(total_blocks=total_blocks,
                                   free_blocks=free_blocks, generation=gen,
                                   uuid16=uuidlib.uuid4().bytes,
-                                  root_block=root_block, root_csum=root_csum)
+                                  root_block=root_block, root_csum=root_csum,
+                                  feat_incompat=L.EMBKFS_INCOMPAT_SNAPREG)
 
     # --- assemble the full image ---
     img = bytearray(size_bytes)  # all zeros
@@ -354,6 +361,7 @@ def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
         img[off:off + len(block_bytes)] = block_bytes
 
     put(SB_BLOCK, superblock)
+    put(L.SNAPREG_BLOCK, L.build_snapreg_block())   # v2.3: empty snapshot registry
     for b, d in meta_blocks:            # root + leaves
         put(b, d)
     for b, d in data_blocks:
@@ -367,6 +375,8 @@ def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
     n_leaves = n_meta - 1 if n_meta > 1 else 1
     print(f"Wrote {path}  ({size_bytes} bytes, {total_blocks} blocks of {bs})")
     print(f"  superblock      : block {SB_BLOCK} (byte {SB_BLOCK*bs})")
+    print(f"  snapshot registry: block {L.SNAPREG_BLOCK} (empty, "
+          f"{L.MAX_SNAPSHOTS} slots, INCOMPAT_SNAPREG set)")
     if n_meta == 1:
         print(f"  metadata        : single leaf at block {root_block} "
               f"(csum 0x{root_csum:08X}, {len(items)} items)")
@@ -718,6 +728,11 @@ def discover_userland_objects(build_dir="build"):
         if name == "init.elf":
             continue                                          # already added first
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+    # The kernel's own .embdbg (EMBDBG_Specification.md §7): a LINE+FUNCS sidecar
+    # the kernel loads at boot so isr_handler symbolizes a panic to func:line.
+    kdbg = _read_file(f"{build_dir}/kernel.embdbg")
+    if kdbg is not None:
+        objects.append((b"system/kernel.embdbg", L.DT_REG, L.S_IFREG | L.PERM_FILE, kdbg))
     so = _read_file(f"{build_dir}/libembk.so")
     if so is not None:
         objects.append((b"system/lib/libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
@@ -743,6 +758,22 @@ def discover_userland_objects(build_dir="build"):
     if libc is not None:
         objects.append((b"system/abi/libc.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libc))
 
+    # DYNAMIC-LINK ABI (so on-OS tcc can build EmUI apps against libembk.so):
+    #   libm.a   -- cosf/sinf and friends that libembk.so imports and that -lm
+    #               must pull into the app (Makefile-derived, like libc.a)
+    #   libtcc1.o -- the float/64-bit intrinsics tcc emits but x86_64 libgcc
+    #               lacks (gcc inlines them); cross-built as build/libtcc1.o
+    #   emlink_dynstubs.o -- crt0's weak bracket symbols as weak-abs-0, the
+    #               tcc-world equivalent of newlib.ld's PROVIDE()s
+    libm = _read_file(NEWLIB_LIBM) if NEWLIB_LIBM else None
+    if libm is not None:
+        objects.append((b"system/abi/libm.a", L.DT_REG, L.S_IFREG | L.PERM_FILE, libm))
+    for host, name in (("build/libtcc1.o", b"system/abi/libtcc1.o"),
+                       ("build/emlink_dynstubs.o", b"system/abi/emlink_dynstubs.o")):
+        blob = _read_file(host)
+        if blob is not None:
+            objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
     # THE HEADERS (the other half of "targeting EmbLinkOS"): newlib's include
     # tree under /system/abi/include (declaring the libc is part of the sealed
     # ABI contract, next to the objects that implement it), and tcc's own
@@ -754,6 +785,128 @@ def discover_userland_objects(build_dir="build"):
     # header-free toys. ~140 files, ~1.1 MB.
     objects.extend(_tree_objects(NEWLIB_INC, b"system/abi/include/", ".h"))
     objects.extend(_tree_objects(TCC_INC, b"data/apps/tcc/include/", ".h"))
+
+    # EmbCC self-hosting fixed point (EmbCC M3, `test embcc self`): its OWN
+    # source tree (preserving src/ subdirs so the relative quote-includes
+    # resolve), its freestanding headers (-> the compiler's default include
+    # dir beside the binary), and the REFERENCE objects the host's gcc-built
+    # embcc produced from the same sources. The on-OS embcc recompiles the
+    # sources and the kernel compares each object to its reference byte for
+    # byte. Env-gated on EMBK_EMBCC_ROOT so a checkout without it just omits
+    # the capability (honest), never fakes it.
+    EMBCC_ROOT = os.environ.get("EMBK_EMBCC_ROOT", "")
+    if EMBCC_ROOT:
+        objects.extend(_tree_objects(EMBCC_ROOT + "/src",
+                                     b"data/src/embcc/", ".c"))
+        objects.extend(_tree_objects(EMBCC_ROOT + "/src",
+                                     b"data/src/embcc/", ".h"))
+        objects.extend(_tree_objects(EMBCC_ROOT + "/include",
+                                     b"data/apps/embcc/include/", ".h"))
+        objects.extend(_tree_objects(EMBCC_ROOT + "/ref",
+                                     b"data/src/embcc/ref/", ".o"))
+
+    # The EmUI toolkit HEADERS + one real app's source (clockw), so on-OS tcc can
+    # COMPILE + DYNAMIC-LINK a GUI app against /system/lib/libembk.so -- the "GUI
+    # wall" coming down. The ui/ tree ships to /data/src/ui/ preserving its subdir
+    # shape (the app's -I set mirrors it); clockw.c beside it.
+    objects.extend(_tree_objects("ui", b"data/src/ui/", ".h"))
+    ck = _read_file("user/bin/clockw.c")
+    if ck is not None:
+        objects.append((b"data/src/ui/clockw.c", L.DT_REG, L.S_IFREG | L.PERM_FILE, ck))
+    # ...and the MANIFEST that builds it: EmbBuild's first GUI target. Until
+    # this shipped, "the OS rebuilds its userland" excluded the GUI -- first
+    # because tcc could not link a libembk.so app at all, then, once it could,
+    # because no manifest named one. `test embbuild gui` is the proof.
+    ckm = _read_file("user/bin/clockw.build.ebm")
+    if ckm is not None:
+        objects.append((b"data/src/ui/build.ebm", L.DT_REG, L.S_IFREG | L.PERM_FILE, ckm))
+
+    # Fixtures for `test blockrace`: two files, each filled with ONE distinct
+    # byte. The block layer's shared DMA bounce buffer corrupts by handing a
+    # reader the OTHER reader's sectors, which is silent -- no fault, no error
+    # code, just wrong bytes. A single-byte fill makes that unmistakable: a
+    # racing read yields 'B' where every byte must be 'A', and the offset says
+    # exactly which sector was stolen.
+    #
+    # 256 KB each, deliberately: the bounce buffer is 32 KB, so one pass over a
+    # fixture is 8+ full buffer loads with a lock acquire/release around each
+    # read call -- a wide window for two processes to interleave. A small file
+    # could be read in a single chunk and might never overlap.
+    for name, fill in ((b"data/racea.bin", b"A"), (b"data/raceb.bin", b"B")):
+        objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, fill * (256 * 1024)))
+
+    # EMBX ring-2 fixture: capchild repackaged as a native EMBX APP declaring
+    # {FILESYSTEM}. Not a *.elf, so the auto-discovery above skips it; pack it
+    # explicitly. `test embx` loads it and checks step 9 + the born cap set.
+    cx = _read_file("build/capchild.embx")
+    if cx is not None:
+        objects.append((b"data/apps/capchildx/capchild.embx",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, cx))
+
+    # The emlibc convergence artifact: an emlibc program linked by EmbLD into a
+    # NATIVE EMBX declaring {FILESYSTEM}. Present only when the host embld built
+    # it (EMBCC_ROOT); absent otherwise, never faked. `test emlibc embx` loads
+    # it and checks the process is born with exactly its DECLARED capability.
+    ex = _read_file("build/emlibc_embxapp.embx")
+    if ex is not None:
+        objects.append((b"data/apps/emlibc_embxapp/emlibc_embxapp.embx",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, ex))
+
+    # mathself: an EMBX whose MATH (math.c + all fdlibm) is EmbCC-compiled --
+    # verifies EmbCC's FP codegen computes real fdlibm correctly on the metal.
+    ms = _read_file("build/mathself.embx")
+    if ms is not None:
+        objects.append((b"data/apps/mathself/mathself.embx",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, ms))
+
+    # emlibc LINK INPUTS for on-OS EMBX emission: crt0 + an app object + the
+    # static library, so the on-image EmbLD (embld.elf) can LINK and EMIT a
+    # native .embx on the metal -- no host toolchain in the loop. x86-64 has
+    # native 64-bit divide, so no libgcc is needed: crt0 + app + libemlibc.a
+    # is the whole link line. `test embld embx` proves it.
+    for src, dst in (("build/emlibc_crt0.o",      b"data/src/emlibc/crt0.o"),
+                     ("build/emlibc_embxapp.o",   b"data/src/emlibc/embxapp.o"),
+                     ("build/libemlibc.a",        b"data/src/emlibc/libemlibc.a")):
+        blob = _read_file(src)
+        if blob is not None:
+            objects.append((dst, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
+    # ...and the SOURCE + emlibc's public headers, so the OS can COMPILE the app
+    # with embcc (against emlibc's headers + embcc's own freestanding stddef/
+    # stdarg, NOT newlib), then link+emit with embld -- the whole artifact
+    # produced by the owned toolchain on the metal. `test embcc embx` proves it.
+    app_c = _read_file("user/bin/emlibc_embxapp.c")
+    if app_c is not None:
+        objects.append((b"data/src/emlibc/embxapp.c",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, app_c))
+    objects.extend(_tree_objects("user/emlibc/include",
+                                 b"data/src/emlibc/include/", ".h"))
+
+    # ...and emlibc's OWN sources (flattened) + the shared syscall header, so
+    # the OS can SELF-HOST the libc: embcc compiles crt0 + every libemlibc unit,
+    # embld links them, and an app runs against the self-compiled libc. The §6
+    # step-5 finale -- `test emlibc selfhost`.
+    for src, dst in (("user/lib/crt0.c",              b"data/src/emlibc/crt0.c"),
+                     ("user/emlibc/string/string.c",  b"data/src/emlibc/string.c"),
+                     ("user/emlibc/stdlib/stdlib.c",  b"data/src/emlibc/stdlib.c"),
+                     ("user/emlibc/stdio/stdio.c",    b"data/src/emlibc/stdio.c"),
+                     ("user/emlibc/rim/syscalls.c",   b"data/src/emlibc/syscalls.c"),
+                     ("user/emlibc/rim/errno.c",      b"data/src/emlibc/errno.c"),
+                     ("user/emlibc/process/process.c",b"data/src/emlibc/process.c"),
+                     ("user/lib/embk_syscall.h",      b"data/src/emlibc/include/embk_syscall.h"),
+                     ("user/emlibc/math/math.c",      b"data/src/emlibc/math.c"),
+                     ("user/bin/mathself.c",          b"data/src/emlibc/mathself.c")):
+        blob = _read_file(src)
+        if blob is not None:
+            objects.append((dst, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
+    # ...and the lifted fdlibm tree (.c + its two headers), so EmbCC can compile
+    # the FP math on the OS -- folding math into the self-host set (loop closes
+    # INCLUDING floating point). `test emlibc math selfhost`.
+    objects.extend(_tree_objects("user/emlibc/math/fdlibm",
+                                 b"data/src/emlibc/fdlibm/", ".c"))
+    objects.extend(_tree_objects("user/emlibc/math/fdlibm",
+                                 b"data/src/emlibc/fdlibm/", ".h"))
 
     # SOURCE on the image: tally's exact closure (the reference pipeline
     # consumer + the sval SDK it links), preserved with its tree shape so the

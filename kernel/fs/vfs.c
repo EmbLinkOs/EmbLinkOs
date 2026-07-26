@@ -22,6 +22,29 @@
 #define VFS_MAX_MOUNTS 8
 static struct vfs_mount g_mounts[VFS_MAX_MOUNTS];
 
+/* EmbDBG v2 VFS Explorer. Mounts are immutable after single-threaded boot in v1
+ * (no lock guards g_mounts), so a read snapshot is safe. Names each fs by its
+ * ops-table address (the tables are static/private to each fs .c). */
+int vfs_mounts_snapshot(struct vfs_mount_info *out, int max)
+{
+    const void *embk = embkfs_vfs_ops_ptr();
+    const void *fat  = fat32_vfs_ops_ptr();
+    const void *ep   = epfs_vfs_ops_ptr();
+    int n = 0;
+    for (int i = 0; i < VFS_MAX_MOUNTS && n < max; i++) {
+        if (!g_mounts[i].used) continue;
+        int k = 0;
+        while (g_mounts[i].at[k] && k < 63) { out[n].at[k] = g_mounts[i].at[k]; k++; }
+        out[n].at[k] = '\0';
+        out[n].root_ino = g_mounts[i].root.ino;
+        const void *o = (const void *)g_mounts[i].ops;
+        out[n].fs = (o == embk) ? "embkfs" : (o == fat) ? "fat32"
+                  : (o == ep)   ? "epfs"   : "?";
+        n++;
+    }
+    return n;
+}
+
 void vfs_init(void)
 {
     /* BSS is already zero, but making the reset explicit means vfs_init can be

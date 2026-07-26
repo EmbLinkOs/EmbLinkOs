@@ -13,6 +13,7 @@
 #include "include/types.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "process/debug.h"   /* sys_debug_* handlers for the table below */
 #include "tty/tty.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"
@@ -24,6 +25,7 @@
 #include "ipc/endpoint.h"
 #include "fs/fd.h"
 #include "fs/vfs.h"
+#include "net/net.h"   /* sys_net_resolve -> net_resolve; socket fds via fd.h */
 #include <stdint.h>
 
 // Heap bounce buffer bounds for sys_read/sys_write. _MAX is the real throughput
@@ -204,7 +206,23 @@ out:
 /* open(path, flags, mode) -> fd, or -errno. `path` is copied in through a
  * bounded kernel buffer (copy_string_from_user) rather than resolved
  * directly from the user pointer. */
+/* The capability gate (ring 3+): a syscall that INSTALLS a resource handle
+ * refuses it to a process lacking the class. Returns 0 to proceed or -EMBK_EPERM
+ * to deny. Gate the INSTALL points only (open, surface/window create) -- ops on
+ * a handle already held are handle-scoped and need no re-check. A syscall always
+ * runs in a ring-3 process, so current_process is non-NULL. */
+static inline int cap_gate(uint32_t cap_id) {
+    return (current_process->cap_set & EMBK_CAP_BIT(cap_id)) ? 0 : -EMBK_EPERM;
+}
+
 static int64_t sys_open(struct regs *r) {
+    /* open() installs an fd handle -- the filesystem access point. Gate it here
+     * (not read/write, which are scoped to an fd already granted). stdio fds
+     * 0/1/2 are installed by fds_init_stdio at spawn, not through open, so a
+     * process without FILESYSTEM still has its console -- it just cannot open
+     * anything new. */
+    int cg = cap_gate(EMBK_CAP_FILESYSTEM);
+    if (cg) return cg;
     const char *user_path = (const char *)r->rdi;
     int flags = (int)r->rsi;
     uint32_t mode = (uint32_t)r->rdx;
@@ -672,11 +690,24 @@ static int64_t sys_spawn(struct regs *r) {
         envp_kernel[envc] = NULL;
     }
 
+    /* A SPAWN_ACTION_SET_CAPS action, if present, carries the child's requested
+     * capability set in `flags`. Absent => EMBK_CAP_INHERIT (the child gets the
+     * parent's whole set, the default every existing spawn already gets).
+     * process_create_caps enforces the request is a subset of THIS process's
+     * own set -- the userspace side of EMBX §6 step 9. */
+    uint64_t requested_caps = EMBK_CAP_INHERIT;
+    for (int i = 0; i < n_count; i++) {
+        if (actions_kernel[i].kind == SPAWN_ACTION_SET_CAPS) {
+            requested_caps = (uint64_t)(uint32_t)actions_kernel[i].flags;
+            break;
+        }
+    }
+
     /* user_envp==0 stays NULL, NOT an empty vector: "no environment" is the
      * default and a distinct, honest answer from "an empty environment". */
-    int pid = process_create_env(path, argv_kernel, argc,
+    int pid = process_create_caps(path, argv_kernel, argc,
                                  user_envp ? envp_kernel : NULL,
-                                 actions_kernel, n_count);
+                                 actions_kernel, n_count, requested_caps);
     /* Safe already: process_create_env() COPIES every string into the child's
      * own stack before returning -- that is its documented contract. */
     if (envp_buf) kfree(envp_buf);
@@ -1002,6 +1033,20 @@ static int64_t sys_gettimeofday(struct regs *r) {
  * create; the caller for the rest. See surface.h and the design spec. */
 
 static int64_t sys_surface_create(struct regs *r) {
+    /* RING 3: the capability GATE on handle installation. A GPU surface is the
+     * handle a process needs before it can draw anything; withhold it from a
+     * process that does not hold EMBK_CAP_GPU and every downstream surface op
+     * has nothing to act on -- so the coarse capability gates WHICH handles get
+     * installed, and the existing object-handle model does the actual
+     * enforcement (this is the reconciliation in capabilities.h, made real).
+     *
+     * No app regresses: everything spawned today inherits EMBK_CAP_ALL from
+     * init, so it holds GPU. Only a process DELIBERATELY spawned without it --
+     * an EMBX binary that did not declare GPU, or a SET_CAPS-attenuated child --
+     * is refused, which is the whole point. */
+    int cg = cap_gate(EMBK_CAP_GPU);
+    if (cg) return cg;
+
     uint32_t w = (uint32_t)r->rdi, h = (uint32_t)r->rsi;
     uint32_t fmt = (uint32_t)r->rdx, n = (uint32_t)r->r10;
     struct surface_info *user_out = (struct surface_info *)r->r8;
@@ -1226,6 +1271,8 @@ static int64_t sys_win_resize(struct regs *r) {
  * r9=out uint64_t* for the shared client VA (0 => plain copy window).
  * Returns a window id (>0) or -EMBK_*. */
 static int64_t sys_win_create(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_GPU);      /* a window is a GPU resource */
+    if (cg) return cg;
     /* Window-style flags ride the high bits of rdi (cw is <= 16 bits real). */
     uint32_t cw = (uint32_t)(r->rdi & 0xFFFFFFFFULL), ch = (uint32_t)r->rsi;
     int chromeless = (r->rdi >> 32) & 1;   /* EMBK_WINF_CHROMELESS */
@@ -1328,6 +1375,8 @@ static int64_t sys_screen_size(struct regs *r) {
  * window id; writes the client pixel VA to *[rdi] and the screen size to *[rsi]
  * (w) and *[rdx] (h) so the app learns the dimensions. */
 static int64_t sys_win_create_desktop(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_GPU);
+    if (cg) return cg;
     uint64_t cva = 0; uint32_t w = 0, h = 0;
     int64_t id = compositor_win_create_desktop(current_process, &cva, &w, &h);
     if (id < 0) return id;
@@ -1462,6 +1511,93 @@ static int64_t sys_tty_mode(struct regs *r) {
     return (uint64_t)old;
 }
 
+/* getcaps() -> this process's coarse resource-class capability set
+ * (capabilities.h). The introspection half of the capability model: a program
+ * can ask what it was granted rather than probe-by-failing. Also the witness
+ * `test spawncaps` uses to prove attenuation crossed the syscall boundary. */
+static int64_t sys_getcaps(struct regs *r) {
+    (void)r;
+    return (int64_t)process_current_caps();
+}
+
+/* ---- Networking (M4): the ring-3 socket surface -------------------------
+ * A socket is an fd backed by a TCP connection (FD_BACKING_SOCKET, fd.c).
+ * socket() claims an unconnected one, connect() runs the active open, and
+ * read()/write()/close() on the fd route to net_tcp_recv/send/close. The
+ * capability gates socket creation and name resolution -- once a process holds
+ * a socket fd, read/write are scoped to it (the same open-vs-read/write rule
+ * the filesystem gate uses). IPs cross the boundary in HOST order. */
+static int64_t sys_net_socket(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    /* type: 2 = SOCK_DGRAM (UDP); anything else = SOCK_STREAM (TCP). */
+    if ((int)r->rdi == 2) return fd_alloc_udp(current_process);
+    return fd_alloc_socket(current_process);
+}
+
+static int64_t sys_net_connect(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    return fd_socket_connect(current_process, (int)r->rdi,
+                             (uint32_t)r->rsi, (uint16_t)r->rdx);
+}
+
+static int64_t sys_net_resolve(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    char name[256];
+    int len = copy_string_from_user(name, (const char *)r->rdi, sizeof(name));
+    if (len < 0) return len;
+    uint32_t ip = 0;
+    if (!net_resolve(name, &ip)) return -EMBK_ECONNREFUSED;   /* no A record / no answer */
+    if (copy_to_user((void *)r->rsi, &ip, sizeof(ip)) != EMBK_OK) return -EMBK_EFAULT;
+    return 0;
+}
+
+/* Server side: bind a local port, listen, and accept (returns a NEW socket fd
+ * for the connection). All CAP_NETWORK-gated, same as the client calls. */
+static int64_t sys_net_bind(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    return fd_socket_bind(current_process, (int)r->rdi, (uint16_t)r->rsi);
+}
+static int64_t sys_net_listen(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    return fd_socket_listen(current_process, (int)r->rdi);   /* r->rsi = backlog, ignored */
+}
+static int64_t sys_net_accept(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    return fd_socket_accept(current_process, (int)r->rdi);
+}
+
+/* UDP datagram send/receive over a SOCK_DGRAM fd. Payloads bounce through a
+ * kernel buffer (<= one datagram); recvfrom optionally reports the source. */
+static int64_t sys_net_sendto(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    uint32_t len = (uint32_t)r->r8;
+    if (len > 1472) len = 1472;
+    uint8_t kbuf[1472];
+    if (len && copy_from_user(kbuf, (const void *)r->r10, len) != EMBK_OK) return -EMBK_EFAULT;
+    return fd_udp_sendto(current_process, (int)r->rdi, (uint32_t)r->rsi, (uint16_t)r->rdx, kbuf, len);
+}
+static int64_t sys_net_recvfrom(struct regs *r) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    uint32_t cap = (uint32_t)r->rdx;
+    if (cap > 1472) cap = 1472;
+    uint8_t kbuf[1472];
+    uint32_t src_ip = 0; uint16_t src_port = 0;
+    int n = fd_udp_recvfrom(current_process, (int)r->rdi, kbuf, cap, &src_ip, &src_port);
+    if (n < 0) return n;
+    if (n && copy_to_user((void *)r->rsi, kbuf, (size_t)n) != EMBK_OK) return -EMBK_EFAULT;
+    if (r->r10 && copy_to_user((void *)r->r10, &src_ip, sizeof(src_ip)) != EMBK_OK) return -EMBK_EFAULT;
+    if (r->r8  && copy_to_user((void *)r->r8, &src_port, sizeof(src_port)) != EMBK_OK) return -EMBK_EFAULT;
+    return n;
+}
+
 /* --- The table: index = syscall number --- */
 typedef int64_t (*syscall_handler_t)(struct regs *);
 
@@ -1532,6 +1668,25 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_key_event_poll 65
 #define SYS_key_mods       66
 #define SYS_tty_mode       67
+#define SYS_getcaps        68
+/* The live-debugging contract (EMBDBG_Specification.md §6.4). Handlers live in
+ * process/debug.c; must match include/debug_abi.h and the userspace mirror. */
+#define SYS_debug_attach   69
+#define SYS_debug_wait     70
+#define SYS_debug_cont     71
+#define SYS_debug_regs     72
+#define SYS_debug_mem      73
+#define SYS_debug_hwbp     74
+#define SYS_debug_detach   75
+/* Networking (M4): the ring-3 socket surface, CAP_NETWORK-gated. */
+#define SYS_net_socket     76
+#define SYS_net_connect    77
+#define SYS_net_resolve    78
+#define SYS_net_bind       79
+#define SYS_net_listen     80
+#define SYS_net_accept     81
+#define SYS_net_sendto     82
+#define SYS_net_recvfrom   83
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1602,6 +1757,22 @@ static syscall_handler_t syscall_table[] = {
     [SYS_key_event_poll] = sys_key_event_poll,
     [SYS_key_mods]       = sys_key_mods,
     [SYS_tty_mode]       = sys_tty_mode,
+    [SYS_getcaps]        = sys_getcaps,
+    [SYS_net_socket]     = sys_net_socket,
+    [SYS_net_connect]    = sys_net_connect,
+    [SYS_net_resolve]    = sys_net_resolve,
+    [SYS_net_bind]       = sys_net_bind,
+    [SYS_net_listen]     = sys_net_listen,
+    [SYS_net_accept]     = sys_net_accept,
+    [SYS_net_sendto]     = sys_net_sendto,
+    [SYS_net_recvfrom]   = sys_net_recvfrom,
+    [SYS_debug_attach]   = sys_debug_attach,
+    [SYS_debug_wait]     = sys_debug_wait,
+    [SYS_debug_cont]     = sys_debug_cont,
+    [SYS_debug_regs]     = sys_debug_regs,
+    [SYS_debug_mem]      = sys_debug_mem,
+    [SYS_debug_hwbp]     = sys_debug_hwbp,
+    [SYS_debug_detach]   = sys_debug_detach,
 };
 
 #define SYSCALL_TABLE_SIZE (sizeof(syscall_table) / sizeof(syscall_handler_t))

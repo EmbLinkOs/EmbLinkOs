@@ -48,8 +48,16 @@
 #define EMBKFS_INCOMPAT_COMPRESSION   0x0000000000000001ULL
 #define EMBKFS_INCOMPAT_ENCRYPTED     0x0000000000000002ULL
 #define EMBKFS_INCOMPAT_VERIFIED_ROOT 0x0000000000000004ULL
+/* SNAPREG (v2.3): the snapshot registry lives in a FIXED block outside the
+ * CoW tree instead of as items inside it (see the snapshot section below).
+ * INCOMPAT, not ro_compat, for a blunt reason: a reader that does not know
+ * about the bit would see that block as free and hand it to the allocator,
+ * overwriting the registry. Refusing the mount is the only safe answer. A
+ * volume WITHOUT this bit still mounts and still works -- it uses the legacy
+ * in-tree registry, with the rollback limitation that implies. */
+#define EMBKFS_INCOMPAT_SNAPREG       0x0000000000000008ULL
 #define EMBKFS_KNOWN_INCOMPAT   (EMBKFS_INCOMPAT_COMPRESSION | EMBKFS_INCOMPAT_ENCRYPTED | \
-                                 EMBKFS_INCOMPAT_VERIFIED_ROOT)
+                                 EMBKFS_INCOMPAT_VERIFIED_ROOT | EMBKFS_INCOMPAT_SNAPREG)
 #define EMBKFS_KNOWN_RO_COMPAT  0ULL
 
 /* Highest major version we know how to read. */
@@ -314,18 +322,51 @@ _Static_assert(sizeof(struct embk_verify_header) == 48, "verify header must be 4
  * same transactional put/commit machinery as everything else, rather than
  * inventing a separate registry format.
  *
- * KNOWN LIMITATION (documented, not silently worked around): because the
- * registry lives INSIDE the same versioned tree it's tracking versions
- * of, rolling back to an OLDER snapshot reverts the ENTIRE tree including
- * the registry itself -- any snapshot taken AFTER the rollback target
- * stops existing in the restored tree (the same way `git reset --hard`
- * to an old commit drops refs that only existed in now-abandoned history
- * unless kept somewhere else). A follow-up could fix this by keeping the
- * registry in superblock-adjacent space instead of the tree; out of scope
- * here. Single create-then-rollback workflows (this phase's own verify
- * criteria) are unaffected. */
+ * THE ROLLBACK LIMITATION, and its fix (v2.3, EMBKFS_INCOMPAT_SNAPREG).
+ *
+ * Storing the registry as ordinary tree items is elegant -- it reuses the
+ * put/commit machinery instead of inventing a second format -- but it puts
+ * the list of versions INSIDE the thing being versioned. Rolling back to an
+ * older snapshot therefore reverts the registry too, and every snapshot taken
+ * AFTER the rollback target stops existing in the restored tree (the way
+ * `git reset --hard` drops refs that lived only in now-abandoned history).
+ * Rollback was a one-way door: you could go back, but not back again.
+ *
+ * v2.3 moves the registry OUT of the tree, into one fixed block
+ * (EMBKFS_SNAPREG_BLOCK) that no transaction ever rewrites. Rollback then
+ * swaps the root and simply does not touch the registry, so snapshots on both
+ * sides of the target survive and rollback becomes navigable in both
+ * directions. The block is fixed rather than allocated for the same reason the
+ * superblock's location is fixed: a pointer to it would itself have to live
+ * somewhere durable, and a registry you must already have the registry to find
+ * is no better off.
+ *
+ * The legacy in-tree layout is still read and written when the feature bit is
+ * absent, so older volumes keep working exactly as before -- with the
+ * limitation above intact, because on those volumes it is still true. */
 #define EMBKFS_MAX_SNAPSHOTS    16
 #define EMBKFS_SNAPSHOT_NAME_MAX 31   /* +1 reserved pad byte = 32 total */
+
+/* Block 1: inside the pre-superblock region (blocks 1..15), which the
+ * formatter has always left unused. Reserving one of those costs nothing and
+ * needs no allocator support -- embkfs_bitmap_build() marks it alongside the
+ * superblock and the backup, in the same "fixed metadata outside the tree"
+ * step. Block 0 stays the null-pointer sentinel. */
+#define EMBKFS_SNAPREG_BLOCK    1ULL
+#define EMBKFS_SNAPREG_MAGIC    0x3147455250414E53ULL /* "SNAPREG1" */
+
+/* On-disk registry block. checksum covers everything after it, exactly the
+ * node-header convention (§8.1), so a torn or corrupted registry is DETECTED
+ * rather than served as a list of plausible-looking roots -- which would be
+ * worse than losing it, since a bad root_ptr sends the allocator marking
+ * garbage as in-use. */
+struct embk_snapshot_registry {
+    uint64_t checksum;     /*  0  CRC32C over [8 .. sizeof(registry)-1] */
+    uint64_t magic;        /*  8  EMBKFS_SNAPREG_MAGIC                  */
+    uint32_t count;        /* 16  live entries in slots[0..count-1]     */
+    uint32_t reserved;     /* 20  must be 0                             */
+    /* slots follow: EMBKFS_MAX_SNAPSHOTS * sizeof(struct embk_snapshot_item) */
+};
 
 struct embk_snapshot_item {
     uint8_t  name[32];       /*  0  NUL-padded; NOT guaranteed NUL-terminated
@@ -336,6 +377,21 @@ struct embk_snapshot_item {
 } __attribute__((packed));
 _Static_assert(sizeof(struct embk_snapshot_item) == 80, "snapshot item must be 80 bytes");
 
+
+/* Whole-object read cache geometry. FOUR slots: enough that the common
+ * concurrent pattern (a couple of readers over a couple of files) stops
+ * thrashing, small enough that a linear scan is cheaper than any index.
+ *
+ * The BUDGET matters more than the slot count. Per-object the cache admits
+ * anything up to EMBKFS_RCACHE_MAX (8 MB), so four slots could pin 32 MB --
+ * a real regression on a 512 MB machine. Instead the cache evicts LRU until
+ * the newcomer fits under a total-bytes cap, so slots buy hit rate without
+ * buying unbounded memory. */
+/* Mirrors EMBKFS_RCACHE_MAX (embkfs.c) for reporting; kept next to the slot
+ * geometry so the two cannot drift apart unnoticed. */
+#define EMBKFS_RCACHE_MAX_MB  8
+#define EMBKFS_RCACHE_SLOTS   4
+#define EMBKFS_RCACHE_BUDGET  (12u * 1024u * 1024u)
 
 /* ---- In-memory mount state ---------------------------------------- */
 
@@ -390,10 +446,24 @@ struct embkfs_volume {
      * Keyed by (oid, generation) -- every write commit bumps `generation`, so a
      * stale entry is detected and refreshed automatically, no manual
      * invalidation needed. */
-    uint64_t  rcache_oid;
-    uint64_t  rcache_gen;
-    uint64_t  rcache_len;
-    uint8_t  *rcache_buf;
+    /* N-WAY, since 2026-07-23. It was ONE slot, which is fine for a single
+     * reader walking one file and pathological the moment two readers alternate
+     * between two files: each miss re-decodes a WHOLE object, and that decode
+     * happens under the EMBKFS big lock, so the other reader is blocked for all
+     * of it. Measured before changing it (`test blockrace`): 65 waits totalling
+     * 31464 ms, ~484 ms per wait -- the duration of exactly one whole-object
+     * decode. Adding slots attacks that directly, without touching the lock. */
+    struct embk_rcache_slot {
+        uint64_t oid;
+        uint64_t gen;
+        uint64_t len;
+        uint64_t stamp;      /* LRU: bumped from vol->rcache_clock on every hit */
+        uint8_t *buf;
+    } rcache[EMBKFS_RCACHE_SLOTS];
+    uint64_t  rcache_clock;  /* monotonic tick for the LRU stamps   */
+    uint64_t  rcache_bytes;  /* live total, held under RCACHE_BUDGET */
+    uint64_t  rcache_hits, rcache_misses, rcache_evicts;
+    uint64_t  rcache_bypass;   /* object > RCACHE_MAX: not cacheable, not a miss */
 
     /* Single-object EXTENT-MAP cache: the collected+validated extref array of
      * the most-recently ranged-over object. Same (oid, generation) keying as
@@ -432,6 +502,7 @@ struct embkfs_volume {
     uint64_t  icache_oid;
     uint64_t  icache_gen;
     bool      icache_valid;
+    uint64_t  icache_hits, icache_misses;
     struct embk_inode_item icache_ino;
 
     /* Windowed read-ahead cache. rcache is all-or-nothing: it caches the WHOLE
@@ -465,6 +536,21 @@ struct embkfs_stat {
     uint64_t prefix_calls;   /* read_object_prefix: collects extents EVERY call */
     uint64_t ecache_hit;
     uint64_t ecache_miss;    /* each miss = count_extents + collect_extents */
+    /* Whole-object read cache. A MISS is expensive in a way the number alone
+     * hides: it decodes an entire object, under the EMBKFS big lock, so every
+     * other thread's fs I/O waits for it. That is why the miss and evict counts
+     * matter more than the hit count -- evictions are misses the cache caused
+     * itself, and they were the whole cost of the old single-slot design. */
+    uint64_t rcache_hit;
+    uint64_t rcache_miss;
+    uint64_t rcache_evict;
+    uint64_t rcache_bypass;  /* too big to cache -- NOT a cache failure */
+    /* icache: the third (oid,generation)-keyed cache, still SINGLE-slot -- the
+     * same shape as the rcache bug. Counted before being changed, because
+     * "same shape" is a hypothesis, not a measurement: icache is only consulted
+     * when rcache MISSES, so it may well be cold in practice. (ecache already
+     * had hit/miss counters above.) */
+    uint64_t icache_hit, icache_miss;
 };
 void embkfs_stat_reset(void);
 void embkfs_stat_get(struct embkfs_stat *out);
@@ -535,6 +621,29 @@ uint32_t embkfs_volume_count(void);
 struct embkfs_volume *embkfs_volume_at(uint32_t index);
 int embkfs_vfs_register(const char *path, struct embkfs_volume *vol);
 
+/* THE EMBKFS BIG LOCK (see the long comment in embkfs.c). Sleeping, recursive
+ * by owner thread, one for the whole filesystem. Every public entry point in
+ * this header takes it; these are exported for callers that need a WIDER
+ * critical section than a single call -- the VFS bridge (several API calls
+ * that must not interleave) and any future multi-step operation.
+ *
+ * Never hold it across a wait on another thread that does fs I/O. */
+void embkfs_lock(void);
+void embkfs_unlock(void);
+
+/* How hard is that one lock actually being leaned on? Answering this is the
+ * prerequisite for making it finer-grained: per-volume or per-object locking
+ * means first un-sharing 34 static scratch buffers in embkfs.c, and that is
+ * only worth doing if something is genuinely waiting. */
+struct embkfs_lockstat {
+    uint64_t acquires;   /* top-level acquisitions (recursion excluded) */
+    uint64_t recursive;  /* re-entries by the owner: free, no waiting    */
+    uint64_t waits;      /* acquisitions that had to BLOCK               */
+    uint64_t wait_us;    /* wall microseconds spent blocked              */
+};
+void embkfs_lockstat_get(struct embkfs_lockstat *out);
+void embkfs_lockstat_reset(void);
+
 /* Probe one block device: read + verify the superblock at byte 65536, and on
  * success fill *vol. Returns EMBK_OK, or -EMBK_EINVAL if the device isn't an
  * EMBKFS volume (or its superblock is corrupt). */
@@ -557,11 +666,13 @@ int embkfs_run_path_selftests(void);
 int embkfs_run_allocator_selftests(void);
 int embkfs_run_tree_selftests(void);
 int embkfs_run_object_selftests(void);
+int embkfs_run_shrink_selftests(void);
 int embkfs_run_timestamp_selftests(void);
 int embkfs_run_multivol_selftests(void);
 int embkfs_run_compress_selftests(void);
 int embkfs_run_selfheal_selftests(void);
 int embkfs_run_snapshot_selftests(void);
+int embkfs_run_snapreg_selftests(void);
 int embkfs_run_provenance_selftests(void);
 int embkfs_run_verifyboot_selftests(void);
 int embkfs_run_namespace_selftests(void);

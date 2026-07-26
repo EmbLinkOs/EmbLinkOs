@@ -35,21 +35,46 @@ left to do.
 ## Memory Management
 
 ### PMM
-- [ ] Linear scan for a free page is O(n) — slow under heavy allocation.
-  Future: free list or buddy allocator.
-- [ ] Stack region hardcoded at 0x200000 — should be allocated dynamically
-  and tracked properly.
-- [ ] Stack and PMM bitmap could collide if the stack grows > 1MB.
-  - Move the stack to its own dedicated region, or allocate it via PMM after
-    init, with proper guard pages.
+- [x] ~~Linear scan for a free page is O(n) — slow under heavy allocation~~ —
+  **fixed, and measured.** Two small changes rather than the buddy allocator
+  this entry reached for: a **rotating hint** (resume where the last success
+  left off, wrap once — still exact, it cannot report ENOMEM while a free page
+  exists) and **byte-at-a-time skipping** (a `0xFF` byte is eight used pages,
+  so one test replaces eight). `pmm_free_page` also aims the hint at the page
+  it just freed, so free-then-allocate costs one test.
+  Controlled A/B via `test pmm`, same build, hint disabled vs enabled:
+
+  | | hint off (old) | hint on | |
+  |---|---:|---:|---|
+  | scan tests, 2048 allocations | 2,289,920 | 2,048 | |
+  | **tests per allocation** | **1118** | **1** | **1118× fewer** |
+
+  The old cost grew with how much memory was already used — low memory fills
+  first and stays full, so every allocation re-walked it. Note the "old" column
+  already includes byte-skipping; the true original (bit-at-a-time from page 0)
+  was ~8× worse again.
+  - [ ] A **buddy allocator** is still the eventual answer *if contiguous
+    multi-page allocation is ever needed* — that is what it buys that this does
+    not. Nothing asks for it yet, so it is not built speculatively.
+- [x] ~~Stack region hardcoded at 0x200000~~ — the boot stack is a 128 KiB
+  `resb` in the kernel's own `.bss` (`kentry.asm`), so it moves with the kernel
+  and there is no hardcoded address left.
+- [x] ~~Stack and PMM bitmap could collide if the stack grows > 1MB~~ —
+  structurally impossible for the same reason: the stack is inside the kernel
+  image, below `kernel_end`, and the bitmap sits *at* `kernel_end`. They cannot
+  overlap without the linker placing `.bss` on top of itself.
+  - [ ] Still absent: **guard pages** on the boot stack. A deep recursion would
+    run off the bottom into whatever `.bss` precedes it rather than faulting.
+    Bounded (the kernel's call depth is shallow and known), but real.
 
 ### VMM — kernel mapping extent (NEW — today's near-miss)
-- [ ] vmm_init maps only the first 2MB of the kernel into the kernel range
-  (`for phys = 0; phys < 0x200000`). The kernel currently fits (~1.5MB), but
-  the moment it crosses 2MB (more drivers, filesystem code, bigger BSS) the
-  high addresses become unmapped → page fault on first access.
-  - FIX: map dynamically up to a rounded-up KV2P(kernel_end) instead of a
-    hardcoded 0x200000.
+- [x] ~~vmm_init maps only the first 2MB of the kernel into the kernel range~~ —
+  done, and the near-miss it warned about did arrive: the kernel is now ~1076
+  sectors (550 KB of image, ~4 MB total with `.bss`), well past 2 MB. `vmm_init`
+  maps `[0 .. max(kernel_end, pmm_reserved_phys_end()))`, rounded up — the
+  bitmap sits *at* `kernel_end` and is written before the remap, so the mapping
+  has to cover it too or the first bitmap access after the CR3 switch faults.
+  Visible at boot: `Mapping Kernel at 0xFFFFFFFF80000000 up to phys: 0x467000`.
 
 ### VMM — page-table location limit (measured)
 - [x] Boots fine at 4 GB. Page tables (~28 KB) + bitmap (160 KB) fit under
@@ -202,8 +227,14 @@ left to do.
 ### Timer / Time
 - [x] Migrate to TSC + HPET for precise time (HPET one-shot, TSC high-res),
   both discovered via ACPI.
-- [ ] Tick handler only does counter++ — eventually: preemption check +
-  scheduler invocation (once there are processes).
+- [x] ~~Tick handler only does counter++ — eventually: preemption check +
+  scheduler invocation~~ — **preemption is live**, it just is not in the handler
+  this entry was looking at. `timer.c`'s PIT handler (IRQ 0) really does only
+  `ticks++`, and correctly: it is the legacy wall clock. The scheduler runs off
+  the **LAPIC timer** — `lapic_timer_handler()` EOIs, re-arms the one-shot
+  TSC-deadline, then calls `schedule()`, on **every core's own tick**. Only the
+  BSP advances the shared tick counter, deliberately, so it stays a wall clock
+  rather than becoming a sum over online cores.
 
 ---
 
@@ -254,7 +285,9 @@ left to do.
     now lives in partition.c.
     Verified against `sfdisk` as an independent oracle (`make part_gpt.img`):
     3/3 partitions, start+length exact.
-    - [ ] Backup header (last LBA) not tried when the primary's CRC fails —
+    - [ ] *(verified still open — `partition.c:225` returns 0 with the comment
+  "the backup header at the last LBA could be tried; not yet")* Backup header
+  (last LBA) not tried when the primary's CRC fails —
       we refuse rather than recover. The recovery is the point of the backup.
     - [ ] Entry-array CRC (`partition_entry_array_crc32`) not checked; only the
       header's.
@@ -269,8 +302,9 @@ left to do.
     Verified against `sfdisk` (`make part_ext.img`): sda1/5/6/7 exact.
     🪤 Names went TWO-digit: logicals start at 5 and GPT allows 128, so the old
     single digit made `sda12` collide with `sda2` — two devices, one name.
-  - [ ] Scan must run after `sti` (ATA read path is IRQ-driven). Placed in
-    main.c right before block enumeration / mount probe for that reason.
+  - [x] ~~Scan must run after `sti` (ATA read path is IRQ-driven)~~ — done, and
+    the entry already described the fix: it sits in `main.c` immediately before
+    block enumeration / mount probe precisely so interrupts are on by then.
 - [x] ~~Block-layer reads/writes on IDE secondary channel hang~~ — done
   (EMBKFS v2 Phase 21), see the ATA/DMA entry above. Disks on the
   secondary channel (3rd/4th drive) now work; FAT32's test disk staying
@@ -299,11 +333,32 @@ left to do.
   Verified: boots (the pre-scheduler partition scan is the thing that would hang),
   `test posix` **ALL PASS**, `test ioperf` unchanged (440 ms/MB cold, 194%
   amplification, disk still 1% of wall).
-  - [ ] ⚠️ **The race itself is NOT covered by a test.** Every test above is
-    single-threaded, so the lock is never contended — they prove no deadlock and
-    no regression, not that the corruption is gone. A genuine concurrent-I/O
-    test (two processes reading different files at once, checking neither gets
-    the other's bytes) is the missing piece.
+  - [x] ~~⚠️ **The race itself is NOT covered by a test.**~~ — written, and it
+    found something better than a pass. **`test blockrace`** spawns 4 readers
+    (`ioracer.elf`) before waiting on any, each verifying every byte of a
+    single-byte-filled fixture, so one stolen sector is unmistakable. All four
+    get their own bytes — **and the bounce lock is contended ZERO times.**
+    - **That is not a weak test, it is a finding:** the **EMBKFS big lock
+      serialises every filesystem operation**, so two processes cannot be
+      inside the block layer at once *by way of the filesystem*. The bounce
+      lock sits underneath a lock that already excludes the concurrency it
+      defends against. Asserting "contention > 0" would have been demanding a
+      race the architecture currently forbids — no amount of hammering
+      produces it.
+    - So the test asserts the **relationship** instead: contention through the
+      fs path must be **zero**, because the big lock serialises above it. If it
+      ever fires non-zero, the layering changed — a finer-grained fs lock (the
+      open item above), a second filesystem alongside EMBKFS (`fat32.c` does
+      **not** take the EMBKFS lock), or a non-fs block user — and the bounce
+      lock stopped being defence-in-depth. The test is how that transition
+      announces itself instead of being found by corruption.
+    - Instrumentation added to make any of this checkable: `blkstat` now counts
+      `bounce_reads` / `bounce_writes` / `bounce_contended`. Measured: a single
+      `test posix` takes the bounce path **8617 times** — it is the hot path,
+      not an edge case, because kmalloc memory is in the direct map while ATA
+      needs the kernel range. Also visible: ~3 MB of logical reads produced only
+      216 device bounce reads, the rest served by EMBKFS's object cache — a
+      test assuming "bytes read == device reads" would be measuring the cache.
   - [ ] Bounce always copies; multi-PRD scatter-gather (page-walk via
     `vmm_get_phys`) would be the zero-copy alternative, and would retire the
     shared buffer — and this lock with it. Also: bounce always copies; multi-PRD scatter-gather (page-walk
@@ -313,14 +368,33 @@ left to do.
 
 ## PCI
 
-- [ ] BARs parsed but not stored in the pci_device struct — only printed.
+- [~] BARs are not cached in `struct pci_device`, but "only printed" is wrong:
+  `pci_read_bar()` reads and **sizes** any BAR on demand and returns a typed
+  `struct pci_bar` (address, size, MMIO-vs-IO, 64-bit, prefetchable, valid),
+  and every driver that needs one calls it (ATA's BAR4, xHCI, virtio-gpu, ...).
+  What is missing is only the caching.
+  - [ ] Cache them in `pci_device` if a caller ever needs BARs without a
+    config-space round trip. Nothing does today — enumeration is once at boot.
   Cache them so drivers retrieve without re-reading.
 - [ ] No ECAM/MCFG (PCIe memory-mapped config) — only legacy CAM. Parse the
   MCFG ACPI table, map config space, support 4KB extended config.
 - [ ] No recursive bridge scanning — brute force works but doesn't follow
   secondary buses behind PCI-to-PCI bridges properly.
-- [ ] No capability-list parsing (MSI/MSI-X, power management).
-- [ ] No interrupt routing — wire device INTx/MSI to IO-APIC/LAPIC.
+- [x] ~~No capability-list parsing (MSI/MSI-X, power management)~~ — the
+  capability list IS walked: `pci.c` checks the status-register capabilities
+  bit, then chains through looking for **MSI (id 0x05)** and **MSI-X (id
+  0x11)**, and programs table entry 0 to deliver a chosen vector
+  (`pci_enable_msi` / `pci_enable_msix`). xHCI uses the MSI-X path in anger.
+  - [ ] Still unparsed: **power management** (id 0x01) and everything else on
+    the chain — only the two interrupt capabilities are looked for.
+- [x] ~~No interrupt routing — wire device INTx/MSI to IO-APIC/LAPIC~~ — both
+  directions exist: ISA/INTx lines go through the IO-APIC with MADT overrides
+  applied (visible at boot, e.g. `IO-APIC: ISA IRQ 14 -> GSI 14 (edge)` then
+  `GSI 14 -> vector 46`), and MSI/MSI-X are programmed straight to a LAPIC
+  vector by `pci_enable_msi`/`pci_enable_msix`.
+  - [ ] Still absent: reading the **ACPI `_PRT`** to discover a PCI device's
+    INTx→GSI mapping. Today a driver is told its line rather than deriving it,
+    which works because this machine's devices are known.
 - [ ] No device-specific driver-binding mechanism yet.
 - [ ] Vendor/device ID → human-name database (currently only class names).
 
@@ -490,26 +564,44 @@ interrupt-driven.
   them. STILL OPEN (the "STRONGER" tier): an on-disk orphan list for
   crash-safe deferred delete, replayed on mount — bigger, only worth it if
   crash-safety of the unlinked-open window specifically matters.
-- [ ] Open-ref table (`g_open_refs`, EMBKFS_MAX_OPEN_OBJECTS = 64) is a fixed
-  array with linear scan and NO lock. SMP now exists (see Process &
-  Scheduling) but nothing currently opens EMBKFS objects from more than
-  one core concurrently — revisit before that changes. Same class as the
-  block-layer bounce buffer below.
+- [~] Open-ref table (`g_open_refs`, EMBKFS_MAX_OPEN_OBJECTS = 64) is a fixed
+  array with linear scan and no lock **of its own** — but it is no longer
+  unprotected: `obj_get`/`obj_put` reach it through public entry points that
+  all take the EMBKFS big lock, so concurrent access is serialised with the
+  rest of the filesystem. What remains is the FIXED SIZE (64) and the linear
+  scan, which are capacity/efficiency limits, not races. The block-layer
+  bounce buffer below is still the genuinely unprotected one.
 - [ ] `embkfs_parent_dir_oid` resolves `..` by a full-tree scan (O(tree) per
   `..`). VFS now does dot-dot itself with a breadcrumb stack, so this path is
   only hit by EMBKFS-internal callers — but if those stay, a stored parent
   back-ref would make it O(1). Low priority.
-- [ ] A pre-existing (not v2-introduced) extent-supersede bug: a shrinking
-  write can fail with `-EMBK_EINVAL` specifically when the object's PRIOR
-  data happened to land as a single multi-block extent instead of several
-  single-block extents covering the same range. 100% reproducible via
-  `test embkfs timestamps` immediately followed by `test embkfs obj` on a
-  freshly-formatted volume. Root-caused down to the old-extent-supersede /
-  `embkfs_alloc_run()` interaction but not fixed — needs GDB-based tracing
-  (`docs/GDB_CHEATSHEET.md`) to finish. Documented in a code comment above
-  `embkfs_write_file()`. Flagging here too since Phase 3/4's compression
-  and encryption both add MORE extent-shape variation on the exact code
-  path this bug lives in, and could make it easier to hit, not harder.
+- [~] The extent-supersede bug (shrinking write → `-EMBK_EINVAL` when the
+  prior data landed as ONE multi-block extent): **no longer reproducible, and
+  not knowingly fixed.** Re-checked 2026-07-23 — the documented sequence
+  (`test embkfs timestamps` then `test embkfs obj` on a fresh volume) passes
+  *with the triggering shape present* (the log shows the 4103-byte write
+  landing as `1 extent, 2 blk`, then the truncate succeeding). No fix was
+  identified: `puts_cap` and the allocate/supersede loop are unchanged since
+  the report (checked against 00fa091), so either something else in the
+  intervening work moved it, or the trigger needed a finer bitmap state than
+  "one extent vs several". **Cannot-reproduce is not fixed**, so this stays
+  on the list rather than being ticked.
+  - What changed instead: the invariant is now *tested*. **`test embkfs
+    shrink`** runs 12 shrinking writes over whatever extent shapes the volume
+    produces (truncate-to-empty, block-boundary and off-by-one cuts, a
+    hole-bearing file) and checks the surviving BYTES, not just the return
+    code. Verified green twice — once on a fresh volume *with* the trigger
+    shape, once on a churned volume without it.
+  - The lesson, recorded because it cost this investigation: the original
+    repro depended on the free-block bitmap state two *unrelated* tests
+    happened to leave behind. That is a coincidence with a procedure attached,
+    not a repro — and it decayed into a passing sequence that could no longer
+    distinguish "fixed" from "hidden". The replacement asserts the invariant
+    and *reports* which shapes it saw, so a run that missed the trigger cannot
+    read as one that hit it. (The first draft of the new test repeated the old
+    mistake — it demanded a shape and skipped when the allocator refused, and
+    7 of 9 cases went unexercised. It reported `try again` rather than green,
+    which is how the flaw was caught.)
 
 #### EMBKFS v2 (see `docs/EMBKFS_spec_v2.2.md` for full detail on all of these)
 - [ ] Snapshot allocator hold-back is conservative ("hold every freed block
@@ -517,11 +609,20 @@ interrupt-driven.
   (never frees something a snapshot needs) but can delay reclaiming space
   that isn't actually still needed. True refcounting would need tracking,
   per block, which snapshot(s) if any still reference it.
-- [ ] Rolling back to a snapshot reverts the snapshot registry too (it
-  lives inside the same versioned tree it's tracking versions of) — any
-  snapshot taken AFTER the rollback target becomes inaccessible. Fix would
-  mean moving the registry to superblock-adjacent space instead of inside
-  the CoW tree itself — a real structural change, not attempted here.
+- [x] ~~Rolling back to a snapshot reverts the snapshot registry too — any
+  snapshot taken AFTER the rollback target becomes inaccessible~~ — **DONE
+  (v2.3, `EMBKFS_INCOMPAT_SNAPREG`)**: the registry moved out of the CoW tree
+  into one fixed block (block 1, in the pre-superblock region the formatter
+  already left unused) that no transaction rewrites. Rollback swaps the root
+  and never touches it, so snapshots on both sides of the target survive and
+  rollback is navigable in both directions. Own CRC32C (a failed check reports
+  EMPTY rather than serving bogus roots at the allocator); `bitmap_build`
+  reserves the block and mkfs counts it, so the mount-time free-count oracle
+  still agrees exactly. Legacy volumes without the bit keep the old in-tree
+  path and the old limitation. Proof: **`test embkfs snapreg`** — s2 survives
+  a rollback to s1, then rolls *forward* to s2 and back again (which also
+  proves s2's frozen tree stayed physically intact), and survives a full
+  bitmap rebuild. `verify_embkfs.py` §1a validates the block independently.
 - [ ] Verified-root boot check uses one HMAC key embedded in the kernel
   binary (authentication against OFFLINE tampering), not real asymmetric
   signing (which would also defend against someone who has the kernel
@@ -607,8 +708,18 @@ interrupt-driven.
   deadlock), `test thread smp` OK (8 threads/one proc — the process_alloc change).
   - [ ] ⚠️ **The race trigger is still not covered by a test** — every suite is
     effectively single-threaded per fd table, so the lock is never contended.
-    Same gap the bounce-buffer lock has; a concurrent open/close hammer (N
-    threads, assert no two fds alias one slot) is the shared missing harness.
+    A concurrent open/close hammer (N processes, assert no two fds alias one
+    slot) is the missing harness.
+    - **The template now exists**: `test blockrace` + `user/bin/ioracer.c` do
+      exactly this shape for the block layer — spawn N processes *before*
+      waiting on any, then assert on content rather than on return codes, and
+      report whether the lock was actually contended so a vacuous pass is
+      visible. Copy that structure; the fd version needs an ioracer-equivalent
+      that opens/closes rather than reads.
+    - Worth knowing before writing it: the bounce-buffer version came back
+      **zero-contended** because the EMBKFS big lock serialises above it. Check
+      whether the fd table has a similar layer above before concluding the
+      absence of contention means the lock is unnecessary.
 - [x] ~~O_TRUNC reserved but not honored.~~ **DONE** — `fd.c` shrinks to zero
   through the VFS truncate op at open time.
 - [ ] O_APPEND is implemented by re-stat-to-end before each write — one extra
@@ -721,31 +832,128 @@ Design/usage docs: `docs/EMUI_GUIDE.md` (how to build an app),
 `docs/EMUI_INTERNALS.md` (how the toolkit is built), `docs/BUILD_SETUP.md`
 (newlib + dynamic linking). Open items only — the toolkit itself, the
 compositor, and dynamic linking are all built and live-verified; what
-follows are known gaps and rough edges, not missing features.
+follows are known gaps and rough edges, not missing features. Since
+2026-07-23 the OS also **builds** EmUI apps on itself (`test tcc dyn`):
+tcc compiles and dynamically links against `libembk.so`, and the widget
+renders — and since the same day EmbBuild **builds** one from a manifest
+(`test embbuild gui`, `/data/src/ui/build.ebm`), so the rebuild-self claim
+covers the GUI, not just static C. See `docs/PORTS.md` § "The GUI wall, and
+how it came down" and BUILD.md §6.
+
+- [ ] **Only ONE EmUI app has a build manifest** (clockw). home/uidemo/wmdemo
+  and the rest of `user/bin/*.c` are still host-built only. This is now
+  breadth, not capability — each needs the same three-stanza shape plus its
+  own header closure.
+- [ ] **Header inputs in manifests are hand-written and can go silently
+  stale.** The clockw manifest's first draft listed 8 of its 12 transitive
+  headers; it would have built fine and skipped rebuilds on a `backend.h`
+  edit. Auto-depfiles (BUILD.md §2.4's deferred item) are the fix; until
+  then, derive the list from the include graph rather than from the top of
+  the .c file.
 
 - [ ] **Dynamic linker: eager relocation only, no lazy PLT binding.** Every
   `R_X86_64_JUMP_SLOT` is resolved at load time in
   `kernel/arch/x86_64/syscall/elf.c`, not on first call. Simpler and
   currently fine at this app count/size; revisit if process start latency
   becomes a real cost.
-- [ ] **A residual, unexplained transient `EFAULT` under SMP** in
-  `copy_from_user`/`copy_to_user` (`kernel/arch/x86_64/syscall/usercopy.c`)
-  — `access_ok` occasionally reports a genuinely-mapped user page as absent
-  under `-smp 4`, cause not found (suspects: a `this_cpu()`/APIC-ID
-  misattribution window, or a memory-ordering gap in the page-table walk
-  that only TCG's multi-threaded emulation exposes). Currently masked, not
-  fixed: both copy functions retry `access_ok` up to `USERCOPY_RETRIES` (8)
-  times before actually reporting a fault, which has been reliable in
-  practice but is a workaround, not a diagnosis. If unrelated EFAULTs
-  reappear elsewhere, start here.
-- [ ] **EMBKFS has latent (not yet triggered) SMP hazards from the UI
-  bring-up's heavier concurrent I/O.** Several `embkfs.c` functions use
-  `static uint8_t probe[4096]`/`datablk[4096]` scratch buffers shared across
-  calls, and the per-volume whole-object read cache (`vol->rcache_*`) is
-  unlocked — both are use-after-free/data-race risks if two cores genuinely
-  race a read against that cache's replace/free path. Worth a per-volume
-  lock at the `embk_vfs` bridge before apps start doing more concurrent
-  filesystem I/O than they do today.
+- [x] ~~**A residual, unexplained transient `EFAULT` under SMP** in
+  `copy_from_user`/`copy_to_user`, masked by retrying `access_ok` up to 8
+  times~~ — **the workaround is REMOVED.** The entry described the state
+  before two real fixes landed in that exact path:
+  - `access_ok` stopped re-reading per-CPU state per page and now captures the
+    pml4 **once with IF=0** (the migration race: `this_cpu()` resolved a core,
+    a timer IRQ migrated the thread, the deref returned a **foreign** pml4);
+  - `vmm_get_phys_in` took `vmm_lock`, closing the multi-level walk against a
+    concurrent mapper — the compositor installing shared window pages into a
+    client's PML4 while that client walked it (`font.ttf open failed -14`).
+
+  Either could have been the whole cause, so it was **measured, not assumed**.
+  `test usercopy` runs both halves of the original repro at once — 6 readers
+  hammering the syscall boundary while UI launches force the compositor to map
+  into client PML4s mid-flight, on `-smp 4`:
+
+      3496 validations, 0 transient retries, 0 hard faults, deepest 1 attempt
+
+  Retries are now **1 attempt**. A retry loop is not free insurance, it is a
+  silencer: it cannot tell a transient from the first symptom of a *new* bug,
+  which is exactly how this one survived long enough to be called "residual,
+  unexplained". A refusal is now loud (prints the address and length) and
+  counted, so a recurrence announces itself instead of being papered over.
+  - [ ] ⚠️ Zero occurrences over one run is **evidence, not proof**. If
+    `usercopy: access_ok REFUSED ...` ever appears from a program known to
+    pass valid pointers, the transient is back — the counters are still there,
+    and re-arming the retry is a one-line change. **Do the diagnosis first
+    this time.**
+
+- [ ] Still coarse: ONE lock for the whole filesystem. **Measured before
+    deciding what to do about it** (`test blockrace` reports it; counters live
+    in `struct embkfs_lockstat`). Under 4 concurrent readers:
+
+        fs big lock: 860 acquire(s), 0 recursive, 65 waited (7%), 31464 ms blocked
+
+    **~484 ms blocked per wait** (guest time — TCG inflates it, but the ratio
+    and the per-wait magnitude are the signal). So the contention is real, not
+    theoretical. Two conclusions, both of which change what "fix it" means:
+    - **Per-VOLUME locking is worthless here.** One EMBKFS volume carries all
+      traffic (`/`; `/run` is epfs, a different filesystem). Splitting the lock
+      per volume splits nothing. This was the obvious-sounding fix and the
+      measurement killed it.
+    - **The cost is HOLD TIME, not granularity** — and the hold time was the
+      *single-slot* whole-object cache thrashing. **Fixed:** `rcache` is now
+      4-way (LRU, 12 MB budget). Controlled A/B, same build and counters, only
+      `EMBKFS_RCACHE_SLOTS` changed:
+
+      | | 1 slot | 4 slots | |
+      |---|---:|---:|---|
+      | rcache misses | 63 | 8 | 7.9× fewer |
+      | …self-inflicted evictions | 61 | 4 | **96% of 1-slot misses** |
+      | device bounce reads | 228 | 16 | 14× fewer |
+      | **total ms blocked on the fs lock** | **172813** | **79108** | **2.2× less** |
+      | ms per wait | 1585 | 437 | 3.6× shorter |
+
+      96% of the old misses were evictions the cache inflicted on *itself* —
+      two readers alternating between two files evicted each other on every
+      switch, and each miss re-decoded a whole object while holding the global
+      lock. Note the wait *count* went UP (109 → 181): threads now make more
+      progress so they queue more often, while each wait is 3.6× shorter. Wait
+      count alone would have read as a regression; total blocked time is the
+      honest metric.
+    - **The other two caches were checked and left alone.** `ecache` (extent
+      map) and `icache` (inode) are *also* single-slot, and "same shape as the
+      rcache bug" looked obvious. Measured instead — with a real >8 MB workload
+      (`cxxdemo.elf`, the only file on the image past `RCACHE_MAX`, which is
+      what drives the ecache path at all):
+
+          ecache: 1608 hit, 11 miss  |  icache: 10784 hit, 11 miss  (1 slot each)
+
+      **99.3% and 99.9% hit on one slot.** No thrash, so no change. The
+      hypothesis was wrong, which is the useful outcome — an N-way rewrite of
+      either would have been churn with a plausible story attached.
+      - ⚠️ **Bounded claim:** there is only ONE >8 MB file on the image, so two
+        big files never alternate — the pattern that *would* thrash ecache is
+        untested because it cannot be built here today. If a second large file
+        appears, re-run `test blockrace` before assuming ecache is still fine.
+    - **The rcache counter was lying, and it was my counter.** That same run
+      reported `rcache: 806 hit, 9186 miss` — an apparent 8% hit rate on a cache
+      that had just been shown to work. Nearly all of those "misses" were reads
+      of the 9 MB file, which is **over `RCACHE_MAX` and therefore uncacheable
+      by policy** — a bypass, not a failure (predicted 9169, reported 9186; the
+      17-difference is the real misses). Now counted separately. A broken
+      instrument is worse than none: this one invited "fixing" a cache that was
+      already fine.
+    - Prerequisite for per-OBJECT locking, if it is ever wanted: **34 shared
+      `static uint8_t [4096]` scratch buffers in embkfs.c** would have to
+      become per-caller first — *they* are what the lock actually protects
+      (see the big-lock comment). That is the real price, and it should not be
+      paid until shortening the hold time has been tried.
+    - Also latency, not correctness: `test embkfs timestamps` holds the lock
+      across a ~2s RTC-resolution wait, and any long selftest blocks unrelated
+      fs I/O for its duration.
+  - ⚠️ **The rule that keeps it safe:** never hold this lock across a wait on
+    *another thread* doing fs I/O (spawn-and-wait, say) — the child's ops take
+    the same lock from a different thread and would block on a holder that is
+    itself blocked on the child. This is exactly why the selftest dispatcher
+    does not wrap commands wholesale; the leaf entry points lock instead.
 - [x] ~~**`mkfs_embkfs.py`'s single-leaf image builder overflows past ~7
   packed files.**~~ — done: `build_btree()` (with `pack_items_into_leaves()`)
   greedily packs metadata items into as many level-0 leaves as they need and
@@ -794,9 +1002,24 @@ follows are known gaps and rough edges, not missing features.
   link, and land on the image with zero build-file edits. *(Minor residual:
   deleting an app's `.c` leaves a stale `build/*.elf` that keeps getting
   packed until `make clean` — adding is free, removing needs the clean.)*
-- [ ] **No real TTY.** The framebuffer console is output-only (no
-  scrollback, no line editing); a text shell (see Architecture roadmap)
-  needs this built first.
+- [x] ~~**No real TTY.** The framebuffer console is output-only (no
+  scrollback, no line editing)~~ — **a real TTY exists** (`kernel/tty/`): a
+  line discipline with cooked and raw modes, line buffering, echo, backspace
+  erase (which refuses to back over the prompt), `^D` EOF on an empty line,
+  and `^C` cancellation returning `-EMBK_ECANCELED`. The console fd's read op
+  in `fs/fd.c` is a thin shim over `tty_read()`, so everything a terminal does
+  that a raw keyboard does not lives in one place. Proven by `test tty`
+  (injection-driven, so it needs no real key presses): **OK**.
+  - The entry bundled two different things and only one of them is still open:
+    **line editing** is done (input side), **scrollback** is not (output side).
+    `console.c`'s `scroll_up()` is overflow scrolling — it advances the screen
+    when text reaches the bottom — not a history buffer you can page back
+    through. Those are separate features and the original wording made them
+    look like one gap.
+  - [ ] **No scrollback history.** Output that scrolls off the top is gone;
+    there is no saved-line ring to page back through. Wanted for reading a long
+    boot log or a command's output on the framebuffer console — the serial log
+    is the current workaround, which is why this has never bitten hard.
 - [ ] **`home.elf` plays an informal init/service-manager role** (spawns and
   tracks every app the user launches, including the clock widget at boot)
   without being a real PID-1/service-manager abstraction — fine for a
@@ -1044,8 +1267,10 @@ substantially complete.
 
 ## Core / Library
 
-- [ ] Refactor done: kprintf + snprintf share one format_string core. Future:
-  add %b (binary) / field-precision if needed; both wrappers benefit.
+- [x] ~~Refactor: kprintf + snprintf share one `format_string` core~~ — done
+  (the entry said so while staying checked-open).
+  - [ ] Optional extras, only if something needs them: `%b` (binary) and
+    field-precision. Both wrappers would benefit for free.
 - [ ] kstring: only the subset in use is implemented. Add more (strstr, strtok,
   memchr, etc.) as needed — don't pre-build the whole libc.
 
@@ -1063,8 +1288,14 @@ substantially complete.
   (no inb/outb, no direct page-table pokes, no x86 asm in logic); route
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
-- [ ] **embbuild** — the native build tool (the make-equivalent — DECIDED and
-  now DESIGNED: `docs/BUILD.md` is the ratification document + v1 spec;
+- [x] ~~**embbuild** — the native build tool (the make-equivalent)~~ —
+  **BUILT AND SHIPPED**, not merely designed. `shell/tools/embbuild.c`; proven
+  by `test embbuild` (cases a–f including the §3 `/system` install refusal),
+  `test embbuild self` (EmbBuild rebuilds EmbBuild, cross-checked by a
+  two-implementations oracle), `test embbuild shell` (the shell rebuilds the
+  shell and the OS adopts it), and `test embbuild gui` (a `libembk.so` EmUI app
+  built from a manifest and adopted). The design record below is kept because
+  the reasoning is still the justification for the shape:
   manifest format, content-hash stamps, stage/adopt via atomic rename,
   `/data/build/` tree, `test embbuild` acceptance).
   The fork was audited and ratified: a **native structured tool**, not a make
@@ -1078,13 +1309,17 @@ substantially complete.
   convention, the ABI as ambient constants — the schema `test tcc tally`
   already executes hand-unrolled. Deliberately absent from v1: variables,
   pattern rules, parallelism (the real graph is ~50 explicit nodes). Honest
-  rebuild-self scope with TCC: static newlib C only — no `__thread` (no
-  linker scripts/PT_TLS), no `libembk.so` apps, no C++, kernel wants GCC.
+  rebuild-self scope with TCC: static newlib C, **and `libembk.so` GUI apps
+  since 2026-07-23** (`test tcc dyn`); still no `__thread` (no linker
+  scripts/PT_TLS), no C++, kernel wants GCC.
   make itself arrives later as opt-in compat with the foreign-tree ports
   story. Nice detail available: build it on the sval SDK, which is on-image
   and already proven self-rebuildable.
-  - [ ] v1 staleness detail: hash file bytes in userspace; exposing a cheap
-    content identity from EMBKFS's CoW generation machinery is a later kernel
-    item, pulled by need.
-  - [ ] Prerequisite already DONE: separate compile-then-link with
-    tcc-produced objects, proven live (`test tcc tally`).
+  - [x] v1 staleness detail: hashing file bytes in userspace — **that is what
+    shipped** (CRC32C over inputs + argv + tool version).
+    - [ ] Still open, and still "pulled by need": exposing a cheap content
+      identity from EMBKFS's CoW generation machinery, so a stamp need not
+      re-read the file to know it changed.
+  - [x] Prerequisite DONE: separate compile-then-link with tcc-produced
+    objects, proven live (`test tcc tally`). *(Was checked-open while its own
+    text said "already DONE".)*

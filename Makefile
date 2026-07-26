@@ -57,12 +57,15 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/cpu/spinlock.c \
              kernel/arch/x86_64/cpu/rwlock.c \
              kernel/arch/x86_64/smp/smp.c \
+             kernel/arch/x86_64/boot/bootinfo.c \
              kernel/arch/x86_64/syscall/syscall.c \
              kernel/arch/x86_64/syscall/usercopy.c \
              kernel/arch/x86_64/syscall/usermode.c \
              kernel/arch/x86_64/syscall/elf.c \
+             kernel/arch/x86_64/syscall/embx.c \
              kernel/process/process.c \
              kernel/process/ksync.c \
+             kernel/process/debug.c \
 			 kernel/tty/tty.c \
              kernel/acpi/acpi.c \
              kernel/drivers/char/serial.c \
@@ -80,6 +83,16 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
              kernel/drivers/bus/pci.c \
+             kernel/net/net.c \
+             kernel/net/virtio_net.c \
+             kernel/net/ethernet/eth.c \
+             kernel/net/ethernet/arp.c \
+             kernel/net/ip/ipv4.c \
+             kernel/net/ip/icmp.c \
+             kernel/net/udp/udp.c \
+             kernel/net/dhcp/dhcp.c \
+             kernel/net/dns/dns.c \
+             kernel/net/tcp/tcp.c \
              kernel/drivers/usb/usb.c \
              kernel/drivers/usb/usb_core.c \
              kernel/drivers/usb/xhci.c \
@@ -116,6 +129,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/gfx/compositor.c \
              kernel/lib/kstring.c \
              kernel/lib/errno.c \
+             kernel/lib/ksym.c \
              kernel/lib/kprintf.c
 
 LINKER      = kernel/linker.ld
@@ -123,15 +137,30 @@ STAGE1_BIN  = boot/stage1/boot.bin
 STAGE2_BIN  = boot/stage2/stage2.bin
 KERNEL_ELF  = kernel/kernel.elf
 # Stripped copy that actually goes into the boot image. The full kernel.elf
-# carries ~490 KB of .debug_*/.symtab that stage2's real-mode loader would
-# otherwise stream into 0x10000.. -- past 0xA0000 (video RAM) at sector 1152
-# and into the VGA option-ROM window at sector 1408, where int 0x13 writes
-# fail (-> disk_error hang) or scribble the VESA framebuffer vbe_init just set.
-# strip removes the non-allocated sections; PT_LOAD offsets and e_entry are
-# untouched, so load_elf still parses it identically. Keep kernel.elf (with
-# symbols) for gdb. See boot ceiling note in memory.
+# carries ~490 KB of .debug_*/.symtab; stripping keeps the boot image small and
+# the boot-time staging copy short, and the debug info lives in the separate
+# .embdbg sidecar below instead. (Historically strip was MANDATORY: the old
+# stage2 staged the ELF at 0x10000 and a kernel past ~576 KB streamed into
+# 0xA0000 video RAM / the option-ROM window -> disk_error hang or a scribbled
+# framebuffer. stage2 now stages the ELF above 1 MB via unreal mode, so that
+# ceiling is lifted -- see boot/stage2/stage2.asm KERNEL_STAGE_PHYS -- but a
+# smaller boot image is still worth keeping.) strip removes the non-allocated
+# sections; PT_LOAD offsets and e_entry are untouched, so load_elf parses it
+# identically. Keep kernel.elf (with symbols) for gdb + the .embdbg producer.
 STRIP       = x86_64-elf-strip
 KERNEL_BIN  = kernel/kernel.strip.elf
+
+# The kernel's own .embdbg panic-symbol sidecar (EMBDBG_Specification.md §7),
+# produced from kernel.elf's DWARF by the EmbDBG tool. Function addresses come
+# from the (unstripped) kernel.elf; the stripped kernel that actually boots has
+# the same vaddrs, so the sidecar symbolizes it. Tolerant: if the tool is not
+# present the build still proceeds (an empty file -> symbolizer disabled, the
+# panic dump falls back to hex, exactly as before).
+EMBDBG      ?= /home/motsou/EmbCC/embdbg
+build/kernel.embdbg: $(KERNEL_ELF) | $(BUILD)
+	@if [ -x "$(EMBDBG)" ]; then \
+	   echo "  EMBDBG   $@"; $(EMBDBG) $< emit-kernel $@; \
+	 else echo "  (embdbg tool absent -> no kernel panic symbols)"; : > $@; fi
 
 
 # ---- Userland ---------------------------------------------------------------
@@ -354,6 +383,195 @@ build/posixdemo.o: user/bin/posixdemo.c | $(BUILD)
 build/posixdemo.elf: build/crt0.o build/syscalls.o build/posixdemo.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/posixdemo.o -lc -lgcc -o $@
 
+# ioracer.elf -- contends for the block layer's shared DMA bounce buffer and
+# verifies it got its OWN file's bytes back. Static-newlib console program like
+# posixdemo (no UI), spawned N-up by `test blockrace`.
+build/ioracer.o: user/bin/ioracer.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+build/ioracer.elf: build/crt0.o build/syscalls.o build/ioracer.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/ioracer.o -lc -lgcc -o $@
+
+# capchild / capspawn -- the ring-1 capability-attenuation test pair. Static
+# newlib console programs (no UI). capspawn is spawned by `test spawncaps` with
+# a limited cap set and drives the rest across the spawn syscall.
+build/capchild.o: user/bin/capchild.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capchild.elf: build/crt0.o build/syscalls.o build/capchild.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capchild.o -lc -lgcc -o $@
+
+# capchild.embx -- the ring-2 fixture: capchild repackaged as an EMBX APP with a
+# DECLARED capability table {FILESYSTEM}. The loader checks that declaration
+# against the grantor (step 9) and the born process gets exactly it, which
+# capchild then reports via its exit code. mkembx.py is the byte-exact producer.
+build/capchild.embx: build/capchild.elf tools/embx/mkembx.py | $(BUILD)
+	python3 tools/embx/mkembx.py build/capchild.elf $@ --cap FILESYSTEM
+
+# crasher -- the crash-resilience witness. A static newlib program that
+# deliberately faults from ring 3; `test faultkill` spawns it and proves the
+# kernel terminates only the process (isr_handler EMBDBG spec §6.6), not the
+# machine. Auto-discovered by mkfs into /data/apps/crasher/crasher.elf.
+build/crasher.o: user/bin/crasher.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/crasher.elf: build/crt0.o build/syscalls.o build/crasher.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/crasher.o -lc -lgcc -o $@
+
+# httpget -- the M4 ring-3 networking witness. Static newlib; resolves + connects
+# + GETs over the BSD-sockets shim (embk_socket.h -> native socket syscalls).
+# `test netuser` spawns it with/without CAP_NETWORK. Auto-discovered by mkfs.
+build/httpget.o: user/bin/httpget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/httpget.elf: build/crt0.o build/syscalls.o build/httpget.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpget.o -lc -lgcc -o $@
+
+# httpd -- the M5 server witness: an on-OS HTTP server (bind/listen/accept over
+# the native socket syscalls). `test httpd` spawns it; the host curls it via a
+# SLIRP hostfwd. Auto-discovered by mkfs.
+build/httpd.o: user/bin/httpd.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/httpd.elf: build/crt0.o build/syscalls.o build/httpd.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpd.o -lc -lgcc -o $@
+
+# udptest -- the M5 ring-3 UDP witness: a userspace DNS resolver over a
+# SOCK_DGRAM socket (sendto/recvfrom). Auto-discovered by mkfs.
+build/udptest.o: user/bin/udptest.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/udptest.elf: build/crt0.o build/syscalls.o build/udptest.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/udptest.o -lc -lgcc -o $@
+
+# wget -- a real HTTP downloader (networking meets the filesystem). Auto-packed.
+build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/wget.elf: build/crt0.o build/syscalls.o build/wget.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o -lc -lgcc -o $@
+
+# ---------------------------------------------------------------------------
+# emlibc -- EmbLinkOS's own non-POSIX C library (docs/EMLIBC_Requirements.md).
+# Built -nostdinc against the COMPILER's freestanding headers only (stddef/
+# stdint/stdarg) + emlibc's own include/ + the shared syscall ABI in user/lib,
+# so a program linking emlibc physically CANNOT reach newlib. newlib stays the
+# default; emlibc replaces it incrementally, never a flag day.
+# ---------------------------------------------------------------------------
+EMLIBC_DIR    := user/emlibc
+GCC_FREEINC   := $(shell $(USER_CC) -print-file-name=include)
+EMLIBC_INC    := -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include -Iuser/lib
+# No -mno-sse: userspace supports SSE (the kernel saves it -- newlib C++/Python
+# do heavy FP), and x86-64 passes float/double in XMM, so FP is impossible with
+# it. crt0 already realigns the stack (and $-16) for SSE. emlibc's non-FP code
+# is unaffected; math.c needs this.
+EMLIBC_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
+                 -fno-stack-protector -O2 -Wall -Wextra $(EMLIBC_INC)
+
+# emlibc's math = a thin glue (emlibc_math.o) over LIFTED fdlibm (Sun's freely-
+# licensed ~1-ulp library, the source newlib's libm is built from). The fdlibm
+# tree is vendored verbatim (only its include lines adapted), so it compiles -w
+# (we do not "fix" third-party warnings) with an extra -I for its own headers.
+EMLIBC_FD_DIR  := $(EMLIBC_DIR)/math/fdlibm
+EMLIBC_FD_SRCS := $(wildcard $(EMLIBC_FD_DIR)/*.c)
+EMLIBC_FD_OBJS := $(patsubst $(EMLIBC_FD_DIR)/%.c,build/emlibc_fd_%.o,$(EMLIBC_FD_SRCS))
+EMLIBC_FD_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
+                    -O2 -w -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include \
+                    -Iuser/lib -I$(EMLIBC_FD_DIR)
+
+EMLIBC_OBJS := build/emlibc_string.o build/emlibc_stdlib.o build/emlibc_stdio.o \
+               build/emlibc_syscalls.o build/emlibc_errno.o build/emlibc_process.o \
+               build/emlibc_math.o $(EMLIBC_FD_OBJS)
+
+build/emlibc_string.o: $(EMLIBC_DIR)/string/string.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_stdlib.o: $(EMLIBC_DIR)/stdlib/stdlib.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_stdio.o: $(EMLIBC_DIR)/stdio/stdio.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_syscalls.o: $(EMLIBC_DIR)/rim/syscalls.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_errno.o: $(EMLIBC_DIR)/rim/errno.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_process.o: $(EMLIBC_DIR)/process/process.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_math.o: $(EMLIBC_DIR)/math/math.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_fd_%.o: $(EMLIBC_FD_DIR)/%.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_FD_CFLAGS) -c $< -o $@
+
+build/libemlibc.a: $(EMLIBC_OBJS)
+	x86_64-elf-ar rcs $@ $(EMLIBC_OBJS)
+
+# emlibc's own crt0 -- the same entry contract, built as emlibc's object
+# (against emlibc headers, resolving exit/malloc/environ to emlibc's).
+build/emlibc_crt0.o: user/lib/crt0.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+
+# The proof (house rule): a program that links emlibc INSTEAD of newlib -- no
+# -lc, no build/crt0.o, no build/syscalls.o -- and runs on the OS.
+build/emlibc_demo.o: user/bin/emlibc_demo.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_demo.elf: build/emlibc_crt0.o build/emlibc_demo.o build/libemlibc.a user/lib/newlib.ld
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+	    build/emlibc_crt0.o build/emlibc_demo.o -Lbuild -lemlibc -lgcc -o $@
+
+# emlibc_caps -- the part newlib cannot express: capability inspection +
+# handle-based spawn with attenuation. Also emlibc-linked, not newlib.
+build/emlibc_caps.o: user/bin/emlibc_caps.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_caps.elf: build/emlibc_crt0.o build/emlibc_caps.o build/libemlibc.a user/lib/newlib.ld
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+	    build/emlibc_crt0.o build/emlibc_caps.o -Lbuild -lemlibc -lgcc -o $@
+
+# emlibc_math -- exercises emlibc's <math.h> + %f/%e formatting. emlibc-linked.
+build/emlibc_math.elf.o: user/bin/emlibc_math.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_math.elf: build/emlibc_crt0.o build/emlibc_math.elf.o build/libemlibc.a user/lib/newlib.ld
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+	    build/emlibc_crt0.o build/emlibc_math.elf.o -Lbuild -lemlibc -lgcc -o $@
+
+# emlibc_embxapp -- the convergence artifact: an emlibc program linked by EmbLD
+# into a NATIVE EMBX declaring {FILESYSTEM} in its capability table (not ELF,
+# not repackaged by host Python). EmbLD is EmbCC's linker, so this is where
+# emlibc + EmbCC + EMBX meet. Built only when the host embld is present
+# (EMBCC_ROOT); otherwise the .embx is simply absent (honest, never faked).
+EMBCC_ROOT ?= /home/motsou/EmbCC
+HOST_EMBLD := $(EMBCC_ROOT)/embld
+LIBGCC_A   := $(shell $(USER_CC) -print-libgcc-file-name)
+build/emlibc_embxapp.o: user/bin/emlibc_embxapp.c | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_embxapp.embx: build/emlibc_crt0.o build/emlibc_embxapp.o build/libemlibc.a $(HOST_EMBLD)
+	$(HOST_EMBLD) --embx --cap filesystem -o $@ \
+	    build/emlibc_crt0.o build/emlibc_embxapp.o build/libemlibc.a $(LIBGCC_A)
+
+# mathself.embx -- the FP math (math.c + all 31 fdlibm) compiled by EmbCC, the
+# rest gcc, linked by EmbLD. Verifies EmbCC's float codegen computes real
+# fdlibm correctly on the metal (`test mathself`). Built only when the host
+# EmbCC + EmbLD are present; absent otherwise (honest, never faked).
+HOST_EMBCC    := $(EMBCC_ROOT)/embcc
+EMLIBC_EC_INC := -I$(EMLIBC_DIR)/include -I$(EMBCC_ROOT)/include -Iuser/lib -I$(EMLIBC_FD_DIR)
+build/mathself.embx: user/bin/mathself.c $(EMLIBC_DIR)/math/math.c $(EMLIBC_FD_SRCS) \
+                     build/emlibc_crt0.o build/libemlibc.a $(HOST_EMBCC) $(HOST_EMBLD)
+	@rm -rf build/mathself.d && mkdir -p build/mathself.d
+	$(HOST_EMBCC) -c user/bin/mathself.c $(EMLIBC_EC_INC) -o build/mathself.d/mathself.o
+	$(HOST_EMBCC) -c $(EMLIBC_DIR)/math/math.c $(EMLIBC_EC_INC) -o build/mathself.d/math.o
+	@for f in $(EMLIBC_FD_SRCS); do $(HOST_EMBCC) -c $$f $(EMLIBC_EC_INC) \
+	    -o build/mathself.d/$$(basename $$f .c).o || exit 1; done
+	$(HOST_EMBLD) --embx --cap filesystem -o $@ \
+	    build/emlibc_crt0.o build/mathself.d/*.o build/libemlibc.a
+
+build/capspawn.o: user/bin/capspawn.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capspawn.elf: build/crt0.o build/syscalls.o build/capspawn.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capspawn.o -lc -lgcc -o $@
+build/capreload.o: user/bin/capreload.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capreload.elf: build/crt0.o build/syscalls.o build/capreload.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capreload.o -lc -lgcc -o $@
+build/capgpu.o: user/bin/capgpu.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capgpu.elf: build/crt0.o build/syscalls.o build/capgpu.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capgpu.o -lc -lgcc -o $@
+build/capfs.o: user/bin/capfs.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/capfs.elf: build/crt0.o build/syscalls.o build/capfs.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capfs.o -lc -lgcc -o $@
+
 # --- shell.elf: the EmbLink structured shell (shell/) --------------------------
 # Static newlib link (hello.elf's shape, not the EmUI dynamic one -- the shell
 # has no UI dependency). Kernel-convention includes: one -Ishell root,
@@ -509,7 +727,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -547,6 +765,12 @@ home: build/home.elf
 # QEMU drive args: boot disk (master) + data disk (slave)
 DRIVES = -drive format=raw,file=$(IMG),if=ide,index=0 \
          -drive format=raw,file=$(DISK),if=ide,index=1
+
+# Networking (M1): QEMU user-mode net (SLIRP) + a virtio-net NIC. No host setup
+# -- SLIRP is the guest's 10.0.2.0/24 with gateway .2 and DNS .3, and answers
+# ARP + ICMP, so `test net` pings the gateway out of the box. Appended to the
+# run targets below. Add hostfwd=tcp::HOST-:GUEST here once TCP (M3) lands.
+NET = -netdev user,id=net0 -device virtio-net,netdev=net0
 
 # `make` builds a COMPLETE, CURRENT system: the boot image AND the userland
 # image. embkfs.img was deliberately absent here before, so a plain `make` could
@@ -610,12 +834,13 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) > $(IMG)
 	truncate -s 1M $(IMG)
 	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
-	video_ceiling=$$(( (0xA0000 - 0x10000) / 512 )); \
-	echo "Kernel is $$kernel_sectors sectors (video-RAM ceiling $$video_ceiling); stage2 loads exact size"; \
-	if [ $$kernel_sectors -ge $$video_ceiling ]; then \
-	  echo "*** WARNING: stripped kernel exceeds the 0xA0000 real-mode load ceiling;"; \
-	  echo "*** stage2 will overflow into video RAM/option-ROM. Move to an unreal-mode"; \
-	  echo "*** high load (>1 MB) before the kernel grows further."; \
+	kernel_top=$$(( 0x100000 + $$(stat -c%s $(KERNEL_BIN)) )); \
+	stage_base=$$(( 0x1000000 )); \
+	echo "Kernel is $$kernel_sectors sectors; stage2 stages the ELF at 0x1000000 (16 MB, unreal-mode high load)"; \
+	if [ $$kernel_top -ge $$stage_base ]; then \
+	  echo "*** WARNING: the kernel's final image (ends ~0x$$(printf %X $$kernel_top)) now reaches the"; \
+	  echo "*** 0x1000000 (16 MB) staging base -- the staged ELF would overwrite the running kernel."; \
+	  echo "*** Raise KERNEL_STAGE_PHYS in boot/stage2/stage2.asm above the kernel's top."; \
 	fi
 # Create the 64 MB data disk only if it doesn't already exist
 $(DISK):
@@ -665,7 +890,10 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	$(STRIP) $@
 endif
 
-EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf \
+EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
+               build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf \
+               build/emlibc_demo.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
@@ -685,7 +913,7 @@ STAGED_APPS ?=
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/libembk.so build/libtcc1.o build/emlink_dynstubs.o
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so build/libtcc1.o build/emlink_dynstubs.o
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -759,7 +987,7 @@ run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
 	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
-	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi
+	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi $(NET)
 	@echo "--- grading the post-COW image ---"
 	python3 embkfs_mkfs/verify_embkfs.py $(EMBKFS_SCRATCH)
 
@@ -775,7 +1003,7 @@ run-embkfs: $(IMG) $(DISK) embkfs.img
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
-	    -serial stdio -no-reboot -no-shutdown
+	    -serial stdio -no-reboot -no-shutdown $(NET)
 
 # --- run-ui: boot to a window, then the live EmbLink UI app ------------------
 # Boots EmbLinkOS with a real display; uidemo.elf (the ring-3 UI toolkit, font
@@ -793,7 +1021,7 @@ run-ui: $(IMG) embkfs.img
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
-	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4
+	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4 $(NET)
 
 # Boots to the window-compositor demo: two kernel-composited windows (one
 # hosting the EmUI toolkit, one drawn directly) over a desktop with title-bar
@@ -805,7 +1033,7 @@ run-wm: $(IMG) embkfs.img
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
-	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4
+	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4 $(NET)
 
 # Encrypted EMBKFS test volume (v2.2 Phase 4). Passphrase is the fixed test
 # string "correcthorsebattery" -- NEVER a real credential, just a KAT-style
@@ -967,6 +1195,39 @@ run-usb-embkfs: $(IMG) $(DISK) usbdisk_embkfs.img
 	    -drive id=usbembkfs,file=usbdisk_embkfs.img,format=raw,if=none \
 	    -device usb-storage,bus=xhci.0,drive=usbembkfs \
 	    -serial stdio -no-reboot -no-shutdown
+
+# ── Single bootable medium: boot + kernel + EMBKFS on ONE device ─────────────
+# The whole system on one image, the way a USB stick or a single physical disk
+# must carry it -- the IDE path splits boot ($(IMG)) and data (embkfs.img) across
+# two -drive lines, but a stick is ONE device. `dd if=usb.img of=/dev/sdX` makes
+# a bootable stick for real hardware; `make run-usb` boots this same file in
+# QEMU. Built from the same stage1/stage2/kernel + embkfs.img the two-image path
+# uses; see tools/mkbootdisk.sh for the on-disk layout.
+usb.img: $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) embkfs.img tools/mkbootdisk.sh
+	tools/mkbootdisk.sh $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) embkfs.img $@
+
+# Boot ENTIRELY from the USB stick -- no IDE boot disk at all. SeaBIOS boots the
+# xHCI mass-storage device (bootindex=0); stage1/stage2 read the kernel off it
+# via INT 13h (BIOS USB legacy emulation), then the kernel re-reads the SAME
+# stick through its own xHCI MSC driver and mounts the EMBKFS in partition 1 at
+# "/". Both I/O worlds -- BIOS, then the native driver -- on one device, which is
+# the real end-to-end USB-boot test.
+run-usb: usb.img
+	qemu-system-x86_64 \
+	    -device qemu-xhci,id=xhci \
+	    -drive id=usbboot,file=usb.img,format=raw,if=none \
+	    -device usb-storage,bus=xhci.0,drive=usbboot,bootindex=0 \
+	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
+
+# Same combined image, but booted as a plain IDE/SATA disk (bootindex on the disk
+# itself). Proves the ONE-image layout also boots a normal disk end-to-end -- the
+# partition scanner finds the EMBKFS partition and mounts it at "/", no second
+# -drive line. This is "a disk with our EMBKFS" from the goal, distinct from USB.
+run-usb-ide: usb.img
+	qemu-system-x86_64 \
+	    -drive id=bootdisk,file=usb.img,format=raw,if=none \
+	    -device ide-hd,drive=bootdisk,bootindex=0 \
+	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
 
 # Two independent EMBKFS volumes mounted at once (sdb -> "/", sdc -> "/sdc"),
 # both on plain IDE -- exercises embkfs_init()'s multi-volume mount table

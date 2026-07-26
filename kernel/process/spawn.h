@@ -9,7 +9,13 @@
  * (spawn returned E2BIG on the shell's own rebuild). Kernel-stack cost of
  * the bump: +1 KB in sys_spawn's argv_buf + 128 B of pointer arrays --
  * well inside the guarded kernel stacks. */
-#define SPAWN_ARGV_MAX             32          // max argv[] entries (incl. the NULL terminator)
+#define SPAWN_ARGV_MAX             64          // max argv[] entries (incl. the NULL terminator).
+                                               // 32 -> 64 for on-OS self-host of the FP math:
+                                               // linking the whole libc + fdlibm tree + app is
+                                               // ~38 object paths in one embld argv. The real
+                                               // limit is the child's 4 KiB argv/envp page, still
+                                               // checked at runtime in process_create_env
+                                               // (STACK_ROOM_NEEDED); this only sizes the arrays.
 #define SPAWN_ARGV_BYTES_MAX       2048        // total bytes of argv[] strings (incl. NUL terminators)
 
 /* ENVIRONMENT -- passed EXPLICITLY at spawn, exactly like argv, and never
@@ -50,6 +56,20 @@
                                                // child receives it at its first free slot. The
                                                // bootstrap for two-process channel tests.
 #define SPAWN_ACTION_INSTALL_OBJ     4         // install a byte-stream obj-handle (a pipe end)
+#define SPAWN_ACTION_DEBUG           6         // born under debug, stopped before _start
+                                               // (EMBDBG_Specification.md §6.2). Needs the
+                                               // spawner to hold EMBK_CAP_DEBUG; the child is
+                                               // created and parked, and the child handle
+                                               // sys_spawn returns doubles as the debug handle.
+                                               // (id 6, not 5 -- SET_CAPS took 5 below.)
+#define SPAWN_ACTION_SET_CAPS        5         // attenuate the child's capability set: `flags`
+                                               // carries the requested cap bitmask (capabilities.h
+                                               // cap IDs). Enforced <= the spawning process's own
+                                               // set; absent => child INHERITs the parent's full
+                                               // set. Not a file action -- consumed by sys_spawn to
+                                               // pick the process_create_caps() request; the action
+                                               // processor skips it. Reuses `flags` so the ABI
+                                               // struct does not grow.
                                                // the PARENT holds as a plain FD in the child:
                                                // `src_obj_handle` names the parent's handle,
                                                // `target_fd` the child fd it lands on (0/1 for

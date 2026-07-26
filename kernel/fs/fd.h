@@ -54,6 +54,8 @@ enum fd_backing {
     FD_BACKING_CONSOLE,       /**< the kernel console (keyboard in, kputchar out) */
     FD_BACKING_PIPE,          /**< one end of a kernel pipe (kernel/ipc/pipe.c) */
     FD_BACKING_NULLDEV,       /**< /dev/null: EOF source / discard sink (stateless) */
+    FD_BACKING_SOCKET,        /**< a TCP connection (kernel/net/tcp) -- M4 network fd */
+    FD_BACKING_UDP,           /**< a UDP datagram socket (kernel/net/udp) -- M5 */
 };
 
 struct pipe;   /* opaque -- defined in kernel/ipc/pipe.c; the fd layer only
@@ -111,6 +113,8 @@ struct fd_entry {
     union {
         struct { struct vnode vn; uint64_t pos; } file;  /**< FD_BACKING_VNODE */
         struct { struct pipe *p; int side; } pipe;       /**< FD_BACKING_PIPE (side: 0=read, 1=write) */
+        struct { int conn; uint16_t bind_port; } sock;   /**< FD_BACKING_SOCKET (conn: TCP index, -1 until connect/listen; bind_port for a server) */
+        struct { int us; } udp;                          /**< FD_BACKING_UDP (UDP socket index) */
         /* FD_BACKING_CONSOLE is stateless -- no arm needed. */
     } u;
 };
@@ -141,6 +145,28 @@ int fd_open_into(struct process *target, int target_fd, const char *path, int fl
  * reference (ref bumped under the lock); the parent's obj-handle stays alive
  * and must be released separately for EOF. side: 0=read, 1=write. */
 int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int side);
+
+/* Network sockets (M4). fd_alloc_socket() claims a free fd backed by an
+ * unconnected TCP socket (conn = -1) in `p`; fd_socket_connect() runs the
+ * active open on that fd's connection. read/write/close on the fd then route to
+ * net_tcp_recv/send/close via sock_fd_ops. Both live here because the socket
+ * fd internals (like pipe's) are private to fd.c. */
+int fd_alloc_socket(struct process *p);
+int fd_socket_connect(struct process *p, int fd, uint32_t ip_host, uint16_t port);
+
+/* Server side: bind records the local port on the socket; listen puts it into
+ * TCP LISTEN; accept blocks for a client and installs the new connection onto a
+ * fresh fd in `p`, returning that fd (the classic BSD accept). */
+int fd_socket_bind(struct process *p, int fd, uint16_t port);   /* handles TCP + UDP fds */
+int fd_socket_listen(struct process *p, int fd);
+int fd_socket_accept(struct process *p, int fd);
+
+/* UDP datagram sockets (M5): a fresh UDP fd, and sendto/recvfrom over it. */
+int fd_alloc_udp(struct process *p);
+int fd_udp_sendto(struct process *p, int fd, uint32_t ip_host, uint16_t port,
+                  const void *data, uint32_t len);
+int fd_udp_recvfrom(struct process *p, int fd, void *buf, uint32_t cap,
+                    uint32_t *src_ip, uint16_t *src_port);
 
 /* Give a new process its stdin/stdout/stderr (fds 0/1/2): inherit from the
  * spawning parent per-backing, or default to the console. process_create()

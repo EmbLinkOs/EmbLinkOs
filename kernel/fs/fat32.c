@@ -2393,3 +2393,6 @@ int fat32_vfs_register(const char *path, struct fat32_volume *vol)
         return -EMBK_ENODEV;
     return vfs_mount(path, &fat32_vfs_ops, vol, FAT32_VFS_ROOT_INO);
 }
+
+/* EmbDBG v2 VFS Explorer: ops table address for fs-type naming (see vfs.c). */
+const void *fat32_vfs_ops_ptr(void) { return &fat32_vfs_ops; }

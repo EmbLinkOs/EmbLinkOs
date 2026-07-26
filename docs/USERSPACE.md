@@ -429,6 +429,16 @@ headers, and `/data/src/<project>/` became the source-tree convention when
 `test tcc tally` rebuilt tally on-OS from `/data/src/shell/`. All packed by
 mkfs from Makefile-owned paths (`EMBK_NEWLIB_INC`, `EMBK_TCC_INC`).
 
+The OWNED TOOLCHAIN slotted into these same conventions with no layout change:
+`/data/apps/embcc/`, `/data/apps/embld/` (the native compiler + linker, staged
+like the ported tools), and `/data/src/embcc/` + `/data/src/emlibc/` (their
+source closures — the compiler's own 14 sources and the whole emlibc tree incl.
+`fdlibm/`, so the OS recompiles both on itself, `test embcc selfhost` /
+`test emlibc math selfhost`). The `include/` slot the tree reserved from day one
+now also carries emlibc's own headers under `/data/src/emlibc/include/`. Every
+one is a `/data/src/<project>/` or `/data/apps/<name>/` instance — the namespace
+absorbed a from-scratch, self-hosting toolchain without a new rule.
+
 
 Derived by diffing this tree against audit §1.2 — every hardcoded path,
 accounted for:

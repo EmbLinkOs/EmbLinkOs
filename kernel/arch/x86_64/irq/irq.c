@@ -31,6 +31,11 @@ extern void irq14(void);       extern void irq15(void);
 // Table of registered IRQ handlers. Indexed by IRQ number (0-15)
 static irq_handler_t irq_handlers[16] = {0};
 
+/* EmbDBG v2 Interrupt Viewer: per-line delivery counters, bumped in irq_handler.
+ * Plain uint64_t writes from one dispatch path; a debug read (irq_snapshot) is a
+ * benign racy sample, no lock needed. */
+static volatile uint64_t irq_counts[16];
+
 /* Prior PIC mask state, captured the first time irq_register() touches a line
  * so irq_unregister() can RESTORE it rather than unconditionally masking.
  * Without this, register-then-unregister is not transparent: it would leave a
@@ -98,10 +103,20 @@ void irq_unregister(uint8_t irq) {
     }
 }
 
+/* EmbDBG v2 Interrupt Viewer: snapshot the 16 IRQ lines' counters + handlers. */
+void irq_snapshot(struct irq_line_info out[16]) {
+    for (int i = 0; i < 16; i++) {
+        out[i].count = irq_counts[i];
+        out[i].handler_addr = (uint64_t)irq_handlers[i];
+    }
+}
+
 
 // called from assembly stub with IRQ number in rdi
 void irq_handler(struct registers *regs) {
     uint8_t irq = (uint8_t)(regs->vector - 32); // IRQ number is vector - 32
+
+    if (irq < 16) irq_counts[irq]++;   // EmbDBG v2: count every delivery on this line
 
     /* Spurious 8259 IRQ7/15 guard. Gated on there being NO registered handler:
      * a registered handler means a REAL device owns this vector via the IO-APIC

@@ -5,6 +5,8 @@
 #include "include/errno.h"
 #include "fs/embkfs/embkfs.h"
 #include "block/block.h"   /* blkstat request counters (test ioperf) */
+#include "net/net.h"       /* g_netif, net_ping (test net) */
+#include "arch/x86_64/syscall/usercopy.h"   /* transient-EFAULT retry counters */
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
 #include "drivers/char/serial.h"      /* serial_write_char: test tcc real heartbeat */
@@ -15,6 +17,11 @@
 #include "drivers/timer/rtc.h"
 #include "arch/x86_64/syscall/usermode.h"
 #include "process/process.h"
+#include "process/debug.h"    /* test debug: the live-debugging contract */
+#include "process/ksync.h"
+#include "mm/vmm.h"
+#include "mm/pmm.h"
+#include "lib/ksym.h"         /* test debugsym: the panic symbolizer */
 #include "tty/tty.h"
 #include "drivers/input/keyboard.h"
 #include "process/ksync.h"
@@ -374,11 +381,20 @@ static void selftests_print_commands(void)
     kprintf("  test embkfs alloc\n");
     kprintf("  test embkfs tree\n");
     kprintf("  test embkfs obj\n");
+    kprintf("  test embkfs shrink\n");
+    kprintf("  test blockrace\n");
+    kprintf("  test usercopy\n");
+    kprintf("  test pmm\n");
+    kprintf("  test caps\n");
+    kprintf("  test spawncaps\n");
+    kprintf("  test embx\n");
+    kprintf("  test capgate\n");
     kprintf("  test embkfs timestamps\n");
     kprintf("  test embkfs multivol\n");
     kprintf("  test embkfs compress\n");
     kprintf("  test embkfs selfheal\n");
     kprintf("  test embkfs snapshot\n");
+    kprintf("  test embkfs snapreg\n");
     kprintf("  test embkfs provenance\n");
     kprintf("  test embkfs verifyboot\n");
     kprintf("  stat <path>\n");
@@ -417,10 +433,27 @@ static void selftests_print_commands(void)
     kprintf("  test tcc compile\n");
     kprintf("  test tcc link\n");
     kprintf("  test tcc real\n");
+    kprintf("  test tcc dyn\n");
     kprintf("  test tcc tally\n");
+    kprintf("  test embcc\n");
+    kprintf("  test embcc self\n");
+    kprintf("  test embcc selfhost\n");
+    kprintf("  test embld\n");
+    kprintf("  test emlibc math selfhost\n");
+    kprintf("  test mathself\n");
+    kprintf("  test emlibc\n");
+    kprintf("  test emlibc math\n");
+    kprintf("  test emlibc caps\n");
+    kprintf("  test emlibc embx\n");
+    kprintf("  test embld embx\n");
+    kprintf("  test embcc embx\n");
+    kprintf("  test emlibc selfhost\n");
+    kprintf("  test embcc asm\n");
+    kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
     kprintf("  test embbuild self\n");
     kprintf("  test embbuild shell\n");
+    kprintf("  test embbuild gui\n");
     kprintf("  test keyboard\n");
     kprintf("  test ksync\n");
     kprintf("  test kheap\n");
@@ -486,6 +519,31 @@ static void run_embkfs_all(void)
     if (rc_ns != EMBK_OK)    kprintf("\n[cmd] embkfs ns failed: %s\n", embk_strerror(rc_ns));
 }
 
+/* Byte-for-byte compare of two files already on the VFS. Returns 1 if both
+ * open, are the same length, and every byte matches; 0 otherwise. Used by the
+ * EmbCC self-hosting checks (object determinism + the on-OS linked stage2). */
+static int vfs_files_identical(const char *a, const char *b)
+{
+    struct vfs_stat sa, sb;
+    if (vfs_stat(a, &sa) != 0 || vfs_stat(b, &sb) != 0) return 0;
+    if (sa.size != sb.size) return 0;
+    int fa = vfs_open(a, O_RDONLY, 0);
+    int fb = vfs_open(b, O_RDONLY, 0);
+    int eq = (fa >= 0 && fb >= 0);
+    static unsigned char ba[4096], bb[4096];
+    while (eq) {
+        size_t ra = 0, rb = 0;
+        vfs_fd_read(fa, ba, sizeof ba, &ra);
+        vfs_fd_read(fb, bb, sizeof bb, &rb);
+        if (ra != rb) { eq = 0; break; }
+        if (ra == 0) break;                 /* both hit EOF together */
+        if (memcmp(ba, bb, ra) != 0) { eq = 0; break; }
+    }
+    if (fa >= 0) vfs_close(fa);
+    if (fb >= 0) vfs_close(fb);
+    return eq;
+}
+
 int selftests_handle_command(const char *cmd)
 {
     if (!cmd || !cmd[0])
@@ -520,6 +578,1577 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+/* CONCURRENT READERS, AND WHAT THE BOUNCE BUFFER'S LOCK IS ACTUALLY FOR.
+ *
+ * block.c has ONE shared DMA bounce buffer, taken whenever a caller's
+ * destination is not DMA-safe for the device -- the common case here, not an
+ * exotic one: kmalloc memory lives in the direct map and the ATA driver needs
+ * the kernel range, so nearly all filesystem I/O bounces (a single
+ * `test posix` run takes that path 8617 times). Two concurrent bounce
+ * transfers would memcpy over each other and each return the OTHER's sectors:
+ * silent corruption, no fault, no error code.
+ *
+ * TODO.md asked for the test that was missing: "the race itself is NOT covered
+ * ... every test above is single-threaded, so the lock is never contended".
+ * This is that test, and writing it turned up something better than a pass.
+ *
+ * WHAT IT FOUND. Four readers, spawned before any is waited on, hammering two
+ * files -- and the bounce lock is contended ZERO times. Not a flaw in the
+ * test: a fact about the system. The EMBKFS big lock serialises every
+ * filesystem operation, so two processes CANNOT be inside the block layer at
+ * once by way of the filesystem. The bounce lock sits underneath a lock that
+ * already excludes the concurrency it defends against.
+ *
+ * So the honest assertion is not "contention must be > 0" -- that would be
+ * demanding a race the architecture currently forbids, and no amount of
+ * hammering would produce it. It is the RELATIONSHIP:
+ *
+ *     contention through the filesystem path must be ZERO, because the
+ *     EMBKFS big lock serialises above it.
+ *
+ * That is the stronger check. If it ever fires non-zero, something real
+ * changed -- the fs lock got finer-grained (per-volume/per-path, an open
+ * TODO item), a second filesystem mounted alongside EMBKFS (fat32.c does NOT
+ * take the EMBKFS lock), or a non-fs block user appeared -- and the bounce
+ * lock stopped being defence-in-depth and became load-bearing. This test is
+ * how that transition announces itself instead of being discovered by
+ * corruption.
+ *
+ * The content check is not redundant either: it proves end-to-end that four
+ * concurrent readers each get their OWN file's bytes, which is the property
+ * users care about regardless of which layer is providing it. Each reader
+ * verifies every byte against a single-byte fill, so one stolen sector is
+ * unmistakable ('B' where only 'A' belongs) and the child exits 2. */
+/* THE TRANSIENT EFAULT: is it still there, or is the retry loop a relic?
+ *
+ * docs/TODO.md carries it as "residual, unexplained ... masked, not fixed:
+ * both copy functions retry up to USERCOPY_RETRIES (8) times before actually
+ * reporting a fault ... a workaround, not a diagnosis." That note predates TWO
+ * real fixes to the same code path:
+ *
+ *   - access_ok now captures the pml4 ONCE with IF=0 instead of re-reading
+ *     per-CPU state per page (the migration race: this_cpu() picked a core, a
+ *     timer IRQ migrated the thread, the deref returned a FOREIGN pml4);
+ *   - vmm_get_phys_in now takes vmm_lock, closing the multi-level walk against
+ *     a concurrent mapper (the compositor installing shared window pages into
+ *     a client PML4 while that client walked it).
+ *
+ * Either could have been the entire cause. "Unexplained" is a statement about
+ * what was known then, not a measurement of now -- so measure now.
+ *
+ * This drives heavy user-copy traffic from several processes at once, which is
+ * what every syscall carrying a buffer does, and then reads the retry counter.
+ *   retries == 0  -> the transient did not occur. The loop is dead code and
+ *                    the TODO entry is stale (it does NOT prove absence, and
+ *                    the report says so).
+ *   retries  > 0  -> it is alive, and now it is CAUGHT: worst_tries says how
+ *                    deep it went, which is the first hard number anyone has
+ *                    had about it.
+ * Either way this is the first time the question has been asked with a
+ * counter instead of an anecdote. */
+/* THE PMM FREE-PAGE SEARCH, measured.
+ *
+ * docs/TODO.md: "Linear scan for a free page is O(n) -- slow under heavy
+ * allocation. Future: free list or buddy allocator." The scan restarted at
+ * page 0 on EVERY call and tested one bit at a time, so once low memory filled
+ * (it fills first and stays full) each allocation re-walked thousands of used
+ * pages to reach fresh ground. Cost per allocation grew with how much memory
+ * was already in use -- quadratic over a run, not linear.
+ *
+ * The fix is deliberately NOT the buddy allocator the TODO reaches for. Two
+ * small changes get the same win for a fraction of the risk:
+ *   - a rotating hint: resume where the last success left off, wrap once. Still
+ *     exact -- it cannot report ENOMEM while a free page exists.
+ *   - byte-at-a-time skipping: a 0xFF byte is eight used pages, so one test
+ *     replaces eight.
+ * A buddy allocator would also buy contiguous multi-page allocation, which
+ * nothing here asks for yet. That is why it stays on the list rather than
+ * getting built speculatively.
+ *
+ * This reports BITS PER ALLOCATION, which is the whole claim in one number:
+ * near 1 means the search is O(1) amortised; large means it is still walking.
+ * Re-run after touching pmm_alloc_page. */
+/* PER-PROCESS CAPABILITIES: seed at init, attenuate at spawn, and the
+ * invariant that makes both worth having (EMBX_Specification_v2 §5.2).
+ *
+ * Two halves, the way everything in this tree is tested: the POLICY is a pure
+ * function (embk_caps_attenuate) exhausted directly, and the PLUMBING gets one
+ * integration create to prove a real child is born holding exactly its granted
+ * set. Splitting them means the invariant is checked without depending on
+ * scheduling, and the wire-up is checked without re-deriving the invariant. */
+/* RING 1: capability attenuation ACROSS THE SPAWN SYSCALL.
+ *
+ * `test caps` proved the kernel mechanism; this proves a USERSPACE parent can
+ * attenuate a child through sys_spawn's SET_CAPS action, and -- the part that
+ * needs a limited parent -- that it cannot grant what it does not hold.
+ *
+ * The trick is the SEED: we spawn capspawn itself with only {FS,NET} (via the
+ * kernel-internal process_create_caps, which is allowed to attenuate from full
+ * kernel authority). capspawn then, holding {FS,NET}, drives the userspace
+ * spawns and self-checks -- exit 0 only if all four of its steps hold, or a
+ * distinct 11..14 naming which failed. So a single exit code carries the whole
+ * result across the boundary. */
+/* RING 2: the EMBX loader end to end, with the capability check that is the
+ * format's reason for existing.
+ *
+ * capchild.embx is capchild repackaged as a native EMBX APP DECLARING
+ * {FILESYSTEM}. Two things are proven, and the second is the point:
+ *   ACCEPT: loaded from a grantor that holds FS, it runs, is born with exactly
+ *           the declared set, and reports it -- exit code 2 == {FS}. So the
+ *           declaration flowed through step 9 into the process's cap_set: the
+ *           binary declared its own authority and got it.
+ *   REFUSE: loaded from a grantor that LACKS FS (a launcher seeded {NETWORK}),
+ *           step 9 denies it with -EMBK_EPERM BEFORE anything is mapped. This
+ *           is the whole difference between an EMBX binary and an ELF one.
+ * The refuse case is exercised by seeding a launcher with only {NET} and having
+ * IT try to load the {FS}-declaring binary -- because the kernel console holds
+ * full authority and could never show the denial itself. */
+/* RING 3: the capability actually GATES a resource. A GPU surface is the
+ * handle a UI process needs before it can draw; sys_surface_create now refuses
+ * it to a process that does not hold EMBK_CAP_GPU. That closes the loop the
+ * whole capability model was for: a declaration (ring 1/2) is not decorative --
+ * it decides what the process can obtain.
+ *
+ * capgpu asks for a surface and exits 2 if granted, 0 if refused. We spawn it
+ * twice with DIFFERENT seeds and check both: without GPU it must be refused,
+ * with GPU it must be granted. One direction alone proves nothing (a gate that
+ * always denies passes the first; one that never gates passes the second). */
+    if (strcmp(cmd, "test suspend") == 0) {
+        /* EmbDBG v2 control: prove suspend/resume FREEZE a thread. The witness
+         * (process_test_suspend, in process.c beside the round-robin one) uses
+         * the proven selftest scheduler harness — adopt self, a timer-preempted
+         * spinner, hlt-based tick waits — so it observes real preemption, not a
+         * fragile yield loop. */
+        int rc = process_test_suspend();
+        kprintf("\n[cmd] test suspend: %s\n", rc == 0 ? "OK" : "FAIL");
+        return rc == 0 ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test debugsym") == 0) {
+        /* EMBDBG_Specification.md §8 M2: the kernel loaded its OWN .embdbg at
+         * boot; prove the symbolizer turns a raw kernel address into
+         * func (file:line). Take the addresses of a few kernel functions and
+         * check ksym names them with a source line — the same ksym_symbolize
+         * isr_handler now uses, so a real panic backtrace is proven too. */
+        if (!ksym_ready()) {
+            kprintf("\n[cmd] test debugsym: kernel symbols not loaded "
+                    "(/system/kernel.embdbg missing?)\n");
+            return 1;
+        }
+        struct { void *fn; const char *name; } cases[] = {
+            { (void *)&kprintf,   "kprintf" },
+            { (void *)&vfs_open,  "vfs_open" },
+            { (void *)&ksym_load, "ksym_load" },
+        };
+        int ok = 1;
+        for (int i = 0; i < 3; i++) {
+            char sym[176];
+            ksym_symbolize((uint64_t)(uintptr_t)cases[i].fn, sym, sizeof sym);
+            kprintf("[debugsym] %p -> %s\n", cases[i].fn, sym);
+            size_t nl = strlen(cases[i].name);
+            if (strncmp(sym, cases[i].name, nl) != 0) {
+                kprintf("[debugsym] FAIL: expected symbol '%s'\n", cases[i].name); ok = 0;
+            }
+            int has_line = 0;
+            for (const char *p = sym; *p; p++) if (*p == '(') { has_line = 1; break; }
+            if (!has_line) { kprintf("[debugsym] FAIL: no (file:line) for %s\n", cases[i].name); ok = 0; }
+        }
+        kprintf("[cmd] test debugsym: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test debug") == 0) {
+        /* EMBDBG_Specification.md §8 M1: prove the whole live-debugging kernel
+         * contract with a raw breakpoint — no .embdbg, no userspace debugger.
+         * The selftest IS the debugger: it spawns a target BORN STOPPED under
+         * SPAWN_ACTION_DEBUG, plants 0xCC, continues, catches #BP via the §6.6
+         * exception routing, reads registers + memory across address spaces,
+         * single-steps, and rides the target to a DBG_EV_EXITED. Driving the
+         * session directly (not via the syscalls) keeps the witness in-kernel;
+         * the syscall handlers are thin marshalling over this same logic. */
+        const char *tp = "/data/apps/hello/hello.elf";
+        struct vfs_stat st;
+        if (vfs_stat(tp, &st) != 0) { kprintf("\n[cmd] test debug: %s not on image\n", tp); return 1; }
+        char *a[] = { (char *)tp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        struct spawn_file_action acts[1];
+        memset(acts, 0, sizeof acts);
+        acts[0].kind = SPAWN_ACTION_DEBUG;
+
+        int ok = 1;
+        int pid = process_create_caps(tp, a, 1, env, acts, 1, EMBK_CAP_INHERIT);
+        if (pid < 0) { kprintf("[debug] FAIL: spawn-under-debug rc=%d\n", pid); return 1; }
+        struct process *tgt = process_find((uint32_t)pid);
+        struct debug_session *s = tgt ? tgt->debug_session : (struct debug_session *)0;
+        if (!s) { kprintf("[debug] FAIL: no debug session on the child\n"); return 1; }
+
+        /* (1) Born stopped at entry. */
+        if (!s->stopped || s->event.reason != DBG_EV_STEP) {
+            kprintf("[debug] FAIL: child not born-stopped (stopped=%d reason=%u)\n",
+                    s->stopped, s->event.reason); ok = 0;
+        }
+        uint64_t entry = s->event.pc;
+        kprintf("[debug] born stopped at entry 0x%lx\n", entry);
+
+        /* Reach the target's entry byte through ITS pml4 + the direct map. */
+        uint64_t phys = vmm_get_phys_in(tgt->pml4_phys, entry & ~0xFFFULL);
+        if (!phys) { kprintf("[debug] FAIL: entry unmapped in target\n"); return 1; }
+        volatile uint8_t *entb = (volatile uint8_t *)(uintptr_t)(P2V(phys) + (entry & 0xFFF));
+        uint8_t orig = *entb;
+
+        /* (2) Plant 0xCC (a software breakpoint — debugger-side). */
+        *entb = 0xCC;
+
+        /* (3) Continue: wake the born-stopped thread; it runs to _start and
+         * immediately traps on our 0xCC. */
+        sched_lock(); s->stopped = 0; wait_queue_wake_one(&s->target_wq); sched_unlock();
+
+        /* (4) Wait for the stop. */
+        sched_lock();
+        while (!s->stopped) { sched_block_current_locked(&s->debugger_wq); sched_lock(); }
+        sched_unlock();
+
+        if (s->event.reason != DBG_EV_BREAKPOINT || s->event.pc != entry) {
+            kprintf("[debug] FAIL: expected #BP at 0x%lx, got reason=%u pc=0x%lx\n",
+                    entry, s->event.reason, s->event.pc); ok = 0;
+        } else {
+            kprintf("[debug] #BP delivered at 0x%lx (was a panic before)\n", s->event.pc);
+        }
+        /* (5) Registers: RIP is one past the 0xCC. */
+        if (!s->stopped_frame || s->stopped_frame->rip != entry + 1) {
+            kprintf("[debug] FAIL: frame rip=0x%lx want 0x%lx\n",
+                    s->stopped_frame ? s->stopped_frame->rip : 0, entry + 1); ok = 0;
+        }
+        /* (6) Memory: read the byte back cross-address-space -> our 0xCC. */
+        uint8_t seen = *entb;
+        if (seen != 0xCC) { kprintf("[debug] FAIL: planted byte reads 0x%02x\n", seen); ok = 0; }
+        else kprintf("[debug] regs + cross-AS memory read OK\n");
+
+        /* (7) Restore the original byte, rewind RIP over the trap. */
+        *entb = orig;
+        s->stopped_frame->rip = entry;
+
+        /* (8) Single-step one instruction (TF). */
+        sched_lock();
+        s->stopped_frame->eflags |= 0x100ULL;   /* TF */
+        s->stopped = 0; wait_queue_wake_one(&s->target_wq);
+        sched_unlock();
+        sched_lock();
+        while (!s->stopped) { sched_block_current_locked(&s->debugger_wq); sched_lock(); }
+        sched_unlock();
+        if (s->event.reason != DBG_EV_STEP) {
+            kprintf("[debug] FAIL: single-step reason=%u\n", s->event.reason); ok = 0;
+        } else {
+            kprintf("[debug] single-step -> #DB at 0x%lx\n", s->event.pc);
+        }
+
+        /* (9) Continue to completion; ride the exit event. */
+        sched_lock();
+        if (s->stopped_frame) s->stopped_frame->eflags &= ~0x100ULL;  /* clear TF */
+        s->stopped = 0; wait_queue_wake_one(&s->target_wq);
+        sched_unlock();
+        sched_lock();
+        while (!s->stopped) { sched_block_current_locked(&s->debugger_wq); sched_lock(); }
+        sched_unlock();
+        if (s->event.reason != DBG_EV_EXITED) {
+            kprintf("[debug] FAIL: expected EXITED, got reason=%u\n", s->event.reason); ok = 0;
+        } else {
+            kprintf("[debug] target exited under debug, code=%u\n", s->event.error_code);
+        }
+
+        tgt->debug_session = NULL;      /* detach before the zombie is reaped */
+        s->used = 0;
+        (void)process_wait((uint32_t)pid);
+
+        kprintf("[cmd] test debug: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test faultkill") == 0) {
+        /* CRASH RESILIENCE: a ring-3 fault must terminate only the faulting
+         * process, not halt the machine (isr_handler's §6.6 non-debugged arm).
+         * The proof is twofold: (1) the spawned crasher comes back with a
+         * PROCESS_EXIT_FAULT code -- it was killed BY the fault, not a clean
+         * exit -- and (2) this selftest keeps running to observe it, TWICE, so
+         * the recoverable-path panic_lock release is exercised (a second crash
+         * would deadlock on a never-released lock, so the second round is the
+         * real test of the fix, not a duplicate). */
+        const char *cp = "/data/apps/crasher/crasher.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cp, &st) != 0) {
+            kprintf("\n[cmd] test faultkill: %s not on image\n", cp); return 1;
+        }
+        char *a[]   = { (char *)cp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+
+        int ok = 1;
+        for (int round = 1; round <= 2; round++) {
+            int pid = process_create_env(cp, a, 1, env, NULL, 0);
+            if (pid < 0) { kprintf("[faultkill] FAIL: spawn rc=%d\n", pid); return 1; }
+            /* If we return from this wait at all, the kernel did NOT halt. */
+            int code = process_wait((uint32_t)pid);
+            int is_fault = (code < 0) && (((-code) & ~0xff) == 0x100);
+            int vec = (-code) & 0xff;
+            if (!is_fault) {
+                kprintf("[faultkill] FAIL round %d: pid %d exit=%d, expected a fault code\n",
+                        round, pid, code);
+                ok = 0;
+            } else {
+                kprintf("[faultkill] round %d: pid %d killed by vector %d (%s), kernel survived\n",
+                        round, pid, vec,
+                        vec == 14 ? "#PF" : vec == 0 ? "#DE" : "fault");
+            }
+        }
+
+        kprintf("[cmd] test faultkill: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test net") == 0) {
+        /* NETWORKING M1 witness: the OS ARP-resolves the gateway and completes an
+         * ICMP echo round trip over virtio-net (virtio-net -> eth -> ARP -> IPv4
+         * -> ICMP). Self-contained under QEMU user-mode net: SLIRP answers ARP
+         * for 10.0.2.2 and replies to the ping. Needs `-device virtio-net`. */
+        if (!g_netif.up) {
+            kprintf("\n[cmd] test net: NIC not up (boot with -netdev user -device virtio-net)\n");
+            return 1;
+        }
+        kprintf("[net] pinging gateway 10.0.2.2 ...\n");
+        int ok = 0;
+        for (int i = 0; i < 3 && !ok; i++)
+            if (net_ping(g_netif.gateway)) ok = 1;
+            else kprintf("[net] attempt %d: no reply\n", i + 1);
+        kprintf("[cmd] test net: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test netlock") == 0) {
+        /* NET LOCK -- the finer HOLD. Each blocking call now holds net_lock only
+         * for a state check + the atomic RX drain, releasing across every
+         * schedule() (net_yield), so a blocked client no longer camps the stack.
+         * Exercise it with a few pings and report contention: at smp=1 contended
+         * stays 0; at smp>1 it goes >0 because the RX kthread genuinely SHARES the
+         * lock between the ping's yields -- the anti-camping property, visible.
+         * The hard assertion is just that the stack still works under the finer
+         * hold (the EMBKFS rule: measure, but correctness first). */
+        if (!g_netif.up) { kprintf("\n[cmd] test netlock: NIC not up\n"); return 1; }
+        net_lockstat_reset();
+        int ok = 0;
+        for (int i = 0; i < 3; i++) if (net_ping(g_netif.gateway)) ok++;
+        struct net_lockstat s; net_lockstat_get(&s);
+        kprintf("[netlock] pings ok=%d/3; net_lock acquires=%llu recursive=%llu contended=%llu\n",
+                ok, (unsigned long long)s.acquires, (unsigned long long)s.recursive,
+                (unsigned long long)s.contended);
+        int pass = (ok >= 1);
+        kprintf("[cmd] test netlock: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test dhcp") == 0) {
+        /* NETWORKING M2 witness: run the DHCP DORA on demand and show the lease.
+         * Under QEMU user-mode net, SLIRP is the DHCP server (10.0.2.2) and hands
+         * out 10.0.2.15 / gw 10.0.2.2 / dns 10.0.2.3 -- self-contained. */
+        if (!g_netif.up) {
+            kprintf("\n[cmd] test dhcp: NIC not up (boot with -netdev user -device virtio-net)\n");
+            return 1;
+        }
+        kprintf("[dhcp] requesting a lease (DISCOVER -> OFFER -> REQUEST -> ACK)...\n");
+        int ok = net_dhcp() ? 1 : 0;
+        if (ok)
+            kprintf("[dhcp] leased ip %u.%u.%u.%u  gw %u.%u.%u.%u  dns %u.%u.%u.%u\n",
+                    (uint8_t)(g_netif.ip>>24),(uint8_t)(g_netif.ip>>16),(uint8_t)(g_netif.ip>>8),(uint8_t)g_netif.ip,
+                    (uint8_t)(g_netif.gateway>>24),(uint8_t)(g_netif.gateway>>16),(uint8_t)(g_netif.gateway>>8),(uint8_t)g_netif.gateway,
+                    (uint8_t)(g_netif.dns>>24),(uint8_t)(g_netif.dns>>16),(uint8_t)(g_netif.dns>>8),(uint8_t)g_netif.dns);
+        kprintf("[cmd] test dhcp: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test dns") == 0) {
+        /* NETWORKING: resolve a name via the DHCP-learned resolver (UDP/53).
+         * SLIRP forwards to the host's resolver, so this needs the host to have
+         * outbound DNS -- unlike DHCP/ping it is NOT purely local. */
+        if (!g_netif.up)  { kprintf("\n[cmd] test dns: NIC not up\n"); return 1; }
+        if (!g_netif.dns) { kprintf("\n[cmd] test dns: no resolver (DHCP gave none)\n"); return 1; }
+        const char *names[] = { "example.com", "dns.google" };
+        int ok = 0;
+        for (int i = 0; i < 2 && !ok; i++) {
+            uint32_t ip = 0;
+            kprintf("[dns] resolving %s ...\n", names[i]);
+            if (net_resolve(names[i], &ip)) {
+                kprintf("[dns] %s -> %u.%u.%u.%u\n", names[i],
+                        (uint8_t)(ip>>24),(uint8_t)(ip>>16),(uint8_t)(ip>>8),(uint8_t)ip);
+                ok = 1;
+            } else {
+                kprintf("[dns] %s: no answer\n", names[i]);
+            }
+        }
+        if (!ok) kprintf("[dns] no resolution (needs outbound DNS via SLIRP/host)\n");
+        kprintf("[cmd] test dns: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test tcp") == 0) {
+        /* NETWORKING M3 witness: the full client path -- DNS resolve, TCP 3-way
+         * handshake to :80, an HTTP/1.0 GET, receive the response, clean close.
+         * SLIRP forwards outbound TCP to the host, so this needs outbound :80. */
+        if (!g_netif.up) { kprintf("\n[cmd] test tcp: NIC not up\n"); return 1; }
+        const char *host = "example.com";
+        uint32_t ip = 0;
+        if (!net_resolve(host, &ip)) {
+            kprintf("\n[cmd] test tcp: DNS failed for %s\n", host); return 1;
+        }
+        kprintf("[tcp] %s -> %u.%u.%u.%u, connecting :80 ...\n", host, IP_OCTETS(ip));
+        int c = net_tcp_connect(ip, 80);
+        if (c < 0) { kprintf("[tcp] connect failed\n[cmd] test tcp: FAIL\n"); return 1; }
+        kprintf("[tcp] connected (conn %d), sending GET\n", c);
+
+        char req[160];
+        int rl = snprintf(req, sizeof req,
+                          "GET / HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", host);
+        net_tcp_send(c, req, rl);
+
+        static char resp[4096];
+        int total = 0;
+        for (;;) {
+            int n = net_tcp_recv(c, resp + total, sizeof(resp) - 1 - total);
+            if (n <= 0) break;
+            total += n;
+            if (total >= (int)sizeof(resp) - 1) break;
+        }
+        resp[total] = 0;
+        net_tcp_close(c);
+
+        int ok = (total >= 12 && strncmp(resp, "HTTP/1", 6) == 0);
+        int nl = 0; while (nl < total && resp[nl] != '\r' && resp[nl] != '\n') nl++;
+        resp[nl] = 0;
+        kprintf("[tcp] received %d bytes; status: %s\n", total, resp);
+        kprintf("[cmd] test tcp: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test netuser") == 0) {
+        /* NETWORKING M4: ring-3 networking through the socket syscalls, AND the
+         * CAP_NETWORK gate. httpget resolves + connects + GETs FROM USER SPACE
+         * via the BSD-sockets shim. With CAP_NETWORK it exits 0 (got HTTP/1.x);
+         * without it, sys_net_* return -EPERM so it exits nonzero. */
+        const char *hp = "/data/apps/httpget/httpget.elf";
+        struct vfs_stat st;
+        if (vfs_stat(hp, &st) != 0) { kprintf("\n[cmd] test netuser: %s not on image\n", hp); return 1; }
+        char *a[]   = { (char *)hp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int ok = 1;
+
+        /* (1) WITH the network cap: the ring-3 HTTP round trip succeeds -> 0. */
+        int p1 = process_create_caps(hp, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_NETWORK));
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[netuser] with NETWORK cap: httpget exit=%d (0 = HTTP round trip)\n", c1);
+        if (c1 != 0) { kprintf("[netuser] FAIL: ring-3 HTTP GET did not succeed\n"); ok = 0; }
+
+        /* (2) WITHOUT it (seed {FILESYSTEM}): socket/resolve refused -> nonzero. */
+        int p2 = process_create_caps(hp, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        kprintf("[netuser] no NETWORK cap:   httpget exit=%d (!=0 = refused)\n", c2);
+        if (c2 == 0) { kprintf("[netuser] FAIL: a process WITHOUT NETWORK reached the network\n"); ok = 0; }
+
+        kprintf("[cmd] test netuser: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test httpd") == 0) {
+        /* NETWORKING M5: the OS as a SERVER. Spawn httpd (bind/listen/accept,
+         * CAP_NETWORK) to serve ONE connection on :8080, then block until it
+         * exits. A client -- the host, via SLIRP hostfwd tcp::5599-:8080 --
+         * connects and gets the page; httpd serves it and exits 0. */
+        const char *hp = "/data/apps/httpd/httpd.elf";
+        struct vfs_stat st;
+        if (vfs_stat(hp, &st) != 0) { kprintf("\n[cmd] test httpd: %s not on image\n", hp); return 1; }
+        char *a[]   = { (char *)hp, (char *)"8080", (char *)"1", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        kprintf("[httpd] spawning server on :8080 -- curl the forwarded host port now...\n");
+        int p1 = process_create_caps(hp, a, 3, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_NETWORK));
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[httpd] server exit=%d (0 = served a connection)\n", c1);
+        int ok = (c1 == 0);
+        kprintf("[cmd] test httpd: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test httpdbig") == 0) {
+        /* THROUGHPUT / windowed TCP: httpd serves ONE 64 KB body on :8080 in a
+         * single write() -- net_tcp_send pipelines it across the peer's window
+         * (many segments in flight, not one-per-RTT). The host curls it and
+         * checks it received all 65536 bytes. */
+        const char *hp = "/data/apps/httpd/httpd.elf";
+        struct vfs_stat st;
+        if (vfs_stat(hp, &st) != 0) { kprintf("\n[cmd] test httpdbig: %s not on image\n", hp); return 1; }
+        char *a[]   = { (char *)hp, (char *)"8080", (char *)"1", (char *)"65536", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        kprintf("[httpdbig] serving a 64 KB body on :8080 -- curl the forwarded port...\n");
+        int p1 = process_create_caps(hp, a, 4, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_NETWORK));
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[httpdbig] server exit=%d\n", c1);
+        int ok = (c1 == 0);
+        kprintf("[cmd] test httpdbig: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test netudp") == 0) {
+        /* NETWORKING M5: ring-3 UDP. udptest resolves a name by speaking DNS
+         * itself over a SOCK_DGRAM socket (sendto/recvfrom) FROM USER SPACE.
+         * With CAP_NETWORK it exits 0; without it, socket() is refused -> !=0. */
+        const char *up = "/data/apps/udptest/udptest.elf";
+        struct vfs_stat st;
+        if (vfs_stat(up, &st) != 0) { kprintf("\n[cmd] test netudp: %s not on image\n", up); return 1; }
+        char *a[]   = { (char *)up, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int ok = 1;
+
+        int p1 = process_create_caps(up, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_NETWORK));
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[netudp] with NETWORK cap: udptest exit=%d (0 = resolved over UDP)\n", c1);
+        if (c1 != 0) { kprintf("[netudp] FAIL: ring-3 UDP DNS did not resolve\n"); ok = 0; }
+
+        int p2 = process_create_caps(up, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        kprintf("[netudp] no NETWORK cap:   udptest exit=%d (!=0 = refused)\n", c2);
+        if (c2 == 0) { kprintf("[netudp] FAIL: a process WITHOUT NETWORK sent UDP\n"); ok = 0; }
+
+        kprintf("[cmd] test netudp: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test wget") == 0) {
+        /* THE PAYOFF: the OS downloads a real file from the internet TO DISK.
+         * wget (ring 3) resolves example.com, GETs http://example.com/, and
+         * writes the body to /wget.out -- networking meets the filesystem. Needs
+         * CAP_NETWORK + CAP_FILESYSTEM and outbound HTTP (SLIRP). */
+        const char *wp = "/data/apps/wget/wget.elf";
+        struct vfs_stat st;
+        if (vfs_stat(wp, &st) != 0) { kprintf("\n[cmd] test wget: %s not on image\n", wp); return 1; }
+        char *a[]   = { (char *)wp, (char *)"-O", (char *)"/wget.out",
+                        (char *)"http://example.com/", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(wp, a, 4, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[wget] exit=%d\n", code);
+
+        int ok = (code == 0);
+        if (ok) {                                  /* verify the downloaded file on disk */
+            struct vfs_stat fs;
+            if (vfs_stat("/wget.out", &fs) != 0) { kprintf("[wget] /wget.out missing\n"); ok = 0; }
+            else {
+                char head[8] = {0}; size_t got = 0;
+                int fd = vfs_open("/wget.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                kprintf("[wget] downloaded %lu bytes to /wget.out, starts '%c'\n",
+                        (unsigned long)fs.size, got ? head[0] : '?');
+                if (fs.size < 100 || head[0] != '<') { kprintf("[wget] not a valid HTML download?\n"); ok = 0; }
+            }
+        }
+        kprintf("[cmd] test wget: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test emlibc") == 0) {
+        /* emlibc phase 1: the OS runs a program that links its OWN non-POSIX C
+         * library INSTEAD of newlib (built -nostdinc, no -lc, no newlib
+         * crt0/syscalls -- proven at build time: zero newlib symbols). The
+         * program exercises emlibc's string/stdlib/stdio and exits 42; it also
+         * writes one line through emlibc's OWN buffered file stream, which we
+         * read back here as a serial-visible witness of the formatter + rim. */
+        const char *ep = "/data/apps/emlibc_demo/emlibc_demo.elf";
+        struct vfs_stat st;
+        if (vfs_stat(ep, &st) != 0) { kprintf("\n[cmd] test emlibc: %s not on image\n", ep); return 1; }
+        (void)vfs_unlink_path("/data/tmp/emlibc.out");
+        char *a[]   = { (char *)ep, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pid  = process_create_caps(ep, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[emlibc] emlibc_demo exit=%d (want 42 -- linked emlibc, NOT newlib)\n", code);
+
+        int ok = (code == 42);
+        char head[64] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/emlibc.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/emlibc.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;   /* kprintf has no %.*s */
+            kprintf("[emlibc] its own stdio wrote: \"%s\"\n", head);
+            if (!(got >= 15 && memcmp(head, "emlibc wrote 42", 15) == 0)) {
+                kprintf("[emlibc] stream witness mismatch\n"); ok = 0; }
+        } else { kprintf("[emlibc] /data/tmp/emlibc.out missing\n"); ok = 0; }
+
+        kprintf("[cmd] test emlibc: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc math") == 0) {
+        /* emlibc's <math.h>: the OS-agnostic transcendentals (§4), plus %f/%e
+         * in its printf. The emlibc-linked demo checks sqrt/sin/exp/log/pow/
+         * atan2/... against known values within 1e-6 and exits 42 iff all pass;
+         * a formatted witness (its OWN %f output) is read back from disk. */
+        const char *mp = "/data/apps/emlibc_math/emlibc_math.elf";
+        struct vfs_stat st;
+        if (vfs_stat(mp, &st) != 0) { kprintf("\n[cmd] test emlibc math: %s not on image\n", mp); return 1; }
+        (void)vfs_unlink_path("/data/tmp/math.out");
+        char *a[]   = { (char *)mp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pid  = process_create_caps(mp, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[emmath] emlibc_math exit=%d (want 42 -- all checks within 1e-6)\n", code);
+
+        int ok = (code == 42);
+        char head[96] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/math.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/math.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            kprintf("[emmath] its own %%f witness: \"%s\"\n", head);
+            /* sqrt(2) formatted to 6 places is the anchor */
+            if (memcmp(head, "sqrt2=1.414214", 14) != 0) {
+                kprintf("[emmath] float formatting/precision off\n"); ok = 0; }
+        } else { kprintf("[emmath] /data/tmp/math.out missing\n"); ok = 0; }
+
+        kprintf("[cmd] test emlibc math: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc math selfhost") == 0) {
+        /* THE LOOP CLOSES INCLUDING FLOATING POINT. The OS compiles emlibc's
+         * FP math with EmbCC -- the glue math.c AND all 31 lifted fdlibm files
+         * (the newlib-grade ~1-ulp library) -- plus the libc closure and the
+         * app, links them with EmbLD into a native EMBX, and runs it. Every
+         * object, FP included, produced by the owned toolchain on the metal. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test emlibc math selfhost: VFS not registered\n"); return 1; }
+        const char *cc = "/data/apps/embcc/embcc.elf";
+        const char *ld = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cc, &st) != 0) { kprintf("\n[cmd] test emlibc math selfhost: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat(ld, &st) != 0) { kprintf("\n[cmd] test emlibc math selfhost: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/emlibc/fdlibm/e_exp.c", &st) != 0) {
+            kprintf("\n[cmd] test emlibc math selfhost: fdlibm sources not on image\n"); return 1; }
+
+        char *env[] = { (char *)"HOME=/", NULL };
+        /* non-fdlibm units live flat in /data/src/emlibc/; fdlibm in fdlibm/. */
+        /* No stdio: mathself uses the raw open/write rim, not streams, and
+         * stdlib's exit() calls emlibc_stdio_flush_all only if it's linked
+         * (WEAK ref -> 0 otherwise; EmbCC now emits the weak undefined). So a
+         * program that never touches stdio doesn't drag it in. */
+        static const char *const flat[] = {
+            "crt0", "string", "stdlib", "syscalls", "errno", "math", "mathself",
+        };
+        static const char *const fd[] = {
+            "e_acos","e_asin","e_atan2","e_cosh","e_exp","e_fmod","e_hypot","e_log",
+            "e_log10","e_pow","e_rem_pio2","e_sinh","k_cos","k_rem_pio2","k_sin","k_tan",
+            "s_atan","s_cbrt","s_ceil","s_copysign","s_cos","s_expm1","s_fabs","s_floor",
+            "s_frexp","s_ldexp","s_scalbn","s_sin","s_tan","s_tanh","s_trunc",
+        };
+        int nflat = (int)(sizeof flat / sizeof flat[0]);
+        int nfd   = (int)(sizeof fd / sizeof fd[0]);
+        int built = 0, total = nflat + nfd;
+
+        /* One uniform include set for every unit (the extra -I is harmless for
+         * files that don't include fdlibm.h). */
+        for (int u = 0; u < total; u++) {
+            int isfd = u >= nflat;
+            const char *base = isfd ? fd[u - nflat] : flat[u];
+            char src[96], obj[96];
+            if (isfd) snprintf(src, sizeof src, "/data/src/emlibc/fdlibm/%s.c", base);
+            else      snprintf(src, sizeof src, "/data/src/emlibc/%s.c", base);
+            snprintf(obj, sizeof obj, "/data/tmp/ms_%s.o", base);
+            (void)vfs_unlink_path(obj);
+            char *ca[] = { (char *)cc, (char *)"-c", src,
+                           (char *)"-I", (char *)"/data/src/emlibc/include",
+                           (char *)"-I", (char *)"/data/apps/embcc/include",
+                           (char *)"-I", (char *)"/data/src/emlibc/fdlibm",
+                           (char *)"-o", obj };
+            int p = process_create_env(cc, ca, 11, env, NULL, 0);
+            if ((p >= 0 ? process_wait((uint32_t)p) : -1) == 0 && vfs_stat(obj, &st) == 0)
+                built++;
+        }
+        kprintf("[mathsh] embcc built %d/%d FP units (libc + math.c + 31 fdlibm + app)\n", built, total);
+        int ok = (built == total);
+
+        /* Link them all into a native EMBX (crt0 first for the entry). */
+        const char *out = "/data/tmp/mathsh.embx";
+        (void)vfs_unlink_path(out);
+        (void)vfs_unlink_path("/data/tmp/mathself.out");
+        if (ok) {
+            char *la[80]; int n = 0;
+            la[n++] = (char *)ld; la[n++] = (char *)"--embx";
+            la[n++] = (char *)"--cap"; la[n++] = (char *)"filesystem";
+            la[n++] = (char *)"-o"; la[n++] = (char *)out;
+            static char paths[64][40];
+            int pi = 0;
+            la[n++] = (char *)"/data/tmp/ms_crt0.o";                 /* entry first */
+            for (int u = 0; u < total; u++) {
+                const char *base = (u >= nflat) ? fd[u - nflat] : flat[u];
+                if (strcmp(base, "crt0") == 0) continue;             /* already added */
+                snprintf(paths[pi], sizeof paths[pi], "/data/tmp/ms_%s.o", base);
+                la[n++] = paths[pi++];
+            }
+            int lp = process_create_caps(ld, la, n, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+            int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            int have = (vfs_stat(out, &st) == 0);
+            kprintf("[mathsh] embld linked %d objects -> exit=%d, %s (%llu bytes)\n",
+                    n - 6, lc, have ? "EMBX" : "MISSING", have ? (unsigned long long)st.size : 0ULL);
+            if (!(lc == 0 && have)) ok = 0;
+        }
+
+        /* Run it -- correct fdlibm @ 1e-12 => exit 42. */
+        if (ok) {
+            char *ra[] = { (char *)out, NULL };
+            int rp = process_create_caps(out, ra, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+            int rc = rp >= 0 ? process_wait((uint32_t)rp) : -1;
+            char head[32] = {0}; size_t got = 0;
+            if (vfs_stat("/data/tmp/mathself.out", &st) == 0) {
+                int fd2 = vfs_open("/data/tmp/mathself.out", O_RDONLY, 0);
+                if (fd2 >= 0) { vfs_fd_read(fd2, head, sizeof head - 1, &got); vfs_close(fd2); }
+                if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            }
+            kprintf("[mathsh] OS-built FP math ran: exit=%d (want 42), \"%s\"\n", rc, head);
+            if (rc != 42) ok = 0;
+        }
+
+        kprintf("[cmd] test emlibc math selfhost: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test mathself") == 0) {
+        /* EmbCC's FP codegen, verified on the metal: an EMBX whose math.c + all
+         * 31 fdlibm files were compiled by EmbCC (rest gcc), linked by EmbLD.
+         * If EmbCC's floating point is correct, the app passes real fdlibm at
+         * 1e-12 relative tolerance and exits 42. */
+        const char *mp = "/data/apps/mathself/mathself.embx";
+        struct vfs_stat st;
+        if (vfs_stat(mp, &st) != 0) { kprintf("\n[cmd] test mathself: %s not on image\n", mp); return 1; }
+        (void)vfs_unlink_path("/data/tmp/mathself.out");
+        char *a[]   = { (char *)mp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pid  = process_create_caps(mp, a, 1, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[mathself] EmbCC-compiled fdlibm exit=%d (want 42 -- correct @ 1e-12)\n", code);
+        int ok = (code == 42);
+        char head[32] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/mathself.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/mathself.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            kprintf("[mathself] witness: \"%s\"\n", head);
+            if (memcmp(head, "math self OK", 12) != 0) ok = 0;
+        } else { kprintf("[mathself] witness missing\n"); ok = 0; }
+        kprintf("[cmd] test mathself: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc caps") == 0) {
+        /* emlibc surfaces the part newlib CANNOT express: capabilities +
+         * handle-based spawn. The demo (linked against emlibc, not newlib) is
+         * spawned holding FILESYSTEM|NETWORK. As the parent it reads its own
+         * caps, then spawns ITSELF as a child ATTENUATED to FILESYSTEM only;
+         * the child confirms it lost NETWORK and proves it cannot grant NETWORK
+         * (which it lacks) to a grandchild -- the kernel refuses. Exit 42 iff
+         * both held; a disk witness carries the child's findings to serial. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test emlibc caps: VFS not registered\n"); return 1; }
+        const char *cp = "/data/apps/emlibc_caps/emlibc_caps.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cp, &st) != 0) { kprintf("\n[cmd] test emlibc caps: %s not on image\n", cp); return 1; }
+        (void)vfs_unlink_path("/data/tmp/emcaps.out");
+        char *a[]   = { (char *)cp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid  = process_create_caps(cp, a, 1, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[emcaps] parent(fs+net) -> child(fs only): exit=%d (want 42)\n", code);
+
+        int ok = (code == 42);
+        char head[64] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/emcaps.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/emcaps.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            kprintf("[emcaps] child witness: \"%s\"\n", head);
+            /* the child was born WITHOUT network and could not grant it back */
+            if (memcmp(head, "child: fs=1 net=0 overreach=refused", 35) != 0) {
+                kprintf("[emcaps] invariant NOT demonstrated\n"); ok = 0; }
+        } else { kprintf("[emcaps] /data/tmp/emcaps.out missing\n"); ok = 0; }
+
+        kprintf("[cmd] test emlibc caps: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc embx") == 0) {
+        /* THE CONVERGENCE: an emlibc program, linked by EmbLD into a NATIVE
+         * EMBX that DECLARES {FILESYSTEM} in its capability table, loaded by the
+         * kernel's EMBX loader. The whole owned stack in one artifact -- emlibc
+         * (libc) + EmbLD (EMBX emitter) + EMBX (format) + the loader.
+         *
+         * The capability comes from the BINARY, not the spawn call: the grantor
+         * here holds FILESYSTEM|NETWORK, but the process is born with EXACTLY
+         * its DECLARED {FILESYSTEM} -- it does NOT get NETWORK even though the
+         * grantor had it, because EMBX grants the declared set, never the
+         * grantor's. (The refusal path -- declared NOT a subset of the grantor
+         * -- is exercised by `test embx` with capchild.embx.) */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test emlibc embx: VFS not registered\n"); return 1; }
+        const char *xp = "/data/apps/emlibc_embxapp/emlibc_embxapp.embx";
+        struct vfs_stat st;
+        if (vfs_stat(xp, &st) != 0) {
+            kprintf("\n[cmd] test emlibc embx: %s not on image "
+                    "(build with EMBCC_ROOT's embld)\n", xp); return 1; }
+        char *a[]   = { (char *)xp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+
+        (void)vfs_unlink_path("/data/tmp/embxapp.out");
+        uint64_t grantor = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid  = process_create_caps(xp, a, 1, env, NULL, 0, grantor);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embx] native EMBX loaded; grantor=fs+net -> exit=%d (want 42)\n", code);
+
+        int ok = (code == 42);
+        char head[64] = {0}; size_t got = 0;
+        if (vfs_stat("/data/tmp/embxapp.out", &st) == 0) {
+            int fd = vfs_open("/data/tmp/embxapp.out", O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+            if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            kprintf("[embx] the EMBX process reports: \"%s\"\n", head);
+            /* born with the DECLARED set only: filesystem yes, network withheld */
+            if (memcmp(head, "embx: born caps=0x2 fs=1 net=0", 30) != 0) {
+                kprintf("[embx] born set != declared {filesystem}\n"); ok = 0; }
+        } else { kprintf("[embx] /data/tmp/embxapp.out missing\n"); ok = 0; }
+
+        kprintf("[cmd] test emlibc embx: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embld embx") == 0) {
+        /* THE OS EMITS ITS OWN NATIVE BINARY. EmbLD runs on the metal
+         * (embld.elf) and now carries the EMBX emitter -- so the OS LINKS
+         * emlibc objects (crt0 + app + libemlibc.a; x86-64 native divide, no
+         * libgcc) and EMITS a native .embx declaring {FILESYSTEM}, entirely
+         * on-image, no host toolchain. Then it LOADS AND RUNS that freshly
+         * produced binary. Compiler/linker/format/loader, all on the OS. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embld embx: VFS not registered\n"); return 1; }
+        const char *ld = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(ld, &st) != 0) { kprintf("\n[cmd] test embld embx: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/emlibc/libemlibc.a", &st) != 0) {
+            kprintf("\n[cmd] test embld embx: emlibc link inputs not on image\n"); return 1; }
+
+        const char *out = "/data/tmp/onos.embx";
+        (void)vfs_unlink_path(out);
+        (void)vfs_unlink_path("/data/tmp/embxapp.out");
+        char *env[] = { (char *)"HOME=/", NULL };
+
+        /* (1) link + emit a native EMBX on the OS */
+        char *la[] = { (char *)ld, (char *)"--embx", (char *)"--cap", (char *)"filesystem",
+                       (char *)"-o", (char *)out,
+                       (char *)"/data/src/emlibc/crt0.o",
+                       (char *)"/data/src/emlibc/embxapp.o",
+                       (char *)"/data/src/emlibc/libemlibc.a" };
+        int lp = process_create_caps(ld, la, 9, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+        int have = (vfs_stat(out, &st) == 0);
+        kprintf("[embldembx] on-OS embld --embx: exit=%d, %s (%llu bytes)\n",
+                lc, have ? "wrote .embx" : "MISSING", have ? (unsigned long long)st.size : 0ULL);
+
+        int ok = (lc == 0) && have;
+        if (have) {                              /* confirm it is really EMBX */
+            unsigned char m[8] = {0}; size_t g = 0;
+            int fd = vfs_open(out, O_RDONLY, 0);
+            if (fd >= 0) { vfs_fd_read(fd, m, sizeof m, &g); vfs_close(fd); }
+            int magic = (g >= 5 && m[0] == 0x7F && m[1] == 'E' && m[2] == 'M' && m[3] == 'B' && m[4] == 'X');
+            kprintf("[embldembx] output magic: %s\n", magic ? "EMBX" : "not EMBX");
+            if (!magic) ok = 0;
+        }
+
+        /* (2) load + run the OS-produced binary */
+        if (ok) {
+            char *ra[] = { (char *)out, NULL };
+            uint64_t grantor = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+            int rp = process_create_caps(out, ra, 1, env, NULL, 0, grantor);
+            int rc = rp >= 0 ? process_wait((uint32_t)rp) : -1;
+            kprintf("[embldembx] ran the OS-built EMBX: exit=%d (want 42, born {filesystem})\n", rc);
+            if (rc != 42) ok = 0;
+            char head[64] = {0}; size_t got = 0;
+            if (vfs_stat("/data/tmp/embxapp.out", &st) == 0) {
+                int fd = vfs_open("/data/tmp/embxapp.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                if (got && head[got - 1] == '\n') head[got - 1] = 0;
+                kprintf("[embldembx] it reports: \"%s\"\n", head);
+            }
+        }
+
+        kprintf("[cmd] test embld embx: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embcc embx") == 0) {
+        /* THE WHOLE ARTIFACT, PRODUCED BY THE OWNED TOOLCHAIN ON THE OS, FROM
+         * SOURCE. EmbCC compiles the emlibc app .c (against emlibc's headers +
+         * embcc's own freestanding stddef/stdarg -- NO newlib), EmbLD links it
+         * with the emlibc rim + libemlibc.a and EMITS a native EMBX declaring
+         * {FILESYSTEM}, and the kernel loads + runs it. Compiler + libc + linker
+         * + format + loader, every stage owned, every stage on the metal. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc embx: VFS not registered\n"); return 1; }
+        const char *cc = "/data/apps/embcc/embcc.elf";
+        const char *ld = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cc, &st) != 0) { kprintf("\n[cmd] test embcc embx: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat(ld, &st) != 0) { kprintf("\n[cmd] test embcc embx: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/emlibc/embxapp.c", &st) != 0) {
+            kprintf("\n[cmd] test embcc embx: emlibc source not on image\n"); return 1; }
+
+        char *env[] = { (char *)"HOME=/", NULL };
+        const char *obj = "/data/tmp/embxapp.cc.o";
+        const char *out = "/data/tmp/cc.embx";
+        (void)vfs_unlink_path(obj);
+        (void)vfs_unlink_path(out);
+        (void)vfs_unlink_path("/data/tmp/embxapp.out");
+
+        /* (1) EmbCC compiles the app against emlibc headers (not newlib) */
+        char *ca[] = { (char *)cc, (char *)"-c", (char *)"/data/src/emlibc/embxapp.c",
+                       (char *)"-I", (char *)"/data/src/emlibc/include",
+                       (char *)"-I", (char *)"/data/apps/embcc/include",
+                       (char *)"-o", (char *)obj };
+        int cp = process_create_env(cc, ca, 9, env, NULL, 0);
+        int cc_code = cp >= 0 ? process_wait((uint32_t)cp) : -1;
+        int have_o = (vfs_stat(obj, &st) == 0);
+        kprintf("[embccembx] embcc compiled emlibc app: exit=%d, %s\n",
+                cc_code, have_o ? "object written" : "MISSING");
+        int ok = (cc_code == 0 && have_o);
+
+        /* (2) EmbLD links the embcc object + rim + libemlibc.a -> native EMBX */
+        if (ok) {
+            char *la[] = { (char *)ld, (char *)"--embx", (char *)"--cap", (char *)"filesystem",
+                           (char *)"-o", (char *)out,
+                           (char *)"/data/src/emlibc/crt0.o",
+                           (char *)obj,
+                           (char *)"/data/src/emlibc/libemlibc.a" };
+            int lp = process_create_caps(ld, la, 9, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+            int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            int have_x = (vfs_stat(out, &st) == 0);
+            kprintf("[embccembx] embld --embx linked it: exit=%d, %s (%llu bytes)\n",
+                    lc, have_x ? "EMBX written" : "MISSING",
+                    have_x ? (unsigned long long)st.size : 0ULL);
+            if (!(lc == 0 && have_x)) ok = 0;
+        }
+
+        /* (3) the kernel loads + runs the OS-built-from-source binary */
+        if (ok) {
+            char *ra[] = { (char *)out, NULL };
+            uint64_t grantor = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+            int rp = process_create_caps(out, ra, 1, env, NULL, 0, grantor);
+            int rc = rp >= 0 ? process_wait((uint32_t)rp) : -1;
+            char head[64] = {0}; size_t got = 0;
+            if (vfs_stat("/data/tmp/embxapp.out", &st) == 0) {
+                int fd = vfs_open("/data/tmp/embxapp.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            }
+            kprintf("[embccembx] ran it: exit=%d (want 42), reports \"%s\"\n", rc, head);
+            if (rc != 42) ok = 0;
+        }
+
+        kprintf("[cmd] test embcc embx: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test emlibc selfhost") == 0) {
+        /* THE FINALE (EMLIBC_Requirements.md §6 step 5): EmbCC compiles emlibc's
+         * OWN sources. The OS builds its libc from scratch with the owned
+         * compiler -- crt0 + every libemlibc unit -- links them with EmbLD into
+         * a native EMBX, and runs an app against the self-compiled libc. The
+         * closed loop: a compiler, a libc it built, a linker, a format, a
+         * loader, an OS -- one system, beholden to nothing external. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test emlibc selfhost: VFS not registered\n"); return 1; }
+        const char *cc = "/data/apps/embcc/embcc.elf";
+        const char *ld = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(cc, &st) != 0) { kprintf("\n[cmd] test emlibc selfhost: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat(ld, &st) != 0) { kprintf("\n[cmd] test emlibc selfhost: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/emlibc/stdio.c", &st) != 0) {
+            kprintf("\n[cmd] test emlibc selfhost: emlibc sources not on image\n"); return 1; }
+
+        char *env[] = { (char *)"HOME=/", NULL };
+        /* crt0 + the six libemlibc units + the app -- all compiled by EmbCC. */
+        static const char *const units[] = {
+            "crt0", "string", "stdlib", "stdio", "syscalls", "errno", "process", "embxapp",
+        };
+        int nunits = (int)(sizeof units / sizeof units[0]);
+        int built = 0;
+        for (int u = 0; u < nunits; u++) {
+            char src[64], obj[64];
+            snprintf(src, sizeof src, "/data/src/emlibc/%s.c", units[u]);
+            snprintf(obj, sizeof obj, "/data/tmp/self_%s.o", units[u]);
+            (void)vfs_unlink_path(obj);
+            char *ca[] = { (char *)cc, (char *)"-c", src,
+                           (char *)"-I", (char *)"/data/src/emlibc/include",
+                           (char *)"-I", (char *)"/data/apps/embcc/include",
+                           (char *)"-o", obj };
+            int p = process_create_env(cc, ca, 9, env, NULL, 0);
+            if ((p >= 0 ? process_wait((uint32_t)p) : -1) == 0 && vfs_stat(obj, &st) == 0)
+                built++;
+        }
+        kprintf("[emself] embcc built %d/%d emlibc units (crt0 + libc + app)\n", built, nunits);
+        int ok = (built == nunits);
+
+        /* Link the self-compiled objects into a native EMBX (crt0 first). */
+        const char *out = "/data/tmp/emself.embx";
+        (void)vfs_unlink_path(out);
+        (void)vfs_unlink_path("/data/tmp/embxapp.out");
+        if (ok) {
+            char *la[] = { (char *)ld, (char *)"--embx", (char *)"--cap", (char *)"filesystem",
+                           (char *)"-o", (char *)out,
+                           (char *)"/data/tmp/self_crt0.o",   (char *)"/data/tmp/self_embxapp.o",
+                           (char *)"/data/tmp/self_string.o", (char *)"/data/tmp/self_stdlib.o",
+                           (char *)"/data/tmp/self_stdio.o",  (char *)"/data/tmp/self_syscalls.o",
+                           (char *)"/data/tmp/self_errno.o",  (char *)"/data/tmp/self_process.o" };
+            int lp = process_create_caps(ld, la, 14, env, NULL, 0, EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+            int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            int have = (vfs_stat(out, &st) == 0);
+            kprintf("[emself] embld linked the self-compiled libc: exit=%d, %s (%llu bytes)\n",
+                    lc, have ? "EMBX written" : "MISSING", have ? (unsigned long long)st.size : 0ULL);
+            if (!(lc == 0 && have)) ok = 0;
+        }
+
+        /* Run the app against the EmbCC-built emlibc. */
+        if (ok) {
+            char *ra[] = { (char *)out, NULL };
+            uint64_t grantor = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+            int rp = process_create_caps(out, ra, 1, env, NULL, 0, grantor);
+            int rc = rp >= 0 ? process_wait((uint32_t)rp) : -1;
+            char head[64] = {0}; size_t got = 0;
+            if (vfs_stat("/data/tmp/embxapp.out", &st) == 0) {
+                int fd = vfs_open("/data/tmp/embxapp.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                if (got && head[got - 1] == '\n') head[got - 1] = 0;
+            }
+            kprintf("[emself] app on EmbCC-built emlibc: exit=%d (want 42), reports \"%s\"\n", rc, head);
+            if (rc != 42) ok = 0;
+        }
+
+        kprintf("[cmd] test emlibc selfhost: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test capgate") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test capgate: VFS not registered\n"); return 1; }
+        const char *gp = "/data/apps/capgpu/capgpu.elf";
+        struct vfs_stat st;
+        if (vfs_stat(gp, &st) != 0) { kprintf("\n[cmd] test capgate: %s not on image\n", gp); return 1; }
+        char *a[] = { (char *)gp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int ok = 1;
+
+        /* (1) WITHOUT GPU: seed {FILESYSTEM} only -> surface refused -> exit 0 */
+        uint64_t no_gpu = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int p1 = process_create_caps(gp, a, 1, env, NULL, 0, no_gpu);
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[capgate] no GPU cap:  capgpu exit=%d (0 = surface refused)\n", c1);
+        if (c1 != 0) { kprintf("[capgate] FAIL: a process WITHOUT GPU got a surface\n"); ok = 0; }
+
+        /* (2) WITH GPU: seed {FILESYSTEM,GPU} -> surface granted -> exit 2 */
+        uint64_t with_gpu = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_GPU);
+        int p2 = process_create_caps(gp, a, 1, env, NULL, 0, with_gpu);
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        kprintf("[capgate] with GPU cap: capgpu exit=%d (2 = surface granted)\n", c2);
+        if (c2 != 2) { kprintf("[capgate] FAIL: a process WITH GPU was denied a surface\n"); ok = 0; }
+
+        /* (3+4) FILESYSTEM: open() is gated the same way. capfs opens a real
+         * file: exit 2 granted, 0 on the clean EPERM denial. A GPU-only process
+         * (no FS) must be refused; an FS-holder must succeed. Proves the gate
+         * generalises past GPU to a second, unrelated resource class. */
+        const char *fp = "/data/apps/capfs/capfs.elf";
+        if (vfs_stat(fp, &st) == 0) {
+            char *fa[] = { (char *)fp, NULL };
+            uint64_t no_fs   = EMBK_CAP_BIT(EMBK_CAP_GPU);
+            uint64_t with_fs = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+            int f1 = process_create_caps(fp, fa, 1, env, NULL, 0, no_fs);
+            int fc1 = f1 >= 0 ? process_wait((uint32_t)f1) : -1;
+            kprintf("[capgate] no FS cap:   capfs exit=%d (0 = open refused)\n", fc1);
+            if (fc1 != 0) { kprintf("[capgate] FAIL: a process WITHOUT FILESYSTEM opened a file\n"); ok = 0; }
+            int f2 = process_create_caps(fp, fa, 1, env, NULL, 0, with_fs);
+            int fc2 = f2 >= 0 ? process_wait((uint32_t)f2) : -1;
+            kprintf("[capgate] with FS cap: capfs exit=%d (2 = open granted)\n", fc2);
+            if (fc2 != 2) { kprintf("[capgate] FAIL: a process WITH FILESYSTEM was denied open\n"); ok = 0; }
+        } else {
+            kprintf("[capgate] (FS case skipped: capfs.elf not on image)\n");
+        }
+
+        kprintf("\n[cmd] test capgate: %s\n",
+                ok ? "OK -- GPU surface AND filesystem open gated on their caps, both ways "
+                     "(win_create/desktop share the proven GPU gate)"
+                   : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embx") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embx: VFS not registered\n"); return 1; }
+        const char *xp = "/data/apps/capchildx/capchild.embx";
+        struct vfs_stat st;
+        if (vfs_stat(xp, &st) != 0) { kprintf("\n[cmd] test embx: %s not on image\n", xp); return 1; }
+        char *env[] = { (char *)"HOME=/", NULL };
+        int ok = 1;
+
+        /* ACCEPT: kernel context holds full authority, so {FS} is grantable.
+         * The EMBX binary runs and exits with its born cap set. */
+        char *a[] = { (char *)xp, NULL };
+        kprintf("[embx] ACCEPT: loading %s from a full-authority grantor\n", xp);
+        int pid = process_create_env(xp, a, 1, env, NULL, 0);
+        if (pid < 0) {
+            kprintf("[embx] FAIL: load returned %s (want success)\n", embk_strerror(pid)); ok = 0;
+        } else {
+            int code = process_wait((uint32_t)pid);
+            uint64_t want = (uint64_t)EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);   /* == 2 */
+            kprintf("[embx] EMBX APP ran, exit=%d (== its born cap_set; want %llu={FS})\n",
+                    code, (unsigned long long)want);
+            if (code != (int)want) { kprintf("[embx] FAIL: declared {FS} did not become the born cap set\n"); ok = 0; }
+        }
+
+        /* REFUSE: seed a launcher with ONLY {NETWORK}; it loads the same EMBX
+         * (which declares {FS}); step 9 must deny it. capreload.elf does the
+         * load and exits 0 on the EXPECTED denial, nonzero otherwise. */
+        if (ok) {
+            const char *lp = "/data/apps/capreload/capreload.elf";
+            if (vfs_stat(lp, &st) == 0) {
+                char *la[] = { (char *)lp, NULL };
+                uint64_t net_only = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+                kprintf("[embx] REFUSE: launcher seeded {NET} tries to load the {FS}-declaring EMBX\n");
+                int lpid = process_create_caps(lp, la, 1, env, NULL, 0, net_only);
+                int lcode = lpid >= 0 ? process_wait((uint32_t)lpid) : -1;
+                kprintf("[embx] launcher exit=%d (0 = it correctly saw the denial)\n", lcode);
+                if (lcode != 0) { kprintf("[embx] FAIL: step-9 denial not observed as expected\n"); ok = 0; }
+            } else {
+                kprintf("[embx] (refuse case skipped: capreload.elf not on image)\n");
+            }
+        }
+
+        kprintf("\n[cmd] test embx: %s\n",
+                ok ? "OK -- EMBX APP loads, its declared caps become the process's, "
+                     "and a grantor lacking them is refused at step 9" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test spawncaps") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test spawncaps: VFS not registered\n"); return 1; }
+        const char *sp = "/data/apps/capspawn/capspawn.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test spawncaps: %s not on image\n", sp); return 1; }
+
+        char *a[] = { (char *)sp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t seed = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        kprintf("[spawncaps] spawning capspawn with a LIMITED set {FS,NET} = 0x%llx\n",
+                (unsigned long long)seed);
+        int pid = process_create_caps(sp, a, 1, env, NULL, 0, seed);
+        if (pid < 0) { kprintf("[spawncaps] seed spawn failed: %s\n", embk_strerror(pid)); 
+                       kprintf("\n[cmd] test spawncaps: FAIL\n"); return 1; }
+        int code = process_wait((uint32_t)pid);
+
+        /* capspawn's exit code IS the verdict. 0 = every step passed; 11..14
+         * name the failing step (see capspawn.c). */
+        const char *why = "unknown";
+        switch (code) {
+            case 0:  why = "all four steps passed"; break;
+            case 11: why = "capspawn's OWN caps were not {FS,NET} (seed/getcaps broken)"; break;
+            case 12: why = "attenuating a child to {FS} did not yield {FS}"; break;
+            case 13: why = "granting the full {FS,NET} did not yield {FS,NET}"; break;
+            case 14: why = "requesting {GPU} it does NOT hold was NOT refused"; break;
+        }
+        kprintf("[spawncaps] capspawn exit=%d -> %s\n", code, why);
+        kprintf("\n[cmd] test spawncaps: %s\n", code == 0 ? "OK -- userspace attenuation enforced, "
+                "and a parent cannot grant what it lacks" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test caps") == 0) {
+        int ok = 1;
+        uint64_t out;
+
+        #define CAP(id) EMBK_CAP_BIT(id)
+        #define WANT(expr, msg) do { if (!(expr)) { \
+            kprintf("[caps] FAIL: %s\n", (msg)); ok = 0; } } while (0)
+
+        /* --- the invariant, exhausted on the pure function --- */
+
+        /* a subset request from a full-authority grantor: granted verbatim */
+        WANT(embk_caps_attenuate(EMBK_CAP_ALL, CAP(EMBK_CAP_FILESYSTEM), &out) == 0
+             && out == CAP(EMBK_CAP_FILESYSTEM),
+             "ALL grantor should grant {FS} exactly");
+
+        /* INHERIT resolves to the grantor's whole set, unchanged */
+        WANT(embk_caps_attenuate(CAP(EMBK_CAP_FILESYSTEM) | CAP(EMBK_CAP_GPU),
+                                 EMBK_CAP_INHERIT, &out) == 0
+             && out == (CAP(EMBK_CAP_FILESYSTEM) | CAP(EMBK_CAP_GPU)),
+             "INHERIT should copy the grantor set");
+
+        /* THE REFUSAL: asking for a capability the grantor does not hold */
+        WANT(embk_caps_attenuate(CAP(EMBK_CAP_FILESYSTEM),
+                                 CAP(EMBK_CAP_FILESYSTEM) | CAP(EMBK_CAP_NETWORK),
+                                 &out) != 0,
+             "{FS} grantor must REFUSE a request for {FS,NET}");
+
+        /* a capless grantor can grant nothing but the empty set */
+        WANT(embk_caps_attenuate(0, CAP(EMBK_CAP_FILESYSTEM), &out) != 0,
+             "empty grantor must refuse any nonzero request");
+        WANT(embk_caps_attenuate(0, 0, &out) == 0 && out == 0,
+             "empty grantor may grant the empty set");
+
+        /* MONOTONICITY down a two-level tree: a set can only ever SHRINK.
+         * init(ALL) -> shell{FS,NET} -> child. The child asking for NET is
+         * fine (subset); asking for GPU -- which the shell never had -- is
+         * refused, EVEN THOUGH init did have it. That is the whole property:
+         * you cannot regain below what a parent dropped above. */
+        uint64_t shell;
+        WANT(embk_caps_attenuate(EMBK_CAP_ALL,
+                                 CAP(EMBK_CAP_FILESYSTEM) | CAP(EMBK_CAP_NETWORK),
+                                 &shell) == 0, "init should grant the shell {FS,NET}");
+        WANT(embk_caps_attenuate(shell, CAP(EMBK_CAP_NETWORK), &out) == 0
+             && out == CAP(EMBK_CAP_NETWORK),
+             "shell{FS,NET} should grant a child {NET}");
+        WANT(embk_caps_attenuate(shell, CAP(EMBK_CAP_GPU), &out) != 0,
+             "shell{FS,NET} must REFUSE {GPU} though init held it -- monotonicity");
+
+        /* EMBK_CAP_ALL really is bits 1..MAX_ID and nothing else (no bit 0,
+         * no id>MAX). cap_id 10 (DEBUG) is now a real class and IS in ALL; the
+         * first id past MAX is what must be refused. */
+        WANT((EMBK_CAP_ALL & 1ULL) == 0, "cap_id 0 must never be in ALL");
+        WANT(embk_caps_attenuate(EMBK_CAP_ALL, CAP(EMBK_CAP_DEBUG), &out) == 0
+             && out == CAP(EMBK_CAP_DEBUG),
+             "cap_id 10 (DEBUG) is a real class, granted from ALL");
+        WANT(embk_caps_attenuate(EMBK_CAP_ALL, EMBK_CAP_BIT(EMBK_CAP_MAX_ID + 1), &out) != 0,
+             "an unknown cap id (>MAX) is not in ALL, so it is refused");
+
+        /* --- integration: a real child is born with exactly its grant --- */
+
+        /* Kernel context here holds full authority, so it can grant {FS}. Spawn
+         * a trivial program with ONLY {FILESYSTEM}; it need not even run for the
+         * check -- we inspect the born process's set. hello.elf exits promptly
+         * so the slot reaps itself. */
+        if (ok && g_vfs_ready) {
+            const char *hp = "/data/apps/hello/hello.elf";
+            struct vfs_stat st;
+            if (vfs_stat(hp, &st) == 0) {
+                char *a[] = { (char *)hp, NULL };
+                char *env[] = { (char *)"HOME=/", NULL };
+                int pid = process_create_caps(hp, a, 1, env, NULL, 0,
+                                              CAP(EMBK_CAP_FILESYSTEM));
+                if (pid < 0) {
+                    kprintf("[caps] FAIL: attenuated spawn returned %d\n", pid); ok = 0;
+                } else {
+                    uint64_t born = process_caps_by_pid((uint32_t)pid);
+                    kprintf("[caps] child pid %d born with cap_set 0x%llx (want 0x%llx)\n",
+                            pid, (unsigned long long)born,
+                            (unsigned long long)CAP(EMBK_CAP_FILESYSTEM));
+                    if (born != CAP(EMBK_CAP_FILESYSTEM)) {
+                        kprintf("[caps] FAIL: child did not receive exactly {FS}\n"); ok = 0;
+                    }
+                    process_wait((uint32_t)pid);   /* let it run + reap */
+                }
+            } else {
+                kprintf("[caps] (skipped integration: %s not on image)\n", hp);
+            }
+        }
+
+        #undef CAP
+        #undef WANT
+        kprintf("\n[cmd] test caps: %s\n",
+                ok ? "OK -- seeded at init, attenuated at spawn, monotonic down the tree"
+                   : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test pmm") == 0) {
+        #define PMM_N 2048
+        static uint64_t pages[PMM_N];
+        uint64_t b0, a0, b1, a1;
+        int ok = 1;
+
+        pmm_scan_stats(&b0, &a0);
+
+        /* Allocate a lot. Under the old scan this is the pathological shape:
+         * each call starts over from page 0 across everything already used. */
+        uint64_t got = 0;
+        for (uint64_t i = 0; i < PMM_N; i++) {
+            pages[i] = pmm_alloc_page();
+            if (!pages[i]) break;
+            got++;
+        }
+        pmm_scan_stats(&b1, &a1);
+        uint64_t alloc_bits = b1 - b0, alloc_n = a1 - a0;
+        kprintf("[pmm] allocated %llu pages: %llu scan tests, %llu per allocation\n",
+                (unsigned long long)got, (unsigned long long)alloc_bits,
+                (unsigned long long)(alloc_n ? alloc_bits / alloc_n : 0));
+        if (got != PMM_N) { kprintf("[pmm] FAIL: only got %llu of %d\n",
+                                    (unsigned long long)got, PMM_N); ok = 0; }
+
+        /* Every page must be distinct -- a hint that skipped a bitmap update
+         * would hand the same frame out twice, which is the failure mode this
+         * optimisation could plausibly introduce, and it is silent. Sorting is
+         * overkill for 2048; a direct duplicate check against the previous
+         * allocation catches the realistic bug (hint not advancing). */
+        for (uint64_t i = 1; i < got && ok; i++) {
+            if (pages[i] == pages[i - 1]) {
+                kprintf("[pmm] FAIL: page %llu handed out twice (0x%llx)\n",
+                        (unsigned long long)i, (unsigned long long)pages[i]);
+                ok = 0;
+            }
+        }
+
+        /* Free them all, then reallocate: with the hint this should be nearly
+         * free, because each free aims the scan at a known-free page. */
+        for (uint64_t i = 0; i < got; i++) pmm_free_page(pages[i]);
+        pmm_scan_stats(&b0, &a0);
+        uint64_t got2 = 0;
+        for (uint64_t i = 0; i < got; i++) {
+            uint64_t p = pmm_alloc_page();
+            if (!p) break;
+            pages[i] = p; got2++;
+        }
+        pmm_scan_stats(&b1, &a1);
+        uint64_t re_bits = b1 - b0, re_n = a1 - a0;
+        kprintf("[pmm] re-allocated %llu pages after free: %llu tests, %llu per allocation\n",
+                (unsigned long long)got2, (unsigned long long)re_bits,
+                (unsigned long long)(re_n ? re_bits / re_n : 0));
+        if (got2 != got) { kprintf("[pmm] FAIL: reallocation got %llu of %llu\n",
+                                   (unsigned long long)got2, (unsigned long long)got); ok = 0; }
+        for (uint64_t i = 0; i < got2; i++) pmm_free_page(pages[i]);
+
+        kprintf("\n[cmd] test pmm: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+        #undef PMM_N
+    }
+
+    if (strcmp(cmd, "test usercopy") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test usercopy: VFS not registered\n"); return 1; }
+
+        /* Every read()/write() crossing the syscall boundary is a user-copy, so
+         * concurrent file readers ARE concurrent user-copy traffic -- and they
+         * run while home/clockw keep the compositor mapping shared window pages,
+         * which is the other half of the historical repro. */
+        /* BOTH HALVES OF THE HISTORICAL REPRO, or this proves little:
+         *   - readers hammering the syscall boundary (every read() is a
+         *     copy_to_user, so this is the walker side), and
+         *   - UI apps being launched DURING that, because window creation is
+         *     what makes the compositor map shared pages into a client's PML4
+         *     on another core -- the writer side named in vmm_get_phys_in's
+         *     comment ("font.ttf open failed -14" under -smp 4).
+         * Readers alone exercise the walk against a quiet page table, which is
+         * the easy case and not the one that ever failed. */
+        #define UC_PROCS 6
+        #define UC_UI    2
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pids[UC_PROCS], uipids[UC_UI];
+        struct usercopy_stat_pub u0, u1;
+
+        usercopy_stat_reset();
+        usercopy_stat_get(&u0);
+
+        for (int i = 0; i < UC_PROCS; i++) {
+            char *a[] = { (char *)"/data/apps/ioracer/ioracer.elf",
+                          (i & 1) ? (char *)"/data/raceb.bin" : (char *)"/data/racea.bin",
+                          (i & 1) ? (char *)"B" : (char *)"A", (char *)"8", NULL };
+            pids[i] = process_create_env("/data/apps/ioracer/ioracer.elf", a, 4, env, NULL, 0);
+            if (pids[i] < 0) kprintf("[usercopy] spawn %d failed: %s\n", i, embk_strerror(pids[i]));
+        }
+        /* Launched AFTER the readers are already running, so the window
+         * mapping lands in the middle of their user-copy traffic. */
+        for (int i = 0; i < UC_UI; i++) {
+            char *a[] = { (char *)"/data/apps/clockw/clockw.elf", NULL };
+            uipids[i] = process_create_env("/data/apps/clockw/clockw.elf", a, 1, env, NULL, 0);
+            kprintf("[usercopy] UI app %d -> pid %d (forces compositor to map shared "
+                    "pages into a client PML4 mid-flight)\n", i, uipids[i]);
+        }
+        kprintf("[usercopy] %d readers x 8 passes x 256 KB (4 KB per read) + %d UI launches\n",
+                UC_PROCS, UC_UI);
+
+        int bad = 0;
+        for (int i = 0; i < UC_PROCS; i++) {
+            int code = (pids[i] >= 0) ? process_wait((uint32_t)pids[i]) : -1;
+            if (code != 0) { kprintf("[usercopy] reader %d exit=%d\n", i, code); bad = 1; }
+        }
+        for (int i = 0; i < UC_UI; i++) {          /* widgets run forever: reap them */
+            if (uipids[i] >= 0) { process_kill((uint32_t)uipids[i]); process_wait((uint32_t)uipids[i]); }
+        }
+
+        usercopy_stat_get(&u1);
+        uint64_t calls   = u1.calls   - u0.calls;
+        uint64_t retries = u1.retries - u0.retries;
+        uint64_t faults  = u1.faults  - u0.faults;
+
+        kprintf("[usercopy] %llu validations, %llu TRANSIENT retries, %llu hard faults, "
+                "deepest %llu attempt(s)\n",
+                (unsigned long long)calls, (unsigned long long)retries,
+                (unsigned long long)faults, (unsigned long long)u1.worst_tries);
+
+        if (retries == 0) {
+            kprintf("[usercopy] no transient observed in %llu validations. That is EVIDENCE,\n"
+                    "           not proof -- absence over one run cannot prove absence -- but\n"
+                    "           it is the first number anyone has had, and it is consistent\n"
+                    "           with the two landed fixes (atomic pml4 capture, vmm_lock in\n"
+                    "           vmm_get_phys_in) having been the whole cause.\n",
+                    (unsigned long long)calls);
+        } else {
+            kprintf("[usercopy] *** THE TRANSIENT IS ALIVE: %llu of %llu validations needed a\n"
+                    "           retry (deepest %llu). It is no longer unexplained-and-unmeasured;\n"
+                    "           this is a live repro to chase.\n",
+                    (unsigned long long)retries, (unsigned long long)calls,
+                    (unsigned long long)u1.worst_tries);
+        }
+
+        /* A hard fault here would mean a genuinely bad pointer from a reader
+         * that is only ever handed valid ones -- that IS a failure. */
+        int ok = !bad && faults == 0;
+        kprintf("\n[cmd] test usercopy: %s\n",
+                ok ? "OK -- all readers completed, no unrecoverable EFAULT" : "FAIL");
+        return 1;
+        #undef UC_PROCS
+        #undef UC_UI
+    }
+
+    if (strcmp(cmd, "test blockrace") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test blockrace: VFS not registered\n"); return 1; }
+
+        /* Six readers, two workloads. The four 256 KB fixtures are the
+         * content-verified ones and live in the whole-object rcache. The two
+         * BIG readers exist for a different reason: cxxdemo.elf is 9 MB, past
+         * EMBKFS_RCACHE_MAX, so it bypasses rcache entirely and drives the
+         * extent-map cache (ecache) instead -- the only workload on this image
+         * that does. Without them the ecache numbers below would be all zeros
+         * and any claim about it would be unfounded. They read in '*' mode:
+         * a real binary has no fill byte, so they drive the path without
+         * pretending to a content check. */
+        #define RACERS 6
+        static const char *files[RACERS] = { "/data/racea.bin", "/data/raceb.bin",
+                                             "/data/racea.bin", "/data/raceb.bin",
+                                             "/data/apps/cxxdemo/cxxdemo.elf",
+                                             "/data/apps/cxxdemo/cxxdemo.elf" };
+        static const char *fills[RACERS] = { "A", "B", "A", "B", "*", "*" };
+        static const char *passes[RACERS] = { "3", "3", "3", "3", "2", "2" };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pids[RACERS], codes[RACERS];
+        int ok = 1, mismatch = 0;
+
+        struct embk_blkstat b0, b1;
+        struct embkfs_lockstat l0, l1;
+        embk_blkstat_get(&b0);
+        embkfs_lockstat_get(&l0);
+
+        /* Spawn ALL of them before waiting on any. Waiting between spawns
+         * would serialise them in the TEST, which would hide whether the
+         * SYSTEM serialises them -- the very thing being measured. */
+        for (int i = 0; i < RACERS; i++) {
+            char *a[] = { (char *)"/data/apps/ioracer/ioracer.elf",
+                          (char *)files[i], (char *)fills[i], (char *)passes[i], NULL };
+            pids[i] = process_create_env("/data/apps/ioracer/ioracer.elf", a, 4, env, NULL, 0);
+            if (pids[i] < 0) {
+                kprintf("[blockrace] spawn %d failed: %s\n", i, embk_strerror(pids[i]));
+                ok = 0;
+            }
+        }
+        kprintf("[blockrace] %d readers spawned before any wait: 4 over two 256 KB\n"
+                "            fixtures (rcache path, content-verified) + 2 over a 9 MB\n"
+                "            binary (>8 MB, so the ecache path). Bounce buffer is 32 KB.\n",
+                RACERS);
+
+        for (int i = 0; i < RACERS; i++) {
+            codes[i] = (pids[i] >= 0) ? process_wait((uint32_t)pids[i]) : -1;
+            if (codes[i] == 2) mismatch = 1;
+            kprintf("[blockrace] reader %d (%s, '%s') exit=%d%s\n",
+                    i, files[i], fills[i], codes[i],
+                    codes[i] == 2 ? "  <-- GOT ANOTHER READER'S BYTES" : "");
+            if (codes[i] != 0) ok = 0;
+        }
+
+        embk_blkstat_get(&b1);
+        embkfs_lockstat_get(&l1);
+        uint64_t breads = b1.bounce_reads - b0.bounce_reads;
+        uint64_t bcont  = b1.bounce_contended - b0.bounce_contended;
+        kprintf("[blockrace] bounce path: %llu read(s), %llu contended\n",
+                (unsigned long long)breads, (unsigned long long)bcont);
+
+        /* The architectural assertion. Zero is CORRECT here and is what makes
+         * the bounce lock defence-in-depth rather than the thing holding the
+         * system together. Non-zero is not a failure of correctness -- the
+         * lock did its job -- but it means the layering changed, and whoever
+         * changed it needs to know this lock is now load-bearing. */
+        if (bcont == 0) {
+            kprintf("[blockrace] bounce lock never contended -- EXPECTED: the EMBKFS big\n"
+                    "            lock serialises fs I/O above it, so two readers cannot be\n"
+                    "            inside the block layer at once. The bounce lock is\n"
+                    "            defence-in-depth for callers that do not hold that lock\n"
+                    "            (fat32.c, the boot partition scan, a future finer-grained\n"
+                    "            fs lock).\n");
+        } else {
+            kprintf("[blockrace] *** bounce lock WAS contended (%llu). The fs no longer\n"
+                    "            serialises above it -- this lock is now LOAD-BEARING.\n"
+                    "            That is fine, but docs/TODO.md's block-layer entry and\n"
+                    "            the EMBKFS big-lock comment both need updating.\n",
+                    (unsigned long long)bcont);
+        }
+
+        /* Also worth seeing: the bounce read count is far below the 3 MB these
+         * readers logically consumed, because EMBKFS's whole-object cache
+         * serves repeat passes without reaching the block layer at all. A
+         * concurrency test that assumed "bytes read == device reads" would be
+         * measuring the cache, not the disk. */
+        kprintf("[blockrace] (%llu device bounce reads for ~3 MB logical -- the rest was\n"
+                "            served by EMBKFS's object cache, never reaching block.c)\n",
+                (unsigned long long)breads);
+
+        /* The EMBKFS big lock, measured under the only genuinely concurrent fs
+         * load in the tree. This is the number that decides whether
+         * finer-grained (per-volume / per-object) locking is worth the 34
+         * shared scratch buffers that would have to be un-shared first. A high
+         * wait time says the coarse lock is costing real throughput; a low one
+         * says leave it alone and spend the effort elsewhere. Measured before
+         * optimised, the same rule the I/O-path rebuild was held to. */
+        {
+            uint64_t acq = l1.acquires - l0.acquires;
+            uint64_t rec = l1.recursive - l0.recursive;
+            uint64_t wts = l1.waits - l0.waits;
+            uint64_t wus = l1.wait_us - l0.wait_us;
+            kprintf("[blockrace] fs big lock: %llu acquire(s), %llu recursive, "
+                    "%llu waited (%llu%%), %llu ms blocked\n",
+                    (unsigned long long)acq, (unsigned long long)rec,
+                    (unsigned long long)wts,
+                    (unsigned long long)(acq ? (wts * 100) / acq : 0),
+                    (unsigned long long)(wus / 1000));
+            struct embkfs_stat es;
+            embkfs_stat_get(&es);
+            kprintf("[blockrace] ecache: %llu hit, %llu miss | icache: %llu hit, %llu miss "
+                    "(both still 1 slot)\n",
+                    (unsigned long long)es.ecache_hit, (unsigned long long)es.ecache_miss,
+                    (unsigned long long)es.icache_hit, (unsigned long long)es.icache_miss);
+            kprintf("[blockrace] rcache: %llu hit, %llu miss, %llu evict, %llu BYPASS "
+                    "(>%u MB, uncacheable by policy)\n"
+                    "[blockrace]         %u slot%s, %u MB budget\n",
+                    (unsigned long long)es.rcache_hit,
+                    (unsigned long long)es.rcache_miss,
+                    (unsigned long long)es.rcache_evict,
+                    (unsigned long long)es.rcache_bypass,
+                    (unsigned)(EMBKFS_RCACHE_MAX_MB),
+                    EMBKFS_RCACHE_SLOTS, EMBKFS_RCACHE_SLOTS == 1 ? "" : "s",
+                    EMBKFS_RCACHE_BUDGET / (1024u * 1024u));
+            kprintf("[blockrace]   (an EVICTION is a miss the cache inflicted on itself, and\n"
+                    "               each miss re-decodes a whole object while holding the big\n"
+                    "               lock -- which is what the ms-blocked figure above IS)\n");
+        }
+
+        kprintf("\n[cmd] test blockrace: %s\n",
+                ok ? "OK -- 4 concurrent readers, every byte its own"
+                   : (mismatch ? "FAIL -- A READER GOT ANOTHER'S BYTES (bounce buffer raced)"
+                               : "FAIL"));
+        return 1;
+        #undef RACERS
+    }
+
+    if (strcmp(cmd, "test embkfs shrink") == 0) {
+        int rc = embkfs_run_shrink_selftests();
+        kprintf("\n[cmd] test embkfs shrink: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
     if (strcmp(cmd, "test embkfs timestamps") == 0) {
         int rc = embkfs_run_timestamp_selftests();
         kprintf("\n[cmd] test embkfs timestamps: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
@@ -549,6 +2178,12 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test embkfs snapshot") == 0) {
         int rc = embkfs_run_snapshot_selftests();
         kprintf("\n[cmd] test embkfs snapshot: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embkfs snapreg") == 0) {
+        int rc = embkfs_run_snapreg_selftests();
+        kprintf("\n[cmd] test embkfs snapreg: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
         return 1;
     }
 
@@ -1658,6 +3293,420 @@ int selftests_handle_command(const char *cmd)
  *
  * Header-free again, and for the same reason as `test tcc compile`: /include
  * does not exist. main() needs no declaration to be defined. */
+
+/* EmbCC, THE SELF-HOSTED COMPILER, ON THE OS (EmbCC M3 fixed point, host
+ * half done in EmbCC's tree). embcc.elf here was itself COMPILED BY EmbCC
+ * and LINKED BY EmbLD on the host -- the compiler and linker are both
+ * EmbLink's own. This runs that self-built compiler on the OS: it compiles
+ * the M1 program (source -> object, exercising the whole frontend, the
+ * x86-64 codegen, the integrated assembler, and the ELF object writer),
+ * then tcc LINKS the EmbCC-produced object against the real crt0/syscalls/
+ * libc, and the kernel runs the result. Exit 42 can only appear if a
+ * compiler built by EmbCC really compiled, and its object was real enough
+ * for a DIFFERENT linker (tcc) to bind and run. Header-free for the same
+ * reason as the tcc tests: /include is flat. */
+    if (strcmp(cmd, "test embcc") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc: VFS not registered\n"); return 1; }
+        struct vfs_stat est;
+        if (vfs_stat("/data/apps/embcc/embcc.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc: /data/apps/embcc/embcc.elf not on image\n");
+            return 1; }
+
+        static const char src[] =
+            "/* Compiled BY EmbCC, ON EmbLink. EmbCC itself was built by EmbCC.\n"
+            "   No #include: the root is flat; a defined main needs none. */\n"
+            "static int twice(int x) { return x + x; }\n"
+            "int main(void) { return twice(21); }\n";
+        {
+            int fd = vfs_open("/data/tmp/e.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { kprintf("test embcc: cannot write /e.c\n"); return 1; }
+            size_t w = 0;
+            vfs_fd_write(fd, src, sizeof src - 1, &w);
+            vfs_close(fd);
+        }
+        (void)vfs_unlink_path("/data/tmp/e.o");
+        (void)vfs_unlink_path("/data/tmp/e.elf");
+
+        /* 1. EmbCC compiles: source -> object. */
+        char *a[] = { "/data/apps/embcc/embcc.elf", "-c", "/data/tmp/e.c",
+                      "-o", "/data/tmp/e.o" };
+        char *env[] = { "HOME=/", NULL };
+        kprintf("[embcc -c] %s %s %s %s\n", a[1], a[2], a[3], a[4]);
+        int pid = process_create_env("/data/apps/embcc/embcc.elf", a, 5, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embcc -c] exit=%d\n", code);
+
+        unsigned char hdr[20] = {0};
+        struct vfs_stat st;
+        int have = (vfs_stat("/data/tmp/e.o", &st) == 0);
+        if (have) {
+            int fd = vfs_open("/data/tmp/e.o", O_RDONLY, 0);
+            if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+        }
+        int is_elf = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
+        int is_64  = is_elf && hdr[4] == 2;
+        int is_rel = is_elf && hdr[16] == 1;
+        kprintf("[embcc -c] /e.o: %s, %llu bytes; ELF=%d 64-bit=%d ET_REL=%d\n",
+                have ? "written" : "MISSING",
+                have ? (unsigned long long)st.size : 0ULL, is_elf, is_64, is_rel);
+
+        /* 2. tcc links the EmbCC object against the real runtime. */
+        int rcode = -1, is_exec = 0;
+        if (is_elf && is_64 && is_rel) {
+            char *b[] = { "/data/apps/tcc/tcc.elf", "-static", "-nostdlib",
+                          "/data/tmp/e.o", "/system/abi/crt0.o",
+                          "/system/abi/syscalls.o", "-L/system/abi", "-lc",
+                          "-o", "/data/tmp/e.elf" };
+            kprintf("[embcc link] tcc %s %s %s %s %s %s %s %s %s\n",
+                    b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]);
+            int lp = process_create_env("/data/apps/tcc/tcc.elf", b, 10, env, NULL, 0);
+            int lcode = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            kprintf("[embcc link] exit=%d\n", lcode);
+            unsigned char eh[20] = {0};
+            struct vfs_stat es;
+            int ehave = (vfs_stat("/data/tmp/e.elf", &es) == 0);
+            if (ehave) {
+                int fd = vfs_open("/data/tmp/e.elf", O_RDONLY, 0);
+                if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, eh, sizeof eh, &r); vfs_close(fd); }
+            }
+            is_exec = ehave && eh[0] == 0x7f && eh[1] == 'E' && eh[16] == 2;
+            kprintf("[embcc link] /e.elf: %s, %llu bytes; ET_EXEC=%d\n",
+                    ehave ? "written" : "MISSING",
+                    ehave ? (unsigned long long)es.size : 0ULL, is_exec);
+
+            /* 3. Run the produced binary. Exit 42 is the whole claim. */
+            if (is_exec) {
+                char *c[] = { "/data/tmp/e.elf", NULL };
+                int p2 = process_create_env("/data/tmp/e.elf", c, 1, env, NULL, 0);
+                rcode = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+                kprintf("[embcc link] /e.elf ran: exit=%d (want 42)\n", rcode);
+            }
+        }
+
+        int ok = (pid >= 0 && code == 0 && is_elf && is_64 && is_rel &&
+                  is_exec && rcode == 42);
+        kprintf("\n[cmd] test embcc: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* THE SELF-HOSTING FIXED POINT, ON THE OS (EmbCC M3 acceptance stage 3).
+ *
+ * embcc.elf was compiled by the host's gcc-built embcc and linked by EmbLD;
+ * the REFERENCE objects under /data/src/embcc/ref/ are that same gcc-built
+ * embcc's output for the same twelve sources. Here the SELF-BUILT compiler
+ * recompiles those sources ON the OS and each object is compared to its
+ * reference BYTE FOR BYTE. Identical output means a compiler and the
+ * compiler it produced agree exactly -- the classic fixed point, which
+ * catches whole classes of codegen bugs nothing else will. STT_FILE is the
+ * basename, so the object depends on content, not on the /data/src path.
+ *
+ * The include order mirrors the host's self-host build exactly: EmbCC's own
+ * freestanding headers first (so <stdarg.h> is EmbCC's char* va_list, not
+ * newlib's), then newlib's ABI headers. */
+    if (strcmp(cmd, "test embcc self") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc self: VFS not registered\n"); return 1; }
+        struct vfs_stat est;
+        if (vfs_stat("/data/apps/embcc/embcc.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc self: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/embcc/ref/sema.o", &est) != 0) {
+            kprintf("\n[cmd] test embcc self: reference objects not on image "
+                    "(build with EMBK_EMBCC_ROOT set)\n"); return 1; }
+
+        static const char *const units[] = {
+            "driver/main",  "driver/util", "lex/lex",     "parse/parse",
+            "sema/sema",    "sema/type",   "ir/irgen",    "opt/opt",
+            "codegen/codegen", "debug/dwarf", "asm/emit",  "asm/topasm",
+            "cpp/predef",   "cpp/cpp",     "elf/write",
+        };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int nunits = (int)(sizeof units / sizeof units[0]);
+        int nmatch = 0;
+
+        for (int u = 0; u < nunits; u++) {
+            char src[96], ref[96], out[96], base[32];
+            /* basename after the last '/' */
+            const char *slash = units[u];
+            for (const char *q = units[u]; *q; q++) if (*q == '/') slash = q + 1;
+            snprintf(base, sizeof base, "%s", slash);
+            snprintf(src, sizeof src, "/data/src/embcc/%s.c", units[u]);
+            snprintf(ref, sizeof ref, "/data/src/embcc/ref/%s.o", base);
+            snprintf(out, sizeof out, "/data/tmp/%s.o", base);
+            (void)vfs_unlink_path(out);
+
+            char *a[] = { (char *)"/data/apps/embcc/embcc.elf", (char *)"-c",
+                          src, (char *)"-I", (char *)"/data/apps/embcc/include",
+                          (char *)"-I", (char *)"/system/abi/include",
+                          (char *)"-o", out };
+            int pid = process_create_env("/data/apps/embcc/embcc.elf", a, 9, env, NULL, 0);
+            int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+
+            /* Compare the fresh object to the reference, byte for byte. */
+            struct vfs_stat so, sr;
+            int have_o = (vfs_stat(out, &so) == 0);
+            int have_r = (vfs_stat(ref, &sr) == 0);
+            int match = 0;
+            if (code == 0 && have_o && have_r && so.size == sr.size) {
+                int fo = vfs_open(out, O_RDONLY, 0);
+                int fr = vfs_open(ref, O_RDONLY, 0);
+                match = (fo >= 0 && fr >= 0);
+                static unsigned char bo[4096], br[4096];
+                while (match) {
+                    size_t ro = 0, rr = 0;
+                    vfs_fd_read(fo, bo, sizeof bo, &ro);
+                    vfs_fd_read(fr, br, sizeof br, &rr);
+                    if (ro != rr) { match = 0; break; }
+                    if (ro == 0) break;              /* both hit EOF together */
+                    if (memcmp(bo, br, ro) != 0) { match = 0; break; }
+                }
+                if (fo >= 0) vfs_close(fo);
+                if (fr >= 0) vfs_close(fr);
+            }
+            kprintf("[embcc self] %-9s compile=%d  %llu vs %llu bytes  %s\n",
+                    base, code,
+                    have_o ? (unsigned long long)so.size : 0ULL,
+                    have_r ? (unsigned long long)sr.size : 0ULL,
+                    match ? "MATCH" : "DIFFER");
+            if (match) nmatch++;
+        }
+
+        kprintf("\n[embcc self] %d/%d objects byte-identical to the reference\n",
+                nmatch, nunits);
+        kprintf("[cmd] test embcc self: %s\n", nmatch == nunits ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embld") == 0) {
+        /* Smoke test: EmbLD -- the linker -- cross-built INTO an EmbLinkOS
+         * binary, runs on the metal. With no inputs it prints usage and
+         * returns 2; a clean exit (not a fault) is the signal embld.elf
+         * loaded and executed. This is the linker JOINING embcc on the OS. */
+        const char *lp = "/data/apps/embld/embld.elf";
+        struct vfs_stat st;
+        if (vfs_stat(lp, &st) != 0) {
+            kprintf("\n[cmd] test embld: embld.elf not on image\n"); return 1; }
+        char *a[]   = { (char *)lp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        int pid  = process_create_env(lp, a, 1, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embld] %s ran, exit=%d (2 = usage; it loaded + executed)\n", lp, code);
+        kprintf("[cmd] test embld: %s\n", code == 2 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embcc selfhost") == 0) {
+        /* THE CLOSED LOOP, ON THE OS. The OS compiles its OWN compiler's 14
+         * sources with embcc (stage1) AND links them with embld -- both
+         * running on the metal, no host toolchain, no tcc in the loop -- into
+         * embcc-stage2, then proves (a) stage2 is byte-identical to the
+         * compiler that built it and (b) stage2 is itself a working compiler
+         * that reproduces a reference object. EmbCC compiling AND linking
+         * itself, here, is what "self-hosting on the OS" finally means. */
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc selfhost: VFS not registered\n"); return 1; }
+        struct vfs_stat st;
+        const char *embcc = "/data/apps/embcc/embcc.elf";
+        const char *embld = "/data/apps/embld/embld.elf";
+        if (vfs_stat(embcc, &st) != 0) { kprintf("\n[cmd] test embcc selfhost: embcc.elf not on image\n"); return 1; }
+        if (vfs_stat(embld, &st) != 0) { kprintf("\n[cmd] test embcc selfhost: embld.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/embcc/ref/lex.o", &st) != 0) {
+            kprintf("\n[cmd] test embcc selfhost: sources/refs not on image "
+                    "(build with EMBK_EMBCC_ROOT set)\n"); return 1; }
+
+        char *env[] = { (char *)"HOME=/", NULL };
+
+        /* (1) compile all 14 sources with the on-OS embcc -> /data/tmp/<base>.o */
+        static const char *const units[] = {
+            "driver/main",  "driver/util", "lex/lex",     "parse/parse",
+            "sema/sema",    "sema/type",   "ir/irgen",    "opt/opt",
+            "codegen/codegen", "debug/dwarf", "asm/emit",  "asm/topasm",
+            "cpp/predef",   "cpp/cpp",     "elf/write",
+        };
+        int nunits = (int)(sizeof units / sizeof units[0]);
+        int compiled = 0;
+        for (int u = 0; u < nunits; u++) {
+            char src[96], out[96], base[32];
+            const char *slash = units[u];
+            for (const char *q = units[u]; *q; q++) if (*q == '/') slash = q + 1;
+            snprintf(base, sizeof base, "%s", slash);
+            snprintf(src, sizeof src, "/data/src/embcc/%s.c", units[u]);
+            snprintf(out, sizeof out, "/data/tmp/%s.o", base);
+            (void)vfs_unlink_path(out);
+            char *a[] = { (char *)embcc, (char *)"-c", src,
+                          (char *)"-I", (char *)"/data/apps/embcc/include",
+                          (char *)"-I", (char *)"/system/abi/include",
+                          (char *)"-o", out };
+            int pid = process_create_env(embcc, a, 9, env, NULL, 0);
+            if ((pid >= 0 ? process_wait((uint32_t)pid) : -1) == 0 && vfs_stat(out, &st) == 0)
+                compiled++;
+        }
+        kprintf("[selfhost] embcc compiled %d/%d sources on the OS\n", compiled, nunits);
+
+        /* (2) link them with embld: crt0, syscalls, the 14 objects in the SAME
+         * alphabetical-basename order the host used for the ref objects, then
+         * libc.a. Same linker, same inputs, same order => same bytes. */
+        const char *stage2 = "/data/tmp/embcc-stage2.elf";
+        (void)vfs_unlink_path(stage2);
+        char *la[] = {
+            (char *)embld, (char *)"-o", (char *)stage2,
+            (char *)"/system/abi/crt0.o", (char *)"/system/abi/syscalls.o",
+            (char *)"/data/tmp/codegen.o", (char *)"/data/tmp/cpp.o",
+            (char *)"/data/tmp/dwarf.o",   (char *)"/data/tmp/emit.o",
+            (char *)"/data/tmp/irgen.o",   (char *)"/data/tmp/lex.o",
+            (char *)"/data/tmp/main.o",    (char *)"/data/tmp/opt.o",
+            (char *)"/data/tmp/parse.o",   (char *)"/data/tmp/predef.o",
+            (char *)"/data/tmp/sema.o",
+            (char *)"/data/tmp/topasm.o",  (char *)"/data/tmp/type.o",
+            (char *)"/data/tmp/util.o",    (char *)"/data/tmp/write.o",
+            (char *)"/system/abi/libc.a",
+        };
+        int lac = (int)(sizeof la / sizeof la[0]);
+        int lpid  = process_create_env(embld, la, lac, env, NULL, 0);
+        int lcode = lpid >= 0 ? process_wait((uint32_t)lpid) : -1;
+        int have2 = (vfs_stat(stage2, &st) == 0);
+        kprintf("[selfhost] embld link exit=%d, stage2 %s (%llu bytes)\n",
+                lcode, have2 ? "written" : "MISSING",
+                have2 ? (unsigned long long)st.size : 0ULL);
+
+        /* (3) stage2 byte-identical to the compiler that built it -- embcc.elf,
+         * itself EmbLD-linked (on the host) from the same objects. */
+        int same = have2 && vfs_files_identical(stage2, embcc);
+        kprintf("[selfhost] stage2 vs embcc.elf: %s\n", same ? "BYTE-IDENTICAL" : "DIFFER");
+
+        /* (4) stage2 is a WORKING compiler: run it to recompile one source and
+         * check the object matches the reference byte for byte. */
+        (void)vfs_unlink_path("/data/tmp/lex-s2.o");
+        char *ca[] = { (char *)stage2, (char *)"-c", (char *)"/data/src/embcc/lex/lex.c",
+                       (char *)"-I", (char *)"/data/apps/embcc/include",
+                       (char *)"-I", (char *)"/system/abi/include",
+                       (char *)"-o", (char *)"/data/tmp/lex-s2.o" };
+        int cpid  = have2 ? process_create_env(stage2, ca, 9, env, NULL, 0) : -1;
+        int ccode = cpid >= 0 ? process_wait((uint32_t)cpid) : -1;
+        int works = (ccode == 0) &&
+                    vfs_files_identical("/data/tmp/lex-s2.o", "/data/src/embcc/ref/lex.o");
+        kprintf("[selfhost] stage2 recompiled lex.c: exit=%d, object vs ref: %s\n",
+                ccode, works ? "MATCH" : "DIFFER");
+
+        int ok = (compiled == nunits) && same && works;
+        kprintf("[cmd] test embcc selfhost: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* EmbCC INLINE ASM, exercised for real (EmbCC's inline-asm milestone). The
+ * program below makes EmbLinkOS syscalls DIRECTLY through `int $0x80`
+ * stubs that EmbCC compiled from fixed-register extended asm — write(1,...)
+ * then exit(42). If the trap byte, the a/D/S/d register loads, and the "=a"
+ * result readback are all right, the line appears on the console AND the
+ * process exits 42. Header-free (the stubs are inlined) so no include search
+ * is needed; linked by tcc against crt0 for _start only — the program needs
+ * no libc, it is its own syscall layer. */
+/* THE emlibc RIM, COMPILED BY EmbCC, RUNNING ON THE OS (EmbCC inline-asm
+ * milestone capstone). rimtest.elf is crt0.c + syscalls.c (EmbLinkOS's
+ * newlib retargeting -- _start, the syscall stubs, sbrk/write/exit) AND a
+ * printf-and-return-42 program, ALL compiled by EmbCC and linked by EmbLD
+ * against newlib's libc.a. Running it exercises the EmbCC-compiled rim end
+ * to end: EmbCC's _start hands off to start_c -> main, printf reaches the
+ * console through EmbCC's _write stub (int $0x80), and main's `return 42`
+ * exits through EmbCC's _exit stub. The line below AND exit 42 can only
+ * appear if the rim EmbCC compiled actually works. */
+    if (strcmp(cmd, "test embcc rim") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc rim: VFS not registered\n"); return 1; }
+        struct vfs_stat rst;
+        if (vfs_stat("/data/apps/rimtest/rimtest.elf", &rst) != 0) {
+            kprintf("\n[cmd] test embcc rim: rimtest.elf not on image\n");
+            return 1; }
+        kprintf("[embcc rim] running rimtest.elf (%llu bytes; EmbCC crt0 + "
+                "syscalls + prog, EmbLD-linked). Expect a line, then exit 42:\n",
+                (unsigned long long)rst.size);
+        char *env[] = { (char *)"HOME=/", NULL };
+        /* CONTROL FIRST (gcc-compiled rim, same program): a rimtest hang
+         * must not hide this result. If it exits 42 while the EmbCC-rim one
+         * hangs/faults, the bug is in EmbCC's compilation of the rim. */
+        int ctl = -1;
+        if (vfs_stat("/data/apps/rimctl/rimctl.elf", &rst) == 0) {
+            char *b[] = { (char *)"/data/apps/rimctl/rimctl.elf", NULL };
+            int p2 = process_create_env("/data/apps/rimctl/rimctl.elf", b, 1,
+                                        env, NULL, 0);
+            ctl = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+            kprintf("[embcc rim] gcc-rim  exit=%d (want 42) [control]\n", ctl);
+        }
+        char *a[] = { (char *)"/data/apps/rimtest/rimtest.elf", NULL };
+        int pid = process_create_env("/data/apps/rimtest/rimtest.elf", a, 1,
+                                     env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embcc rim] EmbCC-rim exit=%d (want 42)\n", code);
+        kprintf("\n[cmd] test embcc rim: %s (EmbCC-rim=%d gcc-rim=%d)\n",
+                code == 42 ? "OK" : "FAIL", code, ctl);
+        return 1;
+    }
+
+    if (strcmp(cmd, "test embcc asm") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc asm: VFS not registered\n"); return 1; }
+        struct vfs_stat est;
+        if (vfs_stat("/data/apps/embcc/embcc.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc asm: embcc.elf not on image\n"); return 1; }
+
+        static const char src[] =
+            "typedef long i64;\n"
+            "static i64 sys3(i64 n,i64 a1,i64 a2,i64 a3){ i64 r;\n"
+            "  __asm__ volatile(\"int $0x80\":\"=a\"(r)\n"
+            "    :\"a\"(n),\"D\"(a1),\"S\"(a2),\"d\"(a3):\"rcx\",\"r11\",\"memory\"); return r; }\n"
+            "static i64 sys1(i64 n,i64 a1){ i64 r;\n"
+            "  __asm__ volatile(\"int $0x80\":\"=a\"(r)\n"
+            "    :\"a\"(n),\"D\"(a1):\"rcx\",\"r11\",\"memory\"); return r; }\n"
+            "int main(void){\n"
+            "  const char m[]=\"embcc inline-asm syscall ok\\n\";\n"
+            "  sys3(1,1,(i64)m,sizeof(m)-1);   /* write(1,m,len) */\n"
+            "  sys1(2,42);                       /* exit(42) */\n"
+            "  return 0;\n"
+            "}\n";
+        {
+            int fd = vfs_open("/data/tmp/asm.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { kprintf("test embcc asm: cannot write asm.c\n"); return 1; }
+            size_t w = 0;
+            vfs_fd_write(fd, src, sizeof src - 1, &w);
+            vfs_close(fd);
+        }
+        (void)vfs_unlink_path("/data/tmp/asm.o");
+        (void)vfs_unlink_path("/data/tmp/asm.elf");
+
+        char *env[] = { (char *)"HOME=/", NULL };
+        char *a[] = { (char *)"/data/apps/embcc/embcc.elf", (char *)"-c",
+                      (char *)"/data/tmp/asm.c", (char *)"-o",
+                      (char *)"/data/tmp/asm.o" };
+        int pid = process_create_env("/data/apps/embcc/embcc.elf", a, 5, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embcc asm] compile exit=%d\n", code);
+
+        int is_exec = 0, rcode = -1;
+        struct vfs_stat st;
+        if (code == 0 && vfs_stat("/data/tmp/asm.o", &st) == 0) {
+            char *b[] = { (char *)"/data/apps/tcc/tcc.elf", (char *)"-static",
+                          (char *)"-nostdlib", (char *)"/data/tmp/asm.o",
+                          (char *)"/system/abi/crt0.o",
+                          (char *)"/system/abi/syscalls.o", (char *)"-L/system/abi",
+                          (char *)"-lc", (char *)"-o", (char *)"/data/tmp/asm.elf" };
+            int lp = process_create_env("/data/apps/tcc/tcc.elf", b, 10, env, NULL, 0);
+            int lcode = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            kprintf("[embcc asm] link exit=%d\n", lcode);
+            unsigned char eh[20] = {0};
+            if (vfs_stat("/data/tmp/asm.elf", &st) == 0) {
+                int fd = vfs_open("/data/tmp/asm.elf", O_RDONLY, 0);
+                if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, eh, sizeof eh, &r); vfs_close(fd); }
+                is_exec = eh[0] == 0x7f && eh[1] == 'E' && eh[16] == 2;
+            }
+            if (is_exec) {
+                kprintf("[embcc asm] running (expect a line below, then exit 42):\n");
+                char *c[] = { (char *)"/data/tmp/asm.elf", NULL };
+                int p2 = process_create_env("/data/tmp/asm.elf", c, 1, env, NULL, 0);
+                rcode = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+                kprintf("[embcc asm] exit=%d (want 42)\n", rcode);
+            }
+        }
+
+        int ok = (code == 0 && is_exec && rcode == 42);
+        kprintf("\n[cmd] test embcc asm: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test tcc link") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test tcc link: VFS not registered\n"); return 1; }
 
@@ -1779,6 +3828,97 @@ int selftests_handle_command(const char *cmd)
         #undef IFCHK
         kprintf("\n[cmd] test writestorm: %s (%d/200, %d IF leak(s))\n",
                 (i == 200 && if_leaks == 0) ? "OK" : "FAIL", i, if_leaks);
+        return 1;
+    }
+
+/* THE GUI WALL COMES DOWN: on-OS tcc COMPILES + DYNAMIC-LINKS a real EmUI app
+ * (clockw) against /system/lib/libembk.so, and the kernel LOADS + RUNS it.
+ *
+ * Static C was already self-hostable; the block was that TCC could not produce
+ * the dynamic ET_EXEC the in-kernel loader binds to libembk.so. Four things
+ * make it work now (all cross-shipped to /system/abi, all proven on the host
+ * first): tcc patch 0004 (pull the .so's undefined libc symbols INTO the app so
+ * -lc/-lm satisfy them and -rdynamic exports them back -- no runtime libc.so
+ * here), libtcc1.o (the float intrinsics tcc emits but x86_64 libgcc lacks),
+ * emlink_dynstubs.o (crt0's weak bracket symbols as weak-abs-0 -- newlib.ld's
+ * PROVIDE()s, which tcc has no linker script for), and libm.a (cosf/sinf).
+ *
+ * Proof: the produced clockw2.elf is ET_EXEC with PT_DYNAMIC, and it SPAWNS and
+ * stays alive as a widget (home spawns the gcc-built clockw the identical way).
+ * The whole point is the dynamic load succeeding on a tcc-built binary. */
+    if (strcmp(cmd, "test tcc dyn") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test tcc dyn: VFS not registered\n"); return 1; }
+        char *env[] = { "HOME=/", NULL };
+        int ok = 1;
+        (void)vfs_unlink_path("/data/tmp/clockw2.o");
+        (void)vfs_unlink_path("/data/apps/clockw2/clockw2.elf");
+        (void)vfs_mkdir_path("/data/apps/clockw2");
+
+        /* (1) compile: tcc -c against the on-image ui headers + newlib */
+        char *ac[] = { "/data/apps/tcc/tcc.elf", "-c",
+                       "-I/data/src/ui/scene", "-I/data/src/ui/backend",
+                       "-I/data/src/ui/layout", "-I/data/src/ui/reactive",
+                       "-I/data/src/ui/declare", "-I/data/src/ui/theme",
+                       "-I/data/src/ui/kit", "-I/data/src/ui/dsl",
+                       "-I/system/abi/include",
+                       "/data/src/ui/clockw.c", "-o", "/data/tmp/clockw2.o" };
+        int p = process_create_env("/data/apps/tcc/tcc.elf", ac, 14, env, NULL, 0);
+        int c = p >= 0 ? process_wait((uint32_t)p) : -1;
+        kprintf("[tcc dyn] compile exit=%d\n", c);
+        if (p < 0 || c != 0) ok = 0;
+
+        /* (2) DYNAMIC LINK against libembk.so + the dynamic-link ABI. -rdynamic
+         * exports the app's newlib for the .so to bind back to; no -static. */
+        if (ok) {
+            char *al[] = { "/data/apps/tcc/tcc.elf", "-nostdlib", "-rdynamic",
+                           "/system/abi/crt0.o", "/system/abi/syscalls.o",
+                           "/data/tmp/clockw2.o", "/system/lib/libembk.so",
+                           "/system/abi/emlink_dynstubs.o", "-L/system/abi",
+                           "-lc", "-lm", "/system/abi/libtcc1.o",
+                           "-o", "/data/apps/clockw2/clockw2.elf" };
+            p = process_create_env("/data/apps/tcc/tcc.elf", al, 14, env, NULL, 0);
+            c = p >= 0 ? process_wait((uint32_t)p) : -1;
+            kprintf("[tcc dyn] link exit=%d\n", c);
+            if (p < 0 || c != 0) ok = 0;
+        }
+
+        /* (2b) the shape the loader requires: ET_EXEC + PT_DYNAMIC (phnum>2) */
+        if (ok) {
+            unsigned char hdr[64] = {0}; struct vfs_stat st;
+            int have = (vfs_stat("/data/apps/clockw2/clockw2.elf", &st) == 0);
+            if (have) { int fd = vfs_open("/data/apps/clockw2/clockw2.elf", O_RDONLY, 0);
+                        if (fd >= 0) { size_t r=0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); } }
+            int is_exec = have && hdr[0]==0x7f && hdr[1]=='E' && hdr[16]==2;
+            unsigned phnum = have ? (unsigned)(hdr[56] | (hdr[57]<<8)) : 0;
+            kprintf("[tcc dyn] clockw2.elf: %llu bytes, ET_EXEC=%d phnum=%u (dynamic>2)\n",
+                    have ? (unsigned long long)st.size : 0ULL, is_exec, phnum);
+            if (!is_exec || phnum < 3) ok = 0;
+        }
+
+        /* (3) THE LOAD: spawn the tcc-built dynamic app. The kernel loads it,
+         * binds it to libembk.so (two-way), and it runs as a widget. If the
+         * dynamic load failed it would return < 0 here, loudly on serial. */
+        if (ok) {
+            char *aw[] = { "/data/apps/clockw2/clockw2.elf", NULL };
+            int wp = process_create_env("/data/apps/clockw2/clockw2.elf", aw, 1, env, NULL, 0);
+            kprintf("[tcc dyn] spawn tcc-built widget -> pid=%d\n", wp);
+            if (wp < 0) ok = 0;
+            else {
+                /* let it run a few ticks; a widget stays alive rendering. */
+                uint64_t t0 = lapic_timer_get_ticks();
+                while (lapic_timer_get_ticks() - t0 < 200) {   /* ~2 guest-s */
+                    compositor_pointer_tick(); __asm__ volatile ("sti; hlt");
+                }
+                int alive = process_alive((uint32_t)wp);
+                kprintf("[tcc dyn] widget alive after run: %s\n", alive ? "YES (loaded + running)" : "no (exited/crashed)");
+                if (!alive) ok = 0;
+                process_kill((uint32_t)wp);
+                process_wait((uint32_t)wp);
+            }
+        }
+
+        kprintf("\n[cmd] test tcc dyn: %s\n",
+                ok ? "OK -- the OS compiled, linked, and RAN a GUI app" : "FAIL");
         return 1;
     }
 
@@ -2039,6 +4179,123 @@ int selftests_handle_command(const char *cmd)
 
         kprintf("\n[cmd] test embbuild shell: %s\n",
                 ok ? "OK -- the shell that runs is a shell the OS built" : "FAIL");
+        return 1;
+    }
+
+/* EMBBUILD'S FIRST GUI TARGET (docs/BUILD.md §6).
+ *
+ * Everything before this rebuilt STATIC C. The GUI was excluded twice over:
+ * first because tcc could not link a libembk.so app at all, then -- once
+ * `test tcc dyn` removed that -- because no manifest named one. This closes
+ * the second gap, and it is the difference between "the toolchain could" and
+ * "the OS does".
+ *
+ * Why it is a separate test from `test tcc dyn`: that one drives tcc DIRECTLY
+ * with a hand-written argv. This one goes through the build tool, which means
+ * the dynamic link line has to survive being written down as a manifest
+ * stanza -- a shape v1 had never executed (no -static, -rdynamic, the .so as
+ * a link input before -lc, emlink_dynstubs.o, libtcc1.o).
+ *
+ *   (1) the manifest builds: 3 ran, 0 up_to_date
+ *   (2) SHAPE: the staged ELF is ET_EXEC with phnum>2 -- the direct readout
+ *       that the DYNAMIC path was taken (a static link gets 2). Asserting
+ *       this before running it means a static-shaped binary fails HERE, with
+ *       a number, rather than mysteriously later.
+ *   (3) it RUNS: the kernel binds it to libembk.so, the compositor gives it
+ *       a window, the widget stays alive. Rendering is the actual claim.
+ *   (4) IDEMPOTENCE: a second run says 0 ran -- the content stamps are honest
+ *       about a GUI target too, not just static C.
+ *   (5) the ADOPTED binary at /data/apps/clockw/clockw.elf (written by the
+ *       manifest's own install stanza) runs as well. */
+    if (strcmp(cmd, "test embbuild gui") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild gui: VFS not registered\n"); return 1; }
+        static char cap[4096];
+        int ok = 1, rc;
+        char *bb  = "/data/apps/embbuild/embbuild.elf";
+        char *st  = "/data/build/out/clockw/clockw.elf";
+        char *ins = "/data/apps/clockw/clockw.elf";
+        char *env[] = { "HOME=/", NULL };
+
+        /* Start from a clean slate: a leftover output would let a no-op run
+         * look like a successful build (CONTRIBUTING lie #1). */
+        (void)vfs_unlink_path("/data/build/stamps/clockw/clockw.o");
+        (void)vfs_unlink_path("/data/build/stamps/clockw/clockw.elf");
+        (void)vfs_unlink_path("/data/build/stamps/clockw/install");
+        (void)vfs_unlink_path(st);
+
+        kprintf("[embbuild-gui] (1) building the clock widget from /data/src/ui\n");
+        char *m[] = { bb, "/data/src/ui/build.ebm", NULL };
+        rc = emb_run_cap(bb, m, 2, cap, sizeof cap);
+        if (rc != 0 || !emb_find(cap, "3 ran, 0 up_to_date")) {
+            kprintf("[embbuild-gui] (1) FAIL rc=%d\n", rc); ok = 0;
+        }
+
+        /* (2) the shape -- the whole point of the target */
+        if (ok) {
+            unsigned char hdr[64] = {0};
+            struct vfs_stat s;
+            int have = (vfs_stat(st, &s) == 0);
+            if (have) {
+                int fd = vfs_open(st, O_RDONLY, 0);
+                if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+            }
+            int is_exec = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[16] == 2;
+            unsigned phnum = have ? (unsigned)(hdr[56] | (hdr[57] << 8)) : 0;
+            kprintf("[embbuild-gui] (2) staged: %llu bytes, ET_EXEC=%d phnum=%u (2=static, >2=dynamic)\n",
+                    have ? (unsigned long long)s.size : 0ULL, is_exec, phnum);
+            if (!is_exec || phnum < 3) { kprintf("[embbuild-gui] (2) FAIL: not the dynamic shape\n"); ok = 0; }
+        }
+
+        /* (3) it runs -- the kernel binds it, the compositor windows it */
+        if (ok) {
+            char *aw[] = { st, NULL };
+            int wp = process_create_env(st, aw, 1, env, NULL, 0);
+            kprintf("[embbuild-gui] (3) spawn EmbBuild-built widget -> pid=%d\n", wp);
+            if (wp < 0) ok = 0;
+            else {
+                uint64_t t0 = lapic_timer_get_ticks();
+                while (lapic_timer_get_ticks() - t0 < 200) {   /* ~2 guest-s */
+                    compositor_pointer_tick(); __asm__ volatile ("sti; hlt");
+                }
+                int alive = process_alive((uint32_t)wp);
+                kprintf("[embbuild-gui] (3) widget alive: %s\n",
+                        alive ? "YES (loaded + rendering)" : "no (exited/crashed)");
+                if (!alive) ok = 0;
+                process_kill((uint32_t)wp);
+                process_wait((uint32_t)wp);
+            }
+        }
+
+        /* (4) the stamps are honest about a GUI target too */
+        if (ok) {
+            rc = emb_run_cap(bb, m, 2, cap, sizeof cap);
+            kprintf("[embbuild-gui] (4) rerun (want 0 ran) rc=%d\n", rc);
+            if (rc != 0 || !emb_find(cap, "0 ran, 3 up_to_date")) {
+                kprintf("[embbuild-gui] (4) FAIL: stamps disagree\n"); ok = 0;
+            }
+        }
+
+        /* (5) the adopted binary is a working widget */
+        if (ok) {
+            char *ai[] = { ins, NULL };
+            int ip = process_create_env(ins, ai, 1, env, NULL, 0);
+            kprintf("[embbuild-gui] (5) spawn ADOPTED %s -> pid=%d\n", ins, ip);
+            if (ip < 0) ok = 0;
+            else {
+                uint64_t t0 = lapic_timer_get_ticks();
+                while (lapic_timer_get_ticks() - t0 < 200) {
+                    compositor_pointer_tick(); __asm__ volatile ("sti; hlt");
+                }
+                int alive = process_alive((uint32_t)ip);
+                kprintf("[embbuild-gui] (5) adopted widget alive: %s\n", alive ? "YES" : "no");
+                if (!alive) ok = 0;
+                process_kill((uint32_t)ip);
+                process_wait((uint32_t)ip);
+            }
+        }
+
+        kprintf("\n[cmd] test embbuild gui: %s\n",
+                ok ? "OK -- the OS built its own GUI app, and it renders" : "FAIL");
         return 1;
     }
 
@@ -2378,6 +4635,12 @@ int selftests_handle_command(const char *cmd)
         kprintf("[blkstat] %llu device reads, %llu blocks (%llu KB), avg %llu blocks/req\n",
                 (unsigned long long)nreq, (unsigned long long)nblk,
                 (unsigned long long)(nblk / 2), (unsigned long long)(nreq ? nblk / nreq : 0));
+        kprintf("[blkstat] bounce path: %llu read(s), %llu write(s), %llu contended\n"
+                "          (contended > 0 is the only proof the bounce lock is\n"
+                "           reachable; 0 means every test of it is vacuous)\n",
+                (unsigned long long)(bs1.bounce_reads - bs0.bounce_reads),
+                (unsigned long long)(bs1.bounce_writes - bs0.bounce_writes),
+                (unsigned long long)(bs1.bounce_contended - bs0.bounce_contended));
         kprintf("[blkstat] %llu ms INSIDE dev->read, %llu us/req -- anything above\n"
                 "          this in the test's wall clock is NOT the disk\n",
                 (unsigned long long)(nus / 1000),

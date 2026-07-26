@@ -1,11 +1,14 @@
 #include "fs/embkfs/embkfs.h"
 #include "fs/embkfs/crc32c.h"
 #include "block/block.h"
+#include "block/partition.h"   /* embk_partition_parent — reach a volume's disk MBR */
+#include "arch/x86_64/boot/bootinfo.h"  /* bootinfo_boot_disk_sig — root-follows-boot */
 #include "include/kmalloc.h"   /* kmalloc / kfree — the Phase 8 heap */
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "include/kstring.h"   /* memcmp, strlen */
 #include "drivers/timer/rtc.h"       /* rtc_now_ns — real inode timestamps (v2.2) */
+#include "drivers/timer/hpet.h"       /* fs-lock contention timing */
 #include "drivers/timer/pit.h"       /* pit_delay_ms — selftest RTC-resolution wait */
 #include "fs/embkfs/embkfs_compress.h"         /* per-extent compression (v2.2 Phase 3) */
 #include "crypto/xts.h"        /* AES-256-XTS (v2.2 Phase 4) */
@@ -13,6 +16,121 @@
 #include "crypto/hmac.h"       /* HMAC-SHA256 (v2.2 Phase 5d verified-root) */
 #include "drivers/input/keyboard.h"  /* keyboard_getchar — mount-time passphrase prompt */
 #include "process/process.h"   /* current_process->pid — writer provenance (v2.2 Phase 5c) */
+
+/* --------------------------------------------------------------------------
+ * THE EMBKFS BIG LOCK.
+ *
+ * This file is full of shared `static uint8_t buf[4096]` node/probe scratch
+ * buffers ("the kernel stack is tiny"), and the per-volume read cache
+ * (vol->rcache_*) is likewise shared. Fine while every caller was the one boot
+ * CPU; a genuine data race once two cores descend the tree at once.
+ *
+ * It stayed LATENT while the boot image was a single-leaf tree -- racing
+ * descents read the SAME block into the shared buffer, identical bytes,
+ * invisible. The first 2-leaf image made concurrent descents read DIFFERENT
+ * blocks, and the Merkle check caught core B validating core A's just-loaded
+ * leaf as the root (observed live: `run /term.elf` racing home's clockw spawn,
+ * "block 17 checksum 0xF7E73490 != parent's 0x6D1CCFF1", where F7E73490 was
+ * leaf 19's csum). Worth restating: the bug was invisible until the DATA got
+ * big enough, not until the code changed.
+ *
+ * A SLEEPING lock, not a spinlock: these ops block on disk I/O, so waiters are
+ * ordinary schedulable threads on a wait queue. Coarse by design -- one lock
+ * for the whole filesystem. Correctness first; per-volume or per-path locking
+ * is a later optimization nothing has yet asked for.
+ *
+ * WHY IT LIVES HERE and not at the VFS bridge, where it started: the bridge
+ * covered everything userspace and the ELF loader do, but the kernel console's
+ * DIRECT calls -- `snap`, `test embkfs ...` -- went around it, which was
+ * documented at the time and left unfixed. A lock belongs with the data it
+ * protects, so it now sits in this file and the bridge delegates to it. The
+ * console paths lock because the entry points they call do.
+ *
+ * RECURSIVE BY OWNER THREAD, deliberately: vfs_ls's readdir CALLBACK stats
+ * each entry (the boot dump's size column), so stat legitimately nests inside
+ * a locked readdir -- a non-recursive lock self-deadlocked the boot at `ls /:`
+ * on the very first locked build. That same recursion is what lets a selftest
+ * take the lock and still call the public API underneath it.
+ *
+ * Owner identity is current_thread; the only NULL-current context that runs fs
+ * code is the single pre-adoption boot CPU, so NULL==NULL cannot alias two
+ * threads.
+ *
+ * NEVER hold this across something that waits on ANOTHER thread doing fs I/O
+ * (spawning a process and waiting for it, say): the child's ops take this same
+ * lock from a different thread and would block on a holder that is itself
+ * blocked on the child. That is why the selftest dispatcher does NOT wrap
+ * commands wholesale -- the lock is taken by the leaf entry points instead.
+ * -------------------------------------------------------------------------- */
+static int g_fs_busy = 0;
+static struct thread *g_fs_owner = 0;   /* valid only while busy */
+static int g_fs_depth = 0;
+static struct wait_queue g_fs_wq;       /* zero-init = empty */
+
+/* Contention instrumentation. The obvious next move on this lock is to make it
+ * finer-grained (per-volume, or per-object), and that is a large change: 34
+ * shared `static` scratch buffers in this file would have to become per-caller
+ * first, because THEY are what the lock is really protecting. Before paying
+ * that, measure whether anything is actually waiting -- the same rule the I/O
+ * path rebuild was held to. `waits` counts acquisitions that had to block;
+ * `wait_us` is the wall time they spent blocked. */
+static struct embkfs_lockstat g_lockstat;
+
+/* Same shape as block.c's blk_now_us: the HPET is the only wall clock here,
+ * and a machine without one just reports 0 rather than a fabricated number. */
+static uint64_t fs_now_us(void)
+{
+    if (!hpet_available()) return 0;
+    uint64_t pf = hpet_period_fs();
+    if (!pf) return 0;
+    uint64_t tpus = 1000000000ULL / pf;
+    if (tpus == 0) tpus = 1;
+    return hpet_read_counter() / tpus;
+}
+
+void embkfs_lockstat_get(struct embkfs_lockstat *out) { if (out) *out = g_lockstat; }
+void embkfs_lockstat_reset(void)
+{
+    g_lockstat.acquires = 0; g_lockstat.recursive = 0;
+    g_lockstat.waits = 0; g_lockstat.wait_us = 0;
+}
+
+void embkfs_lock(void)
+{
+    sched_lock();
+    if (g_fs_busy && g_fs_owner == current_thread) {
+        g_fs_depth++;
+        g_lockstat.recursive++;
+        sched_unlock();
+        return;
+    }
+    g_lockstat.acquires++;
+    bool waited = g_fs_busy;
+    uint64_t t0 = waited ? fs_now_us() : 0;
+    while (g_fs_busy) {
+        sched_block_current_locked(&g_fs_wq);   /* returns UNLOCKED */
+        sched_lock();
+    }
+    if (waited) {
+        g_lockstat.waits++;
+        g_lockstat.wait_us += fs_now_us() - t0;
+    }
+    g_fs_busy = 1;
+    g_fs_owner = current_thread;
+    g_fs_depth = 1;
+    sched_unlock();
+}
+
+void embkfs_unlock(void)
+{
+    sched_lock();
+    if (--g_fs_depth == 0) {
+        g_fs_busy = 0;
+        g_fs_owner = 0;
+        wait_queue_wake_one(&g_fs_wq);
+    }
+    sched_unlock();
+}
 
 _Static_assert(sizeof(struct aes_xts_ctx) <= sizeof(((struct embkfs_volume *)0)->xts_opaque),
                "embkfs_volume.xts_opaque too small for struct aes_xts_ctx");
@@ -727,6 +845,94 @@ static void embk_snapshot_name_pad(const char *name, uint8_t out[32]) {
     memcpy(out, name, n);
 }
 
+/* ---- The registry, v2.3: one fixed block outside the CoW tree -------------
+ *
+ * Why a block and not superblock-adjacent bytes: the crypto (offset 200) and
+ * verify (260) headers share the superblock's 512-byte sector, but 16 slots x
+ * 80 bytes is 1280 -- it does not fit, and shrinking the entry to make it fit
+ * would have cost either the name length or the snapshot count. A fixed block
+ * costs one block out of the 15 the formatter already leaves unused before the
+ * superblock, and nothing else.
+ *
+ * These two helpers are the whole seam between layouts. Everything above them
+ * works on an in-memory array of slots and does not know or care where it came
+ * from, which is what keeps the legacy in-tree path alive without duplicating
+ * create/delete/list/rollback. */
+static bool embk_snapreg_enabled(const struct embkfs_volume *vol)
+{
+    return (vol->feature_incompat & EMBKFS_INCOMPAT_SNAPREG) != 0;
+}
+
+/* Read the registry block into `out` (EMBKFS_MAX_SNAPSHOTS slots), returning
+ * the live count. A registry that fails its magic or checksum is reported as
+ * EMPTY rather than guessed at: a bogus root pointer would send
+ * embkfs_bitmap_build() marking arbitrary blocks in use, which is a worse
+ * outcome than losing the list of snapshots. Loud, because silently having no
+ * snapshots is exactly the kind of thing that should not pass unremarked. */
+static int embkfs_snapreg_load(struct embkfs_volume *vol,
+                               struct embk_snapshot_item *out, uint32_t *out_n)
+{
+    static uint8_t blk[4096];
+    uint64_t spb = vol->block_size / vol->dev->block_size;
+    if (vol->block_size > sizeof blk) return -EMBK_EINVAL;
+
+    int rc = embk_block_read(vol->dev, EMBKFS_SNAPREG_BLOCK * spb, spb, blk);
+    if (rc != EMBK_OK) return rc;
+
+    const struct embk_snapshot_registry *hdr = (const struct embk_snapshot_registry *)blk;
+    uint64_t body = sizeof *hdr + (uint64_t)EMBKFS_MAX_SNAPSHOTS * sizeof(struct embk_snapshot_item);
+    if (body > vol->block_size) return -EMBK_EINVAL;
+
+    if (hdr->magic != EMBKFS_SNAPREG_MAGIC) {
+        kprintf("EMBKFS: %s: snapshot registry block %lu has bad magic -- "
+                "treating as empty\n", vol->dev->name, EMBKFS_SNAPREG_BLOCK);
+        *out_n = 0;
+        return EMBK_OK;
+    }
+    uint32_t want = embk_crc32c(blk + 8, (uint32_t)(body - 8), 0);
+    if ((uint32_t)hdr->checksum != want) {
+        kprintf("EMBKFS: %s: snapshot registry checksum 0x%x != 0x%x -- "
+                "treating as empty (snapshots lost, live tree unaffected)\n",
+                vol->dev->name, (unsigned)hdr->checksum, (unsigned)want);
+        *out_n = 0;
+        return EMBK_OK;
+    }
+    uint32_t n = hdr->count;
+    if (n > EMBKFS_MAX_SNAPSHOTS) n = EMBKFS_MAX_SNAPSHOTS;   /* never trust a count */
+    const struct embk_snapshot_item *slots =
+        (const struct embk_snapshot_item *)(blk + sizeof *hdr);
+    for (uint32_t i = 0; i < n; i++) out[i] = slots[i];
+    *out_n = n;
+    return EMBK_OK;
+}
+
+/* Write `n` slots back. One block write, no transaction: the registry is not
+ * part of the tree, so it has no CoW machinery to ride and needs none -- it is
+ * a single sector-aligned block whose checksum makes a torn write detectable.
+ * The failure mode that matters (power loss mid-write) yields a checksum
+ * mismatch, which load() reports as empty rather than as garbage. */
+static int embkfs_snapreg_store(struct embkfs_volume *vol,
+                                const struct embk_snapshot_item *slots, uint32_t n)
+{
+    static uint8_t blk[4096];
+    uint64_t spb = vol->block_size / vol->dev->block_size;
+    if (vol->block_size > sizeof blk) return -EMBK_EINVAL;
+    if (n > EMBKFS_MAX_SNAPSHOTS) return -EMBK_EINVAL;
+
+    memset(blk, 0, vol->block_size);
+    struct embk_snapshot_registry *hdr = (struct embk_snapshot_registry *)blk;
+    hdr->magic = EMBKFS_SNAPREG_MAGIC;
+    hdr->count = n;
+    hdr->reserved = 0;
+    struct embk_snapshot_item *dst = (struct embk_snapshot_item *)(blk + sizeof *hdr);
+    for (uint32_t i = 0; i < n; i++) dst[i] = slots[i];
+
+    uint64_t body = sizeof *hdr + (uint64_t)EMBKFS_MAX_SNAPSHOTS * sizeof(struct embk_snapshot_item);
+    hdr->checksum = embk_crc32c(blk + 8, (uint32_t)(body - 8), 0);
+
+    return embk_block_write(vol->dev, EMBKFS_SNAPREG_BLOCK * spb, spb, blk);
+}
+
 /* Collects every currently-registered snapshot. out_items/max may be
  * NULL/0 to just get a count. Used both by the public embkfs_snapshot_list()
  * and internally by embkfs_bitmap_build() to protect snapshot-only blocks. */
@@ -734,6 +940,17 @@ static int embkfs_snapshot_list_internal(struct embkfs_volume *vol,
                                          struct embk_snapshot_item *out_items,
                                          uint32_t max, uint32_t *out_n)
 {
+    if (embk_snapreg_enabled(vol)) {
+        struct embk_snapshot_item slots[EMBKFS_MAX_SNAPSHOTS];
+        uint32_t n = 0;
+        int rc = embkfs_snapreg_load(vol, slots, &n);
+        if (rc != EMBK_OK) return rc;
+        for (uint32_t i = 0; out_items && i < n && i < max; i++) out_items[i] = slots[i];
+        if (out_n) *out_n = n;
+        return EMBK_OK;
+    }
+
+    /* legacy: items inside the versioned tree (pre-v2.3 volumes) */
     static uint8_t buf[4096];
     uint32_t n = 0;
     for (uint32_t slot = 0; slot < EMBKFS_MAX_SNAPSHOTS; slot++) {
@@ -754,6 +971,21 @@ static int embkfs_snapshot_find_slot(struct embkfs_volume *vol, const char *name
 {
     uint8_t padded[32];
     embk_snapshot_name_pad(name, padded);
+
+    if (embk_snapreg_enabled(vol)) {
+        struct embk_snapshot_item slots[EMBKFS_MAX_SNAPSHOTS];
+        uint32_t n = 0;
+        int rc = embkfs_snapreg_load(vol, slots, &n);
+        if (rc != EMBK_OK) return rc;
+        for (uint32_t i = 0; i < n; i++) {
+            if (memcmp(slots[i].name, padded, sizeof padded) == 0) {
+                if (out_slot) *out_slot = i;
+                if (out_item) *out_item = slots[i];
+                return EMBK_OK;
+            }
+        }
+        return -EMBK_ENOENT;
+    }
 
     static uint8_t buf[4096];
     for (uint32_t slot = 0; slot < EMBKFS_MAX_SNAPSHOTS; slot++) {
@@ -1458,8 +1690,15 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     vol->total_blocks = sb->total_blocks;
     vol->free_blocks  = sb->free_blocks;
     vol->generation   = sb->generation;
-    /* read cache starts empty (rcache_gen=0 never matches a real generation) */
-    vol->rcache_buf = NULL; vol->rcache_oid = 0; vol->rcache_gen = 0; vol->rcache_len = 0;
+    /* read cache starts empty (gen=0 never matches a real generation) */
+    for (uint32_t i = 0; i < EMBKFS_RCACHE_SLOTS; i++) {
+        vol->rcache[i].buf = NULL; vol->rcache[i].oid = 0;
+        vol->rcache[i].gen = 0;    vol->rcache[i].len = 0;
+        vol->rcache[i].stamp = 0;
+    }
+    vol->rcache_clock = 0; vol->rcache_bytes = 0;
+    vol->rcache_hits = 0; vol->rcache_misses = 0; vol->rcache_evicts = 0;
+    vol->rcache_bypass = 0;
     /* extent-map cache: same deal, same keying (see embkfs.h). Must be seeded --
      * read_object_range tests ecache_ext before ecache_gen, so a garbage pointer
      * from an uninitialised volume would be dereferenced. */
@@ -1468,6 +1707,7 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     /* Inode cache: icache_valid is the gate, so it MUST be seeded -- a garbage
      * true here would serve a stale/garbage inode on the very first read. */
     vol->icache_valid = false; vol->icache_oid = 0; vol->icache_gen = 0;
+    vol->icache_hits = 0; vol->icache_misses = 0;
     /* Read-ahead window: wcache_buf is the gate (NULL = unallocated), same shape
      * as rcache/ecache, so a garbage pointer here would be read as a live cache. */
     vol->wcache_buf = NULL; vol->wcache_oid = 0; vol->wcache_gen = 0;
@@ -1515,7 +1755,21 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
 /* See struct embkfs_stat (embkfs.h). Attributes EMBKFS's block reads by cause. */
 static struct embkfs_stat g_efs_stat;
 void embkfs_stat_reset(void) { memset(&g_efs_stat, 0, sizeof g_efs_stat); }
-void embkfs_stat_get(struct embkfs_stat *out) { if (out) *out = g_efs_stat; }
+void embkfs_stat_get(struct embkfs_stat *out)
+{
+    if (!out) return;
+    /* rcache counters live per-VOLUME (the cache does); fold the live volume's
+     * in here so callers get one struct rather than two sources of truth. */
+    if (g_embkfs_live) {
+        g_efs_stat.rcache_hit   = g_embkfs_live->rcache_hits;
+        g_efs_stat.rcache_miss  = g_embkfs_live->rcache_misses;
+        g_efs_stat.rcache_evict = g_embkfs_live->rcache_evicts;
+        g_efs_stat.rcache_bypass = g_embkfs_live->rcache_bypass;
+        g_efs_stat.icache_hit   = g_embkfs_live->icache_hits;
+        g_efs_stat.icache_miss  = g_embkfs_live->icache_misses;
+    }
+    *out = g_efs_stat;
+}
 
 int embkfs_read_node(struct embkfs_volume *vol,
                      const struct embk_block_ptr *ptr,
@@ -2156,27 +2410,45 @@ static bool embk_bytes_all_zero(const uint8_t *p, uint64_t n)
  * Note the signature: len is now uint64_t (was uint32_t). Existing call sites
  * that pass a small length still compile.
  *
- * KNOWN BUG, found and reproduced while verifying Phase 0 of the v2 EMBKFS
- * work (docs/EMBKFS_spec_v2.2.md), NOT introduced by that work and NOT yet
- * root-caused: a shrinking write (embkfs_truncate_object() calling through
- * here) can fail with -EMBK_EINVAL specifically when the object's PRIOR
- * data happened to land as a single multi-block extent (as opposed to
- * several single-block extents covering the same byte range) -- confirmed
- * 100% reproducible via `test embkfs timestamps` immediately followed by
- * `test embkfs obj` on a freshly formatted volume (the first test's own
- * alloc/free activity leaves the free-block bitmap in a state that makes
- * the second test's 4103-byte write land as ONE 2-block extent instead of
- * two 1-block extents; the following truncate(2) then fails). Ruled out:
- * mid-transaction block reuse (embkfs_note_freed_run only queues blocks
- * into txn->frun -- the bitmap isn't updated, and old blocks can't be
- * reallocated, until embkfs_txn_end() runs after a successful commit) and
- * puts_cap sizing (both the single- and double-extent cases fit their
- * computed cap with room to spare). Needs GDB-based tracing through the
- * old-extent-supersede / embkfs_alloc_run() interaction (docs/
- * GDB_CHEATSHEET.md) to actually root-cause -- flagging here rather than
- * silently working around it, since Phase 3 (compression) and Phase 4
- * (encryption) both add MORE extent-shape variation on top of this exact
- * code path and could make the bug easier, not harder, to hit. */
+ * THE "EXTENT-SUPERSEDE" BUG: no longer reproducible, and NOT knowingly fixed.
+ * Read that second clause carefully before trusting this code.
+ *
+ * The original report (v2 Phase 0) said a shrinking write through
+ * embkfs_truncate_object() failed with -EMBK_EINVAL when the object's prior
+ * data happened to land as ONE multi-block extent instead of several
+ * single-block ones, and called itself "100% reproducible" via
+ * `test embkfs timestamps` immediately followed by `test embkfs obj` on a
+ * freshly formatted volume.
+ *
+ * Re-checked 2026-07-23: that sequence now passes, AND it passes with the
+ * triggering shape genuinely present -- the log shows the 4103-byte write
+ * landing as `1 extent, 2 blk`, exactly the geometry the report blames, and
+ * the following truncate succeeding. So the failure is gone from the case
+ * that produced it.
+ *
+ * What was NOT established: why. No fix was identified. The two things the
+ * original note suspected are unchanged in this function since the report --
+ * puts_cap is still `1 + old_n + max_new`, and the allocate/write/supersede
+ * loop is structurally what it was (checked against 00fa091). Something else
+ * in the intervening work moved, or the failure needed a bitmap state finer
+ * than "one extent vs several". Either way, "cannot reproduce" is not "fixed",
+ * and this comment will not pretend otherwise.
+ *
+ * What DID change is that the invariant is now tested instead of hoped for:
+ * `test embkfs shrink` (embkfs_run_shrink_selftests) runs twelve shrinking
+ * writes across whatever extent shapes the volume produces -- including
+ * truncate-to-empty, block-boundary and off-by-one cuts, and a hole-bearing
+ * file -- and checks the surviving BYTES, not just the return code. It reports
+ * which shapes it actually saw, so a run that never hit the single
+ * multi-block extent cannot be mistaken for one that did.
+ *
+ * The original repro's real defect is worth remembering: it depended on the
+ * free-block bitmap state two unrelated tests happened to leave behind. That
+ * is not a repro, it is a coincidence with a procedure attached, and it decayed
+ * into a passing sequence that could not tell "fixed" from "hidden". Phase 3
+ * (compression) and Phase 4 (encryption) still add extent-shape variation on
+ * this exact path, so if the failure returns, `test embkfs shrink` is where it
+ * should surface -- and it will name the shape it was holding at the time. */
 static int embkfs_write_file(struct embkfs_volume *vol, uint64_t oid,
                              const uint8_t *newdata, uint64_t len)
 {
@@ -3130,7 +3402,7 @@ static int embkfs_rename(struct embkfs_volume *vol,
  * v2.x follow-up, flagged here rather than silently approximated.
  * =================================================================== */
 
-int embkfs_snapshot_create(struct embkfs_volume *vol, const char *name)
+static int embkfs_snapshot_create_impl(struct embkfs_volume *vol, const char *name)
 {
     if (!vol || !vol->mounted || !name) return -EMBK_EINVAL;
     if (vol->read_only) return -EMBK_EROFS;
@@ -3138,16 +3410,45 @@ int embkfs_snapshot_create(struct embkfs_volume *vol, const char *name)
 
     if (embkfs_snapshot_find_slot(vol, name, NULL, NULL) == EMBK_OK) return -EMBK_EEXIST;
 
-    uint32_t slot;
-    int rc = embkfs_snapshot_find_free_slot(vol, &slot);
-    if (rc != EMBK_OK) return rc;
-
     struct embk_snapshot_item si;
     memset(&si, 0, sizeof si);
     embk_snapshot_name_pad(name, si.name);
     si.root       = vol->root;         /* captured by VALUE before this commit moves vol->root */
     si.generation = vol->generation;
     si.timestamp  = rtc_now_ns();
+
+    /* v2.3 (SNAPREG): the registry is a plain block outside the tree, so
+     * creating a snapshot writes ONE block and commits nothing. Note what that
+     * removes: with the in-tree registry, the put that recorded the snapshot
+     * was itself a CoW write that superseded the very tree the snapshot had
+     * just frozen -- which is why the legacy path below has to bump
+     * snapshot_count before reconciling its own frees. Here the frozen tree is
+     * never rewritten, so that hazard does not exist. Order still matters for
+     * a different reason: the count must be live before anything can free a
+     * block, so the registry write comes first and the count follows it. */
+    if (embk_snapreg_enabled(vol)) {
+        struct embk_snapshot_item slots[EMBKFS_MAX_SNAPSHOTS];
+        uint32_t n = 0;
+        int rc = embkfs_snapreg_load(vol, slots, &n);
+        if (rc != EMBK_OK) return rc;
+        if (n >= EMBKFS_MAX_SNAPSHOTS) return -EMBK_ENOSPC;
+        slots[n] = si;
+        rc = embkfs_snapreg_store(vol, slots, n + 1);
+        if (rc != EMBK_OK) {
+            kprintf("EMBKFS: %s: snapshot create '%s' failed: %s\n",
+                    vol->dev->name, name, embk_strerror(rc));
+            return rc;
+        }
+        vol->snapshot_count = n + 1;
+        kprintf("EMBKFS: %s: snapshot '%s' created (slot %u, gen %lu, %u snapshot%s retained)\n",
+                vol->dev->name, name, n, si.generation,
+                (unsigned int)vol->snapshot_count, vol->snapshot_count == 1 ? "" : "s");
+        return EMBK_OK;
+    }
+
+    uint32_t slot;
+    int rc = embkfs_snapshot_find_free_slot(vol, &slot);
+    if (rc != EMBK_OK) return rc;
 
     uint64_t new_gen = vol->generation + 1;
     struct embk_txn txn;
@@ -3189,7 +3490,7 @@ int embkfs_snapshot_create(struct embkfs_volume *vol, const char *name)
     return EMBK_OK;
 }
 
-int embkfs_snapshot_delete(struct embkfs_volume *vol, const char *name)
+static int embkfs_snapshot_delete_impl(struct embkfs_volume *vol, const char *name)
 {
     if (!vol || !vol->mounted || !name) return -EMBK_EINVAL;
     if (vol->read_only) return -EMBK_EROFS;
@@ -3197,6 +3498,30 @@ int embkfs_snapshot_delete(struct embkfs_volume *vol, const char *name)
     uint32_t slot;
     int rc = embkfs_snapshot_find_slot(vol, name, &slot, NULL);
     if (rc != EMBK_OK) return rc;
+
+    if (embk_snapreg_enabled(vol)) {
+        struct embk_snapshot_item slots[EMBKFS_MAX_SNAPSHOTS];
+        uint32_t n = 0;
+        rc = embkfs_snapreg_load(vol, slots, &n);
+        if (rc != EMBK_OK) return rc;
+        if (slot >= n) return -EMBK_ENOENT;
+        for (uint32_t i = slot; i + 1 < n; i++) slots[i] = slots[i + 1];   /* keep it dense */
+        rc = embkfs_snapreg_store(vol, slots, n - 1);
+        if (rc != EMBK_OK) {
+            kprintf("EMBKFS: %s: snapshot delete '%s' failed: %s\n",
+                    vol->dev->name, name, embk_strerror(rc));
+            return rc;
+        }
+        vol->snapshot_count = n - 1;
+        kprintf("EMBKFS: %s: snapshot '%s' deleted (slot %u, %u snapshot%s remaining)\n",
+                vol->dev->name, name, slot,
+                (unsigned int)vol->snapshot_count, vol->snapshot_count == 1 ? "" : "s");
+        if (vol->snapshot_count == 0) {
+            embkfs_bitmap_build(vol);
+            embkfs_free_index_rebuild(vol);
+        }
+        return EMBK_OK;
+    }
 
     uint64_t new_gen = vol->generation + 1;
     struct embk_txn txn;
@@ -3235,7 +3560,7 @@ int embkfs_snapshot_delete(struct embkfs_volume *vol, const char *name)
     return EMBK_OK;
 }
 
-int embkfs_snapshot_rollback(struct embkfs_volume *vol, const char *name)
+static int embkfs_snapshot_rollback_impl(struct embkfs_volume *vol, const char *name)
 {
     if (!vol || !vol->mounted || !name) return -EMBK_EINVAL;
     if (vol->read_only) return -EMBK_EROFS;
@@ -3244,12 +3569,20 @@ int embkfs_snapshot_rollback(struct embkfs_volume *vol, const char *name)
     int rc = embkfs_snapshot_find_slot(vol, name, NULL, &si);
     if (rc != EMBK_OK) return rc;
 
-    /* Compute the post-rollback free count by temporarily pointing vol->root
-     * at the snapshot's root and rebuilding the bitmap from it (+ whatever
-     * OTHER snapshots that historical tree's own registry still names --
-     * see the KNOWN LIMITATION on embk_snapshot_item). Pure in-memory/disk-
-     * READ work up to this point -- nothing durable changes yet, so on any
-     * failure we can just restore vol->root and walk away. */
+    /* Compute the post-rollback free count by temporarily pointing vol->root at
+     * the snapshot's root and rebuilding the bitmap from it, plus every
+     * snapshot the registry names. Pure in-memory/disk-READ work up to this
+     * point -- nothing durable changes yet, so on any failure we just restore
+     * vol->root and walk away.
+     *
+     * Note what is NOT here on a v2.3 volume: any handling of the registry.
+     * Rollback swaps the root and leaves the registry block alone, so every
+     * snapshot -- older AND newer than the target -- is still listed and still
+     * protected afterwards. Rollback stops being a one-way door: you can roll
+     * back to an earlier snapshot and then forward again to a later one,
+     * because the later one still exists to roll forward TO. On a legacy
+     * volume the registry rides inside the tree being replaced, so the newer
+     * ones vanish with the abandoned future (see embkfs.h). */
     struct embk_block_ptr saved_root = vol->root;
     vol->root = si.root;
     rc = embkfs_bitmap_build(vol);
@@ -3276,11 +3609,11 @@ int embkfs_snapshot_rollback(struct embkfs_volume *vol, const char *name)
 
     embkfs_free_index_rebuild(vol);
 
-    /* vol->snapshot_count was already set authoritatively as a side effect
-     * of the embkfs_bitmap_build() call above (it recounts from whatever
-     * root is current at the time -- si.root, since it ran before this
-     * commit). Per the KNOWN LIMITATION this can be FEWER than before the
-     * rollback if newer snapshots existed only in the abandoned future. */
+    /* vol->snapshot_count was already set authoritatively as a side effect of
+     * the embkfs_bitmap_build() call above. On a v2.3 volume that count is
+     * unchanged by the rollback (the registry did not move); on a legacy
+     * volume it can be FEWER than before, if newer snapshots existed only in
+     * the abandoned future. */
 
     kprintf("EMBKFS: %s: rolled back to snapshot '%s' (gen now %lu, %u snapshot%s retained)\n",
             vol->dev->name, name, vol->generation,
@@ -3292,7 +3625,10 @@ int embkfs_snapshot_list(struct embkfs_volume *vol, struct embk_snapshot_item *o
                          uint32_t max, uint32_t *out_n)
 {
     if (!vol || !vol->mounted) return -EMBK_ENODEV;
-    return embkfs_snapshot_list_internal(vol, out_items, max, out_n);
+    embkfs_lock();
+    int rc = embkfs_snapshot_list_internal(vol, out_items, max, out_n);
+    embkfs_unlock();
+    return rc;
 }
 
 
@@ -4395,9 +4731,11 @@ static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
 
     if (vol->icache_valid && vol->icache_oid == oid &&
         vol->icache_gen == vol->generation) {
+        vol->icache_hits++;
         *out = vol->icache_ino;
         return EMBK_OK;
     }
+    vol->icache_misses++;
 
     const struct embk_item_header *ii =
         embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe_i, sizeof probe_i);
@@ -4454,7 +4792,7 @@ int embkfs_read_object(struct embkfs_volume *vol, uint64_t oid,
 
 /* Cap on the whole-object read cache (embkfs_read_object_at): files up to this
  * size are cached for fast sequential reads; larger ones use the direct path. */
-#define EMBKFS_RCACHE_MAX (8u * 1024u * 1024u)
+#define EMBKFS_RCACHE_MAX (EMBKFS_RCACHE_MAX_MB * 1024u * 1024u)
 
 /* Read-ahead window for objects too big for the whole-object cache above.
  * MUST be a power of two (the lookup masks the offset) and a multiple of the
@@ -4511,12 +4849,16 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
     /* Fast path: whole-object read cache. This is the O(n^2) fix -- previously
      * EVERY call re-decoded the entire [0, offset+want) prefix, so a file read
      * sequentially in K chunks re-read growing prefixes (K*(K+1)/2 blocks). */
-    if (vol->rcache_buf && vol->rcache_oid == oid && vol->rcache_gen == vol->generation) {
-        uint64_t total = vol->rcache_len;
+    for (uint32_t i = 0; i < EMBKFS_RCACHE_SLOTS; i++) {
+        struct embk_rcache_slot *sl = &vol->rcache[i];
+        if (!sl->buf || sl->oid != oid || sl->gen != vol->generation) continue;
+        sl->stamp = ++vol->rcache_clock;          /* LRU touch */
+        vol->rcache_hits++;
+        uint64_t total = sl->len;
         if (offset >= total) return EMBK_OK;
         uint64_t want = total - offset;
         if (want > len) want = len;
-        memcpy(buf, vol->rcache_buf + offset, want);
+        memcpy(buf, sl->buf + offset, want);
         *out_read = want;
         return EMBK_OK;
     }
@@ -4538,6 +4880,16 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
     uint64_t want = total - offset;
     if (want > len) want = len;
 
+    /* A lookup that failed is only a MISS if the object was cacheable at all.
+     * An object over EMBKFS_RCACHE_MAX can never be in this cache by policy, so
+     * every read of it would otherwise be scored as a miss -- and one 9 MB file
+     * read twice buries the real number under ~9200 phantom misses, making a
+     * 99%-effective cache read as 8%. That is a broken instrument, and a broken
+     * instrument is worse than none: it invites "fixing" a cache that is fine.
+     * Bypasses are counted separately. */
+    if (total > EMBKFS_RCACHE_MAX) vol->rcache_bypass++;
+    else                           vol->rcache_misses++;
+
     /* Decode the whole object ONCE into the cache (capped so a huge file can't
      * pin unbounded RAM), then serve. On a miss for a >cap file, or on OOM,
      * fall back to the original direct prefix read below. */
@@ -4546,11 +4898,38 @@ int embkfs_read_object_at(struct embkfs_volume *vol, uint64_t oid,
         if (nb) {
             rc = embkfs_read_object_prefix(vol, oid, nb, total, NULL, NULL);
             if (rc != EMBK_OK) { kfree(nb); return rc; }
-            if (vol->rcache_buf) kfree(vol->rcache_buf);
-            vol->rcache_buf = nb;
-            vol->rcache_oid = oid;
-            vol->rcache_gen = vol->generation;
-            vol->rcache_len = total;
+            /* Install. Take a FREE slot if there is one; otherwise evict the
+             * least-recently-used. Then keep evicting until the newcomer fits
+             * the total-bytes budget -- slots are for hit rate, the budget is
+             * what stops four big files pinning 32 MB. */
+            uint32_t victim = 0;
+            uint64_t oldest = (uint64_t)-1;
+            for (uint32_t i = 0; i < EMBKFS_RCACHE_SLOTS; i++) {
+                if (!vol->rcache[i].buf) { victim = i; oldest = 0; break; }
+                if (vol->rcache[i].stamp < oldest) { oldest = vol->rcache[i].stamp; victim = i; }
+            }
+            if (vol->rcache[victim].buf) {
+                vol->rcache_bytes -= vol->rcache[victim].len;
+                kfree(vol->rcache[victim].buf);
+                vol->rcache[victim].buf = NULL;
+                vol->rcache_evicts++;
+            }
+            while (vol->rcache_bytes + total > EMBKFS_RCACHE_BUDGET) {
+                uint32_t v2 = EMBKFS_RCACHE_SLOTS; uint64_t o2 = (uint64_t)-1;
+                for (uint32_t i = 0; i < EMBKFS_RCACHE_SLOTS; i++)
+                    if (vol->rcache[i].buf && vol->rcache[i].stamp < o2) { o2 = vol->rcache[i].stamp; v2 = i; }
+                if (v2 == EMBKFS_RCACHE_SLOTS) break;   /* nothing left to drop */
+                vol->rcache_bytes -= vol->rcache[v2].len;
+                kfree(vol->rcache[v2].buf);
+                vol->rcache[v2].buf = NULL;
+                vol->rcache_evicts++;
+            }
+            vol->rcache[victim].buf   = nb;
+            vol->rcache[victim].oid   = oid;
+            vol->rcache[victim].gen   = vol->generation;
+            vol->rcache[victim].len   = total;
+            vol->rcache[victim].stamp = ++vol->rcache_clock;
+            vol->rcache_bytes += total;
             memcpy(buf, nb + offset, want);
             *out_read = want;
             return EMBK_OK;
@@ -5534,14 +5913,14 @@ static void embkfs_path_norm_smoke(struct embkfs_volume *vol)
                 vol->dev->name, r1, r2, a, b);
 }
 
-int embkfs_run_path_selftests(void)
+static int embkfs_run_path_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     embkfs_path_norm_smoke(g_embkfs_live);
     return EMBK_OK;
 }
 
-int embkfs_run_allocator_selftests(void)
+static int embkfs_run_allocator_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -5641,7 +6020,7 @@ static void embk_tree_case_path(char *out, const char *prefix, uint32_t idx)
     out[12] = '\0';
 }
 
-int embkfs_run_tree_selftests(void)
+static int embkfs_run_tree_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -5713,7 +6092,7 @@ fail:
     return rc;
 }
 
-int embkfs_run_object_selftests(void)
+static int embkfs_run_object_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -5822,6 +6201,206 @@ int embkfs_run_object_selftests(void)
     return EMBK_OK;
 }
 
+/* SHRINKING WRITES, over whatever extent shape the volume produces -- the test
+ * that should have existed when the "extent-supersede" bug was first reported.
+ *
+ * That bug (docs/TODO.md, and the comment above embkfs_write_file) said a
+ * shrinking write failed with -EINVAL when the object's prior data HAPPENED to
+ * land as one multi-block extent rather than several single-block ones, and
+ * called itself "100% reproducible" via `test embkfs timestamps` followed by
+ * `test embkfs obj`. The word doing the damage is HAPPENED: the trigger was
+ * never the tests, it was the free-block bitmap state they ran into, which is
+ * incidental to everything -- image contents, what mkfs packed, what ran
+ * before. A repro resting on allocator luck stops reproducing the moment the
+ * image changes, and then nobody can tell whether the bug was fixed or merely
+ * hidden. Which is exactly what happened: the sequence now passes, WITH the
+ * triggering shape present (see the note on the fix below).
+ *
+ * The lesson shapes this test. A first draft demanded a specific extent count
+ * per case and skipped when it did not get one -- which reproduced the very
+ * flaw it was written to replace (7 of 9 cases went unexercised on the first
+ * run, and the suite honestly reported "try again" rather than green). The
+ * fix is to stop testing a SHAPE and start testing the INVARIANT:
+ *
+ *     a shrinking write succeeds, and the surviving bytes are unchanged,
+ *     WHATEVER extent shape the prior contents happened to take.
+ *
+ * Every case therefore runs against whatever the allocator gives, records the
+ * shape it actually got, and passes or fails on behaviour alone. Shape
+ * coverage is reported separately: the suite says whether it ever managed to
+ * exercise the reported trigger (a single extent spanning >1 block), so a run
+ * that never hit it cannot be mistaken for one that did.
+ *
+ * Every case reads the data back. A shrink that "succeeds" and loses the
+ * surviving bytes is the worse of the two bugs, and only a content check
+ * catches it. */
+struct embk_shrink_stats {
+    int pass, fail;
+    int saw_single_multiblock;   /* the reported trigger: n==1 over >1 block */
+    int saw_multi_extent;        /* the shape it was contrasted against      */
+    uint32_t max_extents;
+};
+
+static int embk_shrink_case(struct embkfs_volume *vol, uint64_t oid, const char *tag,
+                            uint8_t *buf, uint64_t write_len, uint64_t new_len,
+                            struct embk_shrink_stats *st)
+{
+    /* A recognisable, non-repeating pattern: byte i is (i*31+7). Never all-zero
+     * across a block, so hole synthesis stays out of the way unless a case asks
+     * for it, and a misplaced byte is obvious rather than plausible. */
+    for (uint64_t i = 0; i < write_len; i++) buf[i] = (uint8_t)(i * 31 + 7);
+
+    int rc = embkfs_write_object(vol, oid, buf, write_len);
+    if (rc != EMBK_OK) {
+        kprintf("EMBKFS: shrink %s: initial write of %lu failed: %s\n",
+                tag, write_len, embk_strerror(rc));
+        st->fail++;
+        return rc;
+    }
+
+    /* Record the shape we actually got -- the case is defined by its behaviour,
+     * but the shape is what tells a reader which variant was covered. */
+    uint32_t n = 0;
+    rc = embkfs_count_extents(vol, oid, &n);
+    if (rc != EMBK_OK) { st->fail++; return rc; }
+    uint64_t blocks = (write_len + vol->block_size - 1) / vol->block_size;
+    if (n == 1 && blocks > 1) st->saw_single_multiblock++;
+    if (n > 1)                st->saw_multi_extent++;
+    if (n > st->max_extents)  st->max_extents = n;
+
+    rc = embkfs_truncate_object(vol, oid, new_len);
+    if (rc != EMBK_OK) {
+        kprintf("EMBKFS: shrink %s: %lu -> %lu (%u extent%s in) FAILED: %s\n",
+                tag, write_len, new_len, n, n == 1 ? "" : "s", embk_strerror(rc));
+        st->fail++;
+        return rc;
+    }
+
+    /* the survivors must be the original bytes, and the size exact */
+    uint64_t got = 0;
+    memset(buf, 0xA5, new_len ? new_len : 1);
+    rc = embkfs_read_object(vol, oid, buf, new_len, &got);
+    if (rc != EMBK_OK) { st->fail++; return rc; }
+    if (got != new_len) {
+        kprintf("EMBKFS: shrink %s: read back %lu bytes, want %lu\n", tag, got, new_len);
+        st->fail++;
+        return -EMBK_EINVAL;
+    }
+    for (uint64_t i = 0; i < new_len; i++) {
+        if (buf[i] != (uint8_t)(i * 31 + 7)) {
+            kprintf("EMBKFS: shrink %s: byte %lu is 0x%x, want 0x%x -- DATA LOST\n",
+                    tag, i, buf[i], (uint8_t)(i * 31 + 7));
+            st->fail++;
+            return -EMBK_EINVAL;
+        }
+    }
+    kprintf("EMBKFS: shrink %s: %lu -> %lu (%u extent%s in) OK\n",
+            tag, write_len, new_len, n, n == 1 ? "" : "s");
+    st->pass++;
+    return EMBK_OK;
+}
+
+static int embkfs_run_shrink_selftests_impl(void)
+{
+    if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
+    struct embkfs_volume *vol = g_embkfs_live;
+    if (vol->read_only) return -EMBK_EROFS;
+
+    const uint64_t bs = vol->block_size;
+    kprintf("EMBKFS: %s: shrinking writes: begin (block_size %lu)\n", vol->dev->name, bs);
+
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink/f");
+    embkfs_rmdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink");
+
+    uint64_t dir_oid = 0, oid = 0;
+    int rc = embkfs_mkdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink", &dir_oid);
+    if (rc != EMBK_OK) return rc;
+    rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink/f", &oid);
+    if (rc != EMBK_OK) return rc;
+
+    uint8_t *buf = kmalloc(bs * 4 + 16);
+    if (!buf) return -EMBK_ENOMEM;
+
+    struct embk_shrink_stats st = { 0, 0, 0, 0, 0 };
+    int last = EMBK_OK;
+    #define SHRINK(tag, wl, nl) do {                                    \
+        int r = embk_shrink_case(vol, oid, (tag), buf, (wl), (nl), &st); \
+        if (r != EMBK_OK) last = r;                                     \
+    } while (0)
+
+    /* (a) THE REPORTED TRIGGER's exact geometry: bs+7 bytes (the original was
+     * 4103 on a 4096 volume) shrunk to 2 bytes. */
+    SHRINK("a/bs+7->2",        bs + 7,     2);
+
+    /* (b) shrink landing exactly on a block boundary */
+    SHRINK("b/2bs+5->1bs",     bs * 2 + 5, bs);
+
+    /* (c) truncate-to-empty: every extent deleted, none created */
+    SHRINK("c/2bs+5->0",       bs * 2 + 5, 0);
+
+    /* (d) a 4-block object cut to three very different sizes */
+    SHRINK("d/4bs->3",         bs * 4,     3);
+    SHRINK("d/4bs->bs+1",      bs * 4,     bs + 1);
+    SHRINK("d/4bs->3bs",       bs * 4,     bs * 3);
+
+    /* (e) off-by-one either side of a block boundary -- the arithmetic most
+     * likely to be wrong in extent-splitting code */
+    SHRINK("e/2bs->bs-1",      bs * 2,     bs - 1);
+    SHRINK("e/2bs->bs+1",      bs * 2,     bs + 1);
+    SHRINK("e/2bs->bs",        bs * 2,     bs);
+
+    /* (f) single block down to one byte, and to zero */
+    SHRINK("f/bs->1",          bs,         1);
+    SHRINK("f/bs->0",          bs,         0);
+
+    /* (g) a HOLE-bearing file: the middle block is all zero, so write_file
+     * synthesises a logical-only extent (length 0, owning no blocks). Shrinking
+     * across that boundary runs the supersede path against an extent that has
+     * no run to free -- a case the byte-pattern cases cannot reach. */
+    {
+        for (uint64_t i = 0; i < bs * 3; i++) buf[i] = (uint8_t)(i * 31 + 7);
+        memset(buf + bs, 0, bs);                       /* middle block: a hole */
+        int r = embkfs_write_object(vol, oid, buf, bs * 3);
+        uint32_t n = 0;
+        if (r == EMBK_OK) r = embkfs_count_extents(vol, oid, &n);
+        if (r == EMBK_OK) r = embkfs_truncate_object(vol, oid, bs + 4);  /* cut inside the hole */
+        if (r == EMBK_OK) {
+            uint64_t got = 0;
+            memset(buf, 0xA5, bs + 4);
+            r = embkfs_read_object(vol, oid, buf, bs + 4, &got);
+            if (r == EMBK_OK && got != bs + 4) r = -EMBK_EINVAL;
+            for (uint64_t i = 0; r == EMBK_OK && i < bs; i++)
+                if (buf[i] != (uint8_t)(i * 31 + 7)) r = -EMBK_EINVAL;   /* real data */
+            for (uint64_t i = bs; r == EMBK_OK && i < bs + 4; i++)
+                if (buf[i] != 0) r = -EMBK_EINVAL;                       /* hole reads zero */
+        }
+        kprintf("EMBKFS: shrink g/hole 3bs->bs+4: %u extents in, %s\n",
+                n, r == EMBK_OK ? "OK" : embk_strerror(r));
+        if (r == EMBK_OK) st.pass++; else { st.fail++; last = r; }
+    }
+    #undef SHRINK
+
+    kfree(buf);
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink/f");
+    embkfs_rmdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstshrink");
+
+    /* Shape coverage is REPORTED, never asserted -- the volume decides it, and
+     * a run that never saw the reported trigger must not read like one that
+     * did. Both shapes appearing across a run is the useful signal: it means
+     * the invariant held on the shape that used to fail AND on its opposite. */
+    kprintf("EMBKFS: %s: shrinking writes: %d passed, %d failed "
+            "(shapes seen: single-multiblock %d, multi-extent %d, max %u extents)\n",
+            vol->dev->name, st.pass, st.fail,
+            st.saw_single_multiblock, st.saw_multi_extent, st.max_extents);
+    if (!st.saw_single_multiblock)
+        kprintf("EMBKFS: %s: shrinking writes: NOTE -- the reported trigger shape "
+                "(one extent over >1 block) did not occur this run; free space was "
+                "too fragmented to produce it\n", vol->dev->name);
+
+    if (st.fail) return (last == EMBK_OK) ? -EMBK_EINVAL : last;
+    return EMBK_OK;
+}
+
 /* v2.2: real RTC-sourced timestamps (Phase 0). Proves creation sets
  * btime==mtime==ctime==atime, a later content write moves mtime/ctime
  * forward while btime stays fixed, and a parent directory's own mtime
@@ -5831,7 +6410,7 @@ int embkfs_run_object_selftests(void)
  * between the two stats to guarantee a visible difference -- not flaky
  * because it isn't racing anything, just waiting out the clock's own
  * granularity. */
-int embkfs_run_timestamp_selftests(void)
+static int embkfs_run_timestamp_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -5944,7 +6523,7 @@ int embkfs_run_timestamp_selftests(void)
  * device at boot (`make run-multivol`); with only one volume mounted this
  * degrades to a SKIP rather than a FAIL, since most boots (plain `make run`)
  * only attach one EMBKFS-formatted drive. */
-int embkfs_run_multivol_selftests(void)
+static int embkfs_run_multivol_selftests_impl(void)
 {
     uint32_t n = embkfs_volume_count();
     if (n < 2) {
@@ -6033,7 +6612,7 @@ int embkfs_run_multivol_selftests(void)
  * if compression actually ran, so it's an equally rigorous proof. Also
  * covers the low-value case that must NOT shrink (proving the "only keep
  * it if it helps" policy actually runs, not just exists). */
-int embkfs_run_compress_selftests(void)
+static int embkfs_run_compress_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6146,7 +6725,7 @@ int embkfs_run_compress_selftests(void)
  * cleanly. Corrupting/repairing the on-disk backup doesn't touch the
  * already-mounted live volume's in-memory state (root/generation), so
  * this is safe to run against g_embkfs_live without disturbing it. */
-int embkfs_run_selfheal_selftests(void)
+static int embkfs_run_selfheal_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6240,7 +6819,7 @@ int embkfs_run_selfheal_selftests(void)
  * away block is HELD (not reclaimed) by both the txn_end hold-back AND a
  * full bitmap rebuild (the same computation a remount performs), proving
  * the allocator-side half of this phase, not just the registry bookkeeping. */
-int embkfs_run_snapshot_selftests(void)
+static int embkfs_run_snapshot_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6325,14 +6904,162 @@ int embkfs_run_snapshot_selftests(void)
         }
     }
 
-    /* Cleanup -- best-effort; the snapshot's own registry entry is
-     * expected to already be gone post-rollback (see the KNOWN LIMITATION
-     * on embk_snapshot_item), so don't treat delete failing here as a
-     * test failure. */
+    /* Cleanup -- best-effort. On a LEGACY volume the snapshot's own registry
+     * entry is expected to be gone post-rollback (it lived in the tree that
+     * was just replaced); on a v2.3 volume it is expected to still be there.
+     * Either way a failing delete here is not a test failure. */
     embkfs_snapshot_delete(vol, "tstsnap1");
     embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnap");
 
     kprintf("EMBKFS: %s: snapshot: %s\n", vol->dev->name, ok ? "OK" : "FAIL");
+    return ok ? EMBK_OK : -EMBK_EINVAL;
+}
+
+/* ROLLBACK IS NOT A ONE-WAY DOOR (v2.3, EMBKFS_INCOMPAT_SNAPREG).
+ *
+ * The defect this asserts against, in one sentence: with the registry stored
+ * as items INSIDE the versioned tree, rolling back to an older snapshot
+ * reverted the registry too, so every snapshot taken AFTER the target silently
+ * stopped existing -- you could go back, but never forward again.
+ *
+ * The shape of the test is the shape of the bug:
+ *
+ *   write A, snapshot "s1"
+ *   write B, snapshot "s2"      <- taken AFTER s1; the one that used to vanish
+ *   write C                     <- live content, belongs to no snapshot
+ *   rollback to s1              -> content is A
+ *   s2 MUST STILL EXIST         <- the assertion; this is the whole fix
+ *   rollback to s2              -> content is B     (forward again)
+ *   rollback to s1              -> content is A     (and back; not one-shot)
+ *
+ * Rolling FORWARD to s2 after having rolled back to s1 is the part that could
+ * not previously happen at all, and it checks more than the registry: s2's
+ * frozen tree must still be intact on disk, which means bitmap_build kept its
+ * blocks marked in-use across a rollback that made them unreachable from the
+ * live root. A registry entry pointing at recycled blocks would pass a
+ * "snapshot still listed" check and fail this one.
+ *
+ * On a volume WITHOUT the feature bit this test SKIPS rather than fails: the
+ * old behaviour is correct for the old format, and reporting a legacy volume
+ * as broken would be a lie in the other direction. */
+static int embkfs_run_snapreg_selftests_impl(void)
+{
+    if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
+    struct embkfs_volume *vol = g_embkfs_live;
+    if (vol->read_only) return -EMBK_EROFS;
+
+    if (!embk_snapreg_enabled(vol)) {
+        kprintf("EMBKFS: %s: snapreg: SKIP -- volume has no INCOMPAT_SNAPREG "
+                "(legacy in-tree registry; rollback-drops-newer is correct there)\n",
+                vol->dev->name);
+        return -EMBK_ENOTSUP;
+    }
+
+    kprintf("EMBKFS: %s: snapreg: begin (registry block %lu, outside the tree)\n",
+            vol->dev->name, EMBKFS_SNAPREG_BLOCK);
+    bool ok = true;
+
+    static const uint8_t A[] = "A: the oldest content, frozen by s1.\n";
+    static const uint8_t B[] = "B: written after s1, frozen by s2.\n";
+    static const uint8_t C[] = "C: live content, held by no snapshot at all.\n";
+
+    embkfs_snapshot_delete(vol, "sr1");        /* best-effort: prior failed run */
+    embkfs_snapshot_delete(vol, "sr2");
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnapreg");
+
+    uint64_t oid = 0;
+    int rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnapreg", &oid);
+    if (rc != EMBK_OK) { kprintf("EMBKFS: snapreg: FAIL create: %s\n", embk_strerror(rc)); return rc; }
+
+    #define SR_STEP(what, expr) do { if (ok) { rc = (expr); \
+        if (rc != EMBK_OK) { kprintf("EMBKFS: snapreg: FAIL %s: %s\n", (what), embk_strerror(rc)); ok = false; } } } while (0)
+
+    SR_STEP("write A",   embkfs_write_object(vol, oid, A, sizeof A - 1));
+    SR_STEP("create s1", embkfs_snapshot_create(vol, "sr1"));
+    SR_STEP("write B",   embkfs_write_object(vol, oid, B, sizeof B - 1));
+    SR_STEP("create s2", embkfs_snapshot_create(vol, "sr2"));
+    SR_STEP("write C",   embkfs_write_object(vol, oid, C, sizeof C - 1));
+
+    /* Read the file through a fresh path lookup and compare against `want`.
+     * Looking the path up each time (rather than reusing oid) matters: a
+     * rollback replaces the whole tree, and the object id is only meaningful
+     * relative to the tree that is live now. */
+    #define SR_EXPECT(tag, want, wantlen) do { if (ok) {                        \
+        uint64_t o2 = 0; uint8_t rb[128]; uint64_t g = 0;                       \
+        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnapreg", &o2);\
+        if (rc != EMBK_OK) { kprintf("EMBKFS: snapreg: FAIL lookup %s: %s\n",   \
+                                     (tag), embk_strerror(rc)); ok = false; }   \
+        else {                                                                  \
+            rc = embkfs_read_object(vol, o2, rb, sizeof rb, &g);                \
+            if (rc != EMBK_OK || g != (wantlen) || memcmp(rb, (want), g) != 0) {\
+                kprintf("EMBKFS: snapreg: FAIL %s: content is not what the "    \
+                        "snapshot froze (got %lu bytes)\n", (tag), g);          \
+                ok = false;                                                     \
+            } else kprintf("EMBKFS: snapreg: %s content OK\n", (tag));          \
+        } } } while (0)
+
+    SR_EXPECT("live=C", C, sizeof C - 1);
+
+    /* (1) back to the OLDER snapshot */
+    SR_STEP("rollback to s1", embkfs_snapshot_rollback(vol, "sr1"));
+    SR_EXPECT("after rollback to s1: A", A, sizeof A - 1);
+
+    /* (2) THE ASSERTION: s2 was taken after s1 and must have survived. */
+    if (ok) {
+        struct embk_snapshot_item si;
+        rc = embkfs_snapshot_find_slot(vol, "sr2", NULL, &si);
+        if (rc != EMBK_OK) {
+            kprintf("EMBKFS: snapreg: FAIL -- 's2' did not survive the rollback to 's1' "
+                    "(%s). This is the exact defect the out-of-tree registry fixes.\n",
+                    embk_strerror(rc));
+            ok = false;
+        } else {
+            kprintf("EMBKFS: snapreg: 's2' survived the rollback to 's1' (root block %lu)\n",
+                    si.root.block);
+        }
+    }
+    if (ok) {
+        uint32_t n = 0;
+        embkfs_snapshot_list_internal(vol, NULL, 0, &n);
+        if (n != 2) {
+            kprintf("EMBKFS: snapreg: FAIL -- registry lists %u snapshot(s) after rollback, want 2\n", n);
+            ok = false;
+        }
+    }
+
+    /* (3) FORWARD again -- impossible before, and it proves s2's frozen tree
+     * is still physically intact, not merely still named. */
+    SR_STEP("rollback FORWARD to s2", embkfs_snapshot_rollback(vol, "sr2"));
+    SR_EXPECT("after rollback to s2: B", B, sizeof B - 1);
+
+    /* (4) and back again, to show it is not a single extra step */
+    SR_STEP("rollback BACK to s1", embkfs_snapshot_rollback(vol, "sr1"));
+    SR_EXPECT("after second rollback to s1: A", A, sizeof A - 1);
+
+    /* (5) the registry survives a full bitmap rebuild -- the same computation
+     * a remount performs -- so this is durable, not an in-memory illusion. */
+    if (ok) {
+        rc = embkfs_bitmap_build(vol);
+        uint32_t n = 0;
+        embkfs_snapshot_list_internal(vol, NULL, 0, &n);
+        if (rc != EMBK_OK || n != 2 || vol->snapshot_count != 2) {
+            kprintf("EMBKFS: snapreg: FAIL -- after bitmap rebuild: rc=%s, %u listed, count %u (want 2/2)\n",
+                    embk_strerror(rc), n, (unsigned)vol->snapshot_count);
+            ok = false;
+        } else {
+            kprintf("EMBKFS: snapreg: registry intact across a full bitmap rebuild (2 snapshots)\n");
+        }
+        embkfs_free_index_rebuild(vol);
+    }
+    #undef SR_STEP
+    #undef SR_EXPECT
+
+    embkfs_snapshot_delete(vol, "sr2");
+    embkfs_snapshot_delete(vol, "sr1");
+    embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstsnapreg");
+
+    kprintf("EMBKFS: %s: snapreg: %s\n", vol->dev->name,
+            ok ? "OK -- rollback preserves snapshots on both sides of the target" : "FAIL");
     return ok ? EMBK_OK : -EMBK_EINVAL;
 }
 
@@ -6345,7 +7072,7 @@ int embkfs_run_snapshot_selftests(void)
  * generalizes trivially to whichever process is really calling; a
  * dedicated cross-process check belongs in a scheduler/process-level
  * test, not here. */
-int embkfs_run_provenance_selftests(void)
+static int embkfs_run_provenance_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6400,7 +7127,7 @@ int embkfs_run_provenance_selftests(void)
  * merely "some error". Restores the original superblock bytes afterward
  * either way, so this never leaves the live volume's on-disk state
  * altered. */
-int embkfs_run_verifyboot_selftests(void)
+static int embkfs_run_verifyboot_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6485,7 +7212,7 @@ int embkfs_run_verifyboot_selftests(void)
     return ok ? EMBK_OK : -EMBK_EINVAL;
 }
 
-int embkfs_run_namespace_selftests(void)
+static int embkfs_run_namespace_selftests_impl(void)
 {
     if (!g_embkfs_live || !g_embkfs_live->mounted) return -EMBK_ENODEV;
     struct embkfs_volume *vol = g_embkfs_live;
@@ -6642,9 +7369,14 @@ static int embkfs_bitmap_build(struct embkfs_volume *vol)
      * (blocks 1..15) stays free, matching the formatter. */
     embk_bm_set(vol->block_bitmap, 0);
 
-    /* Fixed metadata outside the tree: primary + backup superblock. */
+    /* Fixed metadata outside the tree: primary + backup superblock, and (v2.3)
+     * the snapshot registry. The registry MUST be marked here: it is not
+     * reachable from the tree walk below, so without this the allocator would
+     * see a free block and hand out the one place the snapshot list lives. */
     embk_bm_set(vol->block_bitmap, EMBKFS_SB_OFFSET / vol->block_size);
     embk_bm_set(vol->block_bitmap, vol->total_blocks - 1);
+    if (embk_snapreg_enabled(vol))
+        embk_bm_set(vol->block_bitmap, EMBKFS_SNAPREG_BLOCK);
 
     /* Mark every block the live tree references — and, in the same walk, record
      * the highest object_id in use (accumulated into vol->next_oid). */
@@ -6654,9 +7386,15 @@ static int embkfs_bitmap_build(struct embkfs_volume *vol)
 
     /* Also protect every retained snapshot's frozen tree (v2.2 Phase 5b) --
      * a block can be unreachable from the LIVE tree yet still be exactly
-     * what a snapshot needs. Reads vol->root's OWN registry, so this stays
-     * correct even when vol->root is temporarily a snapshot's root during
-     * embkfs_snapshot_rollback()'s free-count computation. */
+     * what a snapshot needs.
+     *
+     * With SNAPREG (v2.3) this reads the out-of-tree registry, which is the
+     * same list no matter what vol->root currently points at -- including
+     * during embkfs_snapshot_rollback()'s temporary root swap. That is
+     * precisely what makes snapshots survive a rollback: their blocks stay
+     * marked in-use because the registry still names them. On a legacy volume
+     * it reads vol->root's OWN in-tree registry instead, which is why rollback
+     * there loses the snapshots the abandoned future was holding. */
     struct embk_snapshot_item snaps[EMBKFS_MAX_SNAPSHOTS];
     uint32_t n_snaps = 0;
     embkfs_snapshot_list_internal(vol, snaps, EMBKFS_MAX_SNAPSHOTS, &n_snaps);
@@ -6768,6 +7506,13 @@ void embkfs_init(void)
      * boot", normally the internal disk. */
     for (uint32_t i = 0; i < embk_block_count() && g_embkfs_volume_count < EMBKFS_MAX_VOLUMES; i++) {
         struct embk_block_device *d = embk_block_get(i);
+        /* Skip a whole disk that carries a partition table: its filesystems live
+         * in its partitions (which are separate block devices, probed by their
+         * own name below). Probing the whole disk otherwise matches a partition's
+         * tail backup superblock at the wrong offset and -- worse -- self-heals a
+         * bogus "primary superblock" by WRITING over the MBR / boot code. */
+        if (embk_block_is_partitioned(d))
+            continue;
         struct embkfs_volume *slot = &g_embkfs_volumes[g_embkfs_volume_count];
         if (embkfs_mount(d, slot) != EMBK_OK)
             continue;
@@ -6779,6 +7524,48 @@ void embkfs_init(void)
     if (g_embkfs_volume_count == 0) {
         kprintf("EMBKFS: no volume found on any block device\n");
         return;
+    }
+
+    /* Root-follows-boot-device: promote the EMBKFS on the disk we actually
+     * booted from to slot 0 ("/"), rather than leaving root as whichever volume
+     * merely enumerated first (ATA/AHCI before USB). stage2 stashed the boot
+     * disk's MBR signature (bootinfo); match it against each volume's underlying
+     * disk. Silent no-op when the signature is unknown (the unpartitioned
+     * two-image IDE boot disk reports 0) or nothing matches -- the enumeration
+     * default (slot 0) then stands, so the existing single-disk path is
+     * unchanged. Preserves the "slot 0 == primary" invariant below by SWAPPING
+     * rather than repointing, so main.c's per-volume /sdX registration (which
+     * treats index 0 as embk_live) needs no change. */
+    uint32_t boot_sig;
+    if (g_embkfs_volume_count > 1 && bootinfo_boot_disk_sig(&boot_sig)) {
+        for (uint32_t i = 1; i < g_embkfs_volume_count; i++) {
+            struct embk_block_device *disk =
+                embk_partition_parent(g_embkfs_volumes[i].dev);
+            uint8_t mbr[512];
+            if (!disk || embk_block_read(disk, 0, 1, mbr) != EMBK_OK)
+                continue;
+            uint32_t sig =  (uint32_t)mbr[0x1B8]
+                         | ((uint32_t)mbr[0x1B9] << 8)
+                         | ((uint32_t)mbr[0x1BA] << 16)
+                         | ((uint32_t)mbr[0x1BB] << 24);
+            if (sig != boot_sig)
+                continue;
+            /* Every pointer in the struct targets the heap (bitmap / free_ext /
+             * rcache bufs), never the struct itself, so a byte move keeps them
+             * valid; nothing outside holds a &volume yet (vfs registration runs
+             * later, off embkfs_live_volume()). Heap temp -- the struct is
+             * multi-KB, too big for the kernel stack. */
+            struct embkfs_volume *tmp = kmalloc(sizeof *tmp);
+            if (tmp) {
+                *tmp                 = g_embkfs_volumes[0];
+                g_embkfs_volumes[0]  = g_embkfs_volumes[i];
+                g_embkfs_volumes[i]  = *tmp;
+                kfree(tmp);
+                kprintf("EMBKFS: boot-device match -- %s promoted to primary (/)\n",
+                        g_embkfs_volumes[0].dev->name);
+            }
+            break;
+        }
     }
 
     g_embkfs_live = &g_embkfs_volumes[0];
@@ -7127,3 +7914,147 @@ int embkfs_run_boot_diagnostics(void)
     embkfs_path_norm_smoke(vol);
     return EMBK_OK;
 }
+
+
+/* ---- Locked public entry points -------------------------------------------
+ * Each of these is reachable DIRECTLY from the kernel console, bypassing the
+ * VFS bridge that used to be the only place the big lock was taken. Taking it
+ * here is what closes that gap. The lock is recursive by owner thread, so an
+ * _impl that calls another public entry point underneath costs a depth++ and
+ * nothing else. */
+int embkfs_run_path_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_path_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_allocator_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_allocator_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_tree_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_tree_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_object_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_object_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_shrink_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_shrink_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_timestamp_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_timestamp_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_multivol_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_multivol_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_compress_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_compress_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_selfheal_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_selfheal_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_snapshot_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_snapshot_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_snapreg_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_snapreg_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_provenance_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_provenance_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_verifyboot_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_verifyboot_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_run_namespace_selftests(void)
+{
+    embkfs_lock();
+    int rc = embkfs_run_namespace_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_snapshot_create(struct embkfs_volume *vol, const char *name)
+{
+    embkfs_lock();
+    int rc = embkfs_snapshot_create_impl(vol, name);
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_snapshot_delete(struct embkfs_volume *vol, const char *name)
+{
+    embkfs_lock();
+    int rc = embkfs_snapshot_delete_impl(vol, name);
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_snapshot_rollback(struct embkfs_volume *vol, const char *name)
+{
+    embkfs_lock();
+    int rc = embkfs_snapshot_rollback_impl(vol, name);
+    embkfs_unlock();
+    return rc;
+}
+

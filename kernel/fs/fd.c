@@ -9,6 +9,7 @@
 #include "drivers/input/keyboard.h"   /* console fd read: keyboard_getchar_blocking/has_char */
 #include "drivers/video/console.h"    /* console fd write: console_putchar */
 #include "ipc/pipe.h"                 /* pipe fd backing: pipe_read/write + ref/unref */
+#include "net/net.h"                  /* socket fd backing: net_tcp_recv/send/close/abort */
 #include "kworker/kworker.h"          /* vnode close_locked: defer obj_put off the lock */
 #include "include/types.h"
 #include <stdint.h>
@@ -941,6 +942,178 @@ int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int s
     return EMBK_OK;
 }
 
+
+/* ---- FD_BACKING_SOCKET: a TCP connection as a read/write fd (M4) --------- */
+static int sock_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
+    if (e->u.sock.conn < 0) return -EMBK_EINVAL;      /* not connected */
+    int n = net_tcp_recv(e->u.sock.conn, buf, (uint32_t)len);
+    if (n < 0) return -EMBK_EIO;
+    *out = (size_t)n;                                 /* 0 = peer FIN / EOF */
+    return EMBK_OK;
+}
+static int sock_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
+    if (e->u.sock.conn < 0) return -EMBK_EINVAL;
+    int n = net_tcp_send(e->u.sock.conn, buf, (uint32_t)len);
+    if (n < 0) return -EMBK_EIO;
+    *out = (size_t)n;
+    return EMBK_OK;
+}
+static int sock_fd_seek(struct fd_entry *e, int64_t d, int w, uint64_t *out) {
+    (void)e;(void)d;(void)w;(void)out; return -EMBK_ESPIPE;
+}
+static int sock_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
+    (void)e; out->size = 0; out->type = VFS_DT_FIFO;  /* not a tty; isatty(fd) == false */
+    return EMBK_OK;
+}
+static int sock_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
+    /* A socket is not passed to children in M4; if one ever lands in inherited
+     * stdio, a struct copy is safe only because net_tcp_close/abort are
+     * idempotent (a second close on a freed conn is a no-op). */
+    *dst = *src;
+    return EMBK_OK;
+}
+static void sock_fd_close(struct fd_entry *e) {
+    if (e->u.sock.conn >= 0) net_tcp_close(e->u.sock.conn);   /* graceful FIN (may poll) */
+}
+static void sock_fd_close_locked(struct fd_entry *e) {
+    /* Reap path, under g_sched_lock: the graceful close polls+schedules and must
+     * NOT run here, so drop the connection without blocking. */
+    if (e->u.sock.conn >= 0) net_tcp_abort(e->u.sock.conn);
+}
+
+static const struct fd_ops sock_fd_ops = {
+    .read = sock_fd_read, .write = sock_fd_write, .seek = sock_fd_seek,
+    .fstat = sock_fd_fstat, .inherit = sock_fd_inherit,
+    .close = sock_fd_close, .close_locked = sock_fd_close_locked,
+    .avail = NULL,
+};
+
+int fd_alloc_socket(struct process *p) {
+    if (!p) return -EMBK_EINVAL;
+    struct fd_entry *fds = p->fds;
+    fdlock(p);
+    int fd = -1;
+    for (int i = 0; i < FD_MAX_OPEN; i++)
+        if (!fds[i].used) { fd = i + FD_BASE; break; }
+    if (fd < 0) { fdunlock(p); return -EMBK_EMFILE; }
+    struct fd_entry *e = &fds[fd - FD_BASE];
+    memset(e, 0, sizeof(*e));
+    e->used = true;
+    e->backing = FD_BACKING_SOCKET;
+    e->ops = &sock_fd_ops;
+    e->flags = O_RDWR;
+    e->u.sock.conn = -1;                              /* unconnected until connect() */
+    fdunlock(p);
+    return fd;
+}
+
+int fd_socket_connect(struct process *p, int fd, uint32_t ip_host, uint16_t port) {
+    if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry *e = &p->fds[fd - FD_BASE];
+    if (!e->used || e->backing != FD_BACKING_SOCKET) return -EMBK_EBADF;
+    if (e->u.sock.conn >= 0) return -EMBK_EINVAL;     /* already connected */
+    /* net_tcp_connect blocks (polls) -- do NOT hold fdlock across it. */
+    int conn = net_tcp_connect(ip_host, port);
+    if (conn < 0) return -EMBK_ECONNREFUSED;
+    e->u.sock.conn = conn;
+    return EMBK_OK;
+}
+
+int fd_socket_bind(struct process *p, int fd, uint16_t port) {
+    if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry *e = &p->fds[fd - FD_BASE];
+    if (!e->used) return -EMBK_EBADF;
+    if (e->backing == FD_BACKING_SOCKET) { e->u.sock.bind_port = port; return EMBK_OK; }
+    if (e->backing == FD_BACKING_UDP)
+        return net_udp_bind(e->u.udp.us, port) == 0 ? EMBK_OK : -EMBK_EINVAL;
+    return -EMBK_EBADF;
+}
+
+/* ---- FD_BACKING_UDP: a UDP datagram socket (M5) ------------------------- */
+static int udp_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
+    int n = net_udp_recvfrom(e->u.udp.us, buf, (uint32_t)len, 0, 0);   /* recv, drop the addr */
+    if (n < 0) return -EMBK_EIO;
+    *out = (size_t)n;
+    return EMBK_OK;
+}
+static int udp_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
+    (void)e; (void)buf; (void)len; (void)out;
+    return -EMBK_EINVAL;                        /* connectionless: use sendto */
+}
+static int udp_fd_seek(struct fd_entry *e, int64_t d, int w, uint64_t *o) {
+    (void)e;(void)d;(void)w;(void)o; return -EMBK_ESPIPE;
+}
+static int udp_fd_fstat(struct fd_entry *e, struct vfs_stat *o) {
+    (void)e; o->size = 0; o->type = VFS_DT_FIFO; return EMBK_OK;
+}
+static int udp_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) { *dst = *src; return EMBK_OK; }
+static void udp_fd_close(struct fd_entry *e) { net_udp_close(e->u.udp.us); }
+static void udp_fd_close_locked(struct fd_entry *e) { net_udp_abort(e->u.udp.us); }
+
+static const struct fd_ops udp_fd_ops = {
+    .read = udp_fd_read, .write = udp_fd_write, .seek = udp_fd_seek, .fstat = udp_fd_fstat,
+    .inherit = udp_fd_inherit, .close = udp_fd_close, .close_locked = udp_fd_close_locked, .avail = NULL,
+};
+
+int fd_alloc_udp(struct process *p) {
+    if (!p) return -EMBK_EINVAL;
+    int us = net_udp_open();
+    if (us < 0) return -EMBK_EMFILE;
+    struct fd_entry *fds = p->fds;
+    fdlock(p);
+    int fd = -1;
+    for (int i = 0; i < FD_MAX_OPEN; i++) if (!fds[i].used) { fd = i + FD_BASE; break; }
+    if (fd < 0) { fdunlock(p); net_udp_abort(us); return -EMBK_EMFILE; }
+    struct fd_entry *e = &fds[fd - FD_BASE];
+    memset(e, 0, sizeof(*e));
+    e->used = true; e->backing = FD_BACKING_UDP; e->ops = &udp_fd_ops; e->flags = O_RDWR;
+    e->u.udp.us = us;
+    fdunlock(p);
+    return fd;
+}
+
+/* Kernel-buffer sendto/recvfrom; the syscall bounces user memory in/out. */
+int fd_udp_sendto(struct process *p, int fd, uint32_t ip_host, uint16_t port,
+                  const void *data, uint32_t len) {
+    if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry *e = &p->fds[fd - FD_BASE];
+    if (!e->used || e->backing != FD_BACKING_UDP) return -EMBK_EBADF;
+    int n = net_udp_sendto(e->u.udp.us, ip_host, port, data, len);
+    return n < 0 ? -EMBK_EIO : n;
+}
+
+int fd_udp_recvfrom(struct process *p, int fd, void *buf, uint32_t cap,
+                    uint32_t *src_ip, uint16_t *src_port) {
+    if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry *e = &p->fds[fd - FD_BASE];
+    if (!e->used || e->backing != FD_BACKING_UDP) return -EMBK_EBADF;
+    int n = net_udp_recvfrom(e->u.udp.us, buf, cap, src_ip, src_port);
+    return n < 0 ? -EMBK_EIO : n;
+}
+
+int fd_socket_listen(struct process *p, int fd) {
+    if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry *e = &p->fds[fd - FD_BASE];
+    if (!e->used || e->backing != FD_BACKING_SOCKET) return -EMBK_EBADF;
+    if (e->u.sock.bind_port == 0) return -EMBK_EINVAL;      /* bind() first */
+    int lc = net_tcp_listen(e->u.sock.bind_port);
+    if (lc < 0) return -EMBK_EMFILE;
+    e->u.sock.conn = lc;                                    /* fd now backs the listener */
+    return EMBK_OK;
+}
+
+int fd_socket_accept(struct process *p, int fd) {
+    if (!p || fd < FD_BASE || fd >= FD_BASE + FD_MAX_OPEN) return -EMBK_EBADF;
+    struct fd_entry *le = &p->fds[fd - FD_BASE];
+    if (!le->used || le->backing != FD_BACKING_SOCKET || le->u.sock.conn < 0) return -EMBK_EBADF;
+    /* net_tcp_accept blocks (polls) -- do NOT hold fdlock across it. */
+    int child = net_tcp_accept(le->u.sock.conn);
+    if (child < 0) return -EMBK_EIO;
+    int nfd = fd_alloc_socket(p);                          /* a fresh fd for the connection */
+    if (nfd < 0) { net_tcp_abort(child); return nfd; }
+    p->fds[nfd - FD_BASE].u.sock.conn = child;
+    return nfd;
+}
 
 int vfs_fd_run_selftests(void)
 {
