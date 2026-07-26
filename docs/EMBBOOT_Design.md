@@ -290,6 +290,62 @@ Each phase is independently useful and verifiable under OVMF (`make run-uefi`):
 - **We do not own the UEFI Secure Boot key hierarchy** (`db`/`KEK`/`PK`); our
   verification is a layer on top, not a replacement for it.
 
+## 11. Firmware backends (BIOS + UEFI), GRUB-style
+
+GRUB is not a UEFI program — it's a firmware-agnostic boot manager with a
+platform-independent **core** (menu, config language, filesystem/disk drivers,
+commands) sitting on a thin per-platform **backend** (`i386-pc` for BIOS,
+`x86_64-efi` for UEFI, plus coreboot, OpenFirmware, …). One `grub.cfg` drives
+them all. EmbBoot can follow the same shape, and we're already halfway there.
+
+**The split we want:**
+
+```
+        EmbBoot CORE  (firmware-independent):
+        menu · embboot.cfg · .embfw parse · verify · fill boot_protocol
+                 ╱                                              ╲
+   BIOS backend (stage2 grown up):              UEFI backend (our .efi):
+   NO firmware services after boot -->          Boot Services available -->
+   carries its OWN EMBKFS/disk reader,          leans on SimpleFileSystem,
+   its own VBE modeset, its own memory          GetMemoryMap, GOP. Already
+   map (e820). More machinery.                  built (boot/uefi/).
+```
+
+**What's already shared — the handoff.** `boot_protocol` is *the* unifying
+contract, and both backends already fill it: `stage2.asm` (BIOS) and
+`boot/uefi/loader.c` (UEFI) hand the kernel the identical struct. So the hardest
+part of GRUB-style unification — "one handoff regardless of firmware" — is done.
+The `.embfw` / menu / verify core would fill the *same* struct from either side.
+
+**The asymmetry to respect (same one GRUB has).** After BIOS hands off there are
+no firmware services: to read `.embfw` files *from a filesystem* the BIOS backend
+must carry its own EMBKFS + partition reader in the boot environment. Today
+`stage2` sidesteps this by reading the kernel from a fixed raw LBA — fine for one
+kernel, not enough for a file-driven menu. GRUB solves it with `stage1.5` (just
+enough filesystem code to load the full core off a real filesystem). The
+kernel-side EMBKFS reader exists but is 64-bit kernel code, not usable in the
+16/32-bit boot environment, so the BIOS backend needs its own port — the real
+cost of a BIOS EmbBoot.
+
+**Two ways to pay that cost (a decision for later):**
+- **(a) Port a minimal EMBKFS reader into the BIOS backend** — true GRUB
+  `stage1.5` style. Most work, fully self-contained, boots the menu in real/
+  protected mode.
+- **(b) Chainload a 64-bit EmbBoot core** — `stage2` loads a small long-mode
+  "EmbBoot core" payload (which *does* have full drivers) that presents the menu
+  and then loads the chosen `.embfw`. Less duplicated driver code (reuse the
+  64-bit EMBKFS reader), at the cost of a two-stage BIOS boot. Likely the better
+  trade for us, since we already own a 64-bit EMBKFS reader.
+
+**Honest scoping.** The UEFI backend is the pragmatic first (and maybe only)
+target: real hardware is nearly all UEFI now, and vendors are removing BIOS/CSM.
+So **a BIOS EmbBoot backend is optional and deferred** — worth designing the core
+firmware-agnostic *now* (so it can slot in), but not worth building until BIOS
+boot is a goal in its own right. Until then, BIOS keeps its current direct
+`stage1`/`stage2` → kernel path (no menu), and UEFI gets the full EmbBoot. The
+`boot_protocol` foundation means adopting the BIOS backend later costs nothing
+already shipped.
+
 ---
 
 *Next concrete step when we start: M1 — the menu skeleton over the existing
