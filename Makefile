@@ -1276,6 +1276,25 @@ run-uefi: uefi.img embkfs.img
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
 
+# UEFI copy-on-write: the exact twin of run-embkfs-cow but booted via OVMF + our
+# EFI loader instead of the BIOS boot disk. Boots a PRISTINE copy of the EMBKFS
+# each run (writes hit the scratch, never the master), same interactive display
+# (virtio-vga at XRES/YRES, usb-tablet), then grades the post-run image. Use it
+# the way you use `make run-embkfs-cow`:  make run-uefi-cow XRES=1920 YRES=1080
+run-uefi-cow: uefi.img $(EMBKFS_MASTER)
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)
+	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
+	qemu-system-x86_64 \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
+	    -drive format=raw,file=uefi.img,if=ide,index=0 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
+	    -usb -device usb-tablet \
+	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
+	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi $(NET)
+	@echo "--- grading the post-COW image ---"
+	python3 tools/embkfs_mkfs/verify_embkfs.py $(EMBKFS_SCRATCH)
+
 # Two independent EMBKFS volumes mounted at once (sdb -> "/", sdc -> "/sdc"),
 # both on plain IDE -- exercises embkfs_init()'s multi-volume mount table
 # without needing USB. Pair with `test embkfs multivol` at the shell.
