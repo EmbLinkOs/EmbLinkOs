@@ -37,6 +37,17 @@ from-scratch TCP/IP stack (virtio-net → Ethernet/ARP/IPv4/ICMP/UDP/DHCP/DNS/TC
 lets `wget` resolve a host and download a real file off the internet to disk.
 See [docs/PORTS.md](docs/PORTS.md).
 
+**It boots on both firmwares, from its own loaders — and from a USB stick.**
+BIOS boots the two-stage `stage1`/`stage2`; UEFI boots a **from-scratch EFI
+application** (`boot/uefi/`, no GNU-EFI, built with the same owned toolchain) all
+the way to the desktop under OVMF. Both hand the kernel the *same*
+firmware-agnostic **boot protocol** (one struct passed in `RDI`), so one kernel
+runs under either. And it's no longer HDD-only: one partitioned image carries the
+kernel plus its EMBKFS root, so `dd`-ing it to a USB stick (or a disk) boots the
+whole system from that one device. On the UEFI side this is growing into
+**EmbBoot**, a menu-driven boot manager — see
+[docs/EMBBOOT_Design.md](docs/EMBBOOT_Design.md).
+
 ## What it is
 
 EmbLinkOS starts from a 512-byte boot sector and works its way up: real mode
@@ -55,7 +66,12 @@ executable format (EMBX) — which it uses to rebuild its userland on itself.
 
 **Boot & core**
 - Custom two-stage BIOS bootloader (E820 memory map, A20, protected → long
-  mode, ELF kernel loader).
+  mode, ELF kernel loader) **and** a from-scratch UEFI loader (`boot/uefi/`,
+  own PE32+ EFI app: GOP, GetMemoryMap, page tables, ExitBootServices).
+- One firmware-agnostic **boot protocol** both loaders fill (`RDI`), so a single
+  kernel boots BIOS or UEFI; ACPI RSDP handed over via the EFI config table.
+- Boots from **one partitioned medium** (kernel + EMBKFS root) — a USB stick or a
+  disk — not just two IDE drives. `EmbBoot` menu on the UEFI side (M1).
 - Higher-half kernel, linker-script physical/virtual split.
 - Full IDT/ISR exception handling; APIC (Local APIC + IO-APIC), SMP bring-up
   across all detected cores via ACPI/MADT.
