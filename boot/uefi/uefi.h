@@ -74,15 +74,58 @@ typedef struct {
 
 typedef enum { AllocateAnyPages, AllocateMaxAddress, AllocateAddress } EFI_ALLOCATE_TYPE;
 
-/* ---- Simple Text Output (early milestone prints) ------------------------- */
+/* ---- Simple Text Output -------------------------------------------------- */
 struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL;
 typedef EFI_STATUS (EFIAPI *EFI_TEXT_STRING)(
     struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, CHAR16 *String);
+typedef EFI_STATUS (EFIAPI *EFI_TEXT_CLEAR_SCREEN)(
+    struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This);
+typedef EFI_STATUS (EFIAPI *EFI_TEXT_SET_ATTRIBUTE)(
+    struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Attribute);
+typedef EFI_STATUS (EFIAPI *EFI_TEXT_SET_CURSOR)(
+    struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This, UINTN Col, UINTN Row);
 typedef struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
-    void            *Reset;
-    EFI_TEXT_STRING  OutputString;
+    void                   *Reset;
+    EFI_TEXT_STRING         OutputString;
+    void                   *TestString;
+    void                   *QueryMode;
+    void                   *SetMode;
+    EFI_TEXT_SET_ATTRIBUTE  SetAttribute;
+    EFI_TEXT_CLEAR_SCREEN   ClearScreen;
+    EFI_TEXT_SET_CURSOR     SetCursorPosition;
     /* ... rest unused ... */
 } EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL;
+
+/* EFI text attributes (foreground | background<<4) for SetAttribute. */
+#define EFI_LIGHTGRAY  0x07
+#define EFI_DARKGRAY   0x08
+#define EFI_WHITE      0x0F
+#define EFI_BLACK      0x00
+#define EFI_CYAN       0x03
+#define EFI_YELLOW     0x0E
+#define EFI_BG(bg)     ((bg) << 4)
+
+/* ---- Simple Text Input (keyboard) ---------------------------------------- */
+typedef struct { uint16_t ScanCode; CHAR16 UnicodeChar; } EFI_INPUT_KEY;
+
+/* ScanCode values we act on. */
+#define SCAN_UP    0x01
+#define SCAN_DOWN  0x02
+#define SCAN_ESC   0x17
+#define CHAR_CR    0x000D   /* Enter (UnicodeChar) */
+
+struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_RESET)(
+    struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, BOOLEAN ExtendedVerification);
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_READ_KEY)(
+    struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key);
+typedef struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
+    EFI_INPUT_RESET    Reset;
+    EFI_INPUT_READ_KEY ReadKeyStroke;   /* returns EFI_NOT_READY when no key */
+    void              *WaitForKey;
+} EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
+
+#define EFI_NOT_READY  (EFI_ERROR_BIT | 6)
 
 /* ---- Graphics Output Protocol ------------------------------------------- */
 typedef enum {
@@ -130,6 +173,7 @@ typedef EFI_STATUS (EFIAPI *EFI_EXIT_BOOT_SERVICES)(
     EFI_HANDLE ImageHandle, UINTN MapKey);
 typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(
     EFI_GUID *Protocol, void *Registration, void **Interface);
+typedef EFI_STATUS (EFIAPI *EFI_STALL)(UINTN Microseconds);
 
 typedef struct {
     EFI_TABLE_HEADER   Hdr;
@@ -161,7 +205,7 @@ typedef struct {
     void              *UnloadImage;
     EFI_EXIT_BOOT_SERVICES ExitBootServices;
     void              *GetNextMonotonicCount;
-    void              *Stall;
+    EFI_STALL          Stall;
     void              *SetWatchdogTimer;
     void              *ConnectController;
     void              *DisconnectController;
@@ -179,7 +223,7 @@ typedef struct {
     CHAR16                          *FirmwareVendor;
     uint32_t                         FirmwareRevision;
     EFI_HANDLE                       ConsoleInHandle;
-    void                            *ConIn;
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL  *ConIn;
     EFI_HANDLE                       ConsoleOutHandle;
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
     EFI_HANDLE                       StandardErrorHandle;

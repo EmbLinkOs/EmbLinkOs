@@ -13,6 +13,8 @@
  * map higher-half -> phys 0, exactly like stage2 does.
  */
 #include "uefi.h"
+#include "console.h"
+#include "menu.h"
 
 /* ---- boot_protocol ABI (mirrors kernel/arch/x86_64/boot/boot_protocol.h;
  *      that header's _Static_asserts are the master copy -- keep in sync). --- */
@@ -96,27 +98,8 @@ static void mini_memset(void *d, int c, uint64_t n) {
     while (n--) *dp++ = (uint8_t)c;
 }
 
-static EFI_SYSTEM_TABLE *ST;
-
-static void print(const char *s) {
-    CHAR16 buf[128]; unsigned i = 0;
-    while (*s && i < 126) {
-        if (*s == '\n') buf[i++] = '\r';
-        buf[i++] = (CHAR16)(uint8_t)*s++;
-    }
-    buf[i] = 0;
-    ST->ConOut->OutputString(ST->ConOut, buf);
-}
-static void printhex(uint64_t v) {
-    static const char hx[] = "0123456789ABCDEF";
-    char s[19]; s[0] = '0'; s[1] = 'x';
-    for (int i = 0; i < 16; i++) s[2 + i] = hx[(v >> ((15 - i) * 4)) & 0xF];
-    s[18] = 0; print(s);
-}
-static void die(const char *why) {
-    print("\nUEFI loader FATAL: "); print(why); print("\n");
-    for (;;) __asm__ volatile ("cli; hlt");
-}
+/* Console I/O (con_print/con_printhex/con_die) + ST live in console.c now, so
+ * the menu and the loader share one implementation. */
 
 /* Map a firmware memory type to our e820-style numbering. Anything the loader
  * itself allocated is EfiLoaderData, which we mark RESERVED so the kernel's PMM
@@ -138,7 +121,7 @@ static EFI_PHYSICAL_ADDRESS alloc_pages(EFI_ALLOCATE_TYPE how,
                                         const char *what) {
     EFI_PHYSICAL_ADDRESS m = at;
     EFI_STATUS s = ST->BootServices->AllocatePages(how, EfiLoaderData, pages, &m);
-    if (EFI_ERROR(s)) { print(what); die("AllocatePages failed"); }
+    if (EFI_ERROR(s)) { con_print(what); con_die("AllocatePages failed"); }
     return m;
 }
 
@@ -185,7 +168,7 @@ static uint64_t load_kernel(void) {
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)kernel_elf_start;
     if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
         eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F')
-        die("embedded kernel is not ELF");
+        con_die("embedded kernel is not ELF");
 
     const Elf64_Phdr *ph = (const Elf64_Phdr *)(kernel_elf_start + eh->e_phoff);
 
@@ -197,7 +180,7 @@ static uint64_t load_kernel(void) {
         if (p < lo) lo = p;
         if (p + ph[i].p_memsz > hi) hi = p + ph[i].p_memsz;
     }
-    if (hi == 0) die("kernel has no PT_LOAD segments");
+    if (hi == 0) con_die("kernel has no PT_LOAD segments");
 
     uint64_t base  = lo & ~0xFFFULL;
     uint64_t pages = (hi - base + 0xFFF) / 0x1000;
@@ -241,7 +224,7 @@ static void fill_framebuffer(struct boot_protocol *bp) {
     EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
     EFI_STATUS s = ST->BootServices->LocateProtocol(&gop_guid, 0, (void **)&gop);
-    if (EFI_ERROR(s) || !gop) { print("  (no GOP; fb left 0)\n"); return; }
+    if (EFI_ERROR(s) || !gop) { con_print("  (no GOP; fb left 0)\n"); return; }
 
     EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi = gop->Mode->Info;
     bp->fb_addr   = gop->Mode->FrameBufferBase;
@@ -270,12 +253,12 @@ static void finalize_and_handoff(struct boot_protocol *bp,
     BS->GetMemoryMap(&map_size, map, &map_key, &desc_size, &desc_ver);
     map_size += 8 * desc_size;
     if (EFI_ERROR(BS->AllocatePool(EfiLoaderData, map_size, (void **)&map)))
-        die("AllocatePool for memory map");
+        con_die("AllocatePool for memory map");
 
     for (;;) {
         EFI_STATUS s = BS->GetMemoryMap(&map_size, map, &map_key,
                                         &desc_size, &desc_ver);
-        if (EFI_ERROR(s)) die("GetMemoryMap");
+        if (EFI_ERROR(s)) con_die("GetMemoryMap");
 
         /* translate -> boot_mmap_entry (coalescing not needed; kernel handles
          * a sparse map). NO firmware allocation happens past this point. */
@@ -307,9 +290,12 @@ static void finalize_and_handoff(struct boot_protocol *bp,
     __builtin_unreachable();
 }
 
-EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
-    ST = st;
-    print("\nEmbLink UEFI loader\n");
+/* Boot EmbLinkOS: the OS-handoff backend. Loads the (embedded, for M1) kernel,
+ * builds the boot_protocol + page tables, ExitBootServices, and jumps. Never
+ * returns. This is the machinery the "Boot EmbLinkOS" and (later) "Recovery"
+ * menu entries invoke; the menu itself lives in menu.c. */
+void boot_emblinkos(EFI_HANDLE image) {
+    con_print("\nBooting EmbLinkOS...\n");
 
     /* Structures the kernel reads via KP2V must live below 1GB (the extent of
      * the higher-half window we map). One page for the protocol, the rest for
@@ -330,22 +316,41 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     bp->boot_drive    = 0xFF;   /* n/a under UEFI */
     bp->acpi_rsdp     = find_acpi_rsdp();
 
-    print("locating GOP...\n");
+    con_print("locating GOP...\n");
     fill_framebuffer(bp);
-    print("  fb "); printhex(bp->fb_addr);
-    print(" "); printhex(bp->fb_width); print("x"); printhex(bp->fb_height); print("\n");
+    con_print("  fb "); con_printhex(bp->fb_addr);
+    con_print(" "); con_printhex(bp->fb_width); con_print("x"); con_printhex(bp->fb_height); con_print("\n");
 
-    print("loading kernel...\n");
+    con_print("loading kernel...\n");
     uint64_t entry = load_kernel();
-    print("  entry "); printhex(entry); print("\n");
+    con_print("  entry "); con_printhex(entry); con_print("\n");
 
-    print("building page tables...\n");
+    con_print("building page tables...\n");
     uint64_t pml4 = build_page_tables();
 
     /* magic LAST so a torn record fails the kernel's check instead of half-passing */
     bp->magic = BOOT_PROTOCOL_MAGIC;
 
-    print("exiting boot services + jumping to kernel...\n");
+    con_print("exiting boot services + jumping to kernel...\n");
     finalize_and_handoff(bp, mmap, mmap_cap, pml4, entry, (uint64_t)bp, image);
-    return EFI_SUCCESS;   /* unreachable */
+    __builtin_unreachable();
+}
+
+/* ---- EmbBoot entry point: run the menu, dispatch the choice ---------------- */
+EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
+    con_init(st);
+
+    for (;;) {
+        int choice = menu_run();          /* draws the menu, returns an entry id */
+        switch (choice) {
+        case MENU_BOOT_EMBLINKOS:
+            boot_emblinkos(image);        /* never returns */
+            break;
+        default:
+            /* Recovery / Diagnostics / Firmware Update / Boot Manager / Secure
+             * Boot Verification are not built yet -- menu.c shows "(soon)" and
+             * returns here, so we simply re-draw the menu. */
+            break;
+        }
+    }
 }

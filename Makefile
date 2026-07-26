@@ -1245,16 +1245,24 @@ OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
 build/uefi_crt0.o: boot/uefi/crt0.S | $(BUILD)
 	$(CC) -c $< -o $@
 
-build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h | $(BUILD)
+build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h boot/uefi/console.h boot/uefi/menu.h | $(BUILD)
+	$(CC) $(UEFI_CFLAGS) $< -o $@
+
+build/uefi_console.o: boot/uefi/console.c boot/uefi/console.h boot/uefi/uefi.h | $(BUILD)
+	$(CC) $(UEFI_CFLAGS) $< -o $@
+
+build/uefi_menu.o: boot/uefi/menu.c boot/uefi/menu.h boot/uefi/console.h boot/uefi/uefi.h | $(BUILD)
 	$(CC) $(UEFI_CFLAGS) $< -o $@
 
 # Embeds the current kernel; depends on it so a kernel change rebuilds the .efi.
 build/uefi_kernel_blob.o: boot/uefi/kernel_blob.S $(KERNEL_BIN) | $(BUILD)
 	$(CC) -DKERNEL_BLOB_PATH='"$(KERNEL_BIN)"' -c $< -o $@
 
-build/uefi_loader.so: build/uefi_crt0.o build/uefi_loader.o build/uefi_kernel_blob.o boot/uefi/efi.lds
-	$(CC) -nostdlib -shared -Bsymbolic -T boot/uefi/efi.lds \
-	    build/uefi_crt0.o build/uefi_loader.o build/uefi_kernel_blob.o -o $@
+UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
+            build/uefi_menu.o build/uefi_kernel_blob.o
+
+build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds
+	$(CC) -nostdlib -shared -Bsymbolic -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
 
 # ELF -> PE32+ EFI application. The efi-app-x86_64 pseudo-target sets the EFI
 # subsystem and PE layout correctly. Host objcopy: the cross one lacks pei.
