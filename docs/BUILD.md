@@ -267,14 +267,23 @@ output: /data/build/out/kernel/mm_pmm.o
 ### 12.3 The gaps, ranked (each a real dependency)
 
 - **G1 — an on-OS assembler for the 6 kernel `.asm` (and stage1/stage2). THE
-  blocker.** They are **NASM syntax**; TCC's integrated assembler is GAS/AT&T, so
-  nothing on the image assembles them today. EmbCC's inline-asm encoder (K1)
-  already knows the instruction *encodings* but not a standalone NASM front-end.
-  Options: **(a)** port `nasm` (one self-contained binary — the TCC/git/python
-  porting lane applies, no fork/exec needed); **(b)** grow EmbLD/EmbCC a standalone
-  assembler (`embas`) reusing the K1 encoder + a small NASM-subset parser; **(c)**
-  a purpose-built micro-assembler for just these 6 short files. (a) is the most
-  in-spirit and reusable; (b) keeps it inside the owned toolchain.
+  blocker — RECOMMENDATION: grow EmbCC into a standalone assembler.** They are
+  **NASM syntax**; TCC's integrated assembler is GAS/AT&T, so nothing on the image
+  assembles them today. The corpus is *small and bounded* — **621 lines, 11
+  directives** (`global`/`extern`, `section`, `align`, `db/dw/dd/dq/resb`,
+  `%macro`, `incbin`) and **~23 mnemonics**, most of which EmbCC's K1 inline-asm
+  encoder already emits (`cli`,`hlt`,`mov crN`,`rdmsr`,`wrmsr`,`pushfq`,`popfq`,
+  `iretq`,`lgdt`,`push`/`pop`); the new ones are ordinary (`add`,`or`,`xor`,
+  `test`,`jmp`,`jnz`,`call`,`ret`,`lea`,`fxsave`,`fxrstor`). So the right move is
+  **not** porting nasm but growing EmbCC a standalone assembler front-end over the
+  encoder it already has — EmbCC becomes compiler+assembler (like TCC is
+  compiler+assembler+linker in one), fully owned, and the kernel `.asm` stay
+  untouched (EmbCC learns their syntax). The work: (1) add ~10 mnemonics to the
+  K1 encoder; (2) an **Intel-syntax** file front-end — instruction parser
+  (operand order / `[mem]` differ from EmbCC's AT&T inline asm), a label/symbol
+  table, the ~8 directives, one `%macro` expander (the `isr0..255` stub), `incbin`
+  (`ap_trampoline_blob`), and ELF-object emission with relocations. *(Porting nasm
+  stays the fallback; the micro-assembler option collapses into this one.)*
 - **G2 — EmbLD `kernel_end`.** The link's one open item (EmbCC `docs/todo.md` L1):
   minimal `-T`/`SYM = .` support so `kernel_end` is defined at the image end,
   instead of the diagnostic stub used to prove the boot.
