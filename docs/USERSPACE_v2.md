@@ -180,8 +180,21 @@ Every existing app assumes the global `/` (home reads `/font.ttf`, spawns
   The absence property is now live per-process. What remains (UP4) is apps
   *declaring* their needed prefixes in the EMBX manifest so the session grants
   exactly that.
-- **UP3 — multi-user.** `/users/<name>`, the session/login manager, per-user
-  namespace + cap profiles. Two users provably can't name each other's files.
+- **UP3 — multi-user. ✅ SHIPPED (2026-07-28).** A "user" is a home subtree plus a
+  session namespace — no uid/gid. Homes live at `/data/users/<name>`, each with a
+  **session profile** `/data/users/<name>/user.ns` (the same manifest format as the
+  app manifests). init is now the **session manager**: it reads the default user's
+  profile (`load_user_profile`) and launches the desktop confined to that session's
+  namespace (with a full-inherit fallback so pid-1's one job never fails to bring up
+  a desktop). Shipped `teo` (the owner — `rw /`, `ro /system`, `rw /run`, mirroring
+  the global seed so the live desktop is unchanged) and `guest` (`ro /system`,
+  `ro /data/apps`, `rw /data/users/guest` — confined). Proven live by
+  `mu_isolation_test` (in `test ring3 threads`): a confined guest session writes its
+  own home but **cannot name `/data/users/teo`** — which exists on disk, so this is
+  structural absence, not a permission check. Two users provably can't name each
+  other's files. *(Live per-user login/session switching + confining the desktop
+  to a non-owner user is UP3b — needs the apps' broad grants tightened to the
+  user's home.)*
 - **UP4 — declared namespaces. ✅ SHIPPED (2026-07-28).** An app *ships* its
   declared namespace as a per-app manifest (`user/bin/<name>.ns` →
   `/data/apps/<name>/<name>.ns`, lines of `<ro|rw> <prefix>`), and the session

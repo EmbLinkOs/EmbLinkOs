@@ -985,8 +985,24 @@ def discover_userland_objects(build_dir="build"):
 
     # Empty user/scratch directories the layout commits to now (D4 §5, D3 §4.1),
     # so a session can chdir into a home and tcc has a scratch dir to write to.
-    objects.append((b"data/tmp",        L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
-    objects.append((b"data/users/teo",  L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/tmp",          L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/teo",    L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/guest",  L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    # Per-user SESSION PROFILES (docs/USERSPACE_v2.md UP3). Multi-user here is
+    # namespace domains, not uid/gid: a "user" is a home subtree + a session
+    # namespace, declared in the SAME manifest format as the app manifests (UP4).
+    # init (the session manager) reads the default user's profile and launches
+    # the desktop confined to it. A session bound only to its own
+    # /data/users/<name> literally cannot NAME another user's home.
+    #   teo   -- the machine owner: the live desktop runs here. Broad (mirrors the
+    #            global seed: /, /run rw + /system ro) so the desktop is unchanged.
+    #   guest -- a confined session: read-only system + apps, and ONLY its own home.
+    objects.append((b"data/users/teo/user.ns",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"# teo -- the machine owner (the desktop session; broad but sealed)\n"
+                    b"rw /\nro /system\nrw /run\n"))
+    objects.append((b"data/users/guest/user.ns", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"# guest -- a confined session: system + apps read-only, own home only\n"
+                    b"ro /system\nro /data/apps\nrw /data/users/guest\n"))
     return objects
 
 

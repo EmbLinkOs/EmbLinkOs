@@ -158,6 +158,59 @@ static int ns_spawn_test(void)
     return 1;
 }
 
+/* The "mu-child" role of mu_isolation_test(): spawned as a confined GUEST
+ * session -- namespace {/system ro, /data/users/guest rw} -- exactly what a
+ * multi-user login hands a user (docs/USERSPACE_v2.md UP3). It proves the whole
+ * multi-user thesis: a user owns its home and CANNOT NAME another user's home,
+ * because that home was never bound -- absence, not a permission check. Exits 0
+ * iff every facet holds. */
+static void mu_child(void)
+{
+    /* a. own home is writable. */
+    long c = embk_open("/data/users/guest/mu.tmp",
+                       EMBK_O_CREAT | EMBK_O_WRONLY | EMBK_O_TRUNC, 0644);
+    if (c < 0) embk_exit(21);
+    embk_write((int)c, "mine", 4);
+    embk_close((int)c);
+
+    /* b. another user's home is UNNAMEABLE. /data/users/teo EXISTS on disk, but
+     *    this session was never granted it -- so it does not resolve at all. This
+     *    is the multi-user boundary: structural, not an access check. */
+    long o = embk_open("/data/users/teo", EMBK_O_RDONLY, 0);
+    if (o >= 0) { embk_close((int)o); embk_exit(22); }
+    long o2 = embk_open("/data/users/teo/user.ns", EMBK_O_RDONLY, 0);
+    if (o2 >= 0) { embk_close((int)o2); embk_exit(23); }
+
+    /* c. the shared, sealed OS is still readable. */
+    long s = embk_open("/system/bin/primtest.elf", EMBK_O_RDONLY, 0);
+    if (s < 0) embk_exit(24);
+    embk_close((int)s);
+
+    embk_exit(0);
+}
+
+/* Instantiate a confined GUEST session and let it prove multi-user isolation:
+ * it owns its home and cannot name another user's. This is exactly what the
+ * session manager (init) does per user, minus the desktop. */
+static int mu_isolation_test(void)
+{
+    char *argv[] = { "primtest", "mu-child", (char *)0 };
+
+    struct embk_spawn_file_action acts[2];
+    embk_action_ns_bind(&acts[0], "/system",            EMBK_NS_RO);
+    embk_action_ns_bind(&acts[1], "/data/users/guest",  EMBK_NS_RW);
+
+    long h = embk_spawn("/system/bin/primtest.elf", argv, acts, 2);
+    if (h < 0) { embk_puts(1, "mu_isolation_test: FAIL spawn()\n"); return 0; }
+    long code = embk_wait((int)h);
+    if (code != 0) {
+        embk_puts(1, "mu_isolation_test: FAIL guest named another user's home or lost its own\n");
+        return 0;
+    }
+    embk_puts(1, "mu_isolation_test: PASS\n");
+    return 1;
+}
+
 /* init.c is FREESTANDING: it defines its own _start (see the bottom of this
  * file) and links neither crt0.c nor newlib, so nothing else here defines
  * `environ` -- we own it. _start takes the vector the kernel delivers in RDX and
@@ -1066,6 +1119,7 @@ void _start(long argc, char **argv, char **envp)
     if (argc >= 2) {
         /* Reports back what environment (if any) the kernel delivered. */
         if (embk_streq(argv[1], "ns-child"))       ns_child();
+        if (embk_streq(argv[1], "mu-child"))       mu_child();
         if (embk_streq(argv[1], "env-child"))      env_child();
         if (embk_streq(argv[1], "cancel-child"))   cancel_child();
         if (embk_streq(argv[1], "ctrlc-child"))    ctrlc_child();
@@ -1110,6 +1164,7 @@ void _start(long argc, char **argv, char **envp)
     ok &= thread_test();
     ok &= spawn_test();
     ok &= ns_spawn_test();      /* per-process namespace grant (UP2b) */
+    ok &= mu_isolation_test();  /* multi-user = namespace domains (UP3) */
     ok &= env_spawn_test();
     ok &= cancel_test();
     ok &= sbrk_test();
