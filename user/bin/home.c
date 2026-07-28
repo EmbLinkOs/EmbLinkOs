@@ -68,14 +68,14 @@ static void home_ui(void) {
             }
             VStack(.spacing = 16, .align = Center) {
                 HStack(.spacing = 16) {
+                    tile("Files",    "/data/apps/files/files.elf");
+                    tile("Editor",   "/data/apps/edit/edit.elf");
+                    tile("Terminal", "/data/apps/term/term.elf");
+                }
+                HStack(.spacing = 16) {
                     tile("UI Demo",  "/data/apps/uidemo/uidemo.elf");
                     tile("Windows",  "/data/apps/wmdemo/wmdemo.elf");
                     tile("Menus",    "/data/apps/v6demo/v6demo.elf");
-                }
-                HStack(.spacing = 16) {
-                    tile("V4 Demo",  "/data/apps/v4demo/v4demo.elf");
-                    tile("Editor",   "/data/apps/v7demo/v7demo.elf");
-                    tile("Terminal", "/data/apps/term/term.elf");
                 }
             }
         }
