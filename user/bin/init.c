@@ -43,9 +43,28 @@ static char *put_dec(char *p, long v) {
     return p;
 }
 
+/* Live proof of the UP2 namespace: init runs in ring 3 holding the inherited
+ * global view, where /system is a READ-ONLY binding. Opening a /system file for
+ * write must be refused (-EMBK_EROFS) by the kernel's namespace write-gate,
+ * BEFORE the file is even resolved. A pure read of the same file still works.
+ * This is the sealed-OS invariant enforced by naming, not by uid/rwx. */
+static void ns_selfcheck(void) {
+    int64_t w = embk_open("/system/bin/home.elf", EMBK_O_WRONLY, 0);
+    if (w < 0) {
+        log_line("init: ns: /system is read-only for userspace (write refused) -- OK\n");
+    } else {
+        embk_close((int)w);
+        log_line("init: ns: WARNING -- /system accepted a write (namespace RO not enforced)\n");
+    }
+    int64_t r = embk_open("/system/bin/home.elf", EMBK_O_RDONLY, 0);
+    if (r >= 0) { embk_close((int)r); log_line("init: ns: /system still readable -- OK\n"); }
+    else          log_line("init: ns: WARNING -- /system unreadable (over-restricted)\n");
+}
+
 void _start(long argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     log_line("init: up -- root of EmbLink userspace authority\n");
+    ns_selfcheck();
 
     for (;;) {
         char *dargv[] = { (char *)DESKTOP, NULL };

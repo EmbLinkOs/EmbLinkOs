@@ -1,5 +1,6 @@
 #include "fs/fd.h"
 #include "fs/vfs.h"
+#include "fs/namespace.h"   /* ns_check_writable -- read-only binding gate (UP2) */
 #include "include/errno.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
@@ -157,11 +158,18 @@ static int fd_unlink_path(const char *path)
  * Same split-parent + per-fs-op dispatch fd_open_into's O_CREAT path uses. */
 int vfs_unlink_path(const char *path)
 {
+    int wok = ns_check_writable(path);   /* refuse in a read-only binding (UP2) */
+    if (wok != EMBK_OK)
+        return wok;
     return fd_unlink_path(path);
 }
 
 int vfs_mkdir_path(const char *path)
 {
+    int wok = ns_check_writable(path);   /* refuse in a read-only binding (UP2) */
+    if (wok != EMBK_OK)
+        return wok;
+
     struct vnode parent;
     const char *leaf = NULL;
     size_t leaf_len = 0;
@@ -182,6 +190,15 @@ int vfs_rename_path(const char *old_path, const char *new_path)
     struct vnode old_parent, new_parent;
     const char *old_leaf = NULL, *new_leaf = NULL;
     size_t old_len = 0, new_len = 0;
+
+    /* Both endpoints are modified (source removed, dest created) -- both must be
+     * in a writable binding (UP2). */
+    int wok = ns_check_writable(old_path);
+    if (wok != EMBK_OK)
+        return wok;
+    wok = ns_check_writable(new_path);
+    if (wok != EMBK_OK)
+        return wok;
 
     int rc = fd_split_parent(old_path, &old_parent, &old_leaf, &old_len);
     if (rc != EMBK_OK)
@@ -220,6 +237,9 @@ int vfs_fd_truncate(int fd, uint64_t size)
 
 int vfs_chmod_path(const char *path, uint32_t mode)
 {
+    int wok = ns_check_writable(path);   /* metadata write: refuse if read-only (UP2) */
+    if (wok != EMBK_OK)
+        return wok;
     struct vnode vn;
     int rc = vfs_resolve(path, &vn);
     if (rc != EMBK_OK)
@@ -231,6 +251,10 @@ int vfs_chmod_path(const char *path, uint32_t mode)
 
 int vfs_rmdir_path(const char *path)
 {
+    int wok = ns_check_writable(path);   /* refuse in a read-only binding (UP2) */
+    if (wok != EMBK_OK)
+        return wok;
+
     struct vnode parent;
     const char *leaf = NULL;
     size_t leaf_len = 0;
@@ -345,6 +369,16 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         }
         fdunlock(p);
         return rfd;
+    }
+
+    /* Namespace write-gate: an open that can MODIFY the object (write access,
+     * create, or truncate) is refused in a read-only binding -- the sealed
+     * /system, or any narrowed read-only view (docs/USERSPACE_v2.md UP2). A pure
+     * O_RDONLY open is always allowed. No-op in kernel context. */
+    if (fd_writable(flags) || (flags & (O_CREAT | O_TRUNC))) {
+        int wok = ns_check_writable(path);
+        if (wok != EMBK_OK)
+            return wok;
     }
 
     struct vnode vn;

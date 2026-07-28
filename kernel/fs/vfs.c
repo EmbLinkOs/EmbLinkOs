@@ -11,6 +11,7 @@
  * it never owns or frees it. */
 
 #include "fs/vfs.h"
+#include "fs/namespace.h"      /* per-process namespace resolution (UP2) */
 #include "include/errno.h"
 #include "include/kstring.h"   /* strlen, strcmp, memcpy */
 #include "include/kprintf.h"
@@ -148,32 +149,22 @@ static struct vfs_mount *vfs_find_mount(const char *path) {
  * components than this is rejected, never overflowed */
 #define VFS_MAX_DEPTH 64
 
-/* Resolve an absolute path to a vnode. the ONLY path parser in the kernel:
- * it walk one component at a time, asking each filesystem only -> lookup
- * (one name inside one directory). '.' and '..' are handled specially HERE, in the
- * path layer, so every filesystem get them for free. */
-int vfs_resolve(const char *path, struct vnode *out) {
-    
-    if (!path || !out)
-        return -EMBK_EINVAL;
-    // v1 only supports absolute paths there is no per-process cwd yet.
-    if (path[0] != '/')
-        return -EMBK_EINVAL;
-
-    struct vfs_mount *m = vfs_find_mount(path);
-    if (!m)
-        return -EMBK_ENOENT;                                // no mount at all, so no root to start from
-
-    /* Breadcrumb trail. stack[depth-1] is the directory we're currently inside, 
-     * it start s with the mount's root vnode. so '..' at the top is a safe np-op. */
+/* Walk the components of `rel` starting from the object handle `start`, filling
+ * `out` with the resolved vnode. The ONLY component parser in the kernel: one
+ * name at a time via each fs's ->lookup. '.' and '..' are handled HERE so every
+ * filesystem gets them free, and '..' can never climb above `start` (depth is
+ * clamped at 1) -- that is what makes a namespace binding a real containment
+ * boundary. `rel` may lead with '/' or be empty (empty => `out` == `start`). */
+static int vfs_walk_from(struct vnode start, const char *rel, struct vnode *out) {
+    /* Breadcrumb trail. stack[depth-1] is the directory we're currently inside,
+     * starting at `start`, so '..' at the top is a safe no-op. */
     struct vnode stack[VFS_MAX_DEPTH];
     size_t depth = 0;
 
-    stack[depth++] = m->root;                               // a value coppy - vnode own nothing
+    stack[depth++] = start;                                // a value copy - vnode owns nothing
 
-    size_t mlen = strlen(m->at);
-    const char *s = path + mlen;
-    while (*s == '/') s++;                                  // walk relative to mount root
+    const char *s = rel;
+    while (*s == '/') s++;                                  // walk relative to the start object
 
     while (*s != '\0') {
         /* Carve out one component [comp, comp+len]. */
@@ -225,6 +216,47 @@ int vfs_resolve(const char *path, struct vnode *out) {
     return EMBK_OK;
 }
 
+/* Resolve an absolute path to a vnode, honoring the CURRENT process's namespace
+ * (docs/USERSPACE_v2.md UP2). Resolution is "namespace lookup, THEN walk from the
+ * bound root object" -- the kernel starts from a handle the process was handed,
+ * never a global root. `mode_out` (optional) receives the binding's ro/rw mode,
+ * so write paths can enforce a read-only binding.
+ *
+ * When there is no active namespace -- kernel threads, early boot, the boot CPU
+ * creating init -- it falls back to the global mount table, exactly as before,
+ * so nothing outside userspace is affected. */
+int vfs_resolve_ex(const char *path, struct vnode *out, uint8_t *mode_out) {
+    if (!path || !out)
+        return -EMBK_EINVAL;
+    if (path[0] != '/')                                    // absolute paths only (no kernel cwd)
+        return -EMBK_EINVAL;
+
+    struct namespace *ns = process_current_ns();
+    if (ns && ns->active) {
+        struct vnode root;
+        size_t plen;
+        uint8_t mode;
+        int rc = ns_lookup(ns, path, &root, &plen, &mode); // longest-prefix binding
+        if (rc)
+            return rc;                                      // unbound => ENOENT (absence)
+        if (mode_out)
+            *mode_out = mode;
+        return vfs_walk_from(root, path + plen, out);       // walk relative to the bound root
+    }
+
+    /* Global fallback (no active namespace). */
+    if (mode_out)
+        *mode_out = NS_MODE_RW;
+    struct vfs_mount *m = vfs_find_mount(path);
+    if (!m)
+        return -EMBK_ENOENT;                                // no mount, so no root to start from
+    return vfs_walk_from(m->root, path + strlen(m->at), out);
+}
+
+int vfs_resolve(const char *path, struct vnode *out) {
+    return vfs_resolve_ex(path, out, NULL);
+}
+
 
 /* Public wrappers*/
 
@@ -253,9 +285,14 @@ int vfs_resolve(const char *path, struct vnode *out) {
 }
 
 int vfs_write(const char *path, uint64_t off, const void *buf, size_t len, size_t *out_written) {
-    
+
     if ((!buf && len) || !out_written)
         return -EMBK_EINVAL;
+    /* Namespace write-gate: refuse a write to a read-only binding (e.g. the
+     * sealed /system) before touching the fs. Unrestricted in kernel context. */
+    int wok = ns_check_writable(path);
+    if (wok != EMBK_OK)
+        return wok;
     /* Struct: the file must already exist. A missing path resolves to -EMBK_ENOENT 
      * and we propagate it. Creation is NOT done here - this function has no `mode`
      * and create needs one. Creat-on-open (O_CREAT) is the open()/fd layer's responsibility. 

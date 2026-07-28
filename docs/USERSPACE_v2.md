@@ -147,9 +147,24 @@ Every existing app assumes the global `/` (home reads `/font.ttf`, spawns
   (`font.ttf`, `mono.ttf`); the `.txt` items at `/` are deliberate FS-format/POSIX
   test *fixtures* and correctly stay there. `user/bin/init.c` is freestanding
   (own `_start`, no libc — init keeps no dependency it must keep alive).
-- **UP2 — the namespace mechanism.** Per-process binding tables in the kernel;
-  `spawn` grants a namespace; resolution goes through it. Sessions/apps start
-  getting narrowed views. The distinctive core lands here.
+- **UP2 — the namespace mechanism. ✅ SHIPPED (2026-07-28).** Per-process
+  binding tables in the kernel (`kernel/fs/namespace.{c,h}`, `struct namespace`
+  on `struct process` beside `cap_set`). `vfs_resolve` now does *namespace lookup
+  then walk from the bound root object* — it never starts from a global root; a
+  process with no active namespace (kernel/early boot) falls back to the mount
+  table, so nothing outside userspace changed. init is born with the global view
+  (`ns_seed_global`: one RW binding per mount + a **read-only** binding for the
+  sealed `/system`), and children inherit it (`ns_copy`); attenuation
+  (`ns_attenuate`: a child may narrow, never widen) is built and proven, ready
+  for the spawn-grant ABI (UP2b). Read-only bindings are ENFORCED at every write
+  choke point (`ns_check_writable` in `vfs_open`/`vfs_write`/`vfs_{unlink,rename,
+  mkdir,rmdir,chmod}_path`) — a userspace write to `/system` returns EROFS
+  *before* the path even resolves. Verified: `test namespace` 13/13 (lookup,
+  longest-prefix, absence, attenuation, seeding); init's live ring-3 probe
+  confirms `/system` write-refused yet still readable; `test posix` ALL PASS
+  (writes at the `/` RW binding intact); `test ring3 threads` OK. The absence
+  property (a narrowed process cannot *name* what it wasn't granted) is the
+  distinctive core; UP2b makes it live per-app.
 - **UP3 — multi-user.** `/users/<name>`, the session/login manager, per-user
   namespace + cap profiles. Two users provably can't name each other's files.
 - **UP4 — tighten.** Apps ship with a *declared* namespace (in their EMBX

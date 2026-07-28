@@ -129,6 +129,12 @@ static struct process *process_alloc(void) {
              * for user processes (attenuated from the parent); left as-is for
              * kernel threads, which ARE the kernel and hold the full set. */
             process_table[i].cap_set = EMBK_CAP_ALL;
+            /* Namespace: default INACTIVE (global-mount fallback) -- the safe
+             * reset for a REUSED slot and the resting state for kernel threads.
+             * process_create_caps installs the real per-process view for user
+             * processes. A stale active namespace here would silently scope a
+             * fresh kthread to a dead process's tree. */
+            memset(&process_table[i].ns, 0, sizeof(process_table[i].ns));
             /* -1, not the zeroed-by-memset 0: 0 is a VALID cpu_table[]
              * index (the BSP) -- meaningless until live_thread_count hits
              * 0 for the first time (see the field's comment), but starting
@@ -447,6 +453,14 @@ int process_alive(uint32_t pid) {
  * init). The EMBX loader will read this as "what may I grant this binary". */
 uint64_t process_current_caps(void) {
     return current_thread ? current_process->cap_set : EMBK_CAP_ALL;
+}
+
+/* The current process's namespace, or NULL when no user process is running (the
+ * boot CPU / kernel threads) -- in which case the VFS falls back to the global
+ * mount table. This is the "start resolution HERE" hook the resolver consults
+ * on every path (fs/namespace.h, fs/vfs.c). */
+struct namespace *process_current_ns(void) {
+    return current_thread ? &current_process->ns : NULL;
 }
 
 /* Capabilities of `pid`, or 0 (no authority) if there is no such live slot.
@@ -1500,6 +1514,18 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         }
         proc->cap_set = granted;
     }
+
+    /* Namespace grant -- the naming half of the same born authority (UP2). A
+     * child INHERITS the parent's view (attenuating to a narrower one is the
+     * spawn-grant path, UP2b); a kernel-spawned root of authority (init, no
+     * active parent namespace) is born with the global view built from the live
+     * mount table. Kernel threads created before any mount get an inactive
+     * namespace and fall back to the global resolver. */
+    if (current_thread && current_process->ns.active)
+        ns_copy(&proc->ns, &current_process->ns);
+    else
+        ns_seed_global(&proc->ns);
+
     proc->zombie_next = NULL;
     proc->zombie_head = NULL;
     proc->child_list = NULL;

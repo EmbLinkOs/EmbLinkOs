@@ -403,6 +403,7 @@ static void selftests_print_commands(void)
     kprintf("  test embkfs all\n");
     kprintf("  test embkfs diag\n");
     kprintf("  test vfs\n");
+    kprintf("  test namespace\n");
     kprintf("  test fd\n");
     kprintf("  test fat32\n");
     kprintf("  test fat32 vfs\n");
@@ -2223,6 +2224,16 @@ int selftests_handle_command(const char *cmd)
         }
         int rc = vfs_run_selftests();
         kprintf("\n[cmd] test vfs: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+        return 1;
+    }
+
+    if (strcmp(cmd, "test namespace") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test namespace: VFS not registered (need mounts to seed)\n");
+            return 1;
+        }
+        int rc = ns_run_selftests();   /* the per-process namespace engine (UP2) */
+        kprintf("\n[cmd] test namespace: %s\n", rc == EMBK_OK ? "OK" : "FAIL");
         return 1;
     }
 

@@ -119,6 +119,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/embkfs/embk_vfs.c \
              kernel/fs/fd.c \
              kernel/fs/vfs.c \
+             kernel/fs/namespace.c \
              kernel/fs/epfs.c \
              kernel/ipc/handle.c \
              kernel/ipc/channel.c \
