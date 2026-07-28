@@ -233,3 +233,32 @@ Every existing app assumes the global `/` (home reads `/font.ttf`, spawns
    `/apps` + `/state` + a user's home. One-time migration in UP1.
 5. **Session ↔ desktop.** Is the desktop the session, or does a session host a
    desktop it can restart? *Lean: session hosts; desktop is restartable.*
+
+## 11. Well-known folders = grant targets, not conventions (DECIDED 2026-07-28)
+
+We do **not** pre-seed a home with the macOS/XDG taxonomy (`Documents`,
+`Downloads`, `Pictures`, `Music`, `Videos`). On Unix those are *conventions* —
+loose agreements nothing enforces; an app writes to `~/Downloads` because it was
+configured to, not because the folder means anything. Baked into our model they
+would be empty directories nothing keys off — decoration, not structure. A folder
+that nothing is **granted against** is clutter.
+
+Instead, a well-known folder earns its existence by being a **namespace grant
+target** — a capability boundary, which is the thing rwx/XDG can't give you. When
+a fetch/browser app arrives, its manifest declares `rw /downloads` and the session
+rebinds `/downloads` → `/data/users/<u>/downloads`: now "Downloads" is not where
+the app is *asked* to write, it is the *only* place it *can* write. The location
+becomes confinement. (Sharing works the same way — a shared subtree bound into
+several users' namespaces, at a per-user mode, replaces "groups" entirely; see §6.)
+
+Consequences:
+- **Seed only folders that are grant targets.** `/data/users/<name>` starts
+  minimal; add a subtree the day an app needs to be *confined* to it (likely first:
+  `downloads`, maybe a per-user `tmp`). No speculative folders for apps that don't
+  exist yet.
+- This wants **NS_BIND rebind** (child prefix ≠ source path, e.g. `/downloads` →
+  `/data/users/u/downloads`); today NS_BIND binds `prefix == path`, so that is the
+  small mechanism gap to close first.
+- When user *creation* lands (there is no `adduser` yet — homes are baked by mkfs),
+  its skeleton (`/etc/skel` equivalent) seeds the same grant-target folders, not a
+  taxonomy.
