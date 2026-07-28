@@ -185,17 +185,61 @@ SDK deliverable = these, bundled and versioned together, with `embbuild` +
 that already declares a minimal namespace/cap set (so declaring authority is the
 default, not an afterthought).
 
-## 9. Registry / index — local first, our mirror later
+## 9. Registry / index — local first, then a git registry
 
 - **Local index first**: the set of installed bundles (name → version → build_id →
   granted authority), queryable — `pkg list`, `pkg info notes`. This is just the
   `/data/apps` tree + a small registry; buildable now, no network.
-- **Network mirror later**: rides on the net stack (see the networking notes). The
-  crucial point from the Python discussion — **we are the source of EmbLinkOS
-  builds**; there is no third-party ABI. So the index is *our* mirror (or a LAN
-  one), served over HTTP first (no TLS needed for a local mirror), and every
-  artifact is signature + `build_id` verified regardless of transport. The trust is
-  in the signature, not the channel.
+- **The remote registry is a GIT REPO** (decided 2026-07-29) — e.g. a separate
+  `emblink-packages`, distinct from the OS source (registry and OS have different
+  lifecycles). This is the proven model (Homebrew taps, the Arch AUR are git
+  repos), and it fits our "trust the signature, not the channel" rule exactly.
+
+### 9.1 The index in git, the binaries in releases
+
+Git is excellent at one half of this and bad at the other, so we split them:
+
+- **Index / recipes → git.** The repo holds the signed **package manifests** (§3):
+  name, version, `build_id`, declared caps + namespace, signature, and a
+  *download URL* for the bytes. Versioned, diffable, auditable; contributions
+  arrive as **pull requests** the maintainer reviews and merges. One directory per
+  package, versioned manifests inside, plus a top-level index.
+- **Binaries → release assets, NOT git history.** Git stores every blob's full
+  history with no binary dedup — putting each multi-MB build in it turns the repo
+  into a tar-pit. The bundles live as **release/CDN artifacts**, referenced by URL
+  from the manifest. (Homebrew's shape exactly: formulae in the tap, bottles in a
+  bucket.)
+
+### 9.2 Two independent layers of trust
+
+1. **The index is protected by git's signed commits** — the manifest you merged is
+   the manifest the OS reads; the history is tamper-evident.
+2. **The binary is protected by our `build_id` signature** — the OS fetches the
+   bytes from wherever the manifest points, hashes them, and **rejects anything
+   that does not match the signed `build_id`.** A compromised CDN or a hijacked
+   release cannot inject a bad binary. Trust is in the maintainer's signature, not
+   in GitHub and not in the transport.
+
+The supply-chain story that falls out: anyone proposes a package by PR; the
+maintainer signs the release; **the OS trusts the signature, not the host.**
+
+### 9.3 Transport phasing (the TLS caveat)
+
+GitHub is HTTPS-only, so the OS fetching *directly* needs TLS — the same blocker
+as pip-from-PyPI (see the networking discussion). This phases the *transport*, not
+the design:
+
+- **Now / pre-TLS:** the git repo is the authoritative registry (manifests + signed
+  release binaries). The OS syncs its index from a **self-hosted / LAN HTTP mirror**
+  of the repo (no TLS), or via host-side download + copy. Everything is still
+  `build_id` + signature verified on arrival.
+- **After TLS lands:** the OS fetches straight from the repo + releases. And a
+  self-consistent option, since we ported git: the OS can `git pull` the registry
+  itself to sync the index (http:// from a mirror pre-TLS, https:// after).
+
+Because **we are the source of EmbLinkOS builds** (our ABI; no third-party binary
+compat), this registry is *ours* — there is no "download the vendor's `.deb`."
+Every artifact is signature + `build_id` verified regardless of transport.
 
 ## 10. What's genuinely new to build (short)
 
@@ -221,8 +265,11 @@ Most of the machinery exists; the new work is small and keystone-shaped:
   authority.
 - **PK3 — signing + update/rollback + registry.** ed25519 over `build_id`;
   snapshot-backed atomic update and rollback; `pkg list/info`.
-- **PK4 — the mirror.** Fetch + install over HTTP from our own index (rides the
-  net stack); signature-verified regardless of transport.
+- **PK4 — the git registry.** Publish the index as a git repo (`emblink-packages`)
+  with signed manifests + release-asset binaries (§9); the OS syncs the index and
+  `pkg install`s from it over HTTP (a mirror pre-TLS, the repo directly once TLS
+  lands — rides the net stack). Signature + `build_id` verified regardless of
+  transport.
 
 ## 12. What we deliberately do NOT do
 
