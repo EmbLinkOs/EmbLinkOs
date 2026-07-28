@@ -1960,27 +1960,29 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // Static config for now; `test net` pings the gateway. No ring-3 surface yet.
     net_init();
 
-    // Land the user in the graphical HOME launcher: a ring-3 app that takes the
-    // whole screen as the compositor's desktop layer and launches other apps
-    // (see user/bin/home.c). It runs as an ordinary round-robin sibling of this
-    // shell context -- the loop below keeps pumping the compositor pointer and
-    // USB, and the serial/keyboard REPL stays available as a debug console.
+    // Enter userspace through INIT: the kernel spawns exactly ONE user process,
+    // /system/bin/init.elf, the root of userspace authority (docs/USERSPACE_v2.md
+    // "authority IS the namespace", UP1). init in turn brings up the graphical
+    // desktop session (home.elf) and SUPERVISES it -- so the desktop is init's
+    // child, not the first process. init runs as an ordinary round-robin sibling
+    // of this shell context; the loop below keeps pumping the compositor pointer
+    // and USB, and the serial/keyboard REPL stays available as a debug console.
     {
-        char *hargv[] = { (char *)"/system/bin/home.elf", NULL };
+        char *iargv[] = { (char *)"/system/bin/init.elf", NULL };
         /* The desktop is about to own the framebuffer -- disable the text
-         * console's on-screen half BEFORE home becomes a schedulable sibling.
-         * Ordering matters: process_create() makes home RUNNABLE, and userspace
+         * console's on-screen half BEFORE userspace becomes schedulable.
+         * Ordering matters: process_create() makes init RUNNABLE, and userspace
          * stdout/stderr (fd 1/2) now route through console_putchar. If the fb
          * were still enabled here, a timer preemption in the gap between spawn
-         * and this call could let home's first write() paint over the boot
-         * screen. Disabling first closes that window. All kernel logging + the
-         * serial debug console below stay on COM1 and never touch the fb. */
+         * and this call could let the desktop's first write() paint over the
+         * boot screen. Disabling first closes that window. All kernel logging +
+         * the serial debug console below stay on COM1 and never touch the fb. */
         console_set_fb_enabled(false);
-        int hpid = process_create("/system/bin/home.elf", hargv, 1, NULL, 0);
-        if (hpid < 0)
-            kprintf("\nhome: failed to launch /system/bin/home.elf: %s\n", embk_strerror(hpid));
+        int ipid = process_create("/system/bin/init.elf", iargv, 1, NULL, 0);
+        if (ipid < 0)
+            kprintf("\ninit: failed to launch /system/bin/init.elf: %s\n", embk_strerror(ipid));
         else
-            kprintf("\nhome: launched /system/bin/home.elf as pid %d\n", hpid);
+            kprintf("\ninit: launched /system/bin/init.elf as pid %d\n", ipid);
     }
 
     // Main loop (boot CPU): pump the polled drivers (legacy USB + the window

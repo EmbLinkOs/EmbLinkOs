@@ -4,7 +4,9 @@
 
 #include <stdint.h>
 
-#define INIT_PROGRAM_PATH "/system/bin/init.elf"
+/* The `test ring3` one-shot runs the native-primitive self-test (primtest.elf,
+ * formerly misnamed init.elf). The real pid-1 init is a different program now. */
+#define INIT_PROGRAM_PATH "/system/bin/primtest.elf"
 
 /* the new user_stub — runs in ring 3, calls write then exit.
  *

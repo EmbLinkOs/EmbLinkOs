@@ -169,7 +169,7 @@ int main(void) {
     /* Load the font from the EMBKFS root (fast now that the fs read is O(n)). */
     uint64_t t_start = embk_uptime_ms();   /* launch-latency log */
     size_t rl = 0;
-    uint8_t *reg = read_file("/font.ttf", &rl);
+    uint8_t *reg = read_file("/system/fonts/font.ttf", &rl);
     uint32_t fr = reg ? font_load(reg, rl) : 0;
     uint32_t fb = fr;
     if (fr) font_install_backend();

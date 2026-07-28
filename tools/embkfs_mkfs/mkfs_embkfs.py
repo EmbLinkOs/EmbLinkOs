@@ -696,7 +696,7 @@ def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
 # test binaries). Fonts and the format fixtures are NOT *.elf and are placed
 # separately (fonts at root, fixtures at root -- they test the format, not the
 # layout).
-_SYSTEM_BIN = {"init.elf", "shell.elf", "home.elf"}          # -> /system/bin/
+_SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
@@ -736,14 +736,17 @@ def discover_userland_objects(build_dir="build"):
     so = _read_file(f"{build_dir}/libembk.so")
     if so is not None:
         objects.append((b"system/lib/libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
+    # UI fonts are part of the sealed OS, not root stragglers: they live under
+    # /system/fonts (USERSPACE_v2 UP1 -- nothing at bare /). The EmUI runtime
+    # (ui/dsl/em_app.c) and the explicit readers default to these paths.
     font = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
     if font is not None:
-        objects.append((b"font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
+        objects.append((b"system/fonts/font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
     # The terminal's MONOSPACE face (same DejaVu family, so the same
     # rasterizer tech) -- shell tables align only in fixed-pitch glyphs.
     mono = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
     if mono is not None:
-        objects.append((b"mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
+        objects.append((b"system/fonts/mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
     # THE ABI, sealed under /system/abi (docs/USERSPACE.md D2 §3.1): crt0.o
     # (_start), syscalls.o (the newlib retargeting layer) and libc.a ARE the
     # definition of "targeting EmbLinkOS". tcc READS them (read-only reach into

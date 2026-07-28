@@ -453,7 +453,7 @@ typedef struct {
                                   * dragging it resizes the OS window (V5) */
     EmMaterial  material;        /* Acrylic -> frosted glass window (V8) */
     void      (*view)(void);     /* the whole UI, rebuilt only when needed */
-    const char *font;            /* resource path; default "/font.ttf" */
+    const char *font;            /* resource path; default "/system/fonts/font.ttf" */
     int         pace_ms;         /* loop pace while active; default 10 */
 } EmApp;
 

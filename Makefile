@@ -173,15 +173,24 @@ USER_CC      = x86_64-elf-gcc
 ASM_GAS      = x86_64-elf-as   # GNU as for the dynstubs (.set/.weak)
 USER_LD      = x86_64-elf-ld
 USER_INC     = -Iuser/lib
-# Freestanding programs (init.elf): own _start, no libc, no SSE.
+# Freestanding programs (init.elf, primtest.elf): own _start, no libc, no SSE.
 USER_CFLAGS  = -ffreestanding -nostdlib -fno-pic -mno-red-zone \
                -fno-stack-protector -mno-mmx -mno-sse -mno-sse2 -O2 $(USER_INC)
 
+# The real pid-1 init: kernel spawns it first; it brings up the desktop session
+# and supervises. Freestanding (no libc) -- init stays minimal (USERSPACE_v2 UP1).
 build/init.o: user/bin/init.c | $(BUILD)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 build/init.elf: build/init.o user/lib/user.ld
 	$(USER_LD) -T user/lib/user.ld build/init.o -o $@
+
+# The native-primitive self-test (formerly init.elf); `test ring3 threads`.
+build/primtest.o: user/bin/primtest.c | $(BUILD)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+build/primtest.elf: build/primtest.o user/lib/user.ld
+	$(USER_LD) -T user/lib/user.ld build/primtest.o -o $@
 
 # --- newlib-linked userland (user/lib/crt0.c + user/lib/syscalls.c + a program) ---
 # Unlike init.elf (freestanding, -mno-sse, own _start), these link against a
@@ -890,7 +899,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 	$(STRIP) $@
 endif
 
-EMBKFS_APPS := build/init.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
+EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf \
                build/emlibc_demo.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \

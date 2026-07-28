@@ -1,5 +1,11 @@
 # EmbLinkOS Userspace Design — the namespace, the layout, and why
 
+> **⇒ Current architecture: [USERSPACE_v2.md](USERSPACE_v2.md)** — "Authority *is*
+> the Namespace" (ratified 2026-07-28: pure capability-namespace, no uid/gid).
+> It realizes §2's per-process-namespace decision below with a concrete process
+> model (init pid 1), namespace mechanism, multi-user, tree, and build phasing.
+> This doc remains the *reasoning* record; v2 is what we build.
+
 **Status:** COMPLETE — all four decisions ratified 2026-07-18; tree derived in §6
 (supersedes the same-day "split" ratification — see §2.6 for why).
 Decisions are made from invariants up; the directory tree is the LAST

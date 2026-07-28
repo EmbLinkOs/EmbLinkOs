@@ -118,7 +118,7 @@ static void spawn_app(const char *path) {
 int main(void) {
     /* toolkit font + context */
     size_t rl = 0;
-    uint8_t *reg = read_file("/font.ttf", &rl);
+    uint8_t *reg = read_file("/system/fonts/font.ttf", &rl);
     uint32_t fr = reg ? font_load(reg, rl) : 0;
     if (fr) font_install_backend();
     embk_puts(1, fr ? "home: font loaded\n" : "home: FONT MISSING\n");
