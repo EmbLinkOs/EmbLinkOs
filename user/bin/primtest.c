@@ -93,6 +93,71 @@ static int spawn_test(void)
     return 1;
 }
 
+/* The "ns-child" role of ns_spawn_test(): this process was spawned with a
+ * NARROWED namespace of exactly {/system ro, /data rw} (docs/USERSPACE_v2.md
+ * UP2b). It proves all four facets of the model and exits 0 iff every one holds
+ * (a distinct nonzero code per failure aids debugging). Freestanding: it links
+ * no libc, so the narrowed view cannot break its own startup. */
+static void ns_child(void)
+{
+    /* a. /system is granted and readable. */
+    long r = embk_open("/system/bin/primtest.elf", EMBK_O_RDONLY, 0);
+    if (r < 0) embk_exit(11);
+    embk_close((int)r);
+
+    /* b. /system is READ-ONLY: a write-intent open is refused before it resolves. */
+    long w = embk_open("/system/bin/primtest.elf", EMBK_O_WRONLY, 0);
+    if (w >= 0) { embk_close((int)w); embk_exit(12); }
+
+    /* c. /data is granted AND writable: create + write a scratch file. */
+    long c = embk_open("/data/tmp/nschild.tmp",
+                       EMBK_O_CREAT | EMBK_O_WRONLY | EMBK_O_TRUNC, 0644);
+    if (c < 0) embk_exit(13);
+    embk_write((int)c, "ns-ok", 5);
+    embk_close((int)c);
+
+    /* d. ABSENCE -- the distinctive core: /run is a real mount that EXISTS
+     *    globally, but it was NOT granted, so it is UNNAMEABLE here, not merely
+     *    unwritable. A global-namespace process would open it fine. */
+    long run = embk_open("/run", EMBK_O_RDONLY, 0);
+    if (run >= 0) { embk_close((int)run); embk_exit(14); }
+
+    embk_exit(0);   /* all four held */
+}
+
+/* Hand a child a NARROWED namespace via SPAWN_ACTION_NS_BIND and let it prove
+ * its restricted view; then prove a parent cannot grant a prefix it cannot
+ * itself name. The whole UP2b loop, end to end. */
+static int ns_spawn_test(void)
+{
+    char *argv[] = { "primtest", "ns-child", (char *)0 };
+
+    struct embk_spawn_file_action acts[2];
+    embk_action_ns_bind(&acts[0], "/system", EMBK_NS_RO);
+    embk_action_ns_bind(&acts[1], "/data",   EMBK_NS_RW);
+
+    long h = embk_spawn("/system/bin/primtest.elf", argv, acts, 2);
+    if (h < 0) { embk_puts(1, "ns_spawn_test: FAIL spawn()\n"); return 0; }
+    long code = embk_wait((int)h);
+    if (code != 0) {
+        embk_puts(1, "ns_spawn_test: FAIL child rejected its narrowed view\n");
+        return 0;
+    }
+
+    /* Attenuation: a bind the parent cannot resolve fails the spawn outright. */
+    struct embk_spawn_file_action bad[1];
+    embk_action_ns_bind(&bad[0], "/no_such_root_xyz", EMBK_NS_RO);
+    long h2 = embk_spawn("/system/bin/primtest.elf", argv, bad, 1);
+    if (h2 >= 0) {
+        embk_wait((int)h2);
+        embk_puts(1, "ns_spawn_test: FAIL granted an unnameable prefix\n");
+        return 0;
+    }
+
+    embk_puts(1, "ns_spawn_test: PASS\n");
+    return 1;
+}
+
 /* init.c is FREESTANDING: it defines its own _start (see the bottom of this
  * file) and links neither crt0.c nor newlib, so nothing else here defines
  * `environ` -- we own it. _start takes the vector the kernel delivers in RDX and
@@ -1000,6 +1065,7 @@ void _start(long argc, char **argv, char **envp)
      * recursively spawning itself without bound. */
     if (argc >= 2) {
         /* Reports back what environment (if any) the kernel delivered. */
+        if (embk_streq(argv[1], "ns-child"))       ns_child();
         if (embk_streq(argv[1], "env-child"))      env_child();
         if (embk_streq(argv[1], "cancel-child"))   cancel_child();
         if (embk_streq(argv[1], "ctrlc-child"))    ctrlc_child();
@@ -1043,6 +1109,7 @@ void _start(long argc, char **argv, char **envp)
     int ok = 1;
     ok &= thread_test();
     ok &= spawn_test();
+    ok &= ns_spawn_test();      /* per-process namespace grant (UP2b) */
     ok &= env_spawn_test();
     ok &= cancel_test();
     ok &= sbrk_test();

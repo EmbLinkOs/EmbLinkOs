@@ -165,6 +165,21 @@ Every existing app assumes the global `/` (home reads `/font.ttf`, spawns
   (writes at the `/` RW binding intact); `test ring3 threads` OK. The absence
   property (a narrowed process cannot *name* what it wasn't granted) is the
   distinctive core; UP2b makes it live per-app.
+- **UP2b — the spawn-grant ABI. ✅ SHIPPED (2026-07-28).** A parent hands a child
+  a NARROWED namespace at spawn: `SPAWN_ACTION_NS_BIND` (kernel `spawn.h`,
+  userspace `embk_action_ns_bind(a, prefix, EMBK_NS_RO|RW)`). Adding any NS_BIND
+  action makes the child's namespace *exactly* the granted prefixes (absent =>
+  inherit the parent's whole view). The kernel resolves each prefix in the
+  **parent's** namespace (`vfs_resolve_ex`, in `process_create_caps`) — so a
+  parent can only grant what it can itself name, at a mode no wider than it holds:
+  that resolve *is* the attenuation, and it hands back the real directory object.
+  Proven live by `ns_spawn_test` inside `test ring3 threads`: a child granted
+  `{/system ro, /data rw}` reads `/system`, writes `/data`, is refused a write to
+  `/system` (EROFS), and **cannot name `/run`** (a real mount — unnameable, not
+  "denied"); and a parent granting an unnameable prefix has its spawn refused.
+  The absence property is now live per-process. What remains (UP4) is apps
+  *declaring* their needed prefixes in the EMBX manifest so the session grants
+  exactly that.
 - **UP3 — multi-user.** `/users/<name>`, the session/login manager, per-user
   namespace + cap profiles. Two users provably can't name each other's files.
 - **UP4 — tighten.** Apps ship with a *declared* namespace (in their EMBX

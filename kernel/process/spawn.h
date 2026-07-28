@@ -62,6 +62,16 @@
                                                // created and parked, and the child handle
                                                // sys_spawn returns doubles as the debug handle.
                                                // (id 6, not 5 -- SET_CAPS took 5 below.)
+#define SPAWN_ACTION_NS_BIND         7         // narrow the child's NAMESPACE (USERSPACE_v2 UP2b):
+                                               // `path` is the prefix to grant, `flags` its mode
+                                               // (0 = RW, 1 = RO). The prefix is resolved in the
+                                               // PARENT's namespace, so a parent can only hand down
+                                               // what it can itself name, at a mode no wider than it
+                                               // holds -- attenuation by construction. The child's
+                                               // namespace becomes EXACTLY the granted prefixes
+                                               // (absent => inherit the parent's whole view). Reuses
+                                               // `path`+`flags`; consumed at creation, skipped by the
+                                               // file-action processor.
 #define SPAWN_ACTION_SET_CAPS        5         // attenuate the child's capability set: `flags`
                                                // carries the requested cap bitmask (capabilities.h
                                                // cap IDs). Enforced <= the spawning process's own
