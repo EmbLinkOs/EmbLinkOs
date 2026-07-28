@@ -1,0 +1,6 @@
+# edit namespace manifest (docs/USERSPACE_v2.md UP4).
+# A text editor: reads its UI from the sealed /system (fonts + libembk.so),
+# reads and writes the user's files under /data. It cannot name /run or any
+# other root -- exactly the two subtrees it needs, nothing more.
+ro /system
+rw /data

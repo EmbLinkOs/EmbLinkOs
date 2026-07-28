@@ -182,9 +182,20 @@ Every existing app assumes the global `/` (home reads `/font.ttf`, spawns
   exactly that.
 - **UP3 — multi-user.** `/users/<name>`, the session/login manager, per-user
   namespace + cap profiles. Two users provably can't name each other's files.
-- **UP4 — tighten.** Apps ship with a *declared* namespace (in their EMBX
-  manifest, beside their caps); the session manager grants exactly that and no
-  more. The Files app becomes an explicitly-broad-view privilege.
+- **UP4 — declared namespaces. ✅ SHIPPED (2026-07-28).** An app *ships* its
+  declared namespace as a per-app manifest (`user/bin/<name>.ns` →
+  `/data/apps/<name>/<name>.ns`, lines of `<ro|rw> <prefix>`), and the session
+  (home) reads it and grants EXACTLY those bindings via NS_BIND — no manifest =>
+  the app inherits the full view (un-manifested apps unaffected). Shipped:
+  `clockw.ns` = `ro /system` (narrow), `edit.ns` = `ro /system` + `rw /data`,
+  `files.ns` = `rw /` + `ro /system` (the file manager's broad view, now
+  *explicitly declared* rather than ambient, with the OS still sealed). Proven
+  live: at boot home logs `spawn …/clockw.elf -> ns[ro /system] (1 bind)` and
+  clockw then *runs and renders* (`Clock: widget up` / `first frame`) with only
+  `/system` nameable — a real GUI app confined by its own declaration. (Carrier
+  note: ELF apps ship a sidecar manifest; an EMBX binary could carry the same
+  declaration as an inline section beside its capability table — future, and
+  EmbCC-side.)
 
 ## 9. What we deliberately do NOT do (it's our OS)
 

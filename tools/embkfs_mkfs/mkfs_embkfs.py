@@ -728,6 +728,15 @@ def discover_userland_objects(build_dir="build"):
         if name == "init.elf":
             continue                                          # already added first
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+        # Per-app NAMESPACE MANIFEST (docs/USERSPACE_v2.md UP4): an app ships its
+        # declared namespace as user/bin/<name>.ns, packed beside its .elf as
+        # /data/apps/<name>/<name>.ns. The session (home) reads it and grants
+        # EXACTLY those bindings (absent => the app inherits the parent's view).
+        base = name[:-4]                                      # strip ".elf"
+        nsm = _read_file(f"user/bin/{base}.ns")
+        if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
+            dest = f"data/apps/{base}/{base}.ns".encode()
+            objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
     # The kernel's own .embdbg (EMBDBG_Specification.md §7): a LINE+FUNCS sidecar
     # the kernel loads at boot so isr_handler symbolizes a panic to func:line.
     kdbg = _read_file(f"{build_dir}/kernel.embdbg")
