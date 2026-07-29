@@ -29,9 +29,18 @@ export PATH=/usr/local/cross/bin:$PATH
 #      edit the Makefile's `NEWLIB_PREFIX ?=` line once, or pass it every time.
 make NEWLIB_PREFIX=$HOME/cross/newlib-c99
 
-# 4. build + boot. This is the whole OS.
+# 4. verify the prerequisites, then build + boot. This is the whole OS.
+make check-tools          # reports every REQUIRED/OPTIONAL tool as ok/MISSING
 make && make run-embkfs
 ```
+
+**Run `make check-tools` any time** — before or mid-setup — to see exactly what
+is still missing instead of discovering it as a compile error. It probes for the
+cross toolchain, `nasm`, `qemu`, `python3`, and a *working* userspace libc (it
+actually compiles `#include <string.h>` with the build's own flags, so it catches
+both a wrong `NEWLIB_PREFIX` and a bare cross-compiler that ships no libc). It
+exits non-zero if anything REQUIRED is missing; the optional ports (C++, Python,
+git, tcc, EmbCC) are reported but never block the base OS.
 
 Check it worked: the OS boots to the EmUI desktop. At the serial prompt,
 `test posix` should print `ALL PASS`.

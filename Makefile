@@ -214,6 +214,42 @@ print-newlib-prefix:
 	@echo '$(NEWLIB_PREFIX)'
 print-cxx-prefix:
 	@echo '$(if $(HAVE_CXX),$(CXX_PREFIX),)'
+
+# Preflight: report which build prerequisites are present or missing, so a fresh
+# clone gets a clear checklist instead of a confusing mid-build error. Exits
+# non-zero iff a REQUIRED item is missing. The libc check is a real compile probe
+# (does <string.h> resolve with the userspace include flags?) so it catches both a
+# wrong NEWLIB_PREFIX and a bare cross-compiler that ships no libc.
+.PHONY: check-tools
+check-tools:
+	@miss=0; \
+	echo "EmbLinkOS build prerequisites  (make check-tools)"; echo; \
+	echo "REQUIRED -- kernel + base image + boot to the desktop:"; \
+	for t in x86_64-elf-gcc x86_64-elf-ld x86_64-elf-as x86_64-elf-strip x86_64-elf-ar nasm qemu-system-x86_64 python3; do \
+	  if command -v $$t >/dev/null 2>&1; then printf '  [ ok ]  %s\n' "$$t"; \
+	  else printf '  [MISS]  %s\n' "$$t"; miss=$$((miss+1)); fi; \
+	done; \
+	if ! command -v x86_64-elf-gcc >/dev/null 2>&1; then \
+	  printf '  [ -- ]  %s\n' "userspace libc  (skipped: no x86_64-elf-gcc yet)"; \
+	elif echo '#include <string.h>' | x86_64-elf-gcc $(NEWLIB_INC) -ffreestanding -x c -E - >/dev/null 2>&1; then \
+	  printf '  [ ok ]  %s\n' "userspace libc  (<string.h> resolves via NEWLIB_PREFIX=$(NEWLIB_PREFIX))"; \
+	else \
+	  printf '  [MISS]  %s\n' "userspace libc  (<string.h> NOT found -- build newlib + set NEWLIB_PREFIX; BUILD_SETUP.md step 3)"; miss=$$((miss+1)); fi; \
+	echo; echo "OPTIONAL -- UEFI boot + debugging (BIOS boot works without these):"; \
+	for t in mcopy objcopy gdb; do \
+	  if command -v $$t >/dev/null 2>&1; then printf '  [ ok ]  %s\n' "$$t"; \
+	  else printf '  [ -- ]  %-8s (mcopy=mtools; needed only for make run-uefi / -debug)\n' "$$t"; fi; \
+	done; \
+	echo; echo "OPTIONAL -- language ports (absent => that port is simply skipped, no error):"; \
+	if [ -x "$(USER_CXX)" ]; then printf '  [ ok ]  C++\n'; else printf '  [ -- ]  C++    (CXX_PREFIX=$(CXX_PREFIX))\n'; fi; \
+	if [ -x "$(EMBCC_ROOT)/embcc" ] && [ -x "$(EMBCC_ROOT)/embld" ]; then printf '  [ ok ]  EmbCC\n'; else printf '  [ -- ]  EmbCC  (EMBCC_ROOT=$(EMBCC_ROOT))\n'; fi; \
+	for pair in "Python:$(PY_SRC)" "git:$(GIT_SRC)" "tcc:$(TCC_SRC)"; do \
+	  n=$${pair%%:*}; p=$${pair#*:}; \
+	  if [ -e "$$p" ]; then printf '  [ ok ]  %s\n' "$$n"; else printf '  [ -- ]  %-6s (source absent: %s)\n' "$$n" "$$p"; fi; \
+	done; \
+	echo; \
+	if [ $$miss -gt 0 ]; then echo "==> $$miss REQUIRED item(s) MISSING -- see docs/BUILD_SETUP.md, then re-run: make check-tools"; exit 1; \
+	else echo "==> all required tools present.  Build + boot:  make && make run-embkfs"; fi
 NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/x86_64-elf/include,)
 NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
 NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -O2 -Wall $(USER_INC) $(NEWLIB_INC)
