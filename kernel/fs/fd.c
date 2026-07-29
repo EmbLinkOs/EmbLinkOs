@@ -14,7 +14,9 @@
 #include "kworker/kworker.h"          /* vnode close_locked: defer obj_put off the lock */
 #include "include/types.h"
 #include <stdint.h>
-#include <string.h>
+/* string funcs (memcpy/memset/memcmp/strcmp) come from include/kstring.h above --
+ * NOT <string.h>: the kernel is freestanding, so a hosted libc header must never
+ * be relied on (it only resolved because some toolchains ship newlib). */
 
 
 
