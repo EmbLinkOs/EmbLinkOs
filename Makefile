@@ -157,7 +157,7 @@ KERNEL_BIN  = kernel/kernel.strip.elf
 # the same vaddrs, so the sidecar symbolizes it. Tolerant: if the tool is not
 # present the build still proceeds (an empty file -> symbolizer disabled, the
 # panic dump falls back to hex, exactly as before).
-EMBDBG      ?= /home/motsou/EmbCC/embdbg
+EMBDBG      ?= $(HOME)/EmbCC/embdbg
 build/kernel.embdbg: $(KERNEL_ELF) | $(BUILD)
 	@if [ -x "$(EMBDBG)" ]; then \
 	   echo "  EMBDBG   $@"; $(EMBDBG) $< emit-kernel $@; \
@@ -205,7 +205,7 @@ build/primtest.elf: build/primtest.o user/lib/user.ld
 # long-long into this user-owned prefix; pointing -L/-isystem here uses that
 # fuller libc.a instead. Set NEWLIB_PREFIX= (empty) to fall back to the stock
 # toolchain newlib (and re-lose %z/%ll). See user/README.md.
-NEWLIB_PREFIX ?= /home/motsou/cross/newlib-c99
+NEWLIB_PREFIX ?= $(HOME)/cross/newlib-c99
 
 # Let scripts ask the Makefile where newlib is, so NEWLIB_PREFIX stays the ONE
 # source of truth and tools/tcc/build-tcc-emblink.sh cannot drift from the build.
@@ -227,13 +227,13 @@ NEWLIB_LDFLAGS = -nostartfiles -static -T user/lib/newlib.ld $(NEWLIB_LIB)
 # The stock /usr/local/cross gcc is `--enable-languages=c` only, so there is no
 # x86_64-elf-g++ and no libstdc++. CXX_PREFIX points at a SECOND, user-owned
 # toolchain built with c,c++ + libstdc++ against the SAME newlib the apps link
-# (tools: /home/motsou/cross/build_gcc_cxx.sh) -- exactly the NEWLIB_PREFIX
+# (tools: $(HOME)/cross/build_gcc_cxx.sh) -- exactly the NEWLIB_PREFIX
 # pattern above: no sudo, and the stock C toolchain stays untouched.
 #
 # Everything C++ is GATED on that compiler existing, so the tree still builds
 # fine without it -- `make cxx-check` reports whether it's available.
 # Constructors are already handled: crt0.c walks .init_array AND .ctors.
-CXX_PREFIX ?= /home/motsou/cross/gcc-cxx
+CXX_PREFIX ?= $(HOME)/cross/gcc-cxx
 USER_CXX    = $(CXX_PREFIX)/bin/x86_64-elf-g++
 HAVE_CXX   := $(if $(wildcard $(USER_CXX)),yes,)
 
@@ -248,7 +248,7 @@ cxx-check:
 	    echo "C++: $(USER_CXX)"; $(USER_CXX) -dumpversion; \
 	    echo -n "libstdc++: "; ls $(CXX_PREFIX)/x86_64-elf/lib/libstdc++.a 2>/dev/null || echo "MISSING"; \
 	else \
-	    echo "C++: not built. Run /home/motsou/cross/build_gcc_cxx.sh"; \
+	    echo "C++: not built. Run $(HOME)/cross/build_gcc_cxx.sh"; \
 	fi
 .PHONY: cxx-check
 
@@ -271,37 +271,37 @@ CXX_APPS =
 endif
 
 # --- CPython (optional, built OUT OF TREE) ------------------------------------
-# The interpreter is cross-built in /home/motsou/cross/build-py (configure with
-# /home/motsou/cross/configure-py-emblink.sh -- it encodes the platform patches,
+# The interpreter is cross-built in $(HOME)/cross/build-py (configure with
+# $(HOME)/cross/configure-py-emblink.sh -- it encodes the platform patches,
 # the config.site and the crt0/syscalls link line). Same gate shape as HAVE_CXX
 # above: absent toolchain == PY_APPS empty == the tree still builds.
 #
 # It links against build/crt0.o + build/syscalls.o, so the OS must be built once
 # before configuring CPython -- and a libc change means reconfiguring it.
-PY_BUILD ?= /home/motsou/cross/build-py
+PY_BUILD ?= $(HOME)/cross/build-py
 PY_BIN   := $(PY_BUILD)/python
 HAVE_PY  := $(if $(wildcard $(PY_BIN)),yes,)
 
 # git, same shape as HAVE_PY: absent cross-built binary == GIT_APPS empty ==
-# the tree still builds. Build it with /home/motsou/cross/build-git-emblink.sh.
+# the tree still builds. Build it with $(HOME)/cross/build-git-emblink.sh.
 # The build script now lives IN THE REPO (tools/git/), so a teammate's checkout
 # can rebuild git without a copy of the author's home directory. It takes the
 # source tree as an argument and needs a cross-built zlib -- both overridable.
-GIT_SRC  ?= /home/motsou/cross/git-2.49.1
+GIT_SRC  ?= $(HOME)/cross/git-2.49.1
 GIT_BIN  ?= $(GIT_SRC)/git
-ZLIB_BUILD ?= /home/motsou/cross/build-zlib
+ZLIB_BUILD ?= $(HOME)/cross/build-zlib
 GIT_BUILD_SH ?= $(CURDIR)/tools/git/build-git-emblink.sh
 
 # TCC -- a C compiler that RUNS ON the OS. Chosen because it is compiler +
 # assembler + linker in ONE binary: EmbLink has no exec, so GCC's driver (which
 # fork/execs cc1, as, ld) is structurally impossible here, while `tcc a.c -o a`
 # is a single process start to finish.
-TCC_SRC ?= /home/motsou/cross/tcc-0.9.27
+TCC_SRC ?= $(HOME)/cross/tcc-0.9.27
 TCC_BIN ?= $(TCC_SRC)/tcc
 HAVE_TCC := $(if $(wildcard $(TCC_BIN)),yes,)
 HAVE_GIT := $(if $(wildcard $(GIT_BIN)),yes,)
 
-PY_SRC   ?= /home/motsou/cross/Python-3.14.6
+PY_SRC   ?= $(HOME)/cross/Python-3.14.6
 
 ifeq ($(HAVE_PY),yes)
 # The interpreter, the stdlib, and the file that points one at the other. All
@@ -540,7 +540,7 @@ build/emlibc_math.elf: build/emlibc_crt0.o build/emlibc_math.elf.o build/libemli
 # not repackaged by host Python). EmbLD is EmbCC's linker, so this is where
 # emlibc + EmbCC + EMBX meet. Built only when the host embld is present
 # (EMBCC_ROOT); otherwise the .embx is simply absent (honest, never faked).
-EMBCC_ROOT ?= /home/motsou/EmbCC
+EMBCC_ROOT ?= $(HOME)/EmbCC
 HOST_EMBLD := $(EMBCC_ROOT)/embld
 LIBGCC_A   := $(shell $(USER_CC) -print-libgcc-file-name)
 build/emlibc_embxapp.o: user/bin/emlibc_embxapp.c | $(BUILD)

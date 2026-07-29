@@ -4685,7 +4685,7 @@ int selftests_handle_command(const char *cmd)
         struct vfs_stat st;
         if (vfs_stat("/data/apps/python/python.elf", &st) != EMBK_OK) {
             kprintf("\n[cmd] test python: SKIP -- /python.elf not on the image "
-                    "(build it: /home/motsou/cross/configure-py-emblink.sh)\n");
+                    "(build it: see docs/BUILD_SETUP.md, the CPython port)\n");
             return 1;
         }
         char *a[] = { "/data/apps/python/python.elf", "-c", "print('hello from CPython on EmbLink')", NULL };
