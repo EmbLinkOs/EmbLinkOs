@@ -190,6 +190,9 @@ KVM acceleration, host-side UI unit tests, ...).
 | [user/README.md](user/README.md) | The userland SDK layers and newlib port details |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System-wide design decisions and the current stack |
 | [docs/PORTS.md](docs/PORTS.md) | C++, CPython, git and the C compiler on the OS — what works, what honestly can't |
+| [docs/USERSPACE_v2.md](docs/USERSPACE_v2.md) | The userspace model: authority IS the namespace — init, per-process namespaces, capabilities, multi-user (no uid/gid) |
+| [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md) | Building for/on the OS with EmbCC + EmbLD; the sealed ABI; declaring caps + namespace |
+| [docs/PACKAGING_AND_SDK.md](docs/PACKAGING_AND_SDK.md) | Package manager + SDK design: authority-declaring bundles, install = granting (design-only) |
 | [docs/SHELL.md](docs/SHELL.md) | The structured shell: typed pipelines, builtins, semantics |
 | [docs/INTERRUPTION.md](docs/INTERRUPTION.md) | Ctrl-C without signals: how cancellation is routed and observed |
 | [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) | Phase-by-phase build history |

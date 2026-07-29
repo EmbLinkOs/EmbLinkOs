@@ -152,6 +152,10 @@ wedging since the pump rework landed.
 toolchain inputs live in the sealed ABI: `/system/abi/{crt0.o, syscalls.o,
 libc.a}` — `libc.a` (6.6 MB) is the *same archive* the cross-build uses, so a
 program built **on** EmbLink and one built **for** it are the same program.
+*(Since userspace v2, "sealed" is now enforced: `/system` is a read-only
+namespace binding for every user process — a port reads the ABI, and a write to
+`/system` returns EROFS. Ports run namespace-confined like any app; see
+`docs/USERSPACE_v2.md` and `docs/TOOLCHAIN.md`.)*
 tcc's search paths are baked in at configure time
 (`tools/tcc/build-tcc-emblink.sh`): `-lXXX` resolves in `/system/abi`, and
 `#include <...>` resolves in `/system/abi/include` (newlib's full header tree —

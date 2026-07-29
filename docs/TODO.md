@@ -1338,3 +1338,44 @@ substantially complete.
   - [x] Prerequisite DONE: separate compile-then-link with tcc-produced
     objects, proven live (`test tcc tally`). *(Was checked-open while its own
     text said "already DONE".)*
+
+## Userspace authority (v2), packaging & toolchain
+
+The userspace authority model shipped end-to-end — see `docs/USERSPACE_v2.md` for
+the design and the live proofs (`test namespace`, `ns_spawn_test`,
+`mu_isolation_test`). Open items:
+
+- [x] ~~UP1 init as root of authority; UP2 per-process namespaces + sealed /system
+  RO; UP2b spawn-grant narrowing; UP4 declared per-app namespaces; UP3 multi-user
+  as namespace domains~~ — **all shipped.**
+- [ ] **UP3b — live multi-user.** Login/session switching between users, and
+  confining the *desktop* to a non-owner user. Needs the apps' broad grants (chiefly
+  `files.ns`'s `rw /`) tightened to the user's home, and the file manager's start dir
+  moved into `$HOME`.
+- [ ] **NS_BIND rebind** — a namespace grant where the child prefix ≠ the source
+  path (e.g. `/downloads` → `/data/users/<u>/downloads`). Needed for well-known
+  folders as grant targets (USERSPACE_v2 §11) and for `$HOME`-style rebinds.
+- [ ] **`adduser`** — user *creation* (homes are baked by mkfs today). Its skeleton
+  seeds grant-target folders, not a `Documents/Downloads` taxonomy (§11).
+
+### Packaging & SDK (designed, not built — `docs/PACKAGING_AND_SDK.md`)
+
+- [ ] **PK1** — the package manifest format + local `pkg install` (verify → present
+  declared authority → snapshot → adopt into `/data/apps/<name>/` with exactly its
+  `.ns`). Reuses everything through UP4.
+- [ ] **PK2** — the SDK generator: one `build.ebm` package stanza → EMBX caps +
+  `.ns` + package manifest, consistent by construction.
+- [ ] **PK3** — signing (ed25519 over `build_id`) + snapshot-backed update/rollback +
+  the local registry.
+- [ ] **PK4** — the git registry (`emblink-packages`): signed manifests in git,
+  binaries as release assets; fetch over HTTP (mirror pre-TLS, direct once TLS
+  lands). Rides the net stack.
+
+### Toolchain (EmbCC/EmbLD — tracked in full in `EmbCC/docs/todo.md`)
+
+- [ ] **A1** — an on-OS `.asm` assembler (grow EmbCC an Intel/NASM front-end), to
+  drop `nasm`. THE blocker for EmbBuild-builds-the-kernel (see `BUILD.md` §12). *In
+  progress.*
+- [ ] **L1** — EmbLD linker-defined symbols (`kernel_end`) so the kernel links with
+  no external tools and no diagnostic stub.
+- Usage: `docs/TOOLCHAIN.md` (building for/on the OS) + `EmbCC/docs/USAGE.md` (CLI).
