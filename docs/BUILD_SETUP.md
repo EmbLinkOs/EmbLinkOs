@@ -189,8 +189,9 @@ implementations (which assume a different OS) must be disabled or they'd
 conflict at link time.
 
 Point the build at it via `NEWLIB_PREFIX` (Makefile default is
-`/home/motsou/cross/newlib-c99` — **this is the original author's home
-directory and will not exist on your machine**; override it):
+`$(HOME)/cross/newlib-c99` — so if you put the newlib rebuild there, as this
+guide does, no override is needed; otherwise set `NEWLIB_PREFIX` to wherever it
+went, or `NEWLIB_PREFIX=` to fall back to the stock toolchain newlib):
 
 ```bash
 make NEWLIB_PREFIX=$HOME/cross/newlib-c99 embkfs.img

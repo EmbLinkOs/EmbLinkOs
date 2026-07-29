@@ -61,7 +61,7 @@ Fixed by rebuilding newlib **with** those options into a user-owned prefix:
 
 ```
 ../newlib-4.6.0.../configure --target=x86_64-elf \
-    --prefix=/home/motsou/cross/newlib-c99 \
+    --prefix=$HOME/cross/newlib-c99 \
     --disable-newlib-supplied-syscalls --disable-multilib --disable-nls \
     --enable-newlib-io-c99-formats --enable-newlib-io-long-long
 make && make install

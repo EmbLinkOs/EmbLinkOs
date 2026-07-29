@@ -234,7 +234,7 @@ CFLAGS = -ffreestanding -nostdlib -nostartfiles
 Run once:
 ```bash
 mkdir -p ~/.config/gdb
-echo "add-auto-load-safe-path /home/motsou/myos/.gdbinit" >> ~/.config/gdb/gdbinit
+echo "add-auto-load-safe-path $HOME/myos/.gdbinit" >> ~/.config/gdb/gdbinit
 ```
 
 ### Want to debug Stage 1/2 (bootloader)
