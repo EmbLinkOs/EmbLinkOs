@@ -125,7 +125,7 @@ static void draw_win2_band(uint32_t *buf, int w, int h, float phase) {
 int main(void) {
     /* toolkit font + context (only window 1 uses the toolkit) */
     size_t rl = 0;
-    uint8_t *reg = read_file("/font.ttf", &rl);
+    uint8_t *reg = read_file("/system/fonts/font.ttf", &rl);
     uint32_t fr = reg ? font_load(reg, rl) : 0;
     if (fr) font_install_backend();
     embk_puts(1, fr ? "wmdemo: font loaded\n" : "wmdemo: FONT MISSING\n");

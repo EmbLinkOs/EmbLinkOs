@@ -71,6 +71,7 @@
 #define EMBK_SPAWN_ACTION_OPEN        1
 #define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
 #define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */
+#define EMBK_SPAWN_ACTION_NS_BIND     7   /* narrow child namespace; `path`=prefix, `flags`=mode */
 
 /* Coarse resource-class capabilities (kernel capabilities.h, EMBX spec §5.6).
  * A child's set is a subset of its parent's; declare a subset via a
@@ -309,6 +310,28 @@ static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
                                         unsigned cap_mask) {
     a->kind = EMBK_SPAWN_ACTION_SET_CAPS;
     a->target_fd = 0; a->path[0] = 0; a->flags = (int)cap_mask;
+    a->mode = 0; a->src_obj_handle = 0;
+}
+
+/* Namespace grant modes (mirror kernel enum ns_mode). */
+#define EMBK_NS_RW 0
+#define EMBK_NS_RO 1
+
+/* Fill `a` as an NS_BIND action: grant the child a namespace binding for the
+ * absolute prefix `prefix` at `ns_mode` (EMBK_NS_RW / EMBK_NS_RO). Adding ANY
+ * NS_BIND action NARROWS the child to EXACTLY the granted prefixes (absent =>
+ * the child inherits your whole view). The kernel resolves `prefix` in YOUR
+ * namespace, so you can only grant what you can name, at a mode no wider than
+ * you hold; an ungrantable prefix fails the spawn. See docs/USERSPACE_v2.md
+ * UP2b. Copy `prefix` into the fixed path buffer (no libc assumed here). */
+static inline void embk_action_ns_bind(struct embk_spawn_file_action *a,
+                                       const char *prefix, int ns_mode) {
+    a->kind = EMBK_SPAWN_ACTION_NS_BIND;
+    a->target_fd = 0;
+    int i = 0;
+    if (prefix) { while (prefix[i] && i < 255) { a->path[i] = prefix[i]; i++; } }
+    a->path[i] = 0;
+    a->flags = ns_mode ? EMBK_NS_RO : EMBK_NS_RW;
     a->mode = 0; a->src_obj_handle = 0;
 }
 

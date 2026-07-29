@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "include/types.h"
 #include "process/capabilities.h"   /* per-process capability set */
+#include "fs/namespace.h"           /* per-process namespace (the OTHER born grant) */
 #include "arch/x86_64/cpu/kcontext.h"
 #include "arch/x86_64/cpu/percpu.h"
 #include "fs/fd.h"
@@ -346,6 +347,15 @@ struct process {
      * grantor set EMBX §6 step 9 checks a binary's declaration against; nothing
      * gates a syscall on it yet (except the debug syscalls — cap_id 10). */
     uint64_t cap_set;
+
+    /* Per-process NAMESPACE -- the OTHER grant a process is born with (the
+     * "authority IS the namespace" model, docs/USERSPACE_v2.md UP2). Maps path
+     * prefixes -> root object handles (+ ro/rw); path resolution starts HERE,
+     * not at a global root. Seeded to the global view for the kernel-spawned
+     * root of authority (init) and inherited by children, attenuating down the
+     * tree exactly like cap_set. `active == false` => fall back to the global
+     * mount table (kernel threads / early boot). See fs/namespace.{h,c}. */
+    struct namespace ns;
 
     /* Live-debugging session (EMBDBG_Specification.md §6). Non-NULL while this
      * process is being debugged: isr_handler routes its faults here instead of

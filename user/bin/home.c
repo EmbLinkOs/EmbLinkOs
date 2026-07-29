@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -68,14 +69,14 @@ static void home_ui(void) {
             }
             VStack(.spacing = 16, .align = Center) {
                 HStack(.spacing = 16) {
+                    tile("Files",    "/data/apps/files/files.elf");
+                    tile("Editor",   "/data/apps/edit/edit.elf");
+                    tile("Terminal", "/data/apps/term/term.elf");
+                }
+                HStack(.spacing = 16) {
                     tile("UI Demo",  "/data/apps/uidemo/uidemo.elf");
                     tile("Windows",  "/data/apps/wmdemo/wmdemo.elf");
                     tile("Menus",    "/data/apps/v6demo/v6demo.elf");
-                }
-                HStack(.spacing = 16) {
-                    tile("V4 Demo",  "/data/apps/v4demo/v4demo.elf");
-                    tile("Editor",   "/data/apps/v7demo/v7demo.elf");
-                    tile("Terminal", "/data/apps/term/term.elf");
                 }
             }
         }
@@ -94,6 +95,64 @@ static void home_ui(void) {
 #define MAX_TRACKED 8
 static struct { const char *path; int handle_p1; } g_running[MAX_TRACKED];
 
+/* An app DECLARES its namespace needs in /data/apps/<name>/<name>.ns (shipped in
+ * its package -- docs/USERSPACE_v2.md UP4). As the session, home reads that
+ * manifest and grants the child EXACTLY those bindings, so an app runs with only
+ * the subtrees it named -- naming is owning. Each line is "<ro|rw> <prefix>";
+ * '#' comments and blanks are ignored. Parse into NS_BIND spawn actions; return
+ * the count (0 = no manifest => the child inherits our full view, the pre-UP4
+ * default, so un-manifested apps are unaffected). `desc` gets a short summary. */
+#define NS_ACTS_MAX 8
+static int load_app_ns(const char *elf_path,
+                       struct embk_spawn_file_action *acts, int max,
+                       char *desc, size_t desc_cap) {
+    char mpath[256];
+    size_t L = strlen(elf_path);
+    if (L < 5 || L >= sizeof mpath) return 0;
+    memcpy(mpath, elf_path, L + 1);
+    if (strcmp(mpath + L - 4, ".elf") != 0) return 0;   /* only "<...>.elf" */
+    mpath[L - 3] = 'n'; mpath[L - 2] = 's'; mpath[L - 1] = 0;   /* ".elf" -> ".ns" */
+
+    size_t len = 0;
+    uint8_t *buf = read_file(mpath, &len);
+    if (!buf) return 0;
+    if (!len) { free(buf); return 0; }
+
+    int n = 0; size_t dn = 0;
+    if (desc_cap) desc[0] = 0;
+    for (size_t i = 0; i < len && n < max; ) {
+        while (i < len && (buf[i]==' '||buf[i]=='\t'||buf[i]=='\r'||buf[i]=='\n')) i++;
+        if (i >= len) break;
+        if (buf[i] == '#') { while (i < len && buf[i] != '\n') i++; continue; }
+
+        size_t ms = i;
+        while (i < len && buf[i]!=' ' && buf[i]!='\t' && buf[i]!='\n' && buf[i]!='\r') i++;
+        size_t mlen = i - ms;
+        int mode;
+        if      (mlen==2 && buf[ms]=='r' && buf[ms+1]=='o') mode = EMBK_NS_RO;
+        else if (mlen==2 && buf[ms]=='r' && buf[ms+1]=='w') mode = EMBK_NS_RW;
+        else { while (i < len && buf[i] != '\n') i++; continue; }   /* bad mode */
+
+        while (i < len && (buf[i]==' '||buf[i]=='\t')) i++;
+        size_t ps = i;
+        while (i < len && buf[i]!=' ' && buf[i]!='\t' && buf[i]!='\n' && buf[i]!='\r') i++;
+        size_t plen = i - ps;
+        if (plen == 0 || buf[ps] != '/' || plen > 255) { while (i<len && buf[i]!='\n') i++; continue; }
+
+        char prefix[256];
+        memcpy(prefix, buf + ps, plen); prefix[plen] = 0;
+        embk_action_ns_bind(&acts[n], prefix, mode);
+        if (desc_cap && dn + plen + 6 < desc_cap) {
+            if (dn) { desc[dn++]=','; desc[dn++]=' '; }
+            desc[dn++]='r'; desc[dn++]=(mode==EMBK_NS_RO)?'o':'w'; desc[dn++]=' ';
+            memcpy(desc+dn, prefix, plen); dn += plen; desc[dn]=0;
+        }
+        n++;
+    }
+    free(buf);
+    return n;
+}
+
 static void spawn_app(const char *path) {
     int slot = -1;
     for (int i = 0; i < MAX_TRACKED; i++) {
@@ -109,16 +168,29 @@ static void spawn_app(const char *path) {
         g_running[slot].handle_p1 = 0;
     }
 
+    /* Grant the child EXACTLY its declared namespace (UP4); no manifest => it
+     * inherits our full view. */
+    struct embk_spawn_file_action acts[NS_ACTS_MAX];
+    char nsdesc[224];
+    int nacts = load_app_ns(path, acts, NS_ACTS_MAX, nsdesc, sizeof nsdesc);
+
     char *argv[] = { (char *)path, NULL };
-    int h = (int)embk_spawn(path, argv, NULL, 0);
+    int h = (int)embk_spawn(path, argv, nacts ? acts : NULL, nacts);
+
+    char b[320];
+    if (nacts) snprintf(b, sizeof b, "home: spawn %s -> ns[%s] (%d bind%s)\n",
+                        path, nsdesc, nacts, nacts == 1 ? "" : "s");
+    else       snprintf(b, sizeof b, "home: spawn %s -> full inherit (no manifest)\n", path);
+    embk_puts(1, b);
+
     if (h >= 0) { g_running[slot].path = path; g_running[slot].handle_p1 = h + 1; }
-    else { char b[80]; snprintf(b, sizeof b, "home: spawn %s FAILED: %d\n", path, h); embk_puts(1, b); }
+    else { char e[96]; snprintf(e, sizeof e, "home: spawn %s FAILED: %d\n", path, h); embk_puts(1, e); }
 }
 
 int main(void) {
     /* toolkit font + context */
     size_t rl = 0;
-    uint8_t *reg = read_file("/font.ttf", &rl);
+    uint8_t *reg = read_file("/system/fonts/font.ttf", &rl);
     uint32_t fr = reg ? font_load(reg, rl) : 0;
     if (fr) font_install_backend();
     embk_puts(1, fr ? "home: font loaded\n" : "home: FONT MISSING\n");

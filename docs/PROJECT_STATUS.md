@@ -787,6 +787,36 @@ The OS now boots under **both firmwares from its own code**, off **one medium**:
   (`.embfw` payload format, verification, Recovery/Diagnostics, Boot Manager)
   are designed, not built. BIOS boot is unaffected throughout.
 
+### Phase 27 — Userspace v2: authority IS the namespace ✅
+
+A ground-up rework of how userspace is entered and how authority works, on the
+thesis that a process's authority *is* its namespace plus its capabilities — no
+uid/gid, no `rwx`. Full design + proofs in `docs/USERSPACE_v2.md`.
+
+- **UP1 — init as the root of authority.** The kernel now spawns exactly one user
+  process, `/system/bin/init.elf` (the first user process, not the desktop), which
+  brings up the desktop session and *supervises* it. The old test harness that had
+  squatted the name `init.elf` became `primtest.elf`. Fonts moved off bare `/` into
+  `/system/fonts`.
+- **UP2 — per-process namespaces.** `kernel/fs/namespace.{c,h}` + a `struct
+  namespace` on every process beside `cap_set`. Path resolution does *namespace
+  lookup then walk from the bound root object* (never a global root); `/system` is a
+  read-only binding, enforced (a userspace write returns EROFS before the path even
+  resolves). `test namespace` 13/13; `test posix` unaffected.
+- **UP2b — spawn-grant.** `SPAWN_ACTION_NS_BIND` hands a child a *narrowed*
+  namespace, resolved in the parent's namespace (attenuation by construction). A
+  child cannot *name* what it wasn't granted — proven live (`ns_spawn_test`).
+- **UP4 — declared per-app namespaces.** An app ships `<name>.ns`; the session
+  grants exactly that. The clock widget runs live confined to `ro /system`.
+- **UP3 — multi-user as namespace domains.** Users are `/data/users/<name>` +
+  a session profile; init is the session manager. A guest session provably cannot
+  name another user's home (`mu_isolation_test`). No uid/gid anywhere.
+
+Also **designed, not built**: the package manager + SDK (`docs/PACKAGING_AND_SDK.md`)
+— packages as authority-declaring bundles, install = granting the declared authority
+(kernel-enforced), a git registry + signed release binaries. And the toolchain
+usage is now documented (`docs/TOOLCHAIN.md`, `EmbCC/docs/USAGE.md`).
+
 ---
 
 ## Major To-Do Buckets (Rough Priority)

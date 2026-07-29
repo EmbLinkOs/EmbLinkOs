@@ -129,6 +129,12 @@ static struct process *process_alloc(void) {
              * for user processes (attenuated from the parent); left as-is for
              * kernel threads, which ARE the kernel and hold the full set. */
             process_table[i].cap_set = EMBK_CAP_ALL;
+            /* Namespace: default INACTIVE (global-mount fallback) -- the safe
+             * reset for a REUSED slot and the resting state for kernel threads.
+             * process_create_caps installs the real per-process view for user
+             * processes. A stale active namespace here would silently scope a
+             * fresh kthread to a dead process's tree. */
+            memset(&process_table[i].ns, 0, sizeof(process_table[i].ns));
             /* -1, not the zeroed-by-memset 0: 0 is a VALID cpu_table[]
              * index (the BSP) -- meaningless until live_thread_count hits
              * 0 for the first time (see the field's comment), but starting
@@ -447,6 +453,14 @@ int process_alive(uint32_t pid) {
  * init). The EMBX loader will read this as "what may I grant this binary". */
 uint64_t process_current_caps(void) {
     return current_thread ? current_process->cap_set : EMBK_CAP_ALL;
+}
+
+/* The current process's namespace, or NULL when no user process is running (the
+ * boot CPU / kernel threads) -- in which case the VFS falls back to the global
+ * mount table. This is the "start resolution HERE" hook the resolver consults
+ * on every path (fs/namespace.h, fs/vfs.c). */
+struct namespace *process_current_ns(void) {
+    return current_thread ? &current_process->ns : NULL;
 }
 
 /* Capabilities of `pid`, or 0 (no authority) if there is no such live slot.
@@ -1500,6 +1514,52 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         }
         proc->cap_set = granted;
     }
+
+    /* Namespace grant -- the naming half of the same born authority. Three cases:
+     *
+     *  (a) The spawn carries one or more SPAWN_ACTION_NS_BIND actions: the child
+     *      gets a NARROWED namespace of EXACTLY those prefixes (UP2b). Each prefix
+     *      is resolved in the PARENT's namespace (we are in the parent's context
+     *      here), so the parent can only grant what it can itself name -- and the
+     *      granted mode is clamped to the parent's, never widened. That resolve
+     *      IS the attenuation, and it hands back the real directory object.
+     *  (b) No NS_BIND, active parent: the child INHERITS the parent's whole view.
+     *  (c) No NS_BIND, no active parent (the kernel spawning init): the global
+     *      view built from the live mount table. */
+    {
+        int nbind = 0;
+        for (int i = 0; i < n_count; i++)
+            if (actions[i].kind == SPAWN_ACTION_NS_BIND) nbind++;
+
+        if (nbind > 0) {
+            struct namespace narrowed;
+            memset(&narrowed, 0, sizeof(narrowed));
+            for (int i = 0; i < n_count; i++) {
+                if (actions[i].kind != SPAWN_ACTION_NS_BIND)
+                    continue;
+                struct vnode vn;
+                uint8_t pmode;
+                int rc = vfs_resolve_ex(actions[i].path, &vn, &pmode);  /* in parent ns */
+                if (rc != EMBK_OK) {          /* parent cannot name this prefix */
+                    proc->pid = 0;
+                    return rc;
+                }
+                uint8_t reqmode = (actions[i].flags == NS_MODE_RO) ? NS_MODE_RO : NS_MODE_RW;
+                uint8_t granted = (pmode == NS_MODE_RO) ? NS_MODE_RO : reqmode; /* never widen */
+                int br = ns_bind(&narrowed, actions[i].path, vn, granted);
+                if (br != EMBK_OK) {
+                    proc->pid = 0;
+                    return br;
+                }
+            }
+            ns_copy(&proc->ns, &narrowed);
+        } else if (current_thread && current_process->ns.active) {
+            ns_copy(&proc->ns, &current_process->ns);
+        } else {
+            ns_seed_global(&proc->ns);
+        }
+    }
+
     proc->zombie_next = NULL;
     proc->zombie_head = NULL;
     proc->child_list = NULL;
@@ -1660,6 +1720,9 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             /* Not a file action -- the capability request was already extracted
              * by sys_spawn and applied via requested_caps at creation. Skip it
              * here so it is neither an error nor double-handled. */
+        } else if (act->kind == SPAWN_ACTION_NS_BIND) {
+            /* Not a file action -- the namespace grant was already built and
+             * installed into proc->ns at creation (below the cap grant). Skip. */
         } else if (act->kind == SPAWN_ACTION_DEBUG) {
             /* Born under debug (§6.2). Only note it here; the session is
              * created and the child parked at the very end, once its thread and

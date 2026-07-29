@@ -60,7 +60,7 @@ int em_app_run(const EmApp *app) {
 
     /* resources + toolkit */
     em_res_set_loader(emapp_load);
-    uint32_t fr = em_font(app->font ? app->font : "/font.ttf");
+    uint32_t fr = em_font(app->font ? app->font : "/system/fonts/font.ttf");
     { char b[96]; snprintf(b, sizeof b, "%s: font loaded (+%lums)\n", title,
                            (unsigned long)(embk_uptime_ms() - t0)); embk_puts(1, b); }
 
@@ -249,7 +249,7 @@ int em_widget_run(const EmWidget *wg) {
     const char *title = wg->title ? wg->title : "Widget";
 
     em_res_set_loader(emapp_load);
-    uint32_t fr = em_font(wg->font ? wg->font : "/font.ttf");
+    uint32_t fr = em_font(wg->font ? wg->font : "/system/fonts/font.ttf");
 
     struct scene_arena sa; scene_arena_init(&sa);
     struct layout_arena la; layout_arena_init(&la);

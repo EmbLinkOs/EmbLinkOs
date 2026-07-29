@@ -229,7 +229,7 @@ int main(void) {
         .chrome = Chromeless,
         .resize = FixedSize,
         .view   = term_view,
-        .font   = "/mono.ttf",   /* DejaVu Sans Mono -- aligned table columns */
+        .font   = "/system/fonts/mono.ttf",   /* DejaVu Sans Mono -- aligned table columns */
     };
     int rc = em_app_run(&app);
     /* window closed: our pipe fds die with us (reap loop) -> the shell's

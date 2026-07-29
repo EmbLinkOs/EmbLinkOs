@@ -223,3 +223,99 @@ A manifest that becomes genuinely painful to hand-write (earns
 compression features, §2.4); a foreign source tree on the critical
 path (earns the make port, §7); staging-vs-adoption friction so
 constant it argues the boundary is drawn wrong (§3).
+
+---
+
+## 12. Scope — EmbBuild builds the KERNEL (the last self-host frontier)
+
+*The crown of the own-the-stack arc: EmbBuild, on the OS, rebuilds the **kernel**
+(and then the bootable image) from source — so EmbLinkOS reproduces itself, kernel
+included, with no external tools. This is a scope, not a plan of record.*
+
+### 12.1 What is already proven (so this is orchestration, not invention)
+
+The compilers work on kernel-grade C. On the host: **EmbCC compiles all 88 kernel
+TUs** (`-mno-sse`), **EmbLD links** them with the higher-half layout, and the
+result **boots to the home desktop** — no GCC, no `ld` (see EmbCC `docs/todo.md`
+K1–K13, L1–L2). So the remaining question is purely: can EmbBuild drive that same
+pipeline *on the OS*? Everything below is what stands between here and yes.
+
+### 12.2 The DAG EmbBuild must express
+
+```
+88 × (embcc -c foo.c -mno-sse …)  ─┐
+ 6 × (assemble  foo.asm)           ─┼─▶  embld -e _start -Ttext … *.o  ─▶  kernel.elf
+                                    │         (needs kernel_end = L1)
+ stage2.asm ──(assemble, KERNEL_LOAD_SECTORS = ⌈sizeof(kernel.elf)/512⌉)─┐
+ stage1.asm ──(assemble, STAGE2_LOAD_SECTORS  = ⌈sizeof(stage2.bin)/512⌉)┼▶ cat → myos.img
+                                                          kernel.elf ─────┘
+```
+
+The compile fan-out and the link are the shell manifest's `kind: compile` /
+`kind: link` shape, one level larger — pointed at `/data/apps/embcc/embcc.elf`
+and `/data/apps/embld/embld.elf` instead of `tcc.elf`. A single kernel compile
+target reads:
+
+```
+name: mm_pmm.o
+kind: compile
+inputs: /data/src/kernel/mm/pmm.c  /data/src/kernel/mm/pmm.h  … (its headers)
+args: /data/apps/embcc/embcc.elf -c -mno-sse -I/data/src/kernel /data/src/kernel/mm/pmm.c -o /data/build/out/kernel/mm_pmm.o
+output: /data/build/out/kernel/mm_pmm.o
+```
+
+### 12.3 The gaps, ranked (each a real dependency)
+
+- **G1 — an on-OS assembler for the 6 kernel `.asm` (and stage1/stage2). THE
+  blocker — RECOMMENDATION: grow EmbCC into a standalone assembler.** They are
+  **NASM syntax**; TCC's integrated assembler is GAS/AT&T, so nothing on the image
+  assembles them today. The corpus is *small and bounded* — **621 lines, 11
+  directives** (`global`/`extern`, `section`, `align`, `db/dw/dd/dq/resb`,
+  `%macro`, `incbin`) and **~23 mnemonics**, most of which EmbCC's K1 inline-asm
+  encoder already emits (`cli`,`hlt`,`mov crN`,`rdmsr`,`wrmsr`,`pushfq`,`popfq`,
+  `iretq`,`lgdt`,`push`/`pop`); the new ones are ordinary (`add`,`or`,`xor`,
+  `test`,`jmp`,`jnz`,`call`,`ret`,`lea`,`fxsave`,`fxrstor`). So the right move is
+  **not** porting nasm but growing EmbCC a standalone assembler front-end over the
+  encoder it already has — EmbCC becomes compiler+assembler (like TCC is
+  compiler+assembler+linker in one), fully owned, and the kernel `.asm` stay
+  untouched (EmbCC learns their syntax). The work: (1) add ~10 mnemonics to the
+  K1 encoder; (2) an **Intel-syntax** file front-end — instruction parser
+  (operand order / `[mem]` differ from EmbCC's AT&T inline asm), a label/symbol
+  table, the ~8 directives, one `%macro` expander (the `isr0..255` stub), `incbin`
+  (`ap_trampoline_blob`), and ELF-object emission with relocations. *(Porting nasm
+  stays the fallback; the micro-assembler option collapses into this one.)*
+- **G2 — EmbLD `kernel_end`.** The link's one open item (EmbCC `docs/todo.md` L1):
+  minimal `-T`/`SYM = .` support so `kernel_end` is defined at the image end,
+  instead of the diagnostic stub used to prove the boot.
+- **G3 — a derived value feeding a later step's args** (the `KERNEL_LOAD_SECTORS`
+  two-pass). Today's manifest args are static; stage2 must be assembled with a
+  `-D` computed from `kernel.elf`'s size, and stage1 from stage2's. Small EmbBuild
+  feature: a target whose output is a *value* another target's args interpolate
+  (or a `kind: measure` step). This is the one genuinely new EmbBuild capability.
+- **G4 — stage the kernel source on the image.** ~88 `.c` + ~110 headers + 6
+  `.asm` + `linker.ld` under `/data/src/kernel/` (the `/data/src` convention
+  already exists; this is mechanical but grows the image by the kernel tree).
+- **G5 — generate the manifest.** 88+ targets is past hand-writing (§11's
+  "painful to hand-write" trigger, met): a small `Makefile → build.ebm` emitter
+  from `KERNEL_SRC` + the header deps, checked in like the other manifests.
+
+### 12.4 Phasing
+
+- **KM1 — `kernel.elf` on the OS.** G1 (assemble the 6 `.asm`) + G2 (`kernel_end`)
+  + G4 + G5, then `embcc`-compile + `embld`-link on the metal. *Green:* the
+  on-OS `kernel.elf` boots (and/or matches the host EmbCC/EmbLD one).
+- **KM2 — the bootable image.** Add stage1/stage2 assembly + G3 (computed sector
+  counts) + the `cat`. *Green:* EmbBuild emits a `myos.img` on the OS.
+- **KM3 — self-reproduction.** Boot the `myos.img` the OS just built. *Green:* the
+  desktop comes up from an image the running system produced from source — the
+  loop fully closed, kernel included.
+
+### 12.5 Honest boundary
+
+This is the hardest EmbBuild target and it earns real new work: an **assembler on
+the image** (G1) is a genuine port/feature, not a manifest tweak, and the derived-
+value step (G3) is the first EmbBuild capability beyond a static walker. Until G1
+lands, "EmbBuild builds the kernel" is **blocked on assembling six files**, and
+should be stated that plainly. The *userland* image (`embkfs.img`) is a separate
+concern (its own mkfs); KM1–KM3 produce the kernel/`myos.img` against a
+pre-existing userland.

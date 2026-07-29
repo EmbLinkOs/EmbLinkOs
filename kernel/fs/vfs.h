@@ -193,8 +193,15 @@ int  vfs_mount(const char *path, const struct vfs_ops *ops, void *fs_data,
                uint64_t root_ino);
 
 /* Resolve an absolute path to a vnode. This is the component-by-component
- * walk — the ONLY path parser in the kernel. */
+ * walk — the ONLY path parser in the kernel. Honors the current process's
+ * namespace (UP2); falls back to the global mount table in kernel context. */
 int  vfs_resolve(const char *path, struct vnode *out);
+
+/* As vfs_resolve, but also reports the resolving namespace binding's mode
+ * (NS_MODE_RW / NS_MODE_RO) via `mode_out` (may be NULL) -- write paths use it
+ * to refuse a read-only binding. NS_MODE_RW in the global-fallback (kernel)
+ * case. */
+int  vfs_resolve_ex(const char *path, struct vnode *out, uint8_t *mode_out);
 
 /* Convenience wrappers: resolve `path`, then call the matching op. */
 int  vfs_read(const char *path, uint64_t off, void *buf, size_t len, size_t *out_read);

@@ -696,7 +696,7 @@ def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
 # test binaries). Fonts and the format fixtures are NOT *.elf and are placed
 # separately (fonts at root, fixtures at root -- they test the format, not the
 # layout).
-_SYSTEM_BIN = {"init.elf", "shell.elf", "home.elf"}          # -> /system/bin/
+_SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
@@ -728,6 +728,15 @@ def discover_userland_objects(build_dir="build"):
         if name == "init.elf":
             continue                                          # already added first
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
+        # Per-app NAMESPACE MANIFEST (docs/USERSPACE_v2.md UP4): an app ships its
+        # declared namespace as user/bin/<name>.ns, packed beside its .elf as
+        # /data/apps/<name>/<name>.ns. The session (home) reads it and grants
+        # EXACTLY those bindings (absent => the app inherits the parent's view).
+        base = name[:-4]                                      # strip ".elf"
+        nsm = _read_file(f"user/bin/{base}.ns")
+        if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
+            dest = f"data/apps/{base}/{base}.ns".encode()
+            objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
     # The kernel's own .embdbg (EMBDBG_Specification.md §7): a LINE+FUNCS sidecar
     # the kernel loads at boot so isr_handler symbolizes a panic to func:line.
     kdbg = _read_file(f"{build_dir}/kernel.embdbg")
@@ -736,14 +745,17 @@ def discover_userland_objects(build_dir="build"):
     so = _read_file(f"{build_dir}/libembk.so")
     if so is not None:
         objects.append((b"system/lib/libembk.so", L.DT_REG, L.S_IFREG | 0o755, so))
+    # UI fonts are part of the sealed OS, not root stragglers: they live under
+    # /system/fonts (USERSPACE_v2 UP1 -- nothing at bare /). The EmUI runtime
+    # (ui/dsl/em_app.c) and the explicit readers default to these paths.
     font = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
     if font is not None:
-        objects.append((b"font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
+        objects.append((b"system/fonts/font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
     # The terminal's MONOSPACE face (same DejaVu family, so the same
     # rasterizer tech) -- shell tables align only in fixed-pitch glyphs.
     mono = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
     if mono is not None:
-        objects.append((b"mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
+        objects.append((b"system/fonts/mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
     # THE ABI, sealed under /system/abi (docs/USERSPACE.md D2 §3.1): crt0.o
     # (_start), syscalls.o (the newlib retargeting layer) and libc.a ARE the
     # definition of "targeting EmbLinkOS". tcc READS them (read-only reach into
@@ -973,8 +985,24 @@ def discover_userland_objects(build_dir="build"):
 
     # Empty user/scratch directories the layout commits to now (D4 §5, D3 §4.1),
     # so a session can chdir into a home and tcc has a scratch dir to write to.
-    objects.append((b"data/tmp",        L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
-    objects.append((b"data/users/teo",  L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/tmp",          L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/teo",    L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/guest",  L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    # Per-user SESSION PROFILES (docs/USERSPACE_v2.md UP3). Multi-user here is
+    # namespace domains, not uid/gid: a "user" is a home subtree + a session
+    # namespace, declared in the SAME manifest format as the app manifests (UP4).
+    # init (the session manager) reads the default user's profile and launches
+    # the desktop confined to it. A session bound only to its own
+    # /data/users/<name> literally cannot NAME another user's home.
+    #   teo   -- the machine owner: the live desktop runs here. Broad (mirrors the
+    #            global seed: /, /run rw + /system ro) so the desktop is unchanged.
+    #   guest -- a confined session: read-only system + apps, and ONLY its own home.
+    objects.append((b"data/users/teo/user.ns",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"# teo -- the machine owner (the desktop session; broad but sealed)\n"
+                    b"rw /\nro /system\nrw /run\n"))
+    objects.append((b"data/users/guest/user.ns", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"# guest -- a confined session: system + apps read-only, own home only\n"
+                    b"ro /system\nro /data/apps\nrw /data/users/guest\n"))
     return objects
 
 

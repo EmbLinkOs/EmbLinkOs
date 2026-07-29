@@ -1,0 +1,5 @@
+# clockw namespace manifest (docs/USERSPACE_v2.md UP4).
+# A desktop clock widget: no file I/O of its own -- it only needs the UI runtime
+# (fonts + libembk.so under the sealed /system). So it runs with a NARROW,
+# read-only view and cannot name /data, /run, or anything else.
+ro /system
