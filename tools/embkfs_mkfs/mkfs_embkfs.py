@@ -293,14 +293,17 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
     return bytes(block)
 
 
-def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
-    # 64 MB (was 8, was 4). Each bump had the same trigger: one binary grew
-    # past the volume and free_blocks went NEGATIVE -- struct.pack('Q') then
-    # refuses it, which is the (cryptic) way this failure announces itself.
+def make_image(path: str, size_bytes: int = 128 * 1024 * 1024, objects=None):
+    # 128 MB (was 64, 8, 4). Each bump had the same trigger: content grew past
+    # the volume and free_blocks went NEGATIVE -- struct.pack('Q') then refuses
+    # it, which is the (cryptic) way this failure announces itself.
     #   4 -> 8 MB: shell.elf (~410 KB static-newlib)
     #   8 -> 64 MB: cxxdemo.elf is ~9.4 MB ON ITS OWN -- <iostream> pulls in
     #               locales + the whole ios/facet machinery (it was 903 KB
     #               before that one #include). CPython will be bigger again.
+    #   64 -> 128 MB: staging the KERNEL source tree on the image (/data/src/
+    #               kernel, ~180 files) for EmbBuild-builds-the-kernel (BUILD.md
+    #               §12) tipped the near-full 64 MB volume over.
     # The kernel reads total_blocks from the superblock, so growing is safe;
     # the image is sparse-ish on disk and QEMU only reads what's used.
     bs = L.BLOCK_SIZE
@@ -816,6 +819,27 @@ def discover_userland_objects(build_dir="build"):
                                      b"data/apps/embcc/include/", ".h"))
         objects.extend(_tree_objects(EMBCC_ROOT + "/ref",
                                      b"data/src/embcc/ref/", ".o"))
+
+    # KM1 (docs/BUILD.md §12): the KERNEL source tree, so EmbBuild can rebuild the
+    # kernel ON the OS. Staged under /data/src/kernel/ preserving subdirs, so the
+    # on-OS embcc's `-Ikernel` quote-includes (#include "fs/vfs.h", ...) resolve
+    # exactly as on the host. We ship .c + .h + .asm + the linker script, PLUS the
+    # 6 pre-built nasm objects under asm/ -- an on-OS assembler is G1 (not built
+    # yet), so until it lands the on-OS link consumes these prebuilt objects and
+    # only the C compile + the embld link run on the metal.
+    objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".c"))
+    objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".h"))
+    objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".asm"))
+    kld = _read_file("kernel/linker.ld")
+    if kld is not None:
+        objects.append((b"data/src/kernel/linker.ld",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, kld))
+    for aobj in ("isr", "syscall_entry", "kcontext", "kentry",
+                 "ap_entry", "ap_trampoline_blob"):
+        blob = _read_file(f"build/{aobj}.o")
+        if blob is not None:
+            objects.append((b"data/src/kernel/asm/" + aobj.encode() + b".o",
+                            L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
 
     # The EmUI toolkit HEADERS + one real app's source (clockw), so on-OS tcc can
     # COMPILE + DYNAMIC-LINK a GUI app against /system/lib/libembk.so -- the "GUI
