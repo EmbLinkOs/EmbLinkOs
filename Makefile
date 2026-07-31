@@ -963,10 +963,18 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
 # catch. Naming the file is the point.
 STAGED_APPS ?=
 
+# EmbBuild-builds-the-kernel (docs/BUILD.md §12, KM1): the on-OS kernel manifest
+# (89 embcc compiles + one embld link, all in ON-IMAGE paths) and the kernel_end
+# bridge stub. mkfs stages these under /data/src/kernel/ next to the sources.
+build/kernel.build.ebm: tools/gen_kernel_ebm.py Makefile | $(BUILD)
+	python3 tools/gen_kernel_ebm.py $(KERNEL_SRC) > $@
+build/kernel_end.o: tools/kernel_end_stub.asm | $(BUILD)
+	$(ASM) -f elf64 $< -o $@
+
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o build/kernel.build.ebm build/kernel_end.o
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is

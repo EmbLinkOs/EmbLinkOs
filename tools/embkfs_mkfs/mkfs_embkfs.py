@@ -835,11 +835,16 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"data/src/kernel/linker.ld",
                         L.DT_REG, L.S_IFREG | L.PERM_FILE, kld))
     for aobj in ("isr", "syscall_entry", "kcontext", "kentry",
-                 "ap_entry", "ap_trampoline_blob"):
+                 "ap_entry", "ap_trampoline_blob", "kernel_end"):
         blob = _read_file(f"build/{aobj}.o")
         if blob is not None:
             objects.append((b"data/src/kernel/asm/" + aobj.encode() + b".o",
                             L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+    # The generated EmbBuild manifest (G5): 89 embcc compiles + one embld link.
+    kebm = _read_file("build/kernel.build.ebm")
+    if kebm is not None:
+        objects.append((b"data/src/kernel/build.ebm",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, kebm))
 
     # The EmUI toolkit HEADERS + one real app's source (clockw), so on-OS tcc can
     # COMPILE + DYNAMIC-LINK a GUI app against /system/lib/libembk.so -- the "GUI
