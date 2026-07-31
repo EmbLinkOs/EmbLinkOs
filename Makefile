@@ -878,7 +878,14 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 
 $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) > $(IMG)
-	truncate -s 1M $(IMG)
+	@# Round the boot image UP to the next whole MB -- never DOWN. A fixed
+	@# `truncate -s 1M` silently lopped the kernel's tail once it crossed 1 MB
+	@# (e.g. an embcc-compiled kernel: ~1.5x gcc's .text, and no -g to strip),
+	@# so the bootloader loaded an incomplete kernel and died before serial init.
+	@# `%1M` pads small kernels to 1 MB exactly as before, but grows to 2 MB, 3 MB,
+	@# ... as the kernel does, so it can never be truncated. (Stage1/2 load by
+	@# sector count, not image size, so any padded size is fine.)
+	truncate -s %1M $(IMG)
 	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
 	kernel_top=$$(( 0x100000 + $$(stat -c%s $(KERNEL_BIN)) )); \
 	stage_base=$$(( 0x1000000 )); \
