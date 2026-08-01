@@ -1265,6 +1265,24 @@ int selftests_handle_command(const char *cmd)
         return code == 0 ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test emlibc net") == 0) {
+        /* Proves emlibc's NATIVE networking: emlibc_net (ring 3, linked against
+         * libemlibc only -- zero newlib) does an HTTP GET via em_tcp_connect +
+         * read/write, EmbLink's own vocabulary (no BSD sockets). Needs
+         * CAP_NETWORK + outbound :80. */
+        const char *ep = "/data/apps/emlibc_net/emlibc_net.elf";
+        struct vfs_stat st;
+        if (vfs_stat(ep, &st) != 0) { kprintf("\n[cmd] test emlibc net: %s not on image\n", ep); return 1; }
+        char *a[]   = { (char *)ep, (char *)"example.com", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(ep, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[emlibc-net] exit=%d\n", code);
+        kprintf("[cmd] test emlibc net: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test tls") == 0) {
         /* THE HEADLINE (docs/TLS.md T2): the OS speaks TLS 1.3. tlstest (ring 3)
          * resolves cloudflare.com, TCP-connects :443, runs OUR libtls handshake

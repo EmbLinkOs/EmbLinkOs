@@ -597,7 +597,7 @@ EMLIBC_FD_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stac
 
 EMLIBC_OBJS := build/emlibc_string.o build/emlibc_stdlib.o build/emlibc_stdio.o \
                build/emlibc_syscalls.o build/emlibc_errno.o build/emlibc_process.o \
-               build/emlibc_math.o $(EMLIBC_FD_OBJS)
+               build/emlibc_math.o build/emlibc_net.o $(EMLIBC_FD_OBJS)
 
 build/emlibc_string.o: $(EMLIBC_DIR)/string/string.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
@@ -613,6 +613,8 @@ build/emlibc_process.o: $(EMLIBC_DIR)/process/process.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_math.o: $(EMLIBC_DIR)/math/math.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_net.o: $(EMLIBC_DIR)/net/net.c $(EMLIBC_DIR)/include/net.h | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_fd_%.o: $(EMLIBC_FD_DIR)/%.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_FD_CFLAGS) -c $< -o $@
 
@@ -626,11 +628,19 @@ build/emlibc_crt0.o: user/lib/crt0.c | $(BUILD)
 
 # The proof (house rule): a program that links emlibc INSTEAD of newlib -- no
 # -lc, no build/crt0.o, no build/syscalls.o -- and runs on the OS.
-build/emlibc_demo.o: user/bin/emlibc_demo.c | $(BUILD)
+build/emlibc_demo.o: user/bin/emlibc_net.c user/bin/emlibc_demo.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_demo.elf: build/emlibc_crt0.o build/emlibc_demo.o build/libemlibc.a user/lib/newlib.ld
 	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
 	    build/emlibc_crt0.o build/emlibc_demo.o -Lbuild -lemlibc -lgcc -o $@
+
+# emlibc_net -- native networking demo (em_tcp_connect over emlibc, 0 newlib).
+# (Distinct object name from the rim's build/emlibc_net.o.)
+build/emlibcnet_demo.o: user/bin/emlibc_net.c user/emlibc/include/net.h | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_net.elf: build/emlibc_crt0.o build/emlibcnet_demo.o build/libemlibc.a user/lib/newlib.ld
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+	    build/emlibc_crt0.o build/emlibcnet_demo.o -Lbuild -lemlibc -lgcc -o $@
 
 # emlibc_caps -- the part newlib cannot express: capability inspection +
 # handle-based spawn with attenuation. Also emlibc-linked, not newlib.
@@ -849,7 +859,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1022,7 +1032,7 @@ endif
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf \
-               build/emlibc_demo.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
+               build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
