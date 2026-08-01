@@ -1515,3 +1515,5 @@ TLS_CRYPTO_INC := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto
 test-tls-crypto:
 	@cc -Wall $(TLS_CRYPTO_INC) kernel/crypto/sha256.c kernel/crypto/hmac.c \
 	    user/lib/tls/crypto/hkdf.c tools/tls/test_hkdf.c -o /tmp/embk_test_hkdf && /tmp/embk_test_hkdf
+	@cc -Wall $(TLS_CRYPTO_INC) kernel/crypto/aes.c \
+	    user/lib/tls/crypto/gcm.c tools/tls/test_gcm.c -o /tmp/embk_test_gcm && /tmp/embk_test_gcm

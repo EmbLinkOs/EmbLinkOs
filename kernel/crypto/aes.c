@@ -70,33 +70,46 @@ static uint8_t gmul(uint8_t a, uint8_t b) {
 }
 
 #define AES256_NK 8   /* key length in 32-bit words */
+#define AES128_NK 4
 #define AES_NB    4   /* block size in 32-bit words (always 4 for AES) */
 
-void aes256_init(struct aes256_ctx *ctx, const uint8_t key[AES256_KEY_SIZE]) {
-    uint8_t *rk = ctx->round_keys; /* AES_NB*(AES256_NR+1) words, 4 bytes each, laid out flat */
-    memcpy(rk, key, AES256_KEY_SIZE);
+/* Generic FIPS-197 key expansion, parametrized by Nk (key words) and Nr
+ * (rounds). Reduces to the exact AES-256 schedule at (nk=8, nr=14) -- the
+ * extra SubWord at the Nk/2 offset fires only for nk>6 (i.e. AES-256), which
+ * is why aes256_run_selftests (FIPS C.3) still passes byte-for-byte after this
+ * was folded out of the old AES-256-only routine. */
+static void key_expand(uint8_t *rk, const uint8_t *key, int nk, int nr) {
+    memcpy(rk, key, (size_t)nk * 4);
 
-    int total_words = AES_NB * (AES256_NR + 1); /* 60 */
-    for (int i = AES256_NK; i < total_words; i++) {
+    int total_words = AES_NB * (nr + 1);
+    for (int i = nk; i < total_words; i++) {
         uint8_t temp[4];
         memcpy(temp, rk + (i - 1) * 4, 4);
 
-        if (i % AES256_NK == 0) {
+        if (i % nk == 0) {
             /* RotWord */
             uint8_t t0 = temp[0];
             temp[0] = temp[1]; temp[1] = temp[2]; temp[2] = temp[3]; temp[3] = t0;
             /* SubWord */
             for (int k = 0; k < 4; k++) temp[k] = sbox[temp[k]];
-            temp[0] = (uint8_t)(temp[0] ^ rcon[i / AES256_NK]);
-        } else if (i % AES256_NK == 4) {
+            temp[0] = (uint8_t)(temp[0] ^ rcon[i / nk]);
+        } else if (nk > 6 && i % nk == 4) {
             /* AES-256 only: an extra SubWord at the Nk/2 offset. */
             for (int k = 0; k < 4; k++) temp[k] = sbox[temp[k]];
         }
 
         for (int k = 0; k < 4; k++) {
-            rk[i * 4 + k] = (uint8_t)(rk[(i - AES256_NK) * 4 + k] ^ temp[k]);
+            rk[i * 4 + k] = (uint8_t)(rk[(i - nk) * 4 + k] ^ temp[k]);
         }
     }
+}
+
+void aes256_init(struct aes256_ctx *ctx, const uint8_t key[AES256_KEY_SIZE]) {
+    key_expand(ctx->round_keys, key, AES256_NK, AES256_NR);
+}
+
+void aes128_init(struct aes128_ctx *ctx, const uint8_t key[AES128_KEY_SIZE]) {
+    key_expand(ctx->round_keys, key, AES128_NK, AES128_NR);
 }
 
 /* state[row][col] is stored as state[row + 4*col], matching FIPS-197's
@@ -158,22 +171,33 @@ static void inv_mix_columns(uint8_t state[16]) {
     }
 }
 
-void aes256_encrypt_block(const struct aes256_ctx *ctx, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]) {
+/* Forward cipher over Nr rounds -- key-size agnostic (the round transforms are
+ * identical for AES-128 and AES-256; only the round count and round-key table
+ * differ). */
+static void encrypt_block(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
     uint8_t state[16];
     memcpy(state, in, 16);
 
-    add_round_key(state, ctx->round_keys);
-    for (int round = 1; round < AES256_NR; round++) {
+    add_round_key(state, rk);
+    for (int round = 1; round < nr; round++) {
         sub_bytes(state);
         shift_rows(state);
         mix_columns(state);
-        add_round_key(state, ctx->round_keys + round * 16);
+        add_round_key(state, rk + round * 16);
     }
     sub_bytes(state);
     shift_rows(state);
-    add_round_key(state, ctx->round_keys + AES256_NR * 16);
+    add_round_key(state, rk + nr * 16);
 
     memcpy(out, state, 16);
+}
+
+void aes256_encrypt_block(const struct aes256_ctx *ctx, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]) {
+    encrypt_block(ctx->round_keys, AES256_NR, in, out);
+}
+
+void aes128_encrypt_block(const struct aes128_ctx *ctx, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]) {
+    encrypt_block(ctx->round_keys, AES128_NR, in, out);
 }
 
 void aes256_decrypt_block(const struct aes256_ctx *ctx, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]) {
@@ -264,6 +288,18 @@ int aes256_run_selftests(void) {
         }
     }
 
-    kprintf("CRYPTO: aes256: %s\n", ok ? "OK" : "FAIL");
+    /* AES-128 FIPS-197 Appendix C.1 known-answer vector -- guards the shared
+     * key_expand/encrypt_block core at the smaller key size. */
+    uint8_t k128[16], ct128[16];
+    hex_to_bytes("000102030405060708090a0b0c0d0e0f", k128, 16);
+    struct aes128_ctx ctx128;
+    aes128_init(&ctx128, k128);
+    aes128_encrypt_block(&ctx128, pt, ct128);   /* pt = 00112233..eeff, reused */
+    if (!bytes_eq_hex(ct128, 16, "69c4e0d86a7b0430d8cdb78070b4c55a")) {
+        kprintf("CRYPTO: aes128: FAIL FIPS-197 C.1 encrypt vector\n");
+        ok = false;
+    }
+
+    kprintf("CRYPTO: aes: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : -1;
 }
