@@ -1461,10 +1461,24 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       `_sysconfigdata__emblink_` which sysconfig imports).
     - os-function macros exposed: `HAVE_READLINK/GETUID/GETEUID/GETPPID/UMASK`
       (posixpath.realpath/platformdirs reference them; our libc backs each).
-  - [ ] **Brick 5 — `python -m pip install`** end to end. Import works; install
-    exercises the network path (pip urllib3 -> our ssl.py -> _embtls -> pypi),
-    wheel download + unpack to a writable target. Expect more gaps (threading,
-    a writable site-packages, tempfile, more os.*).
+  - [~] **Brick 5 — `python -m pip install`** — reaches the NETWORK LAYER, then
+    hits ONE real blocker. `test python pip install` now imports pip's install
+    command fully (past ssl/urllib3/cachecontrol/platform) and calls pypi.org,
+    failing at the socket with **`[Errno 88]` (ENOSYS)**: pip's urllib3 does
+    `socket.create_connection(..., timeout=T)` -> `settimeout` -> non-blocking
+    mode -> our `fcntl(F_SETFL, O_NONBLOCK)` refuses (we are BLOCKING-ONLY).
+    Cleared to get here: expanded `ssl.py` (OPENSSL_VERSION + OP_*/VERIFY_*/HAS_*
+    constants + SSL*Error classes so urllib3 imports), stub `mmap` + `_ssl`
+    modules (cachecontrol imports mmap unconditionally; pip's `has_tls()` probes
+    `import _ssl`), and `HAVE_GETHOSTNAME` (platform._node).
+    **THE remaining blocker = non-blocking sockets / socket timeouts.** This is a
+    genuine kernel capability we lack, NOT a stub away: per the meta-lesson a
+    false "O_NONBLOCK is set" would hang a caller that then does a non-blocking
+    read expecting EAGAIN. Real fix = kernel non-blocking socket I/O
+    (net_socket + read/write honoring O_NONBLOCK -> EAGAIN, plus poll on socket
+    fds) OR a deliberate, documented blocking-degradation of `settimeout`. Then
+    re-run: also expect the files.pythonhosted.org cert to need a trust anchor
+    (we ship only GTS Root R4), and the wheel unpack to a writable `--target`.
   `pkgfetch` already covers the common "get me this pure package" case without any
   of this.
 - [ ] **git over HTTPS.** The git port is local-only (no HTTP transport). Needs

@@ -49,6 +49,18 @@ OVERRIDES = {
     "ssl.py": os.path.join(_HERE, "cpython", "ssl.py"),
 }
 
+# NEW top-level modules to add that the stdlib doesn't ship as .py (usually C
+# builtins we don't build). mmap: a stub so code that `import mmap`
+# unconditionally (pip's cachecontrol) loads; constructing one raises (the OS has
+# no memory-mapped files, and the only caller is the disk cache, off under
+# --no-cache-dir).
+ADDITIONS = {
+    "mmap.py": os.path.join(_HERE, "cpython", "mmap.py"),
+    # _ssl: a TLS-capability signal. Real TLS is _embtls behind ssl.py; some code
+    # (pip's has_tls()) probes `import _ssl` and reads version identifiers.
+    "_ssl.py": os.path.join(_HERE, "cpython", "_ssl.py"),
+}
+
 # Small in-place source patches applied before compile, keyed by Lib-relative
 # path. Prefer this over a full OVERRIDES copy when only a line or two must
 # change (version-robust: an exact-match replace that fails loudly if the source
@@ -92,6 +104,9 @@ def main() -> int:
         if not extras:
             print(f"mkpystdlib: warning: no _sysconfigdata under {build_root}"
                   f"/build/lib.* -- sysconfig will fail under pip", file=sys.stderr)
+    # Repo-provided additions (stubs for unbuilt C modules, etc.).
+    for arcname, path in ADDITIONS.items():
+        extras.append((arcname[:-3], path))
 
     n = 0
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

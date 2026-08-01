@@ -17,6 +17,14 @@ is the honest outcome for an OS whose TLS only trusts real anchors.
 import _embtls
 import io
 
+# --- version identity ---------------------------------------------------------
+# Deliberately NOT starting with "OpenSSL " -- urllib3 checks that prefix and, if
+# absent, only WARNS (NotOpenSSLWarning) instead of hard-failing on the OpenSSL
+# version gate. This is the honest string: we are libtls, not OpenSSL.
+OPENSSL_VERSION = "EmbLinkOS libtls (TLS 1.3)"
+OPENSSL_VERSION_INFO = (3, 0, 0, 0, 0)   # >= 1.1.1, for code that compares it
+OPENSSL_VERSION_NUMBER = 0x30000000
+
 # --- module constants the stdlib callers reference ---------------------------
 CERT_NONE = 0
 CERT_OPTIONAL = 1
@@ -25,6 +33,43 @@ CERT_REQUIRED = 2
 PROTOCOL_TLS = 2
 PROTOCOL_TLS_CLIENT = 2
 PROTOCOL_TLS_SERVER = 3
+PROTOCOL_TLSv1 = 2
+PROTOCOL_TLSv1_2 = 2
+
+# SSLContext.options flags. libtls's policy is fixed, so these are inert bits an
+# `options |= ...` can set harmlessly.
+OP_ALL = 0
+OP_NO_SSLv2 = 0
+OP_NO_SSLv3 = 0
+OP_NO_TLSv1 = 0
+OP_NO_TLSv1_1 = 0
+OP_NO_TLSv1_2 = 0
+OP_NO_TLSv1_3 = 0
+OP_NO_COMPRESSION = 0
+OP_NO_TICKET = 0
+OP_CIPHER_SERVER_PREFERENCE = 0
+OP_SINGLE_DH_USE = 0
+OP_SINGLE_ECDH_USE = 0
+OP_ENABLE_MIDDLEBOX_COMPAT = 0
+OP_LEGACY_SERVER_CONNECT = 0
+
+VERIFY_DEFAULT = 0
+VERIFY_CRL_CHECK_LEAF = 0
+VERIFY_CRL_CHECK_CHAIN = 0
+VERIFY_X509_STRICT = 0
+VERIFY_X509_TRUSTED_FIRST = 0
+VERIFY_X509_PARTIAL_CHAIN = 0
+
+HAS_ALPN = True
+HAS_NEVER_CHECK_COMMON_NAME = True
+HAS_ECDH = True
+HAS_NPN = False
+HAS_SSLv2 = False
+HAS_SSLv3 = False
+HAS_TLSv1 = False
+HAS_TLSv1_1 = False
+HAS_TLSv1_2 = True
+CHANNEL_BINDING_TYPES = []
 
 # TLSVersion-ish sentinels (attributes only; libtls is 1.3-only regardless).
 class TLSVersion:
@@ -55,6 +100,36 @@ class SSLCertVerificationError(SSLError):
 
 class SSLEOFError(SSLError):
     pass
+
+
+class SSLZeroReturnError(SSLError):
+    pass
+
+
+class SSLWantReadError(SSLError):
+    pass
+
+
+class SSLWantWriteError(SSLError):
+    pass
+
+
+class SSLSyscallError(SSLError):
+    pass
+
+
+class CertificateError(ValueError):
+    pass
+
+
+def match_hostname(cert, hostname):
+    # libtls already verified the peer name during the handshake, so by the time
+    # any caller could match a cert the check has passed. Nothing to do.
+    return None
+
+
+def cert_time_to_seconds(cert_time):
+    raise SSLError("certificate time parsing not supported on EmbLinkOS")
 
 
 class _SSLRawIO(io.RawIOBase):
@@ -203,6 +278,12 @@ class SSLContext:
 
     def set_alpn_protocols(self, protocols):
         self._alpn = list(protocols)
+
+    def load_cert_chain(self, *a, **k):
+        pass                              # no client-cert auth here
+
+    def set_npn_protocols(self, *a):
+        pass
 
     def wrap_socket(self, sock, server_hostname=None, do_handshake_on_connect=True,
                     suppress_ragged_eofs=True, session=None):
