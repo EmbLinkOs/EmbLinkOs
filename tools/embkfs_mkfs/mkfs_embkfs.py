@@ -821,12 +821,11 @@ def discover_userland_objects(build_dir="build"):
                                      b"data/src/embcc/ref/", ".o"))
 
     # KM1 (docs/BUILD.md §12): the KERNEL source tree, so EmbBuild can rebuild the
-    # kernel ON the OS. Staged under /data/src/kernel/ preserving subdirs, so the
-    # on-OS embcc's `-Ikernel` quote-includes (#include "fs/vfs.h", ...) resolve
-    # exactly as on the host. We ship .c + .h + .asm + the linker script, PLUS the
-    # 6 pre-built nasm objects under asm/ -- an on-OS assembler is G1 (not built
-    # yet), so until it lands the on-OS link consumes these prebuilt objects and
-    # only the C compile + the embld link run on the metal.
+    # kernel ON the OS with the on-image embcc + embld -- no gcc, nasm, or ld. The
+    # on-OS embcc COMPILES the .c AND assembles the .asm (its own assembler), and
+    # embld defines kernel_end (--lma-offset), so we stage only SOURCES: staged
+    # under /data/src/kernel/ preserving subdirs, so `-I/data/src/kernel` quote-
+    # includes (#include "fs/vfs.h", ...) resolve exactly as on the host.
     objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".c"))
     objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".h"))
     objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".asm"))
@@ -834,13 +833,15 @@ def discover_userland_objects(build_dir="build"):
     if kld is not None:
         objects.append((b"data/src/kernel/linker.ld",
                         L.DT_REG, L.S_IFREG | L.PERM_FILE, kld))
-    for aobj in ("isr", "syscall_entry", "kcontext", "kentry",
-                 "ap_entry", "ap_trampoline_blob", "kernel_end"):
-        blob = _read_file(f"build/{aobj}.o")
-        if blob is not None:
-            objects.append((b"data/src/kernel/asm/" + aobj.encode() + b".o",
-                            L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
-    # The generated EmbBuild manifest (G5): 89 embcc compiles + one embld link.
+    # ap_trampoline_blob.asm incbin's the flat AP-trampoline; the on-OS assemble
+    # needs it at /data/build/ap_trampoline.bin (the path the manifest names).
+    aptr = _read_file("build/ap_trampoline.bin")
+    if aptr is not None:
+        objects.append((b"data/build/ap_trampoline.bin",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, aptr))
+    # The kernel EmbBuild manifest (89 C + 6 asm + link) -- produced by EmbCC's
+    # tools/gen-kernel-manifest.sh and dropped into build/ via its os-stage flow.
+    # Staged ONLY if present (D-001: the OS builds/boots with EmbCC absent).
     kebm = _read_file("build/kernel.build.ebm")
     if kebm is not None:
         objects.append((b"data/src/kernel/build.ebm",

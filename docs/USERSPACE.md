@@ -355,7 +355,7 @@ D2 = §3 (sealed/mutable), D3 = §4 (regions/compat), D4 = §5 (users).
 
 ```
 /
-├── system/                sealed region (D2). One volume today; its own
+├── system/                sealed rLine 44 was a bare iret — the 32-bit interrupt return. In 64-bit long mode you must use iretq. A bare iret pops truncated 32-bit RIP/CS/RFLAGS off the stack, so the return to ring 3 faults with RSP truncated to its low 32 bits — which is exactly the fingerprint in the dump: CR2 = 0xEFD8 = RSP & 0xFFFFFFFF, right as the first user process (home) is about to run.segion (D2). One volume today; its own
 │   │                      sealed EMBKFS volume when signing lands, mount
 │   │                      landing exactly here — zero path changes (§3.4).
 │   ├── bin/               the system's own programs (D2 §3.1, D3 §4.1)
