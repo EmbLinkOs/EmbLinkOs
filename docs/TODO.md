@@ -1436,12 +1436,35 @@ Encrypt/RSA), `test wget https`, `test pypi`.
   won't verify. Rare for CAs today.
 - [ ] **Ed25519 / EdDSA** certificate + CertificateVerify signatures — not
   implemented.
-- [ ] **No revocation checking** (CRL / OCSP / OCSP-stapling). An unrevoked-but-
-  compromised cert would still verify. Real gap for a security stack.
-- [ ] **Name Constraints, Basic Constraints (CA:TRUE / pathLen), Key Usage /
-  Extended Key Usage** are NOT enforced — we chain by name + signature only. A
-  non-CA cert used as an issuer would wrongly pass. Should enforce before trusting
-  arbitrary chains.
+- [x] ~~**Basic Constraints (CA:TRUE / pathLen), Key Usage (keyCertSign), Extended
+  Key Usage (serverAuth)** not enforced.~~ **DONE** (commit `4ca72bb`): the parser
+  reads all three; `x509_verify_chain` requires every issuer to be a CA with
+  keyCertSign (+ pathLen bound) and the leaf to be server-auth-usable. Closes the
+  classic leaf-as-CA forgery — proven by `test_constraints.c` (a validly-signed
+  cert from a non-CA leaf is refused with `X509_ERR_USAGE`).
+- [ ] **Name Constraints** (permitted/excluded dNSName subtrees on a CA) — still
+  NOT enforced. Rare in the public web (mostly enterprise/gov CAs); moderate
+  parsing effort. A constrained CA could currently issue outside its subtree and
+  we'd accept it.
+- [ ] **Revocation checking** — still absent. Deliberately deferred, not faked: a
+  revocation check that soft-fails on any error (no responder, parse error) is
+  security theater and worse than honest absence. It is a genuine multi-protocol
+  network feature, and the ecosystem is mid-transition, so it's ~a phase of work:
+  - **OCSP stapling** (cleanest, no extra round trip): send `status_request` in
+    ClientHello, read the stapled `CertificateStatus`/CertificateEntry extension,
+    parse `BasicOCSPResponse`, verify its signature (issuer or delegated responder
+    + its own EKU `id-kp-OCSPSigning`), check `certStatus`. *Observed:* pypi.org
+    staples; **Cloudflare and Let's Encrypt do NOT** — so stapling alone covers
+    little.
+  - **CRL** (where the leaf has a CRL Distribution Point — Let's Encrypt now does,
+    having dropped OCSP in 2025): fetch the `.crl` over HTTP, parse the signed
+    `CertificateList`, verify its signature, check the serial. CRLs can be large /
+    sharded.
+  - **OCSP request** (for leaves with only an AIA OCSP URL, e.g. Cloudflare):
+    build a DER OCSPRequest, HTTP POST to the responder, verify the response.
+  Doing it *right* means all three + response-signature verification; anything
+  less silently passes on the sites it doesn't cover. Prereq for treating the
+  stack as trustworthy against key compromise.
 - [ ] **Hostname matching is minimal:** DNS SANs only (no IP-address SANs, no CN
   fallback — CN fallback is deliberately omitted, which is correct), single-label
   `*.` wildcard only.

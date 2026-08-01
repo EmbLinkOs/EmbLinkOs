@@ -842,6 +842,10 @@ verified on the metal.
   bundled trust store, chain building, hostname/SAN + validity, and the
   CertificateVerify check — all wired into the handshake (refuses before Finished
   on any failure). `test tls` now *authenticates* Cloudflare → **GTS Root R4**.
+  **Chain constraints enforced** (RFC 5280): Basic Constraints (CA:TRUE / pathLen),
+  Key Usage (keyCertSign), Extended Key Usage (serverAuth) — the classic
+  leaf-as-CA forgery is refused (`test_constraints.c`). *Not yet:* Name Constraints,
+  revocation (CRL/OCSP) — see `docs/TODO.md`.
 - **T3.5 — RSA.** **RSA-PKCS1-v1.5** (cert-chain sigs) and **RSA-PSS** (TLS 1.3's
   RSA CertificateVerify), bignum widened to 4096-bit. `test tls rsa` authenticates
   a Let's Encrypt (all-RSA) chain → **ISRG Root X1**.
