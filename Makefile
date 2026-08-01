@@ -1524,3 +1524,6 @@ test-tls-crypto:
 	    user/lib/tls/crypto/gcm.c tools/tls/test_gcm.c -o /tmp/embk_test_gcm && /tmp/embk_test_gcm
 	@cc -Wall $(TLS_CRYPTO_INC) \
 	    user/lib/tls/crypto/x25519.c tools/tls/test_x25519.c -o /tmp/embk_test_x25519 && /tmp/embk_test_x25519
+	@cc -Wall $(TLS_CRYPTO_INC) -Iuser/lib/tls kernel/crypto/sha256.c kernel/crypto/hmac.c \
+	    user/lib/tls/crypto/hkdf.c user/lib/tls/keysched.c tools/tls/test_keysched.c \
+	    -o /tmp/embk_test_keysched && /tmp/embk_test_keysched
