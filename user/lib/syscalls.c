@@ -1118,6 +1118,7 @@ int unlink(const char *path) {
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include "embk.h"          /* embk_net_* -- the kernel CAP_NETWORK socket layer */
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/statvfs.h>
@@ -1330,22 +1331,208 @@ int msync(void *addr, size_t len, int flags) {
 int statvfs(const char *path, struct statvfs *buf)  { (void)path; (void)buf; errno = ENOSYS; return -1; }
 int fstatvfs(int fd, struct statvfs *buf)           { (void)fd;   (void)buf; errno = ENOSYS; return -1; }
 
-/* No network stack -- not unconfigured, ABSENT. */
-int socket(int d, int t, int p)  { (void)d; (void)t; (void)p; errno = ENOSYS; return -1; }
-int connect(int fd, const struct sockaddr *a, socklen_t l) { (void)fd; (void)a; (void)l; errno = ENOSYS; return -1; }
-int shutdown(int fd, int how)    { (void)fd; (void)how; errno = ENOSYS; return -1; }
-int setsockopt(int fd, int lvl, int opt, const void *v, socklen_t l) {
-    (void)fd; (void)lvl; (void)opt; (void)v; (void)l; errno = ENOSYS; return -1;
+/* ---- BSD sockets over the kernel CAP_NETWORK layer (embk_net_*) -------------
+ * The porting world (Python's _socket, git) uses this POSIX surface; native
+ * EmbLinkOS apps use embk_net_* / embk_socket.h directly. IPv4 only. A socket is
+ * a real fd, so read()/write()/close() work on it and aren't reimplemented here.
+ * On the wire addresses are network byte order (sockaddr_in); the kernel API is
+ * host order, so we convert at this boundary. */
+
+int socket(int domain, int type, int protocol) {
+    (void)protocol;
+    if (domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+    int fd = embk_net_socket(type == SOCK_DGRAM ? 2 : 1);
+    if (fd < 0) return embk_fail(fd);
+    return fd;
 }
-ssize_t recv(int fd, void *buf, size_t len, int flags) {
-    (void)fd; (void)buf; (void)len; (void)flags; errno = ENOSYS; return -1;
+
+int connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    (void)len;
+    if (!addr || addr->sa_family != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+    const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+    int r = embk_net_connect(fd, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port));
+    return r < 0 ? embk_fail(r) : 0;
 }
+
+int bind(int fd, const struct sockaddr *addr, socklen_t len) {
+    (void)len;
+    const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+    int r = embk_net_bind(fd, in ? ntohs(in->sin_port) : 0);
+    return r < 0 ? embk_fail(r) : 0;
+}
+
+int listen(int fd, int backlog) {
+    int r = embk_net_listen(fd, backlog);
+    return r < 0 ? embk_fail(r) : 0;
+}
+
+int accept(int fd, struct sockaddr *addr, socklen_t *len) {
+    int nfd = embk_net_accept(fd);
+    if (nfd < 0) return embk_fail(nfd);
+    if (addr && len && *len >= sizeof(struct sockaddr_in)) {   /* peer addr not tracked */
+        struct sockaddr_in *in = (struct sockaddr_in *)addr;
+        memset(in, 0, sizeof *in); in->sin_family = AF_INET; *len = sizeof *in;
+    }
+    return nfd;
+}
+
+/* No half-close in the kernel API; the real close happens on close(fd). Succeed
+ * so libraries that shutdown() before close() proceed. */
+int shutdown(int fd, int how) { (void)fd; (void)how; return 0; }
+
+ssize_t send(int fd, const void *buf, size_t len, int flags) { (void)flags; return write(fd, buf, len); }
+ssize_t recv(int fd, void *buf, size_t len, int flags)       { (void)flags; return read(fd, buf, len); }
+
+ssize_t sendto(int fd, const void *buf, size_t len, int flags,
+               const struct sockaddr *dest, socklen_t dlen) {
+    (void)flags; (void)dlen;
+    if (!dest) return write(fd, buf, len);                     /* connected socket */
+    const struct sockaddr_in *in = (const struct sockaddr_in *)dest;
+    int r = embk_net_sendto(fd, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port), buf, len);
+    return r < 0 ? embk_fail(r) : (ssize_t)r;
+}
+
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+                 struct sockaddr *src, socklen_t *slen) {
+    (void)flags;
+    unsigned int ip = 0; unsigned short port = 0;
+    int r = embk_net_recvfrom(fd, buf, len, &ip, &port);
+    if (r < 0) return embk_fail(r);
+    if (src && slen && *slen >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *in = (struct sockaddr_in *)src;
+        memset(in, 0, sizeof *in); in->sin_family = AF_INET;
+        in->sin_addr.s_addr = htonl(ip); in->sin_port = htons(port);
+        *slen = sizeof *in;
+    }
+    return (ssize_t)r;
+}
+
+/* Socket options are advisory here (SO_REUSEADDR, TCP_NODELAY, ...): accept and
+ * ignore. getsockopt(SO_ERROR) reports "no pending error" so post-connect checks
+ * pass -- connect() is synchronous, so any real error already surfaced. */
+int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen) {
+    (void)fd; (void)level; (void)optname; (void)optval; (void)optlen; return 0;
+}
+int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) {
+    (void)fd; (void)level; (void)optname;
+    if (optval && optlen && *optlen >= sizeof(int)) { *(int *)optval = 0; *optlen = sizeof(int); }
+    return 0;
+}
+int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {
+    (void)fd;
+    if (addr && len && *len >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *in = (struct sockaddr_in *)addr;
+        memset(in, 0, sizeof *in); in->sin_family = AF_INET; *len = sizeof *in;
+    }
+    return 0;
+}
+int getpeername(int fd, struct sockaddr *addr, socklen_t *len) { return getsockname(fd, addr, len); }
+
+/* ---- name resolution + address strings -------------------------------------- */
+
+int inet_pton(int af, const char *src, void *dst) {
+    if (af != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+    unsigned int b[4]; int n = 0;
+    const char *p = src;
+    for (int i = 0; i < 4; i++) {
+        if (*p < '0' || *p > '9') return 0;
+        unsigned v = 0;
+        while (*p >= '0' && *p <= '9') { v = v * 10 + (unsigned)(*p++ - '0'); if (v > 255) return 0; }
+        b[i] = v; n++;
+        if (i < 3) { if (*p != '.') return 0; p++; }
+    }
+    if (*p != 0 || n != 4) return 0;
+    ((struct in_addr *)dst)->s_addr = htonl((b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]);
+    return 1;
+}
+
+const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
+    if (af != AF_INET) { errno = EAFNOSUPPORT; return NULL; }
+    unsigned int a = ntohl(((const struct in_addr *)src)->s_addr);
+    snprintf(dst, size, "%u.%u.%u.%u", (a>>24)&255, (a>>16)&255, (a>>8)&255, a&255);
+    return dst;
+}
+
+static int svc_port(const char *service) {
+    if (!service) return 0;
+    if (service[0] >= '0' && service[0] <= '9') return atoi(service);
+    if (!strcmp(service, "http"))  return 80;
+    if (!strcmp(service, "https")) return 443;
+    if (!strcmp(service, "domain")) return 53;
+    if (!strcmp(service, "ftp"))   return 21;
+    return 0;
+}
+
+int getaddrinfo(const char *node, const char *service,
+                const struct addrinfo *hints, struct addrinfo **res) {
+    if (hints && hints->ai_family == AF_INET6) return EAI_FAMILY;   /* IPv4 only */
+    unsigned int ip_host;
+    if (node) {
+        struct in_addr na;
+        if (inet_pton(AF_INET, node, &na) == 1) ip_host = ntohl(na.s_addr);
+        else if (embk_net_resolve(node, &ip_host) != 0) return EAI_NONAME;
+    } else {
+        ip_host = (hints && (hints->ai_flags & AI_PASSIVE)) ? INADDR_ANY : INADDR_LOOPBACK;
+    }
+    struct addrinfo *ai = calloc(1, sizeof *ai);
+    struct sockaddr_in *sa = calloc(1, sizeof *sa);
+    if (!ai || !sa) { free(ai); free(sa); return EAI_MEMORY; }
+    sa->sin_family = AF_INET;
+    sa->sin_port   = htons((unsigned short)svc_port(service));
+    sa->sin_addr.s_addr = htonl(ip_host);
+    ai->ai_family   = AF_INET;
+    ai->ai_socktype = (hints && hints->ai_socktype) ? hints->ai_socktype : SOCK_STREAM;
+    ai->ai_protocol = hints ? hints->ai_protocol : 0;
+    ai->ai_addrlen  = sizeof *sa;
+    ai->ai_addr     = (struct sockaddr *)sa;
+    *res = ai;
+    return 0;
+}
+
+void freeaddrinfo(struct addrinfo *res) {
+    while (res) { struct addrinfo *n = res->ai_next; free(res->ai_addr); free(res); res = n; }
+}
+
+int getnameinfo(const struct sockaddr *sa, socklen_t salen,
+                char *host, socklen_t hostlen, char *serv, socklen_t servlen, int flags) {
+    (void)salen; (void)flags;
+    if (!sa || sa->sa_family != AF_INET) return EAI_FAMILY;
+    const struct sockaddr_in *in = (const struct sockaddr_in *)sa;
+    if (host && hostlen) inet_ntop(AF_INET, &in->sin_addr, host, hostlen);
+    if (serv && servlen) snprintf(serv, servlen, "%u", ntohs(in->sin_port));
+    return 0;
+}
+
+const char *gai_strerror(int e) {
+    switch (e) {
+    case 0:           return "Success";
+    case EAI_NONAME:  return "Name or service not known";
+    case EAI_MEMORY:  return "Memory allocation failure";
+    case EAI_FAMILY:  return "Address family not supported";
+    case EAI_SERVICE: return "Servname not supported";
+    default:          return "Unknown resolver error";
+    }
+}
+
 struct hostent *gethostbyname(const char *name) {
-    (void)name;
-    h_errno = NO_RECOVERY;
-    return NULL;
+    static unsigned int ipbuf;          /* network order */
+    static char *addr_list[2];
+    static struct hostent he;
+    unsigned int ip_host;
+    if (embk_net_resolve(name, &ip_host) != 0) { h_errno = HOST_NOT_FOUND; return NULL; }
+    ipbuf = htonl(ip_host);
+    addr_list[0] = (char *)&ipbuf; addr_list[1] = NULL;
+    he.h_name = (char *)name; he.h_aliases = NULL;
+    he.h_addrtype = AF_INET; he.h_length = 4; he.h_addr_list = addr_list;
+    return &he;
 }
+
 struct servent *getservbyname(const char *name, const char *proto) {
-    (void)name; (void)proto;
-    return NULL;
+    (void)proto;
+    int port = svc_port(name);
+    if (!port) return NULL;
+    static struct servent se;
+    se.s_name = (char *)name; se.s_aliases = NULL;
+    se.s_port = htons((unsigned short)port); se.s_proto = (char *)proto;
+    return &se;
 }

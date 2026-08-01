@@ -1247,6 +1247,24 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test sockdemo") == 0) {
+        /* Proves the newlib BSD-sockets shim: sockdemo (ring 3) does a plain HTTP
+         * GET using the POSIX API (getaddrinfo/socket/connect/send/recv) -- the
+         * same symbols Python's _socket resolves to, now routed to embk_net_*.
+         * Needs CAP_NETWORK + outbound :80 (SLIRP). */
+        const char *sp = "/data/apps/sockdemo/sockdemo.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test sockdemo: %s not on image\n", sp); return 1; }
+        char *a[]   = { (char *)sp, (char *)"example.com", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(sp, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[sockdemo] exit=%d\n", code);
+        kprintf("[cmd] test sockdemo: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test tls") == 0) {
         /* THE HEADLINE (docs/TLS.md T2): the OS speaks TLS 1.3. tlstest (ring 3)
          * resolves cloudflare.com, TCP-connects :443, runs OUR libtls handshake

@@ -475,6 +475,13 @@ build/httpget.o: user/bin/httpget.c user/lib/embk.h user/lib/embk_socket.h | $(B
 build/httpget.elf: build/crt0.o build/syscalls.o build/httpget.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpget.o -lc -lgcc -o $@
 
+# sockdemo -- proves the POSIX BSD-sockets shim (uses real <sys/socket.h>/<netdb.h>,
+# not the native embk_socket.h). The path Python's _socket / git take. Auto-packed.
+build/sockdemo.o: user/bin/sockdemo.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/sockdemo.elf: build/crt0.o build/syscalls.o build/sockdemo.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/sockdemo.o -lc -lgcc -o $@
+
 # httpd -- the M5 server witness: an on-OS HTTP server (bind/listen/accept over
 # the native socket syscalls). `test httpd` spawns it; the host curls it via a
 # SLIRP hostfwd. Auto-discovered by mkfs.
@@ -842,7 +849,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1014,7 +1021,7 @@ endif
 
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf \
                build/emlibc_demo.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \

@@ -1,10 +1,10 @@
 /* sys/socket.h -- EmbLink override header (newlib ships none).
  *
- * EmbLink userspace has NO network stack -- not "not yet linked", ABSENT. These
- * types and constants exist so that portable code (git's connect.c et al)
- * COMPILES; the functions are defined in syscalls.c as honest ENOSYS refusals,
- * so a `git fetch git://...` fails at the socket() call with a truthful errno
- * while purely local work never comes near them. Nothing here fakes success. */
+ * The POSIX BSD-sockets surface for the porting world (Python's _socket, git,
+ * curl). It is a thin shim in syscalls.c over the kernel's CAP_NETWORK sockets
+ * (embk_net_*), which are REAL -- so `connect()` etc. actually work now (IPv4,
+ * TCP + UDP). Native EmbLinkOS programs use embk_net_* / embk_socket.h directly;
+ * this side exists so POSIX code compiles and runs unmodified. */
 #ifndef _EMBK_SYS_SOCKET_H
 #define _EMBK_SYS_SOCKET_H
 
@@ -64,6 +64,10 @@ int getsockname(int fd, struct sockaddr *addr, socklen_t *len);
 int getpeername(int fd, struct sockaddr *addr, socklen_t *len);
 ssize_t send(int fd, const void *buf, size_t len, int flags);
 ssize_t recv(int fd, void *buf, size_t len, int flags);
+ssize_t sendto(int fd, const void *buf, size_t len, int flags,
+               const struct sockaddr *dest, socklen_t dlen);
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+                 struct sockaddr *src, socklen_t *slen);
 
 #ifdef __cplusplus
 }
