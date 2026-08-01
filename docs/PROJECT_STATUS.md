@@ -866,6 +866,18 @@ GlobalSign cover a large majority of the web. Signature schemes: ECDSA
 secp256r1/secp384r1, RSA-PKCS1-v1.5, RSA-PSS. One ciphersuite:
 `TLS_AES_128_GCM_SHA256`.
 
+**Networking reaches both libc worlds.** The kernel's CAP_NETWORK sockets
+(`embk_net_*`) are now exposed through *both* userspace libcs, mirroring the
+emlibc/newlib + EMBX/ELF split:
+- **newlib (porting world):** a real POSIX BSD-sockets layer in `syscalls.c`
+  (`socket`/`connect`/`getaddrinfo`/… — the missing `sys/socket.h`/`netdb.h`
+  functions, previously ENOSYS) so ported POSIX programs (Python's `_socket`,
+  git, curl) work unmodified. Witness `test sockdemo` (plain POSIX HTTP GET).
+- **emlibc (native world):** a native net API (`user/emlibc/net/`, `<net.h>`) in
+  EmbLink's own vocabulary — `em_tcp_connect(host,port)` returning a plain fd, no
+  `sockaddr`. Witness `test emlibc net` (an HTTP GET linked against libemlibc
+  only, zero newlib). This is what native EmbLink apps use.
+
 ---
 
 ## Major To-Do Buckets (Rough Priority)

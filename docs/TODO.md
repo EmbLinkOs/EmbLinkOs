@@ -1403,10 +1403,24 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     won't pull them); picks the last `*-none-any.whl` in the index (simple "newest"
     heuristic, not full PEP 440 version sorting); no wheel hash/signature check
     beyond TLS transport auth.
-- [ ] **Real `pip` (the tool).** Still needs a **libtls-backed `_ssl`** in the
-  external CPython (the ported `ssl.pyc`/`http/client.pyc` need it) — a large
-  extension + a Python rebuild. `pkgfetch` covers the common "get me this pure
-  package" case without it.
+- [ ] **Real `pip` (the tool)** — a multi-brick foundation (Python had NO
+  networking at all: no socket headers, `socket()`=ENOSYS, `_socket`/`_ssl`
+  unbuilt, pip absent). Progress:
+  - [x] **Brick 1 — POSIX BSD sockets in the newlib libc** (commit `64afb42`):
+    the porting-side socket layer (`socket`/`connect`/`getaddrinfo`/… → `embk_net_*`)
+    is now real. `test sockdemo` proves a plain POSIX HTTP client works — the same
+    symbols `_socket` resolves to.
+  - [ ] **Brick 2 — compile `_socket` into the external CPython** (uncomment in
+    `Modules/Setup`, rebuild). socketmodule.c also wants `select`/`poll` on socket
+    fds and non-blocking (`fcntl` O_NONBLOCK) — check those work or add them.
+  - [ ] **Brick 3 — a libtls-backed `_ssl`** (or a smaller native `_embtls`
+    module) + a pure-Python `ssl.py` shim covering `SSLContext`/`wrap_socket`/
+    `makefile` for `http.client`/urllib.
+  - [ ] **Brick 4 — add pip** (`ensurepip`/a `pip.pyz`) to the stdlib zip
+    (`tools/mkpystdlib.py`).
+  - [ ] **Brick 5 — `python -m pip install`** end to end.
+  `pkgfetch` already covers the common "get me this pure package" case without any
+  of this.
 - [ ] **git over HTTPS.** The git port is local-only (no HTTP transport). Needs
   git's smart-HTTP (`git-remote-https`) wired to libtls, or a libcurl shim. Not
   started.
