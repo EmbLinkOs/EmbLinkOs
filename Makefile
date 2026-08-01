@@ -1527,3 +1527,6 @@ test-tls-crypto:
 	@cc -Wall $(TLS_CRYPTO_INC) -Iuser/lib/tls kernel/crypto/sha256.c kernel/crypto/hmac.c \
 	    user/lib/tls/crypto/hkdf.c user/lib/tls/keysched.c tools/tls/test_keysched.c \
 	    -o /tmp/embk_test_keysched && /tmp/embk_test_keysched
+	@cc -Wall $(TLS_CRYPTO_INC) -Iuser/lib/tls kernel/crypto/aes.c \
+	    user/lib/tls/crypto/gcm.c user/lib/tls/record.c tools/tls/test_record.c \
+	    -o /tmp/embk_test_record && /tmp/embk_test_record
