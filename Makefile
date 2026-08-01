@@ -501,9 +501,11 @@ build/wget.elf: build/crt0.o build/syscalls.o build/wget.o user/lib/newlib.ld
 # codebase, kernel and user, exactly as the host tests do. kshim MUST precede
 # -Ikernel so include/{types,kstring,kprintf}.h resolve to the shims. Packed as
 # /data/apps/tlstest/tlstest.elf. Needs CAP_NETWORK + RDRAND at runtime.
-TLS_LIB_INC  := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto -Iuser/lib/tls
+TLS_LIB_INC  := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto -Iuser/lib/tls -Iuser/lib/tls/x509
 TLS_LIB_OBJS := build/tls_sha256.o build/tls_hmac.o build/tls_aes.o \
                 build/tls_hkdf.o build/tls_gcm.o build/tls_x25519.o \
+                build/tls_sha512.o build/tls_bignum.o build/tls_ecdsa.o \
+                build/tls_asn1.o build/tls_cert.o build/tls_trust.o \
                 build/tls_keysched.o build/tls_record.o build/tls_handshake.o build/tls_tls.o
 
 build/tls_sha256.o: kernel/crypto/sha256.c | $(BUILD)
@@ -517,6 +519,18 @@ build/tls_hkdf.o: user/lib/tls/crypto/hkdf.c | $(BUILD)
 build/tls_gcm.o: user/lib/tls/crypto/gcm.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tls_x25519.o: user/lib/tls/crypto/x25519.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_sha512.o: user/lib/tls/crypto/sha512.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_bignum.o: user/lib/tls/crypto/bignum.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_ecdsa.o: user/lib/tls/crypto/ecdsa.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_asn1.o: user/lib/tls/x509/asn1.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_cert.o: user/lib/tls/x509/cert.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_trust.o: user/lib/tls/x509/trust.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tls_keysched.o: user/lib/tls/keysched.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@

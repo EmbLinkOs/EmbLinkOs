@@ -14,10 +14,15 @@
  */
 #include "tls.h"
 #include "keysched.h"
-#include "crypto/x25519.h"
+#include "cert.h"            /* x509 chain verification (T3) */
+#include "asn1.h"
+#include "x25519.h"
+#include "ecdsa.h"
+#include "sha512.h"
 #include "crypto/sha256.h"
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 extern int getentropy(void *buf, size_t len);   /* RDRAND-backed (user/lib/syscalls.c) */
 
@@ -65,6 +70,85 @@ static void install_keys(struct tls_keys *k, const uint8_t secret[32]) {
     tls_expand_label(secret, "key", NULL, 0, key, 16);
     tls_expand_label(secret, "iv",  NULL, 0, iv, 12);
     tls_keys_init(k, key, iv);
+}
+
+/* ---- certificate verification (T3) -------------------------------------- */
+
+/* Current time as "yyyymmddhhmmss" UTC, from the OS clock. */
+static void now_utc14(char out[15]) {
+    time_t t = time(NULL);
+    struct tm g;
+    gmtime_r(&t, &g);
+    strftime(out, 15, "%Y%m%d%H%M%S", &g);
+}
+
+/* Parse a DER ECDSA-Sig-Value SEQUENCE { r INTEGER, s INTEGER }, leading zeros
+ * stripped. Returns 0 on success. */
+static int parse_sig(const uint8_t *der, size_t len,
+                     const uint8_t **r, size_t *rl, const uint8_t **s, size_t *sl) {
+    struct der_tlv seq, ri, si;
+    if (der_parse(der, der + len, &seq) || seq.tag != DER_SEQUENCE) return -1;
+    if (der_parse(seq.val, der_end(&seq), &ri) || ri.tag != DER_INTEGER) return -1;
+    if (der_parse(der_end(&ri), der_end(&seq), &si) || si.tag != DER_INTEGER) return -1;
+    const uint8_t *rp = ri.val; size_t rn = ri.len;
+    const uint8_t *sp = si.val; size_t sn = si.len;
+    while (rn > 1 && rp[0] == 0) { rp++; rn--; }
+    while (sn > 1 && sp[0] == 0) { sp++; sn--; }
+    *r = rp; *rl = rn; *s = sp; *sl = sn;
+    return 0;
+}
+
+/* Authenticate the peer: parse the Certificate chain, verify it to a trust
+ * anchor with hostname + validity, then verify the CertificateVerify signature
+ * with the leaf key. Returns 0 if authenticated, negative otherwise. */
+static const char CV_LABEL[] = "TLS 1.3, server CertificateVerify";
+
+static int tls_verify_peer(struct tls_conn *c, const char *host) {
+    if (!host || c->certmsg_len < 8) return -30;
+
+    /* Certificate message: header(4) | ctx<0..255> | cert_list<0..2^24>. */
+    const uint8_t *p = c->certmsg + 4, *end = c->certmsg + c->certmsg_len;
+    if (p >= end) return -30;
+    uint8_t ctxlen = *p++; p += ctxlen;
+    if (p + 3 > end) return -30;
+    size_t list_len = ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2]; p += 3;
+    const uint8_t *lend = p + list_len;
+    if (lend > end) return -30;
+
+    struct x509_cert certs[6]; int nc = 0;
+    while (p < lend && nc < 6) {
+        if (p + 3 > lend) return -30;
+        size_t clen = ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2]; p += 3;
+        if (p + clen > lend) return -30;
+        const uint8_t *cder = p; p += clen;
+        if (p + 2 > lend) return -30;
+        size_t extlen = ((size_t)p[0] << 8) | p[1]; p += 2 + extlen;
+        if (x509_parse(cder, clen, &certs[nc]) != 0) return -31;   /* cert #nc parse */
+        nc++;
+    }
+    if (nc == 0) return -30;
+
+    char now[15]; now_utc14(now);
+    int v = x509_verify_chain(certs, nc, host, now);
+    if (v != X509_OK) return v;                     /* untrusted / wrong host / expired */
+
+    /* CertificateVerify: signature over 64*0x20 || label || 0x00 || Hash(CH..Cert). */
+    uint8_t content[64 + sizeof CV_LABEL - 1 + 1 + 32];
+    size_t n = 0;
+    memset(content, 0x20, 64); n = 64;
+    memcpy(content + n, CV_LABEL, sizeof CV_LABEL - 1); n += sizeof CV_LABEL - 1;
+    content[n++] = 0x00;
+    memcpy(content + n, c->th_cert, 32); n += 32;
+
+    const struct ec_curve *ec; uint8_t dg[64]; size_t dl;
+    if (c->cv_alg == 0x0403)      { ec = ec_p256(); sha256(content, n, dg); dl = 32; }
+    else if (c->cv_alg == 0x0503) { ec = ec_p384(); sha384(content, n, dg); dl = 48; }
+    else return -20;                                /* unsupported scheme (RSA: later) */
+
+    const uint8_t *r, *s; size_t rl, sl;
+    if (parse_sig(c->cv_sig, c->cv_sig_len, &r, &rl, &s, &sl)) return -21;
+    if (!ecdsa_verify(ec, certs[0].qx, certs[0].qy, dg, dl, r, rl, s, sl)) return -22;
+    return 0;                                       /* AUTHENTICATED */
 }
 
 /* ---- handshake ---------------------------------------------------------- */
@@ -151,13 +235,43 @@ int tls_connect(struct tls_conn *c, int fd, const char *server_name) {
                 off += total;
                 break;
             }
-            /* EncryptedExtensions / Certificate / CertificateVerify: parsed only
-             * to advance the transcript; contents not verified (T2). */
+            if (m[0] == TLS_HS_CERTIFICATE) {
+                /* Stash the Certificate message (chain parsed after the flight),
+                 * fold it in, then snapshot Hash(CH..Certificate) -- exactly what
+                 * the CertificateVerify signs (RFC 8446 §4.4.3). */
+                if (total <= sizeof c->certmsg) { memcpy(c->certmsg, m, total); c->certmsg_len = total; }
+                tls_transcript_update(&c->tr, m, total);
+                tls_transcript_hash(&c->tr, c->th_cert);
+                off += total;
+                continue;
+            }
+            if (m[0] == TLS_HS_CERTIFICATE_VERIFY && mlen >= 4) {
+                /* body: SignatureScheme(2) || signature<0..2^16-1> */
+                c->cv_alg = (uint16_t)((m[4] << 8) | m[5]);
+                size_t slen = ((size_t)m[6] << 8) | m[7];
+                if (slen <= sizeof c->cv_sig && 8 + slen <= total) {
+                    memcpy(c->cv_sig, m + 8, slen); c->cv_sig_len = slen;
+                }
+                tls_transcript_update(&c->tr, m, total);
+                off += total;
+                continue;
+            }
+            /* EncryptedExtensions and anything else: advance the transcript. */
             tls_transcript_update(&c->tr, m, total);
             off += total;
         }
         if (off) { memmove(c->hbuf, c->hbuf + off, c->hlen - off); c->hlen -= off; }
     }
+
+    /* AUTHENTICATE the peer (T3): the server Finished proved the handshake is
+     * intact, but not WHO we're talking to. Verify the certificate chain to a
+     * trusted anchor (+ hostname + validity) and the CertificateVerify signature
+     * before sending our Finished or exchanging any application data. */
+    int vrc = tls_verify_peer(c, server_name);
+    if (vrc != 0) return -100 + vrc;   /* -101 host, -102 expired, -103/-104/-105
+                                        * chain, -120/-121/-122 CertificateVerify,
+                                        * -130 cert-message parse */
+    c->verified = 1;
 
     /* Our Finished, over Hash(CH..server Finished), under the client hs key. */
     uint8_t th_after[32], cfin[36];

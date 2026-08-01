@@ -31,6 +31,13 @@ struct tls_conn {
     uint8_t rleft[TLS_RECORD_MAX_PLAINTEXT + 1];
 
     uint8_t recbuf[5 + TLS_RECORD_MAX_PLAINTEXT + 256 + TLS_TAG_LEN];  /* one wire record */
+
+    /* Captured during the flight for certificate verification (T3). */
+    uint8_t  certmsg[16384]; size_t certmsg_len;   /* the raw Certificate message */
+    uint8_t  th_cert[32];                          /* transcript hash CH..Certificate */
+    uint16_t cv_alg;                               /* CertificateVerify SignatureScheme */
+    uint8_t  cv_sig[512]; size_t cv_sig_len;       /* CertificateVerify signature */
+    int      verified;                             /* 1 once the peer is authenticated */
 };
 
 /* Run the TLS 1.3 handshake over an already-TCP-connected `fd`. `server_name`

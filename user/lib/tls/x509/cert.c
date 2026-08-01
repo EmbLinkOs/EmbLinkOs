@@ -102,9 +102,14 @@ int x509_parse(const uint8_t *der, size_t len, struct x509_cert *out) {
     else if (OIDEQ(&sa_oid, OID_ECDSA_SHA384)) out->sig_alg = X509_SIG_ECDSA_SHA384;
     else out->sig_alg = X509_SIG_NONE;
 
-    /* signatureValue BIT STRING: unused-bits byte, then ECDSA-Sig-Value. */
+    /* signatureValue BIT STRING: unused-bits byte, then the signature. Only
+     * decode it as an ECDSA-Sig-Value when the algorithm is ECDSA -- a chain can
+     * legitimately include a cert signed with something else (e.g. an RSA-signed
+     * root), which we still parse for its name + key; we just never verify such a
+     * cert's own signature (a trust anchor is trusted, not verified). */
     if (sigval.len < 1 || sigval.val[0] != 0) return -1;
-    if (parse_ecdsa_sig(sigval.val + 1, sigval.len - 1, out)) return -1;
+    if (out->sig_alg != X509_SIG_NONE)
+        if (parse_ecdsa_sig(sigval.val + 1, sigval.len - 1, out)) return -1;
 
     /* Walk tbsCertificate fields in order. */
     const uint8_t *p = tbs.val, *e = der_end(&tbs);

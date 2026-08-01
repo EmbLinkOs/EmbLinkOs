@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include "embk_socket.h"
 #include "tls.h"
 
@@ -33,9 +34,22 @@ int main(int argc, char **argv) {
     struct tls_conn *c = malloc(sizeof *c);
     if (!c) { printf("tlstest: oom\n"); return 5; }
 
+    { time_t t = time(NULL); struct tm g; gmtime_r(&t, &g); char b[32];
+      strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", &g);
+      printf("tlstest: OS clock = %s UTC (used for cert validity)\n", b); }
+
     int r = tls_connect(c, fd, host);
-    if (r != 0) { printf("tlstest: TLS handshake FAILED rc=%d\n", r); free(c); return 6; }
-    printf("tlstest: TLS 1.3 handshake OK -- server Finished verified (cert NOT verified: T2)\n");
+    if (r != 0) {
+        printf("tlstest: TLS handshake FAILED rc=%d", r);
+        if (r == -101) printf(" (hostname/SAN)");
+        else if (r == -102) printf(" (cert expired/not-yet-valid -- check OS clock)");
+        else if (r <= -103 && r >= -105) printf(" (chain: bad sig / name / no anchor)");
+        else if (r == -120) printf(" (CertificateVerify: unsupported sig scheme)");
+        else if (r == -122) printf(" (CertificateVerify: signature invalid)");
+        else if (r == -130) printf(" (Certificate message parse)");
+        printf("\n"); free(c); return 6;
+    }
+    printf("tlstest: TLS 1.3 handshake OK -- AUTHENTICATED (chain->GTS Root R4, host, CertificateVerify)\n");
 
     char req[256];
     int rq = snprintf(req, sizeof req,

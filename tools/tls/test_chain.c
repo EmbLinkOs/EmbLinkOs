@@ -22,22 +22,25 @@ static void now_from_nb(const struct x509_cert *c, char out[15]) {
 }
 
 int main(void) {
-    struct x509_cert leaf, we1;
-    printf("parse frozen Cloudflare chain:\n");
+    struct x509_cert leaf, we1, root;
+    printf("parse frozen Cloudflare chain (leaf + WE1 + RSA-signed root):\n");
     CHECK(x509_parse(CHAIN_LEAF, sizeof CHAIN_LEAF, &leaf) == 0, "leaf parses");
     CHECK(x509_parse(CHAIN_WE1, sizeof CHAIN_WE1, &we1) == 0, "WE1 parses");
+    CHECK(x509_parse(CHAIN_ROOT, sizeof CHAIN_ROOT, &root) == 0, "RSA-signed root parses (sig not ECDSA)");
+    CHECK(root.sig_alg == X509_SIG_NONE, "root sig alg is non-ECDSA (tolerated)");
     CHECK(leaf.curve == X509_CURVE_P256, "leaf key is P-256");
     CHECK(we1.curve == X509_CURVE_P256, "WE1 key is P-256");
     CHECK(trust_find(we1.issuer, we1.issuer_len) != NULL, "WE1 issuer is the GTS Root R4 anchor");
 
     char now[15]; now_from_nb(&leaf, now);
-    const struct x509_cert chain[2] = { leaf, we1 };
+    /* Verify the FULL 3-cert chain the server actually sends (the root is
+     * redundant with our anchor, but must not break parsing/verification). */
+    const struct x509_cert chain[3] = { leaf, we1, root };
 
     printf("chain verification (leaf <- WE1 <- GTS Root R4):\n");
-    CHECK(x509_verify_chain(chain, 2, "cloudflare.com", now) == X509_OK, "valid chain + host + anchor => OK");
-    CHECK(x509_verify_chain(chain, 2, "www.cloudflare.com", now) == X509_OK || 1, "www SAN (informational)");
-    CHECK(x509_verify_chain(chain, 2, "attacker.example", now) == X509_ERR_HOST, "wrong host => ERR_HOST");
-    CHECK(x509_verify_chain(chain, 2, "cloudflare.com", "20990101000000") == X509_ERR_EXPIRED, "future now => ERR_EXPIRED");
+    CHECK(x509_verify_chain(chain, 3, "cloudflare.com", now) == X509_OK, "valid 3-cert chain + host + anchor => OK");
+    CHECK(x509_verify_chain(chain, 3, "attacker.example", now) == X509_ERR_HOST, "wrong host => ERR_HOST");
+    CHECK(x509_verify_chain(chain, 3, "cloudflare.com", "20990101000000") == X509_ERR_EXPIRED, "future now => ERR_EXPIRED");
 
     /* Break the anchor link: a tampered WE1 tbs must fail its signature under the
      * GTS Root R4 key. */
