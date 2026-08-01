@@ -1569,3 +1569,5 @@ test-tls-crypto:
 	@cc -Wall $(TLS_CRYPTO_INC) -Iuser/lib/tls kernel/crypto/sha256.c kernel/crypto/hmac.c \
 	    user/lib/tls/crypto/hkdf.c user/lib/tls/keysched.c user/lib/tls/handshake.c \
 	    tools/tls/test_handshake.c -o /tmp/embk_test_handshake && /tmp/embk_test_handshake
+	@cc -Wall -Iuser/lib/tls/x509 user/lib/tls/x509/asn1.c tools/tls/test_asn1.c \
+	    -o /tmp/embk_test_asn1 && /tmp/embk_test_asn1
