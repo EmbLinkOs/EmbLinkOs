@@ -10,18 +10,25 @@
 #include <stddef.h>
 
 enum { X509_CURVE_NONE = 0, X509_CURVE_P256, X509_CURVE_P384 };
-enum { X509_SIG_NONE = 0, X509_SIG_ECDSA_SHA256, X509_SIG_ECDSA_SHA384 };
+enum { X509_KEY_NONE = 0, X509_KEY_EC, X509_KEY_RSA };
+enum { X509_SIG_NONE = 0,
+       X509_SIG_ECDSA_SHA256, X509_SIG_ECDSA_SHA384,
+       X509_SIG_RSA_SHA256, X509_SIG_RSA_SHA384, X509_SIG_RSA_SHA512 };
 
 struct x509_cert {
     const uint8_t *raw;        size_t raw_len;
     const uint8_t *tbs;        size_t tbs_len;      /* signed bytes, hashed as-is */
 
-    int            curve;                            /* X509_CURVE_* of the subject key */
-    const uint8_t *qx, *qy;    size_t coord_len;     /* subject EC public key, affine */
+    int            key_type;                         /* X509_KEY_EC or X509_KEY_RSA */
+    int            curve;                            /* EC: X509_CURVE_* */
+    const uint8_t *qx, *qy;    size_t coord_len;     /* EC: public key, affine */
+    const uint8_t *rsa_n;      size_t rsa_n_len;     /* RSA: modulus + exponent */
+    const uint8_t *rsa_e;      size_t rsa_e_len;
 
     int            sig_alg;                          /* X509_SIG_* on this cert */
-    const uint8_t *sig_r;      size_t sig_r_len;     /* signature, DER leading zero stripped */
+    const uint8_t *sig_r;      size_t sig_r_len;     /* ECDSA: r,s (leading zero stripped) */
     const uint8_t *sig_s;      size_t sig_s_len;
+    const uint8_t *sig_raw;    size_t sig_raw_len;   /* RSA: raw signature bytes */
 
     const uint8_t *issuer;     size_t issuer_len;    /* raw DER Name (for chain matching) */
     const uint8_t *subject;    size_t subject_len;
@@ -65,10 +72,9 @@ int x509_check_validity(const struct x509_cert *c, const char *now_utc);
  * the algorithm named in child->sig_alg and ECDSA-verifies). Returns 1 valid. */
 int x509_verify_signed_by(const struct x509_cert *child, const struct x509_cert *issuer);
 
-/* Same, but against a bare issuer EC key (for a trust-anchor root we store as a
- * key, not a full cert). */
-int x509_verify_sig_with_key(const struct x509_cert *child,
-                             int issuer_curve, const uint8_t *iqx, const uint8_t *iqy);
+/* Same, but against a bundled trust anchor (EC or RSA key). */
+struct trust_anchor;
+int x509_verify_signed_by_anchor(const struct x509_cert *child, const struct trust_anchor *a);
 
 /* Do two raw DER Names compare equal (byte-exact)? Used to link a cert to its
  * issuer in the chain. */

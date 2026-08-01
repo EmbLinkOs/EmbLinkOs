@@ -3,6 +3,7 @@
 #include "asn1.h"
 #include "trust.h"
 #include "ecdsa.h"            /* -Iuser/lib/tls/crypto */
+#include "rsa.h"
 #include "sha512.h"           /* -Iuser/lib/tls/crypto */
 #include "crypto/sha256.h"    /* kernel/crypto via -Ikernel */
 #include <string.h>
@@ -13,6 +14,10 @@ static const uint8_t OID_P256[]        = {0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x0
 static const uint8_t OID_P384[]        = {0x2b,0x81,0x04,0x00,0x22};                  /* secp384r1 */
 static const uint8_t OID_ECDSA_SHA256[]= {0x2a,0x86,0x48,0xce,0x3d,0x04,0x03,0x02};
 static const uint8_t OID_ECDSA_SHA384[]= {0x2a,0x86,0x48,0xce,0x3d,0x04,0x03,0x03};
+static const uint8_t OID_RSA_PUBKEY[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x01}; /* rsaEncryption */
+static const uint8_t OID_RSA_SHA256[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x0b};
+static const uint8_t OID_RSA_SHA384[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x0c};
+static const uint8_t OID_RSA_SHA512[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x0d};
 static const uint8_t OID_SAN[]         = {0x55,0x1d,0x11};                            /* 2.5.29.17 */
 
 #define OIDEQ(t, o) der_oid_eq((t), (o), sizeof(o))
@@ -34,27 +39,42 @@ static int parse_ecdsa_sig(const uint8_t *p, size_t len, struct x509_cert *c) {
     return 0;
 }
 
-/* SubjectPublicKeyInfo: SEQUENCE { AlgorithmIdentifier{ecPublicKey, curve}, BIT STRING }. */
+/* SubjectPublicKeyInfo: SEQUENCE { AlgorithmIdentifier, BIT STRING }. Handles
+ * both id-ecPublicKey (P-256/P-384) and rsaEncryption keys. */
 static int parse_spki(const struct der_tlv *spki, struct x509_cert *c) {
-    struct der_tlv alg, pk;
+    struct der_tlv alg, pk, alg_oid;
     if (der_parse(spki->val, der_end(spki), &alg) || alg.tag != DER_SEQUENCE) return -1;
     if (der_parse(der_end(&alg), der_end(spki), &pk) || pk.tag != DER_BIT_STRING) return -1;
+    if (der_parse(alg.val, der_end(&alg), &alg_oid)) return -1;
+    if (pk.len < 1 || pk.val[0] != 0) return -1;         /* unused-bits byte = 0 */
 
-    struct der_tlv alg_oid, curve_oid;
-    if (der_parse(alg.val, der_end(&alg), &alg_oid) || !OIDEQ(&alg_oid, OID_EC_PUBKEY)) return -1;
-    if (der_parse(der_end(&alg_oid), der_end(&alg), &curve_oid) || curve_oid.tag != DER_OID) return -1;
-    if (OIDEQ(&curve_oid, OID_P256)) c->curve = X509_CURVE_P256;
-    else if (OIDEQ(&curve_oid, OID_P384)) c->curve = X509_CURVE_P384;
-    else return -1;
-
-    /* BIT STRING: first content byte = unused-bit count (0), then 0x04||X||Y. */
-    if (pk.len < 2 || pk.val[0] != 0 || pk.val[1] != 0x04) return -1;
-    size_t point = pk.len - 2;
-    if (point % 2) return -1;
-    c->coord_len = point / 2;
-    c->qx = pk.val + 2;
-    c->qy = pk.val + 2 + c->coord_len;
-    return 0;
+    if (OIDEQ(&alg_oid, OID_EC_PUBKEY)) {
+        struct der_tlv curve_oid;
+        if (der_parse(der_end(&alg_oid), der_end(&alg), &curve_oid) || curve_oid.tag != DER_OID) return -1;
+        if (OIDEQ(&curve_oid, OID_P256)) c->curve = X509_CURVE_P256;
+        else if (OIDEQ(&curve_oid, OID_P384)) c->curve = X509_CURVE_P384;
+        else return -1;
+        if (pk.len < 2 || pk.val[1] != 0x04) return -1;  /* uncompressed 0x04||X||Y */
+        size_t point = pk.len - 2;
+        if (point % 2) return -1;
+        c->key_type = X509_KEY_EC;
+        c->coord_len = point / 2;
+        c->qx = pk.val + 2;
+        c->qy = pk.val + 2 + c->coord_len;
+        return 0;
+    }
+    if (OIDEQ(&alg_oid, OID_RSA_PUBKEY)) {
+        /* BIT STRING wraps RSAPublicKey ::= SEQUENCE { modulus, exponent }. */
+        struct der_tlv seq, mod, exp;
+        if (der_parse(pk.val + 1, der_end(&pk), &seq) || seq.tag != DER_SEQUENCE) return -1;
+        if (der_parse(seq.val, der_end(&seq), &mod) || mod.tag != DER_INTEGER) return -1;
+        if (der_parse(der_end(&mod), der_end(&seq), &exp) || exp.tag != DER_INTEGER) return -1;
+        c->key_type = X509_KEY_RSA;
+        c->rsa_n = mod.val; c->rsa_n_len = mod.len;      /* leading zero tolerated downstream */
+        c->rsa_e = exp.val; c->rsa_e_len = exp.len;
+        return 0;
+    }
+    return -1;
 }
 
 /* Find SubjectAltName inside the extensions [3] and store its GeneralNames. */
@@ -98,17 +118,19 @@ int x509_parse(const uint8_t *der, size_t len, struct x509_cert *out) {
     /* outer signatureAlgorithm */
     struct der_tlv sa_oid;
     if (der_parse(sigalg.val, der_end(&sigalg), &sa_oid)) return -1;
-    if (OIDEQ(&sa_oid, OID_ECDSA_SHA256)) out->sig_alg = X509_SIG_ECDSA_SHA256;
+    if (OIDEQ(&sa_oid, OID_ECDSA_SHA256))      out->sig_alg = X509_SIG_ECDSA_SHA256;
     else if (OIDEQ(&sa_oid, OID_ECDSA_SHA384)) out->sig_alg = X509_SIG_ECDSA_SHA384;
+    else if (OIDEQ(&sa_oid, OID_RSA_SHA256))   out->sig_alg = X509_SIG_RSA_SHA256;
+    else if (OIDEQ(&sa_oid, OID_RSA_SHA384))   out->sig_alg = X509_SIG_RSA_SHA384;
+    else if (OIDEQ(&sa_oid, OID_RSA_SHA512))   out->sig_alg = X509_SIG_RSA_SHA512;
     else out->sig_alg = X509_SIG_NONE;
 
-    /* signatureValue BIT STRING: unused-bits byte, then the signature. Only
-     * decode it as an ECDSA-Sig-Value when the algorithm is ECDSA -- a chain can
-     * legitimately include a cert signed with something else (e.g. an RSA-signed
-     * root), which we still parse for its name + key; we just never verify such a
-     * cert's own signature (a trust anchor is trusted, not verified). */
+    /* signatureValue BIT STRING: unused-bits byte, then the signature. Keep the
+     * raw bytes (RSA uses them directly); additionally decode r,s for ECDSA. An
+     * unrecognized scheme still parses (a trust anchor is trusted, not verified). */
     if (sigval.len < 1 || sigval.val[0] != 0) return -1;
-    if (out->sig_alg != X509_SIG_NONE)
+    out->sig_raw = sigval.val + 1; out->sig_raw_len = sigval.len - 1;
+    if (out->sig_alg == X509_SIG_ECDSA_SHA256 || out->sig_alg == X509_SIG_ECDSA_SHA384)
         if (parse_ecdsa_sig(sigval.val + 1, sigval.len - 1, out)) return -1;
 
     /* Walk tbsCertificate fields in order. */
@@ -207,25 +229,62 @@ int x509_name_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
     return alen == blen && memcmp(a, b, alen) == 0;
 }
 
-static int verify_sig(const struct x509_cert *child, int curve, const uint8_t *qx, const uint8_t *qy) {
-    const struct ec_curve *ec;
-    uint8_t hash[64]; size_t hlen;
-    if (child->sig_alg == X509_SIG_ECDSA_SHA256) { sha256(child->tbs, child->tbs_len, hash); hlen = 32; }
-    else if (child->sig_alg == X509_SIG_ECDSA_SHA384) { sha384(child->tbs, child->tbs_len, hash); hlen = 48; }
-    else return 0;
-    if (curve == X509_CURVE_P256) ec = ec_p256();
-    else if (curve == X509_CURVE_P384) ec = ec_p384();
-    else return 0;
-    return ecdsa_verify(ec, qx, qy, hash, hlen,
-                        child->sig_r, child->sig_r_len, child->sig_s, child->sig_s_len);
+/* An issuer's public key, EC or RSA -- from a full cert or a bundled anchor. */
+struct issuer_key {
+    int key_type;
+    int curve; const uint8_t *qx, *qy;                       /* EC */
+    const uint8_t *rsa_n; size_t rsa_n_len;                  /* RSA */
+    const uint8_t *rsa_e; size_t rsa_e_len;
+};
+
+/* Verify `child`'s signature under `k`. The child's sig_alg names both the hash
+ * and the scheme; the issuer key must match that scheme. */
+static int verify_with(const struct x509_cert *child, const struct issuer_key *k) {
+    uint8_t hash[64];
+    switch (child->sig_alg) {
+    case X509_SIG_ECDSA_SHA256: {
+        if (k->key_type != X509_KEY_EC) return 0;
+        const struct ec_curve *ec = (k->curve == X509_CURVE_P256) ? ec_p256()
+                                  : (k->curve == X509_CURVE_P384) ? ec_p384() : 0;
+        if (!ec) return 0;
+        sha256(child->tbs, child->tbs_len, hash);
+        return ecdsa_verify(ec, k->qx, k->qy, hash, 32,
+                            child->sig_r, child->sig_r_len, child->sig_s, child->sig_s_len);
+    }
+    case X509_SIG_ECDSA_SHA384: {
+        if (k->key_type != X509_KEY_EC) return 0;
+        const struct ec_curve *ec = (k->curve == X509_CURVE_P256) ? ec_p256()
+                                  : (k->curve == X509_CURVE_P384) ? ec_p384() : 0;
+        if (!ec) return 0;
+        sha384(child->tbs, child->tbs_len, hash);
+        return ecdsa_verify(ec, k->qx, k->qy, hash, 48,
+                            child->sig_r, child->sig_r_len, child->sig_s, child->sig_s_len);
+    }
+    case X509_SIG_RSA_SHA256:
+    case X509_SIG_RSA_SHA384:
+    case X509_SIG_RSA_SHA512: {
+        if (k->key_type != X509_KEY_RSA) return 0;
+        int ha; size_t hlen;
+        if (child->sig_alg == X509_SIG_RSA_SHA256) { sha256(child->tbs, child->tbs_len, hash); ha = RSA_HASH_SHA256; hlen = 32; }
+        else if (child->sig_alg == X509_SIG_RSA_SHA384) { sha384(child->tbs, child->tbs_len, hash); ha = RSA_HASH_SHA384; hlen = 48; }
+        else { sha512(child->tbs, child->tbs_len, hash); ha = RSA_HASH_SHA512; hlen = 64; }
+        return rsa_pkcs1_verify(k->rsa_n, k->rsa_n_len, k->rsa_e, k->rsa_e_len,
+                                ha, hash, hlen, child->sig_raw, child->sig_raw_len);
+    }
+    default: return 0;
+    }
 }
 
 int x509_verify_signed_by(const struct x509_cert *child, const struct x509_cert *issuer) {
-    return verify_sig(child, issuer->curve, issuer->qx, issuer->qy);
+    struct issuer_key k = { issuer->key_type, issuer->curve, issuer->qx, issuer->qy,
+                            issuer->rsa_n, issuer->rsa_n_len, issuer->rsa_e, issuer->rsa_e_len };
+    return verify_with(child, &k);
 }
-int x509_verify_sig_with_key(const struct x509_cert *child,
-                             int issuer_curve, const uint8_t *iqx, const uint8_t *iqy) {
-    return verify_sig(child, issuer_curve, iqx, iqy);
+
+int x509_verify_signed_by_anchor(const struct x509_cert *child, const struct trust_anchor *a) {
+    struct issuer_key k = { a->key_type, a->curve, a->qx, a->qy,
+                            a->rsa_n, a->rsa_n_len, a->rsa_e, a->rsa_e_len };
+    return verify_with(child, &k);
 }
 
 int x509_verify_chain(const struct x509_cert *certs, int n,
@@ -241,7 +300,7 @@ int x509_verify_chain(const struct x509_cert *certs, int n,
 
         const struct trust_anchor *a = trust_find(certs[i].issuer, certs[i].issuer_len);
         if (a) {
-            if (x509_verify_sig_with_key(&certs[i], a->curve, a->qx, a->qy)) return X509_OK;
+            if (x509_verify_signed_by_anchor(&certs[i], a)) return X509_OK;
             return X509_ERR_SIG;
         }
         if (i + 1 >= n) return X509_ERR_ANCHOR;          /* ran out; no anchor reached */

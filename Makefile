@@ -504,7 +504,7 @@ build/wget.elf: build/crt0.o build/syscalls.o build/wget.o user/lib/newlib.ld
 TLS_LIB_INC  := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto -Iuser/lib/tls -Iuser/lib/tls/x509
 TLS_LIB_OBJS := build/tls_sha256.o build/tls_hmac.o build/tls_aes.o \
                 build/tls_hkdf.o build/tls_gcm.o build/tls_x25519.o \
-                build/tls_sha512.o build/tls_bignum.o build/tls_ecdsa.o \
+                build/tls_sha512.o build/tls_bignum.o build/tls_ecdsa.o build/tls_rsa.o \
                 build/tls_asn1.o build/tls_cert.o build/tls_trust.o \
                 build/tls_keysched.o build/tls_record.o build/tls_handshake.o build/tls_tls.o
 
@@ -525,6 +525,8 @@ build/tls_sha512.o: user/lib/tls/crypto/sha512.c | $(BUILD)
 build/tls_bignum.o: user/lib/tls/crypto/bignum.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tls_ecdsa.o: user/lib/tls/crypto/ecdsa.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_rsa.o: user/lib/tls/crypto/rsa.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tls_asn1.o: user/lib/tls/x509/asn1.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
@@ -1591,11 +1593,17 @@ test-tls-crypto:
 	    -o /tmp/embk_test_bignum && /tmp/embk_test_bignum
 	@cc -Wall -Iuser/lib/tls/crypto user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
 	    tools/tls/test_ecdsa.c -o /tmp/embk_test_ecdsa && /tmp/embk_test_ecdsa
-	@cc -Wall -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
-	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c kernel/crypto/sha256.c \
-	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
-	    tools/tls/test_x509.c -o /tmp/embk_test_x509 && /tmp/embk_test_x509
-	@cc -Wall -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
+	@cc -w -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
 	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
-	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
+	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
+	    tools/tls/test_x509.c -o /tmp/embk_test_x509 && /tmp/embk_test_x509
+	@cc -w -Iuser/lib/tls/crypto user/lib/tls/crypto/bignum.c user/lib/tls/crypto/rsa.c \
+	    tools/tls/test_rsa.c -o /tmp/embk_test_rsa && /tmp/embk_test_rsa
+	@cc -w -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
+	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
+	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
 	    tools/tls/test_chain.c -o /tmp/embk_test_chain && /tmp/embk_test_chain
+	@cc -w -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
+	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
+	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
+	    tools/tls/test_rsachain.c -o /tmp/embk_test_rsachain && /tmp/embk_test_rsachain

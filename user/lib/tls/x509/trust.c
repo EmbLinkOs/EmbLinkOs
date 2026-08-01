@@ -9,10 +9,17 @@
 
 /* GTS_R4_POINT is the uncompressed point 0x04 || X(48) || Y(48). */
 static const struct trust_anchor ANCHORS[] = {
-    {
+    {   /* GTS Root R4 -- EC P-384 (Cloudflare / Google) */
         GTS_R4_SUBJECT, sizeof GTS_R4_SUBJECT,
-        X509_CURVE_P384,
+        X509_KEY_EC, X509_CURVE_P384,
         GTS_R4_POINT + 1, GTS_R4_POINT + 1 + 48, 48,
+        NULL, 0, NULL, 0,
+    },
+    {   /* ISRG Root X1 -- RSA-4096 (Let's Encrypt, much of the web) */
+        ISRG_X1_SUBJECT, sizeof ISRG_X1_SUBJECT,
+        X509_KEY_RSA, X509_CURVE_NONE,
+        NULL, NULL, 0,
+        ISRG_X1_N, sizeof ISRG_X1_N, ISRG_X1_E, sizeof ISRG_X1_E,
     },
 };
 #define N_ANCHORS (int)(sizeof ANCHORS / sizeof ANCHORS[0])

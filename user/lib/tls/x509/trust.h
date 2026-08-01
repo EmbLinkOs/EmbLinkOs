@@ -11,8 +11,11 @@
 
 struct trust_anchor {
     const uint8_t *subject;   size_t subject_len;   /* raw DER Name */
-    int            curve;                            /* X509_CURVE_* */
-    const uint8_t *qx, *qy;   size_t coord_len;      /* anchor public key */
+    int            key_type;                         /* X509_KEY_EC or X509_KEY_RSA */
+    int            curve;                            /* EC anchor: X509_CURVE_* */
+    const uint8_t *qx, *qy;   size_t coord_len;      /* EC anchor public key */
+    const uint8_t *rsa_n;     size_t rsa_n_len;      /* RSA anchor modulus + exponent */
+    const uint8_t *rsa_e;     size_t rsa_e_len;
 };
 
 /* Find the anchor whose subject DN equals `issuer`, or NULL. */

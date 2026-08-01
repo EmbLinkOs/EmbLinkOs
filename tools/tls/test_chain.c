@@ -26,8 +26,8 @@ int main(void) {
     printf("parse frozen Cloudflare chain (leaf + WE1 + RSA-signed root):\n");
     CHECK(x509_parse(CHAIN_LEAF, sizeof CHAIN_LEAF, &leaf) == 0, "leaf parses");
     CHECK(x509_parse(CHAIN_WE1, sizeof CHAIN_WE1, &we1) == 0, "WE1 parses");
-    CHECK(x509_parse(CHAIN_ROOT, sizeof CHAIN_ROOT, &root) == 0, "RSA-signed root parses (sig not ECDSA)");
-    CHECK(root.sig_alg == X509_SIG_NONE, "root sig alg is non-ECDSA (tolerated)");
+    CHECK(x509_parse(CHAIN_ROOT, sizeof CHAIN_ROOT, &root) == 0, "RSA-signed root parses");
+    CHECK(root.sig_alg == X509_SIG_RSA_SHA256, "root sig alg recognized as RSA (anchor: not verified)");
     CHECK(leaf.curve == X509_CURVE_P256, "leaf key is P-256");
     CHECK(we1.curve == X509_CURVE_P256, "WE1 key is P-256");
     CHECK(trust_find(we1.issuer, we1.issuer_len) != NULL, "WE1 issuer is the GTS Root R4 anchor");

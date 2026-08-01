@@ -1,14 +1,16 @@
 #ifndef EMBK_TLS_BIGNUM_H
 #define EMBK_TLS_BIGNUM_H
-/* A fixed-width unsigned bignum with Montgomery modular arithmetic, sized for
- * the NIST prime curves up to P-384 (docs/TLS.md T3). Limbs are 64-bit; the CIOS
- * Montgomery multiply uses __int128 for the 64x64 products (fine on x86-64, our
- * only target). This is for ECDSA *verification* -- a public-key operation over
- * public values -- so it is NOT written to be constant-time. */
+/* A fixed-width unsigned bignum with Montgomery modular arithmetic (docs/TLS.md
+ * T3). Wide enough for both the NIST prime curves (ECDSA, up to P-384) and RSA
+ * moduli up to 4096-bit. Limbs are 64-bit; the CIOS Montgomery multiply uses
+ * __int128 for the 64x64 products (fine on x86-64, our only target). Every op
+ * takes an explicit limb count, so a 256-bit ECDSA field costs the same as
+ * before -- only the array size grew. For *verification* (public-key ops over
+ * public values), so NOT constant-time. */
 #include <stdint.h>
 #include <stddef.h>
 
-#define BN_MAX_LIMBS 6                 /* 6 * 64 = 384 bits (P-384) */
+#define BN_MAX_LIMBS 64                /* 64 * 64 = 4096 bits (RSA-4096) */
 typedef uint64_t bn[BN_MAX_LIMBS];
 
 void bn_zero(bn a, int n);
@@ -36,6 +38,11 @@ void mont_from(const struct mont *mo, bn r, const bn a);            /* aR -> a  
 void mont_add(const struct mont *mo, bn r, const bn a, const bn b);  /* (a+b) mod m */
 void mont_sub(const struct mont *mo, bn r, const bn a, const bn b);  /* (a-b) mod m */
 void mont_inv(const struct mont *mo, bn r, const bn a);             /* a^-1 (Montgomery in/out) */
+
+/* r = base^exp mod m, base and r in the Montgomery domain, exp a big-endian
+ * integer (the RSA public exponent). Square-and-multiply, MSB first. */
+void mont_pow(const struct mont *mo, bn r, const bn base,
+              const uint8_t *exp_be, size_t exp_len);
 
 /* Reduce a big-endian integer of arbitrary length modulo m -> Montgomery-domain
  * result. Used to load a hash or a signature scalar into the mod-n field. */

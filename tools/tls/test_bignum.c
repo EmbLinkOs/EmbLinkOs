@@ -62,6 +62,15 @@ int main(void) {
     bn_to_be(out, red, mo.n);
     eq("48-byte blob mod p", out, "18181817fefdfcfc131211100f0e0d0c0d0e0f102b2e3134373a3d4042444648", 32);
 
+    /* mont_pow: a^65537 mod p (the RSA public-exponent shape). */
+    printf("mont_pow:\n");
+    static const uint8_t E[] = { 0x01, 0x00, 0x01 };   /* 65537, big-endian */
+    bn powm, pw;
+    mont_pow(&mo, powm, am, E, sizeof E);
+    mont_from(&mo, pw, powm);
+    bn_to_be(out, pw, mo.n);
+    eq("a^65537 mod p", out, "42712ce0ffb70537be8266a4bc215c57ce2bcd0a72968f73065a32e0294a7bc3", 32);
+
     printf("\nMontgomery bignum: %s\n", fails == 0 ? "ALL PASS" : "FAIL");
     return fails == 0 ? 0 : 1;
 }

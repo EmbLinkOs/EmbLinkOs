@@ -118,6 +118,22 @@ void mont_inv(const struct mont *mo, bn r, const bn a) {
     bn_copy(r, result, mo->n);
 }
 
+void mont_pow(const struct mont *mo, bn r, const bn base,
+              const uint8_t *exp_be, size_t exp_len) {
+    bn result; bn_copy(result, mo->one_mont, mo->n);   /* 1 in Montgomery form */
+    int started = 0;                                    /* skip leading zero bits */
+    for (size_t i = 0; i < exp_len; i++) {
+        for (int b = 7; b >= 0; b--) {
+            if (started) mont_mul(mo, result, result, result);
+            if ((exp_be[i] >> b) & 1) {
+                mont_mul(mo, result, result, base);
+                started = 1;
+            }
+        }
+    }
+    bn_copy(r, result, mo->n);
+}
+
 void mont_init(struct mont *mo, const uint8_t *mod_be, size_t nbytes) {
     int n = (int)((nbytes + 7) / 8);
     mo->n = n;
