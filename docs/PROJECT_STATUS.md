@@ -853,9 +853,12 @@ verified on the metal.
   and writes the decrypted body to disk (refuses on cert failure, no insecure
   fallback). `test wget https` → `HTTP 200`, bytes on EMBKFS.
 - **T5 (partial) — the package internet.** Bundled a 3rd anchor (**GlobalSign Root
-  R3**); `test pypi` fetches PyPI's PEP-503 simple index for a package (what pip
-  reads) over our TLS. *pip/git themselves are NOT yet wired* — that needs a
-  libtls-backed Python `_ssl` and a git HTTP transport (see `docs/TODO.md`).
+  R3**). **`pkgfetch`** — a native installer using our own DEFLATE (`inflate.c`) +
+  ZIP reader (`unzip.c`) — fetches a package's PyPI index + wheel over libtls and
+  installs it into `/data/py/site-packages`; `test pkgfetch` installs **`six`** on
+  the metal, importable in the ported Python. *Scope:* pure-Python wheels, one at a
+  time, no dep resolution. The real `pip` tool + git-over-HTTPS still need a
+  libtls-backed CPython `_ssl` / git transport (see `docs/TODO.md`).
 
 Trust anchors bundled: GTS Root R4 (EC P-384), ISRG Root X1 (RSA-4096), GlobalSign
 Root R3 (RSA-2048) — between them, Cloudflare/Google, Let's Encrypt, and

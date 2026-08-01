@@ -1389,18 +1389,32 @@ parts skipped to keep each phase shippable. Green today: `make test-tls-crypto`
 (15 host suites) + on-OS `test tls` (Cloudflare/EC), `test tls rsa` (Let's
 Encrypt/RSA), `test wget https`, `test pypi`.
 
-### T5 — the consumers (the big remaining integration)
-- [ ] **pip over HTTPS.** The ported CPython ships `ssl.pyc`/`http/client.pyc`, but
-  `import ssl` needs a `_ssl` C extension — normally OpenSSL. NOT built. To make
-  `pip install` work we must provide a **libtls-backed `_ssl`** (or a smaller
-  `_socket`-level TLS wrap) exposing enough of `SSLContext`/`SSLSocket`
-  (`wrap_socket`, `do_handshake`, `read`, `write`, `getpeercert`, SNI) for
-  `http.client`/`urllib`. Large. *Today:* `test pypi` proves the OS can fetch
-  PyPI's PEP-503 index over our TLS via `wget` — the data pip needs — but pip
-  itself is not wired.
+### T5 — the consumers
+- [x] ~~**Install a real PyPI package over HTTPS.**~~ **DONE via `pkgfetch`**
+  (commit `f476790`): a native installer (`user/bin/pkgfetch.c` + our own
+  `user/lib/inflate.c` DEFLATE + `user/lib/unzip.c`) fetches a package's PEP-503
+  index + wheel over authenticated libtls and unpacks it into
+  `/data/py/site-packages`. `test pkgfetch` installs `six` from pypi.org /
+  files.pythonhosted.org on the metal; `PYTHONPATH=… python -c 'import six'` then
+  works. This was chosen over rebuilding CPython because the proxy path is blocked
+  (no loopback in the net stack).
+  - **Scope / still open:** pure-Python wheels only (no C-extension compile step);
+    one package at a time (**no dependency resolution** — a package needing deps
+    won't pull them); picks the last `*-none-any.whl` in the index (simple "newest"
+    heuristic, not full PEP 440 version sorting); no wheel hash/signature check
+    beyond TLS transport auth.
+- [ ] **Real `pip` (the tool).** Still needs a **libtls-backed `_ssl`** in the
+  external CPython (the ported `ssl.pyc`/`http/client.pyc` need it) — a large
+  extension + a Python rebuild. `pkgfetch` covers the common "get me this pure
+  package" case without it.
 - [ ] **git over HTTPS.** The git port is local-only (no HTTP transport). Needs
   git's smart-HTTP (`git-remote-https`) wired to libtls, or a libcurl shim. Not
   started.
+- [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
+  one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
+  fragmented Certificate-message / net-read edge case leaving a cert parsed with
+  is_ca=0 rather than failing outright. Investigate the flight reassembly under
+  multi-record certs; possibly related to the sys_read byte-drop history.
 - [ ] **Our own package registry fetch** (packaging PK4) over libtls — the
   authority-declaring bundle download. Design only.
 
