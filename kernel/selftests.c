@@ -1154,6 +1154,26 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test tls") == 0) {
+        /* THE HEADLINE (docs/TLS.md T2): the OS speaks TLS 1.3. tlstest (ring 3)
+         * resolves cloudflare.com, TCP-connects :443, runs OUR libtls handshake
+         * (server Finished verified -- proving ECDHE + key schedule + transcript
+         * + record layer are all byte-correct; cert NOT verified yet: T3), then
+         * does an encrypted HTTPS GET and reads the decrypted reply. Needs
+         * CAP_NETWORK, outbound :443 (SLIRP), and RDRAND (QEMU -cpu max). */
+        const char *tp = "/data/apps/tlstest/tlstest.elf";
+        struct vfs_stat st;
+        if (vfs_stat(tp, &st) != 0) { kprintf("\n[cmd] test tls: %s not on image\n", tp); return 1; }
+        char *a[]   = { (char *)tp, (char *)"cloudflare.com", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(tp, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[tls] exit=%d\n", code);
+        kprintf("[cmd] test tls: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test emlibc") == 0) {
         /* emlibc phase 1: the OS runs a program that links its OWN non-POSIX C
          * library INSTEAD of newlib (built -nostdinc, no -lc, no newlib

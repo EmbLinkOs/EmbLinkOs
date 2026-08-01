@@ -90,14 +90,23 @@ Shared header = contract; one file per concern; subdirs for `crypto`/`x509`.
   full §6.1 DH agreement). Self-contained; no network.
     - Files: `user/lib/tls/crypto/{hkdf,gcm,x25519,selftest}.c`, the kshim under
       `user/lib/tls/kshim/`, host tests `tools/tls/test_*.c`.
-- **T2 — the 1.3 handshake + record layer, NO cert verification.** ClientHello
-  (X25519 key_share, the one suite) → ServerHello → derive the handshake secrets
-  (HKDF-Extract/Expand-Label, the 1.3 key schedule) → AEAD-open EncryptedExtensions
-  / Certificate / CertificateVerify / Finished → send our Finished → exchange
-  encrypted application data. Certificates are *parsed but not verified* (accept
-  any) — INSECURE, explicitly, for the milestone. *Green:* a full TLS 1.3 handshake
-  with a real server and an encrypted round-trip. **This is the headline: the OS
-  can speak TLS.**
+- **T2 — the 1.3 handshake + record layer, NO cert verification. ✅ DONE.**
+  ClientHello (X25519 key_share, the one suite) → ServerHello → derive the
+  handshake secrets (the 1.3 key schedule) → AEAD-open EncryptedExtensions /
+  Certificate / CertificateVerify / Finished → verify the server Finished MAC →
+  send our Finished → exchange encrypted application data. Certificates are
+  *parsed but not verified* (accept any) — INSECURE, explicitly, for the
+  milestone. **Green, on the metal:** `test tls` drove a full TLS 1.3 handshake
+  against **cloudflare.com:443** — server Finished verified (which proves the
+  ECDHE + key schedule + transcript + record layer are all byte-correct), then an
+  encrypted HTTPS GET returned `HTTP/1.1 301` and 1166 bytes of decrypted app
+  data. **The OS speaks TLS.**
+    - `user/lib/tls/{handshake,tls}.{c,h}`, on-OS driver `user/bin/tlstest.c`
+      (packed at `/data/apps/tlstest/`, CAP_NETWORK + RDRAND); host message tests
+      `tools/tls/test_handshake.c`. libtls links the kernel crypto compiled for
+      userspace (the kshim), same one-codebase trick as T1.
+    - Known v1 gaps (fine at this milestone): cert **not** verified (→ T3), no
+      HelloRetryRequest, no KeyUpdate, one suite (AES-128-GCM), blocking API.
 - **T3 — certificate verification (makes it real).** An ASN.1/DER reader, X.509
   cert parsing, **RSA-PKCS1-v1.5 + RSA-PSS** and **ECDSA-P256** signature verify
   (a small constant-time bignum modexp), a bundled **root CA trust store**, chain

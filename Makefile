@@ -496,6 +496,42 @@ build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
 build/wget.elf: build/crt0.o build/syscalls.o build/wget.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o -lc -lgcc -o $@
 
+# libtls (docs/TLS.md T2): the TLS 1.3 client, built FOR USERSPACE. Reuses the
+# kernel crypto (sha256/hmac/aes) compiled against the kshim -- one crypto
+# codebase, kernel and user, exactly as the host tests do. kshim MUST precede
+# -Ikernel so include/{types,kstring,kprintf}.h resolve to the shims. Packed as
+# /data/apps/tlstest/tlstest.elf. Needs CAP_NETWORK + RDRAND at runtime.
+TLS_LIB_INC  := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto -Iuser/lib/tls
+TLS_LIB_OBJS := build/tls_sha256.o build/tls_hmac.o build/tls_aes.o \
+                build/tls_hkdf.o build/tls_gcm.o build/tls_x25519.o \
+                build/tls_keysched.o build/tls_record.o build/tls_handshake.o build/tls_tls.o
+
+build/tls_sha256.o: kernel/crypto/sha256.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_hmac.o: kernel/crypto/hmac.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_aes.o: kernel/crypto/aes.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_hkdf.o: user/lib/tls/crypto/hkdf.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_gcm.o: user/lib/tls/crypto/gcm.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_x25519.o: user/lib/tls/crypto/x25519.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_keysched.o: user/lib/tls/keysched.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_record.o: user/lib/tls/record.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_handshake.o: user/lib/tls/handshake.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_tls.o: user/lib/tls/tls.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+
+build/tlstest.o: user/bin/tlstest.c user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tlstest.elf: build/crt0.o build/syscalls.o build/tlstest.o $(TLS_LIB_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/tlstest.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
+
 # ---------------------------------------------------------------------------
 # emlibc -- EmbLinkOS's own non-POSIX C library (docs/EMLIBC_Requirements.md).
 # Built -nostdinc against the COMPILER's freestanding headers only (stddef/
@@ -778,7 +814,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -950,7 +986,7 @@ endif
 
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf \
                build/emlibc_demo.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
@@ -1530,3 +1566,6 @@ test-tls-crypto:
 	@cc -Wall $(TLS_CRYPTO_INC) -Iuser/lib/tls kernel/crypto/aes.c \
 	    user/lib/tls/crypto/gcm.c user/lib/tls/record.c tools/tls/test_record.c \
 	    -o /tmp/embk_test_record && /tmp/embk_test_record
+	@cc -Wall $(TLS_CRYPTO_INC) -Iuser/lib/tls kernel/crypto/sha256.c kernel/crypto/hmac.c \
+	    user/lib/tls/crypto/hkdf.c user/lib/tls/keysched.c user/lib/tls/handshake.c \
+	    tools/tls/test_handshake.c -o /tmp/embk_test_handshake && /tmp/embk_test_handshake
