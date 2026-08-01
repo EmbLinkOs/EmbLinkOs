@@ -343,6 +343,92 @@ static int run_install(struct stanza *s) {
     return 0;
 }
 
+/*---------------------------- DERIVED VALUES (BUILD.md §12 G3) ------------------
+ * The one EmbBuild capability beyond a static walker: a `kind: measure` stanza
+ * turns a file's size into a NAMED VALUE, and later stanzas interpolate ${name}
+ * into their args. The customer is the KM2 two-pass: stage2 must be assembled
+ * with -D KERNEL_LOAD_SECTORS = ceil(sizeof(kernel.elf)/512), a value that isn't
+ * known until the kernel is linked. A measure stanza:
+ *     name: kernel_sectors
+ *     kind: measure
+ *     inputs: /data/build/out/kernel/kernel.elf
+ *     args: sectors            # op: size | sectors (ceil(size/512))
+ *     output: kernel_sectors   # the VARIABLE name it binds (not a file)
+ * then a later compile: args: ... -DKERNEL_LOAD_SECTORS=${kernel_sectors} ...  */
+#define MAX_VARS 32
+static struct { char name[MAX_TOK]; char val[MAX_TOK]; } g_vars[MAX_VARS];
+static int g_n_vars = 0;
+
+static const char *var_get(const char *name) {
+    for (int i = 0; i < g_n_vars; i++)
+        if (strcmp(g_vars[i].name, name) == 0) return g_vars[i].val;
+    return NULL;
+}
+static void var_set(const char *name, const char *val) {
+    for (int i = 0; i < g_n_vars; i++)
+        if (strcmp(g_vars[i].name, name) == 0) {
+            snprintf(g_vars[i].val, MAX_TOK, "%s", val); return;
+        }
+    if (g_n_vars >= MAX_VARS) {
+        fprintf(stderr, "embbuild: too many measured values (>%d)\n", MAX_VARS); return;
+    }
+    snprintf(g_vars[g_n_vars].name, MAX_TOK, "%s", name);
+    snprintf(g_vars[g_n_vars].val,  MAX_TOK, "%s", val);
+    g_n_vars++;
+}
+
+/* Expand every ${name} in `in` into `out` (cap bytes). Unknown var or overflow
+ * is a hard error (-1) -- a missing derived value must never silently vanish. */
+static int interp(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const char *p = in; *p; ) {
+        if (p[0] == '$' && p[1] == '{') {
+            const char *e = strchr(p + 2, '}');
+            if (e) {
+                size_t nl = (size_t)(e - (p + 2));
+                char name[MAX_TOK];
+                if (nl >= sizeof name) return -1;
+                memcpy(name, p + 2, nl); name[nl] = '\0';
+                const char *v = var_get(name);
+                if (!v) { fprintf(stderr, "embbuild: undefined ${%s}\n", name); return -1; }
+                size_t vl = strlen(v);
+                if (o + vl >= cap) return -1;
+                memcpy(out + o, v, vl); o += vl;
+                p = e + 1;
+                continue;
+            }
+        }
+        if (o + 1 >= cap) return -1;
+        out[o++] = *p++;
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+/* Run a `measure` stanza: stat the single input, apply the op, bind the value. */
+static int run_measure(struct stanza *s) {
+    if (s->n_inputs != 1) {
+        fprintf(stderr, "embbuild: measure '%s' needs exactly one input\n", s->name); return -1;
+    }
+    if (s->n_args != 1) {
+        fprintf(stderr, "embbuild: measure '%s' needs one arg (op: size | sectors)\n", s->name); return -1;
+    }
+    struct stat st;
+    if (stat(s->inputs[0], &st) != 0) {
+        fprintf(stderr, "embbuild: measure '%s': cannot stat '%s'\n", s->name, s->inputs[0]); return -1;
+    }
+    unsigned long v;
+    const char *op = s->argv[0];
+    if      (strcmp(op, "size") == 0)    v = (unsigned long)st.st_size;
+    else if (strcmp(op, "sectors") == 0) v = ((unsigned long)st.st_size + 511) / 512;   /* ceil / 512 */
+    else { fprintf(stderr, "embbuild: measure '%s': unknown op '%s' (want size | sectors)\n", s->name, op); return -1; }
+    char buf[32];
+    snprintf(buf, sizeof buf, "%lu", v);
+    var_set(s->output, buf);
+    printf("[embbuild] %-16s measure %s(%s) -> %s = %s\n", s->name, op, s->inputs[0], s->output, buf);
+    return 0;
+}
+
 /*--------------------------- main walk ---------------------------------*/
 int main(int argc, char **argv) {
     if (argc != 2) {
@@ -362,7 +448,26 @@ int main(int argc, char **argv) {
     int n_ran = 0, n_skipped = 0;   /* counts, not flags: "0 ran" (§10) is a number */
     for (int i = 0; i < g_n_stanzas; i++) {
         struct stanza *s = &g_stanzas[i];
-        
+
+        /* G3 measure: derive a value (e.g. sectors of kernel.elf), bind it, and
+         * move on -- no artifact, no stamp, always cheap to recompute. */
+        if (strcmp(s->kind, "measure") == 0) {
+            if (run_measure(s) != 0) return 1;
+            n_ran++;
+            continue;
+        }
+        /* G3 interpolation: expand ${var} (bound by earlier measure steps) in
+         * this stanza's args BEFORE hashing + running, so a changed derived value
+         * flows into the stamp and rebuilds the consumer. */
+        for (int j = 0; j < s->n_args; j++) {
+            char expanded[MAX_TOK];
+            if (interp(s->argv[j], expanded, sizeof expanded) != 0) {
+                fprintf(stderr, "embbuild: arg interpolation failed in stanza '%s'\n", s->name);
+                return 1;
+            }
+            snprintf(s->argv[j], MAX_TOK, "%s", expanded);
+        }
+
         /* Hash AT THIS STANZA'S TURN: inputs as they exist right now,
          * including bytes produced earlier in this run. then argv, then
          * the tool identity -- a flag change or tool upgrade must rebuild

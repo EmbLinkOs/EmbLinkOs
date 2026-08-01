@@ -454,6 +454,7 @@ static void selftests_print_commands(void)
     kprintf("  test embbuild\n");
     kprintf("  test embbuild self\n");
     kprintf("  test embbuild kernel\n");
+    kprintf("  test embbuild derive\n");
     kprintf("  test embbuild shell\n");
     kprintf("  test embbuild gui\n");
     kprintf("  test keyboard\n");
@@ -4432,6 +4433,33 @@ int selftests_handle_command(const char *cmd)
         int ok = built && is_exec;
         kprintf("\n[cmd] test embbuild kernel: %s (rc=%d)\n",
                 ok ? "OK -- the OS built its own kernel" : "FAIL", rc);
+        return 1;
+    }
+
+    /* G3 (docs/BUILD.md §12): EmbBuild's derived-value step -- the one capability
+     * beyond a static walker. Runs the g3test manifest: a `measure` binds
+     * nsec = sectors(probe.c), and the compile interpolates ${nsec} into a tcc
+     * -DSECT=. probe.c #errors unless SECT arrived as the measured value (1), so
+     * a green compile proves the derived value flowed all the way into a real
+     * build command -- exactly what KM2 needs for stage2's KERNEL_LOAD_SECTORS. */
+    if (strcmp(cmd, "test embbuild derive") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild derive: VFS not registered\n"); return 1; }
+        struct vfs_stat st;
+        char *bb = "/data/apps/embbuild/embbuild.elf";
+        if (vfs_stat("/data/apps/tcc/tcc.elf", &st) != 0) {
+            kprintf("\n[cmd] test embbuild derive: SKIP -- tcc.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/g3test/build.ebm", &st) != 0) {
+            kprintf("\n[cmd] test embbuild derive: SKIP -- g3test manifest not staged\n"); return 1; }
+
+        static char cap[4096];
+        char *m[] = { bb, (char *)"/data/src/g3test/build.ebm", NULL };
+        int rc = emb_run_cap(bb, m, 2, cap, sizeof cap);
+        int measured = emb_find(cap, "measure sectors") && emb_find(cap, "nsec = 1");
+        int built    = (rc == 0) && (vfs_stat("/data/build/out/g3test/probe.o", &st) == 0);
+        int ok = measured && built;
+        kprintf("[km2] measure -> ${nsec} -> tcc -DSECT: measured=%d, compile+#if=%d\n",
+                measured, built);
+        kprintf("\n[cmd] test embbuild derive: %s (rc=%d)\n", ok ? "OK" : "FAIL", rc);
         return 1;
     }
 

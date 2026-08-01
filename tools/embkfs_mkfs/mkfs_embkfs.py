@@ -847,6 +847,23 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"data/src/kernel/build.ebm",
                         L.DT_REG, L.S_IFREG | L.PERM_FILE, kebm))
 
+    # G3 (docs/BUILD.md §12) derived-value test fixture for `test embbuild derive`:
+    # a `measure` step binds nsec = sectors(probe.c), and the compile interpolates
+    # ${nsec} into a tcc -D. probe.c is <512 B (so nsec == 1) and #errors unless
+    # SECT arrived as exactly 1 -- proving the derived value flowed into a real
+    # compile, not just that a substitution happened.
+    objects.append((b"data/src/g3test/probe.c", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"#if SECT == 1\nint g3_derive_ok;\n#else\n"
+                    b"#error \"G3: SECT did not interpolate to the measured sector count\"\n#endif\n"))
+    objects.append((b"data/src/g3test/build.ebm", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"project: g3test\n\n"
+                    b"name: nsec\nkind: measure\ninputs: /data/src/g3test/probe.c\n"
+                    b"args: sectors\noutput: nsec\n\n"
+                    b"name: probe.o\nkind: compile\ninputs: /data/src/g3test/probe.c\n"
+                    b"args: /data/apps/tcc/tcc.elf -c /data/src/g3test/probe.c -DSECT=${nsec} "
+                    b"-o /data/build/out/g3test/probe.o\n"
+                    b"output: /data/build/out/g3test/probe.o\n"))
+
     # The EmUI toolkit HEADERS + one real app's source (clockw), so on-OS tcc can
     # COMPILE + DYNAMIC-LINK a GUI app against /system/lib/libembk.so -- the "GUI
     # wall" coming down. The ui/ tree ships to /data/src/ui/ preserving its subdir
