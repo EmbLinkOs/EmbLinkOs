@@ -1,6 +1,7 @@
 /* X.509 certificate parsing + signature verification (see cert.h). */
 #include "cert.h"
 #include "asn1.h"
+#include "trust.h"
 #include "ecdsa.h"            /* -Iuser/lib/tls/crypto */
 #include "sha512.h"           /* -Iuser/lib/tls/crypto */
 #include "crypto/sha256.h"    /* kernel/crypto via -Ikernel */
@@ -220,4 +221,28 @@ int x509_verify_signed_by(const struct x509_cert *child, const struct x509_cert 
 int x509_verify_sig_with_key(const struct x509_cert *child,
                              int issuer_curve, const uint8_t *iqx, const uint8_t *iqy) {
     return verify_sig(child, issuer_curve, iqx, iqy);
+}
+
+int x509_verify_chain(const struct x509_cert *certs, int n,
+                      const char *host, const char *now_utc) {
+    if (n < 1) return X509_ERR_ANCHOR;
+    if (!x509_match_host(&certs[0], host)) return X509_ERR_HOST;
+
+    /* Walk leaf -> up. Stop with success as soon as a cert's issuer is a trusted
+     * anchor and that cert verifies under the anchor key; otherwise each cert
+     * must be signed by the next one in the presented chain. */
+    for (int i = 0; i < n; i++) {
+        if (!x509_check_validity(&certs[i], now_utc)) return X509_ERR_EXPIRED;
+
+        const struct trust_anchor *a = trust_find(certs[i].issuer, certs[i].issuer_len);
+        if (a) {
+            if (x509_verify_sig_with_key(&certs[i], a->curve, a->qx, a->qy)) return X509_OK;
+            return X509_ERR_SIG;
+        }
+        if (i + 1 >= n) return X509_ERR_ANCHOR;          /* ran out; no anchor reached */
+        if (!x509_name_eq(certs[i].issuer, certs[i].issuer_len,
+                          certs[i + 1].subject, certs[i + 1].subject_len)) return X509_ERR_NAME;
+        if (!x509_verify_signed_by(&certs[i], &certs[i + 1])) return X509_ERR_SIG;
+    }
+    return X509_ERR_ANCHOR;
 }

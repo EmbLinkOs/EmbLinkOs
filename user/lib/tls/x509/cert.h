@@ -35,6 +35,24 @@ struct x509_cert {
 /* Parse a DER certificate. Returns 0 on success, -1 on malformed input. */
 int x509_parse(const uint8_t *der, size_t len, struct x509_cert *out);
 
+/* Chain-verification result. */
+enum {
+    X509_OK          =  0,
+    X509_ERR_HOST    = -1,   /* leaf SAN does not cover the host */
+    X509_ERR_EXPIRED = -2,   /* a cert is outside its validity window */
+    X509_ERR_SIG     = -3,   /* a signature did not verify */
+    X509_ERR_NAME    = -4,   /* issuer/subject linkage broken */
+    X509_ERR_ANCHOR  = -5,   /* chain does not reach a trusted anchor */
+};
+
+/* Verify a server certificate chain: certs[0] is the leaf, certs[1..] the
+ * intermediates in server order. Checks the leaf covers `host`, every cert is
+ * within validity at `now_utc` ("yyyymmddhhmmssZ"-style 14 digits), each cert is
+ * signed by the next with matching issuer/subject names, and the chain reaches a
+ * bundled trust anchor (trust.h). Returns X509_OK or an X509_ERR_*. */
+int x509_verify_chain(const struct x509_cert *certs, int n,
+                      const char *host, const char *now_utc);
+
 /* Does `host` match any dNSName in the cert's SAN (case-insensitive, one level
  * of leading "*." wildcard)? Returns 1 match, 0 no match. */
 int x509_match_host(const struct x509_cert *c, const char *host);

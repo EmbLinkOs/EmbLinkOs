@@ -1581,3 +1581,7 @@ test-tls-crypto:
 	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c kernel/crypto/sha256.c \
 	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
 	    tools/tls/test_x509.c -o /tmp/embk_test_x509 && /tmp/embk_test_x509
+	@cc -Wall -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
+	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
+	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
+	    tools/tls/test_chain.c -o /tmp/embk_test_chain && /tmp/embk_test_chain
