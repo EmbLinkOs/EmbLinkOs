@@ -1453,6 +1453,11 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
     return dst;
 }
 
+in_addr_t inet_addr(const char *cp) {
+    struct in_addr a;
+    return inet_pton(AF_INET, cp, &a) == 1 ? a.s_addr : INADDR_NONE;
+}
+
 static int svc_port(const char *service) {
     if (!service) return 0;
     if (service[0] >= '0' && service[0] <= '9') return atoi(service);

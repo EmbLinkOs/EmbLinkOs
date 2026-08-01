@@ -30,7 +30,16 @@ struct sockaddr_in6 {
 
 #define INADDR_ANY       ((in_addr_t)0x00000000)
 #define INADDR_LOOPBACK  ((in_addr_t)0x7f000001)
+#define INADDR_BROADCAST ((in_addr_t)0xffffffff)
 #define INADDR_NONE      ((in_addr_t)0xffffffff)
+
+/* Classful/multicast test macros (host order) -- referenced by portable socket
+ * code (e.g. CPython's socketmodule multicast paths). */
+#define IN_CLASSA_NSHIFT 24
+#define IN_LOOPBACKNET   127
+#define IN_MULTICAST(a)    (((in_addr_t)(a) & 0xf0000000) == 0xe0000000)
+#define IN_EXPERIMENTAL(a) (((in_addr_t)(a) & 0xf0000000) == 0xf0000000)
+#define IN_CLASSD(a)       (((in_addr_t)(a) & 0xf0000000) == 0xe0000000)
 
 #define IPPROTO_IP  0
 #define IPPROTO_TCP 6

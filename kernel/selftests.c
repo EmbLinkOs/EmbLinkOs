@@ -4947,6 +4947,29 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    if (strcmp(cmd, "test python net") == 0) {
+        /* CPython's `_socket` (now a builtin, over our POSIX socket layer): a real
+         * socket() + connect() + sendall() + recv() from Python. Needs CAP_NETWORK,
+         * outbound :80, RDRAND (-cpu max). This is pip brick 2 proven end to end. */
+        const char *pp = "/data/apps/python/python.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != EMBK_OK) { kprintf("\n[cmd] test python net: python.elf not on image\n"); return 1; }
+        char *code =
+            "import socket;"
+            "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
+            "s.connect(('example.com',80));"
+            "s.sendall(b'GET / HTTP/1.0\\r\\nHost: example.com\\r\\nConnection: close\\r\\n\\r\\n');"
+            "print('PYNET',s.recv(80).split(b'\\r\\n')[0].decode());"
+            "s.close()";
+        char *a2[] = { (char *)pp, "-c", code, NULL };
+        char *env[] = { "HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid2 = process_create_caps(pp, a2, 3, env, NULL, 0, caps);
+        int c2 = pid2 >= 0 ? process_wait((uint32_t)pid2) : -1;
+        kprintf("\n[cmd] test python net: exit=%d -> %s\n", c2, (pid2 >= 0 && c2 == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* The EXTERNAL pipeline contract, end to end: programs that are NOT
      * builtins participating as stages. sysinfo.elf = producer (spawned
      * with a pipe as its fd 3, emits one record frame); tally.elf =
