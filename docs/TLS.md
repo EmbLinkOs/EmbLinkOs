@@ -107,12 +107,22 @@ Shared header = contract; one file per concern; subdirs for `crypto`/`x509`.
       userspace (the kshim), same one-codebase trick as T1.
     - Known v1 gaps (fine at this milestone): cert **not** verified (→ T3), no
       HelloRetryRequest, no KeyUpdate, one suite (AES-128-GCM), blocking API.
-- **T3 — certificate verification (makes it real).** An ASN.1/DER reader, X.509
-  cert parsing, **RSA-PKCS1-v1.5 + RSA-PSS** and **ECDSA-P256** signature verify
-  (a small constant-time bignum modexp), a bundled **root CA trust store**, chain
-  building to a trusted root, validity dates, and **hostname/SAN** matching.
-  *Green:* connecting to a wrong-host / expired / self-signed cert is *refused*;
-  a real one verifies. Now it's TLS, not "encrypted to someone."
+- **T3 — certificate verification (makes it real). ✅ DONE (EC path).** A DER/
+  ASN.1 reader, X.509 v3 parsing, **ECDSA P-256 + P-384** verify (own Montgomery
+  bignum + Jacobian curve math) with **SHA-256/384**, a bundled **trust store**
+  (GTS Root R4), chain building to the anchor, validity dates, and **hostname/
+  SAN** matching -- plus the **CertificateVerify** signature check. All wired into
+  the handshake: `tls_connect` refuses before sending Finished if anything fails.
+  **Green, on the metal:** `test tls` verified Cloudflare's real chain (leaf ←
+  WE1 ← GTS Root R4) to the anchor + host + CertificateVerify, then read
+  `HTTP/1.1 301`; host suites also prove wrong-host / expired / tampered are
+  refused. Now it's TLS, not "encrypted to someone."
+    - `user/lib/tls/crypto/{sha512,bignum,ecdsa}.{c,h}`, `user/lib/tls/x509/
+      {asn1,cert,trust}.{c,h}` + roots.h; host tests test_{asn1,sha512,bignum,
+      ecdsa,x509,chain}.c against OpenSSL-generated vectors + a frozen real chain.
+    - **Not yet (T3.5):** RSA-signed leaves/intermediates (**RSA-PKCS1-v1.5 +
+      PSS**) -- only anchor roots may currently be RSA (parsed, not verified);
+      more bundled roots; a live wrong-host/expired *negative* boot test.
 - **T4 — the HTTPS client.** HTTP/1.1 over `libtls`; `wget https://…` fetches a
   real page and its bytes match. *Green:* the OS reads a real HTTPS URL end to end.
 - **T5 — the consumers.** Wire Python's `ssl`/`_socket` to `libtls` (→ `pip
