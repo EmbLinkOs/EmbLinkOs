@@ -1520,20 +1520,21 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     (`roots.h`+`trust.c`) and `ecdsa_secp384r1_sha384` (0x0503) to the ClientHello
     sig-algs. The host TLS suite still passes, and a host harness verifies
     github's FULL chain (leaf/Sectigo E36/Sectigo E46 -> USERTrust ECC) = **OK**.
-  - **BLOCKER: an OS-side crypto discrepancy.** On the metal `gitclone
-    https://github.com/...` fails the TLS handshake with `rc=-103` (X509_ERR_SIG)
-    at the LEAF signature (verified: rc=-130 = inter-sig fail @ i=0), while the
-    HOST build of the identical cert.c/ecdsa.c/bignum.c/sha256.c verifies the same
-    chain fine. GTS/pypi P-256 leaves DO verify on the OS (`test tls`), so it is a
-    data-dependent target-build bug (x86_64-elf + kshim) on github's specific
-    P-256 ECDSA-SHA256 leaf. Next: instrument the OS ECDSA/bignum verify and diff
-    intermediates against the host to find the divergence.
-  - **Also: a `_free_r` crash** on the cert-FAILURE path (heap corruption in
-    libtls's failed-handshake cleanup); harmless once the chain verifies, but a
-    real robustness bug.
-  - Remaining after the crypto fix: G2 fetch (POST upload-pack -> packfile),
-    G3 packfile unpack (needs SHA1 -- not yet in-tree -- + the libz.a we built for
-    pip, delta resolution), G4 refs + checkout.
+  - **G1 WORKS on the metal:** `test gitclone` -> `GITCLONE 3342 refs -> OK`
+    (github.com/octocat/Hello-World over our own TLS). **The blocker was an
+    uninitialized-memory HEISENBUG** in libtls's ECDSA verify
+    (user/lib/tls/crypto/ecdsa.c read an uninitialized stack `bn`): benign garbage
+    on the host, but under QEMU it broke github's P-256 leaf verification
+    (rc=-103) -- data-dependent, so GTS/pypi leaves passed. Diagnosis: linked the
+    exact target objects into a host harness -- they verified github's chain fine;
+    the failure only reproduced on the OS and flipped with any codegen
+    perturbation (a debug print "fixed" it). **Fix: `-ftrivial-auto-var-init=zero`
+    in NEWLIB_CFLAGS** (zero every uninit auto var -- deterministic, and right for
+    security-critical crypto). Also cleared the `_free_r` cert-failure crash (same
+    root cause). Along the way: added github's root (USERTrust ECC) + 0x0503.
+  - Remaining: **G2** fetch (POST upload-pack -> packfile), **G3** packfile unpack
+    (needs a SHA1 impl -- not yet in-tree -- + the libz.a we built for pip, delta
+    resolution), **G4** refs + checkout.
 - [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
   one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
   fragmented Certificate-message / net-read edge case leaving a cert parsed with

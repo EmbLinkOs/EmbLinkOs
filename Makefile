@@ -257,7 +257,13 @@ check-tools:
 	else echo "==> all required tools present.  Build + boot:  make && make run-embkfs"; fi
 NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/x86_64-elf/include,)
 NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
-NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -O2 -Wall $(USER_INC) $(NEWLIB_INC)
+# -ftrivial-auto-var-init=zero: zero every uninitialized auto variable. Defence
+# in depth against uninitialized-read UB -- and the concrete fix for a git-over-
+# HTTPS heisenbug where libtls's ECDSA verify (user/lib/tls/crypto/ecdsa.c) read
+# an uninitialized stack `bn` whose garbage happened to be benign on the host but
+# broke github's P-256 leaf verification under QEMU (rc=-103). Cheap; belongs on
+# security-critical crypto anyway.
+NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall $(USER_INC) $(NEWLIB_INC)
 # gcc as the link driver so it finds libc.a/libgcc; -nostartfiles because
 # crt0.c provides _start (no standard crtX). newlib.ld places it at 0x400000.
 # NEWLIB_LIB is a -L searched BEFORE the toolchain's default lib dir, so our
