@@ -17,4 +17,17 @@ int rsa_pkcs1_verify(const uint8_t *n, size_t n_len,
                      int hash_alg, const uint8_t *hash, size_t hash_len,
                      const uint8_t *sig, size_t sig_len);
 
+/* One-shot hash, e.g. sha256/sha384/sha512 -- used for MGF1 and H' in PSS. */
+typedef void (*rsa_hash_fn)(const void *data, size_t len, uint8_t *out);
+
+/* RSASSA-PSS verify (RFC 8017 §8.1.2 / §9.1.2) -- the scheme TLS 1.3 uses for
+ * RSA CertificateVerify. `mhash` is Hash(M) (hlen bytes) already computed by the
+ * caller; `hash`/`hlen` name that same hash for MGF1 + H'. The salt length is
+ * recovered from the block. Returns 1 if valid, 0 otherwise. */
+int rsa_pss_verify(const uint8_t *n, size_t n_len,
+                   const uint8_t *e, size_t e_len,
+                   rsa_hash_fn hash, size_t hlen,
+                   const uint8_t *mhash,
+                   const uint8_t *sig, size_t sig_len);
+
 #endif /* EMBK_TLS_RSA_H */

@@ -18,6 +18,7 @@
 #include "asn1.h"
 #include "x25519.h"
 #include "ecdsa.h"
+#include "rsa.h"
 #include "sha512.h"
 #include "crypto/sha256.h"
 #include <string.h>
@@ -140,15 +141,32 @@ static int tls_verify_peer(struct tls_conn *c, const char *host) {
     content[n++] = 0x00;
     memcpy(content + n, c->th_cert, 32); n += 32;
 
-    const struct ec_curve *ec; uint8_t dg[64]; size_t dl;
-    if (c->cv_alg == 0x0403)      { ec = ec_p256(); sha256(content, n, dg); dl = 32; }
-    else if (c->cv_alg == 0x0503) { ec = ec_p384(); sha384(content, n, dg); dl = 48; }
-    else return -20;                                /* unsupported scheme (RSA: later) */
-
-    const uint8_t *r, *s; size_t rl, sl;
-    if (parse_sig(c->cv_sig, c->cv_sig_len, &r, &rl, &s, &sl)) return -21;
-    if (!ecdsa_verify(ec, certs[0].qx, certs[0].qy, dg, dl, r, rl, s, sl)) return -22;
-    return 0;                                       /* AUTHENTICATED */
+    uint8_t dg[64];
+    /* ECDSA schemes: hash the content, then ECDSA-verify with the leaf EC key. */
+    if (c->cv_alg == 0x0403 || c->cv_alg == 0x0503) {
+        const struct ec_curve *ec; size_t dl;
+        if (c->cv_alg == 0x0403) { ec = ec_p256(); sha256(content, n, dg); dl = 32; }
+        else                     { ec = ec_p384(); sha384(content, n, dg); dl = 48; }
+        if (certs[0].key_type != X509_KEY_EC) return -20;
+        const uint8_t *r, *s; size_t rl, sl;
+        if (parse_sig(c->cv_sig, c->cv_sig_len, &r, &rl, &s, &sl)) return -21;
+        if (!ecdsa_verify(ec, certs[0].qx, certs[0].qy, dg, dl, r, rl, s, sl)) return -22;
+        return 0;
+    }
+    /* RSA-PSS schemes (TLS 1.3's RSA CertificateVerify): mHash = Hash(content),
+     * then PSS-verify with the leaf RSA key. */
+    if (c->cv_alg == 0x0804 || c->cv_alg == 0x0805 || c->cv_alg == 0x0806) {
+        if (certs[0].key_type != X509_KEY_RSA) return -20;
+        rsa_hash_fn hf; size_t hl;
+        if (c->cv_alg == 0x0804)      { hf = sha256; hl = 32; }
+        else if (c->cv_alg == 0x0805) { hf = sha384; hl = 48; }
+        else                          { hf = sha512; hl = 64; }
+        hf(content, n, dg);
+        if (!rsa_pss_verify(certs[0].rsa_n, certs[0].rsa_n_len, certs[0].rsa_e, certs[0].rsa_e_len,
+                            hf, hl, dg, c->cv_sig, c->cv_sig_len)) return -22;
+        return 0;
+    }
+    return -20;                                     /* unsupported signature scheme */
 }
 
 /* ---- handshake ---------------------------------------------------------- */
