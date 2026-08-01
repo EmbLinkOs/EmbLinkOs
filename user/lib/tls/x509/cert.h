@@ -37,7 +37,21 @@ struct x509_cert {
     const uint8_t *not_after;  size_t not_after_len;  uint8_t na_tag;
 
     const uint8_t *san;        size_t san_len;       /* GeneralNames SEQUENCE, or NULL */
+
+    /* Constraints (RFC 5280) -- enforced during chain verification. */
+    int      has_basic_constraints;
+    int      is_ca;                     /* BasicConstraints cA */
+    int      path_len;                  /* pathLenConstraint, or -1 if absent */
+    int      has_key_usage;
+    uint16_t key_usage;                 /* RFC 5280 bit i -> mask (0x8000 >> i) */
+    int      has_eku;
+    int      eku_server_auth;           /* serverAuth or anyExtendedKeyUsage present */
 };
+
+/* Key Usage bit masks (RFC 5280 §4.2.1.3, bit i -> 0x8000 >> i). */
+#define X509_KU_DIGITAL_SIGNATURE 0x8000
+#define X509_KU_KEY_CERT_SIGN     0x0400   /* bit 5 */
+#define X509_KU_CRL_SIGN          0x0200   /* bit 6 */
 
 /* Parse a DER certificate. Returns 0 on success, -1 on malformed input. */
 int x509_parse(const uint8_t *der, size_t len, struct x509_cert *out);
@@ -50,6 +64,7 @@ enum {
     X509_ERR_SIG     = -3,   /* a signature did not verify */
     X509_ERR_NAME    = -4,   /* issuer/subject linkage broken */
     X509_ERR_ANCHOR  = -5,   /* chain does not reach a trusted anchor */
+    X509_ERR_USAGE   = -6,   /* CA / key-usage / path-length constraint violated */
 };
 
 /* Verify a server certificate chain: certs[0] is the leaf, certs[1..] the

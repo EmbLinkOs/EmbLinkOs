@@ -44,6 +44,7 @@ int main(int argc, char **argv) {
         if (r == -101) printf(" (hostname/SAN)");
         else if (r == -102) printf(" (cert expired/not-yet-valid -- check OS clock)");
         else if (r <= -103 && r >= -105) printf(" (chain: bad sig / name / no anchor)");
+        else if (r == -106) printf(" (CA/key-usage/path-length constraint violated)");
         else if (r == -120) printf(" (CertificateVerify: unsupported sig scheme)");
         else if (r == -122) printf(" (CertificateVerify: signature invalid)");
         else if (r == -130) printf(" (Certificate message parse)");

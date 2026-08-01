@@ -19,6 +19,11 @@ static const uint8_t OID_RSA_SHA256[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x0
 static const uint8_t OID_RSA_SHA384[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x0c};
 static const uint8_t OID_RSA_SHA512[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x0d};
 static const uint8_t OID_SAN[]         = {0x55,0x1d,0x11};                            /* 2.5.29.17 */
+static const uint8_t OID_BASIC_CONSTR[]= {0x55,0x1d,0x13};                            /* 2.5.29.19 */
+static const uint8_t OID_KEY_USAGE[]   = {0x55,0x1d,0x0f};                            /* 2.5.29.15 */
+static const uint8_t OID_EXT_KEY_USAGE[]={0x55,0x1d,0x25};                            /* 2.5.29.37 */
+static const uint8_t OID_EKU_SERVER[]  = {0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x01};   /* serverAuth 1.3.6.1.5.5.7.3.1 */
+static const uint8_t OID_EKU_ANY[]     = {0x55,0x1d,0x25,0x00};                       /* anyExtendedKeyUsage 2.5.29.37.0 */
 
 #define OIDEQ(t, o) der_oid_eq((t), (o), sizeof(o))
 
@@ -98,12 +103,47 @@ static void parse_extensions(const struct der_tlv *exts_explicit, struct x509_ce
             if (der_parse(val.val, der_end(&val), &gn) == 0 && gn.tag == DER_SEQUENCE) {
                 c->san = der_raw(&gn); c->san_len = der_raw_len(&gn);
             }
+        } else if (OIDEQ(&oid, OID_BASIC_CONSTR)) {
+            /* SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPT } */
+            struct der_tlv seq2, f;
+            c->has_basic_constraints = 1;
+            if (der_parse(val.val, der_end(&val), &seq2) == 0 && seq2.tag == DER_SEQUENCE) {
+                const uint8_t *bp = seq2.val, *be = der_end(&seq2);
+                if (der_parse(bp, be, &f) == 0 && f.tag == DER_BOOLEAN) {
+                    c->is_ca = (f.len && f.val[0] != 0);
+                    bp = der_end(&f);
+                }
+                if (der_parse(bp, be, &f) == 0 && f.tag == DER_INTEGER && f.len && f.len <= 2) {
+                    int v = 0; for (size_t i = 0; i < f.len; i++) v = (v << 8) | f.val[i];
+                    c->path_len = v;
+                }
+            }
+        } else if (OIDEQ(&oid, OID_KEY_USAGE)) {
+            /* extnValue wraps a BIT STRING; bit i -> mask (0x8000 >> i). */
+            struct der_tlv bs;
+            if (der_parse(val.val, der_end(&val), &bs) == 0 && bs.tag == DER_BIT_STRING && bs.len >= 2) {
+                c->has_key_usage = 1;
+                uint16_t u = (uint16_t)bs.val[1] << 8;          /* first usage byte = high bits */
+                if (bs.len >= 3) u |= bs.val[2];
+                c->key_usage = u;
+            }
+        } else if (OIDEQ(&oid, OID_EXT_KEY_USAGE)) {
+            struct der_tlv seq2, o;
+            if (der_parse(val.val, der_end(&val), &seq2) == 0 && seq2.tag == DER_SEQUENCE) {
+                c->has_eku = 1;
+                const uint8_t *bp = seq2.val, *be = der_end(&seq2);
+                while (bp < be && der_parse(bp, be, &o) == 0) {
+                    if (OIDEQ(&o, OID_EKU_SERVER) || OIDEQ(&o, OID_EKU_ANY)) c->eku_server_auth = 1;
+                    bp = der_end(&o);
+                }
+            }
         }
     }
 }
 
 int x509_parse(const uint8_t *der, size_t len, struct x509_cert *out) {
     memset(out, 0, sizeof *out);
+    out->path_len = -1;                 /* -1 = no pathLenConstraint */
     out->raw = der; out->raw_len = len;
 
     struct der_tlv cert;
@@ -287,23 +327,46 @@ int x509_verify_signed_by_anchor(const struct x509_cert *child, const struct tru
     return verify_with(child, &k);
 }
 
+/* Can `issuer` sign certificates? (RFC 5280 §4.2.1.9 / §4.2.1.3.) An issuer must
+ * be a CA (BasicConstraints cA=TRUE), and if it declares Key Usage it must allow
+ * keyCertSign. `depth` is the number of intermediate CAs already below it toward
+ * the leaf, checked against pathLenConstraint. This is what stops the classic
+ * "any valid leaf can mint certs for any host" forgery. */
+static int issuer_ok(const struct x509_cert *issuer, int depth) {
+    if (!issuer->is_ca) return 0;
+    if (issuer->has_key_usage && !(issuer->key_usage & X509_KU_KEY_CERT_SIGN)) return 0;
+    if (issuer->path_len >= 0 && depth > issuer->path_len) return 0;
+    return 1;
+}
+
 int x509_verify_chain(const struct x509_cert *certs, int n,
                       const char *host, const char *now_utc) {
     if (n < 1) return X509_ERR_ANCHOR;
     if (!x509_match_host(&certs[0], host)) return X509_ERR_HOST;
 
+    /* The leaf (end-entity) must be usable for TLS server auth: if it declares
+     * Extended Key Usage it must include serverAuth (or anyEKU), and if it
+     * declares Key Usage it must allow digitalSignature. */
+    if (certs[0].has_eku && !certs[0].eku_server_auth) return X509_ERR_USAGE;
+    if (certs[0].has_key_usage && !(certs[0].key_usage & X509_KU_DIGITAL_SIGNATURE)) return X509_ERR_USAGE;
+
     /* Walk leaf -> up. Stop with success as soon as a cert's issuer is a trusted
      * anchor and that cert verifies under the anchor key; otherwise each cert
-     * must be signed by the next one in the presented chain. */
+     * must be signed by the next one in the presented chain -- and that next one
+     * must be allowed to act as a CA. */
     for (int i = 0; i < n; i++) {
         if (!x509_check_validity(&certs[i], now_utc)) return X509_ERR_EXPIRED;
 
         const struct trust_anchor *a = trust_find(certs[i].issuer, certs[i].issuer_len);
         if (a) {
+            /* certs[i] is issued by a bundled anchor (a trusted root CA). */
             if (x509_verify_signed_by_anchor(&certs[i], a)) return X509_OK;
             return X509_ERR_SIG;
         }
         if (i + 1 >= n) return X509_ERR_ANCHOR;          /* ran out; no anchor reached */
+        /* certs[i+1] is about to sign certs[i]: it must be a valid CA. `i`
+         * intermediate CAs (certs[1..i]) already sit below it toward the leaf. */
+        if (!issuer_ok(&certs[i + 1], i)) return X509_ERR_USAGE;
         if (!x509_name_eq(certs[i].issuer, certs[i].issuer_len,
                           certs[i + 1].subject, certs[i + 1].subject_len)) return X509_ERR_NAME;
         if (!x509_verify_signed_by(&certs[i], &certs[i + 1])) return X509_ERR_SIG;
