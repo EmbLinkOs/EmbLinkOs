@@ -490,23 +490,24 @@ build/udptest.o: user/bin/udptest.c user/lib/embk.h user/lib/embk_socket.h | $(B
 build/udptest.elf: build/crt0.o build/syscalls.o build/udptest.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/udptest.o -lc -lgcc -o $@
 
-# wget -- a real HTTP downloader (networking meets the filesystem). Auto-packed.
-build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/wget.elf: build/crt0.o build/syscalls.o build/wget.o user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o -lc -lgcc -o $@
-
-# libtls (docs/TLS.md T2): the TLS 1.3 client, built FOR USERSPACE. Reuses the
+# libtls (docs/TLS.md): the TLS 1.3 client, built FOR USERSPACE. Reuses the
 # kernel crypto (sha256/hmac/aes) compiled against the kshim -- one crypto
 # codebase, kernel and user, exactly as the host tests do. kshim MUST precede
-# -Ikernel so include/{types,kstring,kprintf}.h resolve to the shims. Packed as
-# /data/apps/tlstest/tlstest.elf. Needs CAP_NETWORK + RDRAND at runtime.
+# -Ikernel so include/{types,kstring,kprintf}.h resolve to the shims. Defined
+# BEFORE the consumers (wget, tlstest) so their prerequisite lists see it.
 TLS_LIB_INC  := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto -Iuser/lib/tls -Iuser/lib/tls/x509
 TLS_LIB_OBJS := build/tls_sha256.o build/tls_hmac.o build/tls_aes.o \
                 build/tls_hkdf.o build/tls_gcm.o build/tls_x25519.o \
                 build/tls_sha512.o build/tls_bignum.o build/tls_ecdsa.o build/tls_rsa.o \
                 build/tls_asn1.o build/tls_cert.o build/tls_trust.o \
                 build/tls_keysched.o build/tls_record.o build/tls_handshake.o build/tls_tls.o
+
+# wget -- a real HTTP/HTTPS downloader (networking + TLS meets the filesystem).
+# Links libtls so https:// does an authenticated TLS 1.3 fetch. Auto-packed.
+build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/wget.elf: build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
 
 build/tls_sha256.o: kernel/crypto/sha256.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@

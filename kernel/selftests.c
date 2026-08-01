@@ -1154,6 +1154,36 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test wget https") == 0) {
+        /* THE T4 PAYOFF: the OS downloads a real file over HTTPS TO DISK. wget
+         * (ring 3) does an authenticated TLS 1.3 fetch of an https:// URL and
+         * writes the decrypted body to /wgets.out -- TLS + networking meet the
+         * filesystem. Target chains to the bundled ISRG Root X1 anchor. Needs
+         * CAP_NETWORK + CAP_FILESYSTEM, outbound :443, and RDRAND (-cpu max). */
+        const char *wp = "/data/apps/wget/wget.elf";
+        struct vfs_stat st;
+        if (vfs_stat(wp, &st) != 0) { kprintf("\n[cmd] test wget https: %s not on image\n", wp); return 1; }
+        char *a[]   = { (char *)wp, (char *)"-O", (char *)"/wgets.out",
+                        (char *)"https://valid-isrgrootx1.letsencrypt.org/", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(wp, a, 4, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[wgets] exit=%d\n", code);
+
+        int ok = (code == 0);
+        if (ok) {
+            struct vfs_stat fs;
+            if (vfs_stat("/wgets.out", &fs) != 0) { kprintf("[wgets] /wgets.out missing\n"); ok = 0; }
+            else {
+                kprintf("[wgets] downloaded %lu bytes over HTTPS to /wgets.out\n", (unsigned long)fs.size);
+                if (fs.size < 100) { kprintf("[wgets] suspiciously small\n"); ok = 0; }
+            }
+        }
+        kprintf("[cmd] test wget https: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test tls") == 0) {
         /* THE HEADLINE (docs/TLS.md T2): the OS speaks TLS 1.3. tlstest (ring 3)
          * resolves cloudflare.com, TCP-connects :443, runs OUR libtls handshake
