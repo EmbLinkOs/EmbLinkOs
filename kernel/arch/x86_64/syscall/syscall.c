@@ -630,22 +630,29 @@ static int64_t sys_spawn(struct regs *r) {
      * Deliberately NOT static: this syscall can run concurrently on a different
      * core for a different spawn() invocation. static buffer here would let 
      * two spawn() invocations corrupt each other's buffers. */
-    char argv_buf[SPAWN_ARGV_BYTES_MAX];
+    /* kmalloc'd, NOT a stack array: at SPAWN_ARGV_BYTES_MAX (8 KiB) it would eat a
+     * big fraction of the kstack before process_create_env() + elf_load() -- the
+     * deepest chain in the kernel -- pile on. Freed on EVERY exit below, like
+     * envp_buf. (A 96-object kernel link is the customer for the raised caps.) */
+    char *argv_buf = kmalloc(SPAWN_ARGV_BYTES_MAX);
+    if (!argv_buf) return -EMBK_ENOMEM;
     char *argv_kernel[SPAWN_ARGV_MAX];
     size_t used = 0;
     for (int i = 0; i < argc; i++) {
-        int slen = copy_string_from_user(argv_buf + used, (const char *)user_argv_ptrs[i], sizeof(argv_buf) - used);
+        int slen = copy_string_from_user(argv_buf + used, (const char *)user_argv_ptrs[i], SPAWN_ARGV_BYTES_MAX - used);
         if (slen < 0) {
+            kfree(argv_buf);
             return slen;   // -EMBK_EFAULT or -EMBK_ENAMETOOLONG
         }
         argv_kernel[i] = argv_buf + used;
         used += (size_t)slen + 1;   // includes the null terminator
-        
+
     }
 
     struct spawn_file_action actions_kernel[SPAWN_ACTIONS_MAX];
     if (n_count > 0 && copy_from_user(actions_kernel, user_actions,
          n_count * sizeof(struct spawn_file_action)) != EMBK_OK) {
+        kfree(argv_buf);
         return -EMBK_EFAULT;
     }
 
@@ -668,22 +675,23 @@ static int64_t sys_spawn(struct regs *r) {
         for (;;) {
             uint64_t p;
             if (copy_from_user(&p, user_envp + envc, sizeof p) != EMBK_OK) {
+                kfree(argv_buf);
                 return -EMBK_EFAULT;
             }
             if (!p) break;                                  /* the terminator */
             /* -1 leaves room for the NULL process_create_env() expects. */
-            if (envc >= SPAWN_ENVP_MAX - 1) return -EMBK_E2BIG;
+            if (envc >= SPAWN_ENVP_MAX - 1) { kfree(argv_buf); return -EMBK_E2BIG; }
             user_envp_ptrs[envc++] = p;
         }
 
         envp_buf = kmalloc(SPAWN_ENVP_BYTES_MAX);
-        if (!envp_buf) return -EMBK_ENOMEM;
+        if (!envp_buf) { kfree(argv_buf); return -EMBK_ENOMEM; }
         size_t eused = 0;
         for (int i = 0; i < envc; i++) {
             int slen = copy_string_from_user(envp_buf + eused,
                                              (const char *)user_envp_ptrs[i],
                                              SPAWN_ENVP_BYTES_MAX - eused);
-            if (slen < 0) { kfree(envp_buf); return slen; }  /* EFAULT/ENAMETOOLONG */
+            if (slen < 0) { kfree(envp_buf); kfree(argv_buf); return slen; }  /* EFAULT/ENAMETOOLONG */
             envp_kernel[i] = envp_buf + eused;
             eused += (size_t)slen + 1;                       /* includes the NUL */
         }
@@ -711,6 +719,7 @@ static int64_t sys_spawn(struct regs *r) {
     /* Safe already: process_create_env() COPIES every string into the child's
      * own stack before returning -- that is its documented contract. */
     if (envp_buf) kfree(envp_buf);
+    kfree(argv_buf);
     if (pid < 0) {
         return pid;   // -errno from process_create_env()
     }

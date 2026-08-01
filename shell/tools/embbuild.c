@@ -30,10 +30,10 @@
 
 /* Fixed caps, loud on overflow -- house style. Generous vs. the reel
  * graph (~50 nodes total across ALL projects). */
-#define MAX_STANZAS 64
-#define MAX_ITEMS   32       /* INPUTS or ARGS words per stanza */
+#define MAX_STANZAS 128
+#define MAX_ITEMS   128      /* INPUTS or ARGS words per stanza */
 #define MAX_TOK     256     
-#define MAX_LINE    1024      
+#define MAX_LINE    8192      
 
 struct stanza {
     char name[MAX_TOK];
