@@ -1488,6 +1488,25 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       instead of calling our real chmod). pip writes+chmods every installed file.
   `pkgfetch` already covers the common "get me this pure package" case without any
   of this.
+  - **What pip still LACKS (verified working = a single pure-Python wheel to a
+    writable `--target`):**
+    - **socket timeouts are not ENFORCED** -- `settimeout(T)` is accepted but the
+      op blocks to completion (see [[networking-stack]] non-blocking note); a
+      hung server would hang pip. select() honors its own timeout, but a blocking
+      recv inside libtls/the SSLSocket does not. Fine for a responsive PyPI.
+    - **needs a writable `--target` + `TMPDIR`** (we pass `/data/tmp`). No
+      default site-packages / `--user` scheme wired; installing into a sealed
+      `/system` is correctly refused, not handled.
+    - **pure wheels only.** An sdist (or any package with a build step) needs
+      PEP 517 -> a subprocess to run the backend -> fork/exec, which EmbLink does
+      not have. `pip install <sdist>` will fail at the build isolation step.
+    - **`--no-deps` is what's proven.** Multi-package dependency resolution +
+      several sequential downloads is plausible (same code path) but untested at
+      scale; the resolver can be slow under TCG.
+    - **no cache** (`--no-cache-dir` used): cachecontrol's disk cache rides on
+      `mmap`, which is a stub. Also no `keyring`/auth, no VCS/editable installs.
+    - threading: pip is largely single-threaded here (fine), but any parallel
+      path would hit our thread gap ([[cpython-port]]).
 - [ ] **git over HTTPS.** The git port is local-only (no HTTP transport). Needs
   git's smart-HTTP (`git-remote-https`) wired to libtls, or a libcurl shim. Not
   started.
