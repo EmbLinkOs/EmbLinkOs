@@ -5021,6 +5021,22 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    if (strcmp(cmd, "test python pip") == 0) {
+        /* pip itself: `python -m pip --version`. pip.zip (its ~450 modules incl.
+         * vendored urllib3/requests/rich) is on ._pth's sys.path, so this is the
+         * whole pip import chain resolving and running -- brick 4. No network. */
+        const char *pp = "/data/apps/python/python.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != EMBK_OK) { kprintf("\n[cmd] test python pip: python.elf not on image\n"); return 1; }
+        char *a2[] = { (char *)pp, "-m", "pip", "--version", NULL };
+        char *env[] = { "HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid2 = process_create_caps(pp, a2, 4, env, NULL, 0, caps);
+        int c2 = pid2 >= 0 ? process_wait((uint32_t)pid2) : -1;
+        kprintf("\n[cmd] test python pip: exit=%d -> %s\n", c2, (pid2 >= 0 && c2 == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* The EXTERNAL pipeline contract, end to end: programs that are NOT
      * builtins participating as stages. sysinfo.elf = producer (spawned
      * with a pipe as its fd 3, emits one record frame); tally.elf =

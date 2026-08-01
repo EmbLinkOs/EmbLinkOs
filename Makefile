@@ -349,7 +349,7 @@ ifeq ($(HAVE_PY),yes)
 # three or none: python.elf without the zip dies at startup with
 # "Failed to import encodings module" (encodings is imported by Py_Initialize
 # and is NOT frozen), and the zip without the ._pth is never looked at.
-PY_APPS = build/python.elf build/python314.zip build/python.elf._pth
+PY_APPS = build/python.elf build/python314.zip build/python.elf._pth build/pip.zip
 
 # STRIP IS NOT COSMETIC HERE: the interpreter is 42 MB unstripped (almost all of
 # it debug_info) and 7.5 MB stripped. The 64 MB volume would not hold the former
@@ -378,8 +378,14 @@ build/python.elf: $(PY_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 # The stdlib as ONE zip: importlib+zipimport are frozen into the interpreter, so
 # a zip on sys.path needs no directory tree and no CPython patch (it's CPython's
 # own ZIP_LANDMARK route, the standard embedded recipe). ~555 modules, ~2.5 MB.
-build/python314.zip: tools/mkpystdlib.py | $(BUILD)
-	python3 tools/mkpystdlib.py $(PY_SRC) $@
+build/python314.zip: tools/mkpystdlib.py tools/cpython/ssl.py | $(BUILD)
+	python3 tools/mkpystdlib.py $(PY_SRC) $@ $(PY_BUILD)
+
+# pip, repacked STORED for zipimport (see tools/mkpip.py). Source is CPython's
+# own bundled wheel, so pip always matches the interpreter. On ._pth's sys.path,
+# so `python -m pip` resolves pip/__main__.
+build/pip.zip: tools/mkpip.py | $(BUILD)
+	python3 tools/mkpip.py $(PY_SRC) $@
 
 # getpath.py reads `<executable>._pth` (verbatim on non-Windows, hence the
 # `.elf` stays in the name) and its lines TOTALLY override sys.path -- each is
@@ -388,7 +394,7 @@ build/python314.zip: tools/mkpystdlib.py | $(BUILD)
 # right for an OS that has no environment. This is why we don't fight configure's
 # --prefix, which otherwise sends the interpreter hunting through /usr/....
 build/python.elf._pth: | $(BUILD)
-	printf 'python314.zip\n.\n' > $@
+	printf 'python314.zip\npip.zip\n.\n' > $@
 else
 PY_APPS =
 endif

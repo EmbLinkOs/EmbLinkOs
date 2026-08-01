@@ -1029,6 +1029,12 @@ def discover_userland_objects(build_dir="build"):
     pth = _read_file(f"{build_dir}/python.elf._pth")
     if pth is not None:
         objects.append((b"data/apps/python/python.elf._pth", L.DT_REG, L.S_IFREG | L.PERM_FILE, pth))
+    # pip.zip rides beside the interpreter and is on ._pth's sys.path, so
+    # `python -m pip` resolves. Like the stdlib zip it is not a *.elf, so the
+    # auto-discovery skips it -- pack it explicitly.
+    pipzip = _read_file(f"{build_dir}/pip.zip")
+    if pipzip is not None:
+        objects.append((b"data/apps/python/pip.zip", L.DT_REG, L.S_IFREG | L.PERM_FILE, pipzip))
 
     # Empty user/scratch directories the layout commits to now (D4 §5, D3 §4.1),
     # so a session can chdir into a home and tcc has a scratch dir to write to.

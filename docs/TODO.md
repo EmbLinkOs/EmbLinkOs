@@ -1447,9 +1447,24 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     needs. Honesty note: libtls always authenticates, so `ssl.py` has no
     unverified mode -- `_create_unverified_context` still verifies (errs toward
     more security). Sockets are blocking-only; `select`/`poll` unverified.
-  - [ ] **Brick 4 — add pip** (`ensurepip`/a `pip.pyz`) to the stdlib zip
-    (`tools/mkpystdlib.py`).
-  - [ ] **Brick 5 — `python -m pip install`** end to end.
+  - [x] **Brick 4 — pip runs on the OS** — **DONE, live: `test python pip` ->
+    `pip 26.1.2 from /data/apps/python/pip.zip/pip (python 3.14)`, exit 0.**
+    `python -m pip --version` imports pip's whole ~450-module tree (vendored
+    urllib3/requests/rich/platformdirs) and runs. Pieces:
+    - `tools/mkpip.py` repacks CPython's bundled pip wheel STORED+precompiled
+      into `build/pip.zip` (a DEFLATED wheel can't be zipimported -- no zlib on
+      the path yet); packed beside the interpreter, added to `._pth`'s sys.path.
+    - **zlib** cross-compiled (`configure-py-emblink.sh` builds `libz.a` from
+      zlib-1.3.1 + declares the stdlib `zlib` module) -- pip's rich imports it.
+    - `tools/mkpystdlib.py` grew a PATCHES map (subprocess `_can_fork_exec=False`
+      -- no fork/exec/wait here) and a build-extras step (packs
+      `_sysconfigdata__emblink_` which sysconfig imports).
+    - os-function macros exposed: `HAVE_READLINK/GETUID/GETEUID/GETPPID/UMASK`
+      (posixpath.realpath/platformdirs reference them; our libc backs each).
+  - [ ] **Brick 5 — `python -m pip install`** end to end. Import works; install
+    exercises the network path (pip urllib3 -> our ssl.py -> _embtls -> pypi),
+    wheel download + unpack to a writable target. Expect more gaps (threading,
+    a writable site-packages, tempfile, more os.*).
   `pkgfetch` already covers the common "get me this pure package" case without any
   of this.
 - [ ] **git over HTTPS.** The git port is local-only (no HTTP transport). Needs
