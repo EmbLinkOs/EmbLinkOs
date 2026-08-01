@@ -507,7 +507,8 @@ TLS_LIB_OBJS := build/tls_sha256.o build/tls_hmac.o build/tls_aes.o \
                 build/tls_hkdf.o build/tls_gcm.o build/tls_x25519.o \
                 build/tls_sha512.o build/tls_bignum.o build/tls_ecdsa.o build/tls_rsa.o \
                 build/tls_asn1.o build/tls_cert.o build/tls_trust.o \
-                build/tls_keysched.o build/tls_record.o build/tls_handshake.o build/tls_tls.o
+                build/tls_keysched.o build/tls_record.o build/tls_handshake.o build/tls_tls.o \
+                build/tls_handle.o
 
 # wget -- a real HTTP/HTTPS downloader (networking + TLS meets the filesystem).
 # Links libtls so https:// does an authenticated TLS 1.3 fetch. Auto-packed.
@@ -560,6 +561,8 @@ build/tls_record.o: user/lib/tls/record.c | $(BUILD)
 build/tls_handshake.o: user/lib/tls/handshake.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tls_tls.o: user/lib/tls/tls.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_handle.o: user/lib/tls/tls_handle.c user/lib/tls/tls_handle.h user/lib/tls/tls.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 
 build/tlstest.o: user/bin/tlstest.c user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)

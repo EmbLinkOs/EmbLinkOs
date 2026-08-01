@@ -102,6 +102,22 @@ grep -q '^_socket socketmodule.c' "$BLD/Modules/Setup.local" \
     || echo '_socket socketmodule.c' >> "$BLD/Modules/Setup.local"
 echo "  NET      pyconfig.h socket macros + Setup.local _socket asserted"
 
+# _embtls: HTTPS without OpenSSL. A tiny C module (tools/cpython/_embtlsmodule.c)
+# wrapping our own TLS 1.3 client (user/lib/tls, docs/TLS.md) over a socket fd,
+# so http.client/urllib -- and pip -- can do authenticated https://. makesetup
+# derives the .o path as Modules/<basename> and only resolves sources under
+# Modules/, so the source is SYMLINKED in; the prebuilt libtls objects
+# ($M/build/tls_*.o, made by the OS build) are listed for the static link.
+ln -sf "$M/tools/cpython/_embtlsmodule.c" "$SRC/Modules/_embtlsmodule.c"
+TLSOBJS=$(ls "$M"/build/tls_*.o 2>/dev/null | tr '\n' ' ')
+if [ -n "$TLSOBJS" ]; then
+    grep -q '^_embtls ' "$BLD/Modules/Setup.local" \
+        || echo "_embtls _embtlsmodule.c -I$M/user/lib/tls $TLSOBJS" >> "$BLD/Modules/Setup.local"
+    echo "  TLS      _embtls declared ($(echo "$TLSOBJS" | wc -w) libtls objects)"
+else
+    echo "  TLS      SKIP _embtls -- no $M/build/tls_*.o (run 'make' in the OS first)" >&2
+fi
+
 echo
 echo "=== configure OK: MACHDEP=$(grep -E '^MACHDEP=' Makefile | head -1) ==="
 echo "=== next: cd $BLD && make -j4 ==="

@@ -1425,9 +1425,20 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     *Note:* sockets are BLOCKING-only (fcntl O_NONBLOCK is refused) and
     `select()`/`poll()` on socket fds are unverified -- fine for simple blocking
     fetches, may bite urllib3 timeouts.
-  - [ ] **Brick 3 — a libtls-backed `_ssl`** (or a smaller native `_embtls`
-    module) + a pure-Python `ssl.py` shim covering `SSLContext`/`wrap_socket`/
-    `makefile` for `http.client`/urllib.
+  - [x] **Brick 3 — a native `_embtls` module** (NOT a libtls-backed `_ssl`:
+    real `_ssl` wants the whole OpenSSL API we don't have) — **DONE, live:
+    `test python tls` -> `PYTLS HTTP/1.1 200 OK`, exit 0.** CPython does an
+    authenticated TLS 1.3 https:// fetch to pypi.org over our OWN libtls
+    (cert + hostname verified against the embedded GTS Root R4), zero OpenSSL.
+    `tools/cpython/_embtlsmodule.c` is a ~180-line capsule module over
+    `user/lib/tls/tls_handle.{c,h}` (an opaque-handle wrapper that keeps libtls's
+    kshim/kernel include world out of the same TU as Python.h); the libtls
+    objects (`build/tls_*.o`) link straight in. Reproducible via the configure
+    script (symlinks the module into Modules/, declares it in Setup.local).
+  - [ ] **Brick 3b — a pure-Python `ssl.py` shim** (`SSLContext`/`wrap_socket`/
+    `SSLSocket.makefile`/`recv`/`sendall`) over `_embtls`, so `http.client`'s
+    `HTTPSConnection` and `urllib` work unmodified. `_embtls` is the transport;
+    this is the API surface pip imports.
   - [ ] **Brick 4 — add pip** (`ensurepip`/a `pip.pyz`) to the stdlib zip
     (`tools/mkpystdlib.py`).
   - [ ] **Brick 5 — `python -m pip install`** end to end.

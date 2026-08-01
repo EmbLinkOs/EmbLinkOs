@@ -4971,6 +4971,32 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    if (strcmp(cmd, "test python tls") == 0) {
+        /* HTTPS from Python over our own libtls (`_embtls` builtin), no OpenSSL.
+         * A real TLS 1.3 handshake -- cert + hostname verified against the
+         * embedded GTS Root R4 -- to pypi.org:443, then an HTTP request through
+         * the encrypted channel. This is the pip-over-HTTPS foundation (brick 3).
+         * The socket fd is DETACHED from the Python socket so _embtls owns it. */
+        const char *pp = "/data/apps/python/python.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != EMBK_OK) { kprintf("\n[cmd] test python tls: python.elf not on image\n"); return 1; }
+        char *code =
+            "import socket,_embtls\n"
+            "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n"
+            "s.connect(('pypi.org',443))\n"
+            "c=_embtls.connect(s.detach(),'pypi.org')\n"
+            "_embtls.write(c,b'GET / HTTP/1.0\\r\\nHost: pypi.org\\r\\nConnection: close\\r\\n\\r\\n')\n"
+            "print('PYTLS',_embtls.read(c,80).split(b'\\r\\n')[0].decode())\n"
+            "_embtls.close(c)\n";
+        char *a2[] = { (char *)pp, "-c", code, NULL };
+        char *env[] = { "HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid2 = process_create_caps(pp, a2, 3, env, NULL, 0, caps);
+        int c2 = pid2 >= 0 ? process_wait((uint32_t)pid2) : -1;
+        kprintf("\n[cmd] test python tls: exit=%d -> %s\n", c2, (pid2 >= 0 && c2 == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* The EXTERNAL pipeline contract, end to end: programs that are NOT
      * builtins participating as stages. sysinfo.elf = producer (spawned
      * with a pipe as its fd 3, emits one record frame); tally.elf =
