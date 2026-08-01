@@ -1507,9 +1507,33 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       `mmap`, which is a stub. Also no `keyring`/auth, no VCS/editable installs.
     - threading: pip is largely single-threaded here (fine), but any parallel
       path would hit our thread gap ([[cpython-port]]).
-- [ ] **git over HTTPS.** The git port is local-only (no HTTP transport). Needs
-  git's smart-HTTP (`git-remote-https`) wired to libtls, or a libcurl shim. Not
-  started.
+- [~] **git over HTTPS.** The stock git CANNOT do this here: its HTTPS transport
+  fork/execs `git-remote-https` AND `index-pack`/`unpack-objects`, and EmbLink has
+  no fork/exec (`start_command` -> `fork()` -> ENOSYS). So it's a from-scratch
+  clone tool that drives git's smart-HTTP protocol directly over libtls and writes
+  a real `.git` the on-OS git can then use. Progress (milestone **G1**):
+  - **Built the protocol tooling** (`user/git/`): `githttp` (smart-HTTP GET/POST
+    over libtls, HTTP/1.0 read-to-EOF) + `pktline` (git framing) + `user/bin/
+    gitclone.c` (ref discovery from `info/refs?service=git-upload-pack`).
+    `test gitclone` spawns it; auto-packed as /data/apps/gitclone.
+  - **Added github.com's root** (USERTrust ECC, P-384) to the trust store
+    (`roots.h`+`trust.c`) and `ecdsa_secp384r1_sha384` (0x0503) to the ClientHello
+    sig-algs. The host TLS suite still passes, and a host harness verifies
+    github's FULL chain (leaf/Sectigo E36/Sectigo E46 -> USERTrust ECC) = **OK**.
+  - **BLOCKER: an OS-side crypto discrepancy.** On the metal `gitclone
+    https://github.com/...` fails the TLS handshake with `rc=-103` (X509_ERR_SIG)
+    at the LEAF signature (verified: rc=-130 = inter-sig fail @ i=0), while the
+    HOST build of the identical cert.c/ecdsa.c/bignum.c/sha256.c verifies the same
+    chain fine. GTS/pypi P-256 leaves DO verify on the OS (`test tls`), so it is a
+    data-dependent target-build bug (x86_64-elf + kshim) on github's specific
+    P-256 ECDSA-SHA256 leaf. Next: instrument the OS ECDSA/bignum verify and diff
+    intermediates against the host to find the divergence.
+  - **Also: a `_free_r` crash** on the cert-FAILURE path (heap corruption in
+    libtls's failed-handshake cleanup); harmless once the chain verifies, but a
+    real robustness bug.
+  - Remaining after the crypto fix: G2 fetch (POST upload-pack -> packfile),
+    G3 packfile unpack (needs SHA1 -- not yet in-tree -- + the libz.a we built for
+    pip, delta resolution), G4 refs + checkout.
 - [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
   one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
   fragmented Certificate-message / net-read edge case leaving a cert parsed with

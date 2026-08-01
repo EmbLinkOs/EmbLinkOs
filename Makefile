@@ -530,6 +530,19 @@ build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h user/lib/tl
 build/wget.elf: build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
 
+# gitclone -- our own git-over-HTTPS (git can't fork/exec its transport here).
+# user/git/ = the git protocol modules (githttp: smart-HTTP over libtls; pktline:
+# framing). githttp.o needs the TLS include set for tls.h (same as wget).
+build/githttp.o: user/git/githttp.c user/git/githttp.h user/lib/tls/tls.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/git -c $< -o $@
+build/pktline.o: user/git/pktline.c user/git/pktline.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
+build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
+GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o
+build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) -lc -lgcc -o $@
+
 # pkgfetch -- native PyPI installer for pure-Python wheels (libtls fetch + our
 # own inflate + zip reader). Auto-packed as /data/apps/pkgfetch/pkgfetch.elf.
 build/pkg_inflate.o: user/lib/inflate.c user/lib/inflate.h | $(BUILD)
@@ -875,7 +888,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1047,7 +1060,7 @@ endif
 
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \

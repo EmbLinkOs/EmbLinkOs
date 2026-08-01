@@ -1282,6 +1282,23 @@ int selftests_handle_command(const char *cmd)
         return code == 0 ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test gitclone") == 0) {
+        /* git over HTTPS, milestone G1: our own gitclone drives git's smart-HTTP
+         * protocol over libtls (git can't -- it fork/execs its transport) and
+         * lists a public repo's refs. Proves the git-protocol-over-TLS path.
+         * Needs CAP_NETWORK + -cpu max (RDRAND). */
+        const char *sp = "/data/apps/gitclone/gitclone.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test gitclone: %s not on image\n", sp); return 1; }
+        char *a[]   = { (char *)sp, (char *)"https://github.com/octocat/Hello-World", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(sp, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[cmd] test gitclone: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test emlibc net") == 0) {
         /* Proves emlibc's NATIVE networking: emlibc_net (ring 3, linked against
          * libemlibc only -- zero newlib) does an HTTP GET via em_tcp_connect +

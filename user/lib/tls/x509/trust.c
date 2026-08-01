@@ -27,6 +27,12 @@ static const struct trust_anchor ANCHORS[] = {
         NULL, NULL, 0,
         GS_R3_N, sizeof GS_R3_N, GS_R3_E, sizeof GS_R3_E,
     },
+    {   /* USERTrust ECC -- EC P-384 (Sectigo; github.com chains here) */
+        USERTRUST_ECC_SUBJECT, sizeof USERTRUST_ECC_SUBJECT,
+        X509_KEY_EC, X509_CURVE_P384,
+        USERTRUST_ECC_POINT + 1, USERTRUST_ECC_POINT + 1 + 48, 48,
+        NULL, 0, NULL, 0,
+    },
 };
 #define N_ANCHORS (int)(sizeof ANCHORS / sizeof ANCHORS[0])
 

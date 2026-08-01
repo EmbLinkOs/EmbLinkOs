@@ -68,6 +68,7 @@ int tls_build_client_hello(uint8_t *out, size_t cap,
             /* signature_algorithms (13) -- required by servers even without verify */
             w16(&b, 13); { size_t e = open16(&b); size_t l = open16(&b);
                 w16(&b, 0x0403);  /* ecdsa_secp256r1_sha256 */
+                w16(&b, 0x0503);  /* ecdsa_secp384r1_sha384 -- github's chain uses it */
                 w16(&b, 0x0804);  /* rsa_pss_rsae_sha256 */
                 w16(&b, 0x0401);  /* rsa_pkcs1_sha256 */
                 w16(&b, 0x0805);  /* rsa_pss_rsae_sha384 */
