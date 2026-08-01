@@ -1174,6 +1174,23 @@ int selftests_handle_command(const char *cmd)
         return code == 0 ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test tls rsa") == 0) {
+        /* Like `test tls`, but against an RSA-leaf server (Let's Encrypt) --
+         * exercises the RSA-PSS CertificateVerify + the RSA chain to the bundled
+         * ISRG Root X1 anchor. Needs CAP_NETWORK + outbound :443 + RDRAND. */
+        const char *tp = "/data/apps/tlstest/tlstest.elf";
+        struct vfs_stat st;
+        if (vfs_stat(tp, &st) != 0) { kprintf("\n[cmd] test tls rsa: %s not on image\n", tp); return 1; }
+        char *a[]   = { (char *)tp, (char *)"valid-isrgrootx1.letsencrypt.org", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(tp, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[tls-rsa] exit=%d\n", code);
+        kprintf("[cmd] test tls rsa: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test emlibc") == 0) {
         /* emlibc phase 1: the OS runs a program that links its OWN non-POSIX C
          * library INSTEAD of newlib (built -nostdinc, no -lc, no newlib

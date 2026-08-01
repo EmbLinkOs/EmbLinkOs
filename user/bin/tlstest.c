@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
         else if (r == -130) printf(" (Certificate message parse)");
         printf("\n"); free(c); return 6;
     }
-    printf("tlstest: TLS 1.3 handshake OK -- AUTHENTICATED (chain->GTS Root R4, host, CertificateVerify)\n");
+    printf("tlstest: TLS 1.3 handshake OK -- AUTHENTICATED (chain->trusted root, host, CertificateVerify)\n");
 
     char req[256];
     int rq = snprintf(req, sizeof req,
