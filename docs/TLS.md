@@ -120,9 +120,17 @@ Shared header = contract; one file per concern; subdirs for `crypto`/`x509`.
     - `user/lib/tls/crypto/{sha512,bignum,ecdsa}.{c,h}`, `user/lib/tls/x509/
       {asn1,cert,trust}.{c,h}` + roots.h; host tests test_{asn1,sha512,bignum,
       ecdsa,x509,chain}.c against OpenSSL-generated vectors + a frozen real chain.
-    - **Not yet (T3.5):** RSA-signed leaves/intermediates (**RSA-PKCS1-v1.5 +
-      PSS**) -- only anchor roots may currently be RSA (parsed, not verified);
-      more bundled roots; a live wrong-host/expired *negative* boot test.
+- **T3.5 — RSA. ✅ DONE.** RSASSA-PKCS1-v1.5 (RFC 8017 §8.2.2, for RSA cert-chain
+  signatures) and RSA-PSS (§9.1.2, for TLS 1.3's RSA CertificateVerify), on a
+  Montgomery bignum widened to 4096-bit (`mont_pow`). X.509 parses RSA keys +
+  RSA sig algs; the verify dispatch and trust anchors handle EC *and* RSA. Second
+  anchor bundled: **ISRG Root X1** (RSA-4096, Let's Encrypt). **Green on the
+  metal:** `test tls rsa` authenticated valid-isrgrootx1.letsencrypt.org --
+  RSA-PSS CertificateVerify + an all-RSA chain to ISRG Root X1 -- and read
+  `HTTP/1.1 200 OK`. Host: `test_{rsa,pss,rsachain}.c` (OpenSSL vectors + a frozen
+  real LE chain), 15 suites green.
+    - **Still open:** more bundled roots; RSA-PSS-*signed* certs (id-RSASSA-PSS,
+      rare for CAs); a live wrong-host/expired *negative* boot test.
 - **T4 — the HTTPS client.** HTTP/1.1 over `libtls`; `wget https://…` fetches a
   real page and its bytes match. *Green:* the OS reads a real HTTPS URL end to end.
 - **T5 — the consumers.** Wire Python's `ssl`/`_socket` to `libtls` (→ `pip
