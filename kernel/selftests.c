@@ -1217,6 +1217,36 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test pkgfetch") == 0) {
+        /* T5 (native path): the OS installs a real PyPI package. pkgfetch (ring 3)
+         * fetches six's simple index + wheel over OUR authenticated TLS, and our
+         * own inflate + zip reader unpack it into /data/py/site-packages. Then
+         * `PYTHONPATH=/data/py/site-packages python -c 'import six'` works. Needs
+         * CAP_NETWORK + CAP_FILESYSTEM, outbound :443, RDRAND (-cpu max). */
+        const char *pp = "/data/apps/pkgfetch/pkgfetch.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != 0) { kprintf("\n[cmd] test pkgfetch: %s not on image\n", pp); return 1; }
+        char *a[]   = { (char *)pp, (char *)"six", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(pp, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[pkgfetch] exit=%d\n", code);
+        int ok = (code == 0);
+        if (ok) {
+            struct vfs_stat fs;
+            if (vfs_stat("/data/py/site-packages/six.py", &fs) != 0) {
+                kprintf("[pkgfetch] six.py not installed\n"); ok = 0;
+            } else {
+                kprintf("[pkgfetch] installed six.py (%lu bytes) -- a real PyPI package, on our own TLS+inflate\n",
+                        (unsigned long)fs.size);
+                if (fs.size < 1000) ok = 0;
+            }
+        }
+        kprintf("[cmd] test pkgfetch: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test tls") == 0) {
         /* THE HEADLINE (docs/TLS.md T2): the OS speaks TLS 1.3. tlstest (ring 3)
          * resolves cloudflare.com, TCP-connects :443, runs OUR libtls handshake

@@ -509,6 +509,17 @@ build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h user/lib/tl
 build/wget.elf: build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
 
+# pkgfetch -- native PyPI installer for pure-Python wheels (libtls fetch + our
+# own inflate + zip reader). Auto-packed as /data/apps/pkgfetch/pkgfetch.elf.
+build/pkg_inflate.o: user/lib/inflate.c user/lib/inflate.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
+build/pkg_unzip.o: user/lib/unzip.c user/lib/unzip.h user/lib/inflate.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
+build/pkgfetch.o: user/bin/pkgfetch.c user/lib/embk_socket.h user/lib/tls/tls.h user/lib/unzip.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/lib -c $< -o $@
+build/pkgfetch.elf: build/crt0.o build/syscalls.o build/pkgfetch.o build/pkg_inflate.o build/pkg_unzip.o $(TLS_LIB_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/pkgfetch.o build/pkg_inflate.o build/pkg_unzip.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
+
 build/tls_sha256.o: kernel/crypto/sha256.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tls_hmac.o: kernel/crypto/hmac.c | $(BUILD)
@@ -831,7 +842,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1003,7 +1014,7 @@ endif
 
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf \
                build/emlibc_demo.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \
