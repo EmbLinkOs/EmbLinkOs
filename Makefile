@@ -1571,3 +1571,5 @@ test-tls-crypto:
 	    tools/tls/test_handshake.c -o /tmp/embk_test_handshake && /tmp/embk_test_handshake
 	@cc -Wall -Iuser/lib/tls/x509 user/lib/tls/x509/asn1.c tools/tls/test_asn1.c \
 	    -o /tmp/embk_test_asn1 && /tmp/embk_test_asn1
+	@cc -Wall -Iuser/lib/tls/crypto user/lib/tls/crypto/sha512.c tools/tls/test_sha512.c \
+	    -o /tmp/embk_test_sha512 && /tmp/embk_test_sha512
