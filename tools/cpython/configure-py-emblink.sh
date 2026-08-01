@@ -78,6 +78,30 @@ MODULE_BUILDTYPE=static \
   LDFLAGS="-static -nostartfiles -T $M/user/lib/newlib.ld -L$NL/lib $M/build/crt0.o $M/build/syscalls.o" \
   "$@" 2>&1 | tee cfg.log
 
+# --- POST-CONFIGURE: enable networking (the pip/git-over-HTTP foundation) -----
+# A cross-compile can't RUN link probes, so configure leaves every socket-layer
+# feature macro #undef and _socket falls back to a stub whose socket() just sets
+# errno=ENOTSUP. EmbLink's newlib libc DOES provide the full BSD surface
+# (user/lib/syscalls.c over the kernel CAP_NETWORK layer -- socket/connect/bind/
+# listen/accept/recvfrom/sendto + getaddrinfo/getnameinfo/inet_*), so we assert
+# the matching HAVE_* here to match reality. Idempotent (flips only the #undef
+# form). Without HAVE_SOCKET the interpreter builds but `socket.socket()` raises
+# OSError(ENOTSUP); the method-table guards (HAVE_CONNECT/BIND/...) drop the
+# corresponding methods entirely. Verified live: `test python net` -> HTTP 200.
+PYCONF="$BLD/pyconfig.h"
+for m in HAVE_SYS_SOCKET_H HAVE_NETINET_IN_H HAVE_NETINET_TCP_H HAVE_NETDB_H \
+         HAVE_ARPA_INET_H HAVE_SOCKET HAVE_CONNECT HAVE_BIND HAVE_LISTEN \
+         HAVE_ACCEPT HAVE_RECVFROM HAVE_SENDTO HAVE_GETADDRINFO HAVE_GETNAMEINFO \
+         HAVE_GAI_STRERROR HAVE_ADDRINFO HAVE_SOCKADDR_STORAGE HAVE_SOCKLEN_T \
+         HAVE_GETHOSTBYNAME HAVE_INET_PTON HAVE_INET_NTOP; do
+    sed -i "s|/\* #undef $m \*/|#define $m 1|" "$PYCONF"
+done
+# socketmodule.c is not in the default static set; declare it as a builtin.
+touch "$BLD/Modules/Setup.local"
+grep -q '^_socket socketmodule.c' "$BLD/Modules/Setup.local" \
+    || echo '_socket socketmodule.c' >> "$BLD/Modules/Setup.local"
+echo "  NET      pyconfig.h socket macros + Setup.local _socket asserted"
+
 echo
 echo "=== configure OK: MACHDEP=$(grep -E '^MACHDEP=' Makefile | head -1) ==="
 echo "=== next: cd $BLD && make -j4 ==="

@@ -797,11 +797,15 @@ int dup(int fd) {
  * convenient stub. (Should exec ever exist -- it will not, by design -- this
  * must become real state.)
  *
- * F_GETFL/F_SETFL -- still REFUSED. O_NONBLOCK genuinely cannot be honoured,
- * and here a false success is exactly the trap: a caller told non-blocking mode
- * was set would then hang forever in a blocking read. F_DUPFD likewise, since
- * dup() itself is ENOSYS (see above).
+ * F_GETFL reports the TRUE state: O_RDWR, blocking (no O_NONBLOCK) -- every fd
+ * here is blocking, so this is a fact, not a stub. F_SETFL accepts a request to
+ * (re)assert blocking mode (a no-op: already so) but REFUSES O_NONBLOCK, because
+ * a false "non-blocking is set" is the real trap -- the caller would then hang
+ * forever in a blocking read. This lets blocking-socket code (CPython's _socket,
+ * which reads/sets the flags) work while never lying about non-blocking.
+ * F_DUPFD likewise refused, since dup() itself is ENOSYS (see above).
  */
+#include <fcntl.h>
 /* uname(): real facts about this OS -- nothing here is faked or guessed.
  * nodename is the sysname: one machine, no network identity to distinguish. */
 #include <sys/utsname.h>
@@ -833,6 +837,16 @@ int fcntl(int fd, int cmd, ...) {
          * "stay open across exec" describe the same (unobservable) reality, so
          * there is nothing to store and nothing that could later disagree. */
         return 0;
+    case F_GETFL:
+        /* True state: read/write, blocking (no O_NONBLOCK on this OS). */
+        return O_RDWR;
+    case F_SETFL: {
+        va_list ap; va_start(ap, cmd);
+        int flags = va_arg(ap, int);
+        va_end(ap);
+        if (flags & O_NONBLOCK) { errno = ENOSYS; return -1; }  /* can't honor -- no false success */
+        return 0;                                               /* asserting blocking: already so */
+    }
     default:
         errno = ENOSYS;
         return -1;

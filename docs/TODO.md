@@ -1410,9 +1410,21 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     the porting-side socket layer (`socket`/`connect`/`getaddrinfo`/… → `embk_net_*`)
     is now real. `test sockdemo` proves a plain POSIX HTTP client works — the same
     symbols `_socket` resolves to.
-  - [ ] **Brick 2 — compile `_socket` into the external CPython** (uncomment in
-    `Modules/Setup`, rebuild). socketmodule.c also wants `select`/`poll` on socket
-    fds and non-blocking (`fcntl` O_NONBLOCK) — check those work or add them.
+  - [x] **Brick 2 — `_socket` compiled into the external CPython** (~/cross/build-py)
+    — **DONE, live: `test python net` -> `PYNET HTTP/1.1 200 OK`, exit 0.** CPython
+    opens a real socket, resolves+connects to example.com:80, and reads the reply
+    entirely through our POSIX socket layer. The build is now reproducible:
+    `tools/cpython/configure-py-emblink.sh` asserts the full socket HAVE_* set in
+    pyconfig.h + `_socket` in Setup.local (configure leaves them all off on a
+    cross-build). Root cause of the earlier ENOTSUP: without `HAVE_SOCKET`,
+    socketmodule.c `#define socket stub_socket` shadows the libc call with a stub
+    that just `errno=ENOTSUP` -- the real `socket()` was never reached. Fixes that
+    landed with it: `fcntl` F_GETFL/F_SETFL (set_inheritable needs F_GETFD, the
+    blocking-flag read), `SOMAXCONN` in `sys/socket.h` (HAVE_LISTEN pulls it in),
+    and `test python net` grants CAP_FILESYSTEM too (CPython reads its stdlib zip).
+    *Note:* sockets are BLOCKING-only (fcntl O_NONBLOCK is refused) and
+    `select()`/`poll()` on socket fds are unverified -- fine for simple blocking
+    fetches, may bite urllib3 timeouts.
   - [ ] **Brick 3 — a libtls-backed `_ssl`** (or a smaller native `_embtls`
     module) + a pure-Python `ssl.py` shim covering `SSLContext`/`wrap_socket`/
     `makefile` for `http.client`/urllib.

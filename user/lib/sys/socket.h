@@ -39,6 +39,11 @@ struct sockaddr_storage {
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
 
+/* listen(2) backlog ceiling. The kernel socket layer does not queue passive
+ * connections yet (M4 accept is a stub), so this only bounds the value apps
+ * pass; 128 matches the common Linux default. */
+#define SOMAXCONN 128
+
 #define SOL_SOCKET   1
 #define SO_REUSEADDR 2
 #define SO_ERROR     4
