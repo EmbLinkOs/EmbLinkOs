@@ -1184,6 +1184,39 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test pypi") == 0) {
+        /* T5 slice: the OS reaches the REAL package ecosystem over its own
+         * authenticated TLS. Fetches PyPI's PEP-503 simple index page for a
+         * package -- exactly what `pip` reads to find distributions -- verifying
+         * pypi.org's chain to the bundled GlobalSign Root R3 anchor. (Wiring this
+         * into pip itself needs a libtls-backed _ssl; see docs/TODO.md.) */
+        const char *wp = "/data/apps/wget/wget.elf";
+        struct vfs_stat st;
+        if (vfs_stat(wp, &st) != 0) { kprintf("\n[cmd] test pypi: %s not on image\n", wp); return 1; }
+        char *a[]   = { (char *)wp, (char *)"-O", (char *)"/pypi.out",
+                        (char *)"https://pypi.org/simple/six/", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(wp, a, 4, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[pypi] exit=%d\n", code);
+        int ok = (code == 0);
+        if (ok) {
+            struct vfs_stat fs;
+            if (vfs_stat("/pypi.out", &fs) != 0) { kprintf("[pypi] /pypi.out missing\n"); ok = 0; }
+            else {
+                char head[16] = {0}; size_t got = 0;
+                int fd = vfs_open("/pypi.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                kprintf("[pypi] fetched %lu bytes of PyPI's index for 'six', starts \"%s\"\n",
+                        (unsigned long)fs.size, got ? head : "");
+                if (fs.size < 100) ok = 0;
+            }
+        }
+        kprintf("[cmd] test pypi: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test tls") == 0) {
         /* THE HEADLINE (docs/TLS.md T2): the OS speaks TLS 1.3. tlstest (ring 3)
          * resolves cloudflare.com, TCP-connects :443, runs OUR libtls handshake

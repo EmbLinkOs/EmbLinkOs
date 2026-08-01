@@ -21,6 +21,12 @@ static const struct trust_anchor ANCHORS[] = {
         NULL, NULL, 0,
         ISRG_X1_N, sizeof ISRG_X1_N, ISRG_X1_E, sizeof ISRG_X1_E,
     },
+    {   /* GlobalSign Root R3 -- RSA-2048 (pypi.org / files.pythonhosted.org) */
+        GS_R3_SUBJECT, sizeof GS_R3_SUBJECT,
+        X509_KEY_RSA, X509_CURVE_NONE,
+        NULL, NULL, 0,
+        GS_R3_N, sizeof GS_R3_N, GS_R3_E, sizeof GS_R3_E,
+    },
 };
 #define N_ANCHORS (int)(sizeof ANCHORS / sizeof ANCHORS[0])
 

@@ -819,6 +819,48 @@ usage is now documented (`docs/TOOLCHAIN.md`, `EmbCC/docs/USAGE.md`).
 
 ---
 
+### Phase 28 — TLS 1.3: a from-scratch, authenticated HTTPS stack ✅
+
+The OS speaks **authenticated TLS 1.3** to the real internet, on crypto written
+from scratch (no OpenSSL). Full design + phase log in `docs/TLS.md`; a userspace
+`libtls` (`user/lib/tls/`) over the existing sockets, reusing the kernel crypto
+compiled twice (three shim headers point `include/{types,kstring,kprintf}.h` at
+standard headers, so `kernel/crypto/{sha256,hmac,aes}.c` run verbatim in
+userspace). **15 host suites green** (`make test-tls-crypto`), every phase also
+verified on the metal.
+
+- **T1 — handshake crypto.** HKDF-SHA256, AES-128 + AES-GCM (AES generalized to
+  128-bit in-kernel, `aes256_*` byte-identical), X25519 — each against RFC
+  vectors. On-OS witness `test tls crypto`.
+- **T2 — handshake + record layer.** The TLS 1.3 key schedule (matched
+  byte-for-byte to **RFC 8448**), the record layer (per-record AEAD, nonce, AAD),
+  ClientHello/ServerHello + transcript + Finished, and the client state machine
+  (`tls_connect/read/write/close`). *Headline:* `test tls` did a live handshake
+  with Cloudflare.
+- **T3 — certificate authentication (EC).** DER/ASN.1, X.509 v3 parsing, **ECDSA
+  P-256/P-384** (own Montgomery bignum + Jacobian curve math), **SHA-384/512**, a
+  bundled trust store, chain building, hostname/SAN + validity, and the
+  CertificateVerify check — all wired into the handshake (refuses before Finished
+  on any failure). `test tls` now *authenticates* Cloudflare → **GTS Root R4**.
+- **T3.5 — RSA.** **RSA-PKCS1-v1.5** (cert-chain sigs) and **RSA-PSS** (TLS 1.3's
+  RSA CertificateVerify), bignum widened to 4096-bit. `test tls rsa` authenticates
+  a Let's Encrypt (all-RSA) chain → **ISRG Root X1**.
+- **T4 — HTTPS client.** `wget https://` runs an authenticated fetch over libtls
+  and writes the decrypted body to disk (refuses on cert failure, no insecure
+  fallback). `test wget https` → `HTTP 200`, bytes on EMBKFS.
+- **T5 (partial) — the package internet.** Bundled a 3rd anchor (**GlobalSign Root
+  R3**); `test pypi` fetches PyPI's PEP-503 simple index for a package (what pip
+  reads) over our TLS. *pip/git themselves are NOT yet wired* — that needs a
+  libtls-backed Python `_ssl` and a git HTTP transport (see `docs/TODO.md`).
+
+Trust anchors bundled: GTS Root R4 (EC P-384), ISRG Root X1 (RSA-4096), GlobalSign
+Root R3 (RSA-2048) — between them, Cloudflare/Google, Let's Encrypt, and
+GlobalSign cover a large majority of the web. Signature schemes: ECDSA
+secp256r1/secp384r1, RSA-PKCS1-v1.5, RSA-PSS. One ciphersuite:
+`TLS_AES_128_GCM_SHA256`.
+
+---
+
 ## Major To-Do Buckets (Rough Priority)
 
 Full detail lives in `TODO.md`, organized by subsystem. Rough priority order:

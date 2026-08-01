@@ -1379,3 +1379,89 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
 - [ ] **L1** — EmbLD linker-defined symbols (`kernel_end`) so the kernel links with
   no external tools and no diagnostic stub.
 - Usage: `docs/TOOLCHAIN.md` (building for/on the OS) + `EmbCC/docs/USAGE.md` (CLI).
+---
+
+## TLS / HTTPS (`docs/TLS.md`, Phase 28)
+
+The OS speaks **authenticated TLS 1.3** on its own crypto (T1–T4 done, T5 partial).
+This section is the honest ledger of what was deliberately **left unbuilt** — the
+parts skipped to keep each phase shippable. Green today: `make test-tls-crypto`
+(15 host suites) + on-OS `test tls` (Cloudflare/EC), `test tls rsa` (Let's
+Encrypt/RSA), `test wget https`, `test pypi`.
+
+### T5 — the consumers (the big remaining integration)
+- [ ] **pip over HTTPS.** The ported CPython ships `ssl.pyc`/`http/client.pyc`, but
+  `import ssl` needs a `_ssl` C extension — normally OpenSSL. NOT built. To make
+  `pip install` work we must provide a **libtls-backed `_ssl`** (or a smaller
+  `_socket`-level TLS wrap) exposing enough of `SSLContext`/`SSLSocket`
+  (`wrap_socket`, `do_handshake`, `read`, `write`, `getpeercert`, SNI) for
+  `http.client`/`urllib`. Large. *Today:* `test pypi` proves the OS can fetch
+  PyPI's PEP-503 index over our TLS via `wget` — the data pip needs — but pip
+  itself is not wired.
+- [ ] **git over HTTPS.** The git port is local-only (no HTTP transport). Needs
+  git's smart-HTTP (`git-remote-https`) wired to libtls, or a libcurl shim. Not
+  started.
+- [ ] **Our own package registry fetch** (packaging PK4) over libtls — the
+  authority-declaring bundle download. Design only.
+
+### Ciphersuites & key exchange (only one of each today)
+- [ ] `TLS_CHACHA20_POLY1305_SHA256` — self-contained AEAD, great on cores without
+  AES-NI. Needs ChaCha20 + Poly1305 (new crypto).
+- [ ] `TLS_AES_256_GCM_SHA384` — the GCM core is already cipher-agnostic and
+  AES-256 exists; needs the SHA-384 transcript/key-schedule variant wired.
+- [ ] P-256 / P-384 ECDHE key_share (only **X25519** is offered/accepted now).
+  Refused-group HelloRetryRequest would then matter.
+
+### Handshake features not implemented
+- [ ] **HelloRetryRequest** — detected and rejected (`-2`), never handled. A server
+  that wants a different group fails. Fine while we only offer X25519 to servers
+  that accept it.
+- [ ] **KeyUpdate** — post-handshake key rotation is ignored; a server that sends
+  one makes subsequent records undecryptable. Rare in a single fetch.
+- [ ] **Session resumption / 0-RTT / PSK** — no NewSessionTicket use (tickets are
+  read and discarded), no early data. Every connection is a full handshake.
+- [ ] **Client certificates** — CertificateRequest not handled (we only do the
+  common server-auth case).
+- [ ] **Record-layer omissions:** no key-update seq reset, no max-record-age /
+  rekey, we emit **no padding**, and we don't fragment outgoing handshake messages
+  (fine — ours are small). Alert handling is minimal (any alert on read = EOF).
+
+### Certificate verification — remaining gaps
+- [ ] **More trust anchors.** Only 3 bundled: GTS Root R4 (EC), ISRG Root X1 (RSA),
+  GlobalSign Root R3 (RSA). Broad but not universal — a DigiCert/Sectigo/etc. site
+  fails with `-105` (no anchor). Want a curated set under `/system/etc/ca` the user
+  can grow (docs/TLS.md §5.1), verified-boot-sealed.
+- [ ] **RSA-PSS-*signed* certs** (`id-RSASSA-PSS` in the cert, not just in
+  CertificateVerify) — parsed as `X509_SIG_NONE`, so a chain link signed that way
+  won't verify. Rare for CAs today.
+- [ ] **Ed25519 / EdDSA** certificate + CertificateVerify signatures — not
+  implemented.
+- [ ] **No revocation checking** (CRL / OCSP / OCSP-stapling). An unrevoked-but-
+  compromised cert would still verify. Real gap for a security stack.
+- [ ] **Name Constraints, Basic Constraints (CA:TRUE / pathLen), Key Usage /
+  Extended Key Usage** are NOT enforced — we chain by name + signature only. A
+  non-CA cert used as an issuer would wrongly pass. Should enforce before trusting
+  arbitrary chains.
+- [ ] **Hostname matching is minimal:** DNS SANs only (no IP-address SANs, no CN
+  fallback — CN fallback is deliberately omitted, which is correct), single-label
+  `*.` wildcard only.
+- [ ] **Validity uses the OS wall clock** (`gettimeofday`); a wrong RTC would
+  wrongly accept/reject. No max-chain-age or "not-after within anchor validity"
+  cross-check.
+
+### Verification / testing gaps
+- [ ] **Live *negative* boot test** — host tests reject wrong-host/expired/tampered,
+  but there's no on-OS test that connects to a deliberately-bad server (expired.
+  badssl.com / wrong.host.badssl.com / self-signed.badssl.com) and confirms the
+  handshake is *refused*. The security property is only host-proven, not metal-
+  proven.
+- [ ] The `test pypi` live run is timing-flaky under TCG (the desktop clock widget
+  starves the kernel serial-console poll, so the fed command isn't always drained);
+  the pypi chain + GlobalSign R3 anchor are host-verified deterministically, and the
+  identical wget-HTTPS-to-disk pipeline is metal-proven by `test wget https`.
+
+### Crypto hardening (verify-only today, not constant-time)
+- [ ] The Montgomery bignum, ECDSA, RSA, and X25519 are written for **verification /
+  public-value** use and are **NOT constant-time**. Before any *signing* or private-
+  key handling on the OS (client certs, our own CA, key storage) they need constant-
+  time review. `getentropy` is RDRAND-only (fine; documented).
