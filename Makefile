@@ -1573,3 +1573,7 @@ test-tls-crypto:
 	    -o /tmp/embk_test_asn1 && /tmp/embk_test_asn1
 	@cc -Wall -Iuser/lib/tls/crypto user/lib/tls/crypto/sha512.c tools/tls/test_sha512.c \
 	    -o /tmp/embk_test_sha512 && /tmp/embk_test_sha512
+	@cc -Wall -Iuser/lib/tls/crypto user/lib/tls/crypto/bignum.c tools/tls/test_bignum.c \
+	    -o /tmp/embk_test_bignum && /tmp/embk_test_bignum
+	@cc -Wall -Iuser/lib/tls/crypto user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
+	    tools/tls/test_ecdsa.c -o /tmp/embk_test_ecdsa && /tmp/embk_test_ecdsa
