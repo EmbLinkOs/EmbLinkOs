@@ -131,8 +131,12 @@ Shared header = contract; one file per concern; subdirs for `crypto`/`x509`.
   real LE chain), 15 suites green.
     - **Still open:** more bundled roots; RSA-PSS-*signed* certs (id-RSASSA-PSS,
       rare for CAs); a live wrong-host/expired *negative* boot test.
-- **T4 — the HTTPS client.** HTTP/1.1 over `libtls`; `wget https://…` fetches a
-  real page and its bytes match. *Green:* the OS reads a real HTTPS URL end to end.
+- **T4 — the HTTPS client. ✅ DONE.** `wget` speaks `https://` over `libtls`:
+  parse http/https, TCP connect, authenticated `tls_connect`, then HTTP over a
+  raw-socket-or-TLS transport shim. Refuses on cert failure (no insecure
+  fallback). **Green on the metal:** `test wget https` fetched
+  https://valid-isrgrootx1.letsencrypt.org/ -> `HTTP 200`, 4067 decrypted bytes
+  written to `/wgets.out` on EMBKFS. The OS reads a real HTTPS URL end to end.
 - **T5 — the consumers.** Wire Python's `ssl`/`_socket` to `libtls` (→ `pip
   install` from PyPI); git-over-HTTPS; and the package registry's network fetch
   (packaging PK4). This is where TLS pays for itself.
