@@ -1508,3 +1508,10 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all run debug clean scene-test backend-test font-test layout-test reactive-test declare-test showcase run-ui run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted
+# --- TLS crypto host tests (docs/TLS.md T1): the SAME crypto that runs on the OS,
+# compiled + vector-checked on the dev host (fast, no boot). Grows per primitive.
+.PHONY: test-tls-crypto
+TLS_CRYPTO_INC := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto
+test-tls-crypto:
+	@cc -Wall $(TLS_CRYPTO_INC) kernel/crypto/sha256.c kernel/crypto/hmac.c \
+	    user/lib/tls/crypto/hkdf.c tools/tls/test_hkdf.c -o /tmp/embk_test_hkdf && /tmp/embk_test_hkdf
