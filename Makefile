@@ -1577,3 +1577,7 @@ test-tls-crypto:
 	    -o /tmp/embk_test_bignum && /tmp/embk_test_bignum
 	@cc -Wall -Iuser/lib/tls/crypto user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
 	    tools/tls/test_ecdsa.c -o /tmp/embk_test_ecdsa && /tmp/embk_test_ecdsa
+	@cc -Wall -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
+	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c kernel/crypto/sha256.c \
+	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
+	    tools/tls/test_x509.c -o /tmp/embk_test_x509 && /tmp/embk_test_x509
