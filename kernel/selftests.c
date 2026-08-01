@@ -453,6 +453,7 @@ static void selftests_print_commands(void)
     kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
     kprintf("  test embbuild self\n");
+    kprintf("  test embbuild kernel\n");
     kprintf("  test embbuild shell\n");
     kprintf("  test embbuild gui\n");
     kprintf("  test keyboard\n");
@@ -4382,6 +4383,55 @@ int selftests_handle_command(const char *cmd)
         }
 
         kprintf("\n[cmd] test embbuild self: %s\n", ok ? "OK (loop closed)" : "FAIL");
+        return 1;
+    }
+
+    /* KM1 (docs/BUILD.md §12): EmbBuild rebuilds the KERNEL on the OS. Spawns the
+     * on-image embbuild against /data/src/kernel/build.ebm -- 89 embcc C compiles
+     * + 6 embcc .asm assembles + one embld link, all on the metal, no gcc/nasm/ld
+     * -- and asserts a real ET_EXEC kernel.elf came out. Honest SKIP (not FAIL)
+     * when the on-OS toolchain + manifest aren't staged (they need EMBK_EMBCC_ROOT
+     * + STAGED_APPS=build/embcc.elf,build/embld.elf + EmbCC's gen-kernel-manifest
+     * output at build/kernel.build.ebm). */
+    if (strcmp(cmd, "test embbuild kernel") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild kernel: VFS not registered\n"); return 1; }
+        static char cap[8192];
+        struct vfs_stat st;
+        char *bb  = "/data/apps/embbuild/embbuild.elf";
+        struct { const char *p, *why; } need[] = {
+            { "/data/apps/embcc/embcc.elf",  "embcc.elf not on image" },
+            { "/data/apps/embld/embld.elf",  "embld.elf not on image" },
+            { "/data/src/kernel/build.ebm",  "kernel manifest not on image" },
+            { "/data/src/kernel/main.c",     "kernel sources not staged" },
+            { bb,                            "embbuild.elf not on image" },
+        };
+        for (int i = 0; i < 5; i++)
+            if (vfs_stat(need[i].p, &st) != 0) {
+                kprintf("\n[cmd] test embbuild kernel: SKIP -- %s\n", need[i].why);
+                return 1;
+            }
+
+        kprintf("[km1] EmbBuild builds the kernel from /data/src/kernel (embcc+embld, on the metal)\n");
+        char *m[] = { bb, (char *)"/data/src/kernel/build.ebm", NULL };
+        int rc = emb_run_cap(bb, m, 2, cap, sizeof cap);
+        int built = (rc == 0) && emb_find(cap, "0 up_to_date");
+
+        /* What came out must be a real ET_EXEC ELF kernel. */
+        unsigned char hdr[20] = {0};
+        int have = (vfs_stat("/data/build/out/kernel/kernel.elf", &st) == 0);
+        if (have) {
+            int fd = vfs_open("/data/build/out/kernel/kernel.elf", O_RDONLY, 0);
+            if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+        }
+        int is_exec = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L'
+                            && hdr[3] == 'F' && hdr[16] == 2;
+        kprintf("[km1] kernel.elf: %s, %llu bytes, ET_EXEC=%d\n",
+                have ? "produced" : "MISSING",
+                have ? (unsigned long long)st.size : 0ULL, is_exec);
+
+        int ok = built && is_exec;
+        kprintf("\n[cmd] test embbuild kernel: %s (rc=%d)\n",
+                ok ? "OK -- the OS built its own kernel" : "FAIL", rc);
         return 1;
     }
 
