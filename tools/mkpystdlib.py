@@ -39,6 +39,15 @@ EXCLUDE_DIRS = {
     "__pycache__", "config-3.14-x86_64-linux-gnu",
 }
 
+# Stdlib modules REPLACED with an EmbLink-specific implementation, keyed by their
+# path inside Lib/. The real ssl.py imports _ssl (OpenSSL, absent); ours is a
+# thin shim over the `_embtls` builtin (our libtls). Kept in-repo (version
+# controlled) rather than editing the CPython source tree in place.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+OVERRIDES = {
+    "ssl.py": os.path.join(_HERE, "cpython", "ssl.py"),
+}
+
 
 def main() -> int:
     if len(sys.argv) != 3:
@@ -75,6 +84,13 @@ def main() -> int:
                 # Paths inside the zip are relative to Lib/, because that is what
                 # sys.path expects: "encodings/__init__.pyc", not "Lib/encodings/...".
                 arc = os.path.relpath(full, lib)
+
+                # Swap in an EmbLink replacement for this module, if any, before
+                # it gets compiled -- keeps the zip's layout identical but the
+                # bytecode ours.
+                override = OVERRIDES.get(arc)
+                if override is not None:
+                    full = override
 
                 # PRECOMPILED: ship .pyc, not source. Compiling the startup
                 # modules from .py under TCG is brutally slow -- the interpreter

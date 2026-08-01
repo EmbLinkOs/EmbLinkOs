@@ -1435,10 +1435,18 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     kshim/kernel include world out of the same TU as Python.h); the libtls
     objects (`build/tls_*.o`) link straight in. Reproducible via the configure
     script (symlinks the module into Modules/, declares it in Setup.local).
-  - [ ] **Brick 3b — a pure-Python `ssl.py` shim** (`SSLContext`/`wrap_socket`/
-    `SSLSocket.makefile`/`recv`/`sendall`) over `_embtls`, so `http.client`'s
-    `HTTPSConnection` and `urllib` work unmodified. `_embtls` is the transport;
-    this is the API surface pip imports.
+  - [x] **Brick 3b — a pure-Python `ssl.py` shim** over `_embtls` — **DONE,
+    live: `test python https` -> `HTTPS 200 OK`, exit 0.** The whole stdlib path
+    works: `http.client.HTTPSConnection` -> our `ssl.py`
+    (`SSLContext`/`wrap_socket`/`SSLSocket` with `sendall`/`recv`/`makefile`) ->
+    `_embtls` handshake -> request -> response headers read back through the
+    buffered TLS stream. The shim REPLACES the stdlib ssl.py (which imports
+    OpenSSL's `_ssl`) via a `tools/mkpystdlib.py` OVERRIDES map; kept in-repo at
+    `tools/cpython/ssl.py`. It also forced four more socket-method HAVE_* macros
+    (SETSOCKOPT/GETSOCKNAME/GETPEERNAME/SHUTDOWN) that http.client's TCP setup
+    needs. Honesty note: libtls always authenticates, so `ssl.py` has no
+    unverified mode -- `_create_unverified_context` still verifies (errs toward
+    more security). Sockets are blocking-only; `select`/`poll` unverified.
   - [ ] **Brick 4 — add pip** (`ensurepip`/a `pip.pyz`) to the stdlib zip
     (`tools/mkpystdlib.py`).
   - [ ] **Brick 5 — `python -m pip install`** end to end.
