@@ -36,6 +36,7 @@
 #include "crypto/pbkdf2.h"
 #include "crypto/aes.h"
 #include "crypto/xts.h"
+#include "selftest.h"   /* user/lib/tls/crypto: tls_crypto_run_selftests (T1) */
 #include "fs/embkfs/embkfs_compress.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"   /* compositor_pointer_tick: keep the desktop live while `shell` waits */
@@ -2299,6 +2300,12 @@ int selftests_handle_command(const char *cmd)
         int rc_xts = aes_xts_run_selftests();
         bool all_ok = (rc_sha == 0 && rc_hmac == 0 && rc_pbkdf2 == 0 && rc_aes == 0 && rc_xts == 0);
         kprintf("\n[cmd] test crypto all: %s\n", all_ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test tls crypto") == 0) {
+        int rc = tls_crypto_run_selftests();
+        kprintf("\n[cmd] test tls crypto: %s\n", rc == 0 ? "OK" : "FAIL");
         return 1;
     }
 

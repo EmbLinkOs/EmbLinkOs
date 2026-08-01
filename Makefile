@@ -10,6 +10,7 @@ CFLAGS = -ffreestanding -nostdlib -nostartfiles \
          -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
          -mcmodel=kernel \
          -Ikernel \
+         -Iuser/lib/tls/crypto \
          -g -O0
 
 IMG = myos.img
@@ -112,6 +113,10 @@ KERNEL_SRC = kernel/main.c \
              kernel/crypto/pbkdf2.c \
              kernel/crypto/aes.c \
              kernel/crypto/xts.c \
+             user/lib/tls/crypto/hkdf.c \
+             user/lib/tls/crypto/gcm.c \
+             user/lib/tls/crypto/x25519.c \
+             user/lib/tls/crypto/selftest.c \
              kernel/fs/fat32.c \
              kernel/fs/embkfs/embkfs.c \
              kernel/fs/embkfs/embkfs_compress.c \

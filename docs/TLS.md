@@ -79,11 +79,17 @@ Shared header = contract; one file per concern; subdirs for `crypto`/`x509`.
 
 ## 3. Phasing
 
-- **T1 — handshake crypto.** AES-128 + **AES-GCM** (AEAD), **HKDF-SHA256**, and
-  **X25519**, each unit-tested against RFC test vectors (RFC 5869 HKDF, RFC 5116/
-  8452 GCM, RFC 7748 X25519). Reuse `sha256`/`hmac`/`aes` in userspace via the
-  shims. *Green:* `test tls crypto` — every vector matches. Self-contained; no
-  network.
+- **T1 — handshake crypto. ✅ DONE.** AES-128 + **AES-GCM** (AEAD),
+  **HKDF-SHA256**, and **X25519**, each unit-tested against RFC test vectors
+  (RFC 5869 HKDF, SP 800-38D GCM, RFC 7748 X25519). The kernel's `sha256`/`hmac`/
+  `aes` are reused verbatim in userspace via the kshim; AES was generalized to
+  AES-128 (kernel `aes256_*` byte-identical, FIPS C.3 selftest guards it). Green
+  two ways: `make test-tls-crypto` runs every vector on the host (no boot), and
+  `test tls crypto` runs the same vectors **on the metal** — both report OK
+  (HKDF PRK/OKM, GCM ciphertext+tag+forged-tag-rejection, X25519 §5.2 KATs + the
+  full §6.1 DH agreement). Self-contained; no network.
+    - Files: `user/lib/tls/crypto/{hkdf,gcm,x25519,selftest}.c`, the kshim under
+      `user/lib/tls/kshim/`, host tests `tools/tls/test_*.c`.
 - **T2 — the 1.3 handshake + record layer, NO cert verification.** ClientHello
   (X25519 key_share, the one suite) → ServerHello → derive the handshake secrets
   (HKDF-Extract/Expand-Label, the 1.3 key schedule) → AEAD-open EncryptedExtensions
