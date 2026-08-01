@@ -1461,24 +1461,31 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       `_sysconfigdata__emblink_` which sysconfig imports).
     - os-function macros exposed: `HAVE_READLINK/GETUID/GETEUID/GETPPID/UMASK`
       (posixpath.realpath/platformdirs reference them; our libc backs each).
-  - [~] **Brick 5 — `python -m pip install`** — reaches the NETWORK LAYER, then
-    hits ONE real blocker. `test python pip install` now imports pip's install
-    command fully (past ssl/urllib3/cachecontrol/platform) and calls pypi.org,
-    failing at the socket with **`[Errno 88]` (ENOSYS)**: pip's urllib3 does
-    `socket.create_connection(..., timeout=T)` -> `settimeout` -> non-blocking
-    mode -> our `fcntl(F_SETFL, O_NONBLOCK)` refuses (we are BLOCKING-ONLY).
-    Cleared to get here: expanded `ssl.py` (OPENSSL_VERSION + OP_*/VERIFY_*/HAS_*
-    constants + SSL*Error classes so urllib3 imports), stub `mmap` + `_ssl`
-    modules (cachecontrol imports mmap unconditionally; pip's `has_tls()` probes
-    `import _ssl`), and `HAVE_GETHOSTNAME` (platform._node).
-    **THE remaining blocker = non-blocking sockets / socket timeouts.** This is a
-    genuine kernel capability we lack, NOT a stub away: per the meta-lesson a
-    false "O_NONBLOCK is set" would hang a caller that then does a non-blocking
-    read expecting EAGAIN. Real fix = kernel non-blocking socket I/O
-    (net_socket + read/write honoring O_NONBLOCK -> EAGAIN, plus poll on socket
-    fds) OR a deliberate, documented blocking-degradation of `settimeout`. Then
-    re-run: also expect the files.pythonhosted.org cert to need a trust anchor
-    (we ship only GTS Root R4), and the wheel unpack to a writable `--target`.
+  - [x] **Brick 5 — `python -m pip install` WORKS** — **DONE, live:
+    `test python pip install` -> `Successfully installed six-1.17.0`, exit 0.**
+    `pip install six` on the metal: index fetch from pypi.org, wheel download
+    from files.pythonhosted.org (both over our own TLS -- their cert chains
+    verified against the embedded GTS Root R4), unpack + install to `--target`.
+    The whole real pip pipeline. What it took, each an honest fix:
+    - **Non-blocking sockets (kernel feature)** -- the enabler. urllib3 sets a
+      socket timeout -> non-blocking; we now support it for real:
+      `fcntl(O_NONBLOCK)` stores a kernel fd flag; `connect` returns
+      `-EINPROGRESS` and completes in the background (the RX kthread advances
+      SYN_SENT->ESTABLISHED); a `select()` over a new `sys_fd_poll` reports
+      readiness; `recv` returns `-EAGAIN` when no data. `test nbsock` proves the
+      whole shape natively. NOT the faked "O_NONBLOCK is set" the meta-lesson
+      warns against -- it genuinely works.
+    - `ssl.py` grew what urllib3 v2 reads: OPENSSL_VERSION/verify_flags, and a
+      getpeercert() that reports the name libtls VERIFIED during the handshake
+      (so urllib3's redundant re-check passes). wrap_socket sets the fd blocking
+      first (libtls does blocking record I/O). fileno() returns the real fd
+      (urllib3 select()s on it for connection reuse).
+    - `_ssl`/`mmap` stub modules; truststore patched to ImportError (it needs a
+      memory-BIO trust store we don't have) so pip takes its certifi+ssl fallback.
+    - `fsync`/`fdatasync` now return 0 -- HONEST: EMBKFS has no write-back cache
+      (writes go straight to the device), so the flush is vacuously satisfied
+      (the FD_CLOEXEC case). `HAVE_CHMOD` on (os.chmod was doing errno=ENOSYS
+      instead of calling our real chmod). pip writes+chmods every installed file.
   `pkgfetch` already covers the common "get me this pure package" case without any
   of this.
 - [ ] **git over HTTPS.** The git port is local-only (no HTTP transport). Needs

@@ -1265,6 +1265,23 @@ int selftests_handle_command(const char *cmd)
         return code == 0 ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test nbsock") == 0) {
+        /* The non-blocking socket path (kernel feature that unblocks pip install):
+         * O_NONBLOCK via fcntl, connect -> EINPROGRESS, select for writable +
+         * readable, getsockopt(SO_ERROR), EAGAIN recv. Native (ring 3), HTTP to
+         * example.com:80 so it isolates the non-blocking machinery from TLS. */
+        const char *sp = "/data/apps/nbsock/nbsock.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test nbsock: %s not on image\n", sp); return 1; }
+        char *a[]   = { (char *)sp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(sp, a, 1, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[cmd] test nbsock: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test emlibc net") == 0) {
         /* Proves emlibc's NATIVE networking: emlibc_net (ring 3, linked against
          * libemlibc only -- zero newlib) does an HTTP GET via em_tcp_connect +

@@ -28,6 +28,9 @@ struct process;
 #define O_ACCMODE    0x0003  /* mask for the above three */
 #define O_CREAT      0x0040
 #define O_EXCL       0x0080
+#define O_NONBLOCK   0x0800  /* fd is non-blocking: read/recv return -EAGAIN and
+                              * connect() returns -EINPROGRESS instead of waiting.
+                              * Stored in fd_entry.flags; set via sys_fcntl. */
 #define O_TRUNC      0x0200  /* LIVE: open() shrinks the file to 0 via the
                               * per-fs truncate op (EMBKFS: a real COW
                               * transaction). Needs writable access; a fs
@@ -103,7 +106,22 @@ struct fd_ops {
      * terminal) poll a pipe from its render loop instead of blocking in
      * read(). NULL = not meaningful for this backing (-EMBK_ENOSYS). */
     int64_t (*avail)(struct fd_entry *e);
+
+    /* Readiness for select()/poll: given the caller's interest `events`
+     * (POLL* bits), return the currently-ready subset (plus POLLERR/POLLHUP
+     * unconditionally when they apply). NULL = the backing is always ready for
+     * whatever is asked (a regular file never blocks), which vfs_fd_poll
+     * synthesizes. Used for non-blocking connect (POLLOUT once ESTABLISHED)
+     * and readable/EOF detection on sockets. */
+    int  (*poll)(struct fd_entry *e, int events);
 };
+
+/* select()/poll event bits (subset; match the userland <poll.h> values). */
+#define POLLIN   0x0001
+#define POLLOUT  0x0004
+#define POLLERR  0x0008
+#define POLLHUP  0x0010
+#define POLLNVAL 0x0020
 
 struct fd_entry {
     bool used;
@@ -131,6 +149,9 @@ int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written);
 int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
 int64_t vfs_fd_avail(int fd);   /* bytes readable without blocking; see fd_ops.avail */
+int vfs_fd_poll(int fd, int events);          /* ready POLL* bits for one fd */
+int vfs_fd_get_flags(int fd);                 /* O_ACCMODE | O_NONBLOCK, or -errno */
+int vfs_fd_set_nonblock(int fd, bool on);     /* set/clear O_NONBLOCK; 0 or -errno */
 int vfs_unlink_path(const char *path);   /* rm: split parent + per-fs unlink op */
 int vfs_mkdir_path(const char *path);    /* mkdir: split parent + per-fs mkdir op */
 int vfs_rename_path(const char *old_path, const char *new_path); /* strict: dest must not exist (POSIX replace = libc veneer) */

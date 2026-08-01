@@ -252,10 +252,17 @@ static bool poll_until(struct tcb *t, int want_state_reached) {
     return false;
 }
 
-int net_tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
-    static uint16_t next_port = 40000;
-    static uint32_t next_isn  = 0x1000;
+/* Ephemeral port + ISN sources, shared by the blocking and non-blocking active
+ * opens so the two never hand out the same local port. */
+static uint16_t g_next_port = 40000;
+static uint32_t g_next_isn  = 0x1000;
 
+/* Non-blocking active open: allocate a TCB, send ONE SYN, and return the conn
+ * index in SYN_SENT WITHOUT waiting. The RX kthread advances it to ESTABLISHED
+ * when the SYN-ACK arrives; net_tcp_ready() reports when. -1 = no free TCB.
+ * No retransmit -- fine on SLIRP (which does not drop); a lost SYN surfaces as a
+ * socket that never becomes writable (select times out), the honest outcome. */
+int net_tcp_connect_start(uint32_t dst_ip, uint16_t dst_port) {
     net_lock();
     int idx = -1;
     for (int i = 0; i < TCP_CONNS; i++) if (!tcbs[i].in_use) { idx = i; break; }
@@ -264,22 +271,82 @@ int net_tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     struct tcb *t = &tcbs[idx];
     memset(t, 0, sizeof(*t));
     t->in_use = true;
-    t->local_ip = g_netif.ip;   t->remote_ip = dst_ip;
-    t->local_port = next_port++; t->remote_port = dst_port;
-    next_isn += 0x9E3F;                          /* bump the ISN each connection */
-    t->snd_una = t->snd_nxt = next_isn;
+    t->local_ip = g_netif.ip;    t->remote_ip = dst_ip;
+    t->local_port = g_next_port++; t->remote_port = dst_port;
+    g_next_isn += 0x9E3F;                        /* bump the ISN each connection */
+    t->snd_una = t->snd_nxt = g_next_isn;
     t->state = TCP_SYN_SENT;
+    tcp_seg(t, TCP_SYN, t->snd_una, 0, 0);
+    t->snd_nxt = t->snd_una + 1;                 /* SYN consumes one seq */
+    net_unlock();
+    return idx;
+}
 
+int net_tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
+    int idx = net_tcp_connect_start(dst_ip, dst_port);   /* sends the first SYN */
+    if (idx < 0) return -1;
+
+    net_lock();
+    struct tcb *t = &tcbs[idx];
     int rc = -1;
     for (int r = 0; r < RETRIES; r++) {
-        tcp_seg(t, TCP_SYN, t->snd_una, 0, 0);   /* (re)send SYN at the ISN */
-        t->snd_nxt = t->snd_una + 1;             /* SYN consumes one seq */
         if (poll_until(t, TCP_ESTABLISHED)) { rc = idx; break; }
         if (t->reset) break;
+        if (r + 1 < RETRIES) {                   /* retransmit SYN at the same ISN */
+            tcp_seg(t, TCP_SYN, t->snd_una, 0, 0);
+            t->snd_nxt = t->snd_una + 1;
+        }
     }
     if (rc < 0) t->in_use = false;
     net_unlock();
     return rc;
+}
+
+/* Non-blocking receive: like net_tcp_recv but never waits.
+ *   >0  bytes copied
+ *    0  EOF (peer FIN / reset, no data left)
+ *   -2  would block (connection live but no data buffered yet)
+ *   -1  bad conn */
+int net_tcp_recv_nb(int conn, void *buf, uint32_t cap) {
+    if (conn < 0 || conn >= TCP_CONNS) return -1;
+    net_lock();
+    struct tcb *t = &tcbs[conn];
+    if (!t->in_use) { net_unlock(); return -1; }
+
+    if (t->rx_len == 0) {
+        int r = (t->peer_fin || t->reset || t->state == TCP_CLOSED) ? 0 : -2;
+        net_unlock();
+        return r;
+    }
+    uint32_t k = t->rx_len < cap ? t->rx_len : cap;
+    memcpy(buf, t->rxbuf, k);
+    if (k < t->rx_len) memmove(t->rxbuf, t->rxbuf + k, t->rx_len - k);
+    t->rx_len -= k;
+    net_unlock();
+    return (int)k;
+}
+
+/* Poll readiness WITHOUT waiting -- see net.h. Returns a TCP_RDY_* bitmask, or
+ * -1 for a bad/closed conn. */
+int net_tcp_ready(int conn) {
+    if (conn < 0 || conn >= TCP_CONNS) return -1;
+    net_lock();
+    struct tcb *t = &tcbs[conn];
+    if (!t->in_use) { net_unlock(); return -1; }
+
+    int r = 0;
+    /* Readable: buffered data, or a FIN/reset (recv would return 0/EOF, not block). */
+    if (t->rx_len > 0 || t->peer_fin || t->reset || t->state == TCP_CLOSED)
+        r |= TCP_RDY_READ;
+    /* Writable: established (send never blocks here). */
+    if (t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT)
+        r |= TCP_RDY_WRITE;
+    /* A connect that resolved to reset/closed is reported writable+error so a
+     * caller polling for connect completion wakes and learns the failure. */
+    if (t->reset || t->state == TCP_CLOSED)
+        r |= TCP_RDY_ERR | TCP_RDY_WRITE;
+    net_unlock();
+    return r;
 }
 
 /* Passive open: put a TCB into LISTEN on `port`. Returns the listen conn index

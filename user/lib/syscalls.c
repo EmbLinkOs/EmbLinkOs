@@ -59,6 +59,7 @@
 #include <dirent.h>        /* DIR, struct dirent, DT_* -- our sys/dirent.h override */
 #include <utime.h>         /* struct utimbuf -- our sys/utime.h override */
 #include <sys/wait.h>
+#include <sys/select.h>   /* fd_set, FD_*, FD_SETSIZE -- for select() */
 
 #include "embk_syscall.h"
 
@@ -149,8 +150,10 @@ static int embk_errno_from_kernel(int64_t ret) {
     case 75:  return EOVERFLOW;      /* EMBK_EOVERFLOW    */
     case 84:  return EILSEQ;         /* EMBK_EILSEQ       */
     case 90:  return EMSGSIZE;       /* EMBK_EMSGSIZE     */
+    case 11:  return EAGAIN;         /* EMBK_EAGAIN (== EWOULDBLOCK) */
     case 95:  return ENOTSUP;        /* EMBK_ENOTSUP      */
     case 110: return ETIMEDOUT;      /* EMBK_ETIMEDOUT    */
+    case 115: return EINPROGRESS;    /* EMBK_EINPROGRESS  */
     case 125: return ECANCELED;      /* EMBK_ECANCELED    */
     default:  return (int)(-ret);    /* agreed by shared Unix ancestry */
     }
@@ -751,21 +754,27 @@ mode_t umask(mode_t mask) {
 /* Genuinely absent -- fail rather than pretend                        */
 /* ------------------------------------------------------------------ */
 
-/* fsync/fdatasync: refusing is the SAFE direction. Returning 0 would promise
- * durability we have not verified EMBKFS provides, and a caller told "your data
- * is on disk" cannot detect the lie -- that is precisely how data is lost. If
- * the block layer is ever confirmed to commit synchronously (or a real flush
- * syscall lands), these become 0 / a real flush. */
+/* fsync/fdatasync succeed as a NO-OP -- and that is honest here, not a lie.
+ * fsync's contract is "flush this fd's buffered writes to the device". EmbLinkOS
+ * has NO write-back path to flush: the block layer keeps no dirty-page cache and
+ * issues every write() straight to the device synchronously (grep block.c/ata.c
+ * -- there is no cache/writeback/flush machinery). So by the time write()
+ * returned, the data was already handed down; there is nothing left for fsync to
+ * do, and "your writes are committed" is a TRUE statement about this OS. This is
+ * the [[FD_CLOEXEC]] case from the port notes: a capability that is vacuously
+ * SATISFIED, not missing -- refusing it (the old ENOSYS) broke callers with every
+ * right to expect success (pip's adjacent_tmp_file does flush()+os.fsync() before
+ * an atomic replace). If a write-back cache is ever added, THIS must become a
+ * real device flush the same day, or it turns into the lie the old comment
+ * feared. */
 int fsync(int fd) {
     (void)fd;
-    errno = ENOSYS;
-    return -1;
+    return 0;
 }
 
 int fdatasync(int fd) {
     (void)fd;
-    errno = ENOSYS;
-    return -1;
+    return 0;
 }
 
 /* No dup: the fd table has no duplicate-into-lowest-free operation, and faking
@@ -837,15 +846,24 @@ int fcntl(int fd, int cmd, ...) {
          * "stay open across exec" describe the same (unobservable) reality, so
          * there is nothing to store and nothing that could later disagree. */
         return 0;
-    case F_GETFL:
-        /* True state: read/write, blocking (no O_NONBLOCK on this OS). */
-        return O_RDWR;
+    case F_GETFL: {
+        /* Access mode is always read/write here; report O_NONBLOCK truthfully
+         * from the kernel fd flag (sockets can now be non-blocking). sys_fcntl
+         * cmd 1 = get non-blocking. */
+        int nb = (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
+        return O_RDWR | ((nb > 0) ? O_NONBLOCK : 0);
+    }
     case F_SETFL: {
         va_list ap; va_start(ap, cmd);
         int flags = va_arg(ap, int);
         va_end(ap);
-        if (flags & O_NONBLOCK) { errno = ENOSYS; return -1; }  /* can't honor -- no false success */
-        return 0;                                               /* asserting blocking: already so */
+        /* Honor O_NONBLOCK for real now: the kernel supports non-blocking
+         * sockets (connect -> EINPROGRESS, recv -> EAGAIN, select for readiness).
+         * For a non-socket fd the flag is stored but every op stays blocking,
+         * which is correct -- files never block. sys_fcntl cmd 2 = set it. */
+        int64_t r = embk_syscall3(EMBK_SYS_fcntl, fd, 2, (flags & O_NONBLOCK) ? 1 : 0);
+        if (embk_is_err(r)) return embk_fail(r);
+        return 0;
     }
     default:
         errno = ENOSYS;
@@ -894,11 +912,66 @@ int pause(void) {
 /* No poll/select machinery: fds have no readiness notification, only blocking
  * reads. Returning 0 ("nothing ready, timed out") would turn every select loop
  * into a silent spin. */
+/* select() over the kernel's per-fd readiness query (sys_fd_poll). CPython's
+ * socket timeout mode calls this to wait for a non-blocking connect to complete
+ * (writable) or for data (readable). We poll each interested fd and, if none is
+ * ready, sleep briefly and retry until the timeout -- the sleep is what lets the
+ * RX kthread advance a connecting socket to ESTABLISHED. Not a scalable event
+ * loop, but exactly what a blocking-with-timeout socket needs. */
 int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
            struct timeval *timeout) {
-    (void)nfds; (void)readfds; (void)writefds; (void)exceptfds; (void)timeout;
-    errno = ENOSYS;
-    return -1;
+    if (nfds < 0 || nfds > FD_SETSIZE) { errno = EINVAL; return -1; }
+
+    long timeout_ms = -1;                     /* -1 => wait indefinitely */
+    if (timeout)
+        timeout_ms = timeout->tv_sec * 1000L + timeout->tv_usec / 1000L;
+
+    /* POLL* bits (match kernel/fs/fd.h + embk.h EMBK_POLL*). Spelled literally
+     * here because embk.h is included further down this file. */
+    enum { P_IN = 0x0001, P_OUT = 0x0004, P_ERR = 0x0008 };
+
+    long elapsed = 0;
+    for (;;) {
+        fd_set r_out, w_out, e_out;
+        FD_ZERO(&r_out); FD_ZERO(&w_out); FD_ZERO(&e_out);
+        int nready = 0;
+
+        for (int fd = 0; fd < nfds; fd++) {
+            int want = 0;
+            if (readfds   && FD_ISSET(fd, readfds))   want |= P_IN;
+            if (writefds  && FD_ISSET(fd, writefds))  want |= P_OUT;
+            if (exceptfds && FD_ISSET(fd, exceptfds)) want |= P_ERR;
+            if (!want) continue;
+
+            int re = (int)embk_syscall2(EMBK_SYS_fd_poll, fd, want | P_ERR);  /* always learn errors */
+            if (re < 0) continue;
+
+            if (readfds  && (re & P_IN))  { FD_SET(fd, &r_out); nready++; }
+            /* An error makes a connecting socket "writable-ready" so the caller
+             * wakes and discovers it via getsockopt(SO_ERROR). */
+            if (writefds && (re & (P_OUT | P_ERR))) { FD_SET(fd, &w_out); nready++; }
+            if (exceptfds && (re & P_ERR)) { FD_SET(fd, &e_out); nready++; }
+        }
+
+        if (nready > 0) {
+            if (readfds)   *readfds   = r_out;
+            if (writefds)  *writefds  = w_out;
+            if (exceptfds) *exceptfds = e_out;
+            return nready;
+        }
+        if (timeout_ms == 0) break;                       /* pure poll, no wait */
+        if (timeout_ms > 0 && elapsed >= timeout_ms) break;
+
+        long step = 10;                                   /* 10 ms granularity */
+        if (timeout_ms > 0 && timeout_ms - elapsed < step) step = timeout_ms - elapsed;
+        embk_syscall1(EMBK_SYS_sleep_ms, step);           /* yields; RX thread runs */
+        elapsed += step;
+    }
+
+    if (readfds)   FD_ZERO(readfds);                      /* timed out: nothing ready */
+    if (writefds)  FD_ZERO(writefds);
+    if (exceptfds) FD_ZERO(exceptfds);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1428,8 +1501,17 @@ int setsockopt(int fd, int level, int optname, const void *optval, socklen_t opt
     (void)fd; (void)level; (void)optname; (void)optval; (void)optlen; return 0;
 }
 int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) {
-    (void)fd; (void)level; (void)optname;
-    if (optval && optlen && *optlen >= sizeof(int)) { *(int *)optval = 0; *optlen = sizeof(int); }
+    (void)level;
+    if (optval && optlen && *optlen >= sizeof(int)) {
+        int val = 0;
+        /* SO_ERROR: how a caller reaps a non-blocking connect() -- 0 if it
+         * completed, an errno if it failed. Derived from the fd's poll error
+         * bit (net_tcp_ready reports reset/closed as POLLERR). */
+        if (optname == SO_ERROR && embk_fd_poll(fd, EMBK_POLLERR) & EMBK_POLLERR)
+            val = ECONNREFUSED;
+        *(int *)optval = val;
+        *optlen = sizeof(int);
+    }
     return 0;
 }
 int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {

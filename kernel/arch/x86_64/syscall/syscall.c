@@ -320,6 +320,34 @@ static int64_t sys_fd_avail(struct regs *r) {
     return vfs_fd_avail(fd);
 }
 
+/* fcntl(fd, cmd, arg) -- the sliver of POSIX fcntl the kernel actually owns:
+ * the O_NONBLOCK fd flag. cmd 1 = get (returns 1 if non-blocking, else 0);
+ * cmd 2 = set non-blocking to `arg`. Everything else about fcntl (F_GETFD,
+ * F_DUPFD, ...) stays a libc concern. */
+static int64_t sys_fcntl(struct regs *r) {
+    int fd  = (int)r->rdi;
+    int cmd = (int)r->rsi;
+    int arg = (int)r->rdx;
+    switch (cmd) {
+    case 1: {
+        int fl = vfs_fd_get_flags(fd);
+        if (fl < 0) return fl;
+        return (fl & O_NONBLOCK) ? 1 : 0;
+    }
+    case 2:
+        return vfs_fd_set_nonblock(fd, arg != 0);
+    default:
+        return -EMBK_EINVAL;
+    }
+}
+
+/* fd_poll(fd, events) -> ready POLL* bits (or POLLNVAL for a bad fd). One fd at
+ * a time; the libc select() loops over the fd_set calling this. What lets a
+ * non-blocking socket report connect-completion (POLLOUT) and readability. */
+static int64_t sys_fd_poll(struct regs *r) {
+    return vfs_fd_poll((int)r->rdi, (int)r->rsi);
+}
+
 /* unlink(path) -> 0 or -errno. The shell's `rm`. */
 static int64_t sys_unlink(struct regs *r) {
     char path[SYSCALL_PATH_MAX];
@@ -1696,6 +1724,8 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_net_accept     81
 #define SYS_net_sendto     82
 #define SYS_net_recvfrom   83
+#define SYS_fcntl          84
+#define SYS_fd_poll        85
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1775,6 +1805,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_net_accept]     = sys_net_accept,
     [SYS_net_sendto]     = sys_net_sendto,
     [SYS_net_recvfrom]   = sys_net_recvfrom,
+    [SYS_fcntl]          = sys_fcntl,
+    [SYS_fd_poll]        = sys_fd_poll,
     [SYS_debug_attach]   = sys_debug_attach,
     [SYS_debug_wait]     = sys_debug_wait,
     [SYS_debug_cont]     = sys_debug_cont,

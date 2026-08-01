@@ -21,6 +21,24 @@ import sys
 import tempfile
 import zipfile
 
+# In-place source patches applied to wheel members before compile, keyed by the
+# path inside the wheel. Each value is a list of (old, new) exact substrings;
+# every one MUST match or the build aborts (no silent skips).
+PATCHES = {
+    # truststore uses the OS-native trust store via a memory-BIO SSLObject --
+    # neither of which EmbLinkOS has (our TLS is _embtls verifying against
+    # embedded roots). Force `import truststore` to raise ImportError so pip
+    # takes its own documented fallback ("platform isn't supported") to the
+    # standard certifi + ssl.create_default_context path, which our ssl.py shim
+    # serves (proven by `test python https`).
+    "pip/_vendor/truststore/__init__.py": [
+        ('import sys as _sys\n',
+         'import sys as _sys\n'
+         'raise ImportError("truststore unsupported on EmbLinkOS: no memory-BIO '
+         'SSL / native trust store; _embtls verifies vs embedded roots")\n'),
+    ],
+}
+
 
 def main() -> int:
     if len(sys.argv) != 3:
@@ -47,6 +65,17 @@ def main() -> int:
                 continue
             data = src.read(name)
             if name.endswith(".py"):
+                patches = PATCHES.get(name)
+                if patches:
+                    text = data.decode("utf-8")
+                    for old, new in patches:
+                        if old not in text:
+                            print(f"mkpip: patch for {name} did not match "
+                                  f"(wheel changed?):\n  {old[:60]}...",
+                                  file=sys.stderr)
+                            return 1
+                        text = text.replace(old, new)
+                    data = text.encode("utf-8")
                 # Precompile to an adjacent <mod>.pyc (the legacy layout
                 # zipimport expects), UNCHECKED_HASH so it loads without the
                 # absent source -- identical recipe to mkpystdlib.py.

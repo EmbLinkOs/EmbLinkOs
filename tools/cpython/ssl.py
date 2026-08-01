@@ -159,9 +159,10 @@ class SSLSocket:
     """A TLS-wrapped socket. Owns the underlying fd (handed to _embtls at
     wrap_socket time); the plaintext socket has been detached and is dead."""
 
-    def __init__(self, conn, server_hostname):
+    def __init__(self, conn, server_hostname, fd=-1):
         self._conn = conn                 # opaque _embtls capsule
         self.server_hostname = server_hostname
+        self._fd = fd                     # the still-open TCP fd libtls rides on
         self._closed = False
 
     # -- byte I/O -------------------------------------------------------------
@@ -211,11 +212,14 @@ class SSLSocket:
     def close(self):
         if not self._closed:
             self._closed = True
-            _embtls.close(self._conn)
+            _embtls.close(self._conn)     # closes the underlying fd too
+            self._fd = -1
 
     def detach(self):
         self._closed = True
-        return -1
+        fd = self._fd
+        self._fd = -1
+        return fd
 
     def settimeout(self, value):
         pass                              # blocking-only; see cpython-port memory
@@ -230,11 +234,27 @@ class SSLSocket:
         pass
 
     def fileno(self):
-        return -1                         # the fd now lives inside _embtls
+        # The TCP fd is still open (libtls reads/writes TLS records over it), so
+        # it's a real, pollable descriptor -- urllib3's connection-reuse check
+        # select()s on it. -1 only once closed.
+        return self._fd
 
     def getpeercert(self, binary_form=False):
-        # libtls verified the peer but does not surface the parsed cert yet.
-        return None
+        # libtls verified the peer's certificate chain AND that it matches
+        # server_hostname during the handshake (it refuses otherwise). It does
+        # not surface the raw DER, so binary_form has nothing to return. For the
+        # dict form, report the VERIFIED name in the shape ssl/urllib3 expect, so
+        # their (redundant) hostname re-check sees a valid, matching cert. This
+        # asserts only what libtls already proved: this peer's cert is valid for
+        # server_hostname.
+        if binary_form:
+            return None
+        if not self.server_hostname:
+            return {}
+        return {
+            "subject": ((("commonName", self.server_hostname),),),
+            "subjectAltName": (("DNS", self.server_hostname),),
+        }
 
     def version(self):
         return "TLSv1.3"
@@ -262,6 +282,7 @@ class SSLContext:
         self.verify_mode = CERT_REQUIRED  # and always requires a trusted cert
         self.post_handshake_auth = None   # http.client checks `is not None`
         self.options = 0
+        self.verify_flags = 0             # urllib3 does `ctx.verify_flags |= ...`
         self.minimum_version = TLSVersion.TLSv1_3
         self.maximum_version = TLSVersion.TLSv1_3
         self._alpn = []
@@ -288,12 +309,20 @@ class SSLContext:
     def wrap_socket(self, sock, server_hostname=None, do_handshake_on_connect=True,
                     suppress_ragged_eofs=True, session=None):
         host = server_hostname or ""
+        # libtls does blocking record I/O internally, so the fd must be blocking
+        # for the handshake -- a caller (urllib3) that set a timeout left it
+        # non-blocking, which would make libtls' reads return EAGAIN mid-flight.
+        # The TCP connect is already complete here; clear O_NONBLOCK first.
+        try:
+            sock.setblocking(True)
+        except OSError:
+            pass
         fd = sock.detach()                # transfer fd ownership to _embtls
         try:
             conn = _embtls.connect(fd, host)
         except OSError as e:
             raise SSLError(str(e)) from e
-        return SSLSocket(conn, server_hostname)
+        return SSLSocket(conn, server_hostname, fd)
 
     def wrap_bio(self, *a, **k):
         raise NotImplementedError("memory BIO not supported on EmbLinkOS")

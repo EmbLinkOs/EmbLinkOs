@@ -109,6 +109,8 @@
 #define EMBK_SYS_net_accept     81
 #define EMBK_SYS_net_sendto     82
 #define EMBK_SYS_net_recvfrom   83
+#define EMBK_SYS_fcntl          84   /* cmd 1 = get O_NONBLOCK, 2 = set it */
+#define EMBK_SYS_fd_poll        85   /* (fd, events) -> ready POLL* bits */
 
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back

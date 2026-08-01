@@ -153,10 +153,13 @@ fi
 # getuid/geteuid/getppid: platformdirs (pip's dir resolver) does
 # `from os import getuid` at import; ours return 0 (single-user OS). umask: our
 # libc has it. All real calls, not stubs.
-for m in HAVE_READLINK HAVE_GETUID HAVE_GETEUID HAVE_GETPPID HAVE_UMASK; do
+# HAVE_CHMOD: without it os.chmod does `errno = ENOSYS` instead of calling the
+# libc chmod() (which is real -- EMBKFS inodes carry a mode). pip's wheel install
+# chmods every file it writes, so this is on the install path.
+for m in HAVE_READLINK HAVE_GETUID HAVE_GETEUID HAVE_GETPPID HAVE_UMASK HAVE_CHMOD; do
     sed -i "s|/\* #undef $m \*/|#define $m 1|" "$PYCONF"
 done
-echo "  OSFN     pyconfig.h os-function macros (readlink/getuid/geteuid/getppid/umask) asserted"
+echo "  OSFN     pyconfig.h os-function macros (readlink/getuid/geteuid/getppid/umask/chmod) asserted"
 
 echo
 echo "=== configure OK: MACHDEP=$(grep -E '^MACHDEP=' Makefile | head -1) ==="
