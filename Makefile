@@ -565,6 +565,34 @@ GITPUSH_OBJS := build/gitpush.o build/githttp.o build/pktline.o build/git_pack.o
 build/gitpush.elf: build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
 
+# pkg -- the package manager (docs/PACKAGING_AND_SDK.md, PK1). Verifies an EMBX's
+# build_id (SHA-256 via tls_sha256.o; -Ikernel for crypto/sha256.h) against its
+# manifest, then adopts the bundle into /data/apps and can run it under exactly
+# its declared caps + namespace. user/pkg/ = the manifest + EMBX-reader modules.
+build/pkg_manifest.o: user/pkg/manifest.c user/pkg/manifest.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -c $< -o $@
+build/pkg_embxinfo.o: user/pkg/embxinfo.c user/pkg/embxinfo.h user/pkg/manifest.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
+build/pkg.o: user/bin/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -c $< -o $@
+PKG_OBJS := build/pkg.o build/pkg_manifest.o build/pkg_embxinfo.o build/tls_sha256.o
+build/pkg.elf: build/crt0.o build/syscalls.o $(PKG_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(PKG_OBJS) -lc -lgcc -o $@
+
+# pkgprobe -- the PK1 confinement test app, bundled as an EMBX + a manifest that
+# grants {filesystem} + ro /system + rw /data/apps/pkgprobe. mkembx repackages
+# the ELF into an EMBX; mkpkg derives the manifest from that EMBX (build_id/caps
+# consistent by construction). The bundle is STAGED (mkfs), pkg adopts it live.
+build/pkgprobe.o: user/bin/pkgprobe.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
+build/pkgprobe.elf: build/crt0.o build/syscalls.o build/pkgprobe.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/pkgprobe.o -lc -lgcc -o $@
+build/pkgprobe.embx: build/pkgprobe.elf tools/embx/mkembx.py | $(BUILD)
+	python3 tools/embx/mkembx.py build/pkgprobe.elf $@ --cap FILESYSTEM
+build/pkgprobe.pkg: build/pkgprobe.embx tools/embx/mkpkg.py | $(BUILD)
+	python3 tools/embx/mkpkg.py build/pkgprobe.embx $@ --name pkgprobe --version 1.0.0 \
+	    --ns "ro /system" --ns "rw /data/apps/pkgprobe"
+
 # pkgfetch -- native PyPI installer for pure-Python wheels (libtls fetch + our
 # own inflate + zip reader). Auto-packed as /data/apps/pkgfetch/pkgfetch.elf.
 build/pkg_inflate.o: user/lib/inflate.c user/lib/inflate.h | $(BUILD)
@@ -910,7 +938,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1085,7 +1113,7 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf build/gitpush.elf \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
-               build/embbuild.elf \
+               build/embbuild.elf build/pkg.elf build/pkgprobe.embx build/pkgprobe.pkg \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
 
 # STAGED_APPS: binaries built OUTSIDE this tree and dropped into build/ to be

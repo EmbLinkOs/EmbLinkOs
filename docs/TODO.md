@@ -1360,13 +1360,27 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
 
 ### Packaging & SDK (designed, not built — `docs/PACKAGING_AND_SDK.md`)
 
-- [ ] **PK1** — the package manifest format + local `pkg install` (verify → present
-  declared authority → snapshot → adopt into `/data/apps/<name>/` with exactly its
-  `.ns`). Reuses everything through UP4.
+- [x] ~~**PK1** — the package manifest format + local `pkg install`.~~ **DONE,
+  metal-proven (`test pkg`).** Manifest (§3) parser + EMBX reader/`build_id`
+  verifier in `user/pkg/`; `pkg verify|install|run|list` (`user/bin/pkg.c`).
+  `install` recomputes the EMBX `build_id` (SHA-256 with `build_id`+`header_checksum`
+  zeroed) and matches it to the header *and* the manifest, cross-checks the
+  manifest `caps:` against the EMBX cap table + `abi`, presents the declared
+  authority, and adopts the bundle into `/data/apps/<name>/` writing the `.ns` home
+  enforces + a `/data/pkg/registry` entry. `pkg run` spawns an installed app under
+  EXACTLY its declared caps (SET_CAPS) + namespace (NS_BIND) — `pkgprobe` self-checks
+  it holds only `filesystem`, reaches `/system`, and cannot name `/data/users`; a
+  tampered bundle (build_id fails to recompute) is refused. Bundle+manifest built by
+  `tools/embx/mkembx.py` + `tools/embx/mkpkg.py` (manifest derived from the EMBX, so
+  caps/build_id are consistent by construction). **Scope honestly deferred:** direct
+  copy, no atomic snapshot/rollback (no userspace EMBKFS snapshot API yet → PK3); no
+  signing (PK3); no network (PK4). The manifest is PK1's source of truth until PK2
+  makes `build.ebm` the source.
 - [ ] **PK2** — the SDK generator: one `build.ebm` package stanza → EMBX caps +
-  `.ns` + package manifest, consistent by construction.
+  `.ns` + package manifest, consistent by construction. (`mkpkg.py` is the seed:
+  it already derives the manifest from a built EMBX.)
 - [ ] **PK3** — signing (ed25519 over `build_id`) + snapshot-backed update/rollback +
-  the local registry.
+  the local registry (a `/data/pkg/registry` skeleton exists).
 - [ ] **PK4** — the git registry (`emblink-packages`): signed manifests in git,
   binaries as release assets; fetch over HTTP (mirror pre-TLS, direct once TLS
   lands). Rides the net stack.

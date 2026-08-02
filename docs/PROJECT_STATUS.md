@@ -914,6 +914,35 @@ emlibc/newlib + EMBX/ELF split:
   `sockaddr`. Witness `test emlibc net` (an HTTP GET linked against libemlibc
   only, zero newlib). This is what native EmbLink apps use.
 
+### Phase 29 — Packaging: authority-declaring bundles (PK1) ✅
+
+A **package** is a self-contained, authority-declaring bundle; **installing is
+granting authority the kernel then enforces** — and the app physically cannot
+exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
+
+- **The manifest (§3)** — a human-readable `<name>.pkg` (`name/version/abi/
+  build_id/caps/namespace/provides`) that *mirrors* an app's declared authority
+  (its EMBX cap table + its UP4 `.ns`). It is a **view, not a second source of
+  truth**: `pkg` cross-checks it against the real binary so it cannot drift.
+- **`pkg`** (`user/bin/pkg.c` + `user/pkg/`): `verify` recomputes the EMBX
+  `build_id` (SHA-256 with `build_id`+`header_checksum` zeroed, EMBX §3.4 — the
+  kernel loader checks CRCs but not this) and matches it to the header *and* the
+  manifest, cross-checks the manifest `caps:` against the cap table + `abi`.
+  `install` then presents the declared authority plainly (*"…nothing else — what
+  it did not declare, it cannot get"*) and adopts the bundle into
+  `/data/apps/<name>/`, writing the `.ns` home enforces + a `/data/pkg/registry`
+  entry. `run` spawns an installed app under EXACTLY its declared caps (SET_CAPS)
+  + namespace (NS_BIND).
+- **Proven** (`test pkg`, metal): a staged `pkgprobe` bundle installs; run under
+  its grant it holds only `filesystem`, reaches `/system`, and **cannot name**
+  `/data/users` — the confinement is kernel-enforced, not installer-promised; and
+  a tampered bundle whose `build_id` fails to recompute is refused. The bundle +
+  manifest are produced by `tools/embx/mkembx.py` + `tools/embx/mkpkg.py`
+  (manifest derived from the EMBX → consistent by construction).
+- *Deferred (PK2–PK4):* the SDK generator (`build.ebm` → all three views), signing
+  + atomic snapshot update/rollback (no userspace snapshot API yet), the git
+  registry. No dependency graph, ever (the only "dependency" is the `abi` integer).
+
 ---
 
 ## Major To-Do Buckets (Rough Priority)

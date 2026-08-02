@@ -2,8 +2,19 @@
 
 *Design record. Builds directly on [USERSPACE_v2.md](USERSPACE_v2.md) (authority
 IS the namespace), [EMBX](own-exe-format) (the capability-declaring executable),
-and EmbBuild. Nothing here is built yet — this is the shape, decided before code,
-the same way the userspace was.*
+and EmbBuild.*
+
+> **Status: PK1 SHIPPED + metal-proven** (§11). The manifest format (§3),
+> `user/pkg/` (manifest parser + EMBX reader/`build_id` verifier), and `pkg`
+> (`verify`/`install`/`run`/`list`) are live. `test pkg`: installs a staged
+> bundle (recomputes the EMBX `build_id`, cross-checks caps/abi against the
+> manifest, presents the declared authority, adopts into `/data/apps/<name>/`
+> writing the `.ns` home enforces), then `pkg run` spawns it under EXACTLY its
+> declared caps (SET_CAPS) + namespace (NS_BIND) — the installed app holds only
+> `filesystem`, reaches `/system`, and CANNOT name `/data/users` — and a
+> tampered bundle whose `build_id` no longer recomputes is refused. PK2–PK4
+> (SDK generator, signing/update/rollback, git registry) remain. The rest of
+> this doc is the shape decided before code, the same way the userspace was.*
 
 ## 0. Thesis
 

@@ -1492,6 +1492,41 @@ int selftests_handle_command(const char *cmd)
         return pass ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test pkg") == 0) {
+        /* Packaging PK1 (docs/PACKAGING_AND_SDK.md): install an authority-declaring
+         * bundle and prove the grant is KERNEL-ENFORCED, not installer-promised.
+         *   1. pkg install /data/staging/pkgprobe -- verify (recompute the EMBX
+         *      build_id, cross-check caps/abi vs the manifest), present the
+         *      declared authority, adopt into /data/apps/pkgprobe.
+         *   2. pkg run pkgprobe -- spawn it under EXACTLY the declared caps
+         *      (SET_CAPS) + namespace (NS_BIND); pkgprobe self-checks that it holds
+         *      filesystem (not network) and can name /system but NOT /data/users.
+         *   3. pkg verify /data/staging/pkgprobe_bad -- a tampered EMBX whose
+         *      build_id no longer recomputes: MUST be refused (non-zero). */
+        const char *sp = "/data/apps/pkg/pkg.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test pkg: %s not on image\n", sp); return 1; }
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        char *a1[] = { (char *)sp, (char *)"install", (char *)"/data/staging/pkgprobe", NULL };
+        int c1 = process_wait((uint32_t)process_create_caps(sp, a1, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 1 install pkgprobe = %s\n", c1 == 0 ? "OK" : "FAIL");
+
+        char *a2[] = { (char *)sp, (char *)"run", (char *)"pkgprobe", NULL };
+        int c2 = process_wait((uint32_t)process_create_caps(sp, a2, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 2 run pkgprobe (confined to its grant) = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        char *a3[] = { (char *)sp, (char *)"verify", (char *)"/data/staging/pkgprobe_bad", NULL };
+        int c3 = process_wait((uint32_t)process_create_caps(sp, a3, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 3 verify tampered bundle -> %s (correctly refused=%d)\n",
+                c3 != 0 ? "REJECTED" : "ACCEPTED", c3 != 0);
+
+        int pass = (c1 == 0 && c2 == 0 && c3 != 0);
+        kprintf("[cmd] test pkg: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test emlibc net") == 0) {
         /* Proves emlibc's NATIVE networking: emlibc_net (ring 3, linked against
          * libemlibc only -- zero newlib) does an HTTP GET via em_tcp_connect +

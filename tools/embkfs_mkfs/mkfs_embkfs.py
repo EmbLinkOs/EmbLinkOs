@@ -726,10 +726,13 @@ def discover_userland_objects(build_dir="build"):
         raise SystemExit(f"mkfs: {build_dir}/init.elf not found -- run `make` first")
     objects = [(_elf_dest("init.elf"), L.DT_REG, L.S_IFREG | 0o755, init)]
     objects.extend(FIXTURE_OBJECTS)                           # format fixtures, at root
+    # Some ELFs are intermediates that ship in another form (e.g. pkgprobe is
+    # repackaged into an EMBX bundle under /data/staging, not auto-adopted).
+    NOT_AUTO_STAGED = {"pkgprobe.elf"}
     for elf in sorted(glob.glob(f"{build_dir}/*.elf")):       # sorted -> deterministic image
         name = os.path.basename(elf)
-        if name == "init.elf":
-            continue                                          # already added first
+        if name == "init.elf" or name in NOT_AUTO_STAGED:
+            continue                                          # already added / staged elsewhere
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
         # Per-app NAMESPACE MANIFEST (docs/USERSPACE_v2.md UP4): an app ships its
         # declared namespace as user/bin/<name>.ns, packed beside its .elf as
@@ -753,6 +756,19 @@ def discover_userland_objects(build_dir="build"):
     if gp_url:
         objects.append((b"data/gitpush/url", L.DT_REG, L.S_IFREG | L.PERM_FILE,
                         gp_url.strip().encode() + b"\n"))
+
+    # PK1 pkgprobe STAGING bundles (docs/PACKAGING_AND_SDK.md): staged, NOT yet
+    # adopted -- `test pkg` runs `pkg install` on them live. Two bundles prove the
+    # two outcomes: a good one (installs + runs confined) and a tampered one
+    # (a flipped payload byte -> build_id no longer recomputes -> pkg refuses).
+    probe_embx = _read_file(f"{build_dir}/pkgprobe.embx")
+    probe_pkg  = _read_file(f"{build_dir}/pkgprobe.pkg")
+    if probe_embx is not None and probe_pkg is not None:
+        objects.append((b"data/staging/pkgprobe/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, probe_embx))
+        objects.append((b"data/staging/pkgprobe/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, probe_pkg))
+        bad = bytearray(probe_embx); bad[-1] ^= 0xFF          # corrupt one payload byte
+        objects.append((b"data/staging/pkgprobe_bad/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, bytes(bad)))
+        objects.append((b"data/staging/pkgprobe_bad/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, probe_pkg))
 
     # The kernel's own .embdbg (EMBDBG_Specification.md §7): a LINE+FUNCS sidecar
     # the kernel loads at boot so isr_handler symbolizes a panic to func:line.
