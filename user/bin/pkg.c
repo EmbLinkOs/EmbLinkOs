@@ -97,11 +97,15 @@ static int verify_sig(const uint8_t *text, size_t len, const uint8_t sig[64]) {
                         hash, 32, sig, 32, sig + 32, 32);
 }
 
-/* Cross-check the manifest against the EMBX + its signature. 0 = ok. */
-static int cross_check(const struct pkg_manifest *m, const struct embx_info *ei, int sig_ok) {
+/* Cross-check the manifest against the EMBX + its signature. `local` allows an
+ * UNSIGNED on-device dev build (installed with --local); a present signature is
+ * still required to be valid, and everything else is checked as normal. 0 = ok. */
+static int cross_check(const struct pkg_manifest *m, const struct embx_info *ei, int sig_ok, int local) {
     int ok = 1;
-    if (!m->have_sig) { printf("  x signature: MISSING -- packages must be signed\n"); ok = 0; }
-    else if (!sig_ok) { printf("  x signature: INVALID -- not signed by the trusted key (or the manifest was altered)\n"); ok = 0; }
+    if (!m->have_sig) {
+        if (local) printf("  signature: none (local build, --local)\n");
+        else { printf("  x signature: MISSING -- packages must be signed (or install with --local)\n"); ok = 0; }
+    } else if (!sig_ok) { printf("  x signature: INVALID -- not signed by the trusted key (or the manifest was altered)\n"); ok = 0; }
     if (!ei->build_id_ok) { printf("  x build_id does not recompute -- binary is corrupt\n"); ok = 0; }
     else if (memcmp(m->build_id, ei->build_id, 32) != 0) {
         printf("  x build_id: the manifest describes a different binary\n"); ok = 0; }
@@ -153,8 +157,8 @@ static int cmd_verify(const char *dir) {
     struct pkg_manifest m; struct embx_info ei; char binpath[1024]; int sig_ok;
     if (load_bundle(dir, &m, &ei, binpath, sizeof binpath, &sig_ok) != 0) return 1;
     printf("PKG verify %s %s (abi %u):\n", m.name, m.version, m.abi);
-    int rc = cross_check(&m, &ei, sig_ok);
-    if (rc == 0) printf("  signature: valid (trusted build key)\n");
+    int rc = cross_check(&m, &ei, sig_ok, 0);
+    if (rc == 0 && m.have_sig) printf("  signature: valid (trusted build key)\n");
     printf("PKG verify: %s\n", rc == 0 ? "OK" : "REJECTED");
     return rc == 0 ? 0 : 1;
 }
@@ -249,13 +253,13 @@ static int retain_current(const char *name, const struct pkg_manifest *old) {
     return 0;
 }
 
-static int cmd_install(const char *dir, int allow_widen) {
+static int cmd_install(const char *dir, int allow_widen, int local) {
     struct pkg_manifest m; struct embx_info ei; char binpath[1024]; int sig_ok;
     if (load_bundle(dir, &m, &ei, binpath, sizeof binpath, &sig_ok) != 0) return 1;
 
-    printf("PKG install %s %s (abi %u)\n", m.name, m.version, m.abi);
-    if (cross_check(&m, &ei, sig_ok) != 0) { printf("PKG install: REJECTED (unsigned / altered / does not match the binary)\n"); return 1; }
-    printf("  signature: valid (trusted build key)\n");
+    printf("PKG install %s %s (abi %u)%s\n", m.name, m.version, m.abi, local ? " [local]" : "");
+    if (cross_check(&m, &ei, sig_ok, local) != 0) { printf("PKG install: REJECTED (unsigned / altered / does not match the binary)\n"); return 1; }
+    if (m.have_sig) printf("  signature: valid (trusted build key)\n");
 
     /* Update-aware: if already installed, re-negotiate authority before adopting.
      * A version that declares MORE than the installed one must be consented to. */
@@ -375,13 +379,14 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "verify")   && argc >= 3) return cmd_verify(argv[2]);
     if (!strcmp(argv[1], "install")  && argc >= 3) {
-        int allow = 0; const char *dir = NULL;
+        int allow = 0, local = 0; const char *dir = NULL;
         for (int i = 2; i < argc; i++) {
-            if (!strcmp(argv[i], "--allow-widen")) allow = 1;
+            if      (!strcmp(argv[i], "--allow-widen")) allow = 1;
+            else if (!strcmp(argv[i], "--local"))       local = 1;
             else dir = argv[i];
         }
         if (!dir) { fprintf(stderr, "pkg install: need a bundle dir\n"); return 2; }
-        return cmd_install(dir, allow);
+        return cmd_install(dir, allow, local);
     }
     if (!strcmp(argv[1], "run")      && argc >= 3) return cmd_run(argv[2], argc - 3, argv + 3);
     if (!strcmp(argv[1], "rollback") && argc >= 3) return cmd_rollback(argv[2]);

@@ -779,6 +779,14 @@ def discover_userland_objects(build_dir="build"):
         badsig = b"\n".join(lines)
         objects.append((b"data/staging/pkgprobe_badsig/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, probe_embx))
         objects.append((b"data/staging/pkgprobe_badsig/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, badsig))
+    # PK2b: the SOURCE for an ON-DEVICE build -- a linked ELF + its .pkgspec.
+    # `test pkgbuild` runs pkgbuild here to generate a bundle on the OS itself.
+    probe_elf  = _read_file(f"{build_dir}/pkgprobe.elf")
+    probe_spec = _read_file("user/pkg/pkgprobe.pkgspec")
+    if probe_elf is not None and probe_spec is not None:
+        objects.append((b"data/staging/build/pkgprobe.elf", L.DT_REG, L.S_IFREG | 0o755, probe_elf))
+        objects.append((b"data/staging/build/pkgprobe.pkgspec", L.DT_REG, L.S_IFREG | L.PERM_FILE, probe_spec))
+
     # PK3 update/rollback: a benign v1.1 (same authority) and a WIDER v2 (adds
     # `network`) -- the latter must be refused as a silent privilege escalation.
     for tag, sub in (("pkgprobe_v11", "pk_v11"), ("pkgprobe_wide", "pk_wide")):

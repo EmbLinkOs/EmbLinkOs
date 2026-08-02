@@ -1385,10 +1385,19 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
   no way to build a bundle whose declared authority disagrees with itself (§4).
   `pkgprobe`'s authority is now declared once in `user/pkg/pkgprobe.pkgspec`
   (was scattered across `mkembx --cap` + `mkpkg --ns` flags); `test pkg` runs
-  green on the pkggen-produced bundle. **Remaining (PK2b):** the on-device half —
-  drive pkggen (or EmbLD directly) from an EmbBuild `build.ebm` `package:` stanza,
-  so an app declares its authority as part of building ON THE OS (needs on-OS
-  linking of a newlib app first).
+  green on the pkggen-produced bundle.
+- [x] ~~**PK2b** — on-device package generation.~~ **DONE, metal-proven
+  (`test pkgbuild`).** `user/pkg/embxgen.c` is a C EMBX writer (repackage a linked
+  ELF → EMBX with a cap table) — a faithful port of `mkembx.py`, host-verified
+  BYTE-IDENTICAL, so the build_id matches. `user/bin/pkgbuild.c` reads ONE
+  `.pkgspec` + an ELF and emits all three views (EMBX/`.ns`/manifest) ON THE OS.
+  On-device builds are unsigned, so `pkg install --local` adopts a dev build (a
+  present signature is still verified; caps/build_id/re-negotiation still apply).
+  `test pkgbuild`: pkgbuild generates pkgprobe's bundle from the staged
+  `.pkgspec` + ELF → `pkg install --local` → `pkg run` confined — the whole
+  SDK→pkgmgr loop on the metal. A `build.ebm` drives it as a normal step running
+  `pkgbuild`; a structured EmbBuild `package:` stanza (embbuild.c fields) is
+  optional polish.
 - [x] ~~**PK3** — signing + update/rollback + registry.~~ **DONE, metal-proven
   (`test pkg`, 8 checks).**
   - **Signing**: `tools/embx/pkgsign.py` signs each manifest (ECDSA P-256 over the

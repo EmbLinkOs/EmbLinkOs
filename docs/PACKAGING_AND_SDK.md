@@ -31,9 +31,17 @@ and EmbBuild.*
 > rollback/remove/info` round it out. `test pkg` (8 checks, metal) proves
 > tampered-binary + altered-signature rejection, update, rollback, refused
 > widening, and consented widening. *Remaining:* an EMBKFS-snapshot-backed
-> variant of update (a future optimization once a snapshot syscall exists); PK4
-> the git registry; and PK2b, driving pkggen from an EmbBuild `build.ebm`
-> `package:` stanza on-device.
+> variant of update (a future optimization once a snapshot syscall exists) and
+> PK4 the git registry.
+> **PK2b — on-device package generation.** `pkgbuild` (`user/bin/pkgbuild.c` +
+> `user/pkg/embxgen.c`, a C EMBX writer byte-identical to mkembx) turns ONE
+> `.pkgspec` + a linked ELF into the three views (EMBX cap table, `.ns`, manifest)
+> ON THE OS ITSELF -- authority declared as part of building on the device. On-OS
+> builds are unsigned; `pkg install --local` adopts a dev build (a present
+> signature is still verified; caps/build_id/re-negotiation still hold).
+> `test pkgbuild` proves the whole loop on the metal: generate -> install --local
+> -> run confined. (A `build.ebm` drives it as a normal build step running
+> `pkgbuild`; a structured EmbBuild `package:` stanza is optional polish.)
 > The rest of this doc is the shape decided before code, like the userspace.*
 
 ## 0. Thesis

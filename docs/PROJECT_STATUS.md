@@ -956,9 +956,14 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
   or namespace** unless `--allow-widen` (a new version cannot silently widen its
   reach); `pkg rollback/remove/info` complete the set. `test pkg` runs 8 checks
   green on the metal.
-- *Deferred (PK4 + PK2b):* the git registry, and driving pkggen from an EmbBuild
-  `build.ebm` `package:` stanza (on-device). No dependency graph, ever (the only
-  "dependency" is the `abi` integer).
+- **PK2b — on-device package generation.** `pkgbuild` (`user/bin/pkgbuild.c` +
+  `user/pkg/embxgen.c`, a C EMBX writer byte-identical to mkembx) turns one
+  `.pkgspec` + a linked ELF into the three views ON THE OS ITSELF; `pkg install
+  --local` adopts the unsigned dev build. `test pkgbuild` proves generate →
+  install → run-confined, all on the metal — authority declared as part of
+  building on the device.
+- *Deferred (PK4):* the git registry (reuses PK3's signature as trust root). No
+  dependency graph, ever (the only "dependency" is the `abi` integer).
 
 ---
 

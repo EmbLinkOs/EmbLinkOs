@@ -1557,6 +1557,42 @@ int selftests_handle_command(const char *cmd)
         return pass ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test pkgbuild") == 0) {
+        /* Packaging PK2b: GENERATE a package bundle ON THE DEVICE, then install +
+         * run it -- the whole SDK->pkgmgr loop, on the OS itself.
+         *   1. pkgbuild <spec> <elf> /data/gen -- the on-OS generator (embxgen
+         *      writes the EMBX with the cap table from the spec, + .ns + manifest,
+         *      consistent by construction). Produces an UNSIGNED local build.
+         *   2. pkg install --local /data/gen -- adopt a dev build (unsigned is
+         *      allowed only with --local; caps/build_id/re-negotiation still hold).
+         *   3. pkg run pkgprobe -- it runs confined to exactly the declared grant. */
+        const char *pb = "/data/apps/pkgbuild/pkgbuild.elf";
+        const char *pk = "/data/apps/pkg/pkg.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pb, &st) != 0 || vfs_stat(pk, &st) != 0) {
+            kprintf("\n[cmd] test pkgbuild: pkgbuild/pkg not on image\n"); return 1; }
+        (void)vfs_mkdir_path("/data/gen");
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        char *a1[] = { (char *)pb, (char *)"/data/staging/build/pkgprobe.pkgspec",
+                       (char *)"/data/staging/build/pkgprobe.elf", (char *)"/data/gen", NULL };
+        int c1 = process_wait((uint32_t)process_create_caps(pb, a1, 4, env, NULL, 0, caps));
+        kprintf("[pkgbuild] 1 generate bundle on-device = %s\n", c1 == 0 ? "OK" : "FAIL");
+
+        char *a2[] = { (char *)pk, (char *)"install", (char *)"--local", (char *)"/data/gen", NULL };
+        int c2 = process_wait((uint32_t)process_create_caps(pk, a2, 4, env, NULL, 0, caps));
+        kprintf("[pkgbuild] 2 pkg install --local = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        char *a3[] = { (char *)pk, (char *)"run", (char *)"pkgprobe", NULL };
+        int c3 = process_wait((uint32_t)process_create_caps(pk, a3, 3, env, NULL, 0, caps));
+        kprintf("[pkgbuild] 3 run generated app (confined) = %s\n", c3 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && c2 == 0 && c3 == 0);
+        kprintf("[cmd] test pkgbuild: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test emlibc net") == 0) {
         /* Proves emlibc's NATIVE networking: emlibc_net (ring 3, linked against
          * libemlibc only -- zero newlib) does an HTTP GET via em_tcp_connect +

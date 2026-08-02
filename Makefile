@@ -581,6 +581,16 @@ PKG_OBJS := build/pkg.o build/pkg_manifest.o build/pkg_embxinfo.o \
 build/pkg.elf: build/crt0.o build/syscalls.o $(PKG_OBJS) user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(PKG_OBJS) -lc -lgcc -o $@
 
+# pkgbuild -- generate a package bundle ON THE DEVICE (PK2b). embxgen is the C
+# EMBX writer (byte-identical to mkembx.py); sha256 via tls_sha256.o (-Ikernel).
+build/pkg_embxgen.o: user/pkg/embxgen.c user/pkg/embxgen.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
+build/pkgbuild.o: user/bin/pkgbuild.c user/pkg/embxgen.h user/pkg/manifest.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -c $< -o $@
+PKGBUILD_OBJS := build/pkgbuild.o build/pkg_embxgen.o build/pkg_manifest.o build/tls_sha256.o
+build/pkgbuild.elf: build/crt0.o build/syscalls.o $(PKGBUILD_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(PKGBUILD_OBJS) -lc -lgcc -o $@
+
 # pkgprobe -- the PK1 confinement test app, bundled as an EMBX + a manifest that
 # grants {filesystem} + ro /system + rw /data/apps/pkgprobe. mkembx repackages
 # the ELF into an EMBX; mkpkg derives the manifest from that EMBX (build_id/caps
@@ -950,7 +960,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1125,7 +1135,7 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf build/gitpush.elf \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
-               build/embbuild.elf build/pkg.elf build/pkgprobe.embx build/pkgprobe.pkg \
+               build/embbuild.elf build/pkg.elf build/pkgbuild.elf build/pkgprobe.embx build/pkgprobe.pkg \
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
 
