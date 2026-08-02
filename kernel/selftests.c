@@ -1620,11 +1620,14 @@ int selftests_handle_command(const char *cmd)
         kprintf("[pkgreg] 1 pkg sync (clone registry over HTTPS) = %s (index on disk=%d)\n",
                 c1 == 0 ? "OK" : "FAIL", have);
 
-        /* 2. `pkg install pkgprobe` -- resolve the NAME from the synced registry,
-         *    verify the signature on arrival, adopt. Like `apt install`. */
+        /* 2. `pkg install pkgprobe` -- resolve the NAME from the synced registry.
+         *    The registry ships only the signed manifest + a `.url`; pkg FETCHES
+         *    the binary (release asset) via wget, then verifies its build_id
+         *    against the signed manifest -- a tampered host cannot inject a bad
+         *    binary. Needs CAP_NETWORK (inherited by wget). Like `apt install`. */
         char *a2[] = { (char *)pk, (char *)"install", (char *)"pkgprobe", NULL };
-        int c2 = process_wait((uint32_t)process_create_caps(pk, a2, 3, env, NULL, 0, caps_fs));
-        kprintf("[pkgreg] 2 pkg install pkgprobe (signature verified on arrival) = %s\n", c2 == 0 ? "OK" : "FAIL");
+        int c2 = process_wait((uint32_t)process_create_caps(pk, a2, 3, env, NULL, 0, caps_net));
+        kprintf("[pkgreg] 2 pkg install pkgprobe (fetch asset + verify build_id) = %s\n", c2 == 0 ? "OK" : "FAIL");
 
         char *a3[] = { (char *)pk, (char *)"run", (char *)"pkgprobe", NULL };
         int c3 = process_wait((uint32_t)process_create_caps(pk, a3, 3, env, NULL, 0, caps_fs));

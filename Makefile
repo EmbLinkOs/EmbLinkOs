@@ -1011,6 +1011,13 @@ NET = -netdev user,id=net0 -device virtio-net,netdev=net0
 # boot an image with a stale (or entirely missing) program on it.
 all: $(IMG) embkfs.img
 
+# `make images` == both bootable images, current. Use this before ANY boot: the
+# two are SEPARATE targets, so `make $(IMG)` alone (a kernel change) leaves the
+# userland image untouched -- which once booted a STALE staged pkg.elf ("unknown
+# command"). This one word rebuilds whatever drifted.
+.PHONY: images
+images: $(IMG) embkfs.img
+
 $(STAGE1_BIN): $(STAGE1_SRC) $(STAGE2_BIN)
 	@stage2_sectors=$$(( ($$(stat -c%s $(STAGE2_BIN)) + 511) / 512 )); \
 	echo "Building stage1 with STAGE2_LOAD_SECTORS=$$stage2_sectors"; \
@@ -1161,7 +1168,12 @@ STAGED_APPS ?=
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o
+# The $(wildcard) prereqs make the image stale whenever ANY already-built binary
+# changes -- not just the ones named in EMBKFS_APPS. On a clean tree the wildcard
+# is empty (nothing built yet) and EMBKFS_APPS drives the first build; on an
+# incremental build it catches every packed .elf/.embx, closing the drift-guard
+# gap so a rebuilt app (e.g. pkg.elf) always re-packs. See the guard below.
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is

@@ -45,6 +45,7 @@
 #define PKG_ROOT  "/data/pkg"
 #define REGISTRY_DIR "/data/registry"
 #define GITCLONE  "/data/apps/gitclone/gitclone.elf"
+#define WGET      "/data/apps/wget/wget.elf"
 
 static char *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb"); if (!f) return NULL;
@@ -142,8 +143,31 @@ static void present_authority(const struct pkg_manifest *m) {
     printf("    nothing else -- what it did not declare, it cannot get.\n");
 }
 
-/* Load + parse an EMBX bundle: the manifest, the EMBX it `provides`, and whether
- * the manifest's signature verifies against the trusted key (*sig_ok). */
+/* If the bundle's EMBX isn't present but a `<name>.url` is (§9.1: the registry
+ * ships only the signed manifest; the binary is a separate release asset),
+ * fetch it with wget. Safe because the caller then checks the fetched binary's
+ * build_id against the SIGNED manifest -- a tampered host cannot inject a bad
+ * binary. Needs CAP_NETWORK (inherited by wget). 0 = present or fetched. */
+static int fetch_binary(const char *dir, const struct pkg_manifest *m) {
+    char dest[1024]; snprintf(dest, sizeof dest, "%s/%s", dir, basename_of(m->provides));
+    struct embk_stat es;
+    if (embk_stat(dest, &es) == 0) return 0;               /* already in the bundle */
+    char urlpath[1024]; snprintf(urlpath, sizeof urlpath, "%s/%s.url", dir, m->name);
+    size_t n; char *u = read_file(urlpath, &n);
+    if (!u) return 0;                                      /* no url; report a missing binary later */
+    size_t k = strlen(u); while (k && (u[k-1]=='\n'||u[k-1]=='\r'||u[k-1]==' ')) u[--k] = 0;
+    printf("  fetching binary (release asset) from %s\n", u);
+    char *av[] = { (char *)WGET, (char *)"-O", dest, u, NULL };
+    int64_t h = embk_spawn(WGET, av, NULL, 0);
+    int rc = (h >= 0) ? (int)embk_wait((int)h) : -1;
+    free(u);
+    if (rc != 0) { fprintf(stderr, "pkg: failed to fetch the binary (%d)\n", rc); return -1; }
+    return 0;
+}
+
+/* Load + parse an EMBX bundle: the manifest, the EMBX it `provides` (fetched via
+ * its `.url` if not in the bundle), and whether the manifest's signature
+ * verifies against the trusted key (*sig_ok). */
 static int load_bundle(const char *dir, struct pkg_manifest *m, struct embx_info *ei,
                        char *binpath, size_t bincap, int *sig_ok) {
     char mpath[1024];
@@ -156,6 +180,7 @@ static int load_bundle(const char *dir, struct pkg_manifest *m, struct embx_info
     free(mtext);
     if (rc != 0) { fprintf(stderr, "pkg: %s: %s\n", mpath, err); return -1; }
 
+    if (fetch_binary(dir, m) != 0) return -1;              /* release-asset fetch, if needed */
     snprintf(binpath, bincap, "%s/%s", dir, basename_of(m->provides));
     if (embx_read_info(binpath, ei, err, sizeof err) != 0) { fprintf(stderr, "pkg: %s\n", err); return -1; }
     return 0;

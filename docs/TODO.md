@@ -1432,8 +1432,14 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
   index and installs it (a `/path` still installs a local bundle). `test
   pkgregistry` (metal): `pkg sync <url>` → `pkg install pkgprobe` (signature valid
   on arrival) → `pkg run` confined — the transport is the very git-over-HTTPS
-  client from the git arc. *Refinement (§9.1):* binaries as release assets rather
-  than in git history (the small bundle rides in the repo here for the proof).
+  client from the git arc.
+  - **Release-asset binaries (§9.1) — DONE.** The registry `main` ships only the
+    signed manifest + a `<name>.url`; the binary lives elsewhere (here an `assets`
+    branch, served raw over HTTPS). `pkg install` fetches it with `wget` and checks
+    the fetched binary's `build_id` against the SIGNED manifest — a tampered host
+    cannot inject a bad binary (§9.2). Metal-proven: wget authenticates
+    raw.githubusercontent (Let's Encrypt → our ISRG Root X1), 200/89288 bytes,
+    signature valid, adopted.
 
 ### Toolchain (EmbCC/EmbLD — tracked in full in `EmbCC/docs/todo.md`)
 
