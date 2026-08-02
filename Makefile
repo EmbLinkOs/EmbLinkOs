@@ -550,11 +550,20 @@ build/git_pack.o: user/git/pack.c user/git/pack.h user/git/sha1.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
 build/git_repo.o: user/git/repo.c user/git/repo.h user/git/pack.h user/git/sha1.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
+build/git_push.o: user/git/push.c user/git/push.h user/git/pack.h user/git/sha1.h user/git/pktline.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
 build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h user/git/repo.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
 GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_repo.o
 build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
+
+# gitpush -- push a first commit over HTTPS (git-receive-pack + pack_write + auth).
+build/gitpush.o: user/bin/gitpush.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/push.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
+GITPUSH_OBJS := build/gitpush.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_push.o
+build/gitpush.elf: build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
 
 # pkgfetch -- native PyPI installer for pure-Python wheels (libtls fetch + our
 # own inflate + zip reader). Auto-packed as /data/apps/pkgfetch/pkgfetch.elf.
@@ -901,7 +910,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1073,7 +1082,7 @@ endif
 
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf build/gitpush.elf \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf \

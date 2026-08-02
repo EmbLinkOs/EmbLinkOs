@@ -1579,12 +1579,31 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     both exit 0). githttp also gained coarse `recv NN KB` progress prints -- the
     22800-ref advertisement is ~1.5 MB and streams slowly over TLS under TCG
     (~10 min), which without progress output is indistinguishable from a hang.
+  - **G8 push (`gitpush`) -- authenticated, metal-proven.** The inverse of clone:
+    `gitpush <url> <file> <path> [branch]` builds a blob+tree+commit, serializes
+    them with a NEW **packfile writer** (`pack_write`, the inverse of pack_unpack
+    -- host-proven: round-trips every sha AND `git index-pack` accepts our pack),
+    and drives **git-receive-pack** (`user/git/push.c`) over libtls with **HTTP
+    Basic auth** (`githttp` gained an `authb64` arg; own base64, byte-checked vs
+    coreutils). Token comes from `$GITPUSH_TOKEN` (env, never argv). Proven three
+    ways: (a) the request feeds a real local `git receive-pack` which accepts it +
+    updates the ref + `fsck` clean; (b) the exact bytes + auth POST to a real
+    GitHub repo return `unpack ok`/`ok <ref>`; (c) LIVE on the metal, `test
+    gitpush` pushed a first commit CREATING `refs/heads/main` on
+    github.com/teo1747/mblink-push-test (`GITPUSH refs/heads/main <sha> -> OK`),
+    and a real `git clone` reads it back -- author `EmbLink <os@emblink>`, the
+    pushed README, `fsck` clean. *Scope:* a FIRST commit (one file, no parent, to
+    create a branch) -- a push to an empty repo; splicing a parent's tree for an
+    incremental commit is the next step. Credentials are staged into the LOCAL
+    image only (mkfs env-gated: `EMBK_GITPUSH_TOKEN_FILE` + `EMBK_GITPUSH_URL`),
+    never committed.
   - **Deferred (not yet exercised):** `want`-list is single-ref HEAD/default only
     (no multi-ref, no `have`/negotiation beyond deepen); no side-band-64k
-    progress; no push, no auth (private repos), no thin-pack completion; deltas
-    seen live are shallow chains (depth 1) -- deep chains are host-proven (depth
-    3) but a large live clone with long chains hasn't been run under TCG (slow).
-    This is CLONE only; the ported stock git.elf stays local-only.
+    progress; push is first-commit-only (no incremental/parent-tree splice, no
+    force, no delete); no thin-pack completion; deltas seen live are shallow
+    chains (depth 1) -- deep chains are host-proven (depth 3) but a large live
+    clone with long chains hasn't been run under TCG (slow). The ported stock
+    git.elf still uses its OWN transport only for local ops.
 - [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
   one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
   fragmented Certificate-message / net-read edge case leaving a cert parsed with

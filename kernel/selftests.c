@@ -1364,6 +1364,48 @@ int selftests_handle_command(const char *cmd)
         return pass ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test gitpush") == 0) {
+        /* git PUSH over HTTPS (G8): gitpush builds a blob+tree+commit, packs them
+         * (pack_write), and drives git-receive-pack over libtls with HTTP Basic
+         * auth. Pushes a FIRST commit (one file) to CREATE a branch -- i.e. a push
+         * to an empty repo. Needs CAP_NETWORK + CAP_FILESYSTEM + -cpu max, plus
+         * LOCAL credentials staged into the image (env-gated in mkfs, never
+         * committed): a PAT at /data/gitpush/token and the repo url at
+         * /data/gitpush/url. Absent => the test refuses honestly. */
+        const char *sp = "/data/apps/gitpush/gitpush.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test gitpush: %s not on image\n", sp); return 1; }
+
+        static char token[512], url[512], tokenv[560];
+        int fd = vfs_open("/data/gitpush/token", O_RDONLY, 0);
+        if (fd < 0) { kprintf("[cmd] test gitpush: no /data/gitpush/token -- rebuild with "
+                              "EMBK_GITPUSH_TOKEN_FILE=<file> EMBK_GITPUSH_URL=<url> (needs a PAT)\n"); return 1; }
+        size_t got = 0; vfs_fd_read(fd, token, sizeof token - 1, &got); vfs_close(fd);
+        while (got > 0 && (token[got-1] == '\n' || token[got-1] == '\r' || token[got-1] == ' ')) got--;
+        token[got] = 0;
+        fd = vfs_open("/data/gitpush/url", O_RDONLY, 0);
+        if (fd < 0) { kprintf("[cmd] test gitpush: no /data/gitpush/url\n"); return 1; }
+        size_t ug = 0; vfs_fd_read(fd, url, sizeof url - 1, &ug); vfs_close(fd);
+        while (ug > 0 && (url[ug-1] == '\n' || url[ug-1] == '\r' || url[ug-1] == ' ')) ug--;
+        url[ug] = 0;
+
+        /* The file to push (its content becomes the repo's README). */
+        int wf = vfs_open("/data/pushme.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (wf >= 0) {
+            static const char m[] = "Pushed from EmbLinkOS -- our own TLS 1.3 + git-receive-pack, no stock git.\n";
+            size_t w = 0; vfs_fd_write(wf, m, sizeof m - 1, &w); vfs_close(wf);
+        }
+
+        snprintf(tokenv, sizeof tokenv, "GITPUSH_TOKEN=%s", token);   /* env, not argv */
+        char *a[]   = { (char *)sp, url, (char *)"/data/pushme.txt", (char *)"README.md", (char *)"main", NULL };
+        char *env[] = { (char *)"HOME=/", tokenv, NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(sp, a, 5, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[cmd] test gitpush: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test emlibc net") == 0) {
         /* Proves emlibc's NATIVE networking: emlibc_net (ring 3, linked against
          * libemlibc only -- zero newlib) does an HTTP GET via em_tcp_connect +

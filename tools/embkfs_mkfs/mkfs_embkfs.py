@@ -740,6 +740,20 @@ def discover_userland_objects(build_dir="build"):
         if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
             dest = f"data/apps/{base}/{base}.ns".encode()
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
+    # `test gitpush` LIVE credentials (LOCAL build artifact ONLY, env-gated so
+    # they never touch the source tree or git). A GitHub PAT + target repo URL,
+    # placed by the developer running the live push test:
+    #   EMBK_GITPUSH_TOKEN_FILE -> /data/gitpush/token  (the PAT, whitespace-trimmed)
+    #   EMBK_GITPUSH_URL        -> /data/gitpush/url     (https repo url)
+    gp_tok = os.environ.get("EMBK_GITPUSH_TOKEN_FILE", "")
+    gp_url = os.environ.get("EMBK_GITPUSH_URL", "")
+    if gp_tok and os.path.exists(gp_tok):
+        objects.append((b"data/gitpush/token", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                        _read_file(gp_tok).strip()))
+    if gp_url:
+        objects.append((b"data/gitpush/url", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                        gp_url.strip().encode() + b"\n"))
+
     # The kernel's own .embdbg (EMBDBG_Specification.md §7): a LINE+FUNCS sidecar
     # the kernel loads at boot so isr_handler symbolizes a panic to func:line.
     kdbg = _read_file(f"{build_dir}/kernel.embdbg")

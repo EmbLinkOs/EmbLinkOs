@@ -98,7 +98,7 @@ static int fetch_pack(const char *base, const char *want, int depth,
 
     uint8_t *body = NULL; size_t len = 0; int status = 0;
     if (git_http("POST", url, "application/x-git-upload-pack-request",
-                 req, rl, &body, &len, &status) != 0) {
+                 req, rl, NULL, &body, &len, &status) != 0) {
         fprintf(stderr, "gitclone: upload-pack transport failed\n");
         return -1;
     }
@@ -146,7 +146,7 @@ int main(int argc, char **argv) {
 
     /* G1: ref discovery. */
     uint8_t *body = NULL; size_t len = 0; int status = 0;
-    if (git_http("GET", url, NULL, NULL, 0, &body, &len, &status) != 0) {
+    if (git_http("GET", url, NULL, NULL, 0, NULL, &body, &len, &status) != 0) {
         fprintf(stderr, "gitclone: transport failed for %s\n", url); return 1;
     }
     if (status / 100 != 2) { fprintf(stderr, "gitclone: HTTP %d fetching refs\n", status); free(body); return 1; }

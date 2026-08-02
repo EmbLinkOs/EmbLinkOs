@@ -9,11 +9,13 @@
 #include <stdint.h>
 
 /* One HTTPS request. `method` is "GET" or "POST". For POST, `ctype` is the
- * Content-Type and req/reqlen the body (NULL/0 for GET). On success returns 0,
- * sets *status to the HTTP status, and *body and *len to a malloc'd response body
- * (caller frees). Follows up to 3 redirects. Negative on transport/TLS error. */
+ * Content-Type and req/reqlen the body (NULL/0 for GET). `authb64`, if non-NULL,
+ * is the base64 of "user:token" sent as `Authorization: Basic ...` (git's HTTP
+ * auth for push / private repos). On success returns 0, sets *status to the HTTP
+ * status, and *body and *len to a malloc'd response body (caller frees). Follows
+ * up to 3 redirects. Negative on transport/TLS error. */
 int git_http(const char *method, const char *url, const char *ctype,
-             const uint8_t *req, size_t reqlen,
+             const uint8_t *req, size_t reqlen, const char *authb64,
              uint8_t **body, size_t *len, int *status);
 
 #endif /* EMBK_GITHTTP_H */

@@ -127,6 +127,45 @@ static void object_sha(int type, const uint8_t *data, size_t size, uint8_t out[2
     sha1_final(&c, out);
 }
 
+/* Encode an object-header varint (the inverse of read_obj_header): byte0 =
+ * [cont|type(3)|size(4)], then 7 bits of size each. Returns bytes written. */
+static size_t write_obj_header(uint8_t *out, int type, size_t size) {
+    size_t i = 0;
+    uint8_t b = (uint8_t)(((type & 7) << 4) | (size & 0x0f));
+    size >>= 4;
+    while (size) { out[i++] = b | 0x80; b = (uint8_t)(size & 0x7f); size >>= 7; }
+    out[i++] = b;
+    return i;
+}
+
+int pack_write(const struct pack_obj *objs, int n, uint8_t **out, size_t *outlen) {
+    if (n < 0) return -1;
+    size_t cap = 12 + 20;
+    for (int i = 0; i < n; i++) cap += 12 + compressBound(objs[i].size);
+    uint8_t *buf = malloc(cap);
+    if (!buf) return -1;
+
+    size_t o = 0;
+    memcpy(buf, "PACK", 4); o = 4;
+    buf[o++] = 0; buf[o++] = 0; buf[o++] = 0; buf[o++] = 2;          /* version 2 */
+    buf[o++] = (uint8_t)(n >> 24); buf[o++] = (uint8_t)(n >> 16);
+    buf[o++] = (uint8_t)(n >> 8);  buf[o++] = (uint8_t)n;            /* object count */
+
+    for (int i = 0; i < n; i++) {
+        o += write_obj_header(buf + o, objs[i].type, objs[i].size);
+        uLongf clen = (uLongf)(cap - o);
+        if (compress(buf + o, &clen, objs[i].data, objs[i].size) != Z_OK) { free(buf); return -1; }
+        o += clen;
+    }
+
+    uint8_t sha[20]; struct sha1_ctx c;
+    sha1_init(&c); sha1_update(&c, buf, o); sha1_final(&c, sha);
+    memcpy(buf + o, sha, 20); o += 20;
+
+    *out = buf; *outlen = o;
+    return 0;
+}
+
 static struct entry *find_by_offset(struct entry *e, int n, size_t off) {
     for (int i = 0; i < n; i++) if (e[i].offset == off) return &e[i];
     return NULL;

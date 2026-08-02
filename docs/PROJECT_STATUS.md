@@ -879,8 +879,14 @@ verified on the metal.
   object we wrote, both exit 0 on the metal. **Shallow clone** works too:
   `gitclone --depth N` negotiates `deepen`, writes `.git/shallow`, and the on-OS
   git reads the result as `(grafted)` — `test gitclone shallow` fetches just the
-  tip (5 objects vs 10). *Deferred:* no push, no auth, no multi-ref negotiation
-  (see `docs/TODO.md`).
+  tip (5 objects vs 10).
+- **T8 — `git push` over our TLS.** The inverse: `gitpush` builds a
+  blob+tree+commit, serializes them with our own **packfile writer** (`pack_write`),
+  and drives **git-receive-pack** with **HTTP Basic auth** (token from the
+  environment). `test gitpush` pushed a first commit **live to a real GitHub repo**
+  (`GITPUSH refs/heads/main <sha> -> OK`), authenticated over our own crypto — a
+  real `git clone` reads it back, `fsck` clean. *Scope:* first-commit-to-empty-repo
+  (see `docs/TODO.md`). *Deferred:* incremental commits, multi-ref negotiation.
 
 Trust anchors bundled: GTS Root R4 (EC P-384), ISRG Root X1 (RSA-4096), GlobalSign
 Root R3 (RSA-2048), USERTrust ECC (EC P-384, for github/Sectigo) — between them,

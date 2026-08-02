@@ -27,7 +27,7 @@ static int split_url(const char *url, char *host, int hostsz,
 }
 
 int git_http(const char *method, const char *url, const char *ctype,
-             const uint8_t *req, size_t reqlen,
+             const uint8_t *req, size_t reqlen, const char *authb64,
              uint8_t **body, size_t *len, int *status) {
     static int depth = 0;
     char host[256], path[2048];
@@ -58,19 +58,22 @@ int git_http(const char *method, const char *url, const char *ctype,
     /* Request headers. HTTP/1.0 + Connection: close => body ends at EOF, so we
      * never have to parse chunked/Content-Length. git-upload-pack tolerates
      * this. Advertise protocol v0 (no Git-Protocol header). */
+    char authln[512]; authln[0] = 0;
+    if (authb64) snprintf(authln, sizeof authln, "Authorization: Basic %s\r\n", authb64);
     char hdr[1024];
     int hl;
     if (req && reqlen) {
         hl = snprintf(hdr, sizeof hdr,
             "%s %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: git/EmbLinkOS\r\n"
-            "Accept: */*\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+            "Accept: */*\r\n%sContent-Type: %s\r\nContent-Length: %zu\r\n"
             "Connection: close\r\n\r\n",
-            method, path, host, ctype ? ctype : "application/octet-stream", reqlen);
+            method, path, host, authln,
+            ctype ? ctype : "application/octet-stream", reqlen);
     } else {
         hl = snprintf(hdr, sizeof hdr,
             "%s %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: git/EmbLinkOS\r\n"
-            "Accept: */*\r\nConnection: close\r\n\r\n",
-            method, path, host);
+            "Accept: */*\r\n%sConnection: close\r\n\r\n",
+            method, path, host, authln);
     }
     if (tls_write(c, hdr, (size_t)hl) < 0) { tls_close(c); free(c); return -1; }
     if (req && reqlen && tls_write(c, req, reqlen) < 0) { tls_close(c); free(c); return -1; }
@@ -111,7 +114,7 @@ int git_http(const char *method, const char *url, const char *ctype,
             }
         }
         free(buf);
-        if (loc[0]) { depth++; int r = git_http(method, loc, ctype, req, reqlen, body, len, status); depth--; return r; }
+        if (loc[0]) { depth++; int r = git_http(method, loc, ctype, req, reqlen, authb64, body, len, status); depth--; return r; }
         return -1;
     }
 
