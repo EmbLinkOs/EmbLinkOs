@@ -1507,34 +1507,45 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       `mmap`, which is a stub. Also no `keyring`/auth, no VCS/editable installs.
     - threading: pip is largely single-threaded here (fine), but any parallel
       path would hit our thread gap ([[cpython-port]]).
-- [~] **git over HTTPS.** The stock git CANNOT do this here: its HTTPS transport
-  fork/execs `git-remote-https` AND `index-pack`/`unpack-objects`, and EmbLink has
-  no fork/exec (`start_command` -> `fork()` -> ENOSYS). So it's a from-scratch
-  clone tool that drives git's smart-HTTP protocol directly over libtls and writes
-  a real `.git` the on-OS git can then use. Progress (milestone **G1**):
-  - **Built the protocol tooling** (`user/git/`): `githttp` (smart-HTTP GET/POST
-    over libtls, HTTP/1.0 read-to-EOF) + `pktline` (git framing) + `user/bin/
-    gitclone.c` (ref discovery from `info/refs?service=git-upload-pack`).
-    `test gitclone` spawns it; auto-packed as /data/apps/gitclone.
-  - **Added github.com's root** (USERTrust ECC, P-384) to the trust store
-    (`roots.h`+`trust.c`) and `ecdsa_secp384r1_sha384` (0x0503) to the ClientHello
-    sig-algs. The host TLS suite still passes, and a host harness verifies
-    github's FULL chain (leaf/Sectigo E36/Sectigo E46 -> USERTrust ECC) = **OK**.
-  - **G1 WORKS on the metal:** `test gitclone` -> `GITCLONE 3342 refs -> OK`
-    (github.com/octocat/Hello-World over our own TLS). **The blocker was an
-    uninitialized-memory HEISENBUG** in libtls's ECDSA verify
-    (user/lib/tls/crypto/ecdsa.c read an uninitialized stack `bn`): benign garbage
-    on the host, but under QEMU it broke github's P-256 leaf verification
-    (rc=-103) -- data-dependent, so GTS/pypi leaves passed. Diagnosis: linked the
-    exact target objects into a host harness -- they verified github's chain fine;
-    the failure only reproduced on the OS and flipped with any codegen
-    perturbation (a debug print "fixed" it). **Fix: `-ftrivial-auto-var-init=zero`
-    in NEWLIB_CFLAGS** (zero every uninit auto var -- deterministic, and right for
-    security-critical crypto). Also cleared the `_free_r` cert-failure crash (same
-    root cause). Along the way: added github's root (USERTrust ECC) + 0x0503.
-  - Remaining: **G2** fetch (POST upload-pack -> packfile), **G3** packfile unpack
-    (needs a SHA1 impl -- not yet in-tree -- + the libz.a we built for pip, delta
-    resolution), **G4** refs + checkout.
+- [x] ~~**git clone over HTTPS.**~~ **DONE (G1-G4), metal-proven.** The stock git
+  CANNOT do this here: its HTTPS transport fork/execs `git-remote-https` AND
+  `index-pack`/`unpack-objects`, and EmbLink has no fork/exec (`start_command` ->
+  `fork()` -> ENOSYS). So it's a from-scratch clone tool (`user/git/` + `user/bin/
+  gitclone.c`) that drives git's smart-HTTP protocol directly over libtls and
+  writes a real `.git` the on-OS git can then use. `test gitclone` clones
+  github.com/octocat/Hello-World into `/data/hello` over our own TLS:
+  - **G1 ref discovery** -- `githttp` (smart-HTTP GET/POST over libtls, HTTP/1.0
+    read-to-EOF) + `pktline` (git framing); parses the `info/refs?service=git-
+    upload-pack` advertisement. Metal: `GITCLONE 3362 refs, HEAD=7fd1a60b (master)`.
+  - **G2 fetch** -- POST `git-upload-pack` with `want <sha>`+flush+`done`, parse
+    `NAK\n` + the raw packfile. Metal: `GITFETCH pack 7 objects, 700 bytes`.
+  - **G3 unpack** -- `user/git/pack.c` (own zlib-streaming inflate over the libz.a
+    built for pip, ofs/ref-delta resolution) + `user/git/sha1.c` (own SHA-1,
+    FIPS-vector + git empty-blob verified) -> SHA-named objects. Metal:
+    `GITUNPACK 7 objects (3 commit, 2 tree, 2 blob), HEAD reconstructed`.
+  - **G4 write + checkout** -- `user/git/repo.c` writes loose objects (zlib-deflate
+    `"<type> <size>\0"`+content, sha-addressed), `HEAD`/`refs/heads/<branch>`/
+    `config`, then recursively checks out the working tree. Metal:
+    `GITCHECKOUT /data/hello: 7 objects, 1 files, branch master -> OK`, and the
+    README lands on EMBKFS (13 bytes = "Hello World!\n", `vfs_stat` confirmed).
+    A **real** upstream git reads the result (`git fsck` clean, `git log` shows
+    all 3 commits) -- verified on the host against the same packfile.
+  - **The blocker (G1) was an uninitialized-memory HEISENBUG** in libtls's ECDSA
+    verify (`ecdsa.c` read an uninitialized stack `bn`): benign garbage on the
+    host, but under QEMU it broke github's P-256 leaf verification (rc=-103) --
+    data-dependent, so GTS/pypi leaves passed. Diagnosis: linked the exact target
+    objects into a host harness -- they verified github's chain fine; the failure
+    only reproduced on the OS and flipped with any codegen perturbation (a debug
+    print "fixed" it). **Fix: `-ftrivial-auto-var-init=zero` in NEWLIB_CFLAGS**
+    (zero every uninit auto var -- deterministic, right for security-critical
+    crypto). Also added github's root (USERTrust ECC, P-384) to the trust store +
+    `ecdsa_secp384r1_sha384` (0x0503) to the ClientHello sig-algs.
+  - **Deferred (not yet exercised):** the octocat repo is small + delta-free, so
+    ref-delta/ofs-delta reconstruction is code-complete but only host-tested, not
+    metal-tested on a real deltified pack; `want`-list is HEAD-only (no shallow,
+    no multi-ref, no `have`/negotiation); no side-band-64k progress; no push, no
+    auth (private repos), no thin-pack completion. A larger clone is the next
+    natural exercise.
 - [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
   one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
   fragmented Certificate-message / net-read edge case leaving a cert parsed with

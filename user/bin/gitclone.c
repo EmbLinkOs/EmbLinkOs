@@ -7,10 +7,10 @@
  *
  * Milestones (user/git/):
  *   G1  ref discovery -- GET info/refs, list refs.                    [done]
- *   G2  fetch         -- POST git-upload-pack with the wants,          [this file]
+ *   G2  fetch         -- POST git-upload-pack with the wants,          [done]
  *                        receive the packfile.
- *   G3  unpack        -- packfile -> loose objects (SHA1 + inflate).   [todo]
- *   G4  refs+checkout.                                                 [todo]
+ *   G3  unpack        -- packfile -> objects (SHA1 + inflate + delta). [done]
+ *   G4  refs+checkout -- write a real .git + working tree to disk.     [done]
  *
  * usage: gitclone <https-url> [dir]
  */
@@ -21,6 +21,7 @@
 #include "pktline.h"
 #include "pack.h"
 #include "sha1.h"
+#include "repo.h"
 
 /* "<base>.git" from a user URL (strip trailing '/', add .git if absent). */
 static void base_git(const char *in, char *out, size_t cap) {
@@ -35,9 +36,9 @@ static void base_git(const char *in, char *out, size_t cap) {
 /* Parse a smart-HTTP ref advertisement (pkt-line). Prints a short summary,
  * counts refs, and copies HEAD's object id (the first ref) into want[41].
  * Returns the ref count, or -1 on a malformed advertisement. */
-static int read_refs(const uint8_t *body, size_t len, char want[41]) {
+static int read_refs(const uint8_t *body, size_t len, char want[41], char branch[128]) {
     const uint8_t *cur = body, *end = body + len, *data; size_t dlen;
-    want[0] = 0;
+    want[0] = 0; strcpy(branch, "master");           /* default if none matches */
 
     int k = pktline_next(&cur, end, &data, &dlen);      /* "# service=..." then flush */
     if (k == PKT_DATA && dlen >= 9 && !strncmp((const char *)data, "# service", 9))
@@ -51,13 +52,18 @@ static int read_refs(const uint8_t *body, size_t len, char want[41]) {
         if (dlen < 41 || data[40] != ' ') continue;
 
         if (!want[0]) { memcpy(want, data, 40); want[40] = 0; }   /* first ref = HEAD */
-        if (count < 3) {                                          /* show a few */
-            const uint8_t *name = data + 41; size_t nlen = dlen - 41;
-            for (size_t i = 0; i < nlen; i++)
-                if (name[i] == '\0' || name[i] == '\n') { nlen = i; break; }
-            char sha[41]; memcpy(sha, data, 40); sha[40] = 0;
-            printf("  %s %.*s\n", sha, (int)nlen, name);
+
+        const uint8_t *name = data + 41; size_t nlen = dlen - 41;
+        for (size_t i = 0; i < nlen; i++)
+            if (name[i] == '\0' || name[i] == '\n') { nlen = i; break; }
+
+        /* The default branch: a refs/heads/<X> pointing at HEAD's object id. */
+        if (nlen > 11 && !memcmp(name, "refs/heads/", 11) && !memcmp(data, want, 40)) {
+            size_t bl = nlen - 11; if (bl > 126) bl = 126;
+            memcpy(branch, name + 11, bl); branch[bl] = 0;
         }
+        if (count < 3) { char sha[41]; memcpy(sha, data, 40); sha[40] = 0;
+            printf("  %s %.*s\n", sha, (int)nlen, name); }
         count++;
     }
     return count;
@@ -116,11 +122,11 @@ int main(int argc, char **argv) {
     if (status / 100 != 2) { fprintf(stderr, "gitclone: HTTP %d fetching refs\n", status); free(body); return 1; }
 
     printf("GITCLONE refs of %s:\n", argv[1]);
-    char want[41];
-    int n = read_refs(body, len, want);
+    char want[41], branch[128];
+    int n = read_refs(body, len, want, branch);
     free(body);
     if (n < 0 || !want[0]) { fprintf(stderr, "gitclone: malformed ref advertisement\n"); return 1; }
-    printf("GITCLONE %d refs, HEAD=%s\n", n, want);
+    printf("GITCLONE %d refs, HEAD=%s (%s)\n", n, want, branch);
 
     /* G2: fetch the packfile for HEAD. */
     uint8_t *pbody = NULL; const uint8_t *pack = NULL; size_t plen = 0;
@@ -154,10 +160,28 @@ int main(int argc, char **argv) {
     }
     printf("GITUNPACK %d objects (%d commit, %d tree, %d blob, %d tag); HEAD %s\n",
            nc, commits, trees, blobs, tags, head_ok ? "reconstructed" : "MISSING");
+    if (!head_ok) { fprintf(stderr, "gitclone: HEAD commit not in pack\n");
+                    for (int i = 0; i < nc; i++) free(objs[i].data); free(objs); return 1; }
+
+    /* G4: write a real .git and check out the working tree (if a dir is given). */
+    int rc = 0;
+    if (argc >= 3) {
+        const char *dir = argv[2];
+        int ow = 0, files = 0;
+        if (repo_init(dir) != 0 ||
+            (ow = repo_write_objects(dir, objs, nc)) < 0 ||
+            repo_write_refs(dir, branch, want) != 0 ||
+            (files = repo_checkout(dir, objs, nc, want)) < 0) {
+            fprintf(stderr, "gitclone: writing repo to %s failed\n", dir);
+            rc = 1;
+        } else {
+            printf("GITCHECKOUT %s: %d objects, %d files, branch %s -> OK\n", dir, ow, files, branch);
+        }
+    } else {
+        printf("GITUNPACK -> OK (no dir; not checked out)\n");
+    }
 
     for (int i = 0; i < nc; i++) free(objs[i].data);
     free(objs);
-    if (!head_ok) { fprintf(stderr, "gitclone: HEAD commit not in pack\n"); return 1; }
-    printf("GITUNPACK -> OK\n");
-    return 0;
+    return rc;
 }

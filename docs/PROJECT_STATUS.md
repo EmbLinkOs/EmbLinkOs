@@ -852,17 +852,31 @@ verified on the metal.
 - **T4 — HTTPS client.** `wget https://` runs an authenticated fetch over libtls
   and writes the decrypted body to disk (refuses on cert failure, no insecure
   fallback). `test wget https` → `HTTP 200`, bytes on EMBKFS.
-- **T5 (partial) — the package internet.** Bundled a 3rd anchor (**GlobalSign Root
-  R3**). **`pkgfetch`** — a native installer using our own DEFLATE (`inflate.c`) +
-  ZIP reader (`unzip.c`) — fetches a package's PyPI index + wheel over libtls and
+- **T5 — the package internet.** Bundled a 3rd anchor (**GlobalSign Root R3**).
+  **`pkgfetch`** — a native installer using our own DEFLATE (`inflate.c`) + ZIP
+  reader (`unzip.c`) — fetches a package's PyPI index + wheel over libtls and
   installs it into `/data/py/site-packages`; `test pkgfetch` installs **`six`** on
-  the metal, importable in the ported Python. *Scope:* pure-Python wheels, one at a
-  time, no dep resolution. The real `pip` tool + git-over-HTTPS still need a
-  libtls-backed CPython `_ssl` / git transport (see `docs/TODO.md`).
+  the metal, importable in the ported Python.
+- **T6 — real `pip` over our TLS.** The ported CPython's `ssl` module is a
+  pure-Python shim over a native `_embtls` extension (libtls-backed), plus
+  **non-blocking sockets** end-to-end (`O_NONBLOCK` fd flag, `sys_fcntl`/
+  `sys_fd_poll`, non-blocking `connect`/`recv`, a `select()` in libc — witnessed by
+  `test nbsock`). With those, **stock `pip install` works**: `urllib3` → our
+  `ssl.py` → `_embtls` → an authenticated PyPI fetch, `pip install six` succeeds.
+- **T7 — `git clone` over our TLS.** git can't fork/exec its HTTPS transport here,
+  so `gitclone` (`user/git/` + `user/bin/gitclone.c`) drives git's **smart-HTTP
+  protocol** directly over libtls: ref discovery, `git-upload-pack` fetch, an own
+  **packfile unpacker** (own zlib-streaming inflate + delta resolution) named by an
+  **own SHA-1**, then writes a real `.git` + checks out the working tree.
+  `test gitclone` clones **github.com/octocat/Hello-World** into `/data/hello` on
+  the metal (`GITCHECKOUT … -> OK`, README on EMBKFS); a real upstream git reads
+  the result. *Deferred:* deltified packs are host- but not metal-tested; no push,
+  no auth, no negotiation/shallow (see `docs/TODO.md`).
 
 Trust anchors bundled: GTS Root R4 (EC P-384), ISRG Root X1 (RSA-4096), GlobalSign
-Root R3 (RSA-2048) — between them, Cloudflare/Google, Let's Encrypt, and
-GlobalSign cover a large majority of the web. Signature schemes: ECDSA
+Root R3 (RSA-2048), USERTrust ECC (EC P-384, for github/Sectigo) — between them,
+Cloudflare/Google, Let's Encrypt, GlobalSign, and github cover a large majority of
+the web. Signature schemes: ECDSA
 secp256r1/secp384r1, RSA-PKCS1-v1.5, RSA-PSS. One ciphersuite:
 `TLS_AES_128_GCM_SHA256`.
 

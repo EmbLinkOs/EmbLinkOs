@@ -1290,13 +1290,18 @@ int selftests_handle_command(const char *cmd)
         const char *sp = "/data/apps/gitclone/gitclone.elf";
         struct vfs_stat st;
         if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test gitclone: %s not on image\n", sp); return 1; }
-        char *a[]   = { (char *)sp, (char *)"https://github.com/octocat/Hello-World", NULL };
+        char *a[]   = { (char *)sp, (char *)"https://github.com/octocat/Hello-World",
+                        (char *)"/data/hello", NULL };
         char *env[] = { (char *)"HOME=/", NULL };
-        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
-        int pid = process_create_caps(sp, a, 2, env, NULL, 0, caps);
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(sp, a, 3, env, NULL, 0, caps);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
-        kprintf("[cmd] test gitclone: %s\n", code == 0 ? "OK" : "FAIL");
-        return code == 0 ? 0 : 1;
+        struct vfs_stat rst;
+        int have_readme = (vfs_stat("/data/hello/README", &rst) == EMBK_OK);
+        kprintf("[cmd] test gitclone: checkout README on disk=%d (%llu bytes)\n",
+                have_readme, have_readme ? (unsigned long long)rst.size : 0ULL);
+        kprintf("[cmd] test gitclone: %s\n", (code == 0 && have_readme) ? "OK" : "FAIL");
+        return (code == 0 && have_readme) ? 0 : 1;
     }
 
     if (strcmp(cmd, "test emlibc net") == 0) {

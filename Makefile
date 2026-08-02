@@ -548,9 +548,11 @@ build/git_sha1.o: user/git/sha1.c user/git/sha1.h | $(BUILD)
 # pack.o inflates with the same libz.a we cross-built for CPython (ZLIB_BUILD).
 build/git_pack.o: user/git/pack.c user/git/pack.h user/git/sha1.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
-build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h | $(BUILD)
+build/git_repo.o: user/git/repo.c user/git/repo.h user/git/pack.h user/git/sha1.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
+build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h user/git/repo.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
-GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o
+GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_repo.o
 build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
 
