@@ -1530,6 +1530,18 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     README lands on EMBKFS (13 bytes = "Hello World!\n", `vfs_stat` confirmed).
     A **real** upstream git reads the result (`git fsck` clean, `git log` shows
     all 3 commits) -- verified on the host against the same packfile.
+  - **G5 deltas -- PROVEN (host SHA-exact + live metal).** Hello-World is
+    delta-free, so delta reconstruction is exercised separately: a host harness
+    (`packtest`) unpacks genuinely deltified packs and every object's sha+type is
+    **byte-identical to `git verify-pack -v`** -- both ofs-delta (github's default,
+    chained to depth 3) and ref-delta (`--no-delta-base-offset`), 24/24 objects
+    each, plus Spoon-Knife's real github pack (16/16). Live on the metal,
+    `test gitclone delta` clones **octocat/Spoon-Knife -> /data/spoon**: github
+    sends a 10-object HEAD pack containing **1 ofs-delta** (confirmed by parsing
+    the entry types), our unpacker resolves it (`GITUNPACK 10 objects … HEAD
+    reconstructed`), and the 3-file working tree (incl. the delta-derived blob)
+    checks out on branch `main` (`index.html` = 355 bytes on EMBKFS). Branch
+    detection also proven here (`main`, not `master`).
   - **The blocker (G1) was an uninitialized-memory HEISENBUG** in libtls's ECDSA
     verify (`ecdsa.c` read an uninitialized stack `bn`): benign garbage on the
     host, but under QEMU it broke github's P-256 leaf verification (rc=-103) --
@@ -1540,12 +1552,12 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     (zero every uninit auto var -- deterministic, right for security-critical
     crypto). Also added github's root (USERTrust ECC, P-384) to the trust store +
     `ecdsa_secp384r1_sha384` (0x0503) to the ClientHello sig-algs.
-  - **Deferred (not yet exercised):** the octocat repo is small + delta-free, so
-    ref-delta/ofs-delta reconstruction is code-complete but only host-tested, not
-    metal-tested on a real deltified pack; `want`-list is HEAD-only (no shallow,
-    no multi-ref, no `have`/negotiation); no side-band-64k progress; no push, no
-    auth (private repos), no thin-pack completion. A larger clone is the next
-    natural exercise.
+  - **Deferred (not yet exercised):** `want`-list is HEAD-only (no shallow, no
+    multi-ref, no `have`/negotiation); no side-band-64k progress; no push, no auth
+    (private repos), no thin-pack completion; deltas seen live are shallow (depth
+    1) -- deep chains are host-proven (depth 3) but a large live clone with long
+    chains hasn't been run under TCG (slow). This is CLONE only; the ported stock
+    git.elf stays local-only.
 - [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
   one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
   fragmented Certificate-message / net-read edge case leaving a cert parsed with

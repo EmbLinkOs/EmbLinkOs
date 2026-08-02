@@ -870,7 +870,10 @@ verified on the metal.
   **own SHA-1**, then writes a real `.git` + checks out the working tree.
   `test gitclone` clones **github.com/octocat/Hello-World** into `/data/hello` on
   the metal (`GITCHECKOUT … -> OK`, README on EMBKFS); a real upstream git reads
-  the result. *Deferred:* deltified packs are host- but not metal-tested; no push,
+  the result. **Delta reconstruction is proven** — a host harness matches
+  `git verify-pack` byte-for-byte on both ofs- and ref-delta packs (chained), and
+  `test gitclone delta` clones **octocat/Spoon-Knife** live (github's ofs-delta
+  pack resolved on the metal, 3-file tree on branch `main`). *Deferred:* no push,
   no auth, no negotiation/shallow (see `docs/TODO.md`).
 
 Trust anchors bundled: GTS Root R4 (EC P-384), ISRG Root X1 (RSA-4096), GlobalSign

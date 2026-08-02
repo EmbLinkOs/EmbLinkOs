@@ -1282,26 +1282,37 @@ int selftests_handle_command(const char *cmd)
         return code == 0 ? 0 : 1;
     }
 
-    if (strcmp(cmd, "test gitclone") == 0) {
-        /* git over HTTPS, milestone G1: our own gitclone drives git's smart-HTTP
-         * protocol over libtls (git can't -- it fork/execs its transport) and
-         * lists a public repo's refs. Proves the git-protocol-over-TLS path.
-         * Needs CAP_NETWORK + -cpu max (RDRAND). */
+    if (strcmp(cmd, "test gitclone") == 0 ||
+        strcmp(cmd, "test gitclone delta") == 0) {
+        /* git over HTTPS (G1-G4): our own gitclone drives git's smart-HTTP
+         * protocol over libtls (git can't -- it fork/execs its transport), fetches
+         * the packfile, unpacks it (own SHA-1 + inflate + delta resolution), then
+         * writes a real .git and checks out the working tree. Needs CAP_NETWORK +
+         * CAP_FILESYSTEM + -cpu max (RDRAND).
+         *   plain: octocat/Hello-World -> /data/hello (delta-FREE baseline).
+         *   delta: octocat/Spoon-Knife -> /data/spoon (github ofs-deltas +
+         *          branch `main` + a 3-file working tree; README is a deep delta,
+         *          so a correct checkout proves delta reconstruction on the metal). */
+        int want_delta = (strcmp(cmd, "test gitclone delta") == 0);
         const char *sp = "/data/apps/gitclone/gitclone.elf";
         struct vfs_stat st;
-        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test gitclone: %s not on image\n", sp); return 1; }
-        char *a[]   = { (char *)sp, (char *)"https://github.com/octocat/Hello-World",
-                        (char *)"/data/hello", NULL };
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] %s: %s not on image\n", cmd, sp); return 1; }
+
+        const char *url   = want_delta ? "https://github.com/octocat/Spoon-Knife"
+                                        : "https://github.com/octocat/Hello-World";
+        const char *dir   = want_delta ? "/data/spoon" : "/data/hello";
+        const char *probe = want_delta ? "/data/spoon/index.html" : "/data/hello/README";
+        char *a[]   = { (char *)sp, (char *)url, (char *)dir, NULL };
         char *env[] = { (char *)"HOME=/", NULL };
         uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
         int pid = process_create_caps(sp, a, 3, env, NULL, 0, caps);
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         struct vfs_stat rst;
-        int have_readme = (vfs_stat("/data/hello/README", &rst) == EMBK_OK);
-        kprintf("[cmd] test gitclone: checkout README on disk=%d (%llu bytes)\n",
-                have_readme, have_readme ? (unsigned long long)rst.size : 0ULL);
-        kprintf("[cmd] test gitclone: %s\n", (code == 0 && have_readme) ? "OK" : "FAIL");
-        return (code == 0 && have_readme) ? 0 : 1;
+        int have = (vfs_stat(probe, &rst) == EMBK_OK);
+        kprintf("[cmd] %s: checkout %s on disk=%d (%llu bytes)\n",
+                cmd, probe, have, have ? (unsigned long long)rst.size : 0ULL);
+        kprintf("[cmd] %s: %s\n", cmd, (code == 0 && have) ? "OK" : "FAIL");
+        return (code == 0 && have) ? 0 : 1;
     }
 
     if (strcmp(cmd, "test emlibc net") == 0) {
