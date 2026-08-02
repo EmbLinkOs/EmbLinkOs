@@ -36,6 +36,7 @@
 #include "crypto/pbkdf2.h"
 #include "crypto/aes.h"
 #include "crypto/xts.h"
+#include "selftest.h"   /* user/lib/tls/crypto: tls_crypto_run_selftests (T1) */
 #include "fs/embkfs/embkfs_compress.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"   /* compositor_pointer_tick: keep the desktop live while `shell` waits */
@@ -453,6 +454,8 @@ static void selftests_print_commands(void)
     kprintf("  test embcc rim\n");
     kprintf("  test embbuild\n");
     kprintf("  test embbuild self\n");
+    kprintf("  test embbuild kernel\n");
+    kprintf("  test embbuild derive\n");
     kprintf("  test embbuild shell\n");
     kprintf("  test embbuild gui\n");
     kprintf("  test keyboard\n");
@@ -1149,6 +1152,582 @@ int selftests_handle_command(const char *cmd)
         }
         kprintf("[cmd] test wget: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test wget https") == 0) {
+        /* THE T4 PAYOFF: the OS downloads a real file over HTTPS TO DISK. wget
+         * (ring 3) does an authenticated TLS 1.3 fetch of an https:// URL and
+         * writes the decrypted body to /wgets.out -- TLS + networking meet the
+         * filesystem. Target chains to the bundled ISRG Root X1 anchor. Needs
+         * CAP_NETWORK + CAP_FILESYSTEM, outbound :443, and RDRAND (-cpu max). */
+        const char *wp = "/data/apps/wget/wget.elf";
+        struct vfs_stat st;
+        if (vfs_stat(wp, &st) != 0) { kprintf("\n[cmd] test wget https: %s not on image\n", wp); return 1; }
+        char *a[]   = { (char *)wp, (char *)"-O", (char *)"/wgets.out",
+                        (char *)"https://valid-isrgrootx1.letsencrypt.org/", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(wp, a, 4, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[wgets] exit=%d\n", code);
+
+        int ok = (code == 0);
+        if (ok) {
+            struct vfs_stat fs;
+            if (vfs_stat("/wgets.out", &fs) != 0) { kprintf("[wgets] /wgets.out missing\n"); ok = 0; }
+            else {
+                kprintf("[wgets] downloaded %lu bytes over HTTPS to /wgets.out\n", (unsigned long)fs.size);
+                if (fs.size < 100) { kprintf("[wgets] suspiciously small\n"); ok = 0; }
+            }
+        }
+        kprintf("[cmd] test wget https: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test pypi") == 0) {
+        /* T5 slice: the OS reaches the REAL package ecosystem over its own
+         * authenticated TLS. Fetches PyPI's PEP-503 simple index page for a
+         * package -- exactly what `pip` reads to find distributions -- verifying
+         * pypi.org's chain to the bundled GlobalSign Root R3 anchor. (Wiring this
+         * into pip itself needs a libtls-backed _ssl; see docs/TODO.md.) */
+        const char *wp = "/data/apps/wget/wget.elf";
+        struct vfs_stat st;
+        if (vfs_stat(wp, &st) != 0) { kprintf("\n[cmd] test pypi: %s not on image\n", wp); return 1; }
+        char *a[]   = { (char *)wp, (char *)"-O", (char *)"/pypi.out",
+                        (char *)"https://pypi.org/simple/six/", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(wp, a, 4, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[pypi] exit=%d\n", code);
+        int ok = (code == 0);
+        if (ok) {
+            struct vfs_stat fs;
+            if (vfs_stat("/pypi.out", &fs) != 0) { kprintf("[pypi] /pypi.out missing\n"); ok = 0; }
+            else {
+                char head[16] = {0}; size_t got = 0;
+                int fd = vfs_open("/pypi.out", O_RDONLY, 0);
+                if (fd >= 0) { vfs_fd_read(fd, head, sizeof head - 1, &got); vfs_close(fd); }
+                kprintf("[pypi] fetched %lu bytes of PyPI's index for 'six', starts \"%s\"\n",
+                        (unsigned long)fs.size, got ? head : "");
+                if (fs.size < 100) ok = 0;
+            }
+        }
+        kprintf("[cmd] test pypi: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test pkgfetch") == 0) {
+        /* T5 (native path): the OS installs a real PyPI package. pkgfetch (ring 3)
+         * fetches six's simple index + wheel over OUR authenticated TLS, and our
+         * own inflate + zip reader unpack it into /data/py/site-packages. Then
+         * `PYTHONPATH=/data/py/site-packages python -c 'import six'` works. Needs
+         * CAP_NETWORK + CAP_FILESYSTEM, outbound :443, RDRAND (-cpu max). */
+        const char *pp = "/data/apps/pkgfetch/pkgfetch.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != 0) { kprintf("\n[cmd] test pkgfetch: %s not on image\n", pp); return 1; }
+        char *a[]   = { (char *)pp, (char *)"six", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(pp, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[pkgfetch] exit=%d\n", code);
+        int ok = (code == 0);
+        if (ok) {
+            struct vfs_stat fs;
+            if (vfs_stat("/data/py/site-packages/six.py", &fs) != 0) {
+                kprintf("[pkgfetch] six.py not installed\n"); ok = 0;
+            } else {
+                kprintf("[pkgfetch] installed six.py (%lu bytes) -- a real PyPI package, on our own TLS+inflate\n",
+                        (unsigned long)fs.size);
+                if (fs.size < 1000) ok = 0;
+            }
+        }
+        kprintf("[cmd] test pkgfetch: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test sockdemo") == 0) {
+        /* Proves the newlib BSD-sockets shim: sockdemo (ring 3) does a plain HTTP
+         * GET using the POSIX API (getaddrinfo/socket/connect/send/recv) -- the
+         * same symbols Python's _socket resolves to, now routed to embk_net_*.
+         * Needs CAP_NETWORK + outbound :80 (SLIRP). */
+        const char *sp = "/data/apps/sockdemo/sockdemo.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test sockdemo: %s not on image\n", sp); return 1; }
+        char *a[]   = { (char *)sp, (char *)"example.com", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(sp, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[sockdemo] exit=%d\n", code);
+        kprintf("[cmd] test sockdemo: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test nbsock") == 0) {
+        /* The non-blocking socket path (kernel feature that unblocks pip install):
+         * O_NONBLOCK via fcntl, connect -> EINPROGRESS, select for writable +
+         * readable, getsockopt(SO_ERROR), EAGAIN recv. Native (ring 3), HTTP to
+         * example.com:80 so it isolates the non-blocking machinery from TLS. */
+        const char *sp = "/data/apps/nbsock/nbsock.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test nbsock: %s not on image\n", sp); return 1; }
+        char *a[]   = { (char *)sp, NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(sp, a, 1, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[cmd] test nbsock: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test gitclone") == 0 ||
+        strcmp(cmd, "test gitclone delta") == 0 ||
+        strcmp(cmd, "test gitclone shallow") == 0) {
+        /* git over HTTPS (G1-G7): our own gitclone drives git's smart-HTTP
+         * protocol over libtls (git can't -- it fork/execs its transport), fetches
+         * the packfile, unpacks it (own SHA-1 + inflate + delta resolution), then
+         * writes a real .git and checks out the working tree. Needs CAP_NETWORK +
+         * CAP_FILESYSTEM + -cpu max (RDRAND).
+         *   plain:   octocat/Hello-World -> /data/hello (delta-FREE baseline).
+         *   delta:   octocat/Spoon-Knife -> /data/spoon (github ofs-deltas +
+         *            branch `main` + a 3-file tree; a deep delta blob checks out).
+         *   shallow: octocat/Spoon-Knife --depth 1 -> /data/spoonshallow (G7: the
+         *            `deepen` negotiation -- server sends `shallow <sha>` bounds,
+         *            we write .git/shallow; only the tip commit's objects arrive). */
+        int want_delta   = (strcmp(cmd, "test gitclone delta") == 0);
+        int want_shallow = (strcmp(cmd, "test gitclone shallow") == 0);
+        const char *sp = "/data/apps/gitclone/gitclone.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] %s: %s not on image\n", cmd, sp); return 1; }
+
+        const char *url   = (want_delta || want_shallow)
+                                ? "https://github.com/octocat/Spoon-Knife"
+                                : "https://github.com/octocat/Hello-World";
+        const char *dir   = want_shallow ? "/data/spoonshallow"
+                          : want_delta   ? "/data/spoon" : "/data/hello";
+        const char *probe = want_shallow ? "/data/spoonshallow/index.html"
+                          : want_delta   ? "/data/spoon/index.html" : "/data/hello/README";
+        /* shallow adds "--depth 1"; the flag is positional-agnostic in gitclone. */
+        char *a_full[]    = { (char *)sp, (char *)url, (char *)dir, NULL };
+        char *a_shallow[] = { (char *)sp, (char *)"--depth", (char *)"1",
+                              (char *)url, (char *)dir, NULL };
+        char **a  = want_shallow ? a_shallow : a_full;
+        int    ac = want_shallow ? 5 : 3;
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid = process_create_caps(sp, a, ac, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        struct vfs_stat rst;
+        int have = (vfs_stat(probe, &rst) == EMBK_OK);
+        kprintf("[cmd] %s: checkout %s on disk=%d (%llu bytes)\n",
+                cmd, probe, have, have ? (unsigned long long)rst.size : 0ULL);
+
+        /* Close the loop: the OS's OWN ported git.elf must be able to operate on
+         * the repo our from-scratch clone tool just wrote. git finds .git by
+         * walking up from PWD -- the per-process cwd `test git cwd` relies on --
+         * so no chdir is needed. Index-free commands only (our clone writes no
+         * index). Skipped (not failed) if git isn't on the image.
+         *   log       -- walks HEAD -> refs/heads/<branch> -> the commit chain,
+         *                inflating+parsing our loose commit objects. THE GATE:
+         *                exit 0 proves the on-OS git reads our refs + objects.
+         *   cat-file  -- reads EVERY object (--batch-all-objects), re-inflating
+         *                and hash-checking each: proves our zlib-deflate object
+         *                writing + SHA naming are byte-correct per the real git.
+         * (`fsck` is avoided on purpose: it works, but ends by SPAWNING
+         *  commit-graph/multi-pack-index sub-checks -- fork/exec is ENOSYS here --
+         *  so its exit is nonzero for a reason unrelated to repo validity.) */
+        int git_ok = 1;   /* vacuously true if git.elf absent */
+        struct vfs_stat gst;
+        if (code == 0 && have && vfs_stat("/data/apps/git/git.elf", &gst) == EMBK_OK) {
+            char pwd[64];
+            snprintf(pwd, sizeof pwd, "PWD=%s", dir);
+            char *genv[] = { (char *)"HOME=/", (char *)"GIT_PAGER=", pwd, NULL };
+            char *log_a[]  = { (char *)"/data/apps/git/git.elf", (char *)"log",
+                               (char *)"--oneline", NULL };
+            char *cat_a[]  = { (char *)"/data/apps/git/git.elf", (char *)"cat-file",
+                               (char *)"--batch-all-objects", (char *)"--batch-check", NULL };
+            int lp = process_create_env("/data/apps/git/git.elf", log_a, 3, genv, NULL, 0);
+            int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            kprintf("[%s on-OS git log] exit=%d\n", cmd, lc);
+            int cp = process_create_env("/data/apps/git/git.elf", cat_a, 4, genv, NULL, 0);
+            int cc = cp >= 0 ? process_wait((uint32_t)cp) : -1;
+            kprintf("[%s on-OS git cat-file(all objects)] exit=%d (informational)\n", cmd, cc);
+            /* Gate on `log`: it reads our refs + commit objects, and unlike fsck/
+             * cat-file's odb-maintenance paths it never tries to fork/exec. */
+            git_ok = (lc == 0);
+        }
+
+        int pass = (code == 0 && have && git_ok);
+        kprintf("[cmd] %s: %s\n", cmd, pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test gitpush") == 0) {
+        /* git PUSH over HTTPS (G8/G9): gitpush builds a blob+tree+commit, packs
+         * them (pack_write), and drives git-receive-pack over libtls with HTTP
+         * Basic auth. Two pushes prove BOTH paths:
+         *   1. README.md -> a FIRST commit that CREATES `main` (empty repo, G8).
+         *   2. NOTES.md  -> an INCREMENTAL commit (G9): fetch the tip, splice its
+         *      tree (README.md must survive), parent = the tip, push.
+         * Needs CAP_NETWORK + CAP_FILESYSTEM + -cpu max, plus LOCAL credentials
+         * staged into the image (env-gated in mkfs, never committed): a PAT at
+         * /data/gitpush/token and the repo url at /data/gitpush/url. */
+        const char *sp = "/data/apps/gitpush/gitpush.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test gitpush: %s not on image\n", sp); return 1; }
+
+        static char token[512], url[512], tokenv[560];
+        int fd = vfs_open("/data/gitpush/token", O_RDONLY, 0);
+        if (fd < 0) { kprintf("[cmd] test gitpush: no /data/gitpush/token -- rebuild with "
+                              "EMBK_GITPUSH_TOKEN_FILE=<file> EMBK_GITPUSH_URL=<url> (needs a PAT)\n"); return 1; }
+        size_t got = 0; vfs_fd_read(fd, token, sizeof token - 1, &got); vfs_close(fd);
+        while (got > 0 && (token[got-1] == '\n' || token[got-1] == '\r' || token[got-1] == ' ')) got--;
+        token[got] = 0;
+        fd = vfs_open("/data/gitpush/url", O_RDONLY, 0);
+        if (fd < 0) { kprintf("[cmd] test gitpush: no /data/gitpush/url\n"); return 1; }
+        size_t ug = 0; vfs_fd_read(fd, url, sizeof url - 1, &ug); vfs_close(fd);
+        while (ug > 0 && (url[ug-1] == '\n' || url[ug-1] == '\r' || url[ug-1] == ' ')) ug--;
+        url[ug] = 0;
+
+        /* Two files: the first-commit README, then the incremental NOTES. */
+        int wf = vfs_open("/data/pushme.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (wf >= 0) { static const char m[] = "Pushed from EmbLinkOS -- our own TLS 1.3 + git-receive-pack, no stock git.\n";
+            size_t w = 0; vfs_fd_write(wf, m, sizeof m - 1, &w); vfs_close(wf); }
+        wf = vfs_open("/data/notes.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (wf >= 0) { static const char m[] = "A second, incremental commit -- README.md must survive the tree splice.\n";
+            size_t w = 0; vfs_fd_write(wf, m, sizeof m - 1, &w); vfs_close(wf); }
+
+        snprintf(tokenv, sizeof tokenv, "GITPUSH_TOKEN=%s", token);   /* env, not argv */
+        char *env[] = { (char *)"HOME=/", tokenv, NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        char *a1[] = { (char *)sp, url, (char *)"/data/pushme.txt", (char *)"README.md", (char *)"main", NULL };
+        int p1 = process_create_caps(sp, a1, 5, env, NULL, 0, caps);
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[cmd] test gitpush: push 1 (README, first commit) = %s\n", c1 == 0 ? "OK" : "FAIL");
+
+        char *a2[] = { (char *)sp, url, (char *)"/data/notes.txt", (char *)"NOTES.md", (char *)"main", NULL };
+        int p2 = process_create_caps(sp, a2, 5, env, NULL, 0, caps);
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        kprintf("[cmd] test gitpush: push 2 (NOTES, incremental) = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && c2 == 0);
+        kprintf("[cmd] test gitpush: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test gitfeat") == 0) {
+        /* The remaining git frontier, live: NESTED-subtree push, MULTI-REF clone,
+         * FORCE-push, and branch DELETE. Runs a self-contained sequence on the
+         * gitpush test repo (same staged /data/gitpush/{token,url} credentials):
+         *   1. push docs/guide.md to `main`   -- INCREMENTAL, NESTED subtree.
+         *   2. push NOTES.md to a NEW `dev`    -- creates a second branch.
+         *   3. gitclone --ref dev              -- MULTI-REF clone (not the default).
+         *   4. gitpush --force main            -- replace main's history.
+         *   5. gitpush --delete dev            -- remove the branch. */
+        const char *spp = "/data/apps/gitpush/gitpush.elf";
+        const char *spc = "/data/apps/gitclone/gitclone.elf";
+        struct vfs_stat st;
+        if (vfs_stat(spp, &st) != 0 || vfs_stat(spc, &st) != 0) {
+            kprintf("\n[cmd] test gitfeat: gitpush/gitclone not on image\n"); return 1; }
+
+        static char token[512], url[512], tokenv[560];
+        int fd = vfs_open("/data/gitpush/token", O_RDONLY, 0);
+        if (fd < 0) { kprintf("[cmd] test gitfeat: no /data/gitpush/token (needs a PAT)\n"); return 1; }
+        size_t got = 0; vfs_fd_read(fd, token, sizeof token - 1, &got); vfs_close(fd);
+        while (got > 0 && (token[got-1] == '\n' || token[got-1] == '\r' || token[got-1] == ' ')) got--;
+        token[got] = 0;
+        fd = vfs_open("/data/gitpush/url", O_RDONLY, 0);
+        if (fd < 0) { kprintf("[cmd] test gitfeat: no /data/gitpush/url\n"); return 1; }
+        size_t ug = 0; vfs_fd_read(fd, url, sizeof url - 1, &ug); vfs_close(fd);
+        while (ug > 0 && (url[ug-1] == '\n' || url[ug-1] == '\r' || url[ug-1] == ' ')) ug--;
+        url[ug] = 0;
+
+        struct { const char *path; const char *msg; } files[] = {
+            { "/data/f_guide.txt", "A nested doc pushed from EmbLinkOS (docs/guide.md).\n" },
+            { "/data/f_notes.txt", "Content living on the dev branch.\n" },
+            { "/data/f_only.txt",  "main's history replaced by a force-push from EmbLinkOS.\n" },
+        };
+        for (unsigned i = 0; i < sizeof files / sizeof files[0]; i++) {
+            int wf = vfs_open(files[i].path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (wf >= 0) { size_t w = 0; vfs_fd_write(wf, files[i].msg, strlen(files[i].msg), &w); vfs_close(wf); }
+        }
+
+        snprintf(tokenv, sizeof tokenv, "GITPUSH_TOKEN=%s", token);
+        char *env[] = { (char *)"HOME=/", tokenv, NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        /* 1. nested incremental push to main */
+        char *a1[] = { (char *)spp, url, (char *)"/data/f_guide.txt", (char *)"docs/guide.md", (char *)"main", NULL };
+        int r1 = process_wait((uint32_t)process_create_caps(spp, a1, 5, env, NULL, 0, caps));
+        kprintf("[gitfeat] 1 nested push docs/guide.md -> main = %s\n", r1 == 0 ? "OK" : "FAIL");
+
+        /* 2. push a new branch dev */
+        char *a2[] = { (char *)spp, url, (char *)"/data/f_notes.txt", (char *)"NOTES.md", (char *)"dev", NULL };
+        int r2 = process_wait((uint32_t)process_create_caps(spp, a2, 5, env, NULL, 0, caps));
+        kprintf("[gitfeat] 2 push NOTES.md -> new branch dev = %s\n", r2 == 0 ? "OK" : "FAIL");
+
+        /* 3. multi-ref clone of dev */
+        char *a3[] = { (char *)spc, (char *)"--ref", (char *)"dev", url, (char *)"/data/devclone", NULL };
+        int r3 = process_wait((uint32_t)process_create_caps(spc, a3, 5, env, NULL, 0, caps));
+        struct vfs_stat ds;
+        int cloned = (vfs_stat("/data/devclone/NOTES.md", &ds) == EMBK_OK);
+        kprintf("[gitfeat] 3 clone --ref dev = %s (NOTES.md on disk=%d)\n",
+                r3 == 0 ? "OK" : "FAIL", cloned);
+
+        /* 4. force-push main */
+        char *a4[] = { (char *)spp, (char *)"--force", url, (char *)"/data/f_only.txt", (char *)"ONLY.md", (char *)"main", NULL };
+        int r4 = process_wait((uint32_t)process_create_caps(spp, a4, 6, env, NULL, 0, caps));
+        kprintf("[gitfeat] 4 force-push main = %s\n", r4 == 0 ? "OK" : "FAIL");
+
+        /* 5. delete dev */
+        char *a5[] = { (char *)spp, (char *)"--delete", url, (char *)"dev", NULL };
+        int r5 = process_wait((uint32_t)process_create_caps(spp, a5, 4, env, NULL, 0, caps));
+        kprintf("[gitfeat] 5 delete dev = %s\n", r5 == 0 ? "OK" : "FAIL");
+
+        int pass = (r1 == 0 && r2 == 0 && r3 == 0 && cloned && r4 == 0 && r5 == 0);
+        kprintf("[cmd] test gitfeat: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test pkg") == 0) {
+        /* Packaging PK1 (docs/PACKAGING_AND_SDK.md): install an authority-declaring
+         * bundle and prove the grant is KERNEL-ENFORCED, not installer-promised.
+         *   1. pkg install /data/staging/pkgprobe -- verify (recompute the EMBX
+         *      build_id, cross-check caps/abi vs the manifest), present the
+         *      declared authority, adopt into /data/apps/pkgprobe.
+         *   2. pkg run pkgprobe -- spawn it under EXACTLY the declared caps
+         *      (SET_CAPS) + namespace (NS_BIND); pkgprobe self-checks that it holds
+         *      filesystem (not network) and can name /system but NOT /data/users.
+         *   3. pkg verify /data/staging/pkgprobe_bad -- a tampered EMBX whose
+         *      build_id no longer recomputes: MUST be refused (non-zero). */
+        const char *sp = "/data/apps/pkg/pkg.elf";
+        struct vfs_stat st;
+        if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test pkg: %s not on image\n", sp); return 1; }
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        char *a1[] = { (char *)sp, (char *)"install", (char *)"/data/staging/pkgprobe", NULL };
+        int c1 = process_wait((uint32_t)process_create_caps(sp, a1, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 1 install pkgprobe = %s\n", c1 == 0 ? "OK" : "FAIL");
+
+        char *a2[] = { (char *)sp, (char *)"run", (char *)"pkgprobe", NULL };
+        int c2 = process_wait((uint32_t)process_create_caps(sp, a2, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 2 run pkgprobe (confined to its grant) = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        char *a3[] = { (char *)sp, (char *)"verify", (char *)"/data/staging/pkgprobe_bad", NULL };
+        int c3 = process_wait((uint32_t)process_create_caps(sp, a3, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 3 verify tampered BINARY -> %s (build_id fails; refused=%d)\n",
+                c3 != 0 ? "REJECTED" : "ACCEPTED", c3 != 0);
+
+        /* 4. altered MANIFEST (flipped signature digit): binary is intact, so
+         *    this isolates the PK3 signature check -- must still be refused. */
+        char *a4[] = { (char *)sp, (char *)"verify", (char *)"/data/staging/pkgprobe_badsig", NULL };
+        int c4 = process_wait((uint32_t)process_create_caps(sp, a4, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 4 verify bad SIGNATURE -> %s (signature fails; refused=%d)\n",
+                c4 != 0 ? "REJECTED" : "ACCEPTED", c4 != 0);
+
+        /* 5. UPDATE to v1.1 (same authority) -> OK; retains v1.0 as rollback point. */
+        char *a5[] = { (char *)sp, (char *)"install", (char *)"/data/staging/pkgprobe_v11", NULL };
+        int c5 = process_wait((uint32_t)process_create_caps(sp, a5, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 5 update -> v1.1 = %s\n", c5 == 0 ? "OK" : "FAIL");
+
+        /* 6. ROLLBACK to the retained v1.0. */
+        char *a6[] = { (char *)sp, (char *)"rollback", (char *)"pkgprobe", NULL };
+        int c6 = process_wait((uint32_t)process_create_caps(sp, a6, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 6 rollback -> v1.0 = %s\n", c6 == 0 ? "OK" : "FAIL");
+
+        /* 7. UPDATE to a WIDER version (adds `network`) -> REFUSED (silent
+         *    privilege escalation caught by authority re-negotiation). */
+        char *a7[] = { (char *)sp, (char *)"install", (char *)"/data/staging/pkgprobe_wide", NULL };
+        int c7 = process_wait((uint32_t)process_create_caps(sp, a7, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 7 update -> wider (adds network) -> %s (refused=%d)\n",
+                c7 != 0 ? "REJECTED" : "ACCEPTED", c7 != 0);
+
+        /* 8. the same wider update, explicitly consented via --allow-widen -> OK. */
+        char *a8[] = { (char *)sp, (char *)"install", (char *)"--allow-widen", (char *)"/data/staging/pkgprobe_wide", NULL };
+        int c8 = process_wait((uint32_t)process_create_caps(sp, a8, 4, env, NULL, 0, caps));
+        kprintf("[pkg] 8 update -> wider WITH --allow-widen = %s\n", c8 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && c2 == 0 && c3 != 0 && c4 != 0 &&
+                    c5 == 0 && c6 == 0 && c7 != 0 && c8 == 0);
+        kprintf("[cmd] test pkg: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test pkgbuild") == 0) {
+        /* Packaging PK2b: GENERATE a package bundle ON THE DEVICE, then install +
+         * run it -- the whole SDK->pkgmgr loop, on the OS itself.
+         *   1. pkgbuild <spec> <elf> /data/gen -- the on-OS generator (embxgen
+         *      writes the EMBX with the cap table from the spec, + .ns + manifest,
+         *      consistent by construction). Produces an UNSIGNED local build.
+         *   2. pkg install --local /data/gen -- adopt a dev build (unsigned is
+         *      allowed only with --local; caps/build_id/re-negotiation still hold).
+         *   3. pkg run pkgprobe -- it runs confined to exactly the declared grant. */
+        const char *pb = "/data/apps/pkgbuild/pkgbuild.elf";
+        const char *pk = "/data/apps/pkg/pkg.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pb, &st) != 0 || vfs_stat(pk, &st) != 0) {
+            kprintf("\n[cmd] test pkgbuild: pkgbuild/pkg not on image\n"); return 1; }
+        (void)vfs_mkdir_path("/data/gen");
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        char *a1[] = { (char *)pb, (char *)"/data/staging/build/pkgprobe.pkgspec",
+                       (char *)"/data/staging/build/pkgprobe.elf", (char *)"/data/gen", NULL };
+        int c1 = process_wait((uint32_t)process_create_caps(pb, a1, 4, env, NULL, 0, caps));
+        kprintf("[pkgbuild] 1 generate bundle on-device = %s\n", c1 == 0 ? "OK" : "FAIL");
+
+        char *a2[] = { (char *)pk, (char *)"install", (char *)"--local", (char *)"/data/gen", NULL };
+        int c2 = process_wait((uint32_t)process_create_caps(pk, a2, 4, env, NULL, 0, caps));
+        kprintf("[pkgbuild] 2 pkg install --local = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        char *a3[] = { (char *)pk, (char *)"run", (char *)"pkgprobe", NULL };
+        int c3 = process_wait((uint32_t)process_create_caps(pk, a3, 3, env, NULL, 0, caps));
+        kprintf("[pkgbuild] 3 run generated app (confined) = %s\n", c3 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && c2 == 0 && c3 == 0);
+        kprintf("[cmd] test pkgbuild: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test pkgstanza") == 0) {
+        /* PK2b structured stanza (docs/PACKAGING_AND_SDK.md §4): a build.ebm
+         * `kind: package` stanza declares the app's authority (caps/grant) inline;
+         * EmbBuild turns it into a .pkgspec and drives pkgbuild -- so declaring
+         * authority is part of building ON THE OS via the build tool itself.
+         *   1. embbuild <build.ebm> -- runs the package stanza -> a bundle in
+         *      /data/build/out/pkgstanza (embbuild spawns pkgbuild, inheriting FS).
+         *   2. pkg install --local -- adopt the (unsigned, on-device) build.
+         *   3. pkg run pkgprobe -- confined to the declared grant. */
+        const char *bb = "/data/apps/embbuild/embbuild.elf";
+        const char *pk = "/data/apps/pkg/pkg.elf";
+        struct vfs_stat st;
+        if (vfs_stat(bb, &st) != 0 || vfs_stat(pk, &st) != 0) {
+            kprintf("\n[cmd] test pkgstanza: embbuild/pkg not on image\n"); return 1; }
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        char *a1[] = { (char *)bb, (char *)"/data/staging/build/pkgstanza.ebm", NULL };
+        int c1 = process_wait((uint32_t)process_create_caps(bb, a1, 2, env, NULL, 0, caps));
+        struct vfs_stat es;
+        int built = (vfs_stat("/data/build/out/pkgstanza/pkgprobe.embx", &es) == EMBK_OK);
+        kprintf("[pkgstanza] 1 embbuild package stanza -> bundle = %s (embx on disk=%d)\n",
+                c1 == 0 ? "OK" : "FAIL", built);
+
+        char *a2[] = { (char *)pk, (char *)"install", (char *)"--local", (char *)"/data/build/out/pkgstanza", NULL };
+        int c2 = process_wait((uint32_t)process_create_caps(pk, a2, 4, env, NULL, 0, caps));
+        kprintf("[pkgstanza] 2 pkg install --local = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        char *a3[] = { (char *)pk, (char *)"run", (char *)"pkgprobe", NULL };
+        int c3 = process_wait((uint32_t)process_create_caps(pk, a3, 3, env, NULL, 0, caps));
+        kprintf("[pkgstanza] 3 run built package (confined) = %s\n", c3 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && built && c2 == 0 && c3 == 0);
+        kprintf("[cmd] test pkgstanza: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test pkgregistry") == 0) {
+        /* Packaging PK4: the registry is a GIT REPO. The OS clones it over HTTPS
+         * (our own git-over-TLS) and installs a SIGNED package from it -- the
+         * signature is verified against the trusted key ON ARRIVAL, so trust is in
+         * the signature, not the channel (§9.2). Needs CAP_NETWORK + -cpu max.
+         *   1. gitclone emblink-packages -> /data/registry (the index + bundles).
+         *   2. pkg install /data/registry/pkgprobe -- verify signature + build_id,
+         *      then adopt (exactly like a local bundle, but it came from the net).
+         *   3. pkg run pkgprobe -- confined to its declared grant. */
+        const char *gc = "/data/apps/gitclone/gitclone.elf";
+        const char *pk = "/data/apps/pkg/pkg.elf";
+        struct vfs_stat st;
+        if (vfs_stat(gc, &st) != 0 || vfs_stat(pk, &st) != 0) {
+            kprintf("\n[cmd] test pkgregistry: gitclone/pkg not on image\n"); return 1; }
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps_net = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        uint64_t caps_fs  = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        /* 1. `pkg sync <url>` -- pkg itself clones the registry (spawns gitclone,
+         *    which inherits pkg's CAP_NETWORK). Like `apt update`. */
+        char *a1[] = { (char *)pk, (char *)"sync",
+                       (char *)"https://github.com/teo1747/emblink-packages", NULL };
+        int c1 = process_wait((uint32_t)process_create_caps(pk, a1, 3, env, NULL, 0, caps_net));
+        int have = (vfs_stat("/data/registry/pkgprobe/pkgprobe.pkg", &st) == EMBK_OK);
+        kprintf("[pkgreg] 1 pkg sync (clone registry over HTTPS) = %s (index on disk=%d)\n",
+                c1 == 0 ? "OK" : "FAIL", have);
+
+        /* 2. `pkg install pkgprobe` -- resolve the NAME from the synced registry.
+         *    The registry ships only the signed manifest + a `.url`; pkg FETCHES
+         *    the binary (release asset) via wget, then verifies its build_id
+         *    against the signed manifest -- a tampered host cannot inject a bad
+         *    binary. Needs CAP_NETWORK (inherited by wget). Like `apt install`. */
+        char *a2[] = { (char *)pk, (char *)"install", (char *)"pkgprobe", NULL };
+        int c2 = process_wait((uint32_t)process_create_caps(pk, a2, 3, env, NULL, 0, caps_net));
+        kprintf("[pkgreg] 2 pkg install pkgprobe (fetch asset + verify build_id) = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        char *a3[] = { (char *)pk, (char *)"run", (char *)"pkgprobe", NULL };
+        int c3 = process_wait((uint32_t)process_create_caps(pk, a3, 3, env, NULL, 0, caps_fs));
+        kprintf("[pkgreg] 3 run installed package (confined) = %s\n", c3 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && have && c2 == 0 && c3 == 0);
+        kprintf("[cmd] test pkgregistry: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test emlibc net") == 0) {
+        /* Proves emlibc's NATIVE networking: emlibc_net (ring 3, linked against
+         * libemlibc only -- zero newlib) does an HTTP GET via em_tcp_connect +
+         * read/write, EmbLink's own vocabulary (no BSD sockets). Needs
+         * CAP_NETWORK + outbound :80. */
+        const char *ep = "/data/apps/emlibc_net/emlibc_net.elf";
+        struct vfs_stat st;
+        if (vfs_stat(ep, &st) != 0) { kprintf("\n[cmd] test emlibc net: %s not on image\n", ep); return 1; }
+        char *a[]   = { (char *)ep, (char *)"example.com", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(ep, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[emlibc-net] exit=%d\n", code);
+        kprintf("[cmd] test emlibc net: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test tls") == 0) {
+        /* THE HEADLINE (docs/TLS.md T2): the OS speaks TLS 1.3. tlstest (ring 3)
+         * resolves cloudflare.com, TCP-connects :443, runs OUR libtls handshake
+         * (server Finished verified -- proving ECDHE + key schedule + transcript
+         * + record layer are all byte-correct; cert NOT verified yet: T3), then
+         * does an encrypted HTTPS GET and reads the decrypted reply. Needs
+         * CAP_NETWORK, outbound :443 (SLIRP), and RDRAND (QEMU -cpu max). */
+        const char *tp = "/data/apps/tlstest/tlstest.elf";
+        struct vfs_stat st;
+        if (vfs_stat(tp, &st) != 0) { kprintf("\n[cmd] test tls: %s not on image\n", tp); return 1; }
+        char *a[]   = { (char *)tp, (char *)"cloudflare.com", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(tp, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[tls] exit=%d\n", code);
+        kprintf("[cmd] test tls: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test tls rsa") == 0) {
+        /* Like `test tls`, but against an RSA-leaf server (Let's Encrypt) --
+         * exercises the RSA-PSS CertificateVerify + the RSA chain to the bundled
+         * ISRG Root X1 anchor. Needs CAP_NETWORK + outbound :443 + RDRAND. */
+        const char *tp = "/data/apps/tlstest/tlstest.elf";
+        struct vfs_stat st;
+        if (vfs_stat(tp, &st) != 0) { kprintf("\n[cmd] test tls rsa: %s not on image\n", tp); return 1; }
+        char *a[]   = { (char *)tp, (char *)"valid-isrgrootx1.letsencrypt.org", NULL };
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+        int pid = process_create_caps(tp, a, 2, env, NULL, 0, caps);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[tls-rsa] exit=%d\n", code);
+        kprintf("[cmd] test tls rsa: %s\n", code == 0 ? "OK" : "FAIL");
+        return code == 0 ? 0 : 1;
     }
 
     if (strcmp(cmd, "test emlibc") == 0) {
@@ -2297,6 +2876,12 @@ int selftests_handle_command(const char *cmd)
         int rc_xts = aes_xts_run_selftests();
         bool all_ok = (rc_sha == 0 && rc_hmac == 0 && rc_pbkdf2 == 0 && rc_aes == 0 && rc_xts == 0);
         kprintf("\n[cmd] test crypto all: %s\n", all_ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test tls crypto") == 0) {
+        int rc = tls_crypto_run_selftests();
+        kprintf("\n[cmd] test tls crypto: %s\n", rc == 0 ? "OK" : "FAIL");
         return 1;
     }
 
@@ -4385,6 +4970,82 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* KM1 (docs/BUILD.md §12): EmbBuild rebuilds the KERNEL on the OS. Spawns the
+     * on-image embbuild against /data/src/kernel/build.ebm -- 89 embcc C compiles
+     * + 6 embcc .asm assembles + one embld link, all on the metal, no gcc/nasm/ld
+     * -- and asserts a real ET_EXEC kernel.elf came out. Honest SKIP (not FAIL)
+     * when the on-OS toolchain + manifest aren't staged (they need EMBK_EMBCC_ROOT
+     * + STAGED_APPS=build/embcc.elf,build/embld.elf + EmbCC's gen-kernel-manifest
+     * output at build/kernel.build.ebm). */
+    if (strcmp(cmd, "test embbuild kernel") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild kernel: VFS not registered\n"); return 1; }
+        static char cap[8192];
+        struct vfs_stat st;
+        char *bb  = "/data/apps/embbuild/embbuild.elf";
+        struct { const char *p, *why; } need[] = {
+            { "/data/apps/embcc/embcc.elf",  "embcc.elf not on image" },
+            { "/data/apps/embld/embld.elf",  "embld.elf not on image" },
+            { "/data/src/kernel/build.ebm",  "kernel manifest not on image" },
+            { "/data/src/kernel/main.c",     "kernel sources not staged" },
+            { bb,                            "embbuild.elf not on image" },
+        };
+        for (int i = 0; i < 5; i++)
+            if (vfs_stat(need[i].p, &st) != 0) {
+                kprintf("\n[cmd] test embbuild kernel: SKIP -- %s\n", need[i].why);
+                return 1;
+            }
+
+        kprintf("[km1] EmbBuild builds the kernel from /data/src/kernel (embcc+embld, on the metal)\n");
+        char *m[] = { bb, (char *)"/data/src/kernel/build.ebm", NULL };
+        int rc = emb_run_cap(bb, m, 2, cap, sizeof cap);
+        int built = (rc == 0) && emb_find(cap, "0 up_to_date");
+
+        /* What came out must be a real ET_EXEC ELF kernel. */
+        unsigned char hdr[20] = {0};
+        int have = (vfs_stat("/data/build/out/kernel/kernel.elf", &st) == 0);
+        if (have) {
+            int fd = vfs_open("/data/build/out/kernel/kernel.elf", O_RDONLY, 0);
+            if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+        }
+        int is_exec = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L'
+                            && hdr[3] == 'F' && hdr[16] == 2;
+        kprintf("[km1] kernel.elf: %s, %llu bytes, ET_EXEC=%d\n",
+                have ? "produced" : "MISSING",
+                have ? (unsigned long long)st.size : 0ULL, is_exec);
+
+        int ok = built && is_exec;
+        kprintf("\n[cmd] test embbuild kernel: %s (rc=%d)\n",
+                ok ? "OK -- the OS built its own kernel" : "FAIL", rc);
+        return 1;
+    }
+
+    /* G3 (docs/BUILD.md §12): EmbBuild's derived-value step -- the one capability
+     * beyond a static walker. Runs the g3test manifest: a `measure` binds
+     * nsec = sectors(probe.c), and the compile interpolates ${nsec} into a tcc
+     * -DSECT=. probe.c #errors unless SECT arrived as the measured value (1), so
+     * a green compile proves the derived value flowed all the way into a real
+     * build command -- exactly what KM2 needs for stage2's KERNEL_LOAD_SECTORS. */
+    if (strcmp(cmd, "test embbuild derive") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embbuild derive: VFS not registered\n"); return 1; }
+        struct vfs_stat st;
+        char *bb = "/data/apps/embbuild/embbuild.elf";
+        if (vfs_stat("/data/apps/tcc/tcc.elf", &st) != 0) {
+            kprintf("\n[cmd] test embbuild derive: SKIP -- tcc.elf not on image\n"); return 1; }
+        if (vfs_stat("/data/src/g3test/build.ebm", &st) != 0) {
+            kprintf("\n[cmd] test embbuild derive: SKIP -- g3test manifest not staged\n"); return 1; }
+
+        static char cap[4096];
+        char *m[] = { bb, (char *)"/data/src/g3test/build.ebm", NULL };
+        int rc = emb_run_cap(bb, m, 2, cap, sizeof cap);
+        int measured = emb_find(cap, "measure sectors") && emb_find(cap, "nsec = 1");
+        int built    = (rc == 0) && (vfs_stat("/data/build/out/g3test/probe.o", &st) == 0);
+        int ok = measured && built;
+        kprintf("[km2] measure -> ${nsec} -> tcc -DSECT: measured=%d, compile+#if=%d\n",
+                measured, built);
+        kprintf("\n[cmd] test embbuild derive: %s (rc=%d)\n", ok ? "OK" : "FAIL", rc);
+        return 1;
+    }
+
 /* EMBBUILD ACCEPTANCE (docs/BUILD.md §10) -- the six cases, one boot:
  *   (a) clean build via manifest + the tally pipeline oracle
  *   (b) immediate re-run: "0 ran" -- content stamps hit
@@ -4693,6 +5354,116 @@ int selftests_handle_command(const char *cmd)
         int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
         kprintf("\n[cmd] test python: exit=%d -> %s\n", code,
                 (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test python net") == 0) {
+        /* CPython's `_socket` (now a builtin, over our POSIX socket layer): a real
+         * socket() + connect() + sendall() + recv() from Python. Needs CAP_NETWORK,
+         * outbound :80, RDRAND (-cpu max). This is pip brick 2 proven end to end. */
+        const char *pp = "/data/apps/python/python.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != EMBK_OK) { kprintf("\n[cmd] test python net: python.elf not on image\n"); return 1; }
+        char *code =
+            "import socket\n"
+            "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n"
+            "s.connect(('example.com',80))\n"
+            "s.sendall(b'GET / HTTP/1.0\\r\\nHost: example.com\\r\\nConnection: close\\r\\n\\r\\n')\n"
+            "print('PYNET',s.recv(80).split(b'\\r\\n')[0].decode())\n"
+            "s.close()\n";
+        char *a2[] = { (char *)pp, "-c", code, NULL };
+        char *env[] = { "HOME=/", NULL };
+        /* CAP_FILESYSTEM too: CPython reads its stdlib zip off disk at startup. */
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid2 = process_create_caps(pp, a2, 3, env, NULL, 0, caps);
+        int c2 = pid2 >= 0 ? process_wait((uint32_t)pid2) : -1;
+        kprintf("\n[cmd] test python net: exit=%d -> %s\n", c2, (pid2 >= 0 && c2 == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test python tls") == 0) {
+        /* HTTPS from Python over our own libtls (`_embtls` builtin), no OpenSSL.
+         * A real TLS 1.3 handshake -- cert + hostname verified against the
+         * embedded GTS Root R4 -- to pypi.org:443, then an HTTP request through
+         * the encrypted channel. This is the pip-over-HTTPS foundation (brick 3).
+         * The socket fd is DETACHED from the Python socket so _embtls owns it. */
+        const char *pp = "/data/apps/python/python.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != EMBK_OK) { kprintf("\n[cmd] test python tls: python.elf not on image\n"); return 1; }
+        char *code =
+            "import socket,_embtls\n"
+            "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n"
+            "s.connect(('pypi.org',443))\n"
+            "c=_embtls.connect(s.detach(),'pypi.org')\n"
+            "_embtls.write(c,b'GET / HTTP/1.0\\r\\nHost: pypi.org\\r\\nConnection: close\\r\\n\\r\\n')\n"
+            "print('PYTLS',_embtls.read(c,80).split(b'\\r\\n')[0].decode())\n"
+            "_embtls.close(c)\n";
+        char *a2[] = { (char *)pp, "-c", code, NULL };
+        char *env[] = { "HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid2 = process_create_caps(pp, a2, 3, env, NULL, 0, caps);
+        int c2 = pid2 >= 0 ? process_wait((uint32_t)pid2) : -1;
+        kprintf("\n[cmd] test python tls: exit=%d -> %s\n", c2, (pid2 >= 0 && c2 == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test python https") == 0) {
+        /* The whole stdlib HTTPS path: `import http.client` -> our ssl.py shim
+         * (over the _embtls builtin) -> wrap_socket handshake -> a real request
+         * to pypi.org, headers read back through the buffered TLS stream. This
+         * is the surface pip imports. Brick 3b. */
+        const char *pp = "/data/apps/python/python.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != EMBK_OK) { kprintf("\n[cmd] test python https: python.elf not on image\n"); return 1; }
+        char *code =
+            "import http.client\n"
+            "c=http.client.HTTPSConnection('pypi.org')\n"
+            "c.request('GET','/')\n"
+            "r=c.getresponse()\n"
+            "print('HTTPS',r.status,r.reason)\n"
+            "c.close()\n";
+        char *a2[] = { (char *)pp, "-c", code, NULL };
+        char *env[] = { "HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid2 = process_create_caps(pp, a2, 3, env, NULL, 0, caps);
+        int c2 = pid2 >= 0 ? process_wait((uint32_t)pid2) : -1;
+        kprintf("\n[cmd] test python https: exit=%d -> %s\n", c2, (pid2 >= 0 && c2 == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test python pip") == 0) {
+        /* pip itself: `python -m pip --version`. pip.zip (its ~450 modules incl.
+         * vendored urllib3/requests/rich) is on ._pth's sys.path, so this is the
+         * whole pip import chain resolving and running -- brick 4. No network. */
+        const char *pp = "/data/apps/python/python.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != EMBK_OK) { kprintf("\n[cmd] test python pip: python.elf not on image\n"); return 1; }
+        char *a2[] = { (char *)pp, "-m", "pip", "--version", NULL };
+        char *env[] = { "HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid2 = process_create_caps(pp, a2, 4, env, NULL, 0, caps);
+        int c2 = pid2 >= 0 ? process_wait((uint32_t)pid2) : -1;
+        kprintf("\n[cmd] test python pip: exit=%d -> %s\n", c2, (pid2 >= 0 && c2 == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test python pip install") == 0) {
+        /* THE payoff: `pip install` end to end -- index lookup + wheel download
+         * over HTTPS (pip urllib3 -> ssl.py -> _embtls -> pypi/pythonhosted) then
+         * unpack to a writable target. `six`: pure-Python, no deps, universal
+         * wheel (no build step). --no-deps keeps it to one download; --target a
+         * writable dir; TMPDIR too. Brick 5. */
+        const char *pp = "/data/apps/python/python.elf";
+        struct vfs_stat st;
+        if (vfs_stat(pp, &st) != EMBK_OK) { kprintf("\n[cmd] test python pip install: python.elf not on image\n"); return 1; }
+        char *a2[] = { (char *)pp, "-m", "pip", "install",
+                       "--no-cache-dir", "--no-deps", "--disable-pip-version-check",
+                       "--target", "/data/tmp/pipsite", "six", NULL };
+        char *env[] = { "HOME=/data/tmp", "TMPDIR=/data/tmp", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        int pid2 = process_create_caps(pp, a2, 10, env, NULL, 0, caps);
+        int c2 = pid2 >= 0 ? process_wait((uint32_t)pid2) : -1;
+        kprintf("\n[cmd] test python pip install: exit=%d -> %s\n", c2, (pid2 >= 0 && c2 == 0) ? "OK" : "FAIL");
         return 1;
     }
 

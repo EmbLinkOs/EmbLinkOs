@@ -174,6 +174,17 @@ bool net_ping(uint32_t dst_ip);
  * while it waits -- consistent with the rest of the synchronous stack. Returns
  * a small connection index (>= 0) or -1. Not the ring-3 surface (that is M4). */
 int  net_tcp_connect(uint32_t dst_ip, uint16_t dst_port);   /* active open, blocks to ESTABLISHED */
+int  net_tcp_connect_start(uint32_t dst_ip, uint16_t dst_port); /* non-blocking: send SYN, return conn (SYN_SENT) */
+int  net_tcp_recv_nb(int conn, void *buf, uint32_t cap);    /* like recv but -2 = would-block (no data yet) */
+/* Readiness for select()/poll on a socket, WITHOUT waiting:
+ *   bit 0 (readable): data buffered, or peer FIN/reset seen (recv won't block)
+ *   bit 1 (writable): connection is ESTABLISHED (or resolved to an error)
+ *   bit 2 (error):    reset / closed abnormally
+ * Returns a negative errno for a bad conn. */
+int  net_tcp_ready(int conn);
+#define TCP_RDY_READ  0x1
+#define TCP_RDY_WRITE 0x2
+#define TCP_RDY_ERR   0x4
 int  net_tcp_listen(uint16_t port);                         /* passive open -> a listen conn index */
 int  net_tcp_accept(int listen_conn);                       /* block for a client -> its conn index */
 int  net_tcp_send(int conn, const void *data, uint32_t len);/* send + wait for ACK */

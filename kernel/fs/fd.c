@@ -573,6 +573,34 @@ int64_t vfs_fd_avail(int fd) {
     return e->ops->avail(e);
 }
 
+/* Ready POLL* bits for one fd (backs select()). A backing without a poll op
+ * (regular file, most char devices) never blocks for select's purposes, so we
+ * report ready for whatever was asked. */
+int vfs_fd_poll(int fd, int events) {
+    struct fd_entry *e = fd_lookup(fd);
+    if (!e || !e->ops)
+        return POLLNVAL;
+    if (e->ops->poll)
+        return e->ops->poll(e, events);
+    return events & (POLLIN | POLLOUT);
+}
+
+int vfs_fd_get_flags(int fd) {
+    struct fd_entry *e = fd_lookup(fd);
+    if (!e)
+        return -EMBK_EBADF;
+    return e->flags;                 /* O_ACCMODE bits | O_NONBLOCK */
+}
+
+int vfs_fd_set_nonblock(int fd, bool on) {
+    struct fd_entry *e = fd_lookup(fd);
+    if (!e)
+        return -EMBK_EBADF;
+    if (on) e->flags |= O_NONBLOCK;
+    else    e->flags &= ~O_NONBLOCK;
+    return EMBK_OK;
+}
+
 int vfs_fd_fstat(int fd, struct vfs_stat *out)
 {
     struct fd_entry *e = fd_lookup(fd);
@@ -982,10 +1010,29 @@ int fd_install_pipe(struct process *target, int target_fd, struct pipe *p, int s
 /* ---- FD_BACKING_SOCKET: a TCP connection as a read/write fd (M4) --------- */
 static int sock_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out) {
     if (e->u.sock.conn < 0) return -EMBK_EINVAL;      /* not connected */
+    if (e->flags & O_NONBLOCK) {                       /* never wait: -EAGAIN if no data */
+        int n = net_tcp_recv_nb(e->u.sock.conn, buf, (uint32_t)len);
+        if (n == -2) return -EMBK_EAGAIN;
+        if (n < 0)   return -EMBK_EIO;
+        *out = (size_t)n;
+        return EMBK_OK;
+    }
     int n = net_tcp_recv(e->u.sock.conn, buf, (uint32_t)len);
     if (n < 0) return -EMBK_EIO;
     *out = (size_t)n;                                 /* 0 = peer FIN / EOF */
     return EMBK_OK;
+}
+/* Readiness for select()/poll: connect-in-progress becomes writable on
+ * ESTABLISHED; buffered data / FIN becomes readable. See net_tcp_ready(). */
+static int sock_fd_poll(struct fd_entry *e, int events) {
+    if (e->u.sock.conn < 0) return POLLNVAL;          /* unconnected socket */
+    int rdy = net_tcp_ready(e->u.sock.conn);
+    if (rdy < 0) return POLLERR;
+    int re = 0;
+    if ((events & POLLIN)  && (rdy & TCP_RDY_READ))  re |= POLLIN;
+    if ((events & POLLOUT) && (rdy & TCP_RDY_WRITE)) re |= POLLOUT;
+    if (rdy & TCP_RDY_ERR) re |= POLLERR;
+    return re;
 }
 static int sock_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out) {
     if (e->u.sock.conn < 0) return -EMBK_EINVAL;
@@ -1021,7 +1068,7 @@ static const struct fd_ops sock_fd_ops = {
     .read = sock_fd_read, .write = sock_fd_write, .seek = sock_fd_seek,
     .fstat = sock_fd_fstat, .inherit = sock_fd_inherit,
     .close = sock_fd_close, .close_locked = sock_fd_close_locked,
-    .avail = NULL,
+    .avail = NULL, .poll = sock_fd_poll,
 };
 
 int fd_alloc_socket(struct process *p) {
@@ -1048,6 +1095,18 @@ int fd_socket_connect(struct process *p, int fd, uint32_t ip_host, uint16_t port
     struct fd_entry *e = &p->fds[fd - FD_BASE];
     if (!e->used || e->backing != FD_BACKING_SOCKET) return -EMBK_EBADF;
     if (e->u.sock.conn >= 0) return -EMBK_EINVAL;     /* already connected */
+
+    /* Non-blocking connect: fire the SYN and return immediately with
+     * -EINPROGRESS. The caller poll()s for POLLOUT (ESTABLISHED) via select().
+     * net_tcp_connect_start does not block, so holding fdlock would be fine, but
+     * we keep the same no-lock discipline as the blocking path below. */
+    if (e->flags & O_NONBLOCK) {
+        int conn = net_tcp_connect_start(ip_host, port);
+        if (conn < 0) return -EMBK_ECONNREFUSED;
+        e->u.sock.conn = conn;
+        return -EMBK_EINPROGRESS;
+    }
+
     /* net_tcp_connect blocks (polls) -- do NOT hold fdlock across it. */
     int conn = net_tcp_connect(ip_host, port);
     if (conn < 0) return -EMBK_ECONNREFUSED;

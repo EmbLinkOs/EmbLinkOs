@@ -2,8 +2,58 @@
 
 *Design record. Builds directly on [USERSPACE_v2.md](USERSPACE_v2.md) (authority
 IS the namespace), [EMBX](own-exe-format) (the capability-declaring executable),
-and EmbBuild. Nothing here is built yet — this is the shape, decided before code,
-the same way the userspace was.*
+and EmbBuild.*
+
+> **Status: PK1–PK4 SHIPPED + metal-proven** (§11) — the packaging arc is complete
+> end to end: build (PK2/PK2b), sign (PK3), publish to a git registry, and install
+> from it over HTTPS (PK4), authority kernel-enforced throughout.
+> **PK1** — the manifest format (§3), `user/pkg/` (manifest parser + EMBX
+> reader/`build_id` verifier), and `pkg` (`verify`/`install`/`run`/`list`).
+> `test pkg`: installs a staged bundle (recomputes the EMBX `build_id`,
+> cross-checks caps/abi against the manifest, presents the declared authority,
+> adopts into `/data/apps/<name>/` writing the `.ns` home enforces), then
+> `pkg run` spawns it under EXACTLY its declared caps (SET_CAPS) + namespace
+> (NS_BIND) — the app holds only `filesystem`, reaches `/system`, CANNOT name
+> `/data/users` — and a tampered bundle (build_id fails to recompute) is refused.
+> **PK2** — the SDK generator `tools/embx/pkggen.py`: ONE `.pkgspec` (name,
+> version, caps, grant) → all three views (EMBX cap table, `.ns`, package
+> manifest), consistent BY CONSTRUCTION — mutate the spec's caps and both the
+> binary's cap table AND the manifest follow; you cannot build a self-disagreeing
+> bundle (§4). `pkgprobe`'s authority is declared once in
+> `user/pkg/pkgprobe.pkgspec`.
+> **PK3 SHIPPED** — (a) **signing**: every manifest is signed at build time
+> (`tools/embx/pkgsign.py`, ECDSA P-256 over the canonical manifest); `pkg`
+> VERIFIES it against the trusted key baked into `user/pkg/pkgkey.h` (our own
+> `ecdsa_verify`) and refuses unsigned/altered/wrongly-keyed manifests. (b)
+> **update + rollback + authority re-negotiation**: `pkg install` over an
+> installed version retains the previous bundle as the rollback point (§6 — each
+> app is self-contained, so its 3 files ARE the rollback point, no whole-FS
+> snapshot needed), and REFUSES an update that WIDENS caps/namespace unless
+> `--allow-widen` — a new version cannot silently widen its reach. `pkg
+> rollback/remove/info` round it out. `test pkg` (8 checks, metal) proves
+> tampered-binary + altered-signature rejection, update, rollback, refused
+> widening, and consented widening. *Remaining:* an EMBKFS-snapshot-backed
+> variant of update (a future optimization once a snapshot syscall exists) and
+> PK4 the git registry.
+> **PK2b — on-device package generation.** `pkgbuild` (`user/bin/pkgbuild.c` +
+> `user/pkg/embxgen.c`, a C EMBX writer byte-identical to mkembx) turns ONE
+> `.pkgspec` + a linked ELF into the three views (EMBX cap table, `.ns`, manifest)
+> ON THE OS ITSELF -- authority declared as part of building on the device. On-OS
+> builds are unsigned; `pkg install --local` adopts a dev build (a present
+> signature is still verified; caps/build_id/re-negotiation still hold).
+> `test pkgbuild` proves the whole loop on the metal: generate -> install --local
+> -> run confined. (A `build.ebm` drives it as a normal build step running
+> `pkgbuild`; a structured EmbBuild `package:` stanza is optional polish.)
+> **PK4 — the git registry.** The registry is a git repo
+> (github.com/teo1747/emblink-packages): one dir per package holds its SIGNED
+> manifest + EMBX. `test pkgregistry` clones it over HTTPS with our own
+> git-over-TLS client (`gitclone`), then `pkg install`s a package from the clone —
+> the signature is verified against the trusted key ON ARRIVAL, so a compromised
+> host cannot inject a bad binary (§9.2): trust is in the signature, not the
+> channel. The clone→install→run-confined loop runs green on the metal. (Refinement
+> per §9.1: binaries as release assets rather than in git history; here the small
+> bundle rides in the repo for the proof.)
+> The rest of this doc is the shape decided before code, like the userspace.*
 
 ## 0. Thesis
 

@@ -57,6 +57,7 @@
 #define EMBK_EPIPE        32    // broken pipe / channel peer has closed
 #define EMBK_EMSGSIZE     90    // message too long for the supplied buffer
 #define EMBK_ECONNREFUSED 111   // endpoint has no live owner (Layer B rendezvous)
+#define EMBK_EINPROGRESS  115   // non-blocking connect() started, not yet complete
 #define EMBK_EPROTO       71    // protocol error (EmbLink UI Piece 2: HELLO version mismatch)
 
 // Helper: turn an error code into a short human-readable string.

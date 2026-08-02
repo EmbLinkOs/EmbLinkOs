@@ -35,7 +35,7 @@ struct debug_session;      /* process/debug.h — a pointer only, see cap_set */
  * no reason connected to why MAX_PROCESSES was raised. Written out
  * explicitly now so the two constants can never drift against each other
  * again. */
-#define KSTACK_SIZE (16 * 1024)             // 16 KiB per thread's kernel stack
+#define KSTACK_SIZE (32 * 1024)             // 16 KiB per thread's kernel stack
 
 /* Same "big slot" VA scheme as USER_CODE_VA (0x400000000000)/USER_STACK_VA
  * (0x700000000000) in process.c -- slot 6, between code and stack. Was

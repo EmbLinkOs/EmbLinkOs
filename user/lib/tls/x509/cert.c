@@ -1,0 +1,375 @@
+/* X.509 certificate parsing + signature verification (see cert.h). */
+#include "cert.h"
+#include "asn1.h"
+#include "trust.h"
+#include "ecdsa.h"            /* -Iuser/lib/tls/crypto */
+#include "rsa.h"
+#include "sha512.h"           /* -Iuser/lib/tls/crypto */
+#include "crypto/sha256.h"    /* kernel/crypto via -Ikernel */
+#include <string.h>
+
+/* OID contents (tag/length stripped). */
+static const uint8_t OID_EC_PUBKEY[]   = {0x2a,0x86,0x48,0xce,0x3d,0x02,0x01};        /* 1.2.840.10045.2.1 */
+static const uint8_t OID_P256[]        = {0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07};   /* prime256v1 */
+static const uint8_t OID_P384[]        = {0x2b,0x81,0x04,0x00,0x22};                  /* secp384r1 */
+static const uint8_t OID_ECDSA_SHA256[]= {0x2a,0x86,0x48,0xce,0x3d,0x04,0x03,0x02};
+static const uint8_t OID_ECDSA_SHA384[]= {0x2a,0x86,0x48,0xce,0x3d,0x04,0x03,0x03};
+static const uint8_t OID_RSA_PUBKEY[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x01}; /* rsaEncryption */
+static const uint8_t OID_RSA_SHA256[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x0b};
+static const uint8_t OID_RSA_SHA384[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x0c};
+static const uint8_t OID_RSA_SHA512[]  = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x0d};
+static const uint8_t OID_SAN[]         = {0x55,0x1d,0x11};                            /* 2.5.29.17 */
+static const uint8_t OID_BASIC_CONSTR[]= {0x55,0x1d,0x13};                            /* 2.5.29.19 */
+static const uint8_t OID_KEY_USAGE[]   = {0x55,0x1d,0x0f};                            /* 2.5.29.15 */
+static const uint8_t OID_EXT_KEY_USAGE[]={0x55,0x1d,0x25};                            /* 2.5.29.37 */
+static const uint8_t OID_EKU_SERVER[]  = {0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x01};   /* serverAuth 1.3.6.1.5.5.7.3.1 */
+static const uint8_t OID_EKU_ANY[]     = {0x55,0x1d,0x25,0x00};                       /* anyExtendedKeyUsage 2.5.29.37.0 */
+
+#define OIDEQ(t, o) der_oid_eq((t), (o), sizeof(o))
+
+/* Parse the DER SEQUENCE { r INTEGER, s INTEGER } of an ECDSA signature, storing
+ * leading-zero-stripped r/s. */
+static int parse_ecdsa_sig(const uint8_t *p, size_t len, struct x509_cert *c) {
+    struct der_tlv seq;
+    if (der_parse(p, p + len, &seq) || seq.tag != DER_SEQUENCE) return -1;
+    struct der_tlv r, s;
+    if (der_parse(seq.val, der_end(&seq), &r) || r.tag != DER_INTEGER) return -1;
+    if (der_parse(der_end(&r), der_end(&seq), &s) || s.tag != DER_INTEGER) return -1;
+    const uint8_t *rp = r.val; size_t rl = r.len;
+    const uint8_t *sp = s.val; size_t sl = s.len;
+    while (rl > 1 && rp[0] == 0) { rp++; rl--; }        /* strip DER sign byte */
+    while (sl > 1 && sp[0] == 0) { sp++; sl--; }
+    c->sig_r = rp; c->sig_r_len = rl;
+    c->sig_s = sp; c->sig_s_len = sl;
+    return 0;
+}
+
+/* SubjectPublicKeyInfo: SEQUENCE { AlgorithmIdentifier, BIT STRING }. Handles
+ * both id-ecPublicKey (P-256/P-384) and rsaEncryption keys. */
+static int parse_spki(const struct der_tlv *spki, struct x509_cert *c) {
+    struct der_tlv alg, pk, alg_oid;
+    if (der_parse(spki->val, der_end(spki), &alg) || alg.tag != DER_SEQUENCE) return -1;
+    if (der_parse(der_end(&alg), der_end(spki), &pk) || pk.tag != DER_BIT_STRING) return -1;
+    if (der_parse(alg.val, der_end(&alg), &alg_oid)) return -1;
+    if (pk.len < 1 || pk.val[0] != 0) return -1;         /* unused-bits byte = 0 */
+
+    if (OIDEQ(&alg_oid, OID_EC_PUBKEY)) {
+        struct der_tlv curve_oid;
+        if (der_parse(der_end(&alg_oid), der_end(&alg), &curve_oid) || curve_oid.tag != DER_OID) return -1;
+        if (OIDEQ(&curve_oid, OID_P256)) c->curve = X509_CURVE_P256;
+        else if (OIDEQ(&curve_oid, OID_P384)) c->curve = X509_CURVE_P384;
+        else return -1;
+        if (pk.len < 2 || pk.val[1] != 0x04) return -1;  /* uncompressed 0x04||X||Y */
+        size_t point = pk.len - 2;
+        if (point % 2) return -1;
+        c->key_type = X509_KEY_EC;
+        c->coord_len = point / 2;
+        c->qx = pk.val + 2;
+        c->qy = pk.val + 2 + c->coord_len;
+        return 0;
+    }
+    if (OIDEQ(&alg_oid, OID_RSA_PUBKEY)) {
+        /* BIT STRING wraps RSAPublicKey ::= SEQUENCE { modulus, exponent }. */
+        struct der_tlv seq, mod, exp;
+        if (der_parse(pk.val + 1, der_end(&pk), &seq) || seq.tag != DER_SEQUENCE) return -1;
+        if (der_parse(seq.val, der_end(&seq), &mod) || mod.tag != DER_INTEGER) return -1;
+        if (der_parse(der_end(&mod), der_end(&seq), &exp) || exp.tag != DER_INTEGER) return -1;
+        c->key_type = X509_KEY_RSA;
+        c->rsa_n = mod.val; c->rsa_n_len = mod.len;      /* leading zero tolerated downstream */
+        c->rsa_e = exp.val; c->rsa_e_len = exp.len;
+        return 0;
+    }
+    return -1;
+}
+
+/* Find SubjectAltName inside the extensions [3] and store its GeneralNames. */
+static void parse_extensions(const struct der_tlv *exts_explicit, struct x509_cert *c) {
+    struct der_tlv seq;
+    if (der_parse(exts_explicit->val, der_end(exts_explicit), &seq) || seq.tag != DER_SEQUENCE) return;
+    const uint8_t *p = seq.val, *e = der_end(&seq);
+    while (p < e) {
+        struct der_tlv ext;
+        if (der_parse(p, e, &ext) || ext.tag != DER_SEQUENCE) return;
+        p = der_end(&ext);
+        struct der_tlv oid, cur;
+        if (der_parse(ext.val, der_end(&ext), &oid)) continue;
+        const uint8_t *q = der_end(&oid);
+        /* optional critical BOOLEAN */
+        if (der_parse(q, der_end(&ext), &cur) == 0 && cur.tag == DER_BOOLEAN) q = der_end(&cur);
+        struct der_tlv val;
+        if (der_parse(q, der_end(&ext), &val) || val.tag != DER_OCTET_STRING) continue;
+        if (OIDEQ(&oid, OID_SAN)) {
+            struct der_tlv gn;    /* extnValue wraps a GeneralNames SEQUENCE */
+            if (der_parse(val.val, der_end(&val), &gn) == 0 && gn.tag == DER_SEQUENCE) {
+                c->san = der_raw(&gn); c->san_len = der_raw_len(&gn);
+            }
+        } else if (OIDEQ(&oid, OID_BASIC_CONSTR)) {
+            /* SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPT } */
+            struct der_tlv seq2, f;
+            c->has_basic_constraints = 1;
+            if (der_parse(val.val, der_end(&val), &seq2) == 0 && seq2.tag == DER_SEQUENCE) {
+                const uint8_t *bp = seq2.val, *be = der_end(&seq2);
+                if (der_parse(bp, be, &f) == 0 && f.tag == DER_BOOLEAN) {
+                    c->is_ca = (f.len && f.val[0] != 0);
+                    bp = der_end(&f);
+                }
+                if (der_parse(bp, be, &f) == 0 && f.tag == DER_INTEGER && f.len && f.len <= 2) {
+                    int v = 0; for (size_t i = 0; i < f.len; i++) v = (v << 8) | f.val[i];
+                    c->path_len = v;
+                }
+            }
+        } else if (OIDEQ(&oid, OID_KEY_USAGE)) {
+            /* extnValue wraps a BIT STRING; bit i -> mask (0x8000 >> i). */
+            struct der_tlv bs;
+            if (der_parse(val.val, der_end(&val), &bs) == 0 && bs.tag == DER_BIT_STRING && bs.len >= 2) {
+                c->has_key_usage = 1;
+                uint16_t u = (uint16_t)bs.val[1] << 8;          /* first usage byte = high bits */
+                if (bs.len >= 3) u |= bs.val[2];
+                c->key_usage = u;
+            }
+        } else if (OIDEQ(&oid, OID_EXT_KEY_USAGE)) {
+            struct der_tlv seq2, o;
+            if (der_parse(val.val, der_end(&val), &seq2) == 0 && seq2.tag == DER_SEQUENCE) {
+                c->has_eku = 1;
+                const uint8_t *bp = seq2.val, *be = der_end(&seq2);
+                while (bp < be && der_parse(bp, be, &o) == 0) {
+                    if (OIDEQ(&o, OID_EKU_SERVER) || OIDEQ(&o, OID_EKU_ANY)) c->eku_server_auth = 1;
+                    bp = der_end(&o);
+                }
+            }
+        }
+    }
+}
+
+int x509_parse(const uint8_t *der, size_t len, struct x509_cert *out) {
+    memset(out, 0, sizeof *out);
+    out->path_len = -1;                 /* -1 = no pathLenConstraint */
+    out->raw = der; out->raw_len = len;
+
+    struct der_tlv cert;
+    if (der_parse(der, der + len, &cert) || cert.tag != DER_SEQUENCE) return -1;
+
+    struct der_tlv tbs, sigalg, sigval;
+    if (der_parse(cert.val, der_end(&cert), &tbs) || tbs.tag != DER_SEQUENCE) return -1;
+    if (der_parse(der_end(&tbs), der_end(&cert), &sigalg) || sigalg.tag != DER_SEQUENCE) return -1;
+    if (der_parse(der_end(&sigalg), der_end(&cert), &sigval) || sigval.tag != DER_BIT_STRING) return -1;
+    out->tbs = der_raw(&tbs); out->tbs_len = der_raw_len(&tbs);
+
+    /* outer signatureAlgorithm */
+    struct der_tlv sa_oid;
+    if (der_parse(sigalg.val, der_end(&sigalg), &sa_oid)) return -1;
+    if (OIDEQ(&sa_oid, OID_ECDSA_SHA256))      out->sig_alg = X509_SIG_ECDSA_SHA256;
+    else if (OIDEQ(&sa_oid, OID_ECDSA_SHA384)) out->sig_alg = X509_SIG_ECDSA_SHA384;
+    else if (OIDEQ(&sa_oid, OID_RSA_SHA256))   out->sig_alg = X509_SIG_RSA_SHA256;
+    else if (OIDEQ(&sa_oid, OID_RSA_SHA384))   out->sig_alg = X509_SIG_RSA_SHA384;
+    else if (OIDEQ(&sa_oid, OID_RSA_SHA512))   out->sig_alg = X509_SIG_RSA_SHA512;
+    else out->sig_alg = X509_SIG_NONE;
+
+    /* signatureValue BIT STRING: unused-bits byte, then the signature. Keep the
+     * raw bytes (RSA uses them directly); additionally decode r,s for ECDSA. An
+     * unrecognized scheme still parses (a trust anchor is trusted, not verified). */
+    if (sigval.len < 1 || sigval.val[0] != 0) return -1;
+    out->sig_raw = sigval.val + 1; out->sig_raw_len = sigval.len - 1;
+    if (out->sig_alg == X509_SIG_ECDSA_SHA256 || out->sig_alg == X509_SIG_ECDSA_SHA384)
+        if (parse_ecdsa_sig(sigval.val + 1, sigval.len - 1, out)) return -1;
+
+    /* Walk tbsCertificate fields in order. */
+    const uint8_t *p = tbs.val, *e = der_end(&tbs);
+    struct der_tlv f;
+    if (der_parse(p, e, &f)) return -1;
+    if (f.tag == 0xA0) p = der_end(&f), der_parse(p, e, &f);   /* skip version [0] */
+    /* serialNumber */                       p = der_end(&f); if (der_parse(p, e, &f)) return -1;
+    /* signature algid */                    p = der_end(&f); if (der_parse(p, e, &f) || f.tag != DER_SEQUENCE) return -1;
+    /* issuer */                             out->issuer = der_raw(&f); out->issuer_len = der_raw_len(&f);
+                                             p = der_end(&f); if (der_parse(p, e, &f) || f.tag != DER_SEQUENCE) return -1;
+    /* validity */
+    { struct der_tlv nb, na;
+      if (der_parse(f.val, der_end(&f), &nb)) return -1;
+      if (der_parse(der_end(&nb), der_end(&f), &na)) return -1;
+      out->not_before = nb.val; out->not_before_len = nb.len; out->nb_tag = nb.tag;
+      out->not_after  = na.val; out->not_after_len  = na.len; out->na_tag  = na.tag; }
+    /* subject */                            p = der_end(&f); if (der_parse(p, e, &f) || f.tag != DER_SEQUENCE) return -1;
+    out->subject = der_raw(&f); out->subject_len = der_raw_len(&f);
+    /* subjectPublicKeyInfo */               p = der_end(&f); if (der_parse(p, e, &f) || f.tag != DER_SEQUENCE) return -1;
+    if (parse_spki(&f, out)) return -1;
+
+    /* optional [1] issuerUID, [2] subjectUID, [3] extensions */
+    p = der_end(&f);
+    while (der_parse(p, e, &f) == 0) {
+        if (f.tag == 0xA3) { parse_extensions(&f, out); break; }
+        p = der_end(&f);
+    }
+    return 0;
+}
+
+static int lc(int ch) { return (ch >= 'A' && ch <= 'Z') ? ch + 32 : ch; }
+
+/* Match one dNSName pattern (pat/patlen) against host, one leading "*." wildcard. */
+static int host_pat_eq(const uint8_t *pat, size_t patlen, const char *host) {
+    if (patlen >= 2 && pat[0] == '*' && pat[1] == '.') {
+        /* "*.example.com" matches "foo.example.com" but not "example.com" or
+         * "a.b.example.com" (wildcard covers exactly one leftmost label). */
+        const char *dot = strchr(host, '.');
+        if (!dot) return 0;
+        size_t suf = patlen - 1;                 /* ".example.com" */
+        size_t hsuf = strlen(dot);
+        if (hsuf != suf) return 0;
+        for (size_t i = 0; i < suf; i++) if (lc(pat[1 + i]) != lc((unsigned char)dot[i])) return 0;
+        return 1;
+    }
+    if (strlen(host) != patlen) return 0;
+    for (size_t i = 0; i < patlen; i++) if (lc(pat[i]) != lc((unsigned char)host[i])) return 0;
+    return 1;
+}
+
+int x509_match_host(const struct x509_cert *c, const char *host) {
+    if (!c->san) return 0;
+    struct der_tlv gn;
+    if (der_parse(c->san, c->san + c->san_len, &gn) || gn.tag != DER_SEQUENCE) return 0;
+    const uint8_t *p = gn.val, *e = der_end(&gn);
+    while (p < e) {
+        struct der_tlv name;
+        if (der_parse(p, e, &name)) return 0;
+        p = der_end(&name);
+        if (name.tag == 0x82)                    /* [2] dNSName (IA5String, implicit) */
+            if (host_pat_eq(name.val, name.len, host)) return 1;
+    }
+    return 0;
+}
+
+/* Normalize a UTCTime/GeneralizedTime to "yyyymmddhhmmss" (14 digits). */
+static int time_to_14(const uint8_t *t, size_t len, uint8_t tag, char out[15]) {
+    char buf[16]; size_t n = 0;
+    if (tag == DER_UTCTIME) {                    /* YYMMDDHHMMSSZ -> add century */
+        if (len < 12) return -1;
+        int yy = (t[0]-'0')*10 + (t[1]-'0');
+        const char *cc = (yy >= 50) ? "19" : "20";
+        out[0]=cc[0]; out[1]=cc[1]; n = 2;
+        for (int i = 0; i < 12 && n < 14; i++) out[n++] = (char)t[i];
+    } else {                                     /* GeneralizedTime YYYYMMDDHHMMSSZ */
+        if (len < 14) return -1;
+        for (int i = 0; i < 14; i++) out[n++] = (char)t[i];
+    }
+    out[14] = 0;
+    (void)buf;
+    return 0;
+}
+
+int x509_check_validity(const struct x509_cert *c, const char *now_utc) {
+    char nb[15], na[15];
+    if (time_to_14(c->not_before, c->not_before_len, c->nb_tag, nb)) return 0;
+    if (time_to_14(c->not_after,  c->not_after_len,  c->na_tag, na)) return 0;
+    /* lexicographic compare of the 14-digit strings == chronological */
+    if (strcmp(now_utc, nb) < 0) return 0;       /* not yet valid */
+    if (strcmp(now_utc, na) > 0) return 0;       /* expired */
+    return 1;
+}
+
+int x509_name_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+    return alen == blen && memcmp(a, b, alen) == 0;
+}
+
+/* An issuer's public key, EC or RSA -- from a full cert or a bundled anchor. */
+struct issuer_key {
+    int key_type;
+    int curve; const uint8_t *qx, *qy;                       /* EC */
+    const uint8_t *rsa_n; size_t rsa_n_len;                  /* RSA */
+    const uint8_t *rsa_e; size_t rsa_e_len;
+};
+
+/* Verify `child`'s signature under `k`. The child's sig_alg names both the hash
+ * and the scheme; the issuer key must match that scheme. */
+static int verify_with(const struct x509_cert *child, const struct issuer_key *k) {
+    uint8_t hash[64];
+    switch (child->sig_alg) {
+    case X509_SIG_ECDSA_SHA256: {
+        if (k->key_type != X509_KEY_EC) return 0;
+        const struct ec_curve *ec = (k->curve == X509_CURVE_P256) ? ec_p256()
+                                  : (k->curve == X509_CURVE_P384) ? ec_p384() : 0;
+        if (!ec) return 0;
+        sha256(child->tbs, child->tbs_len, hash);
+        return ecdsa_verify(ec, k->qx, k->qy, hash, 32,
+                            child->sig_r, child->sig_r_len, child->sig_s, child->sig_s_len);
+    }
+    case X509_SIG_ECDSA_SHA384: {
+        if (k->key_type != X509_KEY_EC) return 0;
+        const struct ec_curve *ec = (k->curve == X509_CURVE_P256) ? ec_p256()
+                                  : (k->curve == X509_CURVE_P384) ? ec_p384() : 0;
+        if (!ec) return 0;
+        sha384(child->tbs, child->tbs_len, hash);
+        return ecdsa_verify(ec, k->qx, k->qy, hash, 48,
+                            child->sig_r, child->sig_r_len, child->sig_s, child->sig_s_len);
+    }
+    case X509_SIG_RSA_SHA256:
+    case X509_SIG_RSA_SHA384:
+    case X509_SIG_RSA_SHA512: {
+        if (k->key_type != X509_KEY_RSA) return 0;
+        int ha; size_t hlen;
+        if (child->sig_alg == X509_SIG_RSA_SHA256) { sha256(child->tbs, child->tbs_len, hash); ha = RSA_HASH_SHA256; hlen = 32; }
+        else if (child->sig_alg == X509_SIG_RSA_SHA384) { sha384(child->tbs, child->tbs_len, hash); ha = RSA_HASH_SHA384; hlen = 48; }
+        else { sha512(child->tbs, child->tbs_len, hash); ha = RSA_HASH_SHA512; hlen = 64; }
+        return rsa_pkcs1_verify(k->rsa_n, k->rsa_n_len, k->rsa_e, k->rsa_e_len,
+                                ha, hash, hlen, child->sig_raw, child->sig_raw_len);
+    }
+    default: return 0;
+    }
+}
+
+int x509_verify_signed_by(const struct x509_cert *child, const struct x509_cert *issuer) {
+    struct issuer_key k = { issuer->key_type, issuer->curve, issuer->qx, issuer->qy,
+                            issuer->rsa_n, issuer->rsa_n_len, issuer->rsa_e, issuer->rsa_e_len };
+    return verify_with(child, &k);
+}
+
+int x509_verify_signed_by_anchor(const struct x509_cert *child, const struct trust_anchor *a) {
+    struct issuer_key k = { a->key_type, a->curve, a->qx, a->qy,
+                            a->rsa_n, a->rsa_n_len, a->rsa_e, a->rsa_e_len };
+    return verify_with(child, &k);
+}
+
+/* Can `issuer` sign certificates? (RFC 5280 §4.2.1.9 / §4.2.1.3.) An issuer must
+ * be a CA (BasicConstraints cA=TRUE), and if it declares Key Usage it must allow
+ * keyCertSign. `depth` is the number of intermediate CAs already below it toward
+ * the leaf, checked against pathLenConstraint. This is what stops the classic
+ * "any valid leaf can mint certs for any host" forgery. */
+static int issuer_ok(const struct x509_cert *issuer, int depth) {
+    if (!issuer->is_ca) return 0;
+    if (issuer->has_key_usage && !(issuer->key_usage & X509_KU_KEY_CERT_SIGN)) return 0;
+    if (issuer->path_len >= 0 && depth > issuer->path_len) return 0;
+    return 1;
+}
+
+int x509_verify_chain(const struct x509_cert *certs, int n,
+                      const char *host, const char *now_utc) {
+    if (n < 1) return X509_ERR_ANCHOR;
+    if (!x509_match_host(&certs[0], host)) return X509_ERR_HOST;
+
+    /* The leaf (end-entity) must be usable for TLS server auth: if it declares
+     * Extended Key Usage it must include serverAuth (or anyEKU), and if it
+     * declares Key Usage it must allow digitalSignature. */
+    if (certs[0].has_eku && !certs[0].eku_server_auth) return X509_ERR_USAGE;
+    if (certs[0].has_key_usage && !(certs[0].key_usage & X509_KU_DIGITAL_SIGNATURE)) return X509_ERR_USAGE;
+
+    /* Walk leaf -> up. Stop with success as soon as a cert's issuer is a trusted
+     * anchor and that cert verifies under the anchor key; otherwise each cert
+     * must be signed by the next one in the presented chain -- and that next one
+     * must be allowed to act as a CA. */
+    for (int i = 0; i < n; i++) {
+        if (!x509_check_validity(&certs[i], now_utc)) return X509_ERR_EXPIRED;
+
+        const struct trust_anchor *a = trust_find(certs[i].issuer, certs[i].issuer_len);
+        if (a) {
+            /* certs[i] is issued by a bundled anchor (a trusted root CA). */
+            if (x509_verify_signed_by_anchor(&certs[i], a)) return X509_OK;
+            return X509_ERR_SIG;
+        }
+        if (i + 1 >= n) return X509_ERR_ANCHOR;          /* ran out; no anchor reached */
+        /* certs[i+1] is about to sign certs[i]: it must be a valid CA. `i`
+         * intermediate CAs (certs[1..i]) already sit below it toward the leaf. */
+        if (!issuer_ok(&certs[i + 1], i)) return X509_ERR_USAGE;
+        if (!x509_name_eq(certs[i].issuer, certs[i].issuer_len,
+                          certs[i + 1].subject, certs[i + 1].subject_len)) return X509_ERR_NAME;
+        if (!x509_verify_signed_by(&certs[i], &certs[i + 1])) return X509_ERR_SIG;
+    }
+    return X509_ERR_ANCHOR;
+}

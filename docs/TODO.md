@@ -1360,16 +1360,99 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
 
 ### Packaging & SDK (designed, not built — `docs/PACKAGING_AND_SDK.md`)
 
-- [ ] **PK1** — the package manifest format + local `pkg install` (verify → present
-  declared authority → snapshot → adopt into `/data/apps/<name>/` with exactly its
-  `.ns`). Reuses everything through UP4.
-- [ ] **PK2** — the SDK generator: one `build.ebm` package stanza → EMBX caps +
-  `.ns` + package manifest, consistent by construction.
-- [ ] **PK3** — signing (ed25519 over `build_id`) + snapshot-backed update/rollback +
-  the local registry.
-- [ ] **PK4** — the git registry (`emblink-packages`): signed manifests in git,
-  binaries as release assets; fetch over HTTP (mirror pre-TLS, direct once TLS
-  lands). Rides the net stack.
+- [x] ~~**PK1** — the package manifest format + local `pkg install`.~~ **DONE,
+  metal-proven (`test pkg`).** Manifest (§3) parser + EMBX reader/`build_id`
+  verifier in `user/pkg/`; `pkg verify|install|run|list` (`user/bin/pkg.c`).
+  `install` recomputes the EMBX `build_id` (SHA-256 with `build_id`+`header_checksum`
+  zeroed) and matches it to the header *and* the manifest, cross-checks the
+  manifest `caps:` against the EMBX cap table + `abi`, presents the declared
+  authority, and adopts the bundle into `/data/apps/<name>/` writing the `.ns` home
+  enforces + a `/data/pkg/registry` entry. `pkg run` spawns an installed app under
+  EXACTLY its declared caps (SET_CAPS) + namespace (NS_BIND) — `pkgprobe` self-checks
+  it holds only `filesystem`, reaches `/system`, and cannot name `/data/users`; a
+  tampered bundle (build_id fails to recompute) is refused. Bundle+manifest built by
+  `tools/embx/mkembx.py` + `tools/embx/mkpkg.py` (manifest derived from the EMBX, so
+  caps/build_id are consistent by construction). **Scope honestly deferred:** direct
+  copy, no atomic snapshot/rollback (no userspace EMBKFS snapshot API yet → PK3); no
+  signing (PK3); no network (PK4). The manifest is PK1's source of truth until PK2
+  makes `build.ebm` the source.
+- [x] ~~**PK2** — the SDK generator.~~ **DONE (generator), metal-verified.**
+  `tools/embx/pkggen.py`: ONE `.pkgspec` (name/version/caps/grant) → all three
+  views — the EMBX cap table (mkembx/EmbLD bakes it), the `.ns` (from the grant),
+  and the package manifest (mkpkg re-derives caps from the EMBX so it cannot
+  drift) — consistent BY CONSTRUCTION. Proven: adding `network` to the one spec
+  line makes it appear in both the binary's cap table AND the manifest; there is
+  no way to build a bundle whose declared authority disagrees with itself (§4).
+  `pkgprobe`'s authority is now declared once in `user/pkg/pkgprobe.pkgspec`
+  (was scattered across `mkembx --cap` + `mkpkg --ns` flags); `test pkg` runs
+  green on the pkggen-produced bundle.
+- [x] ~~**PK2b** — on-device package generation.~~ **DONE, metal-proven
+  (`test pkgbuild`).** `user/pkg/embxgen.c` is a C EMBX writer (repackage a linked
+  ELF → EMBX with a cap table) — a faithful port of `mkembx.py`, host-verified
+  BYTE-IDENTICAL, so the build_id matches. `user/bin/pkgbuild.c` reads ONE
+  `.pkgspec` + an ELF and emits all three views (EMBX/`.ns`/manifest) ON THE OS.
+  On-device builds are unsigned, so `pkg install --local` adopts a dev build (a
+  present signature is still verified; caps/build_id/re-negotiation still apply).
+  `test pkgbuild`: pkgbuild generates pkgprobe's bundle from the staged
+  `.pkgspec` + ELF → `pkg install --local` → `pkg run` confined — the whole
+  SDK→pkgmgr loop on the metal.
+  - **Structured EmbBuild `package:` stanza — DONE (`test pkgstanza`).** EmbBuild
+    (`shell/tools/embbuild.c`) gained a `kind: package` with `version`/`caps`/
+    `grant` fields: it writes a `.pkgspec` from them and drives `pkgbuild`, with the
+    fields folded into the rebuild stamp. A `build.ebm` declares an app's authority
+    inline; `embbuild` produces the bundle on-device. Metal: embbuild package stanza
+    → bundle → `pkg install --local` → run confined.
+- [x] ~~**PK3** — signing + update/rollback + registry.~~ **DONE, metal-proven
+  (`test pkg`, 8 checks).**
+  - **Signing**: `tools/embx/pkgsign.py` signs each manifest (ECDSA P-256 over the
+    canonical manifest — the file minus its `signature:` line, covering name/
+    version/abi/build_id/caps/namespace/provides). `pkg` verifies against the
+    trusted key in `user/pkg/pkgkey.h` (our own `ecdsa_verify`) and refuses
+    unsigned/altered/wrongly-keyed manifests. Signing is part of `pkggen` (dev key
+    `tools/embx/pkgkey_dev.pem`). Trust is in the signature, not the channel (§9.2).
+  - **Update + rollback + authority re-negotiation**: `pkg install` over an
+    installed version retains the previous bundle at `/data/pkg/versions/<name>/
+    prev/` as the rollback point (§6 — each app is self-contained, so its 3 files
+    ARE the rollback point; no whole-FS snapshot needed), and REFUSES an update
+    that WIDENS caps or namespace (`+ NEW capability: network`) unless
+    `--allow-widen` — a new version cannot silently widen its reach.
+    `pkg rollback/remove/info` complete the set.
+  - **Proven**: `test pkg` install → run confined → tampered-binary reject →
+    bad-signature reject → update to v1.1 → rollback to v1.0 → widening update
+    REFUSED → same update with `--allow-widen` accepted.
+  - *EMBKFS-snapshot-backed update — ASSESSED, deliberately not built for pkg.*
+    The kernel API exists (`embkfs_snapshot_create/rollback/delete`, tested) but
+    EMBKFS snapshots are **whole-volume** ("a frozen root block_ptr", spec §6b):
+    a rollback restores ALL of `/data`, not one package — the wrong granularity
+    for per-package rollback, which the **retained-bundle** approach above does
+    correctly. A whole-volume snapshot's only `pkg` benefit would be install
+    *atomicity* (snapshot → install → rollback-on-failure), and that means rolling
+    back the LIVE mounted volume mid-session (risky) for marginal value on a
+    self-contained-bundle install. Verdict: not worth a risky live-volume rollback
+    in `pkg`. If snapshots are wanted as a GENERAL userspace capability (backups,
+    experiments), expose the syscall deliberately for that — a separate feature,
+    not a packaging one.
+- [x] ~~**PK4** — the git registry.~~ **DONE, metal-proven (`test pkgregistry`).**
+  The registry is a git repo (**github.com/teo1747/emblink-packages**): one dir per
+  package holds its SIGNED manifest + the EMBX bundle, plus a top-level `index`.
+  The OS clones it over HTTPS with our own git-over-TLS client (`gitclone` →
+  `/data/registry`), then `pkg install /data/registry/<name>` verifies the
+  signature against the trusted key **on arrival** and adopts — a compromised host
+  cannot inject a bad binary (§9.2): trust is in the signature, not the channel.
+  `pkg` has the apt-like UX: **`pkg sync [url]`** clones the registry into
+  `/data/registry` (spawning `gitclone`, which inherits its CAP_NETWORK) and
+  remembers the url; **`pkg install <name>`** resolves a bare name from the synced
+  index and installs it (a `/path` still installs a local bundle). `test
+  pkgregistry` (metal): `pkg sync <url>` → `pkg install pkgprobe` (signature valid
+  on arrival) → `pkg run` confined — the transport is the very git-over-HTTPS
+  client from the git arc.
+  - **Release-asset binaries (§9.1) — DONE.** The registry `main` ships only the
+    signed manifest + a `<name>.url`; the binary lives elsewhere (here an `assets`
+    branch, served raw over HTTPS). `pkg install` fetches it with `wget` and checks
+    the fetched binary's `build_id` against the SIGNED manifest — a tampered host
+    cannot inject a bad binary (§9.2). Metal-proven: wget authenticates
+    raw.githubusercontent (Let's Encrypt → our ISRG Root X1), 200/89288 bytes,
+    signature valid, adopted.
 
 ### Toolchain (EmbCC/EmbLD — tracked in full in `EmbCC/docs/todo.md`)
 
@@ -1379,3 +1462,344 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
 - [ ] **L1** — EmbLD linker-defined symbols (`kernel_end`) so the kernel links with
   no external tools and no diagnostic stub.
 - Usage: `docs/TOOLCHAIN.md` (building for/on the OS) + `EmbCC/docs/USAGE.md` (CLI).
+---
+
+## TLS / HTTPS (`docs/TLS.md`, Phase 28)
+
+The OS speaks **authenticated TLS 1.3** on its own crypto (T1–T4 done, T5 partial).
+This section is the honest ledger of what was deliberately **left unbuilt** — the
+parts skipped to keep each phase shippable. Green today: `make test-tls-crypto`
+(15 host suites) + on-OS `test tls` (Cloudflare/EC), `test tls rsa` (Let's
+Encrypt/RSA), `test wget https`, `test pypi`.
+
+### T5 — the consumers
+- [x] ~~**Install a real PyPI package over HTTPS.**~~ **DONE via `pkgfetch`**
+  (commit `f476790`): a native installer (`user/bin/pkgfetch.c` + our own
+  `user/lib/inflate.c` DEFLATE + `user/lib/unzip.c`) fetches a package's PEP-503
+  index + wheel over authenticated libtls and unpacks it into
+  `/data/py/site-packages`. `test pkgfetch` installs `six` from pypi.org /
+  files.pythonhosted.org on the metal; `PYTHONPATH=… python -c 'import six'` then
+  works. This was chosen over rebuilding CPython because the proxy path is blocked
+  (no loopback in the net stack).
+  - **Scope / still open:** pure-Python wheels only (no C-extension compile step);
+    one package at a time (**no dependency resolution** — a package needing deps
+    won't pull them); picks the last `*-none-any.whl` in the index (simple "newest"
+    heuristic, not full PEP 440 version sorting); no wheel hash/signature check
+    beyond TLS transport auth.
+- [ ] **Real `pip` (the tool)** — a multi-brick foundation (Python had NO
+  networking at all: no socket headers, `socket()`=ENOSYS, `_socket`/`_ssl`
+  unbuilt, pip absent). Progress:
+  - [x] **Brick 1 — POSIX BSD sockets in the newlib libc** (commit `64afb42`):
+    the porting-side socket layer (`socket`/`connect`/`getaddrinfo`/… → `embk_net_*`)
+    is now real. `test sockdemo` proves a plain POSIX HTTP client works — the same
+    symbols `_socket` resolves to.
+  - [x] **Brick 2 — `_socket` compiled into the external CPython** (~/cross/build-py)
+    — **DONE, live: `test python net` -> `PYNET HTTP/1.1 200 OK`, exit 0.** CPython
+    opens a real socket, resolves+connects to example.com:80, and reads the reply
+    entirely through our POSIX socket layer. The build is now reproducible:
+    `tools/cpython/configure-py-emblink.sh` asserts the full socket HAVE_* set in
+    pyconfig.h + `_socket` in Setup.local (configure leaves them all off on a
+    cross-build). Root cause of the earlier ENOTSUP: without `HAVE_SOCKET`,
+    socketmodule.c `#define socket stub_socket` shadows the libc call with a stub
+    that just `errno=ENOTSUP` -- the real `socket()` was never reached. Fixes that
+    landed with it: `fcntl` F_GETFL/F_SETFL (set_inheritable needs F_GETFD, the
+    blocking-flag read), `SOMAXCONN` in `sys/socket.h` (HAVE_LISTEN pulls it in),
+    and `test python net` grants CAP_FILESYSTEM too (CPython reads its stdlib zip).
+    *Note:* sockets are BLOCKING-only (fcntl O_NONBLOCK is refused) and
+    `select()`/`poll()` on socket fds are unverified -- fine for simple blocking
+    fetches, may bite urllib3 timeouts.
+  - [x] **Brick 3 — a native `_embtls` module** (NOT a libtls-backed `_ssl`:
+    real `_ssl` wants the whole OpenSSL API we don't have) — **DONE, live:
+    `test python tls` -> `PYTLS HTTP/1.1 200 OK`, exit 0.** CPython does an
+    authenticated TLS 1.3 https:// fetch to pypi.org over our OWN libtls
+    (cert + hostname verified against the embedded GTS Root R4), zero OpenSSL.
+    `tools/cpython/_embtlsmodule.c` is a ~180-line capsule module over
+    `user/lib/tls/tls_handle.{c,h}` (an opaque-handle wrapper that keeps libtls's
+    kshim/kernel include world out of the same TU as Python.h); the libtls
+    objects (`build/tls_*.o`) link straight in. Reproducible via the configure
+    script (symlinks the module into Modules/, declares it in Setup.local).
+  - [x] **Brick 3b — a pure-Python `ssl.py` shim** over `_embtls` — **DONE,
+    live: `test python https` -> `HTTPS 200 OK`, exit 0.** The whole stdlib path
+    works: `http.client.HTTPSConnection` -> our `ssl.py`
+    (`SSLContext`/`wrap_socket`/`SSLSocket` with `sendall`/`recv`/`makefile`) ->
+    `_embtls` handshake -> request -> response headers read back through the
+    buffered TLS stream. The shim REPLACES the stdlib ssl.py (which imports
+    OpenSSL's `_ssl`) via a `tools/mkpystdlib.py` OVERRIDES map; kept in-repo at
+    `tools/cpython/ssl.py`. It also forced four more socket-method HAVE_* macros
+    (SETSOCKOPT/GETSOCKNAME/GETPEERNAME/SHUTDOWN) that http.client's TCP setup
+    needs. Honesty note: libtls always authenticates, so `ssl.py` has no
+    unverified mode -- `_create_unverified_context` still verifies (errs toward
+    more security). Sockets are blocking-only; `select`/`poll` unverified.
+  - [x] **Brick 4 — pip runs on the OS** — **DONE, live: `test python pip` ->
+    `pip 26.1.2 from /data/apps/python/pip.zip/pip (python 3.14)`, exit 0.**
+    `python -m pip --version` imports pip's whole ~450-module tree (vendored
+    urllib3/requests/rich/platformdirs) and runs. Pieces:
+    - `tools/mkpip.py` repacks CPython's bundled pip wheel STORED+precompiled
+      into `build/pip.zip` (a DEFLATED wheel can't be zipimported -- no zlib on
+      the path yet); packed beside the interpreter, added to `._pth`'s sys.path.
+    - **zlib** cross-compiled (`configure-py-emblink.sh` builds `libz.a` from
+      zlib-1.3.1 + declares the stdlib `zlib` module) -- pip's rich imports it.
+    - `tools/mkpystdlib.py` grew a PATCHES map (subprocess `_can_fork_exec=False`
+      -- no fork/exec/wait here) and a build-extras step (packs
+      `_sysconfigdata__emblink_` which sysconfig imports).
+    - os-function macros exposed: `HAVE_READLINK/GETUID/GETEUID/GETPPID/UMASK`
+      (posixpath.realpath/platformdirs reference them; our libc backs each).
+  - [x] **Brick 5 — `python -m pip install` WORKS** — **DONE, live:
+    `test python pip install` -> `Successfully installed six-1.17.0`, exit 0.**
+    `pip install six` on the metal: index fetch from pypi.org, wheel download
+    from files.pythonhosted.org (both over our own TLS -- their cert chains
+    verified against the embedded GTS Root R4), unpack + install to `--target`.
+    The whole real pip pipeline. What it took, each an honest fix:
+    - **Non-blocking sockets (kernel feature)** -- the enabler. urllib3 sets a
+      socket timeout -> non-blocking; we now support it for real:
+      `fcntl(O_NONBLOCK)` stores a kernel fd flag; `connect` returns
+      `-EINPROGRESS` and completes in the background (the RX kthread advances
+      SYN_SENT->ESTABLISHED); a `select()` over a new `sys_fd_poll` reports
+      readiness; `recv` returns `-EAGAIN` when no data. `test nbsock` proves the
+      whole shape natively. NOT the faked "O_NONBLOCK is set" the meta-lesson
+      warns against -- it genuinely works.
+    - `ssl.py` grew what urllib3 v2 reads: OPENSSL_VERSION/verify_flags, and a
+      getpeercert() that reports the name libtls VERIFIED during the handshake
+      (so urllib3's redundant re-check passes). wrap_socket sets the fd blocking
+      first (libtls does blocking record I/O). fileno() returns the real fd
+      (urllib3 select()s on it for connection reuse).
+    - `_ssl`/`mmap` stub modules; truststore patched to ImportError (it needs a
+      memory-BIO trust store we don't have) so pip takes its certifi+ssl fallback.
+    - `fsync`/`fdatasync` now return 0 -- HONEST: EMBKFS has no write-back cache
+      (writes go straight to the device), so the flush is vacuously satisfied
+      (the FD_CLOEXEC case). `HAVE_CHMOD` on (os.chmod was doing errno=ENOSYS
+      instead of calling our real chmod). pip writes+chmods every installed file.
+  `pkgfetch` already covers the common "get me this pure package" case without any
+  of this.
+  - **What pip still LACKS (verified working = a single pure-Python wheel to a
+    writable `--target`):**
+    - **socket timeouts are not ENFORCED** -- `settimeout(T)` is accepted but the
+      op blocks to completion (see [[networking-stack]] non-blocking note); a
+      hung server would hang pip. select() honors its own timeout, but a blocking
+      recv inside libtls/the SSLSocket does not. Fine for a responsive PyPI.
+    - **needs a writable `--target` + `TMPDIR`** (we pass `/data/tmp`). No
+      default site-packages / `--user` scheme wired; installing into a sealed
+      `/system` is correctly refused, not handled.
+    - **pure wheels only.** An sdist (or any package with a build step) needs
+      PEP 517 -> a subprocess to run the backend -> fork/exec, which EmbLink does
+      not have. `pip install <sdist>` will fail at the build isolation step.
+    - **`--no-deps` is what's proven.** Multi-package dependency resolution +
+      several sequential downloads is plausible (same code path) but untested at
+      scale; the resolver can be slow under TCG.
+    - **no cache** (`--no-cache-dir` used): cachecontrol's disk cache rides on
+      `mmap`, which is a stub. Also no `keyring`/auth, no VCS/editable installs.
+    - threading: pip is largely single-threaded here (fine), but any parallel
+      path would hit our thread gap ([[cpython-port]]).
+- [x] ~~**git clone over HTTPS.**~~ **DONE (G1-G4), metal-proven.** The stock git
+  CANNOT do this here: its HTTPS transport fork/execs `git-remote-https` AND
+  `index-pack`/`unpack-objects`, and EmbLink has no fork/exec (`start_command` ->
+  `fork()` -> ENOSYS). So it's a from-scratch clone tool (`user/git/` + `user/bin/
+  gitclone.c`) that drives git's smart-HTTP protocol directly over libtls and
+  writes a real `.git` the on-OS git can then use. `test gitclone` clones
+  github.com/octocat/Hello-World into `/data/hello` over our own TLS:
+  - **G1 ref discovery** -- `githttp` (smart-HTTP GET/POST over libtls, HTTP/1.0
+    read-to-EOF) + `pktline` (git framing); parses the `info/refs?service=git-
+    upload-pack` advertisement. Metal: `GITCLONE 3362 refs, HEAD=7fd1a60b (master)`.
+  - **G2 fetch** -- POST `git-upload-pack` with `want <sha>`+flush+`done`, parse
+    `NAK\n` + the raw packfile. Metal: `GITFETCH pack 7 objects, 700 bytes`.
+  - **G3 unpack** -- `user/git/pack.c` (own zlib-streaming inflate over the libz.a
+    built for pip, ofs/ref-delta resolution) + `user/git/sha1.c` (own SHA-1,
+    FIPS-vector + git empty-blob verified) -> SHA-named objects. Metal:
+    `GITUNPACK 7 objects (3 commit, 2 tree, 2 blob), HEAD reconstructed`.
+  - **G4 write + checkout** -- `user/git/repo.c` writes loose objects (zlib-deflate
+    `"<type> <size>\0"`+content, sha-addressed), `HEAD`/`refs/heads/<branch>`/
+    `config`, then recursively checks out the working tree. Metal:
+    `GITCHECKOUT /data/hello: 7 objects, 1 files, branch master -> OK`, and the
+    README lands on EMBKFS (13 bytes = "Hello World!\n", `vfs_stat` confirmed).
+    A **real** upstream git reads the result (`git fsck` clean, `git log` shows
+    all 3 commits) -- verified on the host against the same packfile.
+  - **G5 deltas -- PROVEN (host SHA-exact + live metal).** Hello-World is
+    delta-free, so delta reconstruction is exercised separately: a host harness
+    (`packtest`) unpacks genuinely deltified packs and every object's sha+type is
+    **byte-identical to `git verify-pack -v`** -- both ofs-delta (github's default,
+    chained to depth 3) and ref-delta (`--no-delta-base-offset`), 24/24 objects
+    each, plus Spoon-Knife's real github pack (16/16). Live on the metal,
+    `test gitclone delta` clones **octocat/Spoon-Knife -> /data/spoon**: github
+    sends a 10-object HEAD pack containing **1 ofs-delta** (confirmed by parsing
+    the entry types), our unpacker resolves it (`GITUNPACK 10 objects … HEAD
+    reconstructed`), and the 3-file working tree (incl. the delta-derived blob)
+    checks out on branch `main` (`index.html` = 355 bytes on EMBKFS). Branch
+    detection also proven here (`main`, not `master`).
+  - **G6 loop closed -- the OS's OWN ported `git.elf` operates on the clone.**
+    After `test gitclone[ delta]` checks out, the selftest runs the ported git in
+    the cloned dir (via `PWD=`, the per-process cwd `test git cwd` relies on -- no
+    chdir). Metal: `git log --oneline` **exit 0** prints Spoon-Knife's real 3-commit
+    history (`d0dd1f6 (HEAD -> main) Pointing to the guide for forking` …) --
+    proving the on-OS git reads OUR refs + inflates OUR loose commit objects; and
+    `git cat-file --batch-all-objects` **exit 0** re-inflates and hash-checks
+    **every** object we wrote (10/10 listed with type+size). So our from-scratch
+    HTTPS clone writes a repo the real git implementation fully accepts, on the
+    metal. (`git fsck` also verifies the objects -- `Checking object directories:
+    100%, done`, no object errors -- but then SPAWNS commit-graph/multi-pack-index
+    sub-checks; fork/exec is ENOSYS here, so its *exit* is nonzero for a reason
+    unrelated to repo validity. The test gates on `log`, which never forks.)
+  - **The blocker (G1) was an uninitialized-memory HEISENBUG** in libtls's ECDSA
+    verify (`ecdsa.c` read an uninitialized stack `bn`): benign garbage on the
+    host, but under QEMU it broke github's P-256 leaf verification (rc=-103) --
+    data-dependent, so GTS/pypi leaves passed. Diagnosis: linked the exact target
+    objects into a host harness -- they verified github's chain fine; the failure
+    only reproduced on the OS and flipped with any codegen perturbation (a debug
+    print "fixed" it). **Fix: `-ftrivial-auto-var-init=zero` in NEWLIB_CFLAGS**
+    (zero every uninit auto var -- deterministic, right for security-critical
+    crypto). Also added github's root (USERTrust ECC, P-384) to the trust store +
+    `ecdsa_secp384r1_sha384` (0x0503) to the ClientHello sig-algs.
+  - **G7 shallow clone (`--depth N`) -- metal-proven.** `gitclone --depth N`
+    sends a `deepen N` line in the upload-pack request; the server prefixes the
+    response with `shallow <sha>` boundary lines (ended by a flush) before NAK,
+    which we parse and write to `.git/shallow`. Validated against the REAL github
+    server on the host first (curl replayed our exact request bytes -> the exact
+    `shallow`/flush/NAK/PACK framing our parser consumes -> our unpacker produced
+    the 5-object depth-1 pack matching real git). Live: `test gitclone shallow`
+    clones **octocat/Spoon-Knife --depth 1 -> /data/spoonshallow** --
+    `GITSHALLOW depth 1, 1 boundary commit(s)`, `GITUNPACK 5 objects` (just the
+    tip vs 10 for a full clone), and the on-OS git reads it as genuinely shallow:
+    `d0dd1f6 (grafted, HEAD -> main) …` (**1** commit, not 3; `git log`/`cat-file`
+    both exit 0). githttp also gained coarse `recv NN KB` progress prints -- the
+    22800-ref advertisement is ~1.5 MB and streams slowly over TLS under TCG
+    (~10 min), which without progress output is indistinguishable from a hang.
+  - **G8 push (`gitpush`) -- authenticated, metal-proven.** The inverse of clone:
+    `gitpush <url> <file> <path> [branch]` builds a blob+tree+commit, serializes
+    them with a NEW **packfile writer** (`pack_write`, the inverse of pack_unpack
+    -- host-proven: round-trips every sha AND `git index-pack` accepts our pack),
+    and drives **git-receive-pack** (`user/git/push.c`) over libtls with **HTTP
+    Basic auth** (`githttp` gained an `authb64` arg; own base64, byte-checked vs
+    coreutils). Token comes from `$GITPUSH_TOKEN` (env, never argv). Proven three
+    ways: (a) the request feeds a real local `git receive-pack` which accepts it +
+    updates the ref + `fsck` clean; (b) the exact bytes + auth POST to a real
+    GitHub repo return `unpack ok`/`ok <ref>`; (c) LIVE on the metal, `test
+    gitpush` pushed a first commit CREATING `refs/heads/main` on
+    github.com/teo1747/mblink-push-test (`GITPUSH refs/heads/main <sha> -> OK`),
+    and a real `git clone` reads it back -- author `EmbLink <os@emblink>`, the
+    pushed README, `fsck` clean. Credentials are staged into the LOCAL image only
+    (mkfs env-gated: `EMBK_GITPUSH_TOKEN_FILE` + `EMBK_GITPUSH_URL`), never
+    committed.
+  - **G9 incremental commit push -- metal-proven.** A push onto a NON-empty branch:
+    gitpush sees the tip is non-zero, FETCHES it (shallow upload-pack, reusing the
+    clone machinery), reads the parent commit's root tree, and SPLICES it
+    (`push_make_next_commit`/`splice_tree` in push.c: add/replace the target
+    top-level entry, keep every other, re-serialize in git's tree order) into a new
+    tree; the new commit carries the tip as `parent`. Only the 3 NEW objects are
+    packed -- the unchanged blobs already live on the server. Host-proven (a first
+    then an incremental push to a local `git receive-pack`: the pre-existing file
+    survives, 2-commit chain, fsck clean). LIVE: `test gitpush` now pushes TWICE --
+    `README.md` (first commit, creates `main`) then `NOTES.md` (incremental); on
+    github `main` ends with BOTH files (README.md survived the splice) and a
+    `e709a83 parent=6d96e3b` two-commit chain, fsck clean.
+  - **G10 the write/negotiate frontier -- metal-proven (`test gitfeat`).** Four
+    features, all live on the metal in one sequence + exhaustively host-proven
+    against a real `git receive-pack`:
+    - **multi-ref clone** (`gitclone --ref <branch|tag>`): read_refs selects the
+      requested ref (full or short name, heads or tags) instead of HEAD. Live:
+      cloned the `dev` branch (not the default) and checked out its content.
+    - **nested-subtree splice**: `push_make_commit` + a RECURSIVE `splice_path`
+      rewrite every tree along a `a/b/c` path (creating missing subdirs), so an
+      incremental commit to `docs/guide.md` preserves all other files/dirs. Host:
+      `docs/deep/notes.md` + `docs/guide.md` coexist through three commits, the
+      first file survives every splice. Live: pushed `docs/guide.md` (4 objects =
+      blob + 2 trees + commit).
+    - **force-push** (`--force`): push an unrelated orphan commit as a non-ff
+      update. Host + live: `main`'s whole history replaced by a single commit.
+    - **delete** (`--delete <branch>`): a zero-id update + empty pack. Host + live:
+      the `dev` branch removed (`unpack ok`/`ok`, ref gone).
+  - **Deferred (small tail):** `want`-list has no `have`/negotiation beyond deepen;
+    no side-band-64k progress; no thin-pack completion; deltas seen live are
+    shallow chains (depth 1) -- deep chains host-proven (depth 3) but no large live
+    clone under TCG (slow). The ported stock git.elf still uses its OWN transport
+    only for local ops.
+- [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
+  one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
+  fragmented Certificate-message / net-read edge case leaving a cert parsed with
+  is_ca=0 rather than failing outright. Investigate the flight reassembly under
+  multi-record certs; possibly related to the sys_read byte-drop history.
+- [ ] **Our own package registry fetch** (packaging PK4) over libtls — the
+  authority-declaring bundle download. Design only.
+
+### Ciphersuites & key exchange (only one of each today)
+- [ ] `TLS_CHACHA20_POLY1305_SHA256` — self-contained AEAD, great on cores without
+  AES-NI. Needs ChaCha20 + Poly1305 (new crypto).
+- [ ] `TLS_AES_256_GCM_SHA384` — the GCM core is already cipher-agnostic and
+  AES-256 exists; needs the SHA-384 transcript/key-schedule variant wired.
+- [ ] P-256 / P-384 ECDHE key_share (only **X25519** is offered/accepted now).
+  Refused-group HelloRetryRequest would then matter.
+
+### Handshake features not implemented
+- [ ] **HelloRetryRequest** — detected and rejected (`-2`), never handled. A server
+  that wants a different group fails. Fine while we only offer X25519 to servers
+  that accept it.
+- [ ] **KeyUpdate** — post-handshake key rotation is ignored; a server that sends
+  one makes subsequent records undecryptable. Rare in a single fetch.
+- [ ] **Session resumption / 0-RTT / PSK** — no NewSessionTicket use (tickets are
+  read and discarded), no early data. Every connection is a full handshake.
+- [ ] **Client certificates** — CertificateRequest not handled (we only do the
+  common server-auth case).
+- [ ] **Record-layer omissions:** no key-update seq reset, no max-record-age /
+  rekey, we emit **no padding**, and we don't fragment outgoing handshake messages
+  (fine — ours are small). Alert handling is minimal (any alert on read = EOF).
+
+### Certificate verification — remaining gaps
+- [ ] **More trust anchors.** Only 3 bundled: GTS Root R4 (EC), ISRG Root X1 (RSA),
+  GlobalSign Root R3 (RSA). Broad but not universal — a DigiCert/Sectigo/etc. site
+  fails with `-105` (no anchor). Want a curated set under `/system/etc/ca` the user
+  can grow (docs/TLS.md §5.1), verified-boot-sealed.
+- [ ] **RSA-PSS-*signed* certs** (`id-RSASSA-PSS` in the cert, not just in
+  CertificateVerify) — parsed as `X509_SIG_NONE`, so a chain link signed that way
+  won't verify. Rare for CAs today.
+- [ ] **Ed25519 / EdDSA** certificate + CertificateVerify signatures — not
+  implemented.
+- [x] ~~**Basic Constraints (CA:TRUE / pathLen), Key Usage (keyCertSign), Extended
+  Key Usage (serverAuth)** not enforced.~~ **DONE** (commit `4ca72bb`): the parser
+  reads all three; `x509_verify_chain` requires every issuer to be a CA with
+  keyCertSign (+ pathLen bound) and the leaf to be server-auth-usable. Closes the
+  classic leaf-as-CA forgery — proven by `test_constraints.c` (a validly-signed
+  cert from a non-CA leaf is refused with `X509_ERR_USAGE`).
+- [ ] **Name Constraints** (permitted/excluded dNSName subtrees on a CA) — still
+  NOT enforced. Rare in the public web (mostly enterprise/gov CAs); moderate
+  parsing effort. A constrained CA could currently issue outside its subtree and
+  we'd accept it.
+- [ ] **Revocation checking** — still absent. Deliberately deferred, not faked: a
+  revocation check that soft-fails on any error (no responder, parse error) is
+  security theater and worse than honest absence. It is a genuine multi-protocol
+  network feature, and the ecosystem is mid-transition, so it's ~a phase of work:
+  - **OCSP stapling** (cleanest, no extra round trip): send `status_request` in
+    ClientHello, read the stapled `CertificateStatus`/CertificateEntry extension,
+    parse `BasicOCSPResponse`, verify its signature (issuer or delegated responder
+    + its own EKU `id-kp-OCSPSigning`), check `certStatus`. *Observed:* pypi.org
+    staples; **Cloudflare and Let's Encrypt do NOT** — so stapling alone covers
+    little.
+  - **CRL** (where the leaf has a CRL Distribution Point — Let's Encrypt now does,
+    having dropped OCSP in 2025): fetch the `.crl` over HTTP, parse the signed
+    `CertificateList`, verify its signature, check the serial. CRLs can be large /
+    sharded.
+  - **OCSP request** (for leaves with only an AIA OCSP URL, e.g. Cloudflare):
+    build a DER OCSPRequest, HTTP POST to the responder, verify the response.
+  Doing it *right* means all three + response-signature verification; anything
+  less silently passes on the sites it doesn't cover. Prereq for treating the
+  stack as trustworthy against key compromise.
+- [ ] **Hostname matching is minimal:** DNS SANs only (no IP-address SANs, no CN
+  fallback — CN fallback is deliberately omitted, which is correct), single-label
+  `*.` wildcard only.
+- [ ] **Validity uses the OS wall clock** (`gettimeofday`); a wrong RTC would
+  wrongly accept/reject. No max-chain-age or "not-after within anchor validity"
+  cross-check.
+
+### Verification / testing gaps
+- [ ] **Live *negative* boot test** — host tests reject wrong-host/expired/tampered,
+  but there's no on-OS test that connects to a deliberately-bad server (expired.
+  badssl.com / wrong.host.badssl.com / self-signed.badssl.com) and confirms the
+  handshake is *refused*. The security property is only host-proven, not metal-
+  proven.
+- [ ] The `test pypi` live run is timing-flaky under TCG (the desktop clock widget
+  starves the kernel serial-console poll, so the fed command isn't always drained);
+  the pypi chain + GlobalSign R3 anchor are host-verified deterministically, and the
+  identical wget-HTTPS-to-disk pipeline is metal-proven by `test wget https`.
+
+### Crypto hardening (verify-only today, not constant-time)
+- [ ] The Montgomery bignum, ECDSA, RSA, and X25519 are written for **verification /
+  public-value** use and are **NOT constant-time**. Before any *signing* or private-
+  key handling on the OS (client certs, our own CA, key storage) they need constant-
+  time review. `getentropy` is RDRAND-only (fine; documented).

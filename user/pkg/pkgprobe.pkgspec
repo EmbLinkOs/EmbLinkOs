@@ -1,0 +1,10 @@
+# pkgprobe's package spec -- the SINGLE source of truth for its authority.
+# pkggen turns this one declaration into all three views (the EMBX cap table,
+# the .ns namespace manifest, and the .pkg package manifest), consistent by
+# construction. Change a capability or a grant HERE and every view follows;
+# you cannot build a bundle whose declared authority disagrees with itself.
+name:    pkgprobe
+version: 1.0.0
+caps:    filesystem
+grant:   ro /system
+grant:   rw /data/apps/pkgprobe

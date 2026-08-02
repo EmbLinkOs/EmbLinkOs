@@ -819,6 +819,161 @@ usage is now documented (`docs/TOOLCHAIN.md`, `EmbCC/docs/USAGE.md`).
 
 ---
 
+### Phase 28 — TLS 1.3: a from-scratch, authenticated HTTPS stack ✅
+
+The OS speaks **authenticated TLS 1.3** to the real internet, on crypto written
+from scratch (no OpenSSL). Full design + phase log in `docs/TLS.md`; a userspace
+`libtls` (`user/lib/tls/`) over the existing sockets, reusing the kernel crypto
+compiled twice (three shim headers point `include/{types,kstring,kprintf}.h` at
+standard headers, so `kernel/crypto/{sha256,hmac,aes}.c` run verbatim in
+userspace). **15 host suites green** (`make test-tls-crypto`), every phase also
+verified on the metal.
+
+- **T1 — handshake crypto.** HKDF-SHA256, AES-128 + AES-GCM (AES generalized to
+  128-bit in-kernel, `aes256_*` byte-identical), X25519 — each against RFC
+  vectors. On-OS witness `test tls crypto`.
+- **T2 — handshake + record layer.** The TLS 1.3 key schedule (matched
+  byte-for-byte to **RFC 8448**), the record layer (per-record AEAD, nonce, AAD),
+  ClientHello/ServerHello + transcript + Finished, and the client state machine
+  (`tls_connect/read/write/close`). *Headline:* `test tls` did a live handshake
+  with Cloudflare.
+- **T3 — certificate authentication (EC).** DER/ASN.1, X.509 v3 parsing, **ECDSA
+  P-256/P-384** (own Montgomery bignum + Jacobian curve math), **SHA-384/512**, a
+  bundled trust store, chain building, hostname/SAN + validity, and the
+  CertificateVerify check — all wired into the handshake (refuses before Finished
+  on any failure). `test tls` now *authenticates* Cloudflare → **GTS Root R4**.
+  **Chain constraints enforced** (RFC 5280): Basic Constraints (CA:TRUE / pathLen),
+  Key Usage (keyCertSign), Extended Key Usage (serverAuth) — the classic
+  leaf-as-CA forgery is refused (`test_constraints.c`). *Not yet:* Name Constraints,
+  revocation (CRL/OCSP) — see `docs/TODO.md`.
+- **T3.5 — RSA.** **RSA-PKCS1-v1.5** (cert-chain sigs) and **RSA-PSS** (TLS 1.3's
+  RSA CertificateVerify), bignum widened to 4096-bit. `test tls rsa` authenticates
+  a Let's Encrypt (all-RSA) chain → **ISRG Root X1**.
+- **T4 — HTTPS client.** `wget https://` runs an authenticated fetch over libtls
+  and writes the decrypted body to disk (refuses on cert failure, no insecure
+  fallback). `test wget https` → `HTTP 200`, bytes on EMBKFS.
+- **T5 — the package internet.** Bundled a 3rd anchor (**GlobalSign Root R3**).
+  **`pkgfetch`** — a native installer using our own DEFLATE (`inflate.c`) + ZIP
+  reader (`unzip.c`) — fetches a package's PyPI index + wheel over libtls and
+  installs it into `/data/py/site-packages`; `test pkgfetch` installs **`six`** on
+  the metal, importable in the ported Python.
+- **T6 — real `pip` over our TLS.** The ported CPython's `ssl` module is a
+  pure-Python shim over a native `_embtls` extension (libtls-backed), plus
+  **non-blocking sockets** end-to-end (`O_NONBLOCK` fd flag, `sys_fcntl`/
+  `sys_fd_poll`, non-blocking `connect`/`recv`, a `select()` in libc — witnessed by
+  `test nbsock`). With those, **stock `pip install` works**: `urllib3` → our
+  `ssl.py` → `_embtls` → an authenticated PyPI fetch, `pip install six` succeeds.
+- **T7 — `git clone` over our TLS.** git can't fork/exec its HTTPS transport here,
+  so `gitclone` (`user/git/` + `user/bin/gitclone.c`) drives git's **smart-HTTP
+  protocol** directly over libtls: ref discovery, `git-upload-pack` fetch, an own
+  **packfile unpacker** (own zlib-streaming inflate + delta resolution) named by an
+  **own SHA-1**, then writes a real `.git` + checks out the working tree.
+  `test gitclone` clones **github.com/octocat/Hello-World** into `/data/hello` on
+  the metal (`GITCHECKOUT … -> OK`, README on EMBKFS); a real upstream git reads
+  the result. **Delta reconstruction is proven** — a host harness matches
+  `git verify-pack` byte-for-byte on both ofs- and ref-delta packs (chained), and
+  `test gitclone delta` clones **octocat/Spoon-Knife** live (github's ofs-delta
+  pack resolved on the metal, 3-file tree on branch `main`). **The loop closes:**
+  the OS's OWN ported `git.elf` then operates on the clone — `git log` prints the
+  real commit history and `git cat-file --batch-all-objects` re-hashes every
+  object we wrote, both exit 0 on the metal. **Shallow clone** works too:
+  `gitclone --depth N` negotiates `deepen`, writes `.git/shallow`, and the on-OS
+  git reads the result as `(grafted)` — `test gitclone shallow` fetches just the
+  tip (5 objects vs 10).
+- **T8 — `git push` over our TLS.** The inverse: `gitpush` builds a
+  blob+tree+commit, serializes them with our own **packfile writer** (`pack_write`),
+  and drives **git-receive-pack** with **HTTP Basic auth** (token from the
+  environment). `test gitpush` pushed a first commit **live to a real GitHub repo**
+  (`GITPUSH refs/heads/main <sha> -> OK`), authenticated over our own crypto — a
+  real `git clone` reads it back, `fsck` clean. **Incremental commits** work too:
+  a push onto a non-empty branch fetches the tip, splices its tree (other files
+  survive), and commits with the tip as parent — `test gitpush` pushes a first
+  commit then an incremental one, and `main` ends with both files + a 2-commit
+  chain. **The full write/negotiate frontier works too** (`test gitfeat`, live):
+  **multi-ref clone** (`gitclone --ref <branch>` fetches a non-default ref),
+  **nested-subtree** push (recursive tree splice for `docs/guide.md`, other files
+  survive), **force-push** (`--force`, replaces history), and branch **delete**
+  (`--delete`). *Deferred:* have/negotiation, side-band, thin-pack.
+
+Trust anchors bundled: GTS Root R4 (EC P-384), ISRG Root X1 (RSA-4096), GlobalSign
+Root R3 (RSA-2048), USERTrust ECC (EC P-384, for github/Sectigo) — between them,
+Cloudflare/Google, Let's Encrypt, GlobalSign, and github cover a large majority of
+the web. Signature schemes: ECDSA
+secp256r1/secp384r1, RSA-PKCS1-v1.5, RSA-PSS. One ciphersuite:
+`TLS_AES_128_GCM_SHA256`.
+
+**Networking reaches both libc worlds.** The kernel's CAP_NETWORK sockets
+(`embk_net_*`) are now exposed through *both* userspace libcs, mirroring the
+emlibc/newlib + EMBX/ELF split:
+- **newlib (porting world):** a real POSIX BSD-sockets layer in `syscalls.c`
+  (`socket`/`connect`/`getaddrinfo`/… — the missing `sys/socket.h`/`netdb.h`
+  functions, previously ENOSYS) so ported POSIX programs (Python's `_socket`,
+  git, curl) work unmodified. Witness `test sockdemo` (plain POSIX HTTP GET).
+- **emlibc (native world):** a native net API (`user/emlibc/net/`, `<net.h>`) in
+  EmbLink's own vocabulary — `em_tcp_connect(host,port)` returning a plain fd, no
+  `sockaddr`. Witness `test emlibc net` (an HTTP GET linked against libemlibc
+  only, zero newlib). This is what native EmbLink apps use.
+
+### Phase 29 — Packaging: authority-declaring bundles (PK1) ✅
+
+A **package** is a self-contained, authority-declaring bundle; **installing is
+granting authority the kernel then enforces** — and the app physically cannot
+exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
+
+- **The manifest (§3)** — a human-readable `<name>.pkg` (`name/version/abi/
+  build_id/caps/namespace/provides`) that *mirrors* an app's declared authority
+  (its EMBX cap table + its UP4 `.ns`). It is a **view, not a second source of
+  truth**: `pkg` cross-checks it against the real binary so it cannot drift.
+- **`pkg`** (`user/bin/pkg.c` + `user/pkg/`): `verify` recomputes the EMBX
+  `build_id` (SHA-256 with `build_id`+`header_checksum` zeroed, EMBX §3.4 — the
+  kernel loader checks CRCs but not this) and matches it to the header *and* the
+  manifest, cross-checks the manifest `caps:` against the cap table + `abi`.
+  `install` then presents the declared authority plainly (*"…nothing else — what
+  it did not declare, it cannot get"*) and adopts the bundle into
+  `/data/apps/<name>/`, writing the `.ns` home enforces + a `/data/pkg/registry`
+  entry. `run` spawns an installed app under EXACTLY its declared caps (SET_CAPS)
+  + namespace (NS_BIND).
+- **Proven** (`test pkg`, metal): a staged `pkgprobe` bundle installs; run under
+  its grant it holds only `filesystem`, reaches `/system`, and **cannot name**
+  `/data/users` — the confinement is kernel-enforced, not installer-promised; and
+  a tampered bundle whose `build_id` fails to recompute is refused. The bundle +
+  manifest are produced by `tools/embx/mkembx.py` + `tools/embx/mkpkg.py`
+  (manifest derived from the EMBX → consistent by construction).
+- **PK2 — the SDK generator** (`tools/embx/pkggen.py`): ONE `.pkgspec` (name,
+  version, caps, grant) → all three views (the EMBX cap table, the `.ns`, the
+  package manifest), **consistent by construction**. Adding `network` to the one
+  spec line makes it appear in both the binary's cap table and the manifest — you
+  cannot build a bundle whose declared authority disagrees with itself (§4).
+  `pkgprobe`'s authority is now declared once in `user/pkg/pkgprobe.pkgspec` (was
+  scattered across `mkembx`/`mkpkg` flags); `test pkg` runs green on the generated
+  bundle.
+- **PK3 — signing + update/rollback**. *Signing*: `tools/embx/pkgsign.py` signs
+  each manifest (ECDSA P-256 over the canonical manifest); `pkg` verifies against
+  the trusted key in `user/pkg/pkgkey.h` (our own `ecdsa_verify`) and refuses
+  unsigned/altered/wrongly-keyed manifests — trust is in the signature, not the
+  channel. *Update/rollback*: `pkg install` over an installed version retains the
+  previous bundle as the rollback point and **refuses an update that widens caps
+  or namespace** unless `--allow-widen` (a new version cannot silently widen its
+  reach); `pkg rollback/remove/info` complete the set. `test pkg` runs 8 checks
+  green on the metal.
+- **PK2b — on-device package generation.** `pkgbuild` (`user/bin/pkgbuild.c` +
+  `user/pkg/embxgen.c`, a C EMBX writer byte-identical to mkembx) turns one
+  `.pkgspec` + a linked ELF into the three views ON THE OS ITSELF; `pkg install
+  --local` adopts the unsigned dev build. `test pkgbuild` proves generate →
+  install → run-confined, all on the metal — authority declared as part of
+  building on the device.
+- **PK4 — the git registry.** The registry is a git repo (`emblink-packages`):
+  one dir per package with its signed manifest + EMBX. `test pkgregistry` clones
+  it over HTTPS (our own git-over-TLS client), then `pkg install`s a package from
+  the clone — the signature is verified against the trusted key **on arrival**, so
+  a compromised host cannot inject a bad binary: trust is in the signature, not the
+  channel. Clone → install → run-confined, all on the metal. The packaging arc is
+  now complete end to end (build → sign → publish → install), and its transport is
+  the very git-over-HTTPS client from Phase 28. No dependency graph, ever (the only
+  "dependency" is the `abi` integer).
+
+---
+
 ## Major To-Do Buckets (Rough Priority)
 
 Full detail lives in `TODO.md`, organized by subsystem. Rough priority order:

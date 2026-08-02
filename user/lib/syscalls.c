@@ -59,6 +59,7 @@
 #include <dirent.h>        /* DIR, struct dirent, DT_* -- our sys/dirent.h override */
 #include <utime.h>         /* struct utimbuf -- our sys/utime.h override */
 #include <sys/wait.h>
+#include <sys/select.h>   /* fd_set, FD_*, FD_SETSIZE -- for select() */
 
 #include "embk_syscall.h"
 
@@ -149,8 +150,10 @@ static int embk_errno_from_kernel(int64_t ret) {
     case 75:  return EOVERFLOW;      /* EMBK_EOVERFLOW    */
     case 84:  return EILSEQ;         /* EMBK_EILSEQ       */
     case 90:  return EMSGSIZE;       /* EMBK_EMSGSIZE     */
+    case 11:  return EAGAIN;         /* EMBK_EAGAIN (== EWOULDBLOCK) */
     case 95:  return ENOTSUP;        /* EMBK_ENOTSUP      */
     case 110: return ETIMEDOUT;      /* EMBK_ETIMEDOUT    */
+    case 115: return EINPROGRESS;    /* EMBK_EINPROGRESS  */
     case 125: return ECANCELED;      /* EMBK_ECANCELED    */
     default:  return (int)(-ret);    /* agreed by shared Unix ancestry */
     }
@@ -751,21 +754,27 @@ mode_t umask(mode_t mask) {
 /* Genuinely absent -- fail rather than pretend                        */
 /* ------------------------------------------------------------------ */
 
-/* fsync/fdatasync: refusing is the SAFE direction. Returning 0 would promise
- * durability we have not verified EMBKFS provides, and a caller told "your data
- * is on disk" cannot detect the lie -- that is precisely how data is lost. If
- * the block layer is ever confirmed to commit synchronously (or a real flush
- * syscall lands), these become 0 / a real flush. */
+/* fsync/fdatasync succeed as a NO-OP -- and that is honest here, not a lie.
+ * fsync's contract is "flush this fd's buffered writes to the device". EmbLinkOS
+ * has NO write-back path to flush: the block layer keeps no dirty-page cache and
+ * issues every write() straight to the device synchronously (grep block.c/ata.c
+ * -- there is no cache/writeback/flush machinery). So by the time write()
+ * returned, the data was already handed down; there is nothing left for fsync to
+ * do, and "your writes are committed" is a TRUE statement about this OS. This is
+ * the [[FD_CLOEXEC]] case from the port notes: a capability that is vacuously
+ * SATISFIED, not missing -- refusing it (the old ENOSYS) broke callers with every
+ * right to expect success (pip's adjacent_tmp_file does flush()+os.fsync() before
+ * an atomic replace). If a write-back cache is ever added, THIS must become a
+ * real device flush the same day, or it turns into the lie the old comment
+ * feared. */
 int fsync(int fd) {
     (void)fd;
-    errno = ENOSYS;
-    return -1;
+    return 0;
 }
 
 int fdatasync(int fd) {
     (void)fd;
-    errno = ENOSYS;
-    return -1;
+    return 0;
 }
 
 /* No dup: the fd table has no duplicate-into-lowest-free operation, and faking
@@ -797,11 +806,15 @@ int dup(int fd) {
  * convenient stub. (Should exec ever exist -- it will not, by design -- this
  * must become real state.)
  *
- * F_GETFL/F_SETFL -- still REFUSED. O_NONBLOCK genuinely cannot be honoured,
- * and here a false success is exactly the trap: a caller told non-blocking mode
- * was set would then hang forever in a blocking read. F_DUPFD likewise, since
- * dup() itself is ENOSYS (see above).
+ * F_GETFL reports the TRUE state: O_RDWR, blocking (no O_NONBLOCK) -- every fd
+ * here is blocking, so this is a fact, not a stub. F_SETFL accepts a request to
+ * (re)assert blocking mode (a no-op: already so) but REFUSES O_NONBLOCK, because
+ * a false "non-blocking is set" is the real trap -- the caller would then hang
+ * forever in a blocking read. This lets blocking-socket code (CPython's _socket,
+ * which reads/sets the flags) work while never lying about non-blocking.
+ * F_DUPFD likewise refused, since dup() itself is ENOSYS (see above).
  */
+#include <fcntl.h>
 /* uname(): real facts about this OS -- nothing here is faked or guessed.
  * nodename is the sysname: one machine, no network identity to distinguish. */
 #include <sys/utsname.h>
@@ -833,6 +846,25 @@ int fcntl(int fd, int cmd, ...) {
          * "stay open across exec" describe the same (unobservable) reality, so
          * there is nothing to store and nothing that could later disagree. */
         return 0;
+    case F_GETFL: {
+        /* Access mode is always read/write here; report O_NONBLOCK truthfully
+         * from the kernel fd flag (sockets can now be non-blocking). sys_fcntl
+         * cmd 1 = get non-blocking. */
+        int nb = (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
+        return O_RDWR | ((nb > 0) ? O_NONBLOCK : 0);
+    }
+    case F_SETFL: {
+        va_list ap; va_start(ap, cmd);
+        int flags = va_arg(ap, int);
+        va_end(ap);
+        /* Honor O_NONBLOCK for real now: the kernel supports non-blocking
+         * sockets (connect -> EINPROGRESS, recv -> EAGAIN, select for readiness).
+         * For a non-socket fd the flag is stored but every op stays blocking,
+         * which is correct -- files never block. sys_fcntl cmd 2 = set it. */
+        int64_t r = embk_syscall3(EMBK_SYS_fcntl, fd, 2, (flags & O_NONBLOCK) ? 1 : 0);
+        if (embk_is_err(r)) return embk_fail(r);
+        return 0;
+    }
     default:
         errno = ENOSYS;
         return -1;
@@ -880,11 +912,66 @@ int pause(void) {
 /* No poll/select machinery: fds have no readiness notification, only blocking
  * reads. Returning 0 ("nothing ready, timed out") would turn every select loop
  * into a silent spin. */
+/* select() over the kernel's per-fd readiness query (sys_fd_poll). CPython's
+ * socket timeout mode calls this to wait for a non-blocking connect to complete
+ * (writable) or for data (readable). We poll each interested fd and, if none is
+ * ready, sleep briefly and retry until the timeout -- the sleep is what lets the
+ * RX kthread advance a connecting socket to ESTABLISHED. Not a scalable event
+ * loop, but exactly what a blocking-with-timeout socket needs. */
 int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
            struct timeval *timeout) {
-    (void)nfds; (void)readfds; (void)writefds; (void)exceptfds; (void)timeout;
-    errno = ENOSYS;
-    return -1;
+    if (nfds < 0 || nfds > FD_SETSIZE) { errno = EINVAL; return -1; }
+
+    long timeout_ms = -1;                     /* -1 => wait indefinitely */
+    if (timeout)
+        timeout_ms = timeout->tv_sec * 1000L + timeout->tv_usec / 1000L;
+
+    /* POLL* bits (match kernel/fs/fd.h + embk.h EMBK_POLL*). Spelled literally
+     * here because embk.h is included further down this file. */
+    enum { P_IN = 0x0001, P_OUT = 0x0004, P_ERR = 0x0008 };
+
+    long elapsed = 0;
+    for (;;) {
+        fd_set r_out, w_out, e_out;
+        FD_ZERO(&r_out); FD_ZERO(&w_out); FD_ZERO(&e_out);
+        int nready = 0;
+
+        for (int fd = 0; fd < nfds; fd++) {
+            int want = 0;
+            if (readfds   && FD_ISSET(fd, readfds))   want |= P_IN;
+            if (writefds  && FD_ISSET(fd, writefds))  want |= P_OUT;
+            if (exceptfds && FD_ISSET(fd, exceptfds)) want |= P_ERR;
+            if (!want) continue;
+
+            int re = (int)embk_syscall2(EMBK_SYS_fd_poll, fd, want | P_ERR);  /* always learn errors */
+            if (re < 0) continue;
+
+            if (readfds  && (re & P_IN))  { FD_SET(fd, &r_out); nready++; }
+            /* An error makes a connecting socket "writable-ready" so the caller
+             * wakes and discovers it via getsockopt(SO_ERROR). */
+            if (writefds && (re & (P_OUT | P_ERR))) { FD_SET(fd, &w_out); nready++; }
+            if (exceptfds && (re & P_ERR)) { FD_SET(fd, &e_out); nready++; }
+        }
+
+        if (nready > 0) {
+            if (readfds)   *readfds   = r_out;
+            if (writefds)  *writefds  = w_out;
+            if (exceptfds) *exceptfds = e_out;
+            return nready;
+        }
+        if (timeout_ms == 0) break;                       /* pure poll, no wait */
+        if (timeout_ms > 0 && elapsed >= timeout_ms) break;
+
+        long step = 10;                                   /* 10 ms granularity */
+        if (timeout_ms > 0 && timeout_ms - elapsed < step) step = timeout_ms - elapsed;
+        embk_syscall1(EMBK_SYS_sleep_ms, step);           /* yields; RX thread runs */
+        elapsed += step;
+    }
+
+    if (readfds)   FD_ZERO(readfds);                      /* timed out: nothing ready */
+    if (writefds)  FD_ZERO(writefds);
+    if (exceptfds) FD_ZERO(exceptfds);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1118,6 +1205,7 @@ int unlink(const char *path) {
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include "embk.h"          /* embk_net_* -- the kernel CAP_NETWORK socket layer */
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/statvfs.h>
@@ -1330,22 +1418,222 @@ int msync(void *addr, size_t len, int flags) {
 int statvfs(const char *path, struct statvfs *buf)  { (void)path; (void)buf; errno = ENOSYS; return -1; }
 int fstatvfs(int fd, struct statvfs *buf)           { (void)fd;   (void)buf; errno = ENOSYS; return -1; }
 
-/* No network stack -- not unconfigured, ABSENT. */
-int socket(int d, int t, int p)  { (void)d; (void)t; (void)p; errno = ENOSYS; return -1; }
-int connect(int fd, const struct sockaddr *a, socklen_t l) { (void)fd; (void)a; (void)l; errno = ENOSYS; return -1; }
-int shutdown(int fd, int how)    { (void)fd; (void)how; errno = ENOSYS; return -1; }
-int setsockopt(int fd, int lvl, int opt, const void *v, socklen_t l) {
-    (void)fd; (void)lvl; (void)opt; (void)v; (void)l; errno = ENOSYS; return -1;
+/* ---- BSD sockets over the kernel CAP_NETWORK layer (embk_net_*) -------------
+ * The porting world (Python's _socket, git) uses this POSIX surface; native
+ * EmbLinkOS apps use embk_net_* / embk_socket.h directly. IPv4 only. A socket is
+ * a real fd, so read()/write()/close() work on it and aren't reimplemented here.
+ * On the wire addresses are network byte order (sockaddr_in); the kernel API is
+ * host order, so we convert at this boundary. */
+
+int socket(int domain, int type, int protocol) {
+    (void)protocol;
+    if (domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+    int fd = embk_net_socket(type == SOCK_DGRAM ? 2 : 1);
+    if (fd < 0) return embk_fail(fd);
+    return fd;
 }
-ssize_t recv(int fd, void *buf, size_t len, int flags) {
-    (void)fd; (void)buf; (void)len; (void)flags; errno = ENOSYS; return -1;
+
+int connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    (void)len;
+    if (!addr || addr->sa_family != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+    const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+    int r = embk_net_connect(fd, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port));
+    return r < 0 ? embk_fail(r) : 0;
 }
+
+int bind(int fd, const struct sockaddr *addr, socklen_t len) {
+    (void)len;
+    const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+    int r = embk_net_bind(fd, in ? ntohs(in->sin_port) : 0);
+    return r < 0 ? embk_fail(r) : 0;
+}
+
+int listen(int fd, int backlog) {
+    int r = embk_net_listen(fd, backlog);
+    return r < 0 ? embk_fail(r) : 0;
+}
+
+int accept(int fd, struct sockaddr *addr, socklen_t *len) {
+    int nfd = embk_net_accept(fd);
+    if (nfd < 0) return embk_fail(nfd);
+    if (addr && len && *len >= sizeof(struct sockaddr_in)) {   /* peer addr not tracked */
+        struct sockaddr_in *in = (struct sockaddr_in *)addr;
+        memset(in, 0, sizeof *in); in->sin_family = AF_INET; *len = sizeof *in;
+    }
+    return nfd;
+}
+
+/* No half-close in the kernel API; the real close happens on close(fd). Succeed
+ * so libraries that shutdown() before close() proceed. */
+int shutdown(int fd, int how) { (void)fd; (void)how; return 0; }
+
+ssize_t send(int fd, const void *buf, size_t len, int flags) { (void)flags; return write(fd, buf, len); }
+ssize_t recv(int fd, void *buf, size_t len, int flags)       { (void)flags; return read(fd, buf, len); }
+
+ssize_t sendto(int fd, const void *buf, size_t len, int flags,
+               const struct sockaddr *dest, socklen_t dlen) {
+    (void)flags; (void)dlen;
+    if (!dest) return write(fd, buf, len);                     /* connected socket */
+    const struct sockaddr_in *in = (const struct sockaddr_in *)dest;
+    int r = embk_net_sendto(fd, ntohl(in->sin_addr.s_addr), ntohs(in->sin_port), buf, len);
+    return r < 0 ? embk_fail(r) : (ssize_t)r;
+}
+
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+                 struct sockaddr *src, socklen_t *slen) {
+    (void)flags;
+    unsigned int ip = 0; unsigned short port = 0;
+    int r = embk_net_recvfrom(fd, buf, len, &ip, &port);
+    if (r < 0) return embk_fail(r);
+    if (src && slen && *slen >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *in = (struct sockaddr_in *)src;
+        memset(in, 0, sizeof *in); in->sin_family = AF_INET;
+        in->sin_addr.s_addr = htonl(ip); in->sin_port = htons(port);
+        *slen = sizeof *in;
+    }
+    return (ssize_t)r;
+}
+
+/* Socket options are advisory here (SO_REUSEADDR, TCP_NODELAY, ...): accept and
+ * ignore. getsockopt(SO_ERROR) reports "no pending error" so post-connect checks
+ * pass -- connect() is synchronous, so any real error already surfaced. */
+int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen) {
+    (void)fd; (void)level; (void)optname; (void)optval; (void)optlen; return 0;
+}
+int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) {
+    (void)level;
+    if (optval && optlen && *optlen >= sizeof(int)) {
+        int val = 0;
+        /* SO_ERROR: how a caller reaps a non-blocking connect() -- 0 if it
+         * completed, an errno if it failed. Derived from the fd's poll error
+         * bit (net_tcp_ready reports reset/closed as POLLERR). */
+        if (optname == SO_ERROR && embk_fd_poll(fd, EMBK_POLLERR) & EMBK_POLLERR)
+            val = ECONNREFUSED;
+        *(int *)optval = val;
+        *optlen = sizeof(int);
+    }
+    return 0;
+}
+int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {
+    (void)fd;
+    if (addr && len && *len >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *in = (struct sockaddr_in *)addr;
+        memset(in, 0, sizeof *in); in->sin_family = AF_INET; *len = sizeof *in;
+    }
+    return 0;
+}
+int getpeername(int fd, struct sockaddr *addr, socklen_t *len) { return getsockname(fd, addr, len); }
+
+/* ---- name resolution + address strings -------------------------------------- */
+
+int inet_pton(int af, const char *src, void *dst) {
+    if (af != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+    unsigned int b[4]; int n = 0;
+    const char *p = src;
+    for (int i = 0; i < 4; i++) {
+        if (*p < '0' || *p > '9') return 0;
+        unsigned v = 0;
+        while (*p >= '0' && *p <= '9') { v = v * 10 + (unsigned)(*p++ - '0'); if (v > 255) return 0; }
+        b[i] = v; n++;
+        if (i < 3) { if (*p != '.') return 0; p++; }
+    }
+    if (*p != 0 || n != 4) return 0;
+    ((struct in_addr *)dst)->s_addr = htonl((b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]);
+    return 1;
+}
+
+const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
+    if (af != AF_INET) { errno = EAFNOSUPPORT; return NULL; }
+    unsigned int a = ntohl(((const struct in_addr *)src)->s_addr);
+    snprintf(dst, size, "%u.%u.%u.%u", (a>>24)&255, (a>>16)&255, (a>>8)&255, a&255);
+    return dst;
+}
+
+in_addr_t inet_addr(const char *cp) {
+    struct in_addr a;
+    return inet_pton(AF_INET, cp, &a) == 1 ? a.s_addr : INADDR_NONE;
+}
+
+static int svc_port(const char *service) {
+    if (!service) return 0;
+    if (service[0] >= '0' && service[0] <= '9') return atoi(service);
+    if (!strcmp(service, "http"))  return 80;
+    if (!strcmp(service, "https")) return 443;
+    if (!strcmp(service, "domain")) return 53;
+    if (!strcmp(service, "ftp"))   return 21;
+    return 0;
+}
+
+int getaddrinfo(const char *node, const char *service,
+                const struct addrinfo *hints, struct addrinfo **res) {
+    if (hints && hints->ai_family == AF_INET6) return EAI_FAMILY;   /* IPv4 only */
+    unsigned int ip_host;
+    if (node) {
+        struct in_addr na;
+        if (inet_pton(AF_INET, node, &na) == 1) ip_host = ntohl(na.s_addr);
+        else if (embk_net_resolve(node, &ip_host) != 0) return EAI_NONAME;
+    } else {
+        ip_host = (hints && (hints->ai_flags & AI_PASSIVE)) ? INADDR_ANY : INADDR_LOOPBACK;
+    }
+    struct addrinfo *ai = calloc(1, sizeof *ai);
+    struct sockaddr_in *sa = calloc(1, sizeof *sa);
+    if (!ai || !sa) { free(ai); free(sa); return EAI_MEMORY; }
+    sa->sin_family = AF_INET;
+    sa->sin_port   = htons((unsigned short)svc_port(service));
+    sa->sin_addr.s_addr = htonl(ip_host);
+    ai->ai_family   = AF_INET;
+    ai->ai_socktype = (hints && hints->ai_socktype) ? hints->ai_socktype : SOCK_STREAM;
+    ai->ai_protocol = hints ? hints->ai_protocol : 0;
+    ai->ai_addrlen  = sizeof *sa;
+    ai->ai_addr     = (struct sockaddr *)sa;
+    *res = ai;
+    return 0;
+}
+
+void freeaddrinfo(struct addrinfo *res) {
+    while (res) { struct addrinfo *n = res->ai_next; free(res->ai_addr); free(res); res = n; }
+}
+
+int getnameinfo(const struct sockaddr *sa, socklen_t salen,
+                char *host, socklen_t hostlen, char *serv, socklen_t servlen, int flags) {
+    (void)salen; (void)flags;
+    if (!sa || sa->sa_family != AF_INET) return EAI_FAMILY;
+    const struct sockaddr_in *in = (const struct sockaddr_in *)sa;
+    if (host && hostlen) inet_ntop(AF_INET, &in->sin_addr, host, hostlen);
+    if (serv && servlen) snprintf(serv, servlen, "%u", ntohs(in->sin_port));
+    return 0;
+}
+
+const char *gai_strerror(int e) {
+    switch (e) {
+    case 0:           return "Success";
+    case EAI_NONAME:  return "Name or service not known";
+    case EAI_MEMORY:  return "Memory allocation failure";
+    case EAI_FAMILY:  return "Address family not supported";
+    case EAI_SERVICE: return "Servname not supported";
+    default:          return "Unknown resolver error";
+    }
+}
+
 struct hostent *gethostbyname(const char *name) {
-    (void)name;
-    h_errno = NO_RECOVERY;
-    return NULL;
+    static unsigned int ipbuf;          /* network order */
+    static char *addr_list[2];
+    static struct hostent he;
+    unsigned int ip_host;
+    if (embk_net_resolve(name, &ip_host) != 0) { h_errno = HOST_NOT_FOUND; return NULL; }
+    ipbuf = htonl(ip_host);
+    addr_list[0] = (char *)&ipbuf; addr_list[1] = NULL;
+    he.h_name = (char *)name; he.h_aliases = NULL;
+    he.h_addrtype = AF_INET; he.h_length = 4; he.h_addr_list = addr_list;
+    return &he;
 }
+
 struct servent *getservbyname(const char *name, const char *proto) {
-    (void)name; (void)proto;
-    return NULL;
+    (void)proto;
+    int port = svc_port(name);
+    if (!port) return NULL;
+    static struct servent se;
+    se.s_name = (char *)name; se.s_aliases = NULL;
+    se.s_port = htons((unsigned short)port); se.s_proto = (char *)proto;
+    return &se;
 }

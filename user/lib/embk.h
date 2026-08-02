@@ -271,6 +271,25 @@ static inline unsigned long embk_getcaps(void) {
  * Gated on EMBK_CAP_NETWORK. A socket is a REAL fd, so read()/write()/close()
  * work on it directly (which is what the BSD sockets shim in <embk_socket.h>
  * maps onto for ports). IPs are HOST order: 10.0.2.15 == 0x0A00020F. */
+/* select()/poll readiness bits -- MUST match kernel/fs/fd.h POLL*. */
+#define EMBK_POLLIN   0x0001
+#define EMBK_POLLOUT  0x0004
+#define EMBK_POLLERR  0x0008
+#define EMBK_POLLHUP  0x0010
+#define EMBK_POLLNVAL 0x0020
+
+/* O_NONBLOCK fd flag: sys_fcntl cmd 1 = get (1/0), 2 = set from arg. */
+static inline int embk_fcntl_get_nonblock(int fd) {
+    return (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
+}
+static inline int embk_fcntl_set_nonblock(int fd, int on) {
+    return (int)embk_syscall3(EMBK_SYS_fcntl, fd, 2, on ? 1 : 0);
+}
+/* Ready POLL* bits for one fd right now, without waiting. */
+static inline int embk_fd_poll(int fd, int events) {
+    return (int)embk_syscall2(EMBK_SYS_fd_poll, fd, events);
+}
+
 static inline int embk_net_socket(int type) {      /* type: 1=stream(TCP) 2=dgram(UDP); -> fd */
     return (int)embk_syscall1(EMBK_SYS_net_socket, type);
 }

@@ -10,6 +10,7 @@ CFLAGS = -ffreestanding -nostdlib -nostartfiles \
          -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
          -mcmodel=kernel \
          -Ikernel \
+         -Iuser/lib/tls/crypto \
          -g -O0
 
 IMG = myos.img
@@ -112,6 +113,10 @@ KERNEL_SRC = kernel/main.c \
              kernel/crypto/pbkdf2.c \
              kernel/crypto/aes.c \
              kernel/crypto/xts.c \
+             user/lib/tls/crypto/hkdf.c \
+             user/lib/tls/crypto/gcm.c \
+             user/lib/tls/crypto/x25519.c \
+             user/lib/tls/crypto/selftest.c \
              kernel/fs/fat32.c \
              kernel/fs/embkfs/embkfs.c \
              kernel/fs/embkfs/embkfs_compress.c \
@@ -252,7 +257,13 @@ check-tools:
 	else echo "==> all required tools present.  Build + boot:  make && make run-embkfs"; fi
 NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/x86_64-elf/include,)
 NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
-NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -O2 -Wall $(USER_INC) $(NEWLIB_INC)
+# -ftrivial-auto-var-init=zero: zero every uninitialized auto variable. Defence
+# in depth against uninitialized-read UB -- and the concrete fix for a git-over-
+# HTTPS heisenbug where libtls's ECDSA verify (user/lib/tls/crypto/ecdsa.c) read
+# an uninitialized stack `bn` whose garbage happened to be benign on the host but
+# broke github's P-256 leaf verification under QEMU (rc=-103). Cheap; belongs on
+# security-critical crypto anyway.
+NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall $(USER_INC) $(NEWLIB_INC)
 # gcc as the link driver so it finds libc.a/libgcc; -nostartfiles because
 # crt0.c provides _start (no standard crtX). newlib.ld places it at 0x400000.
 # NEWLIB_LIB is a -L searched BEFORE the toolchain's default lib dir, so our
@@ -344,7 +355,7 @@ ifeq ($(HAVE_PY),yes)
 # three or none: python.elf without the zip dies at startup with
 # "Failed to import encodings module" (encodings is imported by Py_Initialize
 # and is NOT frozen), and the zip without the ._pth is never looked at.
-PY_APPS = build/python.elf build/python314.zip build/python.elf._pth
+PY_APPS = build/python.elf build/python314.zip build/python.elf._pth build/pip.zip
 
 # STRIP IS NOT COSMETIC HERE: the interpreter is 42 MB unstripped (almost all of
 # it debug_info) and 7.5 MB stripped. The 64 MB volume would not hold the former
@@ -373,8 +384,14 @@ build/python.elf: $(PY_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 # The stdlib as ONE zip: importlib+zipimport are frozen into the interpreter, so
 # a zip on sys.path needs no directory tree and no CPython patch (it's CPython's
 # own ZIP_LANDMARK route, the standard embedded recipe). ~555 modules, ~2.5 MB.
-build/python314.zip: tools/mkpystdlib.py | $(BUILD)
-	python3 tools/mkpystdlib.py $(PY_SRC) $@
+build/python314.zip: tools/mkpystdlib.py tools/cpython/ssl.py | $(BUILD)
+	python3 tools/mkpystdlib.py $(PY_SRC) $@ $(PY_BUILD)
+
+# pip, repacked STORED for zipimport (see tools/mkpip.py). Source is CPython's
+# own bundled wheel, so pip always matches the interpreter. On ._pth's sys.path,
+# so `python -m pip` resolves pip/__main__.
+build/pip.zip: tools/mkpip.py | $(BUILD)
+	python3 tools/mkpip.py $(PY_SRC) $@
 
 # getpath.py reads `<executable>._pth` (verbatim on non-Windows, hence the
 # `.elf` stays in the name) and its lines TOTALLY override sys.path -- each is
@@ -383,7 +400,7 @@ build/python314.zip: tools/mkpystdlib.py | $(BUILD)
 # right for an OS that has no environment. This is why we don't fight configure's
 # --prefix, which otherwise sends the interpreter hunting through /usr/....
 build/python.elf._pth: | $(BUILD)
-	printf 'python314.zip\n.\n' > $@
+	printf 'python314.zip\npip.zip\n.\n' > $@
 else
 PY_APPS =
 endif
@@ -470,6 +487,20 @@ build/httpget.o: user/bin/httpget.c user/lib/embk.h user/lib/embk_socket.h | $(B
 build/httpget.elf: build/crt0.o build/syscalls.o build/httpget.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpget.o -lc -lgcc -o $@
 
+# sockdemo -- proves the POSIX BSD-sockets shim (uses real <sys/socket.h>/<netdb.h>,
+# not the native embk_socket.h). The path Python's _socket / git take. Auto-packed.
+build/sockdemo.o: user/bin/sockdemo.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/sockdemo.elf: build/crt0.o build/syscalls.o build/sockdemo.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/sockdemo.o -lc -lgcc -o $@
+
+# nbsock -- the non-blocking socket witness (fcntl O_NONBLOCK + EINPROGRESS
+# connect + select + EAGAIN recv). See user/bin/nbsock.c.
+build/nbsock.o: user/bin/nbsock.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/nbsock.elf: build/crt0.o build/syscalls.o build/nbsock.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/nbsock.o -lc -lgcc -o $@
+
 # httpd -- the M5 server witness: an on-OS HTTP server (bind/listen/accept over
 # the native socket syscalls). `test httpd` spawns it; the host curls it via a
 # SLIRP hostfwd. Auto-discovered by mkfs.
@@ -485,11 +516,157 @@ build/udptest.o: user/bin/udptest.c user/lib/embk.h user/lib/embk_socket.h | $(B
 build/udptest.elf: build/crt0.o build/syscalls.o build/udptest.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/udptest.o -lc -lgcc -o $@
 
-# wget -- a real HTTP downloader (networking meets the filesystem). Auto-packed.
-build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/wget.elf: build/crt0.o build/syscalls.o build/wget.o user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o -lc -lgcc -o $@
+# libtls (docs/TLS.md): the TLS 1.3 client, built FOR USERSPACE. Reuses the
+# kernel crypto (sha256/hmac/aes) compiled against the kshim -- one crypto
+# codebase, kernel and user, exactly as the host tests do. kshim MUST precede
+# -Ikernel so include/{types,kstring,kprintf}.h resolve to the shims. Defined
+# BEFORE the consumers (wget, tlstest) so their prerequisite lists see it.
+TLS_LIB_INC  := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto -Iuser/lib/tls -Iuser/lib/tls/x509
+TLS_LIB_OBJS := build/tls_sha256.o build/tls_hmac.o build/tls_aes.o \
+                build/tls_hkdf.o build/tls_gcm.o build/tls_x25519.o \
+                build/tls_sha512.o build/tls_bignum.o build/tls_ecdsa.o build/tls_rsa.o \
+                build/tls_asn1.o build/tls_cert.o build/tls_trust.o \
+                build/tls_keysched.o build/tls_record.o build/tls_handshake.o build/tls_tls.o \
+                build/tls_handle.o
+
+# wget -- a real HTTP/HTTPS downloader (networking + TLS meets the filesystem).
+# Links libtls so https:// does an authenticated TLS 1.3 fetch. Auto-packed.
+build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/wget.elf: build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
+
+# gitclone -- our own git-over-HTTPS (git can't fork/exec its transport here).
+# user/git/ = the git protocol modules (githttp: smart-HTTP over libtls; pktline:
+# framing). githttp.o needs the TLS include set for tls.h (same as wget).
+build/githttp.o: user/git/githttp.c user/git/githttp.h user/lib/tls/tls.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/git -c $< -o $@
+build/pktline.o: user/git/pktline.c user/git/pktline.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
+build/git_sha1.o: user/git/sha1.c user/git/sha1.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
+# pack.o inflates with the same libz.a we cross-built for CPython (ZLIB_BUILD).
+build/git_pack.o: user/git/pack.c user/git/pack.h user/git/sha1.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
+build/git_repo.o: user/git/repo.c user/git/repo.h user/git/pack.h user/git/sha1.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
+build/git_push.o: user/git/push.c user/git/push.h user/git/pack.h user/git/sha1.h user/git/pktline.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
+build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h user/git/repo.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
+GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_repo.o
+build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
+
+# gitpush -- push a first commit over HTTPS (git-receive-pack + pack_write + auth).
+build/gitpush.o: user/bin/gitpush.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/push.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
+GITPUSH_OBJS := build/gitpush.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_push.o
+build/gitpush.elf: build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
+
+# pkg -- the package manager (docs/PACKAGING_AND_SDK.md, PK1). Verifies an EMBX's
+# build_id (SHA-256 via tls_sha256.o; -Ikernel for crypto/sha256.h) against its
+# manifest, then adopts the bundle into /data/apps and can run it under exactly
+# its declared caps + namespace. user/pkg/ = the manifest + EMBX-reader modules.
+build/pkg_manifest.o: user/pkg/manifest.c user/pkg/manifest.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -c $< -o $@
+build/pkg_embxinfo.o: user/pkg/embxinfo.c user/pkg/embxinfo.h user/pkg/manifest.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
+build/pkg.o: user/bin/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/pkg/pkgkey.h user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -Iuser/lib/tls/crypto -Ikernel -c $< -o $@
+# pkg verifies the manifest signature with ECDSA P-256 (tls_ecdsa + tls_bignum).
+PKG_OBJS := build/pkg.o build/pkg_manifest.o build/pkg_embxinfo.o \
+            build/tls_sha256.o build/tls_ecdsa.o build/tls_bignum.o
+build/pkg.elf: build/crt0.o build/syscalls.o $(PKG_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(PKG_OBJS) -lc -lgcc -o $@
+
+# pkgbuild -- generate a package bundle ON THE DEVICE (PK2b). embxgen is the C
+# EMBX writer (byte-identical to mkembx.py); sha256 via tls_sha256.o (-Ikernel).
+build/pkg_embxgen.o: user/pkg/embxgen.c user/pkg/embxgen.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
+build/pkgbuild.o: user/bin/pkgbuild.c user/pkg/embxgen.h user/pkg/manifest.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -c $< -o $@
+PKGBUILD_OBJS := build/pkgbuild.o build/pkg_embxgen.o build/pkg_manifest.o build/tls_sha256.o
+build/pkgbuild.elf: build/crt0.o build/syscalls.o $(PKGBUILD_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(PKGBUILD_OBJS) -lc -lgcc -o $@
+
+# pkgprobe -- the PK1 confinement test app, bundled as an EMBX + a manifest that
+# grants {filesystem} + ro /system + rw /data/apps/pkgprobe. mkembx repackages
+# the ELF into an EMBX; mkpkg derives the manifest from that EMBX (build_id/caps
+# consistent by construction). The bundle is STAGED (mkfs), pkg adopts it live.
+build/pkgprobe.o: user/bin/pkgprobe.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
+build/pkgprobe.elf: build/crt0.o build/syscalls.o build/pkgprobe.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/pkgprobe.o -lc -lgcc -o $@
+# PK2: ONE spec (user/pkg/pkgprobe.pkgspec) -> all three views via pkggen, the
+# SDK generator -- the caps, the .ns and the manifest are consistent by
+# construction (was two separate mkembx/mkpkg calls with the authority scattered
+# across the flags; now the authority is declared once, in the spec).
+PKGGEN_DEPS := tools/embx/pkggen.py tools/embx/mkembx.py tools/embx/mkpkg.py \
+               tools/embx/pkgsign.py tools/embx/pkgkey_dev.pem
+build/pkgprobe.embx build/pkgprobe.ns build/pkgprobe.pkg &: build/pkgprobe.elf \
+        user/pkg/pkgprobe.pkgspec $(PKGGEN_DEPS) | $(BUILD)
+	python3 tools/embx/pkggen.py user/pkg/pkgprobe.pkgspec build/pkgprobe.elf build
+# Two more versions for the PK3 update/rollback/re-negotiation test: a benign
+# v1.1 (same authority) and a WIDER v2 (adds `network`, must be refused).
+build/pk_v11/pkgprobe.pkg: build/pkgprobe.elf user/pkg/pkgprobe_v11.pkgspec $(PKGGEN_DEPS) | $(BUILD)
+	mkdir -p build/pk_v11 && python3 tools/embx/pkggen.py user/pkg/pkgprobe_v11.pkgspec build/pkgprobe.elf build/pk_v11
+build/pk_wide/pkgprobe.pkg: build/pkgprobe.elf user/pkg/pkgprobe_wide.pkgspec $(PKGGEN_DEPS) | $(BUILD)
+	mkdir -p build/pk_wide && python3 tools/embx/pkggen.py user/pkg/pkgprobe_wide.pkgspec build/pkgprobe.elf build/pk_wide
+
+# pkgfetch -- native PyPI installer for pure-Python wheels (libtls fetch + our
+# own inflate + zip reader). Auto-packed as /data/apps/pkgfetch/pkgfetch.elf.
+build/pkg_inflate.o: user/lib/inflate.c user/lib/inflate.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
+build/pkg_unzip.o: user/lib/unzip.c user/lib/unzip.h user/lib/inflate.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
+build/pkgfetch.o: user/bin/pkgfetch.c user/lib/embk_socket.h user/lib/tls/tls.h user/lib/unzip.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/lib -c $< -o $@
+build/pkgfetch.elf: build/crt0.o build/syscalls.o build/pkgfetch.o build/pkg_inflate.o build/pkg_unzip.o $(TLS_LIB_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/pkgfetch.o build/pkg_inflate.o build/pkg_unzip.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
+
+build/tls_sha256.o: kernel/crypto/sha256.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_hmac.o: kernel/crypto/hmac.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_aes.o: kernel/crypto/aes.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_hkdf.o: user/lib/tls/crypto/hkdf.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_gcm.o: user/lib/tls/crypto/gcm.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_x25519.o: user/lib/tls/crypto/x25519.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_sha512.o: user/lib/tls/crypto/sha512.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_bignum.o: user/lib/tls/crypto/bignum.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_ecdsa.o: user/lib/tls/crypto/ecdsa.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_rsa.o: user/lib/tls/crypto/rsa.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_asn1.o: user/lib/tls/x509/asn1.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_cert.o: user/lib/tls/x509/cert.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_trust.o: user/lib/tls/x509/trust.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_keysched.o: user/lib/tls/keysched.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_record.o: user/lib/tls/record.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_handshake.o: user/lib/tls/handshake.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_tls.o: user/lib/tls/tls.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_handle.o: user/lib/tls/tls_handle.c user/lib/tls/tls_handle.h user/lib/tls/tls.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+
+build/tlstest.o: user/bin/tlstest.c user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tlstest.elf: build/crt0.o build/syscalls.o build/tlstest.o $(TLS_LIB_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/tlstest.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
 
 # ---------------------------------------------------------------------------
 # emlibc -- EmbLinkOS's own non-POSIX C library (docs/EMLIBC_Requirements.md).
@@ -521,7 +698,7 @@ EMLIBC_FD_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stac
 
 EMLIBC_OBJS := build/emlibc_string.o build/emlibc_stdlib.o build/emlibc_stdio.o \
                build/emlibc_syscalls.o build/emlibc_errno.o build/emlibc_process.o \
-               build/emlibc_math.o $(EMLIBC_FD_OBJS)
+               build/emlibc_math.o build/emlibc_net.o $(EMLIBC_FD_OBJS)
 
 build/emlibc_string.o: $(EMLIBC_DIR)/string/string.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
@@ -537,6 +714,8 @@ build/emlibc_process.o: $(EMLIBC_DIR)/process/process.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_math.o: $(EMLIBC_DIR)/math/math.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_net.o: $(EMLIBC_DIR)/net/net.c $(EMLIBC_DIR)/include/net.h | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_fd_%.o: $(EMLIBC_FD_DIR)/%.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_FD_CFLAGS) -c $< -o $@
 
@@ -550,11 +729,19 @@ build/emlibc_crt0.o: user/lib/crt0.c | $(BUILD)
 
 # The proof (house rule): a program that links emlibc INSTEAD of newlib -- no
 # -lc, no build/crt0.o, no build/syscalls.o -- and runs on the OS.
-build/emlibc_demo.o: user/bin/emlibc_demo.c | $(BUILD)
+build/emlibc_demo.o: user/bin/emlibc_net.c user/bin/emlibc_demo.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_demo.elf: build/emlibc_crt0.o build/emlibc_demo.o build/libemlibc.a user/lib/newlib.ld
 	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
 	    build/emlibc_crt0.o build/emlibc_demo.o -Lbuild -lemlibc -lgcc -o $@
+
+# emlibc_net -- native networking demo (em_tcp_connect over emlibc, 0 newlib).
+# (Distinct object name from the rim's build/emlibc_net.o.)
+build/emlibcnet_demo.o: user/bin/emlibc_net.c user/emlibc/include/net.h | $(BUILD)
+	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
+build/emlibc_net.elf: build/emlibc_crt0.o build/emlibcnet_demo.o build/libemlibc.a user/lib/newlib.ld
+	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+	    build/emlibc_crt0.o build/emlibcnet_demo.o -Lbuild -lemlibc -lgcc -o $@
 
 # emlibc_caps -- the part newlib cannot express: capability inspection +
 # handle-based spawn with attenuation. Also emlibc-linked, not newlib.
@@ -773,7 +960,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -823,6 +1010,13 @@ NET = -netdev user,id=net0 -device virtio-net,netdev=net0
 # exit 0 having never built the apps it packs -- `make && make run-*` would then
 # boot an image with a stale (or entirely missing) program on it.
 all: $(IMG) embkfs.img
+
+# `make images` == both bootable images, current. Use this before ANY boot: the
+# two are SEPARATE targets, so `make $(IMG)` alone (a kernel change) leaves the
+# userland image untouched -- which once booted a STALE staged pkg.elf ("unknown
+# command"). This one word rebuilds whatever drifted.
+.PHONY: images
+images: $(IMG) embkfs.img
 
 $(STAGE1_BIN): $(STAGE1_SRC) $(STAGE2_BIN)
 	@stage2_sectors=$$(( ($$(stat -c%s $(STAGE2_BIN)) + 511) / 512 )); \
@@ -878,7 +1072,14 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 
 $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN)
 	cat $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) > $(IMG)
-	truncate -s 1M $(IMG)
+	@# Round the boot image UP to the next whole MB -- never DOWN. A fixed
+	@# `truncate -s 1M` silently lopped the kernel's tail once it crossed 1 MB
+	@# (e.g. an embcc-compiled kernel: ~1.5x gcc's .text, and no -g to strip),
+	@# so the bootloader loaded an incomplete kernel and died before serial init.
+	@# `%1M` pads small kernels to 1 MB exactly as before, but grows to 2 MB, 3 MB,
+	@# ... as the kernel does, so it can never be truncated. (Stage1/2 load by
+	@# sector count, not image size, so any padded size is fine.)
+	truncate -s %1M $(IMG)
 	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
 	kernel_top=$$(( 0x100000 + $$(stat -c%s $(KERNEL_BIN)) )); \
 	stage_base=$$(( 0x1000000 )); \
@@ -938,10 +1139,11 @@ endif
 
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf \
-               build/emlibc_demo.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf build/gitpush.elf \
+               build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
-               build/embbuild.elf \
+               build/embbuild.elf build/pkg.elf build/pkgbuild.elf build/pkgprobe.embx build/pkgprobe.pkg \
+               build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
 
 # STAGED_APPS: binaries built OUTSIDE this tree and dropped into build/ to be
@@ -956,10 +1158,22 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
 # catch. Naming the file is the point.
 STAGED_APPS ?=
 
+# EmbBuild-builds-the-kernel (docs/BUILD.md §12, KM1): the kernel SOURCE TREE is
+# staged on the image (mkfs, /data/src/kernel) so EmbBuild can rebuild the kernel
+# with the on-image embcc (which assembles the .asm too) + embld. The manifest
+# itself (89 C + 6 asm + link) is produced by EmbCC's tools/gen-kernel-manifest.sh
+# and dropped into build/kernel.build.ebm via its os-stage flow -- mkfs stages it
+# only if present, keeping the OS buildable/bootable with EmbCC absent (D-001).
+
 # One recipe, two outputs. & tells GNU Make (4.3+) this recipe produces BOTH
 # targets in one run, rather than potentially invoking the script twice if
 # both are requested stale in the same `make` invocation.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o
+# The $(wildcard) prereqs make the image stale whenever ANY already-built binary
+# changes -- not just the ones named in EMBKFS_APPS. On a clean tree the wildcard
+# is empty (nothing built yet) and EMBKFS_APPS drives the first build; on an
+# incremental build it catches every packed .elf/.embx, closing the drift-guard
+# gap so a rebuilt app (e.g. pkg.elf) always re-packs. See the guard below.
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -1028,7 +1242,7 @@ DISPLAY_1TO1 = -display gtk,zoom-to-fit=off
 
 run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
 	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)
-	qemu-system-x86_64 \
+	qemu-system-x86_64 -cpu max \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
@@ -1330,6 +1544,22 @@ run-uefi: uefi.img embkfs.img
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
 
+# SINGLE self-contained UEFI device: one GPT disk = [ESP: loader+kernel] +
+# [EMBKFS: root]. This is what you dd onto a real USB stick -- the firmware
+# launches BOOTX64.EFI and the kernel finds its root on the SAME device (no
+# second drive). `make run-uefi-usb` proves single-device boot under OVMF.
+uefi-usb.img: $(BOOTX64) embkfs.img tools/mkuefidisk.sh
+	tools/mkuefidisk.sh $(BOOTX64) $@ embkfs.img
+
+run-uefi-usb: uefi-usb.img
+	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
+	qemu-system-x86_64 -cpu max \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
+	    -drive format=raw,file=uefi-usb.img,if=ide,index=0 \
+	    -usb -device usb-tablet \
+	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi $(NET)
+
 # UEFI copy-on-write: the exact twin of run-embkfs-cow but booted via OVMF + our
 # EFI loader instead of the BIOS boot disk. Boots a PRISTINE copy of the EMBKFS
 # each run (writes hit the scratch, never the master), same interactive display
@@ -1494,3 +1724,50 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all run debug clean scene-test backend-test font-test layout-test reactive-test declare-test showcase run-ui run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted
+# --- TLS crypto host tests (docs/TLS.md T1): the SAME crypto that runs on the OS,
+# compiled + vector-checked on the dev host (fast, no boot). Grows per primitive.
+.PHONY: test-tls-crypto
+TLS_CRYPTO_INC := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto
+test-tls-crypto:
+	@cc -Wall $(TLS_CRYPTO_INC) kernel/crypto/sha256.c kernel/crypto/hmac.c \
+	    user/lib/tls/crypto/hkdf.c tools/tls/test_hkdf.c -o /tmp/embk_test_hkdf && /tmp/embk_test_hkdf
+	@cc -Wall $(TLS_CRYPTO_INC) kernel/crypto/aes.c \
+	    user/lib/tls/crypto/gcm.c tools/tls/test_gcm.c -o /tmp/embk_test_gcm && /tmp/embk_test_gcm
+	@cc -Wall $(TLS_CRYPTO_INC) \
+	    user/lib/tls/crypto/x25519.c tools/tls/test_x25519.c -o /tmp/embk_test_x25519 && /tmp/embk_test_x25519
+	@cc -Wall $(TLS_CRYPTO_INC) -Iuser/lib/tls kernel/crypto/sha256.c kernel/crypto/hmac.c \
+	    user/lib/tls/crypto/hkdf.c user/lib/tls/keysched.c tools/tls/test_keysched.c \
+	    -o /tmp/embk_test_keysched && /tmp/embk_test_keysched
+	@cc -Wall $(TLS_CRYPTO_INC) -Iuser/lib/tls kernel/crypto/aes.c \
+	    user/lib/tls/crypto/gcm.c user/lib/tls/record.c tools/tls/test_record.c \
+	    -o /tmp/embk_test_record && /tmp/embk_test_record
+	@cc -Wall $(TLS_CRYPTO_INC) -Iuser/lib/tls kernel/crypto/sha256.c kernel/crypto/hmac.c \
+	    user/lib/tls/crypto/hkdf.c user/lib/tls/keysched.c user/lib/tls/handshake.c \
+	    tools/tls/test_handshake.c -o /tmp/embk_test_handshake && /tmp/embk_test_handshake
+	@cc -Wall -Iuser/lib/tls/x509 user/lib/tls/x509/asn1.c tools/tls/test_asn1.c \
+	    -o /tmp/embk_test_asn1 && /tmp/embk_test_asn1
+	@cc -Wall -Iuser/lib/tls/crypto user/lib/tls/crypto/sha512.c tools/tls/test_sha512.c \
+	    -o /tmp/embk_test_sha512 && /tmp/embk_test_sha512
+	@cc -Wall -Iuser/lib/tls/crypto user/lib/tls/crypto/bignum.c tools/tls/test_bignum.c \
+	    -o /tmp/embk_test_bignum && /tmp/embk_test_bignum
+	@cc -Wall -Iuser/lib/tls/crypto user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
+	    tools/tls/test_ecdsa.c -o /tmp/embk_test_ecdsa && /tmp/embk_test_ecdsa
+	@cc -w -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
+	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
+	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
+	    tools/tls/test_x509.c -o /tmp/embk_test_x509 && /tmp/embk_test_x509
+	@cc -w -Iuser/lib/tls/crypto user/lib/tls/crypto/bignum.c user/lib/tls/crypto/rsa.c \
+	    tools/tls/test_rsa.c -o /tmp/embk_test_rsa && /tmp/embk_test_rsa
+	@cc -w -Iuser/lib/tls/kshim -Iuser/lib/tls/crypto -Ikernel -Itools/tls user/lib/tls/crypto/bignum.c user/lib/tls/crypto/rsa.c kernel/crypto/sha256.c tools/tls/test_pss.c -o /tmp/embk_test_pss && /tmp/embk_test_pss
+	@cc -w -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
+	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
+	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
+	    tools/tls/test_chain.c -o /tmp/embk_test_chain && /tmp/embk_test_chain
+	@cc -w -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
+	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
+	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
+	    tools/tls/test_rsachain.c -o /tmp/embk_test_rsachain && /tmp/embk_test_rsachain
+	@cc -w -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
+	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
+	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
+	    tools/tls/test_constraints.c -o /tmp/embk_test_constraints && /tmp/embk_test_constraints

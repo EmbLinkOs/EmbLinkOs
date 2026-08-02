@@ -293,14 +293,17 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
     return bytes(block)
 
 
-def make_image(path: str, size_bytes: int = 64 * 1024 * 1024, objects=None):
-    # 64 MB (was 8, was 4). Each bump had the same trigger: one binary grew
-    # past the volume and free_blocks went NEGATIVE -- struct.pack('Q') then
-    # refuses it, which is the (cryptic) way this failure announces itself.
+def make_image(path: str, size_bytes: int = 128 * 1024 * 1024, objects=None):
+    # 128 MB (was 64, 8, 4). Each bump had the same trigger: content grew past
+    # the volume and free_blocks went NEGATIVE -- struct.pack('Q') then refuses
+    # it, which is the (cryptic) way this failure announces itself.
     #   4 -> 8 MB: shell.elf (~410 KB static-newlib)
     #   8 -> 64 MB: cxxdemo.elf is ~9.4 MB ON ITS OWN -- <iostream> pulls in
     #               locales + the whole ios/facet machinery (it was 903 KB
     #               before that one #include). CPython will be bigger again.
+    #   64 -> 128 MB: staging the KERNEL source tree on the image (/data/src/
+    #               kernel, ~180 files) for EmbBuild-builds-the-kernel (BUILD.md
+    #               §12) tipped the near-full 64 MB volume over.
     # The kernel reads total_blocks from the superblock, so growing is safe;
     # the image is sparse-ish on disk and QEMU only reads what's used.
     bs = L.BLOCK_SIZE
@@ -723,10 +726,13 @@ def discover_userland_objects(build_dir="build"):
         raise SystemExit(f"mkfs: {build_dir}/init.elf not found -- run `make` first")
     objects = [(_elf_dest("init.elf"), L.DT_REG, L.S_IFREG | 0o755, init)]
     objects.extend(FIXTURE_OBJECTS)                           # format fixtures, at root
+    # Some ELFs are intermediates that ship in another form (e.g. pkgprobe is
+    # repackaged into an EMBX bundle under /data/staging, not auto-adopted).
+    NOT_AUTO_STAGED = {"pkgprobe.elf"}
     for elf in sorted(glob.glob(f"{build_dir}/*.elf")):       # sorted -> deterministic image
         name = os.path.basename(elf)
-        if name == "init.elf":
-            continue                                          # already added first
+        if name == "init.elf" or name in NOT_AUTO_STAGED:
+            continue                                          # already added / staged elsewhere
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
         # Per-app NAMESPACE MANIFEST (docs/USERSPACE_v2.md UP4): an app ships its
         # declared namespace as user/bin/<name>.ns, packed beside its .elf as
@@ -737,6 +743,71 @@ def discover_userland_objects(build_dir="build"):
         if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
             dest = f"data/apps/{base}/{base}.ns".encode()
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
+    # `test gitpush` LIVE credentials (LOCAL build artifact ONLY, env-gated so
+    # they never touch the source tree or git). A GitHub PAT + target repo URL,
+    # placed by the developer running the live push test:
+    #   EMBK_GITPUSH_TOKEN_FILE -> /data/gitpush/token  (the PAT, whitespace-trimmed)
+    #   EMBK_GITPUSH_URL        -> /data/gitpush/url     (https repo url)
+    gp_tok = os.environ.get("EMBK_GITPUSH_TOKEN_FILE", "")
+    gp_url = os.environ.get("EMBK_GITPUSH_URL", "")
+    if gp_tok and os.path.exists(gp_tok):
+        objects.append((b"data/gitpush/token", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                        _read_file(gp_tok).strip()))
+    if gp_url:
+        objects.append((b"data/gitpush/url", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                        gp_url.strip().encode() + b"\n"))
+
+    # PK1 pkgprobe STAGING bundles (docs/PACKAGING_AND_SDK.md): staged, NOT yet
+    # adopted -- `test pkg` runs `pkg install` on them live. Two bundles prove the
+    # two outcomes: a good one (installs + runs confined) and a tampered one
+    # (a flipped payload byte -> build_id no longer recomputes -> pkg refuses).
+    probe_embx = _read_file(f"{build_dir}/pkgprobe.embx")
+    probe_pkg  = _read_file(f"{build_dir}/pkgprobe.pkg")
+    if probe_embx is not None and probe_pkg is not None:
+        objects.append((b"data/staging/pkgprobe/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, probe_embx))
+        objects.append((b"data/staging/pkgprobe/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, probe_pkg))
+        # (a) tampered BINARY: a flipped payload byte -> build_id no longer recomputes.
+        bad = bytearray(probe_embx); bad[-1] ^= 0xFF
+        objects.append((b"data/staging/pkgprobe_bad/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, bytes(bad)))
+        objects.append((b"data/staging/pkgprobe_bad/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, probe_pkg))
+        # (b) altered MANIFEST: a flipped signature hex digit -> signature fails
+        #     (the binary is intact, so this isolates the signature check).
+        lines = bytearray(probe_pkg).split(b"\n")
+        for i, ln in enumerate(lines):
+            if ln.startswith(b"signature:") and len(ln) > 12:
+                lines[i] = ln[:-1] + (b"0" if ln[-1:] != b"0" else b"1")
+        badsig = b"\n".join(lines)
+        objects.append((b"data/staging/pkgprobe_badsig/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, probe_embx))
+        objects.append((b"data/staging/pkgprobe_badsig/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, badsig))
+    # PK2b: the SOURCE for an ON-DEVICE build -- a linked ELF + its .pkgspec.
+    # `test pkgbuild` runs pkgbuild here to generate a bundle on the OS itself.
+    probe_elf  = _read_file(f"{build_dir}/pkgprobe.elf")
+    probe_spec = _read_file("user/pkg/pkgprobe.pkgspec")
+    if probe_elf is not None and probe_spec is not None:
+        objects.append((b"data/staging/build/pkgprobe.elf", L.DT_REG, L.S_IFREG | 0o755, probe_elf))
+        objects.append((b"data/staging/build/pkgprobe.pkgspec", L.DT_REG, L.S_IFREG | L.PERM_FILE, probe_spec))
+        # PK2b structured stanza: a build.ebm whose `kind: package` stanza declares
+        # the authority (caps/grant) inline -- EmbBuild drives pkgbuild from it.
+        ebm = (b"project: pkgstanza\n\n"
+               b"name: pkgprobe\n"
+               b"kind: package\n"
+               b"version: 2.0.0\n"
+               b"caps: filesystem\n"
+               b"grant: ro /system\n"
+               b"grant: rw /data/apps/pkgprobe\n"
+               b"inputs: /data/staging/build/pkgprobe.elf\n"
+               b"output: /data/build/out/pkgstanza/pkgprobe.embx\n")
+        objects.append((b"data/staging/build/pkgstanza.ebm", L.DT_REG, L.S_IFREG | L.PERM_FILE, ebm))
+
+    # PK3 update/rollback: a benign v1.1 (same authority) and a WIDER v2 (adds
+    # `network`) -- the latter must be refused as a silent privilege escalation.
+    for tag, sub in (("pkgprobe_v11", "pk_v11"), ("pkgprobe_wide", "pk_wide")):
+        e = _read_file(f"{build_dir}/{sub}/pkgprobe.embx")
+        p = _read_file(f"{build_dir}/{sub}/pkgprobe.pkg")
+        if e is not None and p is not None:
+            objects.append((f"data/staging/{tag}/pkgprobe.embx".encode(), L.DT_REG, L.S_IFREG | 0o755, e))
+            objects.append((f"data/staging/{tag}/pkgprobe.pkg".encode(),  L.DT_REG, L.S_IFREG | L.PERM_FILE, p))
+
     # The kernel's own .embdbg (EMBDBG_Specification.md §7): a LINE+FUNCS sidecar
     # the kernel loads at boot so isr_handler symbolizes a panic to func:line.
     kdbg = _read_file(f"{build_dir}/kernel.embdbg")
@@ -816,6 +887,50 @@ def discover_userland_objects(build_dir="build"):
                                      b"data/apps/embcc/include/", ".h"))
         objects.extend(_tree_objects(EMBCC_ROOT + "/ref",
                                      b"data/src/embcc/ref/", ".o"))
+
+    # KM1 (docs/BUILD.md §12): the KERNEL source tree, so EmbBuild can rebuild the
+    # kernel ON the OS with the on-image embcc + embld -- no gcc, nasm, or ld. The
+    # on-OS embcc COMPILES the .c AND assembles the .asm (its own assembler), and
+    # embld defines kernel_end (--lma-offset), so we stage only SOURCES: staged
+    # under /data/src/kernel/ preserving subdirs, so `-I/data/src/kernel` quote-
+    # includes (#include "fs/vfs.h", ...) resolve exactly as on the host.
+    objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".c"))
+    objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".h"))
+    objects.extend(_tree_objects("kernel", b"data/src/kernel/", ".asm"))
+    kld = _read_file("kernel/linker.ld")
+    if kld is not None:
+        objects.append((b"data/src/kernel/linker.ld",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, kld))
+    # ap_trampoline_blob.asm incbin's the flat AP-trampoline; the on-OS assemble
+    # needs it at /data/build/ap_trampoline.bin (the path the manifest names).
+    aptr = _read_file("build/ap_trampoline.bin")
+    if aptr is not None:
+        objects.append((b"data/build/ap_trampoline.bin",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, aptr))
+    # The kernel EmbBuild manifest (89 C + 6 asm + link) -- produced by EmbCC's
+    # tools/gen-kernel-manifest.sh and dropped into build/ via its os-stage flow.
+    # Staged ONLY if present (D-001: the OS builds/boots with EmbCC absent).
+    kebm = _read_file("build/kernel.build.ebm")
+    if kebm is not None:
+        objects.append((b"data/src/kernel/build.ebm",
+                        L.DT_REG, L.S_IFREG | L.PERM_FILE, kebm))
+
+    # G3 (docs/BUILD.md §12) derived-value test fixture for `test embbuild derive`:
+    # a `measure` step binds nsec = sectors(probe.c), and the compile interpolates
+    # ${nsec} into a tcc -D. probe.c is <512 B (so nsec == 1) and #errors unless
+    # SECT arrived as exactly 1 -- proving the derived value flowed into a real
+    # compile, not just that a substitution happened.
+    objects.append((b"data/src/g3test/probe.c", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"#if SECT == 1\nint g3_derive_ok;\n#else\n"
+                    b"#error \"G3: SECT did not interpolate to the measured sector count\"\n#endif\n"))
+    objects.append((b"data/src/g3test/build.ebm", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"project: g3test\n\n"
+                    b"name: nsec\nkind: measure\ninputs: /data/src/g3test/probe.c\n"
+                    b"args: sectors\noutput: nsec\n\n"
+                    b"name: probe.o\nkind: compile\ninputs: /data/src/g3test/probe.c\n"
+                    b"args: /data/apps/tcc/tcc.elf -c /data/src/g3test/probe.c -DSECT=${nsec} "
+                    b"-o /data/build/out/g3test/probe.o\n"
+                    b"output: /data/build/out/g3test/probe.o\n"))
 
     # The EmUI toolkit HEADERS + one real app's source (clockw), so on-OS tcc can
     # COMPILE + DYNAMIC-LINK a GUI app against /system/lib/libembk.so -- the "GUI
@@ -982,6 +1097,12 @@ def discover_userland_objects(build_dir="build"):
     pth = _read_file(f"{build_dir}/python.elf._pth")
     if pth is not None:
         objects.append((b"data/apps/python/python.elf._pth", L.DT_REG, L.S_IFREG | L.PERM_FILE, pth))
+    # pip.zip rides beside the interpreter and is on ._pth's sys.path, so
+    # `python -m pip` resolves. Like the stdlib zip it is not a *.elf, so the
+    # auto-discovery skips it -- pack it explicitly.
+    pipzip = _read_file(f"{build_dir}/pip.zip")
+    if pipzip is not None:
+        objects.append((b"data/apps/python/pip.zip", L.DT_REG, L.S_IFREG | L.PERM_FILE, pipzip))
 
     # Empty user/scratch directories the layout commits to now (D4 §5, D3 §4.1),
     # so a session can chdir into a home and tcc has a scratch dir to write to.

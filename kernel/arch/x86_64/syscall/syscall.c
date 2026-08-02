@@ -320,6 +320,34 @@ static int64_t sys_fd_avail(struct regs *r) {
     return vfs_fd_avail(fd);
 }
 
+/* fcntl(fd, cmd, arg) -- the sliver of POSIX fcntl the kernel actually owns:
+ * the O_NONBLOCK fd flag. cmd 1 = get (returns 1 if non-blocking, else 0);
+ * cmd 2 = set non-blocking to `arg`. Everything else about fcntl (F_GETFD,
+ * F_DUPFD, ...) stays a libc concern. */
+static int64_t sys_fcntl(struct regs *r) {
+    int fd  = (int)r->rdi;
+    int cmd = (int)r->rsi;
+    int arg = (int)r->rdx;
+    switch (cmd) {
+    case 1: {
+        int fl = vfs_fd_get_flags(fd);
+        if (fl < 0) return fl;
+        return (fl & O_NONBLOCK) ? 1 : 0;
+    }
+    case 2:
+        return vfs_fd_set_nonblock(fd, arg != 0);
+    default:
+        return -EMBK_EINVAL;
+    }
+}
+
+/* fd_poll(fd, events) -> ready POLL* bits (or POLLNVAL for a bad fd). One fd at
+ * a time; the libc select() loops over the fd_set calling this. What lets a
+ * non-blocking socket report connect-completion (POLLOUT) and readability. */
+static int64_t sys_fd_poll(struct regs *r) {
+    return vfs_fd_poll((int)r->rdi, (int)r->rsi);
+}
+
 /* unlink(path) -> 0 or -errno. The shell's `rm`. */
 static int64_t sys_unlink(struct regs *r) {
     char path[SYSCALL_PATH_MAX];
@@ -630,22 +658,29 @@ static int64_t sys_spawn(struct regs *r) {
      * Deliberately NOT static: this syscall can run concurrently on a different
      * core for a different spawn() invocation. static buffer here would let 
      * two spawn() invocations corrupt each other's buffers. */
-    char argv_buf[SPAWN_ARGV_BYTES_MAX];
+    /* kmalloc'd, NOT a stack array: at SPAWN_ARGV_BYTES_MAX (8 KiB) it would eat a
+     * big fraction of the kstack before process_create_env() + elf_load() -- the
+     * deepest chain in the kernel -- pile on. Freed on EVERY exit below, like
+     * envp_buf. (A 96-object kernel link is the customer for the raised caps.) */
+    char *argv_buf = kmalloc(SPAWN_ARGV_BYTES_MAX);
+    if (!argv_buf) return -EMBK_ENOMEM;
     char *argv_kernel[SPAWN_ARGV_MAX];
     size_t used = 0;
     for (int i = 0; i < argc; i++) {
-        int slen = copy_string_from_user(argv_buf + used, (const char *)user_argv_ptrs[i], sizeof(argv_buf) - used);
+        int slen = copy_string_from_user(argv_buf + used, (const char *)user_argv_ptrs[i], SPAWN_ARGV_BYTES_MAX - used);
         if (slen < 0) {
+            kfree(argv_buf);
             return slen;   // -EMBK_EFAULT or -EMBK_ENAMETOOLONG
         }
         argv_kernel[i] = argv_buf + used;
         used += (size_t)slen + 1;   // includes the null terminator
-        
+
     }
 
     struct spawn_file_action actions_kernel[SPAWN_ACTIONS_MAX];
     if (n_count > 0 && copy_from_user(actions_kernel, user_actions,
          n_count * sizeof(struct spawn_file_action)) != EMBK_OK) {
+        kfree(argv_buf);
         return -EMBK_EFAULT;
     }
 
@@ -668,22 +703,23 @@ static int64_t sys_spawn(struct regs *r) {
         for (;;) {
             uint64_t p;
             if (copy_from_user(&p, user_envp + envc, sizeof p) != EMBK_OK) {
+                kfree(argv_buf);
                 return -EMBK_EFAULT;
             }
             if (!p) break;                                  /* the terminator */
             /* -1 leaves room for the NULL process_create_env() expects. */
-            if (envc >= SPAWN_ENVP_MAX - 1) return -EMBK_E2BIG;
+            if (envc >= SPAWN_ENVP_MAX - 1) { kfree(argv_buf); return -EMBK_E2BIG; }
             user_envp_ptrs[envc++] = p;
         }
 
         envp_buf = kmalloc(SPAWN_ENVP_BYTES_MAX);
-        if (!envp_buf) return -EMBK_ENOMEM;
+        if (!envp_buf) { kfree(argv_buf); return -EMBK_ENOMEM; }
         size_t eused = 0;
         for (int i = 0; i < envc; i++) {
             int slen = copy_string_from_user(envp_buf + eused,
                                              (const char *)user_envp_ptrs[i],
                                              SPAWN_ENVP_BYTES_MAX - eused);
-            if (slen < 0) { kfree(envp_buf); return slen; }  /* EFAULT/ENAMETOOLONG */
+            if (slen < 0) { kfree(envp_buf); kfree(argv_buf); return slen; }  /* EFAULT/ENAMETOOLONG */
             envp_kernel[i] = envp_buf + eused;
             eused += (size_t)slen + 1;                       /* includes the NUL */
         }
@@ -711,6 +747,7 @@ static int64_t sys_spawn(struct regs *r) {
     /* Safe already: process_create_env() COPIES every string into the child's
      * own stack before returning -- that is its documented contract. */
     if (envp_buf) kfree(envp_buf);
+    kfree(argv_buf);
     if (pid < 0) {
         return pid;   // -errno from process_create_env()
     }
@@ -1687,6 +1724,8 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_net_accept     81
 #define SYS_net_sendto     82
 #define SYS_net_recvfrom   83
+#define SYS_fcntl          84
+#define SYS_fd_poll        85
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1766,6 +1805,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_net_accept]     = sys_net_accept,
     [SYS_net_sendto]     = sys_net_sendto,
     [SYS_net_recvfrom]   = sys_net_recvfrom,
+    [SYS_fcntl]          = sys_fcntl,
+    [SYS_fd_poll]        = sys_fd_poll,
     [SYS_debug_attach]   = sys_debug_attach,
     [SYS_debug_wait]     = sys_debug_wait,
     [SYS_debug_cont]     = sys_debug_cont,

@@ -78,6 +78,89 @@ MODULE_BUILDTYPE=static \
   LDFLAGS="-static -nostartfiles -T $M/user/lib/newlib.ld -L$NL/lib $M/build/crt0.o $M/build/syscalls.o" \
   "$@" 2>&1 | tee cfg.log
 
+# --- POST-CONFIGURE: enable networking (the pip/git-over-HTTP foundation) -----
+# A cross-compile can't RUN link probes, so configure leaves every socket-layer
+# feature macro #undef and _socket falls back to a stub whose socket() just sets
+# errno=ENOTSUP. EmbLink's newlib libc DOES provide the full BSD surface
+# (user/lib/syscalls.c over the kernel CAP_NETWORK layer -- socket/connect/bind/
+# listen/accept/recvfrom/sendto + getaddrinfo/getnameinfo/inet_*), so we assert
+# the matching HAVE_* here to match reality. Idempotent (flips only the #undef
+# form). Without HAVE_SOCKET the interpreter builds but `socket.socket()` raises
+# OSError(ENOTSUP); the method-table guards (HAVE_CONNECT/BIND/...) drop the
+# corresponding methods entirely. Verified live: `test python net` -> HTTP 200.
+PYCONF="$BLD/pyconfig.h"
+for m in HAVE_SYS_SOCKET_H HAVE_NETINET_IN_H HAVE_NETINET_TCP_H HAVE_NETDB_H \
+         HAVE_ARPA_INET_H HAVE_SOCKET HAVE_CONNECT HAVE_BIND HAVE_LISTEN \
+         HAVE_ACCEPT HAVE_RECVFROM HAVE_SENDTO HAVE_SETSOCKOPT HAVE_GETSOCKNAME \
+         HAVE_GETPEERNAME HAVE_SHUTDOWN HAVE_GETHOSTNAME HAVE_GETADDRINFO HAVE_GETNAMEINFO \
+         HAVE_GAI_STRERROR HAVE_ADDRINFO HAVE_SOCKADDR_STORAGE HAVE_SOCKLEN_T \
+         HAVE_GETHOSTBYNAME HAVE_INET_PTON HAVE_INET_NTOP; do
+    sed -i "s|/\* #undef $m \*/|#define $m 1|" "$PYCONF"
+done
+# socketmodule.c is not in the default static set; declare it as a builtin.
+touch "$BLD/Modules/Setup.local"
+grep -q '^_socket socketmodule.c' "$BLD/Modules/Setup.local" \
+    || echo '_socket socketmodule.c' >> "$BLD/Modules/Setup.local"
+echo "  NET      pyconfig.h socket macros + Setup.local _socket asserted"
+
+# _embtls: HTTPS without OpenSSL. A tiny C module (tools/cpython/_embtlsmodule.c)
+# wrapping our own TLS 1.3 client (user/lib/tls, docs/TLS.md) over a socket fd,
+# so http.client/urllib -- and pip -- can do authenticated https://. makesetup
+# derives the .o path as Modules/<basename> and only resolves sources under
+# Modules/, so the source is SYMLINKED in; the prebuilt libtls objects
+# ($M/build/tls_*.o, made by the OS build) are listed for the static link.
+ln -sf "$M/tools/cpython/_embtlsmodule.c" "$SRC/Modules/_embtlsmodule.c"
+TLSOBJS=$(ls "$M"/build/tls_*.o 2>/dev/null | tr '\n' ' ')
+if [ -n "$TLSOBJS" ]; then
+    grep -q '^_embtls ' "$BLD/Modules/Setup.local" \
+        || echo "_embtls _embtlsmodule.c -I$M/user/lib/tls $TLSOBJS" >> "$BLD/Modules/Setup.local"
+    echo "  TLS      _embtls declared ($(echo "$TLSOBJS" | wc -w) libtls objects)"
+else
+    echo "  TLS      SKIP _embtls -- no $M/build/tls_*.o (run 'make' in the OS first)" >&2
+fi
+
+# zlib: pip's vendored rich imports it, and http/zip compression wants it. Cross
+# compile a static libz.a from source (zlib is pure, portable C -- only
+# malloc/memcpy, which newlib supplies -- so no target-run configure probes) and
+# declare the stdlib `zlib` module against it. ZLIB_SRC defaults to a sibling of
+# the CPython source; override to point elsewhere.
+ZLIB_SRC="${ZLIB_SRC:-$(dirname "$SRC")/zlib-1.3.1}"
+ZLIB_BUILD="$BLD/zlib"
+if [ -d "$ZLIB_SRC" ]; then
+    mkdir -p "$ZLIB_BUILD"
+    if [ ! -f "$ZLIB_BUILD/libz.a" ]; then
+        for c in adler32 compress crc32 deflate infback inffast inflate \
+                 inftrees trees uncompr zutil gzclose gzlib gzread gzwrite; do
+            x86_64-elf-gcc -mno-red-zone -fno-stack-protector -O2 \
+                -isystem "$NL/include" -DHAVE_HIDDEN \
+                -c "$ZLIB_SRC/$c.c" -o "$ZLIB_BUILD/$c.o"
+        done
+        x86_64-elf-ar rcs "$ZLIB_BUILD/libz.a" "$ZLIB_BUILD"/*.o
+    fi
+    grep -q '^zlib ' "$BLD/Modules/Setup.local" \
+        || echo "zlib zlibmodule.c -I$ZLIB_SRC -L$ZLIB_BUILD -lz" >> "$BLD/Modules/Setup.local"
+    echo "  ZLIB     libz.a + Setup.local zlib declared"
+else
+    echo "  ZLIB     SKIP zlib -- $ZLIB_SRC not found (pip's rich needs it)" >&2
+fi
+
+# os-function macros posixmodule.c gates that our libc backs (as real calls or
+# honest ENOSYS stubs). Exposing them lets stdlib code that merely REFERENCES
+# os.<fn> at import (e.g. posixpath.realpath grabbing os.readlink) load; the stub
+# raises only if actually called, which the caller handles. HAVE_READLINK: pip ->
+# sysconfig -> posixpath.realpath needs os.readlink to EXIST (ours raises ENOSYS,
+# which non-strict realpath catches and treats the path as a non-symlink).
+# getuid/geteuid/getppid: platformdirs (pip's dir resolver) does
+# `from os import getuid` at import; ours return 0 (single-user OS). umask: our
+# libc has it. All real calls, not stubs.
+# HAVE_CHMOD: without it os.chmod does `errno = ENOSYS` instead of calling the
+# libc chmod() (which is real -- EMBKFS inodes carry a mode). pip's wheel install
+# chmods every file it writes, so this is on the install path.
+for m in HAVE_READLINK HAVE_GETUID HAVE_GETEUID HAVE_GETPPID HAVE_UMASK HAVE_CHMOD; do
+    sed -i "s|/\* #undef $m \*/|#define $m 1|" "$PYCONF"
+done
+echo "  OSFN     pyconfig.h os-function macros (readlink/getuid/geteuid/getppid/umask/chmod) asserted"
+
 echo
 echo "=== configure OK: MACHDEP=$(grep -E '^MACHDEP=' Makefile | head -1) ==="
 echo "=== next: cd $BLD && make -j4 ==="
