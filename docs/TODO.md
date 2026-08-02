@@ -1376,9 +1376,19 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
   copy, no atomic snapshot/rollback (no userspace EMBKFS snapshot API yet → PK3); no
   signing (PK3); no network (PK4). The manifest is PK1's source of truth until PK2
   makes `build.ebm` the source.
-- [ ] **PK2** — the SDK generator: one `build.ebm` package stanza → EMBX caps +
-  `.ns` + package manifest, consistent by construction. (`mkpkg.py` is the seed:
-  it already derives the manifest from a built EMBX.)
+- [x] ~~**PK2** — the SDK generator.~~ **DONE (generator), metal-verified.**
+  `tools/embx/pkggen.py`: ONE `.pkgspec` (name/version/caps/grant) → all three
+  views — the EMBX cap table (mkembx/EmbLD bakes it), the `.ns` (from the grant),
+  and the package manifest (mkpkg re-derives caps from the EMBX so it cannot
+  drift) — consistent BY CONSTRUCTION. Proven: adding `network` to the one spec
+  line makes it appear in both the binary's cap table AND the manifest; there is
+  no way to build a bundle whose declared authority disagrees with itself (§4).
+  `pkgprobe`'s authority is now declared once in `user/pkg/pkgprobe.pkgspec`
+  (was scattered across `mkembx --cap` + `mkpkg --ns` flags); `test pkg` runs
+  green on the pkggen-produced bundle. **Remaining (PK2b):** the on-device half —
+  drive pkggen (or EmbLD directly) from an EmbBuild `build.ebm` `package:` stanza,
+  so an app declares its authority as part of building ON THE OS (needs on-OS
+  linking of a newlib app first).
 - [ ] **PK3** — signing (ed25519 over `build_id`) + snapshot-backed update/rollback +
   the local registry (a `/data/pkg/registry` skeleton exists).
 - [ ] **PK4** — the git registry (`emblink-packages`): signed manifests in git,

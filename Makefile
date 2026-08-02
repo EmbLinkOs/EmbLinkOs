@@ -587,11 +587,13 @@ build/pkgprobe.o: user/bin/pkgprobe.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/lib -c $< -o $@
 build/pkgprobe.elf: build/crt0.o build/syscalls.o build/pkgprobe.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/pkgprobe.o -lc -lgcc -o $@
-build/pkgprobe.embx: build/pkgprobe.elf tools/embx/mkembx.py | $(BUILD)
-	python3 tools/embx/mkembx.py build/pkgprobe.elf $@ --cap FILESYSTEM
-build/pkgprobe.pkg: build/pkgprobe.embx tools/embx/mkpkg.py | $(BUILD)
-	python3 tools/embx/mkpkg.py build/pkgprobe.embx $@ --name pkgprobe --version 1.0.0 \
-	    --ns "ro /system" --ns "rw /data/apps/pkgprobe"
+# PK2: ONE spec (user/pkg/pkgprobe.pkgspec) -> all three views via pkggen, the
+# SDK generator -- the caps, the .ns and the manifest are consistent by
+# construction (was two separate mkembx/mkpkg calls with the authority scattered
+# across the flags; now the authority is declared once, in the spec).
+build/pkgprobe.embx build/pkgprobe.ns build/pkgprobe.pkg &: build/pkgprobe.elf \
+        user/pkg/pkgprobe.pkgspec tools/embx/pkggen.py tools/embx/mkembx.py tools/embx/mkpkg.py | $(BUILD)
+	python3 tools/embx/pkggen.py user/pkg/pkgprobe.pkgspec build/pkgprobe.elf build
 
 # pkgfetch -- native PyPI installer for pure-Python wheels (libtls fetch + our
 # own inflate + zip reader). Auto-packed as /data/apps/pkgfetch/pkgfetch.elf.

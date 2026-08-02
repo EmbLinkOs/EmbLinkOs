@@ -939,9 +939,18 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
   a tampered bundle whose `build_id` fails to recompute is refused. The bundle +
   manifest are produced by `tools/embx/mkembx.py` + `tools/embx/mkpkg.py`
   (manifest derived from the EMBX → consistent by construction).
-- *Deferred (PK2–PK4):* the SDK generator (`build.ebm` → all three views), signing
-  + atomic snapshot update/rollback (no userspace snapshot API yet), the git
-  registry. No dependency graph, ever (the only "dependency" is the `abi` integer).
+- **PK2 — the SDK generator** (`tools/embx/pkggen.py`): ONE `.pkgspec` (name,
+  version, caps, grant) → all three views (the EMBX cap table, the `.ns`, the
+  package manifest), **consistent by construction**. Adding `network` to the one
+  spec line makes it appear in both the binary's cap table and the manifest — you
+  cannot build a bundle whose declared authority disagrees with itself (§4).
+  `pkgprobe`'s authority is now declared once in `user/pkg/pkgprobe.pkgspec` (was
+  scattered across `mkembx`/`mkpkg` flags); `test pkg` runs green on the generated
+  bundle.
+- *Deferred (PK3–PK4 + PK2b):* signing + atomic snapshot update/rollback (no
+  userspace snapshot API yet), the git registry, and driving pkggen from an
+  EmbBuild `build.ebm` `package:` stanza (on-device). No dependency graph, ever
+  (the only "dependency" is the `abi` integer).
 
 ---
 

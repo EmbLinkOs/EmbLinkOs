@@ -4,17 +4,24 @@
 IS the namespace), [EMBX](own-exe-format) (the capability-declaring executable),
 and EmbBuild.*
 
-> **Status: PK1 SHIPPED + metal-proven** (§11). The manifest format (§3),
-> `user/pkg/` (manifest parser + EMBX reader/`build_id` verifier), and `pkg`
-> (`verify`/`install`/`run`/`list`) are live. `test pkg`: installs a staged
-> bundle (recomputes the EMBX `build_id`, cross-checks caps/abi against the
-> manifest, presents the declared authority, adopts into `/data/apps/<name>/`
-> writing the `.ns` home enforces), then `pkg run` spawns it under EXACTLY its
-> declared caps (SET_CAPS) + namespace (NS_BIND) — the installed app holds only
-> `filesystem`, reaches `/system`, and CANNOT name `/data/users` — and a
-> tampered bundle whose `build_id` no longer recomputes is refused. PK2–PK4
-> (SDK generator, signing/update/rollback, git registry) remain. The rest of
-> this doc is the shape decided before code, the same way the userspace was.*
+> **Status: PK1 + PK2 SHIPPED + metal-proven** (§11).
+> **PK1** — the manifest format (§3), `user/pkg/` (manifest parser + EMBX
+> reader/`build_id` verifier), and `pkg` (`verify`/`install`/`run`/`list`).
+> `test pkg`: installs a staged bundle (recomputes the EMBX `build_id`,
+> cross-checks caps/abi against the manifest, presents the declared authority,
+> adopts into `/data/apps/<name>/` writing the `.ns` home enforces), then
+> `pkg run` spawns it under EXACTLY its declared caps (SET_CAPS) + namespace
+> (NS_BIND) — the app holds only `filesystem`, reaches `/system`, CANNOT name
+> `/data/users` — and a tampered bundle (build_id fails to recompute) is refused.
+> **PK2** — the SDK generator `tools/embx/pkggen.py`: ONE `.pkgspec` (name,
+> version, caps, grant) → all three views (EMBX cap table, `.ns`, package
+> manifest), consistent BY CONSTRUCTION — mutate the spec's caps and both the
+> binary's cap table AND the manifest follow; you cannot build a self-disagreeing
+> bundle (§4). `pkgprobe`'s authority is now declared once in
+> `user/pkg/pkgprobe.pkgspec`; `test pkg` runs green on the generated bundle.
+> PK3–PK4 (signing/update/rollback, git registry) remain, plus the on-device
+> half of PK2: driving pkggen from an EmbBuild `build.ebm` `package:` stanza.
+> The rest of this doc is the shape decided before code, like the userspace.*
 
 ## 0. Thesis
 
