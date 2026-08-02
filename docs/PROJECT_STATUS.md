@@ -885,8 +885,11 @@ verified on the metal.
   and drives **git-receive-pack** with **HTTP Basic auth** (token from the
   environment). `test gitpush` pushed a first commit **live to a real GitHub repo**
   (`GITPUSH refs/heads/main <sha> -> OK`), authenticated over our own crypto — a
-  real `git clone` reads it back, `fsck` clean. *Scope:* first-commit-to-empty-repo
-  (see `docs/TODO.md`). *Deferred:* incremental commits, multi-ref negotiation.
+  real `git clone` reads it back, `fsck` clean. **Incremental commits** work too:
+  a push onto a non-empty branch fetches the tip, splices its tree (other files
+  survive), and commits with the tip as parent — `test gitpush` pushes a first
+  commit then an incremental one, and `main` ends with both files + a 2-commit
+  chain. *Deferred:* multi-ref negotiation, nested-subtree splice, force/delete.
 
 Trust anchors bundled: GTS Root R4 (EC P-384), ISRG Root X1 (RSA-4096), GlobalSign
 Root R3 (RSA-2048), USERTrust ECC (EC P-384, for github/Sectigo) — between them,

@@ -16,6 +16,20 @@ int push_make_first_commit(const char *fname, const void *content, size_t clen,
                            const char *msg, const char *author, uint32_t ts,
                            struct pack_obj out[3], char newcommit_hex[41]);
 
+/* Build an INCREMENTAL commit on top of `parent_hex`, whose objects (the parent
+ * commit + its root tree + the existing blobs) are in base[0..base_n) -- as
+ * fetched from the server. Splices the parent's root tree: the top-level entry
+ * `fname` is added or replaced with the new blob (all OTHER entries preserved),
+ * so unrelated files survive. Produces only the NEW objects (out[0] blob,
+ * out[1] spliced tree, out[2] commit with `parent_hex` as parent) -- the
+ * unchanged blobs already live on the server. `fname` must be a top-level path
+ * (no '/'). Returns the new commit's id in newcommit_hex. 0 or -1. */
+int push_make_next_commit(const char *fname, const void *content, size_t clen,
+                          const char *msg, const char *author, uint32_t ts,
+                          const char *parent_hex,
+                          const struct pack_obj *base, int base_n,
+                          struct pack_obj out[3], char newcommit_hex[41]);
+
 /* Serialize a git-receive-pack request: one pkt-line command
  * "<old_hex> <new_hex> <ref>\0report-status\n", a flush-pkt, then a packfile of
  * `objs`. old_hex is 40 zeros to CREATE a ref. Sets *req (malloc'd, caller

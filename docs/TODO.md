@@ -1592,18 +1592,28 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     gitpush` pushed a first commit CREATING `refs/heads/main` on
     github.com/teo1747/mblink-push-test (`GITPUSH refs/heads/main <sha> -> OK`),
     and a real `git clone` reads it back -- author `EmbLink <os@emblink>`, the
-    pushed README, `fsck` clean. *Scope:* a FIRST commit (one file, no parent, to
-    create a branch) -- a push to an empty repo; splicing a parent's tree for an
-    incremental commit is the next step. Credentials are staged into the LOCAL
-    image only (mkfs env-gated: `EMBK_GITPUSH_TOKEN_FILE` + `EMBK_GITPUSH_URL`),
-    never committed.
+    pushed README, `fsck` clean. Credentials are staged into the LOCAL image only
+    (mkfs env-gated: `EMBK_GITPUSH_TOKEN_FILE` + `EMBK_GITPUSH_URL`), never
+    committed.
+  - **G9 incremental commit push -- metal-proven.** A push onto a NON-empty branch:
+    gitpush sees the tip is non-zero, FETCHES it (shallow upload-pack, reusing the
+    clone machinery), reads the parent commit's root tree, and SPLICES it
+    (`push_make_next_commit`/`splice_tree` in push.c: add/replace the target
+    top-level entry, keep every other, re-serialize in git's tree order) into a new
+    tree; the new commit carries the tip as `parent`. Only the 3 NEW objects are
+    packed -- the unchanged blobs already live on the server. Host-proven (a first
+    then an incremental push to a local `git receive-pack`: the pre-existing file
+    survives, 2-commit chain, fsck clean). LIVE: `test gitpush` now pushes TWICE --
+    `README.md` (first commit, creates `main`) then `NOTES.md` (incremental); on
+    github `main` ends with BOTH files (README.md survived the splice) and a
+    `e709a83 parent=6d96e3b` two-commit chain, fsck clean.
   - **Deferred (not yet exercised):** `want`-list is single-ref HEAD/default only
     (no multi-ref, no `have`/negotiation beyond deepen); no side-band-64k
-    progress; push is first-commit-only (no incremental/parent-tree splice, no
-    force, no delete); no thin-pack completion; deltas seen live are shallow
-    chains (depth 1) -- deep chains are host-proven (depth 3) but a large live
-    clone with long chains hasn't been run under TCG (slow). The ported stock
-    git.elf still uses its OWN transport only for local ops.
+    progress; push handles top-level files only (no nested-subtree splice), no
+    force, no delete, no thin-pack completion; deltas seen live are shallow chains
+    (depth 1) -- deep chains are host-proven (depth 3) but a large live clone with
+    long chains hasn't been run under TCG (slow). The ported stock git.elf still
+    uses its OWN transport only for local ops.
 - [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
   one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
   fragmented Certificate-message / net-read edge case leaving a cert parsed with

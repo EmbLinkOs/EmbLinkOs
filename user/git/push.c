@@ -25,6 +25,145 @@ static void hex20(const uint8_t sha[20], char out[41]) {
     out[40] = 0;
 }
 
+static int hexv(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+static void unhex20(const char *hex, uint8_t out[20]) {
+    for (int i = 0; i < 20; i++) out[i] = (uint8_t)((hexv(hex[2*i]) << 4) | hexv(hex[2*i+1]));
+}
+
+static const struct pack_obj *find_sha(const struct pack_obj *o, int n, const uint8_t sha[20]) {
+    for (int i = 0; i < n; i++) if (memcmp(o[i].sha, sha, 20) == 0) return &o[i];
+    return NULL;
+}
+
+/* One decoded tree entry. */
+struct tent { char mode[8]; char name[256]; uint8_t sha[20]; int isdir; };
+
+/* git's tree-entry order: names compared byte-wise, but a directory sorts as if
+ * its name had a trailing '/'. Matters only when one name prefixes another. */
+static int tent_cmp(const void *a, const void *b) {
+    const struct tent *x = a, *y = b;
+    size_t lx = strlen(x->name), ly = strlen(y->name), c = lx < ly ? lx : ly;
+    int r = memcmp(x->name, y->name, c);
+    if (r) return r;
+    int cx = (c < lx) ? (unsigned char)x->name[c] : (x->isdir ? '/' : 0);
+    int cy = (c < ly) ? (unsigned char)y->name[c] : (y->isdir ? '/' : 0);
+    return cx - cy;
+}
+
+/* Splice the tree `tree_sha` (found in base): add/replace the top-level entry
+ * `fname` -> (100644, blob_sha), keep the rest, and re-serialize in git order.
+ * Sets *out (malloc'd) and *outlen. 0 or -1. */
+static int splice_tree(const struct pack_obj *base, int base_n, const uint8_t tree_sha[20],
+                       const char *fname, const uint8_t blob_sha[20],
+                       uint8_t **out, size_t *outlen) {
+    const struct pack_obj *t = find_sha(base, base_n, tree_sha);
+    if (!t || t->type != OBJ_TREE) return -1;
+
+    struct tent *e = malloc(sizeof(*e) * 4096);
+    if (!e) return -1;
+    int n = 0;
+    const uint8_t *p = t->data, *end = t->data + t->size;
+    while (p < end && n < 4095) {
+        const uint8_t *sp = memchr(p, ' ', (size_t)(end - p));
+        if (!sp) break;
+        size_t ml = (size_t)(sp - p); if (ml >= sizeof e[n].mode) break;
+        memcpy(e[n].mode, p, ml); e[n].mode[ml] = 0;
+        const uint8_t *nul = memchr(sp + 1, 0, (size_t)(end - (sp + 1)));
+        if (!nul) break;
+        size_t nl = (size_t)(nul - (sp + 1)); if (nl >= sizeof e[n].name) break;
+        memcpy(e[n].name, sp + 1, nl); e[n].name[nl] = 0;
+        if (nul + 1 + 20 > end) break;
+        memcpy(e[n].sha, nul + 1, 20);
+        e[n].isdir = (!strcmp(e[n].mode, "40000") || !strcmp(e[n].mode, "040000"));
+        p = nul + 1 + 20;
+        n++;
+    }
+
+    int replaced = 0;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(e[i].name, fname)) {
+            memcpy(e[i].sha, blob_sha, 20); strcpy(e[i].mode, "100644"); e[i].isdir = 0; replaced = 1;
+        }
+    if (!replaced) {
+        if (n >= 4095) { free(e); return -1; }
+        strcpy(e[n].mode, "100644");
+        strncpy(e[n].name, fname, sizeof e[n].name - 1); e[n].name[sizeof e[n].name - 1] = 0;
+        memcpy(e[n].sha, blob_sha, 20); e[n].isdir = 0; n++;
+    }
+    qsort(e, (size_t)n, sizeof *e, tent_cmp);
+
+    /* serialize: for each entry "<mode> <name>\0" + 20 raw sha */
+    size_t cap = 0;
+    for (int i = 0; i < n; i++) cap += strlen(e[i].mode) + 1 + strlen(e[i].name) + 1 + 20;
+    uint8_t *td = malloc(cap ? cap : 1);
+    if (!td) { free(e); return -1; }
+    size_t o = 0;
+    for (int i = 0; i < n; i++) {
+        size_t ml = strlen(e[i].mode), nl = strlen(e[i].name);
+        memcpy(td + o, e[i].mode, ml); o += ml;
+        td[o++] = ' ';
+        memcpy(td + o, e[i].name, nl); o += nl;
+        td[o++] = 0;
+        memcpy(td + o, e[i].sha, 20); o += 20;
+    }
+    free(e);
+    *out = td; *outlen = o;
+    return 0;
+}
+
+int push_make_next_commit(const char *fname, const void *content, size_t clen,
+                          const char *msg, const char *author, uint32_t ts,
+                          const char *parent_hex,
+                          const struct pack_obj *base, int base_n,
+                          struct pack_obj out[3], char newcommit_hex[41]) {
+    struct pack_obj *blob = &out[0], *tree = &out[1], *commit = &out[2];
+
+    /* blob */
+    blob->type = OBJ_BLOB; blob->size = clen;
+    blob->data = malloc(clen ? clen : 1);
+    if (!blob->data) return -1;
+    memcpy(blob->data, content, clen);
+    obj_sha("blob", blob->data, clen, blob->sha);
+
+    /* find the parent commit + its root tree, then splice in our blob. */
+    uint8_t psha[20]; unhex20(parent_hex, psha);
+    const struct pack_obj *pc = find_sha(base, base_n, psha);
+    if (!pc || pc->type != OBJ_COMMIT || pc->size < 46 ||
+        memcmp(pc->data, "tree ", 5) != 0) { free(blob->data); return -1; }
+    char ptree_hex[41]; memcpy(ptree_hex, pc->data + 5, 40); ptree_hex[40] = 0;
+    uint8_t ptree[20]; unhex20(ptree_hex, ptree);
+
+    uint8_t *td = NULL; size_t tlen = 0;
+    if (splice_tree(base, base_n, ptree, fname, blob->sha, &td, &tlen) != 0) { free(blob->data); return -1; }
+    tree->type = OBJ_TREE; tree->size = tlen; tree->data = td;
+    obj_sha("tree", td, tlen, tree->sha);
+
+    /* commit with a parent line. */
+    char thex[41]; hex20(tree->sha, thex);
+    char body[1024];
+    int bl = snprintf(body, sizeof body,
+        "tree %s\n"
+        "parent %s\n"
+        "author %s %u +0000\n"
+        "committer %s %u +0000\n"
+        "\n%s\n",
+        thex, parent_hex, author, ts, author, ts, msg);
+    if (bl < 0 || bl >= (int)sizeof body) { free(blob->data); free(td); return -1; }
+    commit->type = OBJ_COMMIT; commit->size = (size_t)bl;
+    commit->data = malloc((size_t)bl);
+    if (!commit->data) { free(blob->data); free(td); return -1; }
+    memcpy(commit->data, body, (size_t)bl);
+    obj_sha("commit", commit->data, (size_t)bl, commit->sha);
+
+    hex20(commit->sha, newcommit_hex);
+    return 0;
+}
+
 int push_make_first_commit(const char *fname, const void *content, size_t clen,
                            const char *msg, const char *author, uint32_t ts,
                            struct pack_obj out[3], char newcommit_hex[41]) {

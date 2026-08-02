@@ -1365,13 +1365,15 @@ int selftests_handle_command(const char *cmd)
     }
 
     if (strcmp(cmd, "test gitpush") == 0) {
-        /* git PUSH over HTTPS (G8): gitpush builds a blob+tree+commit, packs them
-         * (pack_write), and drives git-receive-pack over libtls with HTTP Basic
-         * auth. Pushes a FIRST commit (one file) to CREATE a branch -- i.e. a push
-         * to an empty repo. Needs CAP_NETWORK + CAP_FILESYSTEM + -cpu max, plus
-         * LOCAL credentials staged into the image (env-gated in mkfs, never
-         * committed): a PAT at /data/gitpush/token and the repo url at
-         * /data/gitpush/url. Absent => the test refuses honestly. */
+        /* git PUSH over HTTPS (G8/G9): gitpush builds a blob+tree+commit, packs
+         * them (pack_write), and drives git-receive-pack over libtls with HTTP
+         * Basic auth. Two pushes prove BOTH paths:
+         *   1. README.md -> a FIRST commit that CREATES `main` (empty repo, G8).
+         *   2. NOTES.md  -> an INCREMENTAL commit (G9): fetch the tip, splice its
+         *      tree (README.md must survive), parent = the tip, push.
+         * Needs CAP_NETWORK + CAP_FILESYSTEM + -cpu max, plus LOCAL credentials
+         * staged into the image (env-gated in mkfs, never committed): a PAT at
+         * /data/gitpush/token and the repo url at /data/gitpush/url. */
         const char *sp = "/data/apps/gitpush/gitpush.elf";
         struct vfs_stat st;
         if (vfs_stat(sp, &st) != 0) { kprintf("\n[cmd] test gitpush: %s not on image\n", sp); return 1; }
@@ -1389,21 +1391,31 @@ int selftests_handle_command(const char *cmd)
         while (ug > 0 && (url[ug-1] == '\n' || url[ug-1] == '\r' || url[ug-1] == ' ')) ug--;
         url[ug] = 0;
 
-        /* The file to push (its content becomes the repo's README). */
+        /* Two files: the first-commit README, then the incremental NOTES. */
         int wf = vfs_open("/data/pushme.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (wf >= 0) {
-            static const char m[] = "Pushed from EmbLinkOS -- our own TLS 1.3 + git-receive-pack, no stock git.\n";
-            size_t w = 0; vfs_fd_write(wf, m, sizeof m - 1, &w); vfs_close(wf);
-        }
+        if (wf >= 0) { static const char m[] = "Pushed from EmbLinkOS -- our own TLS 1.3 + git-receive-pack, no stock git.\n";
+            size_t w = 0; vfs_fd_write(wf, m, sizeof m - 1, &w); vfs_close(wf); }
+        wf = vfs_open("/data/notes.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (wf >= 0) { static const char m[] = "A second, incremental commit -- README.md must survive the tree splice.\n";
+            size_t w = 0; vfs_fd_write(wf, m, sizeof m - 1, &w); vfs_close(wf); }
 
         snprintf(tokenv, sizeof tokenv, "GITPUSH_TOKEN=%s", token);   /* env, not argv */
-        char *a[]   = { (char *)sp, url, (char *)"/data/pushme.txt", (char *)"README.md", (char *)"main", NULL };
         char *env[] = { (char *)"HOME=/", tokenv, NULL };
         uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
-        int pid = process_create_caps(sp, a, 5, env, NULL, 0, caps);
-        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
-        kprintf("[cmd] test gitpush: %s\n", code == 0 ? "OK" : "FAIL");
-        return code == 0 ? 0 : 1;
+
+        char *a1[] = { (char *)sp, url, (char *)"/data/pushme.txt", (char *)"README.md", (char *)"main", NULL };
+        int p1 = process_create_caps(sp, a1, 5, env, NULL, 0, caps);
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[cmd] test gitpush: push 1 (README, first commit) = %s\n", c1 == 0 ? "OK" : "FAIL");
+
+        char *a2[] = { (char *)sp, url, (char *)"/data/notes.txt", (char *)"NOTES.md", (char *)"main", NULL };
+        int p2 = process_create_caps(sp, a2, 5, env, NULL, 0, caps);
+        int c2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+        kprintf("[cmd] test gitpush: push 2 (NOTES, incremental) = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && c2 == 0);
+        kprintf("[cmd] test gitpush: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
     }
 
     if (strcmp(cmd, "test emlibc net") == 0) {

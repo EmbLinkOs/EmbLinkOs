@@ -39,6 +39,44 @@ static void base64(const uint8_t *src, size_t n, char *out) {
     out[o] = 0;
 }
 
+/* Fetch the objects reachable from `want` (shallow, depth 1) via upload-pack --
+ * used to read the parent commit + its tree so an incremental commit can splice
+ * it. Sets *objs (caller frees each .data and the array) and *n. 0 or -1. */
+static int fetch_tip(const char *base, const char *want, const char *authb64,
+                     struct pack_obj **objs, int *n) {
+    char url[2048]; snprintf(url, sizeof url, "%s/git-upload-pack", base);
+    uint8_t req[192]; size_t rl = 0;
+    char wl[64]; int wn = snprintf(wl, sizeof wl, "want %s\n", want);
+    rl += pktline_write(req + rl, wl, (size_t)wn);
+    rl += pktline_write(req + rl, "deepen 1\n", 9);
+    rl += pktline_flush(req + rl);
+    rl += pktline_write(req + rl, "done\n", 5);
+
+    uint8_t *body = NULL; size_t len = 0; int status = 0;
+    if (git_http("POST", url, "application/x-git-upload-pack-request",
+                 req, rl, authb64, &body, &len, &status) != 0) return -1;
+    if (status / 100 != 2) { free(body); return -1; }
+
+    /* skip shallow lines + flush, stop at NAK/ACK -- then the raw pack. */
+    const uint8_t *cur = body, *end = body + len, *data; size_t dlen;
+    for (;;) {
+        int k = pktline_next(&cur, end, &data, &dlen);
+        if (k == PKT_FLUSH) continue;
+        if (k != PKT_DATA) { free(body); return -1; }
+        if (dlen >= 8 && !strncmp((const char *)data, "shallow ", 8)) continue;
+        if (dlen >= 10 && !strncmp((const char *)data, "unshallow ", 10)) continue;
+        if (dlen >= 3 && (!strncmp((const char *)data, "NAK", 3) ||
+                          !strncmp((const char *)data, "ACK", 3))) break;
+    }
+    const uint8_t *pack = cur; size_t plen = (size_t)(end - cur);
+    if (plen < 12 || memcmp(pack, "PACK", 4) != 0) { free(body); return -1; }
+    int nc = pack_unpack(pack, plen, objs);
+    free(body);
+    if (nc < 0) return -1;
+    *n = nc;
+    return 0;
+}
+
 /* "<base>.git" from a user URL (strip trailing '/', add .git if absent). */
 static void base_git(const char *in, char *out, size_t cap) {
     char base[1600];
@@ -106,14 +144,33 @@ int main(int argc, char **argv) {
     if (status / 100 != 2) { fprintf(stderr, "gitpush: HTTP %d discovering refs\n", status); free(body); free(content); return 1; }
     char old_hex[41]; find_ref(body, len, branch, old_hex);
     free(body);
-    printf("GITPUSH %s: %s currently %s\n", urlarg, branch, old_hex);
+    int is_first = (strspn(old_hex, "0") == 40);
+    printf("GITPUSH %s: %s currently %s (%s)\n", urlarg, branch, old_hex,
+           is_first ? "new branch" : "incremental");
 
-    /* Build the first commit + the receive-pack request. */
+    /* Build the commit. A new branch => a first commit (no parent). Otherwise
+     * fetch the current tip's objects and splice its tree so existing files
+     * survive -- an INCREMENTAL commit with `old_hex` as parent. */
     struct pack_obj objs[3]; char new_hex[41];
-    if (push_make_first_commit(repopath, content, (size_t)fl,
-                               "first commit pushed from EmbLinkOS",
-                               "EmbLink <os@emblink>", (uint32_t)time(NULL),
-                               objs, new_hex) != 0) {
+    const char *msg = is_first ? "first commit pushed from EmbLinkOS"
+                               : "another commit pushed from EmbLinkOS";
+    int build_rc;
+    if (is_first) {
+        build_rc = push_make_first_commit(repopath, content, (size_t)fl, msg,
+                                          "EmbLink <os@emblink>", (uint32_t)time(NULL),
+                                          objs, new_hex);
+    } else {
+        struct pack_obj *tip = NULL; int tn = 0;
+        if (fetch_tip(base, old_hex, authb64, &tip, &tn) != 0) {
+            fprintf(stderr, "gitpush: fetching the parent tip failed\n"); free(content); return 1;
+        }
+        build_rc = push_make_next_commit(repopath, content, (size_t)fl, msg,
+                                         "EmbLink <os@emblink>", (uint32_t)time(NULL),
+                                         old_hex, tip, tn, objs, new_hex);
+        for (int i = 0; i < tn; i++) free(tip[i].data);
+        free(tip);
+    }
+    if (build_rc != 0) {
         fprintf(stderr, "gitpush: building the commit failed\n"); free(content); return 1;
     }
     free(content);
