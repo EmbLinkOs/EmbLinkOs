@@ -4,7 +4,9 @@
 IS the namespace), [EMBX](own-exe-format) (the capability-declaring executable),
 and EmbBuild.*
 
-> **Status: PK1 + PK2 SHIPPED + metal-proven** (§11).
+> **Status: PK1–PK4 SHIPPED + metal-proven** (§11) — the packaging arc is complete
+> end to end: build (PK2/PK2b), sign (PK3), publish to a git registry, and install
+> from it over HTTPS (PK4), authority kernel-enforced throughout.
 > **PK1** — the manifest format (§3), `user/pkg/` (manifest parser + EMBX
 > reader/`build_id` verifier), and `pkg` (`verify`/`install`/`run`/`list`).
 > `test pkg`: installs a staged bundle (recomputes the EMBX `build_id`,
@@ -42,6 +44,15 @@ and EmbBuild.*
 > `test pkgbuild` proves the whole loop on the metal: generate -> install --local
 > -> run confined. (A `build.ebm` drives it as a normal build step running
 > `pkgbuild`; a structured EmbBuild `package:` stanza is optional polish.)
+> **PK4 — the git registry.** The registry is a git repo
+> (github.com/teo1747/emblink-packages): one dir per package holds its SIGNED
+> manifest + EMBX. `test pkgregistry` clones it over HTTPS with our own
+> git-over-TLS client (`gitclone`), then `pkg install`s a package from the clone —
+> the signature is verified against the trusted key ON ARRIVAL, so a compromised
+> host cannot inject a bad binary (§9.2): trust is in the signature, not the
+> channel. The clone→install→run-confined loop runs green on the metal. (Refinement
+> per §9.1: binaries as release assets rather than in git history; here the small
+> bundle rides in the repo for the proof.)
 > The rest of this doc is the shape decided before code, like the userspace.*
 
 ## 0. Thesis

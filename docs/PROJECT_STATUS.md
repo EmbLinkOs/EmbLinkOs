@@ -962,8 +962,15 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
   --local` adopts the unsigned dev build. `test pkgbuild` proves generate →
   install → run-confined, all on the metal — authority declared as part of
   building on the device.
-- *Deferred (PK4):* the git registry (reuses PK3's signature as trust root). No
-  dependency graph, ever (the only "dependency" is the `abi` integer).
+- **PK4 — the git registry.** The registry is a git repo (`emblink-packages`):
+  one dir per package with its signed manifest + EMBX. `test pkgregistry` clones
+  it over HTTPS (our own git-over-TLS client), then `pkg install`s a package from
+  the clone — the signature is verified against the trusted key **on arrival**, so
+  a compromised host cannot inject a bad binary: trust is in the signature, not the
+  channel. Clone → install → run-confined, all on the metal. The packaging arc is
+  now complete end to end (build → sign → publish → install), and its transport is
+  the very git-over-HTTPS client from Phase 28. No dependency graph, ever (the only
+  "dependency" is the `abi` integer).
 
 ---
 

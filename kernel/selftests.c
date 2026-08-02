@@ -1593,6 +1593,44 @@ int selftests_handle_command(const char *cmd)
         return pass ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test pkgregistry") == 0) {
+        /* Packaging PK4: the registry is a GIT REPO. The OS clones it over HTTPS
+         * (our own git-over-TLS) and installs a SIGNED package from it -- the
+         * signature is verified against the trusted key ON ARRIVAL, so trust is in
+         * the signature, not the channel (§9.2). Needs CAP_NETWORK + -cpu max.
+         *   1. gitclone emblink-packages -> /data/registry (the index + bundles).
+         *   2. pkg install /data/registry/pkgprobe -- verify signature + build_id,
+         *      then adopt (exactly like a local bundle, but it came from the net).
+         *   3. pkg run pkgprobe -- confined to its declared grant. */
+        const char *gc = "/data/apps/gitclone/gitclone.elf";
+        const char *pk = "/data/apps/pkg/pkg.elf";
+        struct vfs_stat st;
+        if (vfs_stat(gc, &st) != 0 || vfs_stat(pk, &st) != 0) {
+            kprintf("\n[cmd] test pkgregistry: gitclone/pkg not on image\n"); return 1; }
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps_net = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+        uint64_t caps_fs  = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        char *a1[] = { (char *)gc, (char *)"https://github.com/teo1747/emblink-packages",
+                       (char *)"/data/registry", NULL };
+        int c1 = process_wait((uint32_t)process_create_caps(gc, a1, 3, env, NULL, 0, caps_net));
+        int have = (vfs_stat("/data/registry/pkgprobe/pkgprobe.pkg", &st) == EMBK_OK);
+        kprintf("[pkgreg] 1 clone registry over HTTPS = %s (bundle on disk=%d)\n",
+                c1 == 0 ? "OK" : "FAIL", have);
+
+        char *a2[] = { (char *)pk, (char *)"install", (char *)"/data/registry/pkgprobe", NULL };
+        int c2 = process_wait((uint32_t)process_create_caps(pk, a2, 3, env, NULL, 0, caps_fs));
+        kprintf("[pkgreg] 2 install from registry (signature verified on arrival) = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        char *a3[] = { (char *)pk, (char *)"run", (char *)"pkgprobe", NULL };
+        int c3 = process_wait((uint32_t)process_create_caps(pk, a3, 3, env, NULL, 0, caps_fs));
+        kprintf("[pkgreg] 3 run installed package (confined) = %s\n", c3 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && have && c2 == 0 && c3 == 0);
+        kprintf("[cmd] test pkgregistry: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test emlibc net") == 0) {
         /* Proves emlibc's NATIVE networking: emlibc_net (ring 3, linked against
          * libemlibc only -- zero newlib) does an HTTP GET via em_tcp_connect +

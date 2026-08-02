@@ -1419,9 +1419,19 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
   - *Optional future*: an EMBKFS-snapshot-backed variant of update (needs a
     userspace snapshot syscall — none exists yet); the retained-bundle rollback
     above is the honest per-package equivalent.
-- [ ] **PK4** — the git registry (`emblink-packages`): signed manifests in git,
-  binaries as release assets; fetch over HTTP (mirror pre-TLS, direct once TLS
-  lands). Rides the net stack.
+- [x] ~~**PK4** — the git registry.~~ **DONE, metal-proven (`test pkgregistry`).**
+  The registry is a git repo (**github.com/teo1747/emblink-packages**): one dir per
+  package holds its SIGNED manifest + the EMBX bundle, plus a top-level `index`.
+  The OS clones it over HTTPS with our own git-over-TLS client (`gitclone` →
+  `/data/registry`), then `pkg install /data/registry/<name>` verifies the
+  signature against the trusted key **on arrival** and adopts — a compromised host
+  cannot inject a bad binary (§9.2): trust is in the signature, not the channel.
+  `test pkgregistry`: clone registry → install (signature valid) → run confined,
+  all on the metal — the transport is the very git-over-HTTPS client from the git
+  arc. *Refinement (§9.1):* binaries as release assets rather than in git history
+  (the small bundle rides in the repo here for the proof); `pkg`-side index sync
+  (`pkg install <name>` resolving the registry automatically) is a UX nicety on
+  top of the proven clone+install flow.
 
 ### Toolchain (EmbCC/EmbLD — tracked in full in `EmbCC/docs/todo.md`)
 
