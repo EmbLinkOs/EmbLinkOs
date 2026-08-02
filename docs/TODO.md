@@ -1565,12 +1565,26 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     (zero every uninit auto var -- deterministic, right for security-critical
     crypto). Also added github's root (USERTrust ECC, P-384) to the trust store +
     `ecdsa_secp384r1_sha384` (0x0503) to the ClientHello sig-algs.
-  - **Deferred (not yet exercised):** `want`-list is HEAD-only (no shallow, no
-    multi-ref, no `have`/negotiation); no side-band-64k progress; no push, no auth
-    (private repos), no thin-pack completion; deltas seen live are shallow (depth
-    1) -- deep chains are host-proven (depth 3) but a large live clone with long
-    chains hasn't been run under TCG (slow). This is CLONE only; the ported stock
-    git.elf stays local-only.
+  - **G7 shallow clone (`--depth N`) -- metal-proven.** `gitclone --depth N`
+    sends a `deepen N` line in the upload-pack request; the server prefixes the
+    response with `shallow <sha>` boundary lines (ended by a flush) before NAK,
+    which we parse and write to `.git/shallow`. Validated against the REAL github
+    server on the host first (curl replayed our exact request bytes -> the exact
+    `shallow`/flush/NAK/PACK framing our parser consumes -> our unpacker produced
+    the 5-object depth-1 pack matching real git). Live: `test gitclone shallow`
+    clones **octocat/Spoon-Knife --depth 1 -> /data/spoonshallow** --
+    `GITSHALLOW depth 1, 1 boundary commit(s)`, `GITUNPACK 5 objects` (just the
+    tip vs 10 for a full clone), and the on-OS git reads it as genuinely shallow:
+    `d0dd1f6 (grafted, HEAD -> main) …` (**1** commit, not 3; `git log`/`cat-file`
+    both exit 0). githttp also gained coarse `recv NN KB` progress prints -- the
+    22800-ref advertisement is ~1.5 MB and streams slowly over TLS under TCG
+    (~10 min), which without progress output is indistinguishable from a hang.
+  - **Deferred (not yet exercised):** `want`-list is single-ref HEAD/default only
+    (no multi-ref, no `have`/negotiation beyond deepen); no side-band-64k
+    progress; no push, no auth (private repos), no thin-pack completion; deltas
+    seen live are shallow chains (depth 1) -- deep chains are host-proven (depth
+    3) but a large live clone with long chains hasn't been run under TCG (slow).
+    This is CLONE only; the ported stock git.elf stays local-only.
 - [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
   one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
   fragmented Certificate-message / net-read edge case leaving a cert parsed with

@@ -47,11 +47,13 @@ int git_http(const char *method, const char *url, const char *ctype,
 
     struct tls_conn *c = malloc(sizeof *c);
     if (!c) { close(fd); return -1; }
+    fprintf(stderr, "githttp: %s %s (TLS handshake)\n", method, host);
     int trc = tls_connect(c, fd, host);
     if (trc != 0) {
         fprintf(stderr, "git: TLS to %s failed (rc=%d)\n", host, trc);
         free(c); close(fd); return -1;
     }
+    fprintf(stderr, "githttp: TLS up, sending request\n");
 
     /* Request headers. HTTP/1.0 + Connection: close => body ends at EOF, so we
      * never have to parse chunked/Content-Length. git-upload-pack tolerates
@@ -75,13 +77,19 @@ int git_http(const char *method, const char *url, const char *ctype,
 
     uint8_t *buf = malloc(GITHTTP_MAX_BODY);
     if (!buf) { tls_close(c); free(c); return -1; }
-    size_t total = 0;
+    size_t total = 0, next_mark = 512u * 1024;
     for (;;) {
         long n = tls_read(c, buf + total, GITHTTP_MAX_BODY - total);
         if (n <= 0) break;
         total += (size_t)n;
+        if (total >= next_mark) {      /* coarse progress: big ref advertisements
+                                        * are slow to stream over TLS under TCG */
+            fprintf(stderr, "githttp: recv %zu KB\n", total / 1024);
+            next_mark += 512u * 1024;
+        }
         if (total >= GITHTTP_MAX_BODY) break;
     }
+    fprintf(stderr, "githttp: response complete, %zu bytes\n", total);
     tls_close(c); free(c);
 
     /* Split header/body at CRLFCRLF; read the status line. */

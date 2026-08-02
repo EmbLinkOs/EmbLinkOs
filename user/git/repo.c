@@ -83,6 +83,16 @@ int repo_write_refs(const char *dir, const char *branch, const char *head_hex) {
     return write_file(p, cfg, strlen(cfg));
 }
 
+int repo_write_shallow(const char *dir, char shas[][41], int n) {
+    if (n <= 0) return 0;
+    char buf[8 * 42]; size_t o = 0;
+    for (int i = 0; i < n && o + 42 <= sizeof buf; i++)
+        o += (size_t)snprintf(buf + o, sizeof buf - o, "%s\n", shas[i]);
+    char p[1024];
+    snprintf(p, sizeof p, "%s/.git/shallow", dir);
+    return write_file(p, buf, o);
+}
+
 static const struct pack_obj *find_obj(const struct pack_obj *objs, int n, const uint8_t sha[20]) {
     for (int i = 0; i < n; i++) if (memcmp(objs[i].sha, sha, 20) == 0) return &objs[i];
     return NULL;

@@ -11,8 +11,9 @@
  *                        receive the packfile.
  *   G3  unpack        -- packfile -> objects (SHA1 + inflate + delta). [done]
  *   G4  refs+checkout -- write a real .git + working tree to disk.     [done]
+ *   G7  shallow (--depth N) -- deepen negotiation + .git/shallow.       [done]
  *
- * usage: gitclone <https-url> [dir]
+ * usage: gitclone [--depth N] <https-url> [dir]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,18 +70,29 @@ static int read_refs(const uint8_t *body, size_t len, char want[41], char branch
     return count;
 }
 
-/* G2: POST git-upload-pack with a single want (a full clone of HEAD, no haves)
- * and return the packfile bytes. No side-band capability, so the response is
- * simply "NAK\n" followed by the raw packfile. On success sets pack and packlen
- * (pointing into body, which the caller frees) and returns 0. */
-static int fetch_pack(const char *base, const char *want,
-                      uint8_t **body_out, const uint8_t **pack, size_t *packlen) {
+/* G2/G7: POST git-upload-pack with a single want (a clone of HEAD, no haves) and
+ * return the packfile bytes. No side-band capability, so the response is the
+ * (optional) shallow section then "NAK\n" then the raw packfile.
+ *   depth == 0: a full clone (want, flush, done). Response: NAK, pack.
+ *   depth  > 0: a shallow clone -- add a `deepen <depth>` line, and the server
+ *               prefixes the response with `shallow <sha>` boundary lines (ended
+ *               by a flush) before NAK. The boundaries are returned in
+ *               shallow[]/*nshallow so the caller can write .git/shallow.
+ * On success sets pack/packlen (into body, which the caller frees) and returns 0. */
+static int fetch_pack(const char *base, const char *want, int depth,
+                      uint8_t **body_out, const uint8_t **pack, size_t *packlen,
+                      char shallow[][41], int *nshallow) {
     char url[2048];
     snprintf(url, sizeof url, "%s/git-upload-pack", base);
+    *nshallow = 0;
 
-    uint8_t req[128]; size_t rl = 0;
+    uint8_t req[192]; size_t rl = 0;
     char wl[64]; int wn = snprintf(wl, sizeof wl, "want %s\n", want);
     rl += pktline_write(req + rl, wl, (size_t)wn);
+    if (depth > 0) {
+        char dl[32]; int dn = snprintf(dl, sizeof dl, "deepen %d\n", depth);
+        rl += pktline_write(req + rl, dl, (size_t)dn);
+    }
     rl += pktline_flush(req + rl);
     rl += pktline_write(req + rl, "done\n", 5);
 
@@ -95,12 +107,23 @@ static int fetch_pack(const char *base, const char *want,
         free(body); return -1;
     }
 
-    /* Response: one pkt-line ("NAK\n"), then the raw packfile. */
+    /* Walk the pkt-lines: collect `shallow <sha>` boundaries (deepen only), skip
+     * the flush that ends them, and stop at NAK/ACK -- the raw packfile follows. */
     const uint8_t *cur = body, *end = body + len, *data; size_t dlen;
-    int k = pktline_next(&cur, end, &data, &dlen);
-    if (k != PKT_DATA || dlen < 3 || strncmp((const char *)data, "NAK", 3) != 0) {
-        fprintf(stderr, "gitclone: expected NAK, got a %d-packet\n", k);
-        free(body); return -1;
+    for (;;) {
+        int k = pktline_next(&cur, end, &data, &dlen);
+        if (k == PKT_FLUSH) continue;
+        if (k != PKT_DATA) { fprintf(stderr, "gitclone: bad upload-pack reply (%d)\n", k);
+                             free(body); return -1; }
+        if (dlen >= 48 && !strncmp((const char *)data, "shallow ", 8)) {
+            if (*nshallow < 8) { memcpy(shallow[*nshallow], data + 8, 40);
+                                 shallow[*nshallow][40] = 0; (*nshallow)++; }
+            continue;
+        }
+        if (dlen >= 10 && !strncmp((const char *)data, "unshallow ", 10)) continue;
+        if (dlen >= 3 && (!strncmp((const char *)data, "NAK", 3) ||
+                          !strncmp((const char *)data, "ACK", 3))) break;
+        /* any other informational line: ignore and keep scanning */
     }
     *pack = cur;
     *packlen = (size_t)(end - cur);
@@ -109,9 +132,16 @@ static int fetch_pack(const char *base, const char *want,
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: gitclone <https-url> [dir]\n"); return 2; }
+    /* usage: gitclone [--depth N] <https-url> [dir] */
+    const char *urlarg = NULL, *dir = NULL; int depth = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--depth") && i + 1 < argc) depth = atoi(argv[++i]);
+        else if (!urlarg) urlarg = argv[i];
+        else if (!dir)    dir    = argv[i];
+    }
+    if (!urlarg) { fprintf(stderr, "usage: gitclone [--depth N] <https-url> [dir]\n"); return 2; }
 
-    char base[2048]; base_git(argv[1], base, sizeof base);
+    char base[2048]; base_git(urlarg, base, sizeof base);
     char url[2200]; snprintf(url, sizeof url, "%s/info/refs?service=git-upload-pack", base);
 
     /* G1: ref discovery. */
@@ -121,16 +151,19 @@ int main(int argc, char **argv) {
     }
     if (status / 100 != 2) { fprintf(stderr, "gitclone: HTTP %d fetching refs\n", status); free(body); return 1; }
 
-    printf("GITCLONE refs of %s:\n", argv[1]);
+    printf("GITCLONE refs of %s:\n", urlarg);
     char want[41], branch[128];
     int n = read_refs(body, len, want, branch);
     free(body);
     if (n < 0 || !want[0]) { fprintf(stderr, "gitclone: malformed ref advertisement\n"); return 1; }
-    printf("GITCLONE %d refs, HEAD=%s (%s)\n", n, want, branch);
+    printf("GITCLONE %d refs, HEAD=%s (%s)%s\n", n, want, branch,
+           depth > 0 ? " [shallow]" : "");
 
-    /* G2: fetch the packfile for HEAD. */
+    /* G2/G7: fetch the packfile for HEAD (shallow if depth > 0). */
     uint8_t *pbody = NULL; const uint8_t *pack = NULL; size_t plen = 0;
-    if (fetch_pack(base, want, &pbody, &pack, &plen) != 0) return 1;
+    char shallow[8][41]; int nshallow = 0;
+    if (fetch_pack(base, want, depth, &pbody, &pack, &plen, shallow, &nshallow) != 0) return 1;
+    if (depth > 0) printf("GITSHALLOW depth %d, %d boundary commit(s)\n", depth, nshallow);
 
     if (plen < 12 || memcmp(pack, "PACK", 4) != 0) {
         fprintf(stderr, "gitclone: not a packfile (%zu bytes)\n", plen);
@@ -163,19 +196,22 @@ int main(int argc, char **argv) {
     if (!head_ok) { fprintf(stderr, "gitclone: HEAD commit not in pack\n");
                     for (int i = 0; i < nc; i++) free(objs[i].data); free(objs); return 1; }
 
-    /* G4: write a real .git and check out the working tree (if a dir is given). */
+    /* G4: write a real .git and check out the working tree (if a dir is given).
+     * G7: a shallow clone also writes .git/shallow so git treats the grafted
+     * history as intentionally shallow. */
     int rc = 0;
-    if (argc >= 3) {
-        const char *dir = argv[2];
+    if (dir) {
         int ow = 0, files = 0;
         if (repo_init(dir) != 0 ||
             (ow = repo_write_objects(dir, objs, nc)) < 0 ||
             repo_write_refs(dir, branch, want) != 0 ||
+            repo_write_shallow(dir, shallow, nshallow) != 0 ||
             (files = repo_checkout(dir, objs, nc, want)) < 0) {
             fprintf(stderr, "gitclone: writing repo to %s failed\n", dir);
             rc = 1;
         } else {
-            printf("GITCHECKOUT %s: %d objects, %d files, branch %s -> OK\n", dir, ow, files, branch);
+            printf("GITCHECKOUT %s: %d objects, %d files, branch %s%s -> OK\n",
+                   dir, ow, files, branch, nshallow > 0 ? " (shallow)" : "");
         }
     } else {
         printf("GITUNPACK -> OK (no dir; not checked out)\n");
