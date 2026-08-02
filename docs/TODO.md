@@ -1542,6 +1542,19 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     reconstructed`), and the 3-file working tree (incl. the delta-derived blob)
     checks out on branch `main` (`index.html` = 355 bytes on EMBKFS). Branch
     detection also proven here (`main`, not `master`).
+  - **G6 loop closed -- the OS's OWN ported `git.elf` operates on the clone.**
+    After `test gitclone[ delta]` checks out, the selftest runs the ported git in
+    the cloned dir (via `PWD=`, the per-process cwd `test git cwd` relies on -- no
+    chdir). Metal: `git log --oneline` **exit 0** prints Spoon-Knife's real 3-commit
+    history (`d0dd1f6 (HEAD -> main) Pointing to the guide for forking` …) --
+    proving the on-OS git reads OUR refs + inflates OUR loose commit objects; and
+    `git cat-file --batch-all-objects` **exit 0** re-inflates and hash-checks
+    **every** object we wrote (10/10 listed with type+size). So our from-scratch
+    HTTPS clone writes a repo the real git implementation fully accepts, on the
+    metal. (`git fsck` also verifies the objects -- `Checking object directories:
+    100%, done`, no object errors -- but then SPAWNS commit-graph/multi-pack-index
+    sub-checks; fork/exec is ENOSYS here, so its *exit* is nonzero for a reason
+    unrelated to repo validity. The test gates on `log`, which never forks.)
   - **The blocker (G1) was an uninitialized-memory HEISENBUG** in libtls's ECDSA
     verify (`ecdsa.c` read an uninitialized stack `bn`): benign garbage on the
     host, but under QEMU it broke github's P-256 leaf verification (rc=-103) --

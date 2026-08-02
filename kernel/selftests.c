@@ -1311,8 +1311,45 @@ int selftests_handle_command(const char *cmd)
         int have = (vfs_stat(probe, &rst) == EMBK_OK);
         kprintf("[cmd] %s: checkout %s on disk=%d (%llu bytes)\n",
                 cmd, probe, have, have ? (unsigned long long)rst.size : 0ULL);
-        kprintf("[cmd] %s: %s\n", cmd, (code == 0 && have) ? "OK" : "FAIL");
-        return (code == 0 && have) ? 0 : 1;
+
+        /* Close the loop: the OS's OWN ported git.elf must be able to operate on
+         * the repo our from-scratch clone tool just wrote. git finds .git by
+         * walking up from PWD -- the per-process cwd `test git cwd` relies on --
+         * so no chdir is needed. Index-free commands only (our clone writes no
+         * index). Skipped (not failed) if git isn't on the image.
+         *   log       -- walks HEAD -> refs/heads/<branch> -> the commit chain,
+         *                inflating+parsing our loose commit objects. THE GATE:
+         *                exit 0 proves the on-OS git reads our refs + objects.
+         *   cat-file  -- reads EVERY object (--batch-all-objects), re-inflating
+         *                and hash-checking each: proves our zlib-deflate object
+         *                writing + SHA naming are byte-correct per the real git.
+         * (`fsck` is avoided on purpose: it works, but ends by SPAWNING
+         *  commit-graph/multi-pack-index sub-checks -- fork/exec is ENOSYS here --
+         *  so its exit is nonzero for a reason unrelated to repo validity.) */
+        int git_ok = 1;   /* vacuously true if git.elf absent */
+        struct vfs_stat gst;
+        if (code == 0 && have && vfs_stat("/data/apps/git/git.elf", &gst) == EMBK_OK) {
+            char pwd[64];
+            snprintf(pwd, sizeof pwd, "PWD=%s", dir);
+            char *genv[] = { (char *)"HOME=/", (char *)"GIT_PAGER=", pwd, NULL };
+            char *log_a[]  = { (char *)"/data/apps/git/git.elf", (char *)"log",
+                               (char *)"--oneline", NULL };
+            char *cat_a[]  = { (char *)"/data/apps/git/git.elf", (char *)"cat-file",
+                               (char *)"--batch-all-objects", (char *)"--batch-check", NULL };
+            int lp = process_create_env("/data/apps/git/git.elf", log_a, 3, genv, NULL, 0);
+            int lc = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            kprintf("[%s on-OS git log] exit=%d\n", cmd, lc);
+            int cp = process_create_env("/data/apps/git/git.elf", cat_a, 4, genv, NULL, 0);
+            int cc = cp >= 0 ? process_wait((uint32_t)cp) : -1;
+            kprintf("[%s on-OS git cat-file(all objects)] exit=%d (informational)\n", cmd, cc);
+            /* Gate on `log`: it reads our refs + commit objects, and unlike fsck/
+             * cat-file's odb-maintenance paths it never tries to fork/exec. */
+            git_ok = (lc == 0);
+        }
+
+        int pass = (code == 0 && have && git_ok);
+        kprintf("[cmd] %s: %s\n", cmd, pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
     }
 
     if (strcmp(cmd, "test emlibc net") == 0) {

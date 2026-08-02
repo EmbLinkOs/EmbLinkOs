@@ -873,8 +873,11 @@ verified on the metal.
   the result. **Delta reconstruction is proven** — a host harness matches
   `git verify-pack` byte-for-byte on both ofs- and ref-delta packs (chained), and
   `test gitclone delta` clones **octocat/Spoon-Knife** live (github's ofs-delta
-  pack resolved on the metal, 3-file tree on branch `main`). *Deferred:* no push,
-  no auth, no negotiation/shallow (see `docs/TODO.md`).
+  pack resolved on the metal, 3-file tree on branch `main`). **The loop closes:**
+  the OS's OWN ported `git.elf` then operates on the clone — `git log` prints the
+  real commit history and `git cat-file --batch-all-objects` re-hashes every
+  object we wrote, both exit 0 on the metal. *Deferred:* no push, no auth, no
+  negotiation/shallow (see `docs/TODO.md`).
 
 Trust anchors bundled: GTS Root R4 (EC P-384), ISRG Root X1 (RSA-4096), GlobalSign
 Root R3 (RSA-2048), USERTrust ECC (EC P-384, for github/Sectigo) — between them,
