@@ -1,0 +1,7 @@
+# pkgprobe v1.1.0 -- a benign update: SAME authority as v1.0.0, new version.
+# `pkg install` should update freely and leave v1.0.0 as the rollback point.
+name:    pkgprobe
+version: 1.1.0
+caps:    filesystem
+grant:   ro /system
+grant:   rw /data/apps/pkgprobe

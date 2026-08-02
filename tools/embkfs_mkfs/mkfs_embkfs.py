@@ -779,6 +779,14 @@ def discover_userland_objects(build_dir="build"):
         badsig = b"\n".join(lines)
         objects.append((b"data/staging/pkgprobe_badsig/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, probe_embx))
         objects.append((b"data/staging/pkgprobe_badsig/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, badsig))
+    # PK3 update/rollback: a benign v1.1 (same authority) and a WIDER v2 (adds
+    # `network`) -- the latter must be refused as a silent privilege escalation.
+    for tag, sub in (("pkgprobe_v11", "pk_v11"), ("pkgprobe_wide", "pk_wide")):
+        e = _read_file(f"{build_dir}/{sub}/pkgprobe.embx")
+        p = _read_file(f"{build_dir}/{sub}/pkgprobe.pkg")
+        if e is not None and p is not None:
+            objects.append((f"data/staging/{tag}/pkgprobe.embx".encode(), L.DT_REG, L.S_IFREG | 0o755, e))
+            objects.append((f"data/staging/{tag}/pkgprobe.pkg".encode(),  L.DT_REG, L.S_IFREG | L.PERM_FILE, p))
 
     # The kernel's own .embdbg (EMBDBG_Specification.md §7): a LINE+FUNCS sidecar
     # the kernel loads at boot so isr_handler symbolizes a panic to func:line.

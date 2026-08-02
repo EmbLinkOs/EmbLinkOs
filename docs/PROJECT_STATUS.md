@@ -947,16 +947,18 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
   `pkgprobe`'s authority is now declared once in `user/pkg/pkgprobe.pkgspec` (was
   scattered across `mkembx`/`mkpkg` flags); `test pkg` runs green on the generated
   bundle.
-- **PK3 — signing** (`tools/embx/pkgsign.py`): every manifest is signed at build
-  time (ECDSA P-256 over the canonical manifest); `pkg` verifies it against the
-  trusted key baked into `user/pkg/pkgkey.h` (our own `ecdsa_verify`) and refuses
-  anything unsigned, altered, or wrongly-keyed. `test pkg` rejects both a tampered
-  binary (build_id fails) and an altered signature (intact binary, mangled sig).
-  Trust is in the signature, not the channel.
-- *Deferred (rest of PK3 + PK4 + PK2b):* snapshot-backed atomic update/rollback (no
-  userspace snapshot syscall yet), the git registry, and driving pkggen from an
-  EmbBuild `build.ebm` `package:` stanza (on-device). No dependency graph, ever
-  (the only "dependency" is the `abi` integer).
+- **PK3 — signing + update/rollback**. *Signing*: `tools/embx/pkgsign.py` signs
+  each manifest (ECDSA P-256 over the canonical manifest); `pkg` verifies against
+  the trusted key in `user/pkg/pkgkey.h` (our own `ecdsa_verify`) and refuses
+  unsigned/altered/wrongly-keyed manifests — trust is in the signature, not the
+  channel. *Update/rollback*: `pkg install` over an installed version retains the
+  previous bundle as the rollback point and **refuses an update that widens caps
+  or namespace** unless `--allow-widen` (a new version cannot silently widen its
+  reach); `pkg rollback/remove/info` complete the set. `test pkg` runs 8 checks
+  green on the metal.
+- *Deferred (PK4 + PK2b):* the git registry, and driving pkggen from an EmbBuild
+  `build.ebm` `package:` stanza (on-device). No dependency graph, ever (the only
+  "dependency" is the `abi` integer).
 
 ---
 

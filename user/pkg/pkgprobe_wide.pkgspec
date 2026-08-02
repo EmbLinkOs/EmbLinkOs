@@ -1,0 +1,8 @@
+# pkgprobe 2.0.0 -- a WIDER version: it additionally declares `network`.
+# Installing it over v1.0.0 must be REFUSED (silent privilege escalation),
+# unless the user explicitly consents with --allow-widen.
+name:    pkgprobe
+version: 2.0.0
+caps:    filesystem network
+grant:   ro /system
+grant:   rw /data/apps/pkgprobe

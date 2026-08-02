@@ -19,15 +19,21 @@ and EmbBuild.*
 > binary's cap table AND the manifest follow; you cannot build a self-disagreeing
 > bundle (§4). `pkgprobe`'s authority is declared once in
 > `user/pkg/pkgprobe.pkgspec`.
-> **PK3 signing** — every manifest is signed at build time (`tools/embx/pkgsign.py`,
-> ECDSA P-256 over the canonical manifest) and `pkg` VERIFIES it against the
-> trusted public key baked into `user/pkg/pkgkey.h` (our own `ecdsa_verify`).
-> `pkg install` refuses an unsigned, altered, or wrongly-keyed manifest —
-> `test pkg` proves both a tampered binary (build_id fails) AND an altered
-> signature (intact binary, mangled sig) are rejected. Trust is in the signature,
-> not the channel (§9.2). *Remaining:* PK3's update/rollback (needs a userspace
-> snapshot API) + the registry list/info; PK4 the git registry; and PK2b, driving
-> pkggen from an EmbBuild `build.ebm` `package:` stanza on-device.
+> **PK3 SHIPPED** — (a) **signing**: every manifest is signed at build time
+> (`tools/embx/pkgsign.py`, ECDSA P-256 over the canonical manifest); `pkg`
+> VERIFIES it against the trusted key baked into `user/pkg/pkgkey.h` (our own
+> `ecdsa_verify`) and refuses unsigned/altered/wrongly-keyed manifests. (b)
+> **update + rollback + authority re-negotiation**: `pkg install` over an
+> installed version retains the previous bundle as the rollback point (§6 — each
+> app is self-contained, so its 3 files ARE the rollback point, no whole-FS
+> snapshot needed), and REFUSES an update that WIDENS caps/namespace unless
+> `--allow-widen` — a new version cannot silently widen its reach. `pkg
+> rollback/remove/info` round it out. `test pkg` (8 checks, metal) proves
+> tampered-binary + altered-signature rejection, update, rollback, refused
+> widening, and consented widening. *Remaining:* an EMBKFS-snapshot-backed
+> variant of update (a future optimization once a snapshot syscall exists); PK4
+> the git registry; and PK2b, driving pkggen from an EmbBuild `build.ebm`
+> `package:` stanza on-device.
 > The rest of this doc is the shape decided before code, like the userspace.*
 
 ## 0. Thesis

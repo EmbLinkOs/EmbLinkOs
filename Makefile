@@ -593,9 +593,17 @@ build/pkgprobe.elf: build/crt0.o build/syscalls.o build/pkgprobe.o user/lib/newl
 # SDK generator -- the caps, the .ns and the manifest are consistent by
 # construction (was two separate mkembx/mkpkg calls with the authority scattered
 # across the flags; now the authority is declared once, in the spec).
+PKGGEN_DEPS := tools/embx/pkggen.py tools/embx/mkembx.py tools/embx/mkpkg.py \
+               tools/embx/pkgsign.py tools/embx/pkgkey_dev.pem
 build/pkgprobe.embx build/pkgprobe.ns build/pkgprobe.pkg &: build/pkgprobe.elf \
-        user/pkg/pkgprobe.pkgspec tools/embx/pkggen.py tools/embx/mkembx.py tools/embx/mkpkg.py | $(BUILD)
+        user/pkg/pkgprobe.pkgspec $(PKGGEN_DEPS) | $(BUILD)
 	python3 tools/embx/pkggen.py user/pkg/pkgprobe.pkgspec build/pkgprobe.elf build
+# Two more versions for the PK3 update/rollback/re-negotiation test: a benign
+# v1.1 (same authority) and a WIDER v2 (adds `network`, must be refused).
+build/pk_v11/pkgprobe.pkg: build/pkgprobe.elf user/pkg/pkgprobe_v11.pkgspec $(PKGGEN_DEPS) | $(BUILD)
+	mkdir -p build/pk_v11 && python3 tools/embx/pkggen.py user/pkg/pkgprobe_v11.pkgspec build/pkgprobe.elf build/pk_v11
+build/pk_wide/pkgprobe.pkg: build/pkgprobe.elf user/pkg/pkgprobe_wide.pkgspec $(PKGGEN_DEPS) | $(BUILD)
+	mkdir -p build/pk_wide && python3 tools/embx/pkggen.py user/pkg/pkgprobe_wide.pkgspec build/pkgprobe.elf build/pk_wide
 
 # pkgfetch -- native PyPI installer for pure-Python wheels (libtls fetch + our
 # own inflate + zip reader). Auto-packed as /data/apps/pkgfetch/pkgfetch.elf.
@@ -1118,6 +1126,7 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf build/pkg.elf build/pkgprobe.embx build/pkgprobe.pkg \
+               build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
 
 # STAGED_APPS: binaries built OUTSIDE this tree and dropped into build/ to be

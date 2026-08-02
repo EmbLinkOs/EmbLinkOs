@@ -1389,17 +1389,27 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
   drive pkggen (or EmbLD directly) from an EmbBuild `build.ebm` `package:` stanza,
   so an app declares its authority as part of building ON THE OS (needs on-OS
   linking of a newlib app first).
-- [~] **PK3** — **signing DONE, metal-proven.** Every manifest is signed at build
-  time (`tools/embx/pkgsign.py`: ECDSA P-256 over the canonical manifest — the file
-  with the `signature:` line removed, so it covers name/version/abi/build_id/caps/
-  namespace/provides); `pkg` verifies it against the trusted public key baked into
-  `user/pkg/pkgkey.h` using our own `ecdsa_verify`. `pkg install` refuses anything
-  unsigned, altered, or signed by the wrong key. `test pkg` proves BOTH a tampered
-  binary (build_id fails) AND an altered signature (intact binary, mangled sig hex)
-  are rejected. Signing is part of `pkggen` (build key `tools/embx/pkgkey_dev.pem`,
-  a labelled dev key). Trust is in the signature, not the channel (§9.2).
-  **Remaining in PK3:** snapshot-backed atomic update/rollback (needs a userspace
-  EMBKFS snapshot syscall — none exists yet) + `pkg info`/richer registry.
+- [x] ~~**PK3** — signing + update/rollback + registry.~~ **DONE, metal-proven
+  (`test pkg`, 8 checks).**
+  - **Signing**: `tools/embx/pkgsign.py` signs each manifest (ECDSA P-256 over the
+    canonical manifest — the file minus its `signature:` line, covering name/
+    version/abi/build_id/caps/namespace/provides). `pkg` verifies against the
+    trusted key in `user/pkg/pkgkey.h` (our own `ecdsa_verify`) and refuses
+    unsigned/altered/wrongly-keyed manifests. Signing is part of `pkggen` (dev key
+    `tools/embx/pkgkey_dev.pem`). Trust is in the signature, not the channel (§9.2).
+  - **Update + rollback + authority re-negotiation**: `pkg install` over an
+    installed version retains the previous bundle at `/data/pkg/versions/<name>/
+    prev/` as the rollback point (§6 — each app is self-contained, so its 3 files
+    ARE the rollback point; no whole-FS snapshot needed), and REFUSES an update
+    that WIDENS caps or namespace (`+ NEW capability: network`) unless
+    `--allow-widen` — a new version cannot silently widen its reach.
+    `pkg rollback/remove/info` complete the set.
+  - **Proven**: `test pkg` install → run confined → tampered-binary reject →
+    bad-signature reject → update to v1.1 → rollback to v1.0 → widening update
+    REFUSED → same update with `--allow-widen` accepted.
+  - *Optional future*: an EMBKFS-snapshot-backed variant of update (needs a
+    userspace snapshot syscall — none exists yet); the retained-bundle rollback
+    above is the honest per-package equivalent.
 - [ ] **PK4** — the git registry (`emblink-packages`): signed manifests in git,
   binaries as release assets; fetch over HTTP (mirror pre-TLS, direct once TLS
   lands). Rides the net stack.

@@ -1529,7 +1529,30 @@ int selftests_handle_command(const char *cmd)
         kprintf("[pkg] 4 verify bad SIGNATURE -> %s (signature fails; refused=%d)\n",
                 c4 != 0 ? "REJECTED" : "ACCEPTED", c4 != 0);
 
-        int pass = (c1 == 0 && c2 == 0 && c3 != 0 && c4 != 0);
+        /* 5. UPDATE to v1.1 (same authority) -> OK; retains v1.0 as rollback point. */
+        char *a5[] = { (char *)sp, (char *)"install", (char *)"/data/staging/pkgprobe_v11", NULL };
+        int c5 = process_wait((uint32_t)process_create_caps(sp, a5, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 5 update -> v1.1 = %s\n", c5 == 0 ? "OK" : "FAIL");
+
+        /* 6. ROLLBACK to the retained v1.0. */
+        char *a6[] = { (char *)sp, (char *)"rollback", (char *)"pkgprobe", NULL };
+        int c6 = process_wait((uint32_t)process_create_caps(sp, a6, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 6 rollback -> v1.0 = %s\n", c6 == 0 ? "OK" : "FAIL");
+
+        /* 7. UPDATE to a WIDER version (adds `network`) -> REFUSED (silent
+         *    privilege escalation caught by authority re-negotiation). */
+        char *a7[] = { (char *)sp, (char *)"install", (char *)"/data/staging/pkgprobe_wide", NULL };
+        int c7 = process_wait((uint32_t)process_create_caps(sp, a7, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 7 update -> wider (adds network) -> %s (refused=%d)\n",
+                c7 != 0 ? "REJECTED" : "ACCEPTED", c7 != 0);
+
+        /* 8. the same wider update, explicitly consented via --allow-widen -> OK. */
+        char *a8[] = { (char *)sp, (char *)"install", (char *)"--allow-widen", (char *)"/data/staging/pkgprobe_wide", NULL };
+        int c8 = process_wait((uint32_t)process_create_caps(sp, a8, 4, env, NULL, 0, caps));
+        kprintf("[pkg] 8 update -> wider WITH --allow-widen = %s\n", c8 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && c2 == 0 && c3 != 0 && c4 != 0 &&
+                    c5 == 0 && c6 == 0 && c7 != 0 && c8 == 0);
         kprintf("[cmd] test pkg: %s\n", pass ? "OK" : "FAIL");
         return pass ? 0 : 1;
     }

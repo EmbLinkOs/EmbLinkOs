@@ -7,12 +7,20 @@
  * MEDIATES a grant the kernel then enforces -- and cross-checks the manifest
  * against the real EMBX so the declaration cannot drift from the binary.
  *
- *   pkg verify  <staged-dir>   -- check a bundle (build_id, caps, abi); no adopt.
- *   pkg install <staged-dir>   -- verify, present the declared authority, adopt
- *                                 it into /data/apps/<name>/ + register it.
- *   pkg run     <name>         -- spawn an installed app under EXACTLY its
- *                                 declared caps (SET_CAPS) + namespace (NS_BIND).
- *   pkg list                   -- installed packages (name version build_id).
+ *   pkg verify   <staged-dir>          -- check a bundle (signature, build_id,
+ *                                         caps, abi); no adopt.
+ *   pkg install [--allow-widen] <dir>  -- verify, present the declared authority,
+ *                                         adopt into /data/apps/<name>/. On an
+ *                                         UPDATE, re-negotiate authority: a version
+ *                                         that WIDENS caps/namespace is refused
+ *                                         unless --allow-widen, and the previous
+ *                                         version is retained as a rollback point.
+ *   pkg run      <name>                -- spawn an installed app under EXACTLY its
+ *                                         declared caps (SET_CAPS) + ns (NS_BIND).
+ *   pkg rollback <name>                -- restore the retained previous version.
+ *   pkg remove   <name>                -- delete the bundle + its rollback point.
+ *   pkg info     <name>                -- show an installed package's authority.
+ *   pkg list                           -- installed packages.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -161,39 +169,160 @@ static int write_ns(const char *dir, const struct pkg_manifest *m) {
     return write_file(path, buf, o);
 }
 
-static int cmd_install(const char *dir) {
+/* Parse a manifest file at `path` into m. 0 on success, -1 if absent/bad. */
+static int load_manifest_file(const char *path, struct pkg_manifest *m) {
+    size_t n; char *t = read_file(path, &n);
+    if (!t) return -1;
+    char err[256]; int rc = pkg_manifest_parse(t, n, m, err, sizeof err); free(t);
+    return rc == 0 ? 0 : -1;
+}
+
+/* Read the currently-installed manifest for `name` into m. 0 if installed. */
+static int load_installed(const char *name, struct pkg_manifest *m) {
+    char mpath[1024]; snprintf(mpath, sizeof mpath, "%s/%s/%s.pkg", APPS_ROOT, name, name);
+    return load_manifest_file(mpath, m);
+}
+
+/* Does `old` already grant a bind covering (prefix @ mode ro)? old rw covers any
+ * mode at the same prefix; old ro covers only a new ro. */
+static int ns_covered(const struct pkg_manifest *old, int ro, const char *prefix) {
+    for (int i = 0; i < old->nns; i++)
+        if (!strcmp(old->ns[i].prefix, prefix) && (old->ns[i].ro == 0 || ro == 1)) return 1;
+    return 0;
+}
+
+/* Would adopting `nw` grant MORE authority than the installed `old`? Prints the
+ * widening delta. A new cap, a new namespace prefix, or ro->rw on a prefix all
+ * count -- so a new version cannot silently widen its reach (§6). */
+static int authority_widens(const struct pkg_manifest *old, const struct pkg_manifest *nw) {
+    int widen = 0;
+    for (int i = 0; i < nw->ncaps; i++)
+        if (!cap_in(old->caps, old->ncaps, nw->caps[i])) {
+            printf("    + NEW capability: %s\n", pkg_cap_name(nw->caps[i])); widen = 1; }
+    for (int i = 0; i < nw->nns; i++)
+        if (!ns_covered(old, nw->ns[i].ro, nw->ns[i].prefix)) {
+            printf("    + WIDER namespace: %s %s\n", nw->ns[i].ro ? "ro" : "rw", nw->ns[i].prefix); widen = 1; }
+    return widen;
+}
+
+/* Place a verified bundle under /data/apps/<name>/: the EMBX, the .ns (from the
+ * manifest home enforces), the manifest record, and a registry line. */
+static int adopt(const char *name, const char *provides, const char *src_embx,
+                 const char *src_manifest, const struct pkg_manifest *m) {
+    char appdir[512], dst[1024], mdst[1024];
+    mkdir(APPS_ROOT, 0755);
+    snprintf(appdir, sizeof appdir, "%s/%s", APPS_ROOT, name);
+    mkdir(appdir, 0755);
+    snprintf(dst, sizeof dst, "%s/%s", appdir, basename_of(provides));
+    if (copy_file(src_embx, dst) != 0) { fprintf(stderr, "pkg: failed to write %s\n", dst); return -1; }
+    if (write_ns(appdir, m) != 0) { fprintf(stderr, "pkg: failed to write the .ns\n"); return -1; }
+    snprintf(mdst, sizeof mdst, "%s/%s.pkg", appdir, name);
+    copy_file(src_manifest, mdst);
+    mkdir(PKG_ROOT, 0755);
+    char reg[600]; snprintf(reg, sizeof reg, "%s/registry", PKG_ROOT);
+    FILE *rf = fopen(reg, "ab");
+    if (rf) { char bid[65]; for (int i = 0; i < 32; i++) sprintf(bid + 2*i, "%02x", m->build_id[i]);
+              fprintf(rf, "%s\t%s\t%s\n", name, m->version, bid); fclose(rf); }
+    return 0;
+}
+
+/* The retained-previous-version dir (the rollback point). */
+static void prev_dir(const char *name, char *out, size_t cap) {
+    snprintf(out, cap, "%s/versions/%s/prev", PKG_ROOT, name);
+}
+
+/* Retain the currently-installed bundle so an update is reversible. Each app is
+ * a self-contained bundle (§6), so keeping its 3 files IS the rollback point --
+ * no whole-FS snapshot needed (an EMBKFS-snapshot-backed variant is a future
+ * optimization once a snapshot syscall exists). */
+static int retain_current(const char *name, const struct pkg_manifest *old) {
+    char appdir[512], prev[600], s[1200], d[1200];
+    snprintf(appdir, sizeof appdir, "%s/%s", APPS_ROOT, name);
+    mkdir(PKG_ROOT, 0755);
+    char t[700]; snprintf(t, sizeof t, "%s/versions", PKG_ROOT); mkdir(t, 0755);
+    snprintf(t, sizeof t, "%s/versions/%s", PKG_ROOT, name); mkdir(t, 0755);
+    prev_dir(name, prev, sizeof prev); mkdir(prev, 0755);
+    snprintf(s, sizeof s, "%s/%s", appdir, basename_of(old->provides));
+    snprintf(d, sizeof d, "%s/%s", prev, basename_of(old->provides)); copy_file(s, d);
+    snprintf(s, sizeof s, "%s/%s.pkg", appdir, name); snprintf(d, sizeof d, "%s/%s.pkg", prev, name); copy_file(s, d);
+    snprintf(s, sizeof s, "%s/%s.ns", appdir, name);  snprintf(d, sizeof d, "%s/%s.ns", prev, name);  copy_file(s, d);
+    return 0;
+}
+
+static int cmd_install(const char *dir, int allow_widen) {
     struct pkg_manifest m; struct embx_info ei; char binpath[1024]; int sig_ok;
     if (load_bundle(dir, &m, &ei, binpath, sizeof binpath, &sig_ok) != 0) return 1;
 
     printf("PKG install %s %s (abi %u)\n", m.name, m.version, m.abi);
     if (cross_check(&m, &ei, sig_ok) != 0) { printf("PKG install: REJECTED (unsigned / altered / does not match the binary)\n"); return 1; }
     printf("  signature: valid (trusted build key)\n");
+
+    /* Update-aware: if already installed, re-negotiate authority before adopting.
+     * A version that declares MORE than the installed one must be consented to. */
+    struct pkg_manifest old; int updating = (load_installed(m.name, &old) == 0);
+    if (updating) {
+        printf("  updating: %s %s -> %s\n", m.name, old.version, m.version);
+        if (authority_widens(&old, &m)) {
+            if (!allow_widen) { printf("PKG install: REJECTED -- this update WIDENS authority beyond the installed "
+                                       "version. Re-run with --allow-widen to consent.\n"); return 1; }
+            printf("  (the wider authority above was consented to via --allow-widen)\n");
+        }
+    }
     present_authority(&m);
 
-    /* Adopt: place the bundle under /data/apps/<name>/ (direct copy -- no atomic
-     * snapshot yet; there is no userspace EMBKFS snapshot API, that is PK3). */
-    char appdir[512], dst[1024], mdst[1024];
-    mkdir(APPS_ROOT, 0755);                            /* exists; EEXIST is fine */
-    snprintf(appdir, sizeof appdir, "%s/%s", APPS_ROOT, m.name);
-    if (mkdir(appdir, 0755) != 0) { /* may already exist on reinstall */ }
-
-    snprintf(dst, sizeof dst, "%s/%s", appdir, basename_of(m.provides));
-    if (copy_file(binpath, dst) != 0) { fprintf(stderr, "pkg: failed to write %s\n", dst); return 1; }
-    if (write_ns(appdir, &m) != 0) { fprintf(stderr, "pkg: failed to write the .ns\n"); return 1; }
-
-    /* Keep the manifest as the install record. */
+    if (updating) retain_current(m.name, &old);        /* the rollback point */
     char msrc[1024]; find_manifest(dir, msrc, sizeof msrc);
-    snprintf(mdst, sizeof mdst, "%s/%s.pkg", appdir, m.name);
-    copy_file(msrc, mdst);
+    if (adopt(m.name, m.provides, binpath, msrc, &m) != 0) return 1;
 
-    /* Register (name  version  build_id). */
-    mkdir(PKG_ROOT, 0755);
-    char reg[600]; snprintf(reg, sizeof reg, "%s/registry", PKG_ROOT);
-    FILE *rf = fopen(reg, "ab");
-    if (rf) { char bid[65]; for (int i = 0; i < 32; i++) sprintf(bid + 2*i, "%02x", m.build_id[i]);
-              fprintf(rf, "%s\t%s\t%s\n", m.name, m.version, bid); fclose(rf); }
+    printf("PKG %s %s -> %s/%s -> OK\n", updating ? "update" : "install", m.name, APPS_ROOT, m.name);
+    return 0;
+}
 
-    printf("PKG install %s -> %s -> OK\n", m.name, appdir);
+static int cmd_rollback(const char *name) {
+    char prev[600], mpath[900], binprev[1200];
+    prev_dir(name, prev, sizeof prev);
+    snprintf(mpath, sizeof mpath, "%s/%s.pkg", prev, name);
+    size_t n; char *t = read_file(mpath, &n);
+    if (!t) { fprintf(stderr, "pkg: no rollback point for %s (nothing to roll back to)\n", name); return 1; }
+    struct pkg_manifest pm; char err[256]; int rc = pkg_manifest_parse(t, n, &pm, err, sizeof err); free(t);
+    if (rc != 0) { fprintf(stderr, "pkg: retained manifest bad: %s\n", err); return 1; }
+    snprintf(binprev, sizeof binprev, "%s/%s", prev, basename_of(pm.provides));
+    if (adopt(name, pm.provides, binprev, mpath, &pm) != 0) return 1;
+    printf("PKG rollback %s -> %s -> OK\n", name, pm.version);
+    return 0;
+}
+
+static int cmd_remove(const char *name) {
+    struct pkg_manifest m;
+    if (load_installed(name, &m) != 0) { fprintf(stderr, "pkg: %s is not installed\n", name); return 1; }
+    char appdir[512], p[1200], prev[600];
+    snprintf(appdir, sizeof appdir, "%s/%s", APPS_ROOT, name);
+    snprintf(p, sizeof p, "%s/%s", appdir, basename_of(m.provides)); remove(p);
+    snprintf(p, sizeof p, "%s/%s.ns", appdir, name);  remove(p);
+    snprintf(p, sizeof p, "%s/%s.pkg", appdir, name); remove(p);
+    remove(appdir);
+    prev_dir(name, prev, sizeof prev);
+    snprintf(p, sizeof p, "%s/%s", prev, basename_of(m.provides)); remove(p);
+    snprintf(p, sizeof p, "%s/%s.ns", prev, name);  remove(p);
+    snprintf(p, sizeof p, "%s/%s.pkg", prev, name); remove(p);
+    remove(prev);
+    printf("PKG remove %s -> OK\n", name);
+    return 0;
+}
+
+static int cmd_info(const char *name) {
+    struct pkg_manifest m;
+    if (load_installed(name, &m) != 0) { fprintf(stderr, "pkg: %s is not installed\n", name); return 1; }
+    printf("PKG info %s\n  version: %s  abi: %u\n", m.name, m.version, m.abi);
+    printf("  capabilities:");
+    for (int i = 0; i < m.ncaps; i++) printf(" %s", pkg_cap_name(m.caps[i]));
+    if (!m.ncaps) printf(" (none)");
+    printf("\n  namespace:\n");
+    for (int i = 0; i < m.nns; i++) printf("    %s %s\n", m.ns[i].ro ? "ro" : "rw", m.ns[i].prefix);
+    char prev[600], mpath[900]; prev_dir(name, prev, sizeof prev);
+    snprintf(mpath, sizeof mpath, "%s/%s.pkg", prev, name);
+    struct pkg_manifest pm;
+    if (load_manifest_file(mpath, &pm) == 0) printf("  rollback available -> %s\n", pm.version);
     return 0;
 }
 
@@ -239,11 +368,26 @@ static int cmd_list(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: pkg verify|install <dir> | run <name> | list\n"); return 2; }
-    if (!strcmp(argv[1], "verify")  && argc >= 3) return cmd_verify(argv[2]);
-    if (!strcmp(argv[1], "install") && argc >= 3) return cmd_install(argv[2]);
-    if (!strcmp(argv[1], "run")     && argc >= 3) return cmd_run(argv[2], argc - 3, argv + 3);
-    if (!strcmp(argv[1], "list"))                 return cmd_list();
+    if (argc < 2) {
+        fprintf(stderr, "usage: pkg verify|install [--allow-widen] <dir>\n"
+                        "       pkg run|rollback|remove|info <name> | pkg list\n");
+        return 2;
+    }
+    if (!strcmp(argv[1], "verify")   && argc >= 3) return cmd_verify(argv[2]);
+    if (!strcmp(argv[1], "install")  && argc >= 3) {
+        int allow = 0; const char *dir = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "--allow-widen")) allow = 1;
+            else dir = argv[i];
+        }
+        if (!dir) { fprintf(stderr, "pkg install: need a bundle dir\n"); return 2; }
+        return cmd_install(dir, allow);
+    }
+    if (!strcmp(argv[1], "run")      && argc >= 3) return cmd_run(argv[2], argc - 3, argv + 3);
+    if (!strcmp(argv[1], "rollback") && argc >= 3) return cmd_rollback(argv[2]);
+    if (!strcmp(argv[1], "remove")   && argc >= 3) return cmd_remove(argv[2]);
+    if (!strcmp(argv[1], "info")     && argc >= 3) return cmd_info(argv[2]);
+    if (!strcmp(argv[1], "list"))                  return cmd_list();
     fprintf(stderr, "pkg: unknown command '%s'\n", argv[1]);
     return 2;
 }
