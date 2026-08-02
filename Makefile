@@ -1544,6 +1544,22 @@ run-uefi: uefi.img embkfs.img
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
 
+# SINGLE self-contained UEFI device: one GPT disk = [ESP: loader+kernel] +
+# [EMBKFS: root]. This is what you dd onto a real USB stick -- the firmware
+# launches BOOTX64.EFI and the kernel finds its root on the SAME device (no
+# second drive). `make run-uefi-usb` proves single-device boot under OVMF.
+uefi-usb.img: $(BOOTX64) embkfs.img tools/mkuefidisk.sh
+	tools/mkuefidisk.sh $(BOOTX64) $@ embkfs.img
+
+run-uefi-usb: uefi-usb.img
+	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
+	qemu-system-x86_64 -cpu max \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
+	    -drive format=raw,file=uefi-usb.img,if=ide,index=0 \
+	    -usb -device usb-tablet \
+	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi $(NET)
+
 # UEFI copy-on-write: the exact twin of run-embkfs-cow but booted via OVMF + our
 # EFI loader instead of the BIOS boot disk. Boots a PRISTINE copy of the EMBKFS
 # each run (writes hit the scratch, never the master), same interactive display
