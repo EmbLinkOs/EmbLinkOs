@@ -111,6 +111,14 @@ int pkg_manifest_parse(const char *text, size_t len, struct pkg_manifest *m,
                 m->caps[m->ncaps++] = id;
                 tok = strtok(NULL, " ,\t");
             }
+        } else if (!strcmp(key, "signature")) {
+            if (strlen(val) < 128) FAIL("signature must be 128 hex chars (r||s)");
+            for (int i = 0; i < 64; i++) {
+                int hi = hexv(val[2*i]), lo = hexv(val[2*i+1]);
+                if (hi < 0 || lo < 0) FAIL("signature is not hex");
+                m->signature[i] = (uint8_t)((hi << 4) | lo);
+            }
+            m->have_sig = 1;
         } else if (!strcmp(key, "namespace")) {
             in_ns = 1;                                  /* block follows */
         } else {

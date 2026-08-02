@@ -77,8 +77,13 @@ def main():
     subprocess.run([sys.executable, os.path.join(here, "mkpkg.py"), embx, pkgf,
                     "--name", name, "--version", version] + ns_args, check=True)
 
-    print(f"pkggen: {name} v{version} -> {name}.{{embx,ns,pkg}}  "
-          f"(caps=[{','.join(caps)}], {len(grant)} grant) -- three consistent views from one spec")
+    # 4) SIGN the manifest with the build key (PK3): the OS verifies this against
+    #    the trusted key in user/pkg/pkgkey.h. Signing is part of building.
+    key = os.environ.get("EMBK_PKG_SIGN_KEY", os.path.join(here, "pkgkey_dev.pem"))
+    subprocess.run([sys.executable, os.path.join(here, "pkgsign.py"), pkgf, key], check=True)
+
+    print(f"pkggen: {name} v{version} -> {name}.{{embx,ns,pkg}} (signed)  "
+          f"(caps=[{','.join(caps)}], {len(grant)} grant) -- consistent views from one spec")
 
 if __name__ == "__main__":
     main()

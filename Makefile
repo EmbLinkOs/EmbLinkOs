@@ -573,9 +573,11 @@ build/pkg_manifest.o: user/pkg/manifest.c user/pkg/manifest.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -c $< -o $@
 build/pkg_embxinfo.o: user/pkg/embxinfo.c user/pkg/embxinfo.h user/pkg/manifest.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
-build/pkg.o: user/bin/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/lib/embk.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -c $< -o $@
-PKG_OBJS := build/pkg.o build/pkg_manifest.o build/pkg_embxinfo.o build/tls_sha256.o
+build/pkg.o: user/bin/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/pkg/pkgkey.h user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -Iuser/lib/tls/crypto -Ikernel -c $< -o $@
+# pkg verifies the manifest signature with ECDSA P-256 (tls_ecdsa + tls_bignum).
+PKG_OBJS := build/pkg.o build/pkg_manifest.o build/pkg_embxinfo.o \
+            build/tls_sha256.o build/tls_ecdsa.o build/tls_bignum.o
 build/pkg.elf: build/crt0.o build/syscalls.o $(PKG_OBJS) user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(PKG_OBJS) -lc -lgcc -o $@
 

@@ -24,6 +24,8 @@ struct pkg_manifest {
     struct pkg_ns ns[PKG_MAX_NS];
     int      nns;
     char     provides[256];        /* the EMBX filename within the bundle */
+    uint8_t  signature[64];        /* ECDSA P-256 r||s over the canonical manifest */
+    int      have_sig;
 };
 
 /* Capability id <-> lowercase name (EMBX §5.6 / kernel capabilities.h). */

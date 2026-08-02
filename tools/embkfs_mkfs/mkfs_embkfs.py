@@ -766,9 +766,19 @@ def discover_userland_objects(build_dir="build"):
     if probe_embx is not None and probe_pkg is not None:
         objects.append((b"data/staging/pkgprobe/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, probe_embx))
         objects.append((b"data/staging/pkgprobe/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, probe_pkg))
-        bad = bytearray(probe_embx); bad[-1] ^= 0xFF          # corrupt one payload byte
+        # (a) tampered BINARY: a flipped payload byte -> build_id no longer recomputes.
+        bad = bytearray(probe_embx); bad[-1] ^= 0xFF
         objects.append((b"data/staging/pkgprobe_bad/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, bytes(bad)))
         objects.append((b"data/staging/pkgprobe_bad/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, probe_pkg))
+        # (b) altered MANIFEST: a flipped signature hex digit -> signature fails
+        #     (the binary is intact, so this isolates the signature check).
+        lines = bytearray(probe_pkg).split(b"\n")
+        for i, ln in enumerate(lines):
+            if ln.startswith(b"signature:") and len(ln) > 12:
+                lines[i] = ln[:-1] + (b"0" if ln[-1:] != b"0" else b"1")
+        badsig = b"\n".join(lines)
+        objects.append((b"data/staging/pkgprobe_badsig/pkgprobe.embx", L.DT_REG, L.S_IFREG | 0o755, probe_embx))
+        objects.append((b"data/staging/pkgprobe_badsig/pkgprobe.pkg",  L.DT_REG, L.S_IFREG | L.PERM_FILE, badsig))
 
     # The kernel's own .embdbg (EMBDBG_Specification.md §7): a LINE+FUNCS sidecar
     # the kernel loads at boot so isr_handler symbolizes a panic to func:line.

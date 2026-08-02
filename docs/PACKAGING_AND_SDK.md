@@ -17,10 +17,17 @@ and EmbBuild.*
 > version, caps, grant) → all three views (EMBX cap table, `.ns`, package
 > manifest), consistent BY CONSTRUCTION — mutate the spec's caps and both the
 > binary's cap table AND the manifest follow; you cannot build a self-disagreeing
-> bundle (§4). `pkgprobe`'s authority is now declared once in
-> `user/pkg/pkgprobe.pkgspec`; `test pkg` runs green on the generated bundle.
-> PK3–PK4 (signing/update/rollback, git registry) remain, plus the on-device
-> half of PK2: driving pkggen from an EmbBuild `build.ebm` `package:` stanza.
+> bundle (§4). `pkgprobe`'s authority is declared once in
+> `user/pkg/pkgprobe.pkgspec`.
+> **PK3 signing** — every manifest is signed at build time (`tools/embx/pkgsign.py`,
+> ECDSA P-256 over the canonical manifest) and `pkg` VERIFIES it against the
+> trusted public key baked into `user/pkg/pkgkey.h` (our own `ecdsa_verify`).
+> `pkg install` refuses an unsigned, altered, or wrongly-keyed manifest —
+> `test pkg` proves both a tampered binary (build_id fails) AND an altered
+> signature (intact binary, mangled sig) are rejected. Trust is in the signature,
+> not the channel (§9.2). *Remaining:* PK3's update/rollback (needs a userspace
+> snapshot API) + the registry list/info; PK4 the git registry; and PK2b, driving
+> pkggen from an EmbBuild `build.ebm` `package:` stanza on-device.
 > The rest of this doc is the shape decided before code, like the userspace.*
 
 ## 0. Thesis

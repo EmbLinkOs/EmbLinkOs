@@ -947,8 +947,14 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
   `pkgprobe`'s authority is now declared once in `user/pkg/pkgprobe.pkgspec` (was
   scattered across `mkembx`/`mkpkg` flags); `test pkg` runs green on the generated
   bundle.
-- *Deferred (PK3–PK4 + PK2b):* signing + atomic snapshot update/rollback (no
-  userspace snapshot API yet), the git registry, and driving pkggen from an
+- **PK3 — signing** (`tools/embx/pkgsign.py`): every manifest is signed at build
+  time (ECDSA P-256 over the canonical manifest); `pkg` verifies it against the
+  trusted key baked into `user/pkg/pkgkey.h` (our own `ecdsa_verify`) and refuses
+  anything unsigned, altered, or wrongly-keyed. `test pkg` rejects both a tampered
+  binary (build_id fails) and an altered signature (intact binary, mangled sig).
+  Trust is in the signature, not the channel.
+- *Deferred (rest of PK3 + PK4 + PK2b):* snapshot-backed atomic update/rollback (no
+  userspace snapshot syscall yet), the git registry, and driving pkggen from an
   EmbBuild `build.ebm` `package:` stanza (on-device). No dependency graph, ever
   (the only "dependency" is the `abi` integer).
 

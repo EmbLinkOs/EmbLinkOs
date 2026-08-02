@@ -1519,10 +1519,17 @@ int selftests_handle_command(const char *cmd)
 
         char *a3[] = { (char *)sp, (char *)"verify", (char *)"/data/staging/pkgprobe_bad", NULL };
         int c3 = process_wait((uint32_t)process_create_caps(sp, a3, 3, env, NULL, 0, caps));
-        kprintf("[pkg] 3 verify tampered bundle -> %s (correctly refused=%d)\n",
+        kprintf("[pkg] 3 verify tampered BINARY -> %s (build_id fails; refused=%d)\n",
                 c3 != 0 ? "REJECTED" : "ACCEPTED", c3 != 0);
 
-        int pass = (c1 == 0 && c2 == 0 && c3 != 0);
+        /* 4. altered MANIFEST (flipped signature digit): binary is intact, so
+         *    this isolates the PK3 signature check -- must still be refused. */
+        char *a4[] = { (char *)sp, (char *)"verify", (char *)"/data/staging/pkgprobe_badsig", NULL };
+        int c4 = process_wait((uint32_t)process_create_caps(sp, a4, 3, env, NULL, 0, caps));
+        kprintf("[pkg] 4 verify bad SIGNATURE -> %s (signature fails; refused=%d)\n",
+                c4 != 0 ? "REJECTED" : "ACCEPTED", c4 != 0);
+
+        int pass = (c1 == 0 && c2 == 0 && c3 != 0 && c4 != 0);
         kprintf("[cmd] test pkg: %s\n", pass ? "OK" : "FAIL");
         return pass ? 0 : 1;
     }

@@ -22,6 +22,9 @@
 #include "manifest.h"
 #include "embxinfo.h"
 #include "embk.h"
+#include "ecdsa.h"             /* ecdsa_verify, ec_p256 (user/lib/tls/crypto) */
+#include "crypto/sha256.h"     /* one-shot sha256 (via -Ikernel) */
+#include "pkgkey.h"            /* PKG_SIGN_QX / PKG_SIGN_QY (trusted key) */
 
 #define PKG_ABI   1              /* EMBX_ABI_VERSION this OS provides */
 #define APPS_ROOT "/data/apps"
@@ -66,9 +69,31 @@ static int cap_in(const int *list, int n, int id) {
     return 0;
 }
 
-/* Cross-check the manifest against the EMBX. Prints each failed check. 0 = ok. */
-static int cross_check(const struct pkg_manifest *m, const struct embx_info *ei) {
+/* Offset of the line starting with "signature:", or the length if none. The
+ * signed message is the manifest up to (not including) that line -- matches
+ * pkgsign's canonical form (the file with the signature line removed). */
+static size_t canonical_len(const uint8_t *t, size_t n) {
+    for (size_t i = 0; i < n; ) {
+        if (n - i >= 10 && !memcmp(t + i, "signature:", 10)) return i;
+        while (i < n && t[i] != '\n') i++;
+        if (i < n) i++;
+    }
+    return n;
+}
+
+/* Verify the manifest's ECDSA-P256 signature against the trusted build key. */
+static int verify_sig(const uint8_t *text, size_t len, const uint8_t sig[64]) {
+    uint8_t hash[32];
+    sha256(text, canonical_len(text, len), hash);
+    return ecdsa_verify(ec_p256(), PKG_SIGN_QX, PKG_SIGN_QY,
+                        hash, 32, sig, 32, sig + 32, 32);
+}
+
+/* Cross-check the manifest against the EMBX + its signature. 0 = ok. */
+static int cross_check(const struct pkg_manifest *m, const struct embx_info *ei, int sig_ok) {
     int ok = 1;
+    if (!m->have_sig) { printf("  x signature: MISSING -- packages must be signed\n"); ok = 0; }
+    else if (!sig_ok) { printf("  x signature: INVALID -- not signed by the trusted key (or the manifest was altered)\n"); ok = 0; }
     if (!ei->build_id_ok) { printf("  x build_id does not recompute -- binary is corrupt\n"); ok = 0; }
     else if (memcmp(m->build_id, ei->build_id, 32) != 0) {
         printf("  x build_id: the manifest describes a different binary\n"); ok = 0; }
@@ -97,15 +122,17 @@ static void present_authority(const struct pkg_manifest *m) {
     printf("    nothing else -- what it did not declare, it cannot get.\n");
 }
 
-/* Load + parse an EMBX bundle: the manifest and the EMBX it `provides`. */
+/* Load + parse an EMBX bundle: the manifest, the EMBX it `provides`, and whether
+ * the manifest's signature verifies against the trusted key (*sig_ok). */
 static int load_bundle(const char *dir, struct pkg_manifest *m, struct embx_info *ei,
-                       char *binpath, size_t bincap) {
+                       char *binpath, size_t bincap, int *sig_ok) {
     char mpath[1024];
     if (find_manifest(dir, mpath, sizeof mpath) != 0) { fprintf(stderr, "pkg: no .pkg manifest in %s\n", dir); return -1; }
     size_t mlen; char *mtext = read_file(mpath, &mlen);
     if (!mtext) { fprintf(stderr, "pkg: cannot read %s\n", mpath); return -1; }
     char err[256];
     int rc = pkg_manifest_parse(mtext, mlen, m, err, sizeof err);
+    *sig_ok = (rc == 0 && m->have_sig) ? verify_sig((const uint8_t *)mtext, mlen, m->signature) : 0;
     free(mtext);
     if (rc != 0) { fprintf(stderr, "pkg: %s: %s\n", mpath, err); return -1; }
 
@@ -115,10 +142,11 @@ static int load_bundle(const char *dir, struct pkg_manifest *m, struct embx_info
 }
 
 static int cmd_verify(const char *dir) {
-    struct pkg_manifest m; struct embx_info ei; char binpath[1024];
-    if (load_bundle(dir, &m, &ei, binpath, sizeof binpath) != 0) return 1;
+    struct pkg_manifest m; struct embx_info ei; char binpath[1024]; int sig_ok;
+    if (load_bundle(dir, &m, &ei, binpath, sizeof binpath, &sig_ok) != 0) return 1;
     printf("PKG verify %s %s (abi %u):\n", m.name, m.version, m.abi);
-    int rc = cross_check(&m, &ei);
+    int rc = cross_check(&m, &ei, sig_ok);
+    if (rc == 0) printf("  signature: valid (trusted build key)\n");
     printf("PKG verify: %s\n", rc == 0 ? "OK" : "REJECTED");
     return rc == 0 ? 0 : 1;
 }
@@ -134,11 +162,12 @@ static int write_ns(const char *dir, const struct pkg_manifest *m) {
 }
 
 static int cmd_install(const char *dir) {
-    struct pkg_manifest m; struct embx_info ei; char binpath[1024];
-    if (load_bundle(dir, &m, &ei, binpath, sizeof binpath) != 0) return 1;
+    struct pkg_manifest m; struct embx_info ei; char binpath[1024]; int sig_ok;
+    if (load_bundle(dir, &m, &ei, binpath, sizeof binpath, &sig_ok) != 0) return 1;
 
     printf("PKG install %s %s (abi %u)\n", m.name, m.version, m.abi);
-    if (cross_check(&m, &ei) != 0) { printf("PKG install: REJECTED (declaration does not match the binary)\n"); return 1; }
+    if (cross_check(&m, &ei, sig_ok) != 0) { printf("PKG install: REJECTED (unsigned / altered / does not match the binary)\n"); return 1; }
+    printf("  signature: valid (trusted build key)\n");
     present_authority(&m);
 
     /* Adopt: place the bundle under /data/apps/<name>/ (direct copy -- no atomic
