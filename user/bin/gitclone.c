@@ -19,6 +19,8 @@
 #include <string.h>
 #include "githttp.h"
 #include "pktline.h"
+#include "pack.h"
+#include "sha1.h"
 
 /* "<base>.git" from a user URL (strip trailing '/', add .git if absent). */
 static void base_git(const char *in, char *out, size_t cap) {
@@ -128,9 +130,34 @@ int main(int argc, char **argv) {
         fprintf(stderr, "gitclone: not a packfile (%zu bytes)\n", plen);
         free(pbody); return 1;
     }
-    unsigned long ver = ((unsigned long)pack[4] << 24) | (pack[5] << 16) | (pack[6] << 8) | pack[7];
     unsigned long nobj = ((unsigned long)pack[8] << 24) | (pack[9] << 16) | (pack[10] << 8) | pack[11];
-    printf("GITFETCH pack v%lu, %lu objects, %zu bytes -> OK\n", ver, nobj, plen);
+    printf("GITFETCH pack %lu objects, %zu bytes\n", nobj, plen);
+
+    /* G3: unpack the packfile into real objects (inflate + resolve deltas +
+     * SHA-1 name each). Verifying the HEAD commit's id matches `want` proves the
+     * whole pipe: inflate, delta resolution, and object naming are all correct. */
+    struct pack_obj *objs = NULL;
+    int nc = pack_unpack(pack, plen, &objs);
     free(pbody);
+    if (nc < 0) { fprintf(stderr, "gitclone: packfile unpack failed\n"); return 1; }
+
+    int commits = 0, trees = 0, blobs = 0, tags = 0, head_ok = 0;
+    for (int i = 0; i < nc; i++) {
+        switch (objs[i].type) {
+        case OBJ_COMMIT: commits++; break;
+        case OBJ_TREE:   trees++;   break;
+        case OBJ_BLOB:   blobs++;   break;
+        case OBJ_TAG:    tags++;    break;
+        }
+        char hex[41]; sha1_hex(objs[i].sha, hex);
+        if (strcmp(hex, want) == 0) head_ok = 1;
+    }
+    printf("GITUNPACK %d objects (%d commit, %d tree, %d blob, %d tag); HEAD %s\n",
+           nc, commits, trees, blobs, tags, head_ok ? "reconstructed" : "MISSING");
+
+    for (int i = 0; i < nc; i++) free(objs[i].data);
+    free(objs);
+    if (!head_ok) { fprintf(stderr, "gitclone: HEAD commit not in pack\n"); return 1; }
+    printf("GITUNPACK -> OK\n");
     return 0;
 }

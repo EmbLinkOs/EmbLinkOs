@@ -543,11 +543,16 @@ build/githttp.o: user/git/githttp.c user/git/githttp.h user/lib/tls/tls.h user/l
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/git -c $< -o $@
 build/pktline.o: user/git/pktline.c user/git/pktline.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
-build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h | $(BUILD)
+build/git_sha1.o: user/git/sha1.c user/git/sha1.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
-GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o
-build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) -lc -lgcc -o $@
+# pack.o inflates with the same libz.a we cross-built for CPython (ZLIB_BUILD).
+build/git_pack.o: user/git/pack.c user/git/pack.h user/git/sha1.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
+build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
+GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o
+build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
 
 # pkgfetch -- native PyPI installer for pure-Python wheels (libtls fetch + our
 # own inflate + zip reader). Auto-packed as /data/apps/pkgfetch/pkgfetch.elf.
