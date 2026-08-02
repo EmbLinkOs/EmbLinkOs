@@ -44,6 +44,9 @@ void ui_set_text_color(struct color c);   /* colour for subsequent ui_text calls
 /* --- leaves --- */
 void ui_text(const char *fmt, ...);
 void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float height_px);
+void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                    float width_px, float height_px);
+void ui_image_fill(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih);
 void ui_text_keyed(uint64_t key, const char *fmt, ...);
 void ui_spacer(void);
 bool ui_button(const char *label);

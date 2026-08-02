@@ -529,6 +529,32 @@ void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float 
     scene_set_image(g_sa, n->scene_node, pixels, iw, ih, EMBK_PIXFMT_BGRA8888_PRE);
 }
 
+void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                    float width_px, float height_px) {
+    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, key, key != 0, &created);
+    struct instance *n = instance_resolve(h);
+    if (!n) return;
+    struct layout_node *ln = layout_resolve(g_la, n->layout_node);
+    if (ln) {
+        ln->width.mode = SIZE_FIXED;   ln->width.fixed_value = width_px;
+        ln->height.mode = SIZE_FIXED;  ln->height.fixed_value = height_px;
+    }
+    scene_set_image(g_sa, n->scene_node, pixels, iw, ih, EMBK_PIXFMT_BGRA8888_PRE);
+}
+
+void ui_image_fill(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih) {
+    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, key, key != 0, &created);
+    struct instance *n = instance_resolve(h);
+    if (!n) return;
+    struct layout_node *ln = layout_resolve(g_la, n->layout_node);
+    if (ln) {
+        ln->width.mode = SIZE_FLEX; ln->width.flex_grow = 1;
+        ln->height.mode = SIZE_FLEX; ln->height.flex_grow = 1;
+        ln->is_overlay = true;
+    }
+    scene_set_image(g_sa, n->scene_node, pixels, iw, ih, EMBK_PIXFMT_BGRA8888_PRE);
+}
+
 static bool button_common(uint64_t key, bool has_key, const char *label) {
     struct instance_handle b = enter_container(INSTANCE_BOX, key, has_key);
     ui_text("%s", label);

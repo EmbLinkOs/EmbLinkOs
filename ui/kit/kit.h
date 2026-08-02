@@ -69,6 +69,7 @@ void ui_avatar(const char *initials);
  * ui_input_char in the loop) edit it in place. Draws a caret when focused and a
  * placeholder when empty+unfocused. Returns true while focused. */
 bool ui_text_field(char *buf, unsigned long cap, const char *placeholder);
+bool ui_password_field(char *buf, unsigned long cap, const char *placeholder);
 
 /* --- scroll view --- */
 /* A fixed-height viewport that clips + vertically scrolls its children. `scroll_y`

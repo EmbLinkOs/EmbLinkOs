@@ -29,8 +29,11 @@ static struct entry g_entries[MAX_ENTRIES];
 static int   g_count = 0;
 static char  g_cwd[512] = "/";
 static bool  g_dirty = true;      /* re-read the directory this frame */
+static bool  g_initialized = false;
 static float g_scroll = 0;
 static char  g_status[96] = "";
+static char  g_history[16][512];
+static int   g_history_n;
 
 /* Build "<cwd>/<name>" without doubling the root slash. */
 static void join(char *out, size_t cap, const char *name) {
@@ -71,19 +74,74 @@ static void read_dir(void) {
     embk_puts(1, line);
 }
 
+static void navigate_to(const char *path) {
+    if (!path || path[0] != '/' || strcmp(path, g_cwd) == 0) return;
+    if (g_history_n == 16) {
+        memmove(g_history, g_history + 1, sizeof g_history - sizeof g_history[0]);
+        g_history_n--;
+    }
+    snprintf(g_history[g_history_n++], sizeof g_history[0], "%s", g_cwd);
+    snprintf(g_cwd, sizeof g_cwd, "%s", path);
+    g_dirty = true; g_scroll = 0;
+}
+
 static void enter_dir(const char *name) {
     char nc[512];
     join(nc, sizeof nc, name);
-    snprintf(g_cwd, sizeof g_cwd, "%s", nc);
+    navigate_to(nc);
+}
+
+static void go_back(void) {
+    if (g_history_n <= 0) return;
+    snprintf(g_cwd, sizeof g_cwd, "%s", g_history[--g_history_n]);
     g_dirty = true; g_scroll = 0;
 }
 
 static void go_up(void) {
     if (strcmp(g_cwd, "/") == 0) return;
-    char *slash = strrchr(g_cwd, '/');
-    if (slash == g_cwd) g_cwd[1] = 0;   /* parent is the root */
-    else                *slash = 0;
-    g_dirty = true; g_scroll = 0;
+    char parent[512];
+    snprintf(parent, sizeof parent, "%s", g_cwd);
+    char *slash = strrchr(parent, '/');
+    if (slash == parent) parent[1] = 0;
+    else                 *slash = 0;
+    navigate_to(parent);
+}
+
+static void sidebar_item(int icon, const char *label, const char *path) {
+    HStack(.spacing = 10, .width = 180, .align = Center) {
+        Icon(icon).secondary();
+        if (Button(label).ghost().grow().leading().clicked())
+            navigate_to(path);
+    }
+}
+
+static void sidebar_placeholder(int icon, const char *label) {
+    HStack(.spacing = 10, .width = 180, .align = Center) {
+        Icon(icon).tertiary();
+        if (Button(label).ghost().grow().leading().clicked())
+            snprintf(g_status, sizeof g_status, "%s is not mounted yet", label);
+    }
+}
+
+static void open_file(const char *name);
+
+static void folder_cell(int index) {
+    struct entry *e = &g_entries[index];
+    VStack(.spacing = 5, .width = 126, .align = Center) {
+        if (e->is_dir) {
+            /* Every folder uses the same bitmap, but must retain an independent
+             * interaction identity or their hover states become shared. */
+            if (ImageButtonKey("/system/images/icon-files.pam", 62, e))
+                enter_dir(e->name);
+        } else {
+            if (IconButton(IconDoc).frame(62, 62).font(Title).clicked())
+                open_file(e->name);
+        }
+        if (Button(e->name).ghost().width(122).clicked()) {
+            if (e->is_dir) enter_dir(e->name);
+            else           open_file(e->name);
+        }
+    }
 }
 
 static void open_file(const char *name) {
@@ -98,41 +156,87 @@ static void open_file(const char *name) {
     else        snprintf(g_status, sizeof g_status, "open failed");
 }
 
-static void human(long n, char *out, size_t cap) {
-    if      (n < 1024)        snprintf(out, cap, "%ld B",  n);
-    else if (n < 1024 * 1024) snprintf(out, cap, "%ld KB", n / 1024);
-    else                      snprintf(out, cap, "%ld MB", n / (1024 * 1024));
-}
-
 static void app(void) {
+    if (!g_initialized) {
+        /* Folder shortcuts launch this same app with FILES_PATH. A normal
+         * launch starts in the signed-in user's HOME instead of exposing the
+         * filesystem root as the first screen. */
+        const char *start = getenv("FILES_PATH");
+        if (!start || start[0] != '/') start = getenv("HOME");
+        if (start && start[0] == '/')
+            snprintf(g_cwd, sizeof g_cwd, "%s", start);
+        g_initialized = true;
+    }
     if (g_dirty) { read_dir(); g_dirty = false; }
+    const char *home = getenv("HOME");
+    if (!home || home[0] != '/') home = "/";
+    char desktop[560], documents[560], downloads[560], music[560];
+    char pictures[560], videos[560], trash[560];
+    snprintf(desktop,   sizeof desktop,   "%s/Desktop",   home);
+    snprintf(documents, sizeof documents, "%s/Documents", home);
+    snprintf(downloads, sizeof downloads, "%s/Downloads", home);
+    snprintf(music,     sizeof music,     "%s/Music",     home);
+    snprintf(pictures,  sizeof pictures,  "%s/Pictures",  home);
+    snprintf(videos,    sizeof videos,    "%s/Videos",    home);
+    snprintf(trash,     sizeof trash,     "%s/Trash",     home);
 
     Window("Files") {
-        WindowBar("Files") {
-            CloseGrip();
-        }
-        VStack(.spacing = 8, .padding = 16, .align = Fill) {
-            HStack(.spacing = 12, .align = Fill) {
-                Text(g_cwd).heading();
+        HStack(.spacing = 0, .height = em_viewport_height(), .align = Fill) {
+            VStack(.spacing = 8, .padding = 14, .width = 210, .align = Fill,
+                   .background = { .r=.10f, .g=.105f, .b=.12f, .a=1.0f }) {
+                HStack(.align = Center) {
+                    Icon(IconSearch).secondary();
+                    Text("Files").heading();
+                }
+                Divider();
+                sidebar_item(IconHome,   "Home",      home);
+                sidebar_item(IconGrid,   "Desktop",   desktop);
+                sidebar_item(IconDoc,    "Documents", documents);
+                sidebar_item(IconArrowR, "Downloads", downloads);
+                sidebar_item(IconList,   "Music",     music);
+                sidebar_item(IconFiles,  "Pictures",  pictures);
+                sidebar_item(IconGrid,   "Videos",    videos);
+                sidebar_item(IconTrash,  "Trash",     trash);
+                Divider();
+                Text("Disks").caption().tertiary();
+                sidebar_item(IconFiles, "System Disk", "/");
+                sidebar_placeholder(IconFiles, "External Disk");
+                Divider();
+                sidebar_item(IconFiles, "Other Locations", "/");
                 Spacer();
-                Text(g_status).caption().secondary();
+                Text("EmbLink OS").caption().tertiary();
             }
-            HStack(.spacing = 8) {
-                if (Button("Up").clicked()) go_up();
-            }
-            ScrollView(&g_scroll, 420) {
-                List() {
-                    for (int i = 0; i < g_count; i++) {
-                        char val[32];
-                        if (g_entries[i].is_dir) snprintf(val, sizeof val, "folder");
-                        else                     human(g_entries[i].size, val, sizeof val);
 
-                        int icon = g_entries[i].is_dir ? IconFolder : IconDoc;
-                        if (ListRow(icon, g_entries[i].name, val)
-                                .id(g_entries[i].name).clicked()) {
-                            if (g_entries[i].is_dir) enter_dir(g_entries[i].name);
-                            else                     open_file(g_entries[i].name);
+            VStack(.spacing = 12, .padding = 14, .grow = 1, .align = Fill) {
+                HStack(.spacing = 8, .align = Center) {
+                    if (IconButton(IconChevronL).clicked()) go_back();
+                    if (IconButton(IconChevronU).clicked()) go_up();
+                    Card(.padding = 9, .grow = 1, .corner = 8,
+                         .background = { .r=.14f, .g=.145f, .b=.16f, .a=1.0f }) {
+                        Text(g_cwd).body();
+                    }
+                    Text(g_status).caption().secondary();
+                }
+
+                Divider();
+
+                ScrollView(&g_scroll, 500) {
+                    VStack(.spacing = 16, .align = Fill) {
+                        int cols = ((int)em_viewport_width() - 260) / 142;
+                        if (cols < 2) cols = 2;
+                        if (cols > 7) cols = 7;
+                        for (int row = 0; row * cols < g_count; row++) {
+                            HStack(.spacing = 14, .align = Leading) {
+                                for (int col = 0; col < cols; col++) {
+                                    int i = row * cols + col;
+                                    if (i < g_count) folder_cell(i);
+                                    else             Spacer();
+                                }
+                            }
                         }
+                        if (g_count == 0)
+                            EmptyState(IconFolder, "Empty folder",
+                                       "This location does not contain any files yet.");
                     }
                 }
             }
@@ -142,9 +246,8 @@ static void app(void) {
 
 EM_APPLICATION {
     .title  = "Files",
-    .size   = { 540, 600 },
+    .size   = { 1100, 700 },
     .theme  = Dark,
-    .chrome = Chromeless,
     .resize = Resizable,
     .view   = app,
 };

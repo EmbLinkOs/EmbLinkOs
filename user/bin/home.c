@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 
 #include "embk.h"
 #include "kit.h"
@@ -43,40 +44,84 @@ static uint8_t *read_file(const char *path, size_t *len) {
 
 /* set by a tile click during the UI pass; the loop acts on it after the frame */
 static const char *g_launch = 0;
+static const char *g_launch_dir = 0;
 static char        g_clock[32] = "up 0:00";
+static char        g_datetime[48] = "--:--";
 static float       g_sw = 0, g_sh = 0;   /* screen size (the desktop window) */
+static char      **g_session_env = 0;
 
-/* One launcher tile. `path` != NULL is a real, launchable app (accent tile);
- * NULL is a "coming soon" placeholder (a dim, non-launching tile). Both are the
- * same size so the grid stays even. */
-static void tile(const char *name, const char *path) {
-    if (path) {
-        if (Button(name).primary().width(150).height(96).clicked()) g_launch = path;
-    } else {
-        Button(name).secondary().width(150).height(96).id(name);
+static void launch_folder(const char *path) {
+    g_launch = "/data/apps/files/files.elf";
+    g_launch_dir = path;
+}
+
+static void desktop_image(const char *image, const char *label, const char *path) {
+    VStack(.spacing = 5, .width = 92, .align = Center) {
+        if (ImageButton(image, 64))
+            launch_folder(path);
+        Text(label).caption();
     }
 }
 
-/* The whole home screen: a centred column -- header + a 2x3 tile grid -- filling
- * the whole desktop window (sized explicitly to it, so the bg covers the screen
- * and the content is truly centred). */
+static void task_image(const char *image, const char *app, const char *dir) {
+    if (ImageButton(image, 52)) {
+        if (dir) launch_folder(dir);
+        else     g_launch = app;
+    }
+}
+
+/* Post-login desktop: wallpaper, three honest folder shortcuts, and a
+ * full-width bottom taskbar. The right side deliberately exposes only state the
+ * OS can report today; network/audio/battery indicators arrive with their
+ * corresponding services instead of being decorative lies. */
 static void home_ui(void) {
-    Screen(.width = g_sw, .height = g_sh, .justify = Center, .align = Center) {
-        VStack(.spacing = 30, .align = Center) {
-            VStack(.spacing = 6, .align = Center) {
-                Text("EmbLink OS").title();
-                Text(g_clock).caption().secondary();
-            }
-            VStack(.spacing = 16, .align = Center) {
-                HStack(.spacing = 16) {
-                    tile("Files",    "/data/apps/files/files.elf");
-                    tile("Editor",   "/data/apps/edit/edit.elf");
-                    tile("Terminal", "/data/apps/term/term.elf");
+    Screen(.width = g_sw, .height = g_sh, .padding = -1, .align = Fill) {
+        BackgroundImage("/system/images/colibri-user.ppm");
+        VStack(.width = g_sw, .height = g_sh, .padding = 0, .spacing = 0,
+               .align = Fill) {
+            Glass(.width = g_sw, .height = 32, .padding = 6, .corner = -1,
+                  .background = { .r=.02f, .g=.022f, .b=.028f, .a=.96f },
+                  .border = -1, .shadow = -1) {
+                HStack(.width = g_sw - 12, .spacing = 12, .align = Center) {
+                    Text("EmbLink OS").caption();
+                    Spacer();
+                    Icon(IconCloud).secondary();
+                    Icon(IconBell).secondary();
+                    Icon(IconBolt).secondary();
+                    Text(g_datetime).caption();
                 }
-                HStack(.spacing = 16) {
-                    tile("UI Demo",  "/data/apps/uidemo/uidemo.elf");
-                    tile("Windows",  "/data/apps/wmdemo/wmdemo.elf");
-                    tile("Menus",    "/data/apps/v6demo/v6demo.elf");
+            }
+
+            /* Exact work-area height: the layout engine's `.grow` is intended
+             * for siblings inside a measured row and did not consume the
+             * remaining desktop height here, which left the taskbar mid-screen. */
+            HStack(.padding = 16, .height = g_sh - 32 - 64, .align = Leading) {
+                VStack(.spacing = 18, .align = Center) {
+                    desktop_image("/system/images/icon-files.pam",
+                                  "Home", getenv("HOME"));
+                    desktop_image("/system/images/icon-launcher.pam",
+                                  "Apps", "/data/apps");
+                    desktop_image("/system/images/icon-settings.pam",
+                                  "System", "/system");
+                }
+                Spacer();
+            }
+
+            Glass(.width = g_sw, .height = 64, .padding = 8, .corner = -1,
+                  .background = { .r=.025f, .g=.028f, .b=.038f, .a=.94f },
+                  .border = 1, .shadow = -1) {
+                HStack(.width = g_sw - 16, .spacing = 8, .align = Center) {
+                    task_image("/system/images/icon-launcher.pam",
+                               NULL, "/data/apps");
+                    task_image("/system/images/icon-files.pam",
+                               "/data/apps/files/files.elf", NULL);
+                    task_image("/system/images/icon-terminal.pam",
+                               "/data/apps/term/term.elf", NULL);
+                    task_image("/system/images/icon-settings.pam",
+                               NULL, "/system");
+                    Spacer();
+                    Text(getenv("USER") ? getenv("USER") : "user").caption().secondary();
+                    Text(g_clock).body();
                 }
             }
         }
@@ -93,7 +138,11 @@ static void home_ui(void) {
  * stored the handle AS a pid, so proc_alive() interrogated some unrelated
  * always-alive low pid (the shell/idle) and refused every relaunch. */
 #define MAX_TRACKED 8
-static struct { const char *path; int handle_p1; } g_running[MAX_TRACKED];
+static struct {
+    const char *path;
+    const char *start_dir;  /* distinguishes independent Files shortcuts */
+    int handle_p1;
+} g_running[MAX_TRACKED];
 
 /* An app DECLARES its namespace needs in /data/apps/<name>/<name>.ns (shipped in
  * its package -- docs/USERSPACE_v2.md UP4). As the session, home reads that
@@ -153,15 +202,18 @@ static int load_app_ns(const char *elf_path,
     return n;
 }
 
-static void spawn_app(const char *path) {
+static void spawn_app(const char *path, const char *start_dir) {
     int slot = -1;
     for (int i = 0; i < MAX_TRACKED; i++) {
-        if (g_running[i].path == path) { slot = i; break; }
+        if (g_running[i].path == path &&
+            g_running[i].start_dir == start_dir) { slot = i; break; }
         if (slot < 0 && !g_running[i].path) slot = i;
     }
     if (slot < 0) return;
 
-    if (g_running[slot].path == path && g_running[slot].handle_p1 > 0) {
+    if (g_running[slot].path == path &&
+        g_running[slot].start_dir == start_dir &&
+        g_running[slot].handle_p1 > 0) {
         int h = g_running[slot].handle_p1 - 1;
         if (embk_proc_alive(h)) return;   /* still running -- one instance only */
         embk_wait(h);                     /* dead: reap the zombie + free the handle */
@@ -175,7 +227,21 @@ static void spawn_app(const char *path) {
     int nacts = load_app_ns(path, acts, NS_ACTS_MAX, nsdesc, sizeof nsdesc);
 
     char *argv[] = { (char *)path, NULL };
-    int h = (int)embk_spawn(path, argv, nacts ? acts : NULL, nacts);
+    char file_path_env[640];
+    char *launch_env[64];
+    char **env = g_session_env;
+    if (start_dir && start_dir[0] == '/') {
+        int en = 0;
+        while (g_session_env && g_session_env[en] && en < 62) {
+            launch_env[en] = g_session_env[en];
+            en++;
+        }
+        snprintf(file_path_env, sizeof file_path_env, "FILES_PATH=%s", start_dir);
+        launch_env[en++] = file_path_env;
+        launch_env[en] = NULL;
+        env = launch_env;
+    }
+    int h = (int)embk_spawn_env(path, argv, env, nacts ? acts : NULL, nacts);
 
     char b[320];
     if (nacts) snprintf(b, sizeof b, "home: spawn %s -> ns[%s] (%d bind%s)\n",
@@ -183,11 +249,17 @@ static void spawn_app(const char *path) {
     else       snprintf(b, sizeof b, "home: spawn %s -> full inherit (no manifest)\n", path);
     embk_puts(1, b);
 
-    if (h >= 0) { g_running[slot].path = path; g_running[slot].handle_p1 = h + 1; }
+    if (h >= 0) {
+        g_running[slot].path = path;
+        g_running[slot].start_dir = start_dir;
+        g_running[slot].handle_p1 = h + 1;
+    }
     else { char e[96]; snprintf(e, sizeof e, "home: spawn %s FAILED: %d\n", path, h); embk_puts(1, e); }
 }
 
-int main(void) {
+int main(int argc, char **argv, char **envp) {
+    (void)argc; (void)argv;
+    g_session_env = envp;
     /* toolkit font + context */
     size_t rl = 0;
     uint8_t *reg = read_file("/system/fonts/font.ttf", &rl);
@@ -200,6 +272,7 @@ int main(void) {
     ui_theme_set_fonts(fr, fr);
     ui_theme_use_dark(true);
     ui_init(&sa, &la);
+    em_res_set_loader(read_file);
 
     /* Take the full screen as the compositor's desktop layer (zero-copy): the
      * toolkit renders its launcher straight into the shared pages. */
@@ -215,8 +288,7 @@ int main(void) {
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
 
     em_set_clock(embk_uptime_ms);
-    spawn_app("/data/apps/clockw/clockw.elf");   /* the desktop CLOCK widget (V5) -- fire & track */
-    embk_puts(1, "home: launcher up; click a tile to launch an app\n");
+    embk_puts(1, "home: desktop ready\n");
 
     for (;;) {
         /* pointer: the compositor routes the desktop's content-local mouse to us */
@@ -231,8 +303,12 @@ int main(void) {
         uint64_t secs = embk_uptime_ms() / 1000;
         snprintf(g_clock, sizeof g_clock, "up %lu:%02lu",
                  (unsigned long)(secs / 60), (unsigned long)(secs % 60));
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        if (tm) strftime(g_datetime, sizeof g_datetime, "%a %d %b  %H:%M", tm);
 
         g_launch = 0;
+        g_launch_dir = 0;
         ui_frame_begin(); em_new_frame(); home_ui(); em_flush(); ui_frame_end();
         ui_run_layout((float)sw, (float)sh);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
@@ -258,7 +334,7 @@ int main(void) {
         }
 
         /* a tile was clicked this frame -> launch it as a floating window */
-        if (g_launch) spawn_app(g_launch);
+        if (g_launch) spawn_app(g_launch, g_launch_dir);
 
         embk_sleep_ms(15);   /* pace ~60Hz while YIELDING -- never starve the apps */
     }

@@ -148,7 +148,7 @@ void em_vstack_(EmProps p) { em_flush(); ui_begin_vstack(0); em_apply_box(p); }
 void em_hstack_(EmProps p) { em_flush(); ui_begin_hstack(0); if (!p.align) ui_set_align(ALIGN_CENTER); em_apply_box(p); }
 void em_zstack_(EmProps p) { em_flush(); ui_begin_vstack(0); em_apply_box(p); }
 void em_glass_(EmProps p)  { em_flush(); ui_begin_vstack(0); p.glass = 1;
-                             if (p.corner <= 0) p.corner = TH->radius_lg;
+                             if (p.corner == 0) p.corner = TH->radius_lg;
                              em_apply_box(p); }
 void em_row_(EmProps p)    { em_flush(); ui_begin_hstack(0); ui_set_align(ALIGN_CENTER); if (!p.spacing) ui_set_spacing(TH->sp3); em_apply_box(p); }
 void em_end_(void)         { em_flush(); ui_end_stack(); }
@@ -166,6 +166,7 @@ void em_screen_(EmProps p) {
     ui_set_paint(solid(p.background.a > 0 ? p.background : t->bg));
     ui_set_size(sz_grow(), sz_grow());
     ui_set_padding(t->sp6, t->sp6, t->sp6, t->sp6);
+    if (p.padding < 0) ui_set_padding(0, 0, 0, 0);
     ui_set_spacing(t->sp5);
     em_apply_box(p);
     /* carry the active page transition on the Screen itself (see g_nav_cur_*).
@@ -222,7 +223,7 @@ void em_scroll_end_(void) { em_flush(); ui_scroll_end(); }
 
 typedef enum { PK_NONE, PK_TEXT, PK_ICON, PK_LABEL, PK_BADGE, PK_TAG, PK_AVATAR,
                PK_BANNER, PK_PROGRESS, PK_BUTTON, PK_ICONBTN, PK_TOGGLE, PK_CHECK,
-               PK_SLIDER, PK_STEPPER, PK_FIELD, PK_SEGMENTED, PK_LISTROW,
+               PK_SLIDER, PK_STEPPER, PK_FIELD, PK_PASSWORD, PK_SEGMENTED, PK_LISTROW,
                PK_CLOSEBTN, PK_SEARCH, PK_SPINNER, PK_DROPDOWN } PKind;
 
 static struct {
@@ -252,6 +253,7 @@ static void em_checkbox_impl(const char *l, bool *b, EmProps p);
 static void em_slider_impl(float *b, EmProps p);
 static void em_stepper_impl(const char *l, int *b, int lo, int hi, EmProps p);
 static bool em_field_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *hov);
+static bool em_password_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *hov);
 static void em_segmented_impl(const char *const *labels, int count, int *b, EmProps p);
 static bool em_listrow_impl(int cp, const char *title, const char *value, EmProps p, bool *hov);
 static bool em_closebtn_impl(bool *hov);
@@ -280,6 +282,7 @@ void em_flush(void) {
         case PK_SLIDER:   em_slider_impl((float *)P.bind, pr); break;
         case PK_STEPPER:  em_stepper_impl(P.str, (int *)P.bind, P.lo, P.hi, pr); break;
         case PK_FIELD:    clicked = em_field_impl(P.buf, P.cap, P.str, pr, &hovered); break;  /* clicked == focused */
+        case PK_PASSWORD: clicked = em_password_impl(P.buf, P.cap, P.str, pr, &hovered); break;
         case PK_SEGMENTED:em_segmented_impl(P.labels, P.count, (int *)P.bind, pr); break;
         case PK_LISTROW:  clicked = em_listrow_impl(P.cp, P.str, P.str2, pr, &hovered); break;
         case PK_CLOSEBTN: clicked = em_closebtn_impl(&hovered); break;
@@ -497,6 +500,7 @@ EmV em_checkbox(const char *l, bool *b){ EmV v = stage(PK_CHECK); P.str = l; P.b
 EmV em_slider(float *b){ EmV v = stage(PK_SLIDER); P.bind = b; return v; }
 EmV em_stepper(const char *l, int *b, int lo, int hi){ EmV v = stage(PK_STEPPER); P.str = l; P.bind = b; P.lo = lo; P.hi = hi; return v; }
 EmV em_text_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_FIELD); P.buf = buf; P.cap = cap; P.str = ph; return v; }
+EmV em_password_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_PASSWORD); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_segmented(const char *const *labels, int count, int *b){ EmV v = stage(PK_SEGMENTED); P.labels = labels; P.count = count; P.bind = b; return v; }
 EmV em_listrow(int icon, const char *title, const char *value){ EmV v = stage(PK_LISTROW); P.cp = icon; P.str = title; P.str2 = value; return v; }
 EmV em_close_button(void){ EmV v = stage(PK_CLOSEBTN); P.id = "__em_win_close"; return v; }
@@ -631,6 +635,9 @@ static bool em_iconbtn_impl(int cp, EmProps p, bool *out_hov) {
     ui_set_padding(t->sp2, t->sp2, t->sp2, t->sp2);
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
+    if (p.width > 0 || p.height > 0)
+        ui_set_size(p.width > 0 ? sz_fixed(p.width) : sz_intrinsic(),
+                    p.height > 0 ? sz_fixed(p.height) : sz_intrinsic());
     EmProps ip = { .font = p.font ? p.font : Body, .color = p.color.a > 0 ? p.color : t->text_secondary };
     em_icon_impl(cp, ip);
     ui_end_stack();
@@ -676,6 +683,10 @@ static void em_stepper_impl(const char *label, int *bind, int lo, int hi, EmProp
 static bool em_field_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
     (void)p; if (out_hov) *out_hov = false;
     return ui_text_field(buf, cap, ph);
+}
+static bool em_password_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
+    (void)p; if (out_hov) *out_hov = false;
+    return ui_password_field(buf, cap, ph);
 }
 static void em_segmented_impl(const char *const *labels, int count, int *bind, EmProps p) {
     (void)p; int cur = bind ? *bind : 0; int nv = ui_segmented(labels, count, cur); if (bind) *bind = nv;
@@ -1503,7 +1514,7 @@ uint32_t em_font(const char *path) {
     return h;
 }
 
-/* Minimal P6 (binary) .ppm decoder into malloc'd BGRA-premul, cached by path. */
+/* Minimal P6 RGB + P7 RGB_ALPHA decoder into BGRA-premul, cached by path. */
 const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h) {
     static struct { const char *path; uint32_t *px, w, h; } cache[EM_RES_MAX];
     if (!path) return 0;
@@ -1516,24 +1527,51 @@ const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h) {
     if (!g_res_load) return 0;
     size_t len = 0;
     uint8_t *d = g_res_load(path, &len);
-    if (!d || len < 16 || d[0] != 'P' || d[1] != '6') return 0;
-    size_t o = 2; uint32_t vals[3] = {0,0,0}; int nv = 0;
-    while (o < len && nv < 3) {                        /* width height maxval */
-        while (o < len && (d[o]==' '||d[o]=='\n'||d[o]=='\r'||d[o]=='\t')) o++;
-        if (o < len && d[o] == '#') { while (o < len && d[o] != '\n') o++; continue; }
-        uint32_t v = 0; int any = 0;
-        while (o < len && d[o] >= '0' && d[o] <= '9') { v = v*10 + (d[o]-'0'); o++; any = 1; }
-        if (!any) return 0;
-        vals[nv++] = v;
+    if (!d || len < 16 || d[0] != 'P') return 0;
+    size_t o = 0; uint32_t w = 0, h = 0, depth = 3;
+    if (d[1] == '6') {
+        o = 2; uint32_t vals[3] = {0,0,0}; int nv = 0;
+        while (o < len && nv < 3) {                    /* width height maxval */
+            while (o < len && (d[o]==' '||d[o]=='\n'||d[o]=='\r'||d[o]=='\t')) o++;
+            if (o < len && d[o] == '#') { while (o < len && d[o] != '\n') o++; continue; }
+            uint32_t v = 0; int any = 0;
+            while (o < len && d[o] >= '0' && d[o] <= '9') { v = v*10 + (d[o]-'0'); o++; any = 1; }
+            if (!any) return 0;
+            vals[nv++] = v;
+        }
+        o++;                                           /* whitespace after maxval */
+        w = vals[0]; h = vals[1];
+        if (vals[2] == 0) return 0;
+    } else if (d[1] == '7') {
+        /* PAM headers are textual and small. Copy only the header so string
+         * parsing never walks into the binary (often NUL-filled) pixel data. */
+        size_t hn = len < 255 ? len : 255;
+        char hdr[256];
+        memcpy(hdr, d, hn); hdr[hn] = 0;
+        char *end = strstr(hdr, "ENDHDR\n");
+        char *pw = strstr(hdr, "WIDTH ");
+        char *ph = strstr(hdr, "HEIGHT ");
+        char *pd = strstr(hdr, "DEPTH ");
+        char *pm = strstr(hdr, "MAXVAL ");
+        if (!end || !pw || !ph || !pd || !pm) return 0;
+        w = (uint32_t)strtoul(pw + 6, 0, 10);
+        h = (uint32_t)strtoul(ph + 7, 0, 10);
+        depth = (uint32_t)strtoul(pd + 6, 0, 10);
+        if (strtoul(pm + 7, 0, 10) != 255 || (depth != 3 && depth != 4)) return 0;
+        o = (size_t)(end - hdr) + 7;
+    } else {
+        return 0;
     }
-    o++;                                               /* single whitespace after maxval */
-    uint32_t w = vals[0], h = vals[1];
-    if (!w || !h || vals[2] == 0 || o + (size_t)w*h*3 > len) return 0;
+    if (!w || !h || o + (size_t)w*h*depth > len) return 0;
     uint32_t *px = (uint32_t *)malloc((size_t)w*h*4);
     if (!px) return 0;
     for (size_t i = 0; i < (size_t)w*h; i++) {
-        uint8_t r = d[o+i*3], g = d[o+i*3+1], b = d[o+i*3+2];
-        px[i] = 0xFF000000u | ((uint32_t)r<<16) | ((uint32_t)g<<8) | b;  /* opaque = premul */
+        uint8_t r = d[o+i*depth], g = d[o+i*depth+1], b = d[o+i*depth+2];
+        uint8_t a = depth == 4 ? d[o+i*depth+3] : 255;
+        uint8_t pr = (uint8_t)(((uint32_t)r * a) / 255);
+        uint8_t pg = (uint8_t)(((uint32_t)g * a) / 255);
+        uint8_t pb = (uint8_t)(((uint32_t)b * a) / 255);
+        px[i] = ((uint32_t)a<<24) | ((uint32_t)pr<<16) | ((uint32_t)pg<<8) | pb;
     }
     for (int i = 0; i < EM_RES_MAX; i++)
         if (!cache[i].path) { cache[i].path = path; cache[i].px = px; cache[i].w = w; cache[i].h = h; break; }
@@ -1555,6 +1593,36 @@ void em_image_view(const char *path, EmProps p) {
         return;
     }
     ui_image((uint64_t)(uintptr_t)px, px, w, h, p.height > 0 ? p.height : (float)h);
+}
+
+bool em_image_button_key(const char *path, float size, uint64_t key) {
+    em_flush();
+    uint32_t w = 0, h = 0;
+    const uint32_t *px = em_image(path, &w, &h);
+    if (!px) return false;
+    ui_begin_vstack(key ? key : (uint64_t)(uintptr_t)path);
+    struct instance_handle self = ui_open();
+    bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    ui_set_size(sz_fixed(size), sz_fixed(size));
+    ui_set_padding(4, 4, 4, 4);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    ui_set_corner_radius(12);
+    if (hov) ui_set_paint(solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f)));
+    ui_image_sized((uint64_t)(uintptr_t)px, px, w, h, size - 8, size - 8);
+    ui_end_stack();
+    return ui_consume_click(self);
+}
+
+bool em_image_button(const char *path, float size) {
+    return em_image_button_key(path, size, (uint64_t)(uintptr_t)path);
+}
+
+void em_background_image(const char *path) {
+    em_flush();
+    uint32_t w = 0, h = 0;
+    const uint32_t *px = em_image(path, &w, &h);
+    if (px) ui_image_fill((uint64_t)(uintptr_t)px, px, w, h);
 }
 
 void em_theme_use(EmTheme t) { ui_theme_use_dark(t != Light); }

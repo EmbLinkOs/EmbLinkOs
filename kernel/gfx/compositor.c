@@ -33,6 +33,7 @@ struct comp_window {
                              * pixels; the compositor BLURS the backdrop behind it
                              * and composites the window over it (frosted acrylic).
                              * Implies chromeless (the app owns its own chrome). */
+    int       pending_action; /* one-shot request delivered to the app runtime */
     /* Latched click replay: a press EDGE on this window's content is remembered
      * here so an app that was busy (e.g. mid first-frame render, seconds long
      * under TCG) still receives the click on its next win_input polls instead
@@ -66,8 +67,11 @@ static int        g_active  = 0;   /* desktop has been painted at least once  */
 static uint32_t   g_top_id  = 0;   /* id of the currently-focused (front) window */
 
 /* ---- pointer state (cursor + click-to-focus + title-bar drag) ----------- */
-#define CURSOR_W 11
-#define CURSOR_H 18
+#define CURSOR_LAYER_W 20
+#define CURSOR_LAYER_H 28
+#define CURSOR_W (CURSOR_LAYER_W + 2)  /* complete footprint, including shadow */
+#define CURSOR_H (CURSOR_LAYER_H + 2)
+#define CURSOR_DAMAGE_PAD 3
 #define GLASS_BLUR 7        /* backdrop blur radius for glass windows */
 #define GLASS_ALPHA 216     /* window opacity over the frosted backdrop (~85%) */
 #define GLOW_W 20           /* accent halo width around the focused app window */
@@ -75,7 +79,11 @@ static uint32_t   g_top_id  = 0;   /* id of the currently-focused (front) window
 #define GLOW_R 0x6b
 #define GLOW_G 0x74
 #define GLOW_B 0xf0         /* EmbLink indigo, a touch brighter than the accent */
+#define WORK_TOP 32         /* universal system/status bar */
+#define WORK_BOTTOM 64      /* desktop taskbar */
 static int      g_cursor_x, g_cursor_y, g_cursor_valid;
+static fb_color_t g_cursor_under[CURSOR_W * CURSOR_H];
+static int      g_cursor_under_valid;
 static uint32_t g_prev_buttons;
 static int      g_dragging;        /* a title-bar drag is in progress          */
 static uint32_t g_drag_id;         /* which window is being dragged             */
@@ -260,6 +268,13 @@ static int win_close_rect(const struct comp_window *w, int *x0, int *y0, int *x1
     return 1;
 }
 
+static int win_max_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
+    int cx0, cy0, cx1, cy1;
+    if (!win_close_rect(w, &cx0, &cy0, &cx1, &cy1)) return 0;
+    *x0 = cx0 - 22; *x1 = cx1 - 22; *y0 = cy0; *y1 = cy1;
+    return 1;
+}
+
 /* ---- compositing -------------------------------------------------------- */
 
 /* Draw one window's chrome + content clipped to region [rx0,ry0)-(rx1,ry1). */
@@ -288,21 +303,33 @@ static void paint_window(struct comp_window *w, int focused,
     if (!w->desktop && !w->chromeless) {
         int tbx0 = w->x, tby0 = w->y, tbx1 = w->x + (int)w->cw, tby1 = w->y + COMP_TITLEBAR_H;
         if (!(tbx1 <= rx0 || tbx0 >= rx1 || tby1 <= ry0 || tby0 >= ry1)) {
-            fb_color_t bar = focused ? FB_RGB(0x5b, 0x63, 0xd6) : FB_RGB(0x2a, 0x2d, 0x3d);
+            fb_color_t bar = focused ? FB_RGB(0x24, 0x24, 0x24) : FB_RGB(0x20, 0x20, 0x20);
             fb_fill_rect(tbx0, tby0, (int)w->cw, COMP_TITLEBAR_H, bar);
-            /* a small "traffic light" dot, then the title text */
-            fb_fill_circle(tbx0 + 13, tby0 + COMP_TITLEBAR_H / 2, 4,
-                           focused ? FB_RGB(0xff, 0xd9, 0x5e) : FB_RGB(0x55, 0x58, 0x6b));
-            int tr = focused ? 0xff : 0xb8, tg = focused ? 0xff : 0xbc, tb = focused ? 0xff : 0xc8;
-            int br = focused ? 0x5b : 0x2a, bg = focused ? 0x63 : 0x2d, bb = focused ? 0xd6 : 0x3d;
-            fb_draw_string(w->title, tbx0 + 28, tby0 + (COMP_TITLEBAR_H - 16) / 2,
+            int tr = focused ? 0xf2 : 0xa8, tg = focused ? 0xf2 : 0xa8, tb = focused ? 0xf2 : 0xa8;
+            int br = 0x24, bg = 0x24, bb = 0x24;
+            fb_draw_string(w->title, tbx0 + 12, tby0 + (COMP_TITLEBAR_H - 16) / 2,
                            tr, tg, tb, br, bg, bb);
-            /* close button: a red dot with an X -- click it to close the window */
+
+            /* Linux-style window controls: minimize, maximize and close.
+             * Close is connected to process teardown below. The first two are
+             * deliberately rendered as disabled chrome until the compositor
+             * exposes minimize/maximize lifecycle operations. */
             int cbx0, cby0, cbx1, cby1;
             win_close_rect(w, &cbx0, &cby0, &cbx1, &cby1);
+            int cy = (cby0 + cby1) / 2;
+            int cx = (cbx0 + cbx1) / 2;
+            fb_color_t ctl = focused ? FB_RGB(0x43, 0x43, 0x43) : FB_RGB(0x35, 0x35, 0x35);
+            fb_color_t glyph = focused ? FB_RGB(0xe5, 0xe5, 0xe5) : FB_RGB(0x8f, 0x8f, 0x8f);
+            fb_fill_circle(cx - 44, cy, COMP_CLOSE_SZ / 2, ctl);
+            fb_draw_line(cx - 48, cy + 2, cx - 40, cy + 2, glyph);
+            fb_fill_circle(cx - 22, cy, COMP_CLOSE_SZ / 2, ctl);
+            fb_draw_line(cx - 26, cy - 3, cx - 19, cy - 3, glyph);
+            fb_draw_line(cx - 26, cy - 3, cx - 26, cy + 4, glyph);
+            fb_draw_line(cx - 19, cy - 3, cx - 19, cy + 4, glyph);
+            fb_draw_line(cx - 26, cy + 4, cx - 19, cy + 4, glyph);
             fb_fill_circle((cbx0 + cbx1) / 2, (cby0 + cby1) / 2, COMP_CLOSE_SZ / 2,
-                           focused ? FB_RGB(0xe0, 0x5b, 0x5b) : FB_RGB(0x50, 0x3a, 0x40));
-            fb_color_t xc = focused ? FB_RGB(0x2a, 0x10, 0x10) : FB_RGB(0x9a, 0x82, 0x88);
+                           ctl);
+            fb_color_t xc = glyph;
             fb_draw_line(cbx0 + 5, cby0 + 5, cbx1 - 5, cby1 - 5, xc);
             fb_draw_line(cbx1 - 5, cby0 + 5, cbx0 + 5, cby1 - 5, xc);
         }
@@ -341,18 +368,108 @@ static void paint_window(struct comp_window *w, int focused,
                      focused ? FB_RGB(0x7c, 0x84, 0xf0) : FB_RGB(0x3a, 0x3f, 0x55));
 }
 
-/* A small arrow cursor drawn straight into the framebuffer (clipped to screen
- * by the fb primitives). White fill with a dark 1px edge for contrast. */
-static void draw_cursor(int cx, int cy) {
-    for (int dy = 0; dy < CURSOR_H; dy++) {
-        int span = dy < 9 ? dy : (CURSOR_H - 1 - dy) + 2;   /* arrow silhouette */
-        if (span > CURSOR_W - 1) span = CURSOR_W - 1;
-        for (int dx = 0; dx <= span; dx++) {
-            int edge = (dx == 0) || (dx == span) || (dy == 0);
-            fb_put_pixel_c((uint32_t)(cx + dx), (uint32_t)(cy + dy),
-                           edge ? FB_RGB(0x10, 0x10, 0x14) : FB_RGB(0xff, 0xff, 0xff));
+/* Modern desktop arrow, rasterised from two polygons at 4x4 coverage. This
+ * keeps the diagonal and the neck smooth at 1:1 display scale; the previous
+ * hand-authored bitmap visibly turned into a star where the head met the stem.
+ * Coordinates are quarter-pixels, avoiding floating point in the kernel. */
+struct cursor_pt { int x, y; };
+static const struct cursor_pt cursor_outer[] = {
+    { 4,  4}, { 4, 84}, {24, 64}, {40,100},
+    {56, 92}, {40, 60}, {72, 60}
+};
+static const struct cursor_pt cursor_inner[] = {
+    {12, 14}, {12, 67}, {26, 53}, {42, 88},
+    {47, 85}, {32, 52}, {57, 52}
+};
+static uint32_t cursor_shadow[CURSOR_LAYER_W * CURSOR_LAYER_H];
+static uint32_t cursor_outer_layer[CURSOR_LAYER_W * CURSOR_LAYER_H];
+static uint32_t cursor_inner_layer[CURSOR_LAYER_W * CURSOR_LAYER_H];
+static int cursor_layers_ready;
+
+static int cursor_inside(int x, int y, const struct cursor_pt *p, int n) {
+    int inside = 0;
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        int yi = p[i].y, yj = p[j].y;
+        if ((yi > y) != (yj > y)) {
+            int64_t cross = (int64_t)(p[j].x - p[i].x) * (y - yi);
+            int edge_x = p[i].x + (int)(cross / (yj - yi));
+            if (x < edge_x) inside = !inside;
         }
     }
+    return inside;
+}
+
+static void cursor_polygon_layer(const struct cursor_pt *p, int n,
+                                 uint8_t r, uint8_t g, uint8_t b,
+                                 uint8_t max_alpha, uint32_t *layer) {
+    for (int y = 0; y < CURSOR_LAYER_H; y++) {
+        for (int x = 0; x < CURSOR_LAYER_W; x++) {
+            int hits = 0;
+            for (int sy = 0; sy < 4; sy++)
+                for (int sx = 0; sx < 4; sx++)
+                    hits += cursor_inside(x * 4 + sx, y * 4 + sy, p, n);
+            uint8_t a = (uint8_t)((hits * max_alpha + 8) / 16);
+            /* fb_blit_blend expects straight (non-premultiplied) ARGB and
+             * applies alpha itself. Premultiplying here applies alpha twice,
+             * producing the dark blocks/trails seen while moving the cursor. */
+            layer[y * CURSOR_LAYER_W + x] =
+                a ? FB_ARGB(a, r, g, b) : 0;
+        }
+    }
+}
+
+static void cursor_prepare_layers(void) {
+    if (cursor_layers_ready) return;
+    cursor_polygon_layer(cursor_outer, 7, 0x08, 0x0a, 0x10, 72,
+                         cursor_shadow);
+    cursor_polygon_layer(cursor_outer, 7, 0x08, 0x0a, 0x10, 255,
+                         cursor_outer_layer);
+    cursor_polygon_layer(cursor_inner, 7, 0xf8, 0xf8, 0xf5, 255,
+                         cursor_inner_layer);
+    cursor_layers_ready = 1;
+}
+
+static void draw_cursor(int cx, int cy) {
+    cursor_prepare_layers();
+    fb_blit_blend(cx + 2, cy + 2, CURSOR_LAYER_W, CURSOR_LAYER_H,
+                  cursor_shadow, CURSOR_LAYER_W);
+
+    fb_blit_blend(cx, cy, CURSOR_LAYER_W, CURSOR_LAYER_H,
+                  cursor_outer_layer, CURSOR_LAYER_W);
+
+    fb_blit_blend(cx, cy, CURSOR_LAYER_W, CURSOR_LAYER_H,
+                  cursor_inner_layer, CURSOR_LAYER_W);
+}
+
+/* Software-cursor save-under.  Cursor pixels live only in the framebuffer,
+ * never in a window backing store.  Restoring this small snapshot avoids
+ * recomposing the complete desktop for every pointer movement. */
+static void cursor_restore_under(void) {
+    if (!g_cursor_valid || !g_cursor_under_valid) return;
+    /* One clipped blit also produces one dirty-region update.  The old
+     * per-pixel restore acquired the framebuffer dirty lock hundreds of times
+     * per mouse packet and was the main source of pointer latency. */
+    fb_blit(g_cursor_x, g_cursor_y, CURSOR_W, CURSOR_H,
+            g_cursor_under, CURSOR_W);
+    g_cursor_under_valid = 0;
+}
+
+static void cursor_capture_and_draw(void) {
+    if (!g_cursor_valid) return;
+    const fb_info_t *fi = fb_get_info();
+    if (!fi) return;
+    for (int y = 0; y < CURSOR_H; y++) {
+        int sy = g_cursor_y + y;
+        for (int x = 0; x < CURSOR_W; x++) {
+            int sx = g_cursor_x + x;
+            g_cursor_under[y * CURSOR_W + x] =
+                (sx >= 0 && sy >= 0 &&
+                 sx < (int)fi->width && sy < (int)fi->height)
+                    ? fb_get_pixel((uint32_t)sx, (uint32_t)sy) : 0;
+        }
+    }
+    g_cursor_under_valid = 1;
+    draw_cursor(g_cursor_x, g_cursor_y);
 }
 
 /* Repaint screen region [rx0,ry0)-(rx1,ry1): desktop, then all windows that
@@ -364,6 +481,11 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
     if (rx0 < 0) rx0 = 0; if (ry0 < 0) ry0 = 0;
     if (rx1 > W) rx1 = W; if (ry1 > H) ry1 = H;
     if (rx1 <= rx0 || ry1 <= ry0) return;
+
+    /* Remove the software cursor before changing the composed framebuffer.
+     * This also guarantees that its saved background never contains a previous
+     * cursor image. */
+    cursor_restore_under();
 
     /* 1) desktop background: the aurora field (built once, then blitted). */
     aurora_build(W, H);
@@ -392,13 +514,8 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
         drawn++;
     }
 
-    /* 3) the cursor, on top of everything, if it falls in this region */
-    if (g_cursor_valid) {
-        int cx0 = g_cursor_x, cy0 = g_cursor_y;
-        int cx1 = cx0 + CURSOR_W, cy1 = cy0 + CURSOR_H;
-        if (!(cx1 <= rx0 || cx0 >= rx1 || cy1 <= ry0 || cy0 >= ry1))
-            draw_cursor(g_cursor_x, g_cursor_y);
-    }
+    /* 3) save the fresh pixels below the cursor, then put it back on top. */
+    cursor_capture_and_draw();
 
     fb_present();
 }
@@ -763,6 +880,17 @@ int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y) {
     struct comp_window *w = win_find(pid, id);
     if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
     int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
+    const fb_info_t *fi = fb_get_info();
+    if (!w->desktop && !w->widget && fi) {
+        int maxx = (int)fi->width - (int)w->cw;
+        int maxy = (int)fi->height - WORK_BOTTOM - win_titlebar_h(w) - (int)w->ch;
+        if (maxx < 0) maxx = 0;
+        if (maxy < WORK_TOP) maxy = WORK_TOP;
+        if (x < 0) x = 0;
+        if (x > maxx) x = maxx;
+        if (y < WORK_TOP) y = WORK_TOP;
+        if (y > maxy) y = maxy;
+    }
     w->x = x; w->y = y;
     w->z = w->widget ? g_widget_z++ : g_next_z++;   /* raise within its own band */
     int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
@@ -820,7 +948,11 @@ void compositor_pointer_tick(void) {
                if ((x1)>bx1)bx1=(x1); if ((y1)>by1)by1=(y1); }               \
     } while (0)
 
-    if (!g_cursor_valid) { g_cursor_x = x; g_cursor_y = y; g_cursor_valid = 1; }
+    if (!g_cursor_valid) {
+        g_cursor_x = x; g_cursor_y = y; g_cursor_valid = 1;
+        cursor_capture_and_draw();
+        fb_present();
+    }
 
     int raised = 0;
     int close_pid = 0;   /* set when a close button is clicked */
@@ -840,7 +972,9 @@ void compositor_pointer_tick(void) {
             }
         }
         if (w && !w->desktop) {
+            int title_control = 0;
             int cbx0, cby0, cbx1, cby1;
+            int mbx0, mby0, mbx1, mby1;
             if (win_close_rect(w, &cbx0, &cby0, &cbx1, &cby1) &&
                 x >= cbx0 && x < cbx1 && y >= cby0 && y < cby1) {
                 /* close: HIDE the window now so it disappears immediately (the
@@ -848,21 +982,35 @@ void compositor_pointer_tick(void) {
                  * repaint what's behind, then kill its process below. Its shared
                  * pixel backing is freed later by compositor_reap_pid. */
                 close_pid = w->pid;
+                title_control = 1;
                 kprintf("compositor: close btn -> hide win %u, kill pid %d\n", (unsigned)w->id, w->pid);   /* DIAG */
                 w->visible = 0;
                 if (w->id == g_top_id) g_top_id = 0;
                 int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
                 DIRTY(fx0, fy0, fx1, fy1);
                 raised = 1;   /* re-run enforce_focus() to promote the new front */
-            } else {
+            } else if (win_max_rect(w, &mbx0, &mby0, &mbx1, &mby1) &&
+                       x >= mbx0 && x < mbx1 && y >= mby0 && y < mby1) {
+                w->pending_action = 1; /* EMBK_WIN_ACTION_MAXIMIZE */
+                title_control = 1;
+                if (w != front_window()) w->z = g_next_z++;
+                raised = 1;
+                int fx0, fy0, fx1, fy1;
+                win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
+                DIRTY(fx0, fy0, fx1, fy1);
+            } else if (w != front_window()) {
+                /* Raising a window that is already in front changes no pixels.
+                 * Repainting its complete footprint made fullscreen login/setup
+                 * flash on every click. */
                 w->z = w->widget ? g_widget_z++ : g_next_z++;   /* raise within band */
                 raised = 1;
                 int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
                 DIRTY(fx0, fy0, fx1, fy1);
-                if (y < w->y + win_titlebar_h(w)) {   /* grabbed the title bar */
-                    g_dragging = 1; g_drag_id = w->id;
-                    g_drag_dx = x - w->x; g_drag_dy = y - w->y;
-                }
+            }
+            if (!title_control && w->visible && y < w->y + win_titlebar_h(w)) {
+                /* grabbed the title bar (also valid when already front) */
+                g_dragging = 1; g_drag_id = w->id;
+                g_drag_dx = x - w->x; g_drag_dy = y - w->y;
             }
         }
     }
@@ -875,6 +1023,18 @@ void compositor_pointer_tick(void) {
             int nx = x - g_drag_dx, ny = y - g_drag_dy;
             if (nx != w->x || ny != w->y) {
                 int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
+                const fb_info_t *fi = fb_get_info();
+                if (fi && !w->widget) {
+                    int maxx = (int)fi->width - (int)w->cw;
+                    int maxy = (int)fi->height - WORK_BOTTOM -
+                               win_titlebar_h(w) - (int)w->ch;
+                    if (maxx < 0) maxx = 0;
+                    if (maxy < WORK_TOP) maxy = WORK_TOP;
+                    if (nx < 0) nx = 0;
+                    if (nx > maxx) nx = maxx;
+                    if (ny < WORK_TOP) ny = WORK_TOP;
+                    if (ny > maxy) ny = maxy;
+                }
                 w->x = nx; w->y = ny;
                 int nx0, ny0, nx1, ny1; win_repaint_rect(w, &nx0, &ny0, &nx1, &ny1);
                 DIRTY(ox0, oy0, ox1, oy1);
@@ -886,13 +1046,18 @@ void compositor_pointer_tick(void) {
     /* cursor motion: fold the old + new cursor rects into the dirty bbox so
      * the old cursor is erased and the new one drawn (paint_region stamps the
      * cursor at g_cursor_* last). */
-    if (x != g_cursor_x || y != g_cursor_y) {
-        DIRTY(g_cursor_x, g_cursor_y, g_cursor_x + CURSOR_W, g_cursor_y + CURSOR_H);
+    int cursor_moved = (x != g_cursor_x || y != g_cursor_y);
+    if (cursor_moved) {
+        cursor_restore_under();
         g_cursor_x = x; g_cursor_y = y;
-        DIRTY(x, y, x + CURSOR_W, y + CURSOR_H);
     }
 
-    if (have) paint_region(bx0, by0, bx1, by1);
+    if (have) {
+        paint_region(bx0, by0, bx1, by1);
+    } else if (cursor_moved) {
+        cursor_capture_and_draw();
+        fb_present();
+    }
     if (raised) enforce_focus();   /* demote whoever used to be front */
 
     /* Record the content-local pointer for the topmost window under the cursor
@@ -986,6 +1151,15 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
             w->pend_click = 0;
         }
         break;
+    }
+    /* Window-manager commands share the otherwise ordinary `win` result.
+     * The high bit distinguishes them without changing the stable syscall ABI. */
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        if (g_wins[i].used && g_wins[i].pid == pid && g_wins[i].pending_action) {
+            if (win) *win = 0x80000000u | (uint32_t)g_wins[i].pending_action;
+            g_wins[i].pending_action = 0;
+            break;
+        }
     }
     spin_unlock(&g_comp_lock);
     return focused;

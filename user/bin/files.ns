@@ -1,6 +1,6 @@
-# files namespace manifest (docs/USERSPACE_v2.md UP4).
-# The file manager browses the WHOLE tree, so its broad view is a real
-# privilege -- but here it is EXPLICITLY declared, not ambient, and the OS stays
-# sealed: /system is still read-only. This is the "explicitly-broad-view" app.
-rw /
-ro /system
+# Files inherits the authenticated session namespace.
+#
+# This is intentional: a user's file manager must see exactly what that user
+# can see (their writable home plus the read-only system/application trees).
+# Asking for `rw /` here would exceed the session's authority and the kernel
+# would correctly reject the spawn with -ENOENT.
