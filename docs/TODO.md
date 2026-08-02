@@ -1426,12 +1426,14 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
   `/data/registry`), then `pkg install /data/registry/<name>` verifies the
   signature against the trusted key **on arrival** and adopts — a compromised host
   cannot inject a bad binary (§9.2): trust is in the signature, not the channel.
-  `test pkgregistry`: clone registry → install (signature valid) → run confined,
-  all on the metal — the transport is the very git-over-HTTPS client from the git
-  arc. *Refinement (§9.1):* binaries as release assets rather than in git history
-  (the small bundle rides in the repo here for the proof); `pkg`-side index sync
-  (`pkg install <name>` resolving the registry automatically) is a UX nicety on
-  top of the proven clone+install flow.
+  `pkg` has the apt-like UX: **`pkg sync [url]`** clones the registry into
+  `/data/registry` (spawning `gitclone`, which inherits its CAP_NETWORK) and
+  remembers the url; **`pkg install <name>`** resolves a bare name from the synced
+  index and installs it (a `/path` still installs a local bundle). `test
+  pkgregistry` (metal): `pkg sync <url>` → `pkg install pkgprobe` (signature valid
+  on arrival) → `pkg run` confined — the transport is the very git-over-HTTPS
+  client from the git arc. *Refinement (§9.1):* binaries as release assets rather
+  than in git history (the small bundle rides in the repo here for the proof).
 
 ### Toolchain (EmbCC/EmbLD — tracked in full in `EmbCC/docs/todo.md`)
 

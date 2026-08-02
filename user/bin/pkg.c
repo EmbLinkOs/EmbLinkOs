@@ -9,8 +9,14 @@
  *
  *   pkg verify   <staged-dir>          -- check a bundle (signature, build_id,
  *                                         caps, abi); no adopt.
- *   pkg install [--allow-widen] <dir>  -- verify, present the declared authority,
- *                                         adopt into /data/apps/<name>/. On an
+ *   pkg sync     [url]                 -- clone the registry git repo into
+ *                                         /data/registry (over our git-over-HTTPS);
+ *                                         the url is remembered.
+ *   pkg install [--allow-widen|--local] <dir|name>
+ *                                      -- a path installs that bundle; a bare NAME
+ *                                         resolves to the synced registry. Verify,
+ *                                         present the declared authority, adopt
+ *                                         into /data/apps/<name>/. On an
  *                                         UPDATE, re-negotiate authority: a version
  *                                         that WIDENS caps/namespace is refused
  *                                         unless --allow-widen, and the previous
@@ -37,6 +43,8 @@
 #define PKG_ABI   1              /* EMBX_ABI_VERSION this OS provides */
 #define APPS_ROOT "/data/apps"
 #define PKG_ROOT  "/data/pkg"
+#define REGISTRY_DIR "/data/registry"
+#define GITCLONE  "/data/apps/gitclone/gitclone.elf"
 
 static char *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb"); if (!f) return NULL;
@@ -253,7 +261,18 @@ static int retain_current(const char *name, const struct pkg_manifest *old) {
     return 0;
 }
 
-static int cmd_install(const char *dir, int allow_widen, int local) {
+static int cmd_install(const char *arg, int allow_widen, int local) {
+    /* A path installs from that bundle dir; a bare name resolves to the synced
+     * registry (/data/registry/<name>) -- `pkg sync` then `pkg install <name>`. */
+    char dirbuf[600]; const char *dir = arg;
+    if (arg[0] != '/') {
+        snprintf(dirbuf, sizeof dirbuf, "%s/%s", REGISTRY_DIR, arg);
+        struct embk_stat es;
+        if (embk_stat(dirbuf, &es) != 0) {
+            fprintf(stderr, "pkg: '%s' is not in the registry -- run `pkg sync` first?\n", arg); return 1; }
+        dir = dirbuf;
+        printf("PKG install: '%s' from the registry (%s)\n", arg, dir);
+    }
     struct pkg_manifest m; struct embx_info ei; char binpath[1024]; int sig_ok;
     if (load_bundle(dir, &m, &ei, binpath, sizeof binpath, &sig_ok) != 0) return 1;
 
@@ -371,10 +390,35 @@ static int cmd_list(void) {
     return 0;
 }
 
+/* Sync the package index by cloning the registry git repo (over our own
+ * git-over-HTTPS) into /data/registry. The url is remembered so a later
+ * `pkg sync` needs no argument. Requires CAP_NETWORK (inherited by gitclone). */
+static int cmd_sync(const char *url_arg) {
+    char urlbuf[600]; const char *url = url_arg;
+    char urlpath[700]; snprintf(urlpath, sizeof urlpath, "%s/registry.url", PKG_ROOT);
+    if (!url) {
+        size_t n; char *u = read_file(urlpath, &n);
+        if (u) { size_t k = strlen(u); while (k && (u[k-1]=='\n'||u[k-1]=='\r'||u[k-1]==' ')) u[--k]=0;
+                 strncpy(urlbuf, u, sizeof urlbuf - 1); urlbuf[sizeof urlbuf-1]=0; free(u); url = urlbuf; }
+    }
+    if (!url || !url[0]) { fprintf(stderr, "pkg sync: no registry url (pass one; it is then remembered)\n"); return 1; }
+
+    printf("PKG sync %s -> %s\n", url, REGISTRY_DIR);
+    char *av[] = { (char *)GITCLONE, (char *)url, (char *)REGISTRY_DIR, NULL };
+    int64_t h = embk_spawn(GITCLONE, av, NULL, 0);   /* inherits pkg's caps + ns */
+    if (h < 0) { fprintf(stderr, "pkg sync: cannot run %s (%lld)\n", GITCLONE, (long long)h); return 1; }
+    if (embk_wait((int)h) != 0) { fprintf(stderr, "pkg sync: registry clone failed\n"); return 1; }
+
+    mkdir(PKG_ROOT, 0755);
+    write_file(urlpath, url, strlen(url));
+    printf("PKG sync -> OK (index at %s)\n", REGISTRY_DIR);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: pkg verify|install [--allow-widen] <dir>\n"
-                        "       pkg run|rollback|remove|info <name> | pkg list\n");
+        fprintf(stderr, "usage: pkg sync [url] | pkg install [--allow-widen|--local] <dir|name>\n"
+                        "       pkg verify <dir> | pkg run|rollback|remove|info <name> | pkg list\n");
         return 2;
     }
     if (!strcmp(argv[1], "verify")   && argc >= 3) return cmd_verify(argv[2]);
@@ -392,6 +436,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "rollback") && argc >= 3) return cmd_rollback(argv[2]);
     if (!strcmp(argv[1], "remove")   && argc >= 3) return cmd_remove(argv[2]);
     if (!strcmp(argv[1], "info")     && argc >= 3) return cmd_info(argv[2]);
+    if (!strcmp(argv[1], "sync"))                  return cmd_sync(argc >= 3 ? argv[2] : NULL);
     if (!strcmp(argv[1], "list"))                  return cmd_list();
     fprintf(stderr, "pkg: unknown command '%s'\n", argv[1]);
     return 2;

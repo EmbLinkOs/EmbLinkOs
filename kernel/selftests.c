@@ -1611,16 +1611,20 @@ int selftests_handle_command(const char *cmd)
         uint64_t caps_net = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
         uint64_t caps_fs  = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
 
-        char *a1[] = { (char *)gc, (char *)"https://github.com/teo1747/emblink-packages",
-                       (char *)"/data/registry", NULL };
-        int c1 = process_wait((uint32_t)process_create_caps(gc, a1, 3, env, NULL, 0, caps_net));
+        /* 1. `pkg sync <url>` -- pkg itself clones the registry (spawns gitclone,
+         *    which inherits pkg's CAP_NETWORK). Like `apt update`. */
+        char *a1[] = { (char *)pk, (char *)"sync",
+                       (char *)"https://github.com/teo1747/emblink-packages", NULL };
+        int c1 = process_wait((uint32_t)process_create_caps(pk, a1, 3, env, NULL, 0, caps_net));
         int have = (vfs_stat("/data/registry/pkgprobe/pkgprobe.pkg", &st) == EMBK_OK);
-        kprintf("[pkgreg] 1 clone registry over HTTPS = %s (bundle on disk=%d)\n",
+        kprintf("[pkgreg] 1 pkg sync (clone registry over HTTPS) = %s (index on disk=%d)\n",
                 c1 == 0 ? "OK" : "FAIL", have);
 
-        char *a2[] = { (char *)pk, (char *)"install", (char *)"/data/registry/pkgprobe", NULL };
+        /* 2. `pkg install pkgprobe` -- resolve the NAME from the synced registry,
+         *    verify the signature on arrival, adopt. Like `apt install`. */
+        char *a2[] = { (char *)pk, (char *)"install", (char *)"pkgprobe", NULL };
         int c2 = process_wait((uint32_t)process_create_caps(pk, a2, 3, env, NULL, 0, caps_fs));
-        kprintf("[pkgreg] 2 install from registry (signature verified on arrival) = %s\n", c2 == 0 ? "OK" : "FAIL");
+        kprintf("[pkgreg] 2 pkg install pkgprobe (signature verified on arrival) = %s\n", c2 == 0 ? "OK" : "FAIL");
 
         char *a3[] = { (char *)pk, (char *)"run", (char *)"pkgprobe", NULL };
         int c3 = process_wait((uint32_t)process_create_caps(pk, a3, 3, env, NULL, 0, caps_fs));
