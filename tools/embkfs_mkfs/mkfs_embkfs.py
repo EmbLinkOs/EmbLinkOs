@@ -786,6 +786,18 @@ def discover_userland_objects(build_dir="build"):
     if probe_elf is not None and probe_spec is not None:
         objects.append((b"data/staging/build/pkgprobe.elf", L.DT_REG, L.S_IFREG | 0o755, probe_elf))
         objects.append((b"data/staging/build/pkgprobe.pkgspec", L.DT_REG, L.S_IFREG | L.PERM_FILE, probe_spec))
+        # PK2b structured stanza: a build.ebm whose `kind: package` stanza declares
+        # the authority (caps/grant) inline -- EmbBuild drives pkgbuild from it.
+        ebm = (b"project: pkgstanza\n\n"
+               b"name: pkgprobe\n"
+               b"kind: package\n"
+               b"version: 2.0.0\n"
+               b"caps: filesystem\n"
+               b"grant: ro /system\n"
+               b"grant: rw /data/apps/pkgprobe\n"
+               b"inputs: /data/staging/build/pkgprobe.elf\n"
+               b"output: /data/build/out/pkgstanza/pkgprobe.embx\n")
+        objects.append((b"data/staging/build/pkgstanza.ebm", L.DT_REG, L.S_IFREG | L.PERM_FILE, ebm))
 
     # PK3 update/rollback: a benign v1.1 (same authority) and a WIDER v2 (adds
     # `network`) -- the latter must be refused as a silent privilege escalation.

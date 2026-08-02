@@ -1395,9 +1395,13 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
   present signature is still verified; caps/build_id/re-negotiation still apply).
   `test pkgbuild`: pkgbuild generates pkgprobe's bundle from the staged
   `.pkgspec` + ELF → `pkg install --local` → `pkg run` confined — the whole
-  SDK→pkgmgr loop on the metal. A `build.ebm` drives it as a normal step running
-  `pkgbuild`; a structured EmbBuild `package:` stanza (embbuild.c fields) is
-  optional polish.
+  SDK→pkgmgr loop on the metal.
+  - **Structured EmbBuild `package:` stanza — DONE (`test pkgstanza`).** EmbBuild
+    (`shell/tools/embbuild.c`) gained a `kind: package` with `version`/`caps`/
+    `grant` fields: it writes a `.pkgspec` from them and drives `pkgbuild`, with the
+    fields folded into the rebuild stamp. A `build.ebm` declares an app's authority
+    inline; `embbuild` produces the bundle on-device. Metal: embbuild package stanza
+    → bundle → `pkg install --local` → run confined.
 - [x] ~~**PK3** — signing + update/rollback + registry.~~ **DONE, metal-proven
   (`test pkg`, 8 checks).**
   - **Signing**: `tools/embx/pkgsign.py` signs each manifest (ECDSA P-256 over the

@@ -1593,6 +1593,43 @@ int selftests_handle_command(const char *cmd)
         return pass ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test pkgstanza") == 0) {
+        /* PK2b structured stanza (docs/PACKAGING_AND_SDK.md §4): a build.ebm
+         * `kind: package` stanza declares the app's authority (caps/grant) inline;
+         * EmbBuild turns it into a .pkgspec and drives pkgbuild -- so declaring
+         * authority is part of building ON THE OS via the build tool itself.
+         *   1. embbuild <build.ebm> -- runs the package stanza -> a bundle in
+         *      /data/build/out/pkgstanza (embbuild spawns pkgbuild, inheriting FS).
+         *   2. pkg install --local -- adopt the (unsigned, on-device) build.
+         *   3. pkg run pkgprobe -- confined to the declared grant. */
+        const char *bb = "/data/apps/embbuild/embbuild.elf";
+        const char *pk = "/data/apps/pkg/pkg.elf";
+        struct vfs_stat st;
+        if (vfs_stat(bb, &st) != 0 || vfs_stat(pk, &st) != 0) {
+            kprintf("\n[cmd] test pkgstanza: embbuild/pkg not on image\n"); return 1; }
+        char *env[] = { (char *)"HOME=/", NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        char *a1[] = { (char *)bb, (char *)"/data/staging/build/pkgstanza.ebm", NULL };
+        int c1 = process_wait((uint32_t)process_create_caps(bb, a1, 2, env, NULL, 0, caps));
+        struct vfs_stat es;
+        int built = (vfs_stat("/data/build/out/pkgstanza/pkgprobe.embx", &es) == EMBK_OK);
+        kprintf("[pkgstanza] 1 embbuild package stanza -> bundle = %s (embx on disk=%d)\n",
+                c1 == 0 ? "OK" : "FAIL", built);
+
+        char *a2[] = { (char *)pk, (char *)"install", (char *)"--local", (char *)"/data/build/out/pkgstanza", NULL };
+        int c2 = process_wait((uint32_t)process_create_caps(pk, a2, 4, env, NULL, 0, caps));
+        kprintf("[pkgstanza] 2 pkg install --local = %s\n", c2 == 0 ? "OK" : "FAIL");
+
+        char *a3[] = { (char *)pk, (char *)"run", (char *)"pkgprobe", NULL };
+        int c3 = process_wait((uint32_t)process_create_caps(pk, a3, 3, env, NULL, 0, caps));
+        kprintf("[pkgstanza] 3 run built package (confined) = %s\n", c3 == 0 ? "OK" : "FAIL");
+
+        int pass = (c1 == 0 && built && c2 == 0 && c3 == 0);
+        kprintf("[cmd] test pkgstanza: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test pkgregistry") == 0) {
         /* Packaging PK4: the registry is a GIT REPO. The OS clones it over HTTPS
          * (our own git-over-TLS) and installs a SIGNED package from it -- the

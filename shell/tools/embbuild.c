@@ -37,11 +37,16 @@
 
 struct stanza {
     char name[MAX_TOK];
-    char kind[MAX_TOK];                                     /* "compile" | "link" | "install" */
+    char kind[MAX_TOK];                                     /* "compile"|"link"|"install"|"package" */
     char inputs[MAX_ITEMS][MAX_TOK]; int n_inputs;
     char argv[MAX_ITEMS][MAX_TOK]; int n_args;
     char output[MAX_TOK];
     char stamp[MAX_TOK];                                     /* the hash of the inputs, args, and tool version */
+    /* package stanza (docs/PACKAGING_AND_SDK.md §4): declare authority as part of
+     * building. `version`/`caps`/`grant` become a .pkgspec that drives pkgbuild. */
+    char version[MAX_TOK];
+    char caps[MAX_ITEMS][MAX_TOK];  int n_caps;             /* capability names */
+    char grant[MAX_ITEMS][MAX_TOK]; int n_grant;            /* "ro|rw <prefix>" lines */
     int line;                                                /* for diagnostics */
 };
 
@@ -181,7 +186,15 @@ static int parse_manifest(const char *path) {
             current_stanza->n_args = split_list(value, current_stanza->argv, MAX_ITEMS, "args", current_stanza->name);
             if (current_stanza->n_args < 0) { fclose(f); return -1; }
         } else if (strcmp(key, "output") == 0) strncpy(current_stanza->output, value, sizeof(current_stanza->output) - 1);
-        else {
+        else if (strcmp(key, "version") == 0) strncpy(current_stanza->version, value, sizeof(current_stanza->version) - 1);
+        else if (strcmp(key, "caps") == 0) {
+            current_stanza->n_caps = split_list(value, current_stanza->caps, MAX_ITEMS, "caps", current_stanza->name);
+            if (current_stanza->n_caps < 0) { fclose(f); return -1; }
+        } else if (strcmp(key, "grant") == 0) {
+            /* one grant per line ("ro|rw <prefix>"), accumulated across lines */
+            if (current_stanza->n_grant < MAX_ITEMS)
+                strncpy(current_stanza->grant[current_stanza->n_grant++], value, MAX_TOK - 1);
+        } else {
             fprintf(stderr, "embbuild: unknown key '%s' in stanza '%s' at line %d\n", key, current_stanza->name, line_num);
             fclose(f);
             return -1;
@@ -343,6 +356,39 @@ static int run_install(struct stanza *s) {
     return 0;
 }
 
+/* package = declare authority as part of building (docs/PACKAGING_AND_SDK.md §4).
+ * The stanza's name/version/caps/grant become a .pkgspec, which drives pkgbuild
+ * to emit the EMBX (cap table baked in) + .ns + manifest -- consistent by
+ * construction, ON THE OS. `inputs` = the linked ELF; `output` = the .embx (its
+ * directory is the bundle dir). */
+static int run_package(struct stanza *s) {
+    if (s->n_inputs != 1) {
+        fprintf(stderr, "embbuild: package stanza '%s' needs exactly one input (the linked ELF)\n", s->name);
+        return -1;
+    }
+    char outdir[MAX_TOK];
+    strncpy(outdir, s->output, sizeof outdir - 1); outdir[sizeof outdir - 1] = 0;
+    char *sl = strrchr(outdir, '/');
+    if (sl) *sl = 0; else strcpy(outdir, ".");
+
+    /* Write the .pkgspec from the declared fields (the single source of truth). */
+    char spec[MAX_TOK]; snprintf(spec, sizeof spec, "%s/%s.pkgspec", outdir, s->name);
+    FILE *f = fopen(spec, "w");
+    if (!f) { fprintf(stderr, "embbuild: cannot write %s\n", spec); return -1; }
+    fprintf(f, "name: %s\nversion: %s\ncaps:", s->name, s->version[0] ? s->version : "0.0.0");
+    for (int i = 0; i < s->n_caps; i++) fprintf(f, " %s", s->caps[i]);
+    fprintf(f, "\n");
+    for (int i = 0; i < s->n_grant; i++) fprintf(f, "grant: %s\n", s->grant[i]);
+    fclose(f);
+
+    /* pkgbuild <spec> <elf> <outdir> */
+    char *argv[] = { "/data/apps/pkgbuild/pkgbuild.elf", spec, s->inputs[0], outdir, NULL };
+    int64_t child = embk_spawn(argv[0], argv, NULL, 0);
+    if (child < 0) { fprintf(stderr, "embbuild: cannot run pkgbuild (%d)\n", (int)-child); return -1; }
+    if (embk_wait((int)child) != 0) { fprintf(stderr, "embbuild: pkgbuild failed for '%s'\n", s->name); return -1; }
+    return 0;
+}
+
 /*---------------------------- DERIVED VALUES (BUILD.md §12 G3) ------------------
  * The one EmbBuild capability beyond a static walker: a `kind: measure` stanza
  * turns a file's size into a NAMED VALUE, and later stanzas interpolate ${name}
@@ -484,6 +530,11 @@ int main(int argc, char **argv) {
             crc = crc_feed(crc, s->argv[j], strlen(s->argv[j]) + 1);
         }
         crc = crc_feed(crc, EMBBUILD_VERSION, sizeof EMBBUILD_VERSION);
+        /* A package stanza's authority is part of its identity: changing caps,
+         * grant or version must rebuild the bundle. */
+        crc = crc_feed(crc, s->version, strlen(s->version) + 1);
+        for (int j = 0; j < s->n_caps; j++)  crc = crc_feed(crc, s->caps[j],  strlen(s->caps[j]) + 1);
+        for (int j = 0; j < s->n_grant; j++) crc = crc_feed(crc, s->grant[j], strlen(s->grant[j]) + 1);
         crc ^= 0xffffffffu;
 
         /* Skip iff stamp matches AND the output still exists; a stamp
@@ -497,7 +548,9 @@ int main(int argc, char **argv) {
         }
 
         printf("[embbuild] %-16s %s -> %s\n", s->name, s->kind, s->output);
-        int rc = (strcmp(s->kind, "install") == 0) ? run_install(s) : run_spawn(s);
+        int rc = (strcmp(s->kind, "install") == 0) ? run_install(s)
+               : (strcmp(s->kind, "package") == 0) ? run_package(s)
+               : run_spawn(s);
         if (rc != 0) {
             fprintf(stderr, "embbuild: stanza '%s' failed\n", s->name);
             return 1;
