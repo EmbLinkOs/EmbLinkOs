@@ -889,7 +889,11 @@ verified on the metal.
   a push onto a non-empty branch fetches the tip, splices its tree (other files
   survive), and commits with the tip as parent — `test gitpush` pushes a first
   commit then an incremental one, and `main` ends with both files + a 2-commit
-  chain. *Deferred:* multi-ref negotiation, nested-subtree splice, force/delete.
+  chain. **The full write/negotiate frontier works too** (`test gitfeat`, live):
+  **multi-ref clone** (`gitclone --ref <branch>` fetches a non-default ref),
+  **nested-subtree** push (recursive tree splice for `docs/guide.md`, other files
+  survive), **force-push** (`--force`, replaces history), and branch **delete**
+  (`--delete`). *Deferred:* have/negotiation, side-band, thin-pack.
 
 Trust anchors bundled: GTS Root R4 (EC P-384), ISRG Root X1 (RSA-4096), GlobalSign
 Root R3 (RSA-2048), USERTrust ECC (EC P-384, for github/Sectigo) — between them,

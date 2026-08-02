@@ -1418,6 +1418,80 @@ int selftests_handle_command(const char *cmd)
         return pass ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test gitfeat") == 0) {
+        /* The remaining git frontier, live: NESTED-subtree push, MULTI-REF clone,
+         * FORCE-push, and branch DELETE. Runs a self-contained sequence on the
+         * gitpush test repo (same staged /data/gitpush/{token,url} credentials):
+         *   1. push docs/guide.md to `main`   -- INCREMENTAL, NESTED subtree.
+         *   2. push NOTES.md to a NEW `dev`    -- creates a second branch.
+         *   3. gitclone --ref dev              -- MULTI-REF clone (not the default).
+         *   4. gitpush --force main            -- replace main's history.
+         *   5. gitpush --delete dev            -- remove the branch. */
+        const char *spp = "/data/apps/gitpush/gitpush.elf";
+        const char *spc = "/data/apps/gitclone/gitclone.elf";
+        struct vfs_stat st;
+        if (vfs_stat(spp, &st) != 0 || vfs_stat(spc, &st) != 0) {
+            kprintf("\n[cmd] test gitfeat: gitpush/gitclone not on image\n"); return 1; }
+
+        static char token[512], url[512], tokenv[560];
+        int fd = vfs_open("/data/gitpush/token", O_RDONLY, 0);
+        if (fd < 0) { kprintf("[cmd] test gitfeat: no /data/gitpush/token (needs a PAT)\n"); return 1; }
+        size_t got = 0; vfs_fd_read(fd, token, sizeof token - 1, &got); vfs_close(fd);
+        while (got > 0 && (token[got-1] == '\n' || token[got-1] == '\r' || token[got-1] == ' ')) got--;
+        token[got] = 0;
+        fd = vfs_open("/data/gitpush/url", O_RDONLY, 0);
+        if (fd < 0) { kprintf("[cmd] test gitfeat: no /data/gitpush/url\n"); return 1; }
+        size_t ug = 0; vfs_fd_read(fd, url, sizeof url - 1, &ug); vfs_close(fd);
+        while (ug > 0 && (url[ug-1] == '\n' || url[ug-1] == '\r' || url[ug-1] == ' ')) ug--;
+        url[ug] = 0;
+
+        struct { const char *path; const char *msg; } files[] = {
+            { "/data/f_guide.txt", "A nested doc pushed from EmbLinkOS (docs/guide.md).\n" },
+            { "/data/f_notes.txt", "Content living on the dev branch.\n" },
+            { "/data/f_only.txt",  "main's history replaced by a force-push from EmbLinkOS.\n" },
+        };
+        for (unsigned i = 0; i < sizeof files / sizeof files[0]; i++) {
+            int wf = vfs_open(files[i].path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (wf >= 0) { size_t w = 0; vfs_fd_write(wf, files[i].msg, strlen(files[i].msg), &w); vfs_close(wf); }
+        }
+
+        snprintf(tokenv, sizeof tokenv, "GITPUSH_TOKEN=%s", token);
+        char *env[] = { (char *)"HOME=/", tokenv, NULL };
+        uint64_t caps = EMBK_CAP_BIT(EMBK_CAP_NETWORK) | EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM);
+
+        /* 1. nested incremental push to main */
+        char *a1[] = { (char *)spp, url, (char *)"/data/f_guide.txt", (char *)"docs/guide.md", (char *)"main", NULL };
+        int r1 = process_wait((uint32_t)process_create_caps(spp, a1, 5, env, NULL, 0, caps));
+        kprintf("[gitfeat] 1 nested push docs/guide.md -> main = %s\n", r1 == 0 ? "OK" : "FAIL");
+
+        /* 2. push a new branch dev */
+        char *a2[] = { (char *)spp, url, (char *)"/data/f_notes.txt", (char *)"NOTES.md", (char *)"dev", NULL };
+        int r2 = process_wait((uint32_t)process_create_caps(spp, a2, 5, env, NULL, 0, caps));
+        kprintf("[gitfeat] 2 push NOTES.md -> new branch dev = %s\n", r2 == 0 ? "OK" : "FAIL");
+
+        /* 3. multi-ref clone of dev */
+        char *a3[] = { (char *)spc, (char *)"--ref", (char *)"dev", url, (char *)"/data/devclone", NULL };
+        int r3 = process_wait((uint32_t)process_create_caps(spc, a3, 5, env, NULL, 0, caps));
+        struct vfs_stat ds;
+        int cloned = (vfs_stat("/data/devclone/NOTES.md", &ds) == EMBK_OK);
+        kprintf("[gitfeat] 3 clone --ref dev = %s (NOTES.md on disk=%d)\n",
+                r3 == 0 ? "OK" : "FAIL", cloned);
+
+        /* 4. force-push main */
+        char *a4[] = { (char *)spp, (char *)"--force", url, (char *)"/data/f_only.txt", (char *)"ONLY.md", (char *)"main", NULL };
+        int r4 = process_wait((uint32_t)process_create_caps(spp, a4, 6, env, NULL, 0, caps));
+        kprintf("[gitfeat] 4 force-push main = %s\n", r4 == 0 ? "OK" : "FAIL");
+
+        /* 5. delete dev */
+        char *a5[] = { (char *)spp, (char *)"--delete", url, (char *)"dev", NULL };
+        int r5 = process_wait((uint32_t)process_create_caps(spp, a5, 4, env, NULL, 0, caps));
+        kprintf("[gitfeat] 5 delete dev = %s\n", r5 == 0 ? "OK" : "FAIL");
+
+        int pass = (r1 == 0 && r2 == 0 && r3 == 0 && cloned && r4 == 0 && r5 == 0);
+        kprintf("[cmd] test gitfeat: %s\n", pass ? "OK" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test emlibc net") == 0) {
         /* Proves emlibc's NATIVE networking: emlibc_net (ring 3, linked against
          * libemlibc only -- zero newlib) does an HTTP GET via em_tcp_connect +

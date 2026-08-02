@@ -12,8 +12,9 @@
  *   G3  unpack        -- packfile -> objects (SHA1 + inflate + delta). [done]
  *   G4  refs+checkout -- write a real .git + working tree to disk.     [done]
  *   G7  shallow (--depth N) -- deepen negotiation + .git/shallow.       [done]
+ *   G10 multi-ref (--ref <branch|tag>) -- clone a non-default ref.      [done]
  *
- * usage: gitclone [--depth N] <https-url> [dir]
+ * usage: gitclone [--depth N] [--ref <branch|tag>] <https-url> [dir]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,12 +35,30 @@ static void base_git(const char *in, char *out, size_t cap) {
     snprintf(out, cap, "%s%s", base, has_git ? "" : ".git");
 }
 
-/* Parse a smart-HTTP ref advertisement (pkt-line). Prints a short summary,
- * counts refs, and copies HEAD's object id (the first ref) into want[41].
- * Returns the ref count, or -1 on a malformed advertisement. */
-static int read_refs(const uint8_t *body, size_t len, char want[41], char branch[128]) {
+/* Does the advertised ref `name` (nlen bytes) select the requested `want_ref`?
+ * Matches an exact full name ("refs/heads/x", "refs/tags/x") or a short name
+ * against refs/heads/<x> then refs/tags/<x>. */
+static int ref_matches(const uint8_t *name, size_t nlen, const char *want_ref) {
+    size_t wl = strlen(want_ref);
+    if (nlen == wl && !memcmp(name, want_ref, wl)) return 1;
+    char full[192];
+    int fl = snprintf(full, sizeof full, "refs/heads/%s", want_ref);
+    if ((size_t)fl == nlen && !memcmp(name, full, nlen)) return 1;
+    fl = snprintf(full, sizeof full, "refs/tags/%s", want_ref);
+    if ((size_t)fl == nlen && !memcmp(name, full, nlen)) return 1;
+    return 0;
+}
+
+/* Parse a smart-HTTP ref advertisement (pkt-line). Prints a short summary and
+ * selects the ref to clone into want[41] + its short name into branch[128]:
+ * when want_ref is NULL, HEAD (the default branch); otherwise the ref matching
+ * want_ref (a branch/tag, full or short name). Returns the ref count, -1 on a
+ * malformed advertisement, or -2 if want_ref was given but not found. */
+static int read_refs(const uint8_t *body, size_t len, const char *want_ref,
+                     char want[41], char branch[128]) {
     const uint8_t *cur = body, *end = body + len, *data; size_t dlen;
     want[0] = 0; strcpy(branch, "master");           /* default if none matches */
+    char head_sha[41]; head_sha[0] = 0;              /* first ref = HEAD */
 
     int k = pktline_next(&cur, end, &data, &dlen);      /* "# service=..." then flush */
     if (k == PKT_DATA && dlen >= 9 && !strncmp((const char *)data, "# service", 9))
@@ -52,21 +71,33 @@ static int read_refs(const uint8_t *body, size_t len, char want[41], char branch
         if (k != PKT_DATA) { if (count == 0) return -1; break; }
         if (dlen < 41 || data[40] != ' ') continue;
 
-        if (!want[0]) { memcpy(want, data, 40); want[40] = 0; }   /* first ref = HEAD */
+        if (!head_sha[0]) { memcpy(head_sha, data, 40); head_sha[40] = 0; }
 
         const uint8_t *name = data + 41; size_t nlen = dlen - 41;
         for (size_t i = 0; i < nlen; i++)
             if (name[i] == '\0' || name[i] == '\n') { nlen = i; break; }
 
-        /* The default branch: a refs/heads/<X> pointing at HEAD's object id. */
-        if (nlen > 11 && !memcmp(name, "refs/heads/", 11) && !memcmp(data, want, 40)) {
-            size_t bl = nlen - 11; if (bl > 126) bl = 126;
-            memcpy(branch, name + 11, bl); branch[bl] = 0;
+        if (want_ref) {
+            /* Select the requested ref; branch = its last path component. */
+            if (ref_matches(name, nlen, want_ref) && !want[0]) {
+                memcpy(want, data, 40); want[40] = 0;
+                size_t s = nlen; while (s > 0 && name[s-1] != '/') s--;
+                size_t bl = nlen - s; if (bl > 126) bl = 126;
+                memcpy(branch, name + s, bl); branch[bl] = 0;
+            }
+        } else {
+            if (!want[0]) { memcpy(want, data, 40); want[40] = 0; }   /* HEAD */
+            /* default branch: a refs/heads/<X> pointing at HEAD's id */
+            if (nlen > 11 && !memcmp(name, "refs/heads/", 11) && !memcmp(data, want, 40)) {
+                size_t bl = nlen - 11; if (bl > 126) bl = 126;
+                memcpy(branch, name + 11, bl); branch[bl] = 0;
+            }
         }
         if (count < 3) { char sha[41]; memcpy(sha, data, 40); sha[40] = 0;
             printf("  %s %.*s\n", sha, (int)nlen, name); }
         count++;
     }
+    if (want_ref && !want[0]) return -2;             /* requested ref not found */
     return count;
 }
 
@@ -132,14 +163,15 @@ static int fetch_pack(const char *base, const char *want, int depth,
 }
 
 int main(int argc, char **argv) {
-    /* usage: gitclone [--depth N] <https-url> [dir] */
-    const char *urlarg = NULL, *dir = NULL; int depth = 0;
+    /* usage: gitclone [--depth N] [--ref <branch|tag>] <https-url> [dir] */
+    const char *urlarg = NULL, *dir = NULL, *want_ref = NULL; int depth = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--depth") && i + 1 < argc) depth = atoi(argv[++i]);
+        if      (!strcmp(argv[i], "--depth") && i + 1 < argc) depth = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ref")   && i + 1 < argc) want_ref = argv[++i];
         else if (!urlarg) urlarg = argv[i];
         else if (!dir)    dir    = argv[i];
     }
-    if (!urlarg) { fprintf(stderr, "usage: gitclone [--depth N] <https-url> [dir]\n"); return 2; }
+    if (!urlarg) { fprintf(stderr, "usage: gitclone [--depth N] [--ref <branch|tag>] <https-url> [dir]\n"); return 2; }
 
     char base[2048]; base_git(urlarg, base, sizeof base);
     char url[2200]; snprintf(url, sizeof url, "%s/info/refs?service=git-upload-pack", base);
@@ -153,11 +185,12 @@ int main(int argc, char **argv) {
 
     printf("GITCLONE refs of %s:\n", urlarg);
     char want[41], branch[128];
-    int n = read_refs(body, len, want, branch);
+    int n = read_refs(body, len, want_ref, want, branch);
     free(body);
+    if (n == -2) { fprintf(stderr, "gitclone: ref '%s' not found\n", want_ref); return 1; }
     if (n < 0 || !want[0]) { fprintf(stderr, "gitclone: malformed ref advertisement\n"); return 1; }
-    printf("GITCLONE %d refs, HEAD=%s (%s)%s\n", n, want, branch,
-           depth > 0 ? " [shallow]" : "");
+    printf("GITCLONE %d refs, %s=%s (%s)%s\n", n, want_ref ? "ref" : "HEAD",
+           want, branch, depth > 0 ? " [shallow]" : "");
 
     /* G2/G7: fetch the packfile for HEAD (shallow if depth > 0). */
     uint8_t *pbody = NULL; const uint8_t *pack = NULL; size_t plen = 0;

@@ -1607,13 +1607,27 @@ Encrypt/RSA), `test wget https`, `test pypi`.
     `README.md` (first commit, creates `main`) then `NOTES.md` (incremental); on
     github `main` ends with BOTH files (README.md survived the splice) and a
     `e709a83 parent=6d96e3b` two-commit chain, fsck clean.
-  - **Deferred (not yet exercised):** `want`-list is single-ref HEAD/default only
-    (no multi-ref, no `have`/negotiation beyond deepen); no side-band-64k
-    progress; push handles top-level files only (no nested-subtree splice), no
-    force, no delete, no thin-pack completion; deltas seen live are shallow chains
-    (depth 1) -- deep chains are host-proven (depth 3) but a large live clone with
-    long chains hasn't been run under TCG (slow). The ported stock git.elf still
-    uses its OWN transport only for local ops.
+  - **G10 the write/negotiate frontier -- metal-proven (`test gitfeat`).** Four
+    features, all live on the metal in one sequence + exhaustively host-proven
+    against a real `git receive-pack`:
+    - **multi-ref clone** (`gitclone --ref <branch|tag>`): read_refs selects the
+      requested ref (full or short name, heads or tags) instead of HEAD. Live:
+      cloned the `dev` branch (not the default) and checked out its content.
+    - **nested-subtree splice**: `push_make_commit` + a RECURSIVE `splice_path`
+      rewrite every tree along a `a/b/c` path (creating missing subdirs), so an
+      incremental commit to `docs/guide.md` preserves all other files/dirs. Host:
+      `docs/deep/notes.md` + `docs/guide.md` coexist through three commits, the
+      first file survives every splice. Live: pushed `docs/guide.md` (4 objects =
+      blob + 2 trees + commit).
+    - **force-push** (`--force`): push an unrelated orphan commit as a non-ff
+      update. Host + live: `main`'s whole history replaced by a single commit.
+    - **delete** (`--delete <branch>`): a zero-id update + empty pack. Host + live:
+      the `dev` branch removed (`unpack ok`/`ok`, ref gone).
+  - **Deferred (small tail):** `want`-list has no `have`/negotiation beyond deepen;
+    no side-band-64k progress; no thin-pack completion; deltas seen live are
+    shallow chains (depth 1) -- deep chains host-proven (depth 3) but no large live
+    clone under TCG (slow). The ported stock git.elf still uses its OWN transport
+    only for local ops.
 - [ ] **Robustness: a transient `test pkgfetch` rc=-106 (chain USAGE) was seen on
   one boot** then vanished (later boots verify the same pypi chain fine). Suspect a
   fragmented Certificate-message / net-read edge case leaving a cert parsed with

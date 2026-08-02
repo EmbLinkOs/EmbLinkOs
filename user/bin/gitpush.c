@@ -1,16 +1,20 @@
-/* gitpush -- push a first commit to a git repo over HTTPS, our own way.
+/* gitpush -- push commits to a git repo over HTTPS, our own way.
  *
  * Like gitclone, the stock git can't push here (its HTTPS transport fork/execs
  * git-remote-https + send-pack). So this drives git's smart-HTTP git-receive-pack
- * protocol directly over libtls: it builds a blob+tree+commit, serializes them
+ * protocol directly over libtls: it builds a blob+tree(s)+commit, serializes them
  * into a packfile (pack_write) + a ref-update command, POSTs that, and reads the
  * report-status. Authentication is HTTP Basic with a token from the environment.
  *
- * Scope: pushes a SINGLE first commit (one file, no parent) to CREATE a branch,
- * i.e. a push to an empty repo / brand-new branch. That keeps the tree trivial
- * (no need to read+splice the parent's tree). Enough to prove the push pipe.
+ * Modes:
+ *   - new branch:   the branch doesn't exist -> a first commit (no parent).
+ *   - incremental:  the branch exists -> fetch its tip, splice the parent's tree
+ *                   (nested paths supported) so other files survive, parent = tip.
+ *   - --force:      replace the branch with an unrelated (orphan) commit.
+ *   - --delete:     remove the branch (new id = zeros, empty pack).
  *
- * usage: gitpush <https-url> <local-file> <path-in-repo> [branch]
+ * usage: gitpush [--force] <https-url> <local-file> <path-in-repo> [branch]
+ *        gitpush --delete <https-url> <branch>
  *   env GITPUSH_TOKEN = "<user>:<token>" or just "<token>" (a GitHub PAT works
  *   as the password with any username). Passed via env, never argv.
  */
@@ -111,9 +115,28 @@ static void find_ref(const uint8_t *body, size_t len, const char *branch, char o
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: gitpush <https-url> <local-file> <path-in-repo> [branch]\n"); return 2; }
-    const char *urlarg = argv[1], *localfile = argv[2], *repopath = argv[3];
-    const char *branch = argc >= 5 ? argv[4] : "main";
+    /* usage:
+     *   gitpush [--force] <url> <local-file> <path-in-repo> [branch]
+     *   gitpush --delete <url> <branch>
+     * --force replaces the branch with an unrelated (orphan) commit;
+     * --delete removes the branch. */
+    int do_force = 0, do_delete = 0;
+    const char *pos[5]; int np = 0;
+    for (int i = 1; i < argc; i++) {
+        if      (!strcmp(argv[i], "--force"))  do_force = 1;
+        else if (!strcmp(argv[i], "--delete")) do_delete = 1;
+        else if (np < 5) pos[np++] = argv[i];
+    }
+    const char *urlarg = np > 0 ? pos[0] : NULL;
+    const char *localfile = NULL, *repopath = NULL, *branch = "main";
+    if (do_delete) { branch = np > 1 ? pos[1] : "main"; }
+    else { localfile = np > 1 ? pos[1] : NULL; repopath = np > 2 ? pos[2] : NULL;
+           branch = np > 3 ? pos[3] : "main"; }
+    if (!urlarg || (!do_delete && (!localfile || !repopath))) {
+        fprintf(stderr, "usage: gitpush [--force] <url> <file> <path> [branch]\n"
+                        "       gitpush --delete <url> <branch>\n");
+        return 2;
+    }
 
     const char *token = getenv("GITPUSH_TOKEN");
     if (!token || !*token) { fprintf(stderr, "gitpush: set GITPUSH_TOKEN in the environment\n"); return 2; }
@@ -123,18 +146,21 @@ int main(int argc, char **argv) {
     char authb64[720];
     base64((const uint8_t *)userpass, strlen(userpass), authb64);
 
-    /* Read the file to push. */
-    FILE *f = fopen(localfile, "rb");
-    if (!f) { fprintf(stderr, "gitpush: cannot open %s\n", localfile); return 1; }
-    fseek(f, 0, SEEK_END); long fl = ftell(f); fseek(f, 0, SEEK_SET);
-    if (fl < 0) { fclose(f); return 1; }
-    uint8_t *content = malloc((size_t)fl ? (size_t)fl : 1);
-    if (fread(content, 1, (size_t)fl, f) != (size_t)fl) { fclose(f); free(content); return 1; }
-    fclose(f);
+    /* Read the file to push (skipped for --delete). */
+    long fl = 0; uint8_t *content = NULL;
+    if (!do_delete) {
+        FILE *f = fopen(localfile, "rb");
+        if (!f) { fprintf(stderr, "gitpush: cannot open %s\n", localfile); return 1; }
+        fseek(f, 0, SEEK_END); fl = ftell(f); fseek(f, 0, SEEK_SET);
+        if (fl < 0) { fclose(f); return 1; }
+        content = malloc((size_t)fl ? (size_t)fl : 1);
+        if (fread(content, 1, (size_t)fl, f) != (size_t)fl) { fclose(f); free(content); return 1; }
+        fclose(f);
+    }
 
     char base[2048]; base_git(urlarg, base, sizeof base);
 
-    /* Discover the branch's current id (zeros => create). */
+    /* Discover the branch's current id (zeros => the branch doesn't exist). */
     char url[2200]; snprintf(url, sizeof url, "%s/info/refs?service=git-receive-pack", base);
     uint8_t *body = NULL; size_t len = 0; int status = 0;
     if (git_http("GET", url, NULL, NULL, 0, authb64, &body, &len, &status) != 0) {
@@ -144,45 +170,52 @@ int main(int argc, char **argv) {
     if (status / 100 != 2) { fprintf(stderr, "gitpush: HTTP %d discovering refs\n", status); free(body); free(content); return 1; }
     char old_hex[41]; find_ref(body, len, branch, old_hex);
     free(body);
-    int is_first = (strspn(old_hex, "0") == 40);
-    printf("GITPUSH %s: %s currently %s (%s)\n", urlarg, branch, old_hex,
-           is_first ? "new branch" : "incremental");
-
-    /* Build the commit. A new branch => a first commit (no parent). Otherwise
-     * fetch the current tip's objects and splice its tree so existing files
-     * survive -- an INCREMENTAL commit with `old_hex` as parent. */
-    struct pack_obj objs[3]; char new_hex[41];
-    const char *msg = is_first ? "first commit pushed from EmbLinkOS"
-                               : "another commit pushed from EmbLinkOS";
-    int build_rc;
-    if (is_first) {
-        build_rc = push_make_first_commit(repopath, content, (size_t)fl, msg,
-                                          "EmbLink <os@emblink>", (uint32_t)time(NULL),
-                                          objs, new_hex);
-    } else {
-        struct pack_obj *tip = NULL; int tn = 0;
-        if (fetch_tip(base, old_hex, authb64, &tip, &tn) != 0) {
-            fprintf(stderr, "gitpush: fetching the parent tip failed\n"); free(content); return 1;
-        }
-        build_rc = push_make_next_commit(repopath, content, (size_t)fl, msg,
-                                         "EmbLink <os@emblink>", (uint32_t)time(NULL),
-                                         old_hex, tip, tn, objs, new_hex);
-        for (int i = 0; i < tn; i++) free(tip[i].data);
-        free(tip);
-    }
-    if (build_rc != 0) {
-        fprintf(stderr, "gitpush: building the commit failed\n"); free(content); return 1;
-    }
-    free(content);
+    int exists = (strspn(old_hex, "0") != 40);
     char ref[160]; snprintf(ref, sizeof ref, "refs/heads/%s", branch);
+
     uint8_t *req = NULL; size_t reqlen = 0;
-    if (push_build_request(ref, old_hex, new_hex, objs, 3, &req, &reqlen) != 0) {
-        fprintf(stderr, "gitpush: serializing the request failed\n");
-        for (int i = 0; i < 3; i++) free(objs[i].data);
-        return 1;
+    char new_hex[41] = "0000000000000000000000000000000000000000";
+
+    if (do_delete) {
+        if (!exists) { fprintf(stderr, "gitpush: %s does not exist -- nothing to delete\n", branch); return 1; }
+        printf("GITPUSH %s: deleting %s (%s)\n", urlarg, branch, old_hex);
+        if (push_build_delete(ref, old_hex, &req, &reqlen) != 0) {
+            fprintf(stderr, "gitpush: serializing the delete failed\n"); return 1;
+        }
+    } else {
+        printf("GITPUSH %s: %s currently %s (%s)\n", urlarg, branch, old_hex,
+               !exists ? "new branch" : do_force ? "FORCE" : "incremental");
+        /* First commit / force => no parent (fresh trees). Incremental => fetch
+         * the tip and splice its tree so existing files survive. */
+        int use_parent = (exists && !do_force);
+        const char *msg = !exists ? "first commit pushed from EmbLinkOS"
+                        : do_force ? "force-pushed from EmbLinkOS (history replaced)"
+                                   : "another commit pushed from EmbLinkOS";
+        struct pack_obj *objs = NULL; int nobjs = 0; int build_rc;
+        if (use_parent) {
+            struct pack_obj *tip = NULL; int tn = 0;
+            if (fetch_tip(base, old_hex, authb64, &tip, &tn) != 0) {
+                fprintf(stderr, "gitpush: fetching the parent tip failed\n"); free(content); return 1;
+            }
+            build_rc = push_make_commit(repopath, content, (size_t)fl, msg,
+                                        "EmbLink <os@emblink>", (uint32_t)time(NULL),
+                                        old_hex, tip, tn, &objs, &nobjs, new_hex);
+            for (int i = 0; i < tn; i++) free(tip[i].data);
+            free(tip);
+        } else {
+            build_rc = push_make_commit(repopath, content, (size_t)fl, msg,
+                                        "EmbLink <os@emblink>", (uint32_t)time(NULL),
+                                        NULL, NULL, 0, &objs, &nobjs, new_hex);
+        }
+        if (build_rc != 0) { fprintf(stderr, "gitpush: building the commit failed\n"); free(content); return 1; }
+        free(content);
+        if (push_build_request(ref, old_hex, new_hex, objs, nobjs, &req, &reqlen) != 0) {
+            fprintf(stderr, "gitpush: serializing the request failed\n");
+            for (int i = 0; i < nobjs; i++) free(objs[i].data); free(objs); return 1;
+        }
+        for (int i = 0; i < nobjs; i++) free(objs[i].data); free(objs);
+        printf("GITPUSH new commit %s (%d objects, %zu-byte request)\n", new_hex, nobjs, reqlen);
     }
-    for (int i = 0; i < 3; i++) free(objs[i].data);
-    printf("GITPUSH new commit %s (%zu-byte receive-pack request)\n", new_hex, reqlen);
 
     /* POST it. */
     snprintf(url, sizeof url, "%s/git-receive-pack", base);

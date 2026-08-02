@@ -1,5 +1,6 @@
-/* git push core -- see push.h. Transport-independent: object construction,
- * request serialization, and report-status parsing. */
+/* git push core -- see push.h. Transport-independent: object construction
+ * (blob + the trees along a path + commit, splicing an existing tree so other
+ * entries survive), request serialization, and report-status parsing. */
 #include "push.h"
 #include "pktline.h"
 #include "sha1.h"
@@ -7,8 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* SHA-1 of a git object: "<type> <size>\0" + content (same rule as loose
- * objects and pack naming). */
+/* SHA-1 of a git object: "<type> <size>\0" + content. */
 static void obj_sha(const char *type, const uint8_t *data, size_t size, uint8_t out[20]) {
     char hdr[32];
     int hl = snprintf(hdr, sizeof hdr, "%s %zu", type, size);
@@ -24,7 +24,6 @@ static void hex20(const uint8_t sha[20], char out[41]) {
     for (int i = 0; i < 20; i++) { out[2*i] = h[sha[i] >> 4]; out[2*i+1] = h[sha[i] & 15]; }
     out[40] = 0;
 }
-
 static int hexv(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -40,11 +39,30 @@ static const struct pack_obj *find_sha(const struct pack_obj *o, int n, const ui
     return NULL;
 }
 
+/* A growable list of built objects (the caller frees each .data and the array). */
+struct objlist { struct pack_obj *o; int n, cap; };
+static int ol_add(struct objlist *L, int type, uint8_t *data, size_t size, uint8_t sha_out[20]) {
+    if (L->n == L->cap) {
+        int nc = L->cap ? L->cap * 2 : 8;
+        struct pack_obj *no = realloc(L->o, (size_t)nc * sizeof *no);
+        if (!no) return -1;
+        L->o = no; L->cap = nc;
+    }
+    struct pack_obj *e = &L->o[L->n++];
+    e->type = type; e->data = data; e->size = size;
+    obj_sha(pack_type_name(type), data, size, e->sha);
+    if (sha_out) memcpy(sha_out, e->sha, 20);
+    return 0;
+}
+static void ol_free(struct objlist *L) {
+    for (int i = 0; i < L->n; i++) free(L->o[i].data);
+    free(L->o);
+}
+
 /* One decoded tree entry. */
 struct tent { char mode[8]; char name[256]; uint8_t sha[20]; int isdir; };
 
-/* git's tree-entry order: names compared byte-wise, but a directory sorts as if
- * its name had a trailing '/'. Matters only when one name prefixes another. */
+/* git tree order: names byte-wise, but a directory sorts as if name had '/'. */
 static int tent_cmp(const void *a, const void *b) {
     const struct tent *x = a, *y = b;
     size_t lx = strlen(x->name), ly = strlen(y->name), c = lx < ly ? lx : ly;
@@ -55,17 +73,8 @@ static int tent_cmp(const void *a, const void *b) {
     return cx - cy;
 }
 
-/* Splice the tree `tree_sha` (found in base): add/replace the top-level entry
- * `fname` -> (100644, blob_sha), keep the rest, and re-serialize in git order.
- * Sets *out (malloc'd) and *outlen. 0 or -1. */
-static int splice_tree(const struct pack_obj *base, int base_n, const uint8_t tree_sha[20],
-                       const char *fname, const uint8_t blob_sha[20],
-                       uint8_t **out, size_t *outlen) {
-    const struct pack_obj *t = find_sha(base, base_n, tree_sha);
-    if (!t || t->type != OBJ_TREE) return -1;
-
-    struct tent *e = malloc(sizeof(*e) * 4096);
-    if (!e) return -1;
+/* Parse a tree object's entries into e[0..*n). Returns 0 or -1. */
+static int parse_tree(const struct pack_obj *t, struct tent *e, int *np) {
     int n = 0;
     const uint8_t *p = t->data, *end = t->data + t->size;
     while (p < end && n < 4095) {
@@ -83,21 +92,55 @@ static int splice_tree(const struct pack_obj *base, int base_n, const uint8_t tr
         p = nul + 1 + 20;
         n++;
     }
+    *np = n;
+    return 0;
+}
+
+/* Build the (spliced) tree for path components comp[0..ncomp): set comp[0] to
+ * either the leaf blob (ncomp==1) or a recursively-spliced subtree (ncomp>1),
+ * preserving every other entry of `base_tree_sha` (NULL => a fresh empty tree).
+ * Appends each new tree object to `out` and returns this level's tree sha. */
+static int splice_path(const struct pack_obj *base, int base_n,
+                       const uint8_t *base_tree_sha,
+                       char **comp, int ncomp, const uint8_t leaf_blob_sha[20],
+                       struct objlist *out, uint8_t new_tree_sha[20]) {
+    struct tent *e = malloc(sizeof *e * 4096);
+    if (!e) return -1;
+    int n = 0;
+    if (base_tree_sha) {
+        const struct pack_obj *t = find_sha(base, base_n, base_tree_sha);
+        if (!t || t->type != OBJ_TREE) { free(e); return -1; }
+        if (parse_tree(t, e, &n) != 0) { free(e); return -1; }
+    }
+
+    uint8_t child_sha[20]; char child_mode[8]; int child_isdir;
+    if (ncomp == 1) {                                    /* the file itself */
+        memcpy(child_sha, leaf_blob_sha, 20);
+        strcpy(child_mode, "100644"); child_isdir = 0;
+    } else {                                             /* descend into a subdir */
+        const uint8_t *sub = NULL;
+        for (int i = 0; i < n; i++)
+            if (e[i].isdir && !strcmp(e[i].name, comp[0])) { sub = e[i].sha; break; }
+        if (splice_path(base, base_n, sub, comp + 1, ncomp - 1, leaf_blob_sha, out, child_sha) != 0) {
+            free(e); return -1;
+        }
+        strcpy(child_mode, "40000"); child_isdir = 1;
+    }
 
     int replaced = 0;
     for (int i = 0; i < n; i++)
-        if (!strcmp(e[i].name, fname)) {
-            memcpy(e[i].sha, blob_sha, 20); strcpy(e[i].mode, "100644"); e[i].isdir = 0; replaced = 1;
+        if (!strcmp(e[i].name, comp[0])) {
+            memcpy(e[i].sha, child_sha, 20); strcpy(e[i].mode, child_mode);
+            e[i].isdir = child_isdir; replaced = 1;
         }
     if (!replaced) {
         if (n >= 4095) { free(e); return -1; }
-        strcpy(e[n].mode, "100644");
-        strncpy(e[n].name, fname, sizeof e[n].name - 1); e[n].name[sizeof e[n].name - 1] = 0;
-        memcpy(e[n].sha, blob_sha, 20); e[n].isdir = 0; n++;
+        strcpy(e[n].mode, child_mode);
+        strncpy(e[n].name, comp[0], sizeof e[n].name - 1); e[n].name[sizeof e[n].name - 1] = 0;
+        memcpy(e[n].sha, child_sha, 20); e[n].isdir = child_isdir; n++;
     }
     qsort(e, (size_t)n, sizeof *e, tent_cmp);
 
-    /* serialize: for each entry "<mode> <name>\0" + 20 raw sha */
     size_t cap = 0;
     for (int i = 0; i < n; i++) cap += strlen(e[i].mode) + 1 + strlen(e[i].name) + 1 + 20;
     uint8_t *td = malloc(cap ? cap : 1);
@@ -105,144 +148,114 @@ static int splice_tree(const struct pack_obj *base, int base_n, const uint8_t tr
     size_t o = 0;
     for (int i = 0; i < n; i++) {
         size_t ml = strlen(e[i].mode), nl = strlen(e[i].name);
-        memcpy(td + o, e[i].mode, ml); o += ml;
-        td[o++] = ' ';
-        memcpy(td + o, e[i].name, nl); o += nl;
-        td[o++] = 0;
+        memcpy(td + o, e[i].mode, ml); o += ml; td[o++] = ' ';
+        memcpy(td + o, e[i].name, nl); o += nl; td[o++] = 0;
         memcpy(td + o, e[i].sha, 20); o += 20;
     }
     free(e);
-    *out = td; *outlen = o;
+    if (ol_add(out, OBJ_TREE, td, o, new_tree_sha) != 0) { free(td); return -1; }
     return 0;
 }
 
-int push_make_next_commit(const char *fname, const void *content, size_t clen,
-                          const char *msg, const char *author, uint32_t ts,
-                          const char *parent_hex,
-                          const struct pack_obj *base, int base_n,
-                          struct pack_obj out[3], char newcommit_hex[41]) {
-    struct pack_obj *blob = &out[0], *tree = &out[1], *commit = &out[2];
+int push_make_commit(const char *path, const void *content, size_t clen,
+                     const char *msg, const char *author, uint32_t ts,
+                     const char *parent_hex, const struct pack_obj *base, int base_n,
+                     struct pack_obj **out, int *nout, char newcommit_hex[41]) {
+    struct objlist L = {0};
 
     /* blob */
-    blob->type = OBJ_BLOB; blob->size = clen;
-    blob->data = malloc(clen ? clen : 1);
-    if (!blob->data) return -1;
-    memcpy(blob->data, content, clen);
-    obj_sha("blob", blob->data, clen, blob->sha);
+    uint8_t *bd = malloc(clen ? clen : 1);
+    if (!bd) return -1;
+    memcpy(bd, content, clen);
+    uint8_t blob_sha[20];
+    if (ol_add(&L, OBJ_BLOB, bd, clen, blob_sha) != 0) { free(bd); return -1; }
 
-    /* find the parent commit + its root tree, then splice in our blob. */
-    uint8_t psha[20]; unhex20(parent_hex, psha);
-    const struct pack_obj *pc = find_sha(base, base_n, psha);
-    if (!pc || pc->type != OBJ_COMMIT || pc->size < 46 ||
-        memcmp(pc->data, "tree ", 5) != 0) { free(blob->data); return -1; }
-    char ptree_hex[41]; memcpy(ptree_hex, pc->data + 5, 40); ptree_hex[40] = 0;
-    uint8_t ptree[20]; unhex20(ptree_hex, ptree);
+    /* split the path into components */
+    char pbuf[1024]; strncpy(pbuf, path, sizeof pbuf - 1); pbuf[sizeof pbuf - 1] = 0;
+    char *comp[64]; int ncomp = 0;
+    for (char *tok = strtok(pbuf, "/"); tok && ncomp < 64; tok = strtok(NULL, "/")) comp[ncomp++] = tok;
+    if (ncomp == 0) { ol_free(&L); return -1; }
 
-    uint8_t *td = NULL; size_t tlen = 0;
-    if (splice_tree(base, base_n, ptree, fname, blob->sha, &td, &tlen) != 0) { free(blob->data); return -1; }
-    tree->type = OBJ_TREE; tree->size = tlen; tree->data = td;
-    obj_sha("tree", td, tlen, tree->sha);
+    /* base root tree (incremental) or none (first commit) */
+    uint8_t rootbase[20]; const uint8_t *root_base = NULL;
+    if (parent_hex) {
+        uint8_t psha[20]; unhex20(parent_hex, psha);
+        const struct pack_obj *pc = find_sha(base, base_n, psha);
+        if (!pc || pc->type != OBJ_COMMIT || pc->size < 46 || memcmp(pc->data, "tree ", 5)) { ol_free(&L); return -1; }
+        char thex[41]; memcpy(thex, pc->data + 5, 40); thex[40] = 0;
+        unhex20(thex, rootbase); root_base = rootbase;
+    }
 
-    /* commit with a parent line. */
-    char thex[41]; hex20(tree->sha, thex);
-    char body[1024];
-    int bl = snprintf(body, sizeof body,
-        "tree %s\n"
-        "parent %s\n"
-        "author %s %u +0000\n"
-        "committer %s %u +0000\n"
-        "\n%s\n",
-        thex, parent_hex, author, ts, author, ts, msg);
-    if (bl < 0 || bl >= (int)sizeof body) { free(blob->data); free(td); return -1; }
-    commit->type = OBJ_COMMIT; commit->size = (size_t)bl;
-    commit->data = malloc((size_t)bl);
-    if (!commit->data) { free(blob->data); free(td); return -1; }
-    memcpy(commit->data, body, (size_t)bl);
-    obj_sha("commit", commit->data, (size_t)bl, commit->sha);
+    uint8_t root_sha[20];
+    if (splice_path(base, base_n, root_base, comp, ncomp, blob_sha, &L, root_sha) != 0) { ol_free(&L); return -1; }
 
-    hex20(commit->sha, newcommit_hex);
+    /* commit (with a parent line for an incremental commit) */
+    char thex[41]; hex20(root_sha, thex);
+    char body[1024]; int bl;
+    if (parent_hex)
+        bl = snprintf(body, sizeof body,
+            "tree %s\nparent %s\nauthor %s %u +0000\ncommitter %s %u +0000\n\n%s\n",
+            thex, parent_hex, author, ts, author, ts, msg);
+    else
+        bl = snprintf(body, sizeof body,
+            "tree %s\nauthor %s %u +0000\ncommitter %s %u +0000\n\n%s\n",
+            thex, author, ts, author, ts, msg);
+    if (bl < 0 || bl >= (int)sizeof body) { ol_free(&L); return -1; }
+    uint8_t *cd = malloc((size_t)bl);
+    if (!cd) { ol_free(&L); return -1; }
+    memcpy(cd, body, (size_t)bl);
+    uint8_t csha[20];
+    if (ol_add(&L, OBJ_COMMIT, cd, (size_t)bl, csha) != 0) { free(cd); ol_free(&L); return -1; }
+    hex20(csha, newcommit_hex);
+
+    *out = L.o; *nout = L.n;
     return 0;
 }
 
-int push_make_first_commit(const char *fname, const void *content, size_t clen,
-                           const char *msg, const char *author, uint32_t ts,
-                           struct pack_obj out[3], char newcommit_hex[41]) {
-    struct pack_obj *blob = &out[0], *tree = &out[1], *commit = &out[2];
-
-    /* blob: the file's raw bytes. */
-    blob->type = OBJ_BLOB; blob->size = clen;
-    blob->data = malloc(clen ? clen : 1);
-    if (!blob->data) return -1;
-    memcpy(blob->data, content, clen);
-    obj_sha("blob", blob->data, clen, blob->sha);
-
-    /* tree: a single regular-file entry "100644 <name>\0" + 20 raw sha bytes. */
-    size_t nl = strlen(fname);
-    size_t tsize = 7 + nl + 1 + 20;                 /* "100644 " is 7 bytes */
-    uint8_t *td = malloc(tsize);
-    if (!td) { free(blob->data); return -1; }
+/* Assemble pkt-line(command) + flush-pkt + packfile. */
+static int build_req(const char *cmd_payload, size_t plen,
+                     const struct pack_obj *objs, int n,
+                     uint8_t **req_out, size_t *reqlen) {
+    uint8_t *pack = NULL; size_t packlen = 0;
+    if (pack_write(objs, n, &pack, &packlen) != 0) return -1;
+    size_t total = (4 + plen) + 4 + packlen;
+    uint8_t *req = malloc(total);
+    if (!req) { free(pack); return -1; }
     size_t o = 0;
-    memcpy(td + o, "100644 ", 7);   o += 7;
-    memcpy(td + o, fname, nl);       o += nl;
-    td[o++] = 0;
-    memcpy(td + o, blob->sha, 20);   o += 20;
-    tree->type = OBJ_TREE; tree->size = tsize; tree->data = td;
-    obj_sha("tree", td, tsize, tree->sha);
-
-    /* commit: no parent (first commit); author == committer at `ts` UTC. */
-    char thex[41]; hex20(tree->sha, thex);
-    char body[1024];
-    int bl = snprintf(body, sizeof body,
-        "tree %s\n"
-        "author %s %u +0000\n"
-        "committer %s %u +0000\n"
-        "\n%s\n",
-        thex, author, ts, author, ts, msg);
-    if (bl < 0 || bl >= (int)sizeof body) { free(blob->data); free(td); return -1; }
-    commit->type = OBJ_COMMIT; commit->size = (size_t)bl;
-    commit->data = malloc((size_t)bl);
-    if (!commit->data) { free(blob->data); free(td); return -1; }
-    memcpy(commit->data, body, (size_t)bl);
-    obj_sha("commit", commit->data, (size_t)bl, commit->sha);
-
-    hex20(commit->sha, newcommit_hex);
+    o += pktline_write(req + o, cmd_payload, plen);
+    o += pktline_flush(req + o);
+    memcpy(req + o, pack, packlen); o += packlen;
+    free(pack);
+    *req_out = req; *reqlen = o;
     return 0;
 }
 
 int push_build_request(const char *ref, const char *old_hex, const char *new_hex,
                        const struct pack_obj *objs, int n,
                        uint8_t **req_out, size_t *reqlen) {
-    /* command payload: "<old> <new> <ref>\0report-status\n" */
     uint8_t payload[512]; size_t pl = 0;
     int cl = snprintf((char *)payload, sizeof payload, "%s %s %s", old_hex, new_hex, ref);
     if (cl < 0) return -1;
-    pl = (size_t)cl;
-    payload[pl++] = 0;
-    const char *caps = "report-status";
-    size_t cn = strlen(caps);
-    memcpy(payload + pl, caps, cn); pl += cn;
-    payload[pl++] = '\n';
+    pl = (size_t)cl; payload[pl++] = 0;
+    const char *caps = "report-status"; size_t cn = strlen(caps);
+    memcpy(payload + pl, caps, cn); pl += cn; payload[pl++] = '\n';
+    return build_req((const char *)payload, pl, objs, n, req_out, reqlen);
+}
 
-    uint8_t *pack = NULL; size_t packlen = 0;
-    if (pack_write(objs, n, &pack, &packlen) != 0) return -1;
-
-    /* pkt-line(command) + flush-pkt + packfile */
-    size_t total = (4 + pl) + 4 + packlen;
-    uint8_t *req = malloc(total);
-    if (!req) { free(pack); return -1; }
-    size_t o = 0;
-    o += pktline_write(req + o, payload, pl);
-    o += pktline_flush(req + o);
-    memcpy(req + o, pack, packlen); o += packlen;
-    free(pack);
-
-    *req_out = req; *reqlen = o;
-    return 0;
+int push_build_delete(const char *ref, const char *old_hex,
+                      uint8_t **req_out, size_t *reqlen) {
+    /* Delete = update to the zero id, with an EMPTY packfile (0 objects). */
+    char zeros[41]; memset(zeros, '0', 40); zeros[40] = 0;
+    uint8_t payload[512]; size_t pl = 0;
+    int cl = snprintf((char *)payload, sizeof payload, "%s %s %s", old_hex, zeros, ref);
+    if (cl < 0) return -1;
+    pl = (size_t)cl; payload[pl++] = 0;
+    const char *caps = "report-status"; size_t cn = strlen(caps);
+    memcpy(payload + pl, caps, cn); pl += cn; payload[pl++] = '\n';
+    return build_req((const char *)payload, pl, NULL, 0, req_out, reqlen);
 }
 
 int push_parse_status(const uint8_t *body, size_t len) {
-    /* We negotiated "report-status" (no side-band), so the reply is raw
-     * pkt-lines: "unpack ok\n" then "ok <ref>\n" (or "ng <ref> <why>"). */
     const uint8_t *cur = body, *end = body + len, *data; size_t dlen;
     int unpack_ok = 0, ref_ok = 0;
     for (;;) {
