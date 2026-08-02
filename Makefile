@@ -1242,7 +1242,7 @@ DISPLAY_1TO1 = -display gtk,zoom-to-fit=off
 
 run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
 	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)
-	qemu-system-x86_64 \
+	qemu-system-x86_64 -cpu max \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
