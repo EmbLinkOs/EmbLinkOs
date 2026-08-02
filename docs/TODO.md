@@ -1420,9 +1420,18 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
   - **Proven**: `test pkg` install → run confined → tampered-binary reject →
     bad-signature reject → update to v1.1 → rollback to v1.0 → widening update
     REFUSED → same update with `--allow-widen` accepted.
-  - *Optional future*: an EMBKFS-snapshot-backed variant of update (needs a
-    userspace snapshot syscall — none exists yet); the retained-bundle rollback
-    above is the honest per-package equivalent.
+  - *EMBKFS-snapshot-backed update — ASSESSED, deliberately not built for pkg.*
+    The kernel API exists (`embkfs_snapshot_create/rollback/delete`, tested) but
+    EMBKFS snapshots are **whole-volume** ("a frozen root block_ptr", spec §6b):
+    a rollback restores ALL of `/data`, not one package — the wrong granularity
+    for per-package rollback, which the **retained-bundle** approach above does
+    correctly. A whole-volume snapshot's only `pkg` benefit would be install
+    *atomicity* (snapshot → install → rollback-on-failure), and that means rolling
+    back the LIVE mounted volume mid-session (risky) for marginal value on a
+    self-contained-bundle install. Verdict: not worth a risky live-volume rollback
+    in `pkg`. If snapshots are wanted as a GENERAL userspace capability (backups,
+    experiments), expose the syscall deliberately for that — a separate feature,
+    not a packaging one.
 - [x] ~~**PK4** — the git registry.~~ **DONE, metal-proven (`test pkgregistry`).**
   The registry is a git repo (**github.com/teo1747/emblink-packages**): one dir per
   package holds its SIGNED manifest + the EMBX bundle, plus a top-level `index`.
