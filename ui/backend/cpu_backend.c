@@ -51,6 +51,29 @@ static void blend_over(struct render_target *rt, int ix, int iy,
     *px = px_pack(nb, ng, nr, na);
 }
 
+/* Gamma-correct (linear-light, ~gamma 2.0) over-blend for ANTI-ALIASED EDGES:
+ * `c` is the straight src color, `eff` its effective coverage/alpha at this
+ * pixel. Blending edge coverage in linear light removes the dark fringe naive
+ * sRGB blending leaves at high-contrast edges -- the same reason text does it.
+ * Only ever called on partial-coverage pixels (interiors take the opaque fast
+ * path), so the per-pixel sqrtf is confined to the thin AA band. */
+static void blend_edge_gamma(struct render_target *rt, int ix, int iy, struct color c, float eff) {
+    if (eff <= 0.0f) return;
+    if (ix < 0 || iy < 0 || (uint32_t)ix >= rt->width || (uint32_t)iy >= rt->height) return;
+    uint32_t *px = &rt_row(rt, (uint32_t)iy)[ix];
+    int db, dg, dr, da; px_unpack(*px, &db, &dg, &dr, &da);
+    float inv = 1.0f - eff;
+    float sr = c.r * c.r, sg = c.g * c.g, sb = c.b * c.b;          /* linearise src */
+    float lr = (dr / 255.0f) * (dr / 255.0f);                      /* linearise dst */
+    float lg = (dg / 255.0f) * (dg / 255.0f);
+    float lb = (db / 255.0f) * (db / 255.0f);
+    int nr = clampi((int)(sqrtf(sr * eff + lr * inv) * 255.0f + 0.5f), 0, 255);
+    int ng = clampi((int)(sqrtf(sg * eff + lg * inv) * 255.0f + 0.5f), 0, 255);
+    int nb = clampi((int)(sqrtf(sb * eff + lb * inv) * 255.0f + 0.5f), 0, 255);
+    int na = clampi((int)(eff * 255.0f + da * inv + 0.5f), 0, 255);
+    *px = px_pack(nb, ng, nr, na);
+}
+
 /* ------------------------------------------------------------------------- */
 /* rounded-box SDF (Section 3) -- Inigo Quilez, per-pixel on the CPU          */
 /* ------------------------------------------------------------------------- */
@@ -430,7 +453,7 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
                 struct color c = cpu_paint_at(fill, fx - x, fy - y, w, h);
                 float eff = c.a * cov * opacity;
                 if (eff <= 0.0f) continue;
-                blend_over(rt, ix, iy, c.r * eff, c.g * eff, c.b * eff, eff);
+                blend_edge_gamma(rt, ix, iy, c, eff);
             }
             continue;
         }
@@ -675,7 +698,7 @@ static void cpu_draw_border(struct render_target *rt, float x, float y, float w,
                 struct color bc = has_grad ? cpu_paint_at(paint, fx - x, fy - y, w, h) : color;
                 if (bc.a <= 0.0f) continue;
                 float eff = bc.a * ring;
-                blend_over(rt, ix, iy, bc.r * eff, bc.g * eff, bc.b * eff, eff);
+                blend_edge_gamma(rt, ix, iy, bc, eff);
             }
         }
     }
