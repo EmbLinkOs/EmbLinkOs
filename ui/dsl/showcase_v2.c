@@ -275,8 +275,8 @@ static float g_hsv[3]  = { 0.58f, 0.74f, 0.92f };   /* a pleasant blue */
 static int   g_date[3] = { 2026, 8, 3 };            /* selected day */
 static char  g_cb_buf[32] = "Sta";                  /* filters to Staging */
 static bool  g_cb_open = true;                      /* render menu open */
-static char  g_tags[8][EM_TAG_LEN] = { "kernel", "graphics", "wip" };
-static int   g_tag_n = 3;
+static char  g_tags[8][EM_TAG_LEN] = { "kernel", "graphics", "wip", "audio", "network" };
+static int   g_tag_n = 5;
 static char  g_tag_entry[EM_TAG_LEN] = "";
 static void pkapp(void) {
     static const char *const envs[] = { "Development", "Staging", "Production", "Sandbox" };

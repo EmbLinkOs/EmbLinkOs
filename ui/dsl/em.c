@@ -1473,32 +1473,52 @@ void em_taginput(char (*tags)[EM_TAG_LEN], int *count, int max,
     ui_set_spacing(t->sp2);
     em_apply_box(p);
 
-    /* chips */
+    /* chips: greedily packed into rows against a width budget (the layout engine
+     * has no flex-wrap), so a full tag set never overflows its container. A chip
+     * width is estimated from its label length; removal is deferred to after the
+     * render so it never mutates the list mid-layout. */
+    int remove_idx = -1;
     if (n > 0) {
-        ui_begin_hstack(0);
-        ui_set_spacing(t->sp2);
-        ui_set_align(ALIGN_CENTER);
-        for (int i = 0; i < n; i++) {
-            ui_begin_hstack((uint64_t)(0x7A6C0000u + i));
-            ui_set_paint(solid(t->accent_soft));
-            ui_set_corner_radius(t->radius_pill);
-            ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp2 + 2);
+        float budget = p.width > 0 ? p.width : 240.0f;
+        int i = 0, rowid = 0;
+        while (i < n) {
+            ui_begin_hstack((uint64_t)(0x7A600000u + rowid));
+            ui_set_spacing(t->sp2);
             ui_set_align(ALIGN_CENTER);
-            ui_set_spacing(t->sp1);
-            { EmProps lp = { .font = Body, .color = t->accent }; em_text_impl(tags[i], lp); }
-            ui_box_begin((uint64_t)(0x7A6F0000u + i));
-            struct instance_handle rm = ui_open();
-            { EmProps xp = { .font = Caption, .color = t->accent }; em_icon_impl(IconClose, xp); }
-            ui_box_end();
-            ui_end_stack();
-            if (ui_consume_click(rm) && count) {
-                for (int j = i; j < n - 1; j++) ti_copy(tags[j], tags[j + 1], EM_TAG_LEN);
-                (*count)--;
-                n--;
-                g_em_epoch++;
+            ui_set_size(sz_grow(), sz_intrinsic());
+            float used = 0;
+            int placed = 0;
+            for (; i < n; i++) {
+                int len = 0;
+                while (tags[i][len]) len++;
+                float cw = (float)len * 8.0f + 44.0f;   /* label + padding + ✕ */
+                if (placed > 0 && used + cw > budget) break;
+                used += cw + t->sp2;
+                placed++;
+                ui_begin_hstack((uint64_t)(0x7A6C0000u + i));
+                ui_set_paint(solid(t->accent_soft));
+                ui_set_corner_radius(t->radius_pill);
+                ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp2 + 2);
+                ui_set_align(ALIGN_CENTER);
+                ui_set_spacing(t->sp1);
+                { EmProps lp = { .font = Body, .color = t->accent }; em_text_impl(tags[i], lp); }
+                ui_box_begin((uint64_t)(0x7A6F0000u + i));
+                struct instance_handle rm = ui_open();
+                { EmProps xp = { .font = Caption, .color = t->accent }; em_icon_impl(IconClose, xp); }
+                ui_box_end();
+                ui_end_stack();
+                if (ui_consume_click(rm)) remove_idx = i;
             }
+            ui_spacer();                                 /* left-align the row */
+            ui_end_stack();
+            rowid++;
         }
-        ui_end_stack();
+    }
+    if (remove_idx >= 0 && count) {
+        for (int j = remove_idx; j < n - 1; j++) ti_copy(tags[j], tags[j + 1], EM_TAG_LEN);
+        (*count)--;
+        n--;
+        g_em_epoch++;
     }
 
     /* entry row: field (grows) + add button */
