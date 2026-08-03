@@ -339,6 +339,41 @@ static float measure_wrap_height(struct layout_arena *la, struct scene_arena *sa
     return total + n->padding_top + n->padding_bottom;
 }
 
+/* Height of a GRID container at total width `avail_w`: N equal columns, children
+ * auto-flow with colspan, each row as tall as its tallest cell. Same width->
+ * height deferral so a column parent can size a grid child before its siblings. */
+static float measure_grid_height(struct layout_arena *la, struct scene_arena *sa,
+                                 struct layout_handle h, float avail_w) {
+    struct layout_node *n = layout_resolve(la, h);
+    if (!n || n->grid_cols <= 0) return 0;
+    int cols = n->grid_cols;
+    float cgap = n->grid_col_gap, rgap = n->grid_row_gap;
+    float content_w = avail_w - n->padding_left - n->padding_right;
+    if (content_w < 0) content_w = 0;
+    float col_w = (content_w - cgap * (cols - 1)) / cols;
+    if (col_w < 0) col_w = 0;
+    float total = 0, row_h = 0; int col = 0, nrows = 0;
+    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
+        struct layout_node *cn = layout_resolve(la, c);
+        if (!cn) break;
+        if (!cn->is_overlay) {
+            int span = cn->grid_span > 0 ? cn->grid_span : 1;
+            if (span > cols) span = cols;
+            if (col > 0 && col + span > cols) { total += row_h; nrows++; row_h = 0; col = 0; }
+            float cw = col_w * span + cgap * (span - 1);
+            float ch = (cn->height.mode == SIZE_FIXED) ? cn->height.fixed_value
+                     : is_text(sa, cn) ? layout_measure_height_at_width(la, sa, c, cw)
+                     : cn->intrinsic_h;
+            if (ch > row_h) row_h = ch;
+            col += span;
+        }
+        c = cn->next_sibling;
+    }
+    if (col > 0) { total += row_h; nrows++; }
+    total += rgap * (nrows > 1 ? nrows - 1 : 0);
+    return total + n->padding_top + n->padding_bottom;
+}
+
 static void arrange(struct layout_arena *la, struct scene_arena *sa,
                     struct layout_handle h, float W, float H) {
     struct layout_node *n = layout_resolve(la, h);
@@ -365,6 +400,44 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
     }
     if (nk == 0) return;
 
+    /* --- 2D grid: N equal columns, children auto-flow left-to-right / top-to-
+     * bottom with per-child colspan; each row is as tall as its tallest cell.
+     * Bypasses the flex machinery entirely. --- */
+    if (n->grid_cols > 0) {
+        int cols = n->grid_cols;
+        float cgap = n->grid_col_gap, rgap = n->grid_row_gap;
+        float grid_w = W - n->padding_left - n->padding_right;
+        float col_w = (grid_w - cgap * (cols - 1)) / cols;
+        if (col_w < 0) col_w = 0;
+        float row_y = n->padding_top - n->scroll_offset;
+        int col = 0; float row_h = 0;
+        for (int i = 0; i < nk; i++) {
+            struct layout_node *k = layout_resolve(la, kids[i]);
+            if (k->is_overlay) {
+                k->resolved_x = n->padding_left; k->resolved_y = n->padding_top;
+                k->resolved_w = W - n->padding_left - n->padding_right;
+                k->resolved_h = H - n->padding_top - n->padding_bottom;
+                if (k->is_container) arrange(la, sa, kids[i], k->resolved_w, k->resolved_h);
+                else                 write_scene(sa, k);
+                continue;
+            }
+            int span = k->grid_span > 0 ? k->grid_span : 1;
+            if (span > cols) span = cols;
+            if (col > 0 && col + span > cols) { row_y += row_h + rgap; row_h = 0; col = 0; }
+            float cw = col_w * span + cgap * (span - 1);
+            float cx = n->padding_left + col * (col_w + cgap);
+            float ch = (k->height.mode == SIZE_FIXED) ? k->height.fixed_value
+                     : is_text(sa, k) ? layout_measure_height_at_width(la, sa, kids[i], cw)
+                     : k->intrinsic_h;
+            k->resolved_x = cx; k->resolved_y = row_y; k->resolved_w = cw; k->resolved_h = ch;
+            if (ch > row_h) row_h = ch;
+            if (k->is_container) arrange(la, sa, kids[i], cw, ch);
+            else                 write_scene(sa, k);
+            col += span;
+        }
+        return;
+    }
+
     float base[64], finalm[64], crossv[64];
     float sum_base = 0, sum_grow = 0;
 
@@ -379,6 +452,11 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
 
         if (ms->mode == SIZE_FIXED) {
             base[i] = ms->fixed_value;
+        } else if (k->grid_cols > 0 && !is_row) {
+            /* COLUMN: a grid child's HEIGHT is its auto-flowed grid height at the
+             * width it will get. */
+            float cw = (n->align == ALIGN_STRETCH) ? content_cross : k->intrinsic_w;
+            base[i] = measure_grid_height(la, sa, kids[i], cw);
         } else if (k->wrap && k->is_container && !is_row) {
             /* COLUMN: a wrap-row child's HEIGHT is its wrapped-line height at the
              * width it will get (stretch -> our content width, else intrinsic). */
@@ -391,6 +469,7 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
         } else {
             base[i] = is_row ? k->intrinsic_w : k->intrinsic_h;   /* incl. text one-line width (ROW flex-basis) */
         }
+        if (ms->max_size > 0 && base[i] > ms->max_size) base[i] = ms->max_size;   /* cap the basis */
         sum_base += base[i];
         sum_grow += ms->flex_grow;
     }
@@ -424,6 +503,17 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
         }
     }
 
+    /* clamp the resolved MAIN size to each child's [min, max]. min already
+     * enforced during shrink; max caps growth (a "clamped-responsive" box that
+     * fills available space up to a ceiling). */
+    for (int i = 0; i < nk; i++) {
+        struct layout_node *k = layout_resolve(la, kids[i]);
+        if (k->is_overlay) continue;
+        struct layout_size *ms = is_row ? &k->width : &k->height;
+        if (ms->min_size > 0 && finalm[i] < ms->min_size) finalm[i] = ms->min_size;
+        if (ms->max_size > 0 && finalm[i] > ms->max_size) finalm[i] = ms->max_size;
+    }
+
     /* cross size per child */
     for (int i = 0; i < nk; i++) {
         struct layout_node *k = layout_resolve(la, kids[i]);
@@ -444,6 +534,15 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
         } else {
             crossv[i] = is_row ? k->intrinsic_h : k->intrinsic_w;
         }
+    }
+
+    /* clamp the CROSS size to each child's [min, max] on that axis */
+    for (int i = 0; i < nk; i++) {
+        struct layout_node *k = layout_resolve(la, kids[i]);
+        if (k->is_overlay) continue;
+        struct layout_size *cs = is_row ? &k->height : &k->width;
+        if (cs->min_size > 0 && crossv[i] < cs->min_size) crossv[i] = cs->min_size;
+        if (cs->max_size > 0 && crossv[i] > cs->max_size) crossv[i] = cs->max_size;
     }
 
     /* --- flex-wrap: pack children into lines along the main axis, stack the

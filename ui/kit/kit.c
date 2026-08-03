@@ -8,10 +8,10 @@
 
 #define TH (ui_theme())
 
-static struct layout_size sz_fixed(float v) { return (struct layout_size){ SIZE_FIXED, v, 0, 0, 0 }; }
-static struct layout_size sz_grow(void)     { return (struct layout_size){ SIZE_FLEX, 0, 1, 0, 0 }; }
-static struct layout_size sz_flex(float w)  { return (struct layout_size){ SIZE_FLEX, 0, w, 0, 0 }; }
-static struct layout_size sz_intrinsic(void){ return (struct layout_size){ SIZE_INTRINSIC, 0, 0, 0, 0 }; }
+static struct layout_size sz_fixed(float v) { return (struct layout_size){ SIZE_FIXED, v, 0, 0, 0, 0 }; }
+static struct layout_size sz_grow(void)     { return (struct layout_size){ SIZE_FLEX, 0, 1, 0, 0, 0 }; }
+static struct layout_size sz_flex(float w)  { return (struct layout_size){ SIZE_FLEX, 0, w, 0, 0, 0 }; }
+static struct layout_size sz_intrinsic(void){ return (struct layout_size){ SIZE_INTRINSIC, 0, 0, 0, 0, 0 }; }
 
 static struct paint solid(struct color c) {
     struct paint p; p.kind = PAINT_SOLID; p.solid = c; p.n_stops = 0; return p;

@@ -1712,16 +1712,13 @@ showcase-v2:
 	$(BUILD)/showcase_v2 $(BUILD)/pk_dark.ppm  dark  pk
 	$(BUILD)/showcase_v2 $(BUILD)/gb_light.ppm light b
 	$(BUILD)/showcase_v2 $(BUILD)/gb_dark.ppm  dark  b
-	python3 -c "from PIL import Image; \
-	  Image.open('$(BUILD)/v2_light.ppm').save('$(BUILD)/v2_light.png'); \
-	  Image.open('$(BUILD)/v2_dark.ppm').save('$(BUILD)/v2_dark.png'); \
-	  Image.open('$(BUILD)/v4_light.ppm').save('$(BUILD)/v4_light.png'); \
-	  Image.open('$(BUILD)/v4_dark.ppm').save('$(BUILD)/v4_dark.png'); \
-	  Image.open('$(BUILD)/v6_light.ppm').save('$(BUILD)/v6_light.png'); \
-	  Image.open('$(BUILD)/v6_dark.ppm').save('$(BUILD)/v6_dark.png'); \
-	  Image.open('$(BUILD)/v7_light.ppm').save('$(BUILD)/v7_light.png'); \
-	  Image.open('$(BUILD)/v7_dark.ppm').save('$(BUILD)/v7_dark.png'); \
-	  print('wrote v2_{light,dark}.png + v4_{light,dark}.png')"
+	$(BUILD)/showcase_v2 $(BUILD)/mm_light.ppm light m
+	$(BUILD)/showcase_v2 $(BUILD)/mm_dark.ppm  dark  m
+	$(BUILD)/showcase_v2 $(BUILD)/grid_light.ppm light r
+	$(BUILD)/showcase_v2 $(BUILD)/grid_dark.ppm  dark  r
+	python3 -c "from PIL import Image; import glob, os; \
+	  [Image.open(p).save(p[:-4]+'.png') for p in glob.glob('$(BUILD)/*.ppm')]; \
+	  print('wrote', len(glob.glob('$(BUILD)/*.png')), 'PNGs to $(BUILD)/ (v2 v4 v6 v7 pk gb mm grid, light+dark)')"
 
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(KERNEL_BIN) $(IMG)

@@ -38,6 +38,7 @@ struct layout_size {
     float flex_grow;      /* weight for POSITIVE remaining space */
     float flex_shrink;    /* weight for NEGATIVE remaining space -- ORTHOGONAL to mode */
     float min_size;        /* floor a shrinking node won't cross; default 0 */
+    float max_size;        /* ceiling a growing node won't cross; 0 = no cap */
 };
 
 struct layout_node {
@@ -56,6 +57,9 @@ struct layout_node {
     float spacing;                     /* main-axis gap between children */
     bool  wrap;                        /* flex-wrap: overflowing children flow onto
                                         * new lines stacked on the cross axis */
+    int   grid_cols;                   /* >0 => 2D grid: N equal columns, auto-flow */
+    float grid_col_gap, grid_row_gap;  /* grid track gaps */
+    int   grid_span;                   /* a grid CHILD spans this many columns (default 1) */
     float scroll_offset;               /* column scroll: children shift up by this many px */
     float offset_x, offset_y;          /* post-layout translate ADDED to the resolved
                                         * position (CSS `transform: translate`-style) --

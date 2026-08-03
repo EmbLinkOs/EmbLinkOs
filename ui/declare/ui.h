@@ -29,6 +29,7 @@ void ui_set_corner_radius(float r);
 void ui_set_padding(float top, float right, float bottom, float left);
 void ui_set_spacing(float s);
 void ui_set_size(struct layout_size w, struct layout_size h);
+void ui_set_size_bounds(float min_w, float max_w, float min_h, float max_h);  /* 0 = unset */
 void ui_set_shadow(bool enabled, float dx, float dy, float blur, struct color color);
 void ui_set_opacity(float opacity);   /* 0..1; wraps the subtree in a group */
 void ui_set_offset(float x, float y);  /* post-layout translate (transitions/slides) */
@@ -40,6 +41,8 @@ void ui_set_border_gradient(float width, const struct paint *paint);
 void ui_set_text_gradient(const struct paint *paint);   /* one-shot: next ui_text() */
 void ui_set_axis(enum layout_axis a);
 void ui_set_wrap(bool wrap);   /* flex-wrap: overflowing children flow onto new lines */
+void ui_set_grid(int cols, float col_gap, float row_gap);   /* container: 2D grid */
+void ui_set_grid_span(int span);                            /* child: columns to span */
 void ui_set_justify(enum layout_justify j);
 void ui_set_align(enum layout_align a);
 void ui_set_text_color(struct color c);   /* colour for subsequent ui_text calls */

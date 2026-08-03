@@ -66,7 +66,10 @@ typedef struct {
     float padding, px, py;               /* all / horizontal / vertical */
     float pt, pr, pb, pl;                /* per-edge overrides */
     float width, height;                 /* fixed size (0 = intrinsic) */
+    float minw, maxw, minh, maxh;        /* size bounds (0 = unset); maxw + grow
+                                          * = a clamped-responsive box */
     int   grow;                          /* fill available space (main axis) */
+    int   span;                          /* grid child: columns to span (default 1) */
 
     /* surface */
     Color background, color, border_color;
@@ -135,6 +138,12 @@ const EmTokens *em_tokens_(void);
  * the width (real flex-wrap in the layout engine -- e.g. chips, tag lists). */
 void em_flow_(EmProps p);
 #define Flow(...) EM_SCOPE_(em_flow_((EmProps){__VA_ARGS__}), em_end_())
+
+/* Grid: a true 2D grid -- `cols` equal columns, children auto-flow with an
+ * optional per-child .span. Fills the parent width; row heights auto-size to
+ * content. Gaps come from .spacing.   Grid(3, .spacing=12){ Card(.span=2){} ...} */
+void em_grid_(int cols, EmProps p);
+#define Grid(cols, ...) EM_SCOPE_(em_grid_((cols), (EmProps){__VA_ARGS__}), em_end_())
 
 /* Gradient borders (render-engine feature): stroke a container's border with a
  * linear gradient. em_lgrad/em_lgrad3 build the paint; GradientBorder wraps

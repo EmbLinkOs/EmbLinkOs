@@ -52,9 +52,9 @@ static Color shade(Color c, float k) {
 }
 static Color tint(Color c, float a) { Color o = c; o.a = a; return o; }
 
-static struct layout_size sz_fixed(float v)  { return (struct layout_size){ SIZE_FIXED, v, 0, 0, 0 }; }
-static struct layout_size sz_grow(void)      { return (struct layout_size){ SIZE_FLEX, 0, 1, 0, 0 }; }
-static struct layout_size sz_intrinsic(void) { return (struct layout_size){ SIZE_INTRINSIC, 0, 0, 0, 0 }; }
+static struct layout_size sz_fixed(float v)  { return (struct layout_size){ SIZE_FIXED, v, 0, 0, 0, 0 }; }
+static struct layout_size sz_grow(void)      { return (struct layout_size){ SIZE_FLEX, 0, 1, 0, 0, 0 }; }
+static struct layout_size sz_intrinsic(void) { return (struct layout_size){ SIZE_INTRINSIC, 0, 0, 0, 0, 0 }; }
 
 static void utf8_enc(int cp, char *out) {
     unsigned c = (unsigned)cp;
@@ -128,6 +128,9 @@ static void em_apply_box(EmProps p) {
         struct layout_size h = p.height > 0 ? sz_fixed(p.height) : sz_intrinsic();
         ui_set_size(w, h);
     }
+    if (p.minw > 0 || p.maxw > 0 || p.minh > 0 || p.maxh > 0)
+        ui_set_size_bounds(p.minw, p.maxw, p.minh, p.maxh);
+    if (p.span > 0) ui_set_grid_span(p.span);   /* grid-cell column span */
     if (p.background.a > 0) ui_set_paint(solid(p.background));
     if (p.corner > 0)       ui_set_corner_radius(p.corner);
     if (p.border > 0)       ui_set_border(p.border, p.border_color.a > 0 ? p.border_color : TH->border);
@@ -168,6 +171,15 @@ void em_vstack_(EmProps p) { em_flush(); ui_begin_vstack(0); em_apply_box(p); }
 void em_hstack_(EmProps p) { em_flush(); ui_begin_hstack(0); if (!p.align) ui_set_align(ALIGN_CENTER); em_apply_box(p); }
 /* Flow: a horizontal stack whose children wrap onto new lines (flex-wrap). */
 void em_flow_(EmProps p)   { em_flush(); ui_begin_hstack(0); ui_set_wrap(true); if (!p.align) ui_set_align(ALIGN_START); em_apply_box(p); }
+/* Grid: N equal columns, children auto-flow with optional .span; fills width. */
+void em_grid_(int cols, EmProps p) {
+    em_flush();
+    float gap = p.spacing > 0 ? p.spacing : TH->sp3;
+    ui_begin_vstack(0);
+    em_apply_box(p);
+    ui_set_grid(cols, gap, gap);
+    if (p.width <= 0) ui_set_size(sz_grow(), sz_intrinsic());
+}
 void em_zstack_(EmProps p) { em_flush(); ui_begin_vstack(0); em_apply_box(p); }
 void em_glass_(EmProps p)  { em_flush(); ui_begin_vstack(0); p.glass = 1;
                              if (p.corner <= 0) p.corner = TH->radius_lg;
@@ -984,7 +996,7 @@ void em_window_end_(void) {
          * delta for the runtime. */
         const struct ui_theme *t = TH;
         ui_begin_hstack(0);
-        ui_set_size(sz_grow(), (struct layout_size){ SIZE_FIXED, 0, 0, 0, 0 });
+        ui_set_size(sz_grow(), (struct layout_size){ SIZE_FIXED, 0, 0, 0, 0, 0 });
         ui_set_justify(JUSTIFY_END);
         {
             ui_begin_hstack(1);
@@ -1678,7 +1690,7 @@ void em_toast_host(void) {
     ui_begin_hstack(0);
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
-    ui_set_size(sz_grow(), (struct layout_size){ SIZE_FIXED, 0, 0, 0, 0 });
+    ui_set_size(sz_grow(), (struct layout_size){ SIZE_FIXED, 0, 0, 0, 0, 0 });
     ui_set_offset(0, -62.0f + (1.0f - op) * 16.0f);   /* rise above the tab bar */
     ui_set_opacity(op < 1.0f ? op : 1.0f);
     {

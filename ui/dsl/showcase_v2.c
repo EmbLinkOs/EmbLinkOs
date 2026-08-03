@@ -339,6 +339,55 @@ static void gbapp(void) {
     }
 }
 
+/* ======================================================================= */
+/* min/max constraints ("m") + 2D Grid ("r") -- layout-engine level-ups.    */
+/* ======================================================================= */
+static void mmapp(void) {
+    const struct ui_theme *t = ui_theme();
+    Screen(.justify = Center, .align = Center, .padding = 20) {
+        VStack(.spacing = 14, .align = Fill) {
+            Text("Clamped-responsive").heading();
+            Text("grow to fill, but never exceed maxw").caption().secondary();
+            HStack(.align = Fill) {
+                VStack(.grow = 1, .maxw = 320, .padding = 18, .background = t->surface,
+                       .corner = 14, .spacing = 4) {
+                    Text("max 320px").title();
+                    Text("I fill the row, but stop at 320px wide.").caption().secondary();
+                }
+            }
+            HStack(.align = Fill) {
+                VStack(.grow = 1, .minw = 220, .padding = 18, .background = t->accent_soft,
+                       .corner = 14) {
+                    Text("min 220px floor").title();
+                }
+            }
+        }
+    }
+}
+static void gridapp(void) {
+    static const float spark[] = { 3, 5, 4, 7, 6, 9, 8, 11 };
+    Screen(.padding = 20) {
+        VStack(.spacing = 14, .align = Fill) {
+            Text("Dashboard grid").heading();
+            Grid(3, .spacing = 12) {
+                StatCard("CPU", "37%", "+2.1%", spark, 8);
+                StatCard("MEM", "1.2 GB", "-0.4%", spark, 8);
+                StatCard("NET", "88 ms", "+5 ms", spark, 8);
+                Card(.span = 2, .padding = 16, .spacing = 6) {
+                    Text("Activity").title();
+                    Chart(spark, 8, .height = 64);
+                }
+                Card(.padding = 14, .align = Center) {
+                    Gauge(0.72f, "72%", .height = 90);
+                }
+                Card(.span = 3, .padding = 14) {
+                    Banner(IconCheck, "All systems nominal.").success();
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     int W = 480, H = 1080;
     const char *out = argc > 1 ? argv[1] : "v2.ppm";
@@ -349,12 +398,16 @@ int main(int argc, char **argv) {
     bool gl   = (argc > 3 && argv[3][0] == 'g');
     bool pk   = (argc > 3 && argv[3][0] == 'p');
     bool gb   = (argc > 3 && argv[3][0] == 'b');
+    bool mm   = (argc > 3 && argv[3][0] == 'm');
+    bool gr   = (argc > 3 && argv[3][0] == 'r');
     if (v4) { W = 660; H = 900; }
     if (v6) { W = 560; H = 420; }
     if (v7) { W = 560; H = 420; }
     if (gl) { W = 620; H = 460; }
     if (pk) { W = 700; H = 900; }
     if (gb) { W = 460; H = 520; }
+    if (mm) { W = 480; H = 380; }
+    if (gr) { W = 620; H = 520; }
 
     size_t rl = 0, bl = 0;
     uint8_t *reg  = read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", &rl);
@@ -371,7 +424,7 @@ int main(int argc, char **argv) {
     ui_init(&sa, &la);
 
     if (v4) em_toast("Snapshot created", Success);   /* host clock is 0 -> stays visible */
-    ui_frame_begin(); em_new_frame(); if (gb) gbapp(); else if (pk) pkapp(); else if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
+    ui_frame_begin(); em_new_frame(); if (gr) gridapp(); else if (mm) mmapp(); else if (gb) gbapp(); else if (pk) pkapp(); else if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
     ui_run_layout((float)W, (float)H);
 
     struct render_target rt;

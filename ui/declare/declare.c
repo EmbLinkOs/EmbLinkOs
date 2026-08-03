@@ -381,6 +381,14 @@ void ui_set_size(struct layout_size w, struct layout_size h) {
     if (ln) { ln->width = w; ln->height = h; ln->dirty = true; }
     g_mutation_count++;
 }
+void ui_set_size_bounds(float min_w, float max_w, float min_h, float max_h) {
+    struct instance *b = cur_box(); if (!b) return;
+    struct layout_node *ln = layout_resolve(g_la, b->layout_node);
+    if (!ln) return;
+    ln->width.min_size  = min_w; ln->width.max_size  = max_w;
+    ln->height.min_size = min_h; ln->height.max_size = max_h;
+    ln->dirty = true;
+}
 void ui_set_shadow(bool enabled, float dx, float dy, float blur, struct color color) {
     struct instance *b = cur_box(); if (!b) return;
     /* route through the guarded scene setter so an unchanged shadow (re-applied
@@ -437,6 +445,16 @@ void ui_set_wrap(bool wrap) {
     struct instance *b = cur_box(); if (!b) return;
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
     if (ln) { ln->wrap = wrap; ln->dirty = true; }
+}
+void ui_set_grid(int cols, float col_gap, float row_gap) {
+    struct instance *b = cur_box(); if (!b) return;
+    struct layout_node *ln = layout_resolve(g_la, b->layout_node);
+    if (ln) { ln->grid_cols = cols; ln->grid_col_gap = col_gap; ln->grid_row_gap = row_gap; ln->dirty = true; }
+}
+void ui_set_grid_span(int span) {   /* on the CHILD box */
+    struct instance *b = cur_box(); if (!b) return;
+    struct layout_node *ln = layout_resolve(g_la, b->layout_node);
+    if (ln) { ln->grid_span = span; ln->dirty = true; }
 }
 void ui_set_justify(enum layout_justify j) {
     struct instance *b = cur_box(); if (!b) return;
