@@ -684,10 +684,15 @@ static void gamma_tables_init(void) {
 /* premultiplied-BGRA pixel over-blend, gated by the backend clip/dirty. */
 static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
                                  struct glyph_atlas *atlas, int ax, int ay, int aw, int ah,
-                                 struct color color, float opacity) {
+                                 struct color color, float opacity,
+                                 float ox, float oy, float box_w, float box_h,
+                                 const struct paint *paint) {
     if (!g_gamma_ready) gamma_tables_init();
-    /* src linear-light channels are constant for the whole glyph */
+    bool grad = paint && paint->kind != PAINT_NONE;
+    /* src linear-light channels: constant for a flat glyph, resampled per pixel
+     * for a gradient (coords are text-box-local so the ramp spans the whole run). */
     float sr2 = color.r * color.r, sg2 = color.g * color.g, sb2 = color.b * color.b;
+    float sa = color.a;
     for (int yy = 0; yy < ah; yy++) {
         int py = dy + yy;
         if (py < 0 || py >= (int)rt->height) continue;
@@ -696,7 +701,11 @@ static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
             int px = dx + xx;
             if (px < 0 || px >= (int)rt->width) continue;
             float cov = atlas->coverage[ay + yy][ax + xx] / 255.0f;
-            float eff = color.a * cov * opacity * cpu_coverage_at(px + 0.5f, py + 0.5f);
+            if (grad) {
+                struct color gc = cpu_paint_at(paint, (float)px - ox, (float)py - oy, box_w, box_h);
+                sr2 = gc.r * gc.r; sg2 = gc.g * gc.g; sb2 = gc.b * gc.b; sa = gc.a;
+            }
+            float eff = sa * cov * opacity * cpu_coverage_at(px + 0.5f, py + 0.5f);
             if (eff <= 0.0f) continue;
             uint32_t d = row[px];
             int db = d & 255, dg = (d>>8)&255, dr = (d>>16)&255, da = (d>>24)&255;
@@ -718,7 +727,8 @@ static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
 }
 
 static void backend_draw_text_impl(struct render_target *rt, float x, float y, const char *utf8,
-                                   uint32_t font_handle, float size_px, struct color color, float opacity) {
+                                   uint32_t font_handle, float size_px, struct color color, float opacity,
+                                   const struct paint *paint, float box_w, float box_h) {
     struct font *f = font_for_handle(font_handle);
     if (!f || !utf8) return;
     /* `y` is the top of the text's line box (what layout hands us); the glyph
@@ -738,7 +748,7 @@ static void backend_draw_text_impl(struct render_target *rt, float x, float y, c
             if (g->atlas_w > 0 && g->atlas_h > 0)
                 blit_coverage_tinted(rt, (int)(pen_x + g->bearing_x), (int)(pen_y - g->bearing_y),
                                      &g_atlas, g->atlas_x, g->atlas_y, g->atlas_w, g->atlas_h,
-                                     color, opacity);
+                                     color, opacity, x, y, box_w, box_h, paint);
             pen_x += g->advance_px;
         }
     }

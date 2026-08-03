@@ -37,6 +37,7 @@ void ui_set_clip_children(bool clip);
 void ui_set_overlay(bool on);   /* fill parent, out of flow (modal/popover layer) */
 void ui_set_border(float width, struct color color);
 void ui_set_border_gradient(float width, const struct paint *paint);
+void ui_set_text_gradient(const struct paint *paint);   /* one-shot: next ui_text() */
 void ui_set_axis(enum layout_axis a);
 void ui_set_justify(enum layout_justify j);
 void ui_set_align(enum layout_align a);

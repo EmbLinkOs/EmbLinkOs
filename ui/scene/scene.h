@@ -137,7 +137,8 @@ struct scene_node {
     union {
         struct { struct paint fill; } rect;
         struct { const void *pixels; uint32_t w, h; enum embk_pixfmt fmt; } image;
-        struct { const char *utf8; uint32_t font_handle; float size_px; struct color color; } text;
+        struct { const char *utf8; uint32_t font_handle; float size_px; struct color color;
+                 struct paint paint; /* PAINT_*_GRADIENT -> gradient glyph fill */ } text;
     } data;
 
     bool  dirty;   /* any mutation sets this; lets a caching traversal skip an
@@ -189,6 +190,7 @@ void scene_set_size(struct scene_arena *a, struct node_handle h, float w, float 
 void scene_set_paint(struct scene_arena *a, struct node_handle h, const struct paint *p); /* RECT */
 void scene_set_text(struct scene_arena *a, struct node_handle h, const char *utf8,
                     uint32_t font_handle, float size_px, struct color color);
+void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const struct paint *paint);
 
 /* Force-dirty a node whose (aliased) content was edited in place. */
 void scene_mark_dirty(struct scene_arena *a, struct node_handle h);

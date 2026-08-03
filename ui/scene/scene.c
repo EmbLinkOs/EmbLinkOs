@@ -316,6 +316,17 @@ void scene_set_text(struct scene_arena *a, struct node_handle h, const char *utf
     n->data.text.font_handle = font_handle;
     n->data.text.size_px = size_px;
     n->data.text.color = color;
+    n->data.text.paint.kind = PAINT_NONE;   /* solid unless a gradient is set next */
+    n->dirty = true;
+}
+
+/* Fill the glyphs with a gradient (over the text's own box) instead of a flat
+ * color. First stop becomes the fallback solid color. */
+void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const struct paint *paint) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || !paint) return;
+    n->data.text.paint = *paint;
+    if (paint->n_stops > 0) n->data.text.color = paint->stops[0].color;
     n->dirty = true;
 }
 

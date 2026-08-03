@@ -19,6 +19,10 @@
 /* Rounded-rect clip; the clip stack intersects these. corner_radius 0 = sharp. */
 struct clip_rect { float x, y, w, h, corner_radius; };
 
+/* Sample a paint (solid/gradient) at node-local (u,v) over a w*h box. Public so
+ * the text backend can stroke glyphs with a gradient (gradient headings). */
+struct color cpu_paint_at(const struct paint *p, float u, float v, float w, float h);
+
 struct render_backend {
     void (*begin_frame)(struct render_target *rt, const struct clip_rect *dirty_rects, uint32_t n_dirty);
     void (*end_frame)(struct render_target *rt);
@@ -43,7 +47,9 @@ struct render_backend {
                         const struct paint *paint);   /* paint!=NONE -> gradient stroke */
 
     void (*draw_text)(struct render_target *rt, float x, float y, const char *utf8,
-                      uint32_t font_handle, float size_px, struct color color, float opacity);
+                      uint32_t font_handle, float size_px, struct color color, float opacity,
+                      const struct paint *paint, float box_w, float box_h);
+                      /* paint!=NONE -> glyphs stroked with a gradient over box_w*box_h */
 };
 
 /* The CPU backend singleton (its clip stack + scratch pool are module state). */

@@ -320,6 +320,7 @@ static void gbapp(void) {
     Color viol = { 0.55f, 0.36f, 0.96f, 1.0f };
     Screen(.justify = Center, .align = Center) {
         VStack(.spacing = 20, .align = Center) {
+            GradientText("Gradient Text", em_lgrad3(cyan, viol, pink, 0), .font = Heading);
             GradientBorder(2.5f, em_lgrad(t->accent, pink, 45),
                            .corner = 18, .padding = 22, .background = t->surface) {
                 Text("Gradient ring").title();

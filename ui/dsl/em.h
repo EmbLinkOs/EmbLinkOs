@@ -142,6 +142,12 @@ void em_gborder_end_(void);
 #define GradientBorder(width, grad, ...) \
     EM_SCOPE_(em_gborder_((width), (grad), (EmProps){__VA_ARGS__}), em_gborder_end_())
 
+/* Gradient-filled text / icon (e.g. a gradient heading). */
+void em_gtext(const char *s, struct paint g, EmProps p);
+void em_gicon(int cp, struct paint g, EmProps p);
+#define GradientText(s, grad, ...)  em_gtext((s), (grad), (EmProps){__VA_ARGS__})
+#define GradientIcon(cp, grad, ...) em_gicon((cp), (grad), (EmProps){__VA_ARGS__})
+
 void em_vstack_(EmProps p);
 void em_hstack_(EmProps p);
 void em_zstack_(EmProps p);

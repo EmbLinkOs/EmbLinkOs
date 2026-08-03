@@ -473,6 +473,13 @@ bool ui_open_content_extent(float *content_h, float *viewport_h) {
 }
 void ui_set_text_color(struct color c) { g_text_color = c; }
 
+/* One-shot gradient for the NEXT text: set just before ui_text(), consumed and
+ * cleared by it (so it never leaks to later text). PAINT_NONE = flat color. */
+static struct paint g_text_paint;   /* zero-init -> PAINT_NONE */
+void ui_set_text_gradient(const struct paint *p) {
+    g_text_paint = p ? *p : (struct paint){0};
+}
+
 /* ------------------------------------------------------------------------- */
 /* text + button + spacer                                                    */
 /* ------------------------------------------------------------------------- */
@@ -480,10 +487,11 @@ void ui_set_text_color(struct color c) { g_text_color = c; }
 static void set_text_on(struct instance_handle h, const char *str) {
     struct instance *n = instance_resolve(h);
     if (!n) return;
-    if (n->shadow.has_text && strncmp(n->shadow.text, str, sizeof n->shadow.text) == 0 &&
+    bool grad = (g_text_paint.kind != PAINT_NONE);
+    if (!grad && n->shadow.has_text && strncmp(n->shadow.text, str, sizeof n->shadow.text) == 0 &&
         n->shadow.font_handle == g_font && n->shadow.text_size == g_text_size &&
         memcmp(&n->shadow.text_color, &g_text_color, sizeof(struct color)) == 0)
-        return;   /* no-op skip */
+        return;   /* no-op skip (never while a gradient is pending) */
     strncpy(n->shadow.text, str, sizeof n->shadow.text - 1);
     n->shadow.text[sizeof n->shadow.text - 1] = 0;
     n->shadow.font_handle = g_font; n->shadow.text_size = g_text_size; n->shadow.text_color = g_text_color;
@@ -493,7 +501,9 @@ static void set_text_on(struct instance_handle h, const char *str) {
      * no-op guard sees identical pointers+bytes -- force the dirty explicitly
      * (our strncmp above already proved the content actually changed). */
     scene_set_text(g_sa, n->scene_node, n->shadow.text, g_font, g_text_size, g_text_color);
+    if (grad) scene_set_text_gradient(g_sa, n->scene_node, &g_text_paint);
     scene_mark_dirty(g_sa, n->scene_node);
+    g_text_paint.kind = PAINT_NONE;   /* one-shot: consumed */
     g_mutation_count++;
 }
 

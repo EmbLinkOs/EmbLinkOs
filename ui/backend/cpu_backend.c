@@ -313,7 +313,7 @@ static struct color gradient_at(const struct paint *p, float t) {
     return p->stops[p->n_stops - 1].color;
 }
 /* Straight-alpha paint color at rect-local (u,v) in [0,w]x[0,h]. */
-static struct color paint_at(const struct paint *p, float u, float v, float w, float h) {
+struct color cpu_paint_at(const struct paint *p, float u, float v, float w, float h) {
     switch (p->kind) {
         case PAINT_SOLID: return p->solid;
         case PAINT_LINEAR_GRADIENT: {
@@ -427,7 +427,7 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
                 if (cov <= 0.0f) continue;
                 cov *= coverage_at(fx, fy);
                 if (cov <= 0.0f) continue;
-                struct color c = paint_at(fill, fx - x, fy - y, w, h);
+                struct color c = cpu_paint_at(fill, fx - x, fy - y, w, h);
                 float eff = c.a * cov * opacity;
                 if (eff <= 0.0f) continue;
                 blend_over(rt, ix, iy, c.r * eff, c.g * eff, c.b * eff, eff);
@@ -445,7 +445,7 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
             if (cov <= 0.0f) continue;
             cov *= coverage_at(fx, fy);
             if (cov <= 0.0f) continue;
-            struct color c = paint_at(fill, fx - x, fy - y, w, h);
+            struct color c = cpu_paint_at(fill, fx - x, fy - y, w, h);
             float eff = c.a * cov * opacity;
             if (eff <= 0.0f) continue;
             blend_over(rt, ix, iy, c.r * eff, c.g * eff, c.b * eff, eff);
@@ -672,7 +672,7 @@ static void cpu_draw_border(struct render_target *rt, float x, float y, float w,
                 if (ring <= 0.0f) continue;
                 ring *= coverage_at(fx, fy);
                 if (ring <= 0.0f) continue;
-                struct color bc = has_grad ? paint_at(paint, fx - x, fy - y, w, h) : color;
+                struct color bc = has_grad ? cpu_paint_at(paint, fx - x, fy - y, w, h) : color;
                 if (bc.a <= 0.0f) continue;
                 float eff = bc.a * ring;
                 blend_over(rt, ix, iy, bc.r * eff, bc.g * eff, bc.b * eff, eff);

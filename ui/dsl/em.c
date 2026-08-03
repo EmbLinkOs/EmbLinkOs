@@ -566,6 +566,21 @@ static void em_icon_impl(int cp, EmProps p) {
     if (!p.font) p.font = Body;
     em_text_impl(g, p);
 }
+/* Gradient text / icon: glyphs filled with a gradient over the run's own box.
+ * One-shot -- ui_set_text_gradient is consumed by the ui_text() that follows. */
+void em_gtext(const char *s, struct paint g, EmProps p) {
+    em_flush();
+    uint32_t fh; float sz; em_resolve_font(p.font, &fh, &sz);
+    Color col = p.color.a > 0 ? p.color : TH->text;
+    ui_set_font(fh); ui_set_text_size(sz); ui_set_text_color(col);
+    ui_set_text_gradient(&g);
+    ui_text("%s", s);
+}
+void em_gicon(int cp, struct paint g, EmProps p) {
+    char buf[5]; utf8_enc(cp, buf);
+    if (!p.font) p.font = Body;
+    em_gtext(buf, g, p);
+}
 static void em_label_impl(int cp, const char *s, EmProps p) {
     ui_begin_hstack(0);
     ui_set_align(ALIGN_CENTER);
