@@ -120,7 +120,8 @@ struct scene_node {
     /* --- border (RECT; a hairline stroke drawn INSIDE the rounded edge, on
      * top of the fill) --- */
     float border_width;        /* 0 = no border */
-    struct color border_color;
+    struct color border_color; /* used when border_paint.kind == PAINT_NONE */
+    struct paint border_paint; /* PAINT_*_GRADIENT -> the stroke is a gradient */
 
     /* --- effects --- */
     bool  shadow_enabled;
@@ -196,6 +197,8 @@ void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pi
 void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
                       float dx, float dy, float blur, struct color color);
 void scene_set_border(struct scene_arena *a, struct node_handle h, float width, struct color color);
+void scene_set_border_gradient(struct scene_arena *a, struct node_handle h,
+                               float width, const struct paint *paint);
 void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool enabled, float radius);
 void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacity);
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip);

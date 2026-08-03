@@ -424,6 +424,10 @@ void ui_set_border(float width, struct color color) {
     struct instance *b = cur_box(); if (!b) return;
     scene_set_border(g_sa, b->scene_node, width, color);
 }
+void ui_set_border_gradient(float width, const struct paint *paint) {
+    struct instance *b = cur_box(); if (!b) return;
+    scene_set_border_gradient(g_sa, b->scene_node, width, paint);
+}
 void ui_set_axis(enum layout_axis a) {
     struct instance *b = cur_box(); if (!b) return;
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);

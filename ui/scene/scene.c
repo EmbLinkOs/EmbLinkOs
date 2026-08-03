@@ -353,8 +353,22 @@ void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
 void scene_set_border(struct scene_arena *a, struct node_handle h, float width, struct color color) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n) return;
-    if (n->border_width == width && color_eq(n->border_color, color)) return;
+    if (n->border_width == width && color_eq(n->border_color, color) &&
+        n->border_paint.kind == PAINT_NONE) return;
     n->border_width = width; n->border_color = color;
+    n->border_paint.kind = PAINT_NONE;   /* solid mode */
+    n->dirty = true;
+}
+
+/* Stroke the border with a gradient paint (linear/radial). Falls back to the
+ * first stop as the solid color for any consumer that ignores border_paint. */
+void scene_set_border_gradient(struct scene_arena *a, struct node_handle h,
+                               float width, const struct paint *paint) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || !paint) return;
+    n->border_width  = width;
+    n->border_paint  = *paint;
+    n->border_color  = paint->n_stops > 0 ? paint->stops[0].color : n->border_color;
     n->dirty = true;
 }
 

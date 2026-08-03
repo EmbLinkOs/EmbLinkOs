@@ -310,6 +310,34 @@ static void pkapp(void) {
     }
 }
 
+/* ======================================================================= */
+/* Gradient-border gallery ("b" as argv[3]) -- the new render-engine feature.*/
+/* ======================================================================= */
+static void gbapp(void) {
+    const struct ui_theme *t = ui_theme();
+    Color pink = { 0.93f, 0.28f, 0.60f, 1.0f };
+    Color cyan = { 0.13f, 0.83f, 0.93f, 1.0f };
+    Color viol = { 0.55f, 0.36f, 0.96f, 1.0f };
+    Screen(.justify = Center, .align = Center) {
+        VStack(.spacing = 20, .align = Center) {
+            GradientBorder(2.5f, em_lgrad(t->accent, pink, 45),
+                           .corner = 18, .padding = 22, .background = t->surface) {
+                Text("Gradient ring").title();
+                Text("A border stroked with a linear gradient").caption().secondary();
+            }
+            GradientBorder(3.0f, em_lgrad3(cyan, viol, pink, 90),
+                           .corner = 999, .padding = 14, .background = t->surface) {
+                Text("Pill outline").heading();
+            }
+            HStack(.spacing = 14) {
+                GradientBorder(2.0f, em_lgrad(cyan, t->accent, 0), .corner = 16, .padding = 16, .background = t->surface) { Icon(IconStar); }
+                GradientBorder(2.0f, em_lgrad(pink, viol, 0),      .corner = 16, .padding = 16, .background = t->surface) { Icon(IconHeart); }
+                GradientBorder(2.0f, em_lgrad(viol, cyan, 0),      .corner = 16, .padding = 16, .background = t->surface) { Icon(IconBolt); }
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     int W = 480, H = 1080;
     const char *out = argc > 1 ? argv[1] : "v2.ppm";
@@ -319,11 +347,13 @@ int main(int argc, char **argv) {
     bool v7   = (argc > 3 && argv[3][0] == '7');
     bool gl   = (argc > 3 && argv[3][0] == 'g');
     bool pk   = (argc > 3 && argv[3][0] == 'p');
+    bool gb   = (argc > 3 && argv[3][0] == 'b');
     if (v4) { W = 660; H = 900; }
     if (v6) { W = 560; H = 420; }
     if (v7) { W = 560; H = 420; }
     if (gl) { W = 620; H = 460; }
     if (pk) { W = 700; H = 900; }
+    if (gb) { W = 460; H = 520; }
 
     size_t rl = 0, bl = 0;
     uint8_t *reg  = read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", &rl);
@@ -340,7 +370,7 @@ int main(int argc, char **argv) {
     ui_init(&sa, &la);
 
     if (v4) em_toast("Snapshot created", Success);   /* host clock is 0 -> stays visible */
-    ui_frame_begin(); em_new_frame(); if (pk) pkapp(); else if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
+    ui_frame_begin(); em_new_frame(); if (gb) gbapp(); else if (pk) pkapp(); else if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
     ui_run_layout((float)W, (float)H);
 
     struct render_target rt;

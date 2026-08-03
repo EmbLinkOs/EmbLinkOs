@@ -131,6 +131,17 @@ const EmTokens *em_tokens_(void);
 #define Section(title, ...) EM_SCOPE_(em_section_((title), (EmProps){__VA_ARGS__}), em_end_())
 #define ScrollView(bind, height, ...) EM_SCOPE_(em_scroll_((bind), (height), (EmProps){__VA_ARGS__}), em_scroll_end_())
 
+/* Gradient borders (render-engine feature): stroke a container's border with a
+ * linear gradient. em_lgrad/em_lgrad3 build the paint; GradientBorder wraps
+ * content in a box whose border is that gradient.
+ *   GradientBorder(2.0f, em_lgrad(t->accent, pink, 45), .corner=16, .padding=16){...} */
+struct paint em_lgrad(Color a, Color b, float angle_deg);
+struct paint em_lgrad3(Color a, Color b, Color c, float angle_deg);
+void em_gborder_(float width, struct paint g, EmProps p);
+void em_gborder_end_(void);
+#define GradientBorder(width, grad, ...) \
+    EM_SCOPE_(em_gborder_((width), (grad), (EmProps){__VA_ARGS__}), em_gborder_end_())
+
 void em_vstack_(EmProps p);
 void em_hstack_(EmProps p);
 void em_zstack_(EmProps p);

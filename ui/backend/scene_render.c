@@ -177,7 +177,8 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
                 be->draw_backdrop_blur(target, dx, dy, w, h, n->corner_radius, n->backdrop_blur_radius);
             be->draw_rect(target, dx, dy, w, h, n->corner_radius, &n->data.rect.fill, 1.0f);
             if (n->border_width > 0 && be->draw_border)
-                be->draw_border(target, dx, dy, w, h, n->corner_radius, n->border_width, n->border_color);
+                be->draw_border(target, dx, dy, w, h, n->corner_radius, n->border_width,
+                                n->border_color, &n->border_paint);
             break;
         case SCENE_NODE_IMAGE:
             be->draw_image(target, dx, dy, w, h, n->data.image.pixels,

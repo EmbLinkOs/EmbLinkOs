@@ -629,8 +629,10 @@ static void cpu_draw_backdrop_blur(struct render_target *rt, float x, float y, f
 /* ------------------------------------------------------------------------- */
 
 static void cpu_draw_border(struct render_target *rt, float x, float y, float w, float h,
-                            float radius, float width, struct color color) {
-    if (w <= 0 || h <= 0 || width <= 0 || color.a <= 0) return;
+                            float radius, float width, struct color color,
+                            const struct paint *paint) {
+    bool has_grad = paint && paint->kind != PAINT_NONE;
+    if (w <= 0 || h <= 0 || width <= 0 || (!has_grad && color.a <= 0)) return;
     float half_w = w * 0.5f, half_h = h * 0.5f, cx = x + half_w, cy = y + half_h;
     if (radius > half_w) radius = half_w;
     if (radius > half_h) radius = half_h;
@@ -670,8 +672,10 @@ static void cpu_draw_border(struct render_target *rt, float x, float y, float w,
                 if (ring <= 0.0f) continue;
                 ring *= coverage_at(fx, fy);
                 if (ring <= 0.0f) continue;
-                float eff = color.a * ring;
-                blend_over(rt, ix, iy, color.r * eff, color.g * eff, color.b * eff, eff);
+                struct color bc = has_grad ? paint_at(paint, fx - x, fy - y, w, h) : color;
+                if (bc.a <= 0.0f) continue;
+                float eff = bc.a * ring;
+                blend_over(rt, ix, iy, bc.r * eff, bc.g * eff, bc.b * eff, eff);
             }
         }
     }

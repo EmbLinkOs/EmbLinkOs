@@ -23,6 +23,26 @@
 static struct paint solid(Color c) {
     struct paint p; p.kind = PAINT_SOLID; p.solid = c; p.n_stops = 0; return p;
 }
+
+/* 2- and 3-stop linear gradients (angle in degrees). Usable as a fill or, via
+ * GradientBorder, as a border stroke. */
+struct paint em_lgrad(Color a, Color b, float angle_deg) {
+    struct paint p = {0};
+    p.kind = PAINT_LINEAR_GRADIENT; p.solid = a;
+    p.stops[0].offset = 0.0f; p.stops[0].color = a;
+    p.stops[1].offset = 1.0f; p.stops[1].color = b;
+    p.n_stops = 2; p.angle_deg = angle_deg;
+    return p;
+}
+struct paint em_lgrad3(Color a, Color b, Color c, float angle_deg) {
+    struct paint p = {0};
+    p.kind = PAINT_LINEAR_GRADIENT; p.solid = a;
+    p.stops[0].offset = 0.0f; p.stops[0].color = a;
+    p.stops[1].offset = 0.5f; p.stops[1].color = b;
+    p.stops[2].offset = 1.0f; p.stops[2].color = c;
+    p.n_stops = 3; p.angle_deg = angle_deg;
+    return p;
+}
 static Color shade(Color c, float k) {
     Color o = { c.r * k, c.g * k, c.b * k, c.a };
     if (o.r > 1) o.r = 1;
@@ -152,6 +172,17 @@ void em_glass_(EmProps p)  { em_flush(); ui_begin_vstack(0); p.glass = 1;
                              em_apply_box(p); }
 void em_row_(EmProps p)    { em_flush(); ui_begin_hstack(0); ui_set_align(ALIGN_CENTER); if (!p.spacing) ui_set_spacing(TH->sp3); em_apply_box(p); }
 void em_end_(void)         { em_flush(); ui_end_stack(); }
+
+/* Container whose border is stroked with a gradient. Box props (bg, corner,
+ * padding, ...) arrive via EmProps; the gradient border is applied last so it
+ * wins over any solid .border. */
+void em_gborder_(float width, struct paint g, EmProps p) {
+    em_flush();
+    ui_begin_vstack(0);
+    em_apply_box(p);
+    ui_set_border_gradient(width, &g);
+}
+void em_gborder_end_(void) { em_flush(); ui_end_stack(); }
 
 /* The page-transition transform (opacity/slide), resolved by em_nav each frame.
  * Applied to the PAGE'S OWN root Screen -- em_nav no longer wraps the page in a

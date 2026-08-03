@@ -39,7 +39,8 @@ struct render_backend {
     /* A hairline stroke along the rounded-rect edge, INSIDE the bounds, drawn
      * over the fill. `width` px thick. Antialiased via the same SDF as fills. */
     void (*draw_border)(struct render_target *rt, float x, float y, float w, float h,
-                        float corner_radius, float width, struct color color);
+                        float corner_radius, float width, struct color color,
+                        const struct paint *paint);   /* paint!=NONE -> gradient stroke */
 
     void (*draw_text)(struct render_target *rt, float x, float y, const char *utf8,
                       uint32_t font_handle, float size_px, struct color color, float opacity);
