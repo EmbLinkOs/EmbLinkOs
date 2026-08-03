@@ -1585,6 +1585,90 @@ void em_taginput(char (*tags)[EM_TAG_LEN], int *count, int max,
     ui_end_stack();
 }
 
+/* ---- Dock: a drag-REORDER + drag-OUT-to-remove row of chips --------------- *
+ * `ids` holds the display order (length *n); render(id) draws one chip's inner
+ * content. Press-drag a chip: it lifts (shadow), snaps between slots as the
+ * pointer crosses them (the others flow), and if pulled below the row it dims
+ * and, on release, is removed. This is EmUI's first real drag-and-drop. */
+static int   g_dock_id = -1;      /* id being dragged, -1 = none */
+static float g_dock_grab_x, g_dock_grab_y;   /* pointer at grab (screen) */
+static float g_dock_ptr_y;        /* live pointer y (for drag-out) */
+static int   g_dock_out;          /* pulled below the row -> pending remove */
+
+int em_dock_dragging(void) { return g_dock_id; }   /* id being dragged, or -1 */
+
+void em_dock(int *ids, int *n, void (*render)(int id), EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    int cnt = n ? *n : 0;
+
+    ui_begin_hstack(0);
+    (void)ui_open();
+    ui_set_spacing(p.spacing > 0 ? p.spacing : t->sp2);
+    ui_set_align(ALIGN_CENTER);
+    em_apply_box(p);
+    float dx0, dy0, dw, dh;
+    int have = ui_open_rect(&dx0, &dy0, &dw, &dh);
+
+    int any_active = 0, active_i = -1, target = -1;
+
+    for (int i = 0; i < cnt; i++) {
+        int id = ids[i];
+        int dragged = (id == g_dock_id);
+        ui_box_begin((uint64_t)(0xD0C00000u + (unsigned)id));   /* stable key by id */
+        struct instance_handle self = ui_open();
+        int active = ui_is_active();
+        Color chip = dragged ? shade(t->surface_alt, 1.18f) : t->surface_alt;
+        ui_set_paint(solid(chip));
+        ui_set_corner_radius(t->radius_md);
+        ui_set_padding(t->sp1, t->sp2, t->sp1, t->sp2);
+        ui_set_align(ALIGN_CENTER);
+        if (dragged) {
+            ui_set_shadow(true, 0, 4, 12, t->shadow_md.color);      /* lift */
+            if (g_dock_out) ui_set_offset(0, g_dock_ptr_y - g_dock_grab_y);  /* follow out */
+        }
+        render(id);
+        ui_box_end();
+        (void)self;
+
+        if (active) {
+            any_active = 1; active_i = i;
+            float px, py; ui_pointer_pos(&px, &py);
+            g_dock_ptr_y = py;
+            if (g_dock_id != id) { g_dock_id = id; g_dock_grab_x = px; g_dock_grab_y = py; g_dock_out = 0; }
+            if (have && dw > 0) {
+                int tgt = (int)(((px - dx0) / dw) * cnt);
+                if (tgt < 0) tgt = 0;
+                if (tgt >= cnt) tgt = cnt - 1;
+                target = tgt;
+            }
+            g_dock_out = (have && py > dy0 + dh + 16.0f);
+        }
+    }
+    ui_end_stack();
+
+    /* reorder (after the loop, so no mid-loop mutation); not while removing */
+    if (active_i >= 0 && target >= 0 && target != active_i && !g_dock_out) {
+        int tmp = ids[active_i];
+        if (target > active_i) for (int k = active_i; k < target; k++) ids[k] = ids[k + 1];
+        else                   for (int k = active_i; k > target; k--) ids[k] = ids[k - 1];
+        ids[target] = tmp;
+        g_em_epoch++;
+    }
+    /* release: remove if it was pulled out */
+    if (g_dock_id != -1 && !any_active) {
+        if (g_dock_out && n) {
+            for (int i = 0; i < *n; i++) if (ids[i] == g_dock_id) {
+                for (int k = i; k < *n - 1; k++) ids[k] = ids[k + 1];
+                (*n)--;
+                break;
+            }
+        }
+        g_dock_id = -1; g_dock_out = 0;
+        g_em_epoch++;
+    }
+}
+
 /* ---- StatCard: label / big value / signed delta / mini sparkline -------- */
 void em_stat_card(const char *label, const char *value, const char *delta,
                   const float *vals, int n) {

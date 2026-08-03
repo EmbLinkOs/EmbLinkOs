@@ -139,6 +139,13 @@ const EmTokens *em_tokens_(void);
 void em_flow_(EmProps p);
 #define Flow(...) EM_SCOPE_(em_flow_((EmProps){__VA_ARGS__}), em_end_())
 
+/* Dock: a drag-to-REORDER + drag-out-to-REMOVE row of chips (EmUI drag-and-drop).
+ * `ids` = the display order (length *n); render(id) draws one chip's content.
+ * Drag a chip to reorder; pull it below the row and release to remove it. */
+void em_dock(int *ids, int *n, void (*render)(int id), EmProps p);
+int  em_dock_dragging(void);   /* id currently being dragged, or -1 */
+#define Dock(ids, n, render, ...) em_dock((ids), (n), (render), (EmProps){__VA_ARGS__})
+
 /* Grid: a true 2D grid -- `cols` equal columns, children auto-flow with an
  * optional per-child .span. Fills the parent width; row heights auto-size to
  * content. Gaps come from .spacing.   Grid(3, .spacing=12){ Card(.span=2){} ...} */

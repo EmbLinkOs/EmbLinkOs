@@ -391,6 +391,9 @@ static void gridapp(void) {
 /* ======================================================================= */
 /* Apple-modern top bar ("a") -- glass strip, menus left + status right.    */
 /* ======================================================================= */
+static int  g_bar_items[8] = { IconStar, IconBolt, IconGear };
+static int  g_bar_n = 3;
+static void bar_chip(int id) { Icon(id).secondary(); }
 static void barapp(void) {
     const struct ui_theme *t = ui_theme();
     Screen(.padding = 0, .background = (Color){ 0.09f, 0.11f, 0.17f, 1 }) {
@@ -406,9 +409,7 @@ static void barapp(void) {
                         Menu("View")    { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
                     }
                     Spacer();
-                    Icon(IconStar).secondary();
-                    Icon(IconBolt).secondary();
-                    Icon(IconGear).secondary();
+                    Dock(g_bar_items, &g_bar_n, bar_chip);   /* drag to reorder / drag out to remove */
                     Text("100%").caption().secondary();
                     Text("9:41").bold();
                 }
