@@ -131,6 +131,11 @@ const EmTokens *em_tokens_(void);
 #define Section(title, ...) EM_SCOPE_(em_section_((title), (EmProps){__VA_ARGS__}), em_end_())
 #define ScrollView(bind, height, ...) EM_SCOPE_(em_scroll_((bind), (height), (EmProps){__VA_ARGS__}), em_scroll_end_())
 
+/* Flow: a horizontal stack whose children WRAP onto new lines when they overflow
+ * the width (real flex-wrap in the layout engine -- e.g. chips, tag lists). */
+void em_flow_(EmProps p);
+#define Flow(...) EM_SCOPE_(em_flow_((EmProps){__VA_ARGS__}), em_end_())
+
 /* Gradient borders (render-engine feature): stroke a container's border with a
  * linear gradient. em_lgrad/em_lgrad3 build the paint; GradientBorder wraps
  * content in a box whose border is that gradient.

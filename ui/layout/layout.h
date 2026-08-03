@@ -54,6 +54,8 @@ struct layout_node {
 
     float padding_top, padding_right, padding_bottom, padding_left;
     float spacing;                     /* main-axis gap between children */
+    bool  wrap;                        /* flex-wrap: overflowing children flow onto
+                                        * new lines stacked on the cross axis */
     float scroll_offset;               /* column scroll: children shift up by this many px */
     float offset_x, offset_y;          /* post-layout translate ADDED to the resolved
                                         * position (CSS `transform: translate`-style) --

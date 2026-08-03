@@ -433,6 +433,11 @@ void ui_set_axis(enum layout_axis a) {
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
     if (ln) { ln->axis = a; ln->dirty = true; }
 }
+void ui_set_wrap(bool wrap) {
+    struct instance *b = cur_box(); if (!b) return;
+    struct layout_node *ln = layout_resolve(g_la, b->layout_node);
+    if (ln) { ln->wrap = wrap; ln->dirty = true; }
+}
 void ui_set_justify(enum layout_justify j) {
     struct instance *b = cur_box(); if (!b) return;
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);

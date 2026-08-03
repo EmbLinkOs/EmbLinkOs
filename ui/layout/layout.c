@@ -301,6 +301,45 @@ static void write_scene(struct scene_arena *sa, struct layout_node *n) {
 }
 
 static void arrange(struct layout_arena *la, struct scene_arena *sa,
+                    struct layout_handle h, float W, float H);
+
+/* Height a WRAP row container needs when its children flow into lines at total
+ * width `avail_w`. Mirrors the text height-depends-on-width path so a column
+ * parent can size a wrapping child before placing its siblings. Row-wrap only. */
+static float measure_wrap_height(struct layout_arena *la, struct scene_arena *sa,
+                                 struct layout_handle h, float avail_w) {
+    struct layout_node *n = layout_resolve(la, h);
+    if (!n || !n->is_container) return 0;
+    float content_w = avail_w - n->padding_left - n->padding_right;
+    if (content_w < 0) content_w = 0;
+    float bm[64], bc[64]; int nk = 0;
+    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c) && nk < 64; ) {
+        struct layout_node *cn = layout_resolve(la, c);
+        if (!cn) break;
+        if (!cn->is_overlay) {
+            float cw = (cn->width.mode == SIZE_FIXED) ? cn->width.fixed_value : cn->intrinsic_w;
+            float ch = is_text(sa, cn) ? layout_measure_height_at_width(la, sa, c, cw)
+                     : (cn->height.mode == SIZE_FIXED ? cn->height.fixed_value : cn->intrinsic_h);
+            bm[nk] = cw; bc[nk] = ch; nk++;
+        }
+        c = cn->next_sibling;
+    }
+    float total = 0; int i = 0, nlines = 0;
+    while (i < nk) {
+        int j = i; float lm = 0, lc = 0;
+        while (j < nk) {
+            float add = bm[j] + (j > i ? n->spacing : 0);
+            if (j > i && lm + add > content_w + 0.5f) break;
+            lm += add; if (bc[j] > lc) lc = bc[j]; j++;
+        }
+        if (j == i) j = i + 1;
+        total += lc + (nlines > 0 ? n->spacing : 0);
+        nlines++; i = j;
+    }
+    return total + n->padding_top + n->padding_bottom;
+}
+
+static void arrange(struct layout_arena *la, struct scene_arena *sa,
                     struct layout_handle h, float W, float H) {
     struct layout_node *n = layout_resolve(la, h);
     if (!n) return;
@@ -340,6 +379,11 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
 
         if (ms->mode == SIZE_FIXED) {
             base[i] = ms->fixed_value;
+        } else if (k->wrap && k->is_container && !is_row) {
+            /* COLUMN: a wrap-row child's HEIGHT is its wrapped-line height at the
+             * width it will get (stretch -> our content width, else intrinsic). */
+            float cw = (n->align == ALIGN_STRETCH) ? content_cross : k->intrinsic_w;
+            base[i] = measure_wrap_height(la, sa, kids[i], cw);
         } else if (ktext && !is_row) {
             /* COLUMN: main size is HEIGHT -> wrap at the child's cross WIDTH */
             float cw = (n->align == ALIGN_STRETCH) ? content_cross : k->intrinsic_w;
@@ -400,6 +444,46 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
         } else {
             crossv[i] = is_row ? k->intrinsic_h : k->intrinsic_w;
         }
+    }
+
+    /* --- flex-wrap: pack children into lines along the main axis, stack the
+     * lines on the cross axis. Children keep their flex-basis width (no grow
+     * across lines); each line's cross size is its tallest child; align applies
+     * within a line. Row-wrap (the common case). --- */
+    if (n->wrap && is_row) {
+        float line_gap = n->spacing;
+        float cross_cursor = cross_pad0 - n->scroll_offset;   /* vertical scroll shifts lines up */
+        int i = 0;
+        while (i < nk) {
+            int j = i; float lm = 0, lc = 0;
+            while (j < nk) {
+                struct layout_node *kj = layout_resolve(la, kids[j]);
+                if (kj->is_overlay) { j++; continue; }
+                float add = base[j] + (j > i ? n->spacing : 0);
+                if (j > i && lm + add > content_main + 0.5f) break;   /* wrap */
+                lm += add; if (crossv[j] > lc) lc = crossv[j]; j++;
+            }
+            if (j == i) j = i + 1;                                     /* >=1 per line */
+            float cursor = main_pad0;
+            for (int q = i; q < j; q++) {
+                struct layout_node *k = layout_resolve(la, kids[q]);
+                if (k->is_overlay) continue;
+                float cross_pos = cross_cursor;
+                switch (n->align) {
+                    case ALIGN_CENTER: cross_pos = cross_cursor + (lc - crossv[q]) * 0.5f; break;
+                    case ALIGN_END:    cross_pos = cross_cursor + (lc - crossv[q]);        break;
+                    default:           break;   /* START / STRETCH -> line top */
+                }
+                k->resolved_x = cursor;   k->resolved_y = cross_pos;
+                k->resolved_w = base[q];  k->resolved_h = crossv[q];
+                if (k->is_container) arrange(la, sa, kids[q], k->resolved_w, k->resolved_h);
+                else                 write_scene(sa, k);
+                cursor += base[q] + n->spacing;
+            }
+            cross_cursor += lc + line_gap;
+            i = j;
+        }
+        return;
     }
 
     /* main-axis positions per justify */
