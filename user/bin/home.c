@@ -216,6 +216,7 @@ int main(void) {
 
     em_set_clock(embk_uptime_ms);
     spawn_app("/data/apps/clockw/clockw.elf");   /* the desktop CLOCK widget (V5) -- fire & track */
+    spawn_app("/data/apps/topbar/topbar.elf");   /* the dynamic Apple-modern menu bar */
     embk_puts(1, "home: launcher up; click a tile to launch an app\n");
 
     for (;;) {

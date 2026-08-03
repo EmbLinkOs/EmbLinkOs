@@ -314,6 +314,13 @@ int  em_window_take_close(void);       /* 1 the frame the close gesture committe
 int  em_window_pulling(void);          /* 1 while a close pull is animating (fade/slide) */
 void em_window_set_mover(void (*mover)(int win, int32_t x, int32_t y));
 void em_window_bind(int win, int32_t x, int32_t y);
+void em_window_move_to(int32_t x, int32_t y);   /* snap/pin the bound window */
+void em_window_pos(int32_t *x, int32_t *y);     /* current bound-window top-left */
+
+/* DragHandle: a placeable strip that drags the bound window (menu-bar move). */
+void em_drag_handle_(EmProps p);
+void em_drag_handle_end_(void);
+#define DragHandle(...) EM_SCOPE_(em_drag_handle_((EmProps){__VA_ARGS__}), em_drag_handle_end_())
 
 /* Resizable windows (V5): the runtime enables the grip; Window() then draws a
  * corner handle whose drag, ON RELEASE, records a size delta the runtime

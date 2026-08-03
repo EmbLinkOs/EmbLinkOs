@@ -885,6 +885,13 @@ void em_window_set_mover(void (*mover)(int win, int32_t x, int32_t y)) { g_win_m
 void em_window_bind(int win, int32_t x, int32_t y) {
     g_win_id = win; g_win_x = x; g_win_y = y; g_win_bound = 1;
 }
+/* Programmatically move the bound window (e.g. a pin/snap-to-anchor control). */
+void em_window_move_to(int32_t x, int32_t y) {
+    if (!g_win_bound || !g_win_mover || (x == g_win_x && y == g_win_y)) return;
+    g_win_mover(g_win_id, x, y);
+    g_win_x = x; g_win_y = y;
+}
+void em_window_pos(int32_t *x, int32_t *y) { if (x) *x = g_win_x; if (y) *y = g_win_y; }
 
 /* resizable-window plumbing (V5): the grip accumulates a drag delta and, on
  * RELEASE, parks it here for the runtime to apply (live re-backing every frame
@@ -1077,6 +1084,20 @@ void em_windowbar_(const char *title, EmProps p) {
     ui_end_stack();                                  /* close drag zone; controls follow as siblings */
 }
 void em_windowbar_end_(void) { em_flush(); ui_end_stack(); }
+
+/* DragHandle: a placeable draggable strip -- press-and-move anywhere on it drags
+ * the bound window (like WindowBar's zone, but the app positions it: e.g. the
+ * empty middle of a menu bar). Grows by default; put controls to either side. */
+void em_drag_handle_(EmProps p) {
+    em_flush();
+    ui_begin_hstack(0);
+    ui_open();
+    if (p.width <= 0) ui_set_size(sz_grow(), sz_intrinsic());
+    ui_set_align(ALIGN_CENTER);
+    em_apply_box(p);
+    em_window_drag_();
+}
+void em_drag_handle_end_(void) { em_flush(); ui_end_stack(); }
 
 /* A modern single circular close control (no traffic-light trio). Hover tints
  * it danger-red. Chainable: `CloseButton().clicked()`. */

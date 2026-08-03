@@ -81,8 +81,10 @@ int em_app_run(const EmApp *app) {
     int bar = chromeless ? 0 : 26;
     if (sw && winw > (int)sw - 8)        winw = (int)sw - 8;
     if (sh && winh > (int)sh - bar - 16) winh = (int)sh - bar - 16;
+    /* chromeless strips (menu bars, docks) are legitimately short; normal
+     * titled windows keep a usable floor. */
     if (winw < 200) winw = 200;
-    if (winh < 160) winh = 160;
+    if (winh < (chromeless ? 24 : 160)) winh = chromeless ? 24 : 160;
     int wx = ((int)sw - winw) / 2;        if (wx < 0) wx = 0;
     int wy = ((int)sh - winh - bar) / 2;  if (wy < 0) wy = 0;
 
