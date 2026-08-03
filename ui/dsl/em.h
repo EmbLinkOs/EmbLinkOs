@@ -302,6 +302,35 @@ EmV  em_spinner(void);
 #define Spinner(...)  em_spinner()
 void em_gauge(float frac, const char *center, EmProps p);
 #define Gauge(frac, center, ...)  em_gauge((frac), (center), (EmProps){__VA_ARGS__})
+
+/* ColorPicker: an HSV square + rainbow hue bar, both draggable, with a live
+ * swatch + hex readout. Binds to float hsv[3] = { hue, saturation, value },
+ * all in 0..1. `em_hsv` converts an HSV triple to a Color for use elsewhere. */
+Color em_hsv(float h, float s, float v);
+void  em_colorpicker(float *hsv, EmProps p);
+#define ColorPicker(hsv, ...)  em_colorpicker((hsv), (EmProps){__VA_ARGS__})
+
+/* Calendar / DatePicker: an inline month grid. Binds to int date[3] =
+ * { year, month(1..12), day(1..31) }; tap a day to select, ‹ / › page months. */
+void em_calendar(int *date, EmProps p);
+#define Calendar(date, ...)    em_calendar((date), (EmProps){__VA_ARGS__})
+#define DatePicker(date, ...)  em_calendar((date), (EmProps){__VA_ARGS__})
+
+/* Combobox: an editable field whose menu shows only the options containing the
+ * typed text (case-insensitive); picking one fills the buffer. `open` is
+ * app-owned (like Disclosure); the chevron toggles it. */
+void em_combobox(char *buf, size_t cap, const char *const *labels, int count,
+                 const char *placeholder, bool *open, EmProps p);
+#define Combobox(buf, cap, labels, count, ph, open, ...) \
+    em_combobox((buf), (cap), (labels), (count), (ph), (open), (EmProps){__VA_ARGS__})
+
+/* TagInput: removable chips + an entry field. `tags` is char[max][EM_TAG_LEN];
+ * *count is the live count; `entry` holds the in-progress tag. */
+#define EM_TAG_LEN 24
+void em_taginput(char (*tags)[EM_TAG_LEN], int *count, int max,
+                 char *entry, size_t ecap, EmProps p);
+#define TagInput(tags, count, max, entry, ecap, ...) \
+    em_taginput((tags), (count), (max), (entry), (ecap), (EmProps){__VA_ARGS__})
 EmV  em_search_field(char *buf, size_t cap, const char *placeholder);
 #define SearchField(buf, cap, ph)  em_search_field((buf), (cap), (ph))
 

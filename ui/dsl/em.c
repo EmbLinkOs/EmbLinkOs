@@ -1125,6 +1125,400 @@ void em_gauge(float frac, const char *center, EmProps p) {
     ui_end_stack();
 }
 
+/* ---- ColorPicker: an HSV square + hue bar, rasterised like the Gauge ------ *
+ * Binds to float hsv[3] = { hue, saturation, value }, all 0..1. The square
+ * (saturation x value, for the current hue) re-rasterises only when the hue
+ * changes; the rainbow hue bar is rasterised once. Cursors are composited into
+ * per-frame display copies (cheap integer memcpy + ring), so moving a cursor
+ * never triggers the expensive float rasterisation. Drag either surface. */
+#define CP_W    176
+#define CP_SVH  140
+#define CP_HUEH 18
+static uint32_t g_cp_sv[CP_W * CP_SVH];    /* SV square base (cached on hue)   */
+static uint32_t g_cp_svd[CP_W * CP_SVH];   /* + SV cursor, per frame           */
+static uint32_t g_cp_hue[CP_W * CP_HUEH];  /* rainbow hue bar (rasterised once)*/
+static uint32_t g_cp_hued[CP_W * CP_HUEH]; /* + hue cursor, per frame          */
+
+/* HSV (all 0..1) -> straight-alpha Color. */
+Color em_hsv(float h, float s, float v) {
+    h -= (float)(int)h;
+    if (h < 0) h += 1.0f;
+    if (s < 0) s = 0;
+    if (s > 1) s = 1;
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    float hh = h * 6.0f; int i = (int)hh; float f = hh - i;
+    float p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
+    float r, g, b;
+    switch (i % 6) {
+        case 0:  r = v; g = t; b = p; break;
+        case 1:  r = q; g = v; b = p; break;
+        case 2:  r = p; g = v; b = t; break;
+        case 3:  r = p; g = q; b = v; break;
+        case 4:  r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+    }
+    return (Color){ r, g, b, 1.0f };
+}
+
+/* 2px ring (distance test in a bounding box), used for the SV cursor. */
+static void cp_ring(uint32_t *buf, int w, int h, int cx, int cy, int rad, uint32_t col) {
+    for (int y = cy - rad - 1; y <= cy + rad + 1; y++) {
+        if (y < 0 || y >= h) continue;
+        for (int x = cx - rad - 1; x <= cx + rad + 1; x++) {
+            if (x < 0 || x >= w) continue;
+            int dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
+            if (d2 <= (rad + 1) * (rad + 1) && d2 >= (rad - 1) * (rad - 1)) buf[y * w + x] = col;
+        }
+    }
+}
+
+/* Map the live pointer into the currently-open box while it is pressed;
+ * writes normalised (fx,fy) in [0,1]. Returns true when it updated. */
+static bool cp_drag(float *fx, float *fy) {
+    if (!(ui_is_pressed() || ui_is_active())) return false;
+    float px, py, bx, by, bw, bh;
+    ui_pointer_pos(&px, &py);
+    if (!ui_open_rect(&bx, &by, &bw, &bh) || bw <= 0 || bh <= 0) return false;
+    float x = (px - bx) / bw, y = (py - by) / bh;
+    if (x < 0) x = 0;
+    if (x > 1) x = 1;
+    if (y < 0) y = 0;
+    if (y > 1) y = 1;
+    *fx = x; *fy = y;
+    return true;
+}
+
+void em_colorpicker(float *hsv, EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    float H = hsv ? hsv[0] : 0.0f, S = hsv ? hsv[1] : 1.0f, V = hsv ? hsv[2] : 1.0f;
+
+    /* hue bar: rasterise once (never changes). */
+    static int hue_ready;
+    if (!hue_ready) {
+        hue_ready = 1;
+        for (int x = 0; x < CP_W; x++) {
+            uint32_t c = argb_premul(em_hsv((float)x / (CP_W - 1), 1.0f, 1.0f), 1.0f);
+            for (int y = 0; y < CP_HUEH; y++) g_cp_hue[y * CP_W + x] = c;
+        }
+    }
+    /* SV square: rasterise only when the hue actually changes. */
+    static uint32_t sv_key = 0xFFFFFFFFu;
+    uint32_t hk = (uint32_t)(H * 4096.0f);
+    if (hk != sv_key) {
+        sv_key = hk;
+        for (int y = 0; y < CP_SVH; y++) {
+            float v = 1.0f - (float)y / (CP_SVH - 1);
+            for (int x = 0; x < CP_W; x++) {
+                float s = (float)x / (CP_W - 1);
+                g_cp_sv[y * CP_W + x] = argb_premul(em_hsv(H, s, v), 1.0f);
+            }
+        }
+    }
+    /* per-frame display copies + cursors. */
+    for (int i = 0; i < CP_W * CP_SVH; i++) g_cp_svd[i] = g_cp_sv[i];
+    cp_ring(g_cp_svd, CP_W, CP_SVH, (int)(S * (CP_W - 1)), (int)((1.0f - V) * (CP_SVH - 1)),
+            6, (V > 0.6f && S < 0.5f) ? 0xFF000000u : 0xFFFFFFFFu);
+    for (int i = 0; i < CP_W * CP_HUEH; i++) g_cp_hued[i] = g_cp_hue[i];
+    int hcx = (int)(H * (CP_W - 1));
+    for (int y = 0; y < CP_HUEH; y++) {
+        uint32_t *row = &g_cp_hued[y * CP_W];
+        if (hcx > 0)        row[hcx - 1] = 0xFF000000u;
+        row[hcx] = 0xFFFFFFFFu;
+        if (hcx + 1 < CP_W) row[hcx + 1] = 0xFF000000u;
+    }
+
+    ui_begin_vstack(0);
+    ui_set_spacing(t->sp2);
+    em_apply_box(p);
+
+    /* SV square (draggable) */
+    ui_box_begin(0xC010D1);
+    ui_set_size(sz_fixed(CP_W), sz_fixed(CP_SVH));
+    ui_set_corner_radius(t->radius_md);
+    ui_image((uint64_t)(uintptr_t)&g_cp_svd, g_cp_svd, CP_W, CP_SVH, (float)CP_SVH);
+    { float fx, fy; if (hsv && cp_drag(&fx, &fy)) { hsv[1] = fx; hsv[2] = 1.0f - fy; } }
+    ui_box_end();
+
+    /* hue bar (draggable) */
+    ui_box_begin(0xC010D2);
+    ui_set_size(sz_fixed(CP_W), sz_fixed(CP_HUEH));
+    ui_set_corner_radius(t->radius_md);
+    ui_image((uint64_t)(uintptr_t)&g_cp_hued, g_cp_hued, CP_W, CP_HUEH, (float)CP_HUEH);
+    { float fx, fy; if (hsv && cp_drag(&fx, &fy)) { (void)fy; hsv[0] = fx; } }
+    ui_box_end();
+
+    /* preview: swatch + hex readout */
+    ui_begin_hstack(0);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp2);
+    ui_box_begin(0xC010D3);
+    ui_set_size(sz_fixed(30), sz_fixed(30));
+    ui_set_paint(solid(em_hsv(H, S, V)));
+    ui_set_corner_radius(t->radius_md);
+    ui_set_border(1.0f, t->border);
+    ui_box_end();
+    { Color c = em_hsv(H, S, V);
+      char hex[10];
+      snprintf(hex, sizeof hex, "#%02X%02X%02X",
+               (int)(c.r * 255 + 0.5f), (int)(c.g * 255 + 0.5f), (int)(c.b * 255 + 0.5f));
+      EmProps tp = { .font = BodyBold };
+      em_text_impl(hex, tp); }
+    ui_end_stack();
+
+    ui_end_stack();
+}
+
+/* ---- Calendar / DatePicker: an inline month grid ------------------------- *
+ * Binds to int date[3] = { year, month(1..12), day(1..31) }. Header with
+ * prev/next month, a weekday row, then a 6x7 grid of day cells; the selected
+ * day is filled with the accent. Month navigation carries its own view state
+ * (defaults to the selected month), so paging months doesn't move the pick. */
+static const char *const CAL_MON[12] = {
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December" };
+static const char *const CAL_WD[7] = { "S", "M", "T", "W", "T", "F", "S" };
+
+static int cal_leap(int y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+static int cal_dim(int y, int m) {
+    static const int d[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    return (m == 2 && cal_leap(y)) ? 29 : d[(m - 1) % 12];
+}
+/* Sakamoto's algorithm: weekday of the 1st (0 = Sunday). */
+static int cal_dow1(int y, int m) {
+    static const int t[12] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    int yy = y;
+    if (m < 3) yy -= 1;
+    return (yy + yy / 4 - yy / 100 + yy / 400 + t[(m - 1) % 12] + 1) % 7;
+}
+
+void em_calendar(int *date, EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    int sy = date ? date[0] : 2026, sm = date ? date[1] : 1, sd = date ? date[2] : 1;
+    if (sm < 1) sm = 1;
+    if (sm > 12) sm = 12;
+    static int vy, vm, inited;
+    if (!inited) { inited = 1; vy = sy; vm = sm; }
+
+    ui_begin_vstack(0);
+    ui_set_spacing(t->sp2);
+    em_apply_box(p);
+
+    /* header: ‹  Month Year  › */
+    ui_begin_hstack(0);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    if (em_iconbtn_impl(IconChevronL, (EmProps){0}, 0)) { if (--vm < 1) { vm = 12; vy--; } }
+    ui_spacer();
+    { char hdr[32];
+      snprintf(hdr, sizeof hdr, "%s %d", CAL_MON[vm - 1], vy);
+      EmProps hp = { .font = BodyBold };
+      em_text_impl(hdr, hp); }
+    ui_spacer();
+    if (em_iconbtn_impl(IconChevronR, (EmProps){0}, 0)) { if (++vm > 12) { vm = 1; vy++; } }
+    ui_end_stack();
+
+    /* weekday labels */
+    ui_begin_hstack(0);
+    ui_set_spacing(0);
+    for (int i = 0; i < 7; i++) {
+        ui_box_begin(0);
+        ui_set_size(sz_fixed(34), sz_fixed(22));
+        ui_set_align(ALIGN_CENTER);
+        ui_set_justify(JUSTIFY_CENTER);
+        EmProps wp = { .font = Caption, .color = t->text_tertiary };
+        em_text_impl(CAL_WD[i], wp);
+        ui_box_end();
+    }
+    ui_end_stack();
+
+    /* 6 weeks x 7 days */
+    int dow = cal_dow1(vy, vm), dim = cal_dim(vy, vm);
+    int day = 1 - dow;                       /* first cell's number (<=0 -> blank) */
+    for (int w = 0; w < 6; w++) {
+        ui_begin_hstack(0);
+        ui_set_spacing(0);
+        for (int c = 0; c < 7; c++, day++) {
+            ui_box_begin((uint64_t)(0xDA7E0000u + w * 7 + c));
+            struct instance_handle self = ui_open();
+            bool inmonth = (day >= 1 && day <= dim);
+            bool sel = inmonth && (vy == sy && vm == sm && day == sd);
+            bool hov = inmonth && ui_is_hovered();
+            ui_set_size(sz_fixed(34), sz_fixed(30));
+            ui_set_align(ALIGN_CENTER);
+            ui_set_justify(JUSTIFY_CENTER);
+            if (sel)      { ui_set_paint(solid(t->accent));      ui_set_corner_radius(t->radius_md); }
+            else if (hov) { ui_set_paint(solid(t->surface_alt)); ui_set_corner_radius(t->radius_md); }
+            if (inmonth) {
+                char ds[12];
+                snprintf(ds, sizeof ds, "%d", day);
+                EmProps dp = { .font = sel ? BodyBold : Body, .color = sel ? t->on_accent : t->text };
+                em_text_impl(ds, dp);
+            }
+            ui_box_end();
+            if (inmonth && ui_consume_click(self) && date) { date[0] = vy; date[1] = vm; date[2] = day; }
+        }
+        ui_end_stack();
+    }
+    ui_end_stack();
+}
+
+/* ---- Combobox: an editable field with a filtered option menu ------------- *
+ * Binds an editable text buffer + a list of options; the menu shows only the
+ * options containing the typed text (case-insensitive), and picking one fills
+ * the buffer. `open` (app-owned, like Disclosure) controls the menu; the
+ * chevron toggles it. */
+static char cb_lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+static int  cb_contains(const char *hay, const char *ndl) {
+    if (!ndl || !ndl[0]) return 1;
+    for (const char *h = hay; *h; h++) {
+        const char *a = h, *b = ndl;
+        while (*a && *b && cb_lc(*a) == cb_lc(*b)) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+void em_combobox(char *buf, size_t cap, const char *const *labels, int count,
+                 const char *placeholder, bool *open, EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    bool is_open = open ? *open : false;
+
+    ui_begin_vstack(0);
+    ui_set_align(ALIGN_STRETCH);
+    ui_set_spacing(t->sp1);
+    em_apply_box(p);
+
+    /* field row: text input (grows) + chevron toggle */
+    ui_begin_hstack(0);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp2);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_begin_hstack(0);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_text_field(buf, cap, placeholder);
+    ui_end_stack();
+    if (em_iconbtn_impl(is_open ? IconChevronU : IconChevronD, (EmProps){0}, 0) && open) {
+        *open = !is_open;
+        is_open = *open;
+        g_em_epoch++;
+    }
+    ui_end_stack();
+
+    /* filtered menu */
+    if (is_open) {
+        ui_begin_vstack(0);
+        ui_set_paint(solid(t->surface));
+        ui_set_corner_radius(t->radius_md);
+        ui_set_border(1.0f, t->border);
+        ui_set_clip_children(true);
+        ui_set_align(ALIGN_STRETCH);
+        ui_set_spacing(0);
+        ui_set_shadow(true, t->shadow_md.dx, t->shadow_md.dy, t->shadow_md.blur, t->shadow_md.color);
+        int shown = 0;
+        for (int i = 0; i < count; i++) {
+            if (!cb_contains(labels[i], buf)) continue;
+            shown++;
+            ui_begin_hstack((uint64_t)(i + 1));
+            struct instance_handle row = ui_open();
+            bool rhov = ui_is_hovered(), rpr = ui_is_pressed();
+            ui_set_paint(solid(rpr ? shade(t->accent_soft, 0.94f) : rhov ? t->accent_soft : t->surface));
+            ui_set_padding(t->sp2 + 1, t->sp3, t->sp2 + 1, t->sp3);
+            ui_set_align(ALIGN_CENTER);
+            ui_set_size(sz_grow(), sz_intrinsic());
+            { EmProps lp = { .font = Body, .color = t->text }; em_text_impl(labels[i], lp); }
+            ui_end_stack();
+            if (ui_consume_click(row)) {
+                size_t n = 0;
+                for (const char *s = labels[i]; *s && n + 1 < cap; s++) buf[n++] = *s;
+                buf[n] = 0;
+                if (open) *open = false;
+                is_open = false;
+                g_em_epoch++;
+            }
+        }
+        if (shown == 0) {
+            ui_begin_hstack(0);
+            ui_set_padding(t->sp2 + 1, t->sp3, t->sp2 + 1, t->sp3);
+            EmProps lp = { .font = Body, .color = t->text_tertiary };
+            em_text_impl("No matches", lp);
+            ui_end_stack();
+        }
+        ui_end_stack();
+    }
+    ui_end_stack();
+}
+
+/* ---- TagInput: removable chips + an entry field -------------------------- *
+ * tags is char[max][EM_TAG_LEN]; *count is the live tag count; `entry` is the
+ * text buffer for a new tag. The + button (or a non-empty entry) commits a
+ * tag; each chip's ✕ removes it. */
+static void ti_copy(char *dst, const char *src, size_t cap) {
+    size_t n = 0;
+    for (; src[n] && n + 1 < cap; n++) dst[n] = src[n];
+    dst[n] = 0;
+}
+
+void em_taginput(char (*tags)[EM_TAG_LEN], int *count, int max,
+                 char *entry, size_t ecap, EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    int n = count ? *count : 0;
+
+    ui_begin_vstack(0);
+    ui_set_align(ALIGN_STRETCH);
+    ui_set_spacing(t->sp2);
+    em_apply_box(p);
+
+    /* chips */
+    if (n > 0) {
+        ui_begin_hstack(0);
+        ui_set_spacing(t->sp2);
+        ui_set_align(ALIGN_CENTER);
+        for (int i = 0; i < n; i++) {
+            ui_begin_hstack((uint64_t)(0x7A6C0000u + i));
+            ui_set_paint(solid(t->accent_soft));
+            ui_set_corner_radius(t->radius_pill);
+            ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp2 + 2);
+            ui_set_align(ALIGN_CENTER);
+            ui_set_spacing(t->sp1);
+            { EmProps lp = { .font = Body, .color = t->accent }; em_text_impl(tags[i], lp); }
+            ui_box_begin((uint64_t)(0x7A6F0000u + i));
+            struct instance_handle rm = ui_open();
+            { EmProps xp = { .font = Caption, .color = t->accent }; em_icon_impl(IconClose, xp); }
+            ui_box_end();
+            ui_end_stack();
+            if (ui_consume_click(rm) && count) {
+                for (int j = i; j < n - 1; j++) ti_copy(tags[j], tags[j + 1], EM_TAG_LEN);
+                (*count)--;
+                n--;
+                g_em_epoch++;
+            }
+        }
+        ui_end_stack();
+    }
+
+    /* entry row: field (grows) + add button */
+    ui_begin_hstack(0);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp2);
+    ui_begin_hstack(0);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_text_field(entry, ecap, "Add tag...");
+    ui_end_stack();
+    if (em_iconbtn_impl(IconPlus, (EmProps){0}, 0) && count && entry && entry[0] && n < max) {
+        ti_copy(tags[n], entry, EM_TAG_LEN);
+        (*count)++;
+        entry[0] = 0;
+        g_em_epoch++;
+    }
+    ui_end_stack();
+    ui_end_stack();
+}
+
 /* ---- StatCard: label / big value / signed delta / mini sparkline -------- */
 void em_stat_card(const char *label, const char *value, const char *delta,
                   const float *vals, int n) {

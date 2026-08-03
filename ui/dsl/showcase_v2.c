@@ -268,6 +268,48 @@ static void gapp(void) {
     }
 }
 
+/* ======================================================================= */
+/* Pickers gallery ("pk" as argv[3]) -- ColorPicker (+ future pickers).     */
+/* ======================================================================= */
+static float g_hsv[3]  = { 0.58f, 0.74f, 0.92f };   /* a pleasant blue */
+static int   g_date[3] = { 2026, 8, 3 };            /* selected day */
+static char  g_cb_buf[32] = "Sta";                  /* filters to Staging */
+static bool  g_cb_open = true;                      /* render menu open */
+static char  g_tags[8][EM_TAG_LEN] = { "kernel", "graphics", "wip" };
+static int   g_tag_n = 3;
+static char  g_tag_entry[EM_TAG_LEN] = "";
+static void pkapp(void) {
+    static const char *const envs[] = { "Development", "Staging", "Production", "Sandbox" };
+    Screen(.justify = Center, .align = Center) {
+        VStack(.spacing = 16, .align = Center) {
+            HStack(.spacing = 16, .align = Leading) {
+                Card(.width = 320, .spacing = 14) {
+                    Text("Color Picker").title();
+                    Text("HSV square + hue bar, live swatch").caption().secondary();
+                    ColorPicker(g_hsv);
+                }
+                Card(.width = 280, .spacing = 12) {
+                    Text("Date Picker").title();
+                    Text("Inline month grid").caption().secondary();
+                    Calendar(g_date);
+                }
+            }
+            HStack(.spacing = 16, .align = Leading) {
+                Card(.width = 320, .spacing = 12) {
+                    Text("Combobox").title();
+                    Text("Editable + filtered options").caption().secondary();
+                    Combobox(g_cb_buf, sizeof g_cb_buf, envs, 4, "Environment", &g_cb_open);
+                }
+                Card(.width = 280, .spacing = 12) {
+                    Text("Tag Input").title();
+                    Text("Removable chips + entry").caption().secondary();
+                    TagInput(g_tags, &g_tag_n, 8, g_tag_entry, sizeof g_tag_entry);
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     int W = 480, H = 1080;
     const char *out = argc > 1 ? argv[1] : "v2.ppm";
@@ -276,10 +318,12 @@ int main(int argc, char **argv) {
     bool v6   = (argc > 3 && argv[3][0] == '6');
     bool v7   = (argc > 3 && argv[3][0] == '7');
     bool gl   = (argc > 3 && argv[3][0] == 'g');
+    bool pk   = (argc > 3 && argv[3][0] == 'p');
     if (v4) { W = 660; H = 900; }
     if (v6) { W = 560; H = 420; }
     if (v7) { W = 560; H = 420; }
     if (gl) { W = 620; H = 460; }
+    if (pk) { W = 700; H = 900; }
 
     size_t rl = 0, bl = 0;
     uint8_t *reg  = read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", &rl);
@@ -296,7 +340,7 @@ int main(int argc, char **argv) {
     ui_init(&sa, &la);
 
     if (v4) em_toast("Snapshot created", Success);   /* host clock is 0 -> stays visible */
-    ui_frame_begin(); em_new_frame(); if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
+    ui_frame_begin(); em_new_frame(); if (pk) pkapp(); else if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
     ui_run_layout((float)W, (float)H);
 
     struct render_target rt;

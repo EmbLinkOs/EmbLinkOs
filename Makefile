@@ -1708,6 +1708,8 @@ showcase-v2:
 	$(BUILD)/showcase_v2 $(BUILD)/v6_dark.ppm  dark  6
 	$(BUILD)/showcase_v2 $(BUILD)/v7_light.ppm light 7
 	$(BUILD)/showcase_v2 $(BUILD)/v7_dark.ppm  dark  7
+	$(BUILD)/showcase_v2 $(BUILD)/pk_light.ppm light pk
+	$(BUILD)/showcase_v2 $(BUILD)/pk_dark.ppm  dark  pk
 	python3 -c "from PIL import Image; \
 	  Image.open('$(BUILD)/v2_light.ppm').save('$(BUILD)/v2_light.png'); \
 	  Image.open('$(BUILD)/v2_dark.ppm').save('$(BUILD)/v2_dark.png'); \
