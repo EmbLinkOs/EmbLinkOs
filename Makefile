@@ -1716,6 +1716,8 @@ showcase-v2:
 	$(BUILD)/showcase_v2 $(BUILD)/mm_dark.ppm  dark  m
 	$(BUILD)/showcase_v2 $(BUILD)/grid_light.ppm light r
 	$(BUILD)/showcase_v2 $(BUILD)/grid_dark.ppm  dark  r
+	$(BUILD)/showcase_v2 $(BUILD)/bar_light.ppm light a
+	$(BUILD)/showcase_v2 $(BUILD)/bar_dark.ppm  dark  a
 	python3 -c "from PIL import Image; import glob, os; \
 	  [Image.open(p).save(p[:-4]+'.png') for p in glob.glob('$(BUILD)/*.ppm')]; \
 	  print('wrote', len(glob.glob('$(BUILD)/*.png')), 'PNGs to $(BUILD)/ (v2 v4 v6 v7 pk gb mm grid, light+dark)')"

@@ -388,6 +388,41 @@ static void gridapp(void) {
     }
 }
 
+/* ======================================================================= */
+/* Apple-modern top bar ("a") -- glass strip, menus left + status right.    */
+/* ======================================================================= */
+static void barapp(void) {
+    const struct ui_theme *t = ui_theme();
+    Screen(.padding = 0, .background = (Color){ 0.09f, 0.11f, 0.17f, 1 }) {
+        VStack(.grow = 1, .align = Fill, .spacing = 0) {
+            /* the bar: a thin glass strip pinned to the top */
+            Glass(.align = Fill, .py = 5, .px = 12) {
+                HStack(.align = Center, .spacing = 10, .grow = 1) {
+                    Icon(IconBolt).color(t->text);
+                    MenuBar() {
+                        Menu("EmbLink") { MenuItem("About EmbLink"); MenuSeparator(); MenuItem("Quit"); }
+                        Menu("File")    { MenuItem("New"); MenuItem("Open"); }
+                        Menu("Edit")    { MenuItem("Undo"); MenuItem("Redo"); }
+                        Menu("View")    { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
+                    }
+                    Spacer();
+                    Icon(IconStar).secondary();
+                    Icon(IconBolt).secondary();
+                    Icon(IconGear).secondary();
+                    Text("100%").caption().secondary();
+                    Text("9:41").bold();
+                }
+            }
+            /* a little "desktop" under the bar for context */
+            VStack(.grow = 1, .align = Center) {
+                Spacer();
+                Text("Desktop").heading().color((Color){ 1, 1, 1, 0.45f });
+                Spacer();
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     int W = 480, H = 1080;
     const char *out = argc > 1 ? argv[1] : "v2.ppm";
@@ -400,6 +435,7 @@ int main(int argc, char **argv) {
     bool gb   = (argc > 3 && argv[3][0] == 'b');
     bool mm   = (argc > 3 && argv[3][0] == 'm');
     bool gr   = (argc > 3 && argv[3][0] == 'r');
+    bool bar  = (argc > 3 && argv[3][0] == 'a');
     if (v4) { W = 660; H = 900; }
     if (v6) { W = 560; H = 420; }
     if (v7) { W = 560; H = 420; }
@@ -408,6 +444,7 @@ int main(int argc, char **argv) {
     if (gb) { W = 460; H = 520; }
     if (mm) { W = 480; H = 380; }
     if (gr) { W = 620; H = 520; }
+    if (bar) { W = 760; H = 420; }
 
     size_t rl = 0, bl = 0;
     uint8_t *reg  = read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", &rl);
@@ -424,7 +461,7 @@ int main(int argc, char **argv) {
     ui_init(&sa, &la);
 
     if (v4) em_toast("Snapshot created", Success);   /* host clock is 0 -> stays visible */
-    ui_frame_begin(); em_new_frame(); if (gr) gridapp(); else if (mm) mmapp(); else if (gb) gbapp(); else if (pk) pkapp(); else if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
+    ui_frame_begin(); em_new_frame(); if (bar) barapp(); else if (gr) gridapp(); else if (mm) mmapp(); else if (gb) gbapp(); else if (pk) pkapp(); else if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
     ui_run_layout((float)W, (float)H);
 
     struct render_target rt;
