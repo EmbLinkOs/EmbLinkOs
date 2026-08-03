@@ -639,7 +639,18 @@ newlib-based libc port.*
   through the app runtime), and V7 (a focusable, scrolling, multi-line
   `TextEditor` with full caret navigation — the kernel keyboard driver gained
   extended-scancode arrow/Home/End/Delete keys, delivered as `EMBK_KEY_*`
-  codes, to support it). The backend also got a **performance pass** this
+  codes, to support it), and V8 — a **deepening pass** across three axes: the
+  **layout engine** grew flex-wrap (real container wrapping), per-child
+  min/max size constraints, and a true 2D `Grid`; the **render engine** grew
+  sharper SDF-based rounded-rect anti-aliasing and gradient fills for text,
+  icons, and borders; and the toolkit got its first **drag-and-drop** — a
+  `Dock` container whose chips you drag to reorder or pull out to remove
+  (`em_dock`) — which powers a **dynamic Apple-modern menu bar**
+  (`user/bin/topbar.c`, auto-spawned by home): a chromeless glass strip with a
+  leading logo, a `File`/`Edit`/`View` menu bar, a `DragHandle` middle that
+  moves the whole bar, and a right-side dock of status chips + clock + a pin
+  control that snaps the bar to a screen anchor (`em_window_move_to`). The
+  backend also got a **performance pass** this
   cycle (see `EMUI_INTERNALS.md`): table-based gamma text blending (~5× on
   the text path, replacing 3 per-pixel Newton-loop `sqrtf`s) and an integer
   premultiplied source-over fast path in `draw_image`. The toolkit also gained

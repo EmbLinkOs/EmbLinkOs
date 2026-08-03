@@ -855,6 +855,14 @@ renders — and since the same day EmbBuild **builds** one from a manifest
 covers the GUI, not just static C. See `docs/PORTS.md` § "The GUI wall, and
 how it came down" and BUILD.md §6.
 
+- [ ] **The menu bar's drag-and-drop is one-directional** (`user/bin/topbar.c`
+  + `em_dock`). You can drag a status chip to reorder it or pull it out of the
+  bar to remove it, but you cannot yet drag a *new* item **into** the bar from
+  an external tray — that needs either a same-window chip palette the dock
+  accepts drops from, or true cross-window drag transfer (the compositor would
+  have to hand a drag payload from the tray window to the bar window). The
+  reorder/drag-out half is built and live; the drag-in half is the open piece
+  of the user's "drag stuff into it or out of it" request.
 - [ ] **Only ONE EmUI app has a build manifest** (clockw). home/uidemo/wmdemo
   and the rest of `user/bin/*.c` are still host-built only. This is now
   breadth, not capability — each needs the same three-stanza shape plus its
