@@ -65,10 +65,9 @@ struct app_item { char icon[96]; char label[24]; const char *app; const char *di
  * two (never a copy), so a name never lingers behind. Home's folder is $HOME,
  * filled in once at startup. */
 static struct app_item g_desk[16] = {
-    { "/system/images/icon-launcher.pam", "Apps",   0, "/data/apps" },
     { "/system/images/icon-settings.pam", "System", 0, "/system" },
 };
-static int g_desk_n = 2;
+static int g_desk_n = 1;
 
 /* the bottom app dock -- a centered pill sized to its apps. Grows as apps are
  * dragged in / shrinks as they are dragged out, but never below DOCK_MIN. */
@@ -155,14 +154,31 @@ static float g_dockr[4];             /* dock pill world rect: x0,y0,x1,y1 */
 static int   g_have_dockr = 0;
 static int   g_dock_dirty = 0;       /* dock changed -> the loop force-repaints (no ghosts) */
 
-static void open_item(struct app_item it) {
-    /* the "Apps" shortcut opens the launcher grid, not a Files window */
-    if (it.dir && strcmp(it.dir, "/data/apps") == 0) {
-        scan_apps(); g_apps_open = 1; g_apps_frames = 0; g_dock_dirty = 1;
-        return;
+/* The top bar (a separate program) asks us to open the launcher over an IPC
+ * channel: home LISTENS at /run/emlink.desktop on a background thread (accept
+ * blocks, so it can't live in the render loop) and just raises a flag; the top
+ * bar CONNECTS to signal. The render loop consumes the flag non-blockingly. */
+static volatile int g_apps_requested = 0;
+static void apps_listener(long arg) {
+    (void)arg;
+    int lh = (int)embk_chan_listen("/run/emlink.desktop");
+    if (lh < 0) embk_thread_exit(1);
+    for (;;) {
+        int ch = (int)embk_chan_accept(lh);
+        if (ch < 0) continue;
+        g_apps_requested = 1;          /* the render loop opens the launcher */
+        embk_chan_close(ch);
     }
-    if (it.dir)      launch_folder(it.dir);
-    else if (it.app) g_launch = it.app;
+}
+static void poll_apps_request(void) {
+    if (!g_apps_requested) return;
+    g_apps_requested = 0;
+    if (!g_apps_open) { scan_apps(); g_apps_open = 1; g_apps_frames = 0; g_dock_dirty = 1; }
+}
+
+static void open_item(struct app_item it) {
+    if (it.dir)      launch_folder(it.dir);   /* a folder shortcut -> Files there */
+    else if (it.app) g_launch = it.app;       /* an app -> spawn it */
 }
 
 /* One draggable icon. kind: 1 = desktop source, 2 = dock item. Renders the icon
@@ -467,6 +483,7 @@ static void spawn_app(const char *path, const char *start_dir) {
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv;
     g_session_env = envp;
+    embk_thread_create(apps_listener, 0);   /* the top bar's Apps signal listener */
     /* apps describe their own icon/name (docs presentation manifest) */
     load_app_meta("files", g_dock[0].icon, sizeof g_dock[0].icon, g_dock[0].label, sizeof g_dock[0].label);
     load_app_meta("term",  g_dock[1].icon, sizeof g_dock[1].icon, g_dock[1].label, sizeof g_dock[1].label);
@@ -505,6 +522,8 @@ int main(int argc, char **argv, char **envp) {
     embk_puts(1, "home: desktop ready\n");
 
     for (;;) {
+        poll_apps_request();   /* the top bar's Apps button opens our launcher */
+
         /* pointer: the compositor routes the desktop's content-local mouse to us */
         struct embk_win_input in;
         embk_win_input(&in);

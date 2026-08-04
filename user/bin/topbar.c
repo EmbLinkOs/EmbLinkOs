@@ -43,8 +43,19 @@ static void snap_to(int anchor) {
 
 #define BAR_H 40
 
+/* Ask the desktop to open the Apps launcher. The launcher renders on the desktop
+ * (same program as the dock, so apps can be dragged into it); the top bar is a
+ * separate process, so it signals by CONNECTING to the desktop's IPC channel in
+ * /run (the desktop listens there and opens the grid). The connect itself is the
+ * signal -- no payload -- so we close immediately. */
+static void request_apps(void) {
+    int ch = (int)embk_chan_connect("/run/emlink.desktop");
+    if (ch >= 0) embk_chan_close(ch);
+}
+
 static void bar(void) {
     const struct ui_theme *t = ui_theme();
+    (void)t;
 
     /* park at the top-center the first time we're drawn */
     static int first = 1;
@@ -59,7 +70,8 @@ static void bar(void) {
         HStack(.height = BAR_H, .align = Center, .spacing = 10, .px = 12,
                .background = { .r=.03f, .g=.033f, .b=.043f, .a=.92f },
                .corner = 12, .border = 1) {
-            Icon(IconBolt).color(t->text);
+            /* the leading logo IS the Apps launcher button (like a Start menu) */
+            if (IconButton(IconBolt).accent().clicked()) request_apps();
             MenuBar() {
                 Menu("EmbLink") {
                     MenuItem("About EmbLink");

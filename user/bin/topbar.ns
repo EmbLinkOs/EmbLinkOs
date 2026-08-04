@@ -1,6 +1,8 @@
 # topbar namespace manifest (docs/USERSPACE_v2.md UP4).
-# A self-contained EmUI app: it draws from the UI runtime (fonts + libembk.so +
-# images) under the sealed, read-only /system and owns a window (a GPU
-# capability, not a name). It does NO file I/O of its own, so it runs with a
-# narrow, read-only view of /system and cannot name /data, /run, or a home.
+# The menu bar draws from the UI runtime (fonts + libembk.so + images) under the
+# sealed, read-only /system, and owns a window (a GPU capability, not a name).
+# Its ONE piece of IPC: it connects to the desktop's channel in /run to ask it to
+# open the Apps launcher (the launcher renders on the desktop so apps can be
+# dragged into the dock). So: read /system, reach /run -- nothing else nameable.
 ro /system
+rw /run
