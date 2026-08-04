@@ -153,6 +153,7 @@ static int   g_any_active = 0;       /* any draggable held this frame */
 static float g_dockr[4];             /* dock pill world rect: x0,y0,x1,y1 */
 static int   g_have_dockr = 0;
 static int   g_dock_dirty = 0;       /* dock changed -> the loop force-repaints (no ghosts) */
+static int   g_full_frames = 0;      /* full repaints still owed for that change (see main) */
 static char  g_pin_exec[16][80];     /* stable exec strings for launcher apps pinned to the dock */
 static int   g_pin_n = 0;
 
@@ -167,7 +168,14 @@ static void apps_listener(long arg) {
     if (lh < 0) embk_thread_exit(1);
     for (;;) {
         int ch = (int)embk_chan_accept(lh);
-        if (ch < 0) continue;
+        if (ch < 0) {
+            /* accept only BLOCKS while the endpoint is healthy; the error paths
+             * (bad/unlinked handle, handle table full) return straight away, so
+             * a bare retry here would be an unbounded hot spin -- on one core
+             * that starves the render loop and the whole desktop freezes. */
+            embk_sleep_ms(100);
+            continue;
+        }
         g_apps_requested = 1;          /* the render loop opens the launcher */
         embk_chan_close(ch);
     }
@@ -595,9 +603,20 @@ int main(int argc, char **argv, char **envp) {
          * The launcher only needs a full pass on its open/close TRANSITIONS
          * (g_dock_dirty marks both); a per-frame full rebuild while it merely
          * sat open starved the loop so badly under TCG that clicks were missed
-         * for seconds -- the launcher felt dead. Steady-state uses dirty rects. */
-        int force_full = (g_drag && g_drag_moved) || g_dock_dirty;
-        if (force_full) { scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get()); g_dock_dirty = 0; }
+         * for seconds -- the launcher felt dead. Steady-state uses dirty rects.
+         *
+         * A change needs TWO full frames, not one: the frame that RAISES the
+         * flag still contains the thing being removed (the launcher overlay is
+         * built before its close button is handled), so the first full pass
+         * repaints it. Only the following frame is the first one without it --
+         * and if that one falls back to dirty rects, the removed overlay is
+         * never erased and the desktop looks frozen. */
+        if (g_dock_dirty) { g_full_frames = 2; g_dock_dirty = 0; }
+        int force_full = (g_drag && g_drag_moved) || g_full_frames > 0;
+        if (force_full) {
+            scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+            if (g_full_frames) g_full_frames--;
+        }
 
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
