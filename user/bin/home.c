@@ -83,12 +83,12 @@ static int g_dock_n = 2;
  * /data/apps/<name>/<name>.app ("name X" / "icon Y" lines) -- so the desktop
  * reflects what the app declares, not a hard-coded table. Missing manifest or
  * field => the pre-seeded fallback stays. */
-static void load_app_meta(const char *name, struct app_item *it) {
+static int load_app_meta(const char *name, char *icon, size_t ic, char *label, size_t lc) {
     char path[128];
     snprintf(path, sizeof path, "/data/apps/%s/%s.app", name, name);
     size_t len = 0;
     uint8_t *buf = read_file(path, &len);
-    if (!buf) return;
+    if (!buf) return 0;
     for (size_t i = 0; i < len; ) {
         while (i < len && (buf[i]==' '||buf[i]=='\t'||buf[i]=='\r'||buf[i]=='\n')) i++;
         if (i >= len) break;
@@ -102,11 +102,45 @@ static void load_app_meta(const char *name, struct app_item *it) {
         size_t vl = i - vs;
         while (vl && (buf[vs+vl-1]==' '||buf[vs+vl-1]=='\t')) vl--;
         char *dst = 0; size_t cap = 0;
-        if (kl==4 && !memcmp(buf+ks,"name",4)) { dst = it->label; cap = sizeof it->label; }
-        else if (kl==4 && !memcmp(buf+ks,"icon",4)) { dst = it->icon; cap = sizeof it->icon; }
+        if (kl==4 && !memcmp(buf+ks,"name",4)) { dst = label; cap = lc; }
+        else if (kl==4 && !memcmp(buf+ks,"icon",4)) { dst = icon; cap = ic; }
         if (dst && cap) { size_t n = vl < cap-1 ? vl : cap-1; memcpy(dst, buf+vs, n); dst[n] = 0; }
     }
     free(buf);
+    return 1;
+}
+
+/* --- the Apps launcher: a grid of ALL installed apps, read from /data/apps ---
+ * Each app self-describes via its <name>.app (name + icon); click to launch. */
+struct grid_app { char name[32]; char icon[96]; char label[24]; char exec[80]; };
+static struct grid_app g_all[48];
+static int g_all_n = 0;
+static int   g_apps_open = 0;     /* is the launcher grid showing? */
+static int   g_apps_frames = 0;   /* debounce the click that opened it */
+static float g_apps_scroll = 0;   /* launcher grid scroll offset */
+
+/* Enumerate /data/apps/<name>/, keeping those that hold a <name>.elf, and read
+ * each one's presentation manifest. home's namespace grants `ro /data/apps`. */
+static void scan_apps(void) {
+    g_all_n = 0;
+    struct embk_dirent ents[64];
+    int64_t n = embk_readdir("/data/apps", ents, 64);
+    for (int64_t i = 0; i < n && g_all_n < 48; i++) {
+        if (ents[i].type != EMBK_DT_DIR) continue;
+        const char *nm = ents[i].name;
+        if (nm[0] == '.') continue;
+        struct grid_app *a = &g_all[g_all_n];
+        snprintf(a->exec, sizeof a->exec, "/data/apps/%s/%s.elf", nm, nm);
+        struct embk_stat st;
+        if (embk_stat(a->exec, &st) < 0) continue;   /* only real, launchable apps */
+        snprintf(a->name, sizeof a->name, "%s", nm);
+        snprintf(a->icon, sizeof a->icon, "/system/images/icon-launcher.pam");  /* fallback */
+        snprintf(a->label, sizeof a->label, "%s", nm);
+        /* only apps that DECLARE themselves (ship a <name>.app) appear in the
+         * launcher -- internal tools/tests stay out of the user's face. */
+        if (!load_app_meta(nm, a->icon, sizeof a->icon, a->label, sizeof a->label)) continue;
+        g_all_n++;
+    }
 }
 
 /* --- drag-and-drop state (a desktop icon INTO the dock, or a dock icon OUT) --- */
@@ -122,6 +156,11 @@ static int   g_have_dockr = 0;
 static int   g_dock_dirty = 0;       /* dock changed -> the loop force-repaints (no ghosts) */
 
 static void open_item(struct app_item it) {
+    /* the "Apps" shortcut opens the launcher grid, not a Files window */
+    if (it.dir && strcmp(it.dir, "/data/apps") == 0) {
+        scan_apps(); g_apps_open = 1; g_apps_frames = 0; g_dock_dirty = 1;
+        return;
+    }
     if (it.dir)      launch_folder(it.dir);
     else if (it.app) g_launch = it.app;
 }
@@ -184,6 +223,34 @@ static void drag_ghost(void) {
     ImageButton(g_drag_item.icon, 44);
     ui_end_stack();
     ui_end_stack();
+}
+
+/* The Apps launcher: a modal grid of every installed app, each shown by its
+ * declared icon + name; click one to launch it. Outside-click / Esc dismiss. */
+static void apps_grid(void) {
+    if (!g_apps_open) return;
+    g_apps_frames++;
+    Overlay() {
+        Dialog(.width = 480, .spacing = 12, .padding = 20) {
+            Text("Applications").title();
+            ScrollView(&g_apps_scroll, 430) {
+                Grid(4, .spacing = 12) {
+                    for (int i = 0; i < g_all_n; i++) {
+                        VStack(.spacing = 6, .align = Center) {
+                            if (ImageButtonKey(g_all[i].icon, 56, (uint64_t)(0xA99A0000u + (unsigned)i))) {
+                                g_launch = g_all[i].exec;   /* stable module-static buffer */
+                                g_apps_open = 0; g_dock_dirty = 1;
+                            }
+                            Text(g_all[i].label).caption();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /* click on the bare scrim (outside the dialog) closes -- debounced so the
+     * click that OPENED the launcher does not immediately dismiss it. */
+    if (g_apps_frames >= 3 && OverlayDismissed()) { g_apps_open = 0; g_dock_dirty = 1; }
 }
 
 /* Resolve a released drag: add to / remove from / reorder the dock. Called after
@@ -262,6 +329,7 @@ static void home_ui(void) {
                 dock_pill();
             }
         }
+        apps_grid();           /* the Apps launcher (modal grid), when open */
         drag_ghost();          /* the dragged icon follows the cursor (overlay) */
     }
     dock_resolve_drop();       /* act on a released drag (add / remove / reorder) */
@@ -400,8 +468,8 @@ int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv;
     g_session_env = envp;
     /* apps describe their own icon/name (docs presentation manifest) */
-    load_app_meta("files", &g_dock[0]);
-    load_app_meta("term",  &g_dock[1]);
+    load_app_meta("files", g_dock[0].icon, sizeof g_dock[0].icon, g_dock[0].label, sizeof g_dock[0].label);
+    load_app_meta("term",  g_dock[1].icon, sizeof g_dock[1].icon, g_dock[1].label, sizeof g_dock[1].label);
     /* toolkit font + context */
     size_t rl = 0;
     uint8_t *reg = read_file("/system/fonts/font.ttf", &rl);
@@ -460,7 +528,7 @@ int main(int argc, char **argv, char **envp) {
 
         /* While a drag ghost is airborne (it moves every frame) or the dock just
          * changed, force a clean full repaint so no ghost/trail is left behind. */
-        int force_full = (g_drag && g_drag_moved) || g_dock_dirty;
+        int force_full = (g_drag && g_drag_moved) || g_dock_dirty || g_apps_open;
         if (force_full) { scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get()); g_dock_dirty = 0; }
 
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
