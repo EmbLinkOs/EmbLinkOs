@@ -797,6 +797,7 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * over THIS process's window content (then x,y are window-local pixels and
  * buttons is the mouse state -- EMBK_MOUSE_LEFT etc.), 0 otherwise. The home
  * launcher reads this to make its tiles clickable. */
+#define EMBK_WIN_ACTION_MAXIMIZE  0x80000001u
 struct embk_win_input { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win; int32_t wheel; };
 static inline int embk_win_input(struct embk_win_input *out) {
     return (int)embk_syscall1(EMBK_SYS_win_input, (int64_t)(intptr_t)out);

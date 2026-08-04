@@ -337,7 +337,7 @@ void ui_avatar(const char *initials) {
 
 /* --- text field --------------------------------------------------------- */
 
-bool ui_text_field(char *buf, unsigned long cap, const char *placeholder) {
+static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool masked) {
     const struct ui_theme *t = TH;
     ui_box_begin(0);
     struct instance_handle self = ui_open();
@@ -373,7 +373,16 @@ bool ui_text_field(char *buf, unsigned long cap, const char *placeholder) {
     if (buf[0] == 0 && !focused) {
         text_role(t->font_regular, t->text_body, t->text_tertiary, placeholder);
     } else {
-        text_role(t->font_regular, t->text_body, t->text, buf);
+        char hidden[128];
+        const char *shown = buf;
+        if (masked) {
+            unsigned long n = strlen(buf);
+            if (n >= sizeof hidden) n = sizeof hidden - 1;
+            for (unsigned long i = 0; i < n; i++) hidden[i] = '*';
+            hidden[n] = 0;
+            shown = hidden;
+        }
+        text_role(t->font_regular, t->text_body, t->text, shown);
         if (focused) {                    /* caret */
             ui_box_begin(0);
             ui_set_paint(solid(t->accent));
@@ -385,6 +394,14 @@ bool ui_text_field(char *buf, unsigned long cap, const char *placeholder) {
     ui_end_stack();
     ui_box_end();
     return focused;
+}
+
+bool ui_text_field(char *buf, unsigned long cap, const char *placeholder) {
+    return ui_field(buf, cap, placeholder, false);
+}
+
+bool ui_password_field(char *buf, unsigned long cap, const char *placeholder) {
+    return ui_field(buf, cap, placeholder, true);
 }
 
 /* --- scroll view -------------------------------------------------------- */

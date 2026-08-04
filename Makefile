@@ -937,11 +937,13 @@ $(BUILD)/picobj_dsl_em.o: ui/dsl/em.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_dsl_em_app.o: ui/dsl/em_app.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_auth.o: user/lib/auth.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 LIBEMBK_OBJS = $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
                $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
                $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
                $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
-               $(BUILD)/picobj_dsl_em.o $(BUILD)/picobj_dsl_em_app.o
+               $(BUILD)/picobj_dsl_em.o $(BUILD)/picobj_dsl_em_app.o $(BUILD)/picobj_auth.o
 
 build/libembk.so: $(LIBEMBK_OBJS)
 	$(USER_LD) -shared -soname libembk.so --hash-style=sysv $(LIBEMBK_OBJS) -o $@
@@ -1239,21 +1241,29 @@ XRES ?= 1280
 YRES ?= 800
 VGA_VIRTIO = -vga none -device virtio-vga,xres=$(XRES),yres=$(YRES)
 DISPLAY_1TO1 = -display gtk,zoom-to-fit=off
+# KVM exposes the host CPU directly, including RDRAND which getentropy() needs,
+# and avoids the substantial pointer/UI latency of full software emulation.
+# These remain overridable for machines where KVM is unavailable:
+#   make run-embkfs-cow QEMU_ACCEL=tcg,thread=multi QEMU_CPU=qemu64,+rdrand
+QEMU_ACCEL ?= kvm
+QEMU_CPU ?= max
 
 run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
 	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)
-	qemu-system-x86_64 -cpu max \
+	qemu-system-x86_64 \
+	    -cpu $(QEMU_CPU) \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
-	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi $(NET)
+	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel $(QEMU_ACCEL) $(NET)
 	@echo "--- grading the post-COW image ---"
 	python3 embkfs_mkfs/verify_embkfs.py $(EMBKFS_SCRATCH)
 
 
 run-embkfs-tree: $(IMG) $(DISK) embkfs_tree.img
 	qemu-system-x86_64 \
+	    -cpu $(QEMU_CPU) \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=embkfs_tree.img,if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown
@@ -1261,6 +1271,7 @@ run-embkfs-tree: $(IMG) $(DISK) embkfs_tree.img
 
 run-embkfs: $(IMG) $(DISK) embkfs.img
 	qemu-system-x86_64 \
+	    -cpu $(QEMU_CPU) \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown $(NET)

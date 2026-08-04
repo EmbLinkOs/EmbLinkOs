@@ -230,6 +230,7 @@ struct EmV {
 #define Slider(...)      em_slider(__VA_ARGS__)
 #define Stepper(...)     em_stepper(__VA_ARGS__)
 #define TextField(...)   em_text_field(__VA_ARGS__)
+#define PasswordField(...) em_password_field(__VA_ARGS__)
 #define Segmented(...)   em_segmented(__VA_ARGS__)
 #define Spacer()         em_spacer_()
 #define Divider()        em_divider_()
@@ -249,6 +250,7 @@ EmV em_checkbox(const char *label, bool *bind);
 EmV em_slider(float *bind);
 EmV em_stepper(const char *label, int *bind, int lo, int hi);
 EmV em_text_field(char *buf, size_t cap, const char *placeholder);
+EmV em_password_field(char *buf, size_t cap, const char *placeholder);
 EmV em_segmented(const char *const *labels, int count, int *bind);
 void em_spacer_(void);
 void em_divider_(void);
@@ -526,10 +528,14 @@ typedef struct {
     EmResize    resize;          /* Resizable -> Window() shows a corner grip;
                                   * dragging it resizes the OS window (V5) */
     EmMaterial  material;        /* Acrylic -> frosted glass window (V8) */
+    int         fullscreen;      /* occupy the current display, without a frame */
     void      (*view)(void);     /* the whole UI, rebuilt only when needed */
     const char *font;            /* resource path; default "/system/fonts/font.ttf" */
     int         pace_ms;         /* loop pace while active; default 10 */
 } EmApp;
+
+float em_viewport_width(void);
+float em_viewport_height(void);
 
 /* ---- terminal-shaped runtime hooks (V8) --------------------------------- *
  * For apps whose real input/output is a byte stream (the Terminal hosting
@@ -573,6 +579,10 @@ int em_widget_run(const EmWidget *wg);
 /* Runs the app until its CloseButton/ESC quits. Defined in em_app.c, which is
  * only linked on-target (it speaks the EmbLink SDK); host tests never call it. */
 int em_app_run(const EmApp *app);
+/* Ask the EM_APPLICATION runtime to close cleanly after the current UI pass.
+ * Unlike calling exit() from a view callback, this destroys the compositor
+ * window first, so the next screen never inherits stale pixels. */
+void em_app_request_exit(int code);
 
 #define EM_APPLICATION     static EmApp em_app_spec_;     int main(void) { return em_app_run(&em_app_spec_); }     static EmApp em_app_spec_ =
 
@@ -598,6 +608,13 @@ uint32_t em_font(const char *path);
 const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h);
 void em_image_view(const char *path, EmProps p);
 #define Image(path, ...)  em_image_view((path), (EmProps){__VA_ARGS__})
+bool em_image_button(const char *path, float size);
+#define ImageButton(path, size) em_image_button((path), (size))
+bool em_image_button_key(const char *path, float size, uint64_t key);
+#define ImageButtonKey(path, size, key) \
+    em_image_button_key((path), (size), (uint64_t)(uintptr_t)(key))
+void em_background_image(const char *path);
+#define BackgroundImage(path) em_background_image(path)
 void em_theme_use(EmTheme t);
 
 /* frame + interaction plumbing */

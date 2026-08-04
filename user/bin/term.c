@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -158,7 +159,12 @@ static bool term_spawn_shell(void) {
      * inherited, so the terminal -- the session spawner here -- NAMES it via PWD,
      * and the shell's crt0 seeds cwd from it. Without this the shell defaults to
      * / and `pwd` prints / in the terminal. */
-    char *senv[] = { "HOME=/data/users/teo", "PWD=/data/users/teo", NULL };
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/";
+    char home_env[160], pwd_env[160];
+    snprintf(home_env, sizeof home_env, "HOME=%s", home);
+    snprintf(pwd_env, sizeof pwd_env, "PWD=%s", home);
+    char *senv[] = { home_env, pwd_env, NULL };
     int64_t h = embk_spawn_env("/system/bin/shell.elf", argv, senv, acts, 3);
 
     /* our copies of the CHILD's ends must go, whatever happened -- EOF

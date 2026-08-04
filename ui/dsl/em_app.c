@@ -27,6 +27,19 @@
 #include "scene_render.h"
 #include "font.h"
 
+static int g_app_exit_requested;
+static int g_app_exit_code;
+static float g_viewport_w;
+static float g_viewport_h;
+
+void em_app_request_exit(int code) {
+    g_app_exit_code = code;
+    g_app_exit_requested = 1;
+}
+
+float em_viewport_width(void) { return g_viewport_w; }
+float em_viewport_height(void) { return g_viewport_h; }
+
 /* --- the embk resource loader (whole file -> malloc'd buffer) ------------ */
 static uint8_t *emapp_load(const char *path, size_t *out_len) {
     int fd = (int)embk_open(path, EMBK_O_RDONLY, 0);
@@ -54,6 +67,8 @@ void em_set_key_hook(int (*fn)(int ch)) { g_em_key_hook = fn; }
 void em_set_idle_hook(void (*fn)(void)) { g_em_idle_hook = fn; }
 
 int em_app_run(const EmApp *app) {
+    g_app_exit_requested = 0;
+    g_app_exit_code = 0;
     if (!app || !app->view) return 1;
     const char *title = app->title ? app->title : "EmApp";
     uint64_t t0 = embk_uptime_ms();
@@ -74,19 +89,23 @@ int em_app_run(const EmApp *app) {
     /* the window: requested content size, clamped + centred on the screen */
     uint32_t sw = 0, sh = 0;
     embk_screen_size(&sw, &sh);
-    int winw = app->size.w > 0 ? app->size.w : 640;
-    int winh = app->size.h > 0 ? app->size.h : 480;
+    int winw = app->fullscreen && sw ? (int)sw : (app->size.w > 0 ? app->size.w : 640);
+    int winh = app->fullscreen && sh ? (int)sh : (app->size.h > 0 ? app->size.h : 480);
     int glass = (app->material == Acrylic);      /* frosted window (implies chromeless) */
-    int chromeless = (app->chrome == Chromeless) || glass;
+    int chromeless = app->fullscreen || (app->chrome == Chromeless) || glass;
     int bar = chromeless ? 0 : 26;
-    if (sw && winw > (int)sw - 8)        winw = (int)sw - 8;
-    if (sh && winh > (int)sh - bar - 16) winh = (int)sh - bar - 16;
+    if (!app->fullscreen && sw && winw > (int)sw - 8)        winw = (int)sw - 8;
+    if (!app->fullscreen && sh && winh > (int)sh - 32 - 64 - bar)
+        winh = (int)sh - 32 - 64 - bar;
+    if (winw < 200) winw = 200;
     /* chromeless strips (menu bars, docks) are legitimately short; normal
      * titled windows keep a usable floor. */
-    if (winw < 200) winw = 200;
     if (winh < (chromeless ? 24 : 160)) winh = chromeless ? 24 : 160;
-    int wx = ((int)sw - winw) / 2;        if (wx < 0) wx = 0;
-    int wy = ((int)sh - winh - bar) / 2;  if (wy < 0) wy = 0;
+    int wx = app->fullscreen ? 0 : ((int)sw - winw) / 2;        if (wx < 0) wx = 0;
+    int wy = app->fullscreen ? 0 : 32 + ((int)sh - 32 - 64 - winh - bar) / 2;
+    if (wy < 32 && !app->fullscreen) wy = 32;
+    g_viewport_w = (float)winw;
+    g_viewport_h = (float)winh;
 
     uint32_t *px = 0;
     uint64_t wflags = glass ? EMBK_WINF_GLASS : (chromeless ? EMBK_WINF_CHROMELESS : 0);
@@ -110,6 +129,8 @@ int em_app_run(const EmApp *app) {
 
     int pace = app->pace_ms > 0 ? app->pace_ms : 10;
     int prev_epoch = em_ui_epoch(), first = 1;
+    int maximized = 0;
+    int normal_x = wx, normal_y = wy, normal_w = winw, normal_h = winh;
     struct embk_win_input prev_in; memset(&prev_in, 0, sizeof prev_in);
 
     for (;;) {
@@ -118,6 +139,27 @@ int em_app_run(const EmApp *app) {
                                                  * the terminal's pipe poll */
         struct embk_win_input in;
         embk_win_input(&in);
+
+        /* Native maximize/restore request from the compositor. Resizing must
+         * happen in the client because it owns the shared pixel mapping. */
+        if (in.win == EMBK_WIN_ACTION_MAXIMIZE && !app->fullscreen) {
+            int nw = maximized ? normal_w : (int)sw;
+            int nh = maximized ? normal_h : (int)sh - 32 - 64 - 26;
+            int nx = maximized ? normal_x : 0;
+            int ny = maximized ? normal_y : 32;
+            if (nh < 160) nh = 160;
+            uint32_t *npx = 0;
+            if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
+                px = npx; winw = nw; winh = nh;
+                g_viewport_w = (float)winw; g_viewport_h = (float)winh;
+                rt.pixels = px; rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
+                rt.stride = (uint32_t)winw * 4;
+                embk_win_move(win, nx, ny);
+                scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+                em_request_frame();
+                maximized = !maximized;
+            }
+        }
         int had_key = 0;
         for (int c; (c = embk_key_poll()) != 0; ) {
             if (g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
@@ -176,10 +218,10 @@ int em_app_run(const EmApp *app) {
         ui_run_layout((float)winw, (float)winh);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
-        if (em_window_closed() || em_window_take_close()) {  /* CloseButton or CloseGrip pull */
+        if (g_app_exit_requested || em_window_closed() || em_window_take_close()) {
             embk_win_destroy(win); embk_key_grab(0);
-            char b[64]; snprintf(b, sizeof b, "%s: closed by its own control\n", title); embk_puts(1, b);
-            return 0;
+            char b[64]; snprintf(b, sizeof b, "%s: window closed cleanly\n", title); embk_puts(1, b);
+            return g_app_exit_requested ? g_app_exit_code : 0;
         }
 
         if (force_full || r.full || r.n_dirty == 0) {
@@ -220,6 +262,7 @@ int em_app_run(const EmApp *app) {
             uint32_t *npx = 0;
             if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                 px = npx; winw = nw; winh = nh;
+                g_viewport_w = (float)winw; g_viewport_h = (float)winh;
                 rt.pixels = px; rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
                 rt.stride = (uint32_t)winw * 4;
                 const struct ui_theme *t = ui_theme();
