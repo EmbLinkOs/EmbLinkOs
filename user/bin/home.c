@@ -153,6 +153,8 @@ static int   g_any_active = 0;       /* any draggable held this frame */
 static float g_dockr[4];             /* dock pill world rect: x0,y0,x1,y1 */
 static int   g_have_dockr = 0;
 static int   g_dock_dirty = 0;       /* dock changed -> the loop force-repaints (no ghosts) */
+static char  g_pin_exec[16][80];     /* stable exec strings for launcher apps pinned to the dock */
+static int   g_pin_n = 0;
 
 /* The top bar (a separate program) asks us to open the launcher over an IPC
  * channel: home LISTENS at /run/emlink.desktop on a background thread (accept
@@ -181,7 +183,19 @@ static void open_item(struct app_item it) {
     else if (it.app) g_launch = it.app;       /* an app -> spawn it */
 }
 
-/* One draggable icon. kind: 1 = desktop source, 2 = dock item. Renders the icon
+/* Adapt a launcher-grid entry to the draggable app_item shape. The exec path
+ * points at g_all[]'s reusable buffer; a drop that pins it copies the string to
+ * stable storage (dock_resolve_drop), so a later rescan can't alias it. */
+static struct app_item grid_to_item(int i) {
+    struct app_item it; memset(&it, 0, sizeof it);
+    snprintf(it.icon,  sizeof it.icon,  "%s", g_all[i].icon);
+    snprintf(it.label, sizeof it.label, "%s", g_all[i].label);
+    it.app = g_all[i].exec;
+    return it;
+}
+
+/* One draggable icon. kind: 1 = desktop source, 2 = dock item, 3 = launcher grid.
+ * Renders the icon
  * (with hover styling) and tracks a press as either a click or a drag; the drop
  * is resolved after the frame in dock_resolve_drop(). */
 static void drag_icon(struct app_item it, int size, int kind, int idx) {
@@ -189,8 +203,8 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
      * list shifts (remove/reorder), an index-keyed instance gets reused for a
      * different app -- which left a removed middle app lingering (dimmed) in
      * place while the pill kept its old width. Identity keys track each app. */
-    uint64_t key = (kind == 1 ? 0xDE510000ULL : 0xD0C00000ULL)
-                 ^ (uint64_t)(uintptr_t)(it.app ? it.app : it.dir);
+    uint64_t base = kind == 1 ? 0xDE510000ULL : kind == 3 ? 0x6D170000ULL : 0xD0C00000ULL;
+    uint64_t key  = base ^ (uint64_t)(uintptr_t)(it.app ? it.app : it.dir);
     ui_box_begin(key);
     (void)ui_open();
     ui_set_align(ALIGN_CENTER);
@@ -207,7 +221,7 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
         g_drag_x = px; g_drag_y = py;
         if (!g_drag_moved) {
             float dx = px - g_drag_sx, dy = py - g_drag_sy;
-            if (dx*dx + dy*dy > 49.0f) g_drag_moved = 1;   /* > ~7px = a drag */
+            if (dx*dx + dy*dy > 49.0f) g_drag_moved = 1;    /* > ~7px = a drag */
         }
     }
     ui_box_end();
@@ -248,15 +262,20 @@ static void apps_grid(void) {
     g_apps_frames++;
     Overlay() {
         Dialog(.width = 480, .spacing = 12, .padding = 20) {
-            Text("Applications").title();
+            /* header: title + an explicit close, so the grid has a normal way out
+             * (not only the click-off-the-scrim dismiss) */
+            HStack(.align = Center, .spacing = 8) {
+                Text("Applications").title();
+                Spacer();
+                if (IconButton(IconClose).clicked()) { g_apps_open = 0; g_dock_dirty = 1; }
+            }
             ScrollView(&g_apps_scroll, 430) {
                 Grid(4, .spacing = 12) {
                     for (int i = 0; i < g_all_n; i++) {
                         VStack(.spacing = 6, .align = Center) {
-                            if (ImageButtonKey(g_all[i].icon, 56, (uint64_t)(0xA99A0000u + (unsigned)i))) {
-                                g_launch = g_all[i].exec;   /* stable module-static buffer */
-                                g_apps_open = 0; g_dock_dirty = 1;
-                            }
+                            /* click launches (resolved in dock_resolve_drop);
+                             * drag pins into the dock */
+                            drag_icon(grid_to_item(i), 56, 3, i);
                             Text(g_all[i].label).caption();
                         }
                     }
@@ -278,6 +297,21 @@ static void dock_resolve_drop(void) {
                g_drag_y >= g_dockr[1] - 28 && g_drag_y <= g_dockr[3] + 12;
     if (!g_drag_moved) {
         open_item(g_drag_item);                   /* a plain click -> launch/open */
+        if (g_drag == 3) { g_apps_open = 0; g_dock_dirty = 1; }   /* grid click closes launcher */
+    } else if (g_drag == 3) {                      /* launcher app dragged toward the dock */
+        /* pin a COPY: the grid's exec buffer gets reused on the next rescan, so
+         * the dock keeps its own stable exec string. Skip if already docked. */
+        int dup = 0;
+        for (int k = 0; k < g_dock_n; k++)
+            if (g_dock[k].app && g_drag_item.app && !strcmp(g_dock[k].app, g_drag_item.app)) dup = 1;
+        if (over && !dup && g_dock_n < 16 && g_pin_n < 16) {
+            char *buf = g_pin_exec[g_pin_n++];
+            snprintf(buf, sizeof g_pin_exec[0], "%s", g_drag_item.app);
+            g_drag_item.app = buf;
+            g_dock[g_dock_n++] = g_drag_item;
+            g_apps_open = 0;                       /* pinned -> close the launcher */
+            g_dock_dirty = 1;
+        }                                          /* dropped off the dock -> launcher stays open */
     } else if (g_drag == 1) {                      /* desktop icon dragged onto the dock */
         if (over && g_dock_n < 16) {
             g_dock[g_dock_n++] = g_drag_item;      /* add to dock ... */
@@ -362,9 +396,11 @@ static void home_ui(void) {
  * always-alive low pid (the shell/idle) and refused every relaunch. */
 #define MAX_TRACKED 8
 static struct {
-    const char *path;
-    const char *start_dir;  /* distinguishes independent Files shortcuts */
-    int handle_p1;
+    char path[96];          /* exec path, COPIED -> a stable identity even when the
+                             * caller's pointer is a reused scan buffer (grid apps) */
+    char start_dir[256];    /* "" = none; distinguishes independent Files shortcuts */
+    int  used;
+    int  handle_p1;
 } g_running[MAX_TRACKED];
 
 /* An app DECLARES its namespace needs in /data/apps/<name>/<name>.ns (shipped in
@@ -426,21 +462,29 @@ static int load_app_ns(const char *elf_path,
 }
 
 static void spawn_app(const char *path, const char *start_dir) {
-    int slot = -1;
+    const char *sd = start_dir ? start_dir : "";
+    /* Dedup by exec+dir CONTENT, not pointer: the same app reached from the dock
+     * (a string literal) and from the launcher grid (a reused scan buffer) has
+     * two different addresses -- pointer-equality let it spawn TWICE, and two
+     * instances fighting over one window rendered as a dead black rectangle. */
+    int slot = -1, freeslot = -1;
     for (int i = 0; i < MAX_TRACKED; i++) {
-        if (g_running[i].path == path &&
-            g_running[i].start_dir == start_dir) { slot = i; break; }
-        if (slot < 0 && !g_running[i].path) slot = i;
+        if (g_running[i].used) {
+            if (!strcmp(g_running[i].path, path) &&
+                !strcmp(g_running[i].start_dir, sd)) { slot = i; break; }
+        } else if (freeslot < 0) freeslot = i;
     }
-    if (slot < 0) return;
 
-    if (g_running[slot].path == path &&
-        g_running[slot].start_dir == start_dir &&
-        g_running[slot].handle_p1 > 0) {
-        int h = g_running[slot].handle_p1 - 1;
-        if (embk_proc_alive(h)) return;   /* still running -- one instance only */
-        embk_wait(h);                     /* dead: reap the zombie + free the handle */
-        g_running[slot].handle_p1 = 0;
+    if (slot >= 0) {                       /* already tracked */
+        if (g_running[slot].handle_p1 > 0) {
+            int h = g_running[slot].handle_p1 - 1;
+            if (embk_proc_alive(h)) return;   /* still running -- one instance only */
+            embk_wait(h);                     /* dead: reap the zombie + free the handle */
+            g_running[slot].handle_p1 = 0;
+        }
+    } else {
+        slot = freeslot;
+        if (slot < 0) return;              /* table full */
     }
 
     /* Grant the child EXACTLY its declared namespace (UP4); no manifest => it
@@ -473,8 +517,9 @@ static void spawn_app(const char *path, const char *start_dir) {
     embk_puts(1, b);
 
     if (h >= 0) {
-        g_running[slot].path = path;
-        g_running[slot].start_dir = start_dir;
+        snprintf(g_running[slot].path, sizeof g_running[slot].path, "%s", path);
+        snprintf(g_running[slot].start_dir, sizeof g_running[slot].start_dir, "%s", sd);
+        g_running[slot].used = 1;
         g_running[slot].handle_p1 = h + 1;
     }
     else { char e[96]; snprintf(e, sizeof e, "home: spawn %s FAILED: %d\n", path, h); embk_puts(1, e); }
@@ -546,8 +591,12 @@ int main(int argc, char **argv, char **envp) {
         ui_run_layout((float)sw, (float)sh);
 
         /* While a drag ghost is airborne (it moves every frame) or the dock just
-         * changed, force a clean full repaint so no ghost/trail is left behind. */
-        int force_full = (g_drag && g_drag_moved) || g_dock_dirty || g_apps_open;
+         * changed, force a clean full repaint so no ghost/trail is left behind.
+         * The launcher only needs a full pass on its open/close TRANSITIONS
+         * (g_dock_dirty marks both); a per-frame full rebuild while it merely
+         * sat open starved the loop so badly under TCG that clicks were missed
+         * for seconds -- the launcher felt dead. Steady-state uses dirty rects. */
+        int force_full = (g_drag && g_drag_moved) || g_dock_dirty;
         if (force_full) { scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get()); g_dock_dirty = 0; }
 
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
