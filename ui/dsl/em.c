@@ -2067,7 +2067,10 @@ void em_res_set_loader(uint8_t *(*load)(const char *path, size_t *out_len)) {
     g_res_load = load;
 }
 
-#define EM_RES_MAX 8
+/* One slot per distinct image path. A desktop with a real icon per app blows
+ * straight past the old 8 -- and a full cache used to mean re-decoding every
+ * frame forever, so this bound is load-bearing, not cosmetic. */
+#define EM_RES_MAX 32
 
 uint32_t em_font(const char *path) {
     static struct { char path[128]; int used; uint32_t handle; } cache[EM_RES_MAX];
@@ -2139,6 +2142,13 @@ const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h) {
         return 0;
     }
     if (!w || !h || o + (size_t)w*h*depth > len) return 0;
+    /* Claim the cache slot BEFORE decoding: with no free slot the old code
+     * still malloc'd, returned an uncached buffer, and did it again on the
+     * NEXT frame -- an unbounded per-frame leak once the desktop had more
+     * distinct images than slots. Refusing to draw is the honest failure. */
+    int slot = -1;
+    for (int i = 0; i < EM_RES_MAX; i++) if (!cache[i].used) { slot = i; break; }
+    if (slot < 0) return 0;
     uint32_t *px = (uint32_t *)malloc((size_t)w*h*4);
     if (!px) return 0;
     for (size_t i = 0; i < (size_t)w*h; i++) {
@@ -2149,14 +2159,75 @@ const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h) {
         uint8_t pb = (uint8_t)(((uint32_t)b * a) / 255);
         px[i] = ((uint32_t)a<<24) | ((uint32_t)pr<<16) | ((uint32_t)pg<<8) | pb;
     }
-    for (int i = 0; i < EM_RES_MAX; i++)
-        if (!cache[i].used) {
-            snprintf(cache[i].path, sizeof cache[i].path, "%s", path);
-            cache[i].used = 1; cache[i].px = px; cache[i].w = w; cache[i].h = h; break;
-        }
+    snprintf(cache[slot].path, sizeof cache[slot].path, "%s", path);
+    cache[slot].used = 1; cache[slot].px = px; cache[slot].w = w; cache[slot].h = h;
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
     return px;
+}
+
+/* ---- .eic multi-resolution icons (docs/ICONS.md) ------------------------ */
+
+#define EM_ICON_MAX 24
+
+static uint32_t eic_rd16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+static uint32_t eic_rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Resolve an icon at the size actually being drawn.
+ *
+ * A .eic holds the same icon at several sizes; we hand back the level that
+ * best fits `want_px` so the renderer blits it 1:1 instead of resampling one
+ * oversized master down to whatever the widget asked for. The pixels point
+ * straight INTO the cached file image -- .eic stores premultiplied BGRA, the
+ * exact layout the renderer consumes, so there is no decode and no second
+ * allocation. Anything that isn't a .eic falls through to the .ppm/.pam
+ * decoder, so existing art keeps working. */
+const uint32_t *em_image_at(const char *path, uint32_t want_px,
+                            uint32_t *out_w, uint32_t *out_h) {
+    static struct { char path[128]; int used; uint8_t *file; size_t len; } cache[EM_ICON_MAX];
+    if (!path) return 0;
+    size_t n = strlen(path);
+    if (n < 4 || strcmp(path + n - 4, ".eic") != 0)
+        return em_image(path, out_w, out_h);
+
+    uint8_t *f = 0; size_t len = 0;
+    int slot = -1;
+    for (int i = 0; i < EM_ICON_MAX; i++) {
+        if (cache[i].used && strcmp(cache[i].path, path) == 0) {
+            f = cache[i].file; len = cache[i].len; break;
+        }
+        if (slot < 0 && !cache[i].used) slot = i;
+    }
+    if (!f) {
+        if (slot < 0 || !g_res_load) return 0;
+        f = g_res_load(path, &len);
+        if (!f || len < 32) return 0;
+        snprintf(cache[slot].path, sizeof cache[slot].path, "%s", path);
+        cache[slot].used = 1; cache[slot].file = f; cache[slot].len = len;
+    }
+    if (f[0] != 'E' || f[1] != 'I' || f[2] != 'C' || f[3] != 'O') return 0;
+    uint32_t nlev = eic_rd16(f + 6);
+    if (!nlev || 32 + (size_t)nlev * 16 > len) return 0;
+
+    /* Smallest level that still covers the request: shrinking a bigger level a
+     * little stays sharp, stretching a smaller one never does. */
+    const uint8_t *best = 0;
+    for (uint32_t i = 0; i < nlev; i++) {
+        const uint8_t *e = f + 32 + (size_t)i * 16;
+        best = e;                                  /* table is ascending */
+        if (eic_rd16(e) >= want_px) break;         /* first that covers it */
+    }
+    if (!best) return 0;
+
+    uint32_t w = eic_rd16(best), h = eic_rd16(best + 2);
+    uint32_t off = eic_rd32(best + 8), nb = eic_rd32(best + 12);
+    if (!w || !h || nb != w * h * 4 || (size_t)off + nb > len || (off & 3)) return 0;
+
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return (const uint32_t *)(const void *)(f + off);
 }
 
 void em_image_view(const char *path, EmProps p) {
@@ -2177,7 +2248,11 @@ void em_image_view(const char *path, EmProps p) {
 bool em_image_button_key(const char *path, float size, uint64_t key) {
     em_flush();
     uint32_t w = 0, h = 0;
-    const uint32_t *px = em_image(path, &w, &h);
+    /* The glyph is drawn into size-8 (the padding below), so ask for the level
+     * that matches THAT -- asking for `size` would fetch one level too large
+     * and reintroduce the downscale this format exists to avoid. */
+    float inner = size - 8;
+    const uint32_t *px = em_image_at(path, inner > 1 ? (uint32_t)inner : 1, &w, &h);
     if (!px) return false;
     ui_begin_vstack(key ? key : (uint64_t)(uintptr_t)path);
     struct instance_handle self = ui_open();

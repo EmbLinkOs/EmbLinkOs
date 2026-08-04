@@ -478,8 +478,28 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
 }
 
 /* ------------------------------------------------------------------------- */
-/* draw_image (nearest sample, premultiplied source)                         */
+/* draw_image (premultiplied source; 1:1 copy, or bilinear when rescaling)   */
 /* ------------------------------------------------------------------------- */
+
+/* Bilinear blend of four premultiplied BGRA texels, weights in 0..256.
+ * Filtering PREMULTIPLIED pixels is a plain per-channel lerp -- that is the
+ * whole reason the icon format stores them premultiplied, since filtering
+ * straight alpha would need an unpremultiply/repremultiply round trip and
+ * would bleed the colour of transparent texels into visible edges. */
+static inline uint32_t bilerp4(uint32_t p00, uint32_t p10, uint32_t p01, uint32_t p11,
+                               uint32_t wx, uint32_t wy) {
+    uint32_t out = 0;
+    for (int sh = 0; sh < 32; sh += 8) {
+        uint32_t a = (p00 >> sh) & 0xFFu, b = (p10 >> sh) & 0xFFu;
+        uint32_t c = (p01 >> sh) & 0xFFu, d = (p11 >> sh) & 0xFFu;
+        uint32_t top = a * (256u - wx) + b * wx;
+        uint32_t bot = c * (256u - wx) + d * wx;
+        uint32_t v = (top * (256u - wy) + bot * wy) >> 16;
+        if (v > 255u) v = 255u;
+        out |= v << sh;
+    }
+    return out;
+}
 
 static void cpu_draw_image(struct render_target *rt, float x, float y, float w, float h,
                            const void *pixels, uint32_t src_w, uint32_t src_h,
@@ -500,17 +520,35 @@ static void cpu_draw_image(struct render_target *rt, float x, float y, float w, 
     int img_trivial_all = (opacity >= 0.999f) && g_dirty_full && g_clip_n == 0;
     int img_opaque_op   = (opacity >= 0.999f);
 
+    /* Filter only when the blit actually rescales. Drawing an icon at its own
+     * resolution -- the common case now that .eic hands back the level matching
+     * the requested size -- stays a straight copy on the integer fast path.
+     * Nearest sampling is only wrong when it has to drop or repeat pixels. */
+    int rescaling = ((uint32_t)(w + 0.5f) != src_w) || ((uint32_t)(h + 0.5f) != src_h);
+
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
         float v = (fy - y) / h; if (v < 0) v = 0; if (v >= 1) v = 0.999999f;
-        uint32_t sy = (uint32_t)(v * src_h);
+        float sfy = v * src_h;
+        uint32_t sy = (uint32_t)sfy;
+        uint32_t syn = (sy + 1 < src_h) ? sy + 1 : sy;
+        uint32_t wy = (uint32_t)((sfy - (float)sy) * 256.0f);
         const uint32_t *srow = (const uint32_t *)((const unsigned char *)pixels + (size_t)sy * src_stride);
+        const uint32_t *srown = (const uint32_t *)((const unsigned char *)pixels + (size_t)syn * src_stride);
         uint32_t *drow = rt_row(rt, (uint32_t)iy);
         for (int ix = x0; ix < x1; ix++) {
             float fx = ix + 0.5f;
             float u = (fx - x) / w; if (u < 0) u = 0; if (u >= 1) u = 0.999999f;
-            uint32_t sx = (uint32_t)(u * src_w);
-            uint32_t s = srow[sx];
+            float sfx = u * src_w;
+            uint32_t sx = (uint32_t)sfx;
+            uint32_t s;
+            if (!rescaling) {
+                s = srow[sx];
+            } else {
+                uint32_t sxn = (sx + 1 < src_w) ? sx + 1 : sx;
+                uint32_t wx = (uint32_t)((sfx - (float)sx) * 256.0f);
+                s = bilerp4(srow[sx], srow[sxn], srown[sx], srown[sxn], wx, wy);
+            }
             if (img_trivial_all || (img_opaque_op && coverage_full_at(fx, fy))) {
                 uint32_t sa = s >> 24;
                 if (!sa) continue;

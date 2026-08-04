@@ -131,7 +131,7 @@ static void folder_cell(int index) {
         if (e->is_dir) {
             /* Every folder uses the same bitmap, but must retain an independent
              * interaction identity or their hover states become shared. */
-            if (ImageButtonKey("/system/images/icon-files.pam", 62, e))
+            if (ImageButtonKey("/system/images/icon-files.eic", 62, e))
                 enter_dir(e->name);
         } else {
             if (IconButton(IconDoc).frame(62, 62).font(Title).clicked())

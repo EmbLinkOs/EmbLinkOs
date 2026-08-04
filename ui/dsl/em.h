@@ -611,6 +611,12 @@ int  em_take_frame_request(void);   /* runtime-internal: read-and-clear */
 void em_res_set_loader(uint8_t *(*load)(const char *path, size_t *out_len));
 uint32_t em_font(const char *path);
 const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h);
+/* Icon resolved at the size it will be DRAWN: a .eic container (docs/ICONS.md)
+ * carries the icon at several resolutions and this returns the level that fits
+ * want_px, so the blit is 1:1 rather than a resample of one oversized master.
+ * Non-.eic paths fall through to em_image, so .ppm/.pam art still works. */
+const uint32_t *em_image_at(const char *path, uint32_t want_px,
+                            uint32_t *out_w, uint32_t *out_h);
 void em_image_view(const char *path, EmProps p);
 #define Image(path, ...)  em_image_view((path), (EmProps){__VA_ARGS__})
 bool em_image_button(const char *path, float size);

@@ -1184,7 +1184,21 @@ STAGED_APPS ?=
 # is empty (nothing built yet) and EMBKFS_APPS drives the first build; on an
 # incremental build it catches every packed .elf/.embx, closing the drift-guard
 # gap so a rebuilt app (e.g. pkg.elf) always re-packs. See the guard below.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.app)
+# Icons: one master in icons/masters/<name>.png becomes system/images/<name>.eic
+# carrying every size the shell asks for (docs/ICONS.md). Regenerated whenever a
+# master -- or the generator -- changes, so dropping in new art is just `make`.
+# Falls back to the legacy .pam art for icons that have no PNG master yet.
+ICON_MASTERS := $(wildcard icons/masters/*.png)
+ICON_LEGACY  := $(wildcard system/images/*.pam)
+ICONS_STAMP  := build/.icons.stamp
+$(ICONS_STAMP): tools/mkicons.py $(ICON_MASTERS) $(ICON_LEGACY)
+	@mkdir -p build
+	python3 tools/mkicons.py
+	@touch $@
+.PHONY: icons
+icons: $(ICONS_STAMP)
+
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.app) $(ICONS_STAMP)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
