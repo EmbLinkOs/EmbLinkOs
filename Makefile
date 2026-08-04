@@ -1184,14 +1184,18 @@ STAGED_APPS ?=
 # is empty (nothing built yet) and EMBKFS_APPS drives the first build; on an
 # incremental build it catches every packed .elf/.embx, closing the drift-guard
 # gap so a rebuilt app (e.g. pkg.elf) always re-packs. See the guard below.
-# Icons: one master in icons/masters/<name>.png becomes system/images/<name>.eic
+# Icons: one master in icons/masters/<name>.svg becomes system/images/<name>.eic
 # carrying every size the shell asks for (docs/ICONS.md). Regenerated whenever a
 # master -- or the generator -- changes, so dropping in new art is just `make`.
-# Falls back to the legacy .pam art for icons that have no PNG master yet.
-ICON_MASTERS := $(wildcard icons/masters/*.png)
+# Falls back to the legacy .pam art for icons that have no master yet.
+ICON_MASTERS := $(wildcard icons/masters/*.svg) $(wildcard icons/masters/*.png)
 ICON_LEGACY  := $(wildcard system/images/*.pam)
 ICONS_STAMP  := build/.icons.stamp
-$(ICONS_STAMP): tools/mkicons.py $(ICON_MASTERS) $(ICON_LEGACY)
+# icons/masters is a prerequisite in its OWN right: a directory's mtime moves
+# when an entry is added or REMOVED, and deleting a master (falling back to the
+# legacy art) otherwise leaves the stamp newer than everything left behind, so
+# the stale .eic would survive with art whose master is gone.
+$(ICONS_STAMP): tools/mkicons.py icons/masters $(ICON_MASTERS) $(ICON_LEGACY)
 	@mkdir -p build
 	python3 tools/mkicons.py
 	@touch $@

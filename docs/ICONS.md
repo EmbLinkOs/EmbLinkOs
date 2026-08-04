@@ -9,11 +9,11 @@ same `icon-launcher.pam`, so most of the desktop was one hummingbird.
 
 The fix is a pipeline, not a bigger PNG:
 
-    icons/masters/<name>.png        <- real art, one file, high resolution
-        |  tools/mkicons.py  (build time, LANCZOS, premultiplied)
+    icons/masters/<name>.svg        <- real art, vector
+        |  tools/mkicons.py  (build time; each level rasterised natively)
         v
     system/images/<name>.eic        <- ONE file holding every size
-        |  em_icon(path, want_px)   (runtime, picks a level, zero-copy)
+        |  em_image_at(path, want_px)  (runtime, picks a level, zero-copy)
         v
     a 1:1 blit at the size actually asked for
 
@@ -22,20 +22,42 @@ case does no resampling at all — the renderer copies pixels straight across.
 
 ## Dropping in art
 
-Put a PNG in `icons/masters/` named after the icon:
+Put an SVG in `icons/masters/` named after the icon:
 
-    icons/masters/files.png      ->  /system/images/files.eic
-    icons/masters/terminal.png   ->  /system/images/terminal.eic
+    icons/masters/files.svg      ->  /system/images/files.eic
+    icons/masters/terminal.svg   ->  /system/images/terminal.eic
 
-Then `make embkfs.img`. Requirements:
+Then `make embkfs.img`. A non-square SVG is letterboxed into the square
+viewport rather than stretched, so design on a square canvas —
+`viewBox="0 0 64 64"` is a good default.
 
-- **RGBA PNG** (transparency is respected and resized correctly).
-- **At least as large as the biggest level** — 128×128 by default, but author
-  at 512×512 or 1024×1024 and let the generator do the reduction. Downscaling
-  from a large master is what produces clean small sizes; upscaling a small one
-  cannot invent detail, so the generator warns when a master is too small.
-- **Square**, ideally. A non-square master is padded (not stretched) onto a
-  transparent square canvas so nothing distorts.
+### Why SVG rather than a big PNG
+
+Every level is rasterised **natively at its own size**: the 16px level is drawn
+as a 16px icon, not squeezed down from a 512px bitmap. No level is a downscale
+of another, so small sizes keep their contrast instead of turning to mush, and
+there is no largest-level ceiling to bump into.
+
+It also renders through cairo's `ARGB32`, whose memory layout on little-endian
+is *exactly* the premultiplied B,G,R,A that `.eic` stores — so the render lands
+in the container with no conversion, no premultiply pass, and no filter
+overshoot to clamp.
+
+PNG masters still work (`icons/masters/<name>.png`) for art that is genuinely
+raster — photographs, painted texture. Those are premultiplied and reduced with
+LANCZOS, and the generator warns when the master is smaller than the top of the
+ladder, since upscaling cannot invent detail.
+
+### What the generator needs
+
+- **SVG masters**: librsvg + cairo (`sudo apt install librsvg2-2 libcairo2` on
+  Debian/Ubuntu). They are driven directly through `ctypes` rather than
+  gobject-introspection, because marshalling a cairo context through GI needs
+  the separate `python3-gi-cairo` package — one less thing to install.
+- **PNG and legacy `.pam` masters**: Pillow.
+
+Neither is needed for an ordinary build: the generated `.eic` are committed, so
+a checkout without the rasterisers keeps what is in the tree and says so.
 
 An app points at its icon through its `.app` manifest ([USERSPACE_v2.md](USERSPACE_v2.md)):
 
@@ -104,6 +126,6 @@ bright fringe. The generator clamps every channel to its alpha afterwards.
     python3 tools/mkicons.py            # all masters
     python3 tools/mkicons.py --list     # what would be built, and from what
 
-Until an icon has a real PNG master, the generator falls back to the legacy
+Until an icon has a real master, the generator falls back to the legacy
 `system/images/<name>.pam` so the desktop keeps working; those bootstrap icons
 are marked in `--list` output and are limited by their 96×96 source.
