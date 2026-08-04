@@ -1237,8 +1237,8 @@ EMBKFS_SCRATCH := embkfs_scratch.img
 #    Override per run: `make run-embkfs-cow XRES=1920 YRES=1080`.
 #  - zoom-to-fit=off: show guest pixels 1:1 instead of stretching them to the
 #    window (stretching is what made the display look blurry/badly scaled).
-XRES ?= 1024
-YRES ?= 768
+XRES ?= 800
+YRES ?= 600
 VGA_VIRTIO = -vga none -device virtio-vga,xres=$(XRES),yres=$(YRES)
 DISPLAY_1TO1 = -display gtk,zoom-to-fit=off
 # Default to full software emulation (TCG) so this runs on any machine without
