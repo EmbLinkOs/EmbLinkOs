@@ -903,7 +903,9 @@ int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y) {
     if (!w) { spin_unlock(&g_comp_lock); return -EMBK_ENOENT; }
     int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
     const fb_info_t *fi = fb_get_info();
-    if (!w->desktop && !w->widget && fi) {
+    /* A translucent bar IS the top-strip chrome, so it may sit above WORK_TOP
+     * (a menu bar at y=6). Ordinary app windows still stay in the work area. */
+    if (!w->desktop && !w->widget && !w->translucent && fi) {
         int maxx = (int)fi->width - (int)w->cw;
         int maxy = (int)fi->height - WORK_BOTTOM - win_titlebar_h(w) - (int)w->ch;
         if (maxx < 0) maxx = 0;
@@ -1046,7 +1048,7 @@ void compositor_pointer_tick(void) {
             if (nx != w->x || ny != w->y) {
                 int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
                 const fb_info_t *fi = fb_get_info();
-                if (fi && !w->widget) {
+                if (fi && !w->widget && !w->translucent) {
                     int maxx = (int)fi->width - (int)w->cw;
                     int maxy = (int)fi->height - WORK_BOTTOM -
                                win_titlebar_h(w) - (int)w->ch;
