@@ -55,19 +55,142 @@ static void launch_folder(const char *path) {
     g_launch_dir = path;
 }
 
-static void desktop_image(const char *image, const char *label, const char *path) {
-    VStack(.spacing = 5, .width = 92, .align = Center) {
-        if (ImageButton(image, 64))
-            launch_folder(path);
-        Text(label).caption();
+/* An app the user can click (launch/open) OR drag. `app` spawns an elf; `dir`
+ * opens Files at a folder (one of the two is set). */
+struct app_item { const char *icon; const char *label; const char *app; const char *dir; };
+
+/* Apps live EITHER on the desktop OR in the dock; dragging MOVES one between the
+ * two (never a copy), so a name never lingers behind. Home's folder is $HOME,
+ * filled in once at startup. */
+static struct app_item g_desk[16] = {
+    { "/system/images/icon-launcher.pam", "Apps",   0, "/data/apps" },
+    { "/system/images/icon-settings.pam", "System", 0, "/system" },
+};
+static int g_desk_n = 2;
+
+/* the bottom app dock -- a centered pill sized to its apps. Grows as apps are
+ * dragged in / shrinks as they are dragged out, but never below DOCK_MIN. */
+#define DOCK_MIN 2
+static struct app_item g_dock[16] = {
+    { "/system/images/icon-files.pam",    "Files",    "/data/apps/files/files.elf", 0 },
+    { "/system/images/icon-terminal.pam", "Terminal", "/data/apps/term/term.elf",   0 },
+};
+static int g_dock_n = 2;
+
+/* --- drag-and-drop state (a desktop icon INTO the dock, or a dock icon OUT) --- */
+static int   g_drag = 0;        /* 0 none, 1 dragging a desktop source, 2 a dock item */
+static int   g_drag_i = -1;     /* index in g_desk (kind 1) or g_dock (kind 2) */
+static struct app_item g_drag_item;
+static float g_drag_sx, g_drag_sy;   /* press-start pointer */
+static float g_drag_x, g_drag_y;     /* live pointer */
+static int   g_drag_moved = 0;       /* travelled past the click threshold -> a real drag */
+static int   g_any_active = 0;       /* any draggable held this frame */
+static float g_dockr[4];             /* dock pill world rect: x0,y0,x1,y1 */
+static int   g_have_dockr = 0;
+static int   g_dock_dirty = 0;       /* dock changed -> the loop force-repaints (no ghosts) */
+
+static void open_item(struct app_item it) {
+    if (it.dir)      launch_folder(it.dir);
+    else if (it.app) g_launch = it.app;
+}
+
+/* One draggable icon. kind: 1 = desktop source, 2 = dock item. Renders the icon
+ * (with hover styling) and tracks a press as either a click or a drag; the drop
+ * is resolved after the frame in dock_resolve_drop(). */
+static void drag_icon(struct app_item it, int size, int kind, int idx) {
+    /* Key by the app's IDENTITY (its unique path), NOT its slot index. When the
+     * list shifts (remove/reorder), an index-keyed instance gets reused for a
+     * different app -- which left a removed middle app lingering (dimmed) in
+     * place while the pill kept its old width. Identity keys track each app. */
+    uint64_t key = (kind == 1 ? 0xDE510000ULL : 0xD0C00000ULL)
+                 ^ (uint64_t)(uintptr_t)(it.app ? it.app : it.dir ? it.dir : it.icon);
+    ui_box_begin(key);
+    (void)ui_open();
+    ui_set_align(ALIGN_CENTER);
+    /* ALWAYS set opacity, so an instance never stays dimmed after its drag ends */
+    ui_set_opacity((g_drag == kind && g_drag_i == idx && g_drag_moved) ? 0.3f : 1.0f);
+    ImageButton(it.icon, size);         /* styling only; click/drag handled below */
+    if (ui_is_active()) {
+        g_any_active = 1;
+        float px, py; ui_pointer_pos(&px, &py);
+        if (!(g_drag == kind && g_drag_i == idx)) {  /* new press -> start tracking */
+            g_drag = kind; g_drag_i = idx; g_drag_item = it;
+            g_drag_sx = px; g_drag_sy = py; g_drag_moved = 0;
+        }
+        g_drag_x = px; g_drag_y = py;
+        if (!g_drag_moved) {
+            float dx = px - g_drag_sx, dy = py - g_drag_sy;
+            if (dx*dx + dy*dy > 49.0f) g_drag_moved = 1;   /* > ~7px = a drag */
+        }
+    }
+    ui_box_end();
+}
+
+/* The dock: a centered pill sized to its apps. Captures its own world rect so
+ * the drop can hit-test against it. */
+static void dock_pill(void) {
+    HStack(.height = 52, .spacing = 10, .px = 10, .align = Center,
+           .background = { .r=.03f, .g=.033f, .b=.045f, .a=.96f },
+           .corner = 18, .border = 1, .shadow = 2) {
+        (void)ui_open();
+        { float x, y, w, h; g_have_dockr = ui_open_rect(&x, &y, &w, &h);
+          if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; } }
+        for (int i = 0; i < g_dock_n; i++)
+            drag_icon(g_dock[i], 40, 2, i);
+        if (g_dock_n == 0) { EmProps hp = {0}; (void)hp; Text("  drag apps here  ").caption().secondary(); }
     }
 }
 
-static void task_image(const char *image, const char *app, const char *dir) {
-    if (ImageButton(image, 52)) {
-        if (dir) launch_folder(dir);
-        else     g_launch = app;
+/* The ghost: the dragged icon following the cursor (an out-of-flow overlay). */
+static void drag_ghost(void) {
+    if (!(g_drag && g_drag_moved)) return;
+    ui_begin_vstack(0x6057);
+    ui_set_overlay(true);            /* fill parent, out of flow */
+    ui_begin_vstack(1);
+    ui_set_offset(g_drag_x - 22.0f, g_drag_y - 22.0f);
+    ui_set_opacity(0.85f);
+    ImageButton(g_drag_item.icon, 44);
+    ui_end_stack();
+    ui_end_stack();
+}
+
+/* Resolve a released drag: add to / remove from / reorder the dock. Called after
+ * the frame is built, when the dock rect and final pointer are known. */
+static void dock_resolve_drop(void) {
+    if (!g_drag || g_any_active) return;         /* still held, or nothing pressed */
+    int over = g_have_dockr &&
+               g_drag_x >= g_dockr[0] - 12 && g_drag_x <= g_dockr[2] + 12 &&
+               g_drag_y >= g_dockr[1] - 28 && g_drag_y <= g_dockr[3] + 12;
+    if (!g_drag_moved) {
+        open_item(g_drag_item);                   /* a plain click -> launch/open */
+    } else if (g_drag == 1) {                      /* desktop icon dragged onto the dock */
+        if (over && g_dock_n < 16) {
+            g_dock[g_dock_n++] = g_drag_item;      /* add to dock ... */
+            for (int k = g_drag_i; k < g_desk_n - 1; k++) g_desk[k] = g_desk[k+1];
+            g_desk_n--;                            /* ... and REMOVE from the desktop */
+            g_dock_dirty = 1;
+        }                                          /* dropped off the dock -> snaps back */
+    } else if (g_drag == 2) {                       /* dock item */
+        if (!over) {                                /* pulled out -> back to the desktop */
+            if (g_dock_n > DOCK_MIN && g_desk_n < 16) {   /* keep at least DOCK_MIN docked */
+                g_desk[g_desk_n++] = g_drag_item;  /* return it to the desktop ... */
+                for (int k = g_drag_i; k < g_dock_n - 1; k++) g_dock[k] = g_dock[k+1];
+                g_dock_n--;                        /* ... and remove from the dock */
+                g_dock_dirty = 1;
+            }                                       /* at the minimum -> snaps back */
+        } else if (g_dockr[2] > g_dockr[0]) {       /* reorder by x */
+            int tgt = (int)(((g_drag_x - g_dockr[0]) / (g_dockr[2] - g_dockr[0])) * g_dock_n);
+            if (tgt < 0) tgt = 0;
+            if (tgt >= g_dock_n) tgt = g_dock_n - 1;
+            if (tgt != g_drag_i) {
+                struct app_item tmp = g_dock[g_drag_i];
+                if (tgt > g_drag_i) for (int k=g_drag_i; k<tgt; k++) g_dock[k]=g_dock[k+1];
+                else                for (int k=g_drag_i; k>tgt; k--) g_dock[k]=g_dock[k-1];
+                g_dock[tgt] = tmp; g_dock_dirty = 1;
+            }
+        }
     }
+    g_drag = 0; g_drag_i = -1; g_drag_moved = 0;
 }
 
 /* Post-login desktop: wallpaper, three honest folder shortcuts, and a
@@ -75,57 +198,41 @@ static void task_image(const char *image, const char *app, const char *dir) {
  * OS can report today; network/audio/battery indicators arrive with their
  * corresponding services instead of being decorative lies. */
 static void home_ui(void) {
+    g_any_active = 0; g_have_dockr = 0;   /* recomputed each frame during the build */
     Screen(.width = g_sw, .height = g_sh, .padding = -1, .align = Fill) {
         BackgroundImage("/system/images/colibri-user.ppm");
         VStack(.width = g_sw, .height = g_sh, .padding = 0, .spacing = 0,
                .align = Fill) {
-            Glass(.width = g_sw, .height = 32, .padding = 6, .corner = -1,
-                  .background = { .r=.02f, .g=.022f, .b=.028f, .a=.96f },
-                  .border = -1, .shadow = -1) {
-                HStack(.width = g_sw - 12, .spacing = 12, .align = Center) {
-                    Text("EmbLink OS").caption();
-                    Spacer();
-                    Icon(IconCloud).secondary();
-                    Icon(IconBell).secondary();
-                    Icon(IconBolt).secondary();
-                    Text(g_datetime).caption();
-                }
-            }
+            /* Reserve the top strip for our own floating menu bar (topbar.elf,
+             * spawned at startup) -- its drag handle, dock and pin live there.
+             * No desktop-drawn top bar anymore. */
+            VStack(.width = g_sw, .height = 32, .padding = 0) { }
 
             /* Exact work-area height: the layout engine's `.grow` is intended
              * for siblings inside a measured row and did not consume the
              * remaining desktop height here, which left the taskbar mid-screen. */
             HStack(.padding = 16, .height = g_sh - 32 - 64, .align = Leading) {
                 VStack(.spacing = 18, .align = Center) {
-                    desktop_image("/system/images/icon-files.pam",
-                                  "Home", getenv("HOME"));
-                    desktop_image("/system/images/icon-launcher.pam",
-                                  "Apps", "/data/apps");
-                    desktop_image("/system/images/icon-settings.pam",
-                                  "System", "/system");
+                    /* Desktop apps -- also the drag SOURCES: drag one onto the
+                     * dock to pin it (it leaves the desktop, name and all). */
+                    for (int i = 0; i < g_desk_n; i++) {
+                        VStack(.spacing = 5, .width = 92, .align = Center) {
+                            drag_icon(g_desk[i], 64, 1, i);
+                            Text(g_desk[i].label).caption();
+                        }
+                    }
                 }
                 Spacer();
             }
 
-            Glass(.width = g_sw, .height = 64, .padding = 8, .corner = -1,
-                  .background = { .r=.025f, .g=.028f, .b=.038f, .a=.94f },
-                  .border = 1, .shadow = -1) {
-                HStack(.width = g_sw - 16, .spacing = 8, .align = Center) {
-                    task_image("/system/images/icon-launcher.pam",
-                               NULL, "/data/apps");
-                    task_image("/system/images/icon-files.pam",
-                               "/data/apps/files/files.elf", NULL);
-                    task_image("/system/images/icon-terminal.pam",
-                               "/data/apps/term/term.elf", NULL);
-                    task_image("/system/images/icon-settings.pam",
-                               NULL, "/system");
-                    Spacer();
-                    Text(getenv("USER") ? getenv("USER") : "user").caption().secondary();
-                    Text(g_clock).body();
-                }
+            /* the app dock: a centered pill sized to its apps (not full-width) */
+            HStack(.width = g_sw, .height = 64, .align = Center, .justify = Center) {
+                dock_pill();
             }
         }
+        drag_ghost();          /* the dragged icon follows the cursor (overlay) */
     }
+    dock_resolve_drop();       /* act on a released drag (add / remove / reorder) */
 }
 
 /* One instance per app: remember each child's spawn HANDLE (what embk_spawn
@@ -288,10 +395,10 @@ int main(int argc, char **argv, char **envp) {
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
 
     em_set_clock(embk_uptime_ms);
-    /* The authenticated desktop shell provides its own top status bar + bottom
-     * dock, so we no longer auto-spawn the floating menu bar / clock widget
-     * (they overlapped the shell). Both remain on the image
-     * (/data/apps/topbar, /data/apps/clockw) to launch manually. */
+    /* Our menu bar IS topbar.elf -- the Apple-modern glass bar with the drag
+     * handle, draggable dock chips, and pin/snap. The desktop no longer draws
+     * its own top status bar; this floating bar takes the top strip. */
+    spawn_app("/data/apps/topbar/topbar.elf", NULL);
     embk_puts(1, "home: desktop ready\n");
 
     for (;;) {
@@ -315,9 +422,15 @@ int main(int argc, char **argv, char **envp) {
         g_launch_dir = 0;
         ui_frame_begin(); em_new_frame(); home_ui(); em_flush(); ui_frame_end();
         ui_run_layout((float)sw, (float)sh);
+
+        /* While a drag ghost is airborne (it moves every frame) or the dock just
+         * changed, force a clean full repaint so no ghost/trail is left behind. */
+        int force_full = (g_drag && g_drag_moved) || g_dock_dirty;
+        if (force_full) { scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get()); g_dock_dirty = 0; }
+
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
-        if (r.full || r.n_dirty == 0) {
+        if (force_full || r.full || r.n_dirty == 0) {
             embk_win_present(win, pixels, sw, sh);
         } else {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);

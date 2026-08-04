@@ -1312,9 +1312,10 @@ static int64_t sys_win_create(struct regs *r) {
     if (cg) return cg;
     /* Window-style flags ride the high bits of rdi (cw is <= 16 bits real). */
     uint32_t cw = (uint32_t)(r->rdi & 0xFFFFFFFFULL), ch = (uint32_t)r->rsi;
-    int chromeless = (r->rdi >> 32) & 1;   /* EMBK_WINF_CHROMELESS */
-    int widget     = (r->rdi >> 33) & 1;   /* EMBK_WINF_WIDGET */
-    int glass      = (r->rdi >> 34) & 1;   /* EMBK_WINF_GLASS */
+    int chromeless  = (r->rdi >> 32) & 1;   /* EMBK_WINF_CHROMELESS */
+    int widget      = (r->rdi >> 33) & 1;   /* EMBK_WINF_WIDGET */
+    int glass       = (r->rdi >> 34) & 1;   /* EMBK_WINF_GLASS */
+    int translucent = (r->rdi >> 35) & 1;   /* EMBK_WINF_TRANSLUCENT */
     int32_t x = (int32_t)r->rdx, y = (int32_t)r->r10;
     char title[COMP_TITLE_MAX + 1];
     int i = 0;
@@ -1333,6 +1334,8 @@ static int64_t sys_win_create(struct regs *r) {
         uint64_t cva = 0;
         int64_t id = widget
             ? compositor_win_create_widget(current_process, cw, ch, x, y, title, glass, &cva)
+            : translucent
+            ? compositor_win_create_translucent(current_process, cw, ch, x, y, title, &cva)
             : glass
             ? compositor_win_create_glass(current_process, cw, ch, x, y, title, &cva)
             : chromeless

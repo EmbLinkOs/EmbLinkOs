@@ -318,6 +318,7 @@ void em_window_set_mover(void (*mover)(int win, int32_t x, int32_t y));
 void em_window_bind(int win, int32_t x, int32_t y);
 void em_window_move_to(int32_t x, int32_t y);   /* snap/pin the bound window */
 void em_window_pos(int32_t *x, int32_t *y);     /* current bound-window top-left */
+int  em_window_moved(void);                     /* read-and-clear: window moved since last poll */
 
 /* DragHandle: a placeable strip that drags the bound window (menu-bar move). */
 void em_drag_handle_(EmProps p);
@@ -447,6 +448,7 @@ void em_menubar_end_(void);
 #define Menu(label, ...)  EM_SCOPE_(em_menu_((label), (EmProps){__VA_ARGS__}), em_menu_end_())
 void em_menu_(const char *label, EmProps p);
 void em_menu_end_(void);
+int  em_menu_any_open(void);   /* is any MenuBar dropdown open? (app runtime grows the window) */
 
 /* MenuItem: one row; returns true the frame it's clicked (which also closes the
  * open menu). MenuItemK adds a right-aligned shortcut hint ("Ctrl+S"). */
@@ -517,8 +519,11 @@ typedef enum { ChromeKernel = 0, Chromeless } EmChrome;
 typedef enum { FixedSize = 0, Resizable } EmResize;
 /* Window material. Acrylic = a frosted GLASS window: the compositor blurs the
  * desktop behind it and composites the window's translucent pixels over it, so
- * the title bar and gaps show the wallpaper frosted (implies Chromeless). */
-typedef enum { MaterialSolid = 0, Acrylic } EmMaterial;
+ * the title bar and gaps show the wallpaper frosted (implies Chromeless).
+ * Translucent = per-pixel transparent, NO blur: the window's empty pixels reveal
+ * the SHARP desktop, so a thin bar can carry a tall invisible canvas whose only
+ * painted pixels are the bar strip and its open dropdowns (implies Chromeless). */
+typedef enum { MaterialSolid = 0, Acrylic, Translucent } EmMaterial;
 
 typedef struct {
     const char *title;

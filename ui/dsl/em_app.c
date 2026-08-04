@@ -92,7 +92,8 @@ int em_app_run(const EmApp *app) {
     int winw = app->fullscreen && sw ? (int)sw : (app->size.w > 0 ? app->size.w : 640);
     int winh = app->fullscreen && sh ? (int)sh : (app->size.h > 0 ? app->size.h : 480);
     int glass = (app->material == Acrylic);      /* frosted window (implies chromeless) */
-    int chromeless = app->fullscreen || (app->chrome == Chromeless) || glass;
+    int translucent = (app->material == Translucent);  /* per-pixel transparent, no blur */
+    int chromeless = app->fullscreen || (app->chrome == Chromeless) || glass || translucent;
     int bar = chromeless ? 0 : 26;
     if (!app->fullscreen && sw && winw > (int)sw - 8)        winw = (int)sw - 8;
     if (!app->fullscreen && sh && winh > (int)sh - 32 - 64 - bar)
@@ -108,7 +109,9 @@ int em_app_run(const EmApp *app) {
     g_viewport_h = (float)winh;
 
     uint32_t *px = 0;
-    uint64_t wflags = glass ? EMBK_WINF_GLASS : (chromeless ? EMBK_WINF_CHROMELESS : 0);
+    uint64_t wflags = translucent ? EMBK_WINF_TRANSLUCENT
+                    : glass       ? EMBK_WINF_GLASS
+                    : chromeless  ? EMBK_WINF_CHROMELESS : 0;
     int win = embk_win_create_shared_ex((uint32_t)winw, (uint32_t)winh, wx, wy, title,
                                         wflags, (void **)&px);
     if (win < 0 || !px) {
@@ -131,6 +134,7 @@ int em_app_run(const EmApp *app) {
     int prev_epoch = em_ui_epoch(), first = 1;
     int maximized = 0;
     int normal_x = wx, normal_y = wy, normal_w = winw, normal_h = winh;
+    int thin_h = winh, menu_expanded = 0;   /* translucent menu-bar auto-grow */
     struct embk_win_input prev_in; memset(&prev_in, 0, sizeof prev_in);
 
     for (;;) {
@@ -160,6 +164,29 @@ int em_app_run(const EmApp *app) {
                 maximized = !maximized;
             }
         }
+
+        /* Translucent menu bar: a dropdown can't paint outside its window, so
+         * grow the (thin) bar window tall enough to show the open dropdown, then
+         * shrink back on close. The extra height is fully transparent, so the
+         * bar still reads as a thin strip; only the dropdown paints into it. */
+        if (translucent) {
+            int want = em_menu_any_open();
+            if (want != menu_expanded) {
+                int32_t wyc = 0; em_window_pos(0, &wyc);
+                int nh = want ? (int)sh - wyc - 8 : thin_h;
+                if (want && nh > 340) nh = 340;
+                if (nh < thin_h) nh = thin_h;
+                uint32_t *npx = 0;
+                if (embk_win_resize(win, (uint32_t)winw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
+                    px = npx; winh = nh;
+                    g_viewport_h = (float)winh;
+                    rt.pixels = px; rt.height = (uint32_t)winh; rt.stride = (uint32_t)winw * 4;
+                    scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
+                    em_request_frame();
+                    menu_expanded = want;
+                }
+            }
+        }
         int had_key = 0;
         for (int c; (c = embk_key_poll()) != 0; ) {
             if (g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
@@ -186,9 +213,10 @@ int em_app_run(const EmApp *app) {
          * frames coming while a modal is up costs nothing -- modals are
          * transient -- and matches the always-build loop the modal was designed
          * against. */
+        int win_moved = em_window_moved();   /* read-and-clear (drag/snap last frame) */
         int build = first || input_edge || em_take_frame_request() ||
                     em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
-                    em_overlay_active();
+                    em_overlay_active() || win_moved;
         if (!build) { embk_sleep_ms(pace); continue; }
 
         if (in.focused) {
@@ -204,9 +232,12 @@ int em_app_run(const EmApp *app) {
          * a close pull animates (the fade/slide moves the whole window, which the
          * dirty-rect present would otherwise ghost). */
         bool force_full = false;
-        if (first || em_ui_epoch() != prev_epoch || em_window_pulling()) {
+        if (first || em_ui_epoch() != prev_epoch || em_window_pulling() || win_moved) {
             const struct ui_theme *t = ui_theme();
-            uint32_t bg = (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
+            /* translucent windows clear to fully TRANSPARENT so their empty
+             * canvas reveals the desktop; opaque/glass windows clear to bg. */
+            uint32_t bg = translucent ? 0x00000000u
+                        : (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
                         | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
             for (int i = 0; i < winw * winh; i++) px[i] = bg;
             scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());

@@ -118,6 +118,8 @@ static bool button_impl(const char *label, struct color fill, struct color text_
         ui_set_paint(solid(f));
     } else if (hovered) {                 /* ghost: soft wash on hover */
         ui_set_paint(solid(shade(t->accent_soft, pressed ? 0.9f : 1.0f)));
+    } else {
+        ui_set_paint(solid((struct color){0, 0, 0, 0}));   /* reset: un-hover cleanly */
     }
     ui_set_corner_radius(t->radius_md);
     if (border_w > 0) ui_set_border(border_w, hovered ? t->accent : border_c);
@@ -292,6 +294,8 @@ int ui_segmented(const char *const *labels, int count, int selected) {
             ui_set_shadow(true, t->shadow_sm.dx, t->shadow_sm.dy, t->shadow_sm.blur, t->shadow_sm.color);
         } else if (ui_is_hovered()) {
             ui_set_paint(solid(shade(t->surface_alt, 1.10f)));
+        } else {
+            ui_set_paint(solid((struct color){0, 0, 0, 0}));   /* reset: un-hover cleanly */
         }
         ui_set_corner_radius(t->radius_sm);
         ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp3);

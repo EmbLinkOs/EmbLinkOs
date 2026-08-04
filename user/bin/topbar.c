@@ -41,6 +41,8 @@ static void snap_to(int anchor) {
     em_window_move_to(x, y);
 }
 
+#define BAR_H 40
+
 static void bar(void) {
     const struct ui_theme *t = ui_theme();
 
@@ -48,39 +50,51 @@ static void bar(void) {
     static int first = 1;
     if (first) { first = 0; snap_to(1); }
 
-    HStack(.grow = 1, .align = Center, .spacing = 10, .px = 12) {
-        Icon(IconBolt).color(t->text);
-        MenuBar() {
-            Menu("EmbLink") {
-                MenuItem("About EmbLink");
-                MenuSeparator();
-                if (MenuItem("Quit")) exit(0);
+    /* The window is TRANSLUCENT (per-pixel transparent, no blur) and grows tall
+     * only while a menu is open. So the view fills the whole window, but only
+     * the top strip paints a bar -- the rest stays transparent (revealing the
+     * desktop) and holds the room a dropdown needs to render OUTSIDE the bar. */
+    VStack(.width = em_viewport_width(), .height = em_viewport_height(),
+           .align = Fill, .spacing = 0) {
+        HStack(.height = BAR_H, .align = Center, .spacing = 10, .px = 12,
+               .background = { .r=.03f, .g=.033f, .b=.043f, .a=.92f },
+               .corner = 12, .border = 1) {
+            Icon(IconBolt).color(t->text);
+            MenuBar() {
+                Menu("EmbLink") {
+                    MenuItem("About EmbLink");
+                    MenuSeparator();
+                    if (MenuItem("Quit")) exit(0);
+                }
+                Menu("File") { MenuItem("New"); MenuItem("Open"); }
+                Menu("Edit") { MenuItem("Undo"); MenuItem("Redo"); }
+                Menu("View") { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
             }
-            Menu("File") { MenuItem("New"); MenuItem("Open"); }
-            Menu("Edit") { MenuItem("Undo"); MenuItem("Redo"); }
-            Menu("View") { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
+
+            /* the empty middle drags the whole bar -- give it a real height so
+             * it's grabbable (an intrinsic-height empty strip collapses to 0px
+             * and the press falls through, so the drag never starts). */
+            DragHandle(.grow = 1, .height = 28) { }
+
+            /* draggable status chips: reorder / pull one down to remove */
+            Dock(g_items, &g_n, chip);
+            Text("9:41").bold();
+
+            /* pin: cycle free -> center -> left -> right; the glyph shows pinned */
+            if (Button(g_pin ? "pinned" : "free").ghost().clicked()) {
+                g_pin = (g_pin + 1) % 4;
+                snap_to(g_pin);
+            }
         }
-
-        /* the empty middle drags the whole bar */
-        DragHandle(.grow = 1) { }
-
-        /* draggable status chips: reorder / pull one down to remove */
-        Dock(g_items, &g_n, chip);
-        Text("9:41").bold();
-
-        /* pin: cycle free -> center -> left -> right; the glyph shows pinned */
-        if (Button(g_pin ? "pinned" : "free").ghost().clicked()) {
-            g_pin = (g_pin + 1) % 4;
-            snap_to(g_pin);
-        }
+        Spacer();   /* transparent canvas below the bar -- dropdown room */
     }
 }
 
 EM_APPLICATION {
     .title    = "TopBar",
-    .size     = { BAR_W, 40 },
+    .size     = { BAR_W, BAR_H },
     .theme    = Dark,
     .chrome   = Chromeless,
-    .material = Acrylic,          /* frosted glass */
+    .material = Translucent,      /* thin transparent bar; grows for dropdowns */
     .view     = bar,
 };

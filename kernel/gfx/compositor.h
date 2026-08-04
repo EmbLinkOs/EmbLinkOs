@@ -72,6 +72,13 @@ int64_t compositor_win_create_glass(struct process *client, uint32_t cw, uint32_
                                     int32_t x, int32_t y, const char *title,
                                     uint64_t *out_client_va);
 
+/* TRANSLUCENT window: chromeless, per-pixel transparent, NO blur -- composited
+ * over the sharp backdrop like the desktop but raisable. A thin bar with a tall
+ * invisible canvas for its dropdowns. */
+int64_t compositor_win_create_translucent(struct process *client, uint32_t cw, uint32_t ch,
+                                          int32_t x, int32_t y, const char *title,
+                                          uint64_t *out_client_va);
+
 /* Resize a shared window's content: fresh page backing, new client VA out.
  * The caller must switch to the new pointer immediately. */
 int64_t compositor_win_resize(struct process *client, uint32_t id,

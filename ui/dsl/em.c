@@ -671,6 +671,7 @@ static bool em_button_impl(const char *s, EmProps p, bool *out_hov) {
     if (p.color.a > 0) txt = p.color;
     if (has_fill) { Color f = pressed ? shade(fill, 0.86f) : hov ? shade(fill, 1.10f) : fill; ui_set_paint(solid(f)); }
     else if (hov) ui_set_paint(solid(shade(t->accent_soft, pressed ? 0.9f : 1.0f)));
+    else          ui_set_paint(solid((Color){0, 0, 0, 0}));   /* reset: a ghost button un-hovers cleanly */
     ui_set_corner_radius(p.corner > 0 ? p.corner : t->radius_md);
     if (has_border || p.border > 0) ui_set_border(p.border > 0 ? p.border : 1.0f, hov ? t->accent : bcol);
     ui_set_padding(t->sp2 + 1, t->sp4, t->sp2 + 1, t->sp4);
@@ -891,16 +892,20 @@ static int      g_win_id;
 static int32_t  g_win_x, g_win_y;      /* window's current screen top-left */
 static int      g_win_dragging;
 static float    g_win_grab_x, g_win_grab_y;   /* pointer-at-grab, content-local */
+static int      g_win_moved;                  /* set whenever the window moved -> force a full repaint */
 
 void em_window_set_mover(void (*mover)(int win, int32_t x, int32_t y)) { g_win_mover = mover; }
 void em_window_bind(int win, int32_t x, int32_t y) {
     g_win_id = win; g_win_x = x; g_win_y = y; g_win_bound = 1;
 }
+/* Read-and-clear: did the bound window move since the last poll? The app runtime
+ * force-repaints on a move so a drag/snap can't leave dirty-rect ghost trails. */
+int em_window_moved(void) { int m = g_win_moved; g_win_moved = 0; return m; }
 /* Programmatically move the bound window (e.g. a pin/snap-to-anchor control). */
 void em_window_move_to(int32_t x, int32_t y) {
     if (!g_win_bound || !g_win_mover || (x == g_win_x && y == g_win_y)) return;
     g_win_mover(g_win_id, x, y);
-    g_win_x = x; g_win_y = y;
+    g_win_x = x; g_win_y = y; g_win_moved = 1;
 }
 void em_window_pos(int32_t *x, int32_t *y) { if (x) *x = g_win_x; if (y) *y = g_win_y; }
 
@@ -1059,7 +1064,7 @@ static void em_window_drag_(void) {
             int ny = g_win_y + (int)(py - g_win_grab_y);
             if ((nx != g_win_x || ny != g_win_y) && g_win_mover) {
                 g_win_mover(g_win_id, nx, ny);
-                g_win_x = nx; g_win_y = ny;
+                g_win_x = nx; g_win_y = ny; g_win_moved = 1;
             }
         }
     } else {
@@ -1443,6 +1448,7 @@ void em_calendar(int *date, EmProps p) {
             ui_set_justify(JUSTIFY_CENTER);
             if (sel)      { ui_set_paint(solid(t->accent));      ui_set_corner_radius(t->radius_md); }
             else if (hov) { ui_set_paint(solid(t->surface_alt)); ui_set_corner_radius(t->radius_md); }
+            else          { ui_set_paint(solid((Color){0, 0, 0, 0})); }   /* reset when neither */
             if (inmonth) {
                 char ds[12];
                 snprintf(ds, sizeof ds, "%d", day);
@@ -2173,7 +2179,10 @@ bool em_image_button_key(const char *path, float size, uint64_t key) {
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     ui_set_corner_radius(12);
-    if (hov) ui_set_paint(solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f)));
+    /* ALWAYS set the paint: a hover highlight set only on hover is retained and
+     * would stay lit after the pointer leaves. Transparent when not hovered. */
+    ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
+                     : solid((Color){0, 0, 0, 0}));
     ui_image_sized((uint64_t)(uintptr_t)px, px, w, h, size - 8, size - 8);
     ui_end_stack();
     return ui_consume_click(self);
@@ -2302,6 +2311,11 @@ void em_menu_end_(void) {
     if (g_menu_cur_open) { if (em_menu_panel_close()) { g_menu_open = 0; g_em_epoch++; } }
     else ui_end_stack();                  /* hidden box */
 }
+
+/* Is any MenuBar dropdown currently open? The app runtime uses this to grow a
+ * thin translucent menu-bar window tall enough to show the dropdown, then
+ * shrink it back on close -- so the bar stays a thin strip when idle. */
+int em_menu_any_open(void) { return g_menu_open != 0; }
 
 bool em_menu_item(const char *label, const char *shortcut) {
     em_flush();

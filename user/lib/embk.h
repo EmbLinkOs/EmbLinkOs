@@ -698,6 +698,10 @@ static inline int embk_win_create_shared(uint32_t cw, uint32_t ch, int32_t x, in
                                              * blurs the backdrop behind the window
                                              * and composites its translucent pixels
                                              * over it (frosted acrylic). */
+#define EMBK_WINF_TRANSLUCENT (1ULL << 35)  /* TRANSLUCENT: chromeless, per-pixel
+                                             * transparent, NO blur -- composited
+                                             * over the sharp backdrop. A thin bar
+                                             * with a tall invisible dropdown canvas. */
 
 /* Resize a shared window's content to w x h. The window's pixel pages are
  * REPLACED: *out_pixels receives the NEW mapping base and the old pointer is

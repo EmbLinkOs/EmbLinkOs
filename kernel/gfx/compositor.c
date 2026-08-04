@@ -33,6 +33,11 @@ struct comp_window {
                              * pixels; the compositor BLURS the backdrop behind it
                              * and composites the window over it (frosted acrylic).
                              * Implies chromeless (the app owns its own chrome). */
+    int       translucent;  /* 1 = per-pixel translucent, NO blur (like the desktop
+                             * but a raisable floating window): starts transparent
+                             * and composites over the SHARP backdrop. Lets a thin
+                             * bar carry a tall transparent canvas whose only opaque
+                             * pixels are the bar + its open dropdowns. */
     int       pending_action; /* one-shot request delivered to the app runtime */
     /* Latched click replay: a press EDGE on this window's content is remembered
      * here so an app that was busy (e.g. mid first-frame render, seconds long
@@ -199,9 +204,11 @@ static void win_frame_rect(const struct comp_window *w,
 static int imax(int a, int b) { return a > b ? a : b; }
 static int imin(int a, int b) { return a < b ? a : b; }
 
-/* App windows (not the desktop, not widgets) get the focused-window accent glow. */
+/* App windows (not the desktop, not widgets, not translucent bars) get the
+ * focused-window accent glow. A translucent bar's frame is a tall invisible
+ * canvas, so a halo around it would outline empty space -- skip it. */
 static int win_glows(const struct comp_window *w) {
-    return w->used && !w->desktop && !w->widget;
+    return w->used && !w->desktop && !w->widget && !w->translucent;
 }
 /* The rect a repaint must cover for a window: its frame, GROWN by the glow band
  * for glow windows so the halo is drawn / erased with the window (else it trails
@@ -353,9 +360,11 @@ static void paint_window(struct comp_window *w, int focused,
                 fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
             else
                 fb_blit_uniform(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw, GLASS_ALPHA);
-        } else if (w->desktop) {
-            /* the home desktop renders a translucent scrim over a transparent bg;
-             * composite it per-pixel so the aurora shows through (opaque tiles copy) */
+        } else if (w->desktop || w->translucent) {
+            /* the home desktop and a translucent bar render a transparent canvas
+             * with only some opaque pixels; composite per-pixel over the SHARP
+             * backdrop (no blur), so empty regions reveal the desktop below and a
+             * thin bar can carry a tall invisible area for its dropdowns. */
             fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
         } else {
             fb_blit(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
@@ -605,6 +614,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->chromeless = 0;
     w->widget = 0;
     w->glass = 0;
+    w->translucent = 0;
     w->pend_click = 0;
     w->content = buf;
     int n = 0;
@@ -635,11 +645,13 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
 static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint32_t ch,
                                       int32_t x, int32_t y, const char *title,
                                       int desktop, int chromeless, int widget, int glass,
+                                      int translucent,
                                       uint64_t *out_client_va) {
     const fb_info_t *fi = fb_get_info();
     if (!fi || !client) return -EMBK_EINVAL;
     if (widget) chromeless = 1;                  /* widgets are always chromeless */
     if (glass)  chromeless = 1;                  /* glass windows own their chrome */
+    if (translucent) chromeless = 1;             /* translucent windows own their chrome */
     uint32_t bar = (desktop || chromeless) ? 0 : COMP_TITLEBAR_H;
     if (cw == 0 || ch == 0 || cw > fi->width || ch + bar > fi->height)
         return -EMBK_EINVAL;
@@ -693,6 +705,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->chromeless = chromeless;
     w->widget = widget;
     w->glass = glass && !desktop;
+    w->translucent = translucent && !desktop;
     w->pend_click = 0;
     w->z = desktop ? 0 : widget ? g_widget_z++ : g_next_z++;   /* z band per kind */
     w->content = (uint32_t *)kview;
@@ -701,7 +714,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     /* the desktop (home) and glass WIDGETS start TRANSPARENT so the aurora shows
      * through wherever they render nothing / a translucent tint; opaque app
      * windows (incl. acrylic, which is composited at a uniform alpha) start black */
-    { uint32_t init_px = (desktop || (glass && widget)) ? 0x00000000u : 0xFF000000u;
+    { uint32_t init_px = (desktop || (glass && widget) || translucent) ? 0x00000000u : 0xFF000000u;
       for (size_t i = 0; i < (size_t)cw * ch; i++) w->content[i] = init_px; }
     int n = 0;
     if (title) { while (n < COMP_TITLE_MAX && title[n]) { w->title[n] = title[n]; n++; } }
@@ -722,7 +735,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
 int64_t compositor_win_create_shared(struct process *client, uint32_t cw, uint32_t ch,
                                      int32_t x, int32_t y, const char *title,
                                      uint64_t *out_client_va) {
-    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 0, 0, 0, out_client_va);
+    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 0, 0, 0, 0, out_client_va);
 }
 
 /* Zero-copy floating window with NO kernel chrome: the app draws its own bar
@@ -731,7 +744,7 @@ int64_t compositor_win_create_shared(struct process *client, uint32_t cw, uint32
 int64_t compositor_win_create_chromeless(struct process *client, uint32_t cw, uint32_t ch,
                                          int32_t x, int32_t y, const char *title,
                                          uint64_t *out_client_va) {
-    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, 0, out_client_va);
+    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, 0, 0, out_client_va);
 }
 
 /* Resize a SHARED window's content to (nw,nh): allocate a fresh page backing,
@@ -816,7 +829,7 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
 int64_t compositor_win_create_widget(struct process *client, uint32_t cw, uint32_t ch,
                                      int32_t x, int32_t y, const char *title,
                                      int glass, uint64_t *out_client_va) {
-    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 1, glass, out_client_va);
+    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 1, glass, 0, out_client_va);
 }
 
 /* Full-screen chromeless HOME/desktop window: sized to the framebuffer, pinned
@@ -827,7 +840,7 @@ int64_t compositor_win_create_desktop(struct process *client, uint64_t *out_clie
     const fb_info_t *fi = fb_get_info();
     if (!fi) return -EMBK_ENODEV;
     int64_t id = win_create_shared_impl(client, fi->width, fi->height, 0, 0,
-                                        "", 1, 0, 0, 0, out_client_va);
+                                        "", 1, 0, 0, 0, 0, out_client_va);
     if (id > 0) { if (out_w) *out_w = fi->width; if (out_h) *out_h = fi->height; }
     return id;
 }
@@ -837,7 +850,16 @@ int64_t compositor_win_create_desktop(struct process *client, uint64_t *out_clie
 int64_t compositor_win_create_glass(struct process *client, uint32_t cw, uint32_t ch,
                                      int32_t x, int32_t y, const char *title,
                                      uint64_t *out_client_va) {
-    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, 1, out_client_va);
+    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, 1, 0, out_client_va);
+}
+
+/* Zero-copy TRANSLUCENT window: chromeless, per-pixel transparent, NO blur --
+ * composited over the sharp backdrop like the desktop but raisable. A thin bar
+ * with a tall invisible canvas for its dropdowns (EmUI menu bar). */
+int64_t compositor_win_create_translucent(struct process *client, uint32_t cw, uint32_t ch,
+                                          int32_t x, int32_t y, const char *title,
+                                          uint64_t *out_client_va) {
+    return win_create_shared_impl(client, cw, ch, x, y, title, 0, 1, 0, 0, 1, out_client_va);
 }
 
 int compositor_win_is_shared(int pid, uint32_t id) {
