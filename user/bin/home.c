@@ -288,8 +288,10 @@ int main(int argc, char **argv, char **envp) {
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
 
     em_set_clock(embk_uptime_ms);
-    spawn_app("/data/apps/clockw/clockw.elf");   /* the desktop CLOCK widget (V5) -- fire & track */
-    spawn_app("/data/apps/topbar/topbar.elf");   /* the dynamic Apple-modern menu bar */
+    /* The authenticated desktop shell provides its own top status bar + bottom
+     * dock, so we no longer auto-spawn the floating menu bar / clock widget
+     * (they overlapped the shell). Both remain on the image
+     * (/data/apps/topbar, /data/apps/clockw) to launch manually. */
     embk_puts(1, "home: desktop ready\n");
 
     for (;;) {
