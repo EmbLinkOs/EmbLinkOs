@@ -1241,11 +1241,11 @@ XRES ?= 1280
 YRES ?= 800
 VGA_VIRTIO = -vga none -device virtio-vga,xres=$(XRES),yres=$(YRES)
 DISPLAY_1TO1 = -display gtk,zoom-to-fit=off
-# KVM exposes the host CPU directly, including RDRAND which getentropy() needs,
-# and avoids the substantial pointer/UI latency of full software emulation.
-# These remain overridable for machines where KVM is unavailable:
-#   make run-embkfs-cow QEMU_ACCEL=tcg,thread=multi QEMU_CPU=qemu64,+rdrand
-QEMU_ACCEL ?= kvm
+# Default to full software emulation (TCG) so this runs on any machine without
+# KVM. `-cpu max` still exposes RDRAND (which getentropy() needs) under TCG.
+# On a host WITH KVM, opt in for host-CPU speed:
+#   make run-embkfs-cow QEMU_ACCEL=kvm QEMU_CPU=host
+QEMU_ACCEL ?= tcg,thread=multi
 QEMU_CPU ?= max
 
 run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
