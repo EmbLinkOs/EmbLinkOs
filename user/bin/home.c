@@ -56,8 +56,10 @@ static void launch_folder(const char *path) {
 }
 
 /* An app the user can click (launch/open) OR drag. `app` spawns an elf; `dir`
- * opens Files at a folder (one of the two is set). */
-struct app_item { const char *icon; const char *label; const char *app; const char *dir; };
+ * opens Files at a folder (one of the two is set). icon/label are BUFFERS so an
+ * app can supply them from its own <name>.app presentation manifest; the stable
+ * IDENTITY (for reconciler keys) is the app/dir path, never the icon buffer. */
+struct app_item { char icon[96]; char label[24]; const char *app; const char *dir; };
 
 /* Apps live EITHER on the desktop OR in the dock; dragging MOVES one between the
  * two (never a copy), so a name never lingers behind. Home's folder is $HOME,
@@ -76,6 +78,36 @@ static struct app_item g_dock[16] = {
     { "/system/images/icon-terminal.pam", "Terminal", "/data/apps/term/term.elf",   0 },
 };
 static int g_dock_n = 2;
+
+/* Fill an item's icon+label from the app's OWN presentation manifest at
+ * /data/apps/<name>/<name>.app ("name X" / "icon Y" lines) -- so the desktop
+ * reflects what the app declares, not a hard-coded table. Missing manifest or
+ * field => the pre-seeded fallback stays. */
+static void load_app_meta(const char *name, struct app_item *it) {
+    char path[128];
+    snprintf(path, sizeof path, "/data/apps/%s/%s.app", name, name);
+    size_t len = 0;
+    uint8_t *buf = read_file(path, &len);
+    if (!buf) return;
+    for (size_t i = 0; i < len; ) {
+        while (i < len && (buf[i]==' '||buf[i]=='\t'||buf[i]=='\r'||buf[i]=='\n')) i++;
+        if (i >= len) break;
+        if (buf[i] == '#') { while (i < len && buf[i] != '\n') i++; continue; }
+        size_t ks = i;
+        while (i < len && buf[i]!=' ' && buf[i]!='\t' && buf[i]!='\n' && buf[i]!='\r') i++;
+        size_t kl = i - ks;
+        while (i < len && (buf[i]==' '||buf[i]=='\t')) i++;
+        size_t vs = i;
+        while (i < len && buf[i]!='\n' && buf[i]!='\r') i++;
+        size_t vl = i - vs;
+        while (vl && (buf[vs+vl-1]==' '||buf[vs+vl-1]=='\t')) vl--;
+        char *dst = 0; size_t cap = 0;
+        if (kl==4 && !memcmp(buf+ks,"name",4)) { dst = it->label; cap = sizeof it->label; }
+        else if (kl==4 && !memcmp(buf+ks,"icon",4)) { dst = it->icon; cap = sizeof it->icon; }
+        if (dst && cap) { size_t n = vl < cap-1 ? vl : cap-1; memcpy(dst, buf+vs, n); dst[n] = 0; }
+    }
+    free(buf);
+}
 
 /* --- drag-and-drop state (a desktop icon INTO the dock, or a dock icon OUT) --- */
 static int   g_drag = 0;        /* 0 none, 1 dragging a desktop source, 2 a dock item */
@@ -103,7 +135,7 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
      * different app -- which left a removed middle app lingering (dimmed) in
      * place while the pill kept its old width. Identity keys track each app. */
     uint64_t key = (kind == 1 ? 0xDE510000ULL : 0xD0C00000ULL)
-                 ^ (uint64_t)(uintptr_t)(it.app ? it.app : it.dir ? it.dir : it.icon);
+                 ^ (uint64_t)(uintptr_t)(it.app ? it.app : it.dir);
     ui_box_begin(key);
     (void)ui_open();
     ui_set_align(ALIGN_CENTER);
@@ -367,6 +399,9 @@ static void spawn_app(const char *path, const char *start_dir) {
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv;
     g_session_env = envp;
+    /* apps describe their own icon/name (docs presentation manifest) */
+    load_app_meta("files", &g_dock[0]);
+    load_app_meta("term",  &g_dock[1]);
     /* toolkit font + context */
     size_t rl = 0;
     uint8_t *reg = read_file("/system/fonts/font.ttf", &rl);

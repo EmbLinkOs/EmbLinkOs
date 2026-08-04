@@ -1184,7 +1184,7 @@ STAGED_APPS ?=
 # is empty (nothing built yet) and EMBKFS_APPS drives the first build; on an
 # incremental build it catches every packed .elf/.embx, closing the drift-guard
 # gap so a rebuilt app (e.g. pkg.elf) always re-packs. See the guard below.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns)
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.app)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is

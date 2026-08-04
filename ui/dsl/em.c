@@ -2070,27 +2070,32 @@ void em_res_set_loader(uint8_t *(*load)(const char *path, size_t *out_len)) {
 #define EM_RES_MAX 8
 
 uint32_t em_font(const char *path) {
-    static struct { const char *path; uint32_t handle; } cache[EM_RES_MAX];
+    static struct { char path[128]; int used; uint32_t handle; } cache[EM_RES_MAX];
     static int installed;
     if (!path) return 0;
     for (int i = 0; i < EM_RES_MAX; i++)
-        if (cache[i].path && strcmp(cache[i].path, path) == 0) return cache[i].handle;
+        if (cache[i].used && strcmp(cache[i].path, path) == 0) return cache[i].handle;
     if (!g_res_load) return 0;
     size_t len = 0;
     uint8_t *data = g_res_load(path, &len);       /* kept alive: font parses in place */
     uint32_t h = (data && len) ? font_load(data, len) : 0;
     if (h && !installed) { font_install_backend(); installed = 1; }
     for (int i = 0; i < EM_RES_MAX; i++)
-        if (!cache[i].path) { cache[i].path = path; cache[i].handle = h; break; }
+        if (!cache[i].used) {
+            snprintf(cache[i].path, sizeof cache[i].path, "%s", path);
+            cache[i].used = 1; cache[i].handle = h; break;
+        }
     return h;
 }
 
 /* Minimal P6 RGB + P7 RGB_ALPHA decoder into BGRA-premul, cached by path. */
 const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h) {
-    static struct { const char *path; uint32_t *px, w, h; } cache[EM_RES_MAX];
+    /* Own a COPY of the path: callers may pass a reused stack/heap buffer (e.g.
+     * an app's icon field), so caching the pointer would alias distinct icons. */
+    static struct { char path[128]; int used; uint32_t *px, w, h; } cache[EM_RES_MAX];
     if (!path) return 0;
     for (int i = 0; i < EM_RES_MAX; i++)
-        if (cache[i].path && strcmp(cache[i].path, path) == 0) {
+        if (cache[i].used && strcmp(cache[i].path, path) == 0) {
             if (out_w) *out_w = cache[i].w;
             if (out_h) *out_h = cache[i].h;
             return cache[i].px;
@@ -2145,7 +2150,10 @@ const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h) {
         px[i] = ((uint32_t)a<<24) | ((uint32_t)pr<<16) | ((uint32_t)pg<<8) | pb;
     }
     for (int i = 0; i < EM_RES_MAX; i++)
-        if (!cache[i].path) { cache[i].path = path; cache[i].px = px; cache[i].w = w; cache[i].h = h; break; }
+        if (!cache[i].used) {
+            snprintf(cache[i].path, sizeof cache[i].path, "%s", path);
+            cache[i].used = 1; cache[i].px = px; cache[i].w = w; cache[i].h = h; break;
+        }
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
     return px;

@@ -744,6 +744,13 @@ def discover_userland_objects(build_dir="build"):
         if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
             dest = f"data/apps/{base}/{base}.ns".encode()
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
+        # Per-app PRESENTATION MANIFEST: an app describes itself (display name +
+        # icon) in user/bin/<name>.app, packed as /data/apps/<name>/<name>.app.
+        # The desktop reads it instead of hard-coding each app's name and icon.
+        appm = _read_file(f"user/bin/{base}.app")
+        if appm is not None and _elf_dest(name).startswith(b"data/apps/"):
+            dest = f"data/apps/{base}/{base}.app".encode()
+            objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, appm))
     # `test gitpush` LIVE credentials (LOCAL build artifact ONLY, env-gated so
     # they never touch the source tree or git). A GitHub PAT + target repo URL,
     # placed by the developer running the live push test:
