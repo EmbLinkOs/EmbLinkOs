@@ -285,7 +285,12 @@ static void dock_pill(void) {
         { float x, y, w, h; g_have_dockr = ui_open_rect(&x, &y, &w, &h);
           if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; } }
         for (int i = 0; i < g_dock_n; i++) {
-            VStack(.spacing = 3, .align = Center) {
+            /* FIXED-width slot: magnification must swell the icon IN PLACE,
+             * never reflow the row -- a centered row that re-lays-out as chips
+             * grow slides the chip out from under the pointer, so the press
+             * you aimed lands in a gap. The icon box overflows its slot
+             * upward and sideways (no clip); the slot never moves. */
+            VStack(.spacing = 3, .width = DOCK_BASE + 8, .align = Center) {
                 drag_icon(g_dock[i], (int)dock_icon_size(i), 2, i);
                 /* the running dot: 4px of truth under a live app's chip */
                 if (dock_running(g_dock[i].app)) {

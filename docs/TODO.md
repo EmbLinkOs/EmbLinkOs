@@ -1850,3 +1850,12 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       em_menu_end_. Escape hatch meanwhile: selecting a menu item closes.
       Menus render correctly open+closed (identity fix); launcher/dock/ghost
       unaffected with menus closed.
+
+### Window-materialize motion (2026-08-06, reverted -- findings attached)
+- [ ] Wrapping the app view in an opacity/offset wrapper (fade+rise on open)
+      left the window CROPPED to ~content-text width with an offset ghost of
+      the input row, and it never settled. Suspect the opacity<1 group path:
+      whole-window subtree -> cpu_scratch_acquire at full window size, plus
+      moved-wrapper dirty across animated frames. Chase it in the host
+      harness (menurepro pattern) before re-attempting; the menu drop-in
+      (small area, same mechanism) works fine, so it is scale-related.

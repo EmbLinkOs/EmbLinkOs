@@ -2396,8 +2396,23 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
      * window, and this overlay's parent is a 28px menu strip. Overlays honour
      * an explicit fixed size (layout.c) precisely for this. */
     ui_set_size(sz_fixed(em_viewport_width()), sz_fixed(em_viewport_height()));
+    /* drop-in motion: the panel fades in while settling down its last 8px.
+     * Keyed on WHICH menu is open, so switching between menus re-plays it;
+     * with no clock (host renders) it snaps to settled, like em_nav. */
+    static uint64_t s_anim_key, s_anim_t0;
+    uint64_t mnow = em_now_ms();
+    if (s_anim_key != key) { s_anim_key = key; s_anim_t0 = mnow; }
+    float mt = 1.0f;
+    if (mnow && s_anim_t0) {
+        float e = (float)(mnow - s_anim_t0) / 150.0f;
+        mt = e < 0 ? 0 : e > 1.0f ? 1.0f : e;
+        float inv = 1.0f - mt;
+        mt = 1.0f - inv * inv * inv;
+        if (mt < 1.0f) em_request_frame();
+    }
     ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
-    ui_set_offset(ax, ay);
+    ui_set_opacity(mt);
+    ui_set_offset(ax, ay - 8.0f * (1.0f - mt));
     ui_set_corner_radius(t->radius_md);
     ui_set_shadow(true, t->shadow_lg.dx, t->shadow_lg.dy, t->shadow_lg.blur, t->shadow_lg.color);
     em_glass_apply(12.0f);                 /* blur behind + tint + edge highlight */
