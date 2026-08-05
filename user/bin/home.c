@@ -251,15 +251,51 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
 
 /* The dock: a centered pill sized to its apps. Captures its own world rect so
  * the drop can hit-test against it. */
+static int dock_running(const char *path);   /* below, with g_running */
+
+/* Cursor-driven magnification: an icon's size is a pure function of the
+ * pointer's horizontal distance to it -- the Mac dock's defining gesture.
+ * No animation clock needed; the hand's own motion IS the animation. Uses
+ * LAST frame's dock rect (one-frame-stale geometry is invisible at pointer
+ * speeds) and stands down entirely during a drag, where a chip swelling
+ * under the ghost would fight the gesture. */
+#define DOCK_BASE 38.0f
+#define DOCK_PEAK 58.0f
+static float dock_icon_size(int i) {
+    if (!g_have_dockr || g_drag) return DOCK_BASE;
+    float px, py; ui_pointer_pos(&px, &py);
+    if (py < g_dockr[1] - 30.0f || py > g_dockr[3] + 10.0f ||
+        px < g_dockr[0] - 40.0f || px > g_dockr[2] + 40.0f) return DOCK_BASE;
+    float cx = g_dockr[0] + 12.0f + (float)i * (DOCK_BASE + 10.0f) + DOCK_BASE * 0.5f;
+    float d = px - cx; if (d < 0) d = -d;
+    const float radius = 96.0f;
+    if (d >= radius) return DOCK_BASE;
+    float t = 1.0f - d / radius;
+    return DOCK_BASE + (DOCK_PEAK - DOCK_BASE) * t * t;    /* eased falloff */
+}
+
 static void dock_pill(void) {
-    HStack(.height = 52, .spacing = 10, .px = 10, .align = Center,
-           .background = { .r=.03f, .g=.033f, .b=.045f, .a=.96f },
-           .corner = 18, .border = 1, .shadow = 2) {
+    /* GLASS, not paint: the pill blurs the wallpaper behind it (the desktop
+     * layer paints the wallpaper earlier in this same tree, which is exactly
+     * what in-window backdrop blur samples). Bottom-aligned so magnified
+     * icons grow UPWARD out of the bar, the way the Mac's do. */
+    HStack(.height = 70, .spacing = 10, .px = 12, .pb = 6, .align = Trailing,
+           .glass = 1, .corner = 20, .border = 1, .shadow = 2) {
         (void)ui_open();
         { float x, y, w, h; g_have_dockr = ui_open_rect(&x, &y, &w, &h);
           if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; } }
-        for (int i = 0; i < g_dock_n; i++)
-            drag_icon(g_dock[i], 40, 2, i);
+        for (int i = 0; i < g_dock_n; i++) {
+            VStack(.spacing = 3, .align = Center) {
+                drag_icon(g_dock[i], (int)dock_icon_size(i), 2, i);
+                /* the running dot: 4px of truth under a live app's chip */
+                if (dock_running(g_dock[i].app)) {
+                    HStack(.width = 4, .height = 4, .corner = 2,
+                           .background = { .r=.62f, .g=.66f, .b=.78f, .a=1.f }) { }
+                } else {
+                    HStack(.width = 4, .height = 4) { }   /* keep baselines level */
+                }
+            }
+        }
         if (g_dock_n == 0) { EmProps hp = {0}; (void)hp; Text("  drag apps here  ").caption().secondary(); }
     }
 }
@@ -547,6 +583,18 @@ static struct {
     int  used;
     int  handle_p1;
 } g_running[MAX_TRACKED];
+
+/* Is the app behind this dock chip alive right now? Drives the dock's
+ * indicator dot, so a dot is a RUNNING process, not a memory of one
+ * (proc_alive interrogates the spawn handle; dead handles read 0). */
+static int dock_running(const char *path) {
+    if (!path) return 0;
+    for (int i = 0; i < MAX_TRACKED; i++)
+        if (g_running[i].used && g_running[i].handle_p1 > 0 &&
+            strcmp(g_running[i].path, path) == 0)
+            return embk_proc_alive(g_running[i].handle_p1 - 1) == 1;
+    return 0;
+}
 
 /* An app DECLARES its namespace needs in /data/apps/<name>/<name>.ns (shipped in
  * its package -- docs/USERSPACE_v2.md UP4). As the session, home reads that
