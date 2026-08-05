@@ -136,7 +136,11 @@ struct scene_node {
     /* --- kind-specific payload --- */
     union {
         struct { struct paint fill; } rect;
-        struct { const void *pixels; uint32_t w, h; enum embk_pixfmt fmt; } image;
+        /* tinted: paint `tint` using the image's ALPHA as coverage, so a
+         * single-colour icon behaves exactly like a glyph and follows the
+         * theme. Untinted images draw their own colours. */
+        struct { const void *pixels; uint32_t w, h; enum embk_pixfmt fmt;
+                 bool tinted; struct color tint; } image;
         struct { const char *utf8; uint32_t font_handle; float size_px; struct color color;
                  struct paint paint; /* PAINT_*_GRADIENT -> gradient glyph fill */ } text;
     } data;
@@ -196,6 +200,10 @@ void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const 
 void scene_mark_dirty(struct scene_arena *a, struct node_handle h);
 void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pixels,
                      uint32_t w, uint32_t ht, enum embk_pixfmt fmt);
+/* Draw the image as a MASK filled with `tint` (alpha = coverage). enabled=false
+ * restores normal full-colour drawing. */
+void scene_set_image_tint(struct scene_arena *a, struct node_handle h,
+                          bool enabled, struct color tint);
 void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
                       float dx, float dy, float blur, struct color color);
 void scene_set_border(struct scene_arena *a, struct node_handle h, float width, struct color color);

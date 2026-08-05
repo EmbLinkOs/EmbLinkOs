@@ -52,6 +52,10 @@ void ui_text(const char *fmt, ...);
 void ui_image(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih, float height_px);
 void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
                     float width_px, float height_px);
+/* draws the image as a stencil filled with `tint` (its alpha = coverage), so a
+ * single-colour icon follows the theme exactly as a glyph does */
+void ui_image_sized_tinted(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                           float width_px, float height_px, struct color tint);
 void ui_image_fill(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih);
 void ui_text_keyed(uint64_t key, const char *fmt, ...);
 void ui_spacer(void);

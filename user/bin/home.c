@@ -74,7 +74,7 @@ static int g_desk_n = 1;
 #define DOCK_MIN 2
 static struct app_item g_dock[16] = {
     { "/system/images/file.eic",    "Files",    "/data/apps/files/files.elf", 0 },
-    { "/system/images/icon-terminal.eic", "Terminal", "/data/apps/term/term.elf",   0 },
+    { "/system/images/terminal.eic", "Terminal", "/data/apps/term/term.elf",   0 },
 };
 static int g_dock_n = 2;
 

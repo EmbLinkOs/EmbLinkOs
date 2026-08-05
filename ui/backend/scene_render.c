@@ -183,7 +183,8 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
         case SCENE_NODE_IMAGE:
             be->draw_image(target, dx, dy, w, h, n->data.image.pixels,
                            n->data.image.w, n->data.image.h, n->data.image.w * 4,
-                           n->data.image.fmt, 1.0f);
+                           n->data.image.fmt, 1.0f,
+                           n->data.image.tinted ? &n->data.image.tint : NULL);
             break;
         case SCENE_NODE_TEXT:
             if (be->draw_text)
@@ -270,9 +271,10 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
             render_subtree_opaque(r, a, h, wparent, scratch, (float)bx, (float)by);
             cpu_clip_restore(&sv);
             /* blit flattened result; coverage_at clips this to the dirty union */
+            /* flattened subtree: already-rendered pixels, never a stencil */
             r->be->draw_image(target, (float)bx - ox, (float)by - oy, (float)bw, (float)bh,
                               scratch->pixels, (uint32_t)bw, (uint32_t)bh, scratch->stride,
-                              scratch->format, n->opacity);
+                              scratch->format, n->opacity, NULL);
             cpu_scratch_release(scratch);
         }
         return;

@@ -55,7 +55,6 @@ static void request_apps(void) {
 
 static void bar(void) {
     const struct ui_theme *t = ui_theme();
-    (void)t;
 
     /* park at the top-center the first time we're drawn */
     static int first = 1;
@@ -70,8 +69,12 @@ static void bar(void) {
         HStack(.height = BAR_H, .align = Center, .spacing = 10, .px = 12,
                .background = { .r=.03f, .g=.033f, .b=.043f, .a=.92f },
                .corner = 12, .border = 1) {
-            /* the leading logo IS the Apps launcher button (like a Start menu) */
-            if (IconButton(IconBolt).accent().clicked()) request_apps();
+            /* The leading mark IS the Apps launcher button (like a Start menu).
+             * Real art rather than a font glyph, but drawn as a STENCIL in the
+             * accent colour: it keeps the bar's controls one coherent palette
+             * and follows a theme change, which baked-in art could not. */
+            if (ImageButtonTinted("/system/images/launcher.eic", 32, t->accent))
+                request_apps();
             MenuBar() {
                 Menu("EmbLink") {
                     MenuItem("About EmbLink");

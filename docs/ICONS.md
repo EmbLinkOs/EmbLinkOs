@@ -67,6 +67,25 @@ An app points at its icon through its `.app` manifest ([USERSPACE_v2.md](USERSPA
 Nothing else changes — the desktop reads the manifest, and the size is chosen
 by whichever widget draws it.
 
+## Themed icons (tinting)
+
+An icon can be drawn as a **stencil**: its alpha becomes coverage and the colour
+comes entirely from the caller, so real art behaves exactly like a font glyph
+and follows the palette instead of staying whatever colour it was authored in.
+
+    ImageButtonTinted("/system/images/launcher.eic", 32, t->accent)
+
+That is how the top bar's launcher button works. The art is authored in its own
+colour, but in the bar it renders in the theme accent alongside the glyph-based
+controls, and a theme change recolours it.
+
+Use it for single-colour, glyph-like marks. Full-colour art (a folder, an app
+logo) should be drawn untinted with `ImageButton`, since flattening it to one
+colour throws away exactly what makes it recognisable.
+
+The tint applies at raster time (`draw_image`'s `tint` argument), so it costs no
+extra memory and no second copy of the icon.
+
 ## Sizes
 
 The default ladder is **16, 24, 32, 40, 48, 56, 64, 96, 128**, chosen so that

@@ -2275,6 +2275,37 @@ bool em_image_button(const char *path, float size) {
     return em_image_button_key(path, size, (uint64_t)(uintptr_t)path);
 }
 
+/* An icon button drawn from real art but coloured by the THEME: the image is
+ * used as a stencil, so it sits beside glyph-based controls (which take their
+ * colour from the palette) without looking like a foreign object, and it
+ * follows a theme change instead of staying whatever colour it was authored. */
+bool em_image_button_tinted(const char *path, float size, Color tint) {
+    em_flush();
+    uint32_t w = 0, h = 0;
+    float inner = size - 8;
+    const uint32_t *px = em_image_at(path, inner > 1 ? (uint32_t)inner : 1, &w, &h);
+    if (!px) return false;
+    ui_begin_vstack((uint64_t)(uintptr_t)path ^ 0x71E70000ULL);
+    struct instance_handle self = ui_open();
+    bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    ui_set_size(sz_fixed(size), sz_fixed(size));
+    ui_set_padding(4, 4, 4, 4);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    ui_set_corner_radius(10);
+    ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
+                     : solid((Color){0, 0, 0, 0}));
+    /* key on the tint too: the same pixels drawn in a new colour must not be
+     * mistaken for an unchanged node and skipped by the dirty tracker */
+    uint64_t k = (uint64_t)(uintptr_t)px
+               ^ ((uint64_t)(uint32_t)(tint.r * 255.0f) << 16)
+               ^ ((uint64_t)(uint32_t)(tint.g * 255.0f) << 8)
+               ^ ((uint64_t)(uint32_t)(tint.b * 255.0f));
+    ui_image_sized_tinted(k, px, w, h, inner, inner, tint);
+    ui_end_stack();
+    return ui_consume_click(self);
+}
+
 void em_background_image(const char *path) {
     em_flush();
     uint32_t w = 0, h = 0;

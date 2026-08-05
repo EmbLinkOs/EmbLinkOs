@@ -503,7 +503,8 @@ static inline uint32_t bilerp4(uint32_t p00, uint32_t p10, uint32_t p01, uint32_
 
 static void cpu_draw_image(struct render_target *rt, float x, float y, float w, float h,
                            const void *pixels, uint32_t src_w, uint32_t src_h,
-                           uint32_t src_stride, enum embk_pixfmt src_fmt, float opacity) {
+                           uint32_t src_stride, enum embk_pixfmt src_fmt, float opacity,
+                           const struct color *tint) {
     (void)src_fmt;
     if (!pixels || w <= 0 || h <= 0 || src_w == 0 || src_h == 0 || opacity <= 0) return;
     int x0 = clampi((int)floorf(x), 0, (int)rt->width);
@@ -525,6 +526,12 @@ static void cpu_draw_image(struct render_target *rt, float x, float y, float w, 
      * the requested size -- stays a straight copy on the integer fast path.
      * Nearest sampling is only wrong when it has to drop or repeat pixels. */
     int rescaling = ((uint32_t)(w + 0.5f) != src_w) || ((uint32_t)(h + 0.5f) != src_h);
+
+    /* Tint turns the image into a stencil: the source alpha is coverage and the
+     * colour comes entirely from `tint`, which is how a themed icon ends up
+     * behaving exactly like a text glyph. Hoisted out of the pixel loop. */
+    float tr = 0, tg = 0, tb = 0, ta = 0;
+    if (tint) { tr = tint->r; tg = tint->g; tb = tint->b; ta = tint->a; }
 
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
@@ -548,6 +555,18 @@ static void cpu_draw_image(struct render_target *rt, float x, float y, float w, 
                 uint32_t sxn = (sx + 1 < src_w) ? sx + 1 : sx;
                 uint32_t wx = (uint32_t)((sfx - (float)sx) * 256.0f);
                 s = bilerp4(srow[sx], srow[sxn], srown[sx], srown[sxn], wx, wy);
+            }
+            if (tint) {
+                /* keep the shape, replace the colour; stays premultiplied */
+                uint32_t a = (uint32_t)((float)(s >> 24) * ta + 0.5f);
+                if (a > 255u) a = 255u;
+                uint32_t cr = (uint32_t)(tr * (float)a + 0.5f);
+                uint32_t cg = (uint32_t)(tg * (float)a + 0.5f);
+                uint32_t cb = (uint32_t)(tb * (float)a + 0.5f);
+                if (cr > a) cr = a;
+                if (cg > a) cg = a;
+                if (cb > a) cb = a;
+                s = (a << 24) | (cr << 16) | (cg << 8) | cb;
             }
             if (img_trivial_all || (img_opaque_op && coverage_full_at(fx, fy))) {
                 uint32_t sa = s >> 24;

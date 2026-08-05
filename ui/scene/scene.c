@@ -349,6 +349,19 @@ void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pi
     n->dirty = true;
 }
 
+void scene_set_image_tint(struct scene_arena *a, struct node_handle h,
+                          bool enabled, struct color tint) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n) return;
+    if (n->data.image.tinted == enabled &&
+        (!enabled || (n->data.image.tint.r == tint.r && n->data.image.tint.g == tint.g &&
+                      n->data.image.tint.b == tint.b && n->data.image.tint.a == tint.a)))
+        return;                                  /* unchanged -> stay clean */
+    n->data.image.tinted = enabled;
+    n->data.image.tint = tint;
+    n->dirty = true;
+}
+
 void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
                       float dx, float dy, float blur, struct color color) {
     struct scene_node *n = scene_resolve(a, h);

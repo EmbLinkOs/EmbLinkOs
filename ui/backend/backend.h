@@ -32,9 +32,12 @@ struct render_backend {
 
     void (*draw_rect)(struct render_target *rt, float x, float y, float w, float h,
                       float corner_radius, const struct paint *fill, float opacity);
+    /* tint != NULL draws the image as a MASK filled with that colour, using the
+     * source alpha as coverage -- what lets a themed icon behave like a glyph. */
     void (*draw_image)(struct render_target *rt, float x, float y, float w, float h,
                        const void *pixels, uint32_t src_w, uint32_t src_h,
-                       uint32_t src_stride, enum embk_pixfmt src_fmt, float opacity);
+                       uint32_t src_stride, enum embk_pixfmt src_fmt, float opacity,
+                       const struct color *tint);
     void (*draw_shadow)(struct render_target *rt, float x, float y, float w, float h,
                         float corner_radius, float dx, float dy, float blur_radius,
                         struct color color);

@@ -621,6 +621,10 @@ void em_image_view(const char *path, EmProps p);
 #define Image(path, ...)  em_image_view((path), (EmProps){__VA_ARGS__})
 bool em_image_button(const char *path, float size);
 #define ImageButton(path, size) em_image_button((path), (size))
+/* Icon button drawn from real art but COLOURED BY THE THEME (the image is used
+ * as a stencil), so it sits beside glyph controls and follows theme changes. */
+bool em_image_button_tinted(const char *path, float size, Color tint);
+#define ImageButtonTinted(path, size, tint) em_image_button_tinted((path), (size), (tint))
 bool em_image_button_key(const char *path, float size, uint64_t key);
 #define ImageButtonKey(path, size, key) \
     em_image_button_key((path), (size), (uint64_t)(uintptr_t)(key))

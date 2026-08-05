@@ -579,6 +579,25 @@ void ui_image_sized(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
     scene_set_image(g_sa, n->scene_node, pixels, iw, ih, EMBK_PIXFMT_BGRA8888_PRE);
 }
 
+/* As ui_image_sized, but draws the image as a stencil filled with `tint` (the
+ * image's alpha is the coverage) -- what lets a single-colour icon follow the
+ * theme the way a text glyph does. The tint is passed here rather than set on
+ * "the open box" because an image is a LEAF: it is created without being
+ * opened, so a set-on-open-box call would land on its parent container. */
+void ui_image_sized_tinted(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih,
+                           float width_px, float height_px, struct color tint) {
+    bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, key, key != 0, &created);
+    struct instance *n = instance_resolve(h);
+    if (!n) return;
+    struct layout_node *ln = layout_resolve(g_la, n->layout_node);
+    if (ln) {
+        ln->width.mode = SIZE_FIXED;   ln->width.fixed_value = width_px;
+        ln->height.mode = SIZE_FIXED;  ln->height.fixed_value = height_px;
+    }
+    scene_set_image(g_sa, n->scene_node, pixels, iw, ih, EMBK_PIXFMT_BGRA8888_PRE);
+    scene_set_image_tint(g_sa, n->scene_node, true, tint);
+}
+
 void ui_image_fill(uint64_t key, const void *pixels, uint32_t iw, uint32_t ih) {
     bool created; struct instance_handle h = match_or_create(INSTANCE_IMAGE, key, key != 0, &created);
     struct instance *n = instance_resolve(h);
