@@ -93,6 +93,12 @@ int  sval_read_blocking(struct sval_reader *r, int fd, struct value *out);
  * ------------------------------------------------------------------------- */
 int sval_print(const struct value *v, int fd);
 
+/* Presentation colour (ANSI SGR), for terminals that declare support
+ * (TERM=emlink*). OFF by default so pipes, saves and the serial console
+ * never see escape bytes -- colour is a property of the DISPLAY, which is
+ * why it lives here in the presenter and never in the values themselves. */
+void sval_set_colour(int on);
+
 /* Format a single SCALAR value into `buf` (NUL-terminated, truncated to cap);
  * returns the length written. Exposed because the table renderer and future
  * callers both need "one cell as text". Non-scalars render as a short

@@ -247,6 +247,15 @@ int main(int argc, char **argv) {
         g_console_session = 1;
     }
 
+    /* Colour is opt-IN by the display: the GUI terminal names itself via
+     * TERM=emlink and parses SGR; the serial console and plain pipes never
+     * see an escape byte. The same contract Linux uses (TERM decides). */
+    {
+        const char *t = getenv("TERM");
+        if (!g_console_session && t && strncmp(t, "emlink", 6) == 0)
+            sval_set_colour(1);
+    }
+
     /* one-shot mode: shell.elf -c "ls | where size > 1mb" */
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
         int rc = run_line(argv[2], &top);

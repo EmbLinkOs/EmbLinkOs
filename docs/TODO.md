@@ -1811,3 +1811,12 @@ Encrypt/RSA), `test wget https`, `test pypi`.
   public-value** use and are **NOT constant-time**. Before any *signing* or private-
   key handling on the OS (client certs, our own CA, key storage) they need constant-
   time review. `getentropy` is RDRAND-only (fine; documented).
+
+### Terminal / shell (post "complete terminal" pass, 2026-08-05)
+- [ ] Copy/paste in the terminal -- blocked on an OS clipboard (none exists yet)
+- [ ] Ctrl+C interrupting a RUNNING command from the GUI terminal (needs the
+      async-signal gap closed, or the interrupt-route delegated across the pipe)
+- [ ] Resizable terminal window (T_COLS/T_ROWS fixed; needs reflow on resize)
+- [ ] Wheel scrollback direction untested on real hardware (sign chosen from
+      ui_scroll_begin's convention; flip in term_view if it feels inverted)
+- [ ] SGR: only fg colour + bold honoured; backgrounds/underline dropped

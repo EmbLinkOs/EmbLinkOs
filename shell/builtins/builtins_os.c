@@ -16,6 +16,7 @@
  * ========================================================================== */
 #include "builtins/builtins.h"
 #include "sval/sval.h"
+#include "hist/hist.h"
 #include "embk.h"
 #include <stdlib.h>
 #include <string.h>
@@ -179,8 +180,25 @@ static struct value bi_cd(const struct command *cmd, struct value input,
     (void)env;
     value_free(&input);
     char path[PATH_MAX_LEN];
-    if (arg_path(cmd, 0, "/", path, sizeof path) != 0)
+    /* bare `cd` goes HOME and `cd -` returns whence you came -- the two
+     * motions a hand types without thinking, straight from every Unix shell.
+     * Both look at the RAW word: `-` resolved against the cwd would become
+     * "/somewhere/-" and the intent would be gone before we saw it. */
+    static char oldpwd[PATH_MAX_LEN];
+    const char *home = getenv("HOME");
+    const char *raw = cmd->nargs > 0 ? expr_as_word(cmd->args[0]) : NULL;
+    if (cmd->nargs > 0 && !raw)
         return value_error("cd: path must be a plain word");
+    if (raw && strcmp(raw, "-") == 0) {
+        if (!oldpwd[0]) return value_error("cd: no previous directory");
+        snprintf(path, sizeof path, "%s", oldpwd);
+    } else if (!raw) {
+        snprintf(path, sizeof path, "%s", home && *home ? home : "/");
+    } else {
+        path_resolve(raw, path, sizeof path);
+    }
+    char before[PATH_MAX_LEN];
+    if (!getcwd(before, sizeof before)) before[0] = 0;
 
     /* chdir() does the verifying (exists + is a directory) -- no need to stat
      * first, and no window where we could disagree with it. */
@@ -190,6 +208,7 @@ static struct value bi_cd(const struct command *cmd, struct value input,
                  errno == ENOTDIR ? "not a directory" : "no such directory");
         return value_error(msg);
     }
+    if (before[0]) snprintf(oldpwd, sizeof oldpwd, "%s", before);
     shell_cwd_publish();
     return value_null();
 }
@@ -484,6 +503,60 @@ static struct value bi_kill(const struct command *cmd, struct value input,
 /* -------------------------------------------------------------------------
  * uptime / date / clear
  * ------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------
+ * The identity-and-orientation set every Unix hand types on reflex.
+ * ------------------------------------------------------------------------- */
+static struct value bi_whoami(const struct command *cmd, struct value input,
+                              struct scope *env) {
+    (void)cmd; (void)env; value_free(&input);
+    const char *u = getenv("USER");
+    return value_string(u && *u ? u : "user");
+}
+
+static struct value bi_hostname(const struct command *cmd, struct value input,
+                                struct scope *env) {
+    (void)cmd; (void)env; value_free(&input);
+    const char *h = getenv("HOSTNAME");
+    return value_string(h && *h ? h : "emblink");
+}
+
+/* history -> Table {n, command}: the shell's own ring, oldest first, numbered
+ * the way `history` numbers -- so the output pipes ("history | last 5"). */
+static struct value bi_history(const struct command *cmd, struct value input,
+                               struct scope *env) {
+    (void)cmd; (void)env; value_free(&input);
+    struct value out = value_table();
+    size_t n = hist_count();
+    for (size_t i = 0; i < n; i++) {
+        struct value row = value_record();
+        value_record_set(&row, "n", value_int((int64_t)(i + 1)));
+        value_record_set(&row, "command", value_string(hist_get(i)));
+        value_table_push_row(&out, row);
+    }
+    return out;
+}
+
+/* which <name>: answer the question the way the shell itself would resolve it
+ * -- builtins first (both dispatch tables), then the extern search order
+ * eval_extern actually uses. Guessing differently would be lying. */
+static struct value bi_which(const struct command *cmd, struct value input,
+                             struct scope *env) {
+    (void)env; value_free(&input);
+    const char *name = cmd->nargs > 0 ? expr_as_word(cmd->args[0]) : NULL;
+    if (!name) return value_error("which: which <command>");
+    if (builtin_lookup(name) || builtin_lookup_os(name))
+        return value_string("shell builtin");
+    char path[256];
+    struct embk_stat st;
+    snprintf(path, sizeof path, "/system/bin/%s.elf", name);
+    if (embk_stat(path, &st) == 0) return value_string(path);
+    snprintf(path, sizeof path, "/data/apps/%s/%s.elf", name, name);
+    if (embk_stat(path, &st) == 0) return value_string(path);
+    char msg[128];
+    snprintf(msg, sizeof msg, "which: %s: not found", name);
+    return value_error(msg);
+}
+
 static struct value bi_uptime(const struct command *cmd, struct value input,
                               struct scope *env) {
     (void)cmd; (void)env;
@@ -532,6 +605,8 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "ps",     bi_ps     }, { "kill",   bi_kill   },
         { "env",    bi_env    },
         { "uptime", bi_uptime }, { "date",   bi_date   },
+        { "whoami", bi_whoami }, { "hostname", bi_hostname },
+        { "history", bi_history }, { "which", bi_which },
         { "clear",  bi_clear  },
     };
     for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)

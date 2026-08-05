@@ -1128,7 +1128,10 @@ static bool em_closebtn_impl(bool *out_hov) {
     ui_set_paint(solid(bg));
     ui_set_corner_radius(t->radius_pill);
     ui_set_border(hov ? 0.0f : 1.0f, t->border);
-    ui_set_size(sz_fixed(26), sz_fixed(26));
+    /* 36px, not 26: a close control is aimed at constantly, and Fitts is not
+     * negotiable -- a small pill made closing a window feel like threading a
+     * needle. Every app's bar shares this, so every app gets the fix. */
+    ui_set_size(sz_fixed(36), sz_fixed(30));
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     { EmProps ip = { .font = BodyBold, .color = fg }; em_icon_impl(IconClose, ip); }

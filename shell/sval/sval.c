@@ -173,6 +173,27 @@ size_t sval_format_scalar(const struct value *v, char *buf, size_t cap) {
     return 0;
 }
 
+static int g_colour = 0;
+void sval_set_colour(int on) { g_colour = on; }
+
+/* SGR for a table cell, decided from the ROW -- a "name" whose row says dir
+ * paints blue+bold, a name that looks executable paints green. This is the
+ * presenter styling from data, the way `ls --color` does; the values in the
+ * pipeline stay plain so `where`/`save`/pipes are never polluted. */
+static const char *cell_colour(const struct record *row, const char *col,
+                               const char *cell) {
+    if (!g_colour || strcmp(col, "name") != 0) return NULL;
+    const struct value *tv = record_field((struct record *)row, "type");
+    if (tv && (tv->type == VAL_STRING || tv->type == VAL_PATH) &&
+        tv->u.s.len == 3 && memcmp(tv->u.s.bytes, "dir", 3) == 0)
+        return "\x1b[1;34m";                    /* directory: bold blue */
+    size_t n = strlen(cell);
+    if ((n > 4 && !strcmp(cell + n - 4, ".elf")) ||
+        (n > 5 && !strcmp(cell + n - 5, ".embx")))
+        return "\x1b[1;32m";                    /* executable: bold green */
+    return NULL;
+}
+
 static int puts_fd(int fd, const char *s) {
     size_t n = strlen(s);
     return write_all(fd, (const uint8_t *)s, n);
@@ -227,9 +248,15 @@ static int print_table(const struct table *t, int fd) {
         for (size_t c = 0; c < ncols; c++) {
             const struct value *cv = record_field(row, hdr->names[c]);
             if (cv) sval_format_scalar(cv, cell, sizeof cell); else cell[0] = '\0';
-            char pad[CELL_MAX + 4];
-            snprintf(pad, sizeof pad, "%-*s%s", (int)w[c], cell, c + 1 < ncols ? "  " : "");
-            if (puts_fd(fd, pad)) { free(w); return -1; }
+            /* colour goes AROUND the text, padding goes after the reset --
+             * escape bytes must never count toward the column width */
+            const char *col = cell_colour(row, hdr->names[c], cell);
+            if (col) { puts_fd(fd, col); }
+            if (puts_fd(fd, cell)) { free(w); return -1; }
+            if (col) { puts_fd(fd, "\x1b[0m"); }
+            size_t len = strlen(cell);
+            for (size_t i = len; i < w[c]; i++) puts_fd(fd, " ");
+            if (c + 1 < ncols) puts_fd(fd, "  ");
         }
         puts_fd(fd, "\n");
     }
