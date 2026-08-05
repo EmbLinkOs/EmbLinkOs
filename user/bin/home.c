@@ -59,7 +59,18 @@ static void launch_folder(const char *path) {
  * opens Files at a folder (one of the two is set). icon/label are BUFFERS so an
  * app can supply them from its own <name>.app presentation manifest; the stable
  * IDENTITY (for reconciler keys) is the app/dir path, never the icon buffer. */
-struct app_item { char icon[96]; char label[24]; const char *app; const char *dir; };
+struct app_item {
+    char icon[96]; char label[24]; const char *app; const char *dir;
+    /* Free placement on the desktop: every icon owns its spot rather than
+     * inheriting one from its position in the list. `placed` starts 0 so a
+     * newly-arrived icon is auto-arranged instead of landing at (0,0). */
+    float x, y; int placed;
+};
+
+/* Desktop icon cell: the 64px glyph plus its caption, and the gap around it. */
+#define DESK_CELL_W 92
+#define DESK_CELL_H 92
+#define DESK_MARGIN 16
 
 /* Apps live EITHER on the desktop OR in the dock; dragging MOVES one between the
  * two (never a copy), so a name never lingers behind. Home's folder is $HOME,
@@ -296,6 +307,82 @@ static void apps_grid(void) {
     if (g_apps_frames >= 3 && OverlayDismissed()) { g_apps_open = 0; g_dock_dirty = 1; }
 }
 
+/* --- free desktop placement -------------------------------------------------
+ * Desktop icons are positioned individually rather than flowing in a list, so
+ * one can be dropped anywhere instead of being pinned to its index. Layout only
+ * assigns a spot to icons that have never been placed. */
+
+/* Keep an icon fully inside the work area (below the top bar, above the dock). */
+static void desk_clamp(struct app_item *it) {
+    float maxx = g_sw - DESK_CELL_W - DESK_MARGIN;
+    float maxy = g_sh - 64 - DESK_CELL_H - DESK_MARGIN;
+    if (maxx < DESK_MARGIN) maxx = DESK_MARGIN;
+    if (maxy < 40) maxy = 40;
+    if (it->x < DESK_MARGIN) it->x = DESK_MARGIN;
+    if (it->y < 40) it->y = 40;
+    if (it->x > maxx) it->x = maxx;
+    if (it->y > maxy) it->y = maxy;
+}
+
+/* Give any unplaced icon a spot: down the left edge, wrapping into a new
+ * column at the bottom -- the arrangement the desktop used to hard-code. */
+static void desk_autoplace(void) {
+    float x = DESK_MARGIN, y = 48;
+    for (int i = 0; i < g_desk_n; i++) {
+        if (g_desk[i].placed) continue;
+        while (y + DESK_CELL_H > g_sh - 64 - DESK_MARGIN && x + DESK_CELL_W * 2 < g_sw) {
+            x += DESK_CELL_W + 8; y = 48;          /* column full -> next column */
+        }
+        g_desk[i].x = x; g_desk[i].y = y; g_desk[i].placed = 1;
+        desk_clamp(&g_desk[i]);
+        y += DESK_CELL_H + 18;
+    }
+}
+
+/* Icon positions outlive the session: a desktop that forgot where everything
+ * was on every boot would not be worth arranging. Stored as one line per icon,
+ * keyed by the app/folder path (the same stable identity the drag keys use). */
+#define DESK_LAYOUT "/data/desktop.layout"
+
+static void desk_save_layout(void) {
+    char buf[1600]; int n = 0;
+    for (int i = 0; i < g_desk_n && n < (int)sizeof buf - 160; i++) {
+        const char *key = g_desk[i].app ? g_desk[i].app : g_desk[i].dir;
+        if (!key) continue;
+        n += snprintf(buf + n, sizeof buf - n, "%d %d %s\n",
+                      (int)g_desk[i].x, (int)g_desk[i].y, key);
+    }
+    int fd = (int)embk_open(DESK_LAYOUT, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
+    if (fd < 0) return;                     /* read-only /data -> just don't persist */
+    embk_write(fd, buf, (size_t)n);
+    embk_close(fd);
+}
+
+static void desk_load_layout(void) {
+    size_t len = 0;
+    uint8_t *b = read_file(DESK_LAYOUT, &len);
+    if (!b) return;
+    for (size_t i = 0; i < len; ) {
+        size_t ls = i;
+        while (i < len && b[i] != '\n') i++;
+        size_t le = i; if (i < len) i++;
+        char line[256];
+        size_t ll = le - ls; if (ll >= sizeof line) ll = sizeof line - 1;
+        memcpy(line, b + ls, ll); line[ll] = 0;
+        int x = 0, y = 0; char key[200];
+        if (sscanf(line, "%d %d %199[^\n]", &x, &y, key) != 3) continue;
+        for (int k = 0; k < g_desk_n; k++) {
+            const char *kk = g_desk[k].app ? g_desk[k].app : g_desk[k].dir;
+            if (kk && !strcmp(kk, key)) {
+                g_desk[k].x = (float)x; g_desk[k].y = (float)y; g_desk[k].placed = 1;
+                desk_clamp(&g_desk[k]);
+                break;
+            }
+        }
+    }
+    free(b);
+}
+
 /* Resolve a released drag: add to / remove from / reorder the dock. Called after
  * the frame is built, when the dock rect and final pointer are known. */
 static void dock_resolve_drop(void) {
@@ -320,20 +407,36 @@ static void dock_resolve_drop(void) {
             g_apps_open = 0;                       /* pinned -> close the launcher */
             g_dock_dirty = 1;
         }                                          /* dropped off the dock -> launcher stays open */
-    } else if (g_drag == 1) {                      /* desktop icon dragged onto the dock */
+    } else if (g_drag == 1) {                      /* a desktop icon */
         if (over && g_dock_n < 16) {
-            g_dock[g_dock_n++] = g_drag_item;      /* add to dock ... */
+            g_dock[g_dock_n++] = g_drag_item;      /* onto the dock -> pin it ... */
             for (int k = g_drag_i; k < g_desk_n - 1; k++) g_desk[k] = g_desk[k+1];
             g_desk_n--;                            /* ... and REMOVE from the desktop */
             g_dock_dirty = 1;
-        }                                          /* dropped off the dock -> snaps back */
+            desk_save_layout();
+        } else if (!over && g_drag_i >= 0 && g_drag_i < g_desk_n) {
+            /* dropped on open desktop -> it LIVES there now. Centre the cell on
+             * the cursor so the icon lands where the pointer let go, not offset
+             * by wherever inside the icon the drag happened to start. */
+            g_desk[g_drag_i].x = g_drag_x - DESK_CELL_W / 2.0f;
+            g_desk[g_drag_i].y = g_drag_y - 32.0f;
+            g_desk[g_drag_i].placed = 1;
+            desk_clamp(&g_desk[g_drag_i]);
+            g_dock_dirty = 1;
+            desk_save_layout();
+        }
     } else if (g_drag == 2) {                       /* dock item */
         if (!over) {                                /* pulled out -> back to the desktop */
             if (g_dock_n > DOCK_MIN && g_desk_n < 16) {   /* keep at least DOCK_MIN docked */
+                g_drag_item.x = g_drag_x - DESK_CELL_W / 2.0f;   /* land where dropped */
+                g_drag_item.y = g_drag_y - 32.0f;
+                g_drag_item.placed = 1;
+                desk_clamp(&g_drag_item);
                 g_desk[g_desk_n++] = g_drag_item;  /* return it to the desktop ... */
                 for (int k = g_drag_i; k < g_dock_n - 1; k++) g_dock[k] = g_dock[k+1];
                 g_dock_n--;                        /* ... and remove from the dock */
                 g_dock_dirty = 1;
+                desk_save_layout();
             }                                       /* at the minimum -> snaps back */
         } else if (g_dockr[2] > g_dockr[0]) {       /* reorder by x */
             int tgt = (int)(((g_drag_x - g_dockr[0]) / (g_dockr[2] - g_dockr[0])) * g_dock_n);
@@ -348,6 +451,30 @@ static void dock_resolve_drop(void) {
         }
     }
     g_drag = 0; g_drag_i = -1; g_drag_moved = 0;
+}
+
+/* Desktop icons, each drawn at its OWN position rather than flowing in a list.
+ * One out-of-flow overlay spans the desktop and every icon is offset inside it,
+ * which is what lets a drop put an icon anywhere instead of returning it to a
+ * slot decided by its index. (Same mechanism the drag ghost uses.) */
+static void desktop_icons(void) {
+    desk_autoplace();
+    em_flush();                       /* emit pending DSL leaves before raw ui_* */
+    ui_begin_vstack(0xDE5C0DEEULL);
+    ui_set_overlay(true);
+    for (int i = 0; i < g_desk_n; i++) {
+        const void *id = g_desk[i].app ? (const void *)g_desk[i].app
+                                       : (const void *)g_desk[i].dir;
+        ui_begin_vstack(0xDE5C0000ULL ^ (uint64_t)(uintptr_t)id);
+        ui_set_offset(g_desk[i].x, g_desk[i].y);
+        VStack(.spacing = 5, .width = DESK_CELL_W, .align = Center) {
+            drag_icon(g_desk[i], 64, 1, i);
+            Text(g_desk[i].label).caption();
+        }
+        em_flush();
+        ui_end_stack();
+    }
+    ui_end_stack();
 }
 
 /* Post-login desktop: wallpaper, three honest folder shortcuts, and a
@@ -367,26 +494,18 @@ static void home_ui(void) {
 
             /* Exact work-area height: the layout engine's `.grow` is intended
              * for siblings inside a measured row and did not consume the
-             * remaining desktop height here, which left the taskbar mid-screen. */
-            HStack(.padding = 16, .height = g_sh - 32 - 64, .align = Leading) {
-                VStack(.spacing = 18, .align = Center) {
-                    /* Desktop apps -- also the drag SOURCES: drag one onto the
-                     * dock to pin it (it leaves the desktop, name and all). */
-                    for (int i = 0; i < g_desk_n; i++) {
-                        VStack(.spacing = 5, .width = 92, .align = Center) {
-                            drag_icon(g_desk[i], 64, 1, i);
-                            Text(g_desk[i].label).caption();
-                        }
-                    }
-                }
-                Spacer();
-            }
+             * remaining desktop height here, which left the taskbar mid-screen.
+             * The icons themselves no longer flow inside it -- they are placed
+             * individually by desktop_icons() -- but the strip still reserves
+             * the space between the top bar and the dock. */
+            HStack(.height = g_sh - 32 - 64) { Spacer(); }
 
             /* the app dock: a centered pill sized to its apps (not full-width) */
             HStack(.width = g_sw, .height = 64, .align = Center, .justify = Center) {
                 dock_pill();
             }
         }
+        desktop_icons();       /* freely-placed app icons (each owns its spot) */
         apps_grid();           /* the Apps launcher (modal grid), when open */
         drag_ghost();          /* the dragged icon follows the cursor (overlay) */
     }
@@ -563,6 +682,11 @@ int main(int argc, char **argv, char **envp) {
         return 1;
     }
     g_sw = (float)sw; g_sh = (float)sh;   /* home_ui sizes the Screen to these */
+    /* Restore where the user last left each icon. Must run AFTER the screen
+     * size is known: the loader clamps every position into the work area, and
+     * clamping against a 0x0 screen would collapse the whole desktop into one
+     * corner. */
+    desk_load_layout();
 
     struct render_target rt = { (uint32_t *)pixels, sw, sh, sw * 4, EMBK_PIXFMT_BGRA8888_PRE };
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
