@@ -67,9 +67,13 @@ struct app_item {
     float x, y; int placed;
 };
 
-/* Desktop icon cell: the 64px glyph plus its caption, and the gap around it. */
-#define DESK_CELL_W 92
-#define DESK_CELL_H 92
+/* Desktop icon cell: the glyph plus its caption, and the gap around it.
+ * DESK_ICON is the one knob for how big desktop apps look. Keep it 8 above a
+ * level in the .eic ladder (docs/ICONS.md) -- the art is drawn into size-8, so
+ * 48 lands exactly on the 40 level and needs no resampling. */
+#define DESK_ICON   48
+#define DESK_CELL_W 76
+#define DESK_CELL_H 76
 #define DESK_MARGIN 16
 
 /* Apps live EITHER on the desktop OR in the dock; dragging MOVES one between the
@@ -294,7 +298,7 @@ static void apps_grid(void) {
                         VStack(.spacing = 6, .align = Center) {
                             /* click launches (resolved in dock_resolve_drop);
                              * drag pins into the dock */
-                            drag_icon(grid_to_item(i), 56, 3, i);
+                            drag_icon(grid_to_item(i), DESK_ICON, 3, i);
                             Text(g_all[i].label).caption();
                         }
                     }
@@ -419,7 +423,7 @@ static void dock_resolve_drop(void) {
              * the cursor so the icon lands where the pointer let go, not offset
              * by wherever inside the icon the drag happened to start. */
             g_desk[g_drag_i].x = g_drag_x - DESK_CELL_W / 2.0f;
-            g_desk[g_drag_i].y = g_drag_y - 32.0f;
+            g_desk[g_drag_i].y = g_drag_y - DESK_ICON / 2.0f;
             g_desk[g_drag_i].placed = 1;
             desk_clamp(&g_desk[g_drag_i]);
             g_dock_dirty = 1;
@@ -429,7 +433,7 @@ static void dock_resolve_drop(void) {
         if (!over) {                                /* pulled out -> back to the desktop */
             if (g_dock_n > DOCK_MIN && g_desk_n < 16) {   /* keep at least DOCK_MIN docked */
                 g_drag_item.x = g_drag_x - DESK_CELL_W / 2.0f;   /* land where dropped */
-                g_drag_item.y = g_drag_y - 32.0f;
+                g_drag_item.y = g_drag_y - DESK_ICON / 2.0f;
                 g_drag_item.placed = 1;
                 desk_clamp(&g_drag_item);
                 g_desk[g_desk_n++] = g_drag_item;  /* return it to the desktop ... */
@@ -468,7 +472,7 @@ static void desktop_icons(void) {
         ui_begin_vstack(0xDE5C0000ULL ^ (uint64_t)(uintptr_t)id);
         ui_set_offset(g_desk[i].x, g_desk[i].y);
         VStack(.spacing = 5, .width = DESK_CELL_W, .align = Center) {
-            drag_icon(g_desk[i], 64, 1, i);
+            drag_icon(g_desk[i], DESK_ICON, 1, i);
             Text(g_desk[i].label).caption();
         }
         em_flush();

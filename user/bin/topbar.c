@@ -12,13 +12,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
 
 #include "embk.h"
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
 
-#define BAR_W 760
+#define BAR_W 880
 
 /* status-chip ids (icon codepoints); the user reorders / removes these live */
 static int g_items[8] = { IconStar, IconBolt, IconGear, IconHeart };
@@ -41,7 +43,28 @@ static void snap_to(int anchor) {
     em_window_move_to(x, y);
 }
 
-#define BAR_H 40
+/* Thin like a real menu bar: the strip is chrome, not a panel. */
+#define BAR_H 32
+
+/* Live date + time. The bar used to read a hard-coded "9:41" -- Apple's
+ * marketing time -- which is exactly the kind of decorative lie the rest of the
+ * shell avoids. The OS can report the real clock, so it does. */
+static const char *bar_clock(void) {
+    static char buf[48];
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    /* Standard conversions only: newlib's strftime does not implement the GNU
+     * "%-d" no-pad flag and stops at it, which silently truncated the whole
+     * string to just the weekday. */
+    if (tm) snprintf(buf, sizeof buf, "%s %d %s  %02d:%02d",
+                     (const char *[]){"Sun","Mon","Tue","Wed","Thu","Fri","Sat"}[tm->tm_wday % 7],
+                     tm->tm_mday,
+                     (const char *[]){"Jan","Feb","Mar","Apr","May","Jun",
+                                      "Jul","Aug","Sep","Oct","Nov","Dec"}[tm->tm_mon % 12],
+                     tm->tm_hour, tm->tm_min);
+    else    snprintf(buf, sizeof buf, "--:--");
+    return buf;
+}
 
 /* Ask the desktop to open the Apps launcher. The launcher renders on the desktop
  * (same program as the dock, so apps can be dragged into it); the top bar is a
@@ -66,18 +89,29 @@ static void bar(void) {
      * desktop) and holds the room a dropdown needs to render OUTSIDE the bar. */
     VStack(.width = em_viewport_width(), .height = em_viewport_height(),
            .align = Fill, .spacing = 0) {
-        HStack(.height = BAR_H, .align = Center, .spacing = 10, .px = 12,
-               .background = { .r=.03f, .g=.033f, .b=.043f, .a=.92f },
-               .corner = 12, .border = 1) {
+        /* Tighter spacing and a fuller round than a panel would use: at 32px the
+         * strip reads as chrome the content sits under, not a box on top of it. */
+        HStack(.height = BAR_H, .align = Center, .spacing = 8, .px = 10,
+               .background = { .r=.03f, .g=.033f, .b=.043f, .a=.90f },
+               .corner = 16, .border = 1) {
             /* The leading mark IS the Apps launcher button (like a Start menu).
              * Real art rather than a font glyph, but drawn as a STENCIL in the
              * accent colour: it keeps the bar's controls one coherent palette
              * and follows a theme change, which baked-in art could not. */
-            if (ImageButtonTinted("/system/images/launcher.eic", 32, t->accent))
+            if (ImageButtonTinted("/system/images/launcher.eic", 26, t->accent))
                 request_apps();
             MenuBar() {
+                /* Where the bar sits belongs in the system menu, not on the bar.
+                 * A visible "pinned"/"free" text button was the one control
+                 * shouting its own implementation at the user; a menu bar should
+                 * carry menus and status, nothing else. */
                 Menu("EmbLink") {
                     MenuItem("About EmbLink");
+                    MenuSeparator();
+                    if (MenuItem("Position: Left"))   { g_pin = 2; snap_to(2); }
+                    if (MenuItem("Position: Center")) { g_pin = 1; snap_to(1); }
+                    if (MenuItem("Position: Right"))  { g_pin = 3; snap_to(3); }
+                    if (MenuItem("Position: Free"))   { g_pin = 0; }
                     MenuSeparator();
                     if (MenuItem("Quit")) exit(0);
                 }
@@ -89,17 +123,11 @@ static void bar(void) {
             /* the empty middle drags the whole bar -- give it a real height so
              * it's grabbable (an intrinsic-height empty strip collapses to 0px
              * and the press falls through, so the drag never starts). */
-            DragHandle(.grow = 1, .height = 28) { }
+            DragHandle(.grow = 1, .height = 22) { }
 
-            /* draggable status chips: reorder / pull one down to remove */
+            /* status items, then the clock -- the trailing order a menu bar has */
             Dock(g_items, &g_n, chip);
-            Text("9:41").bold();
-
-            /* pin: cycle free -> center -> left -> right; the glyph shows pinned */
-            if (Button(g_pin ? "pinned" : "free").ghost().clicked()) {
-                g_pin = (g_pin + 1) % 4;
-                snap_to(g_pin);
-            }
+            Text(bar_clock()).caption();
         }
         Spacer();   /* transparent canvas below the bar -- dropdown room */
     }
