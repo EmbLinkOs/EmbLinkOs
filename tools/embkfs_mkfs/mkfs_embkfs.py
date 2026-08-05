@@ -1118,6 +1118,16 @@ def discover_userland_objects(build_dir="build"):
     # so a session can chdir into a home and tcc has a scratch dir to write to.
     objects.append((b"data/tmp", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"home",     L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    # ...and the dev user's home INSIDE it. init sets HOME=/home/<user> and the
+    # terminal starts the shell there, so with only an empty /home the shell
+    # opened in a directory that did not exist -- which is why a bare `ls`
+    # listed nothing at all. Give it a home with the usual folders in it.
+    objects.append((b"home/yves", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    for _d in (b"Desktop", b"Documents", b"Downloads",
+               b"Music", b"Pictures", b"Videos"):
+        objects.append((b"home/yves/" + _d, L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"home/yves/readme.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"Welcome to EmbLink.\n\nThis is your home directory.\n"))
     objects.append((b"etc",      L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"etc/passwd", L.DT_REG, L.S_IFREG | 0o644, b""))
     objects.append((b"etc/shadow", L.DT_REG, L.S_IFREG | 0o600, b""))
