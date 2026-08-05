@@ -98,11 +98,30 @@ static int dirty_hits(struct scene_renderer *r, struct frect f) {
 struct noderec {
     struct node_handle h;
     struct frect       aabb;
+    struct frect       foot;    /* aabb grown by the shadow's reach -- what the
+                                 * node actually STAINS on the target, and
+                                 * therefore what its ghost occupies when it
+                                 * moves or dies */
     int                is_blur;
     int                has_group;
     struct frect       group_bounds;
     int                dirty;
 };
+
+/* the painted footprint: the AABB grown by shadow reach (mirrors paint_visual) */
+static struct frect node_footprint(const struct scene_node *n, struct frect ab) {
+    if (!n->shadow_enabled) return ab;
+    float m  = n->shadow_blur_radius + 2.0f;
+    float x0 = ab.x, y0 = ab.y, x1 = ab.x + ab.w, y1 = ab.y + ab.h;
+    float sx0 = ab.x + n->shadow_dx - m,        sy0 = ab.y + n->shadow_dy - m;
+    float sx1 = ab.x + ab.w + n->shadow_dx + m, sy1 = ab.y + ab.h + n->shadow_dy + m;
+    if (sx0 < x0) x0 = sx0;
+    if (sy0 < y0) y0 = sy0;
+    if (sx1 > x1) x1 = sx1;
+    if (sy1 > y1) y1 = sy1;
+    struct frect f = { x0, y0, x1 - x0, y1 - y0 };
+    return f;
+}
 
 static void gather(struct scene_arena *a, struct node_handle h, const float wparent[16],
                    int has_group, struct frect gbounds,
@@ -116,6 +135,7 @@ static void gather(struct scene_arena *a, struct node_handle h, const float wpar
     struct noderec *rec = &list[(*n)++];
     rec->h = h;
     rec->aabb = node_world_aabb(node, world);
+    rec->foot = node_footprint(node, rec->aabb);
     rec->is_blur = node->backdrop_blur_enabled;
     rec->has_group = has_group;
     rec->group_bounds = gbounds;
@@ -335,28 +355,51 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
     gather(a, root, ident, 0, frect_empty(), recs, &nrec, (int)cap);
 
     /* --- Step 1: dirty accumulation (own dirty flag OR world rect moved OR
-     * newly created); union BOTH the new rect and the cached old rect so a
-     * moved element doesn't leave a ghost at its previous location. --- */
+     * newly created); union BOTH the new footprint and the cached old one so a
+     * moved element doesn't leave a ghost at its previous location. The cache
+     * stores the shadow-grown FOOTPRINT, not the bare AABB -- a ghost occupies
+     * everything the node stained, and a drop shadow stains past the box. --- */
+    uint8_t *seen = (uint8_t *)calloc(r->cache_cap ? r->cache_cap : 1, 1);
     for (int i = 0; i < nrec; i++) {
         struct noderec *rec = &recs[i];
         uint32_t idx = rec->h.index;
         struct scene_node *n = scene_resolve(a, rec->h);
         struct rect_cache *cc = (idx < r->cache_cap) ? &r->cache[idx] : 0;
+        int cache_live = cc && cc->valid && cc->generation == rec->h.generation;
+        if (seen && idx < r->cache_cap && cache_live) seen[idx] = 1;
         int moved = 1;
-        if (cc && cc->valid && cc->generation == rec->h.generation) {
-            moved = !(fabsf(cc->x - rec->aabb.x) < 0.01f && fabsf(cc->y - rec->aabb.y) < 0.01f &&
-                      fabsf(cc->w - rec->aabb.w) < 0.01f && fabsf(cc->h - rec->aabb.h) < 0.01f);
+        if (cache_live) {
+            moved = !(fabsf(cc->x - rec->foot.x) < 0.01f && fabsf(cc->y - rec->foot.y) < 0.01f &&
+                      fabsf(cc->w - rec->foot.w) < 0.01f && fabsf(cc->h - rec->foot.h) < 0.01f);
         }
         int own_dirty = n && n->dirty;
         rec->dirty = own_dirty || moved;
         if (rec->dirty) {
-            dirty_add(r, rec->aabb);                                  /* new footprint */
-            if (cc && cc->valid && cc->generation == rec->h.generation) {
+            dirty_add(r, rec->foot);                                  /* new footprint */
+            if (cache_live) {
                 struct frect old = { cc->x, cc->y, cc->w, cc->h };
                 dirty_add(r, old);                                     /* old ghost */
             }
         }
     }
+
+    /* --- Step 1b: the VACATED. A node that existed last frame and is gone this
+     * frame -- destroyed, or its arena slot handed to a successor -- appears in
+     * no rec, so nothing above ever mentions its pixels; they would sit on the
+     * target forever, which is exactly the "closed launcher stays painted",
+     * "removed icon lingers" family of bugs every app worked around with forced
+     * full repaints. Its last painted footprint is right here in the cache:
+     * dirty it, then drop the slot. Runs BEFORE the blur/group expansions so
+     * they see these rects too. --- */
+    for (uint32_t i = 0; i < r->cache_cap; i++) {
+        struct rect_cache *cc = &r->cache[i];
+        if (!cc->valid) continue;
+        if (seen && i < r->cache_cap && seen[i]) continue;
+        struct frect old = { cc->x, cc->y, cc->w, cc->h };
+        dirty_add(r, old);
+        cc->valid = 0;
+    }
+    free(seen);
 
     /* --- Step 2: backdrop-blur footprint expansion. Any dirty rect touching a
      * blur node forces a full back-to-front repaint of that whole region, so
@@ -393,8 +436,8 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
     for (int i = 0; i < nrec; i++) {
         uint32_t idx = recs[i].h.index;
         if (idx < r->cache_cap) {
-            r->cache[idx].x = recs[i].aabb.x; r->cache[idx].y = recs[i].aabb.y;
-            r->cache[idx].w = recs[i].aabb.w; r->cache[idx].h = recs[i].aabb.h;
+            r->cache[idx].x = recs[i].foot.x; r->cache[idx].y = recs[i].foot.y;
+            r->cache[idx].w = recs[i].foot.w; r->cache[idx].h = recs[i].foot.h;
             r->cache[idx].generation = recs[i].h.generation;
             r->cache[idx].valid = 1;
         }

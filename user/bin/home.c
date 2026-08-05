@@ -168,7 +168,6 @@ static int   g_any_active = 0;       /* any draggable held this frame */
 static float g_dockr[4];             /* dock pill world rect: x0,y0,x1,y1 */
 static int   g_have_dockr = 0;
 static int   g_dock_dirty = 0;       /* dock changed -> the loop force-repaints (no ghosts) */
-static int   g_full_frames = 0;      /* full repaints still owed for that change (see main) */
 static char  g_pin_exec[16][80];     /* stable exec strings for launcher apps pinned to the dock */
 static int   g_pin_n = 0;
 
@@ -731,29 +730,19 @@ int main(int argc, char **argv, char **envp) {
         ui_frame_begin(); em_new_frame(); home_ui(); em_flush(); ui_frame_end();
         ui_run_layout((float)sw, (float)sh);
 
-        /* While a drag ghost is airborne (it moves every frame) or the dock just
-         * changed, force a clean full repaint so no ghost/trail is left behind.
-         * The launcher only needs a full pass on its open/close TRANSITIONS
-         * (g_dock_dirty marks both); a per-frame full rebuild while it merely
-         * sat open starved the loop so badly under TCG that clicks were missed
-         * for seconds -- the launcher felt dead. Steady-state uses dirty rects.
-         *
-         * A change needs TWO full frames, not one: the frame that RAISES the
-         * flag still contains the thing being removed (the launcher overlay is
-         * built before its close button is handled), so the first full pass
-         * repaints it. Only the following frame is the first one without it --
-         * and if that one falls back to dirty rects, the removed overlay is
-         * never erased and the desktop looks frozen. */
-        if (g_dock_dirty) { g_full_frames = 2; g_dock_dirty = 0; }
-        int force_full = (g_drag && g_drag_moved) || g_full_frames > 0;
-        if (force_full) {
-            scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
-            if (g_full_frames) g_full_frames--;
-        }
+        /* No forced full repaints. This loop used to nuke the renderer's rect
+         * cache (two whole frames' worth) on every dock change and all through
+         * a drag, because the dirty tracker lost the pixels of MOVED and
+         * DESTROYED nodes -- the closed launcher stayed painted, dragged icons
+         * left trails. That hole is fixed where it belonged, in scene_render
+         * (moved nodes union old+new footprints; vacated slots -- Step 1b --
+         * surface their last footprint from the renderer's cache), so partial
+         * repaints are simply always correct now, and cost what changed. */
+        g_dock_dirty = 0;
 
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
-        if (force_full || r.full || r.n_dirty == 0) {
+        if (r.full || r.n_dirty == 0) {
             embk_win_present(win, pixels, sw, sh);
         } else {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);

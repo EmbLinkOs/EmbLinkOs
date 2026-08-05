@@ -222,6 +222,50 @@ static void t5_ghost(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* T6: a DESTROYED element leaves no ghost. The vacated-slot half of the
+ * dirty algorithm: a node that is simply gone appears in no traversal, so its
+ * last painted footprint must come out of the renderer's own cache. Before
+ * Step 1b existed this test failed -- the red pixels stayed forever and every
+ * app papered over it with forced full repaints. Also exercises the shadow
+ * footprint: the ghost of a shadowed node must clear PAST its box. */
+static void t6_destroyed(void) {
+    printf("T6 destroyed element leaves no ghost:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle bg = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg, 64, 64);
+    struct paint grey; grey.kind = PAINT_SOLID; grey.solid = (struct color){0.5f,0.5f,0.5f,1}; grey.n_stops = 0;
+    scene_set_paint(&a, bg, &grey);
+    struct node_handle rect = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, rect, 16, 16); scene_set_transform(&a, rect, 8,8,0, 0,0,0,1, 1,1,1);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, rect, &redp);
+    scene_set_shadow(&a, rect, true, 6, 6, 4, (struct color){0,0,0,0.8f});
+
+    scene_render_frame(&r, &a, root, &rt);        /* frame 1: rect + shadow */
+    CHECK(red_at(&rt, 14, 14) > 200, "frame 1: the rect shows");
+    int sh_r = red_at(&rt, 27, 27), sh_g = green_at(&rt, 27, 27);
+    CHECK(sh_g < 110, "frame 1: the shadow darkens past the box");
+
+    scene_destroy_node(&a, rect);                 /* gone -- no move, no flag */
+    scene_render_frame(&r, &a, root, &rt);
+    int r2 = red_at(&rt, 14, 14), g2 = green_at(&rt, 14, 14);
+    CHECK(r2 < 160 && g2 > 100, "frame 2: the body's pixels restored (no ghost)");
+    int sg2 = green_at(&rt, 27, 27);
+    CHECK(sg2 > sh_g + 10, "frame 2: the SHADOW's pixels restored too");
+    (void)sh_r;
+
+    /* and a quiet third frame stays quiet: the vacated slot must not keep
+     * reporting itself dirty forever */
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(r.n_dirty == 0 && !r.full, "frame 3: nothing left to repaint");
+
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -229,6 +273,7 @@ int main(void) {
     t3_opacity_group();
     t4_dirty_blur();
     t5_ghost();
+    t6_destroyed();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }
