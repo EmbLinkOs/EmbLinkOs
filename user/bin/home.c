@@ -65,7 +65,7 @@ struct app_item { char icon[96]; char label[24]; const char *app; const char *di
  * two (never a copy), so a name never lingers behind. Home's folder is $HOME,
  * filled in once at startup. */
 static struct app_item g_desk[16] = {
-    { "/system/images/icon-settings.eic", "System", 0, "/system" },
+    { "/system/images/setting.eic", "System", 0, "/system" },
 };
 static int g_desk_n = 1;
 
@@ -73,7 +73,7 @@ static int g_desk_n = 1;
  * dragged in / shrinks as they are dragged out, but never below DOCK_MIN. */
 #define DOCK_MIN 2
 static struct app_item g_dock[16] = {
-    { "/system/images/icon-files.eic",    "Files",    "/data/apps/files/files.elf", 0 },
+    { "/system/images/file.eic",    "Files",    "/data/apps/files/files.elf", 0 },
     { "/system/images/icon-terminal.eic", "Terminal", "/data/apps/term/term.elf",   0 },
 };
 static int g_dock_n = 2;
@@ -133,7 +133,7 @@ static void scan_apps(void) {
         struct embk_stat st;
         if (embk_stat(a->exec, &st) < 0) continue;   /* only real, launchable apps */
         snprintf(a->name, sizeof a->name, "%s", nm);
-        snprintf(a->icon, sizeof a->icon, "/system/images/icon-launcher.eic");  /* fallback */
+        snprintf(a->icon, sizeof a->icon, "/system/images/app_launcher.eic");  /* fallback */
         snprintf(a->label, sizeof a->label, "%s", nm);
         /* only apps that DECLARE themselves (ship a <name>.app) appear in the
          * launcher -- internal tools/tests stay out of the user's face. */
