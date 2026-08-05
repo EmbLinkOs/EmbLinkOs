@@ -88,6 +88,35 @@ static void hist_step(int dir) {
     g_in_n = (int)strlen(g_in);
 }
 
+/* --- the prompt ------------------------------------------------------------
+ * The shell hands us its working directory as a marker line (0x10 <path> \n)
+ * instead of printing a prompt, so the transcript holds only real output and we
+ * can draw a proper user@host:cwd$ on the input line -- with the path live, so
+ * it follows `cd` the way a shell prompt should. */
+#define CWD_MARK 0x10
+static char g_cwd[192] = "/";
+static int  g_cwd_cap = 0, g_cwd_n = 0;
+
+#define HOSTNAME "emblink"
+
+static const char *prompt_text(void) {
+    static char p[288];
+    const char *user = getenv("USER");
+    const char *home = getenv("HOME");
+    if (!user || !*user) user = "user";
+    char tilde[192];
+    const char *shown = g_cwd;
+    size_t hl = home ? strlen(home) : 0;
+    /* ~ for home, as every shell does -- the full path is noise in your own
+     * directory, which is where you spend most of your time. */
+    if (hl && strncmp(g_cwd, home, hl) == 0 && (g_cwd[hl] == '/' || g_cwd[hl] == 0)) {
+        snprintf(tilde, sizeof tilde, "~%s", g_cwd + hl);
+        shown = tilde;
+    }
+    snprintf(p, sizeof p, "%s@%s:%s$", user, HOSTNAME, shown);
+    return p;
+}
+
 /* ring slot of logical line `i` (0 = oldest live line, g_count-1 = current) */
 static int sb_slot(int i) {
     return (g_head - (g_count - 1) + i + 2 * SB_ROWS) % SB_ROWS;
@@ -105,6 +134,13 @@ static void term_newline(void) {
 }
 
 static void term_putc(char c) {
+    /* the shell's cwd marker: swallowed whole, never shown */
+    if (g_cwd_cap) {
+        if (c == '\n') { g_cwd[g_cwd_n] = 0; g_cwd_cap = 0; }
+        else if (g_cwd_n < (int)sizeof g_cwd - 1) g_cwd[g_cwd_n++] = c;
+        return;
+    }
+    if (c == CWD_MARK) { g_cwd_cap = 1; g_cwd_n = 0; return; }
     if (c == '\n') { term_newline(); return; }
     if (c == '\r') { g_col = 0; return; }
     if (c == '\f') {                       /* form feed: the shell's `clear` */
@@ -184,6 +220,12 @@ static int term_key(int c) {
          * the record of what ran, which is the point of the viewer. */
         hist_push(g_in);
         g_hist_at = -1;
+        /* Record WHAT RAN: write the prompt with no newline, then send the
+         * command -- the shell echoes it, completing the line into
+         * "user@host:~$ ls" ahead of its output. Without this the transcript is
+         * a wall of results with no way to tell which produced which. */
+        term_say(prompt_text());
+        term_putc(' ');
         char nl = '\n';
         if (g_in_n) write(FD_SHELL_IN, g_in, (size_t)g_in_n);
         write(FD_SHELL_IN, &nl, 1);
@@ -257,8 +299,17 @@ static void term_view(void) {
         WindowBar("Terminal") {
             CloseGrip();
         }
+        /* A warm, low-contrast palette rather than the stock cold grey: this is
+         * a window you sit in for a long time, and warm dark backgrounds with
+         * cream text are far easier on the eyes than black-and-white. */
+        const Color TERM_BG    = { .r=.109f, .g=.078f, .b=.062f, .a=1.f };  /* dark brown */
+        const Color TERM_INBG  = { .r=.168f, .g=.121f, .b=.094f, .a=1.f };  /* input row  */
+        const Color TERM_TEXT  = { .r=.905f, .g=.855f, .b=.784f, .a=1.f };  /* warm cream */
+        const Color TERM_PROMPT= { .r=.913f, .g=.647f, .b=.317f, .a=1.f };  /* amber      */
+
         /* the VIEWER: a read-only transcript of everything the shell printed */
-        VStack(.spacing = 1, .px = 12, .pt = 10, .pb = 4, .align = Leading) {
+        VStack(.spacing = 1, .px = 12, .pt = 10, .pb = 4, .align = Leading,
+               .grow = 1, .background = TERM_BG) {
             int start = g_count - T_ROWS - g_view;
             if (start < 0) start = 0;
             for (int r = 0; r < T_ROWS; r++) {
@@ -280,22 +331,19 @@ static void term_view(void) {
                         const char *s = g_sb[sb_slot(logical)];
                         if (s[0]) ln = s;
                     }
-                    Text(ln).caption();
+                    Text(ln).caption().color(TERM_TEXT);
                 }
             }
         }
 
-        Spacer();   /* push the command line to the BOTTOM of the window */
-
         /* the COMMAND LINE: the only place a cursor lives. One row, pinned
          * under the transcript -- you read above, you type here. */
-        const struct ui_theme *t = ui_theme();
-        HStack(.height = 26, .align = Center, .spacing = 8, .px = 12,
-               .background = t->surface_alt, .corner = 8, .border = 1) {
-            Text(">").accent().bold();
+        HStack(.height = 28, .align = Center, .spacing = 8, .px = 12,
+               .background = TERM_INBG) {
+            Text(prompt_text()).caption().bold().color(TERM_PROMPT);
             static char shown[IN_MAX + 2];
             snprintf(shown, sizeof shown, "%s|", g_in);   /* trailing caret */
-            Text(g_dead ? "(shell exited)" : shown).caption();
+            Text(g_dead ? "(shell exited)" : shown).caption().color(TERM_TEXT);
         }
     }
 }

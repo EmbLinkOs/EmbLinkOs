@@ -257,7 +257,18 @@ int main(int argc, char **argv) {
     puts1("EmbLink shell -- structured pipelines. `exit` leaves.\n");
     char line[LINE_MAX_LEN];
     for (;;) {
-        puts1("embk> ");
+        /* The GUI terminal draws its OWN prompt (user@host:cwd$) on its input
+         * line, so printing "embk> " into its transcript would just be a second
+         * prompt sitting in the scrollback. Instead we hand it the one thing it
+         * cannot know -- our current directory -- as a marker line it consumes
+         * and never shows. The serial console still gets a human prompt. */
+        if (g_console_session) {
+            puts1("embk> ");
+        } else {
+            char cwd[192];
+            if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = 0; }
+            puts1("\x10"); puts1(cwd); puts1("\n");
+        }
         int n = read_line(line, sizeof line);
         if (n < 0) break;                      /* console EOF/error: leave */
         if (strcmp(line, "exit") == 0) break;
