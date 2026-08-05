@@ -91,8 +91,13 @@ static void bar(void) {
            .align = Fill, .spacing = 0) {
         /* Tighter spacing and a fuller round than a panel would use: at 32px the
          * strip reads as chrome the content sits under, not a box on top of it. */
+        /* REAL glass: the compositor frosts the desktop behind the strip's
+         * rect (and only the strip -- the dropdown canvas below must stay a
+         * sharp view of the desktop). The fill drops to a tint so the frost
+         * reads through: the same material as the dock and the launcher. */
+        em_window_blur_rect(0, 0, (int)em_viewport_width(), BAR_H);
         HStack(.height = BAR_H, .align = Center, .spacing = 8, .px = 10,
-               .background = { .r=.03f, .g=.033f, .b=.043f, .a=.90f },
+               .background = { .r=.05f, .g=.055f, .b=.075f, .a=.72f },
                .corner = 16, .border = 1) {
             /* The leading mark IS the Apps launcher button (like a Start menu).
              * Real art rather than a font glyph, but drawn as a STENCIL in the

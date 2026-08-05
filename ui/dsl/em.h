@@ -540,6 +540,7 @@ typedef struct {
 } EmApp;
 
 void  em_set_viewport(float w, float h);   /* the app runtime feeds this */
+void  em_window_blur_rect(int x, int y, int w, int h);  /* frost behind a sub-rect */
 float em_viewport_width(void);
 float em_viewport_height(void);
 

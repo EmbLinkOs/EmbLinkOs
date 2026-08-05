@@ -38,6 +38,12 @@ struct comp_window {
                              * and composites over the SHARP backdrop. Lets a thin
                              * bar carry a tall transparent canvas whose only opaque
                              * pixels are the bar + its open dropdowns. */
+    /* Blur-behind SUB-RECT (window-local). A translucent window is mostly
+     * empty canvas -- a menu bar is a 32px strip in a window tall enough to
+     * hold its dropdowns -- so full-window glass would frost a slab of desktop
+     * nobody asked for. Declaring the opaque part lets the strip be real
+     * frosted glass while its canvas stays honestly transparent. 0 = none. */
+    int       blur_set, blur_x, blur_y, blur_w, blur_h;
     int       pending_action; /* one-shot request delivered to the app runtime */
     /* Latched click replay: a press EDGE on this window's content is remembered
      * here so an app that was busy (e.g. mid first-frame render, seconds long
@@ -396,7 +402,18 @@ static void paint_window(struct comp_window *w, int focused,
             /* the home desktop and a translucent bar render a transparent canvas
              * with only some opaque pixels; composite per-pixel over the SHARP
              * backdrop (no blur), so empty regions reveal the desktop below and a
-             * thin bar can carry a tall invisible area for its dropdowns. */
+             * thin bar can carry a tall invisible area for its dropdowns.
+             * Where the window DECLARED an opaque sub-rect, frost that part of
+             * the backdrop first -- real glass for the bar, sharp desktop
+             * everywhere its canvas is empty. */
+            if (w->blur_set) {
+                int bx0 = imax(sx0, cx0 + w->blur_x);
+                int by0 = imax(sy0, cy0 + w->blur_y);
+                int bx1 = imin(sx1, cx0 + w->blur_x + w->blur_w);
+                int by1 = imin(sy1, cy0 + w->blur_y + w->blur_h);
+                if (bx1 > bx0 && by1 > by0)
+                    fb_blur_region(bx0, by0, bx1 - bx0, by1 - by0, GLASS_BLUR);
+            }
             fb_blit_over(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
         } else {
             fb_blit(sx0, sy0, sx1 - sx0, sy1 - sy0, src, w->cw);
@@ -993,6 +1010,20 @@ void compositor_exit_pid(int pid) {
     }
     if (found) enforce_focus();
     spin_unlock(&g_comp_lock);
+}
+
+/* Declare (or clear, w<=0) the window-local sub-rect whose backdrop should be
+ * frosted. Repaints the window so the change is visible at once. */
+int compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w_, int h_) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = win_find(pid, id);
+    if (!w) { spin_unlock(&g_comp_lock); return -1; }
+    w->blur_set = (w_ > 0 && h_ > 0);
+    w->blur_x = x; w->blur_y = y; w->blur_w = w_; w->blur_h = h_;
+    int x0, y0, x1, y1; win_repaint_rect(w, &x0, &y0, &x1, &y1);
+    paint_region(x0, y0, x1, y1);
+    spin_unlock(&g_comp_lock);
+    return 0;
 }
 
 void compositor_reap_pid(int pid) {

@@ -113,6 +113,7 @@
 #define EMBK_SYS_fd_poll        85   /* (fd, events) -> ready POLL* bits */
 #define EMBK_SYS_clip_set       86   /* (buf, len) -> 0 | -err : fill the system clipboard */
 #define EMBK_SYS_clip_get       87   /* (buf, cap) -> held-len | -err : read it back */
+#define EMBK_SYS_win_blur_rect  88   /* (win,x,y,w,h) -> frost the backdrop behind a sub-rect */
 
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back

@@ -95,6 +95,8 @@ int compositor_win_is_shared(int pid, uint32_t id);
 uint32_t compositor_focused_pid(void);
 /* exit-time: hide + repaint a dying pid's windows (reap frees them later) */
 void compositor_exit_pid(int pid);
+/* frost the backdrop behind a window-local sub-rect (translucent windows) */
+int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
                          uint32_t *buttons, uint32_t *win, int32_t *wheel);
 

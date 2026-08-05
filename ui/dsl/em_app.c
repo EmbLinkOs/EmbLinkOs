@@ -30,6 +30,17 @@
 static int g_app_exit_requested;
 static int g_app_exit_code;
 static float g_viewport_w;   /* mirrored into em.c via em_set_viewport */
+static int   g_blur_rect[4] = {0,0,0,0};   /* window-local frost rect (w<=0 = none) */
+static int   g_blur_dirty = 0;
+static int   g_app_win = -1;
+/* Declare the sub-rect of this window whose BACKDROP should be frosted by the
+ * compositor (translucent windows: the opaque strip of a menu bar). Applied on
+ * the next loop turn; call once or whenever the strip geometry changes. */
+void em_window_blur_rect(int x, int y, int w, int h) {
+    if (g_blur_rect[0]==x && g_blur_rect[1]==y && g_blur_rect[2]==w && g_blur_rect[3]==h) return;
+    g_blur_rect[0]=x; g_blur_rect[1]=y; g_blur_rect[2]=w; g_blur_rect[3]=h;
+    g_blur_dirty = 1;
+}
 static float g_viewport_h;
 
 void em_app_request_exit(int code) {
@@ -188,6 +199,12 @@ int em_app_run(const EmApp *app) {
                     menu_expanded = want;
                 }
             }
+        }
+        g_app_win = win;
+        if (g_blur_dirty) {
+            embk_win_blur_rect(win, g_blur_rect[0], g_blur_rect[1],
+                               g_blur_rect[2], g_blur_rect[3]);
+            g_blur_dirty = 0;
         }
         int had_key = 0;
         for (int c; (c = embk_key_poll()) != 0; ) {

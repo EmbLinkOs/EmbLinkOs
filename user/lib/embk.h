@@ -902,6 +902,14 @@ static inline int64_t embk_puts(int fd, const char *s) {
 
 /* TTY mode: 0 = cooked (line-buffered, echo), 1 = raw (unbuffered, no echo).
  * Returns the previous mode (0/1) or -EMBK_* on error. */
+/* Frost the backdrop behind a window-local sub-rect. For TRANSLUCENT windows
+ * (a menu bar is a thin strip inside a window tall enough for its dropdowns):
+ * full-window glass would blur a slab of desktop the window never paints, so
+ * the app declares the part that is actually opaque. w<=0 clears it. */
+static inline int embk_win_blur_rect(int win, int x, int y, int w, int h) {
+    return (int)embk_syscall5(EMBK_SYS_win_blur_rect, win, x, y, w, h);
+}
+
 /* --- the system clipboard: one machine-global text buffer ----------------
  * Set replaces it whole; get copies up to cap bytes OUT and returns how many
  * bytes the clipboard HOLDS -- more than cap means the caller saw a prefix. */

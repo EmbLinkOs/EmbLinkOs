@@ -321,7 +321,12 @@ static void apps_grid(void) {
     if (!g_apps_open) return;
     g_apps_frames++;
     Overlay() {
-        Dialog(.width = 480, .spacing = 12, .padding = 20) {
+        /* Same material language as the dock: the launcher frosts the
+         * wallpaper home itself painted earlier in this tree, rather than
+         * sitting on it as an opaque card. One vocabulary for every surface
+         * that floats -- that unity IS the Mac look, more than any one
+         * effect. */
+        Dialog(.width = 480, .spacing = 12, .padding = 20, .glass = 1) {
             /* header: title + an explicit close, so the grid has a normal way out
              * (not only the click-off-the-scrim dismiss) */
             HStack(.align = Center, .spacing = 8) {
