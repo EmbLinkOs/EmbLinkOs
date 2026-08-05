@@ -423,6 +423,14 @@ void ui_set_clip_children(bool clip) {
 }
 /* Mark the open box as an overlay: it fills its parent and is excluded from the
  * parent's flow (modals/popovers paint on top without disturbing layout). */
+/* Raise the OPEN box (and its whole subtree) to z-layer `l`: 0 = flow,
+ * 1 = popovers/dialog scrims, 2 = drag ghosts. Drives paint AND hit together
+ * (scene.h `layer`). */
+void ui_set_layer(int l) {
+    struct instance *b = cur_box(); if (!b) return;
+    scene_set_layer(g_sa, b->scene_node, (uint8_t)(l < 0 ? 0 : l > 3 ? 3 : l));
+}
+
 void ui_set_overlay(bool on) {
     struct instance *b = cur_box(); if (!b) return;
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
@@ -720,8 +728,8 @@ struct layout_handle ui_layout_of(struct instance_handle h) {
 
 struct hit_ctx {
     float px, py;
-    struct node_handle best;
-    bool found;
+    struct node_handle best[4];   /* topmost hit per z-layer (HIT_LAYERS) */
+    bool  found[4];
 };
 
 static void node_world_rect(const struct scene_node *n, const float world[16],
@@ -743,21 +751,35 @@ static int pt_in(float px, float py, float x0, float y0, float x1, float y1) {
     return px >= x0 && px < x1 && py >= y0 && py < y1;
 }
 
+#define HIT_LAYERS 4
 static void hit_rec(struct hit_ctx *c, struct node_handle h, const float wparent[16],
-                    float cx0, float cy0, float cx1, float cy1) {
+                    float cx0, float cy0, float cx1, float cy1, int layer) {
     struct scene_node *n = scene_resolve(g_sa, h);
     if (!n) return;
     float local[16], world[16];
     scene_trs_to_matrix(n, local);
     scene_mat4_mul(wparent, local, world);
 
+    /* the subtree's effective z-layer: a node can raise, never lower (same
+     * semantics the renderer paints by -- see scene.h `layer`) */
+    if (n->layer > layer) layer = n->layer;
+    int L = layer >= HIT_LAYERS ? HIT_LAYERS - 1 : layer;
+
+    /* an elevated subtree escapes ancestor clips exactly as it escapes them
+     * when painting -- so a dropdown hanging below its clipped strip is
+     * clickable everywhere it is VISIBLE */
+    float ecx0 = cx0, ecy0 = cy0, ecx1 = cx1, ecy1 = cy1;
+    if (n->layer > 0) { ecx0 = -1e30f; ecy0 = -1e30f; ecx1 = 1e30f; ecy1 = 1e30f; }
+
     float x0,y0,x1,y1; node_world_rect(n, world, &x0,&y0,&x1,&y1);
     int in_bounds = pt_in(c->px, c->py, x0, y0, x1, y1);
-    int in_clip   = pt_in(c->px, c->py, cx0, cy0, cx1, cy1);
-    if (in_bounds && in_clip) { c->best = h; c->found = true; }   /* topmost wins (back-to-front) */
+    int in_clip   = pt_in(c->px, c->py, ecx0, ecy0, ecx1, ecy1);
+    if (in_bounds && in_clip) {                   /* topmost-in-layer wins */
+        c->best[L] = h; c->found[L] = true;
+    }
 
     /* descendant clip = current clip intersected with THIS node's rect if it clips */
-    float nx0=cx0, ny0=cy0, nx1=cx1, ny1=cy1;
+    float nx0=ecx0, ny0=ecy0, nx1=ecx1, ny1=ecy1;
     if (n->clip_children) {
         if (x0 > nx0) nx0 = x0;
         if (y0 > ny0) ny0 = y0;
@@ -768,7 +790,7 @@ static void hit_rec(struct hit_ctx *c, struct node_handle h, const float wparent
         struct scene_node *cn = scene_resolve(g_sa, ch);
         if (!cn) break;
         struct node_handle next = cn->next_sibling;
-        hit_rec(c, ch, world, nx0, ny0, nx1, ny1);
+        hit_rec(c, ch, world, nx0, ny0, nx1, ny1, layer);
         ch = next;
     }
 }
@@ -778,12 +800,17 @@ static void hit_rec(struct hit_ctx *c, struct node_handle h, const float wparent
 static struct instance_handle instance_at(float px, float py) {
     struct instance *r = instance_resolve(g_root);
     if (!r) return INSTANCE_HANDLE_NULL;
-    struct hit_ctx c = { px, py, {0,0}, false };
+    struct hit_ctx c; c.px = px; c.py = py;
+    for (int i = 0; i < 4; i++) { c.best[i].index = 0; c.best[i].generation = 0; c.found[i] = false; }
     float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     float huge = 1e30f;
-    hit_rec(&c, r->scene_node, ident, -huge, -huge, huge, huge);
-    if (!c.found) return INSTANCE_HANDLE_NULL;
-    struct scene_node *sn = scene_resolve(g_sa, c.best);
+    hit_rec(&c, r->scene_node, ident, -huge, -huge, huge, huge, 0);
+    /* the highest layer that claims the point wins -- what you SEE on top is
+     * what your click lands on, because paint uses the same field */
+    int L = -1;
+    for (int i = 3; i >= 0; i--) if (c.found[i]) { L = i; break; }
+    if (L < 0) return INSTANCE_HANDLE_NULL;
+    struct scene_node *sn = scene_resolve(g_sa, c.best[L]);
     if (!sn) return INSTANCE_HANDLE_NULL;
     struct instance *inst = instance_resolve(unpack_handle(sn->user_data));
     return inst ? inst->self : INSTANCE_HANDLE_NULL;

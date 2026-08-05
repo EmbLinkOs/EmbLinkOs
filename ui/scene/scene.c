@@ -362,6 +362,13 @@ void scene_set_image_tint(struct scene_arena *a, struct node_handle h,
     n->dirty = true;
 }
 
+void scene_set_layer(struct scene_arena *a, struct node_handle h, uint8_t layer) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || n->layer == layer) return;
+    n->layer = layer;
+    n->dirty = true;
+}
+
 void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
                       float dx, float dy, float blur, struct color color) {
     struct scene_node *n = scene_resolve(a, h);

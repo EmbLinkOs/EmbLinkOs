@@ -217,20 +217,33 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
     }
 }
 
+/* Elevated subtrees found during the flow pass, painted afterwards in
+ * (layer, encounter) order. wparent is stashed so the deferred pass rebuilds
+ * the identical world transform; the clip stack is naturally empty by then,
+ * which is exactly popover semantics (a dropdown escapes its strip's clip). */
+#define ELEV_MAX 32
+struct elev_list {
+    struct { struct node_handle h; float wparent[16]; int layer; } e[ELEV_MAX];
+    int n;
+};
+
 static void render_node(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
-                        const float wparent[16], struct render_target *target, float ox, float oy);
+                        const float wparent[16], struct render_target *target, float ox, float oy,
+                        int in_elev, struct elev_list *el);
 static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
-                              const float wparent[16], struct render_target *target, float ox, float oy);
+                              const float wparent[16], struct render_target *target, float ox, float oy,
+                              int in_elev, struct elev_list *el);
 
 /* Depth-bounded wrapper: a corrupt scene tree with a parent<->child cycle would
  * otherwise recurse forever here (no fault, just a hang). Cap the depth well
  * above any real UI nesting so a cycle degrades instead of hanging. */
 static int g_render_depth;
 static void render_node(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
-                        const float wparent[16], struct render_target *target, float ox, float oy) {
+                        const float wparent[16], struct render_target *target, float ox, float oy,
+                        int in_elev, struct elev_list *el) {
     if (g_render_depth > 1024) return;
     g_render_depth++;
-    render_node_inner(r, a, h, wparent, target, ox, oy);
+    render_node_inner(r, a, h, wparent, target, ox, oy, in_elev, el);
     g_render_depth--;
 }
 
@@ -259,16 +272,28 @@ static void render_subtree_opaque(struct scene_renderer *r, struct scene_arena *
     while (!node_handle_is_null(c) && guard-- != 0) {
         struct scene_node *cn = scene_resolve(a, c);
         struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
-        render_node(r, a, c, world, target, ox, oy);
+        render_node(r, a, c, world, target, ox, oy, 1, 0);   /* groups flatten: inline */
         c = next;
     }
     if (pushed) r->be->pop_clip(target);
 }
 
 static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, struct node_handle h,
-                              const float wparent[16], struct render_target *target, float ox, float oy) {
+                              const float wparent[16], struct render_target *target, float ox, float oy,
+                              int in_elev, struct elev_list *el) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n) return;
+
+    /* an elevated subtree met during the FLOW pass: stash it for the deferred
+     * pass instead of painting it here in document position */
+    if (!in_elev && el && n->layer > 0 && el->n < ELEV_MAX) {
+        el->e[el->n].h = h;
+        for (int i = 0; i < 16; i++) el->e[el->n].wparent[i] = wparent[i];
+        el->e[el->n].layer = n->layer;
+        el->n++;
+        return;
+    }
+
     float local[16], world[16];
     scene_trs_to_matrix(n, local);
     scene_mat4_mul(wparent, local, world);
@@ -313,7 +338,7 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
     while (!node_handle_is_null(c) && guard-- != 0) {
         struct scene_node *cn = scene_resolve(a, c);
         struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
-        render_node(r, a, c, world, target, ox, oy);
+        render_node(r, a, c, world, target, ox, oy, in_elev, el);
         c = next;
     }
     if (pushed) r->be->pop_clip(target);
@@ -428,7 +453,20 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
         } else {
             r->be->begin_frame(target, r->dirty, (uint32_t)r->n_dirty);
         }
-        render_node(r, a, root, ident, target, 0.0f, 0.0f);
+        struct elev_list el; el.n = 0;
+        render_node(r, a, root, ident, target, 0.0f, 0.0f, 0, &el);
+        /* deferred: ascending layer, stable within a layer (encounter order ==
+         * document order). Insertion sort -- the list is tiny. */
+        for (int i = 1; i < el.n; i++) {
+            int j = i;
+            while (j > 0 && el.e[j - 1].layer > el.e[j].layer) {
+                struct elev_list tmp_one; tmp_one.e[0] = el.e[j - 1];
+                el.e[j - 1] = el.e[j]; el.e[j] = tmp_one.e[0];
+                j--;
+            }
+        }
+        for (int i = 0; i < el.n; i++)
+            render_node(r, a, el.e[i].h, el.e[i].wparent, target, 0.0f, 0.0f, 1, 0);
         r->be->end_frame(target);
     }
 

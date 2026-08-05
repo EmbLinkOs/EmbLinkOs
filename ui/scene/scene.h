@@ -116,6 +116,13 @@ struct scene_node {
 
     /* --- clipping --- */
     bool  clip_children;
+    uint8_t layer;  /* z-LAYER of the subtree this node roots: 0 = flow, higher
+                     * = elevated (popovers 1, drag ghosts 2). One field drives
+                     * BOTH paint and hit: elevated subtrees paint AFTER the
+                     * flow (ascending layer, document order within a layer) and
+                     * hit-test BEFORE it (descending), so what you see on top
+                     * is what your click lands on. Elevated subtrees also
+                     * escape ancestor clips -- popover semantics. */
 
     /* --- border (RECT; a hairline stroke drawn INSIDE the rounded edge, on
      * top of the fill) --- */
@@ -204,6 +211,7 @@ void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pi
  * restores normal full-colour drawing. */
 void scene_set_image_tint(struct scene_arena *a, struct node_handle h,
                           bool enabled, struct color tint);
+void scene_set_layer(struct scene_arena *a, struct node_handle h, uint8_t layer);
 void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
                       float dx, float dy, float blur, struct color color);
 void scene_set_border(struct scene_arena *a, struct node_handle h, float width, struct color color);

@@ -36,6 +36,7 @@ void ui_set_offset(float x, float y);  /* post-layout translate (transitions/sli
 void ui_set_backdrop_blur(bool enabled, float radius);
 void ui_set_clip_children(bool clip);
 void ui_set_overlay(bool on);   /* fill parent, out of flow (modal/popover layer) */
+void ui_set_layer(int l);       /* z-layer 0..3: elevated paints above + hits first */
 void ui_set_border(float width, struct color color);
 void ui_set_border_gradient(float width, const struct paint *paint);
 void ui_set_text_gradient(const struct paint *paint);   /* one-shot: next ui_text() */

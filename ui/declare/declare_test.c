@@ -207,6 +207,33 @@ static void t6_hit_clip(void) {
     done();
 }
 
+/* ---- T6b: z-layers -- an early elevated box beats a later flow box ------ */
+static void t6b_hit_layers(void) {
+    printf("T6b hit-test z-layers:\n");
+    fresh();
+    ui_frame_begin();
+    ui_box_begin(0);                       /* an early scrim raised to layer 1 */
+      ui_set_size((struct layout_size){SIZE_FIXED,100,0,0,0}, (struct layout_size){SIZE_FIXED,100,0,0,0});
+      ui_set_layer(1);
+    ui_box_end();
+    ui_box_begin(0);                       /* a LATER flow box over the same pixels */
+      ui_set_size((struct layout_size){SIZE_FIXED,100,0,0,0}, (struct layout_size){SIZE_FIXED,100,0,0,0});
+    ui_box_end();
+    ui_frame_end();
+
+    struct instance_handle scrim = ui_first_child(ui_root());
+    struct instance_handle later = ui_next_sibling(scrim);
+    ui_run_layout(200, 200);
+    /* stack both at the origin so they overlap (layout would stagger them) */
+    scene_set_transform(&SA, ui_scene_of(later), 0, 0, 0, 0,0,0,1, 1,1,1);
+
+    ui_dispatch_click(50, 50);
+    CHECK(ui_consume_click(scrim), "the elevated (layer 1) box wins the point");
+    ui_dispatch_click(50, 50);
+    CHECK(!ui_consume_click(later), "the later flow box does NOT win it");
+    done();
+}
+
 /* ---- T7: button click is a one-frame pulse ----------------------------- */
 static bool g_last_click;
 static void app_button(void) {
@@ -245,6 +272,7 @@ int main(void) {
     t4_props_change();
     t5_keyed_reorder();
     t6_hit_clip();
+    t6b_hit_layers();
     t7_button_pulse();
     printf("=== declare-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

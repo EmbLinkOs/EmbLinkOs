@@ -266,6 +266,57 @@ static void t6_destroyed(void) {
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
 
+/* T7: an ELEVATED subtree paints above later flow content, and escapes its
+ * parent's clip -- the two halves of popover semantics. An early scrim/panel
+ * (layer 1) must not be buried by a Spacer declared after it, and a dropdown
+ * must be able to hang below the 28px strip that declared it. */
+static void t7_layers(void) {
+    printf("T7 elevated layers paint above later flow, escape parent clip:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
+    struct render_target rt = make_target(64, 64);
+
+    struct node_handle root = scene_create_node(&a, SCENE_NODE_GROUP, NODE_HANDLE_NULL);
+    struct node_handle bg = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, bg, 64, 64);
+    struct paint grey; grey.kind = PAINT_SOLID; grey.solid = (struct color){0.5f,0.5f,0.5f,1}; grey.n_stops = 0;
+    scene_set_paint(&a, bg, &grey);
+
+    /* a CLIPPING strip (like a menu bar), 64x10, containing an elevated panel
+     * that hangs far below the strip */
+    struct node_handle strip = scene_create_node(&a, SCENE_NODE_GROUP, root);
+    scene_set_size(&a, strip, 64, 10);
+    scene_set_clip_children(&a, strip, true);
+    struct node_handle panel = scene_create_node(&a, SCENE_NODE_RECT, strip);
+    scene_set_size(&a, panel, 20, 40);
+    scene_set_transform(&a, panel, 8, 4, 0, 0,0,0,1, 1,1,1);
+    scene_set_layer(&a, panel, 1);
+    struct paint redp; redp.kind = PAINT_SOLID; redp.solid = (struct color){1,0,0,1}; redp.n_stops = 0;
+    scene_set_paint(&a, panel, &redp);
+
+    /* LATER flow content overlapping the panel's area (the "Spacer over the
+     * scrim" shape) */
+    struct node_handle late = scene_create_node(&a, SCENE_NODE_RECT, root);
+    scene_set_size(&a, late, 40, 40);
+    scene_set_transform(&a, late, 4, 12, 0, 0,0,0,1, 1,1,1);
+    struct paint bluep; bluep.kind = PAINT_SOLID; bluep.solid = (struct color){0,0,1,1}; bluep.n_stops = 0;
+    scene_set_paint(&a, late, &bluep);
+
+    scene_render_frame(&r, &a, root, &rt);
+    /* inside the panel, below the strip's 10px clip, where `late` also paints:
+     * elevated wins AND the clip did not cut it */
+    CHECK(red_at(&rt, 14, 30) > 200, "elevated panel paints ABOVE later flow");
+    CHECK(blue_at(&rt, 40, 20) > 200, "flow content still paints where the panel is not");
+
+    /* destroy the elevated panel: its pixels restore (vacated pass covers
+     * deferred subtrees exactly like flow ones) */
+    scene_destroy_node(&a, panel);
+    scene_render_frame(&r, &a, root, &rt);
+    CHECK(red_at(&rt, 14, 30) < 160, "destroyed elevated panel leaves no ghost");
+
+    free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== EmbLink UI Piece 4a: render-backend selftests ===\n");
     t1_aa();
@@ -274,6 +325,7 @@ int main(void) {
     t4_dirty_blur();
     t5_ghost();
     t6_destroyed();
+    t7_layers();
     printf("=== backend-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }
