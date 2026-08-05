@@ -137,6 +137,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/epfs.c \
              kernel/ipc/handle.c \
              kernel/ipc/channel.c \
+             kernel/ipc/clipboard.c \
              kernel/ipc/endpoint.c \
              kernel/ipc/pipe.c \
              kernel/kworker/kworker.c \

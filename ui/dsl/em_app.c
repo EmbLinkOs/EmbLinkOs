@@ -189,6 +189,26 @@ int em_app_run(const EmApp *app) {
         }
         int had_key = 0;
         for (int c; (c = embk_key_poll()) != 0; ) {
+            if (c == 0x16) {                       /* Ctrl+V: paste, app-wide */
+                /* The runtime replays the clipboard through the SAME delivery
+                 * path as typing -- key hook first, else the focused field --
+                 * so every app that can take a keystroke can take a paste,
+                 * with zero code of its own. Control bytes become spaces: a
+                 * paste must never EXECUTE anything (a newline reaching a
+                 * terminal's Enter path would run half a paste as commands). */
+                static char clip[4096];
+                int64_t held = embk_clip_get(clip, sizeof clip);
+                int n = held < 0 ? 0 : (held > (int64_t)sizeof clip ? (int)sizeof clip : (int)held);
+                for (int i = 0; i < n; i++) {
+                    int ch = (unsigned char)clip[i];
+                    if (ch == '\n' || ch == '\t') ch = ' ';
+                    if (ch < 0x20 || ch > 0x7E) continue;
+                    if (g_em_key_hook && g_em_key_hook(ch)) continue;
+                    ui_input_char(ch);
+                }
+                had_key = 1;
+                continue;
+            }
             if (g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
             if (c == 27) {
                 embk_win_destroy(win); embk_key_grab(0);

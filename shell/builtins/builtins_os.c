@@ -557,6 +557,31 @@ static struct value bi_which(const struct command *cmd, struct value input,
     return value_error(msg);
 }
 
+/* clip: the piped value's text goes to the SYSTEM clipboard, so the shell's
+ * structured world can feed every paste target in the GUI ("cat notes | clip",
+ * then Ctrl+V anywhere). Copy-without-selection: the pipeline IS the
+ * selection. Scalars and strings in v1; tables have `save`. */
+static struct value bi_clip(const struct command *cmd, struct value input,
+                            struct scope *env) {
+    (void)cmd; (void)env;
+    char small[256];
+    const char *text = NULL; size_t len = 0;
+    if (input.type == VAL_STRING || input.type == VAL_PATH) {
+        text = input.u.s.bytes; len = input.u.s.len;
+    } else if (input.type == VAL_TABLE || input.type == VAL_LIST ||
+               input.type == VAL_RECORD) {
+        value_free(&input);
+        return value_error("clip: pipe text (tables: use `save`)");
+    } else {
+        len = sval_format_scalar(&input, small, sizeof small);
+        text = small;
+    }
+    int rc = embk_clip_set(text, len);
+    value_free(&input);
+    if (rc != 0) return value_error("clip: could not set the clipboard");
+    return value_null();
+}
+
 static struct value bi_uptime(const struct command *cmd, struct value input,
                               struct scope *env) {
     (void)cmd; (void)env;
@@ -607,6 +632,7 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "uptime", bi_uptime }, { "date",   bi_date   },
         { "whoami", bi_whoami }, { "hostname", bi_hostname },
         { "history", bi_history }, { "which", bi_which },
+        { "clip",    bi_clip    },
         { "clear",  bi_clear  },
     };
     for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)

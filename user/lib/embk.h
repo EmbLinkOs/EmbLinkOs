@@ -902,6 +902,16 @@ static inline int64_t embk_puts(int fd, const char *s) {
 
 /* TTY mode: 0 = cooked (line-buffered, echo), 1 = raw (unbuffered, no echo).
  * Returns the previous mode (0/1) or -EMBK_* on error. */
+/* --- the system clipboard: one machine-global text buffer ----------------
+ * Set replaces it whole; get copies up to cap bytes OUT and returns how many
+ * bytes the clipboard HOLDS -- more than cap means the caller saw a prefix. */
+static inline int embk_clip_set(const void *buf, size_t len) {
+    return (int)embk_syscall2(EMBK_SYS_clip_set, (int64_t)(intptr_t)buf, (int64_t)len);
+}
+static inline int64_t embk_clip_get(void *buf, size_t cap) {
+    return embk_syscall2(EMBK_SYS_clip_get, (int64_t)(intptr_t)buf, (int64_t)cap);
+}
+
 static inline int embk_tty_mode(int mode) {
     return (int)embk_syscall1(EMBK_SYS_tty_mode, mode);
 }
