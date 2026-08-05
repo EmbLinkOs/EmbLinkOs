@@ -1,12 +1,21 @@
 /* user/bin/term.c -- the EmbLink Terminal: the structured shell, on screen.
  *
- * A deliberately DUMB byte terminal. It spawns /shell.elf as a child with
- * both stdio ends piped (Piece-0 plumbing: INSTALL_OBJ into the child,
- * fd_install_obj for its own ends), forwards keystrokes into the shell's
- * stdin, and renders whatever the shell prints -- the shell already does
- * echo, backspace erase and the prompt, so the terminal implements no line
- * editing at all. Output is polled with embk_fd_avail() from the runtime's
- * idle hook (a render loop must never block in read()).
+ * NOT a teletype. The window is a read-only TRANSCRIPT VIEWER with a single
+ * INPUT LINE beneath it: you read above, you type below, and the cursor only
+ * ever lives on that one line. Running `ls` prints its output into the viewer
+ * rather than into the thing you are typing in.
+ *
+ * That inverts who owns the line. A classic terminal forwards every keystroke
+ * and lets the shell echo -- which only works when input and output share one
+ * stream. Here nothing is sent until Enter, so the TERMINAL owns the line
+ * buffer, and therefore owns editing and history too. The shell still echoes
+ * the completed command, which is what puts "prompt + command" into the
+ * transcript ahead of the output -- the record of what actually ran.
+ *
+ * It spawns /shell.elf as a child with both stdio ends piped (Piece-0
+ * plumbing: INSTALL_OBJ into the child, fd_install_obj for its own ends).
+ * Output is polled with embk_fd_avail() from the runtime's idle hook (a render
+ * loop must never block in read()).
  *
  * Closing the window closes the shell FOR FREE: the terminal's exit drops
  * its pipe fds (exit-time reap loop), the shell's read(0) returns EOF, and
@@ -25,7 +34,7 @@
 #include "theme.h"
 
 #define T_COLS 96          /* chars per line before a hard wrap */
-#define T_ROWS 24          /* visible lines */
+#define T_ROWS 22          /* visible transcript lines (one row goes to the input line) */
 #define SB_ROWS 200        /* scrollback depth (a ring of whole lines) */
 #define FD_SHELL_IN  10    /* our WRITE end of the shell's stdin  */
 #define FD_SHELL_OUT 11    /* our READ end of the shell's stdout  */
@@ -40,6 +49,44 @@ static int  g_head = 0, g_count = 1, g_col = 0;
 static int  g_view = 0;
 static int  g_shell = -1;      /* spawn handle */
 static bool g_dead = false;
+
+/* --- the command line ------------------------------------------------------
+ * The window is a READ-ONLY transcript with a single input line beneath it, so
+ * the cursor only ever lives on that one line. Nothing is sent to the shell
+ * until Enter, which means the terminal -- not the shell -- owns the line
+ * buffer, and therefore owns editing and history too. (The old design forwarded
+ * every keystroke and let the shell echo; that only works when input and output
+ * share one stream.) The shell still echoes the completed line, which is what
+ * puts "prompt + command" into the transcript above. */
+#define IN_MAX 256
+#define HIST_MAX 32
+static char g_in[IN_MAX];
+static int  g_in_n = 0;
+static char g_hist[HIST_MAX][IN_MAX];
+static int  g_hist_n = 0;      /* how many commands remembered */
+static int  g_hist_at = -1;    /* -1 = editing a fresh line, else index back */
+
+static void hist_push(const char *s) {
+    if (!s[0]) return;
+    if (g_hist_n && !strcmp(g_hist[(g_hist_n - 1) % HIST_MAX], s)) return;  /* no dupes */
+    snprintf(g_hist[g_hist_n % HIST_MAX], IN_MAX, "%s", s);
+    g_hist_n++;
+}
+
+/* Walk history: dir -1 = older (Up), +1 = newer (Down). */
+static void hist_step(int dir) {
+    int avail = g_hist_n < HIST_MAX ? g_hist_n : HIST_MAX;
+    if (!avail) return;
+    int at = g_hist_at + (dir < 0 ? 1 : -1);
+    if (at < 0) {                       /* back to the fresh line */
+        g_hist_at = -1; g_in[0] = 0; g_in_n = 0; return;
+    }
+    if (at >= avail) at = avail - 1;
+    g_hist_at = at;
+    const char *s = g_hist[(g_hist_n - 1 - at) % HIST_MAX];
+    snprintf(g_in, sizeof g_in, "%s", s);
+    g_in_n = (int)strlen(g_in);
+}
 
 /* ring slot of logical line `i` (0 = oldest live line, g_count-1 = current) */
 static int sb_slot(int i) {
@@ -118,19 +165,38 @@ static int term_key(int c) {
         return 1;
     }
     if (g_dead) return 1;
-    char ch;
-    if (c == EMBK_KEY_DEL) ch = '\b';
-    /* Up/Down go THROUGH to the shell: history recall is the shell's job
-     * (it owns the line buffer and the echo), exactly as readline belongs
-     * to bash and not to xterm. The terminal keeps PgUp/PgDn for its own
-     * scrollback -- that's the whole key split. */
-    else if (c == EMBK_KEY_UP || c == EMBK_KEY_DOWN) ch = (char)c;
-    else if (c == '\n' || c == '\b' || c == '\t' ||
-             (c >= 0x20 && c <= 0x7E)) ch = (char)c;
-    else return 1;                               /* other nav keys: swallowed */
-    if (g_view != 0) { g_view = 0; em_request_frame(); }   /* typing = live */
-    write(FD_SHELL_IN, &ch, 1);
-    return 1;                                    /* never reaches the toolkit */
+    if (g_view != 0) g_view = 0;                 /* typing = snap back to live */
+
+    /* Up/Down are OURS now. Once the terminal owns the line buffer, history
+     * has to live here too -- forwarding the keystroke would drive the shell's
+     * own line editor, which no longer has anything to edit. */
+    if (c == EMBK_KEY_UP)   { hist_step(-1); em_request_frame(); return 1; }
+    if (c == EMBK_KEY_DOWN) { hist_step(+1); em_request_frame(); return 1; }
+
+    if (c == '\b' || c == EMBK_KEY_DEL) {
+        if (g_in_n > 0) g_in[--g_in_n] = 0;
+        em_request_frame();
+        return 1;
+    }
+    if (c == '\n' || c == '\r') {   /* accept either newline byte for Enter */
+        /* Send the whole line at once. The shell echoes it after its prompt,
+         * so the transcript above gains "prompt + command" then the output --
+         * the record of what ran, which is the point of the viewer. */
+        hist_push(g_in);
+        g_hist_at = -1;
+        char nl = '\n';
+        if (g_in_n) write(FD_SHELL_IN, g_in, (size_t)g_in_n);
+        write(FD_SHELL_IN, &nl, 1);
+        g_in[0] = 0; g_in_n = 0;
+        em_request_frame();
+        return 1;
+    }
+    if (c >= 0x20 && c <= 0x7E) {
+        if (g_in_n < IN_MAX - 1) { g_in[g_in_n++] = (char)c; g_in[g_in_n] = 0; }
+        em_request_frame();
+        return 1;
+    }
+    return 1;                                    /* other nav keys: swallowed */
 }
 
 /* --- spawn the shell with both stdio ends piped --------------------------- */
@@ -191,7 +257,8 @@ static void term_view(void) {
         WindowBar("Terminal") {
             CloseGrip();
         }
-        VStack(.spacing = 1, .padding = 12, .align = Leading) {
+        /* the VIEWER: a read-only transcript of everything the shell printed */
+        VStack(.spacing = 1, .px = 12, .pt = 10, .pb = 4, .align = Leading) {
             int start = g_count - T_ROWS - g_view;
             if (start < 0) start = 0;
             for (int r = 0; r < T_ROWS; r++) {
@@ -216,6 +283,19 @@ static void term_view(void) {
                     Text(ln).caption();
                 }
             }
+        }
+
+        Spacer();   /* push the command line to the BOTTOM of the window */
+
+        /* the COMMAND LINE: the only place a cursor lives. One row, pinned
+         * under the transcript -- you read above, you type here. */
+        const struct ui_theme *t = ui_theme();
+        HStack(.height = 26, .align = Center, .spacing = 8, .px = 12,
+               .background = t->surface_alt, .corner = 8, .border = 1) {
+            Text(">").accent().bold();
+            static char shown[IN_MAX + 2];
+            snprintf(shown, sizeof shown, "%s|", g_in);   /* trailing caret */
+            Text(g_dead ? "(shell exited)" : shown).caption();
         }
     }
 }

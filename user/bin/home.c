@@ -489,6 +489,12 @@ static void home_ui(void) {
     g_any_active = 0; g_have_dockr = 0;   /* recomputed each frame during the build */
     Screen(.width = g_sw, .height = g_sh, .padding = -1, .align = Fill) {
         BackgroundImage("/system/images/colibri-user.ppm");
+        /* Freely-placed app icons (each owns its spot). Declared BEFORE the
+         * dock/taskbar on purpose: this is a full-screen out-of-flow overlay,
+         * so anything declared after it is hit-tested ABOVE it. Sitting last,
+         * it silently swallowed every click meant for the dock -- launching an
+         * app from the dock simply stopped working. */
+        desktop_icons();
         VStack(.width = g_sw, .height = g_sh, .padding = 0, .spacing = 0,
                .align = Fill) {
             /* Reserve the top strip for our own floating menu bar (topbar.elf,
@@ -509,7 +515,6 @@ static void home_ui(void) {
                 dock_pill();
             }
         }
-        desktop_icons();       /* freely-placed app icons (each owns its spot) */
         apps_grid();           /* the Apps launcher (modal grid), when open */
         drag_ghost();          /* the dragged icon follows the cursor (overlay) */
     }
