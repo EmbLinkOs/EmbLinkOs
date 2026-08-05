@@ -338,9 +338,15 @@ static void term_view(void) {
             }
         }
 
+        /* A grow-only gap: the transcript is a fixed number of rows, so `.grow`
+         * on it cannot absorb the leftover height -- this does, pressing the
+         * command line flush to the bottom edge instead of leaving it floating
+         * with dead space beneath. */
+        Spacer();
+
         /* the COMMAND LINE: the only place a cursor lives. One row, pinned
          * under the transcript -- you read above, you type here. */
-        HStack(.height = 28, .align = Center, .spacing = 8, .px = 12,
+        HStack(.height = 28, .align = Center, .spacing = 8, .px = 12, .pb = 2,
                .background = TERM_INBG) {
             Text(prompt_text()).caption().bold().color(TERM_PROMPT);
             static char shown[IN_MAX + 2];
