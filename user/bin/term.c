@@ -40,8 +40,13 @@
 #include "em.h"
 #include "theme.h"
 
-#define T_COLS 96          /* chars per line before a hard wrap */
-#define T_ROWS 22          /* visible transcript lines (one row goes to the input line) */
+/* CAPACITY (buffer dimensions) vs the LIVE GRID (what fits right now). The
+ * window is resizable, so the grid is measured from the viewport every frame
+ * and the buffers are simply big enough for the largest sane window. */
+#define SB_COLS  220       /* widest line the scrollback can hold */
+#define SB_VROWS 60        /* most transcript rows we can ever render */
+static int g_cols = 96;    /* live: chars per line before a hard wrap */
+static int g_rows = 22;    /* live: visible transcript lines */
 #define SB_ROWS 300        /* scrollback depth (a ring of whole lines) */
 #define FD_SHELL_IN  10    /* our WRITE end of the shell's stdin  */
 #define FD_SHELL_OUT 11    /* our READ end of the shell's stdout  */
@@ -54,8 +59,8 @@
 #define AT_COLOR(a)  ((a) & 0x0F)
 #define AT_BRIGHT    0x10
 #define AT_BOLD      0x20
-static char    g_sb [SB_ROWS][T_COLS + 1];
-static uint8_t g_sba[SB_ROWS][T_COLS];
+static char    g_sb [SB_ROWS][SB_COLS + 1];
+static uint8_t g_sba[SB_ROWS][SB_COLS];
 static int  g_head = 0, g_count = 1, g_col = 0;
 static int  g_view = 0;
 static int  g_shell = -1;      /* spawn handle */
@@ -139,8 +144,8 @@ static void term_newline(void) {
     g_col = 0;
     /* keep a paged-back view anchored on the same CONTENT while new lines
      * arrive underneath -- until the ring saturates and eats it */
-    if (g_view > 0 && g_view < g_count - T_ROWS) g_view++;
-    if (g_view > g_count - T_ROWS) g_view = g_count > T_ROWS ? g_count - T_ROWS : 0;
+    if (g_view > 0 && g_view < g_count - g_rows) g_view++;
+    if (g_view > g_count - g_rows) g_view = g_count > g_rows ? g_count - g_rows : 0;
 }
 
 /* --- ANSI SGR (ESC [ ... m) ------------------------------------------------
@@ -199,7 +204,7 @@ static void term_putc(char c) {
     if (c == '\r') { g_col = 0; return; }
     if (c == '\t') {                       /* expand to 8-column stops */
         int stop = (g_col / 8 + 1) * 8;
-        while (g_col < stop && g_col < T_COLS) {
+        while (g_col < stop && g_col < g_cols) {
             g_sba[g_head][g_col] = 0;
             g_sb[g_head][g_col++] = ' ';
         }
@@ -220,7 +225,7 @@ static void term_putc(char c) {
         return;
     }
     if ((unsigned char)c < 0x20) return;   /* other control bytes: drop */
-    if (g_col >= T_COLS) term_newline();   /* hard wrap */
+    if (g_col >= g_cols) term_newline();   /* hard wrap */
     g_sba[g_head][g_col] = g_attr;
     g_sb[g_head][g_col++] = c;
     g_sb[g_head][g_col] = '\0';
@@ -417,9 +422,9 @@ static int term_key(int c) {
         return 1;
     }
     if (c == EMBK_KEY_PGUP || c == EMBK_KEY_PGDN) {
-        int max_back = g_count > T_ROWS ? g_count - T_ROWS : 0;
-        if (c == EMBK_KEY_PGUP) g_view += T_ROWS / 2;
-        else                    g_view -= T_ROWS / 2;
+        int max_back = g_count > g_rows ? g_count - g_rows : 0;
+        if (c == EMBK_KEY_PGUP) g_view += g_rows / 2;
+        else                    g_view -= g_rows / 2;
         if (g_view > max_back) g_view = max_back;
         if (g_view < 0) g_view = 0;
         em_request_frame();
@@ -561,7 +566,7 @@ static Color ansi_color(uint8_t attr, Color dflt) {
 /* Per-run scratch: substrings handed to Text() must outlive the frame build,
  * so every run gets its own slot rather than sharing one static buffer. */
 #define MAX_RUNS 10
-static char s_run[T_ROWS][MAX_RUNS][T_COLS + 1];
+static char s_run[SB_VROWS][MAX_RUNS][SB_COLS + 1];
 
 /* one transcript row, split into runs of equal attribute */
 static void row_runs(int row_i, const char *s, const uint8_t *a, Color dflt) {
@@ -571,7 +576,7 @@ static void row_runs(int row_i, const char *s, const uint8_t *a, Color dflt) {
             uint8_t at = a[i];
             int j = i;
             while (s[j] && a[j] == at) j++;
-            int len = j - i; if (len > T_COLS) len = T_COLS;
+            int len = j - i; if (len > SB_COLS) len = SB_COLS;
             memcpy(s_run[row_i][run], s + i, (size_t)len);
             s_run[row_i][run][len] = 0;
             EmV t = Text(s_run[row_i][run]).caption().color(ansi_color(at, dflt));
@@ -604,15 +609,15 @@ static void term_view(void) {
             /* the wheel pages the scrollback -- up rolls back in time */
             float wd = ui_take_wheel();
             if (wd != 0.0f) {
-                int max_back = g_count > T_ROWS ? g_count - T_ROWS : 0;
+                int max_back = g_count > g_rows ? g_count - g_rows : 0;
                 g_view += (int)(wd * 3.0f);
                 if (g_view > max_back) g_view = max_back;
                 if (g_view < 0) g_view = 0;
                 em_request_frame();
             }
-            int start = g_count - T_ROWS - g_view;
+            int start = g_count - g_rows - g_view;
             if (start < 0) start = 0;
-            for (int r = 0; r < T_ROWS; r++) {
+            for (int r = 0; r < g_rows; r++) {
                 /* NO `continue`/`break` inside a container's brace scope: the
                  * EmUI containers are for-loop MACROS, so a bare continue
                  * targets the MACRO's hidden loop and silently skips the rest
@@ -647,7 +652,25 @@ static void term_view(void) {
          * Left/Right/Home/End visibly move it through the text. */
         HStack(.height = 28, .align = Center, .spacing = 8, .px = 12, .pb = 2,
                .background = TERM_INBG) {
-            Text(prompt_text()).caption().bold().color(TERM_PROMPT);
+            /* Grid calibration, free of charge: the prompt is drawn in the
+             * same mono face as the transcript and we KNOW its length, so its
+             * measured box gives the character advance and the line height --
+             * no font API, no hidden probe node. Reads LAST frame's geometry
+             * (one frame of lag is invisible while dragging a grip). */
+            HStack(.align = Center) {
+                float bx, by, bw, bh;
+                if (ui_open_rect(&bx, &by, &bw, &bh) && bw > 1 && bh > 1) {
+                    int plen = (int)strlen(prompt_text());
+                    if (plen > 0) {
+                        float cw = bw / (float)plen, lh = bh + 1.0f;
+                        int cols = (int)((em_viewport_width() - 28.0f) / cw);
+                        int rows = (int)((em_viewport_height() - 46.0f - 34.0f) / lh);
+                        g_cols = cols < 20 ? 20 : cols > SB_COLS ? SB_COLS : cols;
+                        g_rows = rows < 3  ? 3  : rows > SB_VROWS ? SB_VROWS : rows;
+                    }
+                }
+                Text(prompt_text()).caption().bold().color(TERM_PROMPT);
+            }
             if (g_dead) {
                 Text("(shell exited)").caption().color(TERM_TEXT);
             } else {
@@ -677,7 +700,7 @@ int main(void) {
         .size   = { 740, 480 },
         .theme  = Dark,
         .chrome = Chromeless,
-        .resize = FixedSize,
+        .resize = Resizable,
         .view   = term_view,
         .font   = "/system/fonts/mono.ttf",   /* DejaVu Sans Mono -- aligned table columns */
     };
