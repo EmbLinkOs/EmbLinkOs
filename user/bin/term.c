@@ -300,14 +300,17 @@ static void term_view(void) {
      * its body and its input row reads as three panels bolted together rather
      * than one object. Warm and low-contrast, because this is a window you sit
      * in front of for a long time. */
-    const Color TERM_BG    = { .r=.109f, .g=.078f, .b=.062f, .a=1.f };  /* the ground */
-    const Color TERM_INBG  = { .r=.145f, .g=.105f, .b=.082f, .a=1.f };  /* input, a hair lifted */
-    const Color TERM_TEXT  = { .r=.905f, .g=.855f, .b=.784f, .a=1.f };  /* warm cream */
-    const Color TERM_PROMPT= { .r=.913f, .g=.647f, .b=.317f, .a=1.f };  /* amber      */
+    const Color TERM_BG    = { .r=.086f, .g=.090f, .b=.106f, .a=1.f };  /* the ground */
+    const Color TERM_INBG  = { .r=.125f, .g=.133f, .b=.156f, .a=1.f };  /* input, a hair lifted */
+    const Color TERM_TEXT  = { .r=.855f, .g=.871f, .b=.898f, .a=1.f };  /* soft off-white */
+    const Color TERM_PROMPT= { .r=.435f, .g=.780f, .b=.612f, .a=1.f };  /* calm green */
 
     Window("Terminal", .background = TERM_BG) {
         WindowBar("Terminal", .background = TERM_BG) {
-            CloseGrip();
+            /* A plain click. CloseGrip is a PULL handle -- it wants a deliberate
+             * drag before it fires, which is a fine guard for something
+             * destructive and pure friction for closing a window. */
+            if (CloseButton().clicked()) exit(0);   /* window is reaped, shell EOFs */
         }
         /* the VIEWER: a read-only transcript of everything the shell printed */
         VStack(.spacing = 1, .px = 12, .pt = 10, .pb = 4, .align = Leading,
