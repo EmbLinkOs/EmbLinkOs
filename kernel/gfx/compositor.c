@@ -208,7 +208,12 @@ static int imin(int a, int b) { return a < b ? a : b; }
  * focused-window accent glow. A translucent bar's frame is a tall invisible
  * canvas, so a halo around it would outline empty space -- skip it. */
 static int win_glows(const struct comp_window *w) {
-    return w->used && !w->desktop && !w->widget && !w->translucent;
+    /* No focus halo. A coloured glow bleeding out of every window is the one
+     * thing that stops an app looking like a solid object -- it read as a
+     * screenshot artefact rather than chrome. Focus is legible from the title
+     * bar tint; the window itself should just be a clean rectangle. */
+    (void)w;
+    return 0;
 }
 /* The rect a repaint must cover for a window: its frame, GROWN by the glow band
  * for glow windows so the halo is drawn / erased with the window (else it trails

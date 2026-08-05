@@ -295,18 +295,20 @@ static bool term_spawn_shell(void) {
 
 /* --- the view -------------------------------------------------------------- */
 static void term_view(void) {
-    Window("Terminal") {
-        WindowBar("Terminal") {
+    /* ONE ground colour for the whole window -- chrome, transcript, command
+     * line and any slack. A terminal that changes shade between its title bar,
+     * its body and its input row reads as three panels bolted together rather
+     * than one object. Warm and low-contrast, because this is a window you sit
+     * in front of for a long time. */
+    const Color TERM_BG    = { .r=.109f, .g=.078f, .b=.062f, .a=1.f };  /* the ground */
+    const Color TERM_INBG  = { .r=.145f, .g=.105f, .b=.082f, .a=1.f };  /* input, a hair lifted */
+    const Color TERM_TEXT  = { .r=.905f, .g=.855f, .b=.784f, .a=1.f };  /* warm cream */
+    const Color TERM_PROMPT= { .r=.913f, .g=.647f, .b=.317f, .a=1.f };  /* amber      */
+
+    Window("Terminal", .background = TERM_BG) {
+        WindowBar("Terminal", .background = TERM_BG) {
             CloseGrip();
         }
-        /* A warm, low-contrast palette rather than the stock cold grey: this is
-         * a window you sit in for a long time, and warm dark backgrounds with
-         * cream text are far easier on the eyes than black-and-white. */
-        const Color TERM_BG    = { .r=.109f, .g=.078f, .b=.062f, .a=1.f };  /* dark brown */
-        const Color TERM_INBG  = { .r=.168f, .g=.121f, .b=.094f, .a=1.f };  /* input row  */
-        const Color TERM_TEXT  = { .r=.905f, .g=.855f, .b=.784f, .a=1.f };  /* warm cream */
-        const Color TERM_PROMPT= { .r=.913f, .g=.647f, .b=.317f, .a=1.f };  /* amber      */
-
         /* the VIEWER: a read-only transcript of everything the shell printed */
         VStack(.spacing = 1, .px = 12, .pt = 10, .pb = 4, .align = Leading,
                .grow = 1, .background = TERM_BG) {
