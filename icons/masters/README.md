@@ -44,7 +44,18 @@ reduced by filtering, so author those at 512² or larger.
 </svg>
 ```
 
-Run `python3 tools/mkicons.py --list` to see which icons have real masters and
-which are still falling back to the legacy 96×96 `.pam` art.
+## Organising into folders
+
+Subfolders are fine and purely organisational — an icon is known by its
+**filename** wherever it sits, so moving art between folders never changes the
+path apps reference:
+
+    icons/masters/svg/list.svg   ->  /system/images/list.eic
+
+The one rule that follows from that: two masters cannot share a filename. If
+they do, the generator says which two rather than silently picking one.
+
+Run `python3 tools/mkicons.py --list` to see every master it found and where
+each one came from.
 
 Full format and pipeline notes: [docs/ICONS.md](../../docs/ICONS.md).

@@ -27,6 +27,12 @@ Put an SVG in `icons/masters/` named after the icon:
     icons/masters/files.svg      ->  /system/images/files.eic
     icons/masters/terminal.svg   ->  /system/images/terminal.eic
 
+Subfolders are scanned too and are purely organisational — an icon is known by
+its **filename** wherever it sits, so reorganising art never changes the path
+apps reference (`icons/masters/svg/list.svg` still becomes `list.eic`). Two
+masters therefore cannot share a filename; the generator names both rather than
+silently picking one.
+
 Then `make embkfs.img`. A non-square SVG is letterboxed into the square
 viewport rather than stretched, so design on a square canvas —
 `viewBox="0 0 64 64"` is a good default.

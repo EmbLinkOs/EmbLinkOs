@@ -1188,14 +1188,18 @@ STAGED_APPS ?=
 # carrying every size the shell asks for (docs/ICONS.md). Regenerated whenever a
 # master -- or the generator -- changes, so dropping in new art is just `make`.
 # Falls back to the legacy .pam art for icons that have no master yet.
-ICON_MASTERS := $(wildcard icons/masters/*.svg) $(wildcard icons/masters/*.png)
+# Recursive: icons/masters may be organised into subfolders, and an icon is
+# known by its FILENAME wherever it sits (see tools/mkicons.py).
+ICON_MASTERS := $(shell find icons/masters -type f \( -name '*.svg' -o -name '*.png' \) 2>/dev/null)
+ICON_DIRS    := $(shell find icons/masters -type d 2>/dev/null)
 ICON_LEGACY  := $(wildcard system/images/*.pam)
 ICONS_STAMP  := build/.icons.stamp
-# icons/masters is a prerequisite in its OWN right: a directory's mtime moves
-# when an entry is added or REMOVED, and deleting a master (falling back to the
-# legacy art) otherwise leaves the stamp newer than everything left behind, so
-# the stale .eic would survive with art whose master is gone.
-$(ICONS_STAMP): tools/mkicons.py icons/masters $(ICON_MASTERS) $(ICON_LEGACY)
+# The master DIRECTORIES are prerequisites in their own right: a directory's
+# mtime moves when an entry is added or REMOVED, and deleting a master otherwise
+# leaves the stamp newer than everything left behind, so a stale .eic would
+# survive with art whose master is gone. Every subfolder counts, not just the
+# root, or a delete inside one would go unnoticed.
+$(ICONS_STAMP): tools/mkicons.py $(ICON_DIRS) $(ICON_MASTERS) $(ICON_LEGACY)
 	@mkdir -p build
 	python3 tools/mkicons.py
 	@touch $@

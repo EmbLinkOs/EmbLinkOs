@@ -248,14 +248,46 @@ def raster_level(pm, size, Image):
 
 # --------------------------------------------------------------------------
 
+def scan_masters():
+    """{name: (path, kind)} for every master under icons/masters, recursively.
+
+    Subdirectories are ORGANISATIONAL only -- an icon is known by its filename
+    wherever it sits, so moving art between folders never changes the path apps
+    reference. That means two masters cannot share a stem; we say so loudly
+    rather than silently letting one win.
+    """
+    found = {}
+    if not os.path.isdir(MASTERS):
+        return found
+    for root, dirs, files in os.walk(MASTERS):
+        dirs.sort()
+        for f in sorted(files):
+            stem, ext = os.path.splitext(f)
+            ext = ext.lower()
+            if ext not in (".svg", ".png"):
+                continue
+            kind = "svg" if ext == ".svg" else "raster"
+            path = os.path.join(root, f)
+            if stem in found:
+                prev, prev_kind = found[stem]
+                # SVG beats PNG for the same name; anything else is a real clash
+                if prev_kind == "svg" and kind == "raster":
+                    continue
+                if not (prev_kind == "raster" and kind == "svg"):
+                    sys.exit(f"mkicons: two masters are both named '{stem}':\n"
+                             f"  {os.path.relpath(prev, REPO)}\n"
+                             f"  {os.path.relpath(path, REPO)}\n"
+                             "Icon names come from the filename, so rename one.")
+            found[stem] = (path, kind)
+    return found
+
+
 def find_master(name):
-    """(path, kind) for an icon. SVG wins, then PNG, then legacy .pam."""
-    svg = os.path.join(MASTERS, name + ".svg")
-    if os.path.exists(svg):
-        return svg, "svg"
-    png = os.path.join(MASTERS, name + ".png")
-    if os.path.exists(png):
-        return png, "raster"
+    """(path, kind) for an icon. A master anywhere under icons/masters wins;
+    otherwise fall back to legacy system/images/<name>.pam art."""
+    m = scan_masters().get(name)
+    if m:
+        return m
     pam = os.path.join(OUTDIR, name + ".pam")
     if os.path.exists(pam):
         return pam, "bootstrap"
@@ -324,12 +356,7 @@ def build_icon(name, ladder, svg=None, quiet=False):
 
 
 def discover():
-    names = set()
-    if os.path.isdir(MASTERS):
-        for f in os.listdir(MASTERS):
-            root, ext = os.path.splitext(f)
-            if ext.lower() in (".svg", ".png"):
-                names.add(root)
+    names = set(scan_masters())
     if os.path.isdir(OUTDIR):
         for f in os.listdir(OUTDIR):
             if f.endswith(".pam"):
