@@ -263,6 +263,19 @@ static struct comp_window *topmost_at(int x, int y) {
     return best;
 }
 
+/* Which process owns the FRONT window -- i.e. who the keyboard belongs to.
+ * Keys are a single global queue, so without an owner every process that polls
+ * drains it and they race; the front window is the one the user is looking at,
+ * so it gets them. 0 = no window at all (then nobody is filtered). */
+uint32_t compositor_focused_pid(void) {
+    uint32_t pid = 0;
+    spin_lock(&g_comp_lock);
+    struct comp_window *top = front_window();
+    if (top) pid = (uint32_t)top->pid;
+    spin_unlock(&g_comp_lock);
+    return pid;
+}
+
 /* Screen rect of a window's title-bar CLOSE button (right side). The chromeless
  * desktop window has no title bar, so no close button (returns 0). */
 #define COMP_CLOSE_SZ 16

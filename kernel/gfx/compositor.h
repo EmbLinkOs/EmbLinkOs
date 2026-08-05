@@ -91,6 +91,8 @@ int compositor_win_is_shared(int pid, uint32_t id);
  * cursor: returns 1 (focused) with content-local x/y, buttons, win id and the
  * accrued scroll wheel filled (wheel is consumed), or 0. Lets an app inside a
  * window read its own mouse. */
+/* pid owning the FRONT window -- who the keyboard belongs to (0 = none). */
+uint32_t compositor_focused_pid(void);
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
                          uint32_t *buttons, uint32_t *win, int32_t *wheel);
 

@@ -1208,6 +1208,14 @@ static int64_t sys_ui_input(struct regs *r) {
  * each frame and routes chars to the focused text field. */
 static int64_t sys_key_poll(struct regs *r) {
     (void)r;
+    /* Keys belong to the FRONT window's process. The character queue is a
+     * single global one, so without this every UI process that polls drains it
+     * and they race for each keystroke -- with two app loops running (a top bar
+     * and an app) a terminal received roughly one press in ten and typing felt
+     * like the keyboard was broken. Anyone who isn't focused reads nothing
+     * rather than stealing somebody else's input. */
+    uint32_t focus = compositor_focused_pid();
+    if (focus && current_process && current_process->pid != focus) return 0;
     if (keyboard_has_char()) return (int64_t)(unsigned char)keyboard_getchar();
     return 0;
 }
