@@ -270,8 +270,22 @@ static struct comp_window *topmost_at(int x, int y) {
 uint32_t compositor_focused_pid(void) {
     uint32_t pid = 0;
     spin_lock(&g_comp_lock);
-    struct comp_window *top = front_window();
-    if (top) pid = (uint32_t)top->pid;
+    struct comp_window *best = 0, *desk = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || !w->visible) continue;
+        if (w->desktop) { desk = w; continue; }     /* the fallback owner */
+        /* CHROME NEVER TAKES THE KEYBOARD. A menu bar or an ambient widget has
+         * nothing to type into, so letting one hold focus could only ever steal
+         * input from the app you were actually typing in -- clicking a menu
+         * would silently kill your terminal's keyboard. */
+        if (w->widget || w->translucent) continue;
+        if (!best || w->z > best->z) best = w;
+    }
+    /* No app window up -> the desktop owns it, so there is ALWAYS exactly one
+     * owner and never a free-for-all (that race is the bug this all fixes). */
+    if (!best) best = desk;
+    if (best) pid = (uint32_t)best->pid;
     spin_unlock(&g_comp_lock);
     return pid;
 }
