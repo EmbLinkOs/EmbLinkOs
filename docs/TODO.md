@@ -1836,3 +1836,17 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       launcher grid clicks -- interaction with reconciliation/epoch or with
       paint order not understood yet. Needs a designed z-layer story (paint
       AND hit), not a flag bolted onto hit only.
+
+### Z-layers: metal menu-dismiss anomaly (2026-08-06, OPEN — evidence attached)
+- [ ] On metal ONLY, while a top-bar dropdown is open, presses into the bar's
+      window stop having any effect: the viewport-sized layer-1 scrim resolves
+      the hit (traced: "PRESS -> inst 9.1 layer=1", and g_menu_scrim == 9.1,
+      same index AND generation), yet ui_consume_click(g_menu_scrim) never
+      closes the menu; in later runs presses stopped arriving at all (no PRESS
+      trace despite QMP button events). Host repro (build/menurepro pattern:
+      dispatch_click -> frame) passes all three checks: open, canvas-dismiss,
+      settle+reopen. Every link re-derived sound; suspect an em_app input-feed
+      / build-gate interaction under TCG, or a consume between press and
+      em_menu_end_. Escape hatch meanwhile: selecting a menu item closes.
+      Menus render correctly open+closed (identity fix); launcher/dock/ghost
+      unaffected with menus closed.

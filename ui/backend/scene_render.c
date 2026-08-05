@@ -4,6 +4,9 @@
  * it's easy to get subtly wrong). */
 
 #include "scene_render.h"
+#ifdef SCENE_TRACE
+#include <stdio.h>
+#endif
 #include <stdlib.h>
 #include <math.h>
 
@@ -184,6 +187,10 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
         if (sy1 > py1) py1 = sy1;
     }
     struct frect foot = { px0 - ox, py0 - oy, px1 - px0, py1 - py0 };
+#ifdef SCENE_TRACE
+    fprintf(stderr, "paint kind=%d layer=%d rect=(%.0f,%.0f %.0fx%.0f) hit=%d\n",
+            n->kind, n->layer, ab.x, ab.y, ab.w, ab.h, dirty_hits(r, foot));
+#endif
     if (!dirty_hits(r, foot)) return;
 
     float dx = ab.x - ox, dy = ab.y - oy, w = ab.w, h = ab.h;

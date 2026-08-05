@@ -539,6 +539,7 @@ typedef struct {
     int         pace_ms;         /* loop pace while active; default 10 */
 } EmApp;
 
+void  em_set_viewport(float w, float h);   /* the app runtime feeds this */
 float em_viewport_width(void);
 float em_viewport_height(void);
 

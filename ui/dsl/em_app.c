@@ -29,7 +29,7 @@
 
 static int g_app_exit_requested;
 static int g_app_exit_code;
-static float g_viewport_w;
+static float g_viewport_w;   /* mirrored into em.c via em_set_viewport */
 static float g_viewport_h;
 
 void em_app_request_exit(int code) {
@@ -37,8 +37,7 @@ void em_app_request_exit(int code) {
     g_app_exit_requested = 1;
 }
 
-float em_viewport_width(void) { return g_viewport_w; }
-float em_viewport_height(void) { return g_viewport_h; }
+
 
 /* --- the embk resource loader (whole file -> malloc'd buffer) ------------ */
 static uint8_t *emapp_load(const char *path, size_t *out_len) {
@@ -105,7 +104,7 @@ int em_app_run(const EmApp *app) {
     int wx = app->fullscreen ? 0 : ((int)sw - winw) / 2;        if (wx < 0) wx = 0;
     int wy = app->fullscreen ? 0 : 32 + ((int)sh - 32 - 64 - winh - bar) / 2;
     if (wy < 32 && !app->fullscreen) wy = 32;
-    g_viewport_w = (float)winw;
+    g_viewport_w = (float)winw; em_set_viewport((float)winw, g_viewport_h);
     g_viewport_h = (float)winh;
 
     uint32_t *px = 0;
@@ -155,7 +154,7 @@ int em_app_run(const EmApp *app) {
             uint32_t *npx = 0;
             if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                 px = npx; winw = nw; winh = nh;
-                g_viewport_w = (float)winw; g_viewport_h = (float)winh;
+                g_viewport_w = (float)winw; g_viewport_h = (float)winh; em_set_viewport((float)winw, (float)winh);
                 rt.pixels = px; rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
                 rt.stride = (uint32_t)winw * 4;
                 embk_win_move(win, nx, ny);
@@ -180,6 +179,9 @@ int em_app_run(const EmApp *app) {
                 if (embk_win_resize(win, (uint32_t)winw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                     px = npx; winh = nh;
                     g_viewport_h = (float)winh;
+                    em_set_viewport((float)winw, (float)winh);   /* the menu scrim
+                        sizes itself to THIS -- unmirrored, it stayed bar-thin
+                        and the dismiss click sailed under it */
                     rt.pixels = px; rt.height = (uint32_t)winh; rt.stride = (uint32_t)winw * 4;
                     scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                     em_request_frame();
@@ -313,7 +315,7 @@ int em_app_run(const EmApp *app) {
             uint32_t *npx = 0;
             if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                 px = npx; winw = nw; winh = nh;
-                g_viewport_w = (float)winw; g_viewport_h = (float)winh;
+                g_viewport_w = (float)winw; g_viewport_h = (float)winh; em_set_viewport((float)winw, (float)winh);
                 rt.pixels = px; rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
                 rt.stride = (uint32_t)winw * 4;
                 const struct ui_theme *t = ui_theme();

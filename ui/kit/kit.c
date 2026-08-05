@@ -446,6 +446,7 @@ void ui_overlay_begin(uint64_t key) {
     g_overlay_h = ui_open();
     struct color scrim = { 0.0f, 0.0f, 0.0f, 0.55f };   /* dim the content behind */
     ui_set_overlay(true);                 /* fill the screen, out of flow (paints on top) */
+    ui_set_layer(1);                      /* elevated: paints above + hits above the flow */
     ui_set_paint(solid(scrim));
     ui_set_size(sz_grow(), sz_grow());
     ui_set_align(ALIGN_CENTER);

@@ -2325,6 +2325,13 @@ void em_theme_use(EmTheme t) { ui_theme_use_dark(t != Light); }
 /* One menu is open at a time, keyed by the Menu's label pointer. The open
  * menu's items float in an out-of-flow overlay anchored where the button was
  * clicked (ui_pointer_pos at open time -- no layout query needed). */
+/* the window's content size, owned HERE so em.c never depends on the ring-3
+ * app runtime (host tools set it directly) */
+static float g_vp_w, g_vp_h;
+void  em_set_viewport(float w, float h) { g_vp_w = w; g_vp_h = h; }
+float em_viewport_width(void)  { return g_vp_w; }
+float em_viewport_height(void) { return g_vp_h; }
+
 static const void *g_menu_open;          /* label ptr of the open Menu, or NULL */
 static float g_menu_ax, g_menu_ay;       /* anchor (window-content coords) */
 static int   g_menu_cur_open;            /* is the Menu being emitted right now open? */
@@ -2362,15 +2369,33 @@ void em_menubar_(EmProps p) {
 }
 void em_menubar_end_(void) { em_flush(); ui_end_stack(); }
 
-/* Shared: open the floating popover panel for the currently-open menu at
- * (ax, ay). Items emit into it; em_*_menu_end_ closes it + handles dismiss. */
+/* One container per menu, SAME EXPLICIT KEY in both states.
+ *
+ * Open and closed used to emit structurally different children (a keyed
+ * overlay vs an anonymous hidden box), so toggling a menu changed the child
+ * LIST SHAPE. Positional (key-0) siblings then slid one slot in the
+ * reconciler, and because reused instances RETAIN scene props a widget
+ * doesn't explicitly set, the drift smeared stale 0x0 sizes and clip flags
+ * across the neighbouring menus -- squashed buttons, item lists escaping
+ * their clipped hidden box. The corruption was latent for as long as the
+ * menus existed; z-layer paint deferral merely changed who covered whom and
+ * made it visible.
+ *
+ * With one keyed container per menu the list shape never changes, and every
+ * property that DIFFERS between the two states is set explicitly in BOTH
+ * branches, so a state flip can never inherit the other state's leftovers. */
 static void em_menu_panel_open(uint64_t key, float ax, float ay) {
     const struct ui_theme *t = TH;
     ui_begin_vstack(key);                 /* the out-of-flow overlay layer */
     g_menu_scrim = ui_open();
     ui_set_overlay(true);
+    ui_set_layer(1);                      /* elevated: paints above + hits above the flow */
+    ui_set_clip_children(false);
     ui_set_paint(solid((Color){0,0,0,0}));        /* transparent: catches outside clicks, no dim */
-    ui_set_size(sz_grow(), sz_grow());
+    /* WINDOW-sized, not parent-sized: the dismiss surface must cover the
+     * window, and this overlay's parent is a 28px menu strip. Overlays honour
+     * an explicit fixed size (layout.c) precisely for this. */
+    ui_set_size(sz_fixed(em_viewport_width()), sz_fixed(em_viewport_height()));
     ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
     ui_set_offset(ax, ay);
     ui_set_corner_radius(t->radius_md);
@@ -2389,11 +2414,23 @@ static int em_menu_panel_close(void) {
     ui_end_stack();                       /* overlay */
     return scrim_hit;
 }
-/* the hidden container a CLOSED menu's items emit into (built but invisible) */
-static void em_menu_hidden_open(void) {
-    ui_begin_vstack(0);
+/* the hidden container a CLOSED menu's items emit into (built but invisible).
+ * SAME key as the open overlay -- one instance per menu, two dressings -- and
+ * every open-state prop explicitly reversed (overlay, layer, paint, offset). */
+static void em_menu_hidden_open(uint64_t key) {
+    ui_begin_vstack(key);
+    ui_set_overlay(false);
+    ui_set_layer(0);
+    ui_set_paint(solid((Color){0,0,0,0}));
     ui_set_size(sz_fixed(0), sz_fixed(0));
     ui_set_clip_children(true);
+    ui_begin_vstack(1);                   /* mirror the panel level */
+    ui_set_offset(0, 0);
+    ui_set_shadow(false, 0, 0, 0, (Color){0,0,0,0});
+    ui_set_backdrop_blur(false, 0);
+    ui_set_paint(solid((Color){0,0,0,0}));
+    ui_set_clip_children(true);
+    ui_set_size(sz_fixed(0), sz_fixed(0));
 }
 
 void em_menu_(const char *label, EmProps p) {
@@ -2421,12 +2458,25 @@ void em_menu_(const char *label, EmProps p) {
     }
     g_menu_cur_open = is_open;
     if (is_open) em_menu_panel_open((uint64_t)(uintptr_t)label, g_menu_ax, g_menu_ay);
-    else         em_menu_hidden_open();
+    else         em_menu_hidden_open((uint64_t)(uintptr_t)label);
 }
 void em_menu_end_(void) {
     em_flush();
-    if (g_menu_cur_open) { if (em_menu_panel_close()) { g_menu_open = 0; g_em_epoch++; } }
-    else ui_end_stack();                  /* hidden box */
+    if (g_menu_cur_open) {
+        if (em_menu_panel_close()) { g_menu_open = 0; g_em_epoch++; }
+    }
+    else {
+        ui_end_stack();                       /* inner mirror */
+        /* Swallow clicks resolved against LAST frame's stale scrim. Hit tests
+         * run on the last-built tree, and the frame that DISMISSES a menu
+         * still built the open tree -- so a click in that one-frame window
+         * lands on a scrim whose menu is already closed. Same keyed instance
+         * in both states, so consuming it here is exact, and the stray click
+         * dies instead of leaking into whatever sat beneath the scrim. */
+        struct instance_handle box = ui_open();
+        ui_end_stack();                       /* hidden box */
+        (void)ui_consume_click(box);
+    }
 }
 
 /* Is any MenuBar dropdown currently open? The app runtime uses this to grow a
@@ -2478,7 +2528,7 @@ void em_context_menu_(bool *open, float x, float y, EmProps p) {
     g_ctx_open_flag = open;
     g_menu_item_chosen = 0;               /* fresh: only THIS frame's item clicks count */
     if (g_ctx_cur_open) em_menu_panel_open((uint64_t)(uintptr_t)open, x, y);
-    else                em_menu_hidden_open();
+    else                em_menu_hidden_open((uint64_t)(uintptr_t)open);
 }
 void em_context_menu_end_(void) {
     em_flush();
@@ -2489,7 +2539,7 @@ void em_context_menu_end_(void) {
             g_em_epoch++;
         }
     } else {
-        ui_end_stack();                   /* hidden box */
+        ui_end_stack(); ui_end_stack();   /* inner mirror + hidden box */
     }
 }
 

@@ -415,8 +415,12 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
             struct layout_node *k = layout_resolve(la, kids[i]);
             if (k->is_overlay) {
                 k->resolved_x = n->padding_left; k->resolved_y = n->padding_top;
-                k->resolved_w = W - n->padding_left - n->padding_right;
-                k->resolved_h = H - n->padding_top - n->padding_bottom;
+                /* parent-fill by default; an EXPLICIT fixed size wins, so a
+                 * dismiss scrim can out-size the strip that declared it */
+                k->resolved_w = k->width.mode  == SIZE_FIXED ? k->width.fixed_value
+                              : W - n->padding_left - n->padding_right;
+                k->resolved_h = k->height.mode == SIZE_FIXED ? k->height.fixed_value
+                              : H - n->padding_top - n->padding_bottom;
                 if (k->is_container) arrange(la, sa, kids[i], k->resolved_w, k->resolved_h);
                 else                 write_scene(sa, k);
                 continue;
@@ -601,10 +605,13 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
     for (int i = 0; i < nk; i++) {
         struct layout_node *k = layout_resolve(la, kids[i]);
         if (k->is_overlay) {
-            /* fill the parent's content box, independent of flow + cursor */
+            /* fill the parent's content box, independent of flow + cursor --
+             * unless the overlay carries an EXPLICIT fixed size (see grid arm) */
             k->resolved_x = n->padding_left; k->resolved_y = n->padding_top;
-            k->resolved_w = W - n->padding_left - n->padding_right;
-            k->resolved_h = H - n->padding_top - n->padding_bottom;
+            k->resolved_w = k->width.mode  == SIZE_FIXED ? k->width.fixed_value
+                          : W - n->padding_left - n->padding_right;
+            k->resolved_h = k->height.mode == SIZE_FIXED ? k->height.fixed_value
+                          : H - n->padding_top - n->padding_bottom;
             if (k->is_container) arrange(la, sa, kids[i], k->resolved_w, k->resolved_h);
             else                 write_scene(sa, k);
             continue;   /* no cursor advance */

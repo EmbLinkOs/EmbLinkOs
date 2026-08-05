@@ -269,6 +269,8 @@ static void drag_ghost(void) {
     if (!(g_drag && g_drag_moved)) return;
     ui_begin_vstack(0x6057);
     ui_set_overlay(true);            /* fill parent, out of flow */
+    ui_set_layer(2);                 /* ABOVE dialog scrims: the ghost must ride
+                                      * over the launcher while dragging out of it */
     ui_begin_vstack(1);
     ui_set_offset(g_drag_x - 22.0f, g_drag_y - 22.0f);
     ui_set_opacity(0.85f);
