@@ -93,6 +93,8 @@ int compositor_win_is_shared(int pid, uint32_t id);
  * window read its own mouse. */
 /* pid owning the FRONT window -- who the keyboard belongs to (0 = none). */
 uint32_t compositor_focused_pid(void);
+/* exit-time: hide + repaint a dying pid's windows (reap frees them later) */
+void compositor_exit_pid(int pid);
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
                          uint32_t *buttons, uint32_t *win, int32_t *wheel);
 

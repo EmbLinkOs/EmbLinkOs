@@ -1432,6 +1432,12 @@ int process_handle_reap_dead(struct process *owner) {
 __attribute__((noreturn))
 void process_exit_self(int code) {
     current_process->exit_code = code;
+    /* Make the death VISIBLE now: hide + repaint this process's windows while
+     * we are still an ordinary syscall context (framebuffer work is fine
+     * here). The reap runs later under the scheduler lock and only reclaims
+     * memory -- without this, a self-closed app's window stayed painted,
+     * hover-lit and dead, until its parent got around to relaunching it. */
+    compositor_exit_pid((int)current_process->pid);
     /* If a debugger is attached, its sys_debug_wait must observe the exit as a
      * DBG_EV_EXITED rather than the child just vanishing (§6.5). Posted before
      * we zombie-and-switch-away, so the event and status are recorded while the

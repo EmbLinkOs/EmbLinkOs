@@ -971,6 +971,30 @@ int64_t compositor_win_destroy(int pid, uint32_t id) {
     return 0;
 }
 
+/* A process is EXITING (normally, by its own hand): hide its windows and
+ * repaint the pixels they covered, NOW, while we are in the dying process's
+ * ordinary syscall context. The reap below cannot do this -- it runs later,
+ * under the scheduler lock, where framebuffer work is off-limits -- which is
+ * why a self-closed app's window used to stay painted on screen, hover-lit
+ * and dead, until something else happened to repaint that region. Death
+ * should be visible immediately, whatever the parent gets around to. */
+void compositor_exit_pid(int pid) {
+    spin_lock(&g_comp_lock);
+    int found = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w->pid != pid || !w->visible) continue;
+        w->visible = 0;
+        if (w->id == g_top_id) g_top_id = 0;
+        int x0, y0, x1, y1;
+        win_repaint_rect(w, &x0, &y0, &x1, &y1);
+        paint_region(x0, y0, x1, y1);
+        found = 1;
+    }
+    if (found) enforce_focus();
+    spin_unlock(&g_comp_lock);
+}
+
 void compositor_reap_pid(int pid) {
     /* Reclaim a dead client's windows. MUST run BEFORE its address space is torn
      * down (process_reap_slot calls us pre-vmm_destroy): a shared window's pages

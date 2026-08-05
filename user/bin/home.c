@@ -467,6 +467,18 @@ static void desktop_icons(void) {
     em_flush();                       /* emit pending DSL leaves before raw ui_* */
     ui_begin_vstack(0xDE5C0DEEULL);
     ui_set_overlay(true);
+    /* A ZERO-SIZED root, not a screen-filling one. The icons are positioned by
+     * per-child offsets, which need no parent extent -- and a full-screen
+     * transparent root CONTAINS every point, so wherever this overlay sits in
+     * document order it either eats the dock's clicks (declared after it) or
+     * loses the icons' clicks to the work-area strip (declared before it).
+     * With no extent of its own, only the ICON BOXES exist for hit testing:
+     * each wins exactly its own pixels and nothing else, and declaration order
+     * stops mattering at all. That dilemma was this desktop's whole click-bug
+     * history in one node. */
+    ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 },
+                (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
+    ui_set_clip_children(false);
     for (int i = 0; i < g_desk_n; i++) {
         const void *id = g_desk[i].app ? (const void *)g_desk[i].app
                                        : (const void *)g_desk[i].dir;
@@ -490,12 +502,6 @@ static void home_ui(void) {
     g_any_active = 0; g_have_dockr = 0;   /* recomputed each frame during the build */
     Screen(.width = g_sw, .height = g_sh, .padding = -1, .align = Fill) {
         BackgroundImage("/system/images/colibri-user.ppm");
-        /* Freely-placed app icons (each owns its spot). Declared BEFORE the
-         * dock/taskbar on purpose: this is a full-screen out-of-flow overlay,
-         * so anything declared after it is hit-tested ABOVE it. Sitting last,
-         * it silently swallowed every click meant for the dock -- launching an
-         * app from the dock simply stopped working. */
-        desktop_icons();
         VStack(.width = g_sw, .height = g_sh, .padding = 0, .spacing = 0,
                .align = Fill) {
             /* Reserve the top strip for our own floating menu bar (topbar.elf,
@@ -516,6 +522,8 @@ static void home_ui(void) {
                 dock_pill();
             }
         }
+        desktop_icons();       /* freely-placed icons; zero-sized root, so it
+                                * can sit last without shadowing anything */
         apps_grid();           /* the Apps launcher (modal grid), when open */
         drag_ghost();          /* the dragged icon follows the cursor (overlay) */
     }
