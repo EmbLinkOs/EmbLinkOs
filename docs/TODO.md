@@ -1820,3 +1820,19 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [ ] Wheel scrollback direction untested on real hardware (sign chosen from
       ui_scroll_begin's convention; flip in term_view if it feels inverted)
 - [ ] SGR: only fg colour + bold honoured; backgrounds/underline dropped
+
+### UI framework: menu-scrim / click-through (investigated 2026-08-05, reverted)
+- [ ] Clicking the top bar's transparent canvas under an open dropdown does
+      NOTHING (menu stays open). TWO stacked causes found:
+      1. the menu's dismiss scrim is an overlay, and overlays size to their
+         PARENT -- here the 28px menubar strip, so the scrim covers almost
+         nothing. Overlays honouring an explicit fixed size fixes this half
+         (layout.c grid+stack overlay arms).
+      2. the hit test has NO layering: "topmost" = last in document order, so
+         the bar's trailing Spacer wins the point over the earlier scrim.
+      A "modal hit layer" flag (2-pass instance_at: modal subtrees first) was
+      prototyped and REVERTED: marking kit's Overlay + the menu scrim modal
+      made the bar's own content vanish while a menu was open and broke
+      launcher grid clicks -- interaction with reconciliation/epoch or with
+      paint order not understood yet. Needs a designed z-layer story (paint
+      AND hit), not a flag bolted onto hit only.
