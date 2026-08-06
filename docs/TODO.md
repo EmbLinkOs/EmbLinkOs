@@ -1893,6 +1893,9 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       config-changed broadcast would fix it; the IPC exists.
 - [ ] The Terminal still has no tabs, no text selection and no font-size
       control. Tabs need a second shell process per tab, which is the real work.
+- [ ] The Terminal's prompt is inline now, but the transcript does not scroll
+      on its own as output arrives past the bottom -- it re-windows to the last
+      N lines. Fine at a screenful; a real pty would want a scrolling region.
 - [ ] `$(wildcard build/*.elf)` in the embkfs.img rule is evaluated at parse
       time, so the FIRST build after adding an app packs an image without it
       (spawn fails -ENOENT). Second `make` is correct. Cost me a boot cycle.

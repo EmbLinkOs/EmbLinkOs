@@ -616,7 +616,6 @@ static void term_view(void) {
      * stays out of the way of the text, which is the only thing here worth
      * looking at, and the prompt is the single spot of colour. */
     const Color TERM_BG    = { .r=.086f, .g=.090f, .b=.106f, .a=1.f };  /* the ground */
-    const Color TERM_INBG  = { .r=.125f, .g=.133f, .b=.156f, .a=1.f };  /* input, a hair lifted */
     const Color TERM_TEXT  = { .r=.855f, .g=.871f, .b=.898f, .a=1.f };  /* soft off-white */
     const Color TERM_PROMPT= { .r=.435f, .g=.780f, .b=.612f, .a=1.f };  /* calm green */
 
@@ -628,8 +627,18 @@ static void term_view(void) {
         AppBar(title_text(), .background = TERM_BG) {
             if (Button("Clear").ghost().color(TERM_TEXT).clicked()) term_clear();
         }
-        /* the VIEWER: a read-only transcript of everything the shell printed */
-        VStack(.spacing = 1, .px = 12, .pt = 10, .pb = 4, .align = Leading,
+        /* THE SURFACE. One column: output, then the prompt you are typing at,
+         * then whatever space is left over.
+         *
+         * The previous version put the command line in its own lifted strip
+         * pinned to the bottom edge. That is a chat window, not a terminal --
+         * and it is wrong in a way you feel rather than see: your typing was
+         * nowhere near the output it belongs to, and a blank gap sat between
+         * the two whenever the transcript was short. A terminal's prompt is
+         * the NEXT LINE of the transcript. It sits directly under the last
+         * thing printed, in the same face on the same ground, and the whole
+         * column grows downward together. */
+        VStack(.spacing = 1, .px = 14, .pt = 10, .pb = 10, .align = Leading,
                .grow = 1, .background = TERM_BG) {
             /* the wheel pages the scrollback -- up rolls back in time */
             float wd = ui_take_wheel();
@@ -640,74 +649,75 @@ static void term_view(void) {
                 if (g_view < 0) g_view = 0;
                 em_request_frame();
             }
-            int start = g_count - g_rows - g_view;
+
+            /* Only the rows that EXIST are drawn. The old view always emitted
+             * g_rows rows, padding with blanks -- which is what forced the
+             * prompt to the bottom of the window and left the gap. */
+            int room  = g_rows > 1 ? g_rows - 1 : 1;      /* one row is the prompt */
+            int avail = g_count - g_view;
+            if (avail < 0) avail = 0;
+            int show  = avail < room ? avail : room;
+            int start = avail - show;
             if (start < 0) start = 0;
-            for (int r = 0; r < g_rows; r++) {
+
+            if (g_view > 0) {
+                static char mark[64];
+                snprintf(mark, sizeof mark,
+                         "-- %d line(s) back -- wheel down to return --", g_view);
+                Text(mark).caption().secondary();
+            }
+            for (int r = 0; r < show; r++) {
                 /* NO `continue`/`break` inside a container's brace scope: the
                  * EmUI containers are for-loop MACROS, so a bare continue
                  * targets the MACRO's hidden loop and silently skips the rest
-                 * of the body -- it rendered an entirely blank terminal until
-                 * this became an if/else. */
-                if (r == 0 && g_view > 0) {
-                    /* paged back: the top row becomes the position marker */
-                    static char mark[64];
-                    snprintf(mark, sizeof mark,
-                             "-- scrollback: %d line(s) back (wheel/PgDn -> live) --", g_view);
-                    Text(mark).caption().secondary();
+                 * of the body. */
+                int logical = start + r;
+                int slot = sb_slot(logical);
+                if (logical >= 0 && logical < g_count && g_sb[slot][0])
+                    row_runs(r, g_sb[slot], g_sba[slot], TERM_TEXT);
+                else
+                    Text(" ").caption().color(TERM_TEXT);   /* empty collapses (V7) */
+            }
+
+            /* THE PROMPT LINE -- the last line of the transcript, not a
+             * separate control. Same row height, same ground, no divider. */
+            HStack(.spacing = 0, .align = Center) {
+                /* Grid calibration, free of charge: the prompt is drawn in the
+                 * same mono face as the transcript and we KNOW its length, so
+                 * its measured box gives the character advance and the line
+                 * height -- no font API, no hidden probe node. Reads LAST
+                 * frame's geometry (one frame of lag is invisible). */
+                HStack(.align = Center) {
+                    float bx, by, bw, bh;
+                    if (ui_open_rect(&bx, &by, &bw, &bh) && bw > 1 && bh > 1) {
+                        int plen = (int)strlen(prompt_text());
+                        if (plen > 0) {
+                            float cw = bw / (float)plen, lh = bh + 1.0f;
+                            int cols = (int)((em_viewport_width() - 32.0f) / cw);
+                            int rows = (int)((em_viewport_height() - 46.0f - 22.0f) / lh);
+                            g_cols = cols < 20 ? 20 : cols > SB_COLS ? SB_COLS : cols;
+                            g_rows = rows < 3  ? 3  : rows > SB_VROWS ? SB_VROWS : rows;
+                        }
+                    }
+                    Text(prompt_text()).caption().bold().color(TERM_PROMPT);
+                }
+                Text(" ").caption().color(TERM_TEXT);
+                if (g_dead) {
+                    Text("[process exited]").caption().secondary();
                 } else {
-                    int logical = start + r;
-                    if (logical >= 0 && logical < g_count && g_sb[sb_slot(logical)][0]) {
-                        int slot = sb_slot(logical);
-                        row_runs(r, g_sb[slot], g_sba[slot], TERM_TEXT);
-                    } else {
-                        Text(" ").caption().color(TERM_TEXT);  /* empty collapses (V7) */
-                    }
-                }
-            }
-        }
-
-        /* A grow-only gap: the transcript is a fixed number of rows, so `.grow`
-         * on it cannot absorb the leftover height -- this does, pressing the
-         * command line flush to the bottom edge instead of leaving it floating
-         * with dead space beneath. */
-        Spacer();
-
-        /* the COMMAND LINE: the only place a cursor lives. One row, pinned
-         * under the transcript -- the caret is drawn AT the edit position, so
-         * Left/Right/Home/End visibly move it through the text. */
-        HStack(.height = 28, .align = Center, .spacing = 8, .px = 12, .pb = 2,
-               .background = TERM_INBG) {
-            /* Grid calibration, free of charge: the prompt is drawn in the
-             * same mono face as the transcript and we KNOW its length, so its
-             * measured box gives the character advance and the line height --
-             * no font API, no hidden probe node. Reads LAST frame's geometry
-             * (one frame of lag is invisible while dragging a grip). */
-            HStack(.align = Center) {
-                float bx, by, bw, bh;
-                if (ui_open_rect(&bx, &by, &bw, &bh) && bw > 1 && bh > 1) {
-                    int plen = (int)strlen(prompt_text());
-                    if (plen > 0) {
-                        float cw = bw / (float)plen, lh = bh + 1.0f;
-                        int cols = (int)((em_viewport_width() - 28.0f) / cw);
-                        int rows = (int)((em_viewport_height() - 46.0f - 34.0f) / lh);
-                        g_cols = cols < 20 ? 20 : cols > SB_COLS ? SB_COLS : cols;
-                        g_rows = rows < 3  ? 3  : rows > SB_VROWS ? SB_VROWS : rows;
-                    }
-                }
-                Text(prompt_text()).caption().bold().color(TERM_PROMPT);
-            }
-            if (g_dead) {
-                Text("(shell exited)").caption().color(TERM_TEXT);
-            } else {
-                HStack(.spacing = 0, .align = Center) {
                     static char pre[IN_MAX], post[IN_MAX];
                     snprintf(pre,  sizeof pre,  "%.*s", g_cur, g_in);
                     snprintf(post, sizeof post, "%s",   g_in + g_cur);
                     if (pre[0])  Text(pre).caption().color(TERM_TEXT);
-                    Text("|").caption().color(TERM_PROMPT);
+                    /* a block caret, the way a terminal draws one */
+                    Text("\xE2\x96\x8B").caption().color(TERM_PROMPT);
                     if (post[0]) Text(post).caption().color(TERM_TEXT);
                 }
             }
+
+            /* everything above stays TOP-aligned; the leftover height is dead
+             * space below the prompt, exactly as in a terminal you just opened */
+            Spacer();
         }
     }
 }
@@ -730,8 +740,24 @@ int main(void) {
         .font   = "/system/fonts/mono.ttf",   /* DejaVu Sans Mono -- aligned table columns */
     };
     int rc = em_app_run(&app);
-    /* window closed: our pipe fds die with us (reap loop) -> the shell's
-     * read(0) EOFs -> its REPL exits -> reap. Collect it if still around. */
-    if (g_shell >= 0) embk_wait(g_shell);
+
+    /* Close the shell's STDIN before waiting for it.
+     *
+     * The old comment here claimed our pipe fds "die with us" and the shell
+     * would EOF -- but they die when the PROCESS exits, and the process cannot
+     * exit while it is parked in this wait. So the terminal waited for a shell
+     * that was itself waiting for an EOF only the terminal's exit could send:
+     * a deadlock, and the terminal stayed alive forever with its dock dot lit.
+     *
+     * It was invisible for as long as the close button called exit(0) directly,
+     * which tore the process down without ever reaching this line. Moving the
+     * button into the shared AppBar routed close through the runtime's clean
+     * return -- and the clean path walked straight into the deadlock that was
+     * always here. Closing the write end explicitly is what the comment always
+     * assumed was happening. */
+    if (g_shell >= 0) {
+        close(FD_SHELL_IN);          /* an fd, so close() -- NOT a handle close */
+        embk_wait(g_shell);          /* ...so this returns */
+    }
     return rc;
 }
