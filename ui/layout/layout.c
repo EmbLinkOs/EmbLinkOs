@@ -564,7 +564,23 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
          * distribute. */
         struct scene_node *sn = paired(sa, n);
         int clips = sn && sn->clip_children;
-        float deficit = (content_main > 0.01f && !clips) ? -remaining : 0.0f;
+
+        /* ...and neither may the CONTENT of one. A scroll view clips, so it is
+         * already exempt -- but the column inside it is not, and that column is
+         * exactly where a document lives. Its children overflow it by design:
+         * being taller than the viewport is what there is to scroll. Shrinking
+         * them to fit squashed every wrapped paragraph into the heading below
+         * it, which measured correctly (nk=54, nlines=3, total=48.9) and was
+         * then thrown away here. If the parent clips, this container's children
+         * are scrollable content and must keep their height. */
+        int parent_clips = 0;
+        if (!layout_handle_is_null(n->parent)) {
+            struct layout_node *pn = layout_resolve(la, n->parent);
+            struct scene_node *psn = pn ? paired(sa, pn) : 0;
+            parent_clips = psn && psn->clip_children;
+        }
+        float deficit = (content_main > 0.01f && !clips && !parent_clips)
+                        ? -remaining : 0.0f;
         for (int pass = 0; pass < 2 && deficit > 0.01f; pass++) {
             float sum_w = 0;
             for (int i = 0; i < nk; i++) {

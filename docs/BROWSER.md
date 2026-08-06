@@ -294,18 +294,32 @@ a browser on your own UI stack:
   content can never overflow, so it never wrapped. Invisible for chips and
   tags, which do not overflow; fatal for inline runs, which exist to. Fixed:
   Flow fills its width, as Grid already did.
-- With wrapping on, a Flow's HEIGHT is still reported short, so wrapped
-  paragraphs overlap what follows them. **Still open, and two hypotheses are
-  now eliminated:**
-    - *not* `Flow` failing to reach `measure_wrap_height` via the size fix —
-      wrapping itself works, so the wrap path is live;
-    - *not* the 64-child cap in `measure_wrap_height`. Raising it to 512 and
-      accounting for the remainder changed the render not at all.
-  Next step is to MEASURE rather than guess a third time: dump the resolved
-  rect of a wrapped Flow and its parent block and compare against the line
-  count. (The viewport-height bug earlier in this project cost two wrong
-  guesses for exactly the same reason; printing the numbers ended it in one
-  cycle.) **This blocks B1 being called done.**
+- Wrapped paragraphs overlap what follows them. **Still open after three
+  eliminated hypotheses, but no longer a mystery about WHERE:**
+
+  MEASUREMENT IS CORRECT. Instrumenting `measure_wrap_height` and its caller
+  printed, for the first paragraph:
+
+      caller:  align=3 (STRETCH) content_cross=896 -> cw=896  base=30.3
+      measure: avail_w=896  nk=54  nlines=3  total=48.9
+
+  So the wrap measurement sees all 54 word boxes, packs them into 3 lines, and
+  returns a correct 48.9px. The height is computed right and then LOST between
+  there and the painted geometry. That is the search area now -- not the
+  measurement, and not the wrap.
+
+  Eliminated, each by experiment rather than argument:
+    1. `Flow` not filling its width — real bug, fixed, made wrapping work, did
+       not fix the height.
+    2. The 64-child cap in `measure_wrap_height` — raised to 512; the numbers
+       above show 54 children, so the cap was never reached.
+    3. The flex-shrink pass squashing scrollable content — a real correctness
+       bug and exempted (content of a clipping container may overflow by
+       design), but the overlap is unchanged.
+
+  Next: follow `base[i]` = 48.9 forward. Print `finalm[i]` after distribution
+  and the node's `resolved_h` after write-back, and find which of the two
+  disagrees with the measurement. **This blocks B1 being called done.**
 
 ## 12. Open questions
 
