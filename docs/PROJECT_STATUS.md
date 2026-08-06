@@ -666,7 +666,14 @@ newlib-based libc port.*
   not just an in-window blur. The desktop itself became an **aurora** — a soft
   mesh-gradient of overlapping color blobs (`aurora_build` in the compositor)
   shown through the home launcher's translucent scrim, so the acrylic windows
-  now blur a colorful field and the frosted glass genuinely glows. A V4.1 app-runtime
+  now blur a colorful field and the frosted glass genuinely glows. Windows are
+  also **physical objects** rather than pasted rectangles: the compositor gives
+  every app window a black **drop shadow** (offset downward, deeper and wider on
+  the focused window than on those behind it — depth, not colour, is the focus
+  indicator) and **antialiased rounded corners**, arc, shadow and border ring
+  all following the same curve (`corners_save`/`corners_carve`, which stash the
+  backdrop under the four corner boxes, let every existing paint path run, then
+  blend it back by 4x4-supersampled arc coverage). A V4.1 app-runtime
   layer (`ui/dsl/em_app.c`, `EM_APPLICATION`/`EM_WIDGET`) collapses what
   used to be ~150 lines of per-app boilerplate (font loading, arena setup,
   window creation, the event loop, dirty-rect presenting, teardown) into

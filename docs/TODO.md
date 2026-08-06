@@ -1821,6 +1821,21 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       ui_scroll_begin's convention; flip in term_view if it feels inverted)
 - [ ] SGR: only fg colour + bold honoured; backgrounds/underline dropped
 
+### Window depth: drop shadow + rounded corners (shipped 2026-08-06)
+- [ ] Focused-vs-unfocused shadow depth is code-verified, not photographed:
+      every metal pairing so far had the back window fully covered, and the
+      desktop is a fallback focus owner so clicking wallpaper cannot defocus a
+      window. Compare the two bands side by side next time two windows overlap.
+- [ ] WIN_RADIUS is a compositor constant (9px), not a theme token -- it should
+      come from theme.c alongside the toolkit's own corner radii, or in-window
+      cards and the window frame will drift apart.
+- [ ] Glass/widget/translucent windows are excluded from BOTH shadow and
+      rounding (they draw their own rounded pill in-surface). Fine today, but
+      a glass APP window would want the compositor treatment.
+- [ ] The carve costs ~324 px/window/repaint. Invisible against a full window
+      blit, but if per-frame cost is ever profiled, this is a candidate for
+      caching the coverage mask (it only changes with the radius).
+
 ### UI framework: menu-scrim / click-through (investigated 2026-08-05, reverted)
 - [ ] Clicking the top bar's transparent canvas under an open dropdown does
       NOTHING (menu stays open). TWO stacked causes found:

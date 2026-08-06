@@ -330,7 +330,168 @@ static int win_max_rect(const struct comp_window *w, int *x0, int *y0, int *x1, 
     return 1;
 }
 
-/* ---- compositing -------------------------------------------------------- */
+/* ---- rounded corners ---------------------------------------------------- *
+ * A window with a hard 90-degree corner reads as a rectangle PASTED onto the
+ * screen; the rounded corner is most of what makes it read as an object lying
+ * on top of one. Doing it properly needs three things at once, or it looks
+ * worse than the square corner it replaced: the arc must be ANTIALIASED (a
+ * stair-stepped curve is uglier than no curve), the shadow must follow the arc
+ * (or each corner shows a bright notch where the shadow stops), and the border
+ * must curve with it (or the frame ends in four disconnected straight lines).
+ *
+ * The trick that gets all three cheaply: paint_region draws bottom-to-top into
+ * one buffer, so at the moment a window starts painting, its four corner boxes
+ * still hold EXACTLY the backdrop that belongs behind it -- aurora, desktop,
+ * lower windows and its own shadow. Save those ~324 pixels, let every existing
+ * paint path (opaque blit, glass, per-pixel, title bar, border) run untouched,
+ * then blend the saved backdrop back in by arc coverage. One carve handles all
+ * five paths and none of them needed to learn about radii. */
+#define WIN_RADIUS  9       /* corner radius, px                              */
+#define WIN_R_MAX  16       /* static-buffer bound                            */
+
+struct corner_box {
+    int x0, y0, x1, y1;         /* the saved sub-box (clipped to the region)  */
+    int cx, cy;                 /* arc centre                                 */
+    uint32_t px[WIN_R_MAX * WIN_R_MAX];
+};
+/* one window is painted at a time under g_comp_lock, so these are scratch */
+static struct corner_box g_corner[4];
+static int g_corner_n;
+
+static uint32_t isqrt32(uint32_t x) {
+    uint32_t r = 0, b = 1u << 30;
+    while (b > x) b >>= 2;
+    while (b) {
+        if (x >= r + b) { x -= r + b; r = (r >> 1) + b; }
+        else r >>= 1;
+        b >>= 2;
+    }
+    return r;
+}
+
+/* The four corner boxes of a window's frame, and their arc centres. */
+static int corner_boxes(const struct comp_window *w, int bx[4], int by[4],
+                        int cx[4], int cy[4]) {
+    int fx0, fy0, fx1, fy1;
+    win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
+    const int r = WIN_RADIUS;
+    if (fx1 - fx0 < 2 * r || fy1 - fy0 < 2 * r) return 0;  /* too small to round */
+    bx[0] = fx0;     by[0] = fy0;     bx[1] = fx1 - r; by[1] = fy0;
+    bx[2] = fx0;     by[2] = fy1 - r; bx[3] = fx1 - r; by[3] = fy1 - r;
+    cx[0] = fx0 + r; cy[0] = fy0 + r; cx[1] = fx1 - r; cy[1] = fy0 + r;
+    cx[2] = fx0 + r; cy[2] = fy1 - r; cx[3] = fx1 - r; cy[3] = fy1 - r;
+    return 1;
+}
+
+/* A corner must never be recomposed from a PARTIAL backdrop, or the carve eats
+ * its own output: it would blend against pixels that already contain last
+ * frame's blend, and after a few repaints the arc creeps back to a square (and
+ * the shadow tint compounds to black). So a repaint region that clips through
+ * any corner box swallows that box whole -- at most 9px of growth per side,
+ * and only when an edge happens to cut a corner. */
+static void region_grow_corners(int *rx0, int *ry0, int *rx1, int *ry1);
+
+/* Stash the backdrop under the four corner boxes, before the window paints. */
+static void corners_save(const struct comp_window *w,
+                         int rx0, int ry0, int rx1, int ry1) {
+    g_corner_n = 0;
+    const int r = WIN_RADIUS;
+    int ox[4], oy[4], cx[4], cy[4];
+    if (!corner_boxes(w, ox, oy, cx, cy)) return;
+
+    for (int i = 0; i < 4; i++) {
+        struct corner_box *c = &g_corner[g_corner_n];
+        c->x0 = imax(ox[i], rx0);     c->y0 = imax(oy[i], ry0);
+        c->x1 = imin(ox[i] + r, rx1); c->y1 = imin(oy[i] + r, ry1);
+        if (c->x1 <= c->x0 || c->y1 <= c->y0) continue;   /* region misses it */
+        c->cx = cx[i]; c->cy = cy[i];
+        for (int y = c->y0; y < c->y1; y++)
+            for (int x = c->x0; x < c->x1; x++)
+                c->px[(y - c->y0) * r + (x - c->x0)] =
+                    fb_get_pixel((uint32_t)x, (uint32_t)y);
+        g_corner_n++;
+    }
+}
+
+/* Blend the saved backdrop back over the painted window, by arc coverage. */
+static void corners_carve(const struct comp_window *w, int focused) {
+    const int r = WIN_RADIUS;
+    const int rr8 = (r * 8) * (r * 8);          /* radius^2 in eighth-pixels  */
+    int has_border = (!w->desktop && !w->chromeless);
+    fb_color_t bcol = focused ? FB_RGB(0x7c, 0x84, 0xf0) : FB_RGB(0x3a, 0x3f, 0x55);
+    int sw = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
+    int sa = focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE;
+
+    for (int i = 0; i < g_corner_n; i++) {
+        struct corner_box *c = &g_corner[i];
+        for (int y = c->y0; y < c->y1; y++) {
+            for (int x = c->x0; x < c->x1; x++) {
+                /* 4x4 supersampled coverage of the arc: 0 = outside the window,
+                 * 16 = fully inside, between = the antialiased edge itself. */
+                int cov = 0;
+                for (int sy = 0; sy < 4; sy++) {
+                    for (int sx = 0; sx < 4; sx++) {
+                        int dx = (x - c->cx) * 8 + sx * 2 + 1;
+                        int dy = (y - c->cy) * 8 + sy * 2 + 1;
+                        if (dx * dx + dy * dy <= rr8) cov++;
+                    }
+                }
+                if (cov == 16) continue;              /* untouched interior */
+
+                uint32_t bak = c->px[(y - c->y0) * r + (x - c->x0)];
+                uint32_t cur = fb_get_pixel((uint32_t)x, (uint32_t)y);
+                int br = (int)((bak >> 16) & 255), bg = (int)((bak >> 8) & 255),
+                    bb = (int)(bak & 255);
+
+                /* carry the drop shadow AROUND the arc: outside the curve this
+                 * pixel is no longer window, so it owes the same darkening its
+                 * neighbours outside the frame already got. */
+                int hx = (x - c->cx) * 2 + 1, hy = (y - c->cy) * 2 + 1;
+                int dout = (int)isqrt32((uint32_t)(hx * hx + hy * hy)) - r * 2;
+                if (dout > 0 && win_shadows(w)) {
+                    int a = sa - sa * dout / (sw * 2);
+                    if (a > 0) { br = br * (255 - a) / 255;
+                                 bg = bg * (255 - a) / 255;
+                                 bb = bb * (255 - a) / 255; }
+                }
+
+                int cr = (int)((cur >> 16) & 255), cg = (int)((cur >> 8) & 255),
+                    cb = (int)(cur & 255);
+                int orr = (cr * cov + br * (16 - cov)) / 16;
+                int og  = (cg * cov + bg * (16 - cov)) / 16;
+                int ob  = (cb * cov + bb * (16 - cov)) / 16;
+
+                /* the border ring, curved: partial-coverage pixels ARE the arc,
+                 * so weighting by cov*(16-cov) traces a 1px antialiased curve
+                 * exactly where the straight ring had to stop. */
+                if (has_border && cov > 0) {
+                    int bw = cov * (16 - cov) * 255 / 64;      /* 0..255       */
+                    int lr = (int)((bcol >> 16) & 255),
+                        lg = (int)((bcol >> 8) & 255),
+                        lb = (int)(bcol & 255);
+                    orr = (orr * (255 - bw) + lr * bw) / 255;
+                    og  = (og  * (255 - bw) + lg * bw) / 255;
+                    ob  = (ob  * (255 - bw) + lb * bw) / 255;
+                }
+                fb_put_pixel_c((uint32_t)x, (uint32_t)y, FB_RGB(orr, og, ob));
+            }
+        }
+    }
+}
+
+/* ---- compositing -------------------------------------------------------- *
+ * Chrome that used to be drawn in full on every partial repaint (the title-bar
+ * fill and the border ring) is now clipped to the region, so a repaint that
+ * doesn't reach a corner box can no longer square it off behind the carve's
+ * back. The title text and window buttons stay unclipped: redrawing them
+ * outside the region reproduces identical pixels over identical ones, and they
+ * never reach the arcs. */
+static void fill_clip(int x, int y, int w, int h, fb_color_t c,
+                      int rx0, int ry0, int rx1, int ry1) {
+    int x0 = imax(x, rx0), y0 = imax(y, ry0);
+    int x1 = imin(x + w, rx1), y1 = imin(y + h, ry1);
+    if (x1 > x0 && y1 > y0) fb_fill_rect(x0, y0, x1 - x0, y1 - y0, c);
+}
 
 /* Draw one window's chrome + content clipped to region [rx0,ry0)-(rx1,ry1). */
 static void paint_window(struct comp_window *w, int focused,
@@ -355,6 +516,11 @@ static void paint_window(struct comp_window *w, int focused,
                      0, 0, 0, (uint8_t)sa_, rx0, ry0, rx1, ry1);
     }
 
+    /* stash the corner backdrops NOW: everything below this line overwrites
+     * them, and corners_carve needs what belonged behind this window. */
+    int round = win_shadows(w);      /* same set that casts a shadow          */
+    if (round) corners_save(w, rx0, ry0, rx1, ry1); else g_corner_n = 0;
+
     int bar_h = win_titlebar_h(w);   /* 0 for the chromeless desktop window */
 
     /* --- title bar (repaint whole bar if the region touches it; text is
@@ -364,7 +530,7 @@ static void paint_window(struct comp_window *w, int focused,
         int tbx0 = w->x, tby0 = w->y, tbx1 = w->x + (int)w->cw, tby1 = w->y + COMP_TITLEBAR_H;
         if (!(tbx1 <= rx0 || tbx0 >= rx1 || tby1 <= ry0 || tby0 >= ry1)) {
             fb_color_t bar = focused ? FB_RGB(0x24, 0x24, 0x24) : FB_RGB(0x20, 0x20, 0x20);
-            fb_fill_rect(tbx0, tby0, (int)w->cw, COMP_TITLEBAR_H, bar);
+            fill_clip(tbx0, tby0, (int)w->cw, COMP_TITLEBAR_H, bar, rx0, ry0, rx1, ry1);
             int tr = focused ? 0xf2 : 0xa8, tg = focused ? 0xf2 : 0xa8, tb = focused ? 0xf2 : 0xa8;
             int br = 0x24, bg = 0x24, bb = 0x24;
             fb_draw_string(w->title, tbx0 + 12, tby0 + (COMP_TITLEBAR_H - 16) / 2,
@@ -436,9 +602,16 @@ static void paint_window(struct comp_window *w, int focused,
     }
 
     /* --- 1px border ring (not on the desktop, nor app-chromed windows) --- */
-    if (!w->desktop && !w->chromeless)
-        fb_draw_rect(fx0, fy0, fx1 - fx0, fy1 - fy0,
-                     focused ? FB_RGB(0x7c, 0x84, 0xf0) : FB_RGB(0x3a, 0x3f, 0x55));
+    if (!w->desktop && !w->chromeless) {
+        fb_color_t ring = focused ? FB_RGB(0x7c, 0x84, 0xf0) : FB_RGB(0x3a, 0x3f, 0x55);
+        fill_clip(fx0, fy0, fx1 - fx0, 1, ring, rx0, ry0, rx1, ry1);
+        fill_clip(fx0, fy1 - 1, fx1 - fx0, 1, ring, rx0, ry0, rx1, ry1);
+        fill_clip(fx0, fy0, 1, fy1 - fy0, ring, rx0, ry0, rx1, ry1);
+        fill_clip(fx1 - 1, fy0, 1, fy1 - fy0, ring, rx0, ry0, rx1, ry1);
+    }
+
+    /* --- and finally round the corners off everything drawn above --- */
+    if (round) corners_carve(w, focused);
 }
 
 /* Modern desktop arrow, rasterised from two polygons at 4x4 coverage. This
@@ -547,10 +720,34 @@ static void cursor_capture_and_draw(void) {
 
 /* Repaint screen region [rx0,ry0)-(rx1,ry1): desktop, then all windows that
  * intersect it, bottom-to-top. Caller holds g_comp_lock. Presents the region. */
+static void region_grow_corners(int *rx0, int *ry0, int *rx1, int *ry1) {
+    const int r = WIN_RADIUS;
+    /* growing may newly clip another window's corner, so settle it */
+    for (int pass = 0; pass < 4; pass++) {
+        int grew = 0;
+        for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+            struct comp_window *w = &g_wins[i];
+            if (!w->used || !w->visible || !win_shadows(w)) continue;
+            int bx[4], by[4], cx[4], cy[4];
+            if (!corner_boxes(w, bx, by, cx, cy)) continue;
+            for (int k = 0; k < 4; k++) {
+                if (bx[k] + r <= *rx0 || bx[k] >= *rx1 ||
+                    by[k] + r <= *ry0 || by[k] >= *ry1) continue;   /* no touch */
+                if (bx[k]     < *rx0) { *rx0 = bx[k];     grew = 1; }
+                if (by[k]     < *ry0) { *ry0 = by[k];     grew = 1; }
+                if (bx[k] + r > *rx1) { *rx1 = bx[k] + r; grew = 1; }
+                if (by[k] + r > *ry1) { *ry1 = by[k] + r; grew = 1; }
+            }
+        }
+        if (!grew) break;
+    }
+}
+
 static void paint_region(int rx0, int ry0, int rx1, int ry1) {
     const fb_info_t *fi = fb_get_info();
     if (!fi) return;
     int W = (int)fi->width, H = (int)fi->height;
+    region_grow_corners(&rx0, &ry0, &rx1, &ry1);
     if (rx0 < 0) rx0 = 0; if (ry0 < 0) ry0 = 0;
     if (rx1 > W) rx1 = W; if (ry1 > H) ry1 = H;
     if (rx1 <= rx0 || ry1 <= ry0) return;
