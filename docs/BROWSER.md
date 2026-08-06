@@ -294,32 +294,32 @@ a browser on your own UI stack:
   content can never overflow, so it never wrapped. Invisible for chips and
   tags, which do not overflow; fatal for inline runs, which exist to. Fixed:
   Flow fills its width, as Grid already did.
-- Wrapped paragraphs overlap what follows them. **Still open after three
-  eliminated hypotheses, but no longer a mystery about WHERE:**
+- Wrapped paragraphs still lay out wrong. **Partly fixed, and one earlier
+  claim in this file has to be retracted.**
 
-  MEASUREMENT IS CORRECT. Instrumenting `measure_wrap_height` and its caller
-  printed, for the first paragraph:
+  THE CAUSE, found by measuring: `measure_wrap_height` was only consulted when
+  a wrap row is a DIRECT child of the container being arranged. A document is
+  column -> block -> Flow, so when the column measured its blocks it used each
+  block's `intrinsic_h` -- computed bottom-up by `measure_intrinsic`, which
+  predates any knowledge of width and reports a wrapping row as ONE LINE. The
+  wrap measurement was computing the right answer (54 boxes, 3 lines, 48.9px)
+  for a caller that no longer existed at that depth. `measure_subtree_height`
+  now measures a container child's height at the width it will get, recursing
+  and honouring the same rules arrange does.
 
-      caller:  align=3 (STRETCH) content_cross=896 -> cw=896  base=30.3
-      measure: avail_w=896  nk=54  nlines=3  total=48.9
+  RETRACTION: this file previously listed three hypotheses as "eliminated by
+  experiment". They were not. Those runs booted a STALE image -- `make
+  embkfs.img` inside a compound command was producing nothing and the `cp`
+  failed silently, exactly the trap already recorded for this project. Four
+  consecutive pixel-identical screenshots was the tell and it was missed. The
+  three may or may not have been contributing causes; they are untested.
 
-  So the wrap measurement sees all 54 word boxes, packs them into 3 lines, and
-  returns a correct 48.9px. The height is computed right and then LOST between
-  there and the painted geometry. That is the search area now -- not the
-  measurement, and not the wrap.
-
-  Eliminated, each by experiment rather than argument:
-    1. `Flow` not filling its width — real bug, fixed, made wrapping work, did
-       not fix the height.
-    2. The 64-child cap in `measure_wrap_height` — raised to 512; the numbers
-       above show 54 children, so the cap was never reached.
-    3. The flex-shrink pass squashing scrollable content — a real correctness
-       bug and exempted (content of a clipping container may overflow by
-       design), but the overlap is unchanged.
-
-  Next: follow `base[i]` = 48.9 forward. Print `finalm[i]` after distribution
-  and the node's `resolved_h` after write-back, and find which of the two
-  disagrees with the measurement. **This blocks B1 being called done.**
+  STILL WRONG: with a real height reaching the block, the paragraph's three
+  lines are now spread about 65px apart instead of ~16px and still collide
+  with the heading below. The height is now over-allocated rather than
+  under-allocated, which points at the wrap row distributing its lines across a
+  box taller than the sum of the lines. Next: compare `measure_subtree_height`'s
+  return against the Flow's own arranged line stack. **B1 is not done.**
 
 ## 12. Open questions
 

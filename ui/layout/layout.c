@@ -323,6 +323,66 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
  * width `avail_w`. Mirrors the text height-depends-on-width path so a column
  * parent can size a wrapping child before placing its siblings. Row-wrap only. */
 static float measure_wrap_height(struct layout_arena *la, struct scene_arena *sa,
+                                 struct layout_handle h, float avail_w);
+
+/* Height of a subtree at a KNOWN width.
+ *
+ * The missing case. arrange already measures a child properly when it is text
+ * (wrapped at its width), a grid, or a wrap row -- but a plain CONTAINER child
+ * fell through to its `intrinsic_h`, which measure_intrinsic computes bottom-up
+ * before any width is known and which therefore reports a wrapping row as ONE
+ * LINE.
+ *
+ * That is invisible until a wrap row is nested. A document is exactly that:
+ * column -> block -> Flow. When the column measured its blocks it used each
+ * block's intrinsic height, so every paragraph was budgeted one line however
+ * many it actually wrapped to, and the next block was placed on top of it.
+ * measure_wrap_height was computing the right answer (54 boxes, 3 lines,
+ * 48.9px) for a caller that no longer existed at that depth.
+ *
+ * So: recurse, applying the same rules arrange does, at the width the child
+ * will actually get. */
+static float measure_subtree_height(struct layout_arena *la, struct scene_arena *sa,
+                                    struct layout_handle h, float avail_w) {
+    struct layout_node *n = layout_resolve(la, h);
+    if (!n) return 0;
+    if (n->height.mode == SIZE_FIXED) return n->height.fixed_value;
+    if (!n->is_container)
+        return is_text(sa, n) ? layout_measure_height_at_width(la, sa, h, avail_w)
+                              : n->intrinsic_h;
+
+    float cw = avail_w - n->padding_left - n->padding_right;
+    if (cw < 0) cw = 0;
+
+    if (n->axis == AXIS_ROW) {
+        if (n->wrap) return measure_wrap_height(la, sa, h, avail_w);
+        float mx = 0;                                  /* a row is its tallest child */
+        for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
+            struct layout_node *cn = layout_resolve(la, c);
+            if (!cn) break;
+            if (!cn->is_overlay) {
+                float w = (cn->width.mode == SIZE_FIXED) ? cn->width.fixed_value
+                        : (cn->intrinsic_w > 0 ? cn->intrinsic_w : cw);
+                float ch = measure_subtree_height(la, sa, c, w);
+                if (ch > mx) mx = ch;
+            }
+            c = cn->next_sibling;
+        }
+        return mx + n->padding_top + n->padding_bottom;
+    }
+
+    float total = 0; int cnt = 0;                      /* a column is their sum */
+    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
+        struct layout_node *cn = layout_resolve(la, c);
+        if (!cn) break;
+        if (!cn->is_overlay) { total += measure_subtree_height(la, sa, c, cw); cnt++; }
+        c = cn->next_sibling;
+    }
+    if (cnt > 1) total += n->spacing * (float)(cnt - 1);
+    return total + n->padding_top + n->padding_bottom;
+}
+
+static float measure_wrap_height(struct layout_arena *la, struct scene_arena *sa,
                                  struct layout_handle h, float avail_w) {
     struct layout_node *n = layout_resolve(la, h);
     if (!n || !n->is_container) return 0;
@@ -494,6 +554,13 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
              * width it will get (stretch -> our content width, else intrinsic). */
             float cw = (n->align == ALIGN_STRETCH) ? content_cross : k->intrinsic_w;
             base[i] = measure_wrap_height(la, sa, kids[i], cw);
+        } else if (k->is_container && !is_row) {
+            /* COLUMN: a container child's HEIGHT measured at the width it will
+             * get, so a wrap row NESTED inside it is counted (see
+             * measure_subtree_height). Without this a paragraph gets one line's
+             * budget and the next block lands on top of it. */
+            float cw = (n->align == ALIGN_STRETCH) ? content_cross : k->intrinsic_w;
+            base[i] = measure_subtree_height(la, sa, kids[i], cw);
         } else if (ktext && !is_row) {
             /* COLUMN: main size is HEIGHT -> wrap at the child's cross WIDTH */
             float cw = (n->align == ALIGN_STRETCH) ? content_cross : k->intrinsic_w;
