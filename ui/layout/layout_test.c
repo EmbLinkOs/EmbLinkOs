@@ -177,6 +177,48 @@ static void t3b_default_shrink(void) {
     layout_arena_destroy(&LA); scene_arena_destroy(&SA);
 }
 
+/* ---- T3c: a wrap row NESTED in blocks (the browser's paragraph) --------- */
+/* document -> html -> body -> p -> wrap-row-of-words. The measured height of
+ * the outermost block must be ONE paragraph's wrapped height, not that height
+ * multiplied by how deeply it happens to be nested. */
+static void t3c_nested_wrap(void) {
+    printf("T3c nested wrap height (browser paragraph):\n");
+    scene_arena_init(&SA); layout_arena_init(&LA);
+
+    struct layout_handle root = mk(LAYOUT_HANDLE_NULL, NODE_HANDLE_NULL, SCENE_NODE_GROUP, 0);
+    L(root)->is_container = true; L(root)->axis = AXIS_COLUMN; L(root)->align = ALIGN_STRETCH;
+
+    /* four nested columns, as document/html/body/p are */
+    struct layout_handle a = root, lev[3];
+    for (int i = 0; i < 3; i++) {
+        struct layout_handle b = mk(a, NODE_HANDLE_NULL, SCENE_NODE_GROUP, 0);
+        L(b)->is_container = true; L(b)->axis = AXIS_COLUMN; L(b)->align = ALIGN_STRETCH;
+        a = b; lev[i] = b;
+    }
+    /* the wrap row: 9 boxes of 40 into a 100-wide parent -> 3 lines of 10 */
+    struct layout_handle fl = mk(a, NODE_HANDLE_NULL, SCENE_NODE_GROUP, 0);
+    L(fl)->is_container = true; L(fl)->axis = AXIS_ROW; L(fl)->wrap = true;
+    L(fl)->align = ALIGN_START;
+    for (int i = 0; i < 9; i++) {
+        struct layout_handle w = mk(fl, NODE_HANDLE_NULL, SCENE_NODE_RECT, 0);
+        L(w)->width  = (struct layout_size){ SIZE_FIXED, 40, 0,0,0 };
+        L(w)->height = (struct layout_size){ SIZE_FIXED, 10, 0,0,0 };
+    }
+
+    layout_run(&LA, &SA, root, 100, 400);
+    /* 9 boxes of 40 into 100 wide = 2 per line = 5 lines of 10 = 50 */
+    printf("       wrap=%.1f  p=%.1f  body=%.1f  html=%.1f\n",
+           L(fl)->resolved_h, L(lev[2])->resolved_h,
+           L(lev[1])->resolved_h, L(lev[0])->resolved_h);
+    CHECK(L(fl)->resolved_h > 45.0f && L(fl)->resolved_h < 55.0f,
+          "the wrap row is 5 lines of 10 (=50)");
+    CHECK(L(lev[2])->resolved_h > 45.0f && L(lev[2])->resolved_h < 55.0f,
+          "its parent block is the SAME 50 -- not a multiple");
+    CHECK(L(lev[0])->resolved_h > 45.0f && L(lev[0])->resolved_h < 55.0f,
+          "three levels up is STILL 50 -- nesting must not accumulate");
+    layout_arena_destroy(&LA); scene_arena_destroy(&SA);
+}
+
 /* ---- T4: ALIGN_STRETCH stretches AUTO cross sizes; FIXED always wins ---- */
 /* (CSS semantics: stretch applies only to auto-sized items. A definite cross
  * size is never overridden -- relied on by declare's hit-test clip test once
@@ -255,6 +297,7 @@ int main(void) {
     t2_grow();
     t3_shrink();
     t3b_default_shrink();
+    t3c_nested_wrap();
     t4_stretch();
     t5_wrap(fh);
     t6_writeback(fh);

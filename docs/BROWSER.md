@@ -314,12 +314,18 @@ a browser on your own UI stack:
   consecutive pixel-identical screenshots was the tell and it was missed. The
   three may or may not have been contributing causes; they are untested.
 
-  STILL WRONG: with a real height reaching the block, the paragraph's three
-  lines are now spread about 65px apart instead of ~16px and still collide
-  with the heading below. The height is now over-allocated rather than
-  under-allocated, which points at the wrap row distributing its lines across a
-  box taller than the sum of the lines. Next: compare `measure_subtree_height`'s
-  return against the Flow's own arranged line stack. **B1 is not done.**
+  ENGINE NOW VERIFIED, and the 4x theory is DISPROVEN. A host test (layout
+  T3c) builds the browser's own shape -- four nested columns ending in a wrap
+  row -- and measures 50 at every level: wrap=50 p=50 body=50 html=50. Nesting
+  does not accumulate. `measure_subtree_height` fixed the engine-side bug, and
+  the host test now locks it in seconds rather than a five-minute boot.
+
+  So the remaining misplacement is DOWNSTREAM of layout -- in render.c or the
+  app, where the test's fixed-size boxes differ from the real thing: words are
+  TEXT nodes measured through the font, link words are BUTTONS with padding,
+  and each block carries CSS margins as padding. Reproduce those three in T3c
+  (a stub font is enough) and the next failure will show up on the host too.
+  **B1 is not done.**
 
 ## 12. Open questions
 
