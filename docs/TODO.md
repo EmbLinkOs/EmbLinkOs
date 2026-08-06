@@ -1978,10 +1978,20 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       only for in-APP whole-view transitions, if one is ever wanted.
 
 ### Vellum, the browser (B1 shipped 2026-08-07) -- what B1 does NOT do
-- [ ] **B2: the network.** B1 loads documents from EMBKFS only. The seam is one
-      function (`fetch_local` in user/bin/vellum.c) plus a planned
-      `user/web/net.c`; everything above and below it stays put. Needs http://
-      over our own TCP and https:// over our own TLS 1.3.
+- [x] ~~**B2: the network.**~~ DONE 2026-08-07: `user/web/net.{c,h}` +
+      `url.{c,h}`, http:// and https:// live on the metal.
+- [ ] No chunked transfer-encoding. The client is HTTP/1.0 with
+      `Connection: close`, so a server that chunks anyway would confuse it.
+      Deliberate for now (see BROWSER.md); needed before HTTP/1.1 keep-alive.
+- [ ] The fetch is SYNCHRONOUS: the UI is frozen for the whole request, which
+      on a slow host is seconds with no feedback. Needs either a worker thread
+      or the non-blocking socket path (`nbsock` already proves it works) plus a
+      loading state in the app.
+- [ ] Nothing caches. Every navigation, including Back, refetches.
+- [ ] No Content-Type handling: everything is parsed as HTML. An image or a
+      binary will be rendered as garbage rather than refused or downloaded.
+- [ ] The response buffer is 512KB (SRC_MAX); larger pages are truncated and
+      say so. Fine, but a real limit worth revisiting with images.
 - [x] ~~**Capabilities for a GUI app.**~~ DONE 2026-08-07: `<name>.caps`
       sidecar, parsed with the `.ns` one by `user/lib/appauth.{c,h}`
       (docs/USERSPACE_v2.md UP5). Vellum is born holding exactly

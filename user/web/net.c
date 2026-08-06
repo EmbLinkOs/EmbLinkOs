@@ -1,0 +1,248 @@
+/* user/web/net.c -- fetching a document, over the filesystem or over the wire.
+ *
+ * The network path is this OS's own stack the whole way down: our DNS resolver,
+ * our TCP, our TLS 1.3 with our own X25519/AES-GCM/SHA-384 and our own X.509
+ * chain verification. Nothing here is a port. See docs/TLS.md and docs/NET.md.
+ *
+ * Deliberately HTTP/1.0 with `Connection: close`, which is the same choice wget
+ * made and for the same reason: the server closing the socket frames the body,
+ * so there is no chunked decoder to write and no keep-alive state machine to
+ * get wrong. A browser that renders is worth more than one that pipelines.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#include "embk.h"
+#include "embk_socket.h"
+#include "tls.h"
+
+#include "url.h"
+#include "net.h"
+
+#define MAX_REDIRECTS 5
+
+/* A transport: a plain socket, or TLS over one. Same shape as wget's, because
+ * it is the same idea -- everything above it is written once. */
+struct xport { int fd; struct tls_conn *tls; };
+
+static long x_send(struct xport *x, const void *b, size_t n) {
+    return x->tls ? tls_write(x->tls, b, n) : send(x->fd, b, n, 0);
+}
+static long x_recv(struct xport *x, void *b, size_t n) {
+    return x->tls ? tls_read(x->tls, b, n) : recv(x->fd, b, n, 0);
+}
+static void x_close(struct xport *x) {
+    if (x->tls) { tls_close(x->tls); free(x->tls); }   /* tls_close closes the fd */
+    else if (x->fd >= 0) close(x->fd);
+}
+
+/* --- the filesystem arm -------------------------------------------------- */
+
+static int fetch_local(const struct url *u, char *out, size_t cap,
+                       struct vnet_result *r) {
+    int fd = (int)embk_open(u->path, EMBK_O_RDONLY, 0);
+    if (fd < 0) {
+        snprintf(r->err, sizeof r->err, "No document at %.120s", u->path);
+        return -1;
+    }
+    size_t n = 0;
+    for (;;) {
+        if (n + 1 >= cap) { r->truncated = 1; break; }
+        int64_t got = embk_read(fd, out + n, cap - 1 - n);
+        if (got <= 0) break;
+        n += (size_t)got;
+    }
+    embk_close(fd);
+    out[n] = 0;
+    r->len = n;
+    r->status = 200;
+    snprintf(r->via, sizeof r->via, "file");
+    return 0;
+}
+
+/* --- the network arm ----------------------------------------------------- */
+
+/* Case-insensitive header lookup over a NUL-terminated header block. Returns a
+ * pointer to the value (past the colon and its spaces) or NULL. */
+static const char *hdr_find(const char *hdr, const char *name) {
+    size_t nl = strlen(name);
+    for (const char *l = hdr; l && *l; ) {
+        const char *eol = strchr(l, '\n');
+        if (!strncasecmp(l, name, nl) && l[nl] == ':') {
+            const char *v = l + nl + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            return v;
+        }
+        if (!eol) break;
+        l = eol + 1;
+    }
+    return 0;
+}
+
+/* Copy a header value up to end-of-line, trimming the CR. */
+static void hdr_value(const char *v, char *out, size_t cap) {
+    size_t i = 0;
+    while (v[i] && v[i] != '\r' && v[i] != '\n' && i + 1 < cap) { out[i] = v[i]; i++; }
+    out[i] = 0;
+}
+
+/* One HTTP exchange, no redirect following. Returns 0 if a response was read
+ * (any status), -1 if the transport failed. `location` gets the Location header
+ * if there was one. */
+static int http_once(const struct url *u, char *out, size_t cap,
+                     struct vnet_result *r, char *location, size_t loc_cap) {
+    location[0] = 0;
+
+    struct in_addr addr;
+    if (emb_resolve(u->host, &addr) != 0) {
+        snprintf(r->err, sizeof r->err, "Cannot resolve %s", u->host);
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        /* The single most likely cause, and worth naming: a process that was
+         * not granted CAP_NETWORK cannot open a socket at all. */
+        snprintf(r->err, sizeof r->err,
+                 "No socket (%d) -- does this app hold the network capability?", fd);
+        return -1;
+    }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons((unsigned short)u->port);
+    sa.sin_addr   = addr;
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        snprintf(r->err, sizeof r->err, "Cannot connect to %s:%d", u->host, u->port);
+        close(fd);
+        return -1;
+    }
+
+    struct xport x = { fd, 0 };
+    if (u->kind == URL_HTTPS) {
+        x.tls = malloc(sizeof(struct tls_conn));
+        if (!x.tls) { snprintf(r->err, sizeof r->err, "Out of memory"); close(fd); return -1; }
+        int rc = tls_connect(x.tls, fd, u->host);
+        if (rc != 0) {
+            /* Refusing is the feature. An unauthenticated page is not a page
+             * you were asked to show. */
+            snprintf(r->err, sizeof r->err,
+                     "TLS handshake failed (rc=%d) -- server not authenticated", rc);
+            free(x.tls); close(fd);
+            return -1;
+        }
+        snprintf(r->via, sizeof r->via, "https (authenticated)");
+    } else {
+        snprintf(r->via, sizeof r->via, "http");
+    }
+
+    char req[768];
+    int rl = snprintf(req, sizeof req,
+                      "GET %s HTTP/1.0\r\n"
+                      "Host: %s\r\n"
+                      "User-Agent: Vellum (EmbLinkOS)\r\n"
+                      "Accept: text/html,*/*\r\n"
+                      "Connection: close\r\n\r\n",
+                      u->path, u->host);
+    if (x_send(&x, req, (size_t)rl) < 0) {
+        snprintf(r->err, sizeof r->err, "Request failed");
+        x_close(&x);
+        return -1;
+    }
+
+    static char hdr[8192];
+    char buf[4096];
+    size_t n = 0;
+    int hlen = 0, header_done = 0;
+
+    for (;;) {
+        long got = x_recv(&x, buf, sizeof buf);
+        if (got <= 0) break;
+        int off = 0;
+        if (!header_done) {
+            for (int i = 0; i < got && !header_done; i++) {
+                if (hlen < (int)sizeof hdr - 1) hdr[hlen++] = buf[i];
+                if (hlen >= 4 && hdr[hlen-4]=='\r' && hdr[hlen-3]=='\n' &&
+                                 hdr[hlen-2]=='\r' && hdr[hlen-1]=='\n') {
+                    header_done = 1;
+                    off = i + 1;
+                }
+            }
+            if (!header_done) continue;
+            hdr[hlen] = 0;
+            if (!strncmp(hdr, "HTTP/1.", 7)) r->status = atoi(hdr + 9);
+            const char *loc = hdr_find(hdr, "Location");
+            if (loc) hdr_value(loc, location, loc_cap);
+        }
+        size_t blen = (size_t)got - (size_t)off;
+        if (blen) {
+            if (n + blen + 1 > cap) { blen = cap - n - 1; r->truncated = 1; }
+            if (blen) { memcpy(out + n, buf + off, blen); n += blen; }
+            if (r->truncated) break;   /* bounded appetite: stop reading */
+        }
+    }
+    x_close(&x);
+
+    out[n] = 0;
+    r->len = n;
+    if (!header_done) {
+        snprintf(r->err, sizeof r->err, "No response from %s", u->host);
+        return -1;
+    }
+    return 0;
+}
+
+/* --- the one entry point ------------------------------------------------- */
+
+int vnet_fetch(const char *url, char *out, size_t cap, struct vnet_result *r) {
+    memset(r, 0, sizeof *r);
+    if (!url || !out || cap < 2) {
+        snprintf(r->err, sizeof r->err, "Nothing to fetch");
+        return -1;
+    }
+
+    char here[512];
+    snprintf(here, sizeof here, "%s", url);
+
+    for (int hop = 0; ; hop++) {
+        struct url u;
+        if (url_parse(here, &u) != 0) {
+            snprintf(r->err, sizeof r->err,
+                     "Not a location Vellum understands: %.100s", here);
+            snprintf(r->final_url, sizeof r->final_url, "%s", here);
+            return -1;
+        }
+        snprintf(r->final_url, sizeof r->final_url, "%s", here);
+        r->redirects = hop;
+
+        if (u.kind == URL_LOCAL) return fetch_local(&u, out, cap, r);
+
+        char location[512];
+        if (http_once(&u, out, cap, r, location, sizeof location) != 0) return -1;
+
+        int is_redirect = (r->status == 301 || r->status == 302 || r->status == 303 ||
+                           r->status == 307 || r->status == 308);
+        if (!is_redirect || !location[0]) return 0;
+
+        if (hop >= MAX_REDIRECTS) {
+            /* Not an error worth hiding: a redirect loop is a thing servers do,
+             * and saying so is more useful than showing the last hop's body. */
+            snprintf(r->err, sizeof r->err,
+                     "Too many redirects (%d) -- stopped at %.100s", hop, here);
+            return -1;
+        }
+
+        char next[512];
+        if (url_resolve(here, location, next, sizeof next) != 0) {
+            snprintf(r->err, sizeof r->err, "Bad redirect target: %.120s", location);
+            return -1;
+        }
+        snprintf(here, sizeof here, "%s", next);
+        /* a fresh hop reuses the buffer; clear what the last one said */
+        r->status = 0; r->len = 0; r->truncated = 0; r->err[0] = 0;
+    }
+}

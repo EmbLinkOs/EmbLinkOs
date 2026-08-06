@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "html.h"
+#include "url.h"
 
 static int failures;
 #define CHECK(c, what) do {                                            \
@@ -168,10 +169,63 @@ static void t9_bounded(void) {
     CHECK(d.n <= 8, "never exceeds the node arena");
 }
 
+/* T10-T11 cover url.c: what a location IS, before anything fetches it. Pure
+ * string work, so it belongs in the fast host loop rather than in a boot. */
+static void t10_url_parse(void) {
+    printf("T10 url_parse (a path and a URL both go in the address bar):\n");
+    struct url u;
+
+    CHECK(url_parse("http://example.com/a/b?q=1", &u) == 0, "http parses");
+    CHECK(u.kind == URL_HTTP && u.port == 80, "default port 80");
+    CHECK(!strcmp(u.host, "example.com"), "host split off");
+    CHECK(!strcmp(u.path, "/a/b?q=1"), "the query stays part of the request target");
+
+    CHECK(url_parse("https://a.test", &u) == 0, "https with no path parses");
+    CHECK(u.kind == URL_HTTPS && u.port == 443, "default port 443");
+    CHECK(!strcmp(u.path, "/"), "an empty path becomes /");
+
+    CHECK(url_parse("http://10.0.2.2:8000/hello.html", &u) == 0, "explicit port parses");
+    CHECK(u.port == 8000 && !strcmp(u.host, "10.0.2.2"), "port split from a literal host");
+
+    CHECK(url_parse("/system/web/index.html", &u) == 0, "a bare path is a LOCAL location");
+    CHECK(u.kind == URL_LOCAL && !strcmp(u.path, "/system/web/index.html"), "kept verbatim");
+
+    CHECK(url_parse("file:///data/x.html", &u) == 0, "file:// parses");
+    CHECK(u.kind == URL_LOCAL && !strcmp(u.path, "/data/x.html"), "file:// yields the path");
+
+    CHECK(url_parse("ftp://x/y", &u) != 0, "an unsupported scheme is refused");
+    CHECK(url_parse("nonsense", &u) != 0, "a bare word is refused, not guessed at");
+    CHECK(url_parse("http://", &u) != 0, "a URL with no host is refused");
+}
+
+static void t11_url_resolve(void) {
+    printf("T11 url_resolve (one rule, two worlds):\n");
+    char out[512];
+
+    CHECK(url_resolve("http://h/a/b.html", "c.html", out, sizeof out) == 0 &&
+          !strcmp(out, "http://h/a/c.html"), "network base + relative -> sibling");
+    CHECK(url_resolve("http://h/a/b.html", "/z.html", out, sizeof out) == 0 &&
+          !strcmp(out, "http://h/z.html"), "network base + root-relative -> host root");
+    CHECK(url_resolve("http://h/a/b.html", "https://o/x", out, sizeof out) == 0 &&
+          !strcmp(out, "https://o/x"), "an absolute href ignores the base");
+
+    /* the local half, which the network resolver cannot do: it has no "://" to
+     * anchor on, and a leading '/' IS the root rather than being relative to one */
+    CHECK(url_resolve("/system/web/index.html", "about.html", out, sizeof out) == 0 &&
+          !strcmp(out, "/system/web/about.html"), "local base + relative -> sibling file");
+    CHECK(url_resolve("/system/web/index.html", "/data/x.html", out, sizeof out) == 0 &&
+          !strcmp(out, "/data/x.html"), "local base + absolute path -> that path");
+    CHECK(url_resolve("/system/web/index.html", "http://h/x", out, sizeof out) == 0 &&
+          !strcmp(out, "http://h/x"), "a local page can link OUT to the network");
+
+    CHECK(url_resolve("http://h/a", "", out, sizeof out) != 0, "an empty href resolves to nothing");
+}
+
 int main(void) {
     printf("=== html-test ===\n");
     t1_structure(); t2_implicit_close(); t3_void_and_attrs(); t4_entities();
     t5_script_style(); t6_whitespace(); t7_malformed(); t8_urls(); t9_bounded();
+    t10_url_parse(); t11_url_resolve();
     printf("=== html-test: %s (%d failures) ===\n", failures ? "FAIL" : "OK", failures);
     return failures ? 1 : 0;
 }

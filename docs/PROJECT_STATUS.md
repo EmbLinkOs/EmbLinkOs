@@ -1053,8 +1053,14 @@ audio, camera, USB, raw disk, kernel extension or debug. A bug in its HTML
 parser cannot reach a device that was never granted. No manifest still means
 inherit, so nothing un-declared changed.
 
-Not yet on the network -- B1 loads documents from EMBKFS; the fetch seam is one
-function (`docs/BROWSER.md` §11). Two toolkit bugs and one layout-engine bug
+**And it is on the network (B2).** `user/web/net.c` fetches over our own TCP
+and our own TLS 1.3; `user/web/url.c` decides what a location means. One entry
+point, so the address bar takes a filesystem path and a URL alike. Proven on the
+metal: a page served from the host over plain HTTP, a relative link resolved
+against a network base, and `https://valid-isrgrootx1.letsencrypt.org/` --
+a real page off the internet, authenticated to ISRG Root X1 by our own X.509
+verification, rendered by our own engine
+(`200  https (authenticated)  4067 bytes  62 nodes`). Two toolkit bugs and one layout-engine bug
 were found by building it, all fixed and locked by host tests; a wrap row is
 now exempt from flex-shrink, and a row measures a wrapping child at the width
 it will get.

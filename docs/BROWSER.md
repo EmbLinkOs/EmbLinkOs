@@ -338,6 +338,43 @@ a browser on your own UI stack:
 
 **B1 is done.** The start page renders correctly on the metal.
 
+**B2 is done: Vellum is on the network.** The seam held -- `user/web/net.c`
+appeared and one call in the app changed, nothing else. `vnet_fetch` is the one
+entry point ("give me the bytes for this location"), so the address bar takes a
+path and a URL without the user telling it which is which; `user/web/url.c` is
+the pure string half, kept separate because deciding what a location MEANS
+should not happen while holding a socket.
+
+HTTP/1.0 with `Connection: close` on purpose, the same choice wget made: the
+server closing the socket frames the body, so there is no chunked decoder and no
+keep-alive state machine. Redirects are followed to a depth of 5 and the address
+bar follows. Responses are bounded by the caller's buffer and truncation is
+REPORTED, never silently grown into.
+
+Proven live, on the metal, each with the status line as the witness:
+
+- `200  file  1254 bytes  72 nodes` -- the local start page, now through the
+  same one entry point.
+- `200  http  698 bytes  38 nodes` -- a page served from the host, fetched over
+  our virtio-net, ARP, IPv4 and TCP. The server's log shows our request:
+  `"GET /hello.html HTTP/1.0" 200`.
+- A relative link on that page resolved against a NETWORK base and navigated to
+  `http://10.0.2.2:8000/second.html`.
+- `200  https (authenticated)  4067 bytes  62 nodes` --
+  `https://valid-isrgrootx1.letsencrypt.org/`, a real page off the actual
+  internet, through our own TLS 1.3, our own X25519/AES-GCM/SHA-384 and our own
+  X.509 chain verification to ISRG Root X1. Rendered by our own engine, in a
+  window drawn by our own compositor, in a process holding exactly the three
+  capabilities its manifest asked for.
+
+One bug found and fixed in the SDK on the way: `emb_resolve` sent dotted-quad
+LITERALS to DNS, so typing `http://10.0.2.2:8000/` failed with "cannot resolve
+10.0.2.2" on a machine that could reach it perfectly well. Asking a name server
+to resolve an address is the wrong question. Fixed in `emb_resolve` rather than
+in the browser, because every caller wants it -- wget and gitclone had the same
+gap. Host-checked against 13 cases first, including the ones that must NOT
+short-circuit DNS (`1example.com`, `256.0.0.1`, `10.0.2.2x`).
+
 ## 12. Open questions
 
 Recorded rather than assumed:

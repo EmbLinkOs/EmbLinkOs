@@ -519,12 +519,20 @@ build/web_style.o: user/web/style.c user/web/style.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
 build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/web/html.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -c $< -o $@
-build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/render.h | $(BUILD)
+build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/render.h \
+                user/web/url.h user/web/net.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -c $< -o $@
-VELLUM_OBJS := build/vellum.o build/web_html.o build/web_style.o build/web_render.o
-build/vellum.elf: build/crt0.o build/syscalls.o $(VELLUM_OBJS) build/libembk.so
+# B2: url.c is pure string work; net.c reaches the network, so it needs the TLS
+# include set (same as wget) for tls.h.
+build/web_url.o: user/web/url.c user/web/url.h user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_net.o: user/web/net.c user/web/net.h user/web/url.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/web -c $< -o $@
+VELLUM_OBJS := build/vellum.o build/web_html.o build/web_style.o build/web_render.o \
+               build/web_url.o build/web_net.o
+build/vellum.elf: build/crt0.o build/syscalls.o $(VELLUM_OBJS) $(TLS_LIB_OBJS) build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $(VELLUM_OBJS) \
-	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+	    $(TLS_LIB_OBJS) build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # httpd -- the M5 server witness: an on-OS HTTP server (bind/listen/accept over
 # the native socket syscalls). `test httpd` spawns it; the host curls it via a
@@ -1728,7 +1736,7 @@ scene-test:
 # in seconds rather than through an image build and a boot.
 html-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iuser/web \
-	    user/web/html.c user/web/html_test.c -o $(BUILD)/html_test
+	    user/web/html.c user/web/url.c user/web/html_test.c -o $(BUILD)/html_test
 	$(BUILD)/html_test
 
 backend-test:

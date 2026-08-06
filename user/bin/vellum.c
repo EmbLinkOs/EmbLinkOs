@@ -22,6 +22,8 @@
 #include "html.h"
 #include "style.h"
 #include "render.h"
+#include "url.h"
+#include "net.h"
 
 /* One document at a time, in fixed arenas. A browser that can be handed a
  * hostile page needs a bounded appetite -- see docs/BROWSER.md §7. */
@@ -51,22 +53,9 @@ static void on_link(const char *href) { (void)href; }
 
 /* --- loading ------------------------------------------------------------ */
 
-/* B2 replaces this with net.c; everything above and below stays put. */
-static int fetch_local(const char *path, char *out, size_t cap, size_t *len) {
-    int fd = (int)embk_open(path, EMBK_O_RDONLY, 0);
-    if (fd < 0) return -1;
-    size_t n = 0;
-    for (;;) {
-        int64_t r = embk_read(fd, out + n, cap - 1 - n);
-        if (r <= 0) break;
-        n += (size_t)r;
-        if (n + 1 >= cap) break;
-    }
-    embk_close(fd);
-    out[n] = 0;
-    *len = n;
-    return 0;
-}
+/* B2: this is now one call. Where the bytes come from -- EMBKFS, a socket, a
+ * TLS session -- is net.c's business, and the seam the design put here is the
+ * reason the browser above it did not have to change. */
 
 /* The error page. A browser that shows a blank window on failure is a browser
  * you cannot debug -- so failures are DOCUMENTS, and go through exactly the
@@ -83,19 +72,30 @@ static void load_error(const char *url, const char *why) {
 }
 
 static void load(const char *url) {
-    size_t n = 0;
     snprintf(g_url, sizeof g_url, "%s", url);
     snprintf(g_bar, sizeof g_bar, "%s", url);
     g_scroll = 0;
 
-    if (fetch_local(url, g_src, sizeof g_src, &n) != 0) {
-        load_error(url, "No document at that path.");
+    struct vnet_result res;
+    if (vnet_fetch(url, g_src, sizeof g_src, &res) != 0) {
+        load_error(url, res.err[0] ? res.err : "The document could not be fetched.");
         return;
     }
-    g_root = html_parse(&g_doc, g_src, n, g_nodes, NODE_MAX, g_strs, STR_MAX);
+    /* A redirect changes where you ARE, and the address bar has to say so. */
+    if (res.redirects) {
+        snprintf(g_url, sizeof g_url, "%s", res.final_url);
+        snprintf(g_bar, sizeof g_bar, "%s", res.final_url);
+    }
+
+    g_root = html_parse(&g_doc, g_src, res.len, g_nodes, NODE_MAX, g_strs, STR_MAX);
     if (g_root < 0) { load_error(url, "The document could not be parsed."); return; }
-    snprintf(g_status, sizeof g_status, "%zu bytes  %d nodes%s",
-             n, g_doc.n, g_doc.truncated ? "  (truncated)" : "");
+
+    /* The status line is the browser's honesty: how the bytes arrived, how many
+     * there were, and whether we told the truth about all of them. */
+    snprintf(g_status, sizeof g_status, "%d  %s  %zu bytes  %d nodes%s%s",
+             res.status, res.via, res.len, g_doc.n,
+             res.truncated  ? "  (response truncated)" : "",
+             g_doc.truncated ? "  (document truncated)" : "");
 }
 
 static void navigate(const char *url) {
@@ -132,9 +132,16 @@ static void app(void) {
         navigate(start && start[0] ? start : "/system/web/index.html");
     }
     /* act on last frame's click before building this one */
-    if (g_goto[0]) { char u[512]; snprintf(u, sizeof u, "%s", g_goto); g_goto[0] = 0; navigate(u); }
-
-    const struct ui_theme *t = ui_theme();
+    if (g_goto[0]) {
+        /* Resolve against where we ARE. A relative href in a page fetched over
+         * the network means a network location, and the same href in a local
+         * document means the file beside it -- one rule, two worlds. */
+        char u[512];
+        if (url_resolve(g_url, g_goto, u, sizeof u) != 0)
+            snprintf(u, sizeof u, "%s", g_goto);
+        g_goto[0] = 0;
+        navigate(u);
+    }
 
     Window("Vellum") {
         AppBar("Vellum") {
