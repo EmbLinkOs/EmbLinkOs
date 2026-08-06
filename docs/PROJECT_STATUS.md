@@ -692,7 +692,11 @@ newlib-based libc port.*
   the desktop for the seconds an app takes to render its first frame under TCG. The system **menu bar** follows the Mac
   model literally -- it spans the display, sits flush with no margin or
   rounding, is 26px, bolds the owning app's name, and carries bare status
-  glyphs in equal-width slots rather than boxed chips; window controls are
+  glyphs in equal-width slots rather than boxed chips. It paints NOTHING at all
+  -- no fill, no frost: the menu bar is its text and glyphs sitting directly on
+  the wallpaper. The dock names the app under the pointer in a floating glass
+  label, and its band is the pill plus a gap so it reads as floating rather
+  than as a taskbar welded to the screen edge; window controls are
   **traffic lights** (red close, green minimize) whose symbol appears only on
   hover, drawn as a small dot inside a deliberately larger invisible hit area.
   A V4.1 app-runtime

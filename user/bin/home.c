@@ -265,6 +265,16 @@ static int dock_running(const char *path);   /* below, with g_running */
  * under the ghost would fight the gesture. */
 #define DOCK_BASE 38.0f
 #define DOCK_PEAK 58.0f
+/* Dock band geometry. These were implicit and they DISAGREED: the row reserved
+ * 64px while the pill inside it was 70 tall, so the pill overflowed its row
+ * and the last 6px -- its bottom edge and rounded corners -- fell off the
+ * bottom of the screen. One set of constants now, and the band is the pill
+ * PLUS a gap, because a dock that touches the screen edge is a taskbar; the
+ * gap is what makes it read as floating. */
+#define DOCK_PILL_H 70.0f
+#define DOCK_GAP    14.0f
+#define DOCK_BAND   (DOCK_PILL_H + DOCK_GAP)
+#define BAR_RESERVE 26.0f      /* must match topbar.c's BAR_H */
 static float dock_icon_size(int i) {
     if (!g_have_dockr || g_drag) return DOCK_BASE;
     float px, py; ui_pointer_pos(&px, &py);
@@ -278,12 +288,51 @@ static float dock_icon_size(int i) {
     return DOCK_BASE + (DOCK_PEAK - DOCK_BASE) * t * t;    /* eased falloff */
 }
 
+/* Which slot the pointer is over, or -1. Same slot arithmetic as the
+ * magnifier, so the label always names the icon that is actually swelling. */
+static int dock_hover_index(void) {
+    if (!g_have_dockr || g_drag) return -1;
+    float px, py; ui_pointer_pos(&px, &py);
+    if (py < g_dockr[1] || py > g_dockr[3]) return -1;
+    for (int i = 0; i < g_dock_n; i++) {
+        float x0 = g_dockr[0] + 12.0f + (float)i * (DOCK_BASE + 10.0f);
+        if (px >= x0 && px < x0 + DOCK_BASE + 8.0f) return i;
+    }
+    return -1;
+}
+
+/* The name of the icon under the pointer, floating above the dock.
+ * Our dock art is abstract -- a glyph is a guess until something names it --
+ * and a label that lives IN the dock would either cost permanent vertical
+ * space or shift the icons when it appeared. So it is an out-of-flow overlay
+ * (the drag-ghost pattern): it costs no layout and moves nothing. */
+static void dock_label(void) {
+    int i = dock_hover_index();
+    if (i < 0 || !g_dock[i].label[0]) return;
+    float cx = g_dockr[0] + 12.0f + (float)i * (DOCK_BASE + 10.0f) + (DOCK_BASE + 8.0f) * 0.5f;
+    /* rough centring: the toolkit measures the text, we only have its length,
+     * and being a few pixels off is invisible next to a 46px icon */
+    int n = 0; while (g_dock[i].label[n]) n++;
+    float w = (float)n * 7.0f + 20.0f;
+
+    ui_begin_vstack(0x70CA);
+    ui_set_overlay(true);
+    ui_set_layer(1);
+    ui_begin_vstack(1);
+    ui_set_offset(cx - w * 0.5f, g_dockr[1] - 34.0f);
+    HStack(.px = 10, .py = 4, .corner = 9, .glass = 1, .border = 1) {
+        Text(g_dock[i].label).caption();
+    }
+    ui_end_stack();
+    ui_end_stack();
+}
+
 static void dock_pill(void) {
     /* GLASS, not paint: the pill blurs the wallpaper behind it (the desktop
      * layer paints the wallpaper earlier in this same tree, which is exactly
      * what in-window backdrop blur samples). Bottom-aligned so magnified
      * icons grow UPWARD out of the bar, the way the Mac's do. */
-    HStack(.height = 70, .spacing = 10, .px = 12, .pb = 6, .align = Trailing,
+    HStack(.height = DOCK_PILL_H, .spacing = 10, .px = 12, .pb = 6, .align = Trailing,
            .glass = 1, .corner = 20, .border = 1, .shadow = 2) {
         (void)ui_open();
         { float x, y, w, h; g_have_dockr = ui_open_rect(&x, &y, &w, &h);
@@ -557,7 +606,7 @@ static void home_ui(void) {
             /* Reserve the top strip for our own floating menu bar (topbar.elf,
              * spawned at startup) -- its drag handle, dock and pin live there.
              * No desktop-drawn top bar anymore. */
-            VStack(.width = g_sw, .height = 32, .padding = 0) { }
+            VStack(.width = g_sw, .height = BAR_RESERVE, .padding = 0) { }
 
             /* Exact work-area height: the layout engine's `.grow` is intended
              * for siblings inside a measured row and did not consume the
@@ -565,10 +614,12 @@ static void home_ui(void) {
              * The icons themselves no longer flow inside it -- they are placed
              * individually by desktop_icons() -- but the strip still reserves
              * the space between the top bar and the dock. */
-            HStack(.height = g_sh - 32 - 64) { Spacer(); }
+            HStack(.height = g_sh - BAR_RESERVE - DOCK_BAND) { Spacer(); }
 
             /* the app dock: a centered pill sized to its apps (not full-width) */
-            HStack(.width = g_sw, .height = 64, .align = Center, .justify = Center) {
+            /* Leading (= top of the band): the pill sits at the top of its
+             * band and the gap lands UNDER it, against the screen edge. */
+            HStack(.width = g_sw, .height = DOCK_BAND, .align = Leading, .justify = Center) {
                 dock_pill();
             }
         }
@@ -603,6 +654,7 @@ static void home_ui(void) {
             }
         }
         apps_grid();           /* the Apps launcher (modal grid), when open */
+        dock_label();          /* names the dock icon under the pointer (overlay) */
         drag_ghost();          /* the dragged icon follows the cursor (overlay) */
     }
     dock_resolve_drop();       /* act on a released drag (add / remove / reorder) */

@@ -2412,12 +2412,19 @@ void em_menubar_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_hstack(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface_alt));
+    /* No surface of its own, and no growing. A menu bar is a ROW OF MENUS --
+     * whatever hosts it owns the material and decides how wide the row is. It
+     * used to paint surface_alt and sz_grow(), so inside the system bar it
+     * claimed half the width (an even split with the trailing Spacer) and
+     * filled it with an opaque slab. That was invisible while the bar had its
+     * own dark fill; the moment the bar went transparent it became a grey
+     * rectangle over the left half of the screen. A caller that does want a
+     * surface still passes .background. */
+    if (p.background.a > 0) ui_set_paint(solid(p.background));
     ui_set_border(0, t->border);
     ui_set_padding(t->sp1, t->sp2, t->sp1, t->sp2);
     ui_set_align(ALIGN_CENTER);
     ui_set_spacing(t->sp1);
-    ui_set_size(sz_grow(), sz_intrinsic());
     em_apply_box(p);
 }
 void em_menubar_end_(void) { em_flush(); ui_end_stack(); }

@@ -14,7 +14,14 @@
  * turned the bar into a row of widgets.
  *
  * The window is TRANSLUCENT and only the top strip paints; the rest is
- * transparent canvas the dropdowns render into. */
+ * transparent canvas the dropdowns render into.
+ *
+ * The strip itself paints NOTHING now -- no fill, no frost. The menu bar is
+ * just its text and glyphs sitting directly on the wallpaper, which is the
+ * most confident version of this and the one that makes the desktop feel like
+ * a single surface rather than a stack of panels. It relies on the wallpaper
+ * being dark behind the top edge; the dropdown panels still carry their own
+ * material, so the menus stay readable wherever they land. */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -95,11 +102,11 @@ static void bar(void) {
          * rect (and only the strip -- the dropdown canvas below must stay a
          * sharp view of the desktop). The fill drops to a tint so the frost
          * reads through: the same material as the dock and the launcher. */
-        em_window_blur_rect(0, 0, (int)em_viewport_width(), BAR_H);
-        /* No corner radius and no border: the bar meets the screen edges, so a
-         * rounded outline would only draw a box around the top of the display. */
-        HStack(.height = BAR_H, .align = Center, .spacing = 6, .px = 8,
-               .background = { .r=.05f, .g=.055f, .b=.075f, .a=.72f }) {
+        /* No blur rect declared: frosting the strip would be a material, and
+         * the point is that there is no material. No corner radius and no
+         * border either -- the bar meets the screen edges, so an outline would
+         * only draw a box around the top of the display. */
+        HStack(.height = BAR_H, .align = Center, .spacing = 6, .px = 8) {
             /* The leading mark IS the Apps launcher button (like a Start menu).
              * Real art rather than a font glyph, but drawn as a STENCIL in the
              * accent colour: it keeps the bar's controls one coherent palette
