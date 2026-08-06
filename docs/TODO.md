@@ -1881,9 +1881,11 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       unaffected with menus closed.
 
 ### Window motion (shipped 2026-08-06, compositor-side)
-- [ ] CLOSING is still instant. The ghost reads the LIVE window buffer, and on
-      close that buffer is freed underneath it -- a close animation needs a
-      copy of the pixels (~1.4MB kmalloc for a big window) or a deferred free.
+- [ ] Closing animates via a full-window pixel COPY (~1.4MB kmalloc per close;
+      the live buffer is freed under the ghost when the process is reaped).
+      Cheap enough at one motion at a time, but if closes ever overlap or
+      windows get much bigger, a deferred free of the shared buffer would beat
+      copying it.
 - [ ] The park target is the bottom CENTRE of the screen, not the app's actual
       dock icon: the dock is drawn by home and the kernel has no idea where its
       icons are. Plumbing the icon rect through (win_set_park_target?) would

@@ -514,10 +514,12 @@ static void corners_carve(const struct comp_window *w, int focused) {
  * repainting mid-flight (the cursor, another window) composes correctly. */
 #define ANIM_MS_OPEN   170
 #define ANIM_MS_PARK   200
+#define ANIM_MS_CLOSE  150   /* shorter than open: leaving should feel decisive */
+#define ANIM_CLOSE_TO   92   /* shrink to 92% while fading -- a collapse, not a fly-off */
 #define ANIM_OPEN_FROM  88   /* open starts at 88% and grows in -- a small move;
                               * a big one reads as a zoom effect, not a window */
 
-enum anim_kind { ANIM_NONE = 0, ANIM_OPEN, ANIM_PARK, ANIM_UNPARK };
+enum anim_kind { ANIM_NONE = 0, ANIM_OPEN, ANIM_PARK, ANIM_UNPARK, ANIM_CLOSE };
 
 static struct {
     int      kind;
@@ -526,6 +528,12 @@ static struct {
     int      from[4], to[4];      /* x, y, w, h */
     int      last[4];             /* where the ghost was drawn last frame */
     int      have_last;
+    /* A CLOSING window's pixels are freed out from under us -- the process is
+     * killed and reaped while the ghost is still in the air. So closing (and
+     * only closing) animates a COPY. Every other motion reads the live buffer,
+     * which stays valid because the app is still there. */
+    uint32_t *snap;
+    int      snap_w, snap_h;
 } g_anim;
 
 static int anim_lerp(int a, int b, int num, int den) {
@@ -564,8 +572,9 @@ static void anim_frame_rect(int out[4], int *alpha) {
     int t = ease_out(num);
     for (int i = 0; i < 4; i++) out[i] = anim_lerp(g_anim.from[i], g_anim.to[i], t, den);
     /* fade with the raw (un-eased) time so opacity and motion don't fight */
-    int a = (g_anim.kind == ANIM_PARK) ? (255 - num * 255 / 1000)
-                                       : (num * 255 / 1000);
+    int a = (g_anim.kind == ANIM_PARK || g_anim.kind == ANIM_CLOSE)
+                ? (255 - num * 255 / 1000)
+                : (num * 255 / 1000);
     if (a < 0) a = 0; if (a > 255) a = 255;
     *alpha = a;
 }
@@ -614,9 +623,26 @@ static void anim_start(struct comp_window *w, int kind) {
     } else if (kind == ANIM_PARK) {
         g_anim.dur = ANIM_MS_PARK;
         for (int i = 0; i < 4; i++) { g_anim.from[i] = full[i]; g_anim.to[i] = dock[i]; }
-    } else {  /* ANIM_UNPARK */
+    } else if (kind == ANIM_UNPARK) {
         g_anim.dur = ANIM_MS_PARK;
         for (int i = 0; i < 4; i++) { g_anim.from[i] = dock[i]; g_anim.to[i] = full[i]; }
+    } else {  /* ANIM_CLOSE */
+        g_anim.dur = ANIM_MS_CLOSE;
+        int sw_ = full[2] * ANIM_CLOSE_TO / 100, sh_ = full[3] * ANIM_CLOSE_TO / 100;
+        for (int i = 0; i < 4; i++) g_anim.from[i] = full[i];
+        g_anim.to[0] = full[0] + (full[2] - sw_) / 2;
+        g_anim.to[1] = full[1] + (full[3] - sh_) / 2;
+        g_anim.to[2] = sw_; g_anim.to[3] = sh_;
+        /* take the copy now, while the buffer is still ours */
+        size_t n = (size_t)w->cw * w->ch;
+        uint32_t *cp = (uint32_t *)kmalloc(n * 4);
+        if (cp) {
+            for (size_t i = 0; i < n; i++) cp[i] = w->content[i];
+            g_anim.snap = cp; g_anim.snap_w = (int)w->cw; g_anim.snap_h = (int)w->ch;
+        } else {
+            g_anim.kind = ANIM_NONE;     /* no copy, no animation -- just close */
+            return;
+        }
     }
     w->visible = 0;                      /* the ghost is the window for now */
 }
@@ -628,10 +654,12 @@ static void anim_finish(void) {
     int last[4]; int had = g_anim.have_last;
     for (int i = 0; i < 4; i++) last[i] = g_anim.last[i];
     g_anim.kind = ANIM_NONE; g_anim.have_last = 0;
-    if (w) w->visible = (kind != ANIM_PARK);
+    if (g_anim.snap) { kfree(g_anim.snap); g_anim.snap = 0; g_anim.snap_w = g_anim.snap_h = 0; }
+    if (w) w->visible = (kind == ANIM_OPEN || kind == ANIM_UNPARK);
     /* repaint the window's footprint AND wherever the ghost last was */
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    if (w) win_repaint_rect(w, &x0, &y0, &x1, &y1);
+    if (w && w->used) win_repaint_rect(w, &x0, &y0, &x1, &y1);
+    else w = 0;
     if (had) {
         if (!w) { x0 = last[0]; y0 = last[1]; x1 = last[0] + last[2]; y1 = last[1] + last[3]; }
         else {
@@ -959,12 +987,17 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
      *     above the windows, below the cursor -- so every repaint composes it
      *     correctly, whatever triggered the repaint. */
     if (g_anim.kind != ANIM_NONE) {
-        struct comp_window *aw = win_by_id(g_anim.win_id);
-        if (aw && aw->content) {
+        const uint32_t *src = 0; int sw_ = 0, sh_ = 0;
+        if (g_anim.snap) {
+            src = g_anim.snap; sw_ = g_anim.snap_w; sh_ = g_anim.snap_h;
+        } else {
+            struct comp_window *aw = win_by_id(g_anim.win_id);
+            if (aw && aw->content) { src = aw->content; sw_ = (int)aw->cw; sh_ = (int)aw->ch; }
+        }
+        if (src) {
             int r[4], alpha; anim_frame_rect(r, &alpha);
-            fb_blit_scaled_uniform(r[0], r[1], r[2], r[3], aw->content,
-                                   (int)aw->cw, (int)aw->ch, aw->cw,
-                                   (uint32_t)alpha, rx0, ry0, rx1, ry1);
+            fb_blit_scaled_uniform(r[0], r[1], r[2], r[3], src, sw_, sh_,
+                                   (uint32_t)sw_, (uint32_t)alpha, rx0, ry0, rx1, ry1);
         }
     }
 
@@ -1406,9 +1439,13 @@ int64_t compositor_win_destroy(int pid, uint32_t id) {
 void compositor_exit_pid(int pid) {
     spin_lock(&g_comp_lock);
     int found = 0;
+    int animated = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
         if (!w->used || w->pid != pid || !w->visible) continue;
+        /* Collapse the FIRST real window on the way out (one motion at a time,
+         * and an app's second window is chrome or a widget anyway). */
+        if (!animated) { anim_start(w, ANIM_CLOSE); animated = (g_anim.kind == ANIM_CLOSE); }
         w->visible = 0;
         if (w->id == g_top_id) g_top_id = 0;
         int x0, y0, x1, y1;
@@ -1575,9 +1612,9 @@ void compositor_pointer_tick(void) {
                  * pixel backing is freed later by compositor_reap_pid. */
                 close_pid = w->pid;
                 title_control = 1;
-                kprintf("compositor: close btn -> hide win %u, kill pid %d\n", (unsigned)w->id, w->pid);   /* DIAG */
-                w->visible = 0;
                 if (w->id == g_top_id) g_top_id = 0;
+                anim_start(w, ANIM_CLOSE);   /* hides it; the ghost collapses */
+                w->visible = 0;              /* (and stays hidden if it declined) */
                 int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
                 DIRTY(fx0, fy0, fx1, fy1);
                 raised = 1;   /* re-run enforce_focus() to promote the new front */

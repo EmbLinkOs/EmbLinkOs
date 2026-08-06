@@ -682,8 +682,8 @@ newlib-based libc port.*
   takes the SPAWN HANDLE rather than a pid, so a launcher can only bring back
   apps it started) to un-park and raise it -- which also fixed the dock click
   on an already-running app doing nothing at all. And windows **move**: opening
-  grows a window in from 88% with a fade, parking flies it down to the dock,
-  un-parking flies it back (`compositor_anim_tick`, driven from the boot CPU's
+  grows a window in from 88% with a fade, closing collapses it to 92% and
+  fades out, parking flies it down to the dock, un-parking flies it back (`compositor_anim_tick`, driven from the boot CPU's
   main loop). The motion is a scale+fade of the window's own finished pixels
   (`fb_blit_scaled_uniform`), so the app is not involved and no scene-graph
   work happens per frame -- which is why this succeeded where the earlier
