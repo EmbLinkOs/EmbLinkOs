@@ -101,6 +101,7 @@ int em_app_run(const EmApp *app) {
      * won't and the desktop is inconsistent by default. */
     { struct oscfg cfg; oscfg_load(&cfg);
       ui_theme_use_dark(cfg.dark != 0);
+      ui_theme_set_scale((float)cfg.ui_scale / 100.0f);
       const struct oscfg_accent *a = &oscfg_accents[cfg.accent];
       ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f }); }
     ui_init(&sa, &la);
@@ -125,8 +126,21 @@ int em_app_run(const EmApp *app) {
     int wx = app->fullscreen ? 0 : ((int)sw - winw) / 2;        if (wx < 0) wx = 0;
     int wy = app->fullscreen ? 0 : 32 + ((int)sh - 32 - 64 - winh - bar) / 2;
     if (wy < 32 && !app->fullscreen) wy = 32;
-    g_viewport_w = (float)winw; em_set_viewport((float)winw, g_viewport_h);
+    /* Publish AFTER both are assigned. This line used to pass g_viewport_h to
+     * em_set_viewport one statement BEFORE that variable was given a value, so
+     * every application started life telling the toolkit its window was zero
+     * pixels tall -- and nothing corrected it until the first resize.
+     *
+     * Anything sized from the viewport height was therefore wrong until you
+     * dragged the window: the Terminal computed a NEGATIVE row count and
+     * clamped to its floor of three (one visible transcript line), and a
+     * ScrollView asked for viewport-minus-chrome got a negative height and
+     * rendered nothing at all. "Make the window smaller and the content
+     * appears" was the bug reporting itself -- resizing was simply the only
+     * code path that ever published a real height. */
+    g_viewport_w = (float)winw;
     g_viewport_h = (float)winh;
+    em_set_viewport(g_viewport_w, g_viewport_h);
 
     uint32_t *px = 0;
     uint64_t wflags = translucent ? EMBK_WINF_TRANSLUCENT

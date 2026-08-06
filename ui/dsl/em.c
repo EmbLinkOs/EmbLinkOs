@@ -131,7 +131,21 @@ static void em_apply_box(EmProps p) {
     if (p.minw > 0 || p.maxw > 0 || p.minh > 0 || p.maxh > 0)
         ui_set_size_bounds(p.minw, p.maxw, p.minh, p.maxh);
     if (p.span > 0) ui_set_grid_span(p.span);   /* grid-cell column span */
-    if (p.background.a > 0) ui_set_paint(solid(p.background));
+    /* ALWAYS set a paint, even when there is no background.
+     *
+     * This used to be `if (a > 0)`, which meant a container with a transparent
+     * background set NOTHING -- and the reconciler reuses instances, so the box
+     * kept whatever fill it had last frame. Any highlight that toggles was
+     * therefore one-way: press a sidebar row and it lit, press another and BOTH
+     * stayed lit, because the row losing selection never said "no fill". It cost
+     * us the same bug twice (the dock's running dot, then the Settings and Files
+     * sidebars) before it was worth fixing at the source.
+     *
+     * EmProps cannot distinguish "unset" from "transparent" -- both are alpha 0 --
+     * so the fix is that they MEAN THE SAME THING: no fill. Containers that want
+     * a default (Card, Sidebar, Window...) now pass it through p.background
+     * above rather than pre-painting behind this function's back. */
+    ui_set_paint(p.background.a > 0 ? solid(p.background) : (struct paint){ 0 });
     if (p.corner > 0)       ui_set_corner_radius(p.corner);
     if (p.border > 0)       ui_set_border(p.border, p.border_color.a > 0 ? p.border_color : TH->border);
     if (p.shadow > 0) {
@@ -208,7 +222,7 @@ void em_screen_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_vstack(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->bg));
+    if (p.background.a <= 0) p.background = t->bg;
     ui_set_size(sz_grow(), sz_grow());
     ui_set_padding(t->sp6, t->sp6, t->sp6, t->sp6);
     if (p.padding < 0) ui_set_padding(0, 0, 0, 0);
@@ -224,7 +238,7 @@ void em_card_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_box_begin(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface));
+    if (p.background.a <= 0) p.background = t->surface;
     ui_set_corner_radius(p.corner > 0 ? p.corner : t->radius_lg);
     ui_set_border(1.0f, t->border);
     if (p.shadow >= 0) ui_set_shadow(true, t->shadow_md.dx, t->shadow_md.dy, t->shadow_md.blur, t->shadow_md.color);
@@ -851,7 +865,7 @@ void em_list_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_vstack(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface_alt));
+    if (p.background.a <= 0) p.background = t->surface_alt;
     ui_set_corner_radius(p.corner > 0 ? p.corner : t->radius_md);
     ui_set_border(1.0f, t->border);
     ui_set_clip_children(true);
@@ -1001,7 +1015,7 @@ void em_window_(const char *title, EmProps p) {
     if (g_win_glass) { Color a = t->accent;
         bg = (Color){ bg.r * 0.92f + a.r * 0.08f, bg.g * 0.92f + a.g * 0.08f,
                       bg.b * 0.92f + a.b * 0.08f, 1.0f }; }
-    ui_set_paint(solid(bg));
+    p.background = bg;          /* em_apply_box owns the paint (see its note) */
     ui_set_size(sz_grow(), sz_grow());
     ui_set_align(ALIGN_STRETCH);
     ui_set_spacing(0);
@@ -1083,7 +1097,7 @@ void em_windowbar_(const char *title, EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_hstack(0);                              /* the bar */
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface_alt));
+    if (p.background.a <= 0) p.background = t->surface_alt;
     ui_set_padding(t->sp2, t->sp3, t->sp2, t->sp3);
     ui_set_align(ALIGN_CENTER);
     ui_set_spacing(t->sp2);
@@ -1113,7 +1127,7 @@ void em_appbar_(const char *title, EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_hstack(0);                              /* the bar */
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface_alt));
+    if (p.background.a <= 0) p.background = t->surface_alt;
     ui_set_padding(t->sp2, t->sp3, t->sp2, t->sp2);
     ui_set_align(ALIGN_CENTER);
     ui_set_spacing(t->sp2);
@@ -2113,7 +2127,7 @@ void em_sidebar_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_vstack(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface));
+    if (p.background.a <= 0) p.background = t->surface;
     ui_set_border(1.0f, t->border);
     ui_set_size(sz_fixed(g_split_w), sz_grow());
     ui_set_align(ALIGN_STRETCH);
@@ -2456,12 +2470,11 @@ void em_menubar_(EmProps p) {
      * own dark fill; the moment the bar went transparent it became a grey
      * rectangle over the left half of the screen. A caller that does want a
      * surface still passes .background. */
-    if (p.background.a > 0) ui_set_paint(solid(p.background));
     ui_set_border(0, t->border);
     ui_set_padding(t->sp1, t->sp2, t->sp1, t->sp2);
     ui_set_align(ALIGN_CENTER);
     ui_set_spacing(t->sp1);
-    em_apply_box(p);
+    em_apply_box(p);            /* paints only if the caller asked for a fill */
 }
 void em_menubar_end_(void) { em_flush(); ui_end_stack(); }
 

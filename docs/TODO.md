@@ -1881,11 +1881,10 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       unaffected with menus closed.
 
 ### Essential apps (Files / Settings / Terminal, 2026-08-06)
-- [ ] Files' status line ("N items") is clipped by a few pixels at the window's
-      bottom edge. NOT the ScrollView height -- reducing it by 26px moved the
-      line not at all, which rules out the obvious cause. Something else in the
-      ContentPane column is taking more height than it reports. Measure the
-      resolved rects of that column's children rather than guessing constants.
+- [ ] Files' status line ("N items") may still sit tight against the window's
+      bottom edge. The viewport-height bug that caused the worst of it is fixed
+      (em_app published height 0 until the first resize); re-check and, if it
+      persists, measure the resolved rects rather than guessing constants.
 - [ ] Files has no delete, rename, copy or move. unlink/rmdir/rename syscalls
       all exist -- what is missing is the confirmation design, and a delete
       that ships before its confirmation is a bug with a keyboard shortcut.

@@ -282,8 +282,10 @@ static void cfg_poll(void) {
      * at launch for ordinary applications; the desktop never exits, so if it
      * only read the file at startup then changing the accent would recolour
      * every window EXCEPT the one always on screen. */
-    if (g_cfg.accent != was.accent || g_cfg.dark != was.dark) {
+    if (g_cfg.accent != was.accent || g_cfg.dark != was.dark ||
+        g_cfg.ui_scale != was.ui_scale) {
         ui_theme_use_dark(g_cfg.dark != 0);
+        ui_theme_set_scale((float)g_cfg.ui_scale / 100.0f);
         const struct oscfg_accent *a = &oscfg_accents[g_cfg.accent];
         ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f });
     }

@@ -533,12 +533,26 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
          *
          * min_size is honoured throughout, and whatever one pass cannot absorb
          * carries into the next. */
-        /* A container with NO extent is not laying out a row -- it is an
-         * anchor whose children are placed by their own offsets (the desktop's
-         * zero-sized icon overlay is exactly this). Every child there looks
-         * like overflow, and shrinking them squashed the desktop icons into
-         * their own captions. No space to distribute means nothing to do. */
-        float deficit = content_main > 0.01f ? -remaining : 0.0f;
+        /* Two containers must NOT shrink their children, because for them
+         * overflow is the whole point rather than a failure:
+         *
+         *   - a container with NO EXTENT is not laying out a row, it is an
+         *     anchor whose children are placed by their own offsets (the
+         *     desktop's zero-sized icon overlay). Everything there looks like
+         *     overflow; shrinking squashed the desktop icons into their
+         *     captions.
+         *   - a container that CLIPS its children has declared itself a window
+         *     onto something larger. A ScrollView is exactly that: its content
+         *     is meant to be taller than the viewport, and that is what there
+         *     is to scroll. Shrinking it to fit collapsed the content instead
+         *     -- Settings' whole right-hand pane rendered empty, and the
+         *     Terminal showed only the last couple of lines.
+         *
+         * In both cases the honest answer is that there is nothing to
+         * distribute. */
+        struct scene_node *sn = paired(sa, n);
+        int clips = sn && sn->clip_children;
+        float deficit = (content_main > 0.01f && !clips) ? -remaining : 0.0f;
         for (int pass = 0; pass < 2 && deficit > 0.01f; pass++) {
             float sum_w = 0;
             for (int i = 0; i < nk; i++) {

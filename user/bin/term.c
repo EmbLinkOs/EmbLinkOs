@@ -724,8 +724,13 @@ static void term_view(void) {
          * the NEXT LINE of the transcript. It sits directly under the last
          * thing printed, in the same face on the same ground, and the whole
          * column grows downward together. */
+        /* .clip: the transcript is a WINDOW onto the scrollback, so if the
+         * row estimate is off by one the extra row must be trimmed -- not
+         * allowed to overflow, because an overflowing column gets shrunk and a
+         * shrunk column of text collapses to nothing legible. This is the same
+         * property a ScrollView has, and for the same reason. */
         VStack(.spacing = 1, .px = 14, .pt = 10, .pb = 10, .align = Leading,
-               .grow = 1, .background = TERM_BG) {
+               .grow = 1, .clip = 1, .background = TERM_BG) {
             /* the wheel pages the scrollback -- up rolls back in time */
             float wd = ui_take_wheel();
             if (wd != 0.0f) {
@@ -739,7 +744,11 @@ static void term_view(void) {
             /* Only the rows that EXIST are drawn. The old view always emitted
              * g_rows rows, padding with blanks -- which is what forced the
              * prompt to the bottom of the window and left the gap. */
-            int room  = g_rows > 1 ? g_rows - 1 : 1;      /* one row is the prompt */
+            /* One row for the prompt, and one of slack: the row height is
+             * derived from a measured box and rounding down by a pixel is
+             * enough to ask for a row that does not fit. Slack costs one line
+             * of scrollback; overflowing costs the whole view. */
+            int room  = g_rows > 2 ? g_rows - 2 : 1;
             int avail = g_count - g_view;
             if (avail < 0) avail = 0;
             int show  = avail < room ? avail : room;
@@ -774,8 +783,9 @@ static void term_view(void) {
                  * height -- no font API, no hidden probe node. Reads LAST
                  * frame's geometry (one frame of lag is invisible). */
                 HStack(.align = Center) {
-                    float bx, by, bw, bh;
-                    if (ui_open_rect(&bx, &by, &bw, &bh) && bw > 1 && bh > 1) {
+                    float bx = 0, by = 0, bw = 0, bh = 0;
+                    int got = ui_open_rect(&bx, &by, &bw, &bh);
+                    if (got && bw > 1 && bh > 1) {
                         int plen = (int)strlen(prompt_text());
                         if (plen > 0) {
                             float cw = bw / (float)plen, lh = bh + 1.0f;
@@ -826,7 +836,10 @@ int main(void) {
 
     static EmApp app = {
         .title  = "Terminal",
-        .size   = { 740, 480 },
+        /* Smaller by default. 740x480 opened as a slab that dominated the
+         * desktop; a terminal you have just opened should look like a tool you
+         * reached for, not the thing you are now doing. It is resizable. */
+        .size   = { 620, 380 },
         .theme  = Dark,
         .chrome = Chromeless,
         .resize = Resizable,

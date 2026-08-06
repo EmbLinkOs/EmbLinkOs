@@ -48,6 +48,7 @@ static char g_procs[32]  = "--";
 
 static void apply_now(void) {
     ui_theme_use_dark(g_cfg.dark != 0);
+    ui_theme_set_scale((float)g_cfg.ui_scale / 100.0f);
     const struct oscfg_accent *a = &oscfg_accents[g_cfg.accent];
     ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f });
     em_request_frame();
@@ -101,6 +102,26 @@ static void pane_appearance(void) {
             Segmented(modes, 2, &dark);
         }
         if (dark != (g_cfg.dark ? 1 : 0)) { g_cfg.dark = dark; commit(); }
+    }
+
+    Section("Interface size") {
+        /* The base size everything else is derived from -- text, and so every
+         * box measured around text, including the Terminal's character grid.
+         * Three steps rather than a slider: this is a legibility decision with
+         * two or three right answers, not a continuous quantity, and a slider
+         * would invite pixel-hunting for a value that does not exist. */
+        static const char *sizes[] = { "Small", "Default", "Large" };
+        int step = g_cfg.ui_scale <= 90 ? 0 : g_cfg.ui_scale >= 115 ? 2 : 1;
+        int was = step;
+        HStack(.spacing = 16, .align = Center, .py = 8, .grow = 1) {
+            setting_label("Text and controls",
+                          "Scales the whole interface, not just this window.");
+            Segmented(sizes, 3, &step);
+        }
+        if (step != was) {
+            g_cfg.ui_scale = step == 0 ? 88 : step == 2 ? 118 : 100;
+            commit();
+        }
     }
 
     Section("Accent") {
@@ -216,7 +237,7 @@ static void app(void) {
                 Text("EmbLink OS").caption().tertiary();
             }
             ContentPane(.padding = 0) {
-                /* measured, not guessed -- see the same note in files.c */
+                /* measured, not guessed -- see the note in files.c */
                 ScrollView(&g_scroll, em_viewport_height() - 58.0f) {
                     VStack(.spacing = 6, .align = Fill, .padding = 20) {
                         Text(g_pane_name[g_pane]).heading();
