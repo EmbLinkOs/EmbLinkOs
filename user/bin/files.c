@@ -483,7 +483,10 @@ static void app(void) {
                         } else if (g_view == 1) {
                             for (int k = 0; k < g_vis_n; k++) list_row(g_vis[k]);
                         } else {
-                            int cols = ((int)em_viewport_width() - 200) / 100;
+                            /* against the PANE's width (window less sidebar
+                             * and padding), not the window's -- the last
+                             * column was overflowing and getting clipped. */
+                            int cols = ((int)em_viewport_width() - 178 - 44) / 100;
                             if (cols < 2) cols = 2;
                             if (cols > 8) cols = 8;
                             for (int base = 0; base < g_vis_n; base += cols) {
@@ -502,7 +505,19 @@ static void app(void) {
                 /* The verbs live in a context menu rather than a toolbar:
                  * they act on ONE item, and a toolbar button cannot say which.
                  * Right-click is also where a Mac user reaches for them. */
-                /* Right-click on empty space is about the FOLDER. Finder does
+                /* Emitted INSIDE the content pane, deliberately.
+                 *
+                 * em_context_menu_ offsets its panel from its PARENT's origin
+                 * while em_right_clicked reports WINDOW-local coordinates, so
+                 * the menu opens down and right of the pointer by the sidebar
+                 * width and the title-bar height. Moving it to the window's top
+                 * level fixes the anchor and BREAKS the menu: the dismiss scrim
+                 * is then viewport-sized over the press point and swallows the
+                 * very click that opened it. A menu in the wrong place beats a
+                 * menu that never appears; the real fix is for the anchor to be
+                 * expressed in window coordinates. See docs/TODO.md.
+                 *
+                 * Right-click on empty space is about the FOLDER. Finder does
                  * this, and it is where New Folder and Paste actually belong --
                  * they were only on the toolbar because there was nowhere else
                  * to put them. Any click no row claimed lands here. */
@@ -591,7 +606,6 @@ static void app(void) {
                     }
                     if (OverlayDismissed()) g_renaming = false;
                 }
-
                 /* status line: what am I looking at */
                 Divider();
                 HStack(.spacing = 10, .align = Center, .px = 12, .py = 3) {
@@ -604,6 +618,7 @@ static void app(void) {
                 }
             }
         }
+
     }
 }
 

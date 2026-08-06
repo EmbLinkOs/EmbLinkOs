@@ -1881,18 +1881,25 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       unaffected with menus closed.
 
 ### Essential apps (Files / Settings / Terminal, 2026-08-06)
-- [ ] RIGHT-CLICK NEVER REACHES AN APPLICATION. em_right_clicked is correct and
-      em_app_run feeds em_feed_pointer with the right button, but a synthetic
-      right press over a Files window produced no context menu and not even the
-      catch-all folder menu (which fires on ANY unclaimed right-click). The
-      desktop's own right-click menu works, and home feeds the same function --
-      so suspect the compositor's button reporting for non-desktop windows.
-      Files' verbs are reachable from a visible "..." row control meanwhile.
+- [x] ~~RIGHT-CLICK NEVER REACHES AN APPLICATION~~ -- WRONG, and worth keeping
+      as a caution. Right-click works fine; the observation was made during the
+      window when `timeout 200 make embkfs.img` was silently producing no image
+      and the VM was booting a stale one (see Harness). The whole chain --
+      compositor button mask, sys_win_input, em_feed_pointer, em_right_clicked
+      -- was correct all along. A negative result from an unverified build is
+      not a result.
 - [ ] Button labels are always CENTRED. em_button_impl uses ui_box_begin, and
       justify appears not to apply to a box the way it does to a stack, so
       .leading() still leaves a file name centred in its column. Needs the
       button's label to live in a stack, or box justify to work.
 - [ ] Files list view has no column headers and no sort-by-column.
+- [ ] ContextMenu's anchor is PARENT-relative while em_right_clicked reports
+      WINDOW-local coordinates, so a menu emitted inside a pane opens offset by
+      that pane's origin. Emitting it at the window's top level fixes the
+      anchor and breaks the menu -- the dismiss scrim then covers the press
+      point and eats the opening click. em_menu_panel_open should subtract its
+      overlay's resolved origin (available a frame late via ui_open_rect), or
+      take window coordinates outright.
 - [ ] Files' status line ("N items") may still sit tight against the window's
       bottom edge. The viewport-height bug that caused the worst of it is fixed
       (em_app published height 0 until the first resize); re-check and, if it
