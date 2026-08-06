@@ -342,6 +342,23 @@ static float measure_wrap_height(struct layout_arena *la, struct scene_arena *sa
  *
  * So: recurse, applying the same rules arrange does, at the width the child
  * will actually get. */
+/* Does anything in here wrap? Intrinsic heights are computed before any width
+ * is known, so they are right for everything EXCEPT a subtree that wraps --
+ * which is why the expensive width-dependent measurement is gated on this
+ * rather than run everywhere. */
+static int subtree_wraps(struct layout_arena *la, struct layout_handle h) {
+    struct layout_node *n = layout_resolve(la, h);
+    if (!n || !n->is_container) return 0;
+    if (n->wrap && n->axis == AXIS_ROW) return 1;
+    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
+        struct layout_node *cn = layout_resolve(la, c);
+        if (!cn) break;
+        if (subtree_wraps(la, c)) return 1;
+        c = cn->next_sibling;
+    }
+    return 0;
+}
+
 static float measure_subtree_height(struct layout_arena *la, struct scene_arena *sa,
                                     struct layout_handle h, float avail_w) {
     struct layout_node *n = layout_resolve(la, h);
@@ -356,13 +373,40 @@ static float measure_subtree_height(struct layout_arena *la, struct scene_arena 
 
     if (n->axis == AXIS_ROW) {
         if (n->wrap) return measure_wrap_height(la, sa, h, avail_w);
-        float mx = 0;                                  /* a row is its tallest child */
+
+        /* A row is its tallest child -- but the height of a child that wraps
+         * depends on the width it will GET, so the widths have to be shared out
+         * first. A flexible child measured at its own intrinsic width is
+         * measured unwrapped, and reports one line. That is a list item: the
+         * bullet takes its intrinsic width and the text column takes the rest,
+         * and if you hand that column its intrinsic width instead you get a
+         * one-line row with three lines of text hanging out the bottom of it,
+         * under whatever comes next. */
+        float fixed_sum = 0; int cnt = 0, flex = 0;
         for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
             struct layout_node *cn = layout_resolve(la, c);
             if (!cn) break;
             if (!cn->is_overlay) {
-                float w = (cn->width.mode == SIZE_FIXED) ? cn->width.fixed_value
-                        : (cn->intrinsic_w > 0 ? cn->intrinsic_w : cw);
+                cnt++;
+                if (cn->width.mode == SIZE_FLEX || cn->width.flex_grow > 0) flex++;
+                else fixed_sum += (cn->width.mode == SIZE_FIXED) ? cn->width.fixed_value
+                                                                 : cn->intrinsic_w;
+            }
+            c = cn->next_sibling;
+        }
+        if (cnt > 1) fixed_sum += n->spacing * (float)(cnt - 1);
+        float share = flex > 0 ? (cw - fixed_sum) / (float)flex : 0;
+        if (share < 0) share = 0;
+
+        float mx = 0;
+        for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
+            struct layout_node *cn = layout_resolve(la, c);
+            if (!cn) break;
+            if (!cn->is_overlay) {
+                float w;
+                if (cn->width.mode == SIZE_FIXED)                        w = cn->width.fixed_value;
+                else if (cn->width.mode == SIZE_FLEX || cn->width.flex_grow > 0) w = share;
+                else w = cn->intrinsic_w > 0 ? cn->intrinsic_w : cw;
                 float ch = measure_subtree_height(la, sa, c, w);
                 if (ch > mx) mx = ch;
             }
@@ -646,7 +690,29 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
             struct scene_node *psn = pn ? paired(sa, pn) : 0;
             parent_clips = psn && psn->clip_children;
         }
-        float deficit = (content_main > 0.01f && !clips && !parent_clips)
+
+        /* ...and a WRAPPING row must not shrink AT ALL. Overflow is not a
+         * failure there, it is the trigger: a wrap row resolves too much
+         * content by starting a new LINE, which is why the wrap arm below
+         * places children at base[] and never looks at finalm[].
+         *
+         * Shrinking one anyway is invisible in the arrangement and lethal in
+         * the measurement. The cross size of a text child is its height AT ITS
+         * FINAL WIDTH -- so a paragraph of 54 word boxes, overflowing its 896px
+         * line by design, had every word squashed to a fraction of its width
+         * and then measured there. Each word CHARACTER-wrapped: "a " reported
+         * one line, "This " three, "page " four. The row's own height stayed
+         * right (it comes from the measure pass, which doesn't shrink), so the
+         * line stride became the tallest of those lies -- 65px for a 16px line
+         * -- and the paragraph's three lines spread out far enough for the next
+         * heading to be drawn between them.
+         *
+         * Which is exactly the report: the top of the document is wrong and the
+         * bottom is fine. The bottom is fine because a paragraph short enough
+         * not to overflow never enters this branch at all. */
+        int wrapping = n->wrap && is_row;
+
+        float deficit = (content_main > 0.01f && !clips && !parent_clips && !wrapping)
                         ? -remaining : 0.0f;
         for (int pass = 0; pass < 2 && deficit > 0.01f; pass++) {
             float sum_w = 0;
@@ -712,6 +778,19 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
             crossv[i] = content_cross;
         } else if (ktext && is_row) {
             crossv[i] = layout_measure_height_at_width(la, sa, kids[i], finalm[i]); /* height at final width */
+        } else if (is_row && k->is_container && subtree_wraps(la, kids[i])) {
+            /* ROW: a container child that WRAPS somewhere inside it cannot be
+             * measured by intrinsic_h -- intrinsics are computed before any
+             * width is known, so a wrapping row inside counts as one line. Ask
+             * for its height at the width it just got instead. This is the
+             * list item: [bullet][text column], where the column wraps to three
+             * lines and the row claimed to be one line tall, so the next item
+             * was placed on top of it.
+             *
+             * Gated on actually containing a wrap, so every ordinary row --
+             * toolbars, buttons, list rows -- keeps its intrinsic height and
+             * this cannot regress them. */
+            crossv[i] = measure_subtree_height(la, sa, kids[i], finalm[i]);
         } else {
             crossv[i] = is_row ? k->intrinsic_h : k->intrinsic_w;
         }

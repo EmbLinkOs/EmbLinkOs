@@ -1976,3 +1976,24 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       SUPERSEDED for window open/close: doing the motion in the COMPOSITOR
       (see above) avoids the toolkit group path entirely. This entry stands
       only for in-APP whole-view transitions, if one is ever wanted.
+
+### Vellum, the browser (B1 shipped 2026-08-07) -- what B1 does NOT do
+- [ ] **B2: the network.** B1 loads documents from EMBKFS only. The seam is one
+      function (`fetch_local` in user/bin/vellum.c) plus a planned
+      `user/web/net.c`; everything above and below it stays put. Needs http://
+      over our own TCP and https:// over our own TLS 1.3.
+- [ ] **Capabilities for a GUI app.** Vellum will need CAP_NETWORK, and `home`
+      currently grants a fixed set. Apps already declare their NAMESPACE via a
+      `<name>.ns` sidecar; capabilities want the same treatment (a `.caps`
+      sidecar, or a field in the existing manifest) so an app declares what it
+      needs instead of the launcher hard-coding it.
+- [ ] No CSS. `struct vstyle` is filled by a user-agent stylesheet; a real
+      cascade fills the same struct and touches nothing else (docs/BROWSER.md
+      §4). No JS, no images, no tables, no forms -- all deliberate, see §5.
+- [ ] Link words are separate ghost Buttons (one per word, for per-word hit
+      testing when a link wraps). Their 2px padding makes a link's inter-word
+      gaps slightly wider than body text. Cosmetic; a per-run hit region would
+      be the real fix.
+- [ ] `make browser-render` renders with DejaVu from the host, so the on-metal
+      metrics differ slightly from the host PNG. Good enough for geometry --
+      do not use it to judge kerning.

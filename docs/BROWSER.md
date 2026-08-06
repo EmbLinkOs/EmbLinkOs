@@ -294,57 +294,49 @@ a browser on your own UI stack:
   content can never overflow, so it never wrapped. Invisible for chips and
   tags, which do not overflow; fatal for inline runs, which exist to. Fixed:
   Flow fills its width, as Grid already did.
-- Wrapped paragraphs still lay out wrong. **Partly fixed, and one earlier
-  claim in this file has to be retracted.**
+- Wrapped paragraphs laid out wrong: a paragraph's lines spread far enough
+  apart that the next heading was drawn between them, but only at the TOP of a
+  document -- the bottom was always fine. **Found and fixed.**
 
-  THE CAUSE, found by measuring: `measure_wrap_height` was only consulted when
-  a wrap row is a DIRECT child of the container being arranged. A document is
-  column -> block -> Flow, so when the column measured its blocks it used each
-  block's `intrinsic_h` -- computed bottom-up by `measure_intrinsic`, which
-  predates any knowledge of width and reports a wrapping row as ONE LINE. The
-  wrap measurement was computing the right answer (54 boxes, 3 lines, 48.9px)
-  for a caller that no longer existed at that depth. `measure_subtree_height`
-  now measures a container child's height at the width it will get, recursing
-  and honouring the same rules arrange does.
+  THE CAUSE. A wrapping row overflows BY DESIGN; that is the trigger that makes
+  it start a new line. The flex-shrink pass fired on it anyway and squashed all
+  54 word boxes of a paragraph. The ARRANGEMENT never noticed, because the wrap
+  arm places children at their base width and never reads the shrunken size.
+  The MEASUREMENT did: a text child's cross size is its height at its final
+  width, so every squashed word was measured at a fraction of its width and
+  CHARACTER-wrapped. "a " reported one line, "This " three, "page " four. The
+  line stride became the tallest of those lies -- 65px for a 16px line.
 
-  RETRACTION: this file previously listed three hypotheses as "eliminated by
-  experiment". They were not. Those runs booted a STALE image -- `make
-  embkfs.img` inside a compound command was producing nothing and the `cp`
-  failed silently, exactly the trap already recorded for this project. Four
-  consecutive pixel-identical screenshots was the tell and it was missed. The
-  three may or may not have been contributing causes; they are untested.
+  Which explains the shape of the report exactly. A paragraph short enough not
+  to overflow never enters that branch, so the bottom of a page was always
+  right and only the top was wrong.
 
-  ENGINE NOW VERIFIED, and the 4x theory is DISPROVEN. A host test (layout
-  T3c) builds the browser's own shape -- four nested columns ending in a wrap
-  row -- and measures 50 at every level: wrap=50 p=50 body=50 html=50. Nesting
-  does not accumulate. `measure_subtree_height` fixed the engine-side bug, and
-  the host test now locks it in seconds rather than a five-minute boot.
+  Fix: a wrap row is exempt from shrink entirely (ui/layout/layout.c). Locked
+  by layout test **T3d**, which was confirmed to fail when the bug is
+  re-introduced -- a regression test nobody has watched fail is a guess.
 
-  T3c now builds the browser's REAL shape -- words as text measured through
-  the font, a link word as a padded container the way a ghost button is, and
-  CSS margins as block padding -- and every invariant still holds:
-  wrap=80, p=96 (=80 plus its 16px of margins), body=96, html=96. The layout
-  engine is cleared for this case.
+  The same fault had a mirror on the other axis: a ROW takes a container
+  child's height from `intrinsic_h`, computed before any width is known, so a
+  wrapping column inside it counted as one line. That is a list item --
+  [bullet][text column] -- and it is why a wrapped bullet had the next bullet
+  drawn on top of it. Fixed by measuring such a child at the width it actually
+  gets, gated on the subtree really containing a wrap so ordinary rows keep
+  their intrinsic height and cannot regress.
 
-  THE ENGINE IS EXONERATED, thoroughly. T3c now reproduces the browser's chain
-  in full -- a fixed-height ScrollView far taller than the content, four nested
-  blocks, words as real text, a padded link button, CSS margins, and a heading
-  AFTER the paragraph -- and everything is correct: wrap=80, p=96, body=116
-  (the paragraph plus that heading), and the following block starts at y=96,
-  exactly where the paragraph ends. No overdraw, no accumulation.
+  THE METHOD, which is the durable part. Everything from document bytes to
+  resolved pixel geometry is syscall-free -- only the window and the network
+  need the OS. So the whole pipeline runs on the host: `make browser-render`
+  (user/web/render_host.c) parses, styles, renders, lays out, prints every
+  resolved rectangle and writes a PNG, in two seconds. It reproduced the
+  reported screenshot exactly on its first run, and the resolved tree named the
+  culprit immediately -- every word box was a multiple of the line height.
 
-  Theories tested and dead: nesting multiplies (no -- 50/50/50/50); the wrap
-  row grows to fill a taller parent (no -- sz_intrinsic has flex_grow 0); a
-  fixed-height ancestor changes it (no); a following sibling is misplaced (no).
+  This should have been built before the first boot, not after the fifth. The
+  symptom was visual, so the VM felt like the right instrument; it was not.
+  Reach for the harness that matches the LAYER of the bug, not the layer of the
+  symptom.
 
-  So the fault is in what render.c EMITS, not in how layout treats it. The
-  symptom in a real render -- three lines of one paragraph at ~130px intervals
-  with a heading and list items drawn BETWEEN them -- is what you get if those
-  lines are not one Flow at all, but several, emitted at different points in
-  the document flow. Next step: dump the tree render.c actually builds for one
-  paragraph (the menurepro host-harness pattern already used for the menu bug)
-  and count the Flows. Stop theorising about layout; look at the emission.
-  **B1 is not done.**
+**B1 is done.** The start page renders correctly on the metal.
 
 ## 12. Open questions
 

@@ -1031,6 +1031,31 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
 
 ---
 
+### Phase 30 — Vellum: the OS's own web browser (B1) ✅
+
+The OS renders HTML it parsed itself, on a layout engine it wrote itself, in a
+font engine it wrote itself. `user/web/` is split per concern behind a header
+that is the contract: `html.c` parses into bounded arenas (a browser handed a
+hostile page needs a bounded appetite), `style.c` computes a `struct vstyle`
+from a user-agent stylesheet, `render.c` maps the CSS box model onto EmUI --
+blocks become columns, an inline run becomes a wrapping row holding ONE TEXT
+NODE PER WORD, list items become [marker][column] so wrapped text hangs under
+itself, `<pre>` neither collapses nor wraps. `user/bin/vellum.c` is the app:
+URL bar, back/forward, clickable links, a status line. The renderer reads only
+`struct vstyle` and never a tag name, so real CSS changes how that struct is
+FILLED and nothing else.
+
+Not yet on the network -- B1 loads documents from EMBKFS; the fetch seam is one
+function (`docs/BROWSER.md` §11). Two toolkit bugs and one layout-engine bug
+were found by building it, all fixed and locked by host tests; a wrap row is
+now exempt from flex-shrink, and a row measures a wrapping child at the width
+it will get.
+
+**`make browser-render`** runs the entire pipeline -- parse, style, render,
+layout, geometry dump, PNG -- on the dev host in two seconds, because nothing
+between document bytes and pixel rectangles needs a syscall. It is the fast
+loop for anything in this stack.
+
 ## Major To-Do Buckets (Rough Priority)
 
 Full detail lives in `TODO.md`, organized by subsystem. Rough priority order:

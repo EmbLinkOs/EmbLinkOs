@@ -1797,6 +1797,21 @@ showcase-v2:
 	  [Image.open(p).save(p[:-4]+'.png') for p in glob.glob('$(BUILD)/*.ppm')]; \
 	  print('wrote', len(glob.glob('$(BUILD)/*.png')), 'PNGs to $(BUILD)/ (v2 v4 v6 v7 pk gb mm grid, light+dark)')"
 
+# browser-render -- the browser's WHOLE pipeline on the host: parse, style,
+# render, layout, and a dump of the resolved geometry. Everything from document
+# bytes to pixel rects is syscall-free, so it runs here in two seconds instead
+# of in a five-minute boot. DOC/W/H/DEPTH/PNG override the defaults.
+DOC   ?= system/web/index.html
+BW    ?= 940
+BH    ?= 620
+DEPTH ?= 6
+browser-render:
+	@mkdir -p $(BUILD)
+	$(HOSTCC) -std=gnu11 -Wall -Wextra -O1 -g $(V2_INC) -Iuser/web \
+	    $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
+	    user/web/render_host.c -lm -o $(BUILD)/browser_render
+	$(BUILD)/browser_render $(DOC) $(BW) $(BH) $(DEPTH) $(PNG)
+
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(KERNEL_BIN) $(IMG)
 	rm -rf $(BUILD)

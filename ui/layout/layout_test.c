@@ -256,6 +256,78 @@ static void t3c_nested_wrap(uint32_t fh) {
     layout_arena_destroy(&LA); scene_arena_destroy(&SA);
 }
 
+/* ---- T3d: an OVERFLOWING wrap row must not shrink its children ---------- */
+/* The bug this locks out shipped in the browser and looked like a wrap-height
+ * fault, which is why it survived several rounds of looking at wrap heights.
+ *
+ * A wrap row overflows BY DESIGN -- that is what makes it start a new line --
+ * so the flex-shrink pass fired on every paragraph and squashed all 54 word
+ * boxes. The arrangement never noticed: the wrap arm places children at their
+ * base width. The MEASUREMENT did. A text child's cross size is its height at
+ * its final width, so each squashed word was measured at a fraction of its
+ * width and CHARACTER-wrapped: "a " reported one line, "This " three, "page "
+ * four. The line stride became the tallest of those lies -- 65px for a 16px
+ * line -- and a paragraph's lines spread far enough apart for the next heading
+ * to be drawn between them.
+ *
+ * Two assertions, because either alone would have missed it: the words keep
+ * their width, and they keep ONE line's height. */
+static void t3d_wrap_no_shrink(uint32_t fh) {
+    printf("T3d overflowing wrap row does not shrink:\n");
+    scene_arena_init(&SA); layout_arena_init(&LA);
+
+    struct layout_handle row = mk(LAYOUT_HANDLE_NULL, NODE_HANDLE_NULL, SCENE_NODE_GROUP, 0);
+    L(row)->is_container = true; L(row)->axis = AXIS_ROW; L(row)->wrap = true;
+    L(row)->align = ALIGN_START;
+
+    struct color black = {0,0,0,1};
+    struct layout_handle w[12];
+    for (int i = 0; i < 12; i++) {
+        struct node_handle sw;
+        w[i] = mk(row, NODE_HANDLE_NULL, SCENE_NODE_TEXT, &sw);
+        scene_set_text(&SA, sw, "wordy ", fh, 20.0f, black);
+    }
+    /* One word's unwrapped size. Intrinsics are computed BY layout, so the
+     * baseline comes from a pass at a width nothing can overflow. */
+    layout_run(&LA, &SA, row, 10000, 400);
+    float one = L(w[0])->resolved_w, lineh = L(w[0])->resolved_h;
+
+    /* now a width that fits about two words: a deep overflow, which is the
+     * ordinary state of every paragraph in a document */
+    layout_run(&LA, &SA, row, one * 2.4f, 400);
+
+    printf("       word w=%.1f (unwrapped %.1f)  h=%.1f (one line %.1f)  row h=%.1f\n",
+           L(w[5])->resolved_w, one, L(w[5])->resolved_h, lineh, L(row)->resolved_h);
+
+    int squashed = 0, tall = 0;
+    for (int i = 0; i < 12; i++) {
+        if (L(w[i])->resolved_w < one - 0.5f)      squashed++;
+        if (L(w[i])->resolved_h > lineh + 0.5f)    tall++;
+    }
+    CHECK(squashed == 0, "no word is shrunk below its width -- the row wraps instead");
+    CHECK(tall == 0, "so no word character-wraps, and every one is a single line");
+
+    /* And the lines are stacked one line-height apart, not one lie apart.
+     * Count the distinct y values the words landed on -- that is the number of
+     * lines the row actually produced. */
+    float ys[12]; int nlines = 0, i;
+    for (i = 0; i < 12; i++) {
+        float y = L(w[i])->resolved_y;
+        int seen = 0;
+        for (int j = 0; j < nlines; j++) if (ys[j] > y - 0.5f && ys[j] < y + 0.5f) seen = 1;
+        if (!seen) ys[nlines++] = y;
+    }
+    float span = 0;
+    for (i = 0; i < nlines; i++) if (ys[i] > span) span = ys[i];
+    printf("       %d lines, last at y=%.1f (a line height apart would be %.1f)\n",
+           nlines, span, lineh * (float)(nlines - 1));
+    CHECK(nlines > 1, "the row really did wrap -- otherwise this proves nothing");
+    CHECK(span <= lineh * (float)(nlines - 1) + 0.5f,
+          "the line stride is the line height, so lines do not spread apart");
+
+    layout_arena_destroy(&LA); scene_arena_destroy(&SA);
+}
+
 /* ---- T4: ALIGN_STRETCH stretches AUTO cross sizes; FIXED always wins ---- */
 /* (CSS semantics: stretch applies only to auto-sized items. A definite cross
  * size is never overridden -- relied on by declare's hit-test clip test once
@@ -335,6 +407,7 @@ int main(void) {
     t3_shrink();
     t3b_default_shrink();
     t3c_nested_wrap(fh);
+    t3d_wrap_no_shrink(fh);
     t4_stretch();
     t5_wrap(fh);
     t6_writeback(fh);

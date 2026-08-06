@@ -77,6 +77,12 @@ static void emit_text(const char *txt, const struct vstyle *s, const char *href)
      * ("italicand"). The space belongs to the text, not to the loop. */
     size_t tl = strlen(txt);
     int trail = tl && txt[tl - 1] == ' ';
+    /* ...and a LEADING one for the same reason from the other side. " and "
+     * after a </i> carries its space in front; the word loop drops leading
+     * whitespace, so the space that separated the tag from the next word
+     * disappeared and you read "italicand". The first word carries it. */
+    int lead = tl && txt[0] == ' ';
+    int first = 1;
     for (const char *p = txt; ; p++) {
         if (*p && *p != ' ') {
             if (n + 1 < sizeof word) word[n++] = *p;
@@ -91,7 +97,9 @@ static void emit_text(const char *txt, const struct vstyle *s, const char *href)
             if (pn >= 512) pn = 0;
             /* trailing space unless the run ends here: the space is part of
              * the word box, so a following comma sits flush against it */
-            snprintf(pool[pn], sizeof pool[0], "%s%s", word, (*p || trail) ? " " : "");
+            snprintf(pool[pn], sizeof pool[0], "%s%s%s",
+                     (first && lead) ? " " : "", word, (*p || trail) ? " " : "");
+            first = 0;
             emit_word(pool[pn], s, href);
             pn++;
             n = 0;
