@@ -514,10 +514,19 @@ build/nbsock.elf: build/crt0.o build/syscalls.o build/nbsock.o user/lib/newlib.l
 # httpd -- the M5 server witness: an on-OS HTTP server (bind/listen/accept over
 # the native socket syscalls). `test httpd` spawns it; the host curls it via a
 # SLIRP hostfwd. Auto-discovered by mkfs.
-build/httpd.o: user/bin/httpd.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/httpd.elf: build/crt0.o build/syscalls.o build/httpd.o user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpd.o -lc -lgcc -o $@
+# user/httpd/ = the server's modules, one concern per file: http (the
+# protocol), mime (content types), serve (which files a URL may reach).
+build/httpd_http.o: user/httpd/http.c user/httpd/http.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
+build/httpd_mime.o: user/httpd/mime.c user/httpd/mime.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
+build/httpd_serve.o: user/httpd/serve.c user/httpd/serve.h user/httpd/http.h user/httpd/mime.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
+build/httpd.o: user/bin/httpd.c user/httpd/http.h user/httpd/serve.h user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
+HTTPD_OBJS := build/httpd.o build/httpd_http.o build/httpd_mime.o build/httpd_serve.o
+build/httpd.elf: build/crt0.o build/syscalls.o $(HTTPD_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(HTTPD_OBJS) -lc -lgcc -o $@
 
 # udptest -- the M5 ring-3 UDP witness: a userspace DNS resolver over a
 # SOCK_DGRAM socket (sendto/recvfrom). Auto-discovered by mkfs.

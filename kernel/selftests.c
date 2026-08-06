@@ -1077,6 +1077,36 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    if (strcmp(cmd, "test httpserve") == 0) {
+        /* The server as a SERVICE, not a witness: httpd serving the real
+         * filesystem for FOUR connections so a host client can exercise a
+         * directory listing, a nested directory, a file with a content type,
+         * and a 404 -- then exit cleanly so the test can report. Root is
+         * /system: the interesting read-only tree, and a reminder that what
+         * the server can reach is bounded by what it was granted. */
+        const char *hp = "/data/apps/httpd/httpd.elf";
+        struct vfs_stat st;
+        if (vfs_stat(hp, &st) != 0) { kprintf("\n[cmd] test httpserve: %s not on image\n", hp); return 1; }
+        char *a[]   = { (char *)hp, (char *)"8080", (char *)"4", NULL };
+        char *env[] = { (char *)"HOME=/", (char *)"HTTPD_ROOT=/system", NULL };
+        kprintf("[httpserve] serving /system on :8080 for 4 connections...\n");
+        /* NETWORK **and** FILESYSTEM. The first run of this granted only
+         * NETWORK, and the server bound its socket, accepted connections and
+         * served directory listings -- then returned 403 for every FILE,
+         * because opendir/stat are not gated the way open() is. That was not a
+         * bug in the server: it was the capability system saying "you were
+         * given the network, not the disk". A file server needs both, and now
+         * says so. */
+        int p1 = process_create_caps(hp, a, 3, env, NULL, 0,
+                                     EMBK_CAP_BIT(EMBK_CAP_NETWORK) |
+                                     EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+        int c1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+        kprintf("[httpserve] exit=%d\n", c1);
+        int ok = (c1 == 0);
+        kprintf("[cmd] test httpserve: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(cmd, "test httpdbig") == 0) {
         /* THROUGHPUT / windowed TCP: httpd serves ONE 64 KB body on :8080 in a
          * single write() -- net_tcp_send pipelines it across the peer's window

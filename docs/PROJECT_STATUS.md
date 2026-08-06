@@ -753,6 +753,8 @@ newlib-based libc port.*
 ### Phase 23 — Networking: a from-scratch TCP/IP stack ✅
 
 A whole network stack, hand-written in `kernel/net/` (split per-protocol, one
+
+And something now STANDS on it: `httpd` (`user/httpd/` + `user/bin/httpd.c`) is a real HTTP/1.1 server that serves the OS's own filesystem -- request parsing, percent-decoded paths, directory listings, content types by extension, 403/404/405, and files streamed in 32KB bites. Point a browser on the host at a SLIRP-forwarded port and you are reading EMBKFS through our own virtio-net, IPv4, TCP and socket layer (`test httpserve`).
 concern per file). virtio-net driver (mirrors the virtio-gpu transport, split
 virtqueues, KV2P DMA, MSI-X RX interrupt) under Ethernet/ARP/IPv4/ICMP, then
 UDP + a DHCP client (real DORA lease at boot) + a minimal DNS resolver, then
