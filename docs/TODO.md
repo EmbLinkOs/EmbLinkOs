@@ -1925,6 +1925,14 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       light at the left and dark at the right gets one ink for the whole bar;
       per-item sampling would be the real answer.
 
+### Harness
+- [ ] `make embkfs.img` takes ~110s after a wide rebuild. A `timeout 200` around
+      it is NOT generous -- it killed the build mid-flight, left no image, and
+      the following `cp embkfs.img ...` failed silently, so the VM booted the
+      PREVIOUS image and several "the fix didn't work" observations were really
+      "the fix was never in the image". Always `test -f` the artifact before
+      copying it, and give the image build 900s.
+
 ### Host test rot
 - [ ] `make font-test` does not compile: font_test.c calls `be->draw_text` with
       8 arguments against the 11-argument backend signature (box_w/box_h/paint

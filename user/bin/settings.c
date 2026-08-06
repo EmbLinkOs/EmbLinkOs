@@ -85,8 +85,8 @@ static void sample_system(void) {
  * is not optional decoration: a switch labelled only "Running indicator" makes
  * the reader guess, and guessing is what settings windows are infamous for. */
 static void setting_label(const char *title, const char *why) {
-    VStack(.spacing = 1, .grow = 1, .align = Leading) {
-        Text(title).body();
+    VStack(.spacing = 0, .grow = 1, .align = Leading) {
+        Text(title).caption();
         if (why && why[0]) Text(why).caption().tertiary();
     }
 }
@@ -97,7 +97,7 @@ static void pane_appearance(void) {
     int dark = g_cfg.dark ? 1 : 0;
 
     Section("Theme") {
-        HStack(.spacing = 16, .align = Center, .py = 8, .grow = 1) {
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
             setting_label("Appearance", "Light or dark ground for every window.");
             Segmented(modes, 2, &dark);
         }
@@ -113,7 +113,7 @@ static void pane_appearance(void) {
         static const char *sizes[] = { "Small", "Default", "Large" };
         int step = g_cfg.ui_scale <= 90 ? 0 : g_cfg.ui_scale >= 115 ? 2 : 1;
         int was = step;
-        HStack(.spacing = 16, .align = Center, .py = 8, .grow = 1) {
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
             setting_label("Text and controls",
                           "Scales the whole interface, not just this window.");
             Segmented(sizes, 3, &step);
@@ -125,21 +125,21 @@ static void pane_appearance(void) {
     }
 
     Section("Accent") {
-        HStack(.spacing = 16, .align = Center, .py = 8, .grow = 1) {
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
             setting_label("Highlight colour",
                           "Selection, focus and active controls -- and nothing else.");
         }
         /* The swatches are the control. A dropdown listing colour NAMES would
          * make you imagine the colour; showing them lets you choose one. */
-        HStack(.spacing = 10, .align = Center, .py = 4) {
+        HStack(.spacing = 8, .align = Center, .py = 2) {
             for (int i = 0; i < OSCFG_ACCENTS; i++) {
                 const struct oscfg_accent *a = &oscfg_accents[i];
                 bool on = (g_cfg.accent == i);
-                VStack(.spacing = 6, .align = Center, .width = 74) {
+                VStack(.spacing = 4, .align = Center, .width = 66) {
                     if (Button(on ? "\xE2\x9C\x93" : " ")
                             .bg((Color){ a->r, a->g, a->b, 1.f })
                             .color(on ? (Color){ 1,1,1,1 } : (Color){ a->r, a->g, a->b, 1.f })
-                            .frame(46, 34).corner(9)
+                            .frame(40, 28).corner(7)
                             .id(a->name).clicked()) {
                         g_cfg.accent = i; commit();
                     }
@@ -152,7 +152,7 @@ static void pane_appearance(void) {
 
 static void pane_desktop(void) {
     Section("Dock") {
-        HStack(.spacing = 16, .align = Center, .py = 8, .grow = 1) {
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
             setting_label("Icon size", "How large the apps in the dock are drawn.");
             char v[16]; snprintf(v, sizeof v, "%d px", g_cfg.dock_size);
             Text(v).caption().secondary();
@@ -168,7 +168,7 @@ static void pane_desktop(void) {
         else if (dragging) { dragging = false; commit(); }
 
         bool dots = g_cfg.dock_dots != 0, was = dots;
-        HStack(.spacing = 16, .align = Center, .py = 8, .grow = 1) {
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
             setting_label("Running indicator",
                           "A dot under an app that is open, so the dock tells the truth.");
             Toggle("", &dots);
@@ -176,7 +176,7 @@ static void pane_desktop(void) {
         if (dots != was) { g_cfg.dock_dots = dots ? 1 : 0; commit(); }
     }
     Section("Desktop") {
-        HStack(.spacing = 16, .align = Center, .py = 8, .grow = 1) {
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
             setting_label("Icon arrangement",
                           "Icons stay wherever you drop them; the desktop menu tidies them.");
             Text("Free").caption().secondary();
@@ -199,7 +199,7 @@ static void pane_system(void) {
 }
 
 static void pane_about(void) {
-    VStack(.spacing = 10, .align = Leading, .py = 10) {
+    VStack(.spacing = 8, .align = Leading, .py = 6) {
         Text("EmbLink OS").title();
         Text("An operating system written from the boot sector up: its own kernel, "
              "filesystem, network stack, TLS, package manager, compiler toolchain "
@@ -224,12 +224,13 @@ static void app(void) {
                 const struct ui_theme *t = ui_theme();
                 for (int i = 0; i < PANE_N; i++) {
                     bool on = (g_pane == i);
-                    HStack(.spacing = 9, .align = Center, .px = 8, .py = 5, .corner = 7,
+                    HStack(.spacing = 7, .align = Center, .px = 7, .py = 1, .corner = 5,
                            .grow = 1,
-                           .background = on ? (Color){ .r=.20f, .g=.22f, .b=.30f, .a=1.f }
+                           .background = on ? (Color){ .r=.24f, .g=.26f, .b=.34f, .a=1.f }
                                             : (Color){ 0, 0, 0, 0 }) {
-                        Icon(g_pane_icon[i]).color(on ? t->accent : t->text_secondary);
-                        if (Button(g_pane_name[i]).ghost().color(on ? t->accent : t->text)
+                        Icon(g_pane_icon[i]).caption().color(on ? t->accent : t->text_secondary);
+                        if (Button(g_pane_name[i]).ghost().font(Caption).py(1)
+                                .color(on ? t->text : t->text_secondary)
                                 .grow().leading().clicked()) { g_pane = i; g_scroll = 0; g_saved[0] = 0; }
                     }
                 }
@@ -239,8 +240,11 @@ static void app(void) {
             ContentPane(.padding = 0) {
                 /* measured, not guessed -- see the note in files.c */
                 ScrollView(&g_scroll, em_viewport_height() - 58.0f) {
-                    VStack(.spacing = 6, .align = Fill, .padding = 20) {
-                        Text(g_pane_name[g_pane]).heading();
+                    /* No page heading. The window's title bar already says
+                     * "Settings" and the sidebar says which pane -- a third
+                     * copy in 26pt type is the Android pattern of restating
+                     * the screen name inside the screen. */
+                    VStack(.spacing = 4, .align = Fill, .padding = 16) {
                         switch (g_pane) {
                             case PANE_APPEARANCE: pane_appearance(); break;
                             case PANE_DESKTOP:    pane_desktop();    break;
