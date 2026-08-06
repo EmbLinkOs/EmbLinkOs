@@ -168,6 +168,10 @@ static int   g_any_active = 0;       /* any draggable held this frame */
 static float g_dockr[4];             /* dock pill world rect: x0,y0,x1,y1 */
 static int   g_have_dockr = 0;
 static int   g_dock_dirty = 0;       /* dock changed -> the loop force-repaints (no ghosts) */
+/* desktop context menu (right-click on empty desktop) */
+static bool  g_ctx_open = false;
+static float g_ctx_x, g_ctx_y;
+
 static char  g_pin_exec[16][80];     /* stable exec strings for launcher apps pinned to the dock */
 static int   g_pin_n = 0;
 
@@ -570,6 +574,34 @@ static void home_ui(void) {
         }
         desktop_icons();       /* freely-placed icons; zero-sized root, so it
                                 * can sit last without shadowing anything */
+
+        /* Right-click the desktop. Every item does something REAL and
+         * immediate -- no greyed-out placeholders, which are just an apology
+         * in menu form. "Clean Up" exists because free placement earned it:
+         * once icons can go anywhere, you need one gesture to make them tidy
+         * again. */
+        {
+            float rx, ry;
+            if (RightClicked(&rx, &ry)) {
+                g_ctx_x = rx; g_ctx_y = ry; g_ctx_open = true;
+                g_dock_dirty = 1;
+            }
+        }
+        ContextMenu(&g_ctx_open, g_ctx_x, g_ctx_y) {
+            if (MenuItem("New Terminal")) g_launch = "/data/apps/term/term.elf";
+            if (MenuItem("Open Files"))   launch_folder(getenv("HOME") ? getenv("HOME") : "/");
+            MenuSeparator();
+            if (MenuItem("Show Applications")) {
+                if (!g_apps_open) { scan_apps(); g_apps_open = 1; g_apps_frames = 0; }
+                g_dock_dirty = 1;
+            }
+            if (MenuItem("Clean Up Icons")) {
+                /* forget every position; autoplace re-columns them next frame */
+                for (int i = 0; i < g_desk_n; i++) g_desk[i].placed = 0;
+                desk_save_layout();
+                g_dock_dirty = 1;
+            }
+        }
         apps_grid();           /* the Apps launcher (modal grid), when open */
         drag_ghost();          /* the dragged icon follows the cursor (overlay) */
     }
@@ -780,10 +812,17 @@ int main(int argc, char **argv, char **envp) {
         /* pointer: the compositor routes the desktop's content-local mouse to us */
         struct embk_win_input in;
         embk_win_input(&in);
-        if (in.focused)
+        if (in.focused) {
             ui_pointer((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_LEFT) != 0);
-        else
+            /* home runs its OWN loop rather than em_app_run, so it must feed
+             * the right button itself -- em's context-menu machinery listens
+             * here and nowhere else. */
+            em_feed_right_button((float)in.x, (float)in.y,
+                                 (in.buttons & EMBK_MOUSE_RIGHT) != 0);
+        } else {
             ui_pointer(-100.0f, -100.0f, false);
+            em_feed_right_button(0, 0, false);
+        }
 
         /* live uptime clock in the header */
         uint64_t secs = embk_uptime_ms() / 1000;
