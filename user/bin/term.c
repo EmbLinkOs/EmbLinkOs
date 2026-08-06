@@ -113,6 +113,21 @@ static int  g_cwd_cap = 0, g_cwd_n = 0;
 
 #define HOSTNAME "emblink"
 
+/* The window's title is the WORKING DIRECTORY, the way a real terminal titles
+ * itself. "Terminal" tells you nothing you did not already know from the icon;
+ * where the shell is standing is the one fact worth carrying in the chrome,
+ * and it is the fact you want when three of these are open at once. */
+static const char *title_text(void) {
+    static char t[224];
+    const char *home = getenv("HOME");
+    size_t hl = home ? strlen(home) : 0;
+    if (hl && strncmp(g_cwd, home, hl) == 0 && (g_cwd[hl] == '/' || g_cwd[hl] == 0))
+        snprintf(t, sizeof t, "~%s", g_cwd + hl);
+    else
+        snprintf(t, sizeof t, "%s", g_cwd);
+    return t;
+}
+
 static const char *prompt_text(void) {
     static char p[288];
     const char *user = getenv("USER");
@@ -129,6 +144,15 @@ static const char *prompt_text(void) {
     }
     snprintf(p, sizeof p, "%s@%s:%s$", user, HOSTNAME, shown);
     return p;
+}
+
+/* Clear the transcript. Not "scroll it away" -- the scrollback is genuinely
+ * emptied, which is what someone reaching for Clear wants: the previous
+ * session's output gone, not hidden one wheel-turn above. The current line is
+ * kept because it is the line you are standing on. */
+static void term_clear(void) {
+    for (int i = 0; i < SB_ROWS; i++) { g_sb[i][0] = 0; g_sba[i][0] = 0; }
+    g_head = 0; g_count = 1; g_col = 0; g_view = 0;
 }
 
 /* ring slot of logical line `i` (0 = oldest live line, g_count-1 = current) */
@@ -597,12 +621,12 @@ static void term_view(void) {
     const Color TERM_PROMPT= { .r=.435f, .g=.780f, .b=.612f, .a=1.f };  /* calm green */
 
     Window("Terminal", .background = TERM_BG) {
-        WindowBar("Terminal", .background = TERM_BG) {
-            /* A plain click. CloseGrip is a PULL handle -- it wants a deliberate
-             * drag before it fires, which is a fine guard for something
-             * destructive and pure friction for closing a window. */
-            MinimizeButton();                       /* park it; the dock brings it back */
-            if (CloseButton().clicked()) exit(0);   /* window is reaped, shell EOFs */
+        /* The shared frame (AppBar), so the Terminal, Files and Settings are
+         * one product. The lights, the drag zone and the centred title all come
+         * from there; what the Terminal adds is the one control that belongs to
+         * a terminal specifically. */
+        AppBar(title_text(), .background = TERM_BG) {
+            if (Button("Clear").ghost().color(TERM_TEXT).clicked()) term_clear();
         }
         /* the VIEWER: a read-only transcript of everything the shell printed */
         VStack(.spacing = 1, .px = 12, .pt = 10, .pb = 4, .align = Leading,

@@ -1880,6 +1880,23 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Menus render correctly open+closed (identity fix); launcher/dock/ghost
       unaffected with menus closed.
 
+### Essential apps (Files / Settings / Terminal, 2026-08-06)
+- [ ] Files has no delete, rename, copy or move. unlink/rmdir/rename syscalls
+      all exist -- what is missing is the confirmation design, and a delete
+      that ships before its confirmation is a bug with a keyboard shortcut.
+- [ ] Files opens a file by spawning the editor; there is no "open with", and
+      a file whose kind we name (Image, Archive) still opens in the editor.
+- [ ] Settings' light theme is applied but has never been looked at seriously
+      -- the whole shell was designed on the dark ground.
+- [ ] Settings changes reach a RUNNING application only if it is the desktop
+      (which polls). Other apps pick up the accent at their next launch. A
+      config-changed broadcast would fix it; the IPC exists.
+- [ ] The Terminal still has no tabs, no text selection and no font-size
+      control. Tabs need a second shell process per tab, which is the real work.
+- [ ] `$(wildcard build/*.elf)` in the embkfs.img rule is evaluated at parse
+      time, so the FIRST build after adding an app packs an image without it
+      (spawn fails -ENOENT). Second `make` is correct. Cost me a boot cycle.
+
 ### Adaptive menu-bar ink (shipped 2026-08-06)
 - [ ] Only the LIGHT ink is verified against a real wallpaper; the dark branch
       was proven by temporarily inverting the threshold (bar text went

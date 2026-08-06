@@ -699,6 +699,17 @@ newlib-based libc port.*
   than as a taskbar welded to the screen edge; window controls are
   **traffic lights** (red close, green minimize) whose symbol appears only on
   hover, drawn as a small dot inside a deliberately larger invisible hit area.
+  The three essential applications share one
+  house style (`AppBar`): traffic lights leading, a centred title, the app's
+  own controls trailing. **Files** is a real file manager (places sidebar,
+  back/forward/up, live search that FILTERS rather than navigates, grid/list
+  views, human sizes and named kinds, New Folder); **Settings** is built to the
+  rule that every control changes something -- accent and light/dark apply
+  instantly and persist to `/data/settings.conf`, dock size and the running
+  indicator are re-read live by the desktop, and the System pane is measured
+  rather than typed; the **Terminal** titles itself with the working directory.
+  Preferences are one schema (`user/lib/oscfg.h`) that em_app_run applies at
+  launch, so an application does not opt in to being themed -- it simply is.
   A V4.1 app-runtime
   layer (`ui/dsl/em_app.c`, `EM_APPLICATION`/`EM_WIDGET`) collapses what
   used to be ~150 lines of per-app boilerplate (font loading, arena setup,
