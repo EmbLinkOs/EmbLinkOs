@@ -506,20 +506,72 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
             finalm[i] = base[i] + remaining * (ms->flex_grow / sum_grow);
         }
     } else if (remaining < 0) {
-        float sum_w = 0;
-        for (int i = 0; i < nk; i++) {
-            struct layout_node *k = layout_resolve(la, kids[i]);
-            struct layout_size *ms = is_row ? &k->width : &k->height;
-            sum_w += ms->flex_shrink * base[i];   /* CSS: shrink weighted BY base size */
-        }
-        if (sum_w > 0) {
+        /* OVERFLOW. This used to do nothing at all: flex_shrink is never
+         * assigned by anyone, so every weight was 0, sum_w was 0, and the
+         * whole branch fell through leaving children at their full base size.
+         * The row simply overflowed its parent and the far end was clipped --
+         * which is exactly what "shrinking the window cuts off the interface"
+         * looks like from the outside.
+         *
+         * The weights come from the size MODE rather than from a field nobody
+         * sets, and the deficit is taken in TWO PASSES, which is the part CSS
+         * does not do and a user interface wants:
+         *
+         *   pass 1  boxes that asked to FLEX give up space first. They
+         *           volunteered to be flexible -- the path field, the title
+         *           zone, the content pane. Taking their slack is invisible.
+         *   pass 2  only if that was not enough do intrinsically-sized boxes
+         *           start to give. Squashing a button is a real cost, so it
+         *           is paid last.
+         *
+         * Only the DEFAULT depends on the mode. flex_shrink stays orthogonal
+         * to it, as the header promises and T3 checks: a caller that sets an
+         * explicit weight gets exactly that, on a fixed box too. It is the
+         * absence of a weight that is interpreted -- and there, a box that
+         * asked for an EXACT size never gives, because a 24px traffic light or
+         * a 4px dot is a decision rather than a preference.
+         *
+         * min_size is honoured throughout, and whatever one pass cannot absorb
+         * carries into the next. */
+        /* A container with NO extent is not laying out a row -- it is an
+         * anchor whose children are placed by their own offsets (the desktop's
+         * zero-sized icon overlay is exactly this). Every child there looks
+         * like overflow, and shrinking them squashed the desktop icons into
+         * their own captions. No space to distribute means nothing to do. */
+        float deficit = content_main > 0.01f ? -remaining : 0.0f;
+        for (int pass = 0; pass < 2 && deficit > 0.01f; pass++) {
+            float sum_w = 0;
             for (int i = 0; i < nk; i++) {
                 struct layout_node *k = layout_resolve(la, kids[i]);
+                if (k->is_overlay) continue;
                 struct layout_size *ms = is_row ? &k->width : &k->height;
-                float shrink = (-remaining) * ((ms->flex_shrink * base[i]) / sum_w);
-                finalm[i] = base[i] - shrink;
-                if (finalm[i] < ms->min_size) finalm[i] = ms->min_size;
+                int expl = ms->flex_shrink > 0;
+                int eligible = (pass == 0) ? (expl || ms->mode == SIZE_FLEX)
+                                           : (!expl && ms->mode == SIZE_INTRINSIC);
+                if (!eligible) continue;
+                sum_w += (expl ? ms->flex_shrink : 1.0f) * finalm[i];
             }
+            if (sum_w <= 0) continue;
+            float absorbed = 0;
+            for (int i = 0; i < nk; i++) {
+                struct layout_node *k = layout_resolve(la, kids[i]);
+                if (k->is_overlay) continue;
+                struct layout_size *ms = is_row ? &k->width : &k->height;
+                int expl = ms->flex_shrink > 0;
+                int eligible = (pass == 0) ? (expl || ms->mode == SIZE_FLEX)
+                                           : (!expl && ms->mode == SIZE_INTRINSIC);
+                if (!eligible) continue;
+                float w = expl ? ms->flex_shrink : 1.0f;
+                float want = deficit * ((w * finalm[i]) / sum_w);
+                float floor_ = ms->min_size > 0 ? ms->min_size : 0.0f;
+                float give = finalm[i] - floor_;
+                if (give < 0) give = 0;
+                if (want > give) want = give;
+                finalm[i] -= want;
+                absorbed += want;
+            }
+            deficit -= absorbed;
+            if (absorbed <= 0.01f) continue;   /* this pass had nothing to give */
         }
     }
 

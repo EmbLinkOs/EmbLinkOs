@@ -216,7 +216,8 @@ static void app(void) {
                 Text("EmbLink OS").caption().tertiary();
             }
             ContentPane(.padding = 0) {
-                ScrollView(&g_scroll, 470) {
+                /* measured, not guessed -- see the same note in files.c */
+                ScrollView(&g_scroll, em_viewport_height() - 58.0f) {
                     VStack(.spacing = 6, .align = Fill, .padding = 20) {
                         Text(g_pane_name[g_pane]).heading();
                         switch (g_pane) {

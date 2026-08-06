@@ -345,7 +345,13 @@ static void app(void) {
                 }
                 Divider();
 
-                ScrollView(&g_scroll, 460) {
+                /* The scroll viewport is measured, not guessed. A constant
+                 * height is a claim about the window size, and the moment the
+                 * window is smaller than the claim the status line below gets
+                 * pushed off the bottom edge -- chrome silently lost to a
+                 * number written months earlier. Reserve the bar, the toolbar
+                 * and the status line; the rest is the list. */
+                ScrollView(&g_scroll, em_viewport_height() - 150.0f) {
                     VStack(.spacing = g_view ? 2 : 14, .align = Fill, .padding = 14) {
                         if (g_vis_n == 0) {
                             if (g_query[0])

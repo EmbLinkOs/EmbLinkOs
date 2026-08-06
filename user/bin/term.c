@@ -62,6 +62,12 @@ static int g_rows = 22;    /* live: visible transcript lines */
 static char    g_sb [SB_ROWS][SB_COLS + 1];
 static uint8_t g_sba[SB_ROWS][SB_COLS];
 static int  g_head = 0, g_count = 1, g_col = 0;
+/* Rows produced by a HARD WRAP are marked as continuations of the row above.
+ * Without that mark a wrapped line and a real newline are indistinguishable in
+ * the ring, and re-wrapping the scrollback at a new width is impossible --
+ * which is why narrowing the window used to CLIP old output instead of
+ * reflowing it. One bit per row buys the whole feature. */
+static uint8_t g_cont[SB_ROWS];
 static int  g_view = 0;
 static int  g_shell = -1;      /* spawn handle */
 static bool g_dead = false;
@@ -151,7 +157,7 @@ static const char *prompt_text(void) {
  * session's output gone, not hidden one wheel-turn above. The current line is
  * kept because it is the line you are standing on. */
 static void term_clear(void) {
-    for (int i = 0; i < SB_ROWS; i++) { g_sb[i][0] = 0; g_sba[i][0] = 0; }
+    for (int i = 0; i < SB_ROWS; i++) { g_sb[i][0] = 0; g_sba[i][0] = 0; g_cont[i] = 0; }
     g_head = 0; g_count = 1; g_col = 0; g_view = 0;
 }
 
@@ -160,8 +166,9 @@ static int sb_slot(int i) {
     return (g_head - (g_count - 1) + i + 2 * SB_ROWS) % SB_ROWS;
 }
 
-static void term_newline(void) {
+static void term_newline_ex(int continuation) {
     g_head = (g_head + 1) % SB_ROWS;
+    g_cont[g_head] = (uint8_t)continuation;
     if (g_count < SB_ROWS) g_count++;
     memset(g_sb[g_head], 0, sizeof g_sb[0]);
     memset(g_sba[g_head], 0, sizeof g_sba[0]);
@@ -170,6 +177,85 @@ static void term_newline(void) {
      * arrive underneath -- until the ring saturates and eats it */
     if (g_view > 0 && g_view < g_count - g_rows) g_view++;
     if (g_view > g_count - g_rows) g_view = g_count > g_rows ? g_count - g_rows : 0;
+}
+static void term_newline(void) { term_newline_ex(0); }
+
+/* Re-wrap the whole scrollback for a new width.
+ *
+ * Output is wrapped as it ARRIVES, so every line already in the ring was cut
+ * to the width the window had at the time. Narrowing the window therefore used
+ * to leave old lines too long -- clipped at the new edge -- and widening left
+ * them short with a ragged right margin. Both are the same bug: the buffer
+ * remembered a decision that belonged to the view.
+ *
+ * So: rebuild. Continuation runs are joined back into the logical lines the
+ * shell actually printed, then re-emitted wrapped at the new width, attributes
+ * carried along with their characters. */
+#define LOGICAL_MAX (SB_COLS * 4)
+
+static void term_reflow(int newcols) {
+    if (newcols < 20) newcols = 20;
+    if (newcols > SB_COLS) newcols = SB_COLS;
+
+    /* static, not stack: this is ~130KB of scratch and the app runs on a
+     * modest thread stack */
+    static char    tsb [SB_ROWS][SB_COLS + 1];
+    static uint8_t tsba[SB_ROWS][SB_COLS];
+    static uint8_t tcont[SB_ROWS];
+    int thead = 0, tcount = 1, tcol = 0;
+    memset(tsb[0], 0, sizeof tsb[0]);
+    memset(tsba[0], 0, sizeof tsba[0]);
+    tcont[0] = 0;
+
+    char    lbuf[LOGICAL_MAX];
+    uint8_t labuf[LOGICAL_MAX];
+    int     ln = 0;
+    int     started = 0;
+
+    for (int i = 0; i <= g_count; i++) {
+        int flush = (i == g_count);            /* one past the end: emit the tail */
+        int slot = flush ? 0 : sb_slot(i);
+        /* a row that is NOT a continuation begins a new logical line */
+        if (!flush && g_cont[slot] && started) {
+            for (int c = 0; c < SB_COLS && g_sb[slot][c] && ln < LOGICAL_MAX; c++) {
+                lbuf[ln] = g_sb[slot][c]; labuf[ln] = g_sba[slot][c]; ln++;
+            }
+            continue;
+        }
+        if (started) {
+            /* emit the completed logical line, wrapped at newcols */
+            for (int c = 0; c < ln; c++) {
+                if (tcol >= newcols) {
+                    thead = (thead + 1) % SB_ROWS;
+                    if (tcount < SB_ROWS) tcount++;
+                    memset(tsb[thead], 0, sizeof tsb[0]);
+                    memset(tsba[thead], 0, sizeof tsba[0]);
+                    tcont[thead] = 1; tcol = 0;
+                }
+                tsba[thead][tcol] = labuf[c];
+                tsb[thead][tcol++] = lbuf[c];
+                tsb[thead][tcol] = 0;
+            }
+            if (!flush) {
+                thead = (thead + 1) % SB_ROWS;
+                if (tcount < SB_ROWS) tcount++;
+                memset(tsb[thead], 0, sizeof tsb[0]);
+                memset(tsba[thead], 0, sizeof tsba[0]);
+                tcont[thead] = 0; tcol = 0;
+            }
+        }
+        if (flush) break;
+        ln = 0; started = 1;
+        for (int c = 0; c < SB_COLS && g_sb[slot][c] && ln < LOGICAL_MAX; c++) {
+            lbuf[ln] = g_sb[slot][c]; labuf[ln] = g_sba[slot][c]; ln++;
+        }
+    }
+
+    memcpy(g_sb,  tsb,  sizeof g_sb);
+    memcpy(g_sba, tsba, sizeof g_sba);
+    memcpy(g_cont, tcont, sizeof g_cont);
+    g_head = thead; g_count = tcount; g_col = tcol;
+    g_view = 0;                 /* the old anchor described the old wrapping */
 }
 
 /* --- ANSI SGR (ESC [ ... m) ------------------------------------------------
@@ -249,7 +335,7 @@ static void term_putc(char c) {
         return;
     }
     if ((unsigned char)c < 0x20) return;   /* other control bytes: drop */
-    if (g_col >= g_cols) term_newline();   /* hard wrap */
+    if (g_col >= g_cols) term_newline_ex(1);   /* hard wrap -> a continuation */
     g_sba[g_head][g_col] = g_attr;
     g_sb[g_head][g_col++] = c;
     g_sb[g_head][g_col] = '\0';
@@ -695,7 +781,8 @@ static void term_view(void) {
                             float cw = bw / (float)plen, lh = bh + 1.0f;
                             int cols = (int)((em_viewport_width() - 32.0f) / cw);
                             int rows = (int)((em_viewport_height() - 46.0f - 22.0f) / lh);
-                            g_cols = cols < 20 ? 20 : cols > SB_COLS ? SB_COLS : cols;
+                            int want = cols < 20 ? 20 : cols > SB_COLS ? SB_COLS : cols;
+                            if (want != g_cols) { g_cols = want; term_reflow(want); }
                             g_rows = rows < 3  ? 3  : rows > SB_VROWS ? SB_VROWS : rows;
                         }
                     }
@@ -715,10 +802,17 @@ static void term_view(void) {
                 }
             }
 
-            /* everything above stays TOP-aligned; the leftover height is dead
-             * space below the prompt, exactly as in a terminal you just opened */
-            Spacer();
         }
+        /* The filler is a SIBLING of the transcript, not a child of it.
+         * EmProps' .grow only makes a box grow along the CROSS axis (width in
+         * a column), so the transcript column is intrinsic-height whatever we
+         * ask -- with the spacer inside, the column ended exactly under the
+         * prompt and the window's resize grip, which anchors after it, was
+         * stranded halfway up the window. Out here the spacer eats the
+         * remaining height and the grip lands in the corner where it belongs.
+         * The dead space below the prompt is the Window's own ground, which is
+         * the same colour, so it reads as one surface either way. */
+        Spacer();
     }
 }
 

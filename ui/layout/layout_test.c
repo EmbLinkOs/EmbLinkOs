@@ -132,6 +132,51 @@ static void t3_shrink(void) {
     layout_arena_destroy(&LA); scene_arena_destroy(&SA);
 }
 
+/* ---- T3b: the DEFAULT shrink -- flexible boxes give first, fixed never --- */
+/* Nobody assigns flex_shrink, so before this the whole shrink branch was dead
+ * and an over-wide row simply overflowed and got clipped ("resizing cuts off
+ * the interface"). The default is now inferred from the size mode, and it is
+ * ordered: FLEX absorbs the overflow, INTRINSIC only helps if that was not
+ * enough, FIXED never gives. */
+static void t3b_default_shrink(void) {
+    printf("T3b default shrink (flex first, intrinsic second, fixed never):\n");
+    scene_arena_init(&SA); layout_arena_init(&LA);
+    struct layout_handle root = mk(LAYOUT_HANDLE_NULL, NODE_HANDLE_NULL, SCENE_NODE_GROUP, 0);
+    L(root)->is_container = true; L(root)->axis = AXIS_ROW;
+
+    /* Three 40-wide children whose MODES differ. The intrinsic and flex ones
+     * get their 40 from a fixed child, the way a real button or a grow-y field
+     * gets its basis from its content -- setting intrinsic_w by hand does not
+     * work, the measure pass computes it. */
+    struct layout_handle fx = mk(root, NODE_HANDLE_NULL, SCENE_NODE_RECT, 0);
+    L(fx)->width = (struct layout_size){ SIZE_FIXED, 40, 0,0,0 };
+
+    struct layout_handle it = mk(root, NODE_HANDLE_NULL, SCENE_NODE_GROUP, 0);
+    L(it)->is_container = true; L(it)->axis = AXIS_ROW;
+    L(it)->width = (struct layout_size){ SIZE_INTRINSIC, 0, 0,0,0 };
+    struct layout_handle itc = mk(it, NODE_HANDLE_NULL, SCENE_NODE_RECT, 0);
+    L(itc)->width = (struct layout_size){ SIZE_FIXED, 40, 0,0,0 };
+
+    struct layout_handle fl = mk(root, NODE_HANDLE_NULL, SCENE_NODE_GROUP, 0);
+    L(fl)->is_container = true; L(fl)->axis = AXIS_ROW;
+    L(fl)->width = (struct layout_size){ SIZE_FLEX, 0, 1,0,0 };
+    struct layout_handle flc = mk(fl, NODE_HANDLE_NULL, SCENE_NODE_RECT, 0);
+    L(flc)->width = (struct layout_size){ SIZE_FIXED, 40, 0,0,0 };
+
+    /* 120 of content into 100: a 20 deficit the FLEX child can absorb alone */
+    layout_run(&LA, &SA, root, 100, 50);
+    CHECK(feq(L(fx)->resolved_w, 40), "fixed keeps its 40");
+    CHECK(feq(L(it)->resolved_w, 40), "intrinsic untouched -- flex covered it");
+    CHECK(feq(L(fl)->resolved_w, 20), "flex absorbed the whole 20");
+
+    /* 60: the flex child bottoms out and the intrinsic one must help */
+    layout_run(&LA, &SA, root, 60, 50);
+    CHECK(feq(L(fx)->resolved_w, 40), "fixed STILL keeps its 40");
+    CHECK(L(fl)->resolved_w < 1.0f,   "flex gave everything it had");
+    CHECK(feq(L(it)->resolved_w, 20), "intrinsic gave exactly the remainder");
+    layout_arena_destroy(&LA); scene_arena_destroy(&SA);
+}
+
 /* ---- T4: ALIGN_STRETCH stretches AUTO cross sizes; FIXED always wins ---- */
 /* (CSS semantics: stretch applies only to auto-sized items. A definite cross
  * size is never overridden -- relied on by declare's hit-test clip test once
@@ -209,6 +254,7 @@ int main(void) {
     t1_space_between();
     t2_grow();
     t3_shrink();
+    t3b_default_shrink();
     t4_stretch();
     t5_wrap(fh);
     t6_writeback(fh);
