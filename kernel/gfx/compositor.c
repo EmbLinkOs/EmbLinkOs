@@ -10,6 +10,7 @@
 #include "include/kmalloc.h"
 #include "include/kprintf.h"
 #include "include/errno.h"
+#include "drivers/timer/timer.h"   /* timer_uptime_ms: the window-motion clock */
 
 /* ---- window registry ---------------------------------------------------- */
 
@@ -44,6 +45,10 @@ struct comp_window {
      * nobody asked for. Declaring the opaque part lets the strip be real
      * frosted glass while its canvas stays honestly transparent. 0 = none. */
     int       blur_set, blur_x, blur_y, blur_w, blur_h;
+    int       presented;    /* 1 once the app has pushed real pixels. A window is
+                             * born BLACK and stays that way for seconds under
+                             * TCG, so the open animation waits for this rather
+                             * than flying a black rectangle across the screen. */
     int       minimized;    /* 1 = hidden by its MINIMIZE button, not by exit or
                              * by a close. The distinction matters: only a window
                              * the user parked can be brought back, and the dock
@@ -493,6 +498,151 @@ static void corners_carve(const struct comp_window *w, int focused) {
     }
 }
 
+/* ---- window motion ------------------------------------------------------ *
+ * Windows used to appear and vanish between one frame and the next, which is
+ * the single loudest way a desktop says "this is a framebuffer, not a surface
+ * you are touching". The earlier attempt at this lived in the TOOLKIT -- wrap
+ * the app's view in an opacity/scale group -- and it failed badly: at whole-
+ * window size the group path cropped the window to its text extents and left a
+ * ghost of the input row (docs/TODO.md).
+ *
+ * Doing it in the compositor sidesteps that entirely. The compositor already
+ * holds the window's FINISHED pixels, so the animation is a scale+fade of a
+ * buffer: no scene graph, no layout, no scratch surface, and the app never
+ * learns it happened. The window is hidden for the duration and a ghost is
+ * drawn in its place; paint_region draws that ghost itself, so anything else
+ * repainting mid-flight (the cursor, another window) composes correctly. */
+#define ANIM_MS_OPEN   170
+#define ANIM_MS_PARK   200
+#define ANIM_OPEN_FROM  88   /* open starts at 88% and grows in -- a small move;
+                              * a big one reads as a zoom effect, not a window */
+
+enum anim_kind { ANIM_NONE = 0, ANIM_OPEN, ANIM_PARK, ANIM_UNPARK };
+
+static struct {
+    int      kind;
+    uint32_t win_id;
+    uint64_t t0, dur;
+    int      from[4], to[4];      /* x, y, w, h */
+    int      last[4];             /* where the ghost was drawn last frame */
+    int      have_last;
+} g_anim;
+
+static int anim_lerp(int a, int b, int num, int den) {
+    return a + (int)(((int64_t)(b - a) * num) / (den ? den : 1));
+}
+
+/* ease-out cubic on 0..1000: fast start, soft landing. 1000-(1-t)^3 */
+static int ease_out(int t) {
+    int64_t u = 1000 - t;
+    return (int)(1000 - (u * u * u) / 1000000);
+}
+
+/* Where a parked window flies to. The dock is drawn by the home process and
+ * the kernel has no idea where its icons are, so this aims at the bottom
+ * centre of the screen -- which is where the dock actually sits. Plumbing the
+ * real icon rect through would make it exact; see docs/TODO.md. */
+static void anim_dock_rect(int out[4]) {
+    const fb_info_t *fi = fb_get_info();
+    int W = fi ? (int)fi->width : 1024, H = fi ? (int)fi->height : 768;
+    out[2] = 64; out[3] = 44;
+    out[0] = W / 2 - out[2] / 2;
+    out[1] = H - 56;
+}
+
+static void anim_progress(int *num, int *den) {
+    uint64_t now = timer_uptime_ms();
+    uint64_t el = now - g_anim.t0;
+    if (el >= g_anim.dur) { *num = 1000; *den = 1000; return; }
+    *num = (int)((el * 1000) / g_anim.dur);
+    *den = 1000;
+}
+
+/* the ghost's rect and opacity at the current instant */
+static void anim_frame_rect(int out[4], int *alpha) {
+    int num, den; anim_progress(&num, &den);
+    int t = ease_out(num);
+    for (int i = 0; i < 4; i++) out[i] = anim_lerp(g_anim.from[i], g_anim.to[i], t, den);
+    /* fade with the raw (un-eased) time so opacity and motion don't fight */
+    int a = (g_anim.kind == ANIM_PARK) ? (255 - num * 255 / 1000)
+                                       : (num * 255 / 1000);
+    if (a < 0) a = 0; if (a > 255) a = 255;
+    *alpha = a;
+}
+
+/* Union of the previous and current ghost rects: what a frame must repaint. */
+static void anim_dirty(int *x0, int *y0, int *x1, int *y1) {
+    int r[4], a; anim_frame_rect(r, &a);
+    *x0 = r[0]; *y0 = r[1]; *x1 = r[0] + r[2]; *y1 = r[1] + r[3];
+    if (g_anim.have_last) {
+        *x0 = imin(*x0, g_anim.last[0]); *y0 = imin(*y0, g_anim.last[1]);
+        *x1 = imax(*x1, g_anim.last[0] + g_anim.last[2]);
+        *y1 = imax(*y1, g_anim.last[1] + g_anim.last[3]);
+    }
+    *x0 -= 2; *y0 -= 2; *x1 += 2; *y1 += 2;
+}
+
+/* Kick off a motion. The window is HIDDEN for the duration (the ghost stands
+ * in for it) and put back -- or not -- when the motion lands. */
+static void paint_region(int rx0, int ry0, int rx1, int ry1);   /* fwd */
+static void enforce_focus(void);
+
+static void anim_start(struct comp_window *w, int kind) {
+    if (!w || !w->content) return;
+    if (w->desktop || w->widget || w->translucent) return;  /* chrome doesn't fly */
+
+    int full[4], dock[4];
+    win_frame_rect(w, &full[0], &full[1], &full[2], &full[3]);
+    full[2] -= full[0]; full[3] -= full[1];
+    anim_dock_rect(dock);
+
+    /* if a motion is already running for another window, let it land first */
+    if (g_anim.kind != ANIM_NONE && g_anim.win_id != w->id) return;
+
+    g_anim.kind = kind;
+    g_anim.win_id = w->id;
+    g_anim.t0 = timer_uptime_ms();
+    g_anim.have_last = 0;
+
+    if (kind == ANIM_OPEN) {
+        g_anim.dur = ANIM_MS_OPEN;
+        int sw_ = full[2] * ANIM_OPEN_FROM / 100, sh_ = full[3] * ANIM_OPEN_FROM / 100;
+        g_anim.from[0] = full[0] + (full[2] - sw_) / 2;
+        g_anim.from[1] = full[1] + (full[3] - sh_) / 2;
+        g_anim.from[2] = sw_; g_anim.from[3] = sh_;
+        for (int i = 0; i < 4; i++) g_anim.to[i] = full[i];
+    } else if (kind == ANIM_PARK) {
+        g_anim.dur = ANIM_MS_PARK;
+        for (int i = 0; i < 4; i++) { g_anim.from[i] = full[i]; g_anim.to[i] = dock[i]; }
+    } else {  /* ANIM_UNPARK */
+        g_anim.dur = ANIM_MS_PARK;
+        for (int i = 0; i < 4; i++) { g_anim.from[i] = dock[i]; g_anim.to[i] = full[i]; }
+    }
+    w->visible = 0;                      /* the ghost is the window for now */
+}
+
+/* Land the motion: the window becomes real again (or stays parked). */
+static void anim_finish(void) {
+    struct comp_window *w = win_by_id(g_anim.win_id);
+    int kind = g_anim.kind;
+    int last[4]; int had = g_anim.have_last;
+    for (int i = 0; i < 4; i++) last[i] = g_anim.last[i];
+    g_anim.kind = ANIM_NONE; g_anim.have_last = 0;
+    if (w) w->visible = (kind != ANIM_PARK);
+    /* repaint the window's footprint AND wherever the ghost last was */
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (w) win_repaint_rect(w, &x0, &y0, &x1, &y1);
+    if (had) {
+        if (!w) { x0 = last[0]; y0 = last[1]; x1 = last[0] + last[2]; y1 = last[1] + last[3]; }
+        else {
+            x0 = imin(x0, last[0]); y0 = imin(y0, last[1]);
+            x1 = imax(x1, last[0] + last[2]); y1 = imax(y1, last[1] + last[3]);
+        }
+    }
+    if (x1 > x0 && y1 > y0) paint_region(x0 - 2, y0 - 2, x1 + 2, y1 + 2);
+    if (w && w->visible) enforce_focus();
+}
+
 /* ---- compositing -------------------------------------------------------- *
  * Chrome that used to be drawn in full on every partial repaint (the title-bar
  * fill and the border ring) is now clipped to the region, so a repaint that
@@ -520,6 +670,13 @@ static void paint_window(struct comp_window *w, int focused,
         px0 -= SHADOW_PAD; py0 -= SHADOW_PAD; px1 += SHADOW_PAD; py1 += SHADOW_PAD;
     }
     if (px1 <= rx0 || px0 >= rx1 || py1 <= ry0 || py0 >= ry1) return;
+
+    /* A window is born BLACK and stays that way until the app renders -- under
+     * TCG that is seconds of a black slab sitting on the desktop, which is the
+     * ugliest moment in launching anything. Now that the open animation waits
+     * for the first real frame anyway, simply don't draw the window until it
+     * has one: the desktop stays whole, and then the window grows in. */
+    if (!w->presented) return;
 
     /* the drop shadow: drawn first (outside the frame) so the window content
      * lands on top of it, offset downward, and deeper while focused. */
@@ -796,6 +953,19 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
         paint_window(&g_wins[best], g_wins[best].z == tz, rx0, ry0, rx1, ry1);
         last_z = g_wins[best].z;
         drawn++;
+    }
+
+    /* 2b) the flying ghost of a window being opened or parked. Drawn HERE --
+     *     above the windows, below the cursor -- so every repaint composes it
+     *     correctly, whatever triggered the repaint. */
+    if (g_anim.kind != ANIM_NONE) {
+        struct comp_window *aw = win_by_id(g_anim.win_id);
+        if (aw && aw->content) {
+            int r[4], alpha; anim_frame_rect(r, &alpha);
+            fb_blit_scaled_uniform(r[0], r[1], r[2], r[3], aw->content,
+                                   (int)aw->cw, (int)aw->ch, aw->cw,
+                                   (uint32_t)alpha, rx0, ry0, rx1, ry1);
+        }
     }
 
     /* 3) save the fresh pixels below the cursor, then put it back on top. */
@@ -1169,6 +1339,16 @@ int64_t compositor_win_damage(int pid, uint32_t id,
      * the frame origin for the chromeless desktop) */
     int sx0 = w->x + (int)rx;
     int sy0 = w->y + win_titlebar_h(w) + (int)ry;
+    if (!w->presented) {
+        /* first real frame: this is the moment the window becomes something
+         * worth showing, so this -- not create -- is where it grows in. */
+        w->presented = 1;
+        anim_start(w, ANIM_OPEN);
+        int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
+        paint_region(fx0, fy0, fx1, fy1);
+        spin_unlock(&g_comp_lock);
+        return 0;
+    }
     paint_region(sx0, sy0, sx0 + (int)rw, sy0 + (int)rh);
     spin_unlock(&g_comp_lock);
     return 0;
@@ -1250,8 +1430,8 @@ int compositor_win_minimize(int pid, uint32_t id) {
     if (!w || w->desktop) { spin_unlock(&g_comp_lock); return -1; }
     if (!w->minimized) {
         w->minimized = 1;
-        w->visible = 0;
         if (w->id == g_top_id) g_top_id = 0;
+        anim_start(w, ANIM_PARK);          /* hides it; the ghost flies down */
         int x0, y0, x1, y1;
         win_repaint_rect(w, &x0, &y0, &x1, &y1);
         paint_region(x0, y0, x1, y1);
@@ -1272,7 +1452,13 @@ int compositor_restore_pid(int pid) {
         struct comp_window *w = &g_wins[i];
         if (!w->used || w->pid != pid) continue;
         if (w->desktop) continue;            /* the back layer is never raised */
-        if (w->minimized) { w->minimized = 0; w->visible = 1; changed = 1; }
+        if (w->minimized) {
+            w->minimized = 0;
+            w->z = g_next_z++;             /* it comes back in front */
+            anim_start(w, ANIM_UNPARK);    /* flies back up out of the dock */
+            changed = 1;
+            continue;                      /* anim_finish makes it visible */
+        }
         if (!w->visible) continue;
         w->z = w->widget ? g_widget_z++ : g_next_z++;
         changed = 1;
@@ -1313,6 +1499,28 @@ void compositor_reap_pid(int pid) {
             if (g_wins[i].id == g_top_id) g_top_id = 0;
         }
     }
+    spin_unlock(&g_comp_lock);
+}
+
+/* Advance any running window motion by one frame. Called from the boot CPU's
+ * main loop beside compositor_pointer_tick -- schedulable context, so the
+ * compositor spinlock is never taken from an IRQ, and the ~100Hz timer that
+ * wakes that loop is a fine frame clock for a 200ms move. No-op when idle,
+ * which is almost always. */
+void compositor_anim_tick(void) {
+    if (g_anim.kind == ANIM_NONE) return;        /* cheap unlocked pre-check */
+    spin_lock(&g_comp_lock);
+    if (g_anim.kind == ANIM_NONE) { spin_unlock(&g_comp_lock); return; }
+
+    int num, den; anim_progress(&num, &den);
+    if (num >= den) { anim_finish(); spin_unlock(&g_comp_lock); return; }
+
+    int x0, y0, x1, y1;
+    anim_dirty(&x0, &y0, &x1, &y1);
+    int r[4], a; anim_frame_rect(r, &a);
+    for (int i = 0; i < 4; i++) g_anim.last[i] = r[i];
+    g_anim.have_last = 1;
+    paint_region(x0, y0, x1, y1);            /* draws the ghost itself */
     spin_unlock(&g_comp_lock);
 }
 
@@ -1378,9 +1586,9 @@ void compositor_pointer_tick(void) {
                 /* minimize: park the window. The process keeps running (its dock
                  * dot stays lit); clicking its dock icon brings it back. */
                 w->minimized = 1;
-                w->visible = 0;
                 if (w->id == g_top_id) g_top_id = 0;
                 title_control = 1;
+                anim_start(w, ANIM_PARK);      /* hides it; the ghost flies down */
                 { int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
                   DIRTY(fx0, fy0, fx1, fy1); }
                 raised = 1;   /* promote whatever is now in front */

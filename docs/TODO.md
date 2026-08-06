@@ -1880,6 +1880,22 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Menus render correctly open+closed (identity fix); launcher/dock/ghost
       unaffected with menus closed.
 
+### Window motion (shipped 2026-08-06, compositor-side)
+- [ ] CLOSING is still instant. The ghost reads the LIVE window buffer, and on
+      close that buffer is freed underneath it -- a close animation needs a
+      copy of the pixels (~1.4MB kmalloc for a big window) or a deferred free.
+- [ ] The park target is the bottom CENTRE of the screen, not the app's actual
+      dock icon: the dock is drawn by home and the kernel has no idea where its
+      icons are. Plumbing the icon rect through (win_set_park_target?) would
+      make it land on the right icon.
+- [ ] Only one motion runs at a time; a second window animating while one is in
+      flight is simply not animated (anim_start returns).
+- [ ] The window is un-hittable for the 170-200ms it is in flight (it is hidden
+      and the ghost takes no input). Fine at these durations, wrong if they grow.
+- [ ] Frame pacing rides the main loop's ~100Hz timer wake. Under heavy TCG load
+      the loop can be slower, and the motion degrades to fewer frames rather
+      than slowing down (it is time-based, so it still lands on schedule).
+
 ### Window-materialize motion (2026-08-06, reverted -- findings attached)
 - [ ] Wrapping the app view in an opacity/offset wrapper (fade+rise on open)
       left the window CROPPED to ~content-text width with an offset ghost of
@@ -1888,3 +1904,6 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       moved-wrapper dirty across animated frames. Chase it in the host
       harness (menurepro pattern) before re-attempting; the menu drop-in
       (small area, same mechanism) works fine, so it is scale-related.
+      SUPERSEDED for window open/close: doing the motion in the COMPOSITOR
+      (see above) avoids the toolkit group path entirely. This entry stands
+      only for in-APP whole-view transitions, if one is ever wanted.

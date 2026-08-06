@@ -681,7 +681,15 @@ newlib-based libc port.*
   dot lit; clicking that dock icon calls `embk_win_restore` (syscall 89, which
   takes the SPAWN HANDLE rather than a pid, so a launcher can only bring back
   apps it started) to un-park and raise it -- which also fixed the dock click
-  on an already-running app doing nothing at all. A V4.1 app-runtime
+  on an already-running app doing nothing at all. And windows **move**: opening
+  grows a window in from 88% with a fade, parking flies it down to the dock,
+  un-parking flies it back (`compositor_anim_tick`, driven from the boot CPU's
+  main loop). The motion is a scale+fade of the window's own finished pixels
+  (`fb_blit_scaled_uniform`), so the app is not involved and no scene-graph
+  work happens per frame -- which is why this succeeded where the earlier
+  toolkit-side attempt did not. A window is also no longer PAINTED until it has
+  presented a real frame, so launching an app no longer parks a black slab on
+  the desktop for the seconds an app takes to render its first frame under TCG. A V4.1 app-runtime
   layer (`ui/dsl/em_app.c`, `EM_APPLICATION`/`EM_WIDGET`) collapses what
   used to be ~150 lines of per-app boilerplate (font loading, arena setup,
   window creation, the event loop, dirty-rect presenting, teardown) into

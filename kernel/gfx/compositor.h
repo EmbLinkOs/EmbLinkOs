@@ -99,6 +99,8 @@ void compositor_exit_pid(int pid);
 int  compositor_restore_pid(int pid);
 /* An app parking its own window (chromeless apps have no kernel button). */
 int  compositor_win_minimize(int pid, uint32_t id);
+/* Advance window open/park motion one frame; no-op when nothing is moving. */
+void compositor_anim_tick(void);
 /* frost the backdrop behind a window-local sub-rect (translucent windows) */
 int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,

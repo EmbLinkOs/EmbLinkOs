@@ -2002,6 +2002,9 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // compositor spinlock is never taken from an IRQ handler. No-op until a
         // window exists.
         compositor_pointer_tick();
+        // Advance any window open/minimize motion. Same reasoning as above: it
+        // repaints, so it must run in schedulable context, not an IRQ.
+        compositor_anim_tick();
         // Kernel DEBUG CONSOLE over SERIAL (COM1). The keyboard + screen belong
         // to userspace now (the launcher, and the shell that reads fd 0); the
         // kernel keeps a SERIAL-ONLY console so selftests + state inspection stay
