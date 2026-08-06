@@ -691,9 +691,21 @@ static bool em_button_impl(const char *s, EmProps p, bool *out_hov) {
     else          ui_set_paint(solid((Color){0, 0, 0, 0}));   /* reset: a ghost button un-hovers cleanly */
     ui_set_corner_radius(p.corner > 0 ? p.corner : t->radius_md);
     if (has_border || p.border > 0) ui_set_border(p.border > 0 ? p.border : 1.0f, hov ? t->accent : bcol);
-    ui_set_padding(t->sp2 + 1, t->sp4, t->sp2 + 1, t->sp4);
-    ui_set_align(ALIGN_CENTER);
-    ui_set_justify(JUSTIFY_CENTER);
+    /* Padding is overridable. A button's default is sized for a control you
+     * aim at, which is right for a dialog and wrong for a dense list row --
+     * and since the button's padding IS the row's height, a caller that could
+     * not change it could not make a compact list at all, however tight the
+     * container asked to be. */
+    { float pv = p.py > 0 ? p.py : (p.padding > 0 ? p.padding : (float)(t->sp2 + 1));
+      float ph = p.px > 0 ? p.px : (p.padding > 0 ? p.padding : (float)t->sp4);
+      ui_set_padding(pv, ph, pv, ph); }
+    /* And so is alignment. .leading() sets the ALIGN prop, but a button's
+     * label sits on the MAIN axis, which justify controls -- so a caller
+     * asking for a left-aligned label got a centred one and no way to say
+     * otherwise. A label in a list column must start where the column does. */
+    ui_set_align(p.align ? map_align(p.align) : ALIGN_CENTER);
+    ui_set_justify(p.justify ? map_justify(p.justify)
+                             : p.align ? map_justify(p.align) : JUSTIFY_CENTER);
     if (p.grow || p.width > 0) { struct layout_size w = p.width > 0 ? sz_fixed(p.width) : sz_grow(); ui_set_size(w, sz_intrinsic()); }
     uint32_t fh; float sz; em_resolve_font(p.font ? p.font : BodyBold, &fh, &sz);
     ui_set_font(fh); ui_set_text_size(sz); ui_set_text_color(txt);

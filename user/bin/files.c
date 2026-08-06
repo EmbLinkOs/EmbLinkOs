@@ -61,6 +61,18 @@ static char  g_fwd[24][512];   static int g_fwd_n;
 static bool  g_naming = false;
 static char  g_newname[NAME_LEN] = "";
 
+/* Right-click target and the three destructive-ish verbs. Everything that can
+ * lose data goes through a dialog: not a habit-forming "are you sure" on every
+ * action, but one on the ONE action that cannot be undone. */
+static bool  g_menu_open = false;
+static float g_menu_x, g_menu_y;
+static int   g_menu_i = -1;          /* entry the menu was opened on */
+static bool  g_confirm_del = false;  /* the delete sheet             */
+static bool  g_renaming = false;     /* the rename sheet             */
+static char  g_rename_to[NAME_LEN] = "";
+static char  g_clip_path[600] = "";  /* the "copied" file            */
+static char  g_clip_name[NAME_LEN] = "";
+
 /* ---- model ------------------------------------------------------------- */
 
 static void join(char *out, size_t cap, const char *name) {
@@ -176,6 +188,55 @@ static void create_folder(void) {
     g_newname[0] = 0; g_naming = false; g_dirty = true;
 }
 
+/* Delete. Directories go through rmdir, which refuses a non-empty one -- and
+ * that refusal is reported rather than worked around: recursive delete is a
+ * different, much more dangerous verb and it should have to be asked for. */
+static void do_delete(int i) {
+    if (i < 0 || i >= g_count) return;
+    struct entry *e = &g_entries[i];
+    char full[600];
+    join(full, sizeof full, e->name);
+    int rc = e->is_dir ? embk_rmdir(full) : embk_unlink(full);
+    if (rc >= 0) snprintf(g_status, sizeof g_status, "Deleted %s", e->name);
+    else if (e->is_dir)
+        snprintf(g_status, sizeof g_status, "%s is not empty", e->name);
+    else snprintf(g_status, sizeof g_status, "Could not delete %s", e->name);
+    g_dirty = true;
+}
+
+static void do_rename(int i) {
+    if (i < 0 || i >= g_count || !g_rename_to[0]) return;
+    char from[600], to[600];
+    join(from, sizeof from, g_entries[i].name);
+    join(to,   sizeof to,   g_rename_to);
+    if (rename(from, to) == 0) snprintf(g_status, sizeof g_status, "Renamed to %s", g_rename_to);
+    else snprintf(g_status, sizeof g_status, "Could not rename (does %s exist?)", g_rename_to);
+    g_dirty = true;
+}
+
+/* Copy is two verbs: remembering a source, then writing it somewhere. Only
+ * files -- copying a directory means walking it, and a half-copied tree is a
+ * worse outcome than a refusal. */
+static void do_paste(void) {
+    if (!g_clip_path[0]) return;
+    char dest[600];
+    join(dest, sizeof dest, g_clip_name);
+    int in = (int)embk_open(g_clip_path, EMBK_O_RDONLY, 0);
+    if (in < 0) { snprintf(g_status, sizeof g_status, "Cannot read %s", g_clip_name); return; }
+    int out = (int)embk_open(dest, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
+    if (out < 0) { embk_close(in);
+        snprintf(g_status, sizeof g_status, "Cannot write here"); return; }
+    static char buf[8192];
+    int64_t n, total = 0; int ok = 1;
+    while ((n = embk_read(in, buf, sizeof buf)) > 0) {
+        if (embk_write(out, buf, (size_t)n) != n) { ok = 0; break; }
+        total += n;
+    }
+    embk_close(in); embk_close(out);
+    snprintf(g_status, sizeof g_status, ok ? "Copied %s" : "Copy of %s failed", g_clip_name);
+    g_dirty = true;
+}
+
 /* ---- naming things ----------------------------------------------------- */
 
 static const char *human_size(long n, char *buf, size_t cap) {
@@ -218,34 +279,68 @@ static int icon_for(const struct entry *e) {
 
 /* ---- pieces ------------------------------------------------------------ */
 
+/* The right-click is consumed ONCE per frame and then hit-tested against each
+ * row's rect. em_right_clicked is read-and-clear -- asking it per row would let
+ * the first row swallow the event and every other row would never see one. */
+static bool  g_rc_armed = false;
+static float g_rc_x, g_rc_y;
+
+static void rc_begin(void) {
+    float x, y;
+    if (RightClicked(&x, &y)) { g_rc_armed = true; g_rc_x = x; g_rc_y = y; }
+}
+
+/* Called from inside a row's container, where ui_open_rect knows its box. */
+static void rc_claim(int i) {
+    if (!g_rc_armed) return;
+    float x, y, w, h;
+    if (!ui_open_rect(&x, &y, &w, &h) || w <= 1 || h <= 1) return;
+    if (g_rc_x < x || g_rc_x >= x + w || g_rc_y < y || g_rc_y >= y + h) return;
+    g_rc_armed = false;                       /* claimed */
+    g_menu_i = i; g_menu_x = g_rc_x; g_menu_y = g_rc_y; g_menu_open = true;
+}
+
+
+
 /* Ghost buttons paint their label in the ACCENT, which is right for an action
  * and wrong for a name. A window where every filename and every place is
  * accent-blue reads as a page of hyperlinks: the accent stops meaning
  * "this one" when everything wears it. So names are text-coloured, and the
  * accent is spent on exactly one thing -- the place you are actually in. */
+/* A Finder sidebar row: small icon, caption-sized label, tight rhythm. The
+ * first version was twice this tall with body-sized text, which is an Android
+ * list -- comfortable for a thumb, wasteful for a pointer. On a desktop the
+ * sidebar is a reference you glance at, so it should be dense enough to take
+ * in at once. */
 static void sidebar_item(int icon, const char *label, const char *path) {
     const struct ui_theme *t = ui_theme();
     bool here = path && !strcmp(path, g_cwd);
-    HStack(.spacing = 9, .align = Center, .px = 8, .py = 4, .corner = 7, .grow = 1,
-           .background = here ? (Color){ .r=.20f, .g=.22f, .b=.30f, .a=1.f }
+    HStack(.spacing = 7, .align = Center, .px = 7, .py = 1, .corner = 5, .grow = 1,
+           .background = here ? (Color){ .r=.24f, .g=.26f, .b=.34f, .a=1.f }
                               : (Color){ 0, 0, 0, 0 }) {
-        Icon(icon).color(here ? t->accent : t->text_secondary);
-        if (Button(label).ghost().color(here ? t->accent : t->text)
+        Icon(icon).caption().color(here ? t->accent : t->text_secondary);
+        /* .py(1): the row's height was never the HStack's to give. A ghost
+         * button carries the toolkit's standard control padding, which is
+         * sized for a tappable control, and THAT is what kept these rows
+         * Android-tall no matter what the container asked for. */
+        if (Button(label).ghost().font(Caption).py(1)
+                         .color(here ? t->text : t->text_secondary)
                          .grow().leading().clicked()) navigate_to(path);
     }
 }
 
 static void grid_cell(int i) {
     struct entry *e = &g_entries[i];
-    VStack(.spacing = 4, .width = 116, .align = Center) {
+    VStack(.spacing = 2, .width = 92, .align = Center) {
+        rc_claim(i);
         if (e->is_dir) {
             /* one bitmap, many folders -- each needs its own interaction
              * identity or they share a hover state */
-            if (ImageButtonKey("/system/images/file.eic", 58, e)) enter_dir(e->name);
+            if (ImageButtonKey("/system/images/file.eic", 44, e)) enter_dir(e->name);
         } else {
-            if (IconButton(icon_for(e)).frame(58, 58).font(Title).clicked()) open_file(e->name);
+            if (IconButton(icon_for(e)).frame(44, 44).font(Title).clicked()) open_file(e->name);
         }
-        if (Button(e->name).ghost().color(ui_theme()->text).width(112).clicked()) {
+        if (Button(e->name).ghost().font(Caption).py(1).color(ui_theme()->text).width(90).clicked()) {
             if (e->is_dir) enter_dir(e->name); else open_file(e->name);
         }
     }
@@ -255,15 +350,27 @@ static void list_row(int i) {
     struct entry *e = &g_entries[i];
     char sz[24];
     bool sel = (g_sel == i);
-    HStack(.spacing = 12, .align = Center, .px = 10, .py = 4, .corner = 6, .grow = 1,
-           .background = sel ? (Color){ .r=.20f, .g=.22f, .b=.30f, .a=1.f }
+    HStack(.spacing = 10, .align = Center, .px = 8, .py = 0, .corner = 4, .grow = 1,
+           .background = sel ? (Color){ .r=.24f, .g=.26f, .b=.34f, .a=1.f }
                              : (Color){ 0, 0, 0, 0 }) {
-        Icon(icon_for(e)).secondary();
-        if (Button(e->name).ghost().color(ui_theme()->text).grow().leading().clicked()) {
+        rc_claim(i);
+        Icon(icon_for(e)).caption().secondary();
+        if (Button(e->name).ghost().font(Caption).py(1).color(ui_theme()->text)
+                           .grow().leading().clicked()) {
             g_sel = i;
             if (e->is_dir) enter_dir(e->name); else open_file(e->name);
         }
-        Text(kind_of(e)).caption().secondary();
+        /* The way IN to the per-file verbs. Right-click arms the same menu,
+         * but a destructive action reachable only by a gesture with no visible
+         * affordance is a feature most people never find -- and right-click
+         * events are not currently reaching applications at all (logged in
+         * docs/TODO.md), so this is also the only path that works today. */
+        if (Button("...").ghost().font(Caption).py(1).px(6)
+                .color(ui_theme()->text_secondary).id(e->name).clicked()) {
+            g_menu_i = i; g_menu_open = true;
+            g_menu_x = 260.0f; g_menu_y = 90.0f + (float)i * 22.0f;
+        }
+        Text(kind_of(e)).caption().tertiary();
         /* Sizes trail so the digits line up down the column and can be compared
          * without reading every one of them. */
         Text(e->is_dir ? "--" : human_size(e->size, sz, sizeof sz)).caption().tertiary();
@@ -281,6 +388,7 @@ static void app(void) {
     }
     if (g_dirty) { read_dir(); g_dirty = false; }
     build_visible();
+    rc_begin();
 
     const char *home = getenv("HOME");
     if (!home || home[0] != '/') home = "/";
@@ -325,21 +433,33 @@ static void app(void) {
 
             ContentPane(.padding = 0) {
                 /* toolbar: where am I, and how do I get out of here */
-                HStack(.spacing = 8, .align = Center, .px = 14, .py = 8) {
+                HStack(.spacing = 6, .align = Center, .px = 10, .py = 5) {
                     if (IconButton(IconChevronL).clicked()) go_back();
                     if (IconButton(IconChevronR).clicked()) go_forward();
                     if (IconButton(IconChevronU).clicked()) go_up();
-                    Card(.padding = 7, .grow = 1, .corner = 7,
+                    Card(.padding = 5, .grow = 1, .corner = 6,
                          .background = { .r=.12f, .g=.125f, .b=.145f, .a=1.f }) {
-                        Text(g_cwd).body();
+                        Text(g_cwd).caption();
                     }
                     if (g_naming) {
                         TextField(g_newname, sizeof g_newname, "Folder name");
                         if (Button("Create").primary().clicked()) create_folder();
                         if (Button("Cancel").ghost().clicked()) { g_naming = false; g_newname[0] = 0; }
                     } else {
-                        if (Button("New Folder").ghost().color(ui_theme()->text).clicked()) {
+                        if (Button("New Folder").ghost().font(Caption)
+                                .color(ui_theme()->text).clicked()) {
                             g_naming = true; g_newname[0] = 0;
+                        }
+                        /* Paste acts on the FOLDER you are in, so it belongs on
+                         * the toolbar; the per-item verbs live in the context
+                         * menu. It only appears when there is something to
+                         * paste -- a permanently greyed control is clutter that
+                         * teaches you to ignore that corner of the window. */
+                        if (g_clip_path[0]) {
+                            char lbl[NAME_LEN + 16];
+                            snprintf(lbl, sizeof lbl, "Paste %s", g_clip_name);
+                            if (Button(lbl).ghost().font(Caption)
+                                    .color(ui_theme()->accent).clicked()) do_paste();
                         }
                     }
                 }
@@ -352,7 +472,7 @@ static void app(void) {
                  * number written months earlier. Reserve the bar, the toolbar
                  * and the status line; the rest is the list. */
                 ScrollView(&g_scroll, em_viewport_height() - 150.0f) {
-                    VStack(.spacing = g_view ? 2 : 14, .align = Fill, .padding = 14) {
+                    VStack(.spacing = g_view ? 0 : 10, .align = Fill, .padding = 10) {
                         if (g_vis_n == 0) {
                             if (g_query[0])
                                 EmptyState(IconSearch, "No matches",
@@ -363,11 +483,11 @@ static void app(void) {
                         } else if (g_view == 1) {
                             for (int k = 0; k < g_vis_n; k++) list_row(g_vis[k]);
                         } else {
-                            int cols = ((int)em_viewport_width() - 250) / 128;
+                            int cols = ((int)em_viewport_width() - 200) / 100;
                             if (cols < 2) cols = 2;
                             if (cols > 8) cols = 8;
                             for (int base = 0; base < g_vis_n; base += cols) {
-                                HStack(.spacing = 12, .align = Leading) {
+                                HStack(.spacing = 8, .align = Leading) {
                                     for (int c = 0; c < cols; c++) {
                                         int k = base + c;
                                         if (k < g_vis_n) grid_cell(g_vis[k]);
@@ -379,9 +499,102 @@ static void app(void) {
                     }
                 }
 
+                /* The verbs live in a context menu rather than a toolbar:
+                 * they act on ONE item, and a toolbar button cannot say which.
+                 * Right-click is also where a Mac user reaches for them. */
+                /* Right-click on empty space is about the FOLDER. Finder does
+                 * this, and it is where New Folder and Paste actually belong --
+                 * they were only on the toolbar because there was nowhere else
+                 * to put them. Any click no row claimed lands here. */
+                if (g_rc_armed) {
+                    g_rc_armed = false;
+                    g_menu_i = -1; g_menu_x = g_rc_x; g_menu_y = g_rc_y; g_menu_open = true;
+                }
+                if (g_menu_open && g_menu_i < 0) {
+                    ContextMenu(&g_menu_open, g_menu_x, g_menu_y) {
+                        if (MenuItem("New Folder")) { g_naming = true; g_newname[0] = 0; }
+                        if (g_clip_path[0]) {
+                            char lbl[NAME_LEN + 16];
+                            snprintf(lbl, sizeof lbl, "Paste %s", g_clip_name);
+                            if (MenuItem(lbl)) do_paste();
+                        }
+                        MenuSeparator();
+                        if (MenuItem("Refresh")) g_dirty = true;
+                    }
+                }
+                if (g_menu_open && g_menu_i >= 0 && g_menu_i < g_count) {
+                    struct entry *e = &g_entries[g_menu_i];
+                    ContextMenu(&g_menu_open, g_menu_x, g_menu_y) {
+                        if (MenuItem(e->is_dir ? "Open" : "Open in Editor")) {
+                            if (e->is_dir) enter_dir(e->name); else open_file(e->name);
+                        }
+                        MenuSeparator();
+                        if (MenuItem("Copy")) {
+                            if (e->is_dir) snprintf(g_status, sizeof g_status,
+                                                    "Copying folders is not supported yet");
+                            else {
+                                join(g_clip_path, sizeof g_clip_path, e->name);
+                                snprintf(g_clip_name, sizeof g_clip_name, "%s", e->name);
+                                snprintf(g_status, sizeof g_status, "Copied %s", e->name);
+                            }
+                        }
+                        if (MenuItem("Rename...")) {
+                            snprintf(g_rename_to, sizeof g_rename_to, "%s", e->name);
+                            g_renaming = true;
+                        }
+                        MenuSeparator();
+                        if (MenuItem("Delete...")) g_confirm_del = true;
+                    }
+                }
+
+                /* DELETE asks first, and the question names the thing and says
+                 * what is permanent about it. The confirming button is the
+                 * destructive-styled one and it is NOT the default position --
+                 * a sheet you can dismiss by reflex should dismiss SAFELY. */
+                if (g_confirm_del && g_menu_i >= 0 && g_menu_i < g_count) {
+                    struct entry *e = &g_entries[g_menu_i];
+                    Overlay() {
+                        Dialog(.width = 380) {
+                            Text(e->is_dir ? "Delete this folder?" : "Delete this file?").title();
+                            Text(e->name).body().secondary();
+                            Text("This cannot be undone -- there is no Trash yet, "
+                                 "so the file is gone for good.").caption().tertiary();
+                            HStack(.spacing = 8, .align = Center, .pt = 12) {
+                                Spacer();
+                                if (Button("Cancel").ghost().color(ui_theme()->text).clicked())
+                                    g_confirm_del = false;
+                                if (Button("Delete").destructive().clicked()) {
+                                    do_delete(g_menu_i); g_confirm_del = false; g_menu_i = -1;
+                                }
+                            }
+                        }
+                    }
+                    if (OverlayDismissed()) g_confirm_del = false;
+                }
+
+                /* RENAME does not ask -- it is reversible by renaming back, and
+                 * a confirmation on a reversible action is just a keystroke tax. */
+                if (g_renaming && g_menu_i >= 0 && g_menu_i < g_count) {
+                    Overlay() {
+                        Dialog(.width = 380) {
+                            Text("Rename").title();
+                            TextField(g_rename_to, sizeof g_rename_to, "New name");
+                            HStack(.spacing = 8, .align = Center, .pt = 12) {
+                                Spacer();
+                                if (Button("Cancel").ghost().color(ui_theme()->text).clicked())
+                                    g_renaming = false;
+                                if (Button("Rename").primary().clicked()) {
+                                    do_rename(g_menu_i); g_renaming = false; g_menu_i = -1;
+                                }
+                            }
+                        }
+                    }
+                    if (OverlayDismissed()) g_renaming = false;
+                }
+
                 /* status line: what am I looking at */
                 Divider();
-                HStack(.spacing = 10, .align = Center, .px = 14, .py = 6) {
+                HStack(.spacing = 10, .align = Center, .px = 12, .py = 3) {
                     char line[96];
                     if (g_query[0]) snprintf(line, sizeof line, "%d of %d items", g_vis_n, g_count);
                     else            snprintf(line, sizeof line, "%d items", g_count);
