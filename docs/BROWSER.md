@@ -320,12 +320,20 @@ a browser on your own UI stack:
   does not accumulate. `measure_subtree_height` fixed the engine-side bug, and
   the host test now locks it in seconds rather than a five-minute boot.
 
-  So the remaining misplacement is DOWNSTREAM of layout -- in render.c or the
-  app, where the test's fixed-size boxes differ from the real thing: words are
-  TEXT nodes measured through the font, link words are BUTTONS with padding,
-  and each block carries CSS margins as padding. Reproduce those three in T3c
-  (a stub font is enough) and the next failure will show up on the host too.
-  **B1 is not done.**
+  T3c now builds the browser's REAL shape -- words as text measured through
+  the font, a link word as a padded container the way a ghost button is, and
+  CSS margins as block padding -- and every invariant still holds:
+  wrap=80, p=96 (=80 plus its 16px of margins), body=96, html=96. The layout
+  engine is cleared for this case.
+
+  So the misplacement is in render.c or the app. The strongest remaining lead:
+  `measure_wrap_height` packs lines using each child's INTRINSIC width, while
+  arrange packs them using RESOLVED widths. Where those disagree the painted
+  line count exceeds the measured one, and a Flow does not clip -- so the extra
+  lines paint straight over the block below while the box itself is the right
+  height. That matches the symptom exactly (correct-looking gaps, content
+  interleaved). Compare the two counts for one paragraph before changing
+  anything. **B1 is not done.**
 
 ## 12. Open questions
 
