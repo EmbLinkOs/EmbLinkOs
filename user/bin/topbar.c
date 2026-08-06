@@ -19,9 +19,14 @@
  * The strip itself paints NOTHING now -- no fill, no frost. The menu bar is
  * just its text and glyphs sitting directly on the wallpaper, which is the
  * most confident version of this and the one that makes the desktop feel like
- * a single surface rather than a stack of panels. It relies on the wallpaper
- * being dark behind the top edge; the dropdown panels still carry their own
- * material, so the menus stay readable wherever they land. */
+ * a single surface rather than a stack of panels.
+ *
+ * With no background, legibility is the wallpaper's problem, so the bar ASKS:
+ * embk_screen_luma samples what is composed just below the strip and the bar
+ * inks itself dark over a light wallpaper and light over a dark one. That is
+ * how a transparent bar stays readable without reintroducing the panel it was
+ * trying not to be. Sampled about twice a second -- a wallpaper does not
+ * change at frame rate, and reading pixels is not free. */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -35,6 +40,33 @@
 #include "theme.h"
 
 #define BAR_W 1024   /* replaced at startup by the real display width */
+/* Thin like a real menu bar: the strip is chrome, not a panel. */
+#define BAR_H 26
+
+/* Ink for everything in the strip: dark over a light wallpaper, light over a
+ * dark one. Sampled from the band immediately BELOW the bar -- the bar's own
+ * pixels are in the framebuffer too, so sampling its own row would measure its
+ * own text. Hysteresis around the midpoint: a wallpaper that sits near the
+ * threshold must not make the bar flicker between inks. */
+static Color g_ink = { .r=.90f, .g=.91f, .b=.93f, .a=1.f };
+static int   g_ink_dark = 0;
+static uint64_t g_ink_next = 0;
+
+static void bar_ink_update(void) {
+    uint64_t now = em_now_ms();
+    /* Not before the desktop exists. The very first sample used to land during
+     * boot, while the screen still held the kernel console, and latch an ink
+     * chosen from white-on-black text that no user ever saw. */
+    if (now < 2500) return;
+    if (now < g_ink_next) return;
+    g_ink_next = now + 500;
+    int l = embk_screen_luma(0, BAR_H, (int)em_viewport_width(), 6);
+    if (l < 0) return;
+    if (!g_ink_dark && l > 150)      g_ink_dark = 1;
+    else if (g_ink_dark && l < 120)  g_ink_dark = 0;
+    g_ink = g_ink_dark ? (Color){ .r=.08f, .g=.08f, .b=.09f, .a=1.f }
+                       : (Color){ .r=.90f, .g=.91f, .b=.93f, .a=1.f };
+}
 
 /* status-chip ids (icon codepoints); the user reorders / removes these live */
 static int g_items[8] = { IconStar, IconBolt, IconGear, IconHeart };
@@ -46,12 +78,10 @@ static int g_n        = 4;
  * Fixed slots are what makes a status row look ruled. */
 static void chip(int id) {
     HStack(.width = 22, .height = 18, .align = Center, .justify = Center) {
-        Icon(id).secondary();
+        Icon(id).color(g_ink);
     }
 }
 
-/* Thin like a real menu bar: the strip is chrome, not a panel. */
-#define BAR_H 26
 
 /* Live date + time. The bar used to read a hard-coded "9:41" -- Apple's
  * marketing time -- which is exactly the kind of decorative lie the rest of the
@@ -89,6 +119,7 @@ static void bar(void) {
     /* park at the top-center the first time we're drawn */
     static int first = 1;
     if (first) { first = 0; em_window_move_to(0, 0); }   /* flush, like Mac's */
+    bar_ink_update();
 
     /* The window is TRANSLUCENT (per-pixel transparent, no blur) and grows tall
      * only while a menu is open. So the view fills the whole window, but only
@@ -120,14 +151,14 @@ static void bar(void) {
                  * carry menus and status, nothing else. */
                 /* BOLD: the leading menu names the application these menus
                  * belong to, and weight is how a menu bar says so. */
-                Menu("EmbLink", .font = BodyBold) {
+                Menu("EmbLink", .font = BodyBold, .color = g_ink) {
                     MenuItem("About EmbLink");
                     MenuSeparator();
                     if (MenuItem("Quit")) exit(0);
                 }
-                Menu("File") { MenuItem("New"); MenuItem("Open"); }
-                Menu("Edit") { MenuItem("Undo"); MenuItem("Redo"); }
-                Menu("View") { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
+                Menu("File", .color = g_ink) { MenuItem("New"); MenuItem("Open"); }
+                Menu("Edit", .color = g_ink) { MenuItem("Undo"); MenuItem("Redo"); }
+                Menu("View", .color = g_ink) { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
             }
 
             Spacer();   /* the menus sit left, everything else trails right */
@@ -136,7 +167,7 @@ static void bar(void) {
              * has. Wider spacing than a toolbar: these are separate readings,
              * not a group of related controls. */
             Dock(g_items, &g_n, chip, .spacing = 8);
-            Text(bar_clock()).caption();
+            Text(bar_clock()).caption().color(g_ink);
         }
         Spacer();   /* transparent canvas below the bar -- dropdown room */
     }
@@ -150,6 +181,7 @@ static EmApp em_app_spec_ = {
     .theme    = Dark,
     .chrome   = Chromeless,
     .material = Translucent,      /* thin transparent bar; grows for dropdowns */
+    .refresh_ms = 1000,           /* the clock is live, and the ink re-samples */
     .view     = bar,
 };
 

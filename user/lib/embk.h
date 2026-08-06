@@ -918,6 +918,13 @@ static inline int embk_win_restore(int handle) {
     return (int)embk_syscall1(EMBK_SYS_win_restore, handle);
 }
 
+/* How bright is what is already composed under this screen rect (0-255, or
+ * -1)? For a window that paints no background of its own and must still stay
+ * legible over whatever wallpaper it happens to sit on. */
+static inline int embk_screen_luma(int x, int y, int w, int h) {
+    return (int)embk_syscall4(EMBK_SYS_screen_luma, x, y, w, h);
+}
+
 /* Park my own window. The process keeps running and its dock dot stays lit;
  * clicking that dock icon calls embk_win_restore and brings it back. */
 static inline int embk_win_minimize(int win) {

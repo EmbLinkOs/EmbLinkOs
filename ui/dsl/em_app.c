@@ -137,6 +137,9 @@ int em_app_run(const EmApp *app) {
     embk_key_grab(1);
 
     struct render_target rt = { px, (uint32_t)winw, (uint32_t)winh, (uint32_t)winw * 4, EMBK_PIXFMT_BGRA8888_PRE };
+    /* A translucent window may paint no background at all, so nothing would
+     * erase what it drew last frame (see render_target.clear_dirty). */
+    rt.clear_dirty = translucent;
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
     { char b[64]; snprintf(b, sizeof b, "%s: interactive loop running\n", title); embk_puts(1, b); }
 
@@ -146,6 +149,7 @@ int em_app_run(const EmApp *app) {
     int normal_x = wx, normal_y = wy, normal_w = winw, normal_h = winh;
     int thin_h = winh, menu_expanded = 0;   /* translucent menu-bar auto-grow */
     struct embk_win_input prev_in; memset(&prev_in, 0, sizeof prev_in);
+    uint64_t last_app_tick = 0;
 
     for (;;) {
         /* --- inputs (always polled; they are the retained-update triggers) --- */
@@ -253,7 +257,15 @@ int em_app_run(const EmApp *app) {
          * transient -- and matches the always-build loop the modal was designed
          * against. */
         int win_moved = em_window_moved();   /* read-and-clear (drag/snap last frame) */
-        int build = first || input_edge || em_take_frame_request() ||
+        /* refresh_ms was honoured for WIDGETS only, so an application whose
+         * view shows something the world changes on its own -- a clock, or the
+         * menu bar sampling the wallpaper under it -- only updated when the
+         * user happened to move the mouse. Same field, same meaning, both
+         * paths. 0 keeps the pure input-driven behaviour. */
+        int app_tick = app->refresh_ms > 0 &&
+                       (em_now_ms() - last_app_tick) >= (uint64_t)app->refresh_ms;
+        if (app_tick) last_app_tick = em_now_ms();
+        int build = first || input_edge || em_take_frame_request() || app_tick ||
                     em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
                     em_overlay_active() || win_moved;
         if (!build) { embk_sleep_ms(pace); continue; }

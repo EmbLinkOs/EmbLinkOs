@@ -540,6 +540,12 @@ typedef struct {
     void      (*view)(void);     /* the whole UI, rebuilt only when needed */
     const char *font;            /* resource path; default "/system/fonts/font.ttf" */
     int         pace_ms;         /* loop pace while active; default 10 */
+    int         refresh_ms;      /* rebuild the view this often even with no
+                                  * input -- for a view showing something the
+                                  * WORLD changes (a clock, the wallpaper's
+                                  * brightness). 0 = input/animation only, the
+                                  * default and right answer for most apps.
+                                  * Same meaning as EmWidget's field. */
 } EmApp;
 
 void  em_set_viewport(float w, float h);   /* the app runtime feeds this */

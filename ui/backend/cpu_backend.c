@@ -12,6 +12,7 @@
  * tiny sqrtf/fabsf shims -- flagged, not solved here (same host-first posture
  * as Piece 3's scene tree). */
 
+#include <string.h>
 #include "backend.h"
 #include <stdlib.h>
 #include <math.h>
@@ -306,9 +307,29 @@ void cpu_scratch_release(struct render_target *rt) {
 /* ------------------------------------------------------------------------- */
 
 static void cpu_begin_frame(struct render_target *rt, const struct clip_rect *dirty, uint32_t n) {
-    (void)rt;
     g_clip_n = 0;             /* node clips are pushed per-node by the driver */
     cpu_set_dirty(dirty, n);  /* the frame's dirty union (Section 6) */
+
+    /* See render_target.clear_dirty. Exactly the dirty rects, never the whole
+     * target: the renderer only redraws what is dirty, so clearing more than
+     * that would blank content nobody is going to repaint. */
+    if (rt && rt->clear_dirty && rt->pixels) {
+        if (n == 0) {                       /* full frame */
+            for (uint32_t y = 0; y < rt->height; y++)
+                memset((uint8_t *)rt->pixels + (size_t)y * rt->stride, 0, (size_t)rt->width * 4);
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                int x0 = (int)dirty[i].x, y0 = (int)dirty[i].y;
+                int x1 = (int)(dirty[i].x + dirty[i].w) + 1, y1 = (int)(dirty[i].y + dirty[i].h) + 1;
+                if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+                if (x1 > (int)rt->width)  x1 = (int)rt->width;
+                if (y1 > (int)rt->height) y1 = (int)rt->height;
+                for (int y = y0; y < y1; y++)
+                    memset((uint8_t *)rt->pixels + (size_t)y * rt->stride + (size_t)x0 * 4,
+                           0, (size_t)(x1 - x0) * 4);
+            }
+        }
+    }
 }
 static void cpu_end_frame(struct render_target *rt) { (void)rt; }
 

@@ -1880,6 +1880,15 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Menus render correctly open+closed (identity fix); launcher/dock/ghost
       unaffected with menus closed.
 
+### Adaptive menu-bar ink (shipped 2026-08-06)
+- [ ] Only the LIGHT ink is verified against a real wallpaper; the dark branch
+      was proven by temporarily inverting the threshold (bar text went
+      near-black, docs say it works, but no light wallpaper exists yet to see
+      it in earnest). Revisit when wallpapers are user-selectable.
+- [ ] The sample is one 6px band directly under the bar. A wallpaper that is
+      light at the left and dark at the right gets one ink for the whole bar;
+      per-item sampling would be the real answer.
+
 ### Host test rot
 - [ ] `make font-test` does not compile: font_test.c calls `be->draw_text` with
       8 arguments against the 11-argument backend signature (box_w/box_h/paint

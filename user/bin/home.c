@@ -315,9 +315,19 @@ static void dock_label(void) {
     int n = 0; while (g_dock[i].label[n]) n++;
     float w = (float)n * 7.0f + 20.0f;
 
+    em_flush();                    /* emit pending DSL leaves before raw ui_* */
     ui_begin_vstack(0x70CA);
     ui_set_overlay(true);
     ui_set_layer(1);
+    /* ZERO-SIZED, for the reason desktop_icons() spells out: a screen-filling
+     * transparent overlay CONTAINS every point, and the hit test gives the
+     * highest layer that claims the point. This one only exists WHILE the
+     * pointer is over a dock icon -- which is precisely when you are trying to
+     * click one -- so at full size it swallowed every launch click. With no
+     * extent, only the label's own little box exists for hit testing. */
+    ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 },
+                (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
+    ui_set_clip_children(false);
     ui_begin_vstack(1);
     ui_set_offset(cx - w * 0.5f, g_dockr[1] - 34.0f);
     HStack(.px = 10, .py = 4, .corner = 9, .glass = 1, .border = 1) {
@@ -345,13 +355,32 @@ static void dock_pill(void) {
              * upward and sideways (no clip); the slot never moves. */
             VStack(.spacing = 3, .width = DOCK_BASE + 8, .align = Center) {
                 drag_icon(g_dock[i], (int)dock_icon_size(i), 2, i);
-                /* the running dot: 4px of truth under a live app's chip */
-                if (dock_running(g_dock[i].app)) {
-                    HStack(.width = 4, .height = 4, .corner = 2,
-                           .background = { .r=.62f, .g=.66f, .b=.78f, .a=1.f }) { }
-                } else {
-                    HStack(.width = 4, .height = 4) { }   /* keep baselines level */
+                /* The running dot: 4px of truth under a live app's chip.
+                 *
+                 * The paint is set EXPLICITLY in BOTH states, and that is the
+                 * whole point. Written as two branches -- a dot with a
+                 * .background, and a bare spacer without one -- the reconciler
+                 * reuses the same instance (same shape, same position) and
+                 * em_apply_box only calls ui_set_paint when .background has
+                 * alpha, so the "off" branch set nothing and the instance KEPT
+                 * last frame's fill. The dot then survived the app that owned
+                 * it: close the terminal and its light stayed on forever. Same
+                 * mechanism as the V6 menu smear -- a reused instance retains
+                 * every prop the new state fails to set. PAINT_NONE is how you
+                 * say "no fill" and mean it. */
+                int running = dock_running(g_dock[i].app);
+                em_flush();
+                ui_begin_hstack(0xD07);
+                ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 4 },
+                            (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 4 });
+                ui_set_corner_radius(2);
+                struct paint dot = { 0 };            /* PAINT_NONE */
+                if (running) {
+                    dot.kind = PAINT_SOLID;
+                    dot.solid = (Color){ .r=.62f, .g=.66f, .b=.78f, .a=1.f };
                 }
+                ui_set_paint(dot);
+                ui_end_stack();
             }
         }
         if (g_dock_n == 0) { EmProps hp = {0}; (void)hp; Text("  drag apps here  ").caption().secondary(); }
@@ -754,11 +783,20 @@ static void spawn_app(const char *path, const char *start_dir) {
      * (a string literal) and from the launcher grid (a reused scan buffer) has
      * two different addresses -- pointer-equality let it spawn TWICE, and two
      * instances fighting over one window rendered as a dead black rectangle. */
-    int slot = -1, freeslot = -1;
+    int slot = -1, freeslot = -1, deadslot = -1;
     for (int i = 0; i < MAX_TRACKED; i++) {
         if (g_running[i].used) {
             if (!strcmp(g_running[i].path, path) &&
                 !strcmp(g_running[i].start_dir, sd)) { slot = i; break; }
+            /* A slot whose app has EXITED is reusable. `used` was never
+             * cleared once set, so after eight distinct apps this table was
+             * permanently full and every further launch returned silently --
+             * apps simply stopped starting, with no dot and no error. The
+             * table is a cache of what is running, not a registry of what has
+             * ever run. */
+            if (deadslot < 0 && (g_running[i].handle_p1 <= 0 ||
+                                 !embk_proc_alive(g_running[i].handle_p1 - 1)))
+                deadslot = i;
         } else if (freeslot < 0) freeslot = i;
     }
 
@@ -777,8 +815,11 @@ static void spawn_app(const char *path, const char *start_dir) {
             g_running[slot].handle_p1 = 0;
         }
     } else {
-        slot = freeslot;
-        if (slot < 0) return;              /* table full */
+        slot = freeslot >= 0 ? freeslot : deadslot;   /* evict an exited app */
+        if (slot < 0) return;              /* genuinely full: all still running */
+        if (g_running[slot].used && g_running[slot].handle_p1 > 0)
+            embk_wait(g_running[slot].handle_p1 - 1);   /* reap before reusing */
+        g_running[slot].handle_p1 = 0;
     }
 
     /* Grant the child EXACTLY its declared namespace (UP4); no manifest => it

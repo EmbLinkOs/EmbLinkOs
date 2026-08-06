@@ -1508,6 +1508,33 @@ int compositor_restore_pid(int pid) {
     return changed;
 }
 
+/* Average perceived luminance (0-255) of the composed framebuffer over a screen
+ * rect, or -1. A window that paints NO background of its own -- the menu bar --
+ * cannot know whether its text will land on a dark wallpaper or a light one,
+ * and it has no other way to find out: the wallpaper is another process's
+ * window content. Sampling is strided; this is asked once or twice a second,
+ * not per frame. */
+int compositor_backdrop_luma(int x, int y, int w, int h) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi || w <= 0 || h <= 0) return -1;
+    int x0 = imax(x, 0), y0 = imax(y, 0);
+    int x1 = imin(x + w, (int)fi->width), y1 = imin(y + h, (int)fi->height);
+    if (x1 <= x0 || y1 <= y0) return -1;
+    int stepx = ((x1 - x0) / 64) + 1, stepy = ((y1 - y0) / 8) + 1;
+    uint64_t sum = 0; uint32_t n = 0;
+    spin_lock(&g_comp_lock);
+    for (int yy = y0; yy < y1; yy += stepy) {
+        for (int xx = x0; xx < x1; xx += stepx) {
+            uint32_t c = fb_get_pixel((uint32_t)xx, (uint32_t)yy);
+            uint32_t r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+            sum += (r * 54 + g * 183 + b * 19) >> 8;   /* Rec.601-ish, integer */
+            n++;
+        }
+    }
+    spin_unlock(&g_comp_lock);
+    return n ? (int)(sum / n) : -1;
+}
+
 /* Declare (or clear, w<=0) the window-local sub-rect whose backdrop should be
  * frosted. Repaints the window so the change is visible at once. */
 int compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w_, int h_) {

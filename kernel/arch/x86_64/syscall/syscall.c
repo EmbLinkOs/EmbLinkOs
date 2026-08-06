@@ -1207,6 +1207,12 @@ static int64_t sys_ui_input(struct regs *r) {
 /* Non-blocking keystroke poll: returns the next ASCII byte (incl. '\b' 0x08 and
  * '\n'), or 0 if the keyboard buffer is empty. The ring-3 UI loop drains this
  * each frame and routes chars to the focused text field. */
+/* screen_luma(x,y,w,h) -- how bright is what is already on screen there. */
+static int64_t sys_screen_luma(struct regs *r) {
+    return (int64_t)compositor_backdrop_luma((int)r->rdi, (int)r->rsi,
+                                             (int)r->rdx, (int)r->r10);
+}
+
 /* win_minimize(win) -- an app parking its OWN window. */
 static int64_t sys_win_minimize(struct regs *r) {
     return compositor_win_minimize(current_process ? (int)current_process->pid : 0,
@@ -1775,6 +1781,7 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_win_blur_rect  88
 #define SYS_win_restore    89
 #define SYS_win_minimize   90
+#define SYS_screen_luma    91
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1861,6 +1868,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_win_blur_rect]  = sys_win_blur_rect,
     [SYS_win_restore]    = sys_win_restore,
     [SYS_win_minimize]   = sys_win_minimize,
+    [SYS_screen_luma]    = sys_screen_luma,
     [SYS_debug_attach]   = sys_debug_attach,
     [SYS_debug_wait]     = sys_debug_wait,
     [SYS_debug_cont]     = sys_debug_cont,

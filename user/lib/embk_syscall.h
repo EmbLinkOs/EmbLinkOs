@@ -116,6 +116,7 @@
 #define EMBK_SYS_win_blur_rect  88   /* (win,x,y,w,h) -> frost the backdrop behind a sub-rect */
 #define EMBK_SYS_win_restore    89   /* (spawn handle) -> un-minimize + raise that app's windows */
 #define EMBK_SYS_win_minimize   90   /* (win) -> park my own window (dock click brings it back) */
+#define EMBK_SYS_screen_luma    91   /* (x,y,w,h) -> mean luminance 0-255 of what is composed there */
 
 /* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
  * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back

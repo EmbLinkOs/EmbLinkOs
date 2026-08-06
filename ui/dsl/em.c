@@ -2525,7 +2525,9 @@ void em_menu_(const char *label, EmProps p) {
      * rest regular -- that weight difference is what tells you which
      * application the menus belong to. */
     { EmProps lp = { .font = p.font ? p.font : Body,
-                     .color = is_open ? t->accent : t->text }; em_text_impl(label, lp); }
+                     .color = is_open ? t->accent
+                            : (p.color.a > 0 ? p.color : t->text) };
+      em_text_impl(label, lp); }
     ui_end_stack();
     if (ui_consume_click(btn)) {
         if (is_open) g_menu_open = 0;

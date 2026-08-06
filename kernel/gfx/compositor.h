@@ -101,6 +101,8 @@ int  compositor_restore_pid(int pid);
 int  compositor_win_minimize(int pid, uint32_t id);
 /* Advance window open/park motion one frame; no-op when nothing is moving. */
 void compositor_anim_tick(void);
+/* Average luminance (0-255) of what is composed under a screen rect, or -1. */
+int  compositor_backdrop_luma(int x, int y, int w, int h);
 /* frost the backdrop behind a window-local sub-rect (translucent windows) */
 int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
