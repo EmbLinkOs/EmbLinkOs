@@ -44,6 +44,11 @@ struct comp_window {
      * nobody asked for. Declaring the opaque part lets the strip be real
      * frosted glass while its canvas stays honestly transparent. 0 = none. */
     int       blur_set, blur_x, blur_y, blur_w, blur_h;
+    int       minimized;    /* 1 = hidden by its MINIMIZE button, not by exit or
+                             * by a close. The distinction matters: only a window
+                             * the user parked can be brought back, and the dock
+                             * needs to keep showing the app as running while it
+                             * sits there with no pixels on screen. */
     int       pending_action; /* one-shot request delivered to the app runtime */
     /* Latched click replay: a press EDGE on this window's content is remembered
      * here so an app that was busy (e.g. mid first-frame render, seconds long
@@ -327,6 +332,15 @@ static int win_max_rect(const struct comp_window *w, int *x0, int *y0, int *x1, 
     int cx0, cy0, cx1, cy1;
     if (!win_close_rect(w, &cx0, &cy0, &cx1, &cy1)) return 0;
     *x0 = cx0 - 22; *x1 = cx1 - 22; *y0 = cy0; *y1 = cy1;
+    return 1;
+}
+
+/* The minimize button was painted from the start but had no hit rect at all --
+ * it was decoration you could click forever with nothing happening. */
+static int win_min_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
+    int cx0, cy0, cx1, cy1;
+    if (!win_close_rect(w, &cx0, &cy0, &cx1, &cy1)) return 0;
+    *x0 = cx0 - 44; *x1 = cx1 - 44; *y0 = cy0; *y1 = cy1;
     return 1;
 }
 
@@ -1226,6 +1240,51 @@ void compositor_exit_pid(int pid) {
     spin_unlock(&g_comp_lock);
 }
 
+/* An app parking ITSELF. Chromeless windows (every EmUI V4 app) have no kernel
+ * title bar to click, so the toolkit's own MinimizeButton needs a way in --
+ * otherwise minimize would exist only for the handful of apps still using
+ * kernel chrome. */
+int compositor_win_minimize(int pid, uint32_t id) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = win_find(pid, id);
+    if (!w || w->desktop) { spin_unlock(&g_comp_lock); return -1; }
+    if (!w->minimized) {
+        w->minimized = 1;
+        w->visible = 0;
+        if (w->id == g_top_id) g_top_id = 0;
+        int x0, y0, x1, y1;
+        win_repaint_rect(w, &x0, &y0, &x1, &y1);
+        paint_region(x0, y0, x1, y1);
+        enforce_focus();
+    }
+    spin_unlock(&g_comp_lock);
+    return 0;
+}
+
+/* Bring a process's windows back to the user: un-park anything it minimized,
+ * and raise its windows to the front. Both halves are what "click the dock
+ * icon of a running app" has to mean -- a parked window comes back, and an app
+ * that is merely buried comes forward. Returns 1 if anything changed. */
+int compositor_restore_pid(int pid) {
+    spin_lock(&g_comp_lock);
+    int changed = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w->pid != pid) continue;
+        if (w->desktop) continue;            /* the back layer is never raised */
+        if (w->minimized) { w->minimized = 0; w->visible = 1; changed = 1; }
+        if (!w->visible) continue;
+        w->z = w->widget ? g_widget_z++ : g_next_z++;
+        changed = 1;
+        int x0, y0, x1, y1;
+        win_repaint_rect(w, &x0, &y0, &x1, &y1);
+        paint_region(x0, y0, x1, y1);
+    }
+    if (changed) enforce_focus();
+    spin_unlock(&g_comp_lock);
+    return changed;
+}
+
 /* Declare (or clear, w<=0) the window-local sub-rect whose backdrop should be
  * frosted. Repaints the window so the change is visible at once. */
 int compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w_, int h_) {
@@ -1314,6 +1373,17 @@ void compositor_pointer_tick(void) {
                 int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
                 DIRTY(fx0, fy0, fx1, fy1);
                 raised = 1;   /* re-run enforce_focus() to promote the new front */
+            } else if (win_min_rect(w, &mbx0, &mby0, &mbx1, &mby1) &&
+                       x >= mbx0 && x < mbx1 && y >= mby0 && y < mby1) {
+                /* minimize: park the window. The process keeps running (its dock
+                 * dot stays lit); clicking its dock icon brings it back. */
+                w->minimized = 1;
+                w->visible = 0;
+                if (w->id == g_top_id) g_top_id = 0;
+                title_control = 1;
+                { int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
+                  DIRTY(fx0, fy0, fx1, fy1); }
+                raised = 1;   /* promote whatever is now in front */
             } else if (win_max_rect(w, &mbx0, &mby0, &mbx1, &mby1) &&
                        x >= mbx0 && x < mbx1 && y >= mby0 && y < mby1) {
                 w->pending_action = 1; /* EMBK_WIN_ACTION_MAXIMIZE */

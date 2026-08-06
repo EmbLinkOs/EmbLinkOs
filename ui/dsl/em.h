@@ -305,6 +305,9 @@ void em_windowbar_end_(void);
 #define CloseButton(...)  em_close_button()
 EmV  em_close_button(void);            /* modern single round close control; chainable (.clicked()) */
 int  em_window_closed(void);           /* 1 if the built-in CloseButton fired this frame */
+#define MinimizeButton(...) em_min_button()
+EmV  em_min_button(void);              /* park the window; the dock icon brings it back */
+int  em_window_minimized(void);        /* 1 if the built-in MinimizeButton fired this frame */
 /* CloseGrip: EmbLink's own close GESTURE (not a fixed button). Put it in the
  * WindowBar; the user PULLS it -- the window fades + slides toward the drag and
  * closes once pulled past the threshold (springs back if released early), the

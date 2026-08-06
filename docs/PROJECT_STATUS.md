@@ -673,7 +673,15 @@ newlib-based libc port.*
   indicator) and **antialiased rounded corners**, arc, shadow and border ring
   all following the same curve (`corners_save`/`corners_carve`, which stash the
   backdrop under the four corner boxes, let every existing paint path run, then
-  blend it back by 4x4-supersampled arc coverage). A V4.1 app-runtime
+  blend it back by 4x4-supersampled arc coverage). Windows can also be
+  **minimized**: kernel-chromed windows via their title-bar button (painted
+  since V4 but until now pure decoration -- it had no hit rect at all), and
+  chromeless EmUI apps via the toolkit's `MinimizeButton` (syscall 90,
+  `embk_win_minimize`). A parked window keeps its process running and its dock
+  dot lit; clicking that dock icon calls `embk_win_restore` (syscall 89, which
+  takes the SPAWN HANDLE rather than a pid, so a launcher can only bring back
+  apps it started) to un-park and raise it -- which also fixed the dock click
+  on an already-running app doing nothing at all. A V4.1 app-runtime
   layer (`ui/dsl/em_app.c`, `EM_APPLICATION`/`EM_WIDGET`) collapses what
   used to be ~150 lines of per-app boilerplate (font loading, arena setup,
   window creation, the event loop, dirty-rect presenting, teardown) into

@@ -1821,6 +1821,20 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       ui_scroll_begin's convention; flip in term_view if it feels inverted)
 - [ ] SGR: only fg colour + bold honoured; backgrounds/underline dropped
 
+### Minimize / restore (shipped 2026-08-06)
+- [ ] No minimize ANIMATION -- the window vanishes and reappears instantly.
+      The Mac genie is the obvious want; a scale+fade toward the dock icon is
+      the cheap version. Blocked on the same window-motion work as the reverted
+      open/close animation below.
+- [ ] Restore is per-PROCESS, not per-window: an app with two windows gets both
+      back. Fine while apps are single-window; revisit with a real window list.
+- [ ] No keyboard path (Super+M) and no "minimize all" -- the dock icon is the
+      only way back.
+- [ ] A minimized app still runs its render loop if it is timer-driven (a clock
+      widget keeps painting into a buffer nobody composites). Retained-update
+      apps idle correctly; a `minimized` bit in win_input would let the rest
+      stop too.
+
 ### Window depth: drop shadow + rounded corners (shipped 2026-08-06)
 - [ ] Focused-vs-unfocused shadow depth is code-verified, not photographed:
       every metal pairing so far had the back window fully covered, and the

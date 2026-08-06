@@ -269,7 +269,7 @@ void em_scroll_end_(void) { em_flush(); ui_scroll_end(); }
 typedef enum { PK_NONE, PK_TEXT, PK_ICON, PK_LABEL, PK_BADGE, PK_TAG, PK_AVATAR,
                PK_BANNER, PK_PROGRESS, PK_BUTTON, PK_ICONBTN, PK_TOGGLE, PK_CHECK,
                PK_SLIDER, PK_STEPPER, PK_FIELD, PK_PASSWORD, PK_SEGMENTED, PK_LISTROW,
-               PK_CLOSEBTN, PK_SEARCH, PK_SPINNER, PK_DROPDOWN } PKind;
+               PK_CLOSEBTN, PK_MINBTN, PK_SEARCH, PK_SPINNER, PK_DROPDOWN } PKind;
 
 static struct {
     int active; PKind kind; EmProps props; const char *id;
@@ -302,6 +302,7 @@ static bool em_password_impl(char *buf, size_t cap, const char *ph, EmProps p, b
 static void em_segmented_impl(const char *const *labels, int count, int *b, EmProps p);
 static bool em_listrow_impl(int cp, const char *title, const char *value, EmProps p, bool *hov);
 static bool em_closebtn_impl(bool *hov);
+static bool em_minbtn_impl(bool *hov);
 static bool em_search_impl(char *buf, size_t cap, const char *ph, bool *hov);
 static void em_spinner_impl(void);
 static bool em_dropdown_impl(const char *const *labels, int count, int *sel, bool *hov);
@@ -331,6 +332,7 @@ void em_flush(void) {
         case PK_SEGMENTED:em_segmented_impl(P.labels, P.count, (int *)P.bind, pr); break;
         case PK_LISTROW:  clicked = em_listrow_impl(P.cp, P.str, P.str2, pr, &hovered); break;
         case PK_CLOSEBTN: clicked = em_closebtn_impl(&hovered); break;
+        case PK_MINBTN:   clicked = em_minbtn_impl(&hovered); break;
         case PK_SEARCH:   clicked = em_search_impl(P.buf, P.cap, P.str, &hovered); break;
         case PK_SPINNER:  em_spinner_impl(); break;
         case PK_DROPDOWN: clicked = em_dropdown_impl(P.labels, P.count, (int *)P.bind, &hovered); break;
@@ -549,6 +551,7 @@ EmV em_password_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_P
 EmV em_segmented(const char *const *labels, int count, int *b){ EmV v = stage(PK_SEGMENTED); P.labels = labels; P.count = count; P.bind = b; return v; }
 EmV em_listrow(int icon, const char *title, const char *value){ EmV v = stage(PK_LISTROW); P.cp = icon; P.str = title; P.str2 = value; return v; }
 EmV em_close_button(void){ EmV v = stage(PK_CLOSEBTN); P.id = "__em_win_close"; return v; }
+EmV em_min_button(void){ EmV v = stage(PK_MINBTN); P.id = "__em_win_min"; return v; }
 EmV em_search_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_SEARCH); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_spinner(void){ return stage(PK_SPINNER); }
 EmV em_dropdown(const char *const *labels, int count, int *sel){ EmV v = stage(PK_DROPDOWN); P.labels = labels; P.count = count; P.bind = sel; return v; }
@@ -1139,6 +1142,30 @@ static bool em_closebtn_impl(bool *out_hov) {
     return ui_consume_click(self);
 }
 int em_window_closed(void) { return Clicked("__em_win_close"); }
+
+/* The close control's quieter sibling: same size and shape (a bar of controls
+ * whose members disagree about their geometry reads as a mistake), but it
+ * hovers to the neutral surface instead of danger-red -- parking a window is
+ * not a destructive act and shouldn't be dressed as one. */
+static bool em_minbtn_impl(bool *out_hov) {
+    const struct ui_theme *t = TH;
+    ui_begin_hstack(0);
+    struct instance_handle self = ui_open();
+    bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    if (out_hov) *out_hov = hov;
+    Color bg = hov ? (pressed ? shade(t->surface_alt, 0.86f) : t->surface_alt) : t->surface;
+    Color fg = hov ? t->text : t->text_secondary;
+    ui_set_paint(solid(bg));
+    ui_set_corner_radius(t->radius_pill);
+    ui_set_border(hov ? 0.0f : 1.0f, t->border);
+    ui_set_size(sz_fixed(36), sz_fixed(30));
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    { EmProps ip = { .font = BodyBold, .color = fg }; em_icon_impl(IconMinus, ip); }
+    ui_end_stack();
+    return ui_consume_click(self);
+}
+int em_window_minimized(void) { return Clicked("__em_win_min"); }
 
 /* ---- Spinner: phase-animated dots (indeterminate activity) ------------- */
 static void em_spinner_impl(void) {

@@ -713,7 +713,14 @@ static void spawn_app(const char *path, const char *start_dir) {
     if (slot >= 0) {                       /* already tracked */
         if (g_running[slot].handle_p1 > 0) {
             int h = g_running[slot].handle_p1 - 1;
-            if (embk_proc_alive(h)) return;   /* still running -- one instance only */
+            if (embk_proc_alive(h)) {
+                /* Still running -- one instance only. But "the app is already
+                 * open" is not a reason to do NOTHING: that is what made a dock
+                 * click on a running app feel broken, and it is the only way
+                 * back for a window the user minimized. Bring it forward. */
+                embk_win_restore(h);
+                return;
+            }
             embk_wait(h);                     /* dead: reap the zombie + free the handle */
             g_running[slot].handle_p1 = 0;
         }

@@ -283,6 +283,11 @@ int em_app_run(const EmApp *app) {
         ui_run_layout((float)winw, (float)winh);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
+        /* Park, don't quit: the app keeps running with no pixels on screen
+         * until its dock icon calls win_restore. Checked before the close
+         * path so a frame can't do both. */
+        if (em_window_minimized()) embk_win_minimize(win);
+
         if (g_app_exit_requested || em_window_closed() || em_window_take_close()) {
             embk_win_destroy(win); embk_key_grab(0);
             char b[64]; snprintf(b, sizeof b, "%s: window closed cleanly\n", title); embk_puts(1, b);

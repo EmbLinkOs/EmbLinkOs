@@ -1207,6 +1207,24 @@ static int64_t sys_ui_input(struct regs *r) {
 /* Non-blocking keystroke poll: returns the next ASCII byte (incl. '\b' 0x08 and
  * '\n'), or 0 if the keyboard buffer is empty. The ring-3 UI loop drains this
  * each frame and routes chars to the focused text field. */
+/* win_minimize(win) -- an app parking its OWN window. */
+static int64_t sys_win_minimize(struct regs *r) {
+    return compositor_win_minimize(current_process ? (int)current_process->pid : 0,
+                                   (uint32_t)r->rdi);
+}
+
+/* win_restore(handle) -- un-minimize and raise the windows of the process the
+ * SPAWN HANDLE names. A handle, not a pid: the launcher is handed handles by
+ * spawn and never learns pids (same contract as proc_alive), and resolving
+ * through the handle table keeps this authority-scoped -- you can only bring
+ * back an app you started. */
+static int64_t sys_win_restore(struct regs *r) {
+    uint32_t pid;
+    if (process_handle_resolve(current_process, (int)r->rdi, &pid) != 0)
+        return -EMBK_EINVAL;
+    return (int64_t)compositor_restore_pid((int)pid);
+}
+
 static int64_t sys_win_blur_rect(struct regs *r) {
     return compositor_win_blur_rect(current_process ? (int)current_process->pid : 0,
                                     (uint32_t)r->rdi, (int)r->rsi, (int)r->rdx,
@@ -1755,6 +1773,8 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_clip_set       86
 #define SYS_clip_get       87
 #define SYS_win_blur_rect  88
+#define SYS_win_restore    89
+#define SYS_win_minimize   90
 
 
 static syscall_handler_t syscall_table[] = {
@@ -1839,6 +1859,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_clip_set]       = sys_clip_set,
     [SYS_clip_get]       = sys_clip_get,
     [SYS_win_blur_rect]  = sys_win_blur_rect,
+    [SYS_win_restore]    = sys_win_restore,
+    [SYS_win_minimize]   = sys_win_minimize,
     [SYS_debug_attach]   = sys_debug_attach,
     [SYS_debug_wait]     = sys_debug_wait,
     [SYS_debug_cont]     = sys_debug_cont,

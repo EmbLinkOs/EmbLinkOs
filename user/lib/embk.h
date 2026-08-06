@@ -910,6 +910,20 @@ static inline int embk_win_blur_rect(int win, int x, int y, int w, int h) {
     return (int)embk_syscall5(EMBK_SYS_win_blur_rect, win, x, y, w, h);
 }
 
+/* Bring back an app you started: un-minimizes any window it parked and raises
+ * its windows to the front. Takes the SPAWN HANDLE (like embk_proc_alive), not
+ * a pid -- a launcher never learns pids, and going through the handle keeps
+ * this scoped to apps you actually spawned. Returns 1 if anything changed. */
+static inline int embk_win_restore(int handle) {
+    return (int)embk_syscall1(EMBK_SYS_win_restore, handle);
+}
+
+/* Park my own window. The process keeps running and its dock dot stays lit;
+ * clicking that dock icon calls embk_win_restore and brings it back. */
+static inline int embk_win_minimize(int win) {
+    return (int)embk_syscall1(EMBK_SYS_win_minimize, win);
+}
+
 /* --- the system clipboard: one machine-global text buffer ----------------
  * Set replaces it whole; get copies up to cap bytes OUT and returns how many
  * bytes the clipboard HOLDS -- more than cap means the caller saw a prefix. */

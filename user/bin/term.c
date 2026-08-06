@@ -601,6 +601,7 @@ static void term_view(void) {
             /* A plain click. CloseGrip is a PULL handle -- it wants a deliberate
              * drag before it fires, which is a fine guard for something
              * destructive and pure friction for closing a window. */
+            MinimizeButton();                       /* park it; the dock brings it back */
             if (CloseButton().clicked()) exit(0);   /* window is reaped, shell EOFs */
         }
         /* the VIEWER: a read-only transcript of everything the shell printed */
