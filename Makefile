@@ -1697,6 +1697,14 @@ scene-test:
 
 # Piece 4a: the CPU render backend + dirty-rect driver. Same host-test posture
 # as Piece 3 -- operates on in-memory render_target buffers, no QEMU/ring-3.
+# html-test -- the browser's HTML parser, tested on the HOST. A parser is the
+# one part of a browser that needs no network, window or font, so it is tested
+# in seconds rather than through an image build and a boot.
+html-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iuser/web \
+	    user/web/html.c user/web/html_test.c -o $(BUILD)/html_test
+	$(BUILD)/html_test
+
 backend-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene -Iui/backend \
 	    ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/scene_render.c \
@@ -1778,7 +1786,7 @@ clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(KERNEL_BIN) $(IMG)
 	rm -rf $(BUILD)
 
-.PHONY: all run debug clean scene-test backend-test font-test layout-test reactive-test declare-test showcase run-ui run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted
+.PHONY: all run debug clean scene-test backend-test html-test font-test layout-test reactive-test declare-test showcase run-ui run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted
 # --- TLS crypto host tests (docs/TLS.md T1): the SAME crypto that runs on the OS,
 # compiled + vector-checked on the dev host (fast, no boot). Grows per primitive.
 .PHONY: test-tls-crypto
