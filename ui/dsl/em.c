@@ -682,7 +682,11 @@ static void em_progress_impl(float frac, EmProps p) { (void)p; ui_progress(frac)
 
 static bool em_button_impl(const char *s, EmProps p, bool *out_hov) {
     const struct ui_theme *t = TH;
-    ui_box_begin(0);
+    /* An hstack, not a box: justify positions a container's children along the
+     * main axis, and a box does not lay children out that way -- so .leading()
+     * set the prop and the label stayed stubbornly centred. Every file name in
+     * a list column was centred in its column because of this. */
+    ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
     if (out_hov) *out_hov = hov;
@@ -720,7 +724,7 @@ static bool em_button_impl(const char *s, EmProps p, bool *out_hov) {
     uint32_t fh; float sz; em_resolve_font(p.font ? p.font : BodyBold, &fh, &sz);
     ui_set_font(fh); ui_set_text_size(sz); ui_set_text_color(txt);
     ui_text("%s", s);
-    ui_box_end();
+    ui_end_stack();
     return ui_consume_click(self);
 }
 static bool em_iconbtn_impl(int cp, EmProps p, bool *out_hov) {
@@ -2527,6 +2531,15 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
      * window, and this overlay's parent is a 28px menu strip. Overlays honour
      * an explicit fixed size (layout.c) precisely for this. */
     ui_set_size(sz_fixed(em_viewport_width()), sz_fixed(em_viewport_height()));
+    /* The panel's offset below is measured from THIS overlay's origin, but
+     * callers pass WINDOW coordinates -- em_right_clicked reports them, and so
+     * does any hit test. Emitted inside a pane, the two disagreed by that
+     * pane's origin and the menu opened down and right of the pointer.
+     * Subtracting the overlay's own resolved origin makes the anchor
+     * window-absolute wherever the menu is emitted. One frame stale, which is
+     * invisible: the menu is not on screen the frame it opens. */
+    float ovx = 0, ovy = 0, ovw, ovh;
+    if (!ui_open_rect(&ovx, &ovy, &ovw, &ovh)) { ovx = 0; ovy = 0; }
     /* drop-in motion: the panel fades in while settling down its last 8px.
      * Keyed on WHICH menu is open, so switching between menus re-plays it;
      * with no clock (host renders) it snaps to settled, like em_nav. */
@@ -2543,7 +2556,7 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
     }
     ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
     ui_set_opacity(mt);
-    ui_set_offset(ax, ay - 8.0f * (1.0f - mt));
+    ui_set_offset(ax - ovx, ay - ovy - 8.0f * (1.0f - mt));
     ui_set_corner_radius(t->radius_md);
     ui_set_shadow(true, t->shadow_lg.dx, t->shadow_lg.dy, t->shadow_lg.blur, t->shadow_lg.color);
     em_glass_apply(12.0f);                 /* blur behind + tint + edge highlight */

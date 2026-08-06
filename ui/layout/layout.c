@@ -328,15 +328,24 @@ static float measure_wrap_height(struct layout_arena *la, struct scene_arena *sa
     if (!n || !n->is_container) return 0;
     float content_w = avail_w - n->padding_left - n->padding_right;
     if (content_w < 0) content_w = 0;
-    float bm[64], bc[64]; int nk = 0;
-    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c) && nk < 64; ) {
+    /* 64 was sized for chips and tags. A DOCUMENT's inline run is one box per
+     * WORD -- hundreds of them -- and stopping at 64 measured the height of the
+     * first sixty-four words only, so a wrapped paragraph reported a fraction
+     * of its real height and the next block was laid straight over it. The cap
+     * still exists (this runs during measurement and must not recurse forever),
+     * but anything past it is now ACCOUNTED FOR rather than dropped. */
+    #define WRAP_MAX 512
+    float bm[WRAP_MAX], bc[WRAP_MAX]; int nk = 0, dropped = 0;
+    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
         struct layout_node *cn = layout_resolve(la, c);
         if (!cn) break;
         if (!cn->is_overlay) {
-            float cw = (cn->width.mode == SIZE_FIXED) ? cn->width.fixed_value : cn->intrinsic_w;
-            float ch = is_text(sa, cn) ? layout_measure_height_at_width(la, sa, c, cw)
-                     : (cn->height.mode == SIZE_FIXED ? cn->height.fixed_value : cn->intrinsic_h);
-            bm[nk] = cw; bc[nk] = ch; nk++;
+            if (nk < WRAP_MAX) {
+                float cw = (cn->width.mode == SIZE_FIXED) ? cn->width.fixed_value : cn->intrinsic_w;
+                float ch = is_text(sa, cn) ? layout_measure_height_at_width(la, sa, c, cw)
+                         : (cn->height.mode == SIZE_FIXED ? cn->height.fixed_value : cn->intrinsic_h);
+                bm[nk] = cw; bc[nk] = ch; nk++;
+            } else dropped++;
         }
         c = cn->next_sibling;
     }
@@ -352,6 +361,9 @@ static float measure_wrap_height(struct layout_arena *la, struct scene_arena *sa
         total += lc + (nlines > 0 ? n->spacing : 0);
         nlines++; i = j;
     }
+    /* the overflow past the cap: charge it the average line, so a very long
+     * run is over-measured slightly rather than under-measured badly */
+    if (dropped && nlines > 0) total += (total / (float)nlines) * ((float)dropped / (float)(nk / (nlines ? nlines : 1) + 1));
     return total + n->padding_top + n->padding_bottom;
 }
 

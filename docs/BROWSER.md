@@ -294,10 +294,18 @@ a browser on your own UI stack:
   content can never overflow, so it never wrapped. Invisible for chips and
   tags, which do not overflow; fatal for inline runs, which exist to. Fixed:
   Flow fills its width, as Grid already did.
-- With wrapping on, a Flow's HEIGHT is still reported as one line, so wrapped
-  paragraphs overlap what follows them. layout.c has `measure_wrap_height` for
-  exactly this; the wrap container is evidently not reaching it. **This is the
-  next thing to fix and it blocks B1 being called done.**
+- With wrapping on, a Flow's HEIGHT is still reported short, so wrapped
+  paragraphs overlap what follows them. **Still open, and two hypotheses are
+  now eliminated:**
+    - *not* `Flow` failing to reach `measure_wrap_height` via the size fix —
+      wrapping itself works, so the wrap path is live;
+    - *not* the 64-child cap in `measure_wrap_height`. Raising it to 512 and
+      accounting for the remainder changed the render not at all.
+  Next step is to MEASURE rather than guess a third time: dump the resolved
+  rect of a wrapped Flow and its parent block and compare against the line
+  count. (The viewport-height bug earlier in this project cost two wrong
+  guesses for exactly the same reason; printing the numbers ended it in one
+  cycle.) **This blocks B1 being called done.**
 
 ## 12. Open questions
 
