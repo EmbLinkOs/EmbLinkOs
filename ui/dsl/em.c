@@ -2329,6 +2329,24 @@ void em_theme_use(EmTheme t) { ui_theme_use_dark(t != Light); }
  * app runtime (host tools set it directly) */
 static float g_vp_w, g_vp_h;
 void  em_set_viewport(float w, float h) { g_vp_w = w; g_vp_h = h; }
+
+/* THE input feed. Every host loop routes its pointer state through here --
+ * em_app_run and the desktop's own loop alike -- because "what the toolkit
+ * needs told each frame" is a fact about the toolkit, not about any one loop.
+ * Two hand-written copies drifted twice: the desktop silently lacked
+ * right-button delivery (context menus dead) and, before that, viewport
+ * mirroring. One function, one truth. */
+void em_feed_pointer(float x, float y, int left_down, int right_down,
+                     int wheel, int focused) {
+    if (focused) {
+        ui_pointer(x, y, left_down != 0);
+        em_feed_right_button(x, y, right_down != 0);
+        if (wheel) ui_wheel((float)wheel);
+    } else {
+        ui_pointer(-100.0f, -100.0f, false);
+        em_feed_right_button(0, 0, false);
+    }
+}
 float em_viewport_width(void)  { return g_vp_w; }
 float em_viewport_height(void) { return g_vp_h; }
 

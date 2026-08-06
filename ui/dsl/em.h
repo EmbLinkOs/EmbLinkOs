@@ -540,6 +540,10 @@ typedef struct {
 } EmApp;
 
 void  em_set_viewport(float w, float h);   /* the app runtime feeds this */
+/* Feed one frame of pointer state to the toolkit (pointer + right button +
+ * wheel). Any loop that is not em_app_run MUST call this -- see em.c. */
+void  em_feed_pointer(float x, float y, int left_down, int right_down,
+                      int wheel, int focused);
 void  em_window_blur_rect(int x, int y, int w, int h);  /* frost behind a sub-rect */
 float em_viewport_width(void);
 float em_viewport_height(void);

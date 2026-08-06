@@ -790,6 +790,11 @@ int main(int argc, char **argv, char **envp) {
         return 1;
     }
     g_sw = (float)sw; g_sh = (float)sh;   /* home_ui sizes the Screen to these */
+    /* ...and TELL THE TOOLKIT, which em_app_run would have done for us. em
+     * sizes popover dismiss-scrims to the viewport, so an unset one leaves a
+     * 0x0 scrim: the context menu would open and then refuse to be dismissed
+     * by clicking away from it. */
+    em_set_viewport(g_sw, g_sh);
     /* Restore where the user last left each icon. Must run AFTER the screen
      * size is known: the loader clamps every position into the work area, and
      * clamping against a 0x0 screen would collapse the whole desktop into one
@@ -812,17 +817,12 @@ int main(int argc, char **argv, char **envp) {
         /* pointer: the compositor routes the desktop's content-local mouse to us */
         struct embk_win_input in;
         embk_win_input(&in);
-        if (in.focused) {
-            ui_pointer((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_LEFT) != 0);
-            /* home runs its OWN loop rather than em_app_run, so it must feed
-             * the right button itself -- em's context-menu machinery listens
-             * here and nowhere else. */
-            em_feed_right_button((float)in.x, (float)in.y,
-                                 (in.buttons & EMBK_MOUSE_RIGHT) != 0);
-        } else {
-            ui_pointer(-100.0f, -100.0f, false);
-            em_feed_right_button(0, 0, false);
-        }
+        /* the SAME feed em_app_run uses -- home has its own loop (it owns the
+         * back-pinned desktop layer, which the app runtime does not create),
+         * but it must never have its own idea of what the toolkit needs. */
+        em_feed_pointer((float)in.x, (float)in.y,
+                        in.buttons & EMBK_MOUSE_LEFT, in.buttons & EMBK_MOUSE_RIGHT,
+                        in.wheel, in.focused);
 
         /* live uptime clock in the header */
         uint64_t secs = embk_uptime_ms() / 1000;

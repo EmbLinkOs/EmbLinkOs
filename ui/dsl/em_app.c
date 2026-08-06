@@ -258,14 +258,9 @@ int em_app_run(const EmApp *app) {
                     em_overlay_active() || win_moved;
         if (!build) { embk_sleep_ms(pace); continue; }
 
-        if (in.focused) {
-            ui_pointer((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_LEFT) != 0);
-            em_feed_right_button((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_RIGHT) != 0);
-            if (in.wheel) ui_wheel((float)in.wheel);
-        } else {
-            ui_pointer(-100.0f, -100.0f, false);
-            em_feed_right_button(0, 0, false);
-        }
+        em_feed_pointer((float)in.x, (float)in.y,
+                        in.buttons & EMBK_MOUSE_LEFT, in.buttons & EMBK_MOUSE_RIGHT,
+                        in.wheel, in.focused);
 
         /* full clear+repaint on structural frames (epoch bump / first), and while
          * a close pull animates (the fade/slide moves the whole window, which the
