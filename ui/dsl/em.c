@@ -1104,6 +1104,42 @@ void em_windowbar_(const char *title, EmProps p) {
 }
 void em_windowbar_end_(void) { em_flush(); ui_end_stack(); }
 
+/* The standard application title bar (see em.h). Deliberately NOT a variant of
+ * WindowBar: WindowBar is the general "put what you like in a bar" container,
+ * while this one is a house style with opinions -- lights leading in Mac
+ * order, a centred title, a hairline under it -- and the point of a house
+ * style is that apps do not get to disagree about it. */
+void em_appbar_(const char *title, EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    ui_begin_hstack(0);                              /* the bar */
+    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface_alt));
+    ui_set_padding(t->sp2, t->sp3, t->sp2, t->sp2);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp2);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_set_border(0, t->border);
+    em_apply_box(p);
+
+    /* the lights, leading */
+    em_close_button(); em_flush();
+    em_min_button();   em_flush();
+
+    /* Title, centred in whatever space is left between the lights and the
+     * app's own controls, and the drag zone at the same time -- so the bar is
+     * grabbable everywhere a control is not. */
+    ui_begin_hstack(0);
+    ui_open();
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    ui_set_spacing(t->sp2);
+    em_window_drag_();
+    { EmProps tp = { .font = BodyBold, .color = t->text }; em_text_impl(title && title[0] ? title : " ", tp); }
+    ui_end_stack();
+}
+void em_appbar_end_(void) { em_flush(); ui_end_stack(); }
+
 /* DragHandle: a placeable draggable strip -- press-and-move anywhere on it drags
  * the bound window (like WindowBar's zone, but the app positions it: e.g. the
  * empty middle of a menu bar). Grows by default; put controls to either side. */

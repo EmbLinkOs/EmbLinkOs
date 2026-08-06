@@ -60,6 +60,7 @@ static void apply_metrics(struct ui_theme *t) {
 }
 
 static struct ui_theme g_current;
+static bool g_dark_pref = true;
 static bool g_init;
 static uint32_t g_font_regular, g_font_bold;
 
@@ -75,7 +76,26 @@ const struct ui_theme *ui_theme(void) {
     if (!g_init) rebuild(false);
     return &g_current;
 }
-void ui_theme_use_dark(bool dark) { rebuild(dark); }
+void ui_theme_use_dark(bool dark) { g_dark_pref = dark; rebuild(dark); }
+
+/* Re-tint the accent without touching anything else. The accent is the one
+ * place the design spends boldness, so it is also the one thing worth letting
+ * a user choose -- and choosing it must not mean editing a palette. The three
+ * derived tones move with it (hover brighter, soft as a low-alpha wash, and
+ * the ink that goes ON the accent), because a user picking "Teal" is not
+ * volunteering to pick four colours that agree. */
+void ui_theme_set_accent(struct color c) {
+    g_current.accent = c;
+    g_current.accent_hover = (struct color){ c.r + (1.f - c.r) * 0.18f,
+                                             c.g + (1.f - c.g) * 0.18f,
+                                             c.b + (1.f - c.b) * 0.18f, c.a };
+    g_current.accent_soft  = (struct color){ c.r, c.g, c.b, 0.18f };
+    /* white on a dark accent, near-black on a light one -- luminance decides,
+     * not taste */
+    float l = c.r * 0.2126f + c.g * 0.7152f + c.b * 0.0722f;
+    g_current.on_accent = l > 0.62f ? (struct color){ 0.08f, 0.08f, 0.09f, 1.f }
+                                    : (struct color){ 1.f, 1.f, 1.f, 1.f };
+}
 void ui_theme_set_fonts(uint32_t regular, uint32_t bold) {
     g_font_regular = regular; g_font_bold = bold;
     if (!g_init) rebuild(false);

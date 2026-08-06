@@ -21,6 +21,7 @@
 #include <stdbool.h>
 
 #include "embk.h"
+#include "oscfg.h"   /* the user's preferences apply to every app */
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
@@ -93,6 +94,15 @@ int em_app_run(const EmApp *app) {
     struct layout_arena la; layout_arena_init(&la);
     ui_theme_set_fonts(fr, fr);
     em_theme_use(app->theme);
+    /* Then let the USER's preferences win over the app's declared default.
+     * Doing it here, once, is what makes a settings app real: an application
+     * does not opt in to being themed, it simply is -- the alternative is
+     * every app remembering to read a config file, which means most of them
+     * won't and the desktop is inconsistent by default. */
+    { struct oscfg cfg; oscfg_load(&cfg);
+      ui_theme_use_dark(cfg.dark != 0);
+      const struct oscfg_accent *a = &oscfg_accents[cfg.accent];
+      ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f }); }
     ui_init(&sa, &la);
     em_set_clock(embk_uptime_ms);
 

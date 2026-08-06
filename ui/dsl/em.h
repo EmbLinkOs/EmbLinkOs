@@ -302,6 +302,20 @@ void em_window_(const char *title, EmProps p);
 void em_window_end_(void);
 void em_windowbar_(const char *title, EmProps p);
 void em_windowbar_end_(void);
+/* AppBar -- the standard chrome for an OS application window. One definition
+ * so Files, Settings and the Terminal are visibly the same product: traffic
+ * lights leading (close, then minimize, Mac order), the title centred in the
+ * space between, and whatever the app puts in the scope trailing. The whole
+ * bar is a drag zone except where a control sits.
+ *
+ *     Window("Files") {
+ *         AppBar("Files") { SearchField(q, sizeof q, "Search"); }
+ *         Split(220) { Sidebar() {...} Content() {...} }
+ *     }                                                                      */
+#define AppBar(title, ...)  EM_SCOPE_(em_appbar_((title), (EmProps){__VA_ARGS__}), em_appbar_end_())
+void em_appbar_(const char *title, EmProps p);
+void em_appbar_end_(void);
+
 #define CloseButton(...)  em_close_button()
 EmV  em_close_button(void);            /* modern single round close control; chainable (.clicked()) */
 int  em_window_closed(void);           /* 1 if the built-in CloseButton fired this frame */

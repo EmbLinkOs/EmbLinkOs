@@ -19,6 +19,7 @@
 #include <time.h>
 
 #include "embk.h"
+#include "oscfg.h"   /* the user's dock preferences, re-read live */
 #include "kit.h"
 #include "ui.h"
 #include "em.h"
@@ -88,10 +89,11 @@ static int g_desk_n = 1;
  * dragged in / shrinks as they are dragged out, but never below DOCK_MIN. */
 #define DOCK_MIN 2
 static struct app_item g_dock[16] = {
-    { "/system/images/file.eic",    "Files",    "/data/apps/files/files.elf", 0 },
-    { "/system/images/terminal.eic", "Terminal", "/data/apps/term/term.elf",   0 },
+    { "/system/images/file.eic",     "Files",    "/data/apps/files/files.elf",       0 },
+    { "/system/images/terminal.eic", "Terminal", "/data/apps/term/term.elf",         0 },
+    { "/system/images/setting.eic",  "Settings", "/data/apps/settings/settings.elf", 0 },
 };
-static int g_dock_n = 2;
+static int g_dock_n = 3;
 
 /* Fill an item's icon+label from the app's OWN presentation manifest at
  * /data/apps/<name>/<name>.app ("name X" / "icon Y" lines) -- so the desktop
@@ -263,15 +265,38 @@ static int dock_running(const char *path);   /* below, with g_running */
  * LAST frame's dock rect (one-frame-stale geometry is invisible at pointer
  * speeds) and stands down entirely during a drag, where a chip swelling
  * under the ghost would fight the gesture. */
-#define DOCK_BASE 38.0f
-#define DOCK_PEAK 58.0f
+/* The dock's base size is a PREFERENCE, not a constant: Settings writes it and
+ * the desktop re-reads it about once a second, so the dock changes under the
+ * slider instead of after a reboot. Peak follows base by the same ratio the
+ * magnifier was tuned at, so choosing a bigger dock does not also flatten the
+ * magnification. */
+static struct oscfg g_cfg;
+static uint64_t     g_cfg_next = 0;
+static void cfg_poll(void) {
+    uint64_t now = embk_uptime_ms();
+    if (now < g_cfg_next) return;
+    g_cfg_next = now + 1000;
+    struct oscfg was = g_cfg;
+    oscfg_load(&g_cfg);
+    /* The shell wears the preference too, and live. em_app_run applies it once
+     * at launch for ordinary applications; the desktop never exits, so if it
+     * only read the file at startup then changing the accent would recolour
+     * every window EXCEPT the one always on screen. */
+    if (g_cfg.accent != was.accent || g_cfg.dark != was.dark) {
+        ui_theme_use_dark(g_cfg.dark != 0);
+        const struct oscfg_accent *a = &oscfg_accents[g_cfg.accent];
+        ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f });
+    }
+}
+#define DOCK_BASE ((float)g_cfg.dock_size)
+#define DOCK_PEAK (DOCK_BASE * 1.53f)
 /* Dock band geometry. These were implicit and they DISAGREED: the row reserved
  * 64px while the pill inside it was 70 tall, so the pill overflowed its row
  * and the last 6px -- its bottom edge and rounded corners -- fell off the
  * bottom of the screen. One set of constants now, and the band is the pill
  * PLUS a gap, because a dock that touches the screen edge is a taskbar; the
  * gap is what makes it read as floating. */
-#define DOCK_PILL_H 70.0f
+#define DOCK_PILL_H (DOCK_BASE + 32.0f)
 #define DOCK_GAP    14.0f
 #define DOCK_BAND   (DOCK_PILL_H + DOCK_GAP)
 #define BAR_RESERVE 26.0f      /* must match topbar.c's BAR_H */
@@ -368,7 +393,7 @@ static void dock_pill(void) {
                  * mechanism as the V6 menu smear -- a reused instance retains
                  * every prop the new state fails to set. PAINT_NONE is how you
                  * say "no fill" and mean it. */
-                int running = dock_running(g_dock[i].app);
+                int running = g_cfg.dock_dots && dock_running(g_dock[i].app);
                 em_flush();
                 ui_begin_hstack(0xD07);
                 ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 4 },
@@ -912,6 +937,7 @@ int main(int argc, char **argv, char **envp) {
     embk_puts(1, "home: desktop ready\n");
 
     for (;;) {
+        cfg_poll();            /* dock size / indicator, as Settings left them */
         poll_apps_request();   /* the top bar's Apps button opens our launcher */
 
         /* pointer: the compositor routes the desktop's content-local mouse to us */

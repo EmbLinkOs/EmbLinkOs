@@ -65,5 +65,7 @@ void ui_theme_use_dark(bool dark);
 
 /* Register the loaded font handles the kit uses for regular vs. bold text. */
 void ui_theme_set_fonts(uint32_t regular, uint32_t bold);
+/* Re-tint the accent (and its derived hover/soft/on-accent tones) at runtime. */
+void ui_theme_set_accent(struct color c);
 
 #endif /* __EMBLINK_UI_THEME_H__ */
