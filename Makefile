@@ -1015,6 +1015,17 @@ build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $< \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
+# home links one thing the generic rule does not: the shared reader for an
+# app's declared authority (user/lib/appauth.c). An explicit rule beats the
+# pattern rule, so this is the whole override.
+build/appauth.o: user/lib/appauth.c user/lib/appauth.h user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+
+build/home.elf: build/home.o build/appauth.o build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o \
+	    build/home.o build/appauth.o \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
 # Build every discovered app.
 emui-apps: $(EMUI_APPS)
 	@echo "EmUI apps: $(notdir $(EMUI_APPS))"
@@ -1231,7 +1242,7 @@ $(ICONS_STAMP): tools/mkicons.py $(ICON_DIRS) $(ICON_MASTERS) $(ICON_LEGACY)
 .PHONY: icons
 icons: $(ICONS_STAMP)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.app) $(ICONS_STAMP)
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is

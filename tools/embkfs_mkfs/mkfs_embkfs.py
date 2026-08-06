@@ -744,6 +744,15 @@ def discover_userland_objects(build_dir="build"):
         if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
             dest = f"data/apps/{base}/{base}.ns".encode()
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
+        # Per-app CAPABILITY MANIFEST: the other half of the same declaration
+        # (user/lib/appauth.h). <name>.caps names the capability CLASSES the app
+        # needs -- what it may DO, where the .ns says what it may NAME. The
+        # session grants exactly that; the kernel refuses any mask that is not a
+        # subset of the grantor's, so the file can only ever narrow.
+        capm = _read_file(f"user/bin/{base}.caps")
+        if capm is not None and _elf_dest(name).startswith(b"data/apps/"):
+            dest = f"data/apps/{base}/{base}.caps".encode()
+            objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, capm))
         # Per-app PRESENTATION MANIFEST: an app describes itself (display name +
         # icon) in user/bin/<name>.app, packed as /data/apps/<name>/<name>.app.
         # The desktop reads it instead of hard-coding each app's name and icon.

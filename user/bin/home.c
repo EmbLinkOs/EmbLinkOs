@@ -19,6 +19,7 @@
 #include <time.h>
 
 #include "embk.h"
+#include "appauth.h"
 #include "oscfg.h"   /* the user's dock preferences, re-read live */
 #include "kit.h"
 #include "ui.h"
@@ -747,63 +748,12 @@ static int dock_running(const char *path) {
     return 0;
 }
 
-/* An app DECLARES its namespace needs in /data/apps/<name>/<name>.ns (shipped in
- * its package -- docs/USERSPACE_v2.md UP4). As the session, home reads that
- * manifest and grants the child EXACTLY those bindings, so an app runs with only
- * the subtrees it named -- naming is owning. Each line is "<ro|rw> <prefix>";
- * '#' comments and blanks are ignored. Parse into NS_BIND spawn actions; return
- * the count (0 = no manifest => the child inherits our full view, the pre-UP4
- * default, so un-manifested apps are unaffected). `desc` gets a short summary. */
+/* An app declares the authority it needs in two sidecars beside its binary --
+ * <name>.ns (what it may NAME) and <name>.caps (what it may DO). The parsing
+ * lives in user/lib/appauth.c because reading an app's declaration is not the
+ * desktop's business specifically; any launcher asks the same question.
+ * See docs/USERSPACE_v2.md UP4. */
 #define NS_ACTS_MAX 8
-static int load_app_ns(const char *elf_path,
-                       struct embk_spawn_file_action *acts, int max,
-                       char *desc, size_t desc_cap) {
-    char mpath[256];
-    size_t L = strlen(elf_path);
-    if (L < 5 || L >= sizeof mpath) return 0;
-    memcpy(mpath, elf_path, L + 1);
-    if (strcmp(mpath + L - 4, ".elf") != 0) return 0;   /* only "<...>.elf" */
-    mpath[L - 3] = 'n'; mpath[L - 2] = 's'; mpath[L - 1] = 0;   /* ".elf" -> ".ns" */
-
-    size_t len = 0;
-    uint8_t *buf = read_file(mpath, &len);
-    if (!buf) return 0;
-    if (!len) { free(buf); return 0; }
-
-    int n = 0; size_t dn = 0;
-    if (desc_cap) desc[0] = 0;
-    for (size_t i = 0; i < len && n < max; ) {
-        while (i < len && (buf[i]==' '||buf[i]=='\t'||buf[i]=='\r'||buf[i]=='\n')) i++;
-        if (i >= len) break;
-        if (buf[i] == '#') { while (i < len && buf[i] != '\n') i++; continue; }
-
-        size_t ms = i;
-        while (i < len && buf[i]!=' ' && buf[i]!='\t' && buf[i]!='\n' && buf[i]!='\r') i++;
-        size_t mlen = i - ms;
-        int mode;
-        if      (mlen==2 && buf[ms]=='r' && buf[ms+1]=='o') mode = EMBK_NS_RO;
-        else if (mlen==2 && buf[ms]=='r' && buf[ms+1]=='w') mode = EMBK_NS_RW;
-        else { while (i < len && buf[i] != '\n') i++; continue; }   /* bad mode */
-
-        while (i < len && (buf[i]==' '||buf[i]=='\t')) i++;
-        size_t ps = i;
-        while (i < len && buf[i]!=' ' && buf[i]!='\t' && buf[i]!='\n' && buf[i]!='\r') i++;
-        size_t plen = i - ps;
-        if (plen == 0 || buf[ps] != '/' || plen > 255) { while (i<len && buf[i]!='\n') i++; continue; }
-
-        char prefix[256];
-        memcpy(prefix, buf + ps, plen); prefix[plen] = 0;
-        embk_action_ns_bind(&acts[n], prefix, mode);
-        if (desc_cap && dn + plen + 6 < desc_cap) {
-            if (dn) { desc[dn++]=','; desc[dn++]=' '; }
-            desc[dn++]='r'; desc[dn++]=(mode==EMBK_NS_RO)?'o':'w'; desc[dn++]=' ';
-            memcpy(desc+dn, prefix, plen); dn += plen; desc[dn]=0;
-        }
-        n++;
-    }
-    free(buf);
-    return n;
-}
 
 static void spawn_app(const char *path, const char *start_dir) {
     const char *sd = start_dir ? start_dir : "";
@@ -852,9 +802,23 @@ static void spawn_app(const char *path, const char *start_dir) {
 
     /* Grant the child EXACTLY its declared namespace (UP4); no manifest => it
      * inherits our full view. */
-    struct embk_spawn_file_action acts[NS_ACTS_MAX];
-    char nsdesc[224];
-    int nacts = load_app_ns(path, acts, NS_ACTS_MAX, nsdesc, sizeof nsdesc);
+    struct embk_spawn_file_action acts[NS_ACTS_MAX + 1];
+    char nsdesc[224], capdesc[128];
+    int nacts = appauth_load_ns(path, acts, NS_ACTS_MAX, nsdesc, sizeof nsdesc);
+
+    /* ...and the capability half of the same declaration. A SET_CAPS action
+     * goes FIRST so the log reads in the order authority is decided, though the
+     * kernel applies each action independently. An app with no .caps inherits
+     * ours, exactly as an app with no .ns inherits our namespace -- silence is
+     * the pre-manifest behaviour, and only a manifest can narrow. */
+    unsigned capmask = 0;
+    int have_caps = appauth_load_caps(path, &capmask, capdesc, sizeof capdesc);
+    if (have_caps && nacts < NS_ACTS_MAX + 1) {
+        /* shift the ns binds along to keep SET_CAPS first */
+        for (int k = nacts; k > 0; k--) acts[k] = acts[k - 1];
+        embk_action_set_caps(&acts[0], capmask);
+        nacts++;
+    }
 
     char *argv[] = { (char *)path, NULL };
     char file_path_env[640];
@@ -873,10 +837,13 @@ static void spawn_app(const char *path, const char *start_dir) {
     }
     int h = (int)embk_spawn_env(path, argv, env, nacts ? acts : NULL, nacts);
 
-    char b[320];
-    if (nacts) snprintf(b, sizeof b, "home: spawn %s -> ns[%s] (%d bind%s)\n",
-                        path, nsdesc, nacts, nacts == 1 ? "" : "s");
-    else       snprintf(b, sizeof b, "home: spawn %s -> full inherit (no manifest)\n", path);
+    char b[448];
+    int binds = nacts - (have_caps ? 1 : 0);
+    if (binds || have_caps)
+        snprintf(b, sizeof b, "home: spawn %s -> ns[%s] caps[%s]\n", path,
+                 binds ? nsdesc : "inherit", have_caps ? capdesc : "inherit");
+    else
+        snprintf(b, sizeof b, "home: spawn %s -> full inherit (no manifest)\n", path);
     embk_puts(1, b);
 
     if (h >= 0) {

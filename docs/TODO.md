@@ -1982,11 +1982,17 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       function (`fetch_local` in user/bin/vellum.c) plus a planned
       `user/web/net.c`; everything above and below it stays put. Needs http://
       over our own TCP and https:// over our own TLS 1.3.
-- [ ] **Capabilities for a GUI app.** Vellum will need CAP_NETWORK, and `home`
-      currently grants a fixed set. Apps already declare their NAMESPACE via a
-      `<name>.ns` sidecar; capabilities want the same treatment (a `.caps`
-      sidecar, or a field in the existing manifest) so an app declares what it
-      needs instead of the launcher hard-coding it.
+- [x] ~~**Capabilities for a GUI app.**~~ DONE 2026-08-07: `<name>.caps`
+      sidecar, parsed with the `.ns` one by `user/lib/appauth.{c,h}`
+      (docs/USERSPACE_v2.md UP5). Vellum is born holding exactly
+      {filesystem, network, gpu}.
+- [ ] Only `home` reads the sidecars. The shell spawns apps too and grants
+      whatever it holds; it should ask `appauth` the same question.
+- [ ] An EMBX binary should carry its declaration inline (a section beside its
+      capability table) instead of as a sidecar file -- the carrier note in
+      USERSPACE_v2 UP4. Sidecars are the ELF-shaped answer.
+- [ ] Nothing tells the USER what an app asked for. The launcher knows the mask
+      at spawn time and could show it, which is the point of declaring it.
 - [ ] No CSS. `struct vstyle` is filled by a user-agent stylesheet; a real
       cascade fills the same struct and touches nothing else (docs/BROWSER.md
       §4). No JS, no images, no tables, no forms -- all deliberate, see §5.

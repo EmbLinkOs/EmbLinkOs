@@ -210,6 +210,35 @@ Every existing app assumes the global `/` (home reads `/font.ttf`, spawns
   declaration as an inline section beside its capability table — future, and
   EmbCC-side.)
 
+- **UP5 — declared capabilities. ✅ SHIPPED (2026-08-07).** The other half of
+  the same idea, and the half that completes "permission = nameable AND
+  capable": an app also ships what it may *do*, as `user/bin/<name>.caps` →
+  `/data/apps/<name>/<name>.caps`, one capability class per line
+  (`filesystem network gpu audio camera usb serial rawdisk kernel_ext debug`,
+  or the single word `none`). The session reads it and grants exactly that mask
+  via the existing SET_CAPS spawn action, which the kernel already refuses to
+  widen beyond the grantor's own set (`test spawncaps`). No manifest => inherit,
+  the same rule the `.ns` sidecar uses, so nothing un-manifested changes.
+
+  Both sidecars are parsed by `user/lib/appauth.{c,h}` rather than inside the
+  desktop, because "what has this app declared?" is a question any launcher
+  asks, not the desktop's private business.
+
+  Shipped: `vellum.caps` = `filesystem network gpu` — a browser is the most
+  exposed program on the machine, so it holds three classes and no others; a
+  bug in its HTML parser cannot reach a device that was never granted.
+  `files.caps` = `filesystem gpu` — the file manager has no business on the
+  network. Proven live: home logs
+  `spawn …/vellum.elf -> ns[inherit] caps[filesystem, network, gpu]` and Vellum
+  then runs and renders, while an app with no manifest logs `caps[inherit]`.
+
+  Two traps worth recording. A window is a GPU resource (`sys_win_create` gates
+  on `EMBK_CAP_GPU`), so any GUI app's manifest must say `gpu` or it launches
+  and cannot draw. And a `.caps` containing only comments must NOT mean the
+  empty set — someone documenting why an app is unrestricted would otherwise
+  silently strip it of everything; saying "I need nothing" requires the word
+  `none`.
+
 ## 9. What we deliberately do NOT do (it's our OS)
 
 - **No uid/gid, no `rwx`/`chmod`, no ACLs.** Authority is names + caps.

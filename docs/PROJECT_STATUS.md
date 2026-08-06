@@ -1045,6 +1045,14 @@ URL bar, back/forward, clickable links, a status line. The renderer reads only
 `struct vstyle` and never a tag name, so real CSS changes how that struct is
 FILLED and nothing else.
 
+An app now also DECLARES the capability classes it needs, in a `<name>.caps`
+sidecar parsed alongside the `<name>.ns` one by `user/lib/appauth.{c,h}` -- the
+capable half of "permission = nameable AND capable" (docs/USERSPACE_v2.md UP5).
+Vellum is born holding exactly {filesystem, network, gpu} and nothing else: no
+audio, camera, USB, raw disk, kernel extension or debug. A bug in its HTML
+parser cannot reach a device that was never granted. No manifest still means
+inherit, so nothing un-declared changed.
+
 Not yet on the network -- B1 loads documents from EMBKFS; the fetch seam is one
 function (`docs/BROWSER.md` §11). Two toolkit bugs and one layout-engine bug
 were found by building it, all fixed and locked by host tests; a wrap row is
