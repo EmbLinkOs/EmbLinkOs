@@ -511,6 +511,21 @@ build/nbsock.o: user/bin/nbsock.c user/lib/sys/socket.h user/lib/netdb.h | $(BUI
 build/nbsock.elf: build/crt0.o build/syscalls.o build/nbsock.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/nbsock.o -lc -lgcc -o $@
 
+# Vellum -- the browser (docs/BROWSER.md). user/web/ = the engine: html (the
+# parser), style (the user-agent stylesheet), render (document -> EmUI).
+build/web_html.o: user/web/html.c user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_style.o: user/web/style.c user/web/style.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -c $< -o $@
+build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/render.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -c $< -o $@
+VELLUM_OBJS := build/vellum.o build/web_html.o build/web_style.o build/web_render.o
+build/vellum.elf: build/crt0.o build/syscalls.o $(VELLUM_OBJS) build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $(VELLUM_OBJS) \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
 # httpd -- the M5 server witness: an on-OS HTTP server (bind/listen/accept over
 # the native socket syscalls). `test httpd` spawns it; the host curls it via a
 # SLIRP hostfwd. Auto-discovered by mkfs.
@@ -981,7 +996,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/vellum.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit

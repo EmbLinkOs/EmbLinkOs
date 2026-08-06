@@ -1,0 +1,4 @@
+# Vellum inherits the session namespace: it needs to READ /system (its font and
+# its built-in documents) and nothing more in this milestone. When it gains a
+# network it will still not need a wider namespace -- a browser that cannot
+# write to the filesystem is a browser whose bugs cannot cost you a file.

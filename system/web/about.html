@@ -1,0 +1,18 @@
+<!doctype html>
+<html><head><title>About</title></head><body>
+<h1>About Vellum</h1>
+<p>Vellum is the surface a document is written on. The name commits this to
+being a <b>reader</b> rather than implying a browser that will one day run web
+applications.</p>
+<h2>The pipeline</h2>
+<ol>
+<li>fetch &mdash; bytes, from the filesystem now and over TCP and TLS next</li>
+<li>parse &mdash; HTML into a document tree, from bounded arenas</li>
+<li>style &mdash; a computed style per node, never mutating the tree</li>
+<li>layout and paint &mdash; EmUI, which already knows how to wrap text</li>
+</ol>
+<p>The seam between styling and layout is the important one: layout reads only a
+computed style and never a tag name, so when CSS arrives the layout stage does
+not change at all.</p>
+<p><a href="/system/web/index.html">Back to the start page</a></p>
+</body></html>

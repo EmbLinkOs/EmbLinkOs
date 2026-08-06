@@ -184,7 +184,10 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
             size_t a = 0, b = tn;                                            \
             /* only the FIRST run in a parent loses its leading space; the    \
              * trailing one is trimmed when the parent closes (trim_tail) */  \
-            if (top(&st) < 0 || d->nodes[top(&st)].first_child < 0)           \
+            int pre_ = 0;                                                    \
+            for (int k_ = st.n - 1; k_ >= 0; k_--)                            \
+                if (ieq(d->nodes[st.idx[k_]].tag, "pre")) { pre_ = 1; break; }\
+            if (!pre_ && (top(&st) < 0 || d->nodes[top(&st)].first_child < 0)) \
                 while (a < b && text[a]==' ') a++;                            \
             if (b > a) {                                                     \
                 char *p = str_put(d, text + a, b - a);                       \
@@ -210,9 +213,17 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                     continue;
                 }
             }
+            /* Inside <pre> whitespace IS content: no collapsing, no newline
+             * folding. Everywhere else a run of space is one space, which is
+             * what makes source formatting invisible in the output. */
+            int in_pre = 0;
+            for (int k = st.n - 1; k >= 0; k--)
+                if (ieq(d->nodes[st.idx[k]].tag, "pre")) { in_pre = 1; break; }
             char c = src[i++];
-            if (c == '\n' || c == '\t' || c == '\r') c = ' ';
-            if (c == ' ' && tn && text[tn - 1] == ' ') continue;   /* collapse */
+            if (!in_pre) {
+                if (c == '\n' || c == '\t' || c == '\r') c = ' ';
+                if (c == ' ' && tn && text[tn - 1] == ' ') continue;
+            }
             if (tn + 1 < sizeof text) text[tn++] = c;
             continue;
         }

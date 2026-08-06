@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><title>Vellum</title></head><body>
+<h1>Vellum</h1>
+<p>This page is being read by a browser this operating system wrote for itself.
+The bytes came off <b>EMBKFS</b>, the markup was parsed by
+<code>user/web/html.c</code>, the styling is a user-agent stylesheet in
+<code>style.c</code>, and every word you are looking at was rasterised from a
+TrueType outline by our own font engine.</p>
+
+<h2>What works</h2>
+<ul>
+<li>Headings, paragraphs and <b>bold</b>, <i>italic</i> and <code>monospace</code> runs</li>
+<li>Lists, with text that hangs correctly under itself when it wraps rather than
+sliding back beneath the bullet</li>
+<li>Links you can click &mdash; try <a href="/system/web/about.html">the about page</a></li>
+<li>Character references: &amp; &lt; &gt; &copy; &mdash; and &#65;&#66;&#67;</li>
+</ul>
+
+<h2>Preformatted text</h2>
+<pre>    struct vstyle {
+        unsigned char display;
+        unsigned char size, bold, italic, mono;
+    };</pre>
+
+<h2>What does not</h2>
+<p>No JavaScript and no CSS cascade yet. This is a <i>document</i> browser, and
+the design says so in <code>docs/BROWSER.md</code> rather than discovering it at
+milestone seven.</p>
+<p><a href="/system/web/about.html">About Vellum</a></p>
+</body></html>

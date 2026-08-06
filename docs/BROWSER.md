@@ -278,7 +278,28 @@ document renders and scrolls at a usable speed, everything after is addition.
 
 ---
 
-## 11. Open questions
+## 11. Status
+
+**B1 is rendering.** A document loads from the filesystem, parses, styles and
+paints: headings at three sizes, paragraphs, bulleted lists whose text hangs
+under itself, bold/italic/monospace runs, accent-coloured clickable links,
+`<pre>` with its indentation intact, and character references decoded. The
+status line reports the byte and node count.
+
+Two bugs found in the TOOLKIT on the way, which is the useful part of building
+a browser on your own UI stack:
+
+- `Flow` set `ui_set_wrap(true)` and never set a size, so its width was
+  intrinsic -- the sum of its children -- and a wrap container sized to its
+  content can never overflow, so it never wrapped. Invisible for chips and
+  tags, which do not overflow; fatal for inline runs, which exist to. Fixed:
+  Flow fills its width, as Grid already did.
+- With wrapping on, a Flow's HEIGHT is still reported as one line, so wrapped
+  paragraphs overlap what follows them. layout.c has `measure_wrap_height` for
+  exactly this; the wrap container is evidently not reaching it. **This is the
+  next thing to fix and it blocks B1 being called done.**
+
+## 12. Open questions
 
 Recorded rather than assumed:
 

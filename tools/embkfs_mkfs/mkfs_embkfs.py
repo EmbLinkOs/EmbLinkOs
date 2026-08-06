@@ -837,6 +837,9 @@ def discover_userland_objects(build_dir="build"):
         objects.append((b"system/fonts/mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
     # Sealed visual assets used by full-screen system experiences (login/setup).
     objects.extend(_tree_objects("system/images", b"system/images/", (".ppm", ".pam", ".eic")))
+    # Vellum's built-in documents (docs/BROWSER.md). Sealed with the OS: the
+    # browser must have something to open before it can reach a network.
+    objects.extend(_tree_objects("system/web", b"system/web/", (".html",)))
     # THE ABI, sealed under /system/abi (docs/USERSPACE.md D2 §3.1): crt0.o
     # (_start), syscalls.o (the newlib retargeting layer) and libc.a ARE the
     # definition of "targeting EmbLinkOS". tcc READS them (read-only reach into

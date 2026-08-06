@@ -184,7 +184,17 @@ void em_flush(void);
 void em_vstack_(EmProps p) { em_flush(); ui_begin_vstack(0); em_apply_box(p); }
 void em_hstack_(EmProps p) { em_flush(); ui_begin_hstack(0); if (!p.align) ui_set_align(ALIGN_CENTER); em_apply_box(p); }
 /* Flow: a horizontal stack whose children wrap onto new lines (flex-wrap). */
-void em_flow_(EmProps p)   { em_flush(); ui_begin_hstack(0); ui_set_wrap(true); if (!p.align) ui_set_align(ALIGN_START); em_apply_box(p); }
+/* Flow FILLS its width, like Grid right below it. A wrap container sized to
+ * its content has nothing to wrap against -- the sum of the children IS its
+ * width, so the overflow that would cause a line break can never happen. It
+ * looked fine for chips and tags, which never overflow; the browser's inline
+ * runs, which exist to overflow, ran off the edge of the page. */
+void em_flow_(EmProps p)   {
+    em_flush(); ui_begin_hstack(0); ui_set_wrap(true);
+    if (!p.align) ui_set_align(ALIGN_START);
+    em_apply_box(p);
+    if (p.width <= 0 && !p.grow) ui_set_size(sz_grow(), sz_intrinsic());
+}
 /* Grid: N equal columns, children auto-flow with optional .span; fills width. */
 void em_grid_(int cols, EmProps p) {
     em_flush();
