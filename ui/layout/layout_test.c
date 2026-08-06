@@ -187,6 +187,9 @@ static void t3c_nested_wrap(uint32_t fh) {
 
     struct layout_handle root = mk(LAYOUT_HANDLE_NULL, NODE_HANDLE_NULL, SCENE_NODE_GROUP, 0);
     L(root)->is_container = true; L(root)->axis = AXIS_COLUMN; L(root)->align = ALIGN_STRETCH;
+    /* the ScrollView: a FIXED height far taller than the content, which is the
+     * one thing the browser's chain has that this test did not */
+    L(root)->height = (struct layout_size){ SIZE_FIXED, 400, 0,0,0 };
 
     /* four nested columns, as document/html/body/p are */
     struct layout_handle a = root, lev[3];
@@ -218,8 +221,19 @@ static void t3c_nested_wrap(uint32_t fh) {
       struct layout_handle lt = mk(lb, NODE_HANDLE_NULL, SCENE_NODE_TEXT, &sl);
       scene_set_text(&SA, sl, "aa ", fh, 20.0f, black); (void)lt; }
 
+    /* a heading AFTER the paragraph -- the thing that was being overdrawn */
+    struct layout_handle nxt = mk(L(lev[2])->parent.index ? lev[1] : lev[1],
+                                  NODE_HANDLE_NULL, SCENE_NODE_GROUP, 0);
+    L(nxt)->is_container = true; L(nxt)->axis = AXIS_COLUMN;
+    { struct node_handle sh;
+      struct layout_handle ht = mk(nxt, NODE_HANDLE_NULL, SCENE_NODE_TEXT, &sh);
+      struct color b2 = {0,0,0,1};
+      scene_set_text(&SA, sh, "heading", fh, 20.0f, b2); (void)ht; }
+
     layout_run(&LA, &SA, root, 100, 400);
     float wrap = L(fl)->resolved_h, blk = L(lev[2])->resolved_h;
+    /* a SIBLING after the paragraph, to see where it actually lands */
+    (void)0;
     int lines = layout_debug_wrap_lines(&LA, &SA, fl, 100.0f);
     printf("       wrap=%.1f  p=%.1f  body=%.1f  html=%.1f\n",
            wrap, blk, L(lev[1])->resolved_h, L(lev[0])->resolved_h);
@@ -230,8 +244,14 @@ static void t3c_nested_wrap(uint32_t fh) {
     CHECK(wrap > 20.0f, "a wrapped row of TEXT is taller than one line");
     CHECK(blk >= wrap && blk <= wrap + 20.0f,
           "the block is its wrap row plus its own margins -- not a multiple");
-    CHECK(L(lev[0])->resolved_h >= wrap && L(lev[0])->resolved_h <= wrap + 24.0f,
-          "and three levels up is still that, not accumulated");
+    /* body now holds the paragraph AND the following heading, so it is taller
+     * by exactly that heading -- still no accumulation of the wrap height */
+    CHECK(L(lev[0])->resolved_h >= blk && L(lev[0])->resolved_h <= blk + 40.0f,
+          "the outer block is the paragraph plus the heading, nothing multiplied");
+    printf("       next-block y=%.1f  (paragraph block ends at %.1f)\n",
+           L(nxt)->resolved_y, L(lev[2])->resolved_y + blk);
+    CHECK(L(nxt)->resolved_y >= L(lev[2])->resolved_y + blk - 0.5f,
+          "the block AFTER the paragraph starts below it -- no overdraw");
     (void)lines;
     layout_arena_destroy(&LA); scene_arena_destroy(&SA);
 }

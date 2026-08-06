@@ -326,14 +326,25 @@ a browser on your own UI stack:
   wrap=80, p=96 (=80 plus its 16px of margins), body=96, html=96. The layout
   engine is cleared for this case.
 
-  So the misplacement is in render.c or the app. The strongest remaining lead:
-  `measure_wrap_height` packs lines using each child's INTRINSIC width, while
-  arrange packs them using RESOLVED widths. Where those disagree the painted
-  line count exceeds the measured one, and a Flow does not clip -- so the extra
-  lines paint straight over the block below while the box itself is the right
-  height. That matches the symptom exactly (correct-looking gaps, content
-  interleaved). Compare the two counts for one paragraph before changing
-  anything. **B1 is not done.**
+  THE ENGINE IS EXONERATED, thoroughly. T3c now reproduces the browser's chain
+  in full -- a fixed-height ScrollView far taller than the content, four nested
+  blocks, words as real text, a padded link button, CSS margins, and a heading
+  AFTER the paragraph -- and everything is correct: wrap=80, p=96, body=116
+  (the paragraph plus that heading), and the following block starts at y=96,
+  exactly where the paragraph ends. No overdraw, no accumulation.
+
+  Theories tested and dead: nesting multiplies (no -- 50/50/50/50); the wrap
+  row grows to fill a taller parent (no -- sz_intrinsic has flex_grow 0); a
+  fixed-height ancestor changes it (no); a following sibling is misplaced (no).
+
+  So the fault is in what render.c EMITS, not in how layout treats it. The
+  symptom in a real render -- three lines of one paragraph at ~130px intervals
+  with a heading and list items drawn BETWEEN them -- is what you get if those
+  lines are not one Flow at all, but several, emitted at different points in
+  the document flow. Next step: dump the tree render.c actually builds for one
+  paragraph (the menurepro host-harness pattern already used for the menu bug)
+  and count the Flows. Stop theorising about layout; look at the emission.
+  **B1 is not done.**
 
 ## 12. Open questions
 
