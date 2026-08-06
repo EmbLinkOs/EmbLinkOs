@@ -85,11 +85,18 @@ static uint32_t   g_top_id  = 0;   /* id of the currently-focused (front) window
 #define CURSOR_DAMAGE_PAD 3
 #define GLASS_BLUR 7        /* backdrop blur radius for glass windows */
 #define GLASS_ALPHA 216     /* window opacity over the frosted backdrop (~85%) */
-#define GLOW_W 20           /* accent halo width around the focused app window */
-#define GLOW_MAX 100        /* peak glow alpha at the window edge (0-255) */
-#define GLOW_R 0x6b
-#define GLOW_G 0x74
-#define GLOW_B 0xf0         /* EmbLink indigo, a touch brighter than the accent */
+/* DROP SHADOW (not a halo): black, offset downward, softer when unfocused.
+ * This is what lifts a window off the wallpaper instead of leaving it a flat
+ * rectangle -- and it carries focus, which the old coloured glow used to do
+ * before it was removed for looking like a screenshot artefact. Depth is the
+ * signal: the front window casts a deeper, wider shadow than the ones behind
+ * it, exactly as stacked paper does. */
+#define SHADOW_W_FOCUS  20  /* band width, focused                          */
+#define SHADOW_W_IDLE   11  /* ...and unfocused: shallower, still grounded  */
+#define SHADOW_A_FOCUS  120 /* peak alpha at the window edge (0-255)        */
+#define SHADOW_A_IDLE    62
+#define SHADOW_DY        5  /* cast DOWNWARD: light comes from above        */
+#define SHADOW_PAD (SHADOW_W_FOCUS + SHADOW_DY + 2)   /* repaint growth     */
 #define WORK_TOP 32         /* universal system/status bar */
 #define WORK_BOTTOM 64      /* desktop taskbar */
 static int      g_cursor_x, g_cursor_y, g_cursor_valid;
@@ -213,13 +220,11 @@ static int imin(int a, int b) { return a < b ? a : b; }
 /* App windows (not the desktop, not widgets, not translucent bars) get the
  * focused-window accent glow. A translucent bar's frame is a tall invisible
  * canvas, so a halo around it would outline empty space -- skip it. */
-static int win_glows(const struct comp_window *w) {
-    /* No focus halo. A coloured glow bleeding out of every window is the one
-     * thing that stops an app looking like a solid object -- it read as a
-     * screenshot artefact rather than chrome. Focus is legible from the title
-     * bar tint; the window itself should just be a clean rectangle. */
-    (void)w;
-    return 0;
+/* Which windows cast one: real app windows. The desktop layer is the ground
+ * itself, widgets are ambient, and a translucent bar's frame is a tall
+ * invisible canvas -- a shadow around any of those would outline empty space. */
+static int win_shadows(const struct comp_window *w) {
+    return w->used && !w->desktop && !w->widget && !w->translucent;
 }
 /* The rect a repaint must cover for a window: its frame, GROWN by the glow band
  * for glow windows so the halo is drawn / erased with the window (else it trails
@@ -227,7 +232,12 @@ static int win_glows(const struct comp_window *w) {
 static void win_repaint_rect(const struct comp_window *w,
                              int *x0, int *y0, int *x1, int *y1) {
     win_frame_rect(w, x0, y0, x1, y1);
-    if (win_glows(w)) { *x0 -= GLOW_W; *y0 -= GLOW_W; *x1 += GLOW_W; *y1 += GLOW_W; }
+    /* grow by the SHADOW's reach (widest case + its downward offset) so the
+     * shadow is drawn and erased with its window instead of trailing */
+    if (win_shadows(w)) {
+        *x0 -= SHADOW_PAD; *y0 -= SHADOW_PAD;
+        *x1 += SHADOW_PAD; *y1 += SHADOW_PAD;
+    }
 }
 
 /* ---- lookup ------------------------------------------------------------- */
@@ -329,16 +339,21 @@ static void paint_window(struct comp_window *w, int focused,
     win_frame_rect(w, &fx0, &fy0, &fx1, &fy1);
     /* early out if the window (grown by its glow band, when it has one) doesn't
      * touch the region at all */
-    int glow = win_glows(w) && focused;
+    int shadow = win_shadows(w);
     int px0 = fx0, py0 = fy0, px1 = fx1, py1 = fy1;
-    if (glow) { px0 -= GLOW_W; py0 -= GLOW_W; px1 += GLOW_W; py1 += GLOW_W; }
+    if (shadow) {
+        px0 -= SHADOW_PAD; py0 -= SHADOW_PAD; px1 += SHADOW_PAD; py1 += SHADOW_PAD;
+    }
     if (px1 <= rx0 || px0 >= rx1 || py1 <= ry0 || py0 >= ry1) return;
 
-    /* focused-window accent halo: drawn first (outside the frame), so the window
-     * content lands on top of it; clipped to the repaint region. */
-    if (glow)
-        fb_glow_rect(fx0, fy0, fx1, fy1, GLOW_W, GLOW_R, GLOW_G, GLOW_B, GLOW_MAX,
-                     rx0, ry0, rx1, ry1);
+    /* the drop shadow: drawn first (outside the frame) so the window content
+     * lands on top of it, offset downward, and deeper while focused. */
+    if (shadow) {
+        int sw_  = focused ? SHADOW_W_FOCUS : SHADOW_W_IDLE;
+        int sa_  = focused ? SHADOW_A_FOCUS : SHADOW_A_IDLE;
+        fb_glow_rect(fx0, fy0 + SHADOW_DY, fx1, fy1 + SHADOW_DY, sw_,
+                     0, 0, 0, (uint8_t)sa_, rx0, ry0, rx1, ry1);
+    }
 
     int bar_h = win_titlebar_h(w);   /* 0 for the chromeless desktop window */
 
@@ -594,17 +609,19 @@ static void enforce_focus(void) {
     if (nt == g_top_id) return;
     struct comp_window *old = win_by_id(g_top_id);   /* previously focused */
     g_top_id = nt;
-    /* repaint both windows' footprints (grown by the glow band) so the accent
-     * halo follows focus: the old one redraws without it, the new one with it.
+    /* Repaint both windows' footprints (grown by the shadow band) so DEPTH
+     * follows focus: the window losing focus redraws with the shallow shadow,
+     * the one gaining it with the deep one. That difference is now the focus
+     * indicator, so it has to be repainted as carefully as the title tint.
      * paint_titlebar covers the kernel-chrome case; the region repaint covers
-     * chromeless/glass app windows (whose glow lives outside their frame). */
+     * chromeless/glass windows (whose shadow lives outside their frame). */
     if (old && old->visible) {
         paint_titlebar(old);
-        if (win_glows(old)) { int x0, y0, x1, y1; win_repaint_rect(old, &x0, &y0, &x1, &y1); paint_region(x0, y0, x1, y1); }
+        if (win_shadows(old)) { int x0, y0, x1, y1; win_repaint_rect(old, &x0, &y0, &x1, &y1); paint_region(x0, y0, x1, y1); }
     }
     if (top) {
         paint_titlebar(top);
-        if (win_glows(top)) { int x0, y0, x1, y1; win_repaint_rect(top, &x0, &y0, &x1, &y1); paint_region(x0, y0, x1, y1); }
+        if (win_shadows(top)) { int x0, y0, x1, y1; win_repaint_rect(top, &x0, &y0, &x1, &y1); paint_region(x0, y0, x1, y1); }
     }
 }
 
