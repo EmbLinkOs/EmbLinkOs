@@ -1,13 +1,20 @@
-/* topbar.c -- a dynamic, Apple-modern menu bar.
+/* topbar.c -- the system menu bar.
  *
- * A floating GLASS (Acrylic) window shaped like a menu bar:
- *   left  : a leading logo + a File/Edit/View menu bar (V6 menus)
- *   middle: a DRAG HANDLE -- press-and-drag the empty middle to move the bar
- *   right : a DOCK of status chips you drag to reorder / pull out to remove,
- *           a clock, and a PIN button that cycles it between screen anchors.
+ * Modelled on the Mac menu bar, which is a very particular thing: it SPANS the
+ * display, sits flush in the top-left corner with no margin and no rounding,
+ * and is thin. It is part of the screen rather than an object on it. It was
+ * previously a floating rounded 880px pill you could drag around and pin to
+ * anchors -- which is a nice widget, and reads as a widget, which is exactly
+ * what a menu bar must not read as.
  *
- * The bar is not app chrome -- it's a chromeless glass strip. The EM_APPLICATION
- * runtime binds the window so DragHandle moves it and the pin snaps it. */
+ * So: full width, flush, 26px, no corners, no drag, no pin. Left is the
+ * launcher mark then the menus, with the owning app's name BOLD (that weight
+ * difference is how a menu bar says whose menus these are). Right is bare
+ * status glyphs and the clock -- glyphs, not chips: boxing each status item
+ * turned the bar into a row of widgets.
+ *
+ * The window is TRANSLUCENT and only the top strip paints; the rest is
+ * transparent canvas the dropdowns render into. */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -20,31 +27,24 @@
 #include "em.h"
 #include "theme.h"
 
-#define BAR_W 880
+#define BAR_W 1024   /* replaced at startup by the real display width */
 
 /* status-chip ids (icon codepoints); the user reorders / removes these live */
 static int g_items[8] = { IconStar, IconBolt, IconGear, IconHeart };
 static int g_n        = 4;
-static int g_pin      = 1;   /* 0 free, 1 top-center, 2 top-left, 3 top-right */
 
-static void chip(int id) { Icon(id).secondary(); }
-
-/* Snap the bar to a screen anchor (the pin control cycles these). */
-static void snap_to(int anchor) {
-    uint32_t sw = 1024, sh = 768;
-    embk_screen_size(&sw, &sh);
-    int32_t x, y = 6;
-    switch (anchor) {
-        case 1: x = ((int)sw - BAR_W) / 2; break;   /* top center */
-        case 2: x = 10;                    break;   /* top left   */
-        case 3: x = (int)sw - BAR_W - 10;  break;   /* top right  */
-        default: return;                            /* 0 = free (no snap) */
+/* Each status item gets an equal-width slot with the glyph centred in it.
+ * Spacing alone does not do this: glyphs have different widths, so a constant
+ * gap puts their CENTRES at uneven distances and the row reads as drifting.
+ * Fixed slots are what makes a status row look ruled. */
+static void chip(int id) {
+    HStack(.width = 22, .height = 18, .align = Center, .justify = Center) {
+        Icon(id).secondary();
     }
-    em_window_move_to(x, y);
 }
 
 /* Thin like a real menu bar: the strip is chrome, not a panel. */
-#define BAR_H 32
+#define BAR_H 26
 
 /* Live date + time. The bar used to read a hard-coded "9:41" -- Apple's
  * marketing time -- which is exactly the kind of decorative lie the rest of the
@@ -81,7 +81,7 @@ static void bar(void) {
 
     /* park at the top-center the first time we're drawn */
     static int first = 1;
-    if (first) { first = 0; snap_to(1); }
+    if (first) { first = 0; em_window_move_to(0, 0); }   /* flush, like Mac's */
 
     /* The window is TRANSLUCENT (per-pixel transparent, no blur) and grows tall
      * only while a menu is open. So the view fills the whole window, but only
@@ -96,27 +96,25 @@ static void bar(void) {
          * sharp view of the desktop). The fill drops to a tint so the frost
          * reads through: the same material as the dock and the launcher. */
         em_window_blur_rect(0, 0, (int)em_viewport_width(), BAR_H);
-        HStack(.height = BAR_H, .align = Center, .spacing = 8, .px = 10,
-               .background = { .r=.05f, .g=.055f, .b=.075f, .a=.72f },
-               .corner = 16, .border = 1) {
+        /* No corner radius and no border: the bar meets the screen edges, so a
+         * rounded outline would only draw a box around the top of the display. */
+        HStack(.height = BAR_H, .align = Center, .spacing = 6, .px = 8,
+               .background = { .r=.05f, .g=.055f, .b=.075f, .a=.72f }) {
             /* The leading mark IS the Apps launcher button (like a Start menu).
              * Real art rather than a font glyph, but drawn as a STENCIL in the
              * accent colour: it keeps the bar's controls one coherent palette
              * and follows a theme change, which baked-in art could not. */
-            if (ImageButtonTinted("/system/images/launcher.eic", 26, t->accent))
+            if (ImageButtonTinted("/system/images/launcher.eic", 17, t->accent))
                 request_apps();
             MenuBar() {
                 /* Where the bar sits belongs in the system menu, not on the bar.
                  * A visible "pinned"/"free" text button was the one control
                  * shouting its own implementation at the user; a menu bar should
                  * carry menus and status, nothing else. */
-                Menu("EmbLink") {
+                /* BOLD: the leading menu names the application these menus
+                 * belong to, and weight is how a menu bar says so. */
+                Menu("EmbLink", .font = BodyBold) {
                     MenuItem("About EmbLink");
-                    MenuSeparator();
-                    if (MenuItem("Position: Left"))   { g_pin = 2; snap_to(2); }
-                    if (MenuItem("Position: Center")) { g_pin = 1; snap_to(1); }
-                    if (MenuItem("Position: Right"))  { g_pin = 3; snap_to(3); }
-                    if (MenuItem("Position: Free"))   { g_pin = 0; }
                     MenuSeparator();
                     if (MenuItem("Quit")) exit(0);
                 }
@@ -125,20 +123,21 @@ static void bar(void) {
                 Menu("View") { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
             }
 
-            /* the empty middle drags the whole bar -- give it a real height so
-             * it's grabbable (an intrinsic-height empty strip collapses to 0px
-             * and the press falls through, so the drag never starts). */
-            DragHandle(.grow = 1, .height = 22) { }
+            Spacer();   /* the menus sit left, everything else trails right */
 
-            /* status items, then the clock -- the trailing order a menu bar has */
-            Dock(g_items, &g_n, chip);
+            /* status glyphs, then the clock -- the trailing order a menu bar
+             * has. Wider spacing than a toolbar: these are separate readings,
+             * not a group of related controls. */
+            Dock(g_items, &g_n, chip, .spacing = 8);
             Text(bar_clock()).caption();
         }
         Spacer();   /* transparent canvas below the bar -- dropdown room */
     }
 }
 
-EM_APPLICATION {
+/* Not EM_APPLICATION: the bar has to span whatever display it finds, and the
+ * macro's spec is fixed at compile time. Same runtime, one line of setup. */
+static EmApp em_app_spec_ = {
     .title    = "TopBar",
     .size     = { BAR_W, BAR_H },
     .theme    = Dark,
@@ -146,3 +145,11 @@ EM_APPLICATION {
     .material = Translucent,      /* thin transparent bar; grows for dropdowns */
     .view     = bar,
 };
+
+int main(void) {
+    uint32_t sw = 0, sh = 0;
+    embk_screen_size(&sw, &sh);
+    if (sw) em_app_spec_.size.w = (int)sw;    /* a menu bar spans the display */
+    (void)sh;
+    return em_app_run(&em_app_spec_);
+}

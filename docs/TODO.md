@@ -1880,6 +1880,13 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Menus render correctly open+closed (identity fix); launcher/dock/ghost
       unaffected with menus closed.
 
+### Host test rot
+- [ ] `make font-test` does not compile: font_test.c calls `be->draw_text` with
+      8 arguments against the 11-argument backend signature (box_w/box_h/paint
+      were added for gradient + clipped text). Pre-existing -- it fails at HEAD
+      too -- but it means the font suite has not run in a while. The other five
+      suites (scene/layout/backend/declare/reactive) are green.
+
 ### Window motion (shipped 2026-08-06, compositor-side)
 - [ ] Closing animates via a full-window pixel COPY (~1.4MB kmalloc per close;
       the live buffer is freed under the ghost when the process is reaped).

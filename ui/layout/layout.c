@@ -143,10 +143,22 @@ static float text_char_advance(struct font *f, uint32_t cp, float size_px) {
     struct glyph_cache_entry *e = glyph_cache_lookup_or_rasterize(font_global_atlas(), f, cp, size_px);
     return e ? e->advance_px : 0.0f;
 }
-/* one-line, unwrapped pixel width of an ASCII string (Phase-1 text intrinsic). */
+/* One-line, unwrapped pixel width (Phase-1 text intrinsic).
+ *
+ * This MUST step the string the way the renderer does. It used to walk BYTES:
+ * every non-ASCII character -- every icon glyph, every chevron, arrow, accent --
+ * was measured as its 2-4 raw UTF-8 bytes looked up as separate codepoints, so
+ * a single icon measured roughly THREE garbage advances wide while the renderer
+ * drew one glyph. Centring then centred that inflated box, which is why every
+ * icon sat far left inside an oversized button: the button was not too big and
+ * the glyph was not off-centre, the string was measured as the wrong string. */
 static float text_line_width(struct font *f, const char *s, float size_px) {
     float w = 0;
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) w += text_char_advance(f, *p, size_px);
+    for (const char *p = s; *p; ) {
+        uint32_t cp;
+        p += font_utf8_decode(p, &cp);
+        w += text_char_advance(f, cp, size_px);
+    }
     return w;
 }
 static float font_line_height(struct font *f, float size_px) {
@@ -186,7 +198,10 @@ int layout_debug_wrap_lines(struct layout_arena *la, struct scene_arena *sa,
         const unsigned char *w0 = p;
         while (*p && *p != ' ') p++;                     /* word = [w0, p) */
         float word_w = 0;
-        for (const unsigned char *q = w0; q < p; q++) word_w += text_char_advance(f, *q, size);
+        for (const char *q = (const char *)w0; q < (const char *)p; ) {
+            uint32_t cp; q += font_utf8_decode(q, &cp);
+            word_w += text_char_advance(f, cp, size);
+        }
 
         if (word_w <= width) {                           /* whole word fits on a line */
             if (cur == 0) cur = word_w;
@@ -194,8 +209,9 @@ int layout_debug_wrap_lines(struct layout_arena *la, struct scene_arena *sa,
             else { lines++; cur = word_w; }
         } else {                                         /* character-wrap fallback */
             if (cur > 0) { lines++; cur = 0; }
-            for (const unsigned char *q = w0; q < p; q++) {
-                float cw = text_char_advance(f, *q, size);
+            for (const char *q = (const char *)w0; q < (const char *)p; ) {
+                uint32_t cp; q += font_utf8_decode(q, &cp);
+                float cw = text_char_advance(f, cp, size);
                 if (cur == 0) cur = cw;
                 else if (cur + cw <= width) cur += cw;
                 else { lines++; cur = cw; }

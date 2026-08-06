@@ -689,7 +689,13 @@ newlib-based libc port.*
   work happens per frame -- which is why this succeeded where the earlier
   toolkit-side attempt did not. A window is also no longer PAINTED until it has
   presented a real frame, so launching an app no longer parks a black slab on
-  the desktop for the seconds an app takes to render its first frame under TCG. A V4.1 app-runtime
+  the desktop for the seconds an app takes to render its first frame under TCG. The system **menu bar** follows the Mac
+  model literally -- it spans the display, sits flush with no margin or
+  rounding, is 26px, bolds the owning app's name, and carries bare status
+  glyphs in equal-width slots rather than boxed chips; window controls are
+  **traffic lights** (red close, green minimize) whose symbol appears only on
+  hover, drawn as a small dot inside a deliberately larger invisible hit area.
+  A V4.1 app-runtime
   layer (`ui/dsl/em_app.c`, `EM_APPLICATION`/`EM_WIDGET`) collapses what
   used to be ~150 lines of per-app boilerplate (font loading, arena setup,
   window creation, the event loop, dirty-rect presenting, teardown) into

@@ -1118,53 +1118,54 @@ void em_drag_handle_(EmProps p) {
 }
 void em_drag_handle_end_(void) { em_flush(); ui_end_stack(); }
 
-/* A modern single circular close control (no traffic-light trio). Hover tints
- * it danger-red. Chainable: `CloseButton().clicked()`. */
-static bool em_closebtn_impl(bool *out_hov) {
-    const struct ui_theme *t = TH;
+/* ---- window controls: traffic lights ------------------------------------ *
+ * Colour IS the affordance, which is the whole point of the Mac design: red
+ * means this window goes away, green means it comes back. That reads instantly
+ * and at any size, where two identical grey pills distinguished only by a tiny
+ * glyph do not -- you had to look at the symbol to know which was which.
+ *
+ * So the glyph is only shown on hover, and the resting state is pure colour.
+ * The visible dot is small (13px, Mac's is 12) but the CONTROL is 24px: the
+ * case is deliberately larger than the dot and completely transparent, so
+ * Fitts' law is satisfied by the hit area while the eye sees a small tidy
+ * light. That separation is why an oversized case is correct here -- it just
+ * has to be invisible, and the dot has to be genuinely centred in it. */
+#define TL_DOT  13
+#define TL_HIT  24
+
+static bool em_light_impl(int cp, Color base, bool *out_hov) {
     ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
     if (out_hov) *out_hov = hov;
-    Color bg = hov ? (pressed ? shade(t->danger, 0.86f) : t->danger) : t->surface;
-    Color fg = hov ? t->on_accent : t->text_secondary;
-    ui_set_paint(solid(bg));
-    ui_set_corner_radius(t->radius_pill);
-    ui_set_border(hov ? 0.0f : 1.0f, t->border);
-    /* 36px, not 26: a close control is aimed at constantly, and Fitts is not
-     * negotiable -- a small pill made closing a window feel like threading a
-     * needle. Every app's bar shares this, so every app gets the fix. */
-    ui_set_size(sz_fixed(36), sz_fixed(30));
+    ui_set_size(sz_fixed(TL_HIT), sz_fixed(TL_HIT));
+    ui_set_paint(solid((Color){ 0.f, 0.f, 0.f, 0.f }));   /* the case is invisible */
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
-    { EmProps ip = { .font = BodyBold, .color = fg }; em_icon_impl(IconClose, ip); }
+
+    ui_box_begin(1);
+    ui_set_size(sz_fixed(TL_DOT), sz_fixed(TL_DOT));
+    ui_set_paint(solid(pressed ? shade(base, 0.80f) : hov ? shade(base, 1.10f) : base));
+    ui_set_corner_radius((float)TL_DOT / 2.0f);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    /* the symbol appears only under the pointer -- at rest the colour says it */
+    if (hov) { EmProps ip = { .font = Caption, .color = { 0.f, 0.f, 0.f, 0.68f } };
+               em_icon_impl(cp, ip); }
+    ui_box_end();
+
     ui_end_stack();
     return ui_consume_click(self);
+}
+
+/* #FF5F57 / #28C840 -- close is red, minimize green, as asked. */
+static bool em_closebtn_impl(bool *out_hov) {
+    return em_light_impl(IconClose, (Color){ 1.00f, 0.373f, 0.341f, 1.f }, out_hov);
+}
+static bool em_minbtn_impl(bool *out_hov) {
+    return em_light_impl(IconMinus, (Color){ 0.157f, 0.784f, 0.251f, 1.f }, out_hov);
 }
 int em_window_closed(void) { return Clicked("__em_win_close"); }
-
-/* The close control's quieter sibling: same size and shape (a bar of controls
- * whose members disagree about their geometry reads as a mistake), but it
- * hovers to the neutral surface instead of danger-red -- parking a window is
- * not a destructive act and shouldn't be dressed as one. */
-static bool em_minbtn_impl(bool *out_hov) {
-    const struct ui_theme *t = TH;
-    ui_begin_hstack(0);
-    struct instance_handle self = ui_open();
-    bool hov = ui_is_hovered(), pressed = ui_is_pressed();
-    if (out_hov) *out_hov = hov;
-    Color bg = hov ? (pressed ? shade(t->surface_alt, 0.86f) : t->surface_alt) : t->surface;
-    Color fg = hov ? t->text : t->text_secondary;
-    ui_set_paint(solid(bg));
-    ui_set_corner_radius(t->radius_pill);
-    ui_set_border(hov ? 0.0f : 1.0f, t->border);
-    ui_set_size(sz_fixed(36), sz_fixed(30));
-    ui_set_align(ALIGN_CENTER);
-    ui_set_justify(JUSTIFY_CENTER);
-    { EmProps ip = { .font = BodyBold, .color = fg }; em_icon_impl(IconMinus, ip); }
-    ui_end_stack();
-    return ui_consume_click(self);
-}
 int em_window_minimized(void) { return Clicked("__em_win_min"); }
 
 /* ---- Spinner: phase-animated dots (indeterminate activity) ------------- */
@@ -1686,7 +1687,14 @@ void em_dock(int *ids, int *n, void (*render)(int id), EmProps p) {
         ui_box_begin((uint64_t)(0xD0C00000u + (unsigned)id));   /* stable key by id */
         struct instance_handle self = ui_open();
         int active = ui_is_active();
-        Color chip = dragged ? shade(t->surface_alt, 1.18f) : t->surface_alt;
+        bool hov = ui_is_hovered();
+        /* A status item is a GLYPH, not a button: boxing each one in its own
+         * grey chip turned a menu bar into a row of widgets. The surface
+         * appears only when the pointer is on it (or while dragging), which is
+         * also the only time it means anything. */
+        Color chip = dragged ? shade(t->surface_alt, 1.18f)
+                   : hov     ? t->surface_alt
+                             : (Color){ 0.f, 0.f, 0.f, 0.f };
         ui_set_paint(solid(chip));
         ui_set_corner_radius(t->radius_md);
         ui_set_padding(t->sp1, t->sp2, t->sp1, t->sp2);
@@ -2494,7 +2502,6 @@ static void em_menu_hidden_open(uint64_t key) {
 }
 
 void em_menu_(const char *label, EmProps p) {
-    (void)p;
     em_flush();
     const struct ui_theme *t = TH;
     int is_open = (g_menu_open == (const void *)label);
@@ -2507,7 +2514,11 @@ void em_menu_(const char *label, EmProps p) {
     ui_set_corner_radius(t->radius_sm);
     ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp3);
     ui_set_align(ALIGN_CENTER);
-    { EmProps lp = { .font = Body, .color = is_open ? t->accent : t->text }; em_text_impl(label, lp); }
+    /* .font honoured: a menu bar bolds the ACTIVE APP's name and leaves the
+     * rest regular -- that weight difference is what tells you which
+     * application the menus belong to. */
+    { EmProps lp = { .font = p.font ? p.font : Body,
+                     .color = is_open ? t->accent : t->text }; em_text_impl(label, lp); }
     ui_end_stack();
     if (ui_consume_click(btn)) {
         if (is_open) g_menu_open = 0;

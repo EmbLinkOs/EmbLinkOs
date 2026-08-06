@@ -640,8 +640,10 @@ struct glyph_cache_entry *glyph_cache_lookup_or_rasterize(
 /* Section 6: draw_text                                                       */
 /* ------------------------------------------------------------------------- */
 
-/* Standard 1-4 byte UTF-8 decode; returns bytes consumed (>=1). */
-static int utf8_decode(const char *s, uint32_t *cp) {
+/* Standard 1-4 byte UTF-8 decode; returns bytes consumed (>=1).
+ * EXPORTED (font_utf8_decode) so layout measures a string exactly the way this
+ * file draws it. They used to disagree -- see the note in layout.c. */
+int font_utf8_decode(const char *s, uint32_t *cp) {
     const uint8_t *u = (const uint8_t *)s;
     if (u[0] < 0x80) { *cp = u[0]; return 1; }
     if ((u[0] & 0xE0) == 0xC0 && (u[1] & 0xC0) == 0x80) {
@@ -742,7 +744,7 @@ static void backend_draw_text_impl(struct render_target *rt, float x, float y, c
      * are far shorter than this cap. */
     for (int guard = 0; *p && guard < 8192; guard++) {
         uint32_t cp;
-        p += utf8_decode(p, &cp);
+        p += font_utf8_decode(p, &cp);
         struct glyph_cache_entry *g = glyph_cache_lookup_or_rasterize(&g_atlas, f, cp, size_px);
         if (g) {
             if (g->atlas_w > 0 && g->atlas_h > 0)
