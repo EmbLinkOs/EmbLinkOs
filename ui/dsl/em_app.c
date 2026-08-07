@@ -468,7 +468,20 @@ int em_widget_run(const EmWidget *wg) {
         return 1;
     }
 
-    struct render_target rt = { px, (uint32_t)winw, (uint32_t)winh, (uint32_t)winw * 4, EMBK_PIXFMT_BGRA8888_PRE };
+    /* Same back buffer as em_app_run, and for the same reason: `px` is shared
+     * with the compositor, which composites from it whenever it likes, so
+     * drawing into it directly puts half-finished frames on screen. A widget is
+     * small enough that this has never been visible -- but "too fast to catch"
+     * is a property of today's widgets, not a property of the design, and a
+     * glass widget already clears its whole window on every single build. The
+     * buffer is winw*winh*4, which for a 190x96 clock is 73KB.
+     *
+     * A failed allocation renders straight into `px`, which is exactly what
+     * every widget did before this. */
+    uint32_t *back = (uint32_t *)malloc((size_t)winw * (size_t)winh * 4);
+    if (back) memcpy(back, px, (size_t)winw * (size_t)winh * 4);
+    struct render_target rt = { back ? back : px, (uint32_t)winw, (uint32_t)winh,
+                                (uint32_t)winw * 4, EMBK_PIXFMT_BGRA8888_PRE };
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
     { char b[64]; snprintf(b, sizeof b, "%s: widget up\n", title); embk_puts(1, b); }
 
@@ -500,14 +513,16 @@ int em_widget_run(const EmWidget *wg) {
             /* a glass widget renders a translucent tint the compositor lays over
              * the blurred aurora -- clear to TRANSPARENT + full-render every build
              * (dirty-rect would re-blend the translucent bg and accumulate). */
-            for (int i = 0; i < winw * winh; i++) px[i] = 0;
+            uint32_t *clr = back ? back : px;
+            for (int i = 0; i < winw * winh; i++) clr[i] = 0;
             scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
             prev_epoch = em_ui_epoch();
         } else if (first || em_ui_epoch() != prev_epoch) {
             const struct ui_theme *t = ui_theme();
             uint32_t bg = (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
                         | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
-            for (int i = 0; i < winw * winh; i++) px[i] = bg;
+            uint32_t *clr = back ? back : px;
+            for (int i = 0; i < winw * winh; i++) clr[i] = bg;
             scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
             prev_epoch = em_ui_epoch();
         }
@@ -515,6 +530,7 @@ int em_widget_run(const EmWidget *wg) {
         ui_frame_begin(); em_new_frame(); wg->view(); em_flush(); ui_frame_end();
         ui_run_layout((float)winw, (float)winh);
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
+        if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
         embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
 
         if (first) { first = 0; char b[64]; snprintf(b, sizeof b, "%s: widget first frame\n", title); embk_puts(1, b); }

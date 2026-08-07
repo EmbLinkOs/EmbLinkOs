@@ -1993,9 +1993,14 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       FINISHED frame across (only the presented band). The compositor can no
       longer see a frame mid-draw. Vellum keeps its page, its chrome and its
       loading indicator intact for the whole of an https fetch.
-- [ ] em_widget_run still renders straight into the shared buffer. Widgets are
-      small and fast so it does not show, but it is the same latent bug; give it
-      the same back buffer when one of them ever does slow work.
+- [x] ~~em_widget_run still renders straight into the shared buffer~~ FIXED
+      2026-08-07, same back buffer as em_app_run. NOTE ON PROOF: the app
+      runtime's version is metal-verified through a live https fetch; the
+      widget version is compile- and review-verified only, because no widget
+      runs at boot and the terminal would not launch through QMP to start one.
+      To exercise it: run `clockw` from the shell and watch for "widget up" on
+      serial. A glass widget is the case that matters -- it clears its whole
+      window on every build.
 - [ ] Under ONE emulated core the loading counter updates only once or twice
       during a fetch: each frame competes with the crypto worker for the core,
       so few complete. Correct, just coarse -- and a real machine or -smp 2 does
