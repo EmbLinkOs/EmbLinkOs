@@ -58,6 +58,10 @@ void vstyle_for(const char *tag, const struct vstyle *p, struct vstyle *o) {
         o->display = VD_FIELD;   /* refined to VD_BUTTON below when type says so */
     }
     else if (ieq(tag,"textarea")) { o->display = VD_FIELD; }
+    /* A <select> is a choice among its own <option> children, so the OPTIONS
+     * must not render as text of their own -- the control draws them. */
+    else if (ieq(tag,"select")) { o->display = VD_SELECT; }
+    else if (ieq(tag,"option")) { o->display = VD_NONE; }
     else if (ieq(tag,"button"))   { o->display = VD_BUTTON; }
     else if (ieq(tag,"form"))     { o->display = VD_BLOCK; o->margin_top=8; o->margin_bottom=10; }
     else if (ieq(tag,"label"))    { o->display = VD_INLINE; }
@@ -139,6 +143,8 @@ void vstyle_for_node(struct html_doc *doc, int node, const struct vstyle *parent
             out->display = VD_BUTTON;
         else if (ty && !strcmp(ty, "hidden"))
             out->display = VD_NONE;
+        else if (ty && !strcmp(ty, "checkbox")) out->display = VD_CHECK;
+        else if (ty && !strcmp(ty, "radio"))    out->display = VD_RADIO;
     }
     if (sheet && doc && node >= 0) css_sheet_apply(sheet, doc, node, out);
     if (doc && node >= 0 && node < doc->n && doc->nodes[node].style)

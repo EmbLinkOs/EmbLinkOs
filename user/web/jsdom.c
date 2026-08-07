@@ -185,6 +185,17 @@ static JSValue js_stop_propagation(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* preventDefault. For `submit` this is a real veto: the browser asks after
+ * dispatching, and does not navigate if a handler said no. That is what lets a
+ * page validate a form, or handle the submission itself with fetch(), which is
+ * how most forms on the modern web work. */
+static JSValue js_prevent_default(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    JS_SetPropertyStr(ctx, this_val, "__prevented", JS_NewInt32(ctx, 1));
+    return JS_UNDEFINED;
+}
+
 static JSValue elem_add_listener(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv) {
     int i = elem_index(ctx, this_val);
@@ -681,9 +692,12 @@ int jsdom_has_listener(int node) {
  * and almost nothing uses it.) `event.target` stays the node the event
  * happened on however far it bubbles, which is the property delegated
  * handlers are written against. stopPropagation ends the walk. */
+static int g_prevented;      /* did a handler veto the default action? */
+
 static int dispatch_event(int node, int type) {
     if (!g_ctx || !g_doc) return 0;
     int ran = 0;
+    g_prevented = 0;
     for (int a = node; a >= 0; a = g_doc->nodes[a].parent) {
         int stopped = 0;
         for (int k = 0; k < MAX_LISTENERS; k++) {
@@ -695,6 +709,9 @@ static int dispatch_event(int node, int type) {
             JS_SetPropertyStr(g_ctx, ev, "__stop", JS_NewInt32(g_ctx, 0));
             JS_SetPropertyStr(g_ctx, ev, "stopPropagation",
                 JS_NewCFunction(g_ctx, js_stop_propagation, "stopPropagation", 0));
+            JS_SetPropertyStr(g_ctx, ev, "__prevented", JS_NewInt32(g_ctx, 0));
+            JS_SetPropertyStr(g_ctx, ev, "preventDefault",
+                JS_NewCFunction(g_ctx, js_prevent_default, "preventDefault", 0));
             JSValue argv[1] = { ev };
             JSValue r = JS_Call(g_ctx, g_listen[k].fn, JS_UNDEFINED, 1, argv);
             if (JS_IsException(r)) {
@@ -708,6 +725,9 @@ static int dispatch_event(int node, int type) {
             JSValue st = JS_GetPropertyStr(g_ctx, ev, "__stop");
             int sv = 0; JS_ToInt32(g_ctx, &sv, st); JS_FreeValue(g_ctx, st);
             if (sv) stopped = 1;
+            JSValue pd = JS_GetPropertyStr(g_ctx, ev, "__prevented");
+            int pv = 0; JS_ToInt32(g_ctx, &pv, pd); JS_FreeValue(g_ctx, pd);
+            if (pv) g_prevented = 1;
             JS_FreeValue(g_ctx, ev);
             ran = 1;
         }
@@ -717,7 +737,10 @@ static int dispatch_event(int node, int type) {
 }
 
 int jsdom_dispatch_click(int node)  { return dispatch_event(node, EV_CLICK); }
-int jsdom_dispatch_submit(int node) { return dispatch_event(node, EV_SUBMIT); }
+int jsdom_dispatch_submit(int node) {
+    dispatch_event(node, EV_SUBMIT);
+    return g_prevented;          /* 1 = a handler said do not navigate */
+}
 int jsdom_dispatch_input(int node)  {
     int a = dispatch_event(node, EV_INPUT);
     int b = dispatch_event(node, EV_CHANGE);

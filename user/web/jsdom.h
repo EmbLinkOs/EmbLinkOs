@@ -56,8 +56,11 @@ int  jsdom_has_listener(int node);
 /* Deliver a click. Returns 1 if a handler ran (and may have mutated the
  * document -- check jsdom_take_dirty afterwards). */
 int  jsdom_dispatch_click(int node);
-/* A form was submitted / a field's value changed. Both BUBBLE, like click. */
+/* A form was submitted. Bubbles like click, and returns 1 if a handler called
+ * preventDefault -- in which case the caller must NOT navigate. That is what
+ * lets a page validate, or submit with fetch() itself. */
 int  jsdom_dispatch_submit(int node);
+/* A field's value changed: fires 'input' then 'change', both bubbling. */
 int  jsdom_dispatch_input(int node);
 
 /* Drive everything the engine owes the page: due timers, a landed fetch, and

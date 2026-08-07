@@ -46,6 +46,15 @@ int form_set(struct html_doc *doc, int node, const char *v);
  * form itself). Writes the resolved URL into `url` and, for POST, the body
  * into `body`. Returns 1 for GET, 2 for POST, or 0 if there is nothing to
  * submit. `base` resolves a relative action, exactly as a link is resolved. */
+/* The node index of a field whose value has changed since this was last
+ * called, or -1. Call in a loop until it returns -1 -- more than one field can
+ * change between two frames (a paste, a script setting several).
+ *
+ * A POLL rather than a callback because the toolkit writes into the value
+ * buffer in place: there is no edit event to hook, so the only way to know is
+ * to have kept what the field used to say. */
+int form_take_changed(void);
+
 int form_submit(struct html_doc *doc, int node, const char *base,
                 char *url, size_t url_cap, char *body, size_t body_cap);
 

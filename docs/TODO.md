@@ -2441,13 +2441,26 @@ Encrypt/RSA), `test wget https`, `test pypi`.
           event.target set to the ul. Delegation exists precisely to ask which
           item was clicked. The hit box now wraps every display path, and the
           INNERMOST listening box consumes.
-- [ ] `preventDefault` is not implemented, so the `submit` event is a
-      NOTIFICATION and not a veto: a script hears about the submission before
-      the navigation, and cannot stop it.
-- [ ] 'input'/'change' can be REGISTERED and are dispatched by
-      jsdom_dispatch_input, but nothing calls it yet -- the field-edit path has
-      no change detection. Registering a listener that never fires is exactly
-      what this browser refuses to do elsewhere; wire it or refuse the name.
+- [x] ~~preventDefault, and 'input'/'change' never firing~~ BOTH CLOSED
+      2026-08-08. preventDefault is a real veto on `submit`: the browser asks
+      after dispatching and does not navigate if a handler said no, which is
+      how a page validates a form or submits it with fetch() itself.
+      'input'/'change' fire from a per-frame POLL of the value table
+      (form_take_changed) rather than a callback, because the toolkit writes
+      into the value buffer in place and there is no edit event to hook -- so
+      the only way to know is to have kept what the field used to say.
+- [x] ~~No checkbox / radio / select~~ SHIPPED 2026-08-08. A boolean control
+      keeps a stable bool per node (the toolkit binds a pointer to it) with the
+      FORM's copy still the source of truth for submission; the working copy is
+      synced in before the control draws and out straight after, so a click is
+      visible to form_submit in the same frame. Radios clear their group by
+      `name`, which is the whole difference between a radio and a round
+      checkbox. A <select> is its <option> children -- labels from their text,
+      the submitted value from `value` or the text -- and an <option> is
+      display:none so it cannot leak into the page as stray text.
+- [ ] <textarea> renders as a SINGLE-LINE field. It submits correctly and it
+      does not look like a text area; a multi-line control needs the toolkit to
+      grow one.
 - [ ] Custom properties are DOCUMENT-scoped, not element-scoped: one table for
       the sheet, last definition wins. Correct for a single `:root` block (the
       overwhelmingly common shape) and wrong for per-component theming

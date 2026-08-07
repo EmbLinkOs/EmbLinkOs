@@ -1032,3 +1032,29 @@ page's scripts exactly as the app does. Without that the corpus tested a
 DIFFERENT document than the browser renders: a page that builds its own DOM
 looked empty on the host and correct on the metal, which is the exact
 divergence a two-second loop exists to prevent.
+
+
+## Form controls, and the two gaps from part 1 (C4, part 2)
+
+`preventDefault` is now a real veto on `submit`: the browser asks after
+dispatching and does not navigate if a handler said no. That is how a page
+validates a form, or submits it with `fetch()` itself, which is how most forms
+on the modern web work.
+
+`input` and `change` fire from a per-frame POLL of the value table rather than
+a callback. The toolkit writes into a field's value buffer in place -- there is
+no edit event to hook -- so the only way to know a field changed is to have
+kept what it used to say. Both gaps were logged in the previous commit rather
+than left silent, which is what made them easy to close.
+
+**Checkbox, radio and select.** A boolean control keeps a stable bool per node,
+because the toolkit binds a pointer to it; the FORM's copy is still the source
+of truth for submission, and the working copy is synced in before the control
+draws and out straight after, so a click is visible to `form_submit` in the
+same frame it happened. Radios clear their group by `name` -- the whole
+difference between a radio and a round checkbox. A `<select>` is its `<option>`
+children, and an `<option>` is `display: none` so it cannot leak into the page
+as stray text.
+
+`<textarea>` still renders as a single-line field. It submits correctly and it
+does not look right; a multi-line control needs the toolkit to grow one.

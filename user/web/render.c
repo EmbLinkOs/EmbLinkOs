@@ -256,13 +256,16 @@ static int is_inline(struct html_doc *d, int n, const struct vstyle *parent) {
         return 0;
     /* controls flow INLINE with their labels, which is what a form looks like */
     return s.display == VD_INLINE || s.display == VD_IMAGE ||
-           s.display == VD_FIELD  || s.display == VD_BUTTON;
+           s.display == VD_FIELD  || s.display == VD_BUTTON ||
+           s.display == VD_CHECK  || s.display == VD_RADIO || s.display == VD_SELECT;
 }
 
 static void render_block(struct html_doc *d, int node, const struct vstyle *s,
                          const char *href, int list_index);
 static void emit_field(struct html_doc *d, int n, const struct vstyle *st);
 static void emit_button(struct html_doc *d, int n, const struct vstyle *st);
+static void emit_check(struct html_doc *d, int n, const struct vstyle *st, int radio);
+static void emit_select(struct html_doc *d, int n, const struct vstyle *st);
 
 /* One inline child, at any depth. RECURSIVE on purpose: this was a
  * hand-unrolled three-level walk that only knew about text, so an <img> (or
@@ -300,6 +303,9 @@ static void emit_inline(struct html_doc *d, int c, const struct vstyle *st,
     if (s.display == VD_IMAGE)  { emit_image(d, c, &s); return; }
     if (s.display == VD_FIELD)  { emit_field(d, c, &s); return; }
     if (s.display == VD_BUTTON) { emit_button(d, c, &s); return; }
+    if (s.display == VD_CHECK)  { emit_check(d, c, &s, 0); return; }
+    if (s.display == VD_RADIO)  { emit_check(d, c, &s, 1); return; }
+    if (s.display == VD_SELECT) { emit_select(d, c, &s); return; }
     /* A block-level box inside an inline run ends the run and becomes a block.
      * Without this, a <table> that happens to sit inside an inline element gets
      * walked as if it were text, and its rows and cells lose all their
@@ -435,6 +441,106 @@ static void render_inline_run(struct html_doc *d, int from, int to,
  *
  * Enter submits, because a search box you cannot submit from the keyboard is
  * a search box that feels broken. */
+/* A boolean control's state, kept per node and stable across frames because
+ * the toolkit binds a pointer to it. The FORM's copy stays the source of
+ * truth for submission -- this is the toolkit's working copy, synced in before
+ * the control draws and out again straight after, so a click is visible to
+ * form_submit in the same frame it happened. */
+#define CHECK_MAX 64
+static struct { int node, used; bool on; } g_check[CHECK_MAX];
+
+static bool *check_slot(int node) {
+    for (int i = 0; i < CHECK_MAX; i++)
+        if (g_check[i].used && g_check[i].node == node) return &g_check[i].on;
+    for (int i = 0; i < CHECK_MAX; i++)
+        if (!g_check[i].used) { g_check[i].used = 1; g_check[i].node = node;
+                                g_check[i].on = false; return &g_check[i].on; }
+    return 0;
+}
+
+/* Turning one radio on turns the rest of its group off. The group is every
+ * radio sharing a `name`, which is what makes a radio a radio -- without this
+ * they are just checkboxes that look round. */
+static void radio_clear_group(struct html_doc *d, int node) {
+    const char *nm = d->nodes[node].name;
+    if (!nm) return;
+    for (int i = 0; i < d->n; i++) {
+        if (i == node || d->nodes[i].kind != HTML_ELEM) continue;
+        if (!d->nodes[i].name || strcmp(d->nodes[i].name, nm)) continue;
+        const char *ty = d->nodes[i].type;
+        if (!ty || strcmp(ty, "radio")) continue;
+        bool *o = check_slot(i);
+        if (o) *o = false;
+        form_set(d, i, "");
+    }
+}
+
+static void emit_check(struct html_doc *d, int n, const struct vstyle *st, int radio) {
+    bool *on = check_slot(n);
+    if (!on) { Text("[too many controls]").caption().tertiary(); return; }
+    /* sync IN: the document's `checked`, or whatever a script last set */
+    const char *cur = form_peek(n);
+    *on = (cur && cur[0]);
+    bool before = *on;
+
+    const char *label = d->nodes[n].alt ? d->nodes[n].alt : "";
+    Checkbox(label, on);
+    em_flush();                       /* the click lands here, not later */
+
+    if (*on != before) {
+        if (radio && *on) radio_clear_group(d, n);
+        /* A checkbox submits its `value`, or "on" when it has none -- which is
+         * what a form on the other end expects to receive. */
+        const char *v = d->nodes[n].value ? d->nodes[n].value : "on";
+        form_set(d, n, *on ? v : "");
+    }
+    (void)st;
+}
+
+/* A <select> is its <option> children. The labels are their text and the
+ * submitted value is the option's `value`, or its text when it has none --
+ * exactly what a browser sends. */
+static void emit_select(struct html_doc *d, int n, const struct vstyle *st) {
+    static const char *labels[16];
+    static int opts[16];
+    int nopt = 0;
+    for (int c = d->nodes[n].first_child; c >= 0 && nopt < 16; c = d->nodes[c].next_sibling) {
+        if (d->nodes[c].kind != HTML_ELEM || strcmp(d->nodes[c].tag, "option")) continue;
+        int t = d->nodes[c].first_child;
+        labels[nopt] = (t >= 0 && d->nodes[t].text) ? d->nodes[t].text : "";
+        opts[nopt] = c;
+        nopt++;
+    }
+    if (!nopt) { Text("[empty select]").caption().tertiary(); return; }
+
+    /* A select needs a stable INDEX across frames, the way a checkbox needs a
+     * stable bool. check_slot allocates the row; the index lives beside it. */
+    if (!check_slot(n)) { Text("[too many controls]").caption().tertiary(); return; }
+    static int sel_store[CHECK_MAX];
+    int idx = 0;
+    for (int i = 0; i < CHECK_MAX; i++)
+        if (g_check[i].used && g_check[i].node == n) { idx = i; break; }
+
+    /* sync IN from the form, so a script's setValue moves the control */
+    const char *cur = form_peek(n);
+    if (cur && cur[0]) {
+        for (int i = 0; i < nopt; i++) {
+            const char *ov = d->nodes[opts[i]].value ? d->nodes[opts[i]].value : labels[i];
+            if (!strcmp(ov, cur)) { sel_store[idx] = i; break; }
+        }
+    }
+    int before = sel_store[idx];
+    float w = st->width ? (float)st->width : 200.0f;
+    HStack(.width = w, .py = 2) { Dropdown(labels, nopt, &sel_store[idx]); }
+    em_flush();
+    if (sel_store[idx] != before || !(cur && cur[0])) {
+        int k = sel_store[idx];
+        if (k < 0 || k >= nopt) k = 0;
+        const char *ov = d->nodes[opts[k]].value ? d->nodes[opts[k]].value : labels[k];
+        form_set(d, n, ov);
+    }
+}
+
 static void emit_field(struct html_doc *d, int n, const struct vstyle *st) {
     char *buf = form_value(d, n);
     if (!buf) {                       /* table full: say so rather than lie */
@@ -829,6 +935,9 @@ static void render_block_inner(struct html_doc *d, int node, const struct vstyle
     if (s->display == VD_TABLE) { render_table(d, node, s, href); return; }
     if (s->display == VD_FIELD)  { emit_field(d, node, s); return; }
     if (s->display == VD_BUTTON) { emit_button(d, node, s); return; }
+    if (s->display == VD_CHECK)  { emit_check(d, node, s, 0); return; }
+    if (s->display == VD_RADIO)  { emit_check(d, node, s, 1); return; }
+    if (s->display == VD_SELECT) { emit_select(d, node, s); return; }
 
     /* The BOX the cascade asked for. Padding is inside the painted area and
      * margin outside it, which is why they stopped sharing a field once a

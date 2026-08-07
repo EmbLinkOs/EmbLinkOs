@@ -29,6 +29,10 @@ enum {
      * therefore the first whose box the RENDERER cannot derive from the
      * document alone -- see form.h. */
     VD_FIELD, VD_BUTTON,
+    /* The controls that are not a text box: a checkbox or radio (a BOOLEAN,
+     * so it needs different storage and a different box) and a select (a
+     * choice among its own <option> children). */
+    VD_CHECK, VD_RADIO, VD_SELECT,
     /* Flex and grid containers. The layout engine has done both since it was
      * written -- the whole toolkit is built on them -- so these are the CSS
      * spelling of machinery that already exists, not new layout. */

@@ -163,7 +163,13 @@ static void on_submit(int node) {
      * if it calls preventDefault the navigation must not happen at all.
      * preventDefault is not implemented, so this is a notification and not yet
      * a veto; docs/TODO.md says so rather than the script finding out. */
-    if (jsdom_dispatch_submit(node)) em_request_frame();
+    if (jsdom_dispatch_submit(node)) {
+        /* A handler called preventDefault: the page is handling this itself,
+         * so the browser must NOT navigate. Half the forms on the modern web
+         * are submitted with fetch() from exactly here. */
+        em_request_frame();
+        return;
+    }
     char url[512], body[1024];
     int how = form_submit(&g_doc, node, g_url, url, sizeof url, body, sizeof body);
     if (how == 1)      navigate(url);
@@ -386,6 +392,13 @@ static void app(void) {
      * fetch, and the microtask queue promises resolve onto. Before the dirty
      * check, because a handler is the most likely thing to have changed the
      * document. */
+    /* A field the person edited fires 'input' and 'change'. The toolkit writes
+     * into the value buffer in place, so this is a POLL of what changed since
+     * the last frame rather than a callback -- and a loop, because more than
+     * one field can change between two frames. */
+    for (int changed; (changed = form_take_changed()) >= 0; )
+        if (jsdom_dispatch_input(changed)) em_request_frame();
+
     if (jsdom_pump(embk_uptime_ms())) em_request_frame();
     if (jsdom_take_dirty()) em_request_frame();
     /* Keep frames coming while the page has WORK OUTSTANDING -- a timer to

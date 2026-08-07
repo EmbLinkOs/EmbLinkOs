@@ -9,9 +9,24 @@
 static struct {
     int  used, node;
     char value[FORM_VALUE_MAX];
+    /* What the value was the last time anyone ASKED what changed. The toolkit
+     * writes into `value` in place under the keyboard -- there is no edit
+     * event to hook -- so the only way to know a field changed is to have kept
+     * what it used to say. */
+    char seen[FORM_VALUE_MAX];
 } g_field[FORM_MAX_FIELDS];
 
 void form_reset(void) { memset(g_field, 0, sizeof g_field); }
+
+int form_take_changed(void) {
+    for (int i = 0; i < FORM_MAX_FIELDS; i++) {
+        if (!g_field[i].used) continue;
+        if (!strcmp(g_field[i].value, g_field[i].seen)) continue;
+        snprintf(g_field[i].seen, sizeof g_field[i].seen, "%s", g_field[i].value);
+        return g_field[i].node;
+    }
+    return -1;
+}
 
 static int slot_of(int node, int create) {
     for (int i = 0; i < FORM_MAX_FIELDS; i++)
