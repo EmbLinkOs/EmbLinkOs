@@ -989,3 +989,46 @@ A host test had to be corrected rather than satisfied: it asserted that
 intent -- an unknown property is skipped rather than half-applied -- is
 unchanged; the example moved to properties that are still genuinely beyond this
 browser.
+
+
+## The DOM a script builds, and events that bubble (C4, part 1)
+
+`document.createElement` / `createTextNode` / `body`, `appendChild`,
+`removeChild`, `remove`, `setAttribute`, `className` and `classList`. A page
+that only reads its own markup is a document; one that creates nodes is an
+application, and every framework written in the last fifteen years does it.
+
+Created nodes come from the SAME arenas the parse used, so a script's nodes
+live exactly as long as the document does and there is no second lifetime to
+reason about. When an arena is full they FAIL and set `truncated` rather than
+growing into a page's hands. A node cannot be appended into its own subtree --
+every walker in this browser recurses without a visited set, so a cycle is not
+a wrong picture, it is a hang.
+
+Events bubble: `click`, `submit`, `input` and `change` fire on the node and
+then on each ancestor, with `event.target` staying the node the event happened
+on, `currentTarget` the one that is listening, and `stopPropagation()` ending
+the walk. An event name this browser cannot deliver is still refused loudly.
+
+### Two bugs of the same shape
+
+Both made a feature look like it worked while being useless:
+
+- `jsdom_has_listener` asked only about the node itself. A DELEGATED listener
+  -- a handler on the `<ul>` rather than on every `<li>`, which is how most
+  pages are written -- therefore left its children unclickable.
+- `render_block` returned early for list items, images, tables and controls,
+  all before the clickable-box code. So a click on an `<li>` inside a listening
+  `<ul>` was consumed by the ul and arrived with `event.target` set to the ul.
+  Delegation exists precisely so a handler can ask which item was clicked. The
+  hit box now wraps every display path, and the innermost listening box
+  consumes -- a child's box is closed before its parent's, so the deepest one
+  asks first.
+
+### The harness runs JavaScript now
+
+`browser_render` links QuickJS and jsdom when they are available, and runs the
+page's scripts exactly as the app does. Without that the corpus tested a
+DIFFERENT document than the browser renders: a page that builds its own DOM
+looked empty on the host and correct on the metal, which is the exact
+divergence a two-second loop exists to prevent.

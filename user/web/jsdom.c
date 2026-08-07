@@ -40,7 +40,14 @@ static void (*g_console)(const char *line);
 #define MAX_LISTENERS 64
 #define MAX_TIMERS    32
 
-static struct { int node; JSValue fn; int used; } g_listen[MAX_LISTENERS];
+/* An event TYPE, small enough to compare as an int. Only the ones this
+ * browser can actually deliver exist -- registering a listener for an event
+ * that will never fire is the hardest kind of bug to see, so an unknown name
+ * is still refused loudly rather than accepted and forgotten. */
+enum { EV_CLICK = 0, EV_SUBMIT, EV_INPUT, EV_CHANGE, EV_N };
+static const char *const EV_NAME[EV_N] = { "click", "submit", "input", "change" };
+
+static struct { int node; int type; JSValue fn; int used; } g_listen[MAX_LISTENERS];
 static struct {
     int      id, used, repeat;
     unsigned long long due, every;
@@ -169,18 +176,29 @@ static JSValue elem_set_style(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* `this` is the event object; setting a flag on it is what the dispatch loop
+ * reads back after the handler returns. */
+static JSValue js_stop_propagation(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    JS_SetPropertyStr(ctx, this_val, "__stop", JS_NewInt32(ctx, 1));
+    return JS_UNDEFINED;
+}
+
 static JSValue elem_add_listener(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv) {
     int i = elem_index(ctx, this_val);
     if (i < 0 || argc < 2) return JS_UNDEFINED;
     const char *type = JS_ToCString(ctx, argv[0]);
     if (!type) return JS_EXCEPTION;
-    /* Only 'click' is real here. An event name we cannot deliver is REFUSED
-     * loudly rather than registered and silently never fired -- a listener
-     * that never runs is the hardest kind of bug to see. */
-    if (strcmp(type, "click") != 0) {
+    int ev = -1;
+    for (int t = 0; t < EV_N; t++) if (!strcmp(type, EV_NAME[t])) { ev = t; break; }
+    if (ev < 0) {
         JS_FreeCString(ctx, type);
-        return JS_ThrowTypeError(ctx, "only 'click' is supported by this browser");
+        /* Still refused LOUDLY. A listener that never runs is the hardest kind
+         * of bug to see, and silence is what makes it hard. */
+        return JS_ThrowTypeError(ctx,
+            "this browser delivers only click, submit, input and change");
     }
     JS_FreeCString(ctx, type);
     if (!JS_IsFunction(ctx, argv[1]))
@@ -190,6 +208,7 @@ static JSValue elem_add_listener(JSContext *ctx, JSValueConst this_val,
         if (g_listen[k].used) continue;
         g_listen[k].used = 1;
         g_listen[k].node = i;
+        g_listen[k].type = ev;
         g_listen[k].fn = JS_DupValue(ctx, argv[1]);
         return JS_UNDEFINED;
     }
@@ -216,6 +235,134 @@ static JSValue elem_set_value(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* --- the document a script BUILDS ---------------------------------------- */
+
+static JSValue elem_append(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv) {
+    int i = elem_index(ctx, this_val);
+    if (i < 0 || argc < 1) return JS_UNDEFINED;
+    JSValue ci = JS_GetPropertyStr(ctx, argv[0], "__i");
+    int c = -1; JS_ToInt32(ctx, &c, ci); JS_FreeValue(ctx, ci);
+    if (c < 0) return JS_ThrowTypeError(ctx, "appendChild expects an element");
+    if (html_append_child(g_doc, i, c) != 0)
+        return JS_ThrowInternalError(ctx, "appendChild refused (cycle, or arena full)");
+    g_dirty = 1;
+    return JS_DupValue(ctx, argv[0]);
+}
+
+static JSValue elem_remove_child(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv) {
+    int i = elem_index(ctx, this_val);
+    if (i < 0 || argc < 1) return JS_UNDEFINED;
+    JSValue ci = JS_GetPropertyStr(ctx, argv[0], "__i");
+    int c = -1; JS_ToInt32(ctx, &c, ci); JS_FreeValue(ctx, ci);
+    if (c < 0 || g_doc->nodes[c].parent != i)
+        return JS_ThrowTypeError(ctx, "removeChild: not a child of this node");
+    html_remove_child(g_doc, c);
+    g_dirty = 1;
+    return JS_DupValue(ctx, argv[0]);
+}
+
+static JSValue elem_remove(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    int i = elem_index(ctx, this_val);
+    if (i < 0) return JS_UNDEFINED;
+    html_remove_child(g_doc, i);
+    g_dirty = 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue elem_set_attr(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    int i = elem_index(ctx, this_val);
+    if (i < 0 || argc < 2) return JS_UNDEFINED;
+    const char *n = JS_ToCString(ctx, argv[0]);
+    const char *v = JS_ToCString(ctx, argv[1]);
+    int rc = (n && v) ? html_set_attr(g_doc, i, n, v) : -1;
+    if (n) JS_FreeCString(ctx, n);
+    if (v) JS_FreeCString(ctx, v);
+    if (rc == 0) g_dirty = 1;
+    /* An attribute this browser does not store is REFUSED, not silently
+     * accepted -- otherwise getAttribute reads back nothing and the script
+     * blames itself. */
+    if (rc != 0) return JS_ThrowTypeError(ctx, "setAttribute: unsupported attribute");
+    return JS_UNDEFINED;
+}
+
+static JSValue elem_get_class(JSContext *ctx, JSValueConst this_val) {
+    int i = elem_index(ctx, this_val);
+    if (i < 0 || !g_doc->nodes[i].klass) return JS_NewString(ctx, "");
+    return JS_NewString(ctx, g_doc->nodes[i].klass);
+}
+
+static JSValue elem_set_class(JSContext *ctx, JSValueConst this_val, JSValueConst v) {
+    int i = elem_index(ctx, this_val);
+    if (i < 0) return JS_UNDEFINED;
+    const char *s = JS_ToCString(ctx, v);
+    if (!s) return JS_EXCEPTION;
+    if (html_set_attr(g_doc, i, "class", s) == 0) g_dirty = 1;
+    JS_FreeCString(ctx, s);
+    return JS_UNDEFINED;
+}
+
+/* class="a b c" -- does it contain `want`? */
+static int class_has(const char *list, const char *want) {
+    if (!list || !want || !*want) return 0;
+    size_t wl = strlen(want);
+    for (const char *p = list; *p; ) {
+        while (*p == ' ') p++;
+        const char *b = p;
+        while (*p && *p != ' ') p++;
+        if ((size_t)(p - b) == wl && !strncmp(b, want, wl)) return 1;
+    }
+    return 0;
+}
+
+/* classList.add / remove / toggle / contains. A real classList is a live
+ * object; this is the four methods every page actually calls, which is what
+ * makes a class-driven UI work. */
+static JSValue elem_class_op(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv, int op) {
+    int i = elem_index(ctx, this_val);
+    if (i < 0 || argc < 1) return JS_UNDEFINED;
+    const char *name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+    const char *cur = g_doc->nodes[i].klass ? g_doc->nodes[i].klass : "";
+    int has = class_has(cur, name);
+    if (op == 3) { JS_FreeCString(ctx, name); return JS_NewBool(ctx, has); }
+    int add = (op == 0) || (op == 2 && !has);
+
+    char buf[256]; size_t bn = 0;
+    for (const char *p = cur; *p; ) {
+        while (*p == ' ') p++;
+        const char *b = p;
+        while (*p && *p != ' ') p++;
+        size_t l = (size_t)(p - b);
+        if (!l) continue;
+        if (l == strlen(name) && !strncmp(b, name, l)) continue;   /* drop it */
+        if (bn && bn + 1 < sizeof buf) buf[bn++] = ' ';
+        if (bn + l < sizeof buf) { memcpy(buf + bn, b, l); bn += l; }
+    }
+    if (add) {
+        size_t l = strlen(name);
+        if (bn && bn + 1 < sizeof buf) buf[bn++] = ' ';
+        if (bn + l < sizeof buf) { memcpy(buf + bn, name, l); bn += l; }
+    }
+    buf[bn] = 0;
+    if (html_set_attr(g_doc, i, "class", buf) == 0) g_dirty = 1;
+    JS_FreeCString(ctx, name);
+    return JS_NewBool(ctx, add);
+}
+static JSValue elem_class_add(JSContext *c, JSValueConst t, int n, JSValueConst *a)
+    { return elem_class_op(c, t, n, a, 0); }
+static JSValue elem_class_rm(JSContext *c, JSValueConst t, int n, JSValueConst *a)
+    { return elem_class_op(c, t, n, a, 1); }
+static JSValue elem_class_tog(JSContext *c, JSValueConst t, int n, JSValueConst *a)
+    { return elem_class_op(c, t, n, a, 2); }
+static JSValue elem_class_has(JSContext *c, JSValueConst t, int n, JSValueConst *a)
+    { return elem_class_op(c, t, n, a, 3); }
+
 static const JSCFunctionListEntry elem_proto[] = {
     JS_CGETSET_DEF("value", elem_get_value, 0),
     JS_CFUNC_DEF("setValue", 1, elem_set_value),
@@ -225,13 +372,63 @@ static const JSCFunctionListEntry elem_proto[] = {
     JS_CFUNC_DEF("setText", 1, elem_set_text),
     JS_CFUNC_DEF("getAttribute", 1, elem_get_attr),
     JS_CFUNC_DEF("setStyle", 1, elem_set_style),
+    JS_CFUNC_DEF("appendChild", 1, elem_append),
+    JS_CFUNC_DEF("removeChild", 1, elem_remove_child),
+    JS_CFUNC_DEF("remove", 0, elem_remove),
+    JS_CFUNC_DEF("setAttribute", 2, elem_set_attr),
+    JS_CGETSET_DEF("className", elem_get_class, elem_set_class),
+    JS_CFUNC_DEF("classAdd", 1, elem_class_add),
+    JS_CFUNC_DEF("classRemove", 1, elem_class_rm),
+    JS_CFUNC_DEF("classToggle", 1, elem_class_tog),
+    JS_CFUNC_DEF("classContains", 1, elem_class_has),
 };
+
+static JSValue make_elem(JSContext *ctx, int idx);
+
+static JSValue doc_create_element(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_UNDEFINED;
+    const char *tag = JS_ToCString(ctx, argv[0]);
+    if (!tag) return JS_EXCEPTION;
+    int i = html_create_element(g_doc, tag);
+    JS_FreeCString(ctx, tag);
+    if (i < 0) return JS_ThrowInternalError(ctx, "document node arena is full");
+    /* DETACHED, as the DOM says: a script builds a subtree and appends it when
+     * it is ready, which is what every one of them does. */
+    return make_elem(ctx, i);
+}
+
+static JSValue doc_create_text(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_UNDEFINED;
+    const char *t = JS_ToCString(ctx, argv[0]);
+    if (!t) return JS_EXCEPTION;
+    int i = html_create_text(g_doc, t);
+    JS_FreeCString(ctx, t);
+    if (i < 0) return JS_ThrowInternalError(ctx, "document string arena is full");
+    return make_elem(ctx, i);
+}
 
 static JSValue make_elem(JSContext *ctx, int idx) {
     JSValue o = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, o, "__i", JS_NewInt32(ctx, idx));
     JS_SetPropertyFunctionList(ctx, o, elem_proto,
                                sizeof elem_proto / sizeof elem_proto[0]);
+    /* classList as a small object over the same element. The real one is live
+     * and iterable; these are the four methods pages actually call. */
+    JSValue cl = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, cl, "__i", JS_NewInt32(ctx, idx));
+    JS_SetPropertyStr(ctx, cl, "add",
+        JS_NewCFunction(ctx, elem_class_add, "add", 1));
+    JS_SetPropertyStr(ctx, cl, "remove",
+        JS_NewCFunction(ctx, elem_class_rm, "remove", 1));
+    JS_SetPropertyStr(ctx, cl, "toggle",
+        JS_NewCFunction(ctx, elem_class_tog, "toggle", 1));
+    JS_SetPropertyStr(ctx, cl, "contains",
+        JS_NewCFunction(ctx, elem_class_has, "contains", 1));
+    JS_SetPropertyStr(ctx, o, "classList", cl);
     return o;
 }
 
@@ -376,6 +573,19 @@ int jsdom_open(struct html_doc *doc, const struct css_sheet *sheet) {
                       JS_NewCFunction(g_ctx, doc_query, "querySelector", 1));
     JS_SetPropertyStr(g_ctx, d, "querySelectorAll",
                       JS_NewCFunction(g_ctx, doc_query_all, "querySelectorAll", 1));
+    JS_SetPropertyStr(g_ctx, d, "createElement",
+                      JS_NewCFunction(g_ctx, doc_create_element, "createElement", 1));
+    JS_SetPropertyStr(g_ctx, d, "createTextNode",
+                      JS_NewCFunction(g_ctx, doc_create_text, "createTextNode", 1));
+    /* document.body: the thing a script appends to. Resolved lazily by tag so
+     * a document without an explicit <body> still answers with its root. */
+    {
+        int b = -1;
+        for (int i = 0; i < g_doc->n && b < 0; i++)
+            if (g_doc->nodes[i].kind == HTML_ELEM && !strcmp(g_doc->nodes[i].tag, "body")) b = i;
+        if (b < 0) b = 0;
+        JS_SetPropertyStr(g_ctx, d, "body", make_elem(g_ctx, b));
+    }
     JSAtom t = JS_NewAtom(g_ctx, "title");
     JS_DefinePropertyGetSet(g_ctx, d, t,
                             JS_NewCFunction(g_ctx, (JSCFunction *)doc_get_title, "title", 0),
@@ -453,34 +663,65 @@ int jsdom_run_scripts(void) {
 
 /* ---- events ------------------------------------------------------------- */
 
+/* A node is clickable if IT or any ANCESTOR is listening: an event bubbles, so
+ * a handler on a <ul> is what makes every <li> inside it a hit target. Getting
+ * this wrong the other way -- asking only about the node itself -- is why a
+ * delegated listener, which is how most pages are written, appeared dead. */
 int jsdom_has_listener(int node) {
-    for (int k = 0; k < MAX_LISTENERS; k++)
-        if (g_listen[k].used && g_listen[k].node == node) return 1;
+    if (!g_doc) return 0;
+    for (int a = node; a >= 0; a = g_doc->nodes[a].parent)
+        for (int k = 0; k < MAX_LISTENERS; k++)
+            if (g_listen[k].used && g_listen[k].node == a && g_listen[k].type == EV_CLICK)
+                return 1;
     return 0;
 }
 
-int jsdom_dispatch_click(int node) {
-    if (!g_ctx) return 0;
+/* Fire `type` on `node`, then on each ancestor in turn -- the BUBBLE phase.
+ * (There is no capture phase: addEventListener's third argument is ignored,
+ * and almost nothing uses it.) `event.target` stays the node the event
+ * happened on however far it bubbles, which is the property delegated
+ * handlers are written against. stopPropagation ends the walk. */
+static int dispatch_event(int node, int type) {
+    if (!g_ctx || !g_doc) return 0;
     int ran = 0;
-    for (int k = 0; k < MAX_LISTENERS; k++) {
-        if (!g_listen[k].used || g_listen[k].node != node) continue;
-        JSValue ev = JS_NewObject(g_ctx);
-        JS_SetPropertyStr(g_ctx, ev, "type", JS_NewString(g_ctx, "click"));
-        JS_SetPropertyStr(g_ctx, ev, "target", make_elem(g_ctx, node));
-        JSValue argv[1] = { ev };
-        JSValue r = JS_Call(g_ctx, g_listen[k].fn, JS_UNDEFINED, 1, argv);
-        if (JS_IsException(r)) {
-            JSValue e = JS_GetException(g_ctx);
-            const char *m = JS_ToCString(g_ctx, e);
-            if (g_console && m) g_console(m);
-            if (m) JS_FreeCString(g_ctx, m);
-            JS_FreeValue(g_ctx, e);
+    for (int a = node; a >= 0; a = g_doc->nodes[a].parent) {
+        int stopped = 0;
+        for (int k = 0; k < MAX_LISTENERS; k++) {
+            if (!g_listen[k].used || g_listen[k].node != a || g_listen[k].type != type) continue;
+            JSValue ev = JS_NewObject(g_ctx);
+            JS_SetPropertyStr(g_ctx, ev, "type", JS_NewString(g_ctx, EV_NAME[type]));
+            JS_SetPropertyStr(g_ctx, ev, "target", make_elem(g_ctx, node));
+            JS_SetPropertyStr(g_ctx, ev, "currentTarget", make_elem(g_ctx, a));
+            JS_SetPropertyStr(g_ctx, ev, "__stop", JS_NewInt32(g_ctx, 0));
+            JS_SetPropertyStr(g_ctx, ev, "stopPropagation",
+                JS_NewCFunction(g_ctx, js_stop_propagation, "stopPropagation", 0));
+            JSValue argv[1] = { ev };
+            JSValue r = JS_Call(g_ctx, g_listen[k].fn, JS_UNDEFINED, 1, argv);
+            if (JS_IsException(r)) {
+                JSValue e = JS_GetException(g_ctx);
+                const char *m = JS_ToCString(g_ctx, e);
+                if (g_console && m) g_console(m);
+                if (m) JS_FreeCString(g_ctx, m);
+                JS_FreeValue(g_ctx, e);
+            }
+            JS_FreeValue(g_ctx, r);
+            JSValue st = JS_GetPropertyStr(g_ctx, ev, "__stop");
+            int sv = 0; JS_ToInt32(g_ctx, &sv, st); JS_FreeValue(g_ctx, st);
+            if (sv) stopped = 1;
+            JS_FreeValue(g_ctx, ev);
+            ran = 1;
         }
-        JS_FreeValue(g_ctx, r);
-        JS_FreeValue(g_ctx, ev);
-        ran = 1;
+        if (stopped) break;
     }
     return ran;
+}
+
+int jsdom_dispatch_click(int node)  { return dispatch_event(node, EV_CLICK); }
+int jsdom_dispatch_submit(int node) { return dispatch_event(node, EV_SUBMIT); }
+int jsdom_dispatch_input(int node)  {
+    int a = dispatch_event(node, EV_INPUT);
+    int b = dispatch_event(node, EV_CHANGE);
+    return a || b;
 }
 
 static JSValue js_set_timer(JSContext *ctx, JSValueConst this_val,

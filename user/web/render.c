@@ -768,8 +768,45 @@ static void render_children(struct html_doc *d, int node, const struct vstyle *s
     g_flex_item = outer_item;
 }
 
+/* Emit whatever this element's display asks for, with no regard to events. */
+static void render_block_inner(struct html_doc *d, int node, const struct vstyle *s,
+                               const char *href, int list_index);
+
+/* An element a script is LISTENING to becomes clickable -- and so does one
+ * whose ANCESTOR is listening, because that is what bubbling means.
+ *
+ * The hit box wraps EVERY display path, which it did not before: the
+ * list-item, image, table and control branches all returned before reaching
+ * it, so a click on an <li> inside a listening <ul> was consumed by the ul and
+ * arrived with `event.target` set to the ul. Delegation exists precisely so a
+ * handler can ask which item was clicked, so that made the feature useless
+ * while appearing to work.
+ *
+ * Only listening elements get a box: a page where every <div> is a hit target
+ * is a page whose links and text selection stop working. */
 static void render_block(struct html_doc *d, int node, const struct vstyle *s,
                          const char *href, int list_index) {
+    if (!(g_has_listener && g_has_listener(node))) {
+        render_block_inner(d, node, s, href, list_index);
+        return;
+    }
+    em_flush();
+    ui_box_begin(0xC11C0000ULL ^ (uint64_t)(uintptr_t)&d->nodes[node]);
+    struct instance_handle self = ui_open();
+    ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
+                (struct layout_size){ .mode = SIZE_INTRINSIC });
+    render_block_inner(d, node, s, href, list_index);
+    em_flush();
+    ui_box_end();
+    /* The INNERMOST listening box consumes -- ui_consume_click clears the
+     * click, and a child's box is closed before its parent's, so the deepest
+     * one asks first. That is what makes event.target the element the person
+     * actually clicked. */
+    if (ui_consume_click(self) && g_on_click) g_on_click(node);
+}
+
+static void render_block_inner(struct html_doc *d, int node, const struct vstyle *s,
+                               const char *href, int list_index) {
     if (s->display == VD_LIST_ITEM) {
         /* [marker][content] as a ROW, so wrapped text hangs under itself
          * instead of sliding back under the bullet */
@@ -793,27 +830,6 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
     if (s->display == VD_FIELD)  { emit_field(d, node, s); return; }
     if (s->display == VD_BUTTON) { emit_button(d, node, s); return; }
 
-    /* An element a script is LISTENING to becomes clickable. Only those: a
-     * page where every <div> is a hit target is a page whose links and text
-     * selection stop working, so the engine decides and the renderer obeys. */
-    int listening = g_has_listener && g_has_listener(node);
-    if (listening) {
-        em_flush();
-        ui_box_begin(0xC11C0000ULL ^ (uint64_t)(uintptr_t)&d->nodes[node]);
-        struct instance_handle self = ui_open();
-        ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
-                    (struct layout_size){ .mode = SIZE_INTRINSIC });
-        VStack(.spacing = 2, .align = Fill,
-               .pt = (float)s->margin_top, .pb = (float)s->margin_bottom,
-               .pl = (float)s->indent) {
-            if (s->pre) render_pre(d, node, s);
-            else        render_children(d, node, s, href);
-        }
-        em_flush();
-        ui_box_end();
-        if (ui_consume_click(self) && g_on_click) g_on_click(node);
-        return;
-    }
     /* The BOX the cascade asked for. Padding is inside the painted area and
      * margin outside it, which is why they stopped sharing a field once a
      * background could be seen. */

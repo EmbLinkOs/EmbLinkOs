@@ -56,6 +56,9 @@ int  jsdom_has_listener(int node);
 /* Deliver a click. Returns 1 if a handler ran (and may have mutated the
  * document -- check jsdom_take_dirty afterwards). */
 int  jsdom_dispatch_click(int node);
+/* A form was submitted / a field's value changed. Both BUBBLE, like click. */
+int  jsdom_dispatch_submit(int node);
+int  jsdom_dispatch_input(int node);
 
 /* Drive everything the engine owes the page: due timers, a landed fetch, and
  * the MICROTASK QUEUE. Returns 1 if anything ran. Call once a frame.

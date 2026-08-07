@@ -158,6 +158,12 @@ static void navigate_post(const char *url, const char *body);
  * special case in this browser: build the URL (and body, for POST) and hand it
  * to the same load path a link uses. */
 static void on_submit(int node) {
+    /* The page hears about it FIRST. A script that validates a form, or that
+     * handles the submission itself, has to run before the navigation -- and
+     * if it calls preventDefault the navigation must not happen at all.
+     * preventDefault is not implemented, so this is a notification and not yet
+     * a veto; docs/TODO.md says so rather than the script finding out. */
+    if (jsdom_dispatch_submit(node)) em_request_frame();
     char url[512], body[1024];
     int how = form_submit(&g_doc, node, g_url, url, sizeof url, body, sizeof body);
     if (how == 1)      navigate(url);

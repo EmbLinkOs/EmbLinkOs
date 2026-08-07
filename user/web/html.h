@@ -103,6 +103,31 @@ int html_set_text(struct html_doc *doc, int node, const char *text);
  * and is why there is no second lifetime to reason about. */
 char *html_intern(struct html_doc *doc, const char *s, size_t n);
 
+/* ---- mutation: the document a script BUILDS ------------------------------
+ *
+ * A page that only reads its own markup is a document; one that creates nodes
+ * is an application, and every framework written in the last fifteen years
+ * does it. These allocate from the SAME arenas the parse used, so a script's
+ * nodes live exactly as long as the document does and there is no second
+ * lifetime to reason about -- and when the arena is full they FAIL and set
+ * `truncated`, rather than growing into a page's hands.
+ *
+ * Created nodes start detached: appending is a separate act, so a script can
+ * build a subtree before it is visible, which is what every one of them does.
+ */
+int  html_create_element(struct html_doc *doc, const char *tag);
+int  html_create_text(struct html_doc *doc, const char *text);
+/* Append `child` to `parent`, detaching it from wherever it was. Returns 0, or
+ * -1 if either index is bad or the move would make a cycle. */
+int  html_append_child(struct html_doc *doc, int parent, int child);
+/* Detach `child` from its parent. It stays allocated (a script may re-append
+ * it), it is simply no longer in the tree. */
+int  html_remove_child(struct html_doc *doc, int child);
+/* class / id / href / style, the attributes the cascade and the renderer read.
+ * An unknown name is ignored rather than stored: there is no general attribute
+ * map, and pretending otherwise would mean getAttribute lying back. */
+int  html_set_attr(struct html_doc *doc, int node, const char *name, const char *val);
+
 /* Parse `src` (len bytes) into `doc`. The caller owns both arenas; the parser
  * never allocates. Returns the root node index, or -1 if the arenas were too
  * small to hold even the root. Always leaves `doc` walkable. */

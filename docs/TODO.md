@@ -2418,6 +2418,36 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [ ] z-index is not honoured; paint order is document order. An absolutely
       positioned box written later in the source paints on top, which is what
       most pages expect anyway.
+- [x] ~~C4 part 1: the DOM a script BUILDS, and events that bubble~~ SHIPPED
+      2026-08-08. document.createElement / createTextNode / body,
+      el.appendChild / removeChild / remove / setAttribute, el.className and
+      el.classList.{add,remove,toggle,contains}. Nodes come from the SAME
+      arenas the parse used, so a script's nodes live exactly as long as the
+      document and there is no second lifetime; when an arena is full they FAIL
+      and set `truncated` rather than growing into a page's hands. A node
+      cannot be appended into its own subtree -- every walker in this browser
+      recurses without a visited set.
+      Events BUBBLE: click, submit, input and change fire on the node and then
+      on each ancestor, with `event.target` staying the node it happened on,
+      `currentTarget` the one listening, and stopPropagation ending the walk.
+      An event name we cannot deliver is still refused LOUDLY.
+      Two bugs found doing it, both of the same shape -- a feature that appears
+      to work while being useless:
+        * jsdom_has_listener asked only about the node itself, so a DELEGATED
+          listener (the way most pages are written) left its children unclickable.
+        * render_block returned early for list items, images, tables and
+          controls, all BEFORE the clickable-box code -- so a click on an <li>
+          inside a listening <ul> was consumed by the ul and arrived with
+          event.target set to the ul. Delegation exists precisely to ask which
+          item was clicked. The hit box now wraps every display path, and the
+          INNERMOST listening box consumes.
+- [ ] `preventDefault` is not implemented, so the `submit` event is a
+      NOTIFICATION and not a veto: a script hears about the submission before
+      the navigation, and cannot stop it.
+- [ ] 'input'/'change' can be REGISTERED and are dispatched by
+      jsdom_dispatch_input, but nothing calls it yet -- the field-edit path has
+      no change detection. Registering a listener that never fires is exactly
+      what this browser refuses to do elsewhere; wire it or refuse the name.
 - [ ] Custom properties are DOCUMENT-scoped, not element-scoped: one table for
       the sheet, last definition wins. Correct for a single `:root` block (the
       overwhelmingly common shape) and wrong for per-component theming

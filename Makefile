@@ -1339,7 +1339,17 @@ $(ICONS_STAMP): tools/mkicons.py $(ICON_DIRS) $(ICON_MASTERS) $(ICON_LEGACY)
 .PHONY: icons
 icons: $(ICONS_STAMP)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP)
+# The CONTENT trees mkfs stages, not just the binaries. system/ is walked by
+# mkfs and was a prerequisite of nothing, so adding a page to system/web left
+# the image "up to date" and the OS could not open the file -- the same silent
+# staleness as an unbuilt .elf, wearing different clothes. The DIRECTORIES are
+# prerequisites too: a directory's mtime moves when an entry is added or
+# removed, which is what catches a NEW file (a wildcard alone is evaluated
+# before it exists).
+EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
+                  $(shell find system data -type d 2>/dev/null)
+
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP) $(EMBKFS_CONTENT)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -1962,22 +1972,29 @@ web-corpus:
 # reports the previous build's answer with total confidence. (This one had no
 # prerequisites at all for a while, and only worked because it was deleted by
 # hand before each run.)
+# QuickJS in the HOST harness too, when it is available. Without it the corpus
+# cannot test a single line of a page's JavaScript -- and a page that builds
+# its own DOM would render empty here and correctly on the metal, which is the
+# exact divergence a two-second loop exists to catch.
+BROWSER_RENDER_JS := $(if $(HAVE_QJS),user/web/jsdom.c $(QJS_SRC)/quickjs.c \
+                       $(QJS_SRC)/libregexp.c $(QJS_SRC)/libunicode.c \
+                       $(QJS_SRC)/cutils.c $(QJS_SRC)/libbf.c,)
+BROWSER_RENDER_JSFLAGS := $(if $(HAVE_QJS),-DHAVE_JSDOM -I$(QJS_SRC) $(QJS_CFLAGS),)
+
 BROWSER_RENDER_SRCS := $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
                        user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
                        user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
                        user/web/url.c user/web/png.c user/web/jpeg.c user/lib/inflate.c \
-                       user/web/form.c user/web/select.c user/web/render_host.c
+                       user/web/form.c user/web/select.c user/web/render_host.c \
+                       $(BROWSER_RENDER_JS)
 BROWSER_RENDER_HDRS := $(wildcard user/web/*.h) $(wildcard user/web/css/*.h) \
                        $(wildcard ui/*/*.h)
 
 build/browser_render: $(BROWSER_RENDER_SRCS) $(BROWSER_RENDER_HDRS)
 	@mkdir -p $(BUILD)
-	$(HOSTCC) -std=gnu11 -Wall -Wextra -O1 -g $(V2_INC) -Iuser/web \
-	    -Iuser/web/css -Iuser/lib \
-	    $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
-	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
-	    user/web/url.c user/web/png.c user/web/jpeg.c user/lib/inflate.c user/web/form.c \
-	    user/web/select.c user/web/render_host.c -lm -o $@
+	$(HOSTCC) -std=gnu11 -Wall -O1 -g $(V2_INC) -Iuser/web \
+	    -Iuser/web/css -Iuser/lib $(BROWSER_RENDER_JSFLAGS) \
+	    $(BROWSER_RENDER_SRCS) -lm -o $@
 
 # Whatever the compiler recorded last time. Missing on a clean tree, which is
 # exactly when it is not needed.

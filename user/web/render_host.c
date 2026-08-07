@@ -26,6 +26,9 @@
 #include "jpeg.h"
 #include "select.h"
 #include "cssref.h"
+#include "net.h"
+#include "fetchjob.h"
+#include "jsdom.h"
 #include "url.h"
 
 #include <stdio.h>
@@ -315,6 +318,15 @@ int main(int argc, char **argv) {
         }
         allcss[n] = 0;
         css_sheet_parse(&g_sheet, n ? allcss : 0, n);
+    }
+    /* Run the page's scripts, as the app does. Without this the harness tests
+     * a DIFFERENT document than the browser renders -- any page that builds
+     * its own DOM would look empty here and correct on the metal, which is the
+     * exact divergence a fast loop exists to prevent. */
+    if (jsdom_open(&g_doc, &g_sheet) == 0 && g_doc.n_js > 0) {
+        int failed = jsdom_run_scripts();
+        jsdom_take_dirty();
+        if (failed) printf("*** %d script(s) threw ***\n", failed);
     }
     if (getenv("DOM")) dump_dom(&g_doc, g_root, 0);
     printf("%s: %zu bytes -> %d nodes%s, root %d, %d css rule%s%s\n", doc, dl, g_doc.n,
@@ -658,6 +670,18 @@ int cssref_start(struct html_doc *doc, const char *base) {
     if (got) fprintf(stderr, "  (loaded %d external stylesheet(s), %zu bytes)\n", got, HCSSN);
     return got;
 }
+
+/* --- the fetch worker, absent -------------------------------------------
+ * jsdom's fetch() needs the worker; the harness has no network and does not
+ * want one. A fetch here never STARTS, so a page's fetch promise simply never
+ * settles -- which is honest (nothing was fetched) and keeps the JS engine,
+ * the DOM bindings and the event model testable in two seconds, which is the
+ * whole point of this file. */
+int fetchjob_start(const char *url, char *buf, size_t cap, int tag) {
+    (void)url; (void)buf; (void)cap; (void)tag; return -1;
+}
+int fetchjob_busy(void) { return 0; }
+int fetchjob_poll(int tag, struct vnet_result *out) { (void)tag; (void)out; return -1; }
 
 void imgcache_reset(void) { memset(H, 0, sizeof H); HUSED = 0; }
 int  imgcache_pump(void) { return 0; }

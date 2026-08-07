@@ -503,6 +503,92 @@ int html_resolve_url(const char *base, const char *href, char *out, size_t cap) 
 
 /* --- mutation ------------------------------------------------------------ */
 
+int html_create_element(struct html_doc *d, const char *tag) {
+    if (!d || !tag) return -1;
+    int idx = node_new(d, HTML_ELEM, -1);      /* detached: no parent yet */
+    if (idx < 0) return -1;
+    snprintf(d->nodes[idx].tag, HTML_TAG_MAX, "%s", tag);
+    for (char *p = d->nodes[idx].tag; *p; p++)
+        if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+    return idx;
+}
+
+int html_create_text(struct html_doc *d, const char *text) {
+    if (!d || !text) return -1;
+    int idx = node_new(d, HTML_TEXT, -1);
+    if (idx < 0) return -1;
+    char *held = str_put(d, text, strlen(text));
+    if (!held) { d->truncated = 1; return -1; }
+    d->nodes[idx].text = held;
+    return idx;
+}
+
+int html_remove_child(struct html_doc *d, int child) {
+    if (!d || child < 0 || child >= d->n) return -1;
+    int p = d->nodes[child].parent;
+    if (p < 0) return 0;                        /* already detached */
+    if (d->nodes[p].first_child == child) {
+        d->nodes[p].first_child = d->nodes[child].next_sibling;
+    } else {
+        int it = d->nodes[p].first_child;
+        while (it >= 0 && d->nodes[it].next_sibling != child)
+            it = d->nodes[it].next_sibling;
+        if (it >= 0) d->nodes[it].next_sibling = d->nodes[child].next_sibling;
+    }
+    d->nodes[child].parent = -1;
+    d->nodes[child].next_sibling = -1;
+    return 0;
+}
+
+int html_append_child(struct html_doc *d, int parent, int child) {
+    if (!d || parent < 0 || parent >= d->n || child < 0 || child >= d->n) return -1;
+    if (parent == child) return -1;
+    /* A node cannot be appended into its own subtree: the tree would gain a
+     * cycle and every walker in this browser recurses without a visited set. */
+    for (int a = parent; a >= 0; a = d->nodes[a].parent)
+        if (a == child) return -1;
+    html_remove_child(d, child);
+    d->nodes[child].parent = parent;
+    d->nodes[child].next_sibling = -1;
+    if (d->nodes[parent].first_child < 0) {
+        d->nodes[parent].first_child = child;
+    } else {
+        int s = d->nodes[parent].first_child;
+        while (d->nodes[s].next_sibling >= 0) s = d->nodes[s].next_sibling;
+        d->nodes[s].next_sibling = child;
+    }
+    return 0;
+}
+
+/* Attribute names are ASCII and case-insensitive; the freestanding libc this
+ * builds against has no strcasecmp, and one comparison does not justify a
+ * dependency. */
+static int aeq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        char x = (*a >= 'A' && *a <= 'Z') ? (char)(*a - 'A' + 'a') : *a;
+        char y = (*b >= 'A' && *b <= 'Z') ? (char)(*b - 'A' + 'a') : *b;
+        if (x != y) return 0;
+    }
+    return !*a && !*b;
+}
+
+int html_set_attr(struct html_doc *d, int node, const char *name, const char *val) {
+    if (!d || node < 0 || node >= d->n || !name || !val) return -1;
+    char *held = str_put(d, val, strlen(val));
+    if (!held) { d->truncated = 1; return -1; }
+    struct html_node *e = &d->nodes[node];
+    if      (aeq(name, "class")) e->klass = held;
+    else if (aeq(name, "id"))    e->id    = held;
+    else if (aeq(name, "style")) e->style = held;
+    else if (aeq(name, "href") || aeq(name, "src") ||
+             aeq(name, "action")) e->href = held;
+    else if (aeq(name, "alt"))   e->alt   = held;
+    else if (aeq(name, "name"))  e->name  = held;
+    else if (aeq(name, "type"))  e->type  = held;
+    else return -1;                       /* not stored: see the header */
+    return 0;
+}
+
 int html_set_text(struct html_doc *d, int node, const char *text) {
     if (!d || node < 0 || node >= d->n || !text) return -1;
     size_t n = strlen(text);

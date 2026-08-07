@@ -1,0 +1,53 @@
+<html><head><title>DOM mutation and events</title><style>
+.hot { color: #ff5040 }
+.on  { color: #40d080 }
+</style></head><body>
+<div id="host"><p id="seed">SEEDTEXT</p></div>
+<ul id="list"><li id="li1">ITEMONE</li><li id="li2">ITEMTWO</li></ul>
+<p id="report">REPORTPLACEHOLDER</p>
+<script>
+/* build a subtree and attach it -- the thing a page cannot do without
+   createElement/appendChild, which is most of what a framework is */
+var host = document.querySelector("#host");
+var made = document.createElement("p");
+made.setText("CREATEDNODE arrived from a script");
+made.className = "hot";
+host.appendChild(made);
+
+/* a second one, appended to a node that is itself created */
+var wrap = document.createElement("div");
+var inner = document.createElement("p");
+inner.setText("NESTEDNODE was built detached, then attached");
+wrap.appendChild(inner);
+document.body.appendChild(wrap);
+
+/* classList */
+var seed = document.querySelector("#seed");
+seed.classList.add("on");
+seed.classList.add("temp");
+seed.classList.remove("temp");
+
+/* removal */
+var gone = document.createElement("p");
+gone.setText("SHOULDNOTAPPEAR");
+host.appendChild(gone);
+gone.remove();
+
+/* event bubbling: the listener is on the UL, the click lands on an LI */
+var log = "";
+document.querySelector("#list").addEventListener("click", function (e) {
+  log = e.target.tagName + "/" + e.currentTarget.tagName;
+  document.querySelector("#report").setText("BUBBLED " + log);
+});
+document.querySelector("#report").setText("READY classes=" + seed.className);
+</script>
+
+<!-- EXPECT-TEXT: CREATEDNODE -->
+<!-- EXPECT-COLOR: CREATEDNODE #ff5040 -->
+<!-- EXPECT-TEXT: NESTEDNODE -->
+<!-- EXPECT-NO-TEXT: SHOULDNOTAPPEAR -->
+<!-- classList.add applied, and the added-then-removed class did not stick -->
+<!-- EXPECT-COLOR: SEEDTEXT #40d080 -->
+<!-- EXPECT-TEXT: READY -->
+<!-- EXPECT-NO-TEXT: REPORTPLACEHOLDER -->
+</body></html>
