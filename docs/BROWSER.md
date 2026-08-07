@@ -261,6 +261,47 @@ networked app needs it.
 
 ## 9. On JavaScript
 
+**The engine now runs on the OS (2026-08-07).** `js.elf` is QuickJS
+2024-01-13, cross-compiled against newlib and hosted by `user/bin/js.c` -- a
+hundred lines that create a runtime, bind `console.log`, evaluate, and report
+an exception with its stack. QuickJS's own `qjs` CLI is deliberately NOT used:
+it brings threads, dlopen, a poll loop and a module loader, none of which a
+first port needs and each of which is a syscall surface to argue with.
+
+The port cost one patch of two hunks. 58k lines cross-compiled with exactly
+two errors, both optional POSIX -- `PTHREAD_MUTEX_INITIALIZER` (Atomics.* is
+SharedArrayBuffer across OS threads; a single-context engine has nothing to
+share with) and `struct tm::tm_gmtoff` (a BSD/GNU extension newlib lacks, for
+which QuickJS already carries a portable path). The patch implements nothing;
+it widens two existing `#ifdef`s so a port can select paths that were already
+there. That is why it is a patch and not a fork, and it is the strongest
+evidence for §9's original position.
+
+Proven on the metal, from the OS's own shell:
+
+    yves@emblink:~$ js /system/js/hello.js
+    JavaScript, on an OS that wrote its own kernel.
+    sum 1..100 = 5050
+    sorted+squared: [1,9,25,81]
+    regexp: 2024
+    closure: 3628800
+
+-- arithmetic and loops, Array.sort with a comparator, .map with an arrow
+function, a regexp with a capture group, JSON.stringify, and a recursive
+closure. A syntax error reports as QuickJS's own SyntaxError through the host's
+handler.
+
+WHAT IS NOT DONE: the bindings. An engine that cannot touch the document is
+still an interpreter that computes 2+2 -- exactly what §9 warned about. Next is
+a `document` object over `struct html_doc`, then events, then the fetch the
+browser already has. That work is Vellum's, not the engine's.
+
+NOTE ON THE SHELL: `js -e EXPR` needs quoting -- `js "-e" "2+2"` -- because the
+structured shell reads a bare `-e` as a unary minus in its own expression
+syntax. Not a JS bug; worth knowing.
+
+The original position, which held:
+
 Not in v1. When it comes, the position this document takes is:
 
 **Port QuickJS; do not write one.** ~50k lines of dependency-free C99 designed
@@ -290,7 +331,7 @@ Each ends with something demonstrable. No milestone is "infrastructure".
 | **B4** | HTTPS via libtls, redirects, byte caps | fetch a real site on the public internet |
 | **B5** | ✅ Inline `style=`, `<style>` + selectors + cascade | a styled page looks like the author meant |
 | **B6** | ✅ `<img>`: PNG via our own DEFLATE, alt text, async image fetch | a page with pictures |
-| **B7** | (open) JavaScript, by porting QuickJS | — |
+| **B7** | 🚧 JavaScript: QuickJS runs ON the OS; DOM bindings next | `js hello.js` prints from a real engine |
 | **+** | ✅ data tables over the layout grid (revisits §5 with evidence) | a reference page states a grid of facts |
 
 **B1 through B3 are the ones that decide whether this is real.** If a

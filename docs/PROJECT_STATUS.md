@@ -1045,6 +1045,12 @@ URL bar, back/forward, clickable links, a status line. The renderer reads only
 `struct vstyle` and never a tag name, so real CSS changes how that struct is
 FILLED and nothing else.
 
+**JavaScript runs (B7, engine half).** QuickJS 2024-01-13 cross-compiled
+against newlib and hosted by ~100 lines of our own (`user/bin/js.c`) -- one
+patch of two hunks for the whole 58k-line engine, both hunks merely widening
+existing `#ifdef`s. `js hello.js` runs closures, regexps, Array.sort and
+JSON from the OS's shell. The DOM bindings, which are the point, are next.
+
 **Data tables.** A `<table>` becomes one grid of the layout engine's own --
 aligned columns across rows, header rows, colspan, captions -- which is what
 made it a contained feature rather than a box-model rewrite.

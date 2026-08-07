@@ -551,6 +551,44 @@ build/vellum.elf: build/crt0.o build/syscalls.o $(VELLUM_OBJS) $(TLS_LIB_OBJS) b
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $(VELLUM_OBJS) \
 	    $(TLS_LIB_OBJS) build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
+# ---- QuickJS: JavaScript on the OS (docs/BROWSER.md B7) ---------------------
+# Ported, not written: §9's position is own the CORE, port the TOOLS, and this
+# OS already ports CPython, TCC and git. Absent source => js.elf is simply not
+# built, the same bargain every other port makes here.
+#
+# The engine needs TWO switches to build against a freestanding libc, both
+# added by tools/quickjs/0001-*.patch (which only widens existing #ifdefs):
+#   CONFIG_NO_ATOMICS    Atomics.* is SharedArrayBuffer across OS threads.
+#                        We have threads, but a single-context engine has
+#                        nothing to share with; pthread_mutex is the only
+#                        thing quickjs.c wanted from POSIX.
+#   CONFIG_NO_TM_GMTOFF  struct tm::tm_gmtoff is a BSD/GNU extension newlib
+#                        does not carry. QuickJS already has a portable
+#                        gmtime/mktime path for it -- this takes that one.
+QJS_SRC ?= $(HOME)/cross/quickjs-2024-01-13
+QJS_OBJS := build/qjs/quickjs.o build/qjs/libregexp.o build/qjs/libunicode.o \
+            build/qjs/cutils.o build/qjs/libbf.o
+QJS_CFLAGS := -D_GNU_SOURCE -DCONFIG_VERSION='"2024-01-13"' -DCONFIG_BIGNUM \
+              -DCONFIG_NO_ATOMICS -DCONFIG_NO_TM_GMTOFF -I$(QJS_SRC)
+HAVE_QJS := $(if $(wildcard $(QJS_SRC)/quickjs.c),1,)
+
+build/qjs:
+	@mkdir -p $@
+
+build/qjs/%.o: $(QJS_SRC)/%.c | build/qjs
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Wno-array-bounds $(QJS_CFLAGS) -c $< -o $@
+
+build/qjs/js.o: user/bin/js.c $(QJS_SRC)/quickjs.h | build/qjs
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 $(QJS_CFLAGS) -c $< -o $@
+
+build/js.elf: build/crt0.o build/syscalls.o build/qjs/js.o $(QJS_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/qjs/js.o \
+	    $(QJS_OBJS) -lc -lm -lgcc -o $@
+
+.PHONY: js
+js: build/js.elf
+	@echo "js.elf: $$(stat -c%s build/js.elf) bytes"
+
 # httpd -- the M5 server witness: an on-OS HTTP server (bind/listen/accept over
 # the native socket syscalls). `test httpd` spawns it; the host curls it via a
 # SLIRP hostfwd. Auto-discovered by mkfs.
@@ -1021,7 +1059,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/vellum.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/vellum.c user/bin/js.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1216,7 +1254,8 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/shell.elf build/sysinfo.elf build/tally.elf \
                build/embbuild.elf build/pkg.elf build/pkgbuild.elf build/pkgprobe.embx build/pkgprobe.pkg \
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
-               $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
+               $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS) \
+               $(if $(HAVE_QJS),build/js.elf,)
 
 # STAGED_APPS: binaries built OUTSIDE this tree and dropped into build/ to be
 # judged by the machine rather than by their author's host -- e.g. EmbCC (a

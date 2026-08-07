@@ -1,0 +1,20 @@
+--- /tmp/qjs_orig.c	2026-08-07 14:12:26.695903574 +0200
++++ quickjs.c	2026-08-07 14:12:26.722525048 +0200
+@@ -67,7 +67,7 @@
+ 
+ /* define to include Atomics.* operations which depend on the OS
+    threads */
+-#if !defined(EMSCRIPTEN)
++#if !defined(EMSCRIPTEN) && !defined(CONFIG_NO_ATOMICS)
+ #define CONFIG_ATOMICS
+ #endif
+ 
+@@ -43194,7 +43194,7 @@
+         }
+     }
+     ti = time;
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(CONFIG_NO_TM_GMTOFF)
+     {
+         struct tm *tm;
+         time_t gm_ti, loc_ti;

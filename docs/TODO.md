@@ -2055,7 +2055,16 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       to reserve a cell in a LATER row, which auto-flow has no way to express.
 - [ ] Cells do not stretch to their row's height, so a short cell's border box
       is shorter than a tall neighbour's. Cosmetic; needs per-row stretch.
-- [ ] Still no JS or forms -- see BROWSER.md §5 and §9.
+- [x] ~~no JS~~ ENGINE DONE 2026-08-07: QuickJS 2024-01-13 runs on the OS
+      (`js.elf`, `make js`, one two-hunk patch). Absent source => skipped.
+- [ ] JS has NO DOM BINDINGS yet -- the engine cannot touch a document, which
+      is the whole point of having it. Next: a `document` object over
+      struct html_doc, then events, then fetch (which net.c already does).
+- [ ] `js -e` needs shell quoting (`js "-e" "2+2"`): the structured shell reads
+      a bare `-e` as a unary minus. Either the shell should pass through
+      unknown leading-dash tokens, or js should take a different flag.
+- [ ] No Atomics.* (SharedArrayBuffer across threads) -- disabled by the port.
+- [ ] Still no forms -- see BROWSER.md §5.
 - [ ] Link words are separate ghost Buttons (one per word, for per-word hit
       testing when a link wraps). Their 2px padding makes a link's inter-word
       gaps slightly wider than body text. Cosmetic; a per-run hit region would
