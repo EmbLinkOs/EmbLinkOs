@@ -71,6 +71,13 @@ static void on_link(const char *href) { (void)href; }
  * call that does nothing observable -- the exact thing this browser refuses to
  * ship elsewhere. The status line is where the browser already tells the truth
  * about a page, so it is where a page's own words go too. */
+/* A click reached an element a script is listening to. The handler may rewrite
+ * the document, so the dirty flag is checked right after -- that is what makes
+ * a button on a page actually change the page. */
+static void on_dom_click(int node) {
+    if (jsdom_dispatch_click(node)) em_request_frame();
+}
+
 static void on_console(const char *line) {
     snprintf(g_console, sizeof g_console, "%s", line);
 }
@@ -214,6 +221,7 @@ static void app(void) {
         first = false;
         em_set_key_hook(vellum_key);
         vellum_set_link_handler(on_link);
+        vellum_set_event_hooks(jsdom_has_listener, on_dom_click);
         const char *start = getenv("VELLUM_URL");
         navigate(start && start[0] ? start : "/system/web/index.html");
     }
@@ -225,8 +233,15 @@ static void app(void) {
     /* ...and the page's pictures, one at a time on the same worker. Each one
      * that lands changes the page, so ask for a frame. */
     if (imgcache_pump()) em_request_frame();
-    /* a script changed the document -> the next frame must show it */
+    /* Timers, then the dirty check: a timer's handler is the most likely thing
+     * to have changed the document, so pump BEFORE asking. */
+    if (jsdom_pump_timers(embk_uptime_ms())) em_request_frame();
     if (jsdom_take_dirty()) em_request_frame();
+    /* A page with a live timer must keep getting frames; a page without one
+     * must cost nothing, which is why this asks the engine rather than
+     * ticking unconditionally. */
+    if (jsdom_next_timer()) em_app_set_refresh(60);
+    else if (!fetchjob_busy() && !imgcache_pending()) em_app_set_refresh(-1);
     if (imgcache_pending()) em_app_set_refresh(200);
 
     /* While a fetch is in flight the view has to keep being built, or the

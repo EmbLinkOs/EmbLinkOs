@@ -325,9 +325,33 @@ closure, READS `document.title` out of the tree, counts `p span.out` with the
 CSS engine, recolours an element through the cascade, and puts its
 `console.log` in the status line.
 
-STILL NOT DONE: events. There is no click, no input, no timer -- a script runs
-once at load and then the page is static. That is the next thing, and it needs
-the renderer to route a hit back to a node, which it already does for links. An engine that cannot touch the document is
+**EVENTS ARE DONE (2026-08-07).** `addEventListener('click', fn)`,
+`setTimeout`, `setInterval`, `clearTimeout`/`clearInterval`. A page responds.
+
+The one design decision here that matters: the RENDERER asks the engine which
+elements have listeners, and makes only those clickable. The alternative --
+every container a hit target -- is a page whose links stop working and whose
+text cannot be selected, so the engine decides and the renderer obeys.
+
+Two refusals, both the same rule this browser applies everywhere. An event name
+we cannot deliver THROWS rather than registering silently, because a listener
+that never fires is the hardest bug in a page to see. And `setInterval(f, 0)`
+is clamped to 10ms: a page asking to run as fast as the machine can go takes
+the window with it on a shared UI thread, and cannot tell that it did anything
+wrong.
+
+A page with a live timer keeps getting frames; a page without one costs
+nothing, because the app asks the engine when the next timer is due rather
+than ticking unconditionally.
+
+Proven on the metal, /system/web/interactive.html: a counter incremented by
+clicks, restyled red by its own handler when it crosses five, a second button
+that resets it, and a setInterval clock that ran past 100 seconds throughout --
+independent of the clicking, with console.log from each handler in the status
+line.
+
+STILL NOT DONE: no `fetch()` binding (net.c does the work already, it is not
+bound), no input/keyboard events, no createElement/appendChild. An engine that cannot touch the document is
 still an interpreter that computes 2+2 -- exactly what §9 warned about. Next is
 a `document` object over `struct html_doc`, then events, then the fetch the
 browser already has. That work is Vellum's, not the engine's.

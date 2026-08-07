@@ -33,6 +33,13 @@ const char *vellum_render_sized(struct html_doc *doc, int root,
 /* Non-NULL enables link rendering (words become clickable). */
 void vellum_set_link_handler(void (*fn)(const char *href));
 
+/* Event hooks. The renderer asks `has_listener` which elements a script cares
+ * about and makes ONLY those clickable -- a browser where every container
+ * swallows clicks is one whose links stop working. Both may be NULL (no
+ * engine), which is exactly the pre-script behaviour. */
+void vellum_set_event_hooks(int (*has_listener)(int node),
+                            void (*on_click)(int node));
+
 /* The link under the pointer, for a status line. NULL when none. */
 const char *vellum_hovered_link(void);
 

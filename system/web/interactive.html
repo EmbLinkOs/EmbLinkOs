@@ -1,0 +1,41 @@
+<!doctype html>
+<html><head><title>Interactive</title>
+<style>
+  h1     { color: #88c0d0 }
+  .btn   { color: #eceff4; background: #3b4252; margin: 6px 0 }
+  .val   { color: #a3be8c }
+  .muted { color: #7b8394; font-size: 13px }
+</style></head>
+<body>
+<h1>A page that responds</h1>
+<p class="muted">Clicks and timers, delivered to the page's own JavaScript.</p>
+
+<p>Counter: <span id="n" class="val">0</span></p>
+<div id="inc" class="btn">&nbsp; Click here to add one &nbsp;</div>
+<div id="reset" class="btn">&nbsp; Reset &nbsp;</div>
+
+<p>Uptime ticking from setInterval: <span id="clock" class="val">--</span></p>
+
+<script>
+  let n = 0;
+  const out = document.querySelector("#n");
+
+  document.querySelector("#inc").addEventListener("click", () => {
+    n = n + 1;
+    out.setText(String(n));
+    out.setStyle(n >= 5 ? "color:#bf616a; font-weight:bold" : "color:#a3be8c");
+    console.log("clicked " + n + " time" + (n === 1 ? "" : "s"));
+  });
+
+  document.querySelector("#reset").addEventListener("click", () => {
+    n = 0;
+    out.setText("0");
+    out.setStyle("color:#a3be8c");
+    console.log("reset");
+  });
+
+  let t = 0;
+  const clock = document.querySelector("#clock");
+  setInterval(() => { t = t + 1; clock.setText(t + "s"); }, 1000);
+</script>
+</body></html>

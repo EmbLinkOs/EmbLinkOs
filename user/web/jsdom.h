@@ -39,6 +39,29 @@ int  jsdom_eval(const char *src, const char *name);
  * uses it to decide whether to re-render, so an idle script costs nothing. */
 int  jsdom_take_dirty(void);
 
+/* ---- events -------------------------------------------------------------
+ * A script that runs once at load and can never respond is a template
+ * engine. These three calls are what make it a program: the renderer asks
+ * which elements care, tells us when one is clicked, and lets timers run.
+ */
+
+/* Does this node have a click listener? The RENDERER asks, so that only
+ * elements a script actually cares about become clickable -- a page where
+ * every <div> swallows clicks is a page whose links stop working. */
+int  jsdom_has_listener(int node);
+
+/* Deliver a click. Returns 1 if a handler ran (and may have mutated the
+ * document -- check jsdom_take_dirty afterwards). */
+int  jsdom_dispatch_click(int node);
+
+/* Run any timer due at `now_ms`. Returns 1 if anything ran. Call once a frame;
+ * cheap when nothing is pending, which is the common case. */
+int  jsdom_pump_timers(unsigned long long now_ms);
+
+/* When is the next timer due, or 0 if none? The app uses it to decide whether
+ * to keep asking for frames -- a page with no timers must cost nothing. */
+unsigned long long jsdom_next_timer(void);
+
 /* Tear down. Safe to call when never opened. */
 void jsdom_close(void);
 

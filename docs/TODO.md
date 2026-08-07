@@ -2060,10 +2060,13 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [x] ~~JS has NO DOM BINDINGS~~ DONE 2026-08-07: user/web/jsdom.c --
       querySelector(All), document.title, textContent, setText, getAttribute,
       setStyle, console.log. Scripts run at load; mutations re-render.
-- [ ] NO EVENTS. A script runs once at load and the page is then static: no
-      click, no input, no setTimeout. This is the biggest remaining gap and
-      the next one to close -- the renderer already routes a click to a node
-      for links, so the hit-testing half exists.
+- [x] ~~NO EVENTS~~ DONE 2026-08-07: addEventListener('click'), setTimeout,
+      setInterval, clearTimeout/clearInterval. The renderer asks the engine
+      which elements listen and makes ONLY those clickable.
+- [ ] Only 'click'. No keyboard, focus, hover or form events -- an unsupported
+      event name THROWS rather than registering silently.
+- [ ] No event bubbling: a click reaches the element that has the listener,
+      not its ancestors. Fine for buttons, wrong for delegation.
 - [ ] No fetch() binding, though net.c does the work already.
 - [ ] The DOM surface is read-mostly: no createElement/appendChild/remove, no
       classList, no attribute WRITES except style. Each absent rather than

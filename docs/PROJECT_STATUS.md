@@ -1050,7 +1050,9 @@ document's own `<script>` can query the tree with the browser's CSS selector
 engine, read and rewrite text, restyle elements through the cascade, and log to
 the status line. One document, one world per page, an index (never a pointer)
 across the boundary, and a memory budget so a stranger's loop cannot hang the
-window. Events are the next gap.
+window. Clicks and timers reach the page too: `addEventListener('click')`,
+`setTimeout`/`setInterval`, with the renderer making only listening elements
+clickable so a page's links keep working.
 
 **The engine half.** QuickJS 2024-01-13 cross-compiled
 against newlib and hosted by ~100 lines of our own (`user/bin/js.c`) -- one

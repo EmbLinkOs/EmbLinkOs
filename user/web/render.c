@@ -44,6 +44,8 @@ static const char *g_pending;
  * rather than threaded through every function, because EVERY style question
  * needs it and passing it down eight call sites would be noise. */
 static const struct css_sheet *g_sheet;
+static int  (*g_has_listener)(int node);
+static void (*g_on_click)(int node);
 
 const char *vellum_hovered_link(void) { return g_hover_href; }
 
@@ -471,6 +473,28 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
      * line breaks happen. */
     if (s->display == VD_IMAGE) { emit_image(d, node, s); return; }
     if (s->display == VD_TABLE) { render_table(d, node, s, href); return; }
+
+    /* An element a script is LISTENING to becomes clickable. Only those: a
+     * page where every <div> is a hit target is a page whose links and text
+     * selection stop working, so the engine decides and the renderer obeys. */
+    int listening = g_has_listener && g_has_listener(node);
+    if (listening) {
+        em_flush();
+        ui_box_begin(0xC11C0000ULL ^ (uint64_t)(uintptr_t)&d->nodes[node]);
+        struct instance_handle self = ui_open();
+        ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
+                    (struct layout_size){ .mode = SIZE_INTRINSIC });
+        VStack(.spacing = 2, .align = Fill,
+               .pt = (float)s->margin_top, .pb = (float)s->margin_bottom,
+               .pl = (float)s->indent) {
+            if (s->pre) render_pre(d, node, s);
+            else        render_children(d, node, s, href);
+        }
+        em_flush();
+        ui_box_end();
+        if (ui_consume_click(self) && g_on_click) g_on_click(node);
+        return;
+    }
     VStack(.spacing = 2, .align = Fill,
            .pt = (float)s->margin_top, .pb = (float)s->margin_bottom,
            .pl = (float)s->indent) {
@@ -509,3 +533,8 @@ const char *vellum_render_sized(struct html_doc *d, int root,
 }
 
 void vellum_set_link_handler(void (*fn)(const char *href)) { g_on_link = fn; }
+
+void vellum_set_event_hooks(int (*has)(int node), void (*click)(int node)) {
+    g_has_listener = has;
+    g_on_click = click;
+}

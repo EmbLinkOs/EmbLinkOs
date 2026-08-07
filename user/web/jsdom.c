@@ -27,6 +27,28 @@ static const struct css_sheet *g_sheet;
 static int  g_dirty;
 static void (*g_console)(const char *line);
 
+/* ---- listeners + timers -------------------------------------------------
+ * Fixed tables, like everything else that a stranger's page can grow. A page
+ * that registers more than this gets the first N and keeps working, which is
+ * the same bargain the DOM arena and the CSS rule table make.
+ */
+#define MAX_LISTENERS 64
+#define MAX_TIMERS    32
+
+static struct { int node; JSValue fn; int used; } g_listen[MAX_LISTENERS];
+static struct {
+    int      id, used, repeat;
+    unsigned long long due, every;
+    JSValue  fn;
+} g_timer[MAX_TIMERS];
+static int g_timer_seq = 1;
+static unsigned long long g_now;   /* last time the app pumped */
+
+/* defined with the rest of the event machinery, below jsdom_open's globals */
+static JSValue js_set_timeout(JSContext *, JSValueConst, int, JSValueConst *);
+static JSValue js_set_interval(JSContext *, JSValueConst, int, JSValueConst *);
+static JSValue js_clear_timer(JSContext *, JSValueConst, int, JSValueConst *);
+
 /* ---- element objects ---------------------------------------------------- */
 
 static JSClassID g_elem_class;
@@ -123,7 +145,35 @@ static JSValue elem_set_style(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+static JSValue elem_add_listener(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv) {
+    int i = elem_index(ctx, this_val);
+    if (i < 0 || argc < 2) return JS_UNDEFINED;
+    const char *type = JS_ToCString(ctx, argv[0]);
+    if (!type) return JS_EXCEPTION;
+    /* Only 'click' is real here. An event name we cannot deliver is REFUSED
+     * loudly rather than registered and silently never fired -- a listener
+     * that never runs is the hardest kind of bug to see. */
+    if (strcmp(type, "click") != 0) {
+        JS_FreeCString(ctx, type);
+        return JS_ThrowTypeError(ctx, "only 'click' is supported by this browser");
+    }
+    JS_FreeCString(ctx, type);
+    if (!JS_IsFunction(ctx, argv[1]))
+        return JS_ThrowTypeError(ctx, "listener must be a function");
+
+    for (int k = 0; k < MAX_LISTENERS; k++) {
+        if (g_listen[k].used) continue;
+        g_listen[k].used = 1;
+        g_listen[k].node = i;
+        g_listen[k].fn = JS_DupValue(ctx, argv[1]);
+        return JS_UNDEFINED;
+    }
+    return JS_ThrowInternalError(ctx, "too many listeners");
+}
+
 static const JSCFunctionListEntry elem_proto[] = {
+    JS_CFUNC_DEF("addEventListener", 2, elem_add_listener),
     JS_CGETSET_DEF("textContent", elem_get_text, 0),
     JS_CGETSET_DEF("tagName", elem_get_tag, 0),
     JS_CFUNC_DEF("setText", 1, elem_set_text),
@@ -233,6 +283,12 @@ void jsdom_set_console(void (*fn)(const char *line)) { g_console = fn; }
 int  jsdom_take_dirty(void) { int d = g_dirty; g_dirty = 0; return d; }
 
 void jsdom_close(void) {
+    if (g_ctx) {
+        for (int k = 0; k < MAX_LISTENERS; k++)
+            if (g_listen[k].used) { JS_FreeValue(g_ctx, g_listen[k].fn); g_listen[k].used = 0; }
+        for (int k = 0; k < MAX_TIMERS; k++)
+            if (g_timer[k].used) { JS_FreeValue(g_ctx, g_timer[k].fn); g_timer[k].used = 0; }
+    }
     if (g_ctx) { JS_FreeContext(g_ctx); g_ctx = 0; }
     if (g_rt)  { JS_FreeRuntime(g_rt);  g_rt = 0; }
     g_doc = 0; g_sheet = 0; g_dirty = 0;
@@ -269,6 +325,15 @@ int jsdom_open(struct html_doc *doc, const struct css_sheet *sheet) {
                             JS_UNDEFINED, JS_PROP_CONFIGURABLE);
     JS_FreeAtom(g_ctx, t);
     JS_SetPropertyStr(g_ctx, g, "document", d);
+
+    JS_SetPropertyStr(g_ctx, g, "setTimeout",
+                      JS_NewCFunction(g_ctx, js_set_timeout, "setTimeout", 2));
+    JS_SetPropertyStr(g_ctx, g, "setInterval",
+                      JS_NewCFunction(g_ctx, js_set_interval, "setInterval", 2));
+    JS_SetPropertyStr(g_ctx, g, "clearTimeout",
+                      JS_NewCFunction(g_ctx, js_clear_timer, "clearTimeout", 1));
+    JS_SetPropertyStr(g_ctx, g, "clearInterval",
+                      JS_NewCFunction(g_ctx, js_clear_timer, "clearInterval", 1));
 
     JS_FreeValue(g_ctx, g);
     (void)g_elem_class;
@@ -307,4 +372,118 @@ int jsdom_run_scripts(void) {
         if (eval_one(g_doc->js[i], g_doc->js_len[i], name) != 0) failed++;
     }
     return failed;
+}
+
+/* ---- events ------------------------------------------------------------- */
+
+int jsdom_has_listener(int node) {
+    for (int k = 0; k < MAX_LISTENERS; k++)
+        if (g_listen[k].used && g_listen[k].node == node) return 1;
+    return 0;
+}
+
+int jsdom_dispatch_click(int node) {
+    if (!g_ctx) return 0;
+    int ran = 0;
+    for (int k = 0; k < MAX_LISTENERS; k++) {
+        if (!g_listen[k].used || g_listen[k].node != node) continue;
+        JSValue ev = JS_NewObject(g_ctx);
+        JS_SetPropertyStr(g_ctx, ev, "type", JS_NewString(g_ctx, "click"));
+        JS_SetPropertyStr(g_ctx, ev, "target", make_elem(g_ctx, node));
+        JSValue argv[1] = { ev };
+        JSValue r = JS_Call(g_ctx, g_listen[k].fn, JS_UNDEFINED, 1, argv);
+        if (JS_IsException(r)) {
+            JSValue e = JS_GetException(g_ctx);
+            const char *m = JS_ToCString(g_ctx, e);
+            if (g_console && m) g_console(m);
+            if (m) JS_FreeCString(g_ctx, m);
+            JS_FreeValue(g_ctx, e);
+        }
+        JS_FreeValue(g_ctx, r);
+        JS_FreeValue(g_ctx, ev);
+        ran = 1;
+    }
+    return ran;
+}
+
+static JSValue js_set_timer(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv, int repeat) {
+    (void)this_val;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "callback must be a function");
+    int32_t ms = 0;
+    if (argc > 1) JS_ToInt32(ctx, &ms, argv[1]);
+    if (ms < 0) ms = 0;
+    /* A floor on repeats. setInterval(f, 0) is a page asking to be run as fast
+     * as the machine can go, which on a shared UI thread means the window
+     * stops responding -- and the page cannot tell that it did anything wrong.
+     * Clamping is kinder than freezing. */
+    if (repeat && ms < 10) ms = 10;
+
+    for (int k = 0; k < MAX_TIMERS; k++) {
+        if (g_timer[k].used) continue;
+        g_timer[k].used = 1;
+        g_timer[k].repeat = repeat;
+        g_timer[k].every = (unsigned long long)ms;
+        g_timer[k].due = g_now + (unsigned long long)ms;
+        g_timer[k].fn = JS_DupValue(ctx, argv[0]);
+        g_timer[k].id = g_timer_seq++;
+        return JS_NewInt32(ctx, g_timer[k].id);
+    }
+    return JS_ThrowInternalError(ctx, "too many timers");
+}
+static JSValue js_set_timeout(JSContext *c, JSValueConst t, int n, JSValueConst *a)
+{ return js_set_timer(c, t, n, a, 0); }
+static JSValue js_set_interval(JSContext *c, JSValueConst t, int n, JSValueConst *a)
+{ return js_set_timer(c, t, n, a, 1); }
+
+static JSValue js_clear_timer(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_UNDEFINED;
+    int32_t id = 0; JS_ToInt32(ctx, &id, argv[0]);
+    for (int k = 0; k < MAX_TIMERS; k++)
+        if (g_timer[k].used && g_timer[k].id == id) {
+            JS_FreeValue(ctx, g_timer[k].fn);
+            g_timer[k].used = 0;
+        }
+    return JS_UNDEFINED;
+}
+
+int jsdom_pump_timers(unsigned long long now_ms) {
+    if (!g_ctx) return 0;
+    g_now = now_ms;
+    int ran = 0;
+    for (int k = 0; k < MAX_TIMERS; k++) {
+        if (!g_timer[k].used || now_ms < g_timer[k].due) continue;
+        JSValue fn = g_timer[k].fn;
+        if (g_timer[k].repeat) {
+            g_timer[k].due = now_ms + g_timer[k].every;
+        } else {
+            g_timer[k].used = 0;               /* one-shot: retire before the
+                                                * call, so a handler that sets
+                                                * a new timer gets a free slot */
+        }
+        JSValue r = JS_Call(g_ctx, fn, JS_UNDEFINED, 0, 0);
+        if (JS_IsException(r)) {
+            JSValue e = JS_GetException(g_ctx);
+            const char *m = JS_ToCString(g_ctx, e);
+            if (g_console && m) g_console(m);
+            if (m) JS_FreeCString(g_ctx, m);
+            JS_FreeValue(g_ctx, e);
+        }
+        JS_FreeValue(g_ctx, r);
+        if (!g_timer[k].repeat) JS_FreeValue(g_ctx, fn);
+        ran = 1;
+    }
+    return ran;
+}
+
+unsigned long long jsdom_next_timer(void) {
+    unsigned long long best = 0;
+    for (int k = 0; k < MAX_TIMERS; k++) {
+        if (!g_timer[k].used) continue;
+        if (!best || g_timer[k].due < best) best = g_timer[k].due;
+    }
+    return best;
 }
