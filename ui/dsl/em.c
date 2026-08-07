@@ -68,6 +68,7 @@ static void em_resolve_font(EmFont role, uint32_t *fh, float *sz) {
     const struct ui_theme *t = TH;
     switch (role) {
         case Title:    *fh = t->font_bold;    *sz = t->text_title;   break;
+        case Subtitle: *fh = t->font_regular; *sz = t->text_title;   break;
         case Heading:  *fh = t->font_bold;    *sz = t->text_heading; break;
         case Caption:  *fh = t->font_regular; *sz = t->text_caption; break;
         case BodyBold: *fh = t->font_bold;    *sz = t->text_body;    break;

@@ -259,6 +259,9 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
          * renderer can act on, and storing the rest would be arena spent on
          * data nobody reads */
         char href[HTML_HREF_MAX]; href[0] = 0;
+        char klass[128]; klass[0] = 0;
+        char eid[64];    eid[0] = 0;
+        char sty[256];   sty[0] = 0;
         while (p < len && src[p] != '>') {
             while (p < len && (src[p]==' '||src[p]=='\t'||src[p]=='\n'||src[p]=='\r')) p++;
             if (p >= len || src[p] == '>' || src[p] == '/') break;
@@ -282,6 +285,15 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                 if ((ieq(aname,"href") || ieq(aname,"src")) && !href[0]) {
                     size_t c = vl < sizeof href - 1 ? vl : sizeof href - 1;
                     memcpy(href, src + vs, c); href[c] = 0;
+                } else if (ieq(aname,"class") && !klass[0]) {
+                    size_t c = vl < sizeof klass - 1 ? vl : sizeof klass - 1;
+                    memcpy(klass, src + vs, c); klass[c] = 0;
+                } else if (ieq(aname,"id") && !eid[0]) {
+                    size_t c = vl < sizeof eid - 1 ? vl : sizeof eid - 1;
+                    memcpy(eid, src + vs, c); eid[c] = 0;
+                } else if (ieq(aname,"style") && !sty[0]) {
+                    size_t c = vl < sizeof sty - 1 ? vl : sizeof sty - 1;
+                    memcpy(sty, src + vs, c); sty[c] = 0;
                 }
                 if (q && p < len) p++;
             }
@@ -316,6 +328,17 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                 if (m) break;
                 k++;
             }
+            /* A <style> body is not markup -- but it is not garbage either.
+             * KEEP it (concatenated across blocks, in document order, which is
+             * the order the cascade needs); <script> is still discarded, since
+             * nothing downstream can run it. */
+            if (ieq(tag, "style") && k > p) {
+                char *held = str_put(d, src + p, k - p);
+                if (held) {
+                    if (!d->css) { d->css = held; d->css_len = k - p; }
+                    else d->css_len = (size_t)(held - d->css) + (k - p);
+                }
+            }
             while (k < len && src[k] != '>') k++;
             i = k < len ? k + 1 : len;
             continue;
@@ -328,7 +351,10 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         int ni = node_new(d, HTML_ELEM, top(&st));
         if (ni < 0) { i = p; continue; }
         snprintf(d->nodes[ni].tag, HTML_TAG_MAX, "%s", tag);
-        if (href[0]) d->nodes[ni].href = str_put(d, href, strlen(href));
+        if (href[0])  d->nodes[ni].href  = str_put(d, href,  strlen(href));
+        if (klass[0]) d->nodes[ni].klass = str_put(d, klass, strlen(klass));
+        if (eid[0])   d->nodes[ni].id    = str_put(d, eid,   strlen(eid));
+        if (sty[0])   d->nodes[ni].style = str_put(d, sty,   strlen(sty));
         if (!is_void(tag) && !self_closing) push(&st, ni);
         i = p;
     }

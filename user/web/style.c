@@ -1,6 +1,8 @@
 /* user/web/style.c -- the user-agent stylesheet. See style.h. */
 #include <string.h>
 #include "style.h"
+#include "html.h"
+#include "css.h"
 
 static int ieq(const char *a, const char *b) {
     for (; *a && *b; a++, b++) {
@@ -26,6 +28,7 @@ void vstyle_for(const char *tag, const struct vstyle *p, struct vstyle *o) {
     o->size = p->size; o->bold = p->bold; o->italic = p->italic;
     o->mono = p->mono; o->underline = p->underline; o->link = p->link;
     o->pre = p->pre;
+    o->color = p->color;          /* colour inherits, like every text property */
     o->display = VD_INLINE;
 
     /* --- headings: size carries the hierarchy, weight reinforces it ---- */
@@ -70,4 +73,18 @@ void vstyle_for(const char *tag, const struct vstyle *p, struct vstyle *o) {
     else if (ieq(tag,"head") || ieq(tag,"title") || ieq(tag,"script") ||
              ieq(tag,"style") || ieq(tag,"meta") || ieq(tag,"link"))
         o->display = VD_NONE;
+}
+
+/* The full stylist: UA sheet -> author cascade -> inline style. Origin order
+ * is the cascade, and it is the whole reason these are three calls and not one
+ * -- each stage may override the last, and none of them may see the others'
+ * inputs. Everything downstream still reads only `struct vstyle`, which is the
+ * seam docs/BROWSER.md §4 promised would make CSS additive. */
+void vstyle_for_node(struct html_doc *doc, int node, const struct vstyle *parent,
+                     const struct css_sheet *sheet, struct vstyle *out) {
+    const char *tag = (doc && node >= 0 && node < doc->n) ? doc->nodes[node].tag : "";
+    vstyle_for(tag, parent, out);
+    if (sheet && doc && node >= 0) css_sheet_apply(sheet, doc, node, out);
+    if (doc && node >= 0 && node < doc->n && doc->nodes[node].style)
+        css_apply_decls(doc->nodes[node].style, strlen(doc->nodes[node].style), out);
 }

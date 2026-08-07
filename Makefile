@@ -515,24 +515,32 @@ build/nbsock.elf: build/crt0.o build/syscalls.o build/nbsock.o user/lib/newlib.l
 # parser), style (the user-agent stylesheet), render (document -> EmUI).
 build/web_html.o: user/web/html.c user/web/html.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
-build/web_style.o: user/web/style.c user/web/style.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
-build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/web/html.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -c $< -o $@
+build/web_style.o: user/web/style.c user/web/style.h user/web/css/css.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/web/html.h user/web/css/css.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css -c $< -o $@
 build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/render.h \
-                user/web/url.h user/web/net.h user/web/fetchjob.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -c $< -o $@
+                user/web/url.h user/web/net.h user/web/fetchjob.h user/web/css/css.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css -c $< -o $@
 # B2: url.c is pure string work; net.c reaches the network, so it needs the TLS
 # include set (same as wget) for tls.h.
 build/web_url.o: user/web/url.c user/web/url.h user/web/html.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+# CSS (B5): three concerns, three files -- declarations, selectors, cascade.
+build/web_css_decl.o: user/web/css/decl.c user/web/css/css.h user/web/style.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_css_sel.o: user/web/css/sel.c user/web/css/css.h user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_css_sheet.o: user/web/css/sheet.c user/web/css/css.h user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
 build/web_net.o: user/web/net.c user/web/net.h user/web/url.h user/lib/embk_socket.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/web -c $< -o $@
 # fetchjob: the fetch runs on a worker thread so the window keeps drawing.
 build/web_fetchjob.o: user/web/fetchjob.c user/web/fetchjob.h user/web/net.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
 VELLUM_OBJS := build/vellum.o build/web_html.o build/web_style.o build/web_render.o \
-               build/web_url.o build/web_net.o build/web_fetchjob.o
+               build/web_url.o build/web_net.o build/web_fetchjob.o \
+               build/web_css_decl.o build/web_css_sel.o build/web_css_sheet.o
 build/vellum.elf: build/crt0.o build/syscalls.o $(VELLUM_OBJS) $(TLS_LIB_OBJS) build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $(VELLUM_OBJS) \
 	    $(TLS_LIB_OBJS) build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
@@ -1739,7 +1747,10 @@ scene-test:
 # in seconds rather than through an image build and a boot.
 html-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iuser/web \
-	    user/web/html.c user/web/url.c user/web/html_test.c -o $(BUILD)/html_test
+	    -Iuser/web/css \
+	    user/web/html.c user/web/url.c user/web/style.c \
+	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
+	    user/web/html_test.c -o $(BUILD)/html_test
 	$(BUILD)/html_test
 
 backend-test:
@@ -1830,7 +1841,9 @@ DEPTH ?= 6
 browser-render:
 	@mkdir -p $(BUILD)
 	$(HOSTCC) -std=gnu11 -Wall -Wextra -O1 -g $(V2_INC) -Iuser/web \
+	    -Iuser/web/css \
 	    $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
+	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
 	    user/web/render_host.c -lm -o $(BUILD)/browser_render
 	$(BUILD)/browser_render $(DOC) $(BW) $(BH) $(DEPTH) $(PNG) $(BUSY)
 

@@ -30,6 +30,13 @@ struct html_node {
     char  tag[HTML_TAG_MAX];        /* lowercased; HTML_ELEM only          */
     char *text;                     /* into the arena; HTML_TEXT only      */
     char *href;                     /* <a href> / <img src>, or NULL       */
+    /* The three attributes CSS needs, and the ONLY parser change CSS
+     * required (docs/BROWSER.md §3 predicted exactly this). Still not a
+     * general attribute map: everything else remains arena spent on data
+     * nobody downstream can act on. */
+    char *klass;                    /* class="..." (space-separated), NULL */
+    char *id;                       /* id="...", or NULL                   */
+    char *style;                    /* style="..." declarations, or NULL   */
     int   first_child, next_sibling, parent;   /* indices, -1 = none       */
 };
 
@@ -40,6 +47,11 @@ struct html_doc {
     size_t strn, strcap;
     int  root;
     int  truncated;                 /* ran out of arena: tree is partial   */
+    /* <style> content, concatenated in document order. The parser still does
+     * not INTERPRET it -- it just stops throwing it away, so the stylist can
+     * ask for it. NULL when the document has no <style>. */
+    char *css;
+    size_t css_len;
 };
 
 /* Parse `src` (len bytes) into `doc`. The caller owns both arenas; the parser

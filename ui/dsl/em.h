@@ -40,7 +40,13 @@ typedef struct color Color;
 /* ------------------------------------------------------------------------- */
 
 typedef enum {                 /* .font = Title / Body / ... */
-    FontDefault = 0, Body, BodyBold, Title, Heading, Caption
+    FontDefault = 0, Body, BodyBold, Title, Heading, Caption,
+    /* Title size at REGULAR weight. Title and Heading are both hardwired to
+     * the bold face, which is right for headings and wrong for everything
+     * else that is merely large -- a lead paragraph, a quiet stat. CSS made
+     * the gap obvious (`font-size: 19px` with no `font-weight` came out bold),
+     * but it was always there. Appended, so every existing value is unchanged. */
+    Subtitle
 } EmFont;
 
 typedef enum {                 /* .align / .justify (shared) */

@@ -12,6 +12,12 @@
  * navigation is about to reuse. */
 const char *vellum_render(struct html_doc *doc, int root);
 
+/* ...and the same with the document's own stylesheet applied. `sheet` may be
+ * NULL, which is exactly vellum_render(). */
+struct css_sheet;
+const char *vellum_render_styled(struct html_doc *doc, int root,
+                                 const struct css_sheet *sheet);
+
 /* Non-NULL enables link rendering (words become clickable). */
 void vellum_set_link_handler(void (*fn)(const char *href));
 

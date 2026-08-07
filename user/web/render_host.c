@@ -20,6 +20,7 @@
 #include "html.h"
 #include "style.h"
 #include "render.h"
+#include "css.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +45,7 @@ static char             g_strs[STR_MAX];
 static struct html_doc  g_doc;
 static int              g_root = -1;
 static float            g_scroll = 0;
+static struct css_sheet g_sheet;
 
 /* The app's shape, verbatim from user/bin/vellum.c -- if this diverges the
  * harness stops being evidence. `g_busy` stands in for a fetch in flight, so
@@ -75,7 +77,7 @@ static void app(void) {
 
         ScrollView(&g_scroll, em_viewport_height() - (g_busy ? 164.0f : 132.0f)) {
             VStack(.spacing = 0, .align = Fill, .padding = 22, .grow = 1) {
-                vellum_render(&g_doc, g_root);
+                vellum_render_styled(&g_doc, g_root, &g_sheet);
             }
         }
 
@@ -173,8 +175,10 @@ int main(int argc, char **argv) {
     font_install_backend();
 
     g_root = html_parse(&g_doc, (const char *)src, dl, g_nodes, NODE_MAX, g_strs, STR_MAX);
-    printf("%s: %zu bytes -> %d nodes%s, root %d\n", doc, dl, g_doc.n,
-           g_doc.truncated ? " (TRUNCATED)" : "", g_root);
+    css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
+    printf("%s: %zu bytes -> %d nodes%s, root %d, %d css rule%s%s\n", doc, dl, g_doc.n,
+           g_doc.truncated ? " (TRUNCATED)" : "", g_root, g_sheet.n,
+           g_sheet.n == 1 ? "" : "s", g_sheet.truncated ? " (TRUNCATED)" : "");
     if (g_root < 0) return 1;
 
     scene_arena_init(&sa);

@@ -1045,6 +1045,12 @@ URL bar, back/forward, clickable links, a status line. The renderer reads only
 `struct vstyle` and never a tag name, so real CSS changes how that struct is
 FILLED and nothing else.
 
+**CSS is live (B5).** `user/web/css/` implements declarations, selectors and a
+real cascade -- user-agent < author < inline, specificity with document-order
+tie-breaks, descendant selectors, selector lists. The seam held: it needed ONE
+parser change (keep class/id/style, keep `<style>` bodies) and nothing
+downstream moved.
+
 An app now also DECLARES the capability classes it needs, in a `<name>.caps`
 sidecar parsed alongside the `<name>.ns` one by `user/lib/appauth.{c,h}` -- the
 capable half of "permission = nameable AND capable" (docs/USERSPACE_v2.md UP5).

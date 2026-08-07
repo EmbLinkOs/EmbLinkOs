@@ -2023,9 +2023,15 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       USERSPACE_v2 UP4. Sidecars are the ELF-shaped answer.
 - [ ] Nothing tells the USER what an app asked for. The launcher knows the mask
       at spawn time and could show it, which is the point of declaring it.
-- [ ] No CSS. `struct vstyle` is filled by a user-agent stylesheet; a real
-      cascade fills the same struct and touches nothing else (docs/BROWSER.md
-      §4). No JS, no images, no tables, no forms -- all deliberate, see §5.
+- [x] ~~No CSS~~ DONE 2026-08-07 (B5): user/web/css/{decl,sel,sheet}.c --
+      declarations, selectors, cascade. 47 host assertions.
+- [ ] CSS gaps, each deliberate: no percentages (need a containing block the
+      box model does not expose), no float/position (the layout engine has no
+      such concept), no `!important`, no pseudo-elements, no `@media`
+      evaluation (dropped, not misapplied). `>` `+` `~` parse as descendant.
+- [ ] font-size maps onto four toolkit roles by px threshold. Honest, but a
+      continuum would need the text leaf to take a size directly.
+- [ ] Still no JS, images, tables or forms -- see BROWSER.md §5.
 - [ ] Link words are separate ghost Buttons (one per word, for per-word hit
       testing when a link wraps). Their 2px padding makes a link's inter-word
       gaps slightly wider than body text. Cosmetic; a per-run hit region would

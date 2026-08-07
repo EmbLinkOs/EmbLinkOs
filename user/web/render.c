@@ -28,6 +28,7 @@
 #include "theme.h"
 #include "html.h"
 #include "style.h"
+#include "css.h"
 #include "render.h"
 
 static void (*g_on_link)(const char *href);
@@ -37,18 +38,37 @@ static const char *g_hover_href;      /* link under the pointer, for the status 
  * The document arena owns the href strings, so this only needs to survive
  * until the click is acted on -- the app copies before navigating. */
 static const char *g_pending;
+/* The document's author stylesheet for this render pass. Held for the pass
+ * rather than threaded through every function, because EVERY style question
+ * needs it and passing it down eight call sites would be noise. */
+static const struct css_sheet *g_sheet;
 
 const char *vellum_hovered_link(void) { return g_hover_href; }
 
 static EmFont font_for(const struct vstyle *s) {
-    if (s->size == 3) return Heading;
-    if (s->size == 2) return Title;
+    /* Size and WEIGHT are independent in CSS, and the toolkit's roles must not
+     * conflate them: `font-size: 19px` with no `font-weight` is a large
+     * paragraph, not a heading. Subtitle is the large regular face. */
+    if (s->size == 3) return s->bold ? Heading : Subtitle;
+    if (s->size == 2) return s->bold ? Title   : Subtitle;
     if (s->size == 1) return Caption;
     return s->bold ? BodyBold : Body;
 }
 
 static Color color_for(const struct vstyle *s) {
     const struct ui_theme *t = ui_theme();
+    /* An AUTHOR colour wins -- that is what the cascade decided. Absent one,
+     * the THEME decides, so an unstyled page follows the desktop into dark
+     * mode instead of being black-on-white in the middle of it. */
+    if (s->color) {
+        Color c;
+        c.r = (float)((s->color >> 16) & 0xFF) / 255.0f;
+        c.g = (float)((s->color >>  8) & 0xFF) / 255.0f;
+        c.b = (float)( s->color        & 0xFF) / 255.0f;
+        c.a = (float)((s->color >> 24) & 0xFF) / 255.0f;
+        if (c.a <= 0.0f) c.a = 1.0f;
+        return c;
+    }
     if (s->link) return t->accent;
     if (s->mono) return t->text_secondary;   /* code reads as a quieter voice */
     return t->text;
@@ -112,7 +132,7 @@ static void emit_text(const char *txt, const struct vstyle *s, const char *href)
 static int is_inline(struct html_doc *d, int n, const struct vstyle *parent) {
     if (d->nodes[n].kind == HTML_TEXT) return 1;
     struct vstyle s;
-    vstyle_for(d->nodes[n].tag, parent, &s);
+    vstyle_for_node(d, n, parent, g_sheet, &s);
     return s.display == VD_INLINE;
 }
 
@@ -131,7 +151,7 @@ static void render_inline_run(struct html_doc *d, int from, int to,
                 if (d->nodes[c].text) emit_text(d->nodes[c].text, parent, href);
             } else {
                 struct vstyle s;
-                vstyle_for(d->nodes[c].tag, parent, &s);
+                vstyle_for_node(d, c, parent, g_sheet, &s);
                 if (s.display == VD_NONE) continue;
                 const char *h = d->nodes[c].href ? d->nodes[c].href : href;
                 /* an inline element's children join the SAME run, so a <b>
@@ -141,7 +161,7 @@ static void render_inline_run(struct html_doc *d, int from, int to,
                         if (d->nodes[k].text) emit_text(d->nodes[k].text, &s, h);
                     } else {
                         struct vstyle s2;
-                        vstyle_for(d->nodes[k].tag, &s, &s2);
+                        vstyle_for_node(d, k, &s, g_sheet, &s2);
                         const char *h2 = d->nodes[k].href ? d->nodes[k].href : h;
                         for (int m = d->nodes[k].first_child; m >= 0; m = d->nodes[m].next_sibling)
                             if (d->nodes[m].kind == HTML_TEXT && d->nodes[m].text)
@@ -185,7 +205,7 @@ static void render_children(struct html_doc *d, int node, const struct vstyle *s
             render_inline_run(d, start, c, s, href);   /* c is the run's end */
         } else {
             struct vstyle cs;
-            vstyle_for(d->nodes[c].tag, s, &cs);
+            vstyle_for_node(d, c, s, g_sheet, &cs);
             if (cs.display != VD_NONE) {
                 if (cs.display == VD_LIST_ITEM) li++;
                 render_block(d, c, &cs, d->nodes[c].href ? d->nodes[c].href : href, li);
@@ -224,11 +244,18 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
 }
 
 const char *vellum_render(struct html_doc *d, int root) {
+    return vellum_render_styled(d, root, 0);
+}
+
+const char *vellum_render_styled(struct html_doc *d, int root,
+                                 const struct css_sheet *sheet) {
     g_pending = 0;
     g_hover_href = 0;
+    g_sheet = sheet;
     struct vstyle rs;
     vstyle_root(&rs);
     if (root >= 0) render_block(d, root, &rs, 0, 0);
+    g_sheet = 0;
     return g_pending;
 }
 

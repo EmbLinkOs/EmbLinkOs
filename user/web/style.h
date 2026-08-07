@@ -23,10 +23,24 @@ struct vstyle {
     unsigned char bold, italic, mono, underline, link, pre;
     unsigned char marker;      /* VM_* -- how a list item is bulleted   */
     short margin_top, margin_bottom, indent;
+    /* An AUTHOR colour, 0xAARRGGBB, or 0 for "the theme decides". Zero is not
+     * a colour here on purpose: a document that sets no colour must follow the
+     * OS theme (a light page in a dark desktop is the author's choice, not an
+     * accident), so the renderer only overrides its palette when this is set.
+     * Inherited like every other text property. */
+    unsigned int color;
 };
 
 /* The document root's style: everything inherits from this. */
 void vstyle_root(struct vstyle *out);
+
+/* Compute an ELEMENT's style: the user-agent stylesheet, then the author's
+ * stylesheet (cascade), then its inline style="" -- CSS's origin order, each
+ * stage overriding the last. `sheet` and `doc`/`node` may be absent (NULL/-1),
+ * which is exactly the pre-CSS behaviour.  */
+struct css_sheet; struct html_doc;
+void vstyle_for_node(struct html_doc *doc, int node, const struct vstyle *parent,
+                     const struct css_sheet *sheet, struct vstyle *out);
 
 /* Compute `tag`'s style given its parent's. Inheritable properties (size,
  * weight, italic, mono, colour-ish flags) descend; box properties (display,

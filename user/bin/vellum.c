@@ -22,6 +22,7 @@
 #include "html.h"
 #include "style.h"
 #include "render.h"
+#include "css.h"
 #include "url.h"
 #include "net.h"
 #include "fetchjob.h"
@@ -43,6 +44,7 @@ static char             g_incoming[SRC_MAX];
 static struct html_node g_nodes[NODE_MAX];
 static char             g_strs[STR_MAX];
 static struct html_doc  g_doc;
+static struct css_sheet g_sheet;   /* the page's own <style>, cascaded */
 static int              g_root = -1;
 
 static char  g_url[512]   = "";
@@ -76,6 +78,7 @@ static void load_error(const char *url, const char *why) {
              "Try <a href=\"/system/web/index.html\">the start page</a>.</p>",
              why, url);
     g_root = html_parse(&g_doc, g_src, strlen(g_src), g_nodes, NODE_MAX, g_strs, STR_MAX);
+    css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
     snprintf(g_status, sizeof g_status, "%s", why);
 }
 
@@ -116,12 +119,18 @@ static void finish_load(const struct vnet_result *res) {
     g_src[n] = 0;
     g_root = html_parse(&g_doc, g_src, n, g_nodes, NODE_MAX, g_strs, STR_MAX);
     if (g_root < 0) { load_error(g_url, "The document could not be parsed."); return; }
+    /* the author's stylesheet, borrowed from the document arena (which is why
+     * it is parsed here, once, and not per frame) */
+    css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
 
     /* The status line is the browser's honesty: how the bytes arrived, how many
      * there were, how long it took, and whether we told the truth about all
      * of them. */
-    snprintf(g_status, sizeof g_status, "%d  %s  %zu bytes  %d nodes%s%s",
-             res->status, res->via, n, g_doc.n,
+    char css[40]; css[0] = 0;
+    if (g_sheet.n) snprintf(css, sizeof css, "  %d css rule%s%s", g_sheet.n,
+                            g_sheet.n == 1 ? "" : "s", g_sheet.truncated ? "+" : "");
+    snprintf(g_status, sizeof g_status, "%d  %s  %zu bytes  %d nodes%s%s%s",
+             res->status, res->via, n, g_doc.n, css,
              res->truncated   ? "  (response truncated)" : "",
              g_doc.truncated  ? "  (document truncated)" : "");
 }
@@ -244,7 +253,7 @@ static void app(void) {
              * its width from. Left it Leading and the whole document sizes to
              * its longest line instead of to the window, so nothing wraps. */
             VStack(.spacing = 0, .align = Fill, .padding = 22, .grow = 1) {
-                const char *clicked = vellum_render(&g_doc, g_root);
+                const char *clicked = vellum_render_styled(&g_doc, g_root, &g_sheet);
                 if (clicked) snprintf(g_goto, sizeof g_goto, "%s", clicked);
             }
         }

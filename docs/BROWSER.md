@@ -269,7 +269,7 @@ Each ends with something demonstrable. No milestone is "infrastructure".
 | **B2** | `net.c`; fetch over HTTP; the app with URL bar and history | browse our own `httpd` — the OS reading itself over TCP |
 | **B3** | Link following, back/forward, error pages; measure layout cost | click through a multi-page site; a number for "how big a document can we hold" |
 | **B4** | HTTPS via libtls, redirects, byte caps | fetch a real site on the public internet |
-| **B5** | Inline `style=`, then `<style>` + selectors | a styled page looks like the author meant |
+| **B5** | ✅ Inline `style=`, `<style>` + selectors + cascade | a styled page looks like the author meant |
 | **B6** | `<img>`: PNG via our zlib, sized boxes | a page with pictures |
 | **B7** | (open) JavaScript, by porting | — |
 
@@ -337,6 +337,39 @@ a browser on your own UI stack:
   symptom.
 
 **B1 is done.** The start page renders correctly on the metal.
+
+**B5 is done: the cascade is live.** `user/web/css/` -- three files because
+there are three concerns that fail differently: `decl.c` (what a declaration
+MEANS), `sel.c` (what a selector MATCHES and how strongly), `sheet.c` (the
+CASCADE: order, not just winners). Origin order is user-agent < author <
+inline, and specificity ties break on document order.
+
+The prediction in §3 held exactly: CSS needed ONE parser change -- keep
+`class`, `id`, `style`, and stop discarding `<style>` bodies. Nothing else
+moved. The renderer still reads only `struct vstyle`; layout, the network
+layer and the app are untouched.
+
+Supported: type/class/id/universal selectors, compounds, the descendant
+combinator, selector lists, comments, and the properties this renderer can
+actually honour (color, font-weight/style/family/size, text-decoration,
+display, the margin and padding shorthands). `>` `+` `~` parse as descendant
+-- over-matching degrades a page, dropping the rule loses the author's intent
+entirely. `@media` is DROPPED rather than misapplied, because a print
+stylesheet applied to a screen rewrites the whole page.
+
+Deliberately absent, and each for a reason rather than a shrug: no
+percentages (they need a containing block this box model does not expose), no
+floats or positioning (the layout engine has no such concept and pretending
+otherwise is a lie that is harder to find than a missing feature), no
+`!important`, no pseudo-elements.
+
+CSS also exposed a real gap in the toolkit: `Title` and `Heading` were both
+hardwired to the bold face, so `font-size: 19px` with no `font-weight` came
+out bold. Size and weight are independent in CSS and must be in the roles too
+-- hence `Subtitle`, the large regular face.
+
+47 host assertions (`make html-test`), and metal-proven: the demo page renders
+`200 file 1477 bytes 51 nodes 11 css rules`.
 
 **B2 is done: Vellum is on the network.** The seam held -- `user/web/net.c`
 appeared and one call in the app changed, nothing else. `vnet_fetch` is the one

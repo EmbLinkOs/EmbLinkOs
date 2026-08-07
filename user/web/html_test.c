@@ -9,6 +9,8 @@
 #include <string.h>
 #include "html.h"
 #include "url.h"
+#include "style.h"
+#include "css.h"
 
 static int failures;
 #define CHECK(c, what) do {                                            \
@@ -221,11 +223,194 @@ static void t11_url_resolve(void) {
     CHECK(url_resolve("http://h/a", "", out, sizeof out) != 0, "an empty href resolves to nothing");
 }
 
+/* ======================= CSS (B5) ======================================= */
+
+static struct html_node CN[512];
+static char CS[16384];
+static struct html_doc CD;
+
+static int cparse(const char *src) {
+    return html_parse(&CD, src, strlen(src), CN, 512, CS, sizeof CS);
+}
+/* find the first element with this tag */
+static int find_tag(const char *tag) {
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && !strcmp(CD.nodes[i].tag, tag)) return i;
+    return -1;
+}
+
+static void t12_attrs_and_style_block(void) {
+    printf("T12 the parser keeps what CSS needs:\n");
+    cparse("<style>p{color:red}</style>"
+           "<p class='lead big' id='intro' style='font-weight:bold'>hi</p>");
+    int p = find_tag("p");
+    CHECK(p >= 0, "the element parsed");
+    CHECK(CD.nodes[p].klass && !strcmp(CD.nodes[p].klass, "lead big"), "class is kept verbatim");
+    CHECK(CD.nodes[p].id && !strcmp(CD.nodes[p].id, "intro"), "id is kept");
+    CHECK(CD.nodes[p].style && !strcmp(CD.nodes[p].style, "font-weight:bold"), "inline style is kept");
+    CHECK(CD.css && CD.css_len > 0, "<style> content is KEPT, not discarded");
+    CHECK(!strncmp(CD.css, "p{color:red}", 12), "...and it is the stylesheet text");
+
+    cparse("<script>var x = '<p>not markup</p>';</script><p>real</p>");
+    CHECK(CD.css == 0, "<script> is still discarded -- nothing can run it");
+    CHECK(find_tag("p") >= 0 && CD.nodes[find_tag("p")].first_child >= 0,
+          "and script content never becomes elements");
+}
+
+static void t13_declarations(void) {
+    printf("T13 declarations mean what they say:\n");
+    struct vstyle v;
+    memset(&v, 0, sizeof v);
+    css_apply_decls("color:#c00; font-weight:bold; font-style:italic", strlen("color:#c00; font-weight:bold; font-style:italic"), &v);
+    CHECK(v.color == 0xFFCC0000u, "#c00 expands to #cc0000");
+    CHECK(v.bold == 1 && v.italic == 1, "weight and style applied");
+
+    memset(&v, 0, sizeof v);
+    css_apply_decls("color:red", strlen("color:red"), &v);
+    CHECK(v.color == 0xFFFF0000u, "named colours work");
+
+    memset(&v, 0, sizeof v);
+    css_apply_decls("display:none", strlen("display:none"), &v);
+    CHECK(v.display == VD_NONE, "display:none hides");
+
+    memset(&v, 0, sizeof v);
+    css_apply_decls("margin: 4px 8px 12px", strlen("margin: 4px 8px 12px"), &v);
+    CHECK(v.margin_top == 4 && v.margin_bottom == 12, "the margin shorthand's 3-value form");
+
+    memset(&v, 0, sizeof v);
+    css_apply_decls("font-family: Menlo, monospace", strlen("font-family: Menlo, monospace"), &v);
+    CHECK(v.mono == 1, "a mono family is recognised");
+
+    memset(&v, 0, sizeof v);
+    v.bold = 1;
+    int n = css_apply_decls("float:left; -webkit-hack:1; color:", strlen("float:left; -webkit-hack:1; color:"), &v);
+    CHECK(n == 0, "properties we cannot honour are skipped, not faked");
+    CHECK(v.bold == 1, "...and skipping one does not disturb the rest");
+
+    memset(&v, 0, sizeof v);
+    css_apply_decls("color:red;;; ; font-weight:bold", strlen("color:red;;; ; font-weight:bold"), &v);
+    CHECK(v.color && v.bold, "malformed separators do not derail the block");
+}
+
+static void t14_selectors(void) {
+    printf("T14 selectors match and carry specificity:\n");
+    cparse("<nav><ul><li class='item'><a id='home' href='#'>x</a></li></ul></nav>");
+    int a = find_tag("a"), li = find_tag("li");
+    struct css_sel s;
+
+    CHECK(css_sel_parse("a", strlen("a"), &s) == 0 && css_sel_match(&s, &CD, a), "type selector");
+    CHECK(s.spec == 1, "...specificity 1");
+    CHECK(css_sel_parse(".item", strlen(".item"), &s) == 0 && css_sel_match(&s, &CD, li), "class selector");
+    CHECK(s.spec == 10, "...specificity 10");
+    CHECK(css_sel_parse("#home", strlen("#home"), &s) == 0 && css_sel_match(&s, &CD, a), "id selector");
+    CHECK(s.spec == 100, "...specificity 100");
+    CHECK(css_sel_parse("*", strlen("*"), &s) == 0 && css_sel_match(&s, &CD, a), "universal matches anything");
+
+    CHECK(css_sel_parse("nav a", strlen("nav a"), &s) == 0 && css_sel_match(&s, &CD, a),
+          "descendant selector crosses generations");
+    CHECK(css_sel_parse("nav ul li a", strlen("nav ul li a"), &s) == 0 && css_sel_match(&s, &CD, a),
+          "a four-part descendant chain");
+    CHECK(css_sel_parse("li.item", strlen("li.item"), &s) == 0 && css_sel_match(&s, &CD, li),
+          "a compound (type + class)");
+    CHECK(css_sel_parse("p a", strlen("p a"), &s) == 0 && !css_sel_match(&s, &CD, a),
+          "a wrong ancestor does NOT match");
+    CHECK(css_sel_parse("li.missing", strlen("li.missing"), &s) == 0 && !css_sel_match(&s, &CD, li),
+          "a wrong class does NOT match");
+    CHECK(css_sel_parse("a:hover", strlen("a:hover"), &s) == 0 && css_sel_match(&s, &CD, a),
+          "an unevaluable pseudo-class keeps the rest of the compound");
+}
+
+static void t15_cascade(void) {
+    printf("T15 the cascade resolves by specificity, then order:\n");
+    struct css_sheet sh;
+    struct vstyle v;
+
+    /* specificity beats document order */
+    static const char *css1 = "p { color: red } .lead { color: blue }";
+    cparse("<p class='lead'>x</p>");
+    css_sheet_parse(&sh, css1, strlen(css1));
+    CHECK(sh.n == 2, "two rules parsed");
+    memset(&v, 0, sizeof v);
+    css_sheet_apply(&sh, &CD, find_tag("p"), &v);
+    CHECK(v.color == 0xFF0000FFu, "the class (10) beats the type (1) whatever the order");
+
+    /* ...and when specificity ties, the LATER rule wins */
+    static const char *css2 = "p { color: red } p { color: blue }";
+    css_sheet_parse(&sh, css2, strlen(css2));
+    memset(&v, 0, sizeof v);
+    css_sheet_apply(&sh, &CD, find_tag("p"), &v);
+    CHECK(v.color == 0xFF0000FFu, "equal specificity -> document order decides");
+
+    /* a weaker rule still contributes properties the stronger one omits */
+    static const char *css3 = "p { color: red; font-style: italic } .lead { color: blue }";
+    css_sheet_parse(&sh, css3, strlen(css3));
+    memset(&v, 0, sizeof v);
+    css_sheet_apply(&sh, &CD, find_tag("p"), &v);
+    CHECK(v.color == 0xFF0000FFu && v.italic == 1,
+          "the loser still supplies what the winner did not set");
+
+    /* selector lists split into rules with their OWN specificity */
+    static const char *css4 = "h1, .lead, #x { font-weight: bold }";
+    css_sheet_parse(&sh, css4, strlen(css4));
+    CHECK(sh.n == 3, "a comma list becomes three rules");
+    memset(&v, 0, sizeof v);
+    css_sheet_apply(&sh, &CD, find_tag("p"), &v);
+    CHECK(v.bold == 1, "...and the one that matches applies");
+
+    /* comments and @media */
+    static const char *css5 = "/* c */ p { color: red } @media print { p { color: lime } }";
+    css_sheet_parse(&sh, css5, strlen(css5));
+    memset(&v, 0, sizeof v);
+    css_sheet_apply(&sh, &CD, find_tag("p"), &v);
+    CHECK(v.color == 0xFFFF0000u, "comments skipped; @media dropped rather than misapplied");
+}
+
+static void t16_origin_order(void) {
+    printf("T16 origin order: user-agent < author < inline:\n");
+    struct css_sheet sh;
+    struct vstyle root, v;
+    vstyle_root(&root);
+
+    cparse("<h1 style='color:lime'>t</h1>");
+    static const char *css = "h1 { color: red }";
+    css_sheet_parse(&sh, css, strlen(css));
+
+    int h = find_tag("h1");
+    vstyle_for_node(&CD, h, &root, &sh, &v);
+    CHECK(v.color == 0xFF00FF00u, "inline style beats the author stylesheet");
+    CHECK(v.size == 3 && v.bold == 1, "...and the UA stylesheet still supplies the rest");
+
+    /* author beats UA */
+    cparse("<h1>t</h1>");
+    static const char *css6 = "h1 { font-weight: normal }";
+    css_sheet_parse(&sh, css6, strlen(css6));
+    vstyle_for_node(&CD, find_tag("h1"), &root, &sh, &v);
+    CHECK(v.bold == 0, "the author can un-bold what the UA stylesheet bolded");
+
+    /* no sheet at all == the pre-CSS behaviour, exactly */
+    vstyle_for_node(&CD, find_tag("h1"), &root, 0, &v);
+    CHECK(v.bold == 1 && v.size == 3, "no stylesheet -> the UA result, unchanged");
+}
+
+static void t17_bounded(void) {
+    printf("T17 a stylesheet from a stranger is bounded:\n");
+    static char big[40000];
+    size_t k = 0;
+    for (int i = 0; i < 400 && k < sizeof big - 40; i++)
+        k += (size_t)snprintf(big + k, sizeof big - k, ".c%d { color: red } ", i);
+    struct css_sheet sh;
+    css_sheet_parse(&sh, big, k);
+    CHECK(sh.n <= CSS_MAX_RULES, "never exceeds the rule table");
+    CHECK(sh.truncated == 1, "and truncation is REPORTED, not silent");
+}
+
 int main(void) {
     printf("=== html-test ===\n");
     t1_structure(); t2_implicit_close(); t3_void_and_attrs(); t4_entities();
     t5_script_style(); t6_whitespace(); t7_malformed(); t8_urls(); t9_bounded();
     t10_url_parse(); t11_url_resolve();
+    t12_attrs_and_style_block(); t13_declarations(); t14_selectors();
+    t15_cascade(); t16_origin_order(); t17_bounded();
     printf("=== html-test: %s (%d failures) ===\n", failures ? "FAIL" : "OK", failures);
     return failures ? 1 : 0;
 }
