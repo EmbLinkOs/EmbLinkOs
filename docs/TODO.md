@@ -2053,13 +2053,30 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       press. Home is still building frames while this happens (the running dot
       under the launched app appears and is correct), so it is not a frozen
       loop -- the input is not arriving.
-      Two leads, both in compositor_pointer_tick: `g_dragging` (its comment
-      says "a drag in progress keeps routing to no app" -- if it sticks after a
-      window opens, every app loses the pointer) and the press-capture pair
-      `g_cap_pid`/`g_cap_win` (set on press, cleared on release; a stale
-      capture pointing at a dead or reused window id would route input into a
-      hole). Print both from compositor_pointer_tick on change and the answer
-      should be immediate.
+      NEW EVIDENCE (user, after the band fix): the APP LAUNCHER grid works
+      perfectly while the dock still does not. That is decisive about where the
+      fault is NOT. The grid tiles call the SAME helper, drag_icon(), with the
+      same ui_is_active() -> g_drag -> dock_resolve_drop() -> open_item() path;
+      only the `kind` differs (3 for a grid tile, 2 for a dock icon). So the
+      input DOES reach home, the toolkit's press latch DOES work, and
+      dock_resolve_drop DOES fire -- for one caller and not the other. This
+      also rules out the compositor leads below, since a grid tile sits over
+      the middle of the screen where app windows are.
+      What is left is the difference between the two call sites:
+        * the dock icon's SIZE changes every frame (dock_icon_size, the
+          magnifier), and shrinks back to base the instant g_drag is set --
+          so the box moves under the pointer on the very frame of the press;
+        * hover uses g_dockr (a captured WORLD rect, which is why
+          magnification and the label follow the pointer correctly), while
+          ui_is_active() uses the toolkit's own hit test on the instance's
+          LAYOUT rect. If those two disagree, hover works and clicks miss --
+          which is exactly the reported symptom.
+      Next probe, and it is one line: print from drag_icon() whether
+      ui_is_active() fires, for kind==2 and kind==3, with the pointer position
+      and the instance rect. Whichever of the two above it is, the answer is in
+      that one print.
+      (Earlier compositor leads -- g_dragging, g_cap_pid/g_cap_win -- are now
+      unlikely for the reason above, but not formally excluded.)
 - [ ] Scrolling a document in Vellum is slow. Cause is structural rather than
       mysterious: render.c emits ONE SCENE NODE PER WORD (deliberately -- it is
       what makes wrapping, mixed inline styling and per-word link hit-testing
