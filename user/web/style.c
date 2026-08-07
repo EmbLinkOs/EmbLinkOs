@@ -29,6 +29,12 @@ void vstyle_for(const char *tag, const struct vstyle *p, struct vstyle *o) {
     o->mono = p->mono; o->underline = p->underline; o->link = p->link;
     o->pre = p->pre;
     o->color = p->color;          /* colour inherits, like every text property */
+    /* text-align and line-height inherit too -- `body { text-align: center }`
+     * must reach the paragraphs, which is the whole reason a page writes it
+     * there. Background and border deliberately do NOT: they are box
+     * properties, and inheriting them would paint every descendant. */
+    o->align = p->align;
+    o->line_height = p->line_height;
     o->display = VD_INLINE;
 
     /* --- headings: size carries the hierarchy, weight reinforces it ---- */

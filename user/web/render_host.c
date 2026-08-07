@@ -132,6 +132,26 @@ static void text_extent(struct node_handle h, float oy, int inside,
     }
 }
 
+/* The first and last TEXT nodes inside the document's clip, in tree order --
+ * which is document order. Used to check a copy came out in the right order
+ * without naming any particular page's words. */
+static void first_last_text(struct node_handle h, int inside,
+                            struct node_handle *first, struct node_handle *last) {
+    struct scene_node *n = scene_resolve(&sa, h);
+    if (!n) return;
+    if (n->clip_children) inside = 1;
+    if (inside && n->kind == SCENE_NODE_TEXT && n->data.text.utf8 && n->data.text.utf8[0]) {
+        if (node_handle_is_null(*first)) *first = h;
+        *last = h;
+    }
+    for (struct node_handle c = n->first_child; !node_handle_is_null(c);) {
+        struct scene_node *cn = scene_resolve(&sa, c);
+        if (!cn) break;
+        first_last_text(c, inside, first, last);
+        c = cn->next_sibling;
+    }
+}
+
 static const char *kindname(enum scene_node_kind k) {
     switch (k) {
     case SCENE_NODE_GROUP: return "group";
@@ -317,7 +337,15 @@ int main(int argc, char **argv) {
          * check. This one read PIXEL-EXACT for as long as the classifier was
          * vetoing every real page -- the two renders agreed because they were
          * the same render. Not being taken is now a FAILURE. */
-        if (!blitted || diff) {
+        /* A document shorter than its viewport cannot scroll, so the blit
+         * genuinely does not apply -- say so rather than failing, or every
+         * short page reports a bug in a feature it never invoked. */
+        float maxy = 0; int nt = 0;
+        text_extent(ui_scene_of(ui_root()), 0, 0, &maxy, &nt);
+        int scrollable = maxy > (float)Hp;
+        if (!scrollable) {
+            printf("    (blit not applicable: the document fits its viewport)\n");
+        } else if (!blitted || diff) {
             printf("*** scroll-blit check FAILED: %s ***\n",
                    !blitted ? "the blit path was never exercised" : "pixels differ");
             g_fail++;
@@ -339,8 +367,9 @@ int main(int argc, char **argv) {
 
         /* Select everything, which is also the Ctrl+A path. */
         int changed = vsel_all();
-        char buf[8192];
+        static char buf[65536];
         size_t n = vsel_copy_text(buf, sizeof buf);
+        int truncated = (n >= sizeof buf - 2);
         printf("\n--- selection: select-all changed=%d, %zu bytes copied ---\n", changed, n);
         if (!changed || n == 0) { printf("*** selection FAILED: select-all produced nothing ***\n"); g_fail++; }
 
@@ -351,13 +380,28 @@ int main(int argc, char **argv) {
             printf("*** selection FAILED: copied text contains the address bar ***\n");
             g_fail++;
         }
-        /* ...and it must contain real page words, in document order. */
+        /* ...and it must be in DOCUMENT ORDER, checked against the document
+         * itself rather than against words hard-coded from one test page --
+         * the first word copied has to be the document's first text node and
+         * the last its last. Page-independent, so this runs on anything. */
         if (n) {
-            const char *a = strstr(buf, "What works");
-            const char *b = strstr(buf, "Preformatted");
             printf("    first 200: [%.200s]\n", buf);
-            if (!a || !b || a > b) {
-                printf("*** selection FAILED: page text missing or out of document order ***\n");
+            struct node_handle first = NODE_HANDLE_NULL, last = NODE_HANDLE_NULL;
+            first_last_text(ui_scene_of(ui_root()), 0, &first, &last);
+            struct scene_node *fn = scene_resolve(&sa, first);
+            struct scene_node *ln = scene_resolve(&sa, last);
+            const char *fw = fn ? fn->data.text.utf8 : 0;
+            const char *lw = ln ? ln->data.text.utf8 : 0;
+            size_t flen = fw ? strlen(fw) : 0;
+            while (flen && fw[flen-1] == ' ') flen--;
+            int head_ok = fw && flen && !strncmp(buf, fw, flen);
+            /* only when the copy FIT: a truncated copy is legitimately
+             * missing its tail, and asserting otherwise tests the buffer */
+            int tail_ok = truncated || (lw && lw[0] && strstr(buf, lw));
+            if (!head_ok || !tail_ok) {
+                printf("*** selection FAILED: copy is not the document in order"
+                       " (head=%d tail=%d first=[%.30s] last=[%.30s]) ***\n",
+                       head_ok, tail_ok, fw ? fw : "(none)", lw ? lw : "(none)");
                 g_fail++;
             }
         }
@@ -366,11 +410,17 @@ int main(int argc, char **argv) {
         vsel_clear();
         vsel_pointer(60, 150, 1, 1);          /* press near the top of the page */
         vsel_pointer(400, 260, 0, 1);         /* drag down and right */
-        char sub[8192];
+        static char sub[65536];
         size_t sn = vsel_copy_text(sub, sizeof sub);
         printf("--- selection: drag copied %zu bytes (of %zu) ---\n", sn, n);
-        if (sn == 0 || sn >= n) {
-            printf("*** selection FAILED: a drag did not select a proper subset ***\n");
+        /* A drag must select something, and never more than everything. It is
+         * only required to be a STRICT subset on a document long enough that
+         * the drag rectangle cannot cover it -- on a three-line page, sweeping
+         * from the first word to the last legitimately is the whole thing. */
+        float dmaxy = 0; int dnt = 0;
+        text_extent(ui_scene_of(ui_root()), 0, 0, &dmaxy, &dnt);
+        if (sn == 0 || sn > n || (dmaxy > (float)H && sn >= n)) {
+            printf("*** selection FAILED: drag selected %zu of %zu bytes ***\n", sn, n);
             g_fail++;
         }
         /* A press with no movement must select NOTHING, or every click on the
@@ -432,6 +482,20 @@ int main(int argc, char **argv) {
     }
 
     if (png) {
+        /* Rebuild first. The checks above each leave the scene in whatever
+         * state they needed -- a scroll offset, images deferred, a selection --
+         * and the PNG was rendering THAT rather than the page. It showed text
+         * from an earlier pass overlapping the current one, which reads as a
+         * renderer bug and is not one. */
+        HDEFER = 0; imgcache_reset(); g_scroll = 0; g_busy = 0;
+        vsel_reset();
+        ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
+        ui_run_layout((float)W, (float)H);
+        /* ...and UNPAINT any selection. vsel_reset drops the RANGE; taking the
+         * highlight off the runs is the post-layout pass's job, which the app
+         * runs every frame and this harness has to run by hand. */
+        vsel_sync_geometry();
+
         struct render_target rt;
         rt.pixels = malloc((size_t)W * H * 4); rt.width = W; rt.height = H;
         rt.stride = W * 4; rt.format = EMBK_PIXFMT_BGRA8888_PRE;

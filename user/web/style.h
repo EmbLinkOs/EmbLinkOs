@@ -31,6 +31,10 @@ enum {
     VD_FIELD, VD_BUTTON,
 };
 enum { VM_NONE = 0, VM_BULLET, VM_DECIMAL };
+/* text-align. Justify is accepted and treated as left: a justified paragraph
+ * needs inter-word stretching the line breaker does not do, and silently
+ * left-aligning is what every browser did before it could justify. */
+enum { VA_LEFT = 0, VA_CENTER, VA_RIGHT };
 
 struct vstyle {
     unsigned char display;
@@ -48,6 +52,19 @@ struct vstyle {
      * because a picture is the one thing whose natural size arrives LATER
      * than the layout that has to hold it. */
     short width, height;
+
+    /* --- the BOX. Not inherited (CSS says so, and a page that painted every
+     * descendant with its parent's background would be unreadable). 0 alpha
+     * means "not set", the same convention `color` already uses. --------- */
+    unsigned int bg;             /* background-color, 0xAARRGGBB          */
+    unsigned int border_color;
+    short        border_width;   /* px; 0 = no border                     */
+    short        radius;         /* border-radius in px                   */
+    short        pad_top, pad_right, pad_bottom, pad_left;
+
+    /* --- inherited text layout ------------------------------------------ */
+    unsigned char align;         /* VA_*                                   */
+    short         line_height;   /* px; 0 = the font's own leading         */
 };
 
 /* The document root's style: everything inherits from this. */

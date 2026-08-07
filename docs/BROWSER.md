@@ -772,3 +772,27 @@ Two things had to be true for the highlight to appear at all, and neither was:
   everything else. `scene_set_text_bg` is a no-op when the colour already
   matches, so the steady state marks nothing dirty: scrolling with a selection
   up costs the same 0.66s as scrolling without one.
+
+
+## The CSS property set, and a layout bug it uncovered
+
+Measuring against real pages said the vocabulary was the gap: eighteen
+properties, none of which could paint anything. Added:
+`background` / `background-color` (the shorthand is scanned for a colour rather
+than dropped whole), `border` and its longhands, `border-radius`, real
+`padding` (all four edges), `text-align`, `line-height`, and `rgb()`/`rgba()`
+colours -- modern stylesheets write colours that way constantly, and a page
+whose every colour is unparsed renders as if it had no CSS at all.
+
+`padding` used to alias onto `margin`. That was harmless while nothing was
+painted and stopped being harmless the moment a box could have a background:
+padding sits inside the painted area, margin outside it.
+
+**text-align turned out to be a layout-engine bug.** `arrange()`'s wrap arm
+started every line at the padding edge and never consulted `justify`; the
+non-wrap arm always had. Since a paragraph of text is exactly a wrapping row,
+`text-align: center` in a stylesheet could not work on any page. Each line box
+now justifies on its own -- which is what text-align means: centre every line,
+not the paragraph as a block.
+
+`line-height` is parsed and stored but layout does not use it yet.

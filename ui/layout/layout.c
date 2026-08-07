@@ -877,7 +877,22 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
                 lm += add; if (crossv[j] > lc) lc = crossv[j]; j++;
             }
             if (j == i) j = i + 1;                                     /* >=1 per line */
+            /* JUSTIFY, PER LINE. The non-wrap arm below has always honoured
+             * justify; this one started every line at the padding edge, so a
+             * wrapping row ignored it entirely -- and since a paragraph of text
+             * IS a wrapping row, `text-align: center` in a stylesheet did
+             * nothing at all. Each line box justifies on its own, which is what
+             * text-align means: centre every line, not the paragraph as a
+             * block. `lm` is already this line's used width including gaps. */
             float cursor = main_pad0;
+            if (n->justify != JUSTIFY_START) {
+                float slack = content_main - lm;
+                if (slack > 0) switch (n->justify) {
+                    case JUSTIFY_CENTER: cursor += slack * 0.5f; break;
+                    case JUSTIFY_END:    cursor += slack;        break;
+                    default:             break;   /* SPACE_BETWEEN: see below */
+                }
+            }
             for (int q = i; q < j; q++) {
                 struct layout_node *k = layout_resolve(la, kids[q]);
                 if (k->is_overlay) continue;

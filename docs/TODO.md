@@ -2171,14 +2171,22 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       the story titles ARE in the DOM and the renderer drops them, which is a
       nested-<table> bug, not a CSS one. In priority order, what is missing:
         1. ~~External stylesheets are never fetched~~ FIXED (see below).
-        2. The CSS vocabulary is ~18 properties. We understand color, display,
-           font-*, width, height, margin*, padding*, max-width,
-           text-decoration. We do NOT understand background/background-color,
-           any border, text-align, line-height, position/top/left/z-index,
-           float, any flex-*, gap, overflow, box-sizing, opacity,
-           border-radius, %/vh/vw/calc(), media queries, :hover/:focus,
-           ::before/::after, or var(). This is the bulk of the remaining gap.
+        2. PARTLY CLOSED 2026-08-07: added background/background-color (incl.
+           the shorthand, scanned for a colour), border + border-width/color/
+           style, border-radius, real padding (padding-top/right/bottom/left,
+           and the shorthand no longer aliased onto margin -- once a box can be
+           painted, inside-vs-outside is visible), text-align, line-height,
+           and rgb()/rgba() colours. Still missing: position/top/left/z-index,
+           float, any flex-*, gap, overflow, box-sizing, opacity, %/vh/vw/
+           calc(), media queries, :hover/:focus, ::before/::after, var(), and
+           per-edge borders (border-left alone paints all four).
+           line-height is PARSED and stored but not yet used by layout.
         3. Nested tables collapse (HN).
+        3b. UNEXPLAINED: danluu.com's FIRST list item renders as overlapping
+           text with a stray filled box. Layout geometry for that row is
+           correct ("xx/xx" at x=37.4, "Patreon " at 75.2, "posts" at 134.0,
+           no overlap), so the fault is below layout. It does not reproduce on
+           any other page tested. Not chased further yet.
         4. JS is 'click' only -- no bubbling, no createElement/appendChild,
            no querySelector.
         5. Form controls are text and submit only -- no checkbox, radio,
@@ -2199,6 +2207,12 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Also fixed: the status line composed its rule count ONCE at load and so
       reported "1 css rule" on a page with seven, three of which were already
       on screen -- it is now recomposed whenever a sheet lands.
+- [x] ~~text-align did nothing, on any page~~ FIXED 2026-08-07, and the bug
+      was in the LAYOUT ENGINE, not the CSS. arrange()'s wrap arm started every
+      line at the padding edge and never consulted `justify`; the non-wrap arm
+      always had. A paragraph of text IS a wrapping row, so `text-align:center`
+      could not work anywhere. Each line box now justifies on its own, which is
+      what text-align means -- centre every line, not the paragraph as a block.
 - [ ] Selection is WORD granular, not character. The renderer emits one node per
       word, so that is the grain available without measuring glyph prefixes
       through the font engine on every pointer move. Also missing: double-click

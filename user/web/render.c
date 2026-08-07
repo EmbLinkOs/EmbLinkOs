@@ -263,12 +263,30 @@ static void emit_inline(struct html_doc *d, int c, const struct vstyle *st,
 }
 
 /* Walk a run of inline siblings [from, to) into one wrapping row. */
+/* A packed 0xAARRGGBB from the cascade, as the toolkit's float Color. Alpha 0
+ * is "not set" everywhere in vstyle, so callers test before calling. */
+static Color argb(unsigned v) {
+    Color c;
+    c.r = (float)((v >> 16) & 0xFF) / 255.0f;
+    c.g = (float)((v >>  8) & 0xFF) / 255.0f;
+    c.b = (float)( v        & 0xFF) / 255.0f;
+    c.a = (float)((v >> 24) & 0xFF) / 255.0f;
+    if (c.a <= 0.0f) c.a = 1.0f;
+    return c;
+}
+
 static void render_inline_run(struct html_doc *d, int from, int to,
                               const struct vstyle *parent, const char *href) {
     /* spacing 0: the inter-word space is baked into each word instead (see
      * emit_text). A uniform gap between boxes puts one in front of a comma
      * that arrived as its own text node -- "bold , italic". */
-    Flow(.spacing = 0) {
+    /* text-align lives on the ROW, not on the block: the block still fills its
+     * container (or a centred paragraph would shrink to its longest line and
+     * take its background with it) -- it is the words inside each line box
+     * that move. */
+    EmAlign j = parent->align == VA_CENTER ? Center
+              : parent->align == VA_RIGHT  ? Trailing : Leading;
+    Flow(.spacing = 0, .justify = j) {
         for (int c = from; c >= 0 && c != to; c = d->nodes[c].next_sibling)
             emit_inline(d, c, parent, href, 0);
     }
@@ -561,12 +579,25 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
         if (ui_consume_click(self) && g_on_click) g_on_click(node);
         return;
     }
-    VStack(.spacing = 2, .align = Fill,
-           .pt = (float)s->margin_top, .pb = (float)s->margin_bottom,
-           .pl = (float)s->indent) {
+    /* The BOX the cascade asked for. Padding is inside the painted area and
+     * margin outside it, which is why they stopped sharing a field once a
+     * background could be seen. */
+    EmProps bp = { .spacing = 2, .align = Fill,
+                   .pt = (float)(s->margin_top + s->pad_top),
+                   .pb = (float)(s->margin_bottom + s->pad_bottom),
+                   .pl = (float)(s->indent + s->pad_left),
+                   .pr = (float)s->pad_right };
+    if (s->bg)           bp.background = argb(s->bg);
+    if (s->border_width) { bp.border = (float)s->border_width;
+                           bp.border_color = argb(s->border_color ? s->border_color
+                                                                  : 0xFF808080u); }
+    if (s->radius)       bp.corner = (float)s->radius;
+    em_vstack_(bp);
+    {
         if (s->pre) render_pre(d, node, s);
         else        render_children(d, node, s, href);
     }
+    em_end_();
 }
 
 const char *vellum_render(struct html_doc *d, int root) {

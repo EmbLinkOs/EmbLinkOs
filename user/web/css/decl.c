@@ -86,6 +86,45 @@ static unsigned css_color(const char *s, size_t n) {
         if (d == 6) return 0xFF000000u | v;
         return 0;
     }
+    /* rgb()/rgba(). Modern stylesheets write colours this way constantly, and
+     * a page whose every colour is unparsed renders as if it had no CSS. The
+     * alpha of rgba() is honoured only as "transparent or not": this renderer
+     * composites a background as a solid, and a half-transparent one would
+     * need the box behind it, which the box model does not expose. */
+    if (n > 4 && (s[0]=='r'||s[0]=='R') && (s[1]=='g'||s[1]=='G') && (s[2]=='b'||s[2]=='B')) {
+        size_t i = 3;
+        if (i < n && (s[i]=='a'||s[i]=='A')) i++;
+        while (i < n && (s[i]==' '||s[i]=='\t')) i++;
+        if (i < n && s[i] == '(') {
+            i++;
+            int comp[4] = {0,0,0,255}, nc = 0, frac = 0;
+            while (i < n && nc < 4) {
+                while (i < n && (s[i]==' '||s[i]=='\t'||s[i]==','||s[i]=='/')) i++;
+                if (i >= n || s[i] == ')') break;
+                int val = 0, digits = 0, isfrac = 0, fd = 0;
+                while (i < n && ((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == '%')) {
+                    if (s[i] == '.') { isfrac = 1; i++; continue; }
+                    if (s[i] == '%') { i++; break; }
+                    if (isfrac) { if (fd == 0) { frac = s[i] - '0'; fd = 1; } }
+                    else { val = val * 10 + (s[i] - '0'); digits++; }
+                    i++;
+                    if (digits > 4) break;
+                }
+                if (nc == 3) {                 /* alpha: 0 / 0.x / 1 */
+                    comp[3] = (val == 0 && !frac) ? 0 : 255;
+                } else {
+                    comp[nc] = val > 255 ? 255 : val;
+                }
+                nc++;
+            }
+            if (nc >= 3) {
+                if (!comp[3]) return 0;        /* fully transparent = not set */
+                return 0xFF000000u | ((unsigned)comp[0] << 16) |
+                       ((unsigned)comp[1] << 8) | (unsigned)comp[2];
+            }
+        }
+        return 0;
+    }
     static const struct { const char *name; unsigned rgb; } named[] = {
         {"black",0x000000},{"white",0xFFFFFF},{"red",0xFF0000},{"green",0x008000},
         {"blue",0x0000FF},{"gray",0x808080},{"grey",0x808080},{"silver",0xC0C0C0},
@@ -179,10 +218,14 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
         } else if (tok_eq(p, pn, "margin-bottom")) {
             int lok = 0; short px = len_px(v, vn, &lok);
             if (lok) { out->margin_bottom = px; ok = 1; }
-        } else if (tok_eq(p, pn, "margin-left") || tok_eq(p, pn, "padding-left")) {
+        } else if (tok_eq(p, pn, "margin-left")) {
             int lok = 0; short px = len_px(v, vn, &lok);
             if (lok) { out->indent = px; ok = 1; }
+        } else if (tok_eq(p, pn, "padding-left")) {
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok) { out->pad_left = px; ok = 1; }
         } else if (tok_eq(p, pn, "margin") || tok_eq(p, pn, "padding")) {
+            int ispad = tok_eq(p, pn, "padding");
             /* the shorthand, in its four spellings. Only the vertical parts
              * and the left indent are things this renderer can express. */
             size_t k = 0; short vals[4]; int nv = 0;
@@ -196,6 +239,107 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
             else if (nv == 2) { out->margin_top = out->margin_bottom = vals[0]; out->indent = vals[1]; ok = 1; }
             else if (nv >= 3) { out->margin_top = vals[0]; out->margin_bottom = vals[2];
                                 out->indent = nv >= 4 ? vals[3] : vals[1]; ok = 1; }
+            if (ok && ispad) {
+                /* PADDING IS NOT MARGIN, and once a box can have a background
+                 * the difference is visible: padding sits inside the painted
+                 * area, margin outside it. They shared a field while nothing
+                 * was painted, and that stopped being harmless here. */
+                out->pad_top = out->margin_top; out->pad_bottom = out->margin_bottom;
+                out->pad_left = out->pad_right = out->indent;
+                out->margin_top = out->margin_bottom = out->indent = 0;
+            }
+        } else if (tok_eq(p, pn, "padding-top") || tok_eq(p, pn, "padding-bottom") ||
+                   tok_eq(p, pn, "padding-right")) {
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok) {
+                if (tok_eq(p, pn, "padding-top")) out->pad_top = px;
+                else if (tok_eq(p, pn, "padding-bottom")) out->pad_bottom = px;
+                else out->pad_right = px;
+                ok = 1;
+            }
+        } else if (tok_eq(p, pn, "background-color") || tok_eq(p, pn, "background")) {
+            /* `background` is a shorthand over image, position, repeat and
+             * more; the COLOUR is the part this renderer can honour, so the
+             * value is scanned for one and the rest ignored rather than the
+             * whole declaration being dropped. */
+            unsigned c = css_color(v, vn);
+            if (!c) {
+                size_t k = 0;
+                while (k < vn && !c) {
+                    while (k < vn && (v[k]==' '||v[k]=='\t')) k++;
+                    size_t s2 = k;
+                    int depth = 0;
+                    while (k < vn && (depth || (v[k]!=' ' && v[k]!='\t'))) {
+                        if (v[k]=='(') depth++;
+                        else if (v[k]==')') depth--;
+                        k++;
+                    }
+                    if (k > s2) c = css_color(v + s2, k - s2);
+                }
+            }
+            if (c) { out->bg = c; ok = 1; }
+            else if (tok_eq(v, vn, "none") || tok_eq(v, vn, "transparent")) { out->bg = 0; ok = 1; }
+        } else if (tok_eq(p, pn, "border-color")) {
+            unsigned c = css_color(v, vn);
+            if (c) { out->border_color = c; if (!out->border_width) out->border_width = 1; ok = 1; }
+        } else if (tok_eq(p, pn, "border-width")) {
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok) { out->border_width = px; ok = 1; }
+        } else if (tok_eq(p, pn, "border-style")) {
+            /* We draw one kind of line. `none`/`hidden` must still be honoured,
+             * because that is how a stylesheet TURNS OFF a border it set
+             * elsewhere -- ignoring it leaves a box outlined that should not be. */
+            if (tok_eq(v, vn, "none") || tok_eq(v, vn, "hidden")) { out->border_width = 0; ok = 1; }
+            else ok = 1;
+        } else if (tok_eq(p, pn, "border")) {
+            /* the shorthand: width, style, colour, in any order */
+            if (tok_eq(v, vn, "none") || tok_eq(v, vn, "0")) { out->border_width = 0; ok = 1; }
+            else {
+                size_t k = 0; short w = 1; unsigned c = 0; int off = 0;
+                while (k < vn) {
+                    while (k < vn && (v[k]==' '||v[k]=='\t')) k++;
+                    size_t s2 = k, depth = 0;
+                    while (k < vn && (depth || (v[k]!=' ' && v[k]!='\t'))) {
+                        if (v[k]=='(') depth++; else if (v[k]==')') depth--;
+                        k++;
+                    }
+                    if (k <= s2) break;
+                    int lok = 0; short px = len_px(v + s2, k - s2, &lok);
+                    unsigned cc = css_color(v + s2, k - s2);
+                    if (tok_eq(v + s2, k - s2, "none") || tok_eq(v + s2, k - s2, "hidden")) off = 1;
+                    else if (cc) c = cc;
+                    else if (lok) w = px;
+                }
+                out->border_width = off ? 0 : w;
+                if (c) out->border_color = c;
+                ok = 1;
+            }
+        } else if (tok_eq(p, pn, "border-radius")) {
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok && px >= 0) { out->radius = px; ok = 1; }
+        } else if (tok_eq(p, pn, "text-align")) {
+            if (tok_eq(v, vn, "center")) { out->align = VA_CENTER; ok = 1; }
+            else if (tok_eq(v, vn, "right") || tok_eq(v, vn, "end")) { out->align = VA_RIGHT; ok = 1; }
+            else if (tok_eq(v, vn, "left") || tok_eq(v, vn, "start") ||
+                     tok_eq(v, vn, "justify")) { out->align = VA_LEFT; ok = 1; }
+        } else if (tok_eq(p, pn, "line-height")) {
+            /* px/em, or a BARE NUMBER, which CSS defines as a multiple of the
+             * font size and is how most stylesheets write it. */
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok && px > 0) { out->line_height = px; ok = 1; }
+            else {
+                int whole = 0, tenth = 0, seen = 0, dot = 0;
+                for (size_t k = 0; k < vn; k++) {
+                    char c2 = v[k];
+                    if (c2 == '.') { dot = 1; continue; }
+                    if (c2 < '0' || c2 > '9') { seen = 0; break; }
+                    if (dot) { if (!tenth) tenth = c2 - '0'; }
+                    else whole = whole * 10 + (c2 - '0');
+                    seen = 1;
+                }
+                /* against a 15px body: the size the renderer actually uses */
+                if (seen && whole < 10) { out->line_height = (short)((whole * 150 + tenth * 15) / 10); ok = 1; }
+            }
         }
         if (ok) applied++;
     }
