@@ -41,7 +41,21 @@ void vstyle_for(const char *tag, const struct vstyle *p, struct vstyle *o) {
     /* <img> is inline-level, like text: a picture in a sentence sits IN the
      * sentence. render.c gives it a box; the stylist only says what kind of
      * box it is. */
-    else if (ieq(tag,"img")) { o->display = VD_INLINE; }
+    else if (ieq(tag,"img")) { o->display = VD_IMAGE; }
+
+    /* --- tables. A data table is not "tables as layout" (the practice
+     * docs/BROWSER.md rightly refuses); it is how a reference page states a
+     * grid of facts, and a documentation browser that cannot show one is
+     * missing the format its own subject matter is written in. --- */
+    else if (ieq(tag,"table")) { o->display=VD_TABLE; o->margin_top=10; o->margin_bottom=14; }
+    else if (ieq(tag,"tr"))    { o->display=VD_ROW; }
+    else if (ieq(tag,"th"))    { o->display=VD_CELL; o->bold=1; }
+    else if (ieq(tag,"td"))    { o->display=VD_CELL; }
+    else if (ieq(tag,"caption")) { o->display=VD_CAPTION; o->size=1; o->margin_bottom=4; }
+    /* row GROUPS are transparent: they carry no box of their own, and the
+     * table walker descends through them to find the rows. */
+    else if (ieq(tag,"thead") || ieq(tag,"tbody") || ieq(tag,"tfoot") ||
+             ieq(tag,"colgroup") || ieq(tag,"col")) { o->display=VD_BLOCK; }
 
     /* --- flow --- */
     else if (ieq(tag,"p"))  { o->display=VD_BLOCK; o->margin_top=0; o->margin_bottom=12; }

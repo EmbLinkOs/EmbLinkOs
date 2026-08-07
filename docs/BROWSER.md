@@ -160,6 +160,25 @@ real box-model engine, and the design's position is that a document browser
 does not need them. If that turns out to be wrong, it is a decision to revisit
 with evidence, not a gap to paper over.
 
+**REVISITED (2026-08-07), for DATA tables only.** The evidence is the subject
+matter: reference pages -- the thing this browser exists to read -- state their
+facts in tables, and a documentation browser that cannot show one is missing
+the format its own material is written in. That is not "tables as layout", the
+practice this paragraph rightly refuses; the refusal stands.
+
+It also cost nothing structural, which is the tell that it belonged. A table's
+one hard requirement is that columns line up ACROSS independent rows -- which a
+row of stacks cannot do and the layout engine's GRID already did, spans
+included. So a `<table>` is one grid, every cell a child of it in reading
+order, exactly as a block is a column and an inline run is a wrapping row.
+
+The honest limit: grid tracks are EQUAL width. Sizing each column to its
+content needs a measurement pass the renderer cannot do -- it emits, layout
+measures afterwards. Equal columns keep every row aligned, which is the
+property that makes a table a table, and cost some space when one column is
+short and another long. Content-proportional tracks are a layout-engine
+feature, logged rather than faked.
+
 **The known risk:** EmUI's layout was built for application UI, where the tree
 is small and rebuilt per frame. A long document is a large tree. If it does not
 hold, the fallback is to lay the document out *once* into a flat display list
@@ -271,7 +290,8 @@ Each ends with something demonstrable. No milestone is "infrastructure".
 | **B4** | HTTPS via libtls, redirects, byte caps | fetch a real site on the public internet |
 | **B5** | ✅ Inline `style=`, `<style>` + selectors + cascade | a styled page looks like the author meant |
 | **B6** | ✅ `<img>`: PNG via our own DEFLATE, alt text, async image fetch | a page with pictures |
-| **B7** | (open) JavaScript, by porting | — |
+| **B7** | (open) JavaScript, by porting QuickJS | — |
+| **+** | ✅ data tables over the layout grid (revisits §5 with evidence) | a reference page states a grid of facts |
 
 **B1 through B3 are the ones that decide whether this is real.** If a
 document renders and scrolls at a usable speed, everything after is addition.

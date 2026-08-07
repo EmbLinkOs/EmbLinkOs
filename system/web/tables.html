@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><title>Tables</title>
+<style>
+  h1 { color: #88c0d0 }
+  .note { color: #7b8394; font-size: 13px }
+</style></head>
+<body>
+<h1>Tables</h1>
+<p>A data table is how a reference page states a grid of facts. Columns line up
+across rows because the whole table is one grid.</p>
+
+<table>
+<caption>Syscalls added for the browser</caption>
+<tr><th>Number</th><th>Name</th><th>What it grants</th></tr>
+<tr><td>39-48</td><td>win_*</td><td>a window, its pixels, and its input</td></tr>
+<tr><td>58</td><td>set_fs_base</td><td>a thread pointer, for TLS</td></tr>
+<tr><td>89</td><td>win_restore</td><td>bring a parked window forward</td></tr>
+<tr><td>91</td><td>screen_luma</td><td>how bright the desktop is behind you</td></tr>
+</table>
+
+<p class="note">Header cells are bold on a tinted row; body rows are separated
+by a hairline. Both come from the theme, so the table follows the desktop.</p>
+
+<table>
+<tr><th colspan="2">A cell that spans two columns</th></tr>
+<tr><td>left</td><td>right</td></tr>
+<tr><td>a ragged row</td></tr>
+</table>
+
+<p><a href="/system/web/index.html">Back to the start page</a></p>
+</body></html>

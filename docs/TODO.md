@@ -2045,7 +2045,17 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       `aspect-ratio` would be the modern answer if a page supplies it.
 - [ ] The image arena is 6.4MB for 8 slots, per page. A page wanting more gets
       alt text for the rest.
-- [ ] Still no JS, tables or forms -- see BROWSER.md §5.
+- [x] ~~tables~~ DONE 2026-08-07: data tables over the layout engine's grid --
+      aligned columns, header rows, colspan, captions, ragged rows. Revisits
+      the BROWSER.md §5 exclusion with evidence (documentation pages ARE
+      tables); "tables as layout" is still refused.
+- [ ] Table columns are EQUAL width. Content-proportional tracks need weighted
+      grid tracks in the layout engine -- the renderer cannot measure, it emits.
+- [ ] rowspan is parsed but ignored (colspan works). A rowspan needs the grid
+      to reserve a cell in a LATER row, which auto-flow has no way to express.
+- [ ] Cells do not stretch to their row's height, so a short cell's border box
+      is shorter than a tall neighbour's. Cosmetic; needs per-row stretch.
+- [ ] Still no JS or forms -- see BROWSER.md §5 and §9.
 - [ ] Link words are separate ghost Buttons (one per word, for per-word hit
       testing when a link wraps). Their 2px padding makes a link's inter-word
       gaps slightly wider than body text. Cosmetic; a per-run hit region would

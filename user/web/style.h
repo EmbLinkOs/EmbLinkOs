@@ -14,7 +14,18 @@
 #ifndef _EMBLINK_WEB_STYLE_H_
 #define _EMBLINK_WEB_STYLE_H_
 
-enum { VD_INLINE = 0, VD_BLOCK, VD_LIST_ITEM, VD_NONE };
+enum {
+    VD_INLINE = 0, VD_BLOCK, VD_LIST_ITEM, VD_NONE,
+    /* A REPLACED element: its content is not markup but a picture. Named in
+     * the display enum rather than sniffed by tag in the renderer, because
+     * render.c's rule is that it reads this struct and never a tag -- and the
+     * first exception (an strcmp for "img") was already one too many. */
+    VD_IMAGE,
+    /* Table structure. CSS models these as display values too (table,
+     * table-row, table-cell), which is exactly why they belong here: the
+     * renderer asks what KIND of box this is, not what it was called. */
+    VD_TABLE, VD_ROW, VD_CELL, VD_CAPTION,
+};
 enum { VM_NONE = 0, VM_BULLET, VM_DECIMAL };
 
 struct vstyle {

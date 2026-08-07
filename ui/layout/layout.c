@@ -357,6 +357,8 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
  * parent can size a wrapping child before placing its siblings. Row-wrap only. */
 static float measure_wrap_height(struct layout_arena *la, struct scene_arena *sa,
                                  struct layout_handle h, float avail_w);
+static float measure_grid_height(struct layout_arena *la, struct scene_arena *sa,
+                                 struct layout_handle h, float avail_w);
 
 /* Height of a subtree at a KNOWN width.
  *
@@ -403,6 +405,13 @@ static float measure_subtree_height(struct layout_arena *la, struct scene_arena 
 
     float cw = avail_w - n->padding_left - n->padding_right;
     if (cw < 0) cw = 0;
+
+    /* A GRID measures by ROWS, not by children. Without this the column branch
+     * below sums every CELL -- a 3x5 table reported the height of fifteen rows
+     * instead of five, and everything after it on the page was pushed off the
+     * bottom while the table itself drew correctly. Exactly the hole
+     * measure_wrap_height fills for wrapping rows, one shape over. */
+    if (n->grid_cols > 0) return measure_grid_height(la, sa, h, avail_w);
 
     if (n->axis == AXIS_ROW) {
         if (n->wrap) return measure_wrap_height(la, sa, h, avail_w);
@@ -526,8 +535,15 @@ static float measure_grid_height(struct layout_arena *la, struct scene_arena *sa
             if (span > cols) span = cols;
             if (col > 0 && col + span > cols) { total += row_h; nrows++; row_h = 0; col = 0; }
             float cw = col_w * span + cgap * (span - 1);
+            /* A CELL is usually a container, and a container's intrinsic_h was
+             * computed before any width was known -- so a cell whose text
+             * wraps measured as ONE LINE. In a grid that is not a cosmetic
+             * error: the row takes its height from the tallest cell, so every
+             * row after it sat too high and the table's rows overlapped.
+             * Measure the subtree at the width the cell will actually get. */
             float ch = (cn->height.mode == SIZE_FIXED) ? cn->height.fixed_value
                      : is_text(sa, cn) ? layout_measure_height_at_width(la, sa, c, cw)
+                     : cn->is_container ? measure_subtree_height(la, sa, c, cw)
                      : cn->intrinsic_h;
             if (ch > row_h) row_h = ch;
             col += span;
@@ -595,8 +611,13 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
             if (col > 0 && col + span > cols) { row_y += row_h + rgap; row_h = 0; col = 0; }
             float cw = col_w * span + cgap * (span - 1);
             float cx = n->padding_left + col * (col_w + cgap);
+            /* same as the measure pass above, and it MUST agree with it: this
+             * ch is both the cell's box and the height its children are
+             * arranged in, so a wrong value here wraps the text differently
+             * than the row was sized for. */
             float ch = (k->height.mode == SIZE_FIXED) ? k->height.fixed_value
                      : is_text(sa, k) ? layout_measure_height_at_width(la, sa, kids[i], cw)
+                     : k->is_container ? measure_subtree_height(la, sa, kids[i], cw)
                      : k->intrinsic_h;
             k->resolved_x = cx; k->resolved_y = row_y; k->resolved_w = cw; k->resolved_h = ch;
             if (ch > row_h) row_h = ch;

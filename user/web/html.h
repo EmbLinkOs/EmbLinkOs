@@ -38,7 +38,11 @@ struct html_node {
     char *id;                       /* id="...", or NULL                   */
     char *style;                    /* style="..." declarations, or NULL   */
     char *alt;                      /* <img alt="...">, or NULL            */
-    short img_w, img_h;             /* <img width/height>, 0 = unstated    */
+    /* <img width/height>, 0 = unstated. img_w DOUBLES as a table cell's
+     * colspan: a cell is never an image and an image is never a cell, so the
+     * two facts cannot collide, and a separate pair of shorts on every node in
+     * the document would be arena spent to keep them apart. */
+    short img_w, img_h;
     int   first_child, next_sibling, parent;   /* indices, -1 = none       */
 };
 

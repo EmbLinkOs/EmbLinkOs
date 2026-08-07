@@ -322,6 +322,18 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                         if (v > 10000) { ok = 0; break; }
                     }
                     if (ok) { if (ieq(aname,"width")) aw = v; else ah = v; }
+                } else if (ieq(aname,"colspan") || ieq(aname,"rowspan")) {
+                    /* colspan shares img_w's slot: a cell is never an image,
+                     * an image is never a cell, and a second pair of shorts on
+                     * every node in the document would be arena spent to keep
+                     * two mutually exclusive facts apart. Named honestly at
+                     * both ends rather than left as a coincidence. */
+                    int v = 0, ok = (vl > 0 && vl < 4);
+                    for (size_t k2 = 0; k2 < vl && ok; k2++) {
+                        char c2 = src[vs + k2];
+                        if (c2 < '0' || c2 > '9') ok = 0; else v = v * 10 + (c2 - '0');
+                    }
+                    if (ok && v > 0 && v <= 32 && ieq(aname,"colspan")) aw = v;
                 } else if (ieq(aname,"alt") && !alt[0]) {
                     /* alt is not decoration: it is what the page SAYS when the
                      * picture cannot be shown, which for us is often. */

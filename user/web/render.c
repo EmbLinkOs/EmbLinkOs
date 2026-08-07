@@ -219,7 +219,7 @@ static int is_inline(struct html_doc *d, int n, const struct vstyle *parent) {
     if (d->nodes[n].kind == HTML_TEXT) return 1;
     struct vstyle s;
     vstyle_for_node(d, n, parent, g_sheet, &s);
-    return s.display == VD_INLINE;
+    return s.display == VD_INLINE || s.display == VD_IMAGE;
 }
 
 static void render_block(struct html_doc *d, int node, const struct vstyle *s,
@@ -243,7 +243,7 @@ static void emit_inline(struct html_doc *d, int c, const struct vstyle *st,
     /* AFTER computing its own style, not before: an image is styled by the
      * rules that match IT (`.half { width: 150px }`), and handing it the
      * parent's vstyle silently ignored every one of them. */
-    if (!strcmp(d->nodes[c].tag, "img")) { emit_image(d, c, &s); return; }
+    if (s.display == VD_IMAGE) { emit_image(d, c, &s); return; }
     const char *h = d->nodes[c].href ? d->nodes[c].href : href;
     for (int k = d->nodes[c].first_child; k >= 0; k = d->nodes[k].next_sibling)
         emit_inline(d, k, &s, h, depth + 1);
@@ -258,6 +258,152 @@ static void render_inline_run(struct html_doc *d, int from, int to,
     Flow(.spacing = 0) {
         for (int c = from; c >= 0 && c != to; c = d->nodes[c].next_sibling)
             emit_inline(d, c, parent, href, 0);
+    }
+}
+
+/* --- tables ---------------------------------------------------------------
+ *
+ * A table is the one document structure whose columns must line up ACROSS
+ * independent rows -- which is precisely what a row of HStacks cannot do and
+ * what the layout engine's grid already does. So a <table> becomes one grid of
+ * N columns and every cell is a child of it, in reading order.
+ *
+ * The honest limit, stated because it is visible: the grid's tracks are EQUAL
+ * width. A real table sizes each column to its content, which needs a
+ * measurement pass the renderer cannot do (it emits; layout measures later).
+ * Equal columns keep every row aligned -- the property that makes a table a
+ * table -- and cost some space in a table of one short column and one long
+ * one. Content-proportional tracks are a layout-engine feature, logged.
+ */
+
+/* Cells of one row, in order; descends through thead/tbody/tfoot, which carry
+ * no box of their own. Returns the count. */
+static int row_cells(struct html_doc *d, int row, int *out, int max,
+                     const struct vstyle *pst) {
+    int n = 0;
+    for (int c = d->nodes[row].first_child; c >= 0 && n < max; c = d->nodes[c].next_sibling) {
+        if (d->nodes[c].kind != HTML_ELEM) continue;
+        struct vstyle cs;
+        vstyle_for_node(d, c, pst, g_sheet, &cs);
+        if (cs.display == VD_CELL) out[n++] = c;
+    }
+    return n;
+}
+
+/* Every row of a table, descending through row groups. */
+static int table_rows(struct html_doc *d, int tbl, int *out, int max,
+                      const struct vstyle *tst) {
+    int n = 0;
+    for (int c = d->nodes[tbl].first_child; c >= 0 && n < max; c = d->nodes[c].next_sibling) {
+        if (d->nodes[c].kind != HTML_ELEM) continue;
+        struct vstyle cs;
+        vstyle_for_node(d, c, tst, g_sheet, &cs);
+        if (cs.display == VD_ROW) { out[n++] = c; continue; }
+        if (cs.display == VD_BLOCK) {            /* thead/tbody/tfoot: descend */
+            for (int r = d->nodes[c].first_child; r >= 0 && n < max; r = d->nodes[r].next_sibling) {
+                if (d->nodes[r].kind != HTML_ELEM) continue;
+                struct vstyle rs;
+                vstyle_for_node(d, r, &cs, g_sheet, &rs);
+                if (rs.display == VD_ROW) out[n++] = r;
+            }
+        }
+    }
+    return n;
+}
+
+#define TBL_MAX_ROWS 128
+#define TBL_MAX_COLS  12
+
+static void render_children(struct html_doc *d, int node, const struct vstyle *s,
+                            const char *href);
+
+static void render_table(struct html_doc *d, int node, const struct vstyle *st,
+                         const char *href) {
+    static int rows[TBL_MAX_ROWS];
+    int nrow = table_rows(d, node, rows, TBL_MAX_ROWS, st);
+    if (!nrow) return;
+
+    /* The column count is the WIDEST row: a row with fewer cells leaves the
+     * tail empty rather than shifting the ones after it into the wrong
+     * column, which is what makes a ragged table still readable. */
+    int ncol = 1;
+    for (int i = 0; i < nrow; i++) {
+        static int cells[TBL_MAX_COLS];
+        int nc = row_cells(d, rows[i], cells, TBL_MAX_COLS, st);
+        int span_total = 0;
+        for (int c = 0; c < nc; c++) {
+            int sp = d->nodes[cells[c]].img_w;   /* colspan, parsed into img_w */
+            span_total += sp > 0 ? sp : 1;
+        }
+        if (span_total > ncol) ncol = span_total;
+    }
+    if (ncol > TBL_MAX_COLS) ncol = TBL_MAX_COLS;
+
+    const struct ui_theme *t = ui_theme();
+    VStack(.spacing = 0, .align = Fill,
+           .pt = (float)st->margin_top, .pb = (float)st->margin_bottom) {
+        /* the caption, if the author wrote one: a table's title belongs above
+         * it and outside the grid */
+        for (int c = d->nodes[node].first_child; c >= 0; c = d->nodes[c].next_sibling) {
+            if (d->nodes[c].kind != HTML_ELEM) continue;
+            struct vstyle cs;
+            vstyle_for_node(d, c, st, g_sheet, &cs);
+            if (cs.display != VD_CAPTION) continue;
+            VStack(.spacing = 0, .align = Fill, .pb = (float)cs.margin_bottom) {
+                render_children(d, c, &cs, href);
+            }
+        }
+
+        em_flush();
+        ui_begin_vstack(0x7AB10000ULL ^ (uint64_t)(uintptr_t)&d->nodes[node]);
+        ui_set_grid(ncol, 0.0f, 0.0f);
+        ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
+                    (struct layout_size){ .mode = SIZE_INTRINSIC });
+
+        for (int i = 0; i < nrow; i++) {
+            static int cells[TBL_MAX_COLS];
+            int nc = row_cells(d, rows[i], cells, TBL_MAX_COLS, st);
+            int placed = 0;
+            for (int c = 0; c < nc && placed < ncol; c++) {
+                int cell = cells[c];
+                struct vstyle rs, cs;
+                vstyle_for_node(d, rows[i], st, g_sheet, &rs);
+                vstyle_for_node(d, cell, &rs, g_sheet, &cs);
+                int sp = d->nodes[cell].img_w;
+                if (sp < 1) sp = 1;
+                if (placed + sp > ncol) sp = ncol - placed;
+
+                em_flush();
+                ui_begin_vstack(0x7AB20000ULL ^ (uint64_t)(uintptr_t)&d->nodes[cell]);
+                ui_set_grid_span(sp);
+                ui_set_padding(7, 9, 7, 9);
+                ui_set_align(ALIGN_STRETCH);
+                /* A header row needs to READ as one, and a row separator is
+                 * what stops a dense table becoming a wall. Both come from the
+                 * theme so the table follows the desktop into dark mode. */
+                if (cs.bold) {
+                    struct paint hp = { 0 };
+                    hp.kind = PAINT_SOLID; hp.solid = t->surface_alt;
+                    ui_set_paint(hp);
+                } else {
+                    struct color line = t->text_secondary; line.a *= 0.16f;
+                    ui_set_border(1.0f, line);
+                }
+                render_children(d, cell, &cs, href);
+                em_flush();
+                ui_end_stack();
+                placed += sp;
+            }
+            /* pad a short row so the next one starts in column 0 */
+            for (; placed < ncol; placed++) {
+                em_flush();
+                ui_begin_vstack(0x7AB30000ULL ^ ((uint64_t)i << 8) ^ (uint64_t)placed);
+                ui_set_padding(7, 9, 7, 9);
+                ui_end_stack();
+            }
+        }
+        em_flush();
+        ui_end_stack();
     }
 }
 
@@ -323,7 +469,8 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
      * wraps -- the first render ran every paragraph off the right edge. A
      * block in a document is as wide as its parent; that is what makes the
      * line breaks happen. */
-    if (!strcmp(d->nodes[node].tag, "img")) { emit_image(d, node, s); return; }
+    if (s->display == VD_IMAGE) { emit_image(d, node, s); return; }
+    if (s->display == VD_TABLE) { render_table(d, node, s, href); return; }
     VStack(.spacing = 2, .align = Fill,
            .pt = (float)s->margin_top, .pb = (float)s->margin_bottom,
            .pl = (float)s->indent) {
