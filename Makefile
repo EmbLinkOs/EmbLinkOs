@@ -190,7 +190,7 @@ ASM_GAS      = x86_64-elf-as   # GNU as for the dynstubs (.set/.weak)
 USER_LD      = x86_64-elf-ld
 USER_INC     = -Iuser/lib
 # Freestanding programs (init.elf, primtest.elf): own _start, no libc, no SSE.
-USER_CFLAGS  = -ffreestanding -nostdlib -fno-pic -mno-red-zone \
+USER_CFLAGS  = -MMD -MP -MF $@.d -ffreestanding -nostdlib -fno-pic -mno-red-zone \
                -fno-stack-protector -mno-mmx -mno-sse -mno-sse2 -O2 $(USER_INC)
 
 # The real pid-1 init: kernel spawns it first; it brings up the desktop session
@@ -808,7 +808,7 @@ EMLIBC_INC    := -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include -Iuse
 # do heavy FP), and x86-64 passes float/double in XMM, so FP is impossible with
 # it. crt0 already realigns the stack (and $-16) for SSE. emlibc's non-FP code
 # is unaffected; math.c needs this.
-EMLIBC_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
+EMLIBC_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
                  -fno-stack-protector -O2 -Wall -Wextra $(EMLIBC_INC)
 
 # emlibc's math = a thin glue (emlibc_math.o) over LIFTED fdlibm (Sun's freely-
@@ -818,7 +818,7 @@ EMLIBC_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
 EMLIBC_FD_DIR  := $(EMLIBC_DIR)/math/fdlibm
 EMLIBC_FD_SRCS := $(wildcard $(EMLIBC_FD_DIR)/*.c)
 EMLIBC_FD_OBJS := $(patsubst $(EMLIBC_FD_DIR)/%.c,build/emlibc_fd_%.o,$(EMLIBC_FD_SRCS))
-EMLIBC_FD_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
+EMLIBC_FD_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
                     -O2 -w -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include \
                     -Iuser/lib -I$(EMLIBC_FD_DIR)
 
@@ -1281,7 +1281,8 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf build/gitpush.elf \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf \
-               build/embbuild.elf build/pkg.elf build/pkgbuild.elf build/pkgprobe.embx build/pkgprobe.pkg \
+               build/embbuild.elf build/pkg.elf build/pkgbuild.elf \
+               build/pkgprobe.elf build/pkgprobe.embx build/pkgprobe.pkg \
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS) \
                $(if $(HAVE_QJS),build/js.elf,) \
@@ -1340,15 +1341,32 @@ embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
-	@# otherwise completely silent. Warn loudly rather than let it rot.
-	@for f in build/*.elf; do \
+	@# otherwise completely silent.
+	@#
+	@# It FAILS THE BUILD. It used to print a warning, and a warning is what it
+	@# was doing on the day build/vellum.elf stopped being rebuilt: the browser
+	@# had never been a prerequisite of anything, so a failed link deleted it,
+	@# `make` said "Nothing to be done", and every image after that packed a
+	@# stale binary against a fresh libembk.so. The guard was right and nobody
+	@# read it. A check that cannot stop the build is not a check.
+	@fail=0; for f in build/*.elf; do \
 	  case " $(EMBKFS_APPS) $(STAGED_APPS) " in \
 	    *" $$f "*) ;; \
-	    *) echo "*** WARNING: $$f is packed onto the image but is NOT a"; \
-	       echo "***          prerequisite of embkfs.img -- changes to it will"; \
-	       echo "***          NOT rebuild the image. Add it to EMBKFS_APPS."; ;; \
+	    *) echo "*** BUILD DRIFT: $$f is packed onto the image but is NOT a"; \
+	       echo "***   prerequisite of embkfs.img, so changes to it will NOT"; \
+	       echo "***   rebuild the image. Add it to EMBKFS_APPS, or name it in"; \
+	       echo "***   STAGED_APPS if it was built outside this tree."; \
+	       fail=1; ;; \
 	  esac; \
-	done
+	done; \
+	if [ $$fail = 1 ]; then exit 1; fi
+	@# ...and the other direction: every app make believes in must EXIST. A
+	@# recipe that "succeeded" while producing nothing is otherwise packed as
+	@# an absent file and only noticed when the OS cannot spawn it.
+	@miss=0; for f in $(EMBKFS_APPS); do \
+	  if [ ! -f "$$f" ]; then echo "*** MISSING: $$f is required by the image but was not built"; miss=1; fi; \
+	done; \
+	if [ $$miss = 1 ]; then exit 1; fi
 	@# EMBK_NEWLIB_LIBC: where mkfs finds the libc.a it packs into /system/abi
 	@# for tcc to link against ON the OS. Derived from the ONE NEWLIB_PREFIX so a
 	@# checkout on another machine needs no mkfs edit -- see docs/BUILD_SETUP.md.
@@ -1936,7 +1954,21 @@ web-corpus:
 	@$(MAKE) --no-print-directory build/browser_render
 	@python3 tools/web_corpus.py $(CORPUS)
 
-build/browser_render:
+# Every source and header it is built from. Written out because this rule
+# compiles in ONE command with no object files, so there are no depfiles to
+# lean on -- and a harness that does not rebuild is worse than no harness: it
+# reports the previous build's answer with total confidence. (This one had no
+# prerequisites at all for a while, and only worked because it was deleted by
+# hand before each run.)
+BROWSER_RENDER_SRCS := $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
+                       user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
+                       user/web/css/vars.c user/web/css/media.c \
+                       user/web/url.c user/web/png.c user/web/jpeg.c user/lib/inflate.c \
+                       user/web/form.c user/web/select.c user/web/render_host.c
+BROWSER_RENDER_HDRS := $(wildcard user/web/*.h) $(wildcard user/web/css/*.h) \
+                       $(wildcard ui/*/*.h)
+
+build/browser_render: $(BROWSER_RENDER_SRCS) $(BROWSER_RENDER_HDRS)
 	@mkdir -p $(BUILD)
 	$(HOSTCC) -std=gnu11 -Wall -Wextra -O1 -g $(V2_INC) -Iuser/web \
 	    -Iuser/web/css -Iuser/lib \

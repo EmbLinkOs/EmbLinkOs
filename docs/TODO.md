@@ -2350,6 +2350,32 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       The corpus gained EXPECT-X, which pins a resolved position -- so a
       percentage is tested for the NUMBER it produced (22 + 30% of 896 = 290.8)
       and not merely for not crashing.
+- [x] ~~THE BUILD SYSTEM~~ FIXED 2026-08-07, after three of one afternoon's
+      four bugs turned out to be build problems rather than code. Four changes,
+      each verified to FAIL when its trap is re-introduced:
+        1. The drift guard FAILS the build instead of warning. It already
+           existed, and on the day build/vellum.elf stopped being rebuilt it
+           printed exactly the right warning -- which scrolled past unread. A
+           check that cannot stop the build is not a check.
+        2. ...and the reverse: every app named in EMBKFS_APPS must EXIST after
+           the build, so a recipe that "succeeds" while producing nothing is
+           caught rather than packed as an absent file.
+        3. -MMD -MP -MF $@.d on every remaining compiler (user, emlibc; newlib
+           was done earlier), with `-include build/*.o.d`. Hand-written header
+           lists go stale: build/web_jsdom.o did not name style.h, so when
+           struct vstyle grew, jsdom kept the OLD layout inside a binary where
+           everything else had the new one. The kernel was already safe -- it
+           is one compile with every kernel header as a prerequisite, and its
+           comment records that trap costing two 35-minute boots.
+        4. build/browser_render got real prerequisites. It had NONE, so it only
+           rebuilt when missing, and only worked because it was deleted by hand
+           before each run. A harness that does not rebuild is worse than no
+           harness: it reports the previous build's answer with total
+           confidence.
+      Verified from a clean tree (2m39s): touching style.h rebuilds
+      web_jsdom.o; touching ui/dsl/em.h rebuilds libembk.so AND every app that
+      links it (the EmProps-by-value hazard); an orphan .elf in build/ fails
+      the build; a deleted app is rebuilt rather than silently dropped.
 - [ ] C3 REMAINDER, the biggest single chunk left: `position`
       (relative/absolute/fixed/sticky) with top/left/right/bottom and z-index,
       `float`/`clear`, `overflow` (hidden/auto/scroll), and `calc()`. These are

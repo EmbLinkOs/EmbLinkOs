@@ -319,3 +319,45 @@ lands, "EmbBuild builds the kernel" is **blocked on assembling six files**, and
 should be stated that plainly. The *userland* image (`embkfs.img`) is a separate
 concern (its own mkfs); KM1–KM3 produce the kernel/`myos.img` against a
 pre-existing userland.
+
+
+## The build's own guards
+
+Three of one afternoon's four bugs were build problems, not code, and each
+looked like a code bug from the outside. The guards below exist so that class
+stops being silent. Each was verified by re-introducing the trap and watching
+the build fail.
+
+**Adding an application.** `mkfs` auto-discovers every `build/*.elf` and packs
+it. So a binary that exists but that no rule rebuilds gets packed STALE, and
+one whose link failed gets silently dropped. Any new app must therefore be
+named in `EMBKFS_APPS` -- and if it is not, the drift guard **fails the build**
+and says so. (It used to warn. On the day `build/vellum.elf` stopped being
+rebuilt it printed exactly the right warning and it scrolled past unread.)
+
+Binaries built outside this tree go in `STAGED_APPS`, named explicitly on the
+command line; a wildcard there would silently disarm the guard for everything.
+
+**Header dependencies are the compiler's job**, via `-MMD -MP -MF $@.d` and
+`-include build/*.o.d`. A hand-written list goes stale, and the failure is
+nasty: `build/web_jsdom.o` did not name `style.h`, so when `struct vstyle` grew
+it kept the OLD layout inside a binary where everything else had the new one --
+which showed up as the browser laying out flex containers wrongly on the metal
+and correctly on the host. Nothing about that symptom points at a Makefile.
+
+The kernel does not need depfiles: it is one `$(CC)` over `$(KERNEL_SRC)` with
+every kernel header as a prerequisite, which is coarse and correct.
+
+**libembk.so crosses a binary boundary by value.** `EmProps` is passed by value
+into the shared library, so growing it requires every app to be rebuilt. That
+now happens automatically -- touching `ui/dsl/em.h` rebuilds the library and
+every app that links it -- and it is worth re-checking after any change to the
+UI headers.
+
+**The host harnesses must rebuild too.** `build/browser_render` had no
+prerequisites at all and only worked because it was deleted by hand before each
+run. A harness that does not rebuild is worse than no harness: it reports the
+previous build's answer with total confidence.
+
+**When in doubt:** `rm -rf build && make` takes about 2m40s. Do it before
+trusting a surprising result on the metal.
