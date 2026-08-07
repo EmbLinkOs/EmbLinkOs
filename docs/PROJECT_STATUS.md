@@ -1111,6 +1111,13 @@ decoder runs is chosen by the file's SIGNATURE, not its extension. Progressive
 is refused rather than half-decoded. Fifteen host assertions pin it against real
 encoder output, including every truncation of a valid file.
 
+**And you can take text out of it.** Drag to select, Ctrl+A, Ctrl+C to the
+system clipboard -- proven on the metal by copying from Vellum and pasting into
+the shell with Ctrl+V. `user/web/select.c` works entirely after layout: it reads
+the laid-out scene for where the words are and writes a background onto the
+selected ones, so render.c does not participate. Word granularity (the renderer
+already emits one node per word); the limits are in TODO.md.
+
 **The raster is ~25x cheaper, and the number came from measuring rather than
 guessing.** A page with a photograph took 21 seconds to appear; the float IDCT
 was the obvious suspect and was the wrong one. Instrumenting said the fetch took

@@ -599,6 +599,11 @@ float em_viewport_height(void);
  * Both are target-runtime features (em_app.c); NULL = off (the default). */
 void em_set_key_hook(int (*fn)(int ch));
 void em_set_idle_hook(void (*fn)(void));
+/* Runs after LAYOUT and before the frame is rendered -- the only moment at
+ * which every node's resolved position is known and the pixels have not been
+ * produced yet. That is exactly what a text SELECTION needs: where the words
+ * ended up, in time to mark the selected ones. NULL = off. */
+void em_set_post_layout_hook(void (*fn)(void));
 
 /* ---- desktop widgets (V5) ----------------------------------------------- *
  * A widget is a small always-on-desktop window: chromeless, z-banded ABOVE

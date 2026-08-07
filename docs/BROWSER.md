@@ -414,6 +414,7 @@ Each ends with something demonstrable. No milestone is "infrastructure".
 | **+** | ✅ data tables over the layout grid (revisits §5 with evidence) | a reference page states a grid of facts |
 | **+** | ✅ JPEG: Huffman + fixed-point IDCT + chroma upsampling | a photograph, not just a diagram |
 | **+** | ✅ the raster made ~25x cheaper, on evidence (see below) | pages that scroll and load at a usable speed |
+| **+** | ✅ SELECT and COPY: drag, Ctrl+A, Ctrl+C to the system clipboard | a browser you can take something out of |
 
 **B1 through B3 are the ones that decide whether this is real.** If a
 document renders and scrolls at a usable speed, everything after is addition.
@@ -727,3 +728,47 @@ its descendants' extents were computed against a clip that is in motion.
 `make browser-render` now FAILS when the blit path is not exercised, and exits
 non-zero. A check that passes because the code under test never ran is not a
 check -- that is the property that hid this for as long as it was hidden.
+
+
+## Selecting text, and taking it away
+
+A browser you cannot copy out of is a browser you can only look at. Drag across
+the page to select, `Ctrl+A` for the whole document, `Ctrl+C` to put it on the
+system clipboard, `Esc` to drop it. Proven end to end on the metal: text
+selected in Vellum, copied, and pasted into the shell in the Terminal with
+`Ctrl+V`.
+
+`user/web/select.c` does all of it AFTER layout, and that is the design. It
+reads the laid-out scene to find where the words are and writes back a
+background on the selected ones; `render.c` does not know the file exists. The
+alternative -- having each emitter announce its own words -- would break
+silently the first time one was forgotten, and render.c emits text from several
+places (words, image alt text, list bullets, error strings). Reading the scene
+cannot be forgotten.
+
+The walk only counts nodes INSIDE a clipping node, which is the ScrollView
+holding the document. Without that test it also picks up the address bar and the
+status line, and dragging across the page selects the chrome -- the host check
+asserts the copied text never contains the URL bar.
+
+**Word granularity, deliberately.** The renderer already emits one node per word
+(that is what keeps a link clickable on both sides of a line break), so the word
+is the grain the document is already cut along. Character-level selection would
+mean measuring glyph prefixes through the font engine on every pointer move. It
+is a real limitation and it is in `docs/TODO.md`, not hidden.
+
+Two things had to be true for the highlight to appear at all, and neither was:
+
+- **`dirty` is not `dirty_content`.** The scene splits them so a pure transform
+  reads as a MOVE rather than a repaint. The first version marked a highlight
+  with `scene_mark_dirty`, which sets only `dirty` -- so the selection was
+  applied to the scene, copied correctly, reported the right byte count, and
+  never drew a single pixel.
+- **Whoever sets a background owns removing it.** The declarative layer briefly
+  cleared every run's background on each build, so each selected word was
+  marked content-dirty twice a frame and a live selection became a full repaint
+  per frame -- the exact cost the dirty-rect path exists to avoid. Now the build
+  only ever SETS, and the post-layout pass paints the range and unpaints
+  everything else. `scene_set_text_bg` is a no-op when the colour already
+  matches, so the steady state marks nothing dirty: scrolling with a selection
+  up costs the same 0.66s as scrolling without one.

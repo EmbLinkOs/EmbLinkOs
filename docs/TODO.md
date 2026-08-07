@@ -2153,6 +2153,24 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       permanently false), used by the image blit, the solid fill and the glyph
       blit; and the image blit steps its source coordinates in 16.16 fixed point
       rather than a float divide per pixel.
+- [x] ~~You cannot copy anything out of the browser~~ SHIPPED 2026-08-07:
+      drag to select, Ctrl+A, Ctrl+C to the system clipboard, Esc to clear.
+      `user/web/select.c`, all post-layout over the scene. Proven on the metal
+      end to end (copied in Vellum, pasted into the shell with Ctrl+V).
+      Two bugs found building it, both worth remembering: `scene_mark_dirty`
+      sets `dirty` but NOT `dirty_content`, so the highlight was applied and
+      copied correctly while drawing zero pixels; and having the declarative
+      build clear each run's background made a live selection re-dirty every
+      selected word twice per frame (a full repaint per frame). Whoever sets a
+      background owns removing it.
+- [ ] Selection is WORD granular, not character. The renderer emits one node per
+      word, so that is the grain available without measuring glyph prefixes
+      through the font engine on every pointer move. Also missing: double-click
+      to select a word, triple-click for a paragraph, shift-click to extend, and
+      selecting inside the chrome (address bar / status line -- excluded on
+      purpose, the walk only counts nodes inside the document's clip). Copy is
+      plain text; there is no text/html flavour. A document past WORD_MAX (4096)
+      words has an unselectable tail.
 - [ ] JPEG is BASELINE only. Progressive is refused, not half-decoded (it is a
       different decoder: coefficients arrive across multiple scans and the whole
       coefficient buffer must stay live between them). Also no arithmetic

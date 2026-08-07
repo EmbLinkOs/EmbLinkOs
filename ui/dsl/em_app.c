@@ -74,6 +74,8 @@ static void emapp_mover(int win, int32_t x, int32_t y) { embk_win_move(win, x, y
 /* --- terminal-shaped runtime hooks (V8; see em.h) ------------------------ */
 static int  (*g_em_key_hook)(int ch)  = 0;
 static void (*g_em_idle_hook)(void)   = 0;
+static void (*g_em_post_layout)(void) = 0;
+void em_set_post_layout_hook(void (*fn)(void)) { g_em_post_layout = fn; }
 void em_set_key_hook(int (*fn)(int ch)) { g_em_key_hook = fn; }
 void em_set_idle_hook(void (*fn)(void)) { g_em_idle_hook = fn; }
 
@@ -360,6 +362,7 @@ int em_app_run(const EmApp *app) {
 
         ui_frame_begin(); em_new_frame(); app->view(); em_flush(); ui_frame_end();
         ui_run_layout((float)winw, (float)winh);
+        if (g_em_post_layout) g_em_post_layout();
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
         /* Park, don't quit: the app keeps running with no pixels on screen
@@ -441,6 +444,7 @@ int em_app_run(const EmApp *app) {
                 scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                 ui_frame_begin(); em_new_frame(); app->view(); em_flush(); ui_frame_end();
                 ui_run_layout((float)winw, (float)winh);
+                if (g_em_post_layout) g_em_post_layout();
                 scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
                 if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
                 embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);

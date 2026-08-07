@@ -356,6 +356,20 @@ void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const 
     DMARK(n); n->dirty = true; n->dirty_content = true;
 }
 
+void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color bg) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || n->kind != SCENE_NODE_TEXT) return;
+    struct color *cur = &n->data.text.bg;
+    if (cur->r == bg.r && cur->g == bg.g && cur->b == bg.b && cur->a == bg.a) return;
+    *cur = bg;
+    /* dirty_content, not just dirty. `dirty` alone means "something about this
+     * node changed", and the renderer reads a node that is dirty-but-not-
+     * content as MOVED -- which is exactly right for a transform and exactly
+     * wrong here. Marked only `dirty`, a selection highlight was applied to the
+     * scene, copied correctly, and never drew a single pixel. */
+    DMARK(n); n->dirty = true; n->dirty_content = true;
+}
+
 /* Explicit dirty for callers whose new content ALIASES the stored pointer (the
  * declare layer's per-instance shadow text buffer is overwritten in place
  * before the set call -- no setter-side comparison can see such an edit). */

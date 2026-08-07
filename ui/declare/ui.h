@@ -47,6 +47,10 @@ void ui_set_grid_span(int span);                            /* child: columns to
 void ui_set_justify(enum layout_justify j);
 void ui_set_align(enum layout_align a);
 void ui_set_text_color(struct color c);   /* colour for subsequent ui_text calls */
+/* Background painted behind the NEXT ui_text's glyphs (one-shot, a==0 = none).
+ * This is how a selection highlight is expressed: a property of the run, so it
+ * lands wherever layout actually put the words. */
+void ui_set_text_bg(struct color c);
 
 /* --- leaves --- */
 void ui_text(const char *fmt, ...);
@@ -80,6 +84,7 @@ void ui_pointer(float x, float y, bool down);
 void ui_pointer_pos(float *x, float *y);   /* live pointer position (surface-local) */
 bool ui_is_hovered(void);   /* is the pointer over the currently open box? */
 bool ui_is_pressed(void);   /* ...and is the button held down? */
+bool ui_pointer_down(void); /* the raw button state, not scoped to a widget */
 bool ui_is_active(void);    /* is the open box the drag owner (pointer capture)? */
 
 /* World rect (last frame's arranged geometry) of an instance / the open box.
@@ -105,6 +110,7 @@ uint32_t ui_debug_mutation_count(void);
 struct instance_handle ui_first_child(struct instance_handle h);
 struct instance_handle ui_next_sibling(struct instance_handle h);
 struct node_handle     ui_scene_of(struct instance_handle h);
+struct scene_arena    *ui_scene_arena(void);
 struct layout_handle   ui_layout_of(struct instance_handle h);
 
 #endif /* __EMBLINK_UI_UI_H__ */

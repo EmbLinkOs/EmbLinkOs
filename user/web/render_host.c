@@ -24,6 +24,7 @@
 #include "imgcache.h"
 #include "png.h"
 #include "jpeg.h"
+#include "select.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -307,6 +308,63 @@ int main(int argc, char **argv) {
         }
         scene_render_destroy(&ra); scene_render_destroy(&rb);
         free(pa); free(pb);
+    }
+
+    /* --- SELECTION: drag across the document, then read back what a copy
+     * would put on the clipboard. The whole feature is post-layout logic over
+     * the scene, so it runs here in full -- no window, no clipboard, no boot.
+     * ------------------------------------------------------------------- */
+    {
+        HDEFER = 0; imgcache_reset(); g_scroll = 0;
+        ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
+        ui_run_layout((float)W, (float)H);
+        vsel_reset();
+        vsel_sync_geometry();
+
+        /* Select everything, which is also the Ctrl+A path. */
+        int changed = vsel_all();
+        char buf[8192];
+        size_t n = vsel_copy_text(buf, sizeof buf);
+        printf("\n--- selection: select-all changed=%d, %zu bytes copied ---\n", changed, n);
+        if (!changed || n == 0) { printf("*** selection FAILED: select-all produced nothing ***\n"); g_fail++; }
+
+        /* The copied text must be the DOCUMENT and not the chrome: the status
+         * line and the address bar are text nodes too, and an earlier walk that
+         * ignored the clip picked them up. */
+        if (n && strstr(buf, g_bar)) {
+            printf("*** selection FAILED: copied text contains the address bar ***\n");
+            g_fail++;
+        }
+        /* ...and it must contain real page words, in document order. */
+        if (n) {
+            const char *a = strstr(buf, "What works");
+            const char *b = strstr(buf, "Preformatted");
+            printf("    first 200: [%.200s]\n", buf);
+            if (!a || !b || a > b) {
+                printf("*** selection FAILED: page text missing or out of document order ***\n");
+                g_fail++;
+            }
+        }
+
+        /* A drag between two points selects a SUBSET, and it must be smaller. */
+        vsel_clear();
+        vsel_pointer(60, 150, 1, 1);          /* press near the top of the page */
+        vsel_pointer(400, 260, 0, 1);         /* drag down and right */
+        char sub[8192];
+        size_t sn = vsel_copy_text(sub, sizeof sub);
+        printf("--- selection: drag copied %zu bytes (of %zu) ---\n", sn, n);
+        if (sn == 0 || sn >= n) {
+            printf("*** selection FAILED: a drag did not select a proper subset ***\n");
+            g_fail++;
+        }
+        /* A press with no movement must select NOTHING, or every click on the
+         * page would leave a word highlighted -- including a click on a link. */
+        vsel_pointer(60, 150, 1, 1);
+        if (vsel_active()) {
+            printf("*** selection FAILED: a bare press selected something ***\n");
+            g_fail++;
+        }
+        vsel_reset();
     }
 
     /* --- THE REFLOW CHECK ------------------------------------------------

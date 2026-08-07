@@ -253,6 +253,11 @@ static void paint_visual(struct scene_renderer *r, struct scene_node *n,
                            n->data.image.tinted ? &n->data.image.tint : NULL);
             break;
         case SCENE_NODE_TEXT:
+            /* the run's own background (selection), behind its glyphs */
+            if (n->data.text.bg.a > 0.001f) {
+                struct paint bp; bp.kind = PAINT_SOLID; bp.solid = n->data.text.bg;
+                be->draw_rect(target, dx, dy, w, h, 0.0f, &bp, 1.0f);
+            }
             if (be->draw_text)
                 be->draw_text(target, dx, dy, n->data.text.utf8, n->data.text.font_handle,
                               n->data.text.size_px, n->data.text.color, 1.0f,

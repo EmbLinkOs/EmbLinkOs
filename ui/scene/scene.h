@@ -157,7 +157,13 @@ struct scene_node {
                   * only record that the text used to be something else, and
                   * without it an in-place update is invisible to dirty
                   * tracking. See scene_set_text. */
-                 uint32_t hash; } text;
+                 uint32_t hash;
+                 /* An optional background painted BEHIND the glyphs. a==0 is
+                  * none, which is every run in an ordinary UI. It exists for
+                  * SELECTION: a highlighted run is a property of the run, not
+                  * a separate overlay tree that would have to be kept in sync
+                  * with where layout actually put the words. */
+                 struct color bg; } text;
     } data;
 
     bool  dirty;   /* any mutation sets this; lets a caching traversal skip an
@@ -216,6 +222,8 @@ void scene_set_paint(struct scene_arena *a, struct node_handle h, const struct p
 void scene_set_text(struct scene_arena *a, struct node_handle h, const char *utf8,
                     uint32_t font_handle, float size_px, struct color color);
 void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const struct paint *paint);
+/* Paint `bg` behind this run's glyphs; alpha 0 removes it. */
+void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color bg);
 
 /* Force-dirty a node whose (aliased) content was edited in place. */
 void scene_mark_dirty(struct scene_arena *a, struct node_handle h);

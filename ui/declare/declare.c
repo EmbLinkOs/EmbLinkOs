@@ -48,6 +48,7 @@ static float g_wheel;                       /* per-frame scroll-wheel delta, con
 static uint32_t g_font;
 static float    g_text_size = 16.0f;
 static struct color g_text_color = { 0, 0, 0, 1 };
+static struct color g_text_bg;      /* a==0: none. One-shot, like the gradient. */
 
 uint32_t ui_debug_mutation_count(void) { return g_mutation_count; }
 
@@ -503,6 +504,7 @@ bool ui_open_content_extent(float *content_h, float *viewport_h) {
     return true;
 }
 void ui_set_text_color(struct color c) { g_text_color = c; }
+void ui_set_text_bg(struct color c) { g_text_bg = c; }
 
 /* One-shot gradient for the NEXT text: set just before ui_text(), consumed and
  * cleared by it (so it never leaks to later text). PAINT_NONE = flat color. */
@@ -518,6 +520,21 @@ void ui_set_text_gradient(const struct paint *p) {
 static void set_text_on(struct instance_handle h, const char *str) {
     struct instance *n = instance_resolve(h);
     if (!n) return;
+    /* BEFORE the no-op guard below: a run whose only change is being selected
+     * has identical text, font and colour, so the guard would return before
+     * ever applying it -- and the highlight would appear on the next unrelated
+     * edit instead of on the click.
+     *
+     * Only ever SETS, never clears. Clearing here would make every build wipe
+     * the highlight and every post-layout pass write it back, so each selected
+     * run would be marked content-dirty TWICE a frame -- turning a live
+     * selection into a full repaint per frame, which is the exact cost the
+     * dirty-rect path exists to avoid. Whoever set a background owns removing
+     * it. */
+    if (g_text_bg.a > 0) {
+        scene_set_text_bg(g_sa, n->scene_node, g_text_bg);
+        g_text_bg.a = 0;
+    }
     bool grad = (g_text_paint.kind != PAINT_NONE);
     if (!grad && n->shadow.has_text && strncmp(n->shadow.text, str, sizeof n->shadow.text) == 0 &&
         n->shadow.font_handle == g_font && n->shadow.text_size == g_text_size &&
@@ -687,6 +704,9 @@ bool ui_consume_click(struct instance_handle h) {
 }
 bool ui_is_hovered(void) { return is_ancestor_or_self(ui_open(), g_hovered); }
 bool ui_is_pressed(void) { return g_ptr_down && is_ancestor_or_self(ui_open(), g_hovered); }
+/* The button state on its own. ui_is_pressed answers "is THIS widget being
+ * pressed", which a drag spanning many widgets cannot ask. */
+bool ui_pointer_down(void) { return g_ptr_down; }
 
 void ui_frame_begin(void) {
     g_cursor_top = -1;
@@ -715,6 +735,11 @@ struct instance_handle ui_first_child(struct instance_handle h) {
 struct instance_handle ui_next_sibling(struct instance_handle h) {
     struct instance *n = instance_resolve(h); return n ? n->next_sibling : INSTANCE_HANDLE_NULL;
 }
+/* The scene the declarative layer is building into. Exposed so a caller that
+ * must reason about RESOLVED geometry -- where layout actually put things --
+ * can walk it after the layout pass. */
+struct scene_arena *ui_scene_arena(void) { return g_sa; }
+
 struct node_handle ui_scene_of(struct instance_handle h) {
     struct instance *n = instance_resolve(h); struct node_handle z = {0,0}; return n ? n->scene_node : z;
 }

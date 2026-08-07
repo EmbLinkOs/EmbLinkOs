@@ -605,6 +605,7 @@ static void em_text_impl(const char *s, EmProps p) {
         ui_box_end();
     } else {
         ui_set_font(fh); ui_set_text_size(sz); ui_set_text_color(col);
+        if (p.background.a > 0) ui_set_text_bg(p.background);
         ui_text("%s", s);
     }
 }

@@ -32,6 +32,7 @@
 #include "url.h"
 #include "net.h"
 #include "fetchjob.h"
+#include "select.h"
 
 /* One document at a time, in fixed arenas. A browser that can be handed a
  * hostile page needs a bounded appetite -- see docs/BROWSER.md §7. */
@@ -123,6 +124,7 @@ static void load_error(const char *url, const char *why) {
     g_root = html_parse(&g_doc, g_src, strlen(g_src), g_nodes, NODE_MAX, g_strs, STR_MAX);
     css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
     imgcache_reset();
+    vsel_reset();
     snprintf(g_status, sizeof g_status, "%s", why);
 }
 
@@ -171,6 +173,7 @@ static void finish_load(const struct vnet_result *res) {
      * it is parsed here, once, and not per frame) */
     css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
     imgcache_reset();          /* one page's pictures never leak into the next */
+    vsel_reset();              /* ...nor does a selection: it indexed the OLD words */
     form_reset();              /* ...nor one page's typing into the next */
 
     /* A NEW WORLD per page: the engine is torn down and rebuilt, so a script
@@ -238,7 +241,35 @@ static void go_fwd(void) {
  * scrolling drivable from the test harness, where wheel events cannot be
  * synthesized -- a feature and an instrument in one.) Consumed only while no
  * text field has focus, or typing a space in the URL bar would jump the page. */
+/* Selection: a drag across the document, and a way to take it away. The drag
+ * is tracked here rather than in select.c because the press/release EDGE is an
+ * app-loop fact -- select.c is told what happened, not asked to guess. */
+static bool g_ptr_was_down;
+
+static void selection_tick(void) {
+    float px, py;
+    ui_pointer_pos(&px, &py);
+    bool down = ui_pointer_down();
+    int changed = 0;
+    if (down && !g_ptr_was_down)      changed = vsel_pointer(px, py, 1, 1);
+    else if (down)                    changed = vsel_pointer(px, py, 0, 1);
+    else if (g_ptr_was_down)          changed = vsel_pointer(px, py, 0, 0);
+    g_ptr_was_down = down;
+    if (changed) em_request_frame();
+}
+
 static int vellum_key(int ch) {
+    if (ch == 0x03) {                     /* Ctrl+C */
+        static char sel[16384];
+        size_t n = vsel_copy_text(sel, sizeof sel);
+        if (n) embk_clip_set(sel, n);
+        if (n) snprintf(g_status, sizeof g_status, "Copied %u bytes", (unsigned)n);
+        else   snprintf(g_status, sizeof g_status, "Nothing selected");
+        snprintf(g_status_done, sizeof g_status_done, "%s", g_status);
+        return 1;
+    }
+    if (ch == 0x01) { return vsel_all(); }   /* Ctrl+A: the whole document */
+    if (ch == 27 && vsel_clear()) return 1;  /* Esc drops a selection first */
     /* Enter in a form field submits it -- a search box you cannot submit from
      * the keyboard feels broken, and every browser has behaved this way since
      * forms existed. */
@@ -262,6 +293,7 @@ static void app(void) {
     if (first) {
         first = false;
         em_set_key_hook(vellum_key);
+        em_set_post_layout_hook(vsel_sync_geometry);
         vellum_set_link_handler(on_link);
         vellum_set_event_hooks(jsdom_has_listener, on_dom_click);
         vellum_set_submit_handler(on_submit);
@@ -330,6 +362,8 @@ static void app(void) {
         snprintf(g_status, sizeof g_status, "%s", g_status_done);
     }
 
+    selection_tick();
+
     /* act on last frame's click before building this one */
     if (g_goto[0]) {
         /* Resolve against where we ARE. A relative href in a page fetched over
@@ -363,7 +397,12 @@ static void app(void) {
             VStack(.spacing = 0, .align = Fill, .padding = 22, .grow = 1) {
                 const char *clicked = vellum_render_sized(&g_doc, g_root, &g_sheet, g_url,
                                                          em_viewport_width() - 44.0f);
-                if (clicked) snprintf(g_goto, sizeof g_goto, "%s", clicked);
+                /* A DRAG that happens to end on a link is a selection, not a
+                 * click. Without this, selecting a paragraph that contains a
+                 * link navigates away the moment you let go -- and the text you
+                 * just selected is gone with the page. */
+                if (clicked && !vsel_active())
+                    snprintf(g_goto, sizeof g_goto, "%s", clicked);
             }
         }
 
