@@ -45,6 +45,29 @@ struct oscfg {
     int ui_scale;      /* interface size, PERCENT (80..130); 100 = default */
 };
 
+/* The screen band the DOCK owns, in pixels, for a given preference.
+ *
+ * This is a CONTRACT between the desktop that draws the dock and every app
+ * that gets a window placed, and it exists because getting it wrong is not a
+ * cosmetic bug. The dock is drawn by the desktop window, which sits BEHIND
+ * every application window, and pointer input goes to the topmost window under
+ * the cursor -- so an app window overlapping the dock silently swallows the
+ * clicks aimed at it. The dock stops responding and nothing says why.
+ *
+ * It is a FUNCTION of the preference, not a constant, because the user can set
+ * the dock icon size from 28 to 60. A hard-coded reserve is right at exactly
+ * one setting and wrong at every other.
+ *
+ * pill (icons + padding) + the gap that keeps it floating rather than welded
+ * to the screen edge.
+ */
+static inline int oscfg_dock_band(const struct oscfg *c) {
+    int base = (c && c->dock_size > 0) ? c->dock_size : 38;
+    if (base < 28) base = 28;
+    if (base > 60) base = 60;
+    return base + 32 + 14;
+}
+
 static inline void oscfg_defaults(struct oscfg *c) {
     c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1;
     c->ui_scale = 100;

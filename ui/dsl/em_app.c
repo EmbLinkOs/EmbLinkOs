@@ -102,11 +102,14 @@ int em_app_run(const EmApp *app) {
      * does not opt in to being themed, it simply is -- the alternative is
      * every app remembering to read a config file, which means most of them
      * won't and the desktop is inconsistent by default. */
+    int dock_band;
     { struct oscfg cfg; oscfg_load(&cfg);
       ui_theme_use_dark(cfg.dark != 0);
       ui_theme_set_scale((float)cfg.ui_scale / 100.0f);
       const struct oscfg_accent *a = &oscfg_accents[cfg.accent];
-      ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f }); }
+      ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f });
+      /* how much of the bottom of the screen belongs to the dock */
+      dock_band = oscfg_dock_band(&cfg); }
     ui_init(&sa, &la);
     em_set_clock(embk_uptime_ms);
 
@@ -120,14 +123,22 @@ int em_app_run(const EmApp *app) {
     int chromeless = app->fullscreen || (app->chrome == Chromeless) || glass || translucent;
     int bar = chromeless ? 0 : 26;
     if (!app->fullscreen && sw && winw > (int)sw - 8)        winw = (int)sw - 8;
-    if (!app->fullscreen && sh && winh > (int)sh - 32 - 64 - bar)
-        winh = (int)sh - 32 - 64 - bar;
+    /* 64 was hard-coded here and it was WRONG at every dock size: the pill is
+     * dock_size+32 tall before the gap, so 84px at the default and 106 at the
+     * largest. Every app window therefore covered the top of the dock -- and
+     * because the dock is drawn by the desktop, which sits behind all windows,
+     * and pointer input goes to the topmost window under the cursor, those
+     * clicks went to the app instead. From the outside: the dock needs several
+     * clicks to launch anything, and once one app is open it stops working
+     * altogether. Ask the preference instead of guessing. */
+    if (!app->fullscreen && sh && winh > (int)sh - 32 - dock_band - bar)
+        winh = (int)sh - 32 - dock_band - bar;
     if (winw < 200) winw = 200;
     /* chromeless strips (menu bars, docks) are legitimately short; normal
      * titled windows keep a usable floor. */
     if (winh < (chromeless ? 24 : 160)) winh = chromeless ? 24 : 160;
     int wx = app->fullscreen ? 0 : ((int)sw - winw) / 2;        if (wx < 0) wx = 0;
-    int wy = app->fullscreen ? 0 : 32 + ((int)sh - 32 - 64 - winh - bar) / 2;
+    int wy = app->fullscreen ? 0 : 32 + ((int)sh - 32 - dock_band - winh - bar) / 2;
     if (wy < 32 && !app->fullscreen) wy = 32;
     /* Publish AFTER both are assigned. This line used to pass g_viewport_h to
      * em_set_viewport one statement BEFORE that variable was given a value, so
@@ -207,7 +218,7 @@ int em_app_run(const EmApp *app) {
          * happen in the client because it owns the shared pixel mapping. */
         if (in.win == EMBK_WIN_ACTION_MAXIMIZE && !app->fullscreen) {
             int nw = maximized ? normal_w : (int)sw;
-            int nh = maximized ? normal_h : (int)sh - 32 - 64 - 26;
+            int nh = maximized ? normal_h : (int)sh - 32 - dock_band - 26;
             int nx = maximized ? normal_x : 0;
             int ny = maximized ? normal_y : 32;
             if (nh < 160) nh = 160;

@@ -2033,3 +2033,41 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [ ] `make browser-render` renders with DejaVu from the host, so the on-metal
       metrics differ slightly from the host PNG. Good enough for geometry --
       do not use it to judge kerning.
+
+### Dock / desktop input (2026-08-07)
+- [x] ~~App windows covered the top of the dock~~ FIXED: em_app reserved a
+      hard-coded 64px bottom strip while the dock band is dock_size+32+14 --
+      84px at the default and 106 at the largest. The dock is drawn by the
+      DESKTOP window, which sits behind every app window, and pointer input
+      goes to the topmost window under the cursor, so anything overlapping the
+      dock silently ate its clicks. The band is now one formula in oscfg.h
+      (`oscfg_dock_band`) that both the desktop and every app window obey.
+      Verified: Files' window is now 792x484 (600-32-84) and the dock is fully
+      clear of it.
+- [ ] OPEN, and the other half of the same report: after ONE app is launched
+      from the dock, further dock clicks do nothing. TRACED, so this does not
+      need re-deriving. The first press logs cleanly --
+        drag=2 idx=0 active=1 -> drag=2 idx=0 active=0 -> spawn -> drag=0
+      -- and the second press logs NOTHING AT ALL: g_drag/g_any_active never
+      change, so drag_icon's ui_is_active() never fired and home never saw the
+      press. Home is still building frames while this happens (the running dot
+      under the launched app appears and is correct), so it is not a frozen
+      loop -- the input is not arriving.
+      Two leads, both in compositor_pointer_tick: `g_dragging` (its comment
+      says "a drag in progress keeps routing to no app" -- if it sticks after a
+      window opens, every app loses the pointer) and the press-capture pair
+      `g_cap_pid`/`g_cap_win` (set on press, cleared on release; a stale
+      capture pointing at a dead or reused window id would route input into a
+      hole). Print both from compositor_pointer_tick on change and the answer
+      should be immediate.
+- [ ] Scrolling a document in Vellum is slow. Cause is structural rather than
+      mysterious: render.c emits ONE SCENE NODE PER WORD (deliberately -- it is
+      what makes wrapping, mixed inline styling and per-word link hit-testing
+      work), so a page is several hundred nodes, and every wheel tick rebuilds
+      and re-measures ALL of them through the font engine, including everything
+      scrolled out of view. Under TCG that is very visible; on real hardware it
+      would be perhaps 20x cheaper. The standard fix is culling: render.c knows
+      the scroll offset and the viewport, so it can skip emitting blocks that
+      fall outside the visible band. That turns per-frame cost from
+      "whole document" into "one screenful" and is the single change worth
+      making before anything fancier.

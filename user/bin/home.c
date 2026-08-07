@@ -302,7 +302,11 @@ static void cfg_poll(void) {
  * gap is what makes it read as floating. */
 #define DOCK_PILL_H (DOCK_BASE + 32.0f)
 #define DOCK_GAP    14.0f
-#define DOCK_BAND   (DOCK_PILL_H + DOCK_GAP)
+/* ONE formula, in oscfg.h, because this number is also what every app window
+ * must stay out of -- and when the two disagreed, app windows covered the top
+ * of the dock and swallowed its clicks. A contract in a shared header cannot
+ * drift the way two copies of a constant did. */
+#define DOCK_BAND   ((float)oscfg_dock_band(&g_cfg))
 #define BAR_RESERVE 26.0f      /* must match topbar.c's BAR_H */
 static float dock_icon_size(int i) {
     if (!g_have_dockr || g_drag) return DOCK_BASE;
