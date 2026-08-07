@@ -72,6 +72,10 @@ void cpu_set_dirty(const struct clip_rect *rects, uint32_t n);
  * the Piece-4b text blit (a separate translation unit) gates its glyph output
  * by the same clip/dirty state every other primitive respects. */
 float cpu_coverage_at(float fx, float fy);
+/* ...and the same question asked once for a whole integer box: 1 iff EVERY
+ * pixel in it is provably at coverage 1.0. Conservative -- never claims more
+ * coverage than cpu_coverage_at would give. */
+int cpu_box_fully_covered(int x0, int y0, int x1, int y1);
 
 /* Clip-stack + dirty-region save/clear/restore -- the driver isolates a group's
  * offscreen render (which draws in the SCRATCH buffer's own coordinate space)

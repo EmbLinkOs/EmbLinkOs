@@ -848,7 +848,7 @@ def discover_userland_objects(build_dir="build"):
     objects.extend(_tree_objects("system/images", b"system/images/", (".ppm", ".pam", ".eic")))
     # Vellum's built-in documents (docs/BROWSER.md). Sealed with the OS: the
     # browser must have something to open before it can reach a network.
-    objects.extend(_tree_objects("system/web", b"system/web/", (".html", ".png", ".json")))
+    objects.extend(_tree_objects("system/web", b"system/web/", (".html", ".png", ".jpg", ".json")))
     objects.extend(_tree_objects("system/js", b"system/js/", (".js",)))
     # THE ABI, sealed under /system/abi (docs/USERSPACE.md D2 §3.1): crt0.o
     # (_start), syscalls.o (the newlib retargeting layer) and libc.a ARE the

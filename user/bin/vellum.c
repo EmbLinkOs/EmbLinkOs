@@ -57,6 +57,8 @@ static char  g_url[512]   = "";
 static char  g_bar[512]   = "";      /* what the URL field is showing        */
 static char  g_status[256] = "";
 static char  g_console[256] = "";     /* the page's last console.log */
+static char  g_status_done[256] = ""; /* what the status said before loading */
+static int   g_status_busy;
 static float g_scroll = 0;
 
 /* Back/forward, the same shape Files uses -- "back" alone is half a history. */
@@ -199,6 +201,7 @@ static void finish_load(const struct vnet_result *res) {
              res->status, res->via, n, g_doc.n, css,
              res->truncated   ? "  (response truncated)" : "",
              g_doc.truncated  ? "  (document truncated)" : "");
+    snprintf(g_status_done, sizeof g_status_done, "%s", g_status);
 }
 
 static void navigate_post(const char *url, const char *body) {
@@ -317,6 +320,14 @@ static void app(void) {
          * actually changing off the end of the line. */
         unsigned ms = fetchjob_elapsed_ms();
         snprintf(g_status, sizeof g_status, "Loading...  %u.%us", ms / 1000, (ms % 1000) / 100);
+        g_status_busy = 1;
+    } else if (g_status_busy) {
+        /* ...and PUT IT BACK when the loading stops. Leaving "Loading..." on
+         * screen after everything has arrived is a status line that lies --
+         * and it lied for a whole minute while an image that could never load
+         * was quietly failing, which is exactly when a person is reading it. */
+        g_status_busy = 0;
+        snprintf(g_status, sizeof g_status, "%s", g_status_done);
     }
 
     /* act on last frame's click before building this one */

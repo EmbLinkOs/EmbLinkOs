@@ -14,6 +14,8 @@
 #include "png.h"
 #include "png_fixtures.h"
 #include "form.h"
+#include "jpeg.h"
+#include "jpeg_fixtures.h"
 
 static int failures;
 #define CHECK(c, what) do {                                            \
@@ -659,6 +661,66 @@ static void t20_png_hostile(void) {
     CHECK(rc != PNG_OK, "corrupt DEFLATE data is detected");
 }
 
+/* ======================= JPEG ========================================== */
+
+static void t21_jpeg(void) {
+    printf("T21 JPEG: Huffman, IDCT, chroma, colour:\n");
+    uint32_t w = 0, h = 0;
+
+    CHECK(jpeg_probe(jpg_flat, sizeof jpg_flat, &w, &h) == JPG_OK && w == 16 && h == 16,
+          "probe reads the frame header");
+
+    int rc = jpeg_decode(jpg_flat, sizeof jpg_flat, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == JPG_OK && w == 16 && h == 16, "a 4:4:4 baseline image decodes");
+    /* JPEG is lossy, so the test is NEARNESS, not equality -- an exact match
+     * would only prove the fixture was re-encoded by the same code. */
+    int r = R(PIX[8 * 16 + 8]), g = G(PIX[8 * 16 + 8]), b = B(PIX[8 * 16 + 8]);
+    CHECK(r > 200 && r < 240 && g < 60 && b < 70,
+          "flat red comes back red (within JPEG's own error)");
+    CHECK(A(PIX[0]) == 255, "opaque: JPEG has no alpha");
+
+    rc = jpeg_decode(jpg_sub420, sizeof jpg_sub420, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == JPG_OK && w == 32 && h == 16, "4:2:0 subsampled image decodes");
+    /* the gradient must still ascend after chroma upsampling */
+    CHECK(R(PIX[2]) < R(PIX[16]) && R(PIX[16]) < R(PIX[29]),
+          "the red ramp still ascends across the row");
+    CHECK(B(PIX[2]) > B(PIX[29]), "...and the blue ramp still descends");
+
+    rc = jpeg_decode(jpg_odd, sizeof jpg_odd, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == JPG_OK && w == 17 && h == 9,
+          "a size that is NOT a multiple of 8 decodes (blocks overrun the edge)");
+    CHECK(G(PIX[8 * 17 + 8]) > 150, "...and the interior is still the right colour");
+
+    rc = jpeg_decode(jpg_gray, sizeof jpg_gray, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == JPG_OK && w == 16 && h == 16, "single-component greyscale decodes");
+    CHECK(R(PIX[8 * 16 + 2]) == G(PIX[8 * 16 + 2]) &&
+          G(PIX[8 * 16 + 2]) == B(PIX[8 * 16 + 2]),
+          "...and grey means r == g == b");
+
+    CHECK(jpeg_decode(jpg_progressive, sizeof jpg_progressive, PIX, sizeof PIX,
+                      SCR, sizeof SCR, &w, &h) == JPG_EUNSUP,
+          "progressive is REFUSED, not half-decoded");
+
+    static const uint8_t notjpg[] = { 'n','o','t',' ','a',' ','j','p','g',0,1,2 };
+    CHECK(jpeg_decode(notjpg, sizeof notjpg, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h)
+          == JPG_ENOTJPG, "a non-JPEG is rejected on its signature");
+
+    static uint32_t tiny[4];
+    CHECK(jpeg_decode(jpg_flat, sizeof jpg_flat, tiny, sizeof tiny, SCR, sizeof SCR, &w, &h)
+          == JPG_ETOOBIG, "an image that does not fit is refused, never truncated");
+
+    /* Every truncation must terminate and never read out of bounds. A JPEG cut
+     * mid-scan should show what arrived, so success is allowed -- what is not
+     * allowed is a hang or a wrong size. */
+    int ok = 1;
+    for (size_t n = 2; n < sizeof jpg_flat; n += 7) {
+        uint32_t tw = 0, th = 0;
+        int r2 = jpeg_decode(jpg_flat, n, PIX, sizeof PIX, SCR, sizeof SCR, &tw, &th);
+        if (r2 == JPG_OK && (tw != 16 || th != 16)) ok = 0;
+    }
+    CHECK(ok, "every truncation either refuses or decodes at the right size");
+}
+
 int main(void) {
     printf("=== html-test ===\n");
     t1_structure(); t2_implicit_close(); t3_void_and_attrs(); t4_entities();
@@ -667,6 +729,7 @@ int main(void) {
     t11b_entities(); t12_attrs_and_style_block(); t13_declarations(); t14_selectors();
     t15_cascade(); t16_origin_order(); t17_bounded();
     t17b_image_sizing(); t17c_forms(); t18_png_basics(); t19_png_palette_and_filters(); t20_png_hostile();
+    t21_jpeg();
     printf("=== html-test: %s (%d failures) ===\n", failures ? "FAIL" : "OK", failures);
     return failures ? 1 : 0;
 }

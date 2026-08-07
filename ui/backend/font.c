@@ -695,6 +695,11 @@ static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
      * for a gradient (coords are text-box-local so the ramp spans the whole run). */
     float sr2 = color.r * color.r, sg2 = color.g * color.g, sb2 = color.b * color.b;
     float sa = color.a;
+    /* A glyph is a small box, and the clip/dirty coverage over it is almost
+     * always uniformly 1 -- so ask ONCE for the whole cell instead of once per
+     * pixel. Text is the bulk of a document's pixels, and cpu_coverage_at walks
+     * the clip stack and the damage list every time it is called. */
+    int cov_all = cpu_box_fully_covered(dx, dy, dx + aw, dy + ah);
     for (int yy = 0; yy < ah; yy++) {
         int py = dy + yy;
         if (py < 0 || py >= (int)rt->height) continue;
@@ -707,7 +712,8 @@ static void blit_coverage_tinted(struct render_target *rt, int dx, int dy,
                 struct color gc = cpu_paint_at(paint, (float)px - ox, (float)py - oy, box_w, box_h);
                 sr2 = gc.r * gc.r; sg2 = gc.g * gc.g; sb2 = gc.b * gc.b; sa = gc.a;
             }
-            float eff = sa * cov * opacity * cpu_coverage_at(px + 0.5f, py + 0.5f);
+            float eff = sa * cov * opacity;
+            if (!cov_all) eff *= cpu_coverage_at(px + 0.5f, py + 0.5f);
             if (eff <= 0.0f) continue;
             uint32_t d = row[px];
             int db = d & 255, dg = (d>>8)&255, dr = (d>>16)&255, da = (d>>24)&255;

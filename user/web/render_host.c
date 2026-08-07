@@ -23,6 +23,7 @@
 #include "css.h"
 #include "imgcache.h"
 #include "png.h"
+#include "jpeg.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -388,12 +389,17 @@ struct img_slot *imgcache_want(const char *url) {
         uint8_t *bytes = read_file(path, &n);
         if (!bytes) { H[i].state = IMG_FAILED; return &H[i]; }
         uint32_t w = 0, h = 0;
-        if (png_probe(bytes, n, &w, &h) != PNG_OK ||
+        int is_jpeg = n > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+        int probed = is_jpeg ? jpeg_probe(bytes, n, &w, &h) : png_probe(bytes, n, &w, &h);
+        if (probed != 0 ||
             w > IMG_MAX_DIM || h > IMG_MAX_DIM || (size_t)w * h > IMG_MAX_PX) {
             H[i].state = IMG_FAILED; free(bytes); return &H[i];
         }
         uint32_t *dst = HARENA + HUSED;
-        if (png_decode(bytes, n, dst, (size_t)w * h * 4, HSCR, sizeof HSCR, &w, &h) != PNG_OK) {
+        int drc = is_jpeg
+            ? jpeg_decode(bytes, n, dst, (size_t)w * h * 4, HSCR, sizeof HSCR, &w, &h)
+            : png_decode(bytes, n, dst, (size_t)w * h * 4, HSCR, sizeof HSCR, &w, &h);
+        if (drc != 0) {
             H[i].state = IMG_FAILED; free(bytes); return &H[i];
         }
         HUSED += (size_t)w * h;

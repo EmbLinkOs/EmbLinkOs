@@ -19,7 +19,7 @@ front rather than discovering it at milestone seven:
 |---|---|
 | JavaScript | Not in v1. See §9 — the decision is *when* and *ported*, not *whether we could*. |
 | CSS | A subset, ours, arriving in stages (§5). Not a spec-complete cascade. |
-| Images | PNG/JPEG decoding is a later milestone; `<img>` reserves its box from the start. |
+| Images | ✅ PNG and baseline JPEG, both from scratch; `<img>` reserves its box from the start. |
 | Video, audio, canvas, WebGL | No. |
 | Cookies, storage, service workers | No. |
 
@@ -412,6 +412,8 @@ Each ends with something demonstrable. No milestone is "infrastructure".
 | **B7** | ✅ JavaScript: QuickJS + DOM, events, fetch() | a page's own script reads, rewrites and responds |
 | **+** | ✅ FORMS: text fields, buttons, GET and POST | a form you can fill in and submit |
 | **+** | ✅ data tables over the layout grid (revisits §5 with evidence) | a reference page states a grid of facts |
+| **+** | ✅ JPEG: Huffman + fixed-point IDCT + chroma upsampling | a photograph, not just a diagram |
+| **+** | ✅ the raster made ~25x cheaper, on evidence (see below) | pages that scroll and load at a usable speed |
 
 **B1 through B3 are the ones that decide whether this is real.** If a
 document renders and scrolls at a usable speed, everything after is addition.
@@ -639,3 +641,65 @@ Recorded rather than assumed:
 5. **The name.** Proposed here as Vellum; alternatives considered were EmbView
    (consistent with the tool naming but implies a system component) and Reader
    (honest but generic).
+
+
+## JPEG, and the measurement that found the real cost
+
+`user/web/jpeg.c` decodes baseline JPEG: Huffman codes rebuilt from a table of
+code lengths, an inverse DCT, chroma upsampling, and the YCbCr conversion --
+four algorithms sharing nothing with the PNG path, which is why it is its own
+file. Progressive JPEG is a different decoder wearing the same extension and is
+REFUSED rather than half-decoded, for the same reason interlaced PNG is. Which
+decoder runs is chosen by the file's SIGNATURE, never its extension: a server is
+free to send a JPEG from a path ending `.png`, and a browser that trusts the
+name renders garbage.
+
+Fifteen host assertions pin it against real encoder output -- 4:4:4, 4:2:0,
+greyscale, a size that is not a multiple of 8, progressive-refused, and every
+truncation of a valid file either refusing or decoding at the right size.
+
+### The part worth writing down
+
+A photograph took **21 seconds** to appear on the metal. The IDCT was the
+obvious suspect -- it was written for clarity, with a float inner loop, and this
+OS runs under TCG where SSE float is emulated in software. Rewriting it in fixed
+point with a DC-only fast path made it 1.75x faster on the host.
+
+On the metal it changed nothing: 21.1s became 20.2s.
+
+So the decoder was instrumented instead of theorised about, and the answer was
+not in the decoder at all:
+
+    tot 4773   net 6   poll 4758   dec 96      (milliseconds, per image)
+
+Six milliseconds to fetch, ninety-six to decode -- and **four and a half seconds
+sitting finished**, waiting for the UI thread to come back and collect it. The
+next measurement said one frame in 4.7 seconds, and the one after that said the
+whole frame was `scene_render_frame`, and the one after that said the whole
+render was `draw_rect`: 5262 ms across 136 rectangles.
+
+`cpu_draw_rect` had no early-out for a fill that paints nothing. An invisible
+rect still walked every pixel of its box -- clip coverage, a rounded-box SDF
+with its `sqrtf`, paint sampling, a float blend -- and discarded the result at
+the very end when the blend found alpha 0. It never showed in this OS's own
+apps, where a box with no background simply is not emitted. **A document is the
+opposite**: every block element gets a background whether or not the page names
+one, so an html/body/div/p nest is a stack of full-width transparent rectangles,
+each paying for a full-window float pass.
+
+Two lines fixed it. Frame render went from **4946 ms to 170-483 ms**, the image
+round trip from 4773 ms to 343 ms, and scrolling from about four seconds to
+0.74 s.
+
+Two further hoists landed with it, because the same shape was in three places.
+The image blit and the solid-fill fast path both asked "is coverage trivial?" as
+`no dirty region and no clips at all` -- but every scrollable view pushes a clip,
+so in a document that scrolls the answer was permanently no and every interior
+pixel paid a per-pixel predicate. Clips and damage rects are axis-aligned boxes,
+so `box_fully_covered()` answers it ONCE per primitive; the glyph blit uses it
+per glyph cell. And the image blit's source coordinates, which step linearly,
+are a 16.16 accumulator instead of a float divide per pixel.
+
+The lesson is the one this project keeps relearning: **measure, don't theorise.**
+The first fix was aimed at a real inefficiency that was not the problem, and
+only cost a day because the measurement was cheap once it was finally taken.

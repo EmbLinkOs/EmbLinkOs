@@ -2133,6 +2133,31 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Host-measured on the browser's real document: 0.75 -> 0.21 ms per
       build+layout pass (`make browser-render` now prints this). Every text-
       heavy surface benefits -- terminal, Files, the editor.
+- [x] ~~A page with a photograph took 21 SECONDS to appear~~ FIXED 2026-08-07,
+      and the fix was nowhere near where it looked. Suspicion fell on the new
+      JPEG decoder's float IDCT (float is emulated under TCG). Rewriting it in
+      fixed point with a DC-only fast path won 1.75x on the host and NOTHING on
+      the metal -- 21.1s became 20.2s. Instrumented instead: `net 6ms, dec
+      96ms, poll 4758ms` -- the image sat decoded for four and a half seconds
+      waiting for a frame. One frame took 4.7s; all of it was
+      `scene_render_frame`; all of THAT was `draw_rect`, 5262ms over 136 rects.
+      `cpu_draw_rect` had no early-out for a fill that paints nothing, so every
+      invisible block background walked its whole box (clip coverage, rounded
+      SDF + sqrtf, paint, float blend) and threw the result away at the end.
+      Never seen in our own apps, where an unstyled box is not emitted; a
+      DOCUMENT emits one per block element. Frame render 4946ms -> 170-483ms,
+      image round trip 4773ms -> 343ms, scroll ~4s -> 0.74s.
+      Landed with two related hoists: `box_fully_covered()` answers "is coverage
+      trivially 1?" once per primitive instead of once per pixel (the old test
+      was `no dirty region AND no clips at all`, which a scrollable view makes
+      permanently false), used by the image blit, the solid fill and the glyph
+      blit; and the image blit steps its source coordinates in 16.16 fixed point
+      rather than a float divide per pixel.
+- [ ] JPEG is BASELINE only. Progressive is refused, not half-decoded (it is a
+      different decoder: coefficients arrive across multiple scans and the whole
+      coefficient buffer must stay live between them). Also no arithmetic
+      coding, no CMYK/YCCK, no EXIF orientation, no restart-marker resync after
+      corrupt data (a bad scan decodes as far as it can and stops).
 - [x] ~~The raster was the remaining scroll cost~~ FIXED: the renderer now has
       a SCROLL BLIT (scene_render.c Step 1s). When a frame is provably a pure
       scroll -- many nodes translated by one shared delta, no content change,

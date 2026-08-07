@@ -22,6 +22,13 @@ premultiplied BGRA &mdash; no conversion pass.</p>
 alpha, premultiplied at decode.</p>
 </figure>
 
+<figure>
+<img src="photo.jpg" width="320" height="180" alt="[a photo]">
+<p class="cap">320&times;180 JPEG at 4:2:0 &mdash; Huffman decoding, an inverse
+DCT, chroma upsampling and the YCbCr conversion, all in user/web/jpeg.c. The
+decoder is chosen by the file's SIGNATURE, not its extension.</p>
+</figure>
+
 <p>An image that does not exist falls back to its alt text, which is what alt
 text is for: <img src="missing.png" alt="[missing.png could not be loaded]"></p>
 <p><a href="/system/web/index.html">Back to the start page</a></p>

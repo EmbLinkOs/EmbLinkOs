@@ -12,6 +12,7 @@
 #include "fetchjob.h"
 #include "net.h"
 #include "png.h"
+#include "jpeg.h"
 
 /* our tag on the shared worker; the document uses a different one */
 #define IMG_TAG 2
@@ -69,9 +70,16 @@ static void finish(int slot, const struct vnet_result *res) {
 
     uint32_t w = 0, h = 0;
     if (res->err[0] && res->len == 0) { s->state = IMG_FAILED; return; }
-    if (png_probe((const uint8_t *)g_src, res->len, &w, &h) != PNG_OK) {
-        s->state = IMG_FAILED; return;         /* not a PNG (or not one we do) */
-    }
+
+    /* Which decoder, decided by the BYTES and not by the URL's extension. A
+     * server is free to send a JPEG from a path ending .png, and a browser
+     * that trusts the name renders garbage; the signature is the only thing
+     * that actually knows. */
+    const uint8_t *bytes = (const uint8_t *)g_src;
+    int is_jpeg = res->len > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+    int probed = is_jpeg ? jpeg_probe(bytes, res->len, &w, &h)
+                         : png_probe(bytes, res->len, &w, &h);
+    if (probed != 0) { s->state = IMG_FAILED; return; }
     /* Reject on DIMENSIONS before spending the arena -- a 20000x20000 header
      * costs nothing to send and would otherwise cost everything to honour. */
     if (w > IMG_MAX_DIM || h > IMG_MAX_DIM) { s->state = IMG_FAILED; return; }
@@ -80,10 +88,10 @@ static void finish(int slot, const struct vnet_result *res) {
     if (need > IMG_ARENA_PX - g_used) { s->state = IMG_FAILED; return; }
 
     uint32_t *dst = g_arena + g_used;
-    if (png_decode((const uint8_t *)g_src, res->len, dst, need * 4,
-                   g_scratch, sizeof g_scratch, &w, &h) != PNG_OK) {
-        s->state = IMG_FAILED; return;
-    }
+    int rc = is_jpeg
+        ? jpeg_decode(bytes, res->len, dst, need * 4, g_scratch, sizeof g_scratch, &w, &h)
+        : png_decode(bytes, res->len, dst, need * 4, g_scratch, sizeof g_scratch, &w, &h);
+    if (rc != 0) { s->state = IMG_FAILED; return; }
     g_used += need;
     s->px = dst; s->w = w; s->h = h;
     s->state = IMG_READY;
@@ -91,7 +99,6 @@ static void finish(int slot, const struct vnet_result *res) {
 
 int imgcache_pump(void) {
     int changed = 0;
-
     /* 1. reap a finished fetch */
     if (g_inflight >= 0) {
         struct vnet_result res;

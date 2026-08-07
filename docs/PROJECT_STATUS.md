@@ -1104,6 +1104,25 @@ layout, geometry dump, PNG -- on the dev host in two seconds, because nothing
 between document bytes and pixel rectangles needs a syscall. It is the fast
 loop for anything in this stack.
 
+**And it shows photographs (JPEG).** `user/web/jpeg.c` is a from-scratch
+baseline JPEG decoder -- canonical Huffman rebuilt from code lengths, a
+fixed-point inverse DCT, chroma upsampling and the YCbCr conversion. Which
+decoder runs is chosen by the file's SIGNATURE, not its extension. Progressive
+is refused rather than half-decoded. Fifteen host assertions pin it against real
+encoder output, including every truncation of a valid file.
+
+**The raster is ~25x cheaper, and the number came from measuring rather than
+guessing.** A page with a photograph took 21 seconds to appear; the float IDCT
+was the obvious suspect and was the wrong one. Instrumenting said the fetch took
+6ms, the decode 96ms, and the image then sat finished for 4.7 SECONDS waiting
+for a frame -- because `cpu_draw_rect` had no early-out for a fill that paints
+nothing, and a document emits a transparent background for every block element.
+Each one walked its whole box through a rounded-box SDF and a float blend to
+write nothing. Frame render went 4946ms -> 170-483ms and scrolling ~4s ->
+0.74s. Landed with `box_fully_covered()`, which answers "is coverage trivially
+1?" once per primitive instead of once per pixel, and a fixed-point stepper in
+the image blit. Every EmUI surface benefits, not just the browser.
+
 ## Major To-Do Buckets (Rough Priority)
 
 Full detail lives in `TODO.md`, organized by subsystem. Rough priority order:

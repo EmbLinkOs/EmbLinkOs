@@ -232,8 +232,54 @@ static int clamp_to_dirty(struct render_target *rt, int *x0, int *y0, int *x1, i
     return (*x1 > *x0 && *y1 > *y0);
 }
 
-/* Public accessor for the Piece-4b text blit (separate translation unit). */
+/* Is EVERY pixel of the integer box [bx0,bx1) x [by0,by1) provably at coverage
+ * exactly 1.0?
+ *
+ * THE per-primitive hoist. coverage_full_at answers the same question one pixel
+ * at a time, and the fast paths below used to settle for `no dirty region and
+ * no clips at all` because that was the only cheap way to know. But every
+ * scrollable view pushes a clip, so in a document that scrolls -- a web page,
+ * say -- the condition was never true and every interior pixel paid the
+ * per-pixel predicate. Clips and damage rects are axis-aligned boxes, so the
+ * question is answerable ONCE for a whole primitive, which is what turns a
+ * clipped image blit or panel fill back into a row of integer stores.
+ *
+ * Conservative by construction: it must never claim coverage the exact path
+ * would not give, so a clip stack deeper than CLIP_MAX (whose extra entries we
+ * did not record) answers no. */
+static int box_fully_covered(int bx0, int by0, int bx1, int by1) {
+    if (bx1 <= bx0 || by1 <= by0) return 1;          /* empty: vacuously true */
+    float fx0 = (float)bx0 + 0.5f, fy0 = (float)by0 + 0.5f;   /* first centre */
+    float fx1 = (float)bx1 - 0.5f, fy1 = (float)by1 - 0.5f;   /* last centre  */
+
+    if (!g_dirty_full) {
+        /* the union is only usable as a whole if ONE rect holds the whole box:
+         * two abutting rects cover it jointly, but proving that is the tiling
+         * problem and this is the hot path */
+        int inside = 0;
+        int n = g_dirty_n < DIRTY_MAX ? g_dirty_n : DIRTY_MAX;
+        for (int i = 0; i < n; i++) {
+            struct clip_rect *c = &g_dirty[i];
+            if (fx0 >= c->x && fx1 < c->x + c->w &&
+                fy0 >= c->y && fy1 < c->y + c->h) { inside = 1; break; }
+        }
+        if (!inside) return 0;
+    }
+    if (g_clip_n > CLIP_MAX) return 0;               /* clips we never stored */
+    for (int i = 0; i < g_clip_n; i++) {
+        struct clip_rect *c = &g_clip[i];
+        float inset = c->corner_radius + 0.5f;       /* same margin as coverage_full_at */
+        if (fx0 < c->x + inset || fx1 > c->x + c->w - inset) return 0;
+        if (fy0 < c->y + inset || fy1 > c->y + c->h - inset) return 0;
+    }
+    return 1;
+}
+
+/* Public accessors for the Piece-4b text blit (separate translation unit). */
 float cpu_coverage_at(float fx, float fy) { return coverage_at(fx, fy); }
+int cpu_box_fully_covered(int x0, int y0, int x1, int y1) {
+    return box_fully_covered(x0, y0, x1, y1);
+}
 
 /* Install the frame's dirty rects (n==0 => full-screen, no restriction). */
 void cpu_set_dirty(const struct clip_rect *rects, uint32_t n) {
@@ -383,6 +429,21 @@ struct color cpu_paint_at(const struct paint *p, float u, float v, float w, floa
 static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, float h,
                           float radius, const struct paint *fill, float opacity) {
     if (!fill || w <= 0 || h <= 0 || opacity <= 0) return;
+
+    /* A RECT THAT PAINTS NOTHING COSTS NOTHING.
+     *
+     * Without this, an invisible fill still walked every pixel of its box --
+     * coverage_at, rounded_box_sdf with its sqrtf, paint_at, blend_over -- and
+     * threw the result away when blend_over found alpha 0 at the very end. It
+     * never showed up in the UI toolkit's own apps, where a box with no
+     * background simply isn't emitted. A DOCUMENT is the opposite: every block
+     * element gets a background whether or not the page names one, so an html /
+     * body / div / p nest is a stack of full-width transparent rects, each
+     * paying for a full-window float pass. Measured on the metal, this was the
+     * whole of a browser frame -- 5.2 seconds across 136 rects. */
+    if (fill->kind == PAINT_NONE) return;
+    if (fill->kind == PAINT_SOLID && fill->solid.a * opacity <= 0.002f) return;
+
     float half_w = w * 0.5f, half_h = h * 0.5f;
     float cx = x + half_w, cy = y + half_h;
     if (radius > half_w) radius = half_w;
@@ -450,9 +511,10 @@ static void cpu_draw_rect(struct render_target *rt, float x, float y, float w, f
                (ROW)[IX] = px_pack(lutB[_b], lutG[_g], lutR[_r], lutA[_a]); }  \
     } while (0)
 
-    /* no dirty restriction and no clips at all -> interior coverage is 1.0 by
-     * construction; the interior fill degenerates to a bare row of stores. */
-    int cov_trivial = (g_dirty_full && g_clip_n == 0);
+    /* the interior box is provably at coverage 1.0 -> the fill degenerates to a
+     * bare row of stores. Asked once for the whole rect, not once per pixel. */
+    int cov_trivial = box_fully_covered(x0 > in_x0 ? x0 : in_x0, y0 > in_y0 ? y0 : in_y0,
+                                        x1 < in_x1 ? x1 : in_x1, y1 < in_y1 ? y1 : in_y1);
 
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
@@ -539,7 +601,7 @@ static void cpu_draw_image(struct render_target *rt, float x, float y, float w, 
      * is dst*(255-sa)/255 + src per channel (same carry-safe trick the shadow
      * blit uses). Avoids 4 float divides + the float blend_over per pixel; the
      * exact float path still runs for opacity<1 and clip/dirty AA edges. */
-    int img_trivial_all = (opacity >= 0.999f) && g_dirty_full && g_clip_n == 0;
+    int img_trivial_all = (opacity >= 0.999f) && box_fully_covered(x0, y0, x1, y1);
     int img_opaque_op   = (opacity >= 0.999f);
 
     /* Filter only when the blit actually rescales. Drawing an icon at its own
@@ -554,27 +616,39 @@ static void cpu_draw_image(struct render_target *rt, float x, float y, float w, 
     float tr = 0, tg = 0, tb = 0, ta = 0;
     if (tint) { tr = tint->r; tg = tint->g; tb = tint->b; ta = tint->a; }
 
+    /* Source coordinates step LINEARLY across the blit, so they are a 16.16
+     * fixed-point accumulator rather than a float divide per pixel. That divide
+     * was the single most expensive thing in a page with pictures on it: under
+     * TCG every float op is emulated, and at ~90k image pixels a frame it cost
+     * seconds. The maths is identical -- sfx = (ix + 0.5 - x) * src_w/w -- only
+     * the ratio is now computed once. */
+    int32_t stepx = (int32_t)((float)src_w / w * 65536.0f + 0.5f);
+    int32_t stepy = (int32_t)((float)src_h / h * 65536.0f + 0.5f);
+    int32_t basex = (int32_t)(((float)x0 + 0.5f - x) * (float)src_w / w * 65536.0f);
+    int32_t basey = (int32_t)(((float)y0 + 0.5f - y) * (float)src_h / h * 65536.0f);
+    int32_t maxfx = (int32_t)(src_w - 1) << 16, maxfy = (int32_t)(src_h - 1) << 16;
+
     for (int iy = y0; iy < y1; iy++) {
         float fy = iy + 0.5f;
-        float v = (fy - y) / h; if (v < 0) v = 0; if (v >= 1) v = 0.999999f;
-        float sfy = v * src_h;
-        uint32_t sy = (uint32_t)sfy;
+        int32_t sfy = basey + (iy - y0) * stepy;
+        if (sfy < 0) sfy = 0; if (sfy > maxfy) sfy = maxfy;
+        uint32_t sy = (uint32_t)(sfy >> 16);
         uint32_t syn = (sy + 1 < src_h) ? sy + 1 : sy;
-        uint32_t wy = (uint32_t)((sfy - (float)sy) * 256.0f);
+        uint32_t wy = (uint32_t)((sfy >> 8) & 0xFF);
         const uint32_t *srow = (const uint32_t *)((const unsigned char *)pixels + (size_t)sy * src_stride);
         const uint32_t *srown = (const uint32_t *)((const unsigned char *)pixels + (size_t)syn * src_stride);
         uint32_t *drow = rt_row(rt, (uint32_t)iy);
-        for (int ix = x0; ix < x1; ix++) {
+        int32_t sfx = basex;
+        for (int ix = x0; ix < x1; ix++, sfx += stepx) {
             float fx = ix + 0.5f;
-            float u = (fx - x) / w; if (u < 0) u = 0; if (u >= 1) u = 0.999999f;
-            float sfx = u * src_w;
-            uint32_t sx = (uint32_t)sfx;
+            int32_t cfx = sfx < 0 ? 0 : (sfx > maxfx ? maxfx : sfx);
+            uint32_t sx = (uint32_t)(cfx >> 16);
             uint32_t s;
             if (!rescaling) {
                 s = srow[sx];
             } else {
                 uint32_t sxn = (sx + 1 < src_w) ? sx + 1 : sx;
-                uint32_t wx = (uint32_t)((sfx - (float)sx) * 256.0f);
+                uint32_t wx = (uint32_t)((cfx >> 8) & 0xFF);
                 s = bilerp4(srow[sx], srow[sxn], srown[sx], srown[sxn], wx, wy);
             }
             if (tint) {
