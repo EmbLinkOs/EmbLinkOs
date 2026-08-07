@@ -211,6 +211,51 @@ int main(int argc, char **argv) {
         printf("\n--- scroll cost: %.2f ms per build+layout pass (host) ---\n", ms);
     }
 
+    /* --- scroll-blit correctness: an INCREMENTAL scroll frame must be pixel-
+     * identical to a from-scratch render at the same offset. The blit is an
+     * optimization; if it can be told apart from the real thing, it is a bug.
+     * Exercises the renderer's Step 1s exactly as a wheel tick does. --- */
+    {
+        int Wp = W, Hp = H;
+        size_t nbytes = (size_t)Wp * Hp * 4;
+        uint32_t *pa = malloc(nbytes), *pb = malloc(nbytes);
+        const struct ui_theme *t = ui_theme();
+        uint32_t bg = (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
+                    | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
+        for (int i = 0; i < Wp * Hp; i++) { pa[i] = bg; pb[i] = bg; }
+        struct render_target ta = { pa, (uint32_t)Wp, (uint32_t)Hp, (uint32_t)Wp * 4, EMBK_PIXFMT_BGRA8888_PRE };
+        struct render_target tb = { pb, (uint32_t)Wp, (uint32_t)Hp, (uint32_t)Wp * 4, EMBK_PIXFMT_BGRA8888_PRE };
+
+        struct scene_renderer ra; scene_render_init(&ra, cpu_backend_get());
+        /* frame 1 at scroll 0, then frame 2 at scroll 64: the INCREMENTAL path */
+        g_scroll = 0;
+        ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
+        ui_run_layout((float)Wp, (float)Hp);
+        scene_render_frame(&ra, &sa, ui_scene_of(ui_root()), &ta);
+        g_scroll = 64;
+        ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
+        ui_run_layout((float)Wp, (float)Hp);
+        scene_render_frame(&ra, &sa, ui_scene_of(ui_root()), &ta);
+        int blitted = ra.has_scroll_present;
+
+        /* fresh renderer straight to scroll 64: the REFERENCE */
+        struct scene_renderer rb; scene_render_init(&rb, cpu_backend_get());
+        scene_render_frame(&rb, &sa, ui_scene_of(ui_root()), &tb);
+
+        int diff = 0, dy0 = -1, dy1 = -1;
+        for (int i = 0; i < Wp * Hp; i++) if (pa[i] != pb[i]) {
+            diff++;
+            int y = i / Wp;
+            if (dy0 < 0) dy0 = y;
+            dy1 = y;
+        }
+        if (diff) printf("    (differing rows: %d..%d)\n", dy0, dy1);
+        printf("--- scroll blit: %s (blit path %s, %d differing px) ---\n",
+               diff == 0 ? "PIXEL-EXACT" : "MISMATCH", blitted ? "TAKEN" : "not taken", diff);
+        scene_render_destroy(&ra); scene_render_destroy(&rb);
+        free(pa); free(pb);
+    }
+
     if (png) {
         struct render_target rt;
         rt.pixels = malloc((size_t)W * H * 4); rt.width = W; rt.height = H;

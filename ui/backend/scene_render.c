@@ -4,11 +4,12 @@
  * it's easy to get subtly wrong). */
 
 #include "scene_render.h"
-#ifdef SCENE_TRACE
+#if defined(SCENE_TRACE) || defined(SCROLL_DEBUG)
 #include <stdio.h>
 #endif
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 
 
 /* ------------------------------------------------------------------------- */
@@ -109,6 +110,14 @@ struct noderec {
     int                has_group;
     struct frect       group_bounds;
     int                dirty;
+    /* scroll-detection scratch (Step 1): the cached old footprint, and the
+     * classification of WHY this node is dirty -- a pure move can be blitted,
+     * a content change cannot. */
+    struct frect       old;
+    int                has_old;
+    int                own_dirty;
+    int                moved;
+    int                clips;
 };
 
 /* the painted footprint: the AABB grown by shadow reach (mirrors paint_visual) */
@@ -143,6 +152,8 @@ static void gather(struct scene_arena *a, struct node_handle h, const float wpar
     rec->has_group = has_group;
     rec->group_bounds = gbounds;
     rec->dirty = 0;
+    rec->has_old = 0; rec->own_dirty = 0; rec->moved = 0;
+    rec->clips = node->clip_children ? 1 : 0;
 
     int child_group = has_group;
     struct frect child_gb = gbounds;
@@ -356,7 +367,7 @@ static void render_node_inner(struct scene_renderer *r, struct scene_arena *a, s
 /* ------------------------------------------------------------------------- */
 
 void scene_render_init(struct scene_renderer *r, struct render_backend *be) {
-    r->be = be; r->cache = 0; r->cache_cap = 0; r->n_dirty = 0; r->full = 0;
+    r->be = be; r->cache = 0; r->cache_cap = 0; r->n_dirty = 0; r->full = 0; r->has_scroll_present = 0;
 }
 void scene_render_destroy(struct scene_renderer *r) {
     free(r->cache); r->cache = 0; r->cache_cap = 0;
@@ -374,7 +385,7 @@ static void ensure_cache(struct scene_renderer *r, uint32_t need) {
 
 void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
                         struct node_handle root, struct render_target *target) {
-    r->n_dirty = 0; r->full = 0;
+    r->n_dirty = 0; r->full = 0; r->has_scroll_present = 0;
     ensure_cache(r, a->next_never_used);
     if (!r->cache) return;
 
@@ -392,6 +403,11 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
      * stores the shadow-grown FOOTPRINT, not the bare AABB -- a ghost occupies
      * everything the node stained, and a drop shadow stains past the box. --- */
     uint8_t *seen = (uint8_t *)calloc(r->cache_cap ? r->cache_cap : 1, 1);
+    /* --- Step 1a: CLASSIFY, adding nothing yet. Whether this frame is "a
+     * scroll" is only knowable from the whole population of changes, so the
+     * verdicts are gathered before any dirty rect is committed. --- */
+    int n_moved = 0, n_content = 0, uniform = 1;
+    float mdx = 0, mdy = 0;
     for (int i = 0; i < nrec; i++) {
         struct noderec *rec = &recs[i];
         uint32_t idx = rec->h.index;
@@ -401,16 +417,232 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
         if (seen && idx < r->cache_cap && cache_live) seen[idx] = 1;
         int moved = 1;
         if (cache_live) {
+            rec->old.x = cc->x; rec->old.y = cc->y; rec->old.w = cc->w; rec->old.h = cc->h;
+            rec->has_old = 1;
             moved = !(fabsf(cc->x - rec->foot.x) < 0.01f && fabsf(cc->y - rec->foot.y) < 0.01f &&
                       fabsf(cc->w - rec->foot.w) < 0.01f && fabsf(cc->h - rec->foot.h) < 0.01f);
         }
-        int own_dirty = n && n->dirty;
-        rec->dirty = own_dirty || moved;
-        if (rec->dirty) {
-            dirty_add(r, rec->foot);                                  /* new footprint */
-            if (cache_live) {
-                struct frect old = { cc->x, cc->y, cc->w, cc->h };
-                dirty_add(r, old);                                     /* old ghost */
+        /* own_dirty means CONTENT changed -- a pure transform is a move, and
+         * moves are what the scroll blit exists for (scene.h dirty_content) */
+        rec->own_dirty = n && n->dirty_content;
+        int any_dirty = n && n->dirty;
+        (void)any_dirty;
+        rec->moved = moved;
+        rec->dirty = rec->own_dirty || moved;
+        if (rec->own_dirty) {
+            n_content++;
+#ifdef SCROLL_DEBUG
+            fprintf(stderr, "content: OWN-DIRTY kind=%d at %.0f,%.0f %.0fx%.0f\n",
+                    n ? (int)n->kind : -1, rec->foot.x, rec->foot.y, rec->foot.w, rec->foot.h);
+#endif
+        }
+        if (moved && !cache_live) {
+            n_content++;            /* a NEW node is content */
+#ifdef SCROLL_DEBUG
+            fprintf(stderr, "content: NEW kind=%d at %.0f,%.0f %.0fx%.0f\n",
+                    n ? (int)n->kind : -1, rec->foot.x, rec->foot.y, rec->foot.w, rec->foot.h);
+#endif
+        }
+        if (moved && cache_live) {
+            /* a translation keeps its size; a resize is content */
+            if (fabsf(rec->old.w - rec->foot.w) > 0.01f ||
+                fabsf(rec->old.h - rec->foot.h) > 0.01f) {
+                n_content++;
+#ifdef SCROLL_DEBUG
+                fprintf(stderr, "content: RESIZE kind=%d %.0fx%.0f -> %.0fx%.0f\n",
+                        n ? (int)n->kind : -1, rec->old.w, rec->old.h, rec->foot.w, rec->foot.h);
+#endif
+            }
+            else {
+                float dx = rec->foot.x - rec->old.x, dy = rec->foot.y - rec->old.y;
+                if (!n_moved) { mdx = dx; mdy = dy; }
+                else if (fabsf(dx - mdx) > 0.5f || fabsf(dy - mdy) > 0.5f) uniform = 0;
+                n_moved++;
+            }
+        }
+    }
+    int n_vacated = 0;
+    for (uint32_t i = 0; i < r->cache_cap; i++)
+        if (r->cache[i].valid && seen && !seen[i]) n_vacated++;
+
+    /* --- Step 1s: THE SCROLL BLIT. When many nodes translated by one shared
+     * vertical delta and NOTHING else changed, this frame is a scroll -- and a
+     * scroll does not need its pixels recomputed, it needs them MOVED. The
+     * old frame already contains almost every pixel of the new one, |dy|
+     * higher or lower. So: find the clip container being scrolled (the
+     * smallest clipping node intersecting the motion), memmove its rows, and
+     * repaint only the strip the motion exposed.
+     *
+     * Without this, a wheel tick moved everything in the viewport, blew the
+     * 16-rect dirty cap, and degraded to a FULL repaint -- hundreds of glyph
+     * blits per notch, which under TCG is a browser that scrolls in lurches.
+     * With it, a notch costs one memmove and a strip of glyphs.
+     *
+     * The guards are the point. Any content change, any resize, any vacated
+     * node, any moved-but-visible node OUTSIDE the clip aborts to the normal
+     * path -- correctness first, the blit only when the frame provably is a
+     * pure scroll. */
+    int scrolled = 0;
+#ifdef SCROLL_DEBUG
+    fprintf(stderr, "scroll? full=%d uniform=%d moved=%d content=%d vacated=%d d=(%.1f,%.1f)\n",
+            r->full, uniform, n_moved, n_content, n_vacated, mdx, mdy);
+#endif
+    /* Content changes do not veto the scroll GLOBALLY -- only content INSIDE
+     * the scrolled region does. A status line ticking at the bottom of the
+     * window, or a hover highlight in the toolbar, has nothing to do with the
+     * document scrolling above it; those repaint as ordinary dirty rects
+     * alongside the strip. The intersection check happens after R is known. */
+    (void)n_content;
+    if (!r->full && uniform && n_moved >= 8 &&
+        fabsf(mdx) < 0.5f && fabsf(mdy) >= 1.0f && target && target->pixels) {
+        /* the union of the moving content, old and new */
+        struct frect mb; int have_mb = 0;
+        for (int i = 0; i < nrec; i++) {
+            if (!(recs[i].moved && recs[i].has_old)) continue;
+            struct frect u = recs[i].foot;
+            if (!have_mb) { mb = u; have_mb = 1; }
+            float x1 = mb.x + mb.w, y1 = mb.y + mb.h;
+            if (u.x < mb.x) mb.x = u.x;
+            if (u.y < mb.y) mb.y = u.y;
+            if (u.x + u.w > x1) x1 = u.x + u.w;
+            if (u.y + u.h > y1) y1 = u.y + u.h;
+            mb.w = x1 - mb.x; mb.h = y1 - mb.y;
+        }
+        /* the scrolled clip: smallest UNMOVED clipping node intersecting it */
+        int ci = -1; float carea = 0;
+        for (int i = 0; i < nrec; i++) {
+            if (!recs[i].clips || recs[i].moved || recs[i].own_dirty) continue;
+            if (!have_mb || !frect_overlap(recs[i].aabb, mb)) continue;
+            float ar = recs[i].aabb.w * recs[i].aabb.h;
+            if (ci < 0 || ar < carea) { ci = i; carea = ar; }
+        }
+#ifdef SCROLL_DEBUG
+        fprintf(stderr, "scroll? clip ci=%d\n", ci);
+#endif
+        if (ci >= 0) {
+            struct frect R = recs[ci].aabb;
+            /* clamp to the target */
+            if (R.x < 0) { R.w += R.x; R.x = 0; }
+            if (R.y < 0) { R.h += R.y; R.y = 0; }
+            if (R.x + R.w > (float)target->width)  R.w = (float)target->width  - R.x;
+            if (R.y + R.h > (float)target->height) R.h = (float)target->height - R.y;
+            /* every UNIFORMLY-MOVED node must be inside R or off-target
+             * (moved content visible outside the clip means this was not that
+             * clip's scroll); and every CONTENT change and VACATED slot must be
+             * OUTSIDE R (stale pixels under the blit would be smeared). */
+            int ok = R.w > 0 && R.h > 0;
+            for (int i = 0; ok && i < nrec; i++) {
+                struct frect t = { 0, 0, (float)target->width, (float)target->height };
+                int resized = recs[i].moved && recs[i].has_old &&
+                              (fabsf(recs[i].old.w - recs[i].foot.w) > 0.01f ||
+                               fabsf(recs[i].old.h - recs[i].foot.h) > 0.01f);
+                int is_content = recs[i].own_dirty || resized ||
+                                 (recs[i].moved && !recs[i].has_old);
+                if (is_content) {
+                    if (frect_overlap(recs[i].foot, recs[ci].aabb) ||
+                        (recs[i].has_old && frect_overlap(recs[i].old, recs[ci].aabb))) {
+                        ok = 0;
+#ifdef SCROLL_DEBUG
+                        struct scene_node *vn = scene_resolve(a, recs[i].h);
+                        fprintf(stderr, "veto: CONTENT-INSIDE kind=%d own=%d new=%d resized=%d %.0f,%.0f %.0fx%.0f\n",
+                                vn ? (int)vn->kind : -1, recs[i].own_dirty,
+                                recs[i].moved && !recs[i].has_old, resized,
+                                recs[i].foot.x, recs[i].foot.y, recs[i].foot.w, recs[i].foot.h);
+#endif
+                    }
+                    continue;
+                }
+                if (!recs[i].moved) continue;
+                if (!frect_overlap(recs[i].foot, t) && !frect_overlap(recs[i].old, t)) continue;
+                struct frect both = recs[i].foot;
+                if (recs[i].has_old) {
+                    float x1 = both.x + both.w, y1 = both.y + both.h;
+                    if (recs[i].old.x < both.x) both.x = recs[i].old.x;
+                    if (recs[i].old.y < both.y) both.y = recs[i].old.y;
+                    if (recs[i].old.x + recs[i].old.w > x1) x1 = recs[i].old.x + recs[i].old.w;
+                    if (recs[i].old.y + recs[i].old.h > y1) y1 = recs[i].old.y + recs[i].old.h;
+                    both.w = x1 - both.x; both.h = y1 - both.y;
+                }
+                if (!frect_overlap(both, recs[ci].aabb)) {
+                    ok = 0;
+#ifdef SCROLL_DEBUG
+                    fprintf(stderr, "veto: MOVED-OUTSIDE %.0f,%.0f %.0fx%.0f\n",
+                            both.x, both.y, both.w, both.h);
+#endif
+                }
+            }
+            for (uint32_t i = 0; ok && i < r->cache_cap; i++) {
+                if (!r->cache[i].valid || (seen && seen[i])) continue;
+                struct frect v = { r->cache[i].x, r->cache[i].y, r->cache[i].w, r->cache[i].h };
+                if (frect_overlap(v, recs[ci].aabb)) ok = 0;   /* a ghost under the blit */
+            }
+#ifdef SCROLL_DEBUG
+            fprintf(stderr, "scroll? ok=%d R=%.0f,%.0f %.0fx%.0f\n", ok, R.x, R.y, R.w, R.h);
+#endif
+            if (ok) {
+                /* Blit INTERIOR rows only. The clip's edges are fractional
+                 * (95.6, say): the edge row blends clipped content with
+                 * whatever sits outside, and copying an interior row over it
+                 * stomps that blend -- one wrong antialiased row at the top of
+                 * every scroll. ceil/floor keeps the blit inside, and the edge
+                 * bands added below repaint the blends properly. */
+                int rx0 = (int)ceilf(R.x),        ry0 = (int)ceilf(R.y);
+                int rx1 = (int)floorf(R.x + R.w), ry1 = (int)floorf(R.y + R.h);
+                int dy = (int)(mdy < 0 ? mdy - 0.5f : mdy + 0.5f);
+                uint8_t *px = (uint8_t *)target->pixels;
+                uint32_t stride = target->stride;
+                size_t rowbytes = (size_t)(rx1 - rx0) * 4;
+                if (dy < 0) {          /* content moved UP: copy top-down */
+                    for (int y = ry0; y < ry1; y++) {
+                        int sy = y - dy;
+                        if (sy >= ry1) break;             /* rest is the exposed strip */
+                        memmove(px + (size_t)y * stride + (size_t)rx0 * 4,
+                                px + (size_t)sy * stride + (size_t)rx0 * 4, rowbytes);
+                    }
+                } else {               /* content moved DOWN: copy bottom-up */
+                    for (int y = ry1 - 1; y >= ry0; y--) {
+                        int sy = y - dy;
+                        if (sy < ry0) break;
+                        memmove(px + (size_t)y * stride + (size_t)rx0 * 4,
+                                px + (size_t)sy * stride + (size_t)rx0 * 4, rowbytes);
+                    }
+                }
+                /* the exposed strip, with 2px of slack for antialiased edges */
+                struct frect strip;
+                strip.x = R.x; strip.w = R.w;
+                if (dy < 0) { strip.y = (float)(ry1 + dy - 2); strip.h = (float)(-dy + 4); }
+                else        { strip.y = (float)(ry0 - 2);      strip.h = (float)(dy + 4); }
+                dirty_add(r, strip);
+                /* the fractional edge rows of R: repaint their blends */
+                { struct frect e1 = { R.x, R.y - 1.0f, R.w, 3.0f };
+                  struct frect e2 = { R.x, R.y + R.h - 2.0f, R.w, 3.0f };
+                  dirty_add(r, e1); dirty_add(r, e2); }
+                /* content changes OUTSIDE R repaint as ordinary dirty rects */
+                for (int i = 0; i < nrec; i++) {
+                    int resized = recs[i].moved && recs[i].has_old &&
+                                  (fabsf(recs[i].old.w - recs[i].foot.w) > 0.01f ||
+                                   fabsf(recs[i].old.h - recs[i].foot.h) > 0.01f);
+                    int is_content = recs[i].own_dirty || resized ||
+                                     (recs[i].moved && !recs[i].has_old);
+                    if (!is_content) continue;
+                    dirty_add(r, recs[i].foot);
+                    if (recs[i].has_old) dirty_add(r, recs[i].old);
+                }
+                scrolled = 1;
+                r->sp_x = R.x; r->sp_y = R.y; r->sp_w = R.w; r->sp_h = R.h;
+                r->has_scroll_present = 1;  /* the consumer must present ALL of R */
+            }
+        }
+    }
+
+    /* --- Step 1c: the normal dirty accumulation, skipped when the frame was
+     * resolved as a scroll (the strip is the only repaint). --- */
+    if (!scrolled) {
+        for (int i = 0; i < nrec; i++) {
+            struct noderec *rec = &recs[i];
+            if (rec->dirty) {
+                dirty_add(r, rec->foot);                              /* new footprint */
+                if (rec->has_old) dirty_add(r, rec->old);             /* old ghost */
             }
         }
     }
@@ -487,7 +719,7 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
             r->cache[idx].valid = 1;
         }
         struct scene_node *n = scene_resolve(a, recs[i].h);
-        if (n) n->dirty = 0;
+        if (n) { n->dirty = 0; n->dirty_content = 0; }
     }
     free(recs);
 }

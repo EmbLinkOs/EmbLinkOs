@@ -23,6 +23,12 @@ struct scene_renderer {
     struct clip_rect       dirty[16];  /* this frame's accumulator (Section 6) */
     int                    n_dirty;
     int                    full;       /* cap exceeded -> one full-screen rect */
+    /* Scroll-blit result (Section 6b): when a frame was resolved as a pure
+     * scroll, only the exposed STRIP was repainted -- but the whole blitted
+     * region's pixels changed, so a consumer that copies/presents by dirty
+     * rect must cover THIS rect too. Valid when has_scroll_present. */
+    float                  sp_x, sp_y, sp_w, sp_h;
+    int                    has_scroll_present;
 };
 
 void scene_render_init(struct scene_renderer *r, struct render_backend *be);

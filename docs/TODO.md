@@ -2073,11 +2073,20 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Host-measured on the browser's real document: 0.75 -> 0.21 ms per
       build+layout pass (`make browser-render` now prints this). Every text-
       heavy surface benefits -- terminal, Files, the editor.
-- [ ] Metal scroll-FEEL not re-verified: QMP wheel synthesis (btn wheel-up/
-      down) does not reach the guest's USB-HID path in the headless harness,
-      though pointer moves do. Feel it in an interactive run. If still heavy,
-      the next cost center is the RASTER of the scrolled band (glyph blits per
-      frame), not layout.
+- [x] ~~The raster was the remaining scroll cost~~ FIXED: the renderer now has
+      a SCROLL BLIT (scene_render.c Step 1s). When a frame is provably a pure
+      scroll -- many nodes translated by one shared delta, no content change,
+      no vacated ghost, and nothing moved-but-visible outside the scrolled clip
+      -- the blitted region is memmove'd and only the exposed strip (plus the
+      clip's fractional edge rows) is repainted. Host-proven PIXEL-EXACT
+      against a from-scratch render (`make browser-render` asserts it, and the
+      check watched the blit path actually being TAKEN). Needed a scene-level
+      split of dirty into geometry-vs-content (dirty_content), because
+      scrolling is itself a transform and was vetoing its own fast path.
+- [ ] Metal scroll-FEEL still not verifiable headless: QMP wheel synthesis does
+      not reach the guest's USB-HID path. Feel it in an interactive run.
+- [ ] The scroll blit keys on ONE clip region per frame; two views scrolling in
+      the same frame fall back to the full repaint (correct, just slower).
 - [ ] The wrap-height memo keys on ONE width. A node measured at two widths
       alternately (never observed; would need the same text in two differently
       sized parents) would thrash the memo -- correct, just uncached.

@@ -162,6 +162,12 @@ struct scene_node {
 
     bool  dirty;   /* any mutation sets this; lets a caching traversal skip an
                     * unchanged subtree's world recompute */
+    bool  dirty_content;   /* dirty MINUS pure transforms. A transform is a
+                            * MOVE: the pixels are still valid, just elsewhere,
+                            * and a scroll can blit them. Every other mutation
+                            * (paint, text, image, border...) invalidates the
+                            * pixels themselves. The renderer's scroll fast
+                            * path tells the two apart with this bit. */
 
     /* Opaque tag Piece 3 never interprets -- exists purely so a consumer above
      * (Piece 7's declarative layer) can stash its own identifier (e.g. a packed

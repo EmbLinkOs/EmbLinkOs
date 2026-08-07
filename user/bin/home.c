@@ -985,6 +985,11 @@ int main(int argc, char **argv, char **envp) {
             embk_win_present(win, pixels, sw, sh);
         } else {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
+            if (r.has_scroll_present) {           /* a scroll blit moved pixels */
+                x0 = (int)r.sp_x; y0 = (int)r.sp_y;
+                x1 = (int)(r.sp_x + r.sp_w) + 1;
+                y1 = (int)(r.sp_y + r.sp_h) + 1;
+            }
             for (int i = 0; i < r.n_dirty; i++) {
                 int a = (int)r.dirty[i].x, b = (int)r.dirty[i].y;
                 int c = (int)(r.dirty[i].x + r.dirty[i].w) + 1, d = (int)(r.dirty[i].y + r.dirty[i].h) + 1;

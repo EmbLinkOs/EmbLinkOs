@@ -378,6 +378,13 @@ int em_app_run(const EmApp *app) {
             embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
         } else {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
+            /* a scroll blit moved pixels the dirty rects do not cover: the
+             * whole blitted region must reach the compositor */
+            if (r.has_scroll_present) {
+                x0 = (int)r.sp_x; y0 = (int)r.sp_y;
+                x1 = (int)(r.sp_x + r.sp_w) + 1;
+                y1 = (int)(r.sp_y + r.sp_h) + 1;
+            }
             for (int i = 0; i < r.n_dirty; i++) {
                 int a = (int)r.dirty[i].x, b = (int)r.dirty[i].y;
                 int c = (int)(r.dirty[i].x + r.dirty[i].w) + 1, d = (int)(r.dirty[i].y + r.dirty[i].h) + 1;
