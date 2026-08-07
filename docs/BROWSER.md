@@ -1144,3 +1144,33 @@ And a granted prefix must EXIST at spawn time, because the kernel resolves it
 in the parent's namespace. An app cannot create what it has not been granted,
 and cannot be granted what does not exist; `mkfs` ships `$HOME/.vellum` to break
 the cycle. That wants a real answer before a second app hits it.
+
+
+## Find in page (C5)
+
+Ctrl+F opens a bar with a live count, Prev/Next that wrap, Enter for next and
+Esc to close. Every match is highlighted, and the CURRENT one in a different
+colour -- without that, "next" moves an indicator you cannot see, which is the
+one thing find-in-page has to show.
+
+`find.c` reuses the runs `select.c` already collected rather than walking the
+scene a second time. Two walks would be two chances to disagree about what
+counts as page text and what counts as chrome, and the first bug that produces
+is "find highlights the address bar".
+
+Matching is case-insensitive and **spans runs**, which is the whole difficulty:
+the renderer emits one box per WORD, so "operating system" is two boxes with a
+space baked into the first, and a matcher confined to a single run fails on
+every phrase anyone actually searches for. The page is flattened into one
+string with a run index per byte, and each hit maps back to the boxes it covers.
+
+### The count was a frame behind
+
+The host reported 3 matches for "browser" and the metal showed **1 of 24**. The
+view draws `find_count()` before the post-layout hook rescans, so the number is
+always one frame behind the query -- and with nothing requesting another frame
+it froze showing the count for a shorter prefix. 24 is the answer for "b".
+
+The harness is what made that obvious: `FIND=<text> browser_render` prints the
+count, so the matcher could be checked independently of the UI drawing it. On a
+screenshot you only ever see the highlight, never the number.

@@ -2520,6 +2520,24 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       every pseudo-class other than the two above, and pseudo-elements. All are
       SKIPPED rather than dropped -- `a:hover` still styles `a`, which is
       closer to the author's page than no rule.
+- [x] ~~No find-in-page~~ SHIPPED 2026-08-08 (C5): Ctrl+F, a bar with a live
+      count ("2 of 4"), Prev/Next that WRAP, Enter for next, Esc to close, and
+      every match highlighted with the CURRENT one a different colour -- without
+      that, "next" moves an indicator you cannot see, which is the one thing
+      find has to show.
+      `user/web/find.c` reuses the runs select.c already collected rather than
+      walking the scene again: two walks would be two chances to disagree about
+      what is page text and what is chrome, and the first bug that produces is
+      "find highlights the address bar". Matching is case-insensitive and SPANS
+      RUNS -- the renderer emits one box per word, so "operating system" is two
+      boxes and a matcher confined to one fails on every phrase anyone searches
+      for; the page is flattened into one string with a run index per byte.
+      A real bug the harness caught: the count on screen was ONE FRAME STALE
+      (the view draws it before the post-layout hook rescans) and nothing asked
+      for another frame, so typing "browser" left "1 of 24" -- which is the
+      answer for "b". The host said 3 and the metal said 24, which is what made
+      it obvious.
+- [ ] Still C5: tabs, persistent history, zoom, downloads, favicon.
 - [ ] Selection is WORD granular, not character. The renderer emits one node per
       word, so that is the grain available without measuring glyph prefixes
       through the font engine on every pointer move. Also missing: double-click

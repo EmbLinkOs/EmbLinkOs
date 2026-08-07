@@ -54,6 +54,25 @@ int  vsel_active(void);
  * of in a five-minute boot. */
 size_t vsel_copy_text(char *out, size_t cap);
 
+/* --- the laid-out runs, for anything else that needs them ---------------- *
+ *
+ * find.c wants exactly what this module already collected: every text run on
+ * the page, in document order, with where it ended up. Exposing that beats
+ * walking the scene a second time -- two walks would be two chances to
+ * disagree about what counts as page text and what counts as chrome. */
+int         vsel_run_count(void);
+const char *vsel_run_text(int i);
+/* Where run `i` sits, in window coordinates. */
+int         vsel_run_rect(int i, float *x, float *y, float *w, float *h);
+/* Paint a background on run `i`: 0 none, 1 a match, 2 the CURRENT match. Reset
+ * every frame by vsel_sync_geometry, so a caller re-marks each frame -- the
+ * same contract the selection itself has. */
+void        vsel_run_mark(int i, int kind);
+/* Called after the runs are collected and before they are painted -- find.c's
+ * chance to mark. A hook rather than a call into find.c, so this module goes
+ * on knowing nothing about it. */
+void        vsel_set_mark_hook(void (*fn)(void));
+
 /* Rebuild the word geometry from the laid-out scene. Called once per frame
  * AFTER layout, because a word's position is not known until then. */
 void vsel_sync_geometry(void);

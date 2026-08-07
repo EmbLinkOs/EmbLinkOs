@@ -41,6 +41,16 @@ def find(runs, needle):
     return [r for r in runs if needle in r["text"]]
 
 
+def find_count(path, needle, w=940, h=620):
+    env = dict(os.environ, FIND=needle)
+    r = subprocess.run([BIN, path, str(w), str(h), "0"],
+                       capture_output=True, text=True, env=env, cwd=ROOT)
+    for line in r.stdout.splitlines():
+        if line.startswith("FIND|"):
+            return int(line.rsplit("|", 1)[1])
+    return -1
+
+
 def check_page(path):
     src = open(path, encoding="utf-8", errors="replace").read()
     expects = re.findall(r"<!--\s*(EXPECT-[A-Z-]+):\s*(.*?)\s*-->", src)
@@ -87,6 +97,16 @@ def check_page(path):
             elif a[0]["x"] >= b[0]["x"]:
                 print("      FAIL %s: %s (x=%.0f) is not left of %s (x=%.0f)"
                       % (kind, parts[0], a[0]["x"], parts[1], b[0]["x"])); fails += 1
+        elif kind == "EXPECT-FIND":
+            # The needle may contain spaces -- "operating system" is the whole
+            # point of the feature -- so the COUNT is the last token and
+            # everything before it is what to look for.
+            want = int(parts[-1])
+            needle = " ".join(parts[:-1])
+            got = find_count(path, needle, w=width)
+            if got != want:
+                print("      FAIL %s: %r found %d times, expected %d"
+                      % (kind, needle, got, want)); fails += 1
         elif kind == "EXPECT-X":
             hit = find(runs, parts[0])
             lo, hi = float(parts[1]), float(parts[2])

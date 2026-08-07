@@ -27,6 +27,7 @@ struct word {
     struct node_handle nh;
     float x, y, w, hgt;
     const char *text;
+    unsigned char mark;      /* 0 none, 1 a find match, 2 the current one */
 };
 
 static struct word g_word[WORD_MAX];
@@ -34,6 +35,31 @@ static int   g_nword;
 static int   g_lo = -1, g_hi = -1;    /* inclusive index range; -1 = none */
 static int   g_anchor = -1;           /* where the drag started */
 static int   g_dragging;
+
+/* find.c's chance to re-mark, after the runs are collected and before they are
+ * painted. A callback rather than a call INTO find.c, so this module still
+ * knows nothing about it. */
+static void (*g_mark_cb)(void);
+void vsel_set_mark_hook(void (*fn)(void)) { g_mark_cb = fn; }
+
+int vsel_run_count(void) { return g_nword; }
+
+const char *vsel_run_text(int i) {
+    return (i >= 0 && i < g_nword) ? g_word[i].text : 0;
+}
+
+int vsel_run_rect(int i, float *x, float *y, float *w, float *h) {
+    if (i < 0 || i >= g_nword) return -1;
+    if (x) *x = g_word[i].x;
+    if (y) *y = g_word[i].y;
+    if (w) *w = g_word[i].w;
+    if (h) *h = g_word[i].hgt;
+    return 0;
+}
+
+void vsel_run_mark(int i, int kind) {
+    if (i >= 0 && i < g_nword) g_word[i].mark = (unsigned char)kind;
+}
 
 void vsel_reset(void) { g_nword = 0; g_lo = g_hi = g_anchor = -1; g_dragging = 0; }
 int  vsel_active(void) { return g_lo >= 0 && g_hi >= g_lo; }
@@ -77,6 +103,11 @@ void vsel_sync_geometry(void) {
     if (g_hi >= g_nword) g_hi = g_nword - 1;
     if (g_lo > g_hi) g_lo = g_hi = -1;
 
+    /* Find marks are re-applied by find.c each frame, exactly as the selection
+     * is -- so clearing them here is what makes a stale highlight impossible. */
+    for (int i = 0; i < g_nword; i++) g_word[i].mark = 0;
+    if (g_mark_cb) g_mark_cb();
+
     /* Paint the range and UNPAINT everything else, every frame.
      *
      * Every word, not just the selected ones, because this is the only pass
@@ -87,9 +118,19 @@ void vsel_sync_geometry(void) {
      * dirty and costs one comparison per word. */
     struct color sel = ui_theme()->accent, none = { 0, 0, 0, 0 };
     sel.a = 0.30f;                     /* the glyphs must stay readable through it */
+    /* A find match is a different colour from a selection, and the CURRENT
+     * match different again -- otherwise "next" moves an indicator you cannot
+     * see, which is the one thing find-in-page has to show. */
+    struct color hit = { 0.95f, 0.75f, 0.20f, 0.35f };
+    struct color cur = { 1.00f, 0.55f, 0.10f, 0.75f };
     int lo = vsel_active() ? g_lo : -1, hi = vsel_active() ? g_hi : -2;
-    for (int i = 0; i < g_nword; i++)
-        scene_set_text_bg(a, g_word[i].nh, (i >= lo && i <= hi) ? sel : none);
+    for (int i = 0; i < g_nword; i++) {
+        struct color c = none;
+        if (i >= lo && i <= hi)      c = sel;
+        else if (g_word[i].mark == 2) c = cur;
+        else if (g_word[i].mark == 1) c = hit;
+        scene_set_text_bg(a, g_word[i].nh, c);
+    }
 }
 
 /* --- hit testing --------------------------------------------------------- */

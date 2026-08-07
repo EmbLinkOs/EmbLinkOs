@@ -36,6 +36,7 @@
 #include "select.h"
 #include "cssref.h"
 #include "cookie.h"
+#include "find.h"
 #include "store.h"
 
 /* One document at a time, in fixed arenas. A browser that can be handed a
@@ -376,7 +377,27 @@ static void selection_tick(void) {
     if (changed) em_request_frame();
 }
 
+static char g_find_buf[96];
+
 static int vellum_key(int ch) {
+    if (ch == 0x06) {                     /* Ctrl+F */
+        find_open();
+        em_request_frame();
+        return 1;
+    }
+    if (find_is_open()) {
+        if (ch == 27) { find_close(); em_request_frame(); return 1; }
+        if (ch == '\n' || ch == '\r') {
+            /* Enter is NEXT, which is what every browser does and what makes
+             * the bar usable without reaching for the mouse. */
+            find_step(1);
+            float y;
+            if (find_current_y(&y)) g_scroll += y - 200.0f;
+            if (g_scroll < 0) g_scroll = 0;
+            em_request_frame();
+            return 1;
+        }
+    }
     if (ch == 0x03) {                     /* Ctrl+C */
         static char sel[16384];
         size_t n = vsel_copy_text(sel, sizeof sel);
@@ -429,6 +450,7 @@ static void app(void) {
         store_load();
         cookie_load();
         em_set_post_layout_hook(vsel_sync_geometry);
+        vsel_set_mark_hook(find_mark);
         vellum_set_link_handler(on_link);
         vellum_set_event_hooks(jsdom_has_listener, on_dom_click);
         vellum_set_submit_handler(on_submit);
@@ -542,9 +564,40 @@ static void app(void) {
             if (TextField(g_bar, sizeof g_bar, "Path or URL").focused()) { }
             if (Button("Open").primary().font(Caption).py(2).clicked()) navigate(g_bar);
         }
+        /* The find bar, only when it is open -- a browser that shows one
+         * always has given up a line of the page for something you use once. */
+        if (find_is_open()) {
+            HStack(.spacing = 8, .align = Center, .px = 12, .py = 4) {
+                Text("Find").caption().tertiary();
+                if (TextField(g_find_buf, sizeof g_find_buf, "text on this page").focused()) { }
+                char n[48];
+                if (find_needle()[0])
+                    snprintf(n, sizeof n, "%d of %d", find_current(), find_count());
+                else n[0] = 0;
+                Text(n).caption().tertiary();
+                if (Button("Prev").ghost().font(Caption).py(2).clicked()) find_step(-1);
+                if (Button("Next").ghost().font(Caption).py(2).clicked()) find_step(1);
+                if (Button("Done").ghost().font(Caption).py(2).clicked()) find_close();
+            }
+            Divider();
+            /* The field is the truth; the module is told what it says. Polling
+             * beats a change callback here because the toolkit edits the buffer
+             * in place -- the same reason 'input' events are a poll. */
+            /* ...and ask for another frame. The count is computed by the
+             * post-layout hook, AFTER this view has already drawn it, so the
+             * number on screen is always one frame behind the query. With no
+             * further frame it freezes showing the count for a shorter prefix
+             * -- typing "browser" left "1 of 24", which is the answer for "b".
+             * One more frame is the whole fix. */
+            if (strcmp(find_needle(), g_find_buf)) {
+                find_set_needle(g_find_buf);
+                em_request_frame();
+            }
+        }
+
         Divider();
 
-        ScrollView(&g_scroll, em_viewport_height() - 132.0f) {
+        ScrollView(&g_scroll, em_viewport_height() - (find_is_open() ? 168.0f : 132.0f)) {
             /* Fill, not Leading: this is the block every other block inherits
              * its width from. Left it Leading and the whole document sizes to
              * its longest line instead of to the window, so nothing wraps. */

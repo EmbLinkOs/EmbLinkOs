@@ -26,6 +26,7 @@
 #include "jpeg.h"
 #include "select.h"
 #include "cssref.h"
+#include "find.h"
 #include "net.h"
 #include "fetchjob.h"
 #include "jsdom.h"
@@ -612,6 +613,21 @@ int main(int argc, char **argv) {
     if (ui_instance_overflow()) {
         printf("*** instance pool OVERFLOWED: %u views dropped ***\n", ui_instance_overflow());
         g_fail++;
+    }
+    /* FIND=<text>: run find-in-page over the laid-out document and report what
+     * it found. The count is the interesting part -- a matcher that spans runs
+     * is exactly the kind that double-counts, and on a screenshot you only see
+     * the highlight, never the number. */
+    if (getenv("FIND")) {
+        HDEFER = 0; imgcache_reset(); g_scroll = 0; g_busy = 0; vsel_reset();
+        ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
+        ui_run_layout((float)W, (float)H);
+        vsel_sync_geometry();
+        find_open();
+        find_set_needle(getenv("FIND"));
+        find_rescan();
+        printf("FIND|%s|%d\n", getenv("FIND"), find_count());
+        find_close();
     }
     if (getenv("TEXTDUMP")) {
         /* after every check, so the tree is the page as it finally renders */
