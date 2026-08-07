@@ -960,3 +960,32 @@ because the struct is built with POSITIONAL initialisers in several files and
 moved to the end of the struct and the initialisers in `em.c` and `kit.c` were
 made designated, so position stops mattering. The layout tests caught it in
 seconds -- which is the argument for having them.
+
+
+## float and clear
+
+CSS floats take a box out of flow, pin it to one edge, and shorten the LINE
+BOXES of everything that follows until something clears -- so text wraps around
+a floated image and then reclaims the full width below it.
+
+This renderer has no exclusion regions: an inline run is a wrapping row that
+knows nothing about boxes beside it. So a float and the content that flows
+beside it become an actual ROW -- `[float][the rest]`, or `[the rest][float]`
+for `float: right` -- and `clear` ends the row.
+
+That is exactly right for the two shapes floats are really used in: an image
+with text beside it, and float-based columns. It is wrong in one visible way,
+and the way is worth knowing: **the text never reclaims the full width below
+the float.** It stays in its column, so a tall float beside a short paragraph
+leaves a gap a real browser would fill.
+
+Doing it properly means teaching the wrap arm about exclusion rects. It already
+walks lines with a y cursor, so the algorithm is reachable; the hard part is
+that the floats live in an ancestor block while the text is in a nested Flow,
+which is a coordinate-space problem rather than an algorithmic one.
+
+A host test had to be corrected rather than satisfied: it asserted that
+`float:left` was *not* honoured, because it was written when that was true. Its
+intent -- an unknown property is skipped rather than half-applied -- is
+unchanged; the example moved to properties that are still genuinely beyond this
+browser.

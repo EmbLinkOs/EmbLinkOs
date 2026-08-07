@@ -41,6 +41,8 @@ enum { VJ_START = 0, VJ_CENTER, VJ_END, VJ_BETWEEN, VJ_STRETCH };
  * than the viewport -- an honest approximation, and the difference only shows
  * when the page scrolls under a fixed header. Named in TODO. */
 enum { VP_STATIC = 0, VP_RELATIVE, VP_ABSOLUTE, VP_FIXED };
+/* float / clear. */
+enum { VF_NONE = 0, VF_LEFT, VF_RIGHT };
 enum { VM_NONE = 0, VM_BULLET, VM_DECIMAL };
 /* text-align. Justify is accepted and treated as left: a justified paragraph
  * needs inter-word stretching the line breaker does not do, and silently
@@ -102,6 +104,8 @@ struct vstyle {
 
     /* --- position / overflow. Box properties; not inherited. ------------- */
     unsigned char position;      /* VP_*                                   */
+    unsigned char floatp;        /* VF_* -- float: left / right            */
+    unsigned char clearp;        /* bit 0 clears left, bit 1 clears right  */
     unsigned char clip;          /* overflow: hidden/auto/scroll           */
     /* top/right/bottom/left, in px, with a bit per edge saying it was stated
      * at all -- because 0 is a perfectly ordinary offset and "unset" has to be

@@ -303,9 +303,22 @@ static void t13_declarations(void) {
 
     memset(&v, 0, sizeof v);
     v.bold = 1;
-    int n = css_apply_decls("float:left; -webkit-hack:1; color:", strlen("float:left; -webkit-hack:1; color:"), &v);
+    /* The example used to be `float:left`, which this browser now honours --
+     * so the case had to move to properties that are still genuinely beyond
+     * it. The claim under test is unchanged: an unknown property, a vendor
+     * hack and a declaration with no value are all SKIPPED rather than
+     * half-applied. */
+    const char *junk = "text-shadow:1px 1px red; -webkit-hack:1; color:";
+    int n = css_apply_decls(junk, strlen(junk), &v);
     CHECK(n == 0, "properties we cannot honour are skipped, not faked");
     CHECK(v.bold == 1, "...and skipping one does not disturb the rest");
+
+    memset(&v, 0, sizeof v);
+    css_apply_decls("float: left", strlen("float: left"), &v);
+    CHECK(v.floatp == VF_LEFT, "float IS honoured now");
+    memset(&v, 0, sizeof v);
+    css_apply_decls("clear: both", strlen("clear: both"), &v);
+    CHECK(v.clearp == 3, "...and so is clear");
 
     memset(&v, 0, sizeof v);
     css_apply_decls("color:red;;; ; font-weight:bold", strlen("color:red;;; ; font-weight:bold"), &v);

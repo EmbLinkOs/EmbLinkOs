@@ -342,6 +342,15 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
             if (pct >= 0) { out->height_pct = (unsigned char)pct; out->height = 0; ok = 1; }
             else { int lok = 0; short px = len_px(v, vn, &lok);
                    if (lok && px > 0) { out->height = px; out->height_pct = 0; ok = 1; } }
+        } else if (tok_eq(p, pn, "float")) {
+            if      (tok_eq(v, vn, "left"))  { out->floatp = VF_LEFT;  ok = 1; }
+            else if (tok_eq(v, vn, "right")) { out->floatp = VF_RIGHT; ok = 1; }
+            else if (tok_eq(v, vn, "none"))  { out->floatp = VF_NONE;  ok = 1; }
+        } else if (tok_eq(p, pn, "clear")) {
+            if      (tok_eq(v, vn, "left"))  { out->clearp = 1; ok = 1; }
+            else if (tok_eq(v, vn, "right")) { out->clearp = 2; ok = 1; }
+            else if (tok_eq(v, vn, "both"))  { out->clearp = 3; ok = 1; }
+            else if (tok_eq(v, vn, "none"))  { out->clearp = 0; ok = 1; }
         } else if (tok_eq(p, pn, "position")) {
             if      (tok_eq(v, vn, "relative")) { out->position = VP_RELATIVE; ok = 1; }
             else if (tok_eq(v, vn, "absolute")) { out->position = VP_ABSOLUTE; ok = 1; }

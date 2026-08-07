@@ -2392,9 +2392,23 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       sheet is read. `calc(100% - 240px)` is width_pct 100 with width -240.
       Real operator precedence: getting `calc(100% - 2 * 20px)` wrong is off by
       exactly one gap, which looks like a rounding bug.
-- [ ] `float` / `clear` remain, and are the last of C3. They need the inline
-      line-box to route around an out-of-flow box, which nothing else here
-      does; the rest of C3 reused machinery that existed.
+- [x] ~~float / clear~~ SHIPPED 2026-08-07, as a ROW rather than as exclusion
+      regions, and the difference is worth stating. CSS floats shorten the LINE
+      BOXES of everything that follows, so text wraps around a floated image
+      and then RECLAIMS THE FULL WIDTH below it. This renderer has no exclusion
+      regions -- an inline run is a wrapping row that knows nothing about boxes
+      beside it -- so a float and the content flowing beside it become an
+      actual row: [float][the rest], or [the rest][float] for float:right, with
+      `clear` ending the row.
+      That is exactly right for the two shapes floats are really used in (an
+      image with text beside it, and float-based columns) and WRONG in one
+      visible way: the text never reclaims the full width below the float, it
+      stays in its column. A tall float beside a short paragraph therefore
+      leaves a gap that a real browser would fill.
+      Doing it properly means teaching the wrap arm about exclusion rects --
+      it already walks lines with a y cursor, so it is reachable; the hard part
+      is that the floats live in an ancestor block and the text is in a nested
+      Flow, i.e. a coordinate-space problem rather than an algorithm one.
 - [ ] `position: fixed` is treated as ABSOLUTE against the nearest positioned
       ancestor, not the viewport. The difference only shows when the page
       scrolls under a fixed header. `sticky` is treated as relative.

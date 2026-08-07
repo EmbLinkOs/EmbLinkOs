@@ -655,29 +655,116 @@ static void render_pre(struct html_doc *d, int node, const struct vstyle *s) {
     }
 }
 
-static void render_children(struct html_doc *d, int node, const struct vstyle *s,
-                            const char *href) {
-    int c = d->nodes[node].first_child;
-    int li = 0;
+/* The style of an element child, or 0 if it is not an element. */
+static int child_style(struct html_doc *d, int c, const struct vstyle *s,
+                       struct vstyle *out) {
+    if (c < 0 || d->nodes[c].kind != HTML_ELEM) return 0;
+    vstyle_for_node(d, c, s, g_sheet, out);
+    return 1;
+}
+
+static void render_range(struct html_doc *d, int from, int to,
+                         const struct vstyle *s, const char *href, int *li);
+
+/* FLOATS, as a row.
+ *
+ * CSS floats take a box out of flow, pin it to one edge, and shorten the LINE
+ * BOXES of everything that follows until something clears -- so text wraps
+ * around a floated image and then reclaims the full width below it. This
+ * renderer has no exclusion regions: an inline run is a wrapping row that
+ * knows nothing about boxes beside it.
+ *
+ * So a float and the content that flows beside it become an actual ROW:
+ * [float][the rest] (or [the rest][float] for float: right). That is exactly
+ * right for the two shapes floats are really used in -- an image with text
+ * beside it, and float-based columns -- and it is WRONG in one visible way:
+ * the text never reclaims the full width below the float, it stays in its
+ * column. Named here and in docs/TODO.md rather than left to be discovered.
+ *
+ * Returns the sibling to continue from. */
+static int render_float_group(struct html_doc *d, int c, int to,
+                              const struct vstyle *s, const char *href, int *li) {
+    int lf[8], rf[8], nl = 0, nr = 0;
+    /* the run of consecutive floated siblings that opens the group */
+    while (c >= 0 && c != to) {
+        struct vstyle cs;
+        if (!child_style(d, c, s, &cs)) {
+            if (is_blank_text(d, c)) { c = d->nodes[c].next_sibling; continue; }
+            break;
+        }
+        if (!cs.floatp) break;
+        if (cs.display != VD_NONE) {
+            if (cs.floatp == VF_RIGHT) { if (nr < 8) rf[nr++] = c; }
+            else                       { if (nl < 8) lf[nl++] = c; }
+        }
+        c = d->nodes[c].next_sibling;
+    }
+
+    /* everything that flows BESIDE them: up to the next clearing sibling */
+    int rest_from = c, rest_to = c;
+    while (rest_to >= 0 && rest_to != to) {
+        struct vstyle cs;
+        if (child_style(d, rest_to, s, &cs) && (cs.clearp || cs.floatp)) break;
+        rest_to = d->nodes[rest_to].next_sibling;
+    }
+
+    HStack(.spacing = 10, .align = Leading, .grow = 1) {
+        int outer = g_flex_item;
+        g_flex_item = 1;                 /* a float shrinks to fit, like an item */
+        for (int i = 0; i < nl; i++) {
+            struct vstyle cs; child_style(d, lf[i], s, &cs);
+            render_block(d, lf[i], &cs, d->nodes[lf[i]].href ? d->nodes[lf[i]].href : href, 0);
+        }
+        if (rest_from != rest_to) {
+            g_flex_item = 0;             /* ...and the text column takes the rest */
+            VStack(.spacing = 2, .align = Fill, .grow = 1) {
+                render_range(d, rest_from, rest_to, s, href, li);
+            }
+        }
+        g_flex_item = 1;
+        for (int i = 0; i < nr; i++) {
+            struct vstyle cs; child_style(d, rf[i], s, &cs);
+            render_block(d, rf[i], &cs, d->nodes[rf[i]].href ? d->nodes[rf[i]].href : href, 0);
+        }
+        g_flex_item = outer;
+    }
+    return rest_to;
+}
+
+static void render_range(struct html_doc *d, int from, int to,
+                         const struct vstyle *s, const char *href, int *li) {
+    int c = from;
     int flexish = (s->display == VD_FLEX || s->display == VD_GRID);
-    int outer_item = g_flex_item;
-    g_flex_item = flexish;
-    while (c >= 0) {
+    while (c >= 0 && c != to) {
         if (flexish && is_blank_text(d, c)) { c = d->nodes[c].next_sibling; continue; }
+        struct vstyle cs;
+        /* A FLOAT opens a row that the following content shares. Not inside a
+         * flex or grid container, where CSS says float does not apply. */
+        if (!flexish && child_style(d, c, s, &cs) && cs.floatp && cs.display != VD_NONE) {
+            c = render_float_group(d, c, to, s, href, li);
+            continue;
+        }
         if (is_inline(d, c, s)) {
             int start = c;
-            while (c >= 0 && is_inline(d, c, s)) c = d->nodes[c].next_sibling;
+            while (c >= 0 && c != to && is_inline(d, c, s)) c = d->nodes[c].next_sibling;
             render_inline_run(d, start, c, s, href);   /* c is the run's end */
         } else {
-            struct vstyle cs;
-            vstyle_for_node(d, c, s, g_sheet, &cs);
-            if (cs.display != VD_NONE) {
-                if (cs.display == VD_LIST_ITEM) li++;
-                render_block(d, c, &cs, d->nodes[c].href ? d->nodes[c].href : href, li);
+            if (child_style(d, c, s, &cs) && cs.display != VD_NONE) {
+                if (cs.display == VD_LIST_ITEM) (*li)++;
+                render_block(d, c, &cs, d->nodes[c].href ? d->nodes[c].href : href, *li);
             }
             c = d->nodes[c].next_sibling;
         }
     }
+}
+
+static void render_children(struct html_doc *d, int node, const struct vstyle *s,
+                            const char *href) {
+    int li = 0;
+    int flexish = (s->display == VD_FLEX || s->display == VD_GRID);
+    int outer_item = g_flex_item;
+    g_flex_item = flexish;
+    render_range(d, d->nodes[node].first_child, -1, s, href, &li);
     g_flex_item = outer_item;
 }
 
