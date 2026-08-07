@@ -37,6 +37,7 @@ struct html_node {
     char *klass;                    /* class="..." (space-separated), NULL */
     char *id;                       /* id="...", or NULL                   */
     char *style;                    /* style="..." declarations, or NULL   */
+    char *alt;                      /* <img alt="...">, or NULL            */
     int   first_child, next_sibling, parent;   /* indices, -1 = none       */
 };
 

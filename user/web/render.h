@@ -18,6 +18,12 @@ struct css_sheet;
 const char *vellum_render_styled(struct html_doc *doc, int root,
                                  const struct css_sheet *sheet);
 
+/* ...and with a BASE URL, so <img src> can be resolved the way links are.
+ * Without it a page's pictures are only findable when its markup happens to
+ * use absolute URLs, which almost none do. */
+const char *vellum_render_page(struct html_doc *doc, int root,
+                               const struct css_sheet *sheet, const char *base);
+
 /* Non-NULL enables link rendering (words become clickable). */
 void vellum_set_link_handler(void (*fn)(const char *href));
 

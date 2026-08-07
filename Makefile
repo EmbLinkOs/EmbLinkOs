@@ -517,7 +517,7 @@ build/web_html.o: user/web/html.c user/web/html.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
 build/web_style.o: user/web/style.c user/web/style.h user/web/css/css.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
-build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/web/html.h user/web/css/css.h | $(BUILD)
+build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/web/html.h user/web/css/css.h user/web/imgcache.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css -c $< -o $@
 build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/render.h \
                 user/web/url.h user/web/net.h user/web/fetchjob.h user/web/css/css.h | $(BUILD)
@@ -538,9 +538,15 @@ build/web_net.o: user/web/net.c user/web/net.h user/web/url.h user/lib/embk_sock
 # fetchjob: the fetch runs on a worker thread so the window keeps drawing.
 build/web_fetchjob.o: user/web/fetchjob.c user/web/fetchjob.h user/web/net.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+# B6: PNG over our own DEFLATE, and the cache that fetches a page's pictures.
+build/web_png.o: user/web/png.c user/web/png.h user/lib/inflate.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_imgcache.o: user/web/imgcache.c user/web/imgcache.h user/web/png.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
 VELLUM_OBJS := build/vellum.o build/web_html.o build/web_style.o build/web_render.o \
                build/web_url.o build/web_net.o build/web_fetchjob.o \
-               build/web_css_decl.o build/web_css_sel.o build/web_css_sheet.o
+               build/web_css_decl.o build/web_css_sel.o build/web_css_sheet.o \
+               build/web_png.o build/web_imgcache.o build/pkg_inflate.o
 build/vellum.elf: build/crt0.o build/syscalls.o $(VELLUM_OBJS) $(TLS_LIB_OBJS) build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $(VELLUM_OBJS) \
 	    $(TLS_LIB_OBJS) build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
@@ -1748,8 +1754,10 @@ scene-test:
 html-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iuser/web \
 	    -Iuser/web/css \
+	    -Iuser/lib \
 	    user/web/html.c user/web/url.c user/web/style.c \
 	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
+	    user/web/png.c user/lib/inflate.c \
 	    user/web/html_test.c -o $(BUILD)/html_test
 	$(BUILD)/html_test
 
@@ -1842,8 +1850,10 @@ browser-render:
 	@mkdir -p $(BUILD)
 	$(HOSTCC) -std=gnu11 -Wall -Wextra -O1 -g $(V2_INC) -Iuser/web \
 	    -Iuser/web/css \
+	    -Iuser/lib \
 	    $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
 	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
+	    user/web/url.c user/web/png.c user/lib/inflate.c \
 	    user/web/render_host.c -lm -o $(BUILD)/browser_render
 	$(BUILD)/browser_render $(DOC) $(BW) $(BH) $(DEPTH) $(PNG) $(BUSY)
 

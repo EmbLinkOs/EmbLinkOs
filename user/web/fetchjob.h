@@ -26,12 +26,23 @@
 
 /* Start fetching `url` into `buf`. The buffer belongs to the JOB until it
  * finishes -- do not touch it before fetchjob_poll reports done.
- * Returns 0, or -1 if a fetch is already in flight. */
-int fetchjob_start(const char *url, char *buf, size_t cap);
+ * `tag` identifies the CALLER: a browser has two of them (the document and
+ * the page's images) sharing one worker, and without a tag whichever polled
+ * first would consume the other's result -- a picture would be handed to the
+ * HTML parser. Returns 0, or -1 if a fetch is already in flight. */
+int fetchjob_start(const char *url, char *buf, size_t cap, int tag);
 
-/* 1 = finished (result written to *out, buffer is yours again),
- * 0 = still in flight, -1 = nothing running. */
-int fetchjob_poll(struct vnet_result *out);
+/* Poll for a result belonging to `tag`.
+ *   1 = finished (written to *out, buffer is yours again, job consumed)
+ *   0 = nothing for you yet -- either still running, or DONE but owned by
+ *       someone else, which must NOT be consumed here
+ *  -1 = nothing running at all
+ *
+ * Consumption is per-owner and that is the whole point. Reporting the tag but
+ * consuming regardless looks like it works and silently destroys the other
+ * caller's result: the browser's document poll ate every image completion, so
+ * pictures stayed "loading" forever with no error anywhere. */
+int fetchjob_poll(int tag, struct vnet_result *out);
 
 /* Is a fetch in flight right now? For the view's loading state. */
 int fetchjob_busy(void);

@@ -38,8 +38,15 @@ void vstyle_for(const char *tag, const struct vstyle *p, struct vstyle *o) {
     else if (ieq(tag,"h4") || ieq(tag,"h5") || ieq(tag,"h6"))
                             { o->display=VD_BLOCK; o->bold=1; o->margin_top=12; o->margin_bottom=5; }
 
+    /* <img> is inline-level, like text: a picture in a sentence sits IN the
+     * sentence. render.c gives it a box; the stylist only says what kind of
+     * box it is. */
+    else if (ieq(tag,"img")) { o->display = VD_INLINE; }
+
     /* --- flow --- */
     else if (ieq(tag,"p"))  { o->display=VD_BLOCK; o->margin_top=0; o->margin_bottom=12; }
+    else if (ieq(tag,"figure")) { o->display=VD_BLOCK; o->margin_top=10; o->margin_bottom=12; }
+    else if (ieq(tag,"figcaption")) { o->display=VD_BLOCK; o->size=1; }
     else if (ieq(tag,"div") || ieq(tag,"section") || ieq(tag,"article") ||
              ieq(tag,"header") || ieq(tag,"footer") || ieq(tag,"nav") ||
              ieq(tag,"main") || ieq(tag,"body") || ieq(tag,"html") ||

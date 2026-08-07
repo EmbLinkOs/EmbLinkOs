@@ -48,6 +48,18 @@ static int entity(const char *s, size_t len, size_t *used, char *out) {
         { "copy", "\xC2\xA9" }, { "reg", "\xC2\xAE" },
         { "ldquo","\xE2\x80\x9C" }, { "rdquo", "\xE2\x80\x9D" },
         { "lsquo","\xE2\x80\x98" }, { "rsquo", "\xE2\x80\x99" },
+        /* the ones a technical document reaches for: dimensions, arrows,
+         * fractions, degrees. Each earned its slot by appearing in real prose
+         * rather than by being in the spec. */
+        { "times","\xC3\x97" }, { "divide", "\xC3\xB7" }, { "minus", "\xE2\x88\x92" },
+        { "deg",  "\xC2\xB0" }, { "plusmn", "\xC2\xB1" }, { "micro", "\xC2\xB5" },
+        { "rarr", "\xE2\x86\x92" }, { "larr", "\xE2\x86\x90" },
+        { "harr", "\xE2\x86\x94" }, { "darr", "\xE2\x86\x93" }, { "uarr", "\xE2\x86\x91" },
+        { "bull", "\xE2\x80\xA2" }, { "middot", "\xC2\xB7" }, { "dagger", "\xE2\x80\xA0" },
+        { "frac12","\xC2\xBD" }, { "frac14", "\xC2\xBC" }, { "sup2", "\xC2\xB2" },
+        { "trade","\xE2\x84\xA2" }, { "euro", "\xE2\x82\xAC" }, { "pound", "\xC2\xA3" },
+        { "laquo","\xC2\xAB" }, { "raquo", "\xC2\xBB" }, { "sect", "\xC2\xA7" },
+        { "para", "\xC2\xB6" }, { "check", "\xE2\x9C\x93" }, { "cross", "\xE2\x9C\x95" },
     };
     if (len < 2 || s[0] != '&') return 0;
     size_t i = 1;
@@ -262,6 +274,7 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         char klass[128]; klass[0] = 0;
         char eid[64];    eid[0] = 0;
         char sty[256];   sty[0] = 0;
+        char alt[256];   alt[0] = 0;
         while (p < len && src[p] != '>') {
             while (p < len && (src[p]==' '||src[p]=='\t'||src[p]=='\n'||src[p]=='\r')) p++;
             if (p >= len || src[p] == '>' || src[p] == '/') break;
@@ -294,6 +307,11 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                 } else if (ieq(aname,"style") && !sty[0]) {
                     size_t c = vl < sizeof sty - 1 ? vl : sizeof sty - 1;
                     memcpy(sty, src + vs, c); sty[c] = 0;
+                } else if (ieq(aname,"alt") && !alt[0]) {
+                    /* alt is not decoration: it is what the page SAYS when the
+                     * picture cannot be shown, which for us is often. */
+                    size_t c = vl < sizeof alt - 1 ? vl : sizeof alt - 1;
+                    memcpy(alt, src + vs, c); alt[c] = 0;
                 }
                 if (q && p < len) p++;
             }
@@ -355,6 +373,7 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         if (klass[0]) d->nodes[ni].klass = str_put(d, klass, strlen(klass));
         if (eid[0])   d->nodes[ni].id    = str_put(d, eid,   strlen(eid));
         if (sty[0])   d->nodes[ni].style = str_put(d, sty,   strlen(sty));
+        if (alt[0])   d->nodes[ni].alt   = str_put(d, alt,   strlen(alt));
         if (!is_void(tag) && !self_closing) push(&st, ni);
         i = p;
     }

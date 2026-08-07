@@ -23,6 +23,7 @@ static size_t            g_cap;
 static char              g_url[512];
 static int               g_tid = -1;
 static uint64_t          g_started_ms;
+static int               g_tag;
 
 static void worker(long arg) {
     (void)arg;
@@ -32,7 +33,7 @@ static void worker(long arg) {
     embk_thread_exit(0);
 }
 
-int fetchjob_start(const char *url, char *buf, size_t cap) {
+int fetchjob_start(const char *url, char *buf, size_t cap, int tag) {
     if (g_state == JOB_RUNNING) return -1;
 
     /* Reap the previous worker before starting another. A thread that has run
@@ -46,6 +47,7 @@ int fetchjob_start(const char *url, char *buf, size_t cap) {
     g_buf = buf;
     g_cap = cap;
     g_started_ms = embk_uptime_ms();
+    g_tag = tag;
     g_state = JOB_RUNNING;                /* set BEFORE the thread exists, so a
                                            * poll racing the spawn sees RUNNING
                                            * rather than IDLE */
@@ -62,9 +64,10 @@ int fetchjob_start(const char *url, char *buf, size_t cap) {
     return 0;
 }
 
-int fetchjob_poll(struct vnet_result *out) {
+int fetchjob_poll(int tag, struct vnet_result *out) {
     if (g_state == JOB_RUNNING) return 0;
     if (g_state != JOB_DONE)    return -1;
+    if (g_tag != tag) return 0;          /* someone else's -- leave it for them */
     if (g_tid >= 0) { embk_thread_join(g_tid); g_tid = -1; }
     if (out) *out = g_res;
     g_state = JOB_IDLE;

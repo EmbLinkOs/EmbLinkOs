@@ -11,6 +11,8 @@
 #include "url.h"
 #include "style.h"
 #include "css.h"
+#include "png.h"
+#include "png_fixtures.h"
 
 static int failures;
 #define CHECK(c, what) do {                                            \
@@ -239,6 +241,21 @@ static int find_tag(const char *tag) {
     return -1;
 }
 
+static void t11b_entities(void) {
+    printf("T11b the entities a technical document actually uses:\n");
+    cparse("<p>300&times;60 &deg; 90&rarr;100 &frac12; &bull; &euro;5 &check;</p>");
+    const char *t = CD.nodes[CD.nodes[find_tag("p")].first_child].text;
+    CHECK(t && strstr(t, "\xC3\x97") != 0, "&times; -> U+00D7");
+    CHECK(t && strstr(t, "\xC2\xB0") != 0, "&deg; -> U+00B0");
+    CHECK(t && strstr(t, "\xE2\x86\x92") != 0, "&rarr; -> U+2192");
+    CHECK(t && strstr(t, "\xC2\xBD") != 0, "&frac12; -> U+00BD");
+    CHECK(t && !strstr(t, "&times;"), "...and none of them survive as raw text");
+    cparse("<p>a &notreal; b</p>");
+    t = CD.nodes[CD.nodes[find_tag("p")].first_child].text;
+    CHECK(t && strstr(t, "&notreal;") != 0,
+          "an unknown entity renders as itself -- a failure the reader sees through");
+}
+
 static void t12_attrs_and_style_block(void) {
     printf("T12 the parser keeps what CSS needs:\n");
     cparse("<style>p{color:red}</style>"
@@ -404,13 +421,127 @@ static void t17_bounded(void) {
     CHECK(sh.truncated == 1, "and truncation is REPORTED, not silent");
 }
 
+/* ======================= PNG (B6) ======================================= */
+/* Fixtures are generated PNGs (see png_fixtures.h). Each is small enough to
+ * reason about by hand, which is the point: a decoder verified against big
+ * photos tells you it did not crash, not that it is correct. */
+
+static uint32_t PIX[64 * 64];
+static uint8_t  SCR[64 * 64 * 8];
+
+#define A(p) (((p) >> 24) & 0xFF)
+#define R(p) (((p) >> 16) & 0xFF)
+#define G(p) (((p) >>  8) & 0xFF)
+#define B(p) ( (p)        & 0xFF)
+
+static void t18_png_basics(void) {
+    printf("T18 PNG: colour types decode to premultiplied BGRA:\n");
+    uint32_t w = 0, h = 0;
+
+    CHECK(png_probe(png_rgb, sizeof png_rgb, &w, &h) == PNG_OK && w == 4 && h == 2,
+          "probe reads the header without decoding");
+
+    int rc = png_decode(png_rgb, sizeof png_rgb, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == PNG_OK && w == 4 && h == 2, "8-bit RGB decodes");
+    CHECK(R(PIX[0]) == 255 && G(PIX[0]) == 0 && B(PIX[0]) == 0, "pixel 0 is red");
+    CHECK(G(PIX[1]) == 255 && R(PIX[1]) == 0, "pixel 1 is green");
+    CHECK(B(PIX[2]) == 255, "pixel 2 is blue");
+    CHECK(R(PIX[4]) == 255 && G(PIX[4]) == 0, "row 1 starts a new scanline");
+
+    rc = png_decode(png_rgba, sizeof png_rgba, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == PNG_OK && w == 2 && h == 2, "8-bit RGBA decodes");
+    CHECK(A(PIX[0]) == 255 && R(PIX[0]) == 255, "opaque pixel keeps its colour");
+    CHECK(A(PIX[1]) == 128 && G(PIX[1]) == 128,
+          "half-alpha green is PREMULTIPLIED (128, not 255)");
+    CHECK(A(PIX[2]) == 0 && R(PIX[2]) == 0 && G(PIX[2]) == 0 && B(PIX[2]) == 0,
+          "fully transparent premultiplies to all-zero");
+}
+
+static void t19_png_palette_and_filters(void) {
+    printf("T19 PNG: palettes, sub-byte depths, and all five filters:\n");
+    uint32_t w = 0, h = 0;
+
+    int rc = png_decode(png_pal8, sizeof png_pal8, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == PNG_OK && w == 4 && h == 4, "8-bit palette decodes");
+    CHECK(R(PIX[0]) == 255 && G(PIX[0]) == 0, "palette index 0 -> red");
+    CHECK(B(PIX[2]) == 255, "palette index 2 -> blue");
+    CHECK(A(PIX[3]) == 0, "tRNS makes index 3 transparent");
+
+    rc = png_decode(png_pal4, sizeof png_pal4, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == PNG_OK && w == 4 && h == 1, "4-bit palette decodes (2 px per byte)");
+    CHECK(R(PIX[0]) == 0 && R(PIX[1]) == 255 && G(PIX[1]) == 255,
+          "the high nibble is the FIRST pixel, not the second");
+    CHECK(R(PIX[2]) == 255 && G(PIX[2]) == 0, "index 2 -> red");
+    CHECK(B(PIX[3]) == 255, "index 3 -> blue");
+
+    /* The filters are the part PNG owns. Row 0 is unfiltered 0,10,20..;
+     * row 1 is Sub(+10) so it accumulates left-to-right; row 2 is Up on row 1;
+     * row 3 Average; row 4 Paeth. Checking row 1 pixel 2 proves Sub actually
+     * accumulated rather than being copied. */
+    rc = png_decode(png_grayfilters, sizeof png_grayfilters, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == PNG_OK && w == 8 && h == 5, "the five-filter image decodes");
+    CHECK(R(PIX[0]) == 0 && R(PIX[1]) == 10 && R(PIX[7]) == 70, "row 0 (None) is verbatim");
+    CHECK(R(PIX[8]) == 10 && R(PIX[9]) == 20 && R(PIX[10]) == 30,
+          "row 1 (Sub) accumulates from the left");
+    CHECK(R(PIX[16]) == 15 && R(PIX[17]) == 25, "row 2 (Up) adds the row above");
+    CHECK(R(PIX[24]) == 8, "row 3 (Average) adds (left+up)/2");
+    CHECK(R(PIX[32]) == 10, "row 4 (Paeth) picks its predictor");
+}
+
+static void t20_png_hostile(void) {
+    printf("T20 PNG: bytes from a stranger:\n");
+    uint32_t w = 0, h = 0;
+
+    int rc = png_decode(png_split_idat, sizeof png_split_idat, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc == PNG_OK && w == 3 && h == 3,
+          "IDAT split across three chunks is CONCATENATED, not inflated piecewise");
+
+    CHECK(png_decode(png_interlaced, sizeof png_interlaced, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h)
+          == PNG_EUNSUP, "interlaced is REFUSED, not half-decoded");
+
+    static const uint8_t notpng[] = { 'h','e','l','l','o',0,1,2,3,4,5,6,7,8 };
+    CHECK(png_decode(notpng, sizeof notpng, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h)
+          == PNG_ENOTPNG, "a non-PNG is rejected on its signature");
+
+    /* Truncation at EVERY length. Cutting into the compressed data must be
+     * refused; losing only the trailing IEND must NOT be, because the image
+     * is all there and a browser that discards a complete picture over a
+     * missing end-marker is worse than one that shows it. The real invariant
+     * is that no length reads out of bounds -- run under a sanitizer this
+     * loop is the whole point. */
+    size_t iend = sizeof png_rgb - 12;        /* IEND chunk is the last 12 bytes */
+    int refused = 0, accepted = 0;
+    for (size_t n = 1; n < sizeof png_rgb; n++) {
+        uint32_t tw = 0, th = 0;
+        int r2 = png_decode(png_rgb, n, PIX, sizeof PIX, SCR, sizeof SCR, &tw, &th);
+        if (r2 != PNG_OK) { refused++; continue; }
+        accepted++;
+        CHECK(tw == 4 && th == 2, "an accepted truncation still has the right size");
+        break;                                 /* one report is enough */
+    }
+    CHECK(refused >= (int)iend - 1, "every cut into the image data is refused");
+
+    /* a picture larger than the caller's buffer must be REFUSED, not clipped */
+    static uint32_t tiny[4];
+    CHECK(png_decode(png_rgb, sizeof png_rgb, tiny, sizeof tiny, SCR, sizeof SCR, &w, &h)
+          == PNG_ETOOBIG, "an image that does not fit is refused, never truncated");
+
+    /* a corrupt compressed stream must fail rather than emit garbage */
+    static uint8_t bad[sizeof png_rgb];
+    memcpy(bad, png_rgb, sizeof bad);
+    for (size_t i = 40; i < sizeof bad - 8; i++) bad[i] ^= 0x5A;
+    rc = png_decode(bad, sizeof bad, PIX, sizeof PIX, SCR, sizeof SCR, &w, &h);
+    CHECK(rc != PNG_OK, "corrupt DEFLATE data is detected");
+}
+
 int main(void) {
     printf("=== html-test ===\n");
     t1_structure(); t2_implicit_close(); t3_void_and_attrs(); t4_entities();
     t5_script_style(); t6_whitespace(); t7_malformed(); t8_urls(); t9_bounded();
     t10_url_parse(); t11_url_resolve();
-    t12_attrs_and_style_block(); t13_declarations(); t14_selectors();
+    t11b_entities(); t12_attrs_and_style_block(); t13_declarations(); t14_selectors();
     t15_cascade(); t16_origin_order(); t17_bounded();
+    t18_png_basics(); t19_png_palette_and_filters(); t20_png_hostile();
     printf("=== html-test: %s (%d failures) ===\n", failures ? "FAIL" : "OK", failures);
     return failures ? 1 : 0;
 }

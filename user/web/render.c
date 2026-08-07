@@ -28,7 +28,9 @@
 #include "theme.h"
 #include "html.h"
 #include "style.h"
+#include "url.h"
 #include "css.h"
+#include "imgcache.h"
 #include "render.h"
 
 static void (*g_on_link)(const char *href);
@@ -128,6 +130,49 @@ static void emit_text(const char *txt, const struct vstyle *s, const char *href)
     }
 }
 
+/* An <img>. The base URL is needed to resolve src, and the cache is what
+ * turns a URL into pixels -- neither belongs in the DOM, so both are held for
+ * the render pass like the stylesheet is. */
+static const char *g_base;
+
+/* Emit one picture, or the honest stand-in for one. A slot that is still
+ * loading gets a PLACEHOLDER OF THE RIGHT SIZE when the markup gave width and
+ * height, so the page does not reflow under the reader when it arrives --
+ * which is the single most irritating thing a browser does. */
+static void emit_image(struct html_doc *d, int n, const struct vstyle *st) {
+    const char *src = d->nodes[n].href;      /* the parser stores src here */
+    if (!src || !src[0]) return;
+
+    char url[512];
+    if (url_resolve(g_base ? g_base : "", src, url, sizeof url) != 0)
+        snprintf(url, sizeof url, "%s", src);
+
+    struct img_slot *s = imgcache_want(url);
+    /* A picture that has not arrived means the page is not finished, so the
+     * loop must come back. Requesting the frame HERE -- where the need is
+     * discovered -- is what keeps the pump running; asking the app to predict
+     * it before the view has run is the trap that stalled this once already. */
+    if (s && (s->state == IMG_WANTED || s->state == IMG_LOADING)) em_request_frame();
+    if (s && s->state == IMG_READY && s->px) {
+        em_flush();
+        ui_image_sized((uint64_t)(uintptr_t)s->px, s->px, s->w, s->h,
+                       (float)s->w, (float)s->h);
+        return;
+    }
+
+    /* Not here (yet). Show the alt text if the author wrote one -- that is
+     * what alt text is FOR, and a page of empty boxes is worse than a page
+     * that reads. Otherwise a quiet frame so the layout is honest about a
+     * picture being there. */
+    const char *alt = d->nodes[n].alt;
+    if (alt && alt[0]) {
+        Text(alt).font(font_for(st)).color(ui_theme()->text_secondary);
+        return;
+    }
+    const char *mark = (s && s->state == IMG_FAILED) ? "\xE2\x9C\x95" : "\xE2\x97\xAF";
+    Text(mark).caption().tertiary();
+}
+
 /* Is this subtree inline-only? An inline run ends where a block begins. */
 static int is_inline(struct html_doc *d, int n, const struct vstyle *parent) {
     if (d->nodes[n].kind == HTML_TEXT) return 1;
@@ -139,6 +184,28 @@ static int is_inline(struct html_doc *d, int n, const struct vstyle *parent) {
 static void render_block(struct html_doc *d, int node, const struct vstyle *s,
                          const char *href, int list_index);
 
+/* One inline child, at any depth. RECURSIVE on purpose: this was a
+ * hand-unrolled three-level walk that only knew about text, so an <img> (or
+ * any element) nested inside an inline wrapper was silently dropped -- a
+ * <figure><img></figure> rendered as nothing at all, with no error anywhere.
+ * Depth is bounded so hostile markup cannot recurse us to death. */
+static void emit_inline(struct html_doc *d, int c, const struct vstyle *st,
+                        const char *href, int depth) {
+    if (depth > 8) return;
+    if (d->nodes[c].kind == HTML_TEXT) {
+        if (d->nodes[c].text) emit_text(d->nodes[c].text, st, href);
+        return;
+    }
+    if (!strcmp(d->nodes[c].tag, "img")) { emit_image(d, c, st); return; }
+
+    struct vstyle s;
+    vstyle_for_node(d, c, st, g_sheet, &s);
+    if (s.display == VD_NONE) return;
+    const char *h = d->nodes[c].href ? d->nodes[c].href : href;
+    for (int k = d->nodes[c].first_child; k >= 0; k = d->nodes[k].next_sibling)
+        emit_inline(d, k, &s, h, depth + 1);
+}
+
 /* Walk a run of inline siblings [from, to) into one wrapping row. */
 static void render_inline_run(struct html_doc *d, int from, int to,
                               const struct vstyle *parent, const char *href) {
@@ -146,30 +213,8 @@ static void render_inline_run(struct html_doc *d, int from, int to,
      * emit_text). A uniform gap between boxes puts one in front of a comma
      * that arrived as its own text node -- "bold , italic". */
     Flow(.spacing = 0) {
-        for (int c = from; c >= 0 && c != to; c = d->nodes[c].next_sibling) {
-            if (d->nodes[c].kind == HTML_TEXT) {
-                if (d->nodes[c].text) emit_text(d->nodes[c].text, parent, href);
-            } else {
-                struct vstyle s;
-                vstyle_for_node(d, c, parent, g_sheet, &s);
-                if (s.display == VD_NONE) continue;
-                const char *h = d->nodes[c].href ? d->nodes[c].href : href;
-                /* an inline element's children join the SAME run, so a <b>
-                 * mid-sentence does not start a new line */
-                for (int k = d->nodes[c].first_child; k >= 0; k = d->nodes[k].next_sibling) {
-                    if (d->nodes[k].kind == HTML_TEXT) {
-                        if (d->nodes[k].text) emit_text(d->nodes[k].text, &s, h);
-                    } else {
-                        struct vstyle s2;
-                        vstyle_for_node(d, k, &s, g_sheet, &s2);
-                        const char *h2 = d->nodes[k].href ? d->nodes[k].href : h;
-                        for (int m = d->nodes[k].first_child; m >= 0; m = d->nodes[m].next_sibling)
-                            if (d->nodes[m].kind == HTML_TEXT && d->nodes[m].text)
-                                emit_text(d->nodes[m].text, &s2, h2);
-                    }
-                }
-            }
-        }
+        for (int c = from; c >= 0 && c != to; c = d->nodes[c].next_sibling)
+            emit_inline(d, c, parent, href, 0);
     }
 }
 
@@ -235,6 +280,7 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
      * wraps -- the first render ran every paragraph off the right edge. A
      * block in a document is as wide as its parent; that is what makes the
      * line breaks happen. */
+    if (!strcmp(d->nodes[node].tag, "img")) { emit_image(d, node, s); return; }
     VStack(.spacing = 2, .align = Fill,
            .pt = (float)s->margin_top, .pb = (float)s->margin_bottom,
            .pl = (float)s->indent) {
@@ -249,6 +295,12 @@ const char *vellum_render(struct html_doc *d, int root) {
 
 const char *vellum_render_styled(struct html_doc *d, int root,
                                  const struct css_sheet *sheet) {
+    return vellum_render_page(d, root, sheet, 0);
+}
+
+const char *vellum_render_page(struct html_doc *d, int root,
+                               const struct css_sheet *sheet, const char *base) {
+    g_base = base;
     g_pending = 0;
     g_hover_href = 0;
     g_sheet = sheet;

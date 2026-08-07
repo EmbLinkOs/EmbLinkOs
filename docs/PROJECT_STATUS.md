@@ -1045,6 +1045,11 @@ URL bar, back/forward, clickable links, a status line. The renderer reads only
 `struct vstyle` and never a tag name, so real CSS changes how that struct is
 FILLED and nothing else.
 
+**Pictures (B6).** PNG decodes through our own DEFLATE straight into the
+compositor's premultiplied BGRA, and a small cache fetches a page's images one
+at a time on the browser's worker thread -- so they appear as they arrive and
+the window never stops drawing. Alt text stands in until then.
+
 **CSS is live (B5).** `user/web/css/` implements declarations, selectors and a
 real cascade -- user-agent < author < inline, specificity with document-order
 tie-breaks, descendant selectors, selector lists. The seam held: it needed ONE

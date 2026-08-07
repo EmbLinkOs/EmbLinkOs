@@ -21,6 +21,8 @@
 #include "style.h"
 #include "render.h"
 #include "css.h"
+#include "imgcache.h"
+#include "png.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +48,7 @@ static struct html_doc  g_doc;
 static int              g_root = -1;
 static float            g_scroll = 0;
 static struct css_sheet g_sheet;
+static const char      *g_doc_base;
 
 /* The app's shape, verbatim from user/bin/vellum.c -- if this diverges the
  * harness stops being evidence. `g_busy` stands in for a fetch in flight, so
@@ -77,7 +80,7 @@ static void app(void) {
 
         ScrollView(&g_scroll, em_viewport_height() - (g_busy ? 164.0f : 132.0f)) {
             VStack(.spacing = 0, .align = Fill, .padding = 22, .grow = 1) {
-                vellum_render_styled(&g_doc, g_root, &g_sheet);
+                vellum_render_page(&g_doc, g_root, &g_sheet, g_doc_base);
             }
         }
 
@@ -176,6 +179,7 @@ int main(int argc, char **argv) {
 
     g_root = html_parse(&g_doc, (const char *)src, dl, g_nodes, NODE_MAX, g_strs, STR_MAX);
     css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
+    g_doc_base = doc;
     printf("%s: %zu bytes -> %d nodes%s, root %d, %d css rule%s%s\n", doc, dl, g_doc.n,
            g_doc.truncated ? " (TRUNCATED)" : "", g_root, g_sheet.n,
            g_sheet.n == 1 ? "" : "s", g_sheet.truncated ? " (TRUNCATED)" : "");
@@ -282,6 +286,47 @@ int main(int argc, char **argv) {
         }
         fclose(f);
         fprintf(stderr, "wrote %s (%dx%d)\n", png, W, H);
+    }
+    return 0;
+}
+
+/* --- imgcache, host flavour --------------------------------------------- *
+ * The on-target cache fetches over the network on a worker thread; here the
+ * pictures are simply files. Same interface, so render.c is identical in both
+ * worlds -- which is what makes the host render worth trusting. */
+static struct img_slot H[IMG_SLOTS];
+static uint32_t HARENA[1600 * 1024];
+static size_t   HUSED;
+static uint8_t  HSCR[IMG_MAX_W * IMG_MAX_H * 4 + IMG_MAX_H + 64];
+
+void imgcache_reset(void) { memset(H, 0, sizeof H); HUSED = 0; }
+int  imgcache_pump(void) { return 0; }
+int  imgcache_pending(void) { return 0; }
+
+struct img_slot *imgcache_want(const char *url) {
+    if (!url || !url[0]) return 0;
+    for (int i = 0; i < IMG_SLOTS; i++)
+        if (H[i].state != IMG_EMPTY && !strcmp(H[i].url, url)) return &H[i];
+    for (int i = 0; i < IMG_SLOTS; i++) {
+        if (H[i].state != IMG_EMPTY) continue;
+        snprintf(H[i].url, sizeof H[i].url, "%s", url);
+        size_t n = 0;
+        const char *path = url;
+        while (*path == '/') path++;              /* repo-relative on the host */
+        uint8_t *bytes = read_file(path, &n);
+        if (!bytes) { H[i].state = IMG_FAILED; return &H[i]; }
+        uint32_t w = 0, h = 0;
+        if (png_probe(bytes, n, &w, &h) != PNG_OK || w > IMG_MAX_W || h > IMG_MAX_H) {
+            H[i].state = IMG_FAILED; free(bytes); return &H[i];
+        }
+        uint32_t *dst = HARENA + HUSED;
+        if (png_decode(bytes, n, dst, (size_t)w * h * 4, HSCR, sizeof HSCR, &w, &h) != PNG_OK) {
+            H[i].state = IMG_FAILED; free(bytes); return &H[i];
+        }
+        HUSED += (size_t)w * h;
+        H[i].px = dst; H[i].w = w; H[i].h = h; H[i].state = IMG_READY;
+        free(bytes);
+        return &H[i];
     }
     return 0;
 }

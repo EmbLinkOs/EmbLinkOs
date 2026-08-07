@@ -2031,7 +2031,19 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       evaluation (dropped, not misapplied). `>` `+` `~` parse as descendant.
 - [ ] font-size maps onto four toolkit roles by px threshold. Honest, but a
       continuum would need the text leaf to take a size directly.
-- [ ] Still no JS, images, tables or forms -- see BROWSER.md §5.
+- [x] ~~images~~ DONE 2026-08-07 (B6): user/web/png.c + imgcache.c. 24 host
+      assertions on the decoder alone.
+- [ ] PNG only. JPEG is the other half of the real web and is a DCT decoder,
+      not an afternoon. GIF/WebP not considered.
+- [ ] No interlaced (Adam7) PNG -- refused, not half-decoded.
+- [ ] Images are not SIZED by the markup: width/height attributes and CSS
+      dimensions are ignored, so a picture renders at its natural size and a
+      big one overflows. The reflow-on-arrival this causes is the single most
+      irritating thing a browser does; fixing it needs width/height parsed and
+      a placeholder box of the right size.
+- [ ] The image arena is 6.4MB for 8 slots, per page. A page wanting more gets
+      alt text for the rest.
+- [ ] Still no JS, tables or forms -- see BROWSER.md §5.
 - [ ] Link words are separate ghost Buttons (one per word, for per-word hit
       testing when a link wraps). Their 2px padding makes a link's inter-word
       gaps slightly wider than body text. Cosmetic; a per-run hit region would

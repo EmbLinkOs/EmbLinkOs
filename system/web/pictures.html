@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><title>Pictures</title>
+<style>
+  h1    { color: #88c0d0 }
+  .cap  { color: #7b8394; font-size: 13px }
+  figure{ margin: 10px 0 16px 0 }
+</style></head>
+<body>
+<h1>Vellum shows pictures</h1>
+<p>These PNGs were decoded by <code>user/web/png.c</code> on top of the
+DEFLATE this OS already had, and drawn straight into the compositor's
+premultiplied BGRA &mdash; no conversion pass.</p>
+
+<figure>
+<img src="strip.png" alt="[a colour strip]">
+<p class="cap">300&times;60, colour type 2 (RGB, no alpha), relative src.</p>
+</figure>
+
+<figure>
+<img src="badge.png" alt="[a round badge]">
+<p class="cap">120&times;120, colour type 6 (RGBA) &mdash; the soft edge is real
+alpha, premultiplied at decode.</p>
+</figure>
+
+<p>An image that does not exist falls back to its alt text, which is what alt
+text is for: <img src="missing.png" alt="[missing.png could not be loaded]"></p>
+<p><a href="/system/web/index.html">Back to the start page</a></p>
+</body></html>

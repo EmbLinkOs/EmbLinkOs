@@ -23,6 +23,10 @@
 #include "style.h"
 #include "render.h"
 #include "css.h"
+#include "imgcache.h"
+
+/* who owns a fetch on the shared worker */
+#define DOC_TAG 1
 #include "url.h"
 #include "net.h"
 #include "fetchjob.h"
@@ -79,6 +83,7 @@ static void load_error(const char *url, const char *why) {
              why, url);
     g_root = html_parse(&g_doc, g_src, strlen(g_src), g_nodes, NODE_MAX, g_strs, STR_MAX);
     css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
+    imgcache_reset();
     snprintf(g_status, sizeof g_status, "%s", why);
 }
 
@@ -90,7 +95,7 @@ static void load(const char *url) {
     snprintf(g_url, sizeof g_url, "%s", url);
     snprintf(g_bar, sizeof g_bar, "%s", url);
     g_scroll = 0;
-    if (fetchjob_start(url, g_incoming, sizeof g_incoming) != 0) {
+    if (fetchjob_start(url, g_incoming, sizeof g_incoming, DOC_TAG) != 0) {
         /* One at a time. Refusing is honest: the page you asked for first is
          * still coming, and silently dropping it would be worse. */
         snprintf(g_status, sizeof g_status, "Still loading %s", fetchjob_url());
@@ -122,6 +127,7 @@ static void finish_load(const struct vnet_result *res) {
     /* the author's stylesheet, borrowed from the document arena (which is why
      * it is parsed here, once, and not per frame) */
     css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
+    imgcache_reset();          /* one page's pictures never leak into the next */
 
     /* The status line is the browser's honesty: how the bytes arrived, how many
      * there were, how long it took, and whether we told the truth about all
@@ -187,7 +193,12 @@ static void app(void) {
     /* Has the worker landed? Polled once per frame, which is the whole cost of
      * not freezing. */
     struct vnet_result res;
-    if (fetchjob_poll(&res) == 1) finish_load(&res);
+    if (fetchjob_poll(DOC_TAG, &res) == 1) finish_load(&res);
+
+    /* ...and the page's pictures, one at a time on the same worker. Each one
+     * that lands changes the page, so ask for a frame. */
+    if (imgcache_pump()) em_request_frame();
+    if (imgcache_pending()) em_app_set_refresh(200);
 
     /* While a fetch is in flight the view has to keep being built, or the
      * runtime -- which draws on input by design -- would never poll again and
@@ -253,7 +264,7 @@ static void app(void) {
              * its width from. Left it Leading and the whole document sizes to
              * its longest line instead of to the window, so nothing wraps. */
             VStack(.spacing = 0, .align = Fill, .padding = 22, .grow = 1) {
-                const char *clicked = vellum_render_styled(&g_doc, g_root, &g_sheet);
+                const char *clicked = vellum_render_page(&g_doc, g_root, &g_sheet, g_url);
                 if (clicked) snprintf(g_goto, sizeof g_goto, "%s", clicked);
             }
         }

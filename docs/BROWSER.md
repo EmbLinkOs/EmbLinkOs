@@ -270,7 +270,7 @@ Each ends with something demonstrable. No milestone is "infrastructure".
 | **B3** | Link following, back/forward, error pages; measure layout cost | click through a multi-page site; a number for "how big a document can we hold" |
 | **B4** | HTTPS via libtls, redirects, byte caps | fetch a real site on the public internet |
 | **B5** | ✅ Inline `style=`, `<style>` + selectors + cascade | a styled page looks like the author meant |
-| **B6** | `<img>`: PNG via our zlib, sized boxes | a page with pictures |
+| **B6** | ✅ `<img>`: PNG via our own DEFLATE, alt text, async image fetch | a page with pictures |
 | **B7** | (open) JavaScript, by porting | — |
 
 **B1 through B3 are the ones that decide whether this is real.** If a
@@ -337,6 +337,29 @@ a browser on your own UI stack:
   symptom.
 
 **B1 is done.** The start page renders correctly on the metal.
+
+**B6 is done: the browser shows pictures.** `user/web/png.c` decodes PNG on
+top of the DEFLATE this OS already had (written for the package installer --
+the reuse was the point of having it). Colour types 0/2/3/4/6, bit depths 1-16,
+all five filters, PLTE and tRNS, straight to premultiplied BGRA so the decode
+lands in the compositor's own format with no conversion pass. Interlaced PNG is
+REFUSED rather than half-decoded.
+
+`user/web/imgcache.c` is the other half, and the harder one: a document NAMES
+images, it does not contain them, so each is another round trip after the HTML
+is already complete. One fetch at a time on the worker the document uses, so
+the window keeps drawing; pictures appear as they land; alt text stands in
+until then, which is what alt text is for.
+
+Two bugs worth remembering, both found on the metal:
+
+- The document and the images share one worker, and `fetchjob_poll` REPORTED
+  the owner but consumed the job regardless -- so the document's poll silently
+  ate every image completion and pictures stayed "loading" forever with no
+  error anywhere. Consumption is now per-owner.
+- `render_inline_run` was a hand-unrolled three-level walk that only knew about
+  text, so an `<img>` nested inside any inline wrapper was dropped in silence.
+  It is recursive now, depth-bounded.
 
 **B5 is done: the cascade is live.** `user/web/css/` -- three files because
 there are three concerns that fail differently: `decl.c` (what a declaration
