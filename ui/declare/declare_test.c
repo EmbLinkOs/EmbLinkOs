@@ -264,7 +264,64 @@ static void t7_button_pulse(void) {
     done();
 }
 
+/* ---- T8: a press must latch on a MAGNIFYING icon --------------------------
+ * The dock repro, boiled down. A dock icon is [box [imgbutton [image]]] where
+ * the IMAGE LEAF is keyed by its pixel pointer -- and a magnifying icon swaps
+ * mip levels as it swells, so that key CHANGES while the pointer approaches.
+ * The press edge captures whatever last frame's tree had under the pointer;
+ * this asserts the box still recognises that capture as its own. */
+static uint32_t px_a[64], px_b[64];    /* two "mip levels" of one icon */
+
+static int t8_active;
+static void t8_app(int which_level, float size) {
+    ui_begin_vstack(0xB0B0);                       /* the dock pill */
+      ui_begin_vstack(0xD0C1);                     /* the slot */
+        ui_begin_vstack(0xFACE);                   /* drag_icon's box */
+          ui_begin_vstack(0x1C0);                  /* em_image_button's box */
+            void *px = which_level ? (void *)px_b : (void *)px_a;
+            /* keyed like the FIXED em_image_button: stable identity, varying
+             * pixels. Flip this back to (uintptr_t)px to watch T8 fail. */
+            ui_image_sized(0x1CA7, px, 8, 8, size - 8, size - 8);
+          ui_end_stack();
+          t8_active = ui_is_active();              /* what drag_icon reads */
+        ui_end_stack();
+      ui_end_stack();
+    ui_end_stack();
+}
+
+static void t8_frame(int level, float size, float px_, float py_, int down) {
+    ui_pointer(px_, py_, down != 0);
+    ui_frame_begin(); t8_app(level, size); ui_frame_end();
+    ui_run_layout(200, 200);
+}
+
+static void t8_magnifier_press(void) {
+    printf("T8 press latch across a mip-level swap (the dock magnifier):\n");
+    fresh();
+
+    /* frame 1: pointer far away, small icon, level A */
+    t8_frame(0, 40, 190, 190, 0);
+    /* frame 2: pointer arrives over the icon; still level A geometry retained */
+    t8_frame(0, 40, 16, 16, 0);
+    /* frame 3: the magnifier crosses a level boundary: level B, bigger */
+    t8_frame(1, 56, 16, 16, 0);
+    /* frame 4: THE PRESS. The edge is hit-tested against frame 3's tree. */
+    t8_frame(1, 56, 16, 16, 1);
+    CHECK(t8_active, "press latches when the level flipped BEFORE the press");
+
+    /* release cleanly */
+    t8_frame(1, 56, 16, 16, 0);
+
+    /* now the nastier order: the level flips ON the press frame itself */
+    t8_frame(0, 40, 16, 16, 0);      /* retained tree back to level A */
+    t8_frame(1, 56, 16, 16, 1);      /* press + flip in the same frame */
+    CHECK(t8_active, "press latches when the level flips ON the press frame");
+
+    done();
+}
+
 int main(void) {
+    t8_magnifier_press();
     printf("=== EmbLink UI Piece 7: declarative-API selftests ===\n");
     t1_reuse();
     t2_sweep();

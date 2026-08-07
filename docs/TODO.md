@@ -2052,31 +2052,17 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       The error compounds with the slot index -- 8px off at slot 1, 24px at
       slot 3 -- so the wrong icon swelled and the label named the wrong app.
       One helper, dock_slot_x0(), now serves all three.
-- [ ] OPEN, and this is the one that blocks launching: after ONE app is
-      launched from the dock, NO dock icon is hit-testable again -- including
-      the very icon that just worked. TRACED to the frame, do not re-derive:
-        PRESS 314,550 hover=0 ... drag=0 act=0  -> ACTIVE kind=2 idx=0 -> spawn
-        PRESS 482,550 hover=3 ... drag=0 act=0  -> (no ACTIVE, ever again)
-        PRESS 314,550 hover=0 ... drag=0 act=0  -> (no ACTIVE -- slot 0 too)
-      So: home RECEIVES the press with correct content-local coordinates and
-      focused=1 on the desktop window; home's own geometry agrees the pointer
-      is over a slot (hover=0/1/2/3); the drag state is clean (drag=0 act=0);
-      the dock's world rect is captured and unchanged, which means the dock
-      subtree IS being built every frame. The toolkit's hit test simply stops
-      finding those instances once any app has launched.
-      Ruled out by measurement: input routing (the press arrives), window
-      overlap (fixed separately, and the press arrives anyway), a stuck
-      press-latch or drag state (both read 0), the dock not being emitted (its
-      rect is captured live), slot geometry (hover agrees), the shared 0xD07
-      instance key on the running dots (made per-app; no change), and
-      kind==2-vs-3 (slot 0 fails too, and it is the same helper that works in
-      the launcher).
-      What that leaves is the toolkit's hit test itself: something about the
-      dock's instances stops matching after the first spawn. The next probe is
-      one level down from home -- print, from ui's hit test, which instance it
-      returns for (482,550) and what that instance's rect is, versus the dock
-      icon's own rect. The launcher grid working is the control: same helper,
-      same path, hit-testable throughout.
+- [x] ~~Dock clicks died while the magnifier animated~~ FIXED + locked by
+      declare-test T8. em_image_button keyed its image LEAF by the PIXEL
+      POINTER, which names the mip level -- and a magnifying icon swaps levels
+      as it swells, so the leaf's identity churned during animation. A press
+      edge captures LAST frame's instance; when the press landed on the same
+      frame as a level flip, the captured handle was destroyed by that very
+      build and ui_is_active() walked up from a dead instance. Clicks died
+      exactly while the magnifier animated, which is exactly when a person
+      clicks; the launcher grid never magnifies, so it never missed. Found by
+      HOST repro after five metal boots of instrumentation narrowed it; the
+      host test failed in two seconds and the fix is one stable key.
 - [ ] Scrolling a document in Vellum is slow. Cause is structural rather than
       mysterious: render.c emits ONE SCENE NODE PER WORD (deliberately -- it is
       what makes wrapping, mixed inline styling and per-word link hit-testing

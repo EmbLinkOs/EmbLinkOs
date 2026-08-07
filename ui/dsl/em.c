@@ -2381,7 +2381,19 @@ bool em_image_button_key(const char *path, float size, uint64_t key) {
      * would stay lit after the pointer leaves. Transparent when not hovered. */
     ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
                      : solid((Color){0, 0, 0, 0}));
-    ui_image_sized((uint64_t)(uintptr_t)px, px, w, h, size - 8, size - 8);
+    /* The leaf's key must be STABLE, and the pixel pointer is not: it names
+     * the mip level, and an icon that magnifies swaps levels as it swells. A
+     * key that changes destroys and recreates the instance -- and a press edge
+     * captures LAST frame's instance, so a click landing on the same frame as
+     * a level flip held a handle to an instance the build then threw away.
+     * ui_is_active() walked up from a dead handle and found nothing.
+     *
+     * That was the dock: hover engages the magnifier, the magnifier animates
+     * levels, and clicks died exactly while it animated -- which is exactly
+     * when a person clicks. The launcher grid never magnifies, so it never
+     * missed. Locked by declare-test T8. The leaf is the box's only image
+     * child, so any nonzero constant is unique here. */
+    ui_image_sized(0x1CA7, px, w, h, size - 8, size - 8);
     ui_end_stack();
     return ui_consume_click(self);
 }
