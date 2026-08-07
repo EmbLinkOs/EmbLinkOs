@@ -432,6 +432,17 @@ void ui_set_offset(float x, float y) {
     struct layout_node *ln = layout_resolve(g_la, b->layout_node);
     if (ln) { ln->offset_x = x; ln->offset_y = y; }
 }
+void ui_set_insets(float top, float right, float bottom, float left,
+                   unsigned set, bool relative) {
+    struct instance *b = cur_box(); if (!b) return;
+    struct layout_node *ln = layout_resolve(g_la, b->layout_node);
+    if (!ln) return;
+    ln->ins_top = top; ln->ins_right = right;
+    ln->ins_bottom = bottom; ln->ins_left = left;
+    ln->ins_set = (unsigned char)set;
+    ln->relative = relative ? 1 : 0;
+}
+
 void ui_set_clip_children(bool clip) {
     struct instance *b = cur_box(); if (!b) return;
     if (b->shadow.has_clip && b->shadow.clip == clip) return;

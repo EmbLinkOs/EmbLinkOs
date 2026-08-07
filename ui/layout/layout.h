@@ -40,11 +40,18 @@ enum size_mode      { SIZE_FIXED, SIZE_INTRINSIC, SIZE_FLEX, SIZE_PERCENT };
 
 struct layout_size {
     enum size_mode mode;
-    float fixed_value;    /* SIZE_FIXED only */
+    float fixed_value;    /* SIZE_FIXED: px. SIZE_PERCENT: the fraction. */
     float flex_grow;      /* weight for POSITIVE remaining space */
     float flex_shrink;    /* weight for NEGATIVE remaining space -- ORTHOGONAL to mode */
     float min_size;        /* floor a shrinking node won't cross; default 0 */
     float max_size;        /* ceiling a growing node won't cross; 0 = no cap */
+    /* LAST, on purpose. This struct is built with positional initialisers in
+     * several places, so a field added in the middle silently shifts every one
+     * of them -- flex_grow became pct_px and the whole flex algorithm went
+     * quiet-wrong. New fields go here, and the initialisers below were made
+     * designated so the next one cannot do this again. */
+    float pct_px;         /* SIZE_PERCENT only: pixels ADDED to the fraction,
+                           * which is what calc(100% - 240px) reduces to. */
 };
 
 struct layout_node {
@@ -71,6 +78,14 @@ struct layout_node {
                                         * position (CSS `transform: translate`-style) --
                                         * for transitions/slides; doesn't affect flow */
     bool  is_overlay;                  /* fill the parent, excluded from flow (modals/popovers) */
+    /* Offsets for a POSITIONED box. For an overlay these are CSS's
+     * top/right/bottom/left against the containing block; for an in-flow box
+     * they are `position: relative`, added after the flow has placed it so the
+     * siblings never notice. `ins_set` has a bit per edge because 0 is an
+     * ordinary offset and must be distinguishable from unset. */
+    float ins_top, ins_right, ins_bottom, ins_left;
+    unsigned char ins_set;             /* bit 0 top, 1 right, 2 bottom, 3 left */
+    unsigned char relative;            /* offsets apply, but stay in flow      */
 
     struct layout_size width, height;  /* own sizing, per axis */
 

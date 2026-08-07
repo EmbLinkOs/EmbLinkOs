@@ -36,6 +36,12 @@ void ui_set_offset(float x, float y);  /* post-layout translate (transitions/sli
 void ui_set_backdrop_blur(bool enabled, float radius);
 void ui_set_clip_children(bool clip);
 void ui_set_overlay(bool on);   /* fill parent, out of flow (modal/popover layer) */
+/* CSS top/right/bottom/left on the open box. `set` is a bitmask -- bit 0 top,
+ * 1 right, 2 bottom, 3 left -- because 0 is an ordinary offset and has to be
+ * distinguishable from unset. `relative` keeps the box IN flow and offsets it
+ * afterwards, so its siblings never notice. */
+void ui_set_insets(float top, float right, float bottom, float left,
+                   unsigned set, bool relative);
 void ui_set_layer(int l);       /* z-layer 0..3: elevated paints above + hits first */
 void ui_set_border(float width, struct color color);
 void ui_set_border_gradient(float width, const struct paint *paint);

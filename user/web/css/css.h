@@ -82,6 +82,13 @@ void css_media_set(float w, float h, int dark);
  * about and must not be a second copy of it. */
 float css_viewport_w(void);
 float css_viewport_h(void);
+
+/* ---- calc.c ------------------------------------------------------------- *
+ * Reduce a calc() to a LINEAR EXPRESSION -- `*out_pct` percent of the
+ * containing block plus `*out_px` pixels -- because the percentage cannot be
+ * resolved until layout knows the container. Returns 0, or -1 if the value is
+ * not a calc() or is not a length. */
+int css_calc(const char *s, size_t n, float *out_pct, float *out_px);
 int  css_media_matches(const char *query, size_t n);
 
 /* Parse ONE selector ("nav ul li.item"). Returns 0, or -1 if unusable. */

@@ -240,6 +240,12 @@ static int is_inline(struct html_doc *d, int n, const struct vstyle *parent) {
     if (d->nodes[n].kind == HTML_TEXT) return 1;
     struct vstyle s;
     vstyle_for_node(d, n, parent, g_sheet, &s);
+    /* An ABSOLUTELY positioned box leaves the flow, and CSS blockifies it --
+     * `position: absolute` on a <span> makes it a block. Without this the span
+     * stays part of an inline run, which has no box to position. (Relative
+     * positioning does NOT blockify, so an inline that is merely nudged is
+     * still not offset here -- see docs/TODO.md.) */
+    if (s.position == VP_ABSOLUTE || s.position == VP_FIXED) return 0;
     /* BLOCKIFIED: every element child of a flex or grid container is a flex
      * ITEM, whatever its own display says. CSS says so, and without it a nav
      * bar written as `<nav style="display:flex"><a>One</a><a>Two</a></nav>`
@@ -388,14 +394,16 @@ static void size_box(const struct vstyle *s, int flex_item) {
     float grow_h = s->border_box ? 0.0f
                  : (float)(s->pad_top + s->pad_bottom) + 2.0f * (float)s->border_width;
     if (s->width_pct)      w = (struct layout_size){ .mode = SIZE_PERCENT,
-                                                     .fixed_value = (float)s->width_pct / 100.0f };
+                                                     .fixed_value = (float)s->width_pct / 100.0f,
+                                                     .pct_px = (float)s->width };
     else if (s->width > 0) w = (struct layout_size){ .mode = SIZE_FIXED,
                                                      .fixed_value = (float)s->width + grow_w };
     else if (s->grow)      w = (struct layout_size){ .mode = SIZE_FLEX,  .flex_grow = 1 };
     else if (flex_item)    w = (struct layout_size){ .mode = SIZE_INTRINSIC };
     else                   w = (struct layout_size){ .mode = SIZE_FLEX,  .flex_grow = 1 };
     if (s->height_pct)     h = (struct layout_size){ .mode = SIZE_PERCENT,
-                                                     .fixed_value = (float)s->height_pct / 100.0f };
+                                                     .fixed_value = (float)s->height_pct / 100.0f,
+                                                     .pct_px = (float)s->height };
     else if (s->height > 0) h = (struct layout_size){ .mode = SIZE_FIXED,
                                                       .fixed_value = (float)s->height + grow_h };
     else                   h = (struct layout_size){ .mode = SIZE_INTRINSIC };
@@ -739,8 +747,17 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
     if (s->height > 0) bp.height = (float)s->height;
 
     int was_item = g_flex_item;
+    /* An absolutely positioned box leaves the flow entirely: it stops being a
+     * flex item, and its siblings must lay out as if it were not there. */
+    int out_of_flow = (s->position == VP_ABSOLUTE || s->position == VP_FIXED);
     open_box(s, bp);
-    size_box(s, was_item);
+    if (out_of_flow) ui_set_overlay(true);
+    if (s->clip) ui_set_clip_children(true);
+    if (s->position != VP_STATIC && (s->ins_set || out_of_flow))
+        ui_set_insets((float)s->ins_top, (float)s->ins_right,
+                      (float)s->ins_bottom, (float)s->ins_left,
+                      s->ins_set, s->position == VP_RELATIVE);
+    size_box(s, was_item && !out_of_flow);
     {
         if (s->pre) render_pre(d, node, s);
         else        render_children(d, node, s, href);

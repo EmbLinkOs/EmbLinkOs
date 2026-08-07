@@ -682,9 +682,48 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
  * that axis. Returns 0 and clears *has when the size is auto. */
 static float stated_px(const struct layout_size *s, float avail, int *has) {
     if (s->mode == SIZE_FIXED)   { *has = 1; return s->fixed_value; }
-    if (s->mode == SIZE_PERCENT) { *has = 1; return s->fixed_value * avail; }
+    if (s->mode == SIZE_PERCENT) {
+        *has = 1;
+        float v = s->fixed_value * avail + s->pct_px;
+        return v < 0 ? 0 : v;      /* calc() can go negative; a box cannot */
+    }
     *has = 0;
     return 0;
+}
+
+/* Place an OUT-OF-FLOW box inside its containing block: CSS absolute
+ * positioning, in the shape this engine can express. A stated edge pins that
+ * side; both edges on an axis give the size; neither leaves the box at the
+ * content origin, sized as the caller asked. */
+static void place_positioned(struct layout_arena *la, struct scene_arena *sa,
+                             struct layout_handle kh, struct layout_node *k,
+                             struct layout_node *n, float W, float H) {
+    float cx = n->padding_left, cy = n->padding_top;
+    float cw = W - n->padding_left - n->padding_right;
+    float ch = H - n->padding_top - n->padding_bottom;
+    int L = (k->ins_set & 8) != 0, R = (k->ins_set & 2) != 0;
+    int T = (k->ins_set & 1) != 0, B = (k->ins_set & 4) != 0;
+
+    int has_w = 0, has_h = 0;
+    float w = stated_px(&k->width,  cw, &has_w);
+    float h = stated_px(&k->height, ch, &has_h);
+    if (!has_w) w = (L && R) ? cw - k->ins_left - k->ins_right
+                             : (k->intrinsic_w > 0 ? k->intrinsic_w : cw);
+    if (!has_h) h = (T && B) ? ch - k->ins_top - k->ins_bottom
+                             : (k->intrinsic_h > 0 ? k->intrinsic_h : ch);
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+
+    float x = cx, y = cy;
+    if (L)      x = cx + k->ins_left;
+    else if (R) x = cx + cw - k->ins_right - w;
+    if (T)      y = cy + k->ins_top;
+    else if (B) y = cy + ch - k->ins_bottom - h;
+
+    k->resolved_x = x; k->resolved_y = y;
+    k->resolved_w = w; k->resolved_h = h;
+    if (k->is_container) arrange(la, sa, kh, w, h);
+    else                 write_scene(sa, k);
 }
 
 static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
@@ -1073,16 +1112,23 @@ static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
     for (int i = 0; i < nk; i++) {
         struct layout_node *k = layout_resolve(la, kids[i]);
         if (k->is_overlay) {
-            /* fill the parent's content box, independent of flow + cursor --
-             * unless the overlay carries an EXPLICIT fixed size (see grid arm) */
-            k->resolved_x = n->padding_left; k->resolved_y = n->padding_top;
-            k->resolved_w = k->width.mode  == SIZE_FIXED ? k->width.fixed_value
-                          : W - n->padding_left - n->padding_right;
-            k->resolved_h = k->height.mode == SIZE_FIXED ? k->height.fixed_value
-                          : H - n->padding_top - n->padding_bottom;
-            if (k->is_container) arrange(la, sa, kids[i], k->resolved_w, k->resolved_h);
-            else                 write_scene(sa, k);
+            /* OUT OF FLOW. Without offsets this fills the parent's content box,
+             * which is what a modal scrim wants. With them it is CSS absolute
+             * positioning: an edge that was stated pins that side, both edges
+             * stated give the width, and neither leaves it at the content
+             * origin sized to its content. */
+            place_positioned(la, sa, kids[i], k, n, W, H);
             continue;   /* no cursor advance */
+        }
+        /* position: relative -- offset AFTER the flow has placed it, so the
+         * siblings never notice. That is the whole difference between relative
+         * and absolute, and the reason relative is safe to apply late. */
+        float rel_x = 0, rel_y = 0;
+        if (k->relative) {
+            if (k->ins_set & 8)      rel_x =  k->ins_left;
+            else if (k->ins_set & 2) rel_x = -k->ins_right;
+            if (k->ins_set & 1)      rel_y =  k->ins_top;
+            else if (k->ins_set & 4) rel_y = -k->ins_bottom;
         }
         float main_pos = cursor;
         float cross_pos = cross_pad0;
@@ -1099,6 +1145,7 @@ static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
             k->resolved_y = main_pos; k->resolved_x = cross_pos;
             k->resolved_h = finalm[i]; k->resolved_w = crossv[i];
         }
+        k->resolved_x += rel_x; k->resolved_y += rel_y;   /* position: relative */
         if (k->is_container) arrange(la, sa, kids[i], k->resolved_w, k->resolved_h);
         else                 write_scene(sa, k);
         cursor += finalm[i] + gap;

@@ -588,6 +588,8 @@ build/web_css_vars.o: user/web/css/vars.c user/web/css/css.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
 build/web_css_media.o: user/web/css/media.c user/web/css/css.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_css_calc.o: user/web/css/calc.c user/web/css/css.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
 build/web_net.o: user/web/net.c user/web/net.h user/web/url.h user/lib/embk_socket.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/web -c $< -o $@
 # fetchjob: the fetch runs on a worker thread so the window keeps drawing.
@@ -610,7 +612,7 @@ build/web_cssref.o: user/web/cssref.c user/web/cssref.h user/web/html.h | $(BUIL
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
 VELLUM_OBJS := build/vellum.o build/web_html.o build/web_style.o build/web_render.o \
                build/web_url.o build/web_net.o build/web_fetchjob.o \
-               build/web_css_decl.o build/web_css_sel.o build/web_css_sheet.o build/web_css_vars.o build/web_css_media.o \
+               build/web_css_decl.o build/web_css_sel.o build/web_css_sheet.o build/web_css_vars.o build/web_css_media.o build/web_css_calc.o \
                build/web_png.o build/web_jpeg.o build/web_imgcache.o build/pkg_inflate.o \
                build/web_form.o build/web_select.o build/web_cssref.o
 VELLUM_JS := $(if $(HAVE_QJS),build/web_jsdom.o $(QJS_OBJS),)
@@ -1843,7 +1845,7 @@ html-test:
 	    -Iuser/web/css \
 	    -Iuser/lib \
 	    user/web/html.c user/web/url.c user/web/style.c \
-	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c user/web/css/vars.c user/web/css/media.c \
+	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
 	    user/web/png.c user/web/jpeg.c user/lib/inflate.c user/web/form.c \
 	    user/web/html_test.c -o $(BUILD)/html_test
 	$(BUILD)/html_test
@@ -1939,7 +1941,7 @@ browser-render:
 	    -Iuser/web/css \
 	    -Iuser/lib \
 	    $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
-	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c user/web/css/vars.c user/web/css/media.c \
+	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
 	    user/web/url.c user/web/png.c user/web/jpeg.c user/lib/inflate.c user/web/form.c \
 	    user/web/select.c \
 	    user/web/render_host.c -lm -o $(BUILD)/browser_render
@@ -1962,7 +1964,7 @@ web-corpus:
 # hand before each run.)
 BROWSER_RENDER_SRCS := $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
                        user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
-                       user/web/css/vars.c user/web/css/media.c \
+                       user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
                        user/web/url.c user/web/png.c user/web/jpeg.c user/lib/inflate.c \
                        user/web/form.c user/web/select.c user/web/render_host.c
 BROWSER_RENDER_HDRS := $(wildcard user/web/*.h) $(wildcard user/web/css/*.h) \
@@ -1973,7 +1975,7 @@ build/browser_render: $(BROWSER_RENDER_SRCS) $(BROWSER_RENDER_HDRS)
 	$(HOSTCC) -std=gnu11 -Wall -Wextra -O1 -g $(V2_INC) -Iuser/web \
 	    -Iuser/web/css -Iuser/lib \
 	    $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
-	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c user/web/css/vars.c user/web/css/media.c \
+	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
 	    user/web/url.c user/web/png.c user/web/jpeg.c user/lib/inflate.c user/web/form.c \
 	    user/web/select.c user/web/render_host.c -lm -o $@
 

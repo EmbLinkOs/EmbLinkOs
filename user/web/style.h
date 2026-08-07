@@ -36,6 +36,11 @@ enum {
 };
 /* justify-content / align-items, in the small set that decides real layouts. */
 enum { VJ_START = 0, VJ_CENTER, VJ_END, VJ_BETWEEN, VJ_STRETCH };
+/* position. STATIC is the default and means "wherever the flow puts it".
+ * FIXED is treated as ABSOLUTE against the nearest positioned ancestor rather
+ * than the viewport -- an honest approximation, and the difference only shows
+ * when the page scrolls under a fixed header. Named in TODO. */
+enum { VP_STATIC = 0, VP_RELATIVE, VP_ABSOLUTE, VP_FIXED };
 enum { VM_NONE = 0, VM_BULLET, VM_DECIMAL };
 /* text-align. Justify is accepted and treated as left: a justified paragraph
  * needs inter-word stretching the line breaker does not do, and silently
@@ -57,10 +62,17 @@ struct vstyle {
     /* A stated box size in px, 0 = auto. Only images use it today, and only
      * because a picture is the one thing whose natural size arrives LATER
      * than the layout that has to hold it. */
-    short width, height;
+    short width, height;   /* px -- or the +px term of a percentage, see below */
     /* ...stated as a PERCENTAGE instead, 0-100. A percentage is relative to
      * the containing block, whose size nobody knows while the stylesheet is
-     * being read -- so it travels as a percentage and layout resolves it. */
+     * being read -- so it travels as a percentage and layout resolves it.
+     *
+     * When a percentage IS set, `width`/`height` above stop meaning "pixels"
+     * and start meaning "pixels ADDED to the percentage" -- which is what a
+     * calc() reduces to: `calc(100% - 240px)` is width_pct 100, width -240.
+     * The overload is deliberate (two fields, not four) and is the reason this
+     * comment exists; read one without the other and you get a sidebar layout
+     * that is exactly one sidebar too wide. */
     unsigned char width_pct, height_pct;
     /* box-sizing: border-box. Nearly every modern stylesheet sets this
      * globally, and without it a box with padding and a stated width is wider
@@ -87,6 +99,16 @@ struct vstyle {
     /* flex-grow on THIS element -- a child property, read where the child is
      * emitted rather than by its parent, which is how the toolkit spells it. */
     unsigned char grow;
+
+    /* --- position / overflow. Box properties; not inherited. ------------- */
+    unsigned char position;      /* VP_*                                   */
+    unsigned char clip;          /* overflow: hidden/auto/scroll           */
+    /* top/right/bottom/left, in px, with a bit per edge saying it was stated
+     * at all -- because 0 is a perfectly ordinary offset and "unset" has to be
+     * distinguishable from it, or every absolute box pins itself to the top
+     * left corner whether the author asked or not. */
+    short         ins_top, ins_right, ins_bottom, ins_left;
+    unsigned char ins_set;       /* bit 0 top, 1 right, 2 bottom, 3 left   */
 
     /* --- inherited text layout ------------------------------------------ */
     unsigned char align;         /* VA_*                                   */

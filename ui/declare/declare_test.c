@@ -181,10 +181,10 @@ static void t6_hit_clip(void) {
      * outside), clipped away past x=50. */
     ui_frame_begin();
     ui_box_begin(0);
-      ui_set_size((struct layout_size){SIZE_FIXED,50,0,0,0}, (struct layout_size){SIZE_FIXED,50,0,0,0});
+      ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 50 }, (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 50 });
       ui_set_clip_children(true);
       ui_box_begin(0);
-        ui_set_size((struct layout_size){SIZE_FIXED,40,0,0,0}, (struct layout_size){SIZE_FIXED,40,0,0,0});
+        ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 40 }, (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 40 });
       ui_box_end();
     ui_box_end();
     ui_frame_end();
@@ -213,11 +213,11 @@ static void t6b_hit_layers(void) {
     fresh();
     ui_frame_begin();
     ui_box_begin(0);                       /* an early scrim raised to layer 1 */
-      ui_set_size((struct layout_size){SIZE_FIXED,100,0,0,0}, (struct layout_size){SIZE_FIXED,100,0,0,0});
+      ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 100 }, (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 100 });
       ui_set_layer(1);
     ui_box_end();
     ui_box_begin(0);                       /* a LATER flow box over the same pixels */
-      ui_set_size((struct layout_size){SIZE_FIXED,100,0,0,0}, (struct layout_size){SIZE_FIXED,100,0,0,0});
+      ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 100 }, (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 100 });
     ui_box_end();
     ui_frame_end();
 

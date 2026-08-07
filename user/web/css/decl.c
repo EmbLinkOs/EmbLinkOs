@@ -315,7 +315,24 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
                 }
             }
             if (cols > 0 && cols <= 64) { out->grid_cols = (unsigned char)cols; ok = 1; }
-        } else if (tok_eq(p, pn, "width")) {
+        } else if (tok_eq(p, pn, "width") || tok_eq(p, pn, "height")) {
+            int is_w = tok_eq(p, pn, "width");
+            short *dst_px  = is_w ? &out->width : &out->height;
+            unsigned char *dst_pct = is_w ? &out->width_pct : &out->height_pct;
+            float cpct = 0, cpx = 0;
+            if (css_calc(v, vn, &cpct, &cpx) == 0) {
+                /* a calc reduces to pct% + px; both halves travel */
+                if (cpct != 0) { *dst_pct = (unsigned char)(cpct > 100 ? 100 : (cpct < 0 ? 0 : cpct));
+                                 *dst_px  = (short)cpx; }
+                else           { *dst_pct = 0; *dst_px = (short)(cpx > 0 ? cpx : 0); }
+                ok = 1;
+            } else {
+                int pct2 = len_pct(v, vn);
+                if (pct2 >= 0) { *dst_pct = (unsigned char)pct2; *dst_px = 0; ok = 1; }
+                else { int lok = 0; short px = len_px(v, vn, &lok);
+                       if (lok && px > 0) { *dst_px = px; *dst_pct = 0; ok = 1; } }
+            }
+        } else if (0) {
             int pct = len_pct(v, vn);
             if (pct >= 0) { out->width_pct = (unsigned char)pct; out->width = 0; ok = 1; }
             else { int lok = 0; short px = len_px(v, vn, &lok);
@@ -325,6 +342,33 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
             if (pct >= 0) { out->height_pct = (unsigned char)pct; out->height = 0; ok = 1; }
             else { int lok = 0; short px = len_px(v, vn, &lok);
                    if (lok && px > 0) { out->height = px; out->height_pct = 0; ok = 1; } }
+        } else if (tok_eq(p, pn, "position")) {
+            if      (tok_eq(v, vn, "relative")) { out->position = VP_RELATIVE; ok = 1; }
+            else if (tok_eq(v, vn, "absolute")) { out->position = VP_ABSOLUTE; ok = 1; }
+            else if (tok_eq(v, vn, "fixed"))    { out->position = VP_FIXED;    ok = 1; }
+            else if (tok_eq(v, vn, "static"))   { out->position = VP_STATIC;   ok = 1; }
+            /* sticky behaves as relative until it sticks, and relative is the
+             * half we can do -- closer than dropping the rule. */
+            else if (tok_eq(v, vn, "sticky"))   { out->position = VP_RELATIVE; ok = 1; }
+        } else if (tok_eq(p, pn, "top") || tok_eq(p, pn, "right") ||
+                   tok_eq(p, pn, "bottom") || tok_eq(p, pn, "left")) {
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok) {
+                if      (tok_eq(p, pn, "top"))    { out->ins_top = px;    out->ins_set |= 1; }
+                else if (tok_eq(p, pn, "right"))  { out->ins_right = px;  out->ins_set |= 2; }
+                else if (tok_eq(p, pn, "bottom")) { out->ins_bottom = px; out->ins_set |= 4; }
+                else                              { out->ins_left = px;   out->ins_set |= 8; }
+                ok = 1;
+            }
+        } else if (tok_eq(p, pn, "overflow") || tok_eq(p, pn, "overflow-x") ||
+                   tok_eq(p, pn, "overflow-y")) {
+            /* hidden/auto/scroll all CLIP here; the difference between them is
+             * a scrollbar this renderer does not draw on an arbitrary box. The
+             * clipping is the part that changes the layout, and leaving it out
+             * is how an overflowing box paints across the rest of the page. */
+            if (tok_eq(v, vn, "hidden") || tok_eq(v, vn, "auto") ||
+                tok_eq(v, vn, "scroll") || tok_eq(v, vn, "clip")) { out->clip = 1; ok = 1; }
+            else if (tok_eq(v, vn, "visible")) { out->clip = 0; ok = 1; }
         } else if (tok_eq(p, pn, "box-sizing")) {
             if (tok_eq(v, vn, "border-box"))      { out->border_box = 1; ok = 1; }
             else if (tok_eq(v, vn, "content-box")) { out->border_box = 0; ok = 1; }

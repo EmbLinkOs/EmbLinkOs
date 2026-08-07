@@ -929,3 +929,34 @@ The corpus gained `EXPECT-X`, which pins a resolved position. That is what lets
 a percentage be tested for the number it produced -- 22 + 30% of 896 = 290.8 --
 rather than for not crashing; removing SIZE_PERCENT moves that run to x=82.5
 and the check says so.
+
+
+## Position, overflow and calc (C3, second half)
+
+`position: relative` offsets a box after the flow has placed it, so its
+siblings never notice -- that is the whole difference from absolute, and the
+reason relative is safe to apply late. `absolute` and `fixed` leave the flow
+through the layout engine's existing overlay path, which has been taught CSS's
+insets: a stated edge pins that side, both edges on an axis give the size, and
+neither leaves the box at the content origin sized to its content.
+
+`overflow: hidden`, `auto` and `scroll` all CLIP. The difference between them
+is a scrollbar this renderer does not draw on an arbitrary box; the clipping is
+the part that changes the layout, and leaving it out is how an overflowing box
+paints across the rest of the page.
+
+`calc()` reduces to a LINEAR EXPRESSION -- `pct` percent of the containing
+block plus `px` pixels -- because the percentage is against a block that does
+not exist when the stylesheet is read. So `calc(100% - 240px)` travels as
+width_pct 100 with a -240 pixel term, and layout finishes it. Precedence is the
+real one; `calc(100% - 2 * 20px)` evaluated left to right is off by exactly one
+gap, which looks like a rounding bug rather than a parser bug.
+
+### A struct that grew in the middle
+
+Adding `pct_px` to `struct layout_size` broke flex grow and shrink instantly,
+because the struct is built with POSITIONAL initialisers in several files and
+`sz_grow()`'s `1` landed in the new field instead of `flex_grow`. The field
+moved to the end of the struct and the initialisers in `em.c` and `kit.c` were
+made designated, so position stops mattering. The layout tests caught it in
+seconds -- which is the argument for having them.

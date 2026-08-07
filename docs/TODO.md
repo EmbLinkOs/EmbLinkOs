@@ -2376,11 +2376,34 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       web_jsdom.o; touching ui/dsl/em.h rebuilds libembk.so AND every app that
       links it (the EmProps-by-value hazard); an orphan .elf in build/ fails
       the build; a deleted app is rebuilt rather than silently dropped.
-- [ ] C3 REMAINDER, the biggest single chunk left: `position`
-      (relative/absolute/fixed/sticky) with top/left/right/bottom and z-index,
-      `float`/`clear`, `overflow` (hidden/auto/scroll), and `calc()`. These are
-      genuinely new layout rather than exposing what the engine already does,
-      which is why they are separated from the sizing work above.
+- [x] ~~C3 REMAINDER: position, overflow, calc()~~ SHIPPED 2026-08-07, except
+      float. `position: relative` offsets a box AFTER the flow has placed it,
+      so its siblings never notice -- which is the whole difference from
+      absolute and the reason relative is safe to apply late. `absolute` and
+      `fixed` go out of flow through the engine's existing overlay path, now
+      taught CSS's insets: a stated edge pins that side, both edges on an axis
+      give the size, neither leaves the box at the content origin.
+      `overflow: hidden/auto/scroll` all CLIP (the difference between them is a
+      scrollbar this renderer does not draw on an arbitrary box; the clipping
+      is the part that changes the layout, and leaving it out is how an
+      overflowing box paints across the rest of the page).
+      calc() reduces to a LINEAR EXPRESSION -- pct% of the container plus px --
+      because the percentage is against a block that does not exist when the
+      sheet is read. `calc(100% - 240px)` is width_pct 100 with width -240.
+      Real operator precedence: getting `calc(100% - 2 * 20px)` wrong is off by
+      exactly one gap, which looks like a rounding bug.
+- [ ] `float` / `clear` remain, and are the last of C3. They need the inline
+      line-box to route around an out-of-flow box, which nothing else here
+      does; the rest of C3 reused machinery that existed.
+- [ ] `position: fixed` is treated as ABSOLUTE against the nearest positioned
+      ancestor, not the viewport. The difference only shows when the page
+      scrolls under a fixed header. `sticky` is treated as relative.
+- [ ] `position: relative` on an INLINE element does nothing -- an inline run
+      has no box to offset. Absolute DOES work on one, because CSS blockifies
+      an absolutely positioned box and the renderer now does too.
+- [ ] z-index is not honoured; paint order is document order. An absolutely
+      positioned box written later in the source paints on top, which is what
+      most pages expect anyway.
 - [ ] Custom properties are DOCUMENT-scoped, not element-scoped: one table for
       the sheet, last definition wins. Correct for a single `:root` block (the
       overwhelmingly common shape) and wrong for per-component theming

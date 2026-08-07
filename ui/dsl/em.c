@@ -52,9 +52,9 @@ static Color shade(Color c, float k) {
 }
 static Color tint(Color c, float a) { Color o = c; o.a = a; return o; }
 
-static struct layout_size sz_fixed(float v)  { return (struct layout_size){ SIZE_FIXED, v, 0, 0, 0, 0 }; }
-static struct layout_size sz_grow(void)      { return (struct layout_size){ SIZE_FLEX, 0, 1, 0, 0, 0 }; }
-static struct layout_size sz_intrinsic(void) { return (struct layout_size){ SIZE_INTRINSIC, 0, 0, 0, 0, 0 }; }
+static struct layout_size sz_fixed(float v)  { return (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = v }; }
+static struct layout_size sz_grow(void)      { return (struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 }; }
+static struct layout_size sz_intrinsic(void) { return (struct layout_size){ .mode = SIZE_INTRINSIC }; }
 
 static void utf8_enc(int cp, char *out) {
     unsigned c = (unsigned)cp;
@@ -1065,7 +1065,7 @@ void em_window_end_(void) {
          * delta for the runtime. */
         const struct ui_theme *t = TH;
         ui_begin_hstack(0);
-        ui_set_size(sz_grow(), (struct layout_size){ SIZE_FIXED, 0, 0, 0, 0, 0 });
+        ui_set_size(sz_grow(), (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
         ui_set_justify(JUSTIFY_END);
         {
             ui_begin_hstack(1);
@@ -1929,7 +1929,7 @@ void em_toast_host(void) {
     ui_begin_hstack(0);
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
-    ui_set_size(sz_grow(), (struct layout_size){ SIZE_FIXED, 0, 0, 0, 0, 0 });
+    ui_set_size(sz_grow(), (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
     ui_set_offset(0, -62.0f + (1.0f - op) * 16.0f);   /* rise above the tab bar */
     ui_set_opacity(op < 1.0f ? op : 1.0f);
     {
