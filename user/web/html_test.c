@@ -13,6 +13,7 @@
 #include "css.h"
 #include "png.h"
 #include "png_fixtures.h"
+#include "form.h"
 
 static int failures;
 #define CHECK(c, what) do {                                            \
@@ -473,6 +474,91 @@ static void t17b_image_sizing(void) {
     CHECK(v.width == 0, "a percentage is refused -- no containing block to resolve it");
 }
 
+static void t17c_forms(void) {
+    printf("T17c forms: what submitting one means:\n");
+    char url[512], body[512];
+
+    form_reset();
+    cparse("<form action='/search' method='get'>"
+           "<input name='q' value='hello world'>"
+           "<input name='lang' value='en'>"
+           "<input value='no name -- skipped'>"
+           "<input type='submit' value='Go'></form>");
+    int sub = -1;
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && CD.nodes[i].type &&
+            !strcmp(CD.nodes[i].type, "submit")) sub = i;
+    CHECK(sub >= 0, "the submit button parsed");
+
+    /* touch each field so its value is seeded from the markup */
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && !strcmp(CD.nodes[i].tag, "input"))
+            form_value(&CD, i);
+
+    int how = form_submit(&CD, sub, "/page.html", url, sizeof url, body, sizeof body);
+    CHECK(how == 1, "method=get submits as GET");
+    CHECK(!strcmp(url, "/search?q=hello+world&lang=en"),
+          "fields are urlencoded, joined with &, and space becomes +");
+    CHECK(!strstr(url, "skipped"), "a control with no NAME is not submitted");
+
+    /* POST puts the same encoding in the body, not the URL */
+    form_reset();
+    cparse("<form action='/post' method='POST'><input name='a' value='x y'>"
+           "<input type='submit'></form>");
+    sub = -1;
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && CD.nodes[i].type &&
+            !strcmp(CD.nodes[i].type, "submit")) sub = i;
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && !strcmp(CD.nodes[i].tag, "input"))
+            form_value(&CD, i);
+    how = form_submit(&CD, sub, "/page.html", url, sizeof url, body, sizeof body);
+    CHECK(how == 2, "method=POST (any case) submits as POST");
+    CHECK(!strcmp(url, "/post") && !strcmp(body, "a=x+y"),
+          "the URL stays clean and the fields go in the body");
+
+    /* no action -> this page; and the query REPLACES the action's own */
+    form_reset();
+    cparse("<form action='/s?old=1'><input name='n' value='2'>"
+           "<input type='submit'></form>");
+    sub = -1;
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && CD.nodes[i].type) sub = i;
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && !strcmp(CD.nodes[i].tag, "input"))
+            form_value(&CD, i);
+    form_submit(&CD, sub, "/page.html", url, sizeof url, body, sizeof body);
+    CHECK(!strcmp(url, "/s?n=2"),
+          "a form REPLACES the action's query rather than appending to it");
+
+    /* percent-encoding of the characters that would break the encoding */
+    form_reset();
+    cparse("<form action='/e'><input name='k' value='a&b=c/d?e'>"
+           "<input type='submit'></form>");
+    sub = -1;
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && CD.nodes[i].type) sub = i;
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && !strcmp(CD.nodes[i].tag, "input"))
+            form_value(&CD, i);
+    form_submit(&CD, sub, "/page.html", url, sizeof url, body, sizeof body);
+    CHECK(!strcmp(url, "/e?k=a%26b%3Dc%2Fd%3Fe"),
+          "& = / ? are escaped, so a value cannot forge a second field");
+
+    /* a script's value beats the markup's, and the user's beats both */
+    form_reset();
+    cparse("<form action='/v'><input name='n' value='markup'>"
+           "<input type='submit'></form>");
+    int fld = -1;
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && CD.nodes[i].name) fld = i;
+    CHECK(!strcmp(form_value(&CD, fld), "markup"), "value= seeds the field");
+    form_set(&CD, fld, "typed");
+    CHECK(!strcmp(form_peek(fld), "typed"), "a later set wins");
+    CHECK(!strcmp(form_value(&CD, fld), "typed"),
+          "...and re-reading does NOT re-seed from the markup");
+}
+
 static void t18_png_basics(void) {
     printf("T18 PNG: colour types decode to premultiplied BGRA:\n");
     uint32_t w = 0, h = 0;
@@ -580,7 +666,7 @@ int main(void) {
     t10_url_parse(); t11_url_resolve();
     t11b_entities(); t12_attrs_and_style_block(); t13_declarations(); t14_selectors();
     t15_cascade(); t16_origin_order(); t17_bounded();
-    t17b_image_sizing(); t18_png_basics(); t19_png_palette_and_filters(); t20_png_hostile();
+    t17b_image_sizing(); t17c_forms(); t18_png_basics(); t19_png_palette_and_filters(); t20_png_hostile();
     printf("=== html-test: %s (%d failures) ===\n", failures ? "FAIL" : "OK", failures);
     return failures ? 1 : 0;
 }

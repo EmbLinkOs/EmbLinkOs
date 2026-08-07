@@ -34,4 +34,12 @@ struct vnet_result {
  * r->err explaining why. `r` is always filled in. */
 int vnet_fetch(const char *url, char *out, size_t cap, struct vnet_result *r);
 
+/* ...and the same with a POST body (form-urlencoded). `body` may be NULL,
+ * which is exactly vnet_fetch. A form is the first thing this browser does
+ * that SENDS, so POST is a real method here and not a stub -- a submit button
+ * that silently performs a GET would lose the user's data to a server that
+ * never sees it. */
+int vnet_post(const char *url, const char *body,
+              char *out, size_t cap, struct vnet_result *r);
+
 #endif /* _EMBLINK_WEB_NET_H_ */

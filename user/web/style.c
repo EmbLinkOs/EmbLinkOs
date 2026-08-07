@@ -43,6 +43,19 @@ void vstyle_for(const char *tag, const struct vstyle *p, struct vstyle *o) {
      * box it is. */
     else if (ieq(tag,"img")) { o->display = VD_IMAGE; }
 
+    /* --- form controls. `type` decides which box an <input> is, which is the
+     * one place a tag's ATTRIBUTE and not its name selects the display -- and
+     * exactly why the stylist rather than the renderer decides it. --- */
+    else if (ieq(tag,"input")) {
+        const char *ty = 0;   /* filled by the caller via vstyle_for_node */
+        (void)ty;
+        o->display = VD_FIELD;   /* refined to VD_BUTTON below when type says so */
+    }
+    else if (ieq(tag,"textarea")) { o->display = VD_FIELD; }
+    else if (ieq(tag,"button"))   { o->display = VD_BUTTON; }
+    else if (ieq(tag,"form"))     { o->display = VD_BLOCK; o->margin_top=8; o->margin_bottom=10; }
+    else if (ieq(tag,"label"))    { o->display = VD_INLINE; }
+
     /* --- tables. A data table is not "tables as layout" (the practice
      * docs/BROWSER.md rightly refuses); it is how a reference page states a
      * grid of facts, and a documentation browser that cannot show one is
@@ -105,6 +118,17 @@ void vstyle_for_node(struct html_doc *doc, int node, const struct vstyle *parent
                      const struct css_sheet *sheet, struct vstyle *out) {
     const char *tag = (doc && node >= 0 && node < doc->n) ? doc->nodes[node].tag : "";
     vstyle_for(tag, parent, out);
+    /* An <input> is a FIELD or a BUTTON depending on its type -- the one case
+     * where an attribute picks the box. Done here, where the node is in hand,
+     * so vstyle_for stays a pure function of the tag. */
+    if (out->display == VD_FIELD && doc && node >= 0 && node < doc->n) {
+        const char *ty = doc->nodes[node].type;
+        if (ty && (!strcmp(ty, "submit") || !strcmp(ty, "button") ||
+                   !strcmp(ty, "reset")))
+            out->display = VD_BUTTON;
+        else if (ty && !strcmp(ty, "hidden"))
+            out->display = VD_NONE;
+    }
     if (sheet && doc && node >= 0) css_sheet_apply(sheet, doc, node, out);
     if (doc && node >= 0 && node < doc->n && doc->nodes[node].style)
         css_apply_decls(doc->nodes[node].style, strlen(doc->nodes[node].style), out);

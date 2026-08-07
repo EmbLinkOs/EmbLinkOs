@@ -25,6 +25,10 @@ enum {
      * table-row, table-cell), which is exactly why they belong here: the
      * renderer asks what KIND of box this is, not what it was called. */
     VD_TABLE, VD_ROW, VD_CELL, VD_CAPTION,
+    /* Form controls. The first part of the web that is not read-only, and
+     * therefore the first whose box the RENDERER cannot derive from the
+     * document alone -- see form.h. */
+    VD_FIELD, VD_BUTTON,
 };
 enum { VM_NONE = 0, VM_BULLET, VM_DECIMAL };
 

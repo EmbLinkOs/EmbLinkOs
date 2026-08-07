@@ -40,6 +40,15 @@ void vellum_set_link_handler(void (*fn)(const char *href));
 void vellum_set_event_hooks(int (*has_listener)(int node),
                             void (*on_click)(int node));
 
+/* A form was submitted (a submit button pressed). The renderer knows WHEN;
+ * only the app knows what navigating means. */
+void vellum_set_submit_handler(void (*fn)(int node));
+
+/* Which field had keyboard focus on the last rendered frame, or -1. The app
+ * uses it to make Enter submit -- which is a FORM's idea, not a text box's,
+ * so the toolkit rightly has no opinion about it. */
+int  vellum_focused_field(void);
+
 /* The link under the pointer, for a status line. NULL when none. */
 const char *vellum_hovered_link(void);
 

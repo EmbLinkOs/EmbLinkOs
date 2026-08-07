@@ -24,13 +24,27 @@ static char              g_url[512];
 static int               g_tid = -1;
 static uint64_t          g_started_ms;
 static int               g_tag;
+static char              g_body[2048];
+static int               g_have_body;
 
 static void worker(long arg) {
     (void)arg;
     /* Copy nothing, allocate nothing, touch no UI state -- just the fetch. */
-    vnet_fetch(g_url, g_buf, g_cap, &g_res);
+    if (g_have_body) vnet_post(g_url, g_body, g_buf, g_cap, &g_res);
+    else             vnet_fetch(g_url, g_buf, g_cap, &g_res);
     g_state = JOB_DONE;                  /* published last: see above */
     embk_thread_exit(0);
+}
+
+int fetchjob_start_post(const char *url, const char *body,
+                        char *buf, size_t cap, int tag) {
+    int rc = fetchjob_start(url, buf, cap, tag);
+    if (rc != 0) return rc;
+    /* set AFTER the start succeeded, and copied: the form's buffer is the
+     * app's and may be reused before the worker reads it */
+    snprintf(g_body, sizeof g_body, "%s", body ? body : "");
+    g_have_body = 1;
+    return 0;
 }
 
 int fetchjob_start(const char *url, char *buf, size_t cap, int tag) {
@@ -48,6 +62,7 @@ int fetchjob_start(const char *url, char *buf, size_t cap, int tag) {
     g_cap = cap;
     g_started_ms = embk_uptime_ms();
     g_tag = tag;
+    g_have_body = 0;
     g_state = JOB_RUNNING;                /* set BEFORE the thread exists, so a
                                            * poll racing the spawn sees RUNNING
                                            * rather than IDLE */

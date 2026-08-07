@@ -276,6 +276,9 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         char sty[256];   sty[0] = 0;
         char alt[256];   alt[0] = 0;
         int  aw = 0, ah = 0;
+        char fname[64];  fname[0] = 0;
+        char fval[256];  fval[0] = 0;
+        char ftype[24];  ftype[0] = 0;
         while (p < len && src[p] != '>') {
             while (p < len && (src[p]==' '||src[p]=='\t'||src[p]=='\n'||src[p]=='\r')) p++;
             if (p >= len || src[p] == '>' || src[p] == '/') break;
@@ -296,7 +299,11 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                 if (q) { while (p < len && src[p] != q) p++; }
                 else   { while (p < len && src[p]!='>' && src[p]!=' ' && src[p]!='\t') p++; }
                 size_t vl = p - vs;
-                if ((ieq(aname,"href") || ieq(aname,"src")) && !href[0]) {
+                /* a form's ACTION is its target, which is what href already
+                 * means -- same slot, same resolution against the base, and
+                 * the same code path in url_resolve */
+                if ((ieq(aname,"href") || ieq(aname,"src") ||
+                     ieq(aname,"action")) && !href[0]) {
                     size_t c = vl < sizeof href - 1 ? vl : sizeof href - 1;
                     memcpy(href, src + vs, c); href[c] = 0;
                 } else if (ieq(aname,"class") && !klass[0]) {
@@ -334,6 +341,15 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                         if (c2 < '0' || c2 > '9') ok = 0; else v = v * 10 + (c2 - '0');
                     }
                     if (ok && v > 0 && v <= 32 && ieq(aname,"colspan")) aw = v;
+                } else if (ieq(aname,"name") && !fname[0]) {
+                    size_t c = vl < sizeof fname - 1 ? vl : sizeof fname - 1;
+                    memcpy(fname, src + vs, c); fname[c] = 0;
+                } else if (ieq(aname,"value") && !fval[0]) {
+                    size_t c = vl < sizeof fval - 1 ? vl : sizeof fval - 1;
+                    memcpy(fval, src + vs, c); fval[c] = 0;
+                } else if ((ieq(aname,"type") || ieq(aname,"method")) && !ftype[0]) {
+                    size_t c = vl < sizeof ftype - 1 ? vl : sizeof ftype - 1;
+                    memcpy(ftype, src + vs, c); ftype[c] = 0;
                 } else if (ieq(aname,"alt") && !alt[0]) {
                     /* alt is not decoration: it is what the page SAYS when the
                      * picture cannot be shown, which for us is often. */
@@ -405,6 +421,9 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         if (eid[0])   d->nodes[ni].id    = str_put(d, eid,   strlen(eid));
         if (sty[0])   d->nodes[ni].style = str_put(d, sty,   strlen(sty));
         if (alt[0])   d->nodes[ni].alt   = str_put(d, alt,   strlen(alt));
+        if (fname[0]) d->nodes[ni].name  = str_put(d, fname, strlen(fname));
+        if (fval[0])  d->nodes[ni].value = str_put(d, fval,  strlen(fval));
+        if (ftype[0]) d->nodes[ni].type  = str_put(d, ftype, strlen(ftype));
         d->nodes[ni].img_w = (short)aw; d->nodes[ni].img_h = (short)ah;
         if (!is_void(tag) && !self_closing) push(&st, ni);
         i = p;

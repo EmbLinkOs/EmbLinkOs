@@ -565,6 +565,9 @@ build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/rend
 # include set (same as wget) for tls.h.
 build/web_url.o: user/web/url.c user/web/url.h user/web/html.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+# forms: the first part of the web that is not read-only (user/web/form.h)
+build/web_form.o: user/web/form.c user/web/form.h user/web/html.h user/web/url.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
 # CSS (B5): three concerns, three files -- declarations, selectors, cascade.
 build/web_css_decl.o: user/web/css/decl.c user/web/css/css.h user/web/style.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
@@ -588,7 +591,8 @@ build/web_imgcache.o: user/web/imgcache.c user/web/imgcache.h user/web/png.h | $
 VELLUM_OBJS := build/vellum.o build/web_html.o build/web_style.o build/web_render.o \
                build/web_url.o build/web_net.o build/web_fetchjob.o \
                build/web_css_decl.o build/web_css_sel.o build/web_css_sheet.o \
-               build/web_png.o build/web_imgcache.o build/pkg_inflate.o
+               build/web_png.o build/web_imgcache.o build/pkg_inflate.o \
+               build/web_form.o
 VELLUM_JS := $(if $(HAVE_QJS),build/web_jsdom.o $(QJS_OBJS),)
 build/vellum.elf: build/crt0.o build/syscalls.o $(VELLUM_OBJS) $(VELLUM_JS) $(TLS_LIB_OBJS) build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $(VELLUM_OBJS) \
@@ -1801,7 +1805,7 @@ html-test:
 	    -Iuser/lib \
 	    user/web/html.c user/web/url.c user/web/style.c \
 	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
-	    user/web/png.c user/lib/inflate.c \
+	    user/web/png.c user/lib/inflate.c user/web/form.c \
 	    user/web/html_test.c -o $(BUILD)/html_test
 	$(BUILD)/html_test
 
@@ -1897,7 +1901,7 @@ browser-render:
 	    -Iuser/lib \
 	    $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
 	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
-	    user/web/url.c user/web/png.c user/lib/inflate.c \
+	    user/web/url.c user/web/png.c user/lib/inflate.c user/web/form.c \
 	    user/web/render_host.c -lm -o $(BUILD)/browser_render
 	$(BUILD)/browser_render $(DOC) $(BW) $(BH) $(DEPTH) $(PNG) $(BUSY)
 

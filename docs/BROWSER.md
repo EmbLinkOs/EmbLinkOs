@@ -409,7 +409,8 @@ Each ends with something demonstrable. No milestone is "infrastructure".
 | **B4** | HTTPS via libtls, redirects, byte caps | fetch a real site on the public internet |
 | **B5** | ✅ Inline `style=`, `<style>` + selectors + cascade | a styled page looks like the author meant |
 | **B6** | ✅ `<img>`: PNG via our own DEFLATE, alt text, async image fetch | a page with pictures |
-| **B7** | ✅ JavaScript: QuickJS + DOM bindings, scripts run in the page | a page's own script reads and rewrites it |
+| **B7** | ✅ JavaScript: QuickJS + DOM, events, fetch() | a page's own script reads, rewrites and responds |
+| **+** | ✅ FORMS: text fields, buttons, GET and POST | a form you can fill in and submit |
 | **+** | ✅ data tables over the layout grid (revisits §5 with evidence) | a reference page states a grid of facts |
 
 **B1 through B3 are the ones that decide whether this is real.** If a
@@ -476,6 +477,38 @@ a browser on your own UI stack:
   symptom.
 
 **B1 is done.** The start page renders correctly on the metal.
+
+**FORMS (2026-08-07): the first part of the web that is not read-only.**
+
+`user/web/form.{c,h}`. Text fields, submit buttons, GET and POST, Enter to
+submit, and `el.value` from script.
+
+The structural decision is where a value LIVES. Everything else this browser
+draws is a function of the document; a form's values are not -- they are the
+user's, they change under the keyboard, and they must survive a re-render of a
+document that knows nothing about them. So they live in a table keyed by node
+index, deliberately NOT in the DOM. That separation is what stops a re-render
+from wiping a half-filled form, and it is why `value` is not simply another
+attribute. The markup's `value=` seeds a field ONCE, on first use: re-seeding
+every frame would fight the keyboard, and the field would appear to reject
+input.
+
+The rest is reuse rather than new machinery. A text field is EmUI's -- the
+toolkit already owns editing, focus, the caret and the keyboard, so a control
+is the browser handing it a buffer and getting typing back. A submission is a
+NAVIGATION, so it goes down the same load path a link uses; POST differs only
+in what goes on the wire. And `action` is parsed into the same slot as `href`,
+because a form's target is a link target and resolves identically.
+
+Correctness the tests pin down (11 assertions): `&`, `=`, `/` and `?` are
+percent-encoded so a value cannot forge a second field; space becomes `+`; a
+control with no NAME is not submitted, which is the HTML rule; a form REPLACES
+its action's query rather than appending to it; POST/redirect/GET, so a 303
+after a POST does not re-post the body.
+
+Proven on the metal: two fields typed, Submit pressed, the address bar shows
+`?who=vellum&what=hello+there`, and the page's own script reads
+`location.search` back and prints `who = vellum | what = hello there`.
 
 **B6 is done: the browser shows pictures, and the page does not jump.**
 

@@ -26,6 +26,9 @@ struct css_sheet;
  * is also how a script cannot outlive the page that wrote it. */
 int  jsdom_open(struct html_doc *doc, const struct css_sheet *sheet);
 
+/* The page's own address, for `location`. Set BEFORE jsdom_open. */
+void jsdom_set_url(const char *url);
+
 /* Run every <script> the document carried, in order. Returns the number that
  * threw -- a script that fails must not stop the ones after it, exactly as in
  * a browser, because one broken analytics tag should not blank a page. */

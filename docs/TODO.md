@@ -2078,7 +2078,14 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       a bare `-e` as a unary minus. Either the shell should pass through
       unknown leading-dash tokens, or js should take a different flag.
 - [ ] No Atomics.* (SharedArrayBuffer across threads) -- disabled by the port.
-- [ ] Still no forms -- see BROWSER.md §5.
+- [x] ~~forms~~ DONE 2026-08-07: user/web/form.{c,h} -- text fields, submit
+      buttons, GET and POST, Enter to submit, el.value from script. 11 host
+      assertions on the encoding and method rules.
+- [ ] Only text inputs and buttons. No checkbox, radio, select, textarea
+      (parsed as a field but rendered single-line), or file upload.
+- [ ] No client-side validation (required, pattern, type=email).
+- [ ] No form.submit() / onsubmit from script -- a script can read and set
+      values but cannot submit or intercept.
 - [ ] Link words are separate ghost Buttons (one per word, for per-word hit
       testing when a link wraps). Their 2px padding makes a link's inter-word
       gaps slightly wider than body text. Cosmetic; a per-run hit region would

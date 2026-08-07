@@ -92,6 +92,8 @@ static void hdr_value(const char *v, char *out, size_t cap) {
 /* One HTTP exchange, no redirect following. Returns 0 if a response was read
  * (any status), -1 if the transport failed. `location` gets the Location header
  * if there was one. */
+static const char *g_post_body;      /* set for the duration of one submission */
+
 static int http_once(const struct url *u, char *out, size_t cap,
                      struct vnet_result *r, char *location, size_t loc_cap) {
     location[0] = 0;
@@ -166,14 +168,28 @@ static int http_once(const struct url *u, char *out, size_t cap,
         snprintf(r->via, sizeof r->via, "http");
     }
 
-    char req[768];
-    int rl = snprintf(req, sizeof req,
+    char req[2048];
+    int rl;
+    if (g_post_body) {
+        rl = snprintf(req, sizeof req,
+                      "POST %s HTTP/1.0\r\n"
+                      "Host: %s\r\n"
+                      "User-Agent: Vellum (EmbLinkOS)\r\n"
+                      "Accept: text/html,*/*\r\n"
+                      "Content-Type: application/x-www-form-urlencoded\r\n"
+                      "Content-Length: %u\r\n"
+                      "Connection: close\r\n\r\n%s",
+                      u->path, u->host,
+                      (unsigned)strlen(g_post_body), g_post_body);
+    } else {
+        rl = snprintf(req, sizeof req,
                       "GET %s HTTP/1.0\r\n"
                       "Host: %s\r\n"
                       "User-Agent: Vellum (EmbLinkOS)\r\n"
                       "Accept: text/html,*/*\r\n"
                       "Connection: close\r\n\r\n",
                       u->path, u->host);
+    }
     if (x_send(&x, req, (size_t)rl) < 0) {
         snprintf(r->err, sizeof r->err, "Request failed");
         x_close(&x);
@@ -224,6 +240,15 @@ static int http_once(const struct url *u, char *out, size_t cap,
 
 /* --- the one entry point ------------------------------------------------- */
 
+int vnet_post(const char *url, const char *body,
+              char *out, size_t cap, struct vnet_result *r) {
+    g_post_body = body;
+    int rc = vnet_fetch(url, out, cap, r);
+    g_post_body = 0;         /* one submission only: a later GET must not
+                              * inherit a body from a form the user has left */
+    return rc;
+}
+
 int vnet_fetch(const char *url, char *out, size_t cap, struct vnet_result *r) {
     memset(r, 0, sizeof *r);
     if (!url || !out || cap < 2) {
@@ -261,6 +286,11 @@ int vnet_fetch(const char *url, char *out, size_t cap, struct vnet_result *r) {
                      "Too many redirects (%d) -- stopped at %.100s", hop, here);
             return -1;
         }
+
+        /* POST/redirect/GET: a 303 (and, in practice, a 301/302) after a POST
+         * becomes a GET. Re-posting the body to the redirect target is how a
+         * form gets submitted twice. */
+        if (r->status == 301 || r->status == 302 || r->status == 303) g_post_body = 0;
 
         char next[512];
         if (url_resolve(here, location, next, sizeof next) != 0) {

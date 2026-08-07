@@ -1060,6 +1060,10 @@ patch of two hunks for the whole 58k-line engine, both hunks merely widening
 existing `#ifdef`s. `js hello.js` runs closures, regexps, Array.sort and
 JSON from the OS's shell. The DOM bindings, which are the point, are next.
 
+**Forms.** Text fields, submit buttons, GET and POST over the browser's own
+network layer. Values live apart from the DOM (they are the user's, not the
+document's), so a re-render never wipes a half-filled form.
+
 **Data tables.** A `<table>` becomes one grid of the layout engine's own --
 aligned columns across rows, header rows, colspan, captions -- which is what
 made it a contained feature rather than a box-model rewrite.

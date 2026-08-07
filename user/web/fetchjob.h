@@ -32,6 +32,11 @@
  * HTML parser. Returns 0, or -1 if a fetch is already in flight. */
 int fetchjob_start(const char *url, char *buf, size_t cap, int tag);
 
+/* ...with a POST body. `body` is COPIED, because the caller's buffer (a form's
+ * encoded fields) is not guaranteed to outlive the worker. */
+int fetchjob_start_post(const char *url, const char *body,
+                        char *buf, size_t cap, int tag);
+
 /* Poll for a result belonging to `tag`.
  *   1 = finished (written to *out, buffer is yours again, job consumed)
  *   0 = nothing for you yet -- either still running, or DONE but owned by

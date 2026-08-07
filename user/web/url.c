@@ -19,6 +19,8 @@ int url_parse(const char *u, struct url *out) {
 
     if (out->kind == URL_LOCAL) {
         snprintf(out->path, sizeof out->path, "%s", p);
+        char *q = strchr(out->path, '?');
+        if (q) { snprintf(out->query, sizeof out->query, "%s", q + 1); *q = 0; }
         return out->path[0] ? 0 : -1;
     }
 

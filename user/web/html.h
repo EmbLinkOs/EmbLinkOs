@@ -38,6 +38,16 @@ struct html_node {
     char *id;                       /* id="...", or NULL                   */
     char *style;                    /* style="..." declarations, or NULL   */
     char *alt;                      /* <img alt="...">, or NULL            */
+    /* Form controls. These are their OWN fields and do NOT share a slot with
+     * class/id: those are what CSS selectors match on, so borrowing them would
+     * make a styled input unstylable -- a bug that would look like the cascade
+     * being broken. `type` doubles as a <form>'s METHOD, which is safe because
+     * a form has no type attribute and an input has no method: genuinely
+     * exclusive, unlike class. */
+    char *name;                     /* <input name="q">                    */
+    char *value;                    /* <input value="...">, the INITIAL one */
+    char *type;                     /* <input type>, or <form method>      */
+
     /* <img width/height>, 0 = unstated. img_w DOUBLES as a table cell's
      * colspan: a cell is never an image and an image is never a cell, so the
      * two facts cannot collide, and a separate pair of shorts on every node in

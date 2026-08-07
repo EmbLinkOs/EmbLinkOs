@@ -21,6 +21,11 @@ struct url {
     char host[128];
     int  port;
     char path[512];   /* the request target; for URL_LOCAL, the file path */
+    /* A LOCAL url's query is split OFF the path: "/a.html?q=x" must open
+     * a.html, while the address bar still shows the whole thing and a script
+     * can still read the query. A network path keeps its query, because the
+     * server is the one that parses it. */
+    char query[256];
 };
 
 /* Split an absolute location. Anything that is not http:// or https:// and

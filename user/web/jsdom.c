@@ -21,11 +21,14 @@
 #include "jsdom.h"
 #include "fetchjob.h"
 #include "net.h"
+#include "form.h"
+#include "url.h"
 
 static JSRuntime *g_rt;
 static JSContext *g_ctx;
 static struct html_doc *g_doc;
 static const struct css_sheet *g_sheet;
+static const char *g_url;      /* the page's own address, for location */
 static int  g_dirty;
 static void (*g_console)(const char *line);
 
@@ -193,7 +196,29 @@ static JSValue elem_add_listener(JSContext *ctx, JSValueConst this_val,
     return JS_ThrowInternalError(ctx, "too many listeners");
 }
 
+/* A control's value is the USER's, not the document's -- form.c holds it (see
+ * form.h). Exposing it as a property is what lets a script validate, prefill
+ * or clear a field, which is most of what page scripts do with forms. */
+static JSValue elem_get_value(JSContext *ctx, JSValueConst this_val) {
+    int i = elem_index(ctx, this_val);
+    if (i < 0) return JS_UNDEFINED;
+    return JS_NewString(ctx, form_peek(i));
+}
+static JSValue elem_set_value(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    int i = elem_index(ctx, this_val);
+    if (i < 0 || argc < 1) return JS_UNDEFINED;
+    const char *s = JS_ToCString(ctx, argv[0]);
+    if (!s) return JS_EXCEPTION;
+    form_set(g_doc, i, s);
+    g_dirty = 1;
+    JS_FreeCString(ctx, s);
+    return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry elem_proto[] = {
+    JS_CGETSET_DEF("value", elem_get_value, 0),
+    JS_CFUNC_DEF("setValue", 1, elem_set_value),
     JS_CFUNC_DEF("addEventListener", 2, elem_add_listener),
     JS_CGETSET_DEF("textContent", elem_get_text, 0),
     JS_CGETSET_DEF("tagName", elem_get_tag, 0),
@@ -324,6 +349,8 @@ void jsdom_close(void) {
     g_doc = 0; g_sheet = 0; g_dirty = 0;
 }
 
+void jsdom_set_url(const char *url) { g_url = url; }
+
 int jsdom_open(struct html_doc *doc, const struct css_sheet *sheet) {
     jsdom_close();
     g_doc = doc; g_sheet = sheet;
@@ -354,6 +381,24 @@ int jsdom_open(struct html_doc *doc, const struct css_sheet *sheet) {
                             JS_NewCFunction(g_ctx, (JSCFunction *)doc_get_title, "title", 0),
                             JS_UNDEFINED, JS_PROP_CONFIGURABLE);
     JS_FreeAtom(g_ctx, t);
+    /* location: a page that cannot read its own URL cannot act on a form's
+     * query string, which is how half the web's search results pages work. */
+    JSValue loc = JS_NewObject(g_ctx);
+    JS_SetPropertyStr(g_ctx, loc, "href", JS_NewString(g_ctx, g_url ? g_url : ""));
+    {
+        struct url u;
+        if (g_url && url_parse(g_url, &u) == 0) {
+            JS_SetPropertyStr(g_ctx, loc, "pathname", JS_NewString(g_ctx, u.path));
+            char q[300];
+            snprintf(q, sizeof q, "%s%s", u.query[0] ? "?" : "", u.query);
+            JS_SetPropertyStr(g_ctx, loc, "search", JS_NewString(g_ctx, q));
+        } else {
+            JS_SetPropertyStr(g_ctx, loc, "pathname", JS_NewString(g_ctx, ""));
+            JS_SetPropertyStr(g_ctx, loc, "search", JS_NewString(g_ctx, ""));
+        }
+    }
+    JS_SetPropertyStr(g_ctx, g, "location", loc);
+
     JS_SetPropertyStr(g_ctx, g, "document", d);
 
     JS_SetPropertyStr(g_ctx, g, "setTimeout",

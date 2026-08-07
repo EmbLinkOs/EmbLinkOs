@@ -31,6 +31,7 @@
 #include "url.h"
 #include "css.h"
 #include "imgcache.h"
+#include "form.h"
 #include "render.h"
 
 static void (*g_on_link)(const char *href);
@@ -46,6 +47,10 @@ static const char *g_pending;
 static const struct css_sheet *g_sheet;
 static int  (*g_has_listener)(int node);
 static void (*g_on_click)(int node);
+static void (*g_on_submit)(int node);
+/* the field that had keyboard focus on the last frame, or -1 */
+static int g_focused_field = -1;
+int vellum_focused_field(void) { return g_focused_field; }
 
 const char *vellum_hovered_link(void) { return g_hover_href; }
 
@@ -221,11 +226,15 @@ static int is_inline(struct html_doc *d, int n, const struct vstyle *parent) {
     if (d->nodes[n].kind == HTML_TEXT) return 1;
     struct vstyle s;
     vstyle_for_node(d, n, parent, g_sheet, &s);
-    return s.display == VD_INLINE || s.display == VD_IMAGE;
+    /* controls flow INLINE with their labels, which is what a form looks like */
+    return s.display == VD_INLINE || s.display == VD_IMAGE ||
+           s.display == VD_FIELD  || s.display == VD_BUTTON;
 }
 
 static void render_block(struct html_doc *d, int node, const struct vstyle *s,
                          const char *href, int list_index);
+static void emit_field(struct html_doc *d, int n, const struct vstyle *st);
+static void emit_button(struct html_doc *d, int n, const struct vstyle *st);
 
 /* One inline child, at any depth. RECURSIVE on purpose: this was a
  * hand-unrolled three-level walk that only knew about text, so an <img> (or
@@ -245,7 +254,9 @@ static void emit_inline(struct html_doc *d, int c, const struct vstyle *st,
     /* AFTER computing its own style, not before: an image is styled by the
      * rules that match IT (`.half { width: 150px }`), and handing it the
      * parent's vstyle silently ignored every one of them. */
-    if (s.display == VD_IMAGE) { emit_image(d, c, &s); return; }
+    if (s.display == VD_IMAGE)  { emit_image(d, c, &s); return; }
+    if (s.display == VD_FIELD)  { emit_field(d, c, &s); return; }
+    if (s.display == VD_BUTTON) { emit_button(d, c, &s); return; }
     const char *h = d->nodes[c].href ? d->nodes[c].href : href;
     for (int k = d->nodes[c].first_child; k >= 0; k = d->nodes[k].next_sibling)
         emit_inline(d, k, &s, h, depth + 1);
@@ -260,6 +271,59 @@ static void render_inline_run(struct html_doc *d, int from, int to,
     Flow(.spacing = 0) {
         for (int c = from; c >= 0 && c != to; c = d->nodes[c].next_sibling)
             emit_inline(d, c, parent, href, 0);
+    }
+}
+
+/* A text field. The toolkit already owns editing, focus, the caret and the
+ * keyboard -- so a form control is not new machinery here, it is the browser
+ * handing EmUI a buffer and getting typing back. The buffer belongs to form.c
+ * (the user's typing is not part of the document; see form.h), which is what
+ * lets a re-render leave a half-filled form alone.
+ *
+ * Enter submits, because a search box you cannot submit from the keyboard is
+ * a search box that feels broken. */
+static void emit_field(struct html_doc *d, int n, const struct vstyle *st) {
+    char *buf = form_value(d, n);
+    if (!buf) {                       /* table full: say so rather than lie */
+        Text("[too many fields]").caption().tertiary();
+        return;
+    }
+    const char *ph = d->nodes[n].alt ? d->nodes[n].alt : "";
+    float w = st->width ? (float)st->width : 260.0f;
+    HStack(.width = w, .py = 2) {
+        /* Remember WHICH field has focus, so the app can submit on Enter. The
+         * toolkit's field reports focus but has no notion of submission -- and
+         * it should not: Enter meaning "submit" is a form's idea, not a text
+         * box's. */
+        if (TextField(buf, FORM_VALUE_MAX, ph).focused()) g_focused_field = n;
+    }
+}
+
+/* A button. `value` is its label for <input type=submit>, its text content for
+ * <button> -- and "Submit" when the page said neither, because an unlabelled
+ * button is a control nobody can use. */
+static void emit_button(struct html_doc *d, int n, const struct vstyle *st) {
+    static char label[128];
+    const char *v = d->nodes[n].value;
+    if (v && v[0]) snprintf(label, sizeof label, "%s", v);
+    else {
+        size_t len = 0; label[0] = 0;
+        for (int c = d->nodes[n].first_child; c >= 0; c = d->nodes[c].next_sibling)
+            if (d->nodes[c].kind == HTML_TEXT && d->nodes[c].text) {
+                int w = snprintf(label + len, sizeof label - len, "%s", d->nodes[c].text);
+                if (w > 0) len += (size_t)w;
+            }
+        if (!label[0]) snprintf(label, sizeof label, "Submit");
+    }
+    (void)st;
+    HStack(.py = 2) {
+        if (Button(label).primary().id(label).clicked()) {
+            /* A listener wins over submission: a script that took the click
+             * asked to handle it, and firing both would submit a form the page
+             * meant to intercept. */
+            if (g_has_listener && g_has_listener(n)) { if (g_on_click) g_on_click(n); }
+            else if (g_on_submit) g_on_submit(n);
+        }
     }
 }
 
@@ -473,6 +537,8 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
      * line breaks happen. */
     if (s->display == VD_IMAGE) { emit_image(d, node, s); return; }
     if (s->display == VD_TABLE) { render_table(d, node, s, href); return; }
+    if (s->display == VD_FIELD)  { emit_field(d, node, s); return; }
+    if (s->display == VD_BUTTON) { emit_button(d, node, s); return; }
 
     /* An element a script is LISTENING to becomes clickable. Only those: a
      * page where every <div> is a hit target is a page whose links and text
@@ -522,6 +588,7 @@ const char *vellum_render_sized(struct html_doc *d, int root,
                                 float content_w) {
     g_base = base;
     g_content_w = content_w;
+    g_focused_field = -1;
     g_pending = 0;
     g_hover_href = 0;
     g_sheet = sheet;
@@ -533,6 +600,8 @@ const char *vellum_render_sized(struct html_doc *d, int root,
 }
 
 void vellum_set_link_handler(void (*fn)(const char *href)) { g_on_link = fn; }
+
+void vellum_set_submit_handler(void (*fn)(int node)) { g_on_submit = fn; }
 
 void vellum_set_event_hooks(int (*has)(int node), void (*click)(int node)) {
     g_has_listener = has;

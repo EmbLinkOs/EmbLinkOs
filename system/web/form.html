@@ -1,0 +1,43 @@
+<!doctype html>
+<html><head><title>Forms</title>
+<style>
+  h1     { color: #88c0d0 }
+  h2     { color: #a3be8c }
+  .muted { color: #7b8394; font-size: 13px }
+  .res   { color: #ebcb8b }
+  label  { color: #d8dee9 }
+</style></head>
+<body>
+<h1>A form you can fill in</h1>
+<p class="muted">Type, press Enter or the button. The browser encodes the
+fields, navigates, and this page reads its own query string back.</p>
+
+<form action="/system/web/form.html" method="get">
+  <p><label>Name </label><input name="who" value="" ></p>
+  <p><label>Says </label><input name="what" value=""></p>
+  <p><input type="submit" value="Submit"></p>
+</form>
+
+<h2>What arrived</h2>
+<p>Query string: <span id="qs" class="res">(nothing yet)</span></p>
+<p>Parsed: <span id="parsed" class="res">&mdash;</span></p>
+
+<p class="muted">The fields live in user/web/form.c, apart from the DOM: your
+typing is not part of the document the server sent, which is why re-rendering
+the page does not wipe a half-filled form.</p>
+<p><a href="/system/web/index.html">Back to the start page</a></p>
+
+<script>
+  const q = location.search;
+  document.querySelector("#qs").setText(q ? q : "(nothing yet)");
+  if (q && q.length > 1) {
+    const out = [];
+    for (const pair of q.slice(1).split("&")) {
+      const [k, v] = pair.split("=");
+      out.push(k + " = " + decodeURIComponent((v || "").replace(/\+/g, " ")));
+    }
+    document.querySelector("#parsed").setText(out.join("   |   "));
+    console.log("form delivered " + out.length + " field(s)");
+  }
+</script>
+</body></html>

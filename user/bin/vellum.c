@@ -25,6 +25,7 @@
 #include "css.h"
 #include "imgcache.h"
 #include "jsdom.h"
+#include "form.h"
 
 /* who owns a fetch on the shared worker */
 #define DOC_TAG 1
@@ -74,6 +75,25 @@ static void on_link(const char *href) { (void)href; }
 /* A click reached an element a script is listening to. The handler may rewrite
  * the document, so the dirty flag is checked right after -- that is what makes
  * a button on a page actually change the page. */
+/* A POST is a navigation that carries something. It shares the history and
+ * load path with an ordinary one -- a form submission IS a page visit -- and
+ * differs only in what goes on the wire. Declared up here because `load` is
+ * what consults them and it comes first. */
+static char g_post[1024];
+static int  g_have_post;
+static void navigate(const char *url);
+static void navigate_post(const char *url, const char *body);
+
+/* Submitting is just navigating, which is the whole reason a form is not a
+ * special case in this browser: build the URL (and body, for POST) and hand it
+ * to the same load path a link uses. */
+static void on_submit(int node) {
+    char url[512], body[1024];
+    int how = form_submit(&g_doc, node, g_url, url, sizeof url, body, sizeof body);
+    if (how == 1)      navigate(url);
+    else if (how == 2) navigate_post(url, body);
+}
+
 static void on_dom_click(int node) {
     if (jsdom_dispatch_click(node)) em_request_frame();
 }
@@ -112,7 +132,11 @@ static void load(const char *url) {
     snprintf(g_url, sizeof g_url, "%s", url);
     snprintf(g_bar, sizeof g_bar, "%s", url);
     g_scroll = 0;
-    if (fetchjob_start(url, g_incoming, sizeof g_incoming, DOC_TAG) != 0) {
+    int started = g_have_post
+        ? fetchjob_start_post(url, g_post, g_incoming, sizeof g_incoming, DOC_TAG)
+        : fetchjob_start(url, g_incoming, sizeof g_incoming, DOC_TAG);
+    g_have_post = 0;           /* one submission: a later link must not re-post */
+    if (started != 0) {
         /* One at a time. Refusing is honest: the page you asked for first is
          * still coming, and silently dropping it would be worse. */
         snprintf(g_status, sizeof g_status, "Still loading %s", fetchjob_url());
@@ -145,12 +169,14 @@ static void finish_load(const struct vnet_result *res) {
      * it is parsed here, once, and not per frame) */
     css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
     imgcache_reset();          /* one page's pictures never leak into the next */
+    form_reset();              /* ...nor one page's typing into the next */
 
     /* A NEW WORLD per page: the engine is torn down and rebuilt, so a script
      * cannot outlive the document that wrote it, and one page's globals can
      * never be read by the next. Then run what the page brought. */
     g_console[0] = 0;
     jsdom_set_console(on_console);
+    jsdom_set_url(g_url);
     if (jsdom_open(&g_doc, &g_sheet) == 0 && g_doc.n_js > 0) {
         int failed = jsdom_run_scripts();
         jsdom_take_dirty();     /* the first render happens anyway */
@@ -173,6 +199,12 @@ static void finish_load(const struct vnet_result *res) {
              res->status, res->via, n, g_doc.n, css,
              res->truncated   ? "  (response truncated)" : "",
              g_doc.truncated  ? "  (document truncated)" : "");
+}
+
+static void navigate_post(const char *url, const char *body) {
+    snprintf(g_post, sizeof g_post, "%s", body ? body : "");
+    g_have_post = 1;
+    navigate(url);
 }
 
 static void navigate(const char *url) {
@@ -204,6 +236,13 @@ static void go_fwd(void) {
  * synthesized -- a feature and an instrument in one.) Consumed only while no
  * text field has focus, or typing a space in the URL bar would jump the page. */
 static int vellum_key(int ch) {
+    /* Enter in a form field submits it -- a search box you cannot submit from
+     * the keyboard feels broken, and every browser has behaved this way since
+     * forms existed. */
+    if (ch == '\n' || ch == '\r') {
+        int f = vellum_focused_field();
+        if (f >= 0) { on_submit(f); return 1; }
+    }
     if (ui_any_focus()) return 0;
     float page = (em_viewport_height() - 132.0f) * 0.85f;
     if (ch == ' ')      { g_scroll += page; }
@@ -222,6 +261,7 @@ static void app(void) {
         em_set_key_hook(vellum_key);
         vellum_set_link_handler(on_link);
         vellum_set_event_hooks(jsdom_has_listener, on_dom_click);
+        vellum_set_submit_handler(on_submit);
         const char *start = getenv("VELLUM_URL");
         navigate(start && start[0] ? start : "/system/web/index.html");
     }
