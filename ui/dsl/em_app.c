@@ -163,10 +163,28 @@ int em_app_run(const EmApp *app) {
     em_window_set_glass(glass);          /* Window() adds a faint accent cast when glass */
     embk_key_grab(1);
 
-    struct render_target rt = { px, (uint32_t)winw, (uint32_t)winh, (uint32_t)winw * 4, EMBK_PIXFMT_BGRA8888_PRE };
+    /* THE BACK BUFFER, and the reason for it.
+     *
+     * `px` is SHARED with the compositor: it composites from that memory on its
+     * own schedule, not ours. Rendering straight into it means every frame is
+     * visible while it is still being drawn. That is harmless when a view
+     * builds in a millisecond and ruinous the moment an app competes for the
+     * core with a busy worker -- a browser fetching over TLS, say -- because
+     * then a half-drawn frame is on screen for a long time. Worse, a full
+     * repaint begins by CLEARING those pixels, so what the user sees is an
+     * empty window until the redraw catches up.
+     *
+     * So we draw into memory nobody else can see and copy the FINISHED frame
+     * across. The copy is a fraction of the render it protects, and only the
+     * region being presented is copied. Falling back to direct rendering when
+     * the allocation fails keeps a low-memory machine working, just tearing. */
+    uint32_t *back = (uint32_t *)malloc((size_t)winw * (size_t)winh * 4);
+    struct render_target rt = { back ? back : px, (uint32_t)winw, (uint32_t)winh,
+                                (uint32_t)winw * 4, EMBK_PIXFMT_BGRA8888_PRE };
     /* A translucent window may paint no background at all, so nothing would
      * erase what it drew last frame (see render_target.clear_dirty). */
     rt.clear_dirty = translucent;
+    if (back) memcpy(back, px, (size_t)winw * (size_t)winh * 4);
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
     { char b[64]; snprintf(b, sizeof b, "%s: interactive loop running\n", title); embk_puts(1, b); }
 
@@ -197,7 +215,9 @@ int em_app_run(const EmApp *app) {
             if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                 px = npx; winw = nw; winh = nh;
                 g_viewport_w = (float)winw; g_viewport_h = (float)winh; em_set_viewport((float)winw, (float)winh);
-                rt.pixels = px; rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
+                if (back) back = (uint32_t *)realloc(back, (size_t)winw * (size_t)winh * 4);
+                rt.pixels = back ? back : px;
+                rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
                 rt.stride = (uint32_t)winw * 4;
                 embk_win_move(win, nx, ny);
                 scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
@@ -220,11 +240,13 @@ int em_app_run(const EmApp *app) {
                 uint32_t *npx = 0;
                 if (embk_win_resize(win, (uint32_t)winw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                     px = npx; winh = nh;
+                    if (back) back = (uint32_t *)realloc(back, (size_t)winw * (size_t)winh * 4);
                     g_viewport_h = (float)winh;
                     em_set_viewport((float)winw, (float)winh);   /* the menu scrim
                         sizes itself to THIS -- unmirrored, it stayed bar-thin
                         and the dismiss click sailed under it */
-                    rt.pixels = px; rt.height = (uint32_t)winh; rt.stride = (uint32_t)winw * 4;
+                    rt.pixels = back ? back : px;
+                    rt.height = (uint32_t)winh; rt.stride = (uint32_t)winw * 4;
                     scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                     em_request_frame();
                     menu_expanded = want;
@@ -261,7 +283,7 @@ int em_app_run(const EmApp *app) {
             }
             if (g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
             if (c == 27) {
-                embk_win_destroy(win); embk_key_grab(0);
+                embk_win_destroy(win); embk_key_grab(0); free(back);
                 char b[64]; snprintf(b, sizeof b, "%s: exit\n", title); embk_puts(1, b);
                 return 0;
             }
@@ -318,7 +340,8 @@ int em_app_run(const EmApp *app) {
             uint32_t bg = translucent ? 0x00000000u
                         : (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
                         | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
-            for (int i = 0; i < winw * winh; i++) px[i] = bg;
+            uint32_t *clr = back ? back : px;
+            for (int i = 0; i < winw * winh; i++) clr[i] = bg;
             scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
             prev_epoch = em_ui_epoch();
             force_full = true;
@@ -334,12 +357,13 @@ int em_app_run(const EmApp *app) {
         if (em_window_minimized()) embk_win_minimize(win);
 
         if (g_app_exit_requested || em_window_closed() || em_window_take_close()) {
-            embk_win_destroy(win); embk_key_grab(0);
+            embk_win_destroy(win); embk_key_grab(0); free(back);
             char b[64]; snprintf(b, sizeof b, "%s: window closed cleanly\n", title); embk_puts(1, b);
             return g_app_exit_requested ? g_app_exit_code : 0;
         }
 
         if (force_full || r.full || r.n_dirty == 0) {
+            if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
             embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
         } else {
             int x0 = 1 << 29, y0 = 1 << 29, x1 = -(1 << 29), y1 = -(1 << 29);
@@ -355,8 +379,14 @@ int em_app_run(const EmApp *app) {
             if (y0 < 0) y0 = 0;
             if (x1 > winw) x1 = winw;
             if (y1 > winh) y1 = winh;
-            if (x1 > x0 && y1 > y0)
+            if (x1 > x0 && y1 > y0) {
+                /* only the band that changed crosses over */
+                if (back)
+                    for (int y = y0; y < y1; y++)
+                        memcpy(px + (size_t)y * winw + x0, back + (size_t)y * winw + x0,
+                               (size_t)(x1 - x0) * 4);
                 embk_win_present_rect(win, px, (uint32_t)winw, (uint32_t)winh, x0, y0, x1 - x0, y1 - y0);
+            }
         }
 
         if (first) {
@@ -378,16 +408,23 @@ int em_app_run(const EmApp *app) {
             if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                 px = npx; winw = nw; winh = nh;
                 g_viewport_w = (float)winw; g_viewport_h = (float)winh; em_set_viewport((float)winw, (float)winh);
-                rt.pixels = px; rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
+                if (back) {
+                    uint32_t *nb = (uint32_t *)realloc(back, (size_t)winw * (size_t)winh * 4);
+                    back = nb;                       /* NULL -> direct rendering, still correct */
+                }
+                rt.pixels = back ? back : px;
+                rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
                 rt.stride = (uint32_t)winw * 4;
                 const struct ui_theme *t = ui_theme();
                 uint32_t bg = (255u << 24) | ((uint32_t)(t->bg.r * 255) << 16)
                             | ((uint32_t)(t->bg.g * 255) << 8) | (uint32_t)(t->bg.b * 255);
-                for (int i = 0; i < winw * winh; i++) px[i] = bg;
+                uint32_t *clr = back ? back : px;
+                for (int i = 0; i < winw * winh; i++) clr[i] = bg;
                 scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                 ui_frame_begin(); em_new_frame(); app->view(); em_flush(); ui_frame_end();
                 ui_run_layout((float)winw, (float)winh);
                 scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
+                if (back) memcpy(px, back, (size_t)winw * (size_t)winh * 4);
                 embk_win_present(win, px, (uint32_t)winw, (uint32_t)winh);
                 char b[64]; snprintf(b, sizeof b, "%s: resized to %dx%d\n", title, winw, winh); embk_puts(1, b);
             }
