@@ -36,7 +36,12 @@ static size_t skip_junk(const char *s, size_t len, size_t i) {
 void css_sheet_parse(struct css_sheet *sheet, const char *text, size_t len) {
     if (!sheet) return;
     memset(sheet, 0, sizeof *sheet);
+    css_vars_reset();
     if (!text || !len) return;
+    /* Collect custom properties across the WHOLE sheet first, so a rule can
+     * use a var defined below it -- which CSS allows and a resolve-as-you-go
+     * pass would get wrong. */
+    css_vars_collect(text, len);
 
     size_t i = 0;
     unsigned short order = 0;

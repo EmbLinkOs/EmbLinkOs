@@ -179,6 +179,31 @@ static void dump_dom(struct html_doc *d, int node, int depth) {
         dump_dom(d, c, depth + 1);
 }
 
+/* One line per text run: position, size, resolved colour, resolved background,
+ * and the text. This is the corpus's assertion surface -- it lets a page pin
+ * what the CASCADE produced ("this word must be #e0604a") and not merely that
+ * the word appeared, which is the difference between testing CSS and testing
+ * that the parser did not crash. */
+static void dump_text_runs(struct node_handle h, float ox, float oy, int inside) {
+    struct scene_node *n = scene_resolve(&sa, h);
+    if (!n) return;
+    float x = ox + n->tx, y = oy + n->ty;
+    if (n->clip_children) inside = 1;
+    if (inside && n->kind == SCENE_NODE_TEXT && n->data.text.utf8) {
+        struct color c = n->data.text.color, b = n->data.text.bg;
+        printf("RUN|%.1f|%.1f|%.1f|%.1f|#%02x%02x%02x|%s|%s\n", x, y, n->width, n->height,
+               (unsigned)(c.r * 255.0f + 0.5f), (unsigned)(c.g * 255.0f + 0.5f),
+               (unsigned)(c.b * 255.0f + 0.5f),
+               b.a > 0.001f ? "bg" : "-", n->data.text.utf8);
+    }
+    for (struct node_handle c2 = n->first_child; !node_handle_is_null(c2);) {
+        struct scene_node *cn = scene_resolve(&sa, c2);
+        if (!cn) break;
+        dump_text_runs(c2, x, y, inside);
+        c2 = cn->next_sibling;
+    }
+}
+
 static const char *kindname(enum scene_node_kind k) {
     switch (k) {
     case SCENE_NODE_GROUP: return "group";
@@ -571,6 +596,14 @@ int main(int argc, char **argv) {
     if (ui_instance_overflow()) {
         printf("*** instance pool OVERFLOWED: %u views dropped ***\n", ui_instance_overflow());
         g_fail++;
+    }
+    if (getenv("TEXTDUMP")) {
+        /* after every check, so the tree is the page as it finally renders */
+        HDEFER = 0; imgcache_reset(); g_scroll = 0; g_busy = 0; vsel_reset();
+        em_feed_pointer(-10000.0f, -10000.0f, 0, 0, 0, 0);
+        ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
+        ui_run_layout((float)W, (float)H);
+        dump_text_runs(ui_scene_of(ui_root()), 0, 0, 0);
     }
     if (g_fail) fprintf(stderr, "\n*** browser-render: %d CHECK(S) FAILED ***\n", g_fail);
     return g_fail ? 1 : 0;

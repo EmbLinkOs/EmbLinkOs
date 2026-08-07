@@ -165,6 +165,23 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
         const char *p = text + ps, *v = text + vs;
         if (!pn || !vn) continue;
 
+        /* A custom property DEFINES rather than sets: record it and move on.
+         * (The sheet already collected these at parse time; an inline
+         * style="--x: y" reaches us only here.) */
+        if (pn > 2 && p[0] == '-' && p[1] == '-') {
+            css_var_set(p, pn, v, vn);
+            applied++;
+            continue;
+        }
+        /* ...and every other value may USE one. Substituting before the value
+         * is interpreted means every property below gets var() support for
+         * free, instead of each one having to remember. */
+        char expanded[160];
+        if (css_var_expand(v, vn, expanded, sizeof expanded)) {
+            v = expanded;
+            vn = strlen(expanded);
+        }
+
         int ok = 0;
         if (tok_eq(p, pn, "color")) {
             unsigned c = css_color(v, vn);

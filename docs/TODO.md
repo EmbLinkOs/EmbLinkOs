@@ -2262,6 +2262,30 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       always had. A paragraph of text IS a wrapping row, so `text-align:center`
       could not work anywhere. Each line box now justifies on its own, which is
       what text-align means -- centre every line, not the paragraph as a block.
+- [x] ~~`>` `+` `~` were parsed as DESCENDANT, so every scoped rule over-matched~~
+      FIXED 2026-08-07: real child, adjacent-sibling and general-sibling
+      combinators, plus `:first-child` / `:last-child`. Pinned by
+      tests/web/selectors.html, which asserts what must NOT match as well --
+      the old behaviour turns GRANDCHILD red and the corpus says so.
+- [x] ~~var() was unsupported, so a modern stylesheet resolved to no colours~~
+      FIXED 2026-08-07: `user/web/css/vars.c`. Custom properties are collected
+      across the WHOLE sheet before any rule is applied (so a rule may use a
+      var defined below it), and var() is expanded in decl.c before a value is
+      interpreted -- which gives every property support for free instead of
+      each one remembering. `var(--x, fallback)` honoured.
+      Found while writing the test: the collector treated the sheet as one
+      declaration block, and `:root {` begins with a COLON -- so the commonest
+      place in the world to define a variable was the one place it was missed.
+      It scans brace blocks now.
+- [ ] Custom properties are DOCUMENT-scoped, not element-scoped: one table for
+      the sheet, last definition wins. Correct for a single `:root` block (the
+      overwhelmingly common shape) and wrong for per-component theming
+      (`.dark { --bg: black }` re-theming one panel). Needs the table to hang
+      off the element and inherit.
+- [ ] Still unsupported in selectors: attribute selectors (`[type=checkbox]`),
+      every pseudo-class other than the two above, and pseudo-elements. All are
+      SKIPPED rather than dropped -- `a:hover` still styles `a`, which is
+      closer to the author's page than no rule.
 - [ ] Selection is WORD granular, not character. The renderer emits one node per
       word, so that is the grain available without measuring glyph prefixes
       through the font engine on every pointer move. Also missing: double-click

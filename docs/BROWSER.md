@@ -836,3 +836,29 @@ declarative instance pool silently produced a wrong page instead of saying they
 had run out. Both now count what they refused, and `make browser-render` fails
 on either -- because a renderer that quietly drops content is worse than one
 that stops.
+
+
+## The corpus
+
+`make web-corpus` renders every page in `tests/web/` and checks what each page
+claims about itself. A page states its expectations in HTML comments, next to
+the markup they are about:
+
+    <!-- EXPECT-COLOR: GRANDCHILD #ecedf1 -->
+    <!-- EXPECT-LEFT-OF: 1. headline -->
+    <!-- EXPECT-BELOW: LASTMARKER Item -->
+
+Every check runs against the RESOLVED render -- each text run's position and
+computed colour, dumped by `TEXTDUMP=1` -- not against the source, which is the
+only way to test a cascade rather than a parser.
+
+The pages are ours, not vendored copies of other people's sites: the point is
+the SHAPE, and a shape can be reproduced without taking someone's page. Every
+page exists for a bug that actually happened, and each was checked to FAIL when
+that bug is put back -- re-introducing the depth-8 guard loses NESTEDLINK, and
+re-introducing the 64-child cap makes long-list report 66 dropped containers.
+A check that cannot fail has been the recurring hazard in this project; these
+were verified against it before being trusted.
+
+For a real site: fetch it outside the tree, `make web-corpus CORPUS=<dir>`, and
+when it finds something, add a page here that reproduces the shape.

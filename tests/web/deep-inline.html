@@ -1,0 +1,20 @@
+<html><head><title>Deep inline nesting</title></head><body>
+<center>
+<table border="0"><tr><td>
+  <table border="0"><tr><td>
+    <span class="outer"><b><a href="/one">DEEPLINK-A</a></b> | <a href="/two">DEEPLINK-B</a></span>
+  </td></tr></table>
+</td></tr></table>
+</center>
+<p><span><b><i><em><small><span><b><i><a href="/deep">NESTEDLINK</a></i></b></span></small></em></i></b></span>
+&mdash; nine levels of purely INLINE nesting, which is a separate hazard from
+the nested-table one above: a block breaks the inline context and resets the
+walk, so only a chain like this one reaches the depth guard.</p>
+<p>Both links above must render their TEXT. Nine levels of nesting is what a
+real news front page reaches before its first headline, and a depth guard set
+below that drops the link text while the plain " | " between them survives.</p>
+<!-- EXPECT-TEXT: NESTEDLINK -->
+<!-- EXPECT-TEXT: DEEPLINK-A -->
+<!-- EXPECT-TEXT: DEEPLINK-B -->
+<!-- EXPECT-ORDER: DEEPLINK-A DEEPLINK-B -->
+</body></html>

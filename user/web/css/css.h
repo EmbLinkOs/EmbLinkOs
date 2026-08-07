@@ -37,10 +37,24 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out);
 
 #define CSS_SEL_PARTS 4          /* "nav ul li a" -- deeper is vanishingly rare */
 
+/* How a compound is joined to the one BEFORE it in the selector. Stored on the
+ * later part, because matching runs right-to-left and that is the direction
+ * the question gets asked in: "given this element, what must its parent /
+ * previous sibling / some ancestor be?" */
+enum {
+    CSS_COMB_DESC = 0,   /* "a b"  -- any ancestor   */
+    CSS_COMB_CHILD,      /* "a > b" -- the parent    */
+    CSS_COMB_ADJ,        /* "a + b" -- the previous element sibling */
+    CSS_COMB_SIB,        /* "a ~ b" -- any earlier sibling */
+};
+
 struct css_sel_part {
     char tag[16];                /* "" = any (or '*')          */
     char klass[32];              /* "" = none                  */
     char id[32];                 /* "" = none                  */
+    unsigned char comb;          /* CSS_COMB_* joining to the previous part */
+    unsigned char first_child;   /* :first-child */
+    unsigned char last_child;    /* :last-child  */
 };
 
 struct css_sel {
@@ -48,6 +62,16 @@ struct css_sel {
     unsigned char n;
     unsigned short spec;         /* specificity: id*100 + class*10 + type */
 };
+
+/* ---- vars.c: CSS custom properties ------------------------------------- *
+ * Document-scoped: one table for the whole sheet, last definition wins. See
+ * vars.c for why, and for what that gives up. */
+void        css_vars_reset(void);
+void        css_vars_collect(const char *text, size_t len);   /* find `--x: y` */
+void        css_var_set(const char *name, size_t nn, const char *val, size_t vn);
+const char *css_var_get(const char *name, size_t nn);
+/* Expand var() in a value. Returns 1 if anything was substituted. */
+int         css_var_expand(const char *val, size_t vn, char *out, size_t cap);
 
 /* Parse ONE selector ("nav ul li.item"). Returns 0, or -1 if unusable. */
 int css_sel_parse(const char *s, size_t len, struct css_sel *out);

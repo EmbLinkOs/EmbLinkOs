@@ -1,0 +1,21 @@
+<html><head><title>Tables, both kinds</title></head><body>
+<h1>Layout table (no rules)</h1>
+<table border="0"><tr>
+  <td>1.</td><td>A headline that is much longer than the rank beside it</td>
+</tr><tr>
+  <td>2.</td><td>Another headline, also much longer than its rank</td>
+</tr></table>
+<p>The rank column must be NARROW and the headline column wide: columns are
+sized to content, not split equally. No cell may be outlined -- a bare table
+has no rules on the web, which is why the old web can use tables for layout.</p>
+
+<h1>Data table (rules asked for)</h1>
+<table border="1">
+  <tr><th>Number</th><th>Name</th><th>What it grants</th></tr>
+  <tr><td>39</td><td>win_create</td><td>a window, its pixels, and its input</td></tr>
+  <tr><td>58</td><td>set_fs_base</td><td>a thread pointer, for TLS</td></tr>
+</table>
+<p>This one asked for rules with border="1", so it gets them.</p>
+<!-- EXPECT-LEFT-OF: 1. headline -->
+<!-- EXPECT-TEXT: win_create -->
+</body></html>

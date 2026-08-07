@@ -1,0 +1,44 @@
+<html><head><title>Selectors</title><style>
+/* A child combinator must NOT reach a grandchild. Parsed as a descendant --
+   which is what this browser used to do -- the deep word turns red too. */
+nav > p          { color: #ff0000 }
+/* Adjacent sibling: only the paragraph immediately after the marker. */
+.mark + p        { color: #00c000 }
+/* General sibling: every later sibling, but nothing before. */
+.mark ~ blockquote { color: #00a0ff }
+/* Structural pseudo-classes. */
+ul li:first-child { color: #ffb000 }
+ul li:last-child  { color: #c060ff }
+/* Specificity: the id must beat the class, whichever order they are written. */
+.spec            { color: #ff0000 }
+#spec            { color: #30c0a0 }
+</style></head><body>
+
+<nav>
+  <p>CHILDHIT is a direct child of nav and must be red.</p>
+  <div><p>GRANDCHILD is a level deeper and must NOT be red.</p></div>
+</nav>
+
+<p class="mark">MARKER</p>
+<p>ADJACENTHIT immediately follows the marker and must be green.</p>
+<p>ADJACENTMISS is two paragraphs later and must not be green.</p>
+<blockquote>SIBLINGHIT follows the marker and must be blue.</blockquote>
+
+<ul>
+  <li>FIRSTITEM must be amber</li>
+  <li>MIDDLEITEM must be neither</li>
+  <li>LASTITEM must be purple</li>
+</ul>
+
+<p class="spec" id="spec">SPECIFICITY: the id wins, so this is teal.</p>
+
+<!-- EXPECT-COLOR: CHILDHIT #ff0000 -->
+<!-- EXPECT-COLOR: GRANDCHILD #ecedf1 -->
+<!-- EXPECT-COLOR: ADJACENTHIT #00c000 -->
+<!-- EXPECT-COLOR: ADJACENTMISS #ecedf1 -->
+<!-- EXPECT-COLOR: SIBLINGHIT #00a0ff -->
+<!-- EXPECT-COLOR: FIRSTITEM #ffb000 -->
+<!-- EXPECT-COLOR: MIDDLEITEM #ecedf1 -->
+<!-- EXPECT-COLOR: LASTITEM #c060ff -->
+<!-- EXPECT-COLOR: SPECIFICITY #30c0a0 -->
+</body></html>

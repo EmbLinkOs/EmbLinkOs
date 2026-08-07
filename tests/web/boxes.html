@@ -1,0 +1,23 @@
+<html><head><title>Boxes</title><style>
+body { background: #14141c }
+.card { background: #1e2230; border: 2px solid #4a6fd0; border-radius: 10px;
+        padding: 16px; margin-bottom: 14px }
+.warn { background: rgb(70, 40, 20); border-left: 4px solid orange;
+        padding: 12px; color: #f0c080 }
+h1   { text-align: center; color: #e8e8f0 }
+.mid { text-align: center; color: #a0a0b0 }
+.rt  { text-align: right; color: #a0a0b0 }
+p    { line-height: 1.6 }
+</style></head><body>
+<h1>Boxes, borders and alignment</h1>
+<div class="card"><p>A card: it has a background the cascade chose, a two pixel
+blue border, rounded corners, and sixteen pixels of padding holding the text off
+its own edge.</p></div>
+<div class="warn"><p>A warning panel, coloured with rgb() rather than a hex
+literal &mdash; which is how most real stylesheets write a colour.</p></div>
+<p class="mid">This line is centred.</p>
+<p class="rt">And this one is aligned right.</p>
+<!-- EXPECT-COLOR: centred #a0a0b0 -->
+<!-- EXPECT-COLOR: warning #f0c080 -->
+<!-- EXPECT-TEXT: rounded -->
+</body></html>

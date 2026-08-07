@@ -7,12 +7,19 @@
  * Supported: type (`p`), class (`.item`), id (`#main`), universal (`*`),
  * compounds (`li.item`, `a#home.x`) and the descendant combinator (space).
  *
- * NOT supported, and parsed as descendant on purpose: `>` `+` `~`, attribute
- * selectors, pseudo-classes. Treating a child combinator as a descendant
- * over-matches -- it styles some elements the author scoped more tightly --
- * which degrades a page's appearance. Treating it as no-match would DROP the
- * rule entirely, which loses the author's intent completely. Erring toward
- * "applies too widely" keeps the page looking closer to what was meant.
+ * Combinators are REAL: `>` (child), `+` (adjacent sibling) and `~` (general
+ * sibling) each mean what they say. They used to be parsed as descendant,
+ * which over-matched -- `nav > ul` also styled a `ul` three levels down inside
+ * a nav -- and an author who scoped a rule tightly got it applied widely. That
+ * was the right first approximation (dropping the rule loses the intent
+ * entirely) and it stops being right once pages are the target rather than
+ * documents we wrote ourselves.
+ *
+ * Also supported: `:first-child` and `:last-child`.
+ *
+ * Still NOT supported, and still skipped rather than dropped: attribute
+ * selectors and every other pseudo-class. `a:hover` styling `a` is closer to
+ * the author's page than no rule at all.
  */
 #include <string.h>
 
@@ -34,10 +41,19 @@ int css_sel_parse(const char *s, size_t len, struct css_sel *out) {
 
     size_t i = 0;
     while (i < len && out->n < CSS_SEL_PARTS) {
-        while (i < len && (is_ws(s[i]) || s[i]=='>' || s[i]=='+' || s[i]=='~')) i++;
+        /* the combinator between the previous compound and this one; the last
+         * one written wins, so "a  >  b" is a child combinator and not two */
+        int comb = CSS_COMB_DESC;
+        while (i < len && (is_ws(s[i]) || s[i]=='>' || s[i]=='+' || s[i]=='~')) {
+            if      (s[i] == '>') comb = CSS_COMB_CHILD;
+            else if (s[i] == '+') comb = CSS_COMB_ADJ;
+            else if (s[i] == '~') comb = CSS_COMB_SIB;
+            i++;
+        }
         if (i >= len) break;
 
         struct css_sel_part *pt = &out->part[out->n];
+        pt->comb = (unsigned char)comb;
         int got = 0;
         while (i < len && !is_ws(s[i]) && s[i]!='>' && s[i]!='+' && s[i]!='~') {
             if (s[i] == '.' || s[i] == '#') {
@@ -53,13 +69,21 @@ int css_sel_parse(const char *s, size_t len, struct css_sel *out) {
                     got = 1;
                 }
             } else if (s[i] == ':' || s[i] == '[') {
-                /* a pseudo-class or attribute test we cannot evaluate. Skip
-                 * the token and keep the rest of the compound: `a:hover`
-                 * still styling `a` is closer to the author's page than
-                 * dropping the rule. */
+                char lead = s[i];
                 i++;
+                if (i < len && s[i] == ':') i++;      /* ::before -- an element */
+                size_t vs = i;
                 while (i < len && !is_ws(s[i]) && s[i]!='.' && s[i]!='#' &&
                        s[i]!='>' && s[i]!='+' && s[i]!='~') i++;
+                size_t vn = i - vs;
+                if (lead == ':') {
+                    char name[24];
+                    cpy_lower(name, sizeof name, s + vs, vn);
+                    if (!strcmp(name, "first-child")) { pt->first_child = 1; out->spec += 10; got = 1; }
+                    else if (!strcmp(name, "last-child")) { pt->last_child = 1; out->spec += 10; got = 1; }
+                    /* anything else: skip the token and keep the compound --
+                     * `a:hover` still styling `a` beats dropping the rule */
+                }
             } else if (s[i] == '*') {
                 i++; got = 1;                       /* any element, spec 0 */
             } else {
@@ -96,9 +120,35 @@ static int has_class(const char *list, const char *want) {
     return 0;
 }
 
+/* The previous ELEMENT sibling, or -1. The DOM stores forward links only, so
+ * this is a walk from the parent -- which is fine: sibling combinators are
+ * rare and the lists are short. */
+static int prev_elem_sibling(struct html_doc *d, int n) {
+    int p = d->nodes[n].parent;
+    if (p < 0) return -1;
+    int prev = -1;
+    for (int c = d->nodes[p].first_child; c >= 0; c = d->nodes[c].next_sibling) {
+        if (c == n) return prev;
+        if (d->nodes[c].kind == HTML_ELEM) prev = c;
+    }
+    return -1;
+}
+
+static int is_first_elem_child(struct html_doc *d, int n) {
+    return prev_elem_sibling(d, n) < 0;
+}
+
+static int is_last_elem_child(struct html_doc *d, int n) {
+    for (int c = d->nodes[n].next_sibling; c >= 0; c = d->nodes[c].next_sibling)
+        if (d->nodes[c].kind == HTML_ELEM) return 0;
+    return 1;
+}
+
 static int part_matches(const struct css_sel_part *pt, struct html_doc *d, int n) {
     const struct html_node *e = &d->nodes[n];
     if (e->kind != HTML_ELEM) return 0;
+    if (pt->first_child && !is_first_elem_child(d, n)) return 0;
+    if (pt->last_child  && !is_last_elem_child(d, n))  return 0;
     if (pt->tag[0]) {
         size_t i = 0;
         while (pt->tag[i] && e->tag[i] && ci(e->tag[i]) == pt->tag[i]) i++;
@@ -121,15 +171,35 @@ int css_sel_match(const struct css_sel *sel, struct html_doc *d, int node) {
     int k = sel->n - 1;
     if (!part_matches(&sel->part[k], d, node)) return 0;
 
-    /* Then walk ancestors, matching the remaining parts right to left. This
-     * is greedy and therefore not strictly correct for pathological selectors
-     * ("a a b" against nested a's), but it is right for every selector a real
-     * document uses and it cannot loop. */
-    int cur = d->nodes[node].parent;
-    k--;
-    while (k >= 0 && cur >= 0) {
-        if (part_matches(&sel->part[k], d, cur)) k--;
-        cur = d->nodes[cur].parent;
+    /* Then the remaining parts, right to left, each reached by ITS OWN
+     * combinator -- the one recorded on the part that follows it.
+     *
+     * Descendant and general-sibling are greedy: they take the first candidate
+     * that matches and never back up. That is not strictly correct for
+     * pathological selectors ("a a b" against nested a's) and it is right for
+     * every selector a real document uses, while being unable to loop. */
+    int cur = node;
+    while (k > 0) {
+        int comb = sel->part[k].comb;
+        const struct css_sel_part *want = &sel->part[k - 1];
+        if (comb == CSS_COMB_CHILD) {
+            cur = d->nodes[cur].parent;
+            if (cur < 0 || !part_matches(want, d, cur)) return 0;
+        } else if (comb == CSS_COMB_ADJ) {
+            cur = prev_elem_sibling(d, cur);
+            if (cur < 0 || !part_matches(want, d, cur)) return 0;
+        } else if (comb == CSS_COMB_SIB) {
+            int p = prev_elem_sibling(d, cur);
+            while (p >= 0 && !part_matches(want, d, p)) p = prev_elem_sibling(d, p);
+            if (p < 0) return 0;
+            cur = p;
+        } else {
+            int a = d->nodes[cur].parent;
+            while (a >= 0 && !part_matches(want, d, a)) a = d->nodes[a].parent;
+            if (a < 0) return 0;
+            cur = a;
+        }
+        k--;
     }
-    return k < 0;
+    return 1;
 }
