@@ -308,12 +308,28 @@ static void cfg_poll(void) {
  * drift the way two copies of a constant did. */
 #define DOCK_BAND   ((float)oscfg_dock_band(&g_cfg))
 #define BAR_RESERVE 26.0f      /* must match topbar.c's BAR_H */
+/* Where slot `i` ACTUALLY starts, derived from the layout rather than guessed.
+ *
+ * The row is: px 12, then per slot a VStack of width DOCK_BASE+8 separated by
+ * spacing 10 -- so the pitch is DOCK_BASE+18, not DOCK_BASE+10. Three places
+ * had independently written the +10 version, and the error compounds with the
+ * slot index: at the default size it is 8px off at slot 1 and 24px off at slot
+ * 3. Proven, not guessed -- the dock's captured world rect is 238px wide for
+ * four slots, and 4*(38+8) + 3*10 + 2*12 is exactly 238, while the +10 formula
+ * predicts 216.
+ *
+ * The visible cost: the magnifier swells one icon while you point at another,
+ * and the floating label names the wrong app. */
+#define DOCK_SLOT_W  (DOCK_BASE + 8.0f)
+#define DOCK_PITCH   (DOCK_SLOT_W + 10.0f)
+static float dock_slot_x0(int i) { return g_dockr[0] + 12.0f + (float)i * DOCK_PITCH; }
+
 static float dock_icon_size(int i) {
     if (!g_have_dockr || g_drag) return DOCK_BASE;
     float px, py; ui_pointer_pos(&px, &py);
     if (py < g_dockr[1] - 30.0f || py > g_dockr[3] + 10.0f ||
         px < g_dockr[0] - 40.0f || px > g_dockr[2] + 40.0f) return DOCK_BASE;
-    float cx = g_dockr[0] + 12.0f + (float)i * (DOCK_BASE + 10.0f) + DOCK_BASE * 0.5f;
+    float cx = dock_slot_x0(i) + DOCK_SLOT_W * 0.5f;
     float d = px - cx; if (d < 0) d = -d;
     const float radius = 96.0f;
     if (d >= radius) return DOCK_BASE;
@@ -328,8 +344,8 @@ static int dock_hover_index(void) {
     float px, py; ui_pointer_pos(&px, &py);
     if (py < g_dockr[1] || py > g_dockr[3]) return -1;
     for (int i = 0; i < g_dock_n; i++) {
-        float x0 = g_dockr[0] + 12.0f + (float)i * (DOCK_BASE + 10.0f);
-        if (px >= x0 && px < x0 + DOCK_BASE + 8.0f) return i;
+        float x0 = dock_slot_x0(i);
+        if (px >= x0 && px < x0 + DOCK_SLOT_W) return i;
     }
     return -1;
 }
@@ -342,7 +358,7 @@ static int dock_hover_index(void) {
 static void dock_label(void) {
     int i = dock_hover_index();
     if (i < 0 || !g_dock[i].label[0]) return;
-    float cx = g_dockr[0] + 12.0f + (float)i * (DOCK_BASE + 10.0f) + (DOCK_BASE + 8.0f) * 0.5f;
+    float cx = dock_slot_x0(i) + DOCK_SLOT_W * 0.5f;
     /* rough centring: the toolkit measures the text, we only have its length,
      * and being a few pixels off is invisible next to a 46px icon */
     int n = 0; while (g_dock[i].label[n]) n++;
@@ -403,7 +419,23 @@ static void dock_pill(void) {
                  * say "no fill" and mean it. */
                 int running = g_cfg.dock_dots && dock_running(g_dock[i].app);
                 em_flush();
-                ui_begin_hstack(0xD07);
+                /* Key by the app's IDENTITY, exactly as drag_icon does, and for
+                 * a sharper reason than tidiness: this key was the CONSTANT
+                 * 0xD07 inside the loop over dock slots, so every dot in the
+                 * dock claimed the SAME instance. Four emitters, one instance,
+                 * every frame.
+                 *
+                 * That stayed invisible while all the dots were identical --
+                 * which is the case until something is running. Launch one app
+                 * and its dot alone becomes PAINT_SOLID: now the emitters
+                 * disagree about the shared instance, they fight over it frame
+                 * after frame, and the dock's reconciled tree -- including the
+                 * hit rects of the icons above these dots -- stops matching
+                 * what is on screen. From the outside: the dock launches apps
+                 * perfectly until you launch one, and then it goes dead, while
+                 * the launcher grid and the desktop icons (which have no dots)
+                 * keep working. */
+                ui_begin_hstack(0xD0700000ULL ^ (uint64_t)(uintptr_t)g_dock[i].app);
                 ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 4 },
                             (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 4 });
                 ui_set_corner_radius(2);

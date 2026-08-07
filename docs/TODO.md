@@ -2044,39 +2044,39 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       (`oscfg_dock_band`) that both the desktop and every app window obey.
       Verified: Files' window is now 792x484 (600-32-84) and the dock is fully
       clear of it.
-- [ ] OPEN, and the other half of the same report: after ONE app is launched
-      from the dock, further dock clicks do nothing. TRACED, so this does not
-      need re-deriving. The first press logs cleanly --
-        drag=2 idx=0 active=1 -> drag=2 idx=0 active=0 -> spawn -> drag=0
-      -- and the second press logs NOTHING AT ALL: g_drag/g_any_active never
-      change, so drag_icon's ui_is_active() never fired and home never saw the
-      press. Home is still building frames while this happens (the running dot
-      under the launched app appears and is correct), so it is not a frozen
-      loop -- the input is not arriving.
-      NEW EVIDENCE (user, after the band fix): the APP LAUNCHER grid works
-      perfectly while the dock still does not. That is decisive about where the
-      fault is NOT. The grid tiles call the SAME helper, drag_icon(), with the
-      same ui_is_active() -> g_drag -> dock_resolve_drop() -> open_item() path;
-      only the `kind` differs (3 for a grid tile, 2 for a dock icon). So the
-      input DOES reach home, the toolkit's press latch DOES work, and
-      dock_resolve_drop DOES fire -- for one caller and not the other. This
-      also rules out the compositor leads below, since a grid tile sits over
-      the middle of the screen where app windows are.
-      What is left is the difference between the two call sites:
-        * the dock icon's SIZE changes every frame (dock_icon_size, the
-          magnifier), and shrinks back to base the instant g_drag is set --
-          so the box moves under the pointer on the very frame of the press;
-        * hover uses g_dockr (a captured WORLD rect, which is why
-          magnification and the label follow the pointer correctly), while
-          ui_is_active() uses the toolkit's own hit test on the instance's
-          LAYOUT rect. If those two disagree, hover works and clicks miss --
-          which is exactly the reported symptom.
-      Next probe, and it is one line: print from drag_icon() whether
-      ui_is_active() fires, for kind==2 and kind==3, with the pointer position
-      and the instance rect. Whichever of the two above it is, the answer is in
-      that one print.
-      (Earlier compositor leads -- g_dragging, g_cap_pid/g_cap_win -- are now
-      unlikely for the reason above, but not formally excluded.)
+- [x] ~~The dock's magnifier and label named the WRONG icon~~ FIXED: three
+      places computed the slot pitch as DOCK_BASE+10 while the layout uses a
+      slot of DOCK_BASE+8 separated by spacing 10, i.e. DOCK_BASE+18. Proven
+      from the captured world rect: the dock is 238px wide for four slots and
+      4*(38+8)+3*10+2*12 is exactly 238, while the +10 formula predicts 216.
+      The error compounds with the slot index -- 8px off at slot 1, 24px at
+      slot 3 -- so the wrong icon swelled and the label named the wrong app.
+      One helper, dock_slot_x0(), now serves all three.
+- [ ] OPEN, and this is the one that blocks launching: after ONE app is
+      launched from the dock, NO dock icon is hit-testable again -- including
+      the very icon that just worked. TRACED to the frame, do not re-derive:
+        PRESS 314,550 hover=0 ... drag=0 act=0  -> ACTIVE kind=2 idx=0 -> spawn
+        PRESS 482,550 hover=3 ... drag=0 act=0  -> (no ACTIVE, ever again)
+        PRESS 314,550 hover=0 ... drag=0 act=0  -> (no ACTIVE -- slot 0 too)
+      So: home RECEIVES the press with correct content-local coordinates and
+      focused=1 on the desktop window; home's own geometry agrees the pointer
+      is over a slot (hover=0/1/2/3); the drag state is clean (drag=0 act=0);
+      the dock's world rect is captured and unchanged, which means the dock
+      subtree IS being built every frame. The toolkit's hit test simply stops
+      finding those instances once any app has launched.
+      Ruled out by measurement: input routing (the press arrives), window
+      overlap (fixed separately, and the press arrives anyway), a stuck
+      press-latch or drag state (both read 0), the dock not being emitted (its
+      rect is captured live), slot geometry (hover agrees), the shared 0xD07
+      instance key on the running dots (made per-app; no change), and
+      kind==2-vs-3 (slot 0 fails too, and it is the same helper that works in
+      the launcher).
+      What that leaves is the toolkit's hit test itself: something about the
+      dock's instances stops matching after the first spawn. The next probe is
+      one level down from home -- print, from ui's hit test, which instance it
+      returns for (482,550) and what that instance's rect is, versus the dock
+      icon's own rect. The launcher grid working is the control: same helper,
+      same path, hit-testable throughout.
 - [ ] Scrolling a document in Vellum is slow. Cause is structural rather than
       mysterious: render.c emits ONE SCENE NODE PER WORD (deliberately -- it is
       what makes wrapping, mixed inline styling and per-word link hit-testing
