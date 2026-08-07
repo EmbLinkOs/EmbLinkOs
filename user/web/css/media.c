@@ -32,6 +32,9 @@ void css_media_set(float w, float h, int dark) {
     g_dark = dark ? 1 : 0;
 }
 
+float css_viewport_w(void) { return g_vw; }
+float css_viewport_h(void) { return g_vh; }
+
 static int ci(char c) { return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c; }
 static int is_ws(char c) { return c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\f'; }
 

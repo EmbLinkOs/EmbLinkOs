@@ -30,7 +30,13 @@ static inline bool layout_handle_is_null(struct layout_handle h) { return h.inde
 enum layout_axis    { AXIS_ROW, AXIS_COLUMN };
 enum layout_justify { JUSTIFY_START, JUSTIFY_CENTER, JUSTIFY_END, JUSTIFY_SPACE_BETWEEN };
 enum layout_align   { ALIGN_START, ALIGN_CENTER, ALIGN_END, ALIGN_STRETCH };
-enum size_mode      { SIZE_FIXED, SIZE_INTRINSIC, SIZE_FLEX };
+/* SIZE_PERCENT keeps the FRACTION in fixed_value (0.5 == 50%), resolved
+ * against the containing block's content size on that axis -- which is a
+ * number nobody knows until arrange, and is exactly why a percentage cannot
+ * be turned into pixels when the stylesheet is read. Anywhere this mode is
+ * not handled it falls through to intrinsic, which is a sane degradation
+ * rather than a wrong number. */
+enum size_mode      { SIZE_FIXED, SIZE_INTRINSIC, SIZE_FLEX, SIZE_PERCENT };
 
 struct layout_size {
     enum size_mode mode;

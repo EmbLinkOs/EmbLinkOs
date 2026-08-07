@@ -2332,6 +2332,29 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       same binary as everything using the new one. Nothing about that symptom
       points at a Makefile. Found while chasing the flex divergence above; it
       was not the cause, and it was a real bug either way.
+- [x] ~~Percentage widths, vw/vh, and box-sizing~~ SHIPPED 2026-08-07 (C3,
+      first half). `width: 50%` travels as a PERCENTAGE through vstyle and is
+      resolved by layout against the containing block, because that number does
+      not exist while the stylesheet is being read -- a new SIZE_PERCENT mode
+      whose fixed_value holds the fraction. Anywhere the mode is not handled it
+      degrades to intrinsic, which is a sane fallback rather than a wrong
+      number. vw/vh read the same viewport a media query asks about, so there
+      is one environment and not two copies of it.
+      box-sizing turned out to be the reverse of the expected job: the layout
+      engine subtracts padding from a node's size to get its content box, so a
+      layout node IS a border box. `border-box` was therefore already right and
+      the CSS DEFAULT (content-box) was the broken case -- a stated width is
+      the CONTENT, and the border box is that much wider. Pinned side by side
+      in tests/web/sizing.html: 200px content-box renders 240 wide, 200px
+      border-box renders 200.
+      The corpus gained EXPECT-X, which pins a resolved position -- so a
+      percentage is tested for the NUMBER it produced (22 + 30% of 896 = 290.8)
+      and not merely for not crashing.
+- [ ] C3 REMAINDER, the biggest single chunk left: `position`
+      (relative/absolute/fixed/sticky) with top/left/right/bottom and z-index,
+      `float`/`clear`, `overflow` (hidden/auto/scroll), and `calc()`. These are
+      genuinely new layout rather than exposing what the engine already does,
+      which is why they are separated from the sizing work above.
 - [ ] Custom properties are DOCUMENT-scoped, not element-scoped: one table for
       the sheet, last definition wins. Correct for a single `:root` block (the
       overwhelmingly common shape) and wrong for per-component theming

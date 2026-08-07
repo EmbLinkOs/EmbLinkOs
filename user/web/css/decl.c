@@ -38,6 +38,23 @@ static int tok_has(const char *s, size_t n, const char *w) {   /* substring */
 /* A length in px. "12px", "12", "1.5em" (em ~ 16px, close enough for a
  * document). Returns 0 and sets *ok=0 for things we cannot honour, so the
  * caller can leave the property alone rather than write a wrong number. */
+/* A percentage, 0-100, or -1 if the value is not one. Kept separate from
+ * len_px because a percentage is not a length until a containing block exists;
+ * conflating them is how `width: 50%` quietly became `width: 0`. */
+static int len_pct(const char *s, size_t n) {
+    size_t i = 0;
+    while (i < n && (s[i]==' '||s[i]=='\t')) i++;
+    double v = 0; int seen = 0;
+    while (i < n && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; seen = 1; }
+    if (i < n && s[i] == '.') {
+        i++; double f = 0.1;
+        while (i < n && s[i] >= '0' && s[i] <= '9') { v += (s[i]-'0') * f; f *= 0.1; i++; }
+    }
+    while (i < n && (s[i]==' '||s[i]=='\t')) i++;
+    if (!seen || i >= n || s[i] != '%') return -1;
+    return v > 100.0 ? 100 : (int)(v + 0.5);
+}
+
 static short len_px(const char *s, size_t n, int *ok) {
     *ok = 0;
     size_t i = 0;
@@ -55,6 +72,8 @@ static short len_px(const char *s, size_t n, int *ok) {
         while (i < n && s[i] >= '0' && s[i] <= '9') { v += (s[i]-'0') * f; f *= 0.1; i++; }
     }
     if (tok_has(s + i, n - i, "em") || tok_has(s + i, n - i, "rem")) v *= 16.0;
+    else if (tok_has(s + i, n - i, "vw")) v = v * (double)css_viewport_w() / 100.0;
+    else if (tok_has(s + i, n - i, "vh")) v = v * (double)css_viewport_h() / 100.0;
     else if (tok_has(s + i, n - i, "%")) { return 0; }   /* percentages need a container */
     *ok = 1;
     /* Generous, because this same parser serves margins (tens of px) and
@@ -297,11 +316,18 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
             }
             if (cols > 0 && cols <= 64) { out->grid_cols = (unsigned char)cols; ok = 1; }
         } else if (tok_eq(p, pn, "width")) {
-            int lok = 0; short px = len_px(v, vn, &lok);
-            if (lok && px > 0) { out->width = px; ok = 1; }
+            int pct = len_pct(v, vn);
+            if (pct >= 0) { out->width_pct = (unsigned char)pct; out->width = 0; ok = 1; }
+            else { int lok = 0; short px = len_px(v, vn, &lok);
+                   if (lok && px > 0) { out->width = px; out->width_pct = 0; ok = 1; } }
         } else if (tok_eq(p, pn, "height")) {
-            int lok = 0; short px = len_px(v, vn, &lok);
-            if (lok && px > 0) { out->height = px; ok = 1; }
+            int pct = len_pct(v, vn);
+            if (pct >= 0) { out->height_pct = (unsigned char)pct; out->height = 0; ok = 1; }
+            else { int lok = 0; short px = len_px(v, vn, &lok);
+                   if (lok && px > 0) { out->height = px; out->height_pct = 0; ok = 1; } }
+        } else if (tok_eq(p, pn, "box-sizing")) {
+            if (tok_eq(v, vn, "border-box"))      { out->border_box = 1; ok = 1; }
+            else if (tok_eq(v, vn, "content-box")) { out->border_box = 0; ok = 1; }
         } else if (tok_eq(p, pn, "max-width")) {
             /* the one percentage worth honouring, because it means "do not
              * overflow me" and that is exactly what an oversized picture does */

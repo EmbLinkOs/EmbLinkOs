@@ -373,13 +373,31 @@ static void open_box(const struct vstyle *s, EmProps bp) {
  * leftover space and shoved its siblings to the right edge. Saying the size
  * out loud every frame is what makes a retained tree behave like an immediate
  * one. */
+/* The layout engine subtracts padding from a node's size to get its content
+ * box, so a layout node IS a border box. That makes `box-sizing: border-box`
+ * -- what nearly every modern stylesheet sets globally -- free, and makes the
+ * CSS DEFAULT the case needing work: under content-box a stated width is the
+ * CONTENT, and the border box is that much wider. */
+static float box_inset(const struct vstyle *s) {
+    return (float)(s->pad_left + s->pad_right) + 2.0f * (float)s->border_width;
+}
+
 static void size_box(const struct vstyle *s, int flex_item) {
     struct layout_size w, h;
-    if (s->width > 0)      w = (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = (float)s->width };
+    float grow_w = s->border_box ? 0.0f : box_inset(s);
+    float grow_h = s->border_box ? 0.0f
+                 : (float)(s->pad_top + s->pad_bottom) + 2.0f * (float)s->border_width;
+    if (s->width_pct)      w = (struct layout_size){ .mode = SIZE_PERCENT,
+                                                     .fixed_value = (float)s->width_pct / 100.0f };
+    else if (s->width > 0) w = (struct layout_size){ .mode = SIZE_FIXED,
+                                                     .fixed_value = (float)s->width + grow_w };
     else if (s->grow)      w = (struct layout_size){ .mode = SIZE_FLEX,  .flex_grow = 1 };
     else if (flex_item)    w = (struct layout_size){ .mode = SIZE_INTRINSIC };
     else                   w = (struct layout_size){ .mode = SIZE_FLEX,  .flex_grow = 1 };
-    if (s->height > 0)     h = (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = (float)s->height };
+    if (s->height_pct)     h = (struct layout_size){ .mode = SIZE_PERCENT,
+                                                     .fixed_value = (float)s->height_pct / 100.0f };
+    else if (s->height > 0) h = (struct layout_size){ .mode = SIZE_FIXED,
+                                                      .fixed_value = (float)s->height + grow_h };
     else                   h = (struct layout_size){ .mode = SIZE_INTRINSIC };
     ui_set_size(w, h);
 }
@@ -719,6 +737,7 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
     if (s->grow) bp.grow = 1;
     if (s->width  > 0) bp.width  = (float)s->width;
     if (s->height > 0) bp.height = (float)s->height;
+
     int was_item = g_flex_item;
     open_box(s, bp);
     size_box(s, was_item);

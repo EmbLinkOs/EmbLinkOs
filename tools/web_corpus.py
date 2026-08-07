@@ -76,6 +76,14 @@ def check_page(path):
             elif a[0]["x"] >= b[0]["x"]:
                 print("      FAIL %s: %s (x=%.0f) is not left of %s (x=%.0f)"
                       % (kind, parts[0], a[0]["x"], parts[1], b[0]["x"])); fails += 1
+        elif kind == "EXPECT-X":
+            hit = find(runs, parts[0])
+            lo, hi = float(parts[1]), float(parts[2])
+            if not hit:
+                print("      FAIL %s: no run contains %r" % (kind, parts[0])); fails += 1
+            elif not (lo <= hit[0]["x"] <= hi):
+                print("      FAIL %s: %s at x=%.1f, expected %.0f..%.0f"
+                      % (kind, parts[0], hit[0]["x"], lo, hi)); fails += 1
         elif kind == "EXPECT-BELOW":
             a, b = find(runs, parts[0]), find(runs, parts[1])
             if not a or not b:

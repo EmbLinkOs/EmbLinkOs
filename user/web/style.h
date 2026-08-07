@@ -58,6 +58,15 @@ struct vstyle {
      * because a picture is the one thing whose natural size arrives LATER
      * than the layout that has to hold it. */
     short width, height;
+    /* ...stated as a PERCENTAGE instead, 0-100. A percentage is relative to
+     * the containing block, whose size nobody knows while the stylesheet is
+     * being read -- so it travels as a percentage and layout resolves it. */
+    unsigned char width_pct, height_pct;
+    /* box-sizing: border-box. Nearly every modern stylesheet sets this
+     * globally, and without it a box with padding and a stated width is wider
+     * than the author asked for -- which on a grid of cards is the difference
+     * between three across and two. */
+    unsigned char border_box;
 
     /* --- the BOX. Not inherited (CSS says so, and a page that painted every
      * descendant with its parent's background would be unreadable). 0 alpha

@@ -78,6 +78,10 @@ int         css_var_expand(const char *val, size_t vn, char *out, size_t cap);
  * the desktop is dark), because the browser is not the only thing that will
  * want to ask. Set it before parsing a sheet; a resize means parsing again. */
 void css_media_set(float w, float h, int dark);
+/* ...and read back, because vw/vh are the same environment a media query asks
+ * about and must not be a second copy of it. */
+float css_viewport_w(void);
+float css_viewport_h(void);
 int  css_media_matches(const char *query, size_t n);
 
 /* Parse ONE selector ("nav ul li.item"). Returns 0, or -1 if unusable. */

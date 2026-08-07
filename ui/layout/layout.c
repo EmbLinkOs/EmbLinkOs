@@ -677,6 +677,16 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
     g_kid_top = save;                 /* pop, whichever way the callee returned */
 }
 
+/* A STATED size in pixels, if the node states one: SIZE_FIXED already is
+ * pixels, SIZE_PERCENT is a fraction of the containing block's content size on
+ * that axis. Returns 0 and clears *has when the size is auto. */
+static float stated_px(const struct layout_size *s, float avail, int *has) {
+    if (s->mode == SIZE_FIXED)   { *has = 1; return s->fixed_value; }
+    if (s->mode == SIZE_PERCENT) { *has = 1; return s->fixed_value * avail; }
+    *has = 0;
+    return 0;
+}
+
 static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
                           struct layout_handle h, float W, float H) {
     struct layout_node *n = layout_resolve(la, h);
@@ -768,8 +778,10 @@ static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
         (void)ca;
         int ktext = is_text(sa, k);
 
-        if (ms->mode == SIZE_FIXED) {
-            base[i] = ms->fixed_value;
+        int has_main = 0;
+        float stated_main = stated_px(ms, content_main, &has_main);
+        if (has_main) {
+            base[i] = stated_main;
         } else if (k->grid_cols > 0 && !is_row) {
             /* COLUMN: a grid child's HEIGHT is its auto-flowed grid height at the
              * width it will get. */
@@ -950,12 +962,15 @@ static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
         if (k->is_overlay) continue;
         struct layout_size *cs = is_row ? &k->height : &k->width;
         int ktext = is_text(sa, k);
-        if (cs->mode == SIZE_FIXED) {
+        int has_cross = 0;
+        float stated_cross = stated_px(cs, content_cross, &has_cross);
+        if (has_cross) {
             /* a definite cross size always wins -- CSS stretch only applies to
              * auto-sized items (a 50px-wide child of a stretch column stays
              * 50px; stretching it broke fixed-size boxes once the ROOT became
-             * a stretch column). */
-            crossv[i] = cs->fixed_value;
+             * a stretch column). A percentage is definite too, once the
+             * containing block is known, which is here. */
+            crossv[i] = stated_cross;
         } else if (n->align == ALIGN_STRETCH) {
             crossv[i] = content_cross;
         } else if (ktext && is_row) {
