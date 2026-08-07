@@ -2063,14 +2063,21 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       clicks; the launcher grid never magnifies, so it never missed. Found by
       HOST repro after five metal boots of instrumentation narrowed it; the
       host test failed in two seconds and the fix is one stable key.
-- [ ] Scrolling a document in Vellum is slow. Cause is structural rather than
-      mysterious: render.c emits ONE SCENE NODE PER WORD (deliberately -- it is
-      what makes wrapping, mixed inline styling and per-word link hit-testing
-      work), so a page is several hundred nodes, and every wheel tick rebuilds
-      and re-measures ALL of them through the font engine, including everything
-      scrolled out of view. Under TCG that is very visible; on real hardware it
-      would be perhaps 20x cheaper. The standard fix is culling: render.c knows
-      the scroll offset and the viewport, so it can skip emitting blocks that
-      fall outside the visible band. That turns per-frame cost from
-      "whole document" into "one screenful" and is the single change worth
-      making before anything fancier.
+- [x] ~~Scrolling a document in Vellum is slow~~ IMPROVED 3.5x at the measured
+      cost center (2026-08-07): text measurement is now MEMOIZED on the layout
+      node, keyed by the scene node's content hash (+ font, size, width). A
+      wheel tick used to re-measure every word of the document through the font
+      engine -- one-line widths in the intrinsic pass, and the full wrap
+      SIMULATION from seven call sites. All of it is a pure function of
+      (content, font, size, width), none of which change while scrolling.
+      Host-measured on the browser's real document: 0.75 -> 0.21 ms per
+      build+layout pass (`make browser-render` now prints this). Every text-
+      heavy surface benefits -- terminal, Files, the editor.
+- [ ] Metal scroll-FEEL not re-verified: QMP wheel synthesis (btn wheel-up/
+      down) does not reach the guest's USB-HID path in the headless harness,
+      though pointer moves do. Feel it in an interactive run. If still heavy,
+      the next cost center is the RASTER of the scrolled band (glyph blits per
+      frame), not layout.
+- [ ] The wrap-height memo keys on ONE width. A node measured at two widths
+      alternately (never observed; would need the same text in two differently
+      sized parents) would thrash the memo -- correct, just uncached.

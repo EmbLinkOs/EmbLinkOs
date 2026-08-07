@@ -72,6 +72,23 @@ struct layout_node {
     float intrinsic_w, intrinsic_h;                        /* Phase 1 */
     float resolved_x, resolved_y, resolved_w, resolved_h;  /* Phase 2, PARENT-relative px */
 
+    /* --- text-measurement memo (computed scratch) ---
+     * Measuring text is the layout engine's real per-frame cost: one-line
+     * width walks every glyph through the font engine, and wrapped height
+     * SIMULATES the whole wrap. Both are pure functions of (content, font,
+     * size[, width]) -- and the scene node already carries a content hash
+     * (added for dirty tracking), so the answers can be remembered on the
+     * node. A 500-word document then re-measures NOTHING while scrolling: the
+     * content, font and width are all unchanged frame to frame.
+     * meas_hash 0 = no memo (also the state of a node whose text was written
+     * without scene_set_text, which never memoizes and stays correct). */
+    uint32_t meas_hash;      /* content hash the memo was computed against */
+    uint32_t meas_font;      /* + font handle ... */
+    float    meas_size;      /* + size_px: the full key for line width */
+    float    meas_line_w;    /* cached one-line width */
+    float    meas_wrap_w;    /* width the wrap height was computed at (<0 = none) */
+    float    meas_wrap_h;    /* cached wrapped height at meas_wrap_w */
+
     bool dirty;   /* set by authoring mutation; consumed by Piece 6 */
 };
 

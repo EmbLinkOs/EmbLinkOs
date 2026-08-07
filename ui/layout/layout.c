@@ -229,8 +229,26 @@ float layout_measure_height_at_width(struct layout_arena *la, struct scene_arena
     if (!s || s->kind != SCENE_NODE_TEXT) return 0;
     struct font *f = font_for_handle(s->data.text.font_handle);
     if (!f) return 0;
+    /* memoized: wrapping is a pure function of (content, font, size, width),
+     * and this is called from SEVEN sites per arrange -- for a document,
+     * hundreds of times per frame at an unchanged width. The line-width memo
+     * above owns the (hash,font,size) part of the key; this adds width. */
+    if (s->data.text.hash &&
+        n->meas_hash == s->data.text.hash &&
+        n->meas_font == s->data.text.font_handle &&
+        n->meas_size == s->data.text.size_px &&
+        n->meas_wrap_w == width)
+        return n->meas_wrap_h;
     int lines = layout_debug_wrap_lines(la, sa, text_node, width);
-    return lines * font_line_height(f, s->data.text.size_px);
+    float h = lines * font_line_height(f, s->data.text.size_px);
+    if (s->data.text.hash &&
+        n->meas_hash == s->data.text.hash &&
+        n->meas_font == s->data.text.font_handle &&
+        n->meas_size == s->data.text.size_px) {
+        n->meas_wrap_w = width;
+        n->meas_wrap_h = h;
+    }
+    return h;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -255,7 +273,22 @@ static void measure_intrinsic(struct layout_arena *la, struct scene_arena *sa, s
         struct scene_node *s = paired(sa, n);
         if (s && s->kind == SCENE_NODE_TEXT && s->data.text.utf8) {
             struct font *f = font_for_handle(s->data.text.font_handle);
-            n->intrinsic_w = f ? text_line_width(f, s->data.text.utf8, s->data.text.size_px) : 0;
+            /* memoized: same content+font+size -> same width, no glyph walk */
+            if (f && s->data.text.hash &&
+                n->meas_hash == s->data.text.hash &&
+                n->meas_font == s->data.text.font_handle &&
+                n->meas_size == s->data.text.size_px) {
+                n->intrinsic_w = n->meas_line_w;
+            } else {
+                n->intrinsic_w = f ? text_line_width(f, s->data.text.utf8, s->data.text.size_px) : 0;
+                if (f && s->data.text.hash) {
+                    n->meas_hash   = s->data.text.hash;
+                    n->meas_font   = s->data.text.font_handle;
+                    n->meas_size   = s->data.text.size_px;
+                    n->meas_line_w = n->intrinsic_w;
+                    n->meas_wrap_w = -1.0f;        /* new content: old wrap memo dies */
+                }
+            }
         } else if (s && s->kind == SCENE_NODE_IMAGE) {
             n->intrinsic_w = (float)s->data.image.w;
         } else {

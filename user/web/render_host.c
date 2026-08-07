@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static uint8_t *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -191,6 +192,24 @@ int main(int argc, char **argv) {
 
     printf("\n--- line boxes (a wrapped paragraph should be ONE row) ---\n");
     survey(ui_scene_of(ui_root()), 0, 0);
+
+    /* --- scroll cost: N build+layout passes, exactly what a wheel tick costs.
+     * The scroll offset changes each pass so this measures the SCROLLING case,
+     * not a fully-static frame. --- */
+    {
+        struct timespec t0, t1;
+        int N = 60;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < N; i++) {
+            g_scroll = (float)(i * 17 % 300);
+            ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
+            ui_run_layout((float)W, (float)H);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = ((double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                     (double)(t1.tv_nsec - t0.tv_nsec) / 1e6) / N;
+        printf("\n--- scroll cost: %.2f ms per build+layout pass (host) ---\n", ms);
+    }
 
     if (png) {
         struct render_target rt;
