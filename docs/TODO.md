@@ -2299,6 +2299,39 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [ ] @media is evaluated at PARSE time, so a var or rule behind a query is
       re-read on resize but a `@media` nested inside another is not handled.
       Also unsupported: @supports, @font-face (web fonts), @keyframes.
+- [x] ~~display:flex and display:grid from CSS~~ SHIPPED 2026-08-07 (C2).
+      flex-direction, flex-wrap, justify-content, align-items, gap/row-gap/
+      column-gap, flex/flex-grow, grid-template-columns (the track COUNT --
+      `repeat(3, 1fr)` and `1fr 1fr 1fr` are both three, and the widths come
+      from content). Cheap because the layout engine has done flex and grid
+      since it was written: this is the CSS spelling of machinery the whole
+      toolkit already runs on.
+      Two things CSS requires that had to be added: element children of a flex
+      container are BLOCKIFIED (without it a nav bar's links merge into one
+      inline run, so the gap and the justification apply to the strip instead
+      of between the links), and whitespace-only text makes NO anonymous item
+      (the newline between two <div>s was becoming a third grid cell, landing
+      every card one column late).
+      space-around / space-evenly fall back to space-between: the gap is in the
+      wrong place but the items are still spread.
+- [x] ~~A widget kept the SIZE it was given on a previous frame~~ FIXED, and
+      this is a TOOLKIT bug that reached every EmUI app. em_apply_box calls
+      ui_set_size only when a prop asks for one, so a reused instance keeps
+      whatever size it last had. Invisible in a harness that renders one tree a
+      few times; very visible in an app, which builds an empty view first and
+      the document second -- instances are matched by POSITION across two
+      different trees, so a box inherited `grow` from whatever held its slot
+      before, ate the row's leftover and shoved its siblings to the right edge.
+      The browser now states each box's size explicitly every frame
+      (render.c size_box). The general fix -- em_apply_box always stating a
+      size -- is still open, because every existing app is written against the
+      current behaviour and would need re-checking.
+- [x] ~~Makefile header dependencies were written by hand~~ FIXED: -MMD -MP.
+      build/web_jsdom.o listed jsdom.c/jsdom.h/html.h but not style.h, so when
+      `struct vstyle` grew, jsdom.o kept the OLD layout and was linked into the
+      same binary as everything using the new one. Nothing about that symptom
+      points at a Makefile. Found while chasing the flex divergence above; it
+      was not the cause, and it was a real bug either way.
 - [ ] Custom properties are DOCUMENT-scoped, not element-scoped: one table for
       the sheet, last definition wins. Correct for a single `:root` block (the
       overwhelmingly common shape) and wrong for per-component theming

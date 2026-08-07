@@ -222,10 +222,32 @@ static void emit_image(struct html_doc *d, int n, const struct vstyle *st) {
 }
 
 /* Is this subtree inline-only? An inline run ends where a block begins. */
+/* Text that is only whitespace. A document is written with newlines between
+ * its tags, so these nodes are everywhere -- harmless in a paragraph, and NOT
+ * harmless in a flex or grid container, where CSS declines to make an
+ * anonymous item out of one. Left in, the newline between two <div>s becomes a
+ * third grid cell and every card after it lands one column late. */
+static int is_blank_text(struct html_doc *d, int n) {
+    if (d->nodes[n].kind != HTML_TEXT) return 0;
+    const char *t = d->nodes[n].text;
+    if (!t) return 1;
+    for (; *t; t++)
+        if (*t != ' ' && *t != '\t' && *t != '\n' && *t != '\r') return 0;
+    return 1;
+}
+
 static int is_inline(struct html_doc *d, int n, const struct vstyle *parent) {
     if (d->nodes[n].kind == HTML_TEXT) return 1;
     struct vstyle s;
     vstyle_for_node(d, n, parent, g_sheet, &s);
+    /* BLOCKIFIED: every element child of a flex or grid container is a flex
+     * ITEM, whatever its own display says. CSS says so, and without it a nav
+     * bar written as `<nav style="display:flex"><a>One</a><a>Two</a></nav>`
+     * has its links merged into ONE inline run and therefore one item -- so
+     * the gap and the justification apply to the whole strip instead of
+     * between the links, which is not a subtle difference. */
+    if (parent && (parent->display == VD_FLEX || parent->display == VD_GRID))
+        return 0;
     /* controls flow INLINE with their labels, which is what a form looks like */
     return s.display == VD_INLINE || s.display == VD_IMAGE ||
            s.display == VD_FIELD  || s.display == VD_BUTTON;
@@ -247,7 +269,8 @@ static void emit_button(struct html_doc *d, int n, const struct vstyle *st);
  * renderer that walks it as inline anyway flattens the whole subtree. */
 static int breaks_inline(unsigned char display) {
     return display == VD_BLOCK || display == VD_LIST_ITEM || display == VD_TABLE ||
-           display == VD_ROW   || display == VD_CELL      || display == VD_CAPTION;
+           display == VD_ROW   || display == VD_CELL      || display == VD_CAPTION ||
+           display == VD_FLEX  || display == VD_GRID;
 }
 
 static void emit_inline(struct html_doc *d, int c, const struct vstyle *st,
@@ -293,6 +316,72 @@ static Color argb(unsigned v) {
     c.a = (float)((v >> 24) & 0xFF) / 255.0f;
     if (c.a <= 0.0f) c.a = 1.0f;
     return c;
+}
+
+/* justify-content / align-items in the toolkit's spelling. */
+static EmAlign em_of(unsigned char vj, EmAlign dflt) {
+    switch (vj) {
+        case VJ_CENTER:  return Center;
+        case VJ_END:     return Trailing;
+        case VJ_BETWEEN: return SpaceBetween;
+        case VJ_STRETCH: return Fill;
+        case VJ_START:   return Leading;
+    }
+    return dflt;
+}
+
+/* Open the container this element's `display` asks for.
+ *
+ * The layout engine has done flex and grid since it was written -- the whole
+ * toolkit is built on them -- so a CSS flex container is not new layout, it is
+ * the CSS spelling of machinery that already exists. That is the whole reason
+ * this is short. */
+/* Is the box being emitted a FLEX ITEM? Set by render_children while it walks
+ * a flex or grid container's children, because a box cannot see its own
+ * parent's display and the two want opposite widths: a block-level box fills
+ * its container, a flex item is sized by its content unless it grows. */
+static int g_flex_item;
+
+static void open_box(const struct vstyle *s, EmProps bp) {
+    if (s->gap > 0) bp.spacing = (float)s->gap;
+    if (s->display == VD_FLEX) {
+        bp.justify = em_of(s->justify, Leading);
+        /* align-items DEFAULTS to stretch in CSS, which is Fill here -- and is
+         * also what a block container wants, so the default below is shared. */
+        bp.align = em_of(s->align_items, Fill);
+        if (s->flex_col)       { em_vstack_(bp); return; }
+        if (s->flex_wrap)      { em_flow_(bp);   return; }
+        em_hstack_(bp);
+        return;
+    }
+    if (s->display == VD_GRID) {
+        em_grid_(s->grid_cols > 0 ? s->grid_cols : 1, bp);
+        return;
+    }
+    if (s->justify) bp.justify = em_of(s->justify, Leading);
+    em_vstack_(bp);
+}
+
+/* State the box's size EXPLICITLY, every time.
+ *
+ * em_apply_box only calls ui_set_size when a prop asks for one, so a widget
+ * instance that is REUSED next frame keeps whatever size it was last given.
+ * That is invisible in a harness which renders one tree a few times, and very
+ * visible in the app, which builds an empty view first and the document
+ * second: the instances are matched by position across two DIFFERENT trees, so
+ * a box inherited `grow` from whatever occupied its slot before, ate the row's
+ * leftover space and shoved its siblings to the right edge. Saying the size
+ * out loud every frame is what makes a retained tree behave like an immediate
+ * one. */
+static void size_box(const struct vstyle *s, int flex_item) {
+    struct layout_size w, h;
+    if (s->width > 0)      w = (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = (float)s->width };
+    else if (s->grow)      w = (struct layout_size){ .mode = SIZE_FLEX,  .flex_grow = 1 };
+    else if (flex_item)    w = (struct layout_size){ .mode = SIZE_INTRINSIC };
+    else                   w = (struct layout_size){ .mode = SIZE_FLEX,  .flex_grow = 1 };
+    if (s->height > 0)     h = (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = (float)s->height };
+    else                   h = (struct layout_size){ .mode = SIZE_INTRINSIC };
+    ui_set_size(w, h);
 }
 
 static void render_inline_run(struct html_doc *d, int from, int to,
@@ -544,7 +633,11 @@ static void render_children(struct html_doc *d, int node, const struct vstyle *s
                             const char *href) {
     int c = d->nodes[node].first_child;
     int li = 0;
+    int flexish = (s->display == VD_FLEX || s->display == VD_GRID);
+    int outer_item = g_flex_item;
+    g_flex_item = flexish;
     while (c >= 0) {
+        if (flexish && is_blank_text(d, c)) { c = d->nodes[c].next_sibling; continue; }
         if (is_inline(d, c, s)) {
             int start = c;
             while (c >= 0 && is_inline(d, c, s)) c = d->nodes[c].next_sibling;
@@ -559,6 +652,7 @@ static void render_children(struct html_doc *d, int node, const struct vstyle *s
             c = d->nodes[c].next_sibling;
         }
     }
+    g_flex_item = outer_item;
 }
 
 static void render_block(struct html_doc *d, int node, const struct vstyle *s,
@@ -620,7 +714,14 @@ static void render_block(struct html_doc *d, int node, const struct vstyle *s,
                            bp.border_color = argb(s->border_color ? s->border_color
                                                                   : 0xFF808080u); }
     if (s->radius)       bp.corner = (float)s->radius;
-    em_vstack_(bp);
+    /* flex-grow is a property of the CHILD, and this is where the child is
+     * emitted -- so it is read here rather than by whatever contains us. */
+    if (s->grow) bp.grow = 1;
+    if (s->width  > 0) bp.width  = (float)s->width;
+    if (s->height > 0) bp.height = (float)s->height;
+    int was_item = g_flex_item;
+    open_box(s, bp);
+    size_box(s, was_item);
     {
         if (s->pre) render_pre(d, node, s);
         else        render_children(d, node, s, href);

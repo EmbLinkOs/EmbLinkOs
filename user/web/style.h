@@ -29,7 +29,13 @@ enum {
      * therefore the first whose box the RENDERER cannot derive from the
      * document alone -- see form.h. */
     VD_FIELD, VD_BUTTON,
+    /* Flex and grid containers. The layout engine has done both since it was
+     * written -- the whole toolkit is built on them -- so these are the CSS
+     * spelling of machinery that already exists, not new layout. */
+    VD_FLEX, VD_GRID,
 };
+/* justify-content / align-items, in the small set that decides real layouts. */
+enum { VJ_START = 0, VJ_CENTER, VJ_END, VJ_BETWEEN, VJ_STRETCH };
 enum { VM_NONE = 0, VM_BULLET, VM_DECIMAL };
 /* text-align. Justify is accepted and treated as left: a justified paragraph
  * needs inter-word stretching the line breaker does not do, and silently
@@ -61,6 +67,17 @@ struct vstyle {
     short        border_width;   /* px; 0 = no border                     */
     short        radius;         /* border-radius in px                   */
     short        pad_top, pad_right, pad_bottom, pad_left;
+
+    /* --- flex / grid. Box properties, so not inherited. ------------------ */
+    unsigned char justify;       /* justify-content, VJ_*                  */
+    unsigned char align_items;   /* align-items, VJ_* (STRETCH = fill)     */
+    unsigned char flex_col;      /* flex-direction: column                 */
+    unsigned char flex_wrap;     /* flex-wrap: wrap                        */
+    unsigned char grid_cols;     /* display:grid track count, 0 = not one  */
+    short         gap;           /* gap / row-gap / column-gap, px         */
+    /* flex-grow on THIS element -- a child property, read where the child is
+     * emitted rather than by its parent, which is how the toolkit spells it. */
+    unsigned char grow;
 
     /* --- inherited text layout ------------------------------------------ */
     unsigned char align;         /* VA_*                                   */

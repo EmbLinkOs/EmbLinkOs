@@ -1,0 +1,35 @@
+<html><head><title>Flex and grid</title><style>
+.bar   { display: flex; gap: 20px; background: #1c2030; padding: 10px }
+.right { display: flex; justify-content: flex-end; gap: 12px; background: #1c2030; padding: 10px }
+.spread{ display: flex; justify-content: space-between; background: #1c2030; padding: 10px }
+.col   { display: flex; flex-direction: column; gap: 6px; background: #202436; padding: 10px }
+.grow  { flex: 1 }
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px }
+.card  { background: #232838; border: 1px solid #3a4258; border-radius: 8px; padding: 10px }
+</style></head><body>
+
+<nav class="bar"><a href="/a">NAVONE</a><a href="/b">NAVTWO</a><a href="/c">NAVTHREE</a></nav>
+<div class="right"><span>RIGHTA</span><span>RIGHTB</span></div>
+<div class="spread"><span>SPREADLEFT</span><span>SPREADRIGHT</span></div>
+<div class="col"><span>COLONE</span><span>COLTWO</span></div>
+<div class="bar"><span class="grow">GROWER takes the leftover</span><span>TAIL</span></div>
+
+<div class="cards">
+  <div class="card">GRIDA first column</div>
+  <div class="card">GRIDB second column</div>
+  <div class="card">GRIDC third column</div>
+</div>
+
+<!-- a flex row lays its items out SIDE BY SIDE, so each link starts to the
+     right of the last; merged into one inline run they would share an x -->
+<!-- EXPECT-LEFT-OF: NAVONE NAVTWO -->
+<!-- EXPECT-LEFT-OF: NAVTWO NAVTHREE -->
+<!-- a column stacks them, so the second is BELOW rather than beside -->
+<!-- EXPECT-BELOW: COLTWO COLONE -->
+<!-- space-between pins the last item to the right edge -->
+<!-- EXPECT-LEFT-OF: SPREADLEFT SPREADRIGHT -->
+<!-- a grid puts its three cards on ONE row, left to right -->
+<!-- EXPECT-LEFT-OF: GRIDA GRIDB -->
+<!-- EXPECT-LEFT-OF: GRIDB GRIDC -->
+<!-- EXPECT-TEXT: GROWER -->
+</body></html>

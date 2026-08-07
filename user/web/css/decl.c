@@ -218,6 +218,84 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
             else if (tok_eq(v, vn, "inline")) { out->display = VD_INLINE;    ok = 1; }
             else if (tok_eq(v, vn, "list-item")) { out->display = VD_LIST_ITEM; ok = 1; }
             else if (tok_eq(v, vn, "inline-block")) { out->display = VD_INLINE; ok = 1; }
+            else if (tok_eq(v, vn, "flex") || tok_eq(v, vn, "inline-flex"))
+                                             { out->display = VD_FLEX;  ok = 1; }
+            else if (tok_eq(v, vn, "grid") || tok_eq(v, vn, "inline-grid"))
+                                             { out->display = VD_GRID;  ok = 1; }
+            /* table displays reach here from a stylesheet as well as from the
+             * tag table, which is the point of naming them in the display
+             * enum in the first place */
+            else if (tok_eq(v, vn, "table"))      { out->display = VD_TABLE; ok = 1; }
+            else if (tok_eq(v, vn, "table-row"))  { out->display = VD_ROW;   ok = 1; }
+            else if (tok_eq(v, vn, "table-cell")) { out->display = VD_CELL;  ok = 1; }
+        } else if (tok_eq(p, pn, "flex-direction")) {
+            if (tok_eq(v, vn, "column") || tok_eq(v, vn, "column-reverse"))
+                 { out->flex_col = 1; ok = 1; }
+            else if (tok_eq(v, vn, "row") || tok_eq(v, vn, "row-reverse"))
+                 { out->flex_col = 0; ok = 1; }
+        } else if (tok_eq(p, pn, "flex-wrap")) {
+            if (tok_eq(v, vn, "wrap") || tok_eq(v, vn, "wrap-reverse")) { out->flex_wrap = 1; ok = 1; }
+            else if (tok_eq(v, vn, "nowrap")) { out->flex_wrap = 0; ok = 1; }
+        } else if (tok_eq(p, pn, "justify-content")) {
+            if      (tok_eq(v, vn, "center"))        { out->justify = VJ_CENTER;  ok = 1; }
+            else if (tok_eq(v, vn, "flex-end") || tok_eq(v, vn, "end") ||
+                     tok_eq(v, vn, "right"))         { out->justify = VJ_END;     ok = 1; }
+            else if (tok_eq(v, vn, "space-between")) { out->justify = VJ_BETWEEN; ok = 1; }
+            else if (tok_eq(v, vn, "flex-start") || tok_eq(v, vn, "start") ||
+                     tok_eq(v, vn, "left"))          { out->justify = VJ_START;   ok = 1; }
+            /* space-around / space-evenly fall back to space-between: the gap
+             * is in the wrong place but the items are still spread, which is
+             * nearer the author's intent than piling them at the start. */
+            else if (tok_eq(v, vn, "space-around") || tok_eq(v, vn, "space-evenly"))
+                                                     { out->justify = VJ_BETWEEN; ok = 1; }
+        } else if (tok_eq(p, pn, "align-items")) {
+            if      (tok_eq(v, vn, "center"))     { out->align_items = VJ_CENTER;  ok = 1; }
+            else if (tok_eq(v, vn, "flex-end") || tok_eq(v, vn, "end"))
+                                                  { out->align_items = VJ_END;     ok = 1; }
+            else if (tok_eq(v, vn, "stretch"))    { out->align_items = VJ_STRETCH; ok = 1; }
+            else if (tok_eq(v, vn, "flex-start") || tok_eq(v, vn, "start") ||
+                     tok_eq(v, vn, "baseline"))   { out->align_items = VJ_START;   ok = 1; }
+        } else if (tok_eq(p, pn, "gap") || tok_eq(p, pn, "row-gap") ||
+                   tok_eq(p, pn, "column-gap") || tok_eq(p, pn, "grid-gap")) {
+            /* `gap: 12px 20px` states row then column; this layout has one
+             * spacing, so the first (row) wins -- the axis a stacked list
+             * actually notices. */
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok && px >= 0) { out->gap = px; ok = 1; }
+        } else if (tok_eq(p, pn, "flex") || tok_eq(p, pn, "flex-grow")) {
+            /* `flex: 1`, `flex: 1 1 auto`, `flex-grow: 2` -- what matters here
+             * is whether this child takes the leftover space at all. */
+            int nonzero = 0;
+            for (size_t k = 0; k < vn; k++) {
+                if (v[k] >= '1' && v[k] <= '9') { nonzero = 1; break; }
+                if (v[k] == ' ') break;
+            }
+            if (tok_eq(v, vn, "none")) { out->grow = 0; ok = 1; }
+            else { out->grow = nonzero ? 1 : 0; ok = 1; }
+        } else if (tok_eq(p, pn, "grid-template-columns")) {
+            /* The track COUNT is what this grid can honour: `repeat(3, 1fr)`
+             * and `1fr 1fr 1fr` are both three columns. Widths come from the
+             * content (see layout.c's automatic table layout), so a track list
+             * that states sizes is read for its length and not its values --
+             * which is right for the equal-fr case that dominates and
+             * approximate for anything else. */
+            int cols = 0;
+            size_t k = 0;
+            if (vn > 7 && (v[0]=='r'||v[0]=='R') && !strncmp(v + 1, "epeat", 5)) {
+                while (k < vn && v[k] != '(') k++;
+                k++;
+                int nrep = 0;
+                while (k < vn && v[k] >= '0' && v[k] <= '9') { nrep = nrep * 10 + (v[k] - '0'); k++; }
+                cols = nrep;
+            } else {
+                int in_tok = 0;
+                for (; k < vn; k++) {
+                    int ws = (v[k]==' '||v[k]=='\t');
+                    if (!ws && !in_tok) { cols++; in_tok = 1; }
+                    else if (ws) in_tok = 0;
+                }
+            }
+            if (cols > 0 && cols <= 64) { out->grid_cols = (unsigned char)cols; ok = 1; }
         } else if (tok_eq(p, pn, "width")) {
             int lok = 0; short px = len_px(v, vn, &lok);
             if (lok && px > 0) { out->width = px; ok = 1; }

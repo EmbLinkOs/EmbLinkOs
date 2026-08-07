@@ -273,7 +273,16 @@ NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
 # an uninitialized stack `bn` whose garbage happened to be benign on the host but
 # broke github's P-256 leaf verification under QEMU (rc=-103). Cheap; belongs on
 # security-critical crypto anyway.
-NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall $(USER_INC) $(NEWLIB_INC)
+# -MMD -MP: let the COMPILER write the header dependencies.
+#
+# They were written by hand, and a hand-written list is a list that goes stale.
+# build/web_jsdom.o named jsdom.c, jsdom.h and html.h but not style.h -- so
+# when `struct vstyle` grew, jsdom.o kept the OLD layout and was linked into
+# the same binary as everything that had the new one. The browser then laid
+# out flex containers wrongly on the metal and correctly on the host, because
+# the host harness does not link jsdom at all. Nothing about that symptom
+# points at a Makefile.
+NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
 # gcc as the link driver so it finds libc.a/libgcc; -nostartfiles because
 # crt0.c provides _start (no standard crtX). newlib.ld places it at 0x400000.
 # NEWLIB_LIB is a -L searched BEFORE the toolchain's default lib dir, so our
@@ -1935,6 +1944,10 @@ build/browser_render:
 	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c user/web/css/vars.c user/web/css/media.c \
 	    user/web/url.c user/web/png.c user/web/jpeg.c user/lib/inflate.c user/web/form.c \
 	    user/web/select.c user/web/render_host.c -lm -o $@
+
+# Whatever the compiler recorded last time. Missing on a clean tree, which is
+# exactly when it is not needed.
+-include $(wildcard $(BUILD)/*.o.d) $(wildcard $(BUILD)/qjs/*.o.d)
 
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(KERNEL_BIN) $(IMG)
