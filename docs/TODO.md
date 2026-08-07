@@ -2458,6 +2458,34 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       checkbox. A <select> is its <option> children -- labels from their text,
       the submitted value from `value` or the text -- and an <option> is
       display:none so it cannot leak into the page as stray text.
+- [x] ~~No cookies~~ SHIPPED 2026-08-08: `user/web/cookie.c`. A cookie is how a
+      site remembers you between two requests, and without one every page load
+      is a stranger arriving. Sent on every request for a matching host+path,
+      taken from Set-Cookie BEFORE a redirect is followed (the hop carries the
+      session the next request needs), and exposed as document.cookie with
+      HttpOnly cookies EXCLUDED -- that exclusion is the whole security value
+      of the flag.
+      16 host assertions (T23) pin the scoping rules, and one caught a real
+      bug: a cookie with no Domain must be HOST-ONLY. Defaulting it to
+      domain-scoped quietly widens every cookie a site sets, handing a session
+      set on example.com to any subdomain including one an attacker controls.
+      Also pinned: a suffix match must fall on a dot (else evil-example.com
+      claims example.com's cookies), /app must not match /applesauce, a host
+      cannot set a cookie for another domain, Secure stays off plain http, and
+      Max-Age=0 deletes -- which is how logout works.
+      Metal-proven against a real server: the browser stored two cookies from
+      one response and the next request came back "SERVERSAW sid=SESSION42;
+      pref=dark".
+- [ ] The cookie jar is NOT PERSISTED: a session survives navigation but not a
+      restart. Writing it to disk means deciding where, who else may read it,
+      and when things expire on a machine whose clock may not be set -- and
+      this OS's answer to all three should be the capability system, not a
+      hard-coded path.
+- [ ] No localStorage / sessionStorage. Same questions as the cookie jar, plus
+      an origin-keyed store on disk.
+- [ ] Expires= is not parsed as a DATE; only the epoch spelling is recognised
+      (which is what a deletion looks like). Everything else becomes a session
+      cookie, erring toward keeping it.
 - [ ] <textarea> renders as a SINGLE-LINE field. It submits correctly and it
       does not look like a text area; a multi-line control needs the toolkit to
       grow one.

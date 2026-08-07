@@ -11,6 +11,7 @@
 #include "url.h"
 #include "style.h"
 #include "css.h"
+#include "cookie.h"
 #include "png.h"
 #include "png_fixtures.h"
 #include "form.h"
@@ -674,6 +675,88 @@ static void t20_png_hostile(void) {
     CHECK(rc != PNG_OK, "corrupt DEFLATE data is detected");
 }
 
+/* ======================= cookies ======================================== */
+
+static void t23_cookies(void) {
+    printf("T23 the cookie jar: scope, and who may read it:\n");
+    char out[512];
+
+    cookie_reset();
+    cookie_set("example.com", "sid=abc123; Path=/");
+    cookie_header("example.com", "/", 0, out, sizeof out);
+    CHECK(!strcmp(out, "sid=abc123"), "a cookie comes back to the host that set it");
+
+    /* THE domain check. A suffix match alone lets evil-example.com claim
+     * example.com's cookies, so the match must fall on a dot. */
+    cookie_header("evil-example.com", "/", 0, out, sizeof out);
+    CHECK(out[0] == 0, "a look-alike host does NOT get the cookie");
+    cookie_header("www.example.com", "/", 0, out, sizeof out);
+    CHECK(out[0] == 0, "...nor a subdomain, when no Domain was stated");
+
+    cookie_reset();
+    cookie_set("example.com", "wide=1; Domain=example.com");
+    cookie_header("api.example.com", "/", 0, out, sizeof out);
+    CHECK(!strcmp(out, "wide=1"), "a stated Domain DOES reach a subdomain");
+
+    /* a server may not scope a cookie to somebody else's domain */
+    cookie_reset();
+    cookie_set("evil.com", "bad=1; Domain=example.com");
+    cookie_header("example.com", "/", 0, out, sizeof out);
+    CHECK(out[0] == 0, "a host cannot set a cookie for another domain");
+
+    /* Path: /app must not match /applesauce */
+    cookie_reset();
+    cookie_set("example.com", "p=1; Path=/app");
+    cookie_header("example.com", "/app/x", 0, out, sizeof out);
+    CHECK(!strcmp(out, "p=1"), "a path cookie reaches a deeper path");
+    cookie_header("example.com", "/applesauce", 0, out, sizeof out);
+    CHECK(out[0] == 0, "...but not a path that merely starts the same");
+
+    /* HttpOnly is invisible to scripts -- the whole point of the flag */
+    cookie_reset();
+    cookie_set("example.com", "sess=zz; HttpOnly");
+    cookie_set("example.com", "theme=dark");
+    cookie_header("example.com", "/", 0, out, sizeof out);
+    CHECK(strstr(out, "sess=zz") && strstr(out, "theme=dark"),
+          "the REQUEST carries both cookies");
+    cookie_for_script("example.com", "/", out, sizeof out);
+    CHECK(!strstr(out, "sess=zz"), "document.cookie cannot see an HttpOnly one");
+    CHECK(strstr(out, "theme=dark") != 0, "...and can see the ordinary one");
+
+    /* Secure stays off a plain connection */
+    cookie_reset();
+    cookie_set("example.com", "s=1; Secure");
+    cookie_header("example.com", "/", 0, out, sizeof out);
+    CHECK(out[0] == 0, "a Secure cookie is not sent over plain http");
+    cookie_header("example.com", "/", 1, out, sizeof out);
+    CHECK(!strcmp(out, "s=1"), "...and is sent over https");
+
+    /* replacing, and deleting the way a logout does */
+    cookie_reset();
+    cookie_set("example.com", "k=one");
+    cookie_set("example.com", "k=two");
+    cookie_header("example.com", "/", 0, out, sizeof out);
+    CHECK(!strcmp(out, "k=two"), "setting the same name REPLACES it");
+    cookie_set("example.com", "k=; Max-Age=0");
+    cookie_header("example.com", "/", 0, out, sizeof out);
+    CHECK(out[0] == 0, "Max-Age=0 deletes it, which is how logout works");
+
+    /* a whole response block, with the comma inside Expires that is exactly
+     * why Set-Cookie must not be comma-joined with its siblings */
+    cookie_reset();
+    const char *resp =
+        "HTTP/1.1 200 OK\r\n"
+        "Set-Cookie: a=1; Path=/\r\n"
+        "Content-Type: text/html\r\n"
+        "Set-Cookie: b=2; Expires=Wed, 09 Jun 2027 10:18:14 GMT\r\n"
+        "\r\n";
+    int got = cookie_take_headers("example.com", resp);
+    CHECK(got == 2, "two Set-Cookie headers are taken separately");
+    cookie_header("example.com", "/", 0, out, sizeof out);
+    CHECK(strstr(out, "a=1") && strstr(out, "b=2"), "...and both are sent back");
+    cookie_reset();
+}
+
 /* ================= external stylesheets ================================ */
 
 static void t22_linkcss(void) {
@@ -781,6 +864,7 @@ int main(void) {
     t15_cascade(); t16_origin_order(); t17_bounded();
     t17b_image_sizing(); t17c_forms(); t18_png_basics(); t19_png_palette_and_filters(); t20_png_hostile();
     t22_linkcss();
+    t23_cookies();
     t21_jpeg();
     printf("=== html-test: %s (%d failures) ===\n", failures ? "FAIL" : "OK", failures);
     return failures ? 1 : 0;

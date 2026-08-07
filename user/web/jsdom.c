@@ -23,6 +23,7 @@
 #include "net.h"
 #include "form.h"
 #include "url.h"
+#include "cookie.h"
 
 static JSRuntime *g_rt;
 static JSContext *g_ctx;
@@ -396,6 +397,38 @@ static const JSCFunctionListEntry elem_proto[] = {
 
 static JSValue make_elem(JSContext *ctx, int idx);
 
+/* The host and path of the page, for cookie scoping. A local file has no
+ * host, and a cookie without one belongs to nothing -- so file:// pages get an
+ * empty jar rather than a shared one. */
+static void page_origin(char *host, size_t hcap, char *path, size_t pcap) {
+    struct url u;
+    host[0] = 0; snprintf(path, pcap, "/");
+    if (!g_url || url_parse(g_url, &u) != 0) return;
+    if (u.kind == URL_LOCAL) return;
+    snprintf(host, hcap, "%s", u.host);
+    snprintf(path, pcap, "%s", u.path[0] ? u.path : "/");
+}
+
+static JSValue doc_get_cookie(JSContext *ctx, JSValueConst this_val) {
+    (void)this_val;
+    char host[128], path[256], out[1024];
+    page_origin(host, sizeof host, path, sizeof path);
+    if (!host[0]) return JS_NewString(ctx, "");
+    cookie_for_script(host, path, out, sizeof out);
+    return JS_NewString(ctx, out);
+}
+
+static JSValue doc_set_cookie(JSContext *ctx, JSValueConst this_val, JSValueConst v) {
+    (void)this_val;
+    char host[128], path[256];
+    page_origin(host, sizeof host, path, sizeof path);
+    const char *s = JS_ToCString(ctx, v);
+    if (!s) return JS_EXCEPTION;
+    if (host[0]) cookie_set(host, s);
+    JS_FreeCString(ctx, s);
+    return JS_UNDEFINED;
+}
+
 static JSValue doc_create_element(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
     (void)this_val;
@@ -602,6 +635,18 @@ int jsdom_open(struct html_doc *doc, const struct css_sheet *sheet) {
                             JS_NewCFunction(g_ctx, (JSCFunction *)doc_get_title, "title", 0),
                             JS_UNDEFINED, JS_PROP_CONFIGURABLE);
     JS_FreeAtom(g_ctx, t);
+    /* document.cookie. HttpOnly cookies are EXCLUDED, which is the entire
+     * security value of that flag -- a script that could read them would make
+     * it decorative. */
+    {
+        JSAtom ca = JS_NewAtom(g_ctx, "cookie");
+        JS_DefinePropertyGetSet(g_ctx, d, ca,
+            JS_NewCFunction(g_ctx, (JSCFunction *)doc_get_cookie, "cookie", 0),
+            JS_NewCFunction(g_ctx, (JSCFunction *)doc_set_cookie, "cookie", 1),
+            JS_PROP_CONFIGURABLE);
+        JS_FreeAtom(g_ctx, ca);
+    }
+
     /* location: a page that cannot read its own URL cannot act on a form's
      * query string, which is how half the web's search results pages work. */
     JSValue loc = JS_NewObject(g_ctx);

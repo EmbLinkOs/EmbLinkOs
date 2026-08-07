@@ -21,6 +21,7 @@
 
 #include "url.h"
 #include "net.h"
+#include "cookie.h"
 
 #define MAX_REDIRECTS 5
 
@@ -168,6 +169,13 @@ static int http_once(const struct url *u, char *out, size_t cap,
         snprintf(r->via, sizeof r->via, "http");
     }
 
+    /* Whatever the jar has for this host and path. A site that cannot get its
+     * cookie back is a site you are logged out of on every click. */
+    char ck[1024]; ck[0] = 0;
+    size_t cn = cookie_header(u->host, u->path, u->kind == URL_HTTPS, ck, sizeof ck);
+    char ckhdr[1088]; ckhdr[0] = 0;
+    if (cn) snprintf(ckhdr, sizeof ckhdr, "Cookie: %s\r\n", ck);
+
     char req[2048];
     int rl;
     if (g_post_body) {
@@ -178,17 +186,19 @@ static int http_once(const struct url *u, char *out, size_t cap,
                       "Accept: text/html,*/*\r\n"
                       "Content-Type: application/x-www-form-urlencoded\r\n"
                       "Content-Length: %u\r\n"
+                      "%s"
                       "Connection: close\r\n\r\n%s",
                       u->path, u->host,
-                      (unsigned)strlen(g_post_body), g_post_body);
+                      (unsigned)strlen(g_post_body), ckhdr, g_post_body);
     } else {
         rl = snprintf(req, sizeof req,
                       "GET %s HTTP/1.0\r\n"
                       "Host: %s\r\n"
                       "User-Agent: Vellum (EmbLinkOS)\r\n"
                       "Accept: text/html,*/*\r\n"
+                      "%s"
                       "Connection: close\r\n\r\n",
-                      u->path, u->host);
+                      u->path, u->host, ckhdr);
     }
     if (x_send(&x, req, (size_t)rl) < 0) {
         snprintf(r->err, sizeof r->err, "Request failed");
@@ -216,6 +226,10 @@ static int http_once(const struct url *u, char *out, size_t cap,
             }
             if (!header_done) continue;
             hdr[hlen] = 0;
+            /* Set-Cookie, before anything else looks at the response: a
+             * redirect carries the session cookie that the NEXT request needs,
+             * and taking it after following the hop is one hop too late. */
+            cookie_take_headers(u->host, hdr);
             if (!strncmp(hdr, "HTTP/1.", 7)) r->status = atoi(hdr + 9);
             const char *loc = hdr_find(hdr, "Location");
             if (loc) hdr_value(loc, location, loc_cap);

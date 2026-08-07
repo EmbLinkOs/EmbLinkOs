@@ -1058,3 +1058,40 @@ as stray text.
 
 `<textarea>` still renders as a single-line field. It submits correctly and it
 does not look right; a multi-line control needs the toolkit to grow one.
+
+
+## Cookies
+
+A cookie is how a site remembers you between two requests. Without one, every
+page load is a stranger arriving -- no login survives a click. It is also the
+first state this browser keeps that belongs to a SERVER rather than to the
+document, which is why it lives in `user/web/cookie.c` and is scoped by host
+rather than by page.
+
+Sent on every request whose host and path match, taken from `Set-Cookie` before
+a redirect is followed (that hop carries the session the next request needs),
+and exposed as `document.cookie` with HttpOnly cookies excluded -- which is the
+entire security value of that flag.
+
+The scoping rules are where the security is, so they are the tests:
+
+- a suffix match must fall on a dot, or `evil-example.com` claims
+  `example.com`'s cookies;
+- `/app` must not match `/applesauce`;
+- a host cannot set a cookie for a domain it does not belong to;
+- Secure stays off a plain connection;
+- `Max-Age=0` deletes, which is how logout works.
+
+One of those tests found a real bug: **a cookie with no `Domain` must be
+host-only.** Defaulting it to domain-scoped quietly widens every cookie a site
+sets, handing a session set on `example.com` to any subdomain -- including one
+an attacker controls. Stating a `Domain` is how a site opts INTO sharing.
+
+Proven on the metal against a real server: two cookies stored from one
+response, and the next request came back `SERVERSAW sid=SESSION42; pref=dark`.
+
+The jar is not persisted -- a session survives navigation but not a restart.
+That is a deliberate stopping point: writing cookies to disk means deciding
+where, deciding who else may read them, and deciding when they expire on a
+machine whose clock may not have been set. This OS's answer to all three should
+be the capability system, not a path hard-coded here.
