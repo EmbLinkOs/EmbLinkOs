@@ -2067,7 +2067,9 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       event name THROWS rather than registering silently.
 - [ ] No event bubbling: a click reaches the element that has the listener,
       not its ancestors. Fine for buttons, wrong for delegation.
-- [ ] No fetch() binding, though net.c does the work already.
+- [x] ~~No fetch() binding~~ DONE 2026-08-07: real Promises, shared worker,
+      microtask drain (JS_ExecutePendingJob every frame). Response = {ok,
+      status, text()} -- deliberately small.
 - [ ] The DOM surface is read-mostly: no createElement/appendChild/remove, no
       classList, no attribute WRITES except style. Each absent rather than
       faked -- a binding that accepts a call and changes nothing observable is

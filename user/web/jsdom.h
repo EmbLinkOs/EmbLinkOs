@@ -54,13 +54,23 @@ int  jsdom_has_listener(int node);
  * document -- check jsdom_take_dirty afterwards). */
 int  jsdom_dispatch_click(int node);
 
-/* Run any timer due at `now_ms`. Returns 1 if anything ran. Call once a frame;
- * cheap when nothing is pending, which is the common case. */
-int  jsdom_pump_timers(unsigned long long now_ms);
+/* Drive everything the engine owes the page: due timers, a landed fetch, and
+ * the MICROTASK QUEUE. Returns 1 if anything ran. Call once a frame.
+ *
+ * The microtask drain is the part that is easy to leave out and fatal to omit:
+ * QuickJS queues `.then` callbacks as pending jobs, so a promise that resolves
+ * is a promise whose handlers never run until someone executes them. Without
+ * it `fetch(...).then(...)` is a call that succeeds and does nothing -- the
+ * exact failure this browser refuses to ship. */
+int  jsdom_pump(unsigned long long now_ms);
 
 /* When is the next timer due, or 0 if none? The app uses it to decide whether
  * to keep asking for frames -- a page with no timers must cost nothing. */
 unsigned long long jsdom_next_timer(void);
+
+/* Is the engine waiting on anything (a fetch in flight, a promise unsettled)?
+ * The app keeps frames coming while this is true. */
+int  jsdom_busy(void);
 
 /* Tear down. Safe to call when never opened. */
 void jsdom_close(void);

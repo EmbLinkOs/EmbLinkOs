@@ -19,6 +19,8 @@
 #include "style.h"
 #include "css.h"
 #include "jsdom.h"
+#include "fetchjob.h"
+#include "net.h"
 
 static JSRuntime *g_rt;
 static JSContext *g_ctx;
@@ -42,12 +44,31 @@ static struct {
     JSValue  fn;
 } g_timer[MAX_TIMERS];
 static int g_timer_seq = 1;
+
+/* ---- fetch --------------------------------------------------------------
+ * A page's fetch shares the ONE worker the document and the images use, and
+ * takes its turn behind them: the page you asked for outranks the data a
+ * script wants about it. FETCH_TAG is how the poll knows the result is ours
+ * (fetchjob.h -- a poll that does not own a result must not consume it).
+ */
+#define FETCH_TAG  3
+#define FETCH_MAX  4
+#define FETCH_BUF  (256 * 1024)
+
+static struct {
+    int     used, started;
+    char    url[512];
+    JSValue resolve, reject;
+} g_fetch[FETCH_MAX];
+static char g_fetch_buf[FETCH_BUF];
+static int  g_fetch_active = -1;
 static unsigned long long g_now;   /* last time the app pumped */
 
 /* defined with the rest of the event machinery, below jsdom_open's globals */
 static JSValue js_set_timeout(JSContext *, JSValueConst, int, JSValueConst *);
 static JSValue js_set_interval(JSContext *, JSValueConst, int, JSValueConst *);
 static JSValue js_clear_timer(JSContext *, JSValueConst, int, JSValueConst *);
+static JSValue js_fetch(JSContext *, JSValueConst, int, JSValueConst *);
 
 /* ---- element objects ---------------------------------------------------- */
 
@@ -288,6 +309,15 @@ void jsdom_close(void) {
             if (g_listen[k].used) { JS_FreeValue(g_ctx, g_listen[k].fn); g_listen[k].used = 0; }
         for (int k = 0; k < MAX_TIMERS; k++)
             if (g_timer[k].used) { JS_FreeValue(g_ctx, g_timer[k].fn); g_timer[k].used = 0; }
+        /* An unsettled promise whose page is gone is not an error to report --
+         * there is no longer anyone to report it to. Drop the handlers. */
+        for (int k = 0; k < FETCH_MAX; k++)
+            if (g_fetch[k].used) {
+                JS_FreeValue(g_ctx, g_fetch[k].resolve);
+                JS_FreeValue(g_ctx, g_fetch[k].reject);
+                g_fetch[k].used = 0;
+            }
+        g_fetch_active = -1;
     }
     if (g_ctx) { JS_FreeContext(g_ctx); g_ctx = 0; }
     if (g_rt)  { JS_FreeRuntime(g_rt);  g_rt = 0; }
@@ -334,6 +364,8 @@ int jsdom_open(struct html_doc *doc, const struct css_sheet *sheet) {
                       JS_NewCFunction(g_ctx, js_clear_timer, "clearTimeout", 1));
     JS_SetPropertyStr(g_ctx, g, "clearInterval",
                       JS_NewCFunction(g_ctx, js_clear_timer, "clearInterval", 1));
+    JS_SetPropertyStr(g_ctx, g, "fetch",
+                      JS_NewCFunction(g_ctx, js_fetch, "fetch", 1));
 
     JS_FreeValue(g_ctx, g);
     (void)g_elem_class;
@@ -450,20 +482,149 @@ static JSValue js_clear_timer(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-int jsdom_pump_timers(unsigned long long now_ms) {
+/* fetch(url) -> Promise. The Promise is real: QuickJS hands back its resolve
+ * and reject functions, we stash them on a slot, and the pump settles the
+ * Promise when the bytes land -- which is what makes `await fetch(...)` and
+ * `.then(...)` behave as a script author expects rather than as a stub. */
+static JSValue js_fetch(JSContext *ctx, JSValueConst this_val,
+                        int argc, JSValueConst *argv) {
+    (void)this_val;
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, funcs);   /* [resolve, reject] */
+    if (JS_IsException(promise)) return promise;
+
+    const char *url = argc > 0 ? JS_ToCString(ctx, argv[0]) : 0;
+    int slot = -1;
+    for (int k = 0; k < FETCH_MAX; k++) if (!g_fetch[k].used) { slot = k; break; }
+
+    if (!url || slot < 0) {
+        /* Reject NOW, on this stack. The pump would work too, but a fetch that
+         * cannot even be queued should fail on the same turn it was asked, the
+         * way a browser rejects a malformed URL immediately. */
+        JSValue err = JS_NewError(ctx);
+        JS_SetPropertyStr(ctx, err, "message",
+                          JS_NewString(ctx, url ? "too many concurrent fetches" : "fetch: no URL"));
+        JSValue r = JS_Call(ctx, funcs[1], JS_UNDEFINED, 1, (JSValueConst[]){ err });
+        JS_FreeValue(ctx, r); JS_FreeValue(ctx, err);
+        JS_FreeValue(ctx, funcs[0]); JS_FreeValue(ctx, funcs[1]);
+        if (url) JS_FreeCString(ctx, url);
+        return promise;
+    }
+
+    g_fetch[slot].used = 1;
+    g_fetch[slot].started = 0;
+    snprintf(g_fetch[slot].url, sizeof g_fetch[slot].url, "%s", url);
+    g_fetch[slot].resolve = funcs[0];
+    g_fetch[slot].reject  = funcs[1];
+    JS_FreeCString(ctx, url);
+    return promise;
+}
+
+/* Settle a fetch slot: build a small Response-shaped object ({ ok, status,
+ * text() }) and resolve, or reject with the network error. Deliberately not
+ * the whole Fetch spec -- headers, streaming, a real Body -- because a
+ * documentation page's script wants status and text, and a binding that
+ * pretends to more than it has is the lie this browser refuses. */
+static void fetch_settle(int slot, const struct vnet_result *res) {
+    JSContext *ctx = g_ctx;
+    JSValue rf = g_fetch[slot].resolve, jf = g_fetch[slot].reject;
+    g_fetch[slot].used = 0;
+
+    if (res->err[0] && res->len == 0) {
+        JSValue err = JS_NewError(ctx);
+        JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, res->err));
+        JSValue r = JS_Call(ctx, jf, JS_UNDEFINED, 1, (JSValueConst[]){ err });
+        JS_FreeValue(ctx, r); JS_FreeValue(ctx, err);
+    } else {
+        JSValue body = JS_NewStringLen(ctx, g_fetch_buf, res->len);
+        JSValue resp = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, resp, "ok", JS_NewBool(ctx, res->status / 100 == 2));
+        JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, res->status));
+        /* text() returns a resolved Promise of the body -- Response.text() is
+         * async in the real API, and matching that means `await resp.text()`
+         * is what a script writes here too. */
+        JSValue textfn = JS_Eval(ctx, "(function(b){return function(){return Promise.resolve(b);};})",
+                                 60, "<fetch>", JS_EVAL_TYPE_GLOBAL);
+        JSValue bound = JS_Call(ctx, textfn, JS_UNDEFINED, 1, (JSValueConst[]){ body });
+        JS_SetPropertyStr(ctx, resp, "text", bound);
+        JS_FreeValue(ctx, textfn);
+        JSValue r = JS_Call(ctx, rf, JS_UNDEFINED, 1, (JSValueConst[]){ resp });
+        JS_FreeValue(ctx, r); JS_FreeValue(ctx, resp); JS_FreeValue(ctx, body);
+    }
+    JS_FreeValue(ctx, rf);
+    JS_FreeValue(ctx, jf);
+}
+
+/* Move fetches along: reap the active one, start the next. One at a time on
+ * the shared worker, behind the document and its images. */
+static int fetch_pump(void) {
+    int changed = 0;
+    if (g_fetch_active >= 0) {
+        struct vnet_result res;
+        int r = fetchjob_poll(FETCH_TAG, &res);
+        if (r == 1) {
+            fetch_settle(g_fetch_active, &res);
+            g_fetch_active = -1; changed = 1;
+        } else if (r < 0) {                 /* the job vanished (page changed) */
+            if (g_fetch_active < FETCH_MAX && g_fetch[g_fetch_active].used) {
+                g_fetch[g_fetch_active].used = 0;
+                JS_FreeValue(g_ctx, g_fetch[g_fetch_active].resolve);
+                JS_FreeValue(g_ctx, g_fetch[g_fetch_active].reject);
+            }
+            g_fetch_active = -1; changed = 1;
+        }
+    }
+    if (g_fetch_active < 0 && !fetchjob_busy()) {
+        for (int k = 0; k < FETCH_MAX; k++) {
+            if (!g_fetch[k].used || g_fetch[k].started) continue;
+            if (fetchjob_start(g_fetch[k].url, g_fetch_buf, sizeof g_fetch_buf, FETCH_TAG) == 0) {
+                g_fetch[k].started = 1;
+                g_fetch_active = k;
+                changed = 1;
+            }
+            break;
+        }
+    }
+    return changed;
+}
+
+/* Drain QuickJS's pending-job queue: promise reactions, queueMicrotask, and
+ * the async continuations `await` compiles to. This is the beating heart of
+ * async in the engine, and forgetting it makes every promise a silent no-op. */
+static int drain_jobs(void) {
+    int did = 0;
+    JSContext *c;
+    for (;;) {
+        int r = JS_ExecutePendingJob(g_rt, &c);
+        if (r <= 0) {                        /* 0 = none left, <0 = a job threw */
+            if (r < 0 && c) {
+                JSValue e = JS_GetException(c);
+                const char *m = JS_ToCString(c, e);
+                if (g_console && m) g_console(m);
+                if (m) JS_FreeCString(c, m);
+                JS_FreeValue(c, e);
+                did = 1;
+                continue;                    /* keep draining past a rejection */
+            }
+            break;
+        }
+        did = 1;
+    }
+    return did;
+}
+
+int jsdom_pump(unsigned long long now_ms) {
     if (!g_ctx) return 0;
     g_now = now_ms;
-    int ran = 0;
+    int changed = 0;
+    if (fetch_pump()) changed = 1;
+
+    /* timers */
     for (int k = 0; k < MAX_TIMERS; k++) {
         if (!g_timer[k].used || now_ms < g_timer[k].due) continue;
         JSValue fn = g_timer[k].fn;
-        if (g_timer[k].repeat) {
-            g_timer[k].due = now_ms + g_timer[k].every;
-        } else {
-            g_timer[k].used = 0;               /* one-shot: retire before the
-                                                * call, so a handler that sets
-                                                * a new timer gets a free slot */
-        }
+        if (g_timer[k].repeat) g_timer[k].due = now_ms + g_timer[k].every;
+        else                   g_timer[k].used = 0;
         JSValue r = JS_Call(g_ctx, fn, JS_UNDEFINED, 0, 0);
         if (JS_IsException(r)) {
             JSValue e = JS_GetException(g_ctx);
@@ -474,9 +635,13 @@ int jsdom_pump_timers(unsigned long long now_ms) {
         }
         JS_FreeValue(g_ctx, r);
         if (!g_timer[k].repeat) JS_FreeValue(g_ctx, fn);
-        ran = 1;
+        changed = 1;
     }
-    return ran;
+
+    /* microtasks LAST: a timer or a settled fetch may have queued promise
+     * reactions, and they must run this frame, not next. */
+    if (drain_jobs()) changed = 1;
+    return changed;
 }
 
 unsigned long long jsdom_next_timer(void) {
@@ -486,4 +651,9 @@ unsigned long long jsdom_next_timer(void) {
         if (!best || g_timer[k].due < best) best = g_timer[k].due;
     }
     return best;
+}
+
+int jsdom_busy(void) {
+    for (int k = 0; k < FETCH_MAX; k++) if (g_fetch[k].used) return 1;
+    return 0;
 }

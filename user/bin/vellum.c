@@ -233,14 +233,16 @@ static void app(void) {
     /* ...and the page's pictures, one at a time on the same worker. Each one
      * that lands changes the page, so ask for a frame. */
     if (imgcache_pump()) em_request_frame();
-    /* Timers, then the dirty check: a timer's handler is the most likely thing
-     * to have changed the document, so pump BEFORE asking. */
-    if (jsdom_pump_timers(embk_uptime_ms())) em_request_frame();
+    /* One pump for everything the engine owes the page: due timers, a landed
+     * fetch, and the microtask queue promises resolve onto. Before the dirty
+     * check, because a handler is the most likely thing to have changed the
+     * document. */
+    if (jsdom_pump(embk_uptime_ms())) em_request_frame();
     if (jsdom_take_dirty()) em_request_frame();
-    /* A page with a live timer must keep getting frames; a page without one
-     * must cost nothing, which is why this asks the engine rather than
-     * ticking unconditionally. */
-    if (jsdom_next_timer()) em_app_set_refresh(60);
+    /* Keep frames coming while the page has WORK OUTSTANDING -- a timer to
+     * fire or a fetch to land -- and stop the moment it does not, so an idle
+     * page costs nothing. */
+    if (jsdom_next_timer() || jsdom_busy()) em_app_set_refresh(60);
     else if (!fetchjob_busy() && !imgcache_pending()) em_app_set_refresh(-1);
     if (imgcache_pending()) em_app_set_refresh(200);
 

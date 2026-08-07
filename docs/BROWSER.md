@@ -350,8 +350,26 @@ that resets it, and a setInterval clock that ran past 100 seconds throughout --
 independent of the clicking, with console.log from each handler in the status
 line.
 
-STILL NOT DONE: no `fetch()` binding (net.c does the work already, it is not
-bound), no input/keyboard events, no createElement/appendChild. An engine that cannot touch the document is
+**fetch() IS DONE (2026-08-07).** `fetch(url)` returns a REAL Promise: QuickJS
+hands over its resolve/reject pair, the request takes its turn on the one
+worker the document and images share (the page you asked for outranks the data
+a script wants about it), and the pump settles the Promise when the bytes land.
+The Response is deliberately small -- `ok`, `status`, `text()` (async, as the
+spec has it) -- because a documentation page's script wants status and text,
+and a binding that pretends to more is the lie this browser refuses.
+
+The part that is easy to omit and fatal to: the MICROTASK DRAIN.
+`JS_ExecutePendingJob` runs the reactions promises resolve onto; without it,
+`.then` callbacks queue forever and fetch "succeeds" while doing nothing
+visible. The pump drains jobs after timers and fetches, every frame, and keeps
+draining past a rejection so one bad promise cannot wedge the queue.
+
+Proven on the metal: a page fetches /system/web/data.json, chains two .then()s,
+JSON.parses the body, and writes three DOM fields -- 200 OK, the parsed name,
+and the milestone list -- with its console.log in the status line.
+
+STILL NOT DONE: forms and keyboard events, createElement/appendChild, event
+bubbling beyond the listening element's own subtree, JPEG, caching. An engine that cannot touch the document is
 still an interpreter that computes 2+2 -- exactly what §9 warned about. Next is
 a `document` object over `struct html_doc`, then events, then the fetch the
 browser already has. That work is Vellum's, not the engine's.
