@@ -293,26 +293,44 @@ void scene_set_paint(struct scene_arena *a, struct node_handle h, const struct p
     n->dirty = true;
 }
 
+/* FNV-1a over the string. Short strings, called once per text node per frame. */
+static uint32_t text_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    if (s) while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    return h;
+}
+
 void scene_set_text(struct scene_arena *a, struct node_handle h, const char *utf8,
                     uint32_t font_handle, float size_px, struct color color) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n) return;
-    /* Content-aware no-op guard: comparing only the POINTER hid in-place edits
-     * (e.g. the home's clock snprintf's into the same buffer every second --
-     * the text never re-rendered). Compare bytes; when equal, still adopt the
-     * new pointer (the old one's lifetime belongs to the caller), no dirty. */
-    int same_text = (n->data.text.utf8 == utf8);
-    if (!same_text && n->data.text.utf8 && utf8) {
-        const char *p = n->data.text.utf8, *q = utf8;
-        while (*p && *p == *q) { p++; q++; }
-        same_text = (*p == *q);
-    }
+    /* Content-aware no-op guard, by HASH rather than by pointer or by bytes.
+     *
+     * Comparing the pointer hid in-place edits. Comparing bytes was the first
+     * fix and it is not enough either, because it cannot see the case that
+     * matters most: when the caller passes back the SAME buffer it just wrote
+     * into, the stored pointer already points at the new bytes, so comparing
+     * them finds them equal to themselves and reports "unchanged". The node
+     * keeps no copy of the old string, so a hash of it is the only record that
+     * the text used to be something else.
+     *
+     * That is not hypothetical. A browser's status line updating "Loading...
+     * 1.2s" in a static buffer never repainted for the whole fetch -- the app
+     * was rebuilding correctly and the screen simply never heard about it.
+     *
+     * A 32-bit collision would drop one repaint and self-correct on the next
+     * change; a missed repaint every four billion updates is a fair trade for
+     * not copying every string in the tree every frame. */
+    uint32_t nh = text_hash(utf8);
+    int same_text = (nh == n->data.text.hash) &&
+                    ((n->data.text.utf8 == 0) == (utf8 == 0));
     if (same_text && n->data.text.font_handle == font_handle &&
         n->data.text.size_px == size_px && color_eq(n->data.text.color, color)) {
         n->data.text.utf8 = utf8;
         return;
     }
     n->data.text.utf8 = utf8;
+    n->data.text.hash = nh;
     n->data.text.font_handle = font_handle;
     n->data.text.size_px = size_px;
     n->data.text.color = color;

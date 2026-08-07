@@ -149,7 +149,15 @@ struct scene_node {
         struct { const void *pixels; uint32_t w, h; enum embk_pixfmt fmt;
                  bool tinted; struct color tint; } image;
         struct { const char *utf8; uint32_t font_handle; float size_px; struct color color;
-                 struct paint paint; /* PAINT_*_GRADIENT -> gradient glyph fill */ } text;
+                 struct paint paint; /* PAINT_*_GRADIENT -> gradient glyph fill */
+                 /* Content hash of `utf8` as it was when last set. A node holds
+                  * a POINTER to the caller's buffer, so when that buffer is
+                  * edited IN PLACE there is nothing left to compare against --
+                  * the stored pointer already sees the new bytes. This is the
+                  * only record that the text used to be something else, and
+                  * without it an in-place update is invisible to dirty
+                  * tracking. See scene_set_text. */
+                 uint32_t hash; } text;
     } data;
 
     bool  dirty;   /* any mutation sets this; lets a caching traversal skip an

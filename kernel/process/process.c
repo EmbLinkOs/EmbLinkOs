@@ -47,7 +47,17 @@
  * simplification rather than an oversight. */
 #define USER_THREAD_STACK_BASE  0x0000700010000000ULL
 #define USER_THREAD_STACK_SLOT  0x0000000000100000ULL   /* 1 MiB apart per thread slot */
-#define USER_THREAD_STACK_PAGES 4                         /* 16 KiB actual mapped stack */
+/* 128 KiB, raised from 16 KiB. Four pages was enough for a thread that only
+ * makes syscalls, and nothing else had ever run on one. The moment real
+ * compiled code did -- a TLS 1.3 handshake, whose X.509 chain verification
+ * carries certificates and Montgomery bignums in automatic storage -- 16 KiB
+ * stopped being plausible: tls_connect's own frame is over 3 KiB before it
+ * calls anything. A stack overflow here lands in the unmapped guard below and
+ * kills the process, which is safe but reads as a mystery fault.
+ *
+ * The slot is a whole megabyte and the guard below still spans ~900 KiB, so
+ * this costs 112 KiB of physical memory per live thread and nothing else. */
+#define USER_THREAD_STACK_PAGES 32                        /* 128 KiB actual mapped stack */
 
 /* Phase 4 (docs/architecture/process-and-scheduling.md): the thread/process
  * split. `struct thread` (process.h) is the schedulable unit -- everything
@@ -2562,9 +2572,26 @@ int thread_create_user(struct process *proc, uint64_t entry_point, uint64_t arg)
         vmm_map_in(proc->pml4_phys, va, phys, VMM_WRITABLE | VMM_USER | VMM_NX);
     }
 
+    /* THE ABI, and it is not optional. SysV x86-64 says a function sees
+     * RSP % 16 == 8 on entry, because the CALL that reached it pushed an 8-byte
+     * return address onto a 16-aligned stack. A thread is entered by a JUMP --
+     * nothing was pushed -- so handing it the 16-aligned slot top puts every
+     * frame in the thread 8 bytes out of phase for its whole life.
+     *
+     * That is invisible until compiled C uses an ALIGNED SSE instruction, which
+     * gcc emits freely for struct zeroing and copies. `movaps %xmm0,-0xd30(%rbp)`
+     * then raises #GP -- not a page fault, so it reads like memory corruption
+     * rather than an alignment bug. It cost a browser one crash inside
+     * tls_connect to find, and the only reason it had not surfaced before is
+     * that the one other user thread in the system (home's listener) calls
+     * nothing but raw syscalls and never spills a vector register.
+     *
+     * Eight bytes of dead stack is the entire fix. */
+    uint64_t entry_rsp = slot_top - 8;
+
     t->joinable = true;
     if (!thread_init_for(t, proc, (uint64_t)(uintptr_t)process_trampoline,
-                          entry_point, slot_top, arg)) {
+                          entry_point, entry_rsp, arg)) {
         /* The stack pages mapped above are simply left mapped -- same
          * reasoning as the OOM path just above: they're only reachable
          * through `proc`'s own tables and vanish with it. Not worth a

@@ -373,6 +373,7 @@ void em_flush(void) {
  * (the dirty-rect renderer doesn't erase a removed subtree's pixels). */
 static int g_em_epoch;
 int em_ui_epoch(void) { return g_em_epoch; }
+void em_structure_changed(void) { g_em_epoch++; }
 
 /* Retained updates: live animations ask for the NEXT frame while active; the
  * app runtime skips all UI work on frames nobody asked for (see em_app.c). */

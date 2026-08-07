@@ -35,7 +35,7 @@ static long x_recv(struct xport *x, void *b, size_t n) {
     return x->tls ? tls_read(x->tls, b, n) : recv(x->fd, b, n, 0);
 }
 static void x_close(struct xport *x) {
-    if (x->tls) { tls_close(x->tls); free(x->tls); }   /* tls_close closes the fd */
+    if (x->tls) tls_close(x->tls);      /* tls_close closes the fd; the conn is static */
     else if (x->fd >= 0) close(x->fd);
 }
 
@@ -124,15 +124,23 @@ static int http_once(const struct url *u, char *out, size_t cap,
 
     struct xport x = { fd, 0 };
     if (u->kind == URL_HTTPS) {
-        x.tls = malloc(sizeof(struct tls_conn));
-        if (!x.tls) { snprintf(r->err, sizeof r->err, "Out of memory"); close(fd); return -1; }
+        /* STATIC, not malloc'd, and that is deliberate. This function runs on a
+         * worker thread (fetchjob.c) so the UI does not freeze during a fetch,
+         * and newlib's allocator here is not thread-safe -- __malloc_lock is a
+         * stub. libtls itself allocates nothing, so keeping this one struct
+         * static makes the whole fetch path allocation-free and the two threads
+         * never touch the same allocator state. One fetch is in flight at a
+         * time, which is what makes a single static sound. */
+        static struct tls_conn conn;
+        memset(&conn, 0, sizeof conn);
+        x.tls = &conn;
         int rc = tls_connect(x.tls, fd, u->host);
         if (rc != 0) {
             /* Refusing is the feature. An unauthenticated page is not a page
              * you were asked to show. */
             snprintf(r->err, sizeof r->err,
                      "TLS handshake failed (rc=%d) -- server not authenticated", rc);
-            free(x.tls); close(fd);
+            x.tls = 0; close(fd);
             return -1;
         }
         snprintf(r->via, sizeof r->via, "https (authenticated)");

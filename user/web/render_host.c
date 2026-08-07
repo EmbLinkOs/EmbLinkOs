@@ -45,13 +45,44 @@ static int              g_root = -1;
 static float            g_scroll = 0;
 
 /* The app's shape, verbatim from user/bin/vellum.c -- if this diverges the
- * harness stops being evidence. */
+ * harness stops being evidence. `g_busy` stands in for a fetch in flight, so
+ * the loading strip can be laid out here instead of in a five-minute boot. */
+static int  g_busy;
+static char g_bar[512] = "https://valid-isrgrootx1.letsencrypt.org/";
+
 static void app(void) {
     Window("Vellum") {
-        ScrollView(&g_scroll, em_viewport_height() - 132.0f) {
+        AppBar("Vellum") {
+            IconButton(IconChevronL);
+            IconButton(IconChevronR);
+            IconButton(IconArrowR);
+        }
+        HStack(.spacing = 8, .align = Center, .px = 12, .py = 6) {
+            TextField(g_bar, sizeof g_bar, "Path or URL");
+            Button("Open").primary().font(Caption).py(2);
+        }
+        Divider();
+
+        if (g_busy) {
+            HStack(.spacing = 8, .align = Center, .px = 12, .py = 4) {
+                Spinner();
+                Text("Loading https://valid-isrgrootx1.letsencrypt.org/   1.2s")
+                    .caption().secondary();
+            }
+            Divider();
+        }
+
+        ScrollView(&g_scroll, em_viewport_height() - (g_busy ? 164.0f : 132.0f)) {
             VStack(.spacing = 0, .align = Fill, .padding = 22, .grow = 1) {
                 vellum_render(&g_doc, g_root);
             }
+        }
+
+        Divider();
+        HStack(.spacing = 10, .align = Center, .px = 12, .py = 4) {
+            Text("200  https (authenticated)  4067 bytes").caption().tertiary();
+            Spacer();
+            Text(g_bar).caption().tertiary();
         }
     }
 }
@@ -129,6 +160,7 @@ int main(int argc, char **argv) {
     int H = argc > 3 ? atoi(argv[3]) : 620;
     int maxdepth = argc > 4 ? atoi(argv[4]) : 6;
     const char *png = argc > 5 ? argv[5] : 0;
+    g_busy = (argc > 6 && argv[6][0] == 'b');
 
     size_t rl = 0, bl = 0, dl = 0;
     uint8_t *reg  = read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", &rl);

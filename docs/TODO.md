@@ -1983,10 +1983,22 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [ ] No chunked transfer-encoding. The client is HTTP/1.0 with
       `Connection: close`, so a server that chunks anyway would confuse it.
       Deliberate for now (see BROWSER.md); needed before HTTP/1.1 keep-alive.
-- [ ] The fetch is SYNCHRONOUS: the UI is frozen for the whole request, which
-      on a slow host is seconds with no feedback. Needs either a worker thread
-      or the non-blocking socket path (`nbsock` already proves it works) plus a
-      loading state in the app.
+- [x] ~~The fetch is SYNCHRONOUS~~ DONE 2026-08-07: it runs on a worker thread
+      (`user/web/fetchjob.{c,h}`) and the view polls. The window stays alive and
+      the page lands without a freeze. Three real bugs BELOW the browser had to
+      be fixed to get there -- see the commit; all three were latent for anyone
+      who tried the same thing.
+- [ ] OPEN, and the last rough edge of that work: while a fetch is in flight the
+      DOCUMENT AREA goes blank (chrome paints fine, the load lands fine, the
+      final page is correct). The previous page should stay on screen until the
+      new one replaces it. Known NOT to be: layout (host harness renders both
+      states correctly at the exact window size), the viewport (logged 792x504
+      in both states), buffer aliasing (fetch and display buffers are now
+      separate), or in-place text staleness (fixed + locked by scene-test).
+      Next thing to try: instrument `scene_render_frame`'s dirty accounting on
+      the first frame after a force_full clear -- the symptom is "buffer was
+      cleared, only some nodes repainted", so the question is which nodes the
+      cache thought were clean.
 - [ ] Nothing caches. Every navigation, including Back, refetches.
 - [ ] No Content-Type handling: everything is parsed as HTML. An image or a
       binary will be rendered as garbage rather than refused or downloaded.

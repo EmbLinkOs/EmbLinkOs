@@ -515,6 +515,17 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height);
  * An app's loop compares it across frames and forces a full repaint on change. */
 int em_ui_epoch(void);
 
+/* An APP restructuring its OWN view must say so, for exactly the same reason
+ * the built-in components do. Adding or removing a row changes where every
+ * later row sits, and the runtime's partial repaint only knows about the boxes
+ * it was told changed -- so the frame lands with the new layout drawn over the
+ * old pixels. A browser inserting a "loading" strip showed this perfectly: the
+ * app bar vanished and the previous page appeared 56px out of place.
+ *
+ * Call this on the EDGE, when the shape changes, not every frame -- a
+ * permanent bump means a permanent full repaint. */
+void em_structure_changed(void);
+
 /* ======================================================================= */
 /* EmApplication -- the declarative app runtime (V4.1).                     */
 /* One macro replaces the whole main(): font/resource setup, arenas, theme, */
