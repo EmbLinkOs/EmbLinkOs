@@ -1,0 +1,8 @@
+/* An EXTERNAL stylesheet: the browser had to fetch this file separately,
+   resolve its path against the document, and merge it into the cascade. */
+body       { color: #d8d8e0 }
+h1         { color: #e0604a; font-size: xx-large }
+.lead      { color: #6aa9ff; font-weight: bold }
+.note      { color: #8a8a95; font-style: italic }
+.gone      { display: none }
+code       { color: #7fd6a0; font-family: monospace }

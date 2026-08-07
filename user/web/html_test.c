@@ -661,6 +661,44 @@ static void t20_png_hostile(void) {
     CHECK(rc != PNG_OK, "corrupt DEFLATE data is detected");
 }
 
+/* ================= external stylesheets ================================ */
+
+static void t22_linkcss(void) {
+    printf("T22 <link rel=stylesheet>: the parser records WHERE, never fetches:\n");
+    static struct html_node nodes[256];
+    static char strs[8192];
+    struct html_doc d;
+
+    const char *doc =
+        "<html><head>"
+        "<link rel=stylesheet href=\"/a.css\">"
+        "<link rel='alternate stylesheet' href='b.css'>"
+        "<link rel=icon href=/favicon.ico>"
+        "<link href=/no-rel.css>"
+        "<style>p{color:red}</style>"
+        "</head><body><p>hi</p></body></html>";
+    html_parse(&d, doc, strlen(doc), nodes, 256, strs, sizeof strs);
+
+    CHECK(d.n_cssref == 2, "two stylesheets found, and only the stylesheets");
+    CHECK(d.n_cssref > 0 && !strcmp(d.cssref[0], "/a.css"), "...the first, in document order");
+    CHECK(d.n_cssref > 1 && !strcmp(d.cssref[1], "b.css"), "...and the second");
+    /* rel is a TOKEN LIST: "alternate stylesheet" counts, "icon" does not, and
+     * a <link> with no rel at all is not a stylesheet however it is named. */
+    CHECK(d.css && !strncmp(d.css, "p{color:red}", 12), "an inline <style> is still captured");
+
+    /* A page may reference more sheets than we will hold. The cap must be a
+     * bounded truncation, not an overrun. */
+    static char many[4096];
+    size_t mn = 0;
+    mn += (size_t)snprintf(many + mn, sizeof many - mn, "<html><head>");
+    for (int i = 0; i < 20; i++)
+        mn += (size_t)snprintf(many + mn, sizeof many - mn,
+                               "<link rel=stylesheet href=/s%d.css>", i);
+    snprintf(many + mn, sizeof many - mn, "</head><body>x</body></html>");
+    html_parse(&d, many, strlen(many), nodes, 256, strs, sizeof strs);
+    CHECK(d.n_cssref == 8, "twenty sheets truncate to the cap, without overrunning");
+}
+
 /* ======================= JPEG ========================================== */
 
 static void t21_jpeg(void) {
@@ -729,6 +767,7 @@ int main(void) {
     t11b_entities(); t12_attrs_and_style_block(); t13_declarations(); t14_selectors();
     t15_cascade(); t16_origin_order(); t17_bounded();
     t17b_image_sizing(); t17c_forms(); t18_png_basics(); t19_png_palette_and_filters(); t20_png_hostile();
+    t22_linkcss();
     t21_jpeg();
     printf("=== html-test: %s (%d failures) ===\n", failures ? "FAIL" : "OK", failures);
     return failures ? 1 : 0;

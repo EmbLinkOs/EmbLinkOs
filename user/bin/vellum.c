@@ -33,6 +33,7 @@
 #include "net.h"
 #include "fetchjob.h"
 #include "select.h"
+#include "cssref.h"
 
 /* One document at a time, in fixed arenas. A browser that can be handed a
  * hostile page needs a bounded appetite -- see docs/BROWSER.md §7. */
@@ -52,6 +53,31 @@ static struct html_node g_nodes[NODE_MAX];
 static char             g_strs[STR_MAX];
 static struct html_doc  g_doc;
 static struct css_sheet g_sheet;   /* the page's own <style>, cascaded */
+
+
+/* The cascade is built from EVERY sheet the page has: the external ones that
+ * have arrived so far, then the document's own <style>. Rebuilt each time a
+ * <link> lands, because css_sheet_parse replaces a sheet rather than extending
+ * it -- and because a page must be readable before the last stylesheet does. */
+static char g_allcss[160 * 1024];
+static void rebuild_sheet(void) {
+    size_t n = 0, extn = 0;
+    const char *ext = cssref_text(&extn);
+    if (ext && extn) {
+        if (extn > sizeof g_allcss - 2) extn = sizeof g_allcss - 2;
+        memcpy(g_allcss, ext, extn);
+        n = extn;
+        g_allcss[n++] = '\n';
+    }
+    if (g_doc.css && g_doc.css_len) {
+        size_t k = g_doc.css_len;
+        if (n + k > sizeof g_allcss - 1) k = sizeof g_allcss - 1 - n;
+        memcpy(g_allcss + n, g_doc.css, k);
+        n += k;
+    }
+    g_allcss[n] = 0;
+    css_sheet_parse(&g_sheet, n ? g_allcss : 0, n);
+}
 static int              g_root = -1;
 
 static char  g_url[512]   = "";
@@ -60,6 +86,39 @@ static char  g_status[256] = "";
 static char  g_console[256] = "";     /* the page's last console.log */
 static char  g_status_done[256] = ""; /* what the status said before loading */
 static int   g_status_busy;
+
+/* What the status line says about the load that produced this page. Kept as
+ * FIELDS rather than composed once, because the counts it reports keep
+ * changing after the document lands: an external stylesheet arriving adds
+ * rules. The line said "1 css rule" on a page with four while three of them
+ * were already applied on screen -- a status line that under-reports is the
+ * same lie as one that over-reports. */
+static struct {
+    int    status;
+    char   via[64];
+    size_t bytes;
+    int    res_trunc;
+} g_st;
+
+static void update_status(void) {
+    char css[80]; css[0] = 0;
+    if (g_sheet.n) snprintf(css, sizeof css, "  %d css rule%s%s", g_sheet.n,
+                            g_sheet.n == 1 ? "" : "s", g_sheet.truncated ? "+" : "");
+    if (cssref_pending()) {
+        size_t k = strlen(css);
+        snprintf(css + k, sizeof css - k, " (+css)");
+    }
+    if (g_doc.n_js) {
+        size_t k = strlen(css);
+        snprintf(css + k, sizeof css - k, "  %d script%s",
+                 g_doc.n_js, g_doc.n_js == 1 ? "" : "s");
+    }
+    snprintf(g_status, sizeof g_status, "%d  %s  %zu bytes  %d nodes%s%s%s",
+             g_st.status, g_st.via, g_st.bytes, g_doc.n, css,
+             g_st.res_trunc  ? "  (response truncated)" : "",
+             g_doc.truncated ? "  (document truncated)" : "");
+    snprintf(g_status_done, sizeof g_status_done, "%s", g_status);
+}
 static float g_scroll = 0;
 
 /* Back/forward, the same shape Files uses -- "back" alone is half a history. */
@@ -122,7 +181,7 @@ static void load_error(const char *url, const char *why) {
              "Try <a href=\"/system/web/index.html\">the start page</a>.</p>",
              why, url);
     g_root = html_parse(&g_doc, g_src, strlen(g_src), g_nodes, NODE_MAX, g_strs, STR_MAX);
-    css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
+    cssref_reset(); rebuild_sheet();
     imgcache_reset();
     vsel_reset();
     snprintf(g_status, sizeof g_status, "%s", why);
@@ -171,7 +230,8 @@ static void finish_load(const struct vnet_result *res) {
     if (g_root < 0) { load_error(g_url, "The document could not be parsed."); return; }
     /* the author's stylesheet, borrowed from the document arena (which is why
      * it is parsed here, once, and not per frame) */
-    css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
+    cssref_start(&g_doc, g_url);
+    rebuild_sheet();
     imgcache_reset();          /* one page's pictures never leak into the next */
     vsel_reset();              /* ...nor does a selection: it indexed the OLD words */
     form_reset();              /* ...nor one page's typing into the next */
@@ -189,22 +249,11 @@ static void finish_load(const struct vnet_result *res) {
             snprintf(g_console, sizeof g_console, "%d script(s) threw", failed);
     }
 
-    /* The status line is the browser's honesty: how the bytes arrived, how many
-     * there were, how long it took, and whether we told the truth about all
-     * of them. */
-    char css[72]; css[0] = 0;
-    if (g_sheet.n) snprintf(css, sizeof css, "  %d css rule%s%s", g_sheet.n,
-                            g_sheet.n == 1 ? "" : "s", g_sheet.truncated ? "+" : "");
-    if (g_doc.n_js) {
-        size_t k = strlen(css);
-        snprintf(css + k, sizeof css - k, "  %d script%s",
-                 g_doc.n_js, g_doc.n_js == 1 ? "" : "s");
-    }
-    snprintf(g_status, sizeof g_status, "%d  %s  %zu bytes  %d nodes%s%s%s",
-             res->status, res->via, n, g_doc.n, css,
-             res->truncated   ? "  (response truncated)" : "",
-             g_doc.truncated  ? "  (document truncated)" : "");
-    snprintf(g_status_done, sizeof g_status_done, "%s", g_status);
+    g_st.status = res->status;
+    snprintf(g_st.via, sizeof g_st.via, "%s", res->via);
+    g_st.bytes = n;
+    g_st.res_trunc = res->truncated;
+    update_status();
 }
 
 static void navigate_post(const char *url, const char *body) {
@@ -305,9 +354,15 @@ static void app(void) {
     struct vnet_result res;
     if (fetchjob_poll(DOC_TAG, &res) == 1) finish_load(&res);
 
+    /* Stylesheets BEFORE pictures. Both share the one worker, and a page that
+     * paints its images before it knows what colour anything is shows the
+     * reader a wrong-looking page and then rearranges it. Style first is also
+     * the order a browser's own preload scanner uses, for the same reason. */
+    if (cssref_pump()) { rebuild_sheet(); update_status(); em_request_frame(); }
+
     /* ...and the page's pictures, one at a time on the same worker. Each one
      * that lands changes the page, so ask for a frame. */
-    if (imgcache_pump()) em_request_frame();
+    if (!cssref_pending() && imgcache_pump()) em_request_frame();
     /* One pump for everything the engine owes the page: due timers, a landed
      * fetch, and the microtask queue promises resolve onto. Before the dirty
      * check, because a handler is the most likely thing to have changed the
@@ -318,8 +373,9 @@ static void app(void) {
      * fire or a fetch to land -- and stop the moment it does not, so an idle
      * page costs nothing. */
     if (jsdom_next_timer() || jsdom_busy()) em_app_set_refresh(60);
-    else if (!fetchjob_busy() && !imgcache_pending()) em_app_set_refresh(-1);
-    if (imgcache_pending()) em_app_set_refresh(200);
+    else if (!fetchjob_busy() && !imgcache_pending() && !cssref_pending())
+        em_app_set_refresh(-1);
+    if (imgcache_pending() || cssref_pending()) em_app_set_refresh(200);
 
     /* While a fetch is in flight the view has to keep being built, or the
      * runtime -- which draws on input by design -- would never poll again and

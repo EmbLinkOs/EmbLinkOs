@@ -2163,6 +2163,42 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       build clear each run's background made a live selection re-dirty every
       selected word twice per frame (a full repaint per frame). Whoever sets a
       background owns removing it.
+- [ ] HOW FAR VELLUM IS FROM A BROWSER, measured 2026-08-07 against four real
+      pages rather than our own documents. example.com: correct.
+      motherfuckingwebsite.com: essentially perfect. danluu.com: readable, but
+      its `d{width:4em}` and `li{display:flex}` do nothing so dates weld onto
+      titles. news.ycombinator.com: 1307 nodes in, "1. by | 2. by |" out --
+      the story titles ARE in the DOM and the renderer drops them, which is a
+      nested-<table> bug, not a CSS one. In priority order, what is missing:
+        1. ~~External stylesheets are never fetched~~ FIXED (see below).
+        2. The CSS vocabulary is ~18 properties. We understand color, display,
+           font-*, width, height, margin*, padding*, max-width,
+           text-decoration. We do NOT understand background/background-color,
+           any border, text-align, line-height, position/top/left/z-index,
+           float, any flex-*, gap, overflow, box-sizing, opacity,
+           border-radius, %/vh/vw/calc(), media queries, :hover/:focus,
+           ::before/::after, or var(). This is the bulk of the remaining gap.
+        3. Nested tables collapse (HN).
+        4. JS is 'click' only -- no bubbling, no createElement/appendChild,
+           no querySelector.
+        5. Form controls are text and submit only -- no checkbox, radio,
+           select, textarea, file.
+        6. No cookies, no cache, no charset handling beyond UTF-8, no iframe,
+           canvas, svg, video or audio.
+- [x] ~~<link rel=stylesheet> is parsed and thrown away~~ FIXED 2026-08-07:
+      the parser records the hrefs (doc->cssref, document order, capped at 8
+      and truncating rather than overrunning -- T22), and `user/web/cssref.c`
+      fetches them on the shared worker, one at a time, BEFORE the page's
+      images: a page that paints pictures before it knows what colour anything
+      is shows the reader a wrong page and then rearranges it. A sheet that
+      404s is not fatal -- the page renders with whatever styling arrived.
+      Cascade order is every external sheet in document order, then the
+      document's own <style>; the true CSS order interleaves them as they
+      appear in the source, and that difference is written down in cssref.h
+      rather than pretended away. Metal-proven on /system/web/styled.html.
+      Also fixed: the status line composed its rule count ONCE at load and so
+      reported "1 css rule" on a page with seven, three of which were already
+      on screen -- it is now recomposed whenever a sheet lands.
 - [ ] Selection is WORD granular, not character. The renderer emits one node per
       word, so that is the grain available without measuring glyph prefixes
       through the font engine on every pointer move. Also missing: double-click

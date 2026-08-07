@@ -75,6 +75,14 @@ struct html_doc {
     char  *js[8];
     size_t js_len[8];
     int    n_js;
+    /* <link rel=stylesheet href=...> targets, in document order. The parser
+     * records the URLs and nothing else: fetching them is a NETWORK act, and
+     * the parser is the one part of this browser that never touches the
+     * network. The app fetches each one and appends it to `css` before the
+     * cascade runs -- which is also why they are in document order, since a
+     * later sheet outranks an earlier one at equal specificity. */
+    char  *cssref[8];
+    int    n_cssref;
 };
 
 /* Replace an element's text content. Allocates from the document's own string

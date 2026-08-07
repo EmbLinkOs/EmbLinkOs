@@ -279,6 +279,7 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         char fname[64];  fname[0] = 0;
         char fval[256];  fval[0] = 0;
         char ftype[24];  ftype[0] = 0;
+        char frel[32];   frel[0] = 0;
         while (p < len && src[p] != '>') {
             while (p < len && (src[p]==' '||src[p]=='\t'||src[p]=='\n'||src[p]=='\r')) p++;
             if (p >= len || src[p] == '>' || src[p] == '/') break;
@@ -350,6 +351,9 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                 } else if ((ieq(aname,"type") || ieq(aname,"method")) && !ftype[0]) {
                     size_t c = vl < sizeof ftype - 1 ? vl : sizeof ftype - 1;
                     memcpy(ftype, src + vs, c); ftype[c] = 0;
+                } else if (ieq(aname,"rel") && !frel[0]) {
+                    size_t c = vl < sizeof frel - 1 ? vl : sizeof frel - 1;
+                    memcpy(frel, src + vs, c); frel[c] = 0;
                 } else if (ieq(aname,"alt") && !alt[0]) {
                     /* alt is not decoration: it is what the page SAYS when the
                      * picture cannot be shown, which for us is often. */
@@ -363,6 +367,27 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         if (p < len) p++;                              /* past '>' */
 
         if (!tag[0]) { i = p; continue; }
+
+        /* <link rel=stylesheet>: remember WHERE the sheet is. rel is matched by
+         * substring because it is a space-separated token list and real pages
+         * write "alternate stylesheet" and "stylesheet noopener" alike. */
+        if (ieq(tag, "link") && href[0] && d->n_cssref < 8) {
+            int is_sheet = 0;
+            for (size_t k2 = 0; frel[k2]; k2++) {
+                int m = 1;
+                const char *w = "stylesheet";
+                for (int k3 = 0; k3 < 10; k3++) {
+                    char c3 = frel[k2 + k3];
+                    if (c3 >= 'A' && c3 <= 'Z') c3 = (char)(c3 - 'A' + 'a');
+                    if (c3 != w[k3]) { m = 0; break; }
+                }
+                if (m) { is_sheet = 1; break; }
+            }
+            if (is_sheet) {
+                char *held = str_put(d, href, strlen(href));
+                if (held) d->cssref[d->n_cssref++] = held;
+            }
+        }
 
         if (closing) {
             FLUSH();

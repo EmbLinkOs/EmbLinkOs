@@ -25,6 +25,8 @@
 #include "png.h"
 #include "jpeg.h"
 #include "select.h"
+#include "cssref.h"
+#include "url.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -214,9 +216,23 @@ int main(int argc, char **argv) {
     uint32_t fr = font_load(reg, rl), fb = font_load(bold, bl);
     font_install_backend();
 
+    g_doc_base = doc;                /* before cssref_start: sheets resolve against it */
     g_root = html_parse(&g_doc, (const char *)src, dl, g_nodes, NODE_MAX, g_strs, STR_MAX);
-    css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
-    g_doc_base = doc;
+    /* external sheets first, then the document's own <style> -- the same
+     * order (and the same concatenation) the app builds its cascade with */
+    cssref_start(&g_doc, g_doc_base);
+    {
+        static char allcss[320 * 1024];
+        size_t n = 0, extn = 0;
+        const char *ext = cssref_text(&extn);
+        if (ext && extn) { memcpy(allcss, ext, extn); n = extn; allcss[n++] = '\n'; }
+        if (g_doc.css && g_doc.css_len && n + g_doc.css_len < sizeof allcss - 1) {
+            memcpy(allcss + n, g_doc.css, g_doc.css_len);
+            n += g_doc.css_len;
+        }
+        allcss[n] = 0;
+        css_sheet_parse(&g_sheet, n ? allcss : 0, n);
+    }
     printf("%s: %zu bytes -> %d nodes%s, root %d, %d css rule%s%s\n", doc, dl, g_doc.n,
            g_doc.truncated ? " (TRUNCATED)" : "", g_root, g_sheet.n,
            g_sheet.n == 1 ? "" : "s", g_sheet.truncated ? " (TRUNCATED)" : "");
@@ -364,7 +380,12 @@ int main(int argc, char **argv) {
             printf("*** selection FAILED: a bare press selected something ***\n");
             g_fail++;
         }
+        /* ...and UNPAINT. vsel_reset drops the range but the runs keep the
+         * background they were last given -- in the app the post-layout pass
+         * runs every frame and takes it away, here nothing would, and the PNG
+         * below would show this test's highlight as if it were the page. */
         vsel_reset();
+        vsel_sync_geometry();
     }
 
     /* --- THE REFLOW CHECK ------------------------------------------------
@@ -445,6 +466,43 @@ static struct img_slot H[IMG_SLOTS];
 static uint32_t HARENA[IMG_MAX_PX];
 static size_t   HUSED;
 static uint8_t  HSCR[IMG_MAX_PX * 4 + IMG_MAX_DIM + 64];
+
+/* --- external stylesheets, from disk ------------------------------------
+ * The real cssref.c fetches over the network, which is the one thing this
+ * harness cannot do. Loading the sheets from beside the document instead keeps
+ * everything ABOVE the fetch -- resolution, concatenation, cascade order --
+ * under test, which is where the interesting behaviour is. */
+static char   HCSS[160 * 1024];
+static size_t HCSSN;
+
+void cssref_reset(void) { HCSSN = 0; HCSS[0] = 0; }
+int  cssref_pump(void) { return 0; }
+int  cssref_pending(void) { return 0; }
+const char *cssref_text(size_t *len) { if (len) *len = HCSSN; return HCSSN ? HCSS : 0; }
+
+int cssref_start(struct html_doc *doc, const char *base) {
+    cssref_reset();
+    if (!doc) return 0;
+    int got = 0;
+    for (int i = 0; i < doc->n_cssref; i++) {
+        char path[1024];
+        if (url_resolve(base, doc->cssref[i], path, sizeof path) != 0) continue;
+        /* a network href has no file behind it here; skip rather than invent */
+        size_t n = 0;
+        uint8_t *buf = read_file(path, &n);
+        if (!buf) { fprintf(stderr, "  (no local sheet for %s)\n", doc->cssref[i]); continue; }
+        if (HCSSN + n + 2 < sizeof HCSS) {
+            if (HCSSN) HCSS[HCSSN++] = '\n';
+            memcpy(HCSS + HCSSN, buf, n);
+            HCSSN += n;
+            HCSS[HCSSN] = 0;
+            got++;
+        }
+        free(buf);
+    }
+    if (got) fprintf(stderr, "  (loaded %d external stylesheet(s), %zu bytes)\n", got, HCSSN);
+    return got;
+}
 
 void imgcache_reset(void) { memset(H, 0, sizeof H); HUSED = 0; }
 int  imgcache_pump(void) { return 0; }

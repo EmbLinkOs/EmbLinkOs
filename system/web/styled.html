@@ -1,33 +1,14 @@
-<!doctype html>
-<html><head><title>CSS</title>
-<style>
-  /* the cascade, exercised by a page that means it */
-  body      { color: #d8dee9 }
-  h1        { color: #88c0d0; margin-bottom: 4px }
-  h2        { color: #a3be8c }
-  .lead     { font-size: 19px; color: #eceff4 }
-  .muted    { color: #7b8394; font-size: 13px }
-  code      { color: #ebcb8b }
-  .card     { margin: 14px 0 14px 18px }
-  .card p   { margin-bottom: 4px }
-  #warn     { color: #bf616a; font-weight: bold }
-  nav a     { color: #b48ead; text-decoration: none }
-  .hidden   { display: none }
-  @media print { body { color: lime } }
-</style></head>
-<body>
-<h1>Vellum styles a page</h1>
-<p class="lead">This paragraph is styled by a class selector, which beats the
-element rule below it no matter which came first &mdash; that is specificity.</p>
-<p>Ordinary body text, coloured by the <code>body</code> rule and inherited all
-the way down. A <code>code</code> span takes its own colour.</p>
-<h2>Selectors that work</h2>
-<div class="card">
-  <p>Descendant selectors: <code>.card p</code> tightens this paragraph's margin.</p>
-  <p id="warn">An id selector (100) outranks every class here.</p>
-</div>
-<p class="muted">Smaller, quieter text via two properties in one class.</p>
-<p style="color:#a3be8c; font-style:italic">Inline style beats the stylesheet.</p>
-<p class="hidden">If you can read this, display:none is broken.</p>
-<nav><a href="/system/web/index.html">a nav link, restyled</a></nav>
+<html><head>
+<title>Styled from a file</title>
+<link rel="stylesheet" href="styled.css">
+<style>.lead { font-style: italic }</style>
+</head><body>
+<h1>This page is styled by a separate file</h1>
+<p class="lead">Blue and bold from <code>styled.css</code>, italic from the page's own
+&lt;style&gt; block &mdash; two sheets, one cascade.</p>
+<p class="gone">If the external stylesheet had not loaded, this line would be visible,
+and the heading above would be plain white body text.</p>
+<p class="note">Nearly every site on the web keeps its CSS in a file like this one.
+Until the browser fetched them, all of that styling was simply missing.</p>
+<p><a href="/system/web/index.html">Back to the start page</a></p>
 </body></html>
