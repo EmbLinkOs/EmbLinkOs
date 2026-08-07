@@ -377,6 +377,10 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
              * KEEP it (concatenated across blocks, in document order, which is
              * the order the cascade needs); <script> is still discarded, since
              * nothing downstream can run it. */
+            if (ieq(tag, "script") && k > p && d->n_js < 8) {
+                char *held = str_put(d, src + p, k - p);
+                if (held) { d->js[d->n_js] = held; d->js_len[d->n_js] = k - p; d->n_js++; }
+            }
             if (ieq(tag, "style") && k > p) {
                 char *held = str_put(d, src + p, k - p);
                 if (held) {
@@ -441,3 +445,34 @@ int html_resolve_url(const char *base, const char *href, char *out, size_t cap) 
     else                   snprintf(out, cap, "%.*s%s", (int)dirlen, base, href);
     return 0;
 }
+
+/* --- mutation ------------------------------------------------------------ */
+
+int html_set_text(struct html_doc *d, int node, const char *text) {
+    if (!d || node < 0 || node >= d->n || !text) return -1;
+    size_t n = strlen(text);
+    char *held = str_put(d, text, n);
+    if (!held) { d->truncated = 1; return -1; }
+
+    struct html_node *e = &d->nodes[node];
+    if (e->kind == HTML_TEXT) { e->text = held; return 0; }
+
+    /* An ELEMENT's textContent replaces all its children with one text node.
+     * Reusing the FIRST child when it is already text keeps the common case
+     * (a <span> whose message a script updates) from consuming a node per
+     * assignment -- an animation loop would otherwise exhaust the arena. */
+    int c = e->first_child;
+    if (c >= 0 && d->nodes[c].kind == HTML_TEXT) {
+        d->nodes[c].text = held;
+        d->nodes[c].next_sibling = -1;      /* drop any siblings after it */
+        return 0;
+    }
+    int ni = node_new(d, HTML_TEXT, node);
+    if (ni < 0) return -1;
+    d->nodes[ni].text = held;
+    e->first_child = ni;
+    d->nodes[ni].next_sibling = -1;
+    return 0;
+}
+
+char *html_intern(struct html_doc *d, const char *s, size_t n) { return str_put(d, s, n); }

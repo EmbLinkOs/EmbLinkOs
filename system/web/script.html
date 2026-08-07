@@ -1,0 +1,40 @@
+<!doctype html>
+<html><head><title>Scripting</title>
+<style>
+  h1     { color: #88c0d0 }
+  .out   { color: #a3be8c }
+  .muted { color: #7b8394; font-size: 13px }
+</style></head>
+<body>
+<h1>JavaScript touches this page</h1>
+<p>Everything below was written by a script in this document, at load time,
+through bindings over the browser's own DOM.</p>
+
+<p>Computed: <span id="calc" class="out">(not run)</span></p>
+<p>Read back from the tree: <span id="readback" class="out">(not run)</span></p>
+<p>Counted by selector: <span id="count" class="out">(not run)</span></p>
+<p>Restyled by script: <span id="painted">this text was recoloured</span></p>
+
+<p class="muted">The engine is QuickJS; the bindings are user/web/jsdom.c;
+querySelector is the browser's own CSS selector engine, reused.</p>
+
+<script>
+  // arithmetic and closures, to show it is a real engine
+  const fact = n => n <= 1 ? 1 : n * fact(n - 1);
+  document.querySelector("#calc").setText("10! = " + fact(10));
+
+  // READ the document -- the title comes from <title>, not from a string here
+  document.querySelector("#readback").setText(
+      "document.title is \"" + document.title + "\"");
+
+  // query the tree the way CSS does
+  const spans = document.querySelectorAll("p span.out");
+  document.querySelector("#count").setText(
+      spans.length + " spans match 'p span.out'");
+
+  // mutate STYLE, which the cascade then applies on the next frame
+  document.querySelector("#painted").setStyle("color:#d08770; font-weight:bold");
+
+  console.log("script ran: " + spans.length + " spans, " + fact(5) + " = 5!");
+</script>
+</body></html>

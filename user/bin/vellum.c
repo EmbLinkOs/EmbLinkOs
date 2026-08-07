@@ -24,6 +24,7 @@
 #include "render.h"
 #include "css.h"
 #include "imgcache.h"
+#include "jsdom.h"
 
 /* who owns a fetch on the shared worker */
 #define DOC_TAG 1
@@ -54,6 +55,7 @@ static int              g_root = -1;
 static char  g_url[512]   = "";
 static char  g_bar[512]   = "";      /* what the URL field is showing        */
 static char  g_status[256] = "";
+static char  g_console[256] = "";     /* the page's last console.log */
 static float g_scroll = 0;
 
 /* Back/forward, the same shape Files uses -- "back" alone is half a history. */
@@ -64,6 +66,14 @@ static char g_fwd[24][512];  static int g_fwd_n;
  * in the arena the load is about to overwrite. */
 static char g_goto[512] = "";
 static void on_link(const char *href) { (void)href; }
+
+/* A script's output has to go SOMEWHERE a person can see, or console.log is a
+ * call that does nothing observable -- the exact thing this browser refuses to
+ * ship elsewhere. The status line is where the browser already tells the truth
+ * about a page, so it is where a page's own words go too. */
+static void on_console(const char *line) {
+    snprintf(g_console, sizeof g_console, "%s", line);
+}
 
 /* --- loading ------------------------------------------------------------ */
 
@@ -129,12 +139,29 @@ static void finish_load(const struct vnet_result *res) {
     css_sheet_parse(&g_sheet, g_doc.css, g_doc.css_len);
     imgcache_reset();          /* one page's pictures never leak into the next */
 
+    /* A NEW WORLD per page: the engine is torn down and rebuilt, so a script
+     * cannot outlive the document that wrote it, and one page's globals can
+     * never be read by the next. Then run what the page brought. */
+    g_console[0] = 0;
+    jsdom_set_console(on_console);
+    if (jsdom_open(&g_doc, &g_sheet) == 0 && g_doc.n_js > 0) {
+        int failed = jsdom_run_scripts();
+        jsdom_take_dirty();     /* the first render happens anyway */
+        if (failed && !g_console[0])
+            snprintf(g_console, sizeof g_console, "%d script(s) threw", failed);
+    }
+
     /* The status line is the browser's honesty: how the bytes arrived, how many
      * there were, how long it took, and whether we told the truth about all
      * of them. */
-    char css[40]; css[0] = 0;
+    char css[72]; css[0] = 0;
     if (g_sheet.n) snprintf(css, sizeof css, "  %d css rule%s%s", g_sheet.n,
                             g_sheet.n == 1 ? "" : "s", g_sheet.truncated ? "+" : "");
+    if (g_doc.n_js) {
+        size_t k = strlen(css);
+        snprintf(css + k, sizeof css - k, "  %d script%s",
+                 g_doc.n_js, g_doc.n_js == 1 ? "" : "s");
+    }
     snprintf(g_status, sizeof g_status, "%d  %s  %zu bytes  %d nodes%s%s%s",
              res->status, res->via, n, g_doc.n, css,
              res->truncated   ? "  (response truncated)" : "",
@@ -198,6 +225,8 @@ static void app(void) {
     /* ...and the page's pictures, one at a time on the same worker. Each one
      * that lands changes the page, so ask for a frame. */
     if (imgcache_pump()) em_request_frame();
+    /* a script changed the document -> the next frame must show it */
+    if (jsdom_take_dirty()) em_request_frame();
     if (imgcache_pending()) em_app_set_refresh(200);
 
     /* While a fetch is in flight the view has to keep being built, or the
@@ -272,8 +301,10 @@ static void app(void) {
 
         Divider();
         HStack(.spacing = 10, .align = Center, .px = 12, .py = 4) {
+            /* what the PAGE said outranks what the browser has to say: a
+             * script's output is the thing the reader is waiting for. */
             const char *h = vellum_hovered_link();
-            Text(h ? h : g_status).caption().tertiary();
+            Text(h ? h : (g_console[0] ? g_console : g_status)).caption().tertiary();
             Spacer();
             Text(g_url).caption().tertiary();
         }

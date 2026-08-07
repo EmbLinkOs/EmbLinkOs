@@ -1045,7 +1045,14 @@ URL bar, back/forward, clickable links, a status line. The renderer reads only
 `struct vstyle` and never a tag name, so real CSS changes how that struct is
 FILLED and nothing else.
 
-**JavaScript runs (B7, engine half).** QuickJS 2024-01-13 cross-compiled
+**JavaScript runs IN THE PAGE (B7).** QuickJS plus `user/web/jsdom.c`: a
+document's own `<script>` can query the tree with the browser's CSS selector
+engine, read and rewrite text, restyle elements through the cascade, and log to
+the status line. One document, one world per page, an index (never a pointer)
+across the boundary, and a memory budget so a stranger's loop cannot hang the
+window. Events are the next gap.
+
+**The engine half.** QuickJS 2024-01-13 cross-compiled
 against newlib and hosted by ~100 lines of our own (`user/bin/js.c`) -- one
 patch of two hunks for the whole 58k-line engine, both hunks merely widening
 existing `#ifdef`s. `js hello.js` runs closures, regexps, Array.sort and

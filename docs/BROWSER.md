@@ -291,7 +291,43 @@ function, a regexp with a capture group, JSON.stringify, and a recursive
 closure. A syntax error reports as QuickJS's own SyntaxError through the host's
 handler.
 
-WHAT IS NOT DONE: the bindings. An engine that cannot touch the document is
+**THE BINDINGS ARE DONE (2026-08-07).** `user/web/jsdom.c` gives a page's
+script `document.querySelector` / `querySelectorAll`, `document.title`,
+`el.textContent`, `el.setText`, `el.getAttribute`, `el.setStyle` and
+`console.log`. Vellum runs every `<script>` after parsing, in document order,
+and a mutation marks the document so the next frame shows it.
+
+querySelector cost almost nothing, and that is the dividend from splitting the
+CSS engine by concern: `sel.c` already answers "does this selector match this
+element", so the binding is a tree walk plus a call. The browser's selector
+engine and the DOM's are the same code.
+
+Design decisions worth stating:
+
+- An element reaches JavaScript as its NODE INDEX, never a pointer. The DOM
+  arena is an array a mutation can grow, so a pointer handed to a script is one
+  a later mutation invalidates -- a use-after-free with a stranger's page as
+  the trigger. An index cannot dangle.
+- ONE document. The tree a script mutates is the tree the renderer walks; there
+  is no shadow DOM and therefore no synchronisation question.
+- A NEW WORLD per page: the runtime is torn down and rebuilt on every
+  navigation, so a script cannot outlive the document that wrote it and one
+  page's globals are unreachable from the next.
+- A page's script gets a BUDGET (16MB, 512KB stack). A browser that one line of
+  someone else's JavaScript can hang is not one you can browse with.
+- `el.setStyle("color:red")` is deliberately NOT spelled `el.style.color`.
+  The real thing needs a property-per-CSS-property proxy; naming ours
+  differently stops an author believing they have the real one and then
+  wondering why it reads back undefined.
+
+Proven on the metal: /system/web/script.html computes 10! with a recursive
+closure, READS `document.title` out of the tree, counts `p span.out` with the
+CSS engine, recolours an element through the cascade, and puts its
+`console.log` in the status line.
+
+STILL NOT DONE: events. There is no click, no input, no timer -- a script runs
+once at load and then the page is static. That is the next thing, and it needs
+the renderer to route a hit back to a node, which it already does for links. An engine that cannot touch the document is
 still an interpreter that computes 2+2 -- exactly what §9 warned about. Next is
 a `document` object over `struct html_doc`, then events, then the fetch the
 browser already has. That work is Vellum's, not the engine's.
@@ -331,7 +367,7 @@ Each ends with something demonstrable. No milestone is "infrastructure".
 | **B4** | HTTPS via libtls, redirects, byte caps | fetch a real site on the public internet |
 | **B5** | ✅ Inline `style=`, `<style>` + selectors + cascade | a styled page looks like the author meant |
 | **B6** | ✅ `<img>`: PNG via our own DEFLATE, alt text, async image fetch | a page with pictures |
-| **B7** | 🚧 JavaScript: QuickJS runs ON the OS; DOM bindings next | `js hello.js` prints from a real engine |
+| **B7** | ✅ JavaScript: QuickJS + DOM bindings, scripts run in the page | a page's own script reads and rewrites it |
 | **+** | ✅ data tables over the layout grid (revisits §5 with evidence) | a reference page states a grid of facts |
 
 **B1 through B3 are the ones that decide whether this is real.** If a

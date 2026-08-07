@@ -58,7 +58,26 @@ struct html_doc {
      * ask for it. NULL when the document has no <style>. */
     char *css;
     size_t css_len;
+    /* <script> content, same bargain: kept, never run by the parser. Whether
+     * it runs at all is the APP's decision -- a document viewer with no engine
+     * simply ignores this field, which is how the browser behaved before there
+     * was an engine to give it to. */
+    char  *js[8];
+    size_t js_len[8];
+    int    n_js;
 };
+
+/* Replace an element's text content. Allocates from the document's own string
+ * arena -- the DOM a script mutates is the same tree the renderer walks, so
+ * there is exactly one document and no synchronisation question. Returns 0, or
+ * -1 if the arena is full (the tree is left untouched, and truncated is set). */
+int html_set_text(struct html_doc *doc, int node, const char *text);
+
+/* Copy `n` bytes into the document's string arena and return the copy, or NULL
+ * when it is full. Exposed because a script's mutations must live exactly as
+ * long as the document does -- borrowing the same arena is what guarantees it,
+ * and is why there is no second lifetime to reason about. */
+char *html_intern(struct html_doc *doc, const char *s, size_t n);
 
 /* Parse `src` (len bytes) into `doc`. The caller owns both arenas; the parser
  * never allocates. Returns the root node index, or -1 if the arenas were too

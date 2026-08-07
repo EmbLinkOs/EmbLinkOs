@@ -2057,9 +2057,18 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       is shorter than a tall neighbour's. Cosmetic; needs per-row stretch.
 - [x] ~~no JS~~ ENGINE DONE 2026-08-07: QuickJS 2024-01-13 runs on the OS
       (`js.elf`, `make js`, one two-hunk patch). Absent source => skipped.
-- [ ] JS has NO DOM BINDINGS yet -- the engine cannot touch a document, which
-      is the whole point of having it. Next: a `document` object over
-      struct html_doc, then events, then fetch (which net.c already does).
+- [x] ~~JS has NO DOM BINDINGS~~ DONE 2026-08-07: user/web/jsdom.c --
+      querySelector(All), document.title, textContent, setText, getAttribute,
+      setStyle, console.log. Scripts run at load; mutations re-render.
+- [ ] NO EVENTS. A script runs once at load and the page is then static: no
+      click, no input, no setTimeout. This is the biggest remaining gap and
+      the next one to close -- the renderer already routes a click to a node
+      for links, so the hit-testing half exists.
+- [ ] No fetch() binding, though net.c does the work already.
+- [ ] The DOM surface is read-mostly: no createElement/appendChild/remove, no
+      classList, no attribute WRITES except style. Each absent rather than
+      faked -- a binding that accepts a call and changes nothing observable is
+      worse than a missing one.
 - [ ] `js -e` needs shell quoting (`js "-e" "2+2"`): the structured shell reads
       a bare `-e` as a unary minus. Either the shell should pass through
       unknown leading-dash tokens, or js should take a different flag.
