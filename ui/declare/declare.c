@@ -16,12 +16,16 @@
 /* ------------------------------------------------------------------------- */
 
 /* One instance per emitted view -- and in a DOCUMENT that means one per WORD.
- * 4096 was sized for an application's worth of widgets and a real web page
- * walks straight through it: danluu.com's index alone is several thousand
- * words. The failure was silent and ugly -- inst_alloc returned null, the
- * caller carried on, and the nodes collapsed to 0x0 and painted on top of each
- * other at the first row's origin, which reads as a renderer bug. */
-#define INST_MAX          65536
+ * 4096 was sized for an application's worth of widgets; a real page needs
+ * thousands (danluu.com's index: 2214 measured, Hacker News: 1255).
+ *
+ * SIZED, not maximised. An instance carries a shadow copy of its text, so this
+ * array IS libembk.so's .bss -- and the shared library is mapped by every
+ * process on the desktop. 65536 took it to 48MB. Overflow past this is now
+ * COUNTED (ui_instance_overflow) instead of silently returning null and
+ * letting the caller draw a collapsed box; paging this arena the way the scene
+ * and layout arenas already are is the proper fix, logged in docs/TODO.md. */
+#define INST_MAX          8192
 #define CURSOR_STACK_MAX  64
 
 static struct instance g_inst[INST_MAX];

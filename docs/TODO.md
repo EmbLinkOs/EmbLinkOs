@@ -2184,12 +2184,13 @@ Encrypt/RSA), `test wget https`, `test pypi`.
         3. ~~Nested tables collapse (HN)~~ FIXED (see below).
         3b. ~~danluu's first list item renders as overlapping text~~ EXPLAINED
            and FIXED: it was the 64-child cap in layout (see below).
-        3c. Table columns are still equal-width, so HN's rank column is as wide
-           as its title column. And every non-header CELL gets a faint border
-           from the UA stylesheet, which is right for a data table and wrong
-           for the layout tables the old web is built from -- HTML's own
-           `border="0"` attribute is the mechanism that turns it off and we do
-           not parse it.
+        3c. ~~Table columns are equal-width; every cell gets a UA border~~ BOTH
+           FIXED 2026-08-07. Columns are now sized to content (a miniature of
+           CSS's automatic table layout: a column is as wide as its widest
+           cell, surplus and shortfall shared out in proportion), and cell
+           rules are drawn only when the table asks with <table border=N> --
+           the web's default is no border, which is why half the old web can
+           use tables for LAYOUT.
         4. JS is 'click' only -- no bubbling, no createElement/appendChild,
            no querySelector.
         5. Form controls are text and submit only -- no checkbox, radio,
@@ -2210,6 +2211,23 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Also fixed: the status line composed its rule count ONCE at load and so
       reported "1 css rule" on a page with seven, three of which were already
       on screen -- it is now recomposed whenever a sheet lands.
+- [x] ~~`make` did not build the browser~~ FIXED 2026-08-07, and this one cost
+      most of an afternoon. mkfs AUTO-DISCOVERS every build/*.elf, and
+      build/vellum.elf was never a prerequisite of anything -- it survived from
+      an old explicit `make build/vellum.elf`. When a link failed and deleted
+      it, `make` reported "Nothing to be done" and every image after that
+      packed either NOTHING or a stale vellum.elf against a freshly built
+      libembk.so. EmProps crosses that library boundary BY VALUE, so a stale
+      app is a wild-pointer crash: a ring-3 page fault at CR2=0x9FFFFFFFF
+      inside strlen, deterministic, on the second frame. It was bisected
+      against four subsystems before the build was suspected -- the lesson is
+      to check that the binary under test is the binary you just built.
+      build/vellum.elf is now in the staged-app list. Any app reachable only by
+      an explicit target has the same hazard; see docs/TODO.md.
+- [ ] The instance pool (ui/declare) is a fixed INST_MAX array in libembk.so's
+      .bss, so raising it costs every process on the desktop (65536 -> a 48MB
+      shared library). It should be PAGED like the scene and layout arenas.
+      8192 covers the worst real page measured (danluu 2752) with headroom.
 - [x] ~~A container with more than 64 children silently lost the rest~~ FIXED
       2026-08-07, and this was the single worst bug found so far. `arrange()`
       gathered children into `kids[64]` on the C STACK; past 64 they were never

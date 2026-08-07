@@ -280,6 +280,7 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         char fval[256];  fval[0] = 0;
         char ftype[24];  ftype[0] = 0;
         char frel[32];   frel[0] = 0;
+        int  tbord = 0;
         while (p < len && src[p] != '>') {
             while (p < len && (src[p]==' '||src[p]=='\t'||src[p]=='\n'||src[p]=='\r')) p++;
             if (p >= len || src[p] == '>' || src[p] == '/') break;
@@ -351,6 +352,15 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                 } else if ((ieq(aname,"type") || ieq(aname,"method")) && !ftype[0]) {
                     size_t c = vl < sizeof ftype - 1 ? vl : sizeof ftype - 1;
                     memcpy(ftype, src + vs, c); ftype[c] = 0;
+                } else if (ieq(aname,"border")) {
+                    /* Presentational, ancient, and still the only thing that
+                     * decides whether an old page's table has rules. */
+                    int v2 = 0, ok2 = (vl > 0 && vl < 4);
+                    for (size_t k2 = 0; k2 < vl && ok2; k2++) {
+                        char c2 = src[vs + k2];
+                        if (c2 < '0' || c2 > '9') ok2 = 0; else v2 = v2 * 10 + (c2 - '0');
+                    }
+                    if (ok2) tbord = v2 > 255 ? 255 : v2;
                 } else if (ieq(aname,"rel") && !frel[0]) {
                     size_t c = vl < sizeof frel - 1 ? vl : sizeof frel - 1;
                     memcpy(frel, src + vs, c); frel[c] = 0;
@@ -450,6 +460,7 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         if (fval[0])  d->nodes[ni].value = str_put(d, fval,  strlen(fval));
         if (ftype[0]) d->nodes[ni].type  = str_put(d, ftype, strlen(ftype));
         d->nodes[ni].img_w = (short)aw; d->nodes[ni].img_h = (short)ah;
+        d->nodes[ni].tborder = (unsigned char)tbord;
         if (!is_void(tag) && !self_closing) push(&st, ni);
         i = p;
     }

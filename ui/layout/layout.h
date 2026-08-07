@@ -105,6 +105,12 @@ struct layout_node {
 int  layout_children_dropped(void);
 void layout_reset_children_dropped(void);
 
+/* How many containers had children the layout scratch could not hold. Non-zero
+ * means boxes were NOT positioned and are sitting at 0x0 on their parent's
+ * origin -- a visibly broken page, so callers that can report it should. */
+int  layout_children_dropped(void);
+void layout_reset_children_dropped(void);
+
 struct layout_arena {
     struct layout_node *pages[LAYOUT_MAX_PAGES];
     uint32_t            n_pages_allocated;

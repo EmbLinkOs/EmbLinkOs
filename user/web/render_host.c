@@ -61,6 +61,12 @@ static const char      *g_doc_base;
 static int  g_busy;
 static char g_bar[512] = "https://valid-isrgrootx1.letsencrypt.org/";
 
+/* The app registers one, and until this harness did too, every link rendered
+ * here as plain Text while on the metal it renders as a BUTTON -- so the whole
+ * button path was untested on the fast loop and only ever exercised in a
+ * five-minute boot. */
+static void host_on_link(const char *href) { (void)href; }
+
 static void app(void) {
     Window("Vellum") {
         AppBar("Vellum") {
@@ -263,6 +269,7 @@ int main(int argc, char **argv) {
     uint32_t fr = font_load(reg, rl), fb = font_load(bold, bl);
     font_install_backend();
 
+    vellum_set_link_handler(host_on_link);
     g_doc_base = doc;                /* before cssref_start: sheets resolve against it */
     g_root = html_parse(&g_doc, (const char *)src, dl, g_nodes, NODE_MAX, g_strs, STR_MAX);
     /* external sheets first, then the document's own <style> -- the same

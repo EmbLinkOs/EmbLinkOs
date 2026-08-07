@@ -516,16 +516,101 @@ static float measure_wrap_height(struct layout_arena *la, struct scene_arena *sa
 /* Height of a GRID container at total width `avail_w`: N equal columns, children
  * auto-flow with colspan, each row as tall as its tallest cell. Same width->
  * height deferral so a column parent can size a grid child before its siblings. */
+/* --- automatic table layout, in miniature -------------------------------
+ *
+ * A column is as wide as its widest cell, and whatever is left over (or
+ * missing) is shared out in proportion. Equal columns are the right answer for
+ * a grid of TILES and the wrong one for a TABLE: they made the rank column of
+ * a news page exactly as wide as its headline column, which is how a real site
+ * ends up looking like a spreadsheet.
+ *
+ * Deliberately simpler than CSS's real algorithm, which distributes surplus
+ * between min-content and max-content per column. This uses one measurement
+ * (each cell's intrinsic width) and scales, in both directions -- which gets
+ * the shape of a layout table right and degrades sanely on a dense one. */
+#define GRID_MAX_COLS 64
+
+static void grid_col_widths(struct layout_arena *la, struct layout_node *n,
+                            float content_w, float *out) {
+    int cols = n->grid_cols;
+    if (cols > GRID_MAX_COLS) cols = GRID_MAX_COLS;
+    float cgap = n->grid_col_gap;
+    float want[GRID_MAX_COLS];
+    for (int i = 0; i < cols; i++) want[i] = 0;
+
+    /* Pass 1: cells that occupy ONE column set that column's appetite. A
+     * spanning cell says nothing about any single column it covers. */
+    int col = 0;
+    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
+        struct layout_node *cn = layout_resolve(la, c);
+        if (!cn) break;
+        if (!cn->is_overlay) {
+            int span = cn->grid_span > 0 ? cn->grid_span : 1;
+            if (span > cols) span = cols;
+            if (col > 0 && col + span > cols) col = 0;
+            if (span == 1 && col < cols) {
+                float w = (cn->width.mode == SIZE_FIXED) ? cn->width.fixed_value
+                                                         : cn->intrinsic_w;
+                if (w > want[col]) want[col] = w;
+            }
+            col += span;
+        }
+        c = cn->next_sibling;
+    }
+
+    /* Pass 2: a spanning cell must still FIT across the columns it covers; any
+     * shortfall goes to the last of them, which is where a browser puts it. */
+    col = 0;
+    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
+        struct layout_node *cn = layout_resolve(la, c);
+        if (!cn) break;
+        if (!cn->is_overlay) {
+            int span = cn->grid_span > 0 ? cn->grid_span : 1;
+            if (span > cols) span = cols;
+            if (col > 0 && col + span > cols) col = 0;
+            if (span > 1 && col + span <= cols) {
+                float w = (cn->width.mode == SIZE_FIXED) ? cn->width.fixed_value
+                                                         : cn->intrinsic_w;
+                float have = cgap * (float)(span - 1);
+                for (int k = 0; k < span; k++) have += want[col + k];
+                if (w > have) want[col + span - 1] += w - have;
+            }
+            col += span;
+        }
+        c = cn->next_sibling;
+    }
+
+    float avail = content_w - cgap * (float)(cols - 1);
+    if (avail < 0) avail = 0;
+    float sum = 0;
+    for (int i = 0; i < cols; i++) sum += want[i];
+    if (sum <= 0.01f) {                    /* nothing to go on: share equally */
+        float e = cols > 0 ? avail / (float)cols : 0;
+        for (int i = 0; i < cols; i++) out[i] = e;
+        return;
+    }
+    float k = avail / sum;                 /* grows AND shrinks: same formula */
+    for (int i = 0; i < cols; i++) out[i] = want[i] * k;
+}
+
+/* x of a column's left edge, given the resolved widths */
+static float grid_col_x(const float *w, float cgap, int col) {
+    float x = 0;
+    for (int i = 0; i < col; i++) x += w[i] + cgap;
+    return x;
+}
+
 static float measure_grid_height(struct layout_arena *la, struct scene_arena *sa,
                                  struct layout_handle h, float avail_w) {
     struct layout_node *n = layout_resolve(la, h);
     if (!n || n->grid_cols <= 0) return 0;
-    int cols = n->grid_cols;
+    /* clamped: colw[] is indexed by it */
+    int cols = n->grid_cols > GRID_MAX_COLS ? GRID_MAX_COLS : n->grid_cols;
     float cgap = n->grid_col_gap, rgap = n->grid_row_gap;
     float content_w = avail_w - n->padding_left - n->padding_right;
     if (content_w < 0) content_w = 0;
-    float col_w = (content_w - cgap * (cols - 1)) / cols;
-    if (col_w < 0) col_w = 0;
+    float colw[GRID_MAX_COLS];
+    grid_col_widths(la, n, content_w, colw);
     float total = 0, row_h = 0; int col = 0, nrows = 0;
     for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
         struct layout_node *cn = layout_resolve(la, c);
@@ -534,7 +619,8 @@ static float measure_grid_height(struct layout_arena *la, struct scene_arena *sa
             int span = cn->grid_span > 0 ? cn->grid_span : 1;
             if (span > cols) span = cols;
             if (col > 0 && col + span > cols) { total += row_h; nrows++; row_h = 0; col = 0; }
-            float cw = col_w * span + cgap * (span - 1);
+            float cw = cgap * (float)(span - 1);
+            for (int k2 = 0; k2 < span && col + k2 < cols; k2++) cw += colw[col + k2];
             /* A CELL is usually a container, and a container's intrinsic_h was
              * computed before any width was known -- so a cell whose text
              * wraps measured as ONE LINE. In a grid that is not a cosmetic
@@ -627,11 +713,11 @@ static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
      * bottom with per-child colspan; each row is as tall as its tallest cell.
      * Bypasses the flex machinery entirely. --- */
     if (n->grid_cols > 0) {
-        int cols = n->grid_cols;
+        int cols = n->grid_cols > GRID_MAX_COLS ? GRID_MAX_COLS : n->grid_cols;
         float cgap = n->grid_col_gap, rgap = n->grid_row_gap;
         float grid_w = W - n->padding_left - n->padding_right;
-        float col_w = (grid_w - cgap * (cols - 1)) / cols;
-        if (col_w < 0) col_w = 0;
+        float colw[GRID_MAX_COLS];
+        grid_col_widths(la, n, grid_w, colw);
         float row_y = n->padding_top - n->scroll_offset;
         int col = 0; float row_h = 0;
         for (int i = 0; i < nk; i++) {
@@ -651,8 +737,9 @@ static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
             int span = k->grid_span > 0 ? k->grid_span : 1;
             if (span > cols) span = cols;
             if (col > 0 && col + span > cols) { row_y += row_h + rgap; row_h = 0; col = 0; }
-            float cw = col_w * span + cgap * (span - 1);
-            float cx = n->padding_left + col * (col_w + cgap);
+            float cw = cgap * (float)(span - 1);
+            for (int k2 = 0; k2 < span && col + k2 < cols; k2++) cw += colw[col + k2];
+            float cx = n->padding_left + grid_col_x(colw, cgap, col);
             /* same as the measure pass above, and it MUST agree with it: this
              * ch is both the cell's box and the height its children are
              * arranged in, so a wrong value here wraps the text differently

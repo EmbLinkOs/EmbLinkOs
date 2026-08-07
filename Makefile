@@ -1271,7 +1271,8 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/embbuild.elf build/pkg.elf build/pkgbuild.elf build/pkgprobe.embx build/pkgprobe.pkg \
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS) \
-               $(if $(HAVE_QJS),build/js.elf,)
+               $(if $(HAVE_QJS),build/js.elf,) \
+               build/vellum.elf
 
 # STAGED_APPS: binaries built OUTSIDE this tree and dropped into build/ to be
 # judged by the machine rather than by their author's host -- e.g. EmbCC (a

@@ -444,6 +444,9 @@ static void render_table(struct html_doc *d, int node, const struct vstyle *st,
     if (ncol > TBL_MAX_COLS) ncol = TBL_MAX_COLS;
 
     const struct ui_theme *t = ui_theme();
+    /* Does this table want rules drawn? <table border=N> is the only thing on
+     * the old web that says so, and its absence means no. */
+    int rules = d->nodes[node].tborder > 0;
     VStack(.spacing = 0, .align = Fill,
            .pt = (float)st->margin_top, .pb = (float)st->margin_bottom) {
         /* the caption, if the author wrote one: a table's title belongs above
@@ -489,7 +492,12 @@ static void render_table(struct html_doc *d, int node, const struct vstyle *st,
                     struct paint hp = { 0 };
                     hp.kind = PAINT_SOLID; hp.solid = t->surface_alt;
                     ui_set_paint(hp);
-                } else {
+                } else if (rules) {
+                    /* Only when the TABLE asked for rules. A bare <table> has
+                     * no borders on the web -- the initial border-style is
+                     * none -- and half the old web uses tables purely for
+                     * LAYOUT, writing border="0" to say so. Outlining every
+                     * cell of those turns a news site into a spreadsheet. */
                     struct color line = t->text_secondary; line.a *= 0.16f;
                     ui_set_border(1.0f, line);
                 }

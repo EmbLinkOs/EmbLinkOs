@@ -53,6 +53,12 @@ struct html_node {
      * two facts cannot collide, and a separate pair of shorts on every node in
      * the document would be arena spent to keep them apart. */
     short img_w, img_h;
+    /* <table border=N>. Its own field, not another slot shared with something
+     * "mutually exclusive": that trick is how img_w came to mean colspan, and
+     * one such coincidence per struct is already the limit. 0 = unstated,
+     * which for a table means NO rules -- the web's actual default, and what
+     * `border="0"` says explicitly. */
+    unsigned char tborder;
     int   first_child, next_sibling, parent;   /* indices, -1 = none       */
 };
 
