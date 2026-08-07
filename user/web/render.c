@@ -130,15 +130,25 @@ static void emit_text(const char *txt, const struct vstyle *s, const char *href)
     }
 }
 
-/* An <img>. The base URL is needed to resolve src, and the cache is what
- * turns a URL into pixels -- neither belongs in the DOM, so both are held for
- * the render pass like the stylesheet is. */
+/* An <img>. The base URL is needed to resolve src, the cache is what turns a
+ * URL into pixels, and the content width is what an oversized picture gets
+ * clamped to -- none of which belong in the DOM, so all three are held for the
+ * render pass like the stylesheet is. */
 static const char *g_base;
+static float g_content_w;
 
-/* Emit one picture, or the honest stand-in for one. A slot that is still
- * loading gets a PLACEHOLDER OF THE RIGHT SIZE when the markup gave width and
- * height, so the page does not reflow under the reader when it arrives --
- * which is the single most irritating thing a browser does. */
+/* Emit one picture, or a stand-in that occupies THE SAME SPACE.
+ *
+ * Reserving the box before the bytes arrive is the whole point. A picture that
+ * appears at its natural size after the page has been laid out shoves the
+ * paragraph the reader is in the middle of -- the single most irritating thing
+ * a browser does, and it is entirely avoidable whenever the markup or the
+ * stylesheet said how big the picture is.
+ *
+ * Size is decided in cascade order (CSS beats the markup's attributes beats the
+ * picture's own natural size), then clamped to the content width with the
+ * ASPECT PRESERVED, because a wide image that overflows its column is worse
+ * than a smaller one. */
 static void emit_image(struct html_doc *d, int n, const struct vstyle *st) {
     const char *src = d->nodes[n].href;      /* the parser stores src here */
     if (!src || !src[0]) return;
@@ -148,29 +158,60 @@ static void emit_image(struct html_doc *d, int n, const struct vstyle *st) {
         snprintf(url, sizeof url, "%s", src);
 
     struct img_slot *s = imgcache_want(url);
-    /* A picture that has not arrived means the page is not finished, so the
-     * loop must come back. Requesting the frame HERE -- where the need is
-     * discovered -- is what keeps the pump running; asking the app to predict
-     * it before the view has run is the trap that stalled this once already. */
     if (s && (s->state == IMG_WANTED || s->state == IMG_LOADING)) em_request_frame();
-    if (s && s->state == IMG_READY && s->px) {
-        em_flush();
-        ui_image_sized((uint64_t)(uintptr_t)s->px, s->px, s->w, s->h,
-                       (float)s->w, (float)s->h);
+
+    int ready = s && s->state == IMG_READY && s->px;
+
+    /* --- how big? CSS, then the attributes, then what arrived --- */
+    float w = 0, h = 0;
+    if (st->width)  w = (float)st->width;
+    if (st->height) h = (float)st->height;
+    if (!w && d->nodes[n].img_w) w = (float)d->nodes[n].img_w;
+    if (!h && d->nodes[n].img_h) h = (float)d->nodes[n].img_h;
+
+    /* One dimension stated, the other implied by the picture's own shape --
+     * which is only knowable once it has arrived. */
+    if (ready) {
+        float nw = (float)s->w, nh = (float)s->h;
+        if (w && !h) h = nh * (w / nw);
+        else if (h && !w) w = nw * (h / nh);
+        else if (!w && !h) { w = nw; h = nh; }
+    }
+    if (w <= 0 || h <= 0) {
+        /* Nothing to reserve honestly: no stated size and no picture yet.
+         * Alt text is the right stand-in -- inventing a box height would move
+         * the page exactly as much as not reserving one. */
+        const char *alt = d->nodes[n].alt;
+        if (alt && alt[0]) { Text(alt).font(font_for(st)).color(ui_theme()->text_secondary); return; }
+        Text((s && s->state == IMG_FAILED) ? "\xE2\x9C\x95" : "\xE2\x97\xAF").caption().tertiary();
         return;
     }
 
-    /* Not here (yet). Show the alt text if the author wrote one -- that is
-     * what alt text is FOR, and a page of empty boxes is worse than a page
-     * that reads. Otherwise a quiet frame so the layout is honest about a
-     * picture being there. */
-    const char *alt = d->nodes[n].alt;
-    if (alt && alt[0]) {
-        Text(alt).font(font_for(st)).color(ui_theme()->text_secondary);
+    /* --- clamp to the column, preserving the aspect --- */
+    if (g_content_w > 16.0f && w > g_content_w) {
+        h *= g_content_w / w;
+        w  = g_content_w;
+    }
+
+    if (ready) {
+        em_flush();
+        ui_image_sized((uint64_t)(uintptr_t)s->px, s->px, s->w, s->h, w, h);
         return;
     }
-    const char *mark = (s && s->state == IMG_FAILED) ? "\xE2\x9C\x95" : "\xE2\x97\xAF";
-    Text(mark).caption().tertiary();
+
+    /* The reserved box: the picture's space, held open, faintly outlined so it
+     * reads as "something is coming" rather than as a rendering hole. */
+    em_flush();
+    ui_begin_vstack(0x1A6E0000ULL ^ (uint64_t)(uintptr_t)s);
+    ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = w },
+                (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = h });
+    ui_set_corner_radius(4);
+    { struct paint pl = { 0 };
+      pl.kind = PAINT_SOLID;
+      pl.solid = ui_theme()->surface_alt;
+      pl.solid.a *= (s && s->state == IMG_FAILED) ? 0.35f : 0.6f;
+      ui_set_paint(pl); }
+    ui_end_stack();
 }
 
 /* Is this subtree inline-only? An inline run ends where a block begins. */
@@ -196,11 +237,13 @@ static void emit_inline(struct html_doc *d, int c, const struct vstyle *st,
         if (d->nodes[c].text) emit_text(d->nodes[c].text, st, href);
         return;
     }
-    if (!strcmp(d->nodes[c].tag, "img")) { emit_image(d, c, st); return; }
-
     struct vstyle s;
     vstyle_for_node(d, c, st, g_sheet, &s);
     if (s.display == VD_NONE) return;
+    /* AFTER computing its own style, not before: an image is styled by the
+     * rules that match IT (`.half { width: 150px }`), and handing it the
+     * parent's vstyle silently ignored every one of them. */
+    if (!strcmp(d->nodes[c].tag, "img")) { emit_image(d, c, &s); return; }
     const char *h = d->nodes[c].href ? d->nodes[c].href : href;
     for (int k = d->nodes[c].first_child; k >= 0; k = d->nodes[k].next_sibling)
         emit_inline(d, k, &s, h, depth + 1);
@@ -300,7 +343,14 @@ const char *vellum_render_styled(struct html_doc *d, int root,
 
 const char *vellum_render_page(struct html_doc *d, int root,
                                const struct css_sheet *sheet, const char *base) {
+    return vellum_render_sized(d, root, sheet, base, 0.0f);
+}
+
+const char *vellum_render_sized(struct html_doc *d, int root,
+                                const struct css_sheet *sheet, const char *base,
+                                float content_w) {
     g_base = base;
+    g_content_w = content_w;
     g_pending = 0;
     g_hover_href = 0;
     g_sheet = sheet;

@@ -57,7 +57,10 @@ static short len_px(const char *s, size_t n, int *ok) {
     if (tok_has(s + i, n - i, "em") || tok_has(s + i, n - i, "rem")) v *= 16.0;
     else if (tok_has(s + i, n - i, "%")) { return 0; }   /* percentages need a container */
     *ok = 1;
-    if (v > 400) v = 400;                                 /* a margin, not a canvas */
+    /* Generous, because this same parser serves margins (tens of px) and
+     * image widths (hundreds). The ceiling exists to stop a hostile stylesheet
+     * from asking for a mile, not to express a design opinion. */
+    if (v > 4000) v = 4000;
     return (short)(neg ? -v : v);
 }
 
@@ -159,6 +162,17 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
             else if (tok_eq(v, vn, "inline")) { out->display = VD_INLINE;    ok = 1; }
             else if (tok_eq(v, vn, "list-item")) { out->display = VD_LIST_ITEM; ok = 1; }
             else if (tok_eq(v, vn, "inline-block")) { out->display = VD_INLINE; ok = 1; }
+        } else if (tok_eq(p, pn, "width")) {
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok && px > 0) { out->width = px; ok = 1; }
+        } else if (tok_eq(p, pn, "height")) {
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok && px > 0) { out->height = px; ok = 1; }
+        } else if (tok_eq(p, pn, "max-width")) {
+            /* the one percentage worth honouring, because it means "do not
+             * overflow me" and that is exactly what an oversized picture does */
+            int lok = 0; short px = len_px(v, vn, &lok);
+            if (lok && px > 0 && (!out->width || px < out->width)) { out->width = px; ok = 1; }
         } else if (tok_eq(p, pn, "margin-top")) {
             int lok = 0; short px = len_px(v, vn, &lok);
             if (lok) { out->margin_top = px; ok = 1; }

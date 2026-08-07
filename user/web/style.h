@@ -29,6 +29,10 @@ struct vstyle {
      * accident), so the renderer only overrides its palette when this is set.
      * Inherited like every other text property. */
     unsigned int color;
+    /* A stated box size in px, 0 = auto. Only images use it today, and only
+     * because a picture is the one thing whose natural size arrives LATER
+     * than the layout that has to hold it. */
+    short width, height;
 };
 
 /* The document root's style: everything inherits from this. */

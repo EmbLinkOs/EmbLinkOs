@@ -48,6 +48,7 @@ static struct html_doc  g_doc;
 static int              g_root = -1;
 static float            g_scroll = 0;
 static struct css_sheet g_sheet;
+static int HDEFER;   /* host cache: pretend no picture has arrived yet */
 static const char      *g_doc_base;
 
 /* The app's shape, verbatim from user/bin/vellum.c -- if this diverges the
@@ -80,7 +81,8 @@ static void app(void) {
 
         ScrollView(&g_scroll, em_viewport_height() - (g_busy ? 164.0f : 132.0f)) {
             VStack(.spacing = 0, .align = Fill, .padding = 22, .grow = 1) {
-                vellum_render_page(&g_doc, g_root, &g_sheet, g_doc_base);
+                vellum_render_sized(&g_doc, g_root, &g_sheet, g_doc_base,
+                                    em_viewport_width() - 44.0f);
             }
         }
 
@@ -97,6 +99,34 @@ static void app(void) {
 
 static struct scene_arena  sa;
 static struct layout_arena la;
+
+/* The lowest text INSIDE THE SCROLL AREA, and how many text nodes are there.
+ *
+ * Inside, specifically: the first attempt walked the whole window and kept
+ * finding y=688.6 on every page, because the lowest text in a browser window
+ * is the status bar -- furniture that never moves no matter what the document
+ * does. A reflow check that measures the chrome cannot fail, which is the
+ * worst property a check can have. The document lives under the first
+ * clipping node (the ScrollView), so the walk only counts once it is inside
+ * one. Layout positions everything whether or not it is clipped away, so text
+ * below the fold still reports an honest y. */
+static void text_extent(struct node_handle h, float oy, int inside,
+                        float *maxy, int *count) {
+    struct scene_node *n = scene_resolve(&sa, h);
+    if (!n) return;
+    float y = oy + n->ty;
+    if (n->clip_children) inside = 1;
+    if (inside && n->kind == SCENE_NODE_TEXT) {
+        if (y > *maxy) *maxy = y;
+        (*count)++;
+    }
+    for (struct node_handle c = n->first_child; !node_handle_is_null(c);) {
+        struct scene_node *cn = scene_resolve(&sa, c);
+        if (!cn) break;
+        text_extent(c, y, inside, maxy, count);
+        c = cn->next_sibling;
+    }
+}
 
 static const char *kindname(enum scene_node_kind k) {
     switch (k) {
@@ -264,6 +294,37 @@ int main(int argc, char **argv) {
         free(pa); free(pb);
     }
 
+    /* --- THE REFLOW CHECK ------------------------------------------------
+     * The claim images make is not "they render" -- it is that the page does
+     * not MOVE when they land. So lay the document out twice, once with every
+     * picture still outstanding and once with them all decoded, and compare
+     * where the text ended up. Any difference is the reader's paragraph
+     * jumping out from under them. --- */
+    {
+        float y_before = 0, y_after = 0;
+        int   n_before = 0, n_after = 0;
+
+        HDEFER = 1; imgcache_reset(); g_scroll = 0;
+        ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
+        ui_run_layout((float)W, (float)H);
+        text_extent(ui_scene_of(ui_root()), 0, 0, &y_before, &n_before);
+
+        HDEFER = 0; imgcache_reset(); g_scroll = 0;
+        ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
+        ui_run_layout((float)W, (float)H);
+        text_extent(ui_scene_of(ui_root()), 0, 0, &y_after, &n_after);
+
+        /* The verdict is Y, not the node count: an image with NO stated size
+         * legitimately shows alt text until it arrives, so the counts differ
+         * by design. What must not change is where the text sits. */
+        printf("--- reflow: last text y=%.1f before images -> y=%.1f after : %s"
+               "   (text nodes %d -> %d)%s ---\n",
+               y_before, y_after,
+               y_before == y_after ? "NO REFLOW" : "PAGE MOVED",
+               n_before, n_after,
+               n_before != n_after ? "  [unsized images fell back to alt text]" : "");
+    }
+
     if (png) {
         struct render_target rt;
         rt.pixels = malloc((size_t)W * H * 4); rt.width = W; rt.height = H;
@@ -295,9 +356,9 @@ int main(int argc, char **argv) {
  * pictures are simply files. Same interface, so render.c is identical in both
  * worlds -- which is what makes the host render worth trusting. */
 static struct img_slot H[IMG_SLOTS];
-static uint32_t HARENA[1600 * 1024];
+static uint32_t HARENA[IMG_MAX_PX];
 static size_t   HUSED;
-static uint8_t  HSCR[IMG_MAX_W * IMG_MAX_H * 4 + IMG_MAX_H + 64];
+static uint8_t  HSCR[IMG_MAX_PX * 4 + IMG_MAX_DIM + 64];
 
 void imgcache_reset(void) { memset(H, 0, sizeof H); HUSED = 0; }
 int  imgcache_pump(void) { return 0; }
@@ -305,6 +366,17 @@ int  imgcache_pending(void) { return 0; }
 
 struct img_slot *imgcache_want(const char *url) {
     if (!url || !url[0]) return 0;
+    if (HDEFER) {
+        for (int i = 0; i < IMG_SLOTS; i++)
+            if (H[i].state != IMG_EMPTY && !strcmp(H[i].url, url)) return &H[i];
+        for (int i = 0; i < IMG_SLOTS; i++) {
+            if (H[i].state != IMG_EMPTY) continue;
+            snprintf(H[i].url, sizeof H[i].url, "%s", url);
+            H[i].state = IMG_WANTED;
+            return &H[i];
+        }
+        return 0;
+    }
     for (int i = 0; i < IMG_SLOTS; i++)
         if (H[i].state != IMG_EMPTY && !strcmp(H[i].url, url)) return &H[i];
     for (int i = 0; i < IMG_SLOTS; i++) {
@@ -316,7 +388,8 @@ struct img_slot *imgcache_want(const char *url) {
         uint8_t *bytes = read_file(path, &n);
         if (!bytes) { H[i].state = IMG_FAILED; return &H[i]; }
         uint32_t w = 0, h = 0;
-        if (png_probe(bytes, n, &w, &h) != PNG_OK || w > IMG_MAX_W || h > IMG_MAX_H) {
+        if (png_probe(bytes, n, &w, &h) != PNG_OK ||
+            w > IMG_MAX_DIM || h > IMG_MAX_DIM || (size_t)w * h > IMG_MAX_PX) {
             H[i].state = IMG_FAILED; free(bytes); return &H[i];
         }
         uint32_t *dst = HARENA + HUSED;

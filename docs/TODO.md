@@ -2036,11 +2036,13 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [ ] PNG only. JPEG is the other half of the real web and is a DCT decoder,
       not an afternoon. GIF/WebP not considered.
 - [ ] No interlaced (Adam7) PNG -- refused, not half-decoded.
-- [ ] Images are not SIZED by the markup: width/height attributes and CSS
-      dimensions are ignored, so a picture renders at its natural size and a
-      big one overflows. The reflow-on-arrival this causes is the single most
-      irritating thing a browser does; fixing it needs width/height parsed and
-      a placeholder box of the right size.
+- [x] ~~Images are not SIZED by the markup~~ DONE 2026-08-07: width/height
+      attributes + CSS width/height/max-width, cascade order, aspect-preserving
+      clamp to the column, and a reserved placeholder box so a sized picture
+      causes NO reflow (proven by the reflow check in `make browser-render`).
+- [ ] An image with no stated size still reflows when it lands -- unavoidable
+      without knowing its dimensions, and true of every browser. CSS
+      `aspect-ratio` would be the modern answer if a page supplies it.
 - [ ] The image arena is 6.4MB for 8 slots, per page. A page wanting more gets
       alt text for the rest.
 - [ ] Still no JS, tables or forms -- see BROWSER.md §5.

@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><title>Sizing</title>
+<style> .half { width: 150px } h2 { color:#88c0d0 } </style></head>
+<body>
+<h1>Reserved space, and nothing overflows</h1>
+<h2>Stated size</h2>
+<p>This one declares <code>width=300 height=60</code>, so the layout holds its
+box open before the bytes arrive &mdash; the text below does not move when it
+lands.</p>
+<img src="strip.png" width="300" height="60" alt="[strip]">
+<p>Text immediately after the picture.</p>
+<h2>Oversized</h2>
+<p>This picture is 1400&times;200, far wider than the column. It is scaled to
+fit with its aspect preserved rather than overflowing.</p>
+<img src="wide.png" width="1400" height="200" alt="[a wide gradient]">
+<h2>CSS beats the attribute</h2>
+<p>Marked <code>width=300</code> but styled <code>.half { width: 150px }</code>.</p>
+<img src="strip.png" width="300" height="60" class="half" alt="[half]">
+<p><a href="/system/web/index.html">Back</a></p>
+</body></html>

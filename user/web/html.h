@@ -38,6 +38,7 @@ struct html_node {
     char *id;                       /* id="...", or NULL                   */
     char *style;                    /* style="..." declarations, or NULL   */
     char *alt;                      /* <img alt="...">, or NULL            */
+    short img_w, img_h;             /* <img width/height>, 0 = unstated    */
     int   first_child, next_sibling, parent;   /* indices, -1 = none       */
 };
 

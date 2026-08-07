@@ -338,7 +338,27 @@ a browser on your own UI stack:
 
 **B1 is done.** The start page renders correctly on the metal.
 
-**B6 is done: the browser shows pictures.** `user/web/png.c` decodes PNG on
+**B6 is done: the browser shows pictures, and the page does not jump.**
+
+Sizing came second and matters as much as decoding. `width`/`height` from the
+markup and `width`/`height`/`max-width` from CSS decide a picture's box in
+cascade order, and an oversized image is scaled to the column with its ASPECT
+PRESERVED rather than overflowing. When the size is known, the layout holds the
+box open BEFORE the bytes arrive -- so the paragraph the reader is in the
+middle of does not get shoved down when a picture lands.
+
+That claim is checked rather than asserted: `make browser-render` lays the
+document out twice, once with every picture outstanding and once with them
+decoded, and compares where the text ended up. On a page whose images all state
+their size: `last text y=716.3 before images -> y=716.3 after : NO REFLOW`.
+
+Two things that check caught about itself, which is the useful part: it first
+measured the LOWEST text in the window and kept reporting the same y on every
+page -- that was the status bar, furniture that never moves, so the check could
+not fail. And an image with NO stated size legitimately swaps alt text for a
+picture, so the node count differs by design and only the Y is the verdict.
+Unsized images still reflow, in this browser and in every other one; that is
+what the width/height attributes are for. `user/web/png.c` decodes PNG on
 top of the DEFLATE this OS already had (written for the package installer --
 the reuse was the point of having it). Colour types 0/2/3/4/6, bit depths 1-16,
 all five filters, PLTE and tRNS, straight to premultiplied BGRA so the decode

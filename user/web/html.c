@@ -275,6 +275,7 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         char eid[64];    eid[0] = 0;
         char sty[256];   sty[0] = 0;
         char alt[256];   alt[0] = 0;
+        int  aw = 0, ah = 0;
         while (p < len && src[p] != '>') {
             while (p < len && (src[p]==' '||src[p]=='\t'||src[p]=='\n'||src[p]=='\r')) p++;
             if (p >= len || src[p] == '>' || src[p] == '/') break;
@@ -307,6 +308,20 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
                 } else if (ieq(aname,"style") && !sty[0]) {
                     size_t c = vl < sizeof sty - 1 ? vl : sizeof sty - 1;
                     memcpy(sty, src + vs, c); sty[c] = 0;
+                } else if (ieq(aname,"width") || ieq(aname,"height")) {
+                    /* Kept because a stated size lets the layout RESERVE the
+                     * space before the picture arrives -- without it every
+                     * image that lands shoves the text the reader is in the
+                     * middle of. Plain integers only; "50%" needs a
+                     * containing block this box model does not expose. */
+                    int v = 0, ok = (vl > 0);
+                    for (size_t k2 = 0; k2 < vl; k2++) {
+                        char c2 = src[vs + k2];
+                        if (c2 < '0' || c2 > '9') { ok = 0; break; }
+                        v = v * 10 + (c2 - '0');
+                        if (v > 10000) { ok = 0; break; }
+                    }
+                    if (ok) { if (ieq(aname,"width")) aw = v; else ah = v; }
                 } else if (ieq(aname,"alt") && !alt[0]) {
                     /* alt is not decoration: it is what the page SAYS when the
                      * picture cannot be shown, which for us is often. */
@@ -374,6 +389,7 @@ int html_parse(struct html_doc *d, const char *src, size_t len,
         if (eid[0])   d->nodes[ni].id    = str_put(d, eid,   strlen(eid));
         if (sty[0])   d->nodes[ni].style = str_put(d, sty,   strlen(sty));
         if (alt[0])   d->nodes[ni].alt   = str_put(d, alt,   strlen(alt));
+        d->nodes[ni].img_w = (short)aw; d->nodes[ni].img_h = (short)ah;
         if (!is_void(tag) && !self_closing) push(&st, ni);
         i = p;
     }

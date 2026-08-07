@@ -18,7 +18,7 @@
 
 /* The pixel arena. Sized for a documentation page: a few diagrams, not a photo
  * gallery. Blown deliberately rather than grown -- see the header. */
-#define IMG_ARENA_PX (1600u * 1024u)          /* 6.4 MB of BGRA */
+#define IMG_ARENA_PX IMG_MAX_PX               /* 6.4 MB of BGRA */
 static uint32_t g_arena[IMG_ARENA_PX];
 static size_t   g_used;
 
@@ -26,7 +26,8 @@ static size_t   g_used;
  * so a second copy would be memory spent to hold nothing. */
 #define IMG_SRC_MAX (512 * 1024)
 static char    g_src[IMG_SRC_MAX];
-static uint8_t g_scratch[IMG_MAX_W * IMG_MAX_H * 4 + IMG_MAX_H + 64];
+/* inflated scanlines: pixels*4 plus one filter byte per row */
+static uint8_t g_scratch[IMG_MAX_PX * 4 + IMG_MAX_DIM + 64];
 
 static struct img_slot g_slot[IMG_SLOTS];
 static int g_inflight = -1;                   /* slot index, or -1 */
@@ -73,8 +74,9 @@ static void finish(int slot, const struct vnet_result *res) {
     }
     /* Reject on DIMENSIONS before spending the arena -- a 20000x20000 header
      * costs nothing to send and would otherwise cost everything to honour. */
-    if (w > IMG_MAX_W || h > IMG_MAX_H) { s->state = IMG_FAILED; return; }
+    if (w > IMG_MAX_DIM || h > IMG_MAX_DIM) { s->state = IMG_FAILED; return; }
     size_t need = (size_t)w * h;
+    if (need > IMG_MAX_PX) { s->state = IMG_FAILED; return; }
     if (need > IMG_ARENA_PX - g_used) { s->state = IMG_FAILED; return; }
 
     uint32_t *dst = g_arena + g_used;

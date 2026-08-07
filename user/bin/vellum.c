@@ -264,7 +264,8 @@ static void app(void) {
              * its width from. Left it Leading and the whole document sizes to
              * its longest line instead of to the window, so nothing wraps. */
             VStack(.spacing = 0, .align = Fill, .padding = 22, .grow = 1) {
-                const char *clicked = vellum_render_page(&g_doc, g_root, &g_sheet, g_url);
+                const char *clicked = vellum_render_sized(&g_doc, g_root, &g_sheet, g_url,
+                                                         em_viewport_width() - 44.0f);
                 if (clicked) snprintf(g_goto, sizeof g_goto, "%s", clicked);
             }
         }

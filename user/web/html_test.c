@@ -434,6 +434,45 @@ static uint8_t  SCR[64 * 64 * 8];
 #define G(p) (((p) >>  8) & 0xFF)
 #define B(p) ( (p)        & 0xFF)
 
+static void t17b_image_sizing(void) {
+    printf("T17b <img> sizing: the space is reserved BEFORE the picture:\n");
+    cparse("<img src='a.png' width='320' height='180' alt='x'>"
+           "<img src='b.png' alt='y'>"
+           "<img src='c.png' width='9999999' height='4'>");
+    int i0 = -1, i1 = -1, i2 = -1, seen = 0;
+    for (int i = 0; i < CD.n; i++)
+        if (CD.nodes[i].kind == HTML_ELEM && !strcmp(CD.nodes[i].tag, "img")) {
+            if (seen == 0) i0 = i; else if (seen == 1) i1 = i; else i2 = i;
+            seen++;
+        }
+    CHECK(seen == 3, "three images parsed");
+    CHECK(CD.nodes[i0].img_w == 320 && CD.nodes[i0].img_h == 180,
+          "width/height attributes are kept");
+    CHECK(CD.nodes[i1].img_w == 0 && CD.nodes[i1].img_h == 0,
+          "an image with no stated size says so with 0");
+    CHECK(CD.nodes[i2].img_w == 0,
+          "an absurd width is refused rather than stored");
+
+    /* CSS outranks the attributes, which is the cascade doing its job */
+    struct css_sheet sh; struct vstyle v, root;
+    vstyle_root(&root);
+    static const char *css = "img { width: 100px; height: 50px }";
+    css_sheet_parse(&sh, css, strlen(css));
+    vstyle_for_node(&CD, i0, &root, &sh, &v);
+    CHECK(v.width == 100 && v.height == 50, "CSS width/height beat the attributes");
+
+    memset(&v, 0, sizeof v);
+    css_apply_decls("max-width: 200px", strlen("max-width: 200px"), &v);
+    CHECK(v.width == 200, "max-width caps the box");
+    v.width = 120;
+    css_apply_decls("max-width: 400px", strlen("max-width: 400px"), &v);
+    CHECK(v.width == 120, "...but never widens one that is already narrower");
+
+    memset(&v, 0, sizeof v);
+    css_apply_decls("width: 50%", strlen("width: 50%"), &v);
+    CHECK(v.width == 0, "a percentage is refused -- no containing block to resolve it");
+}
+
 static void t18_png_basics(void) {
     printf("T18 PNG: colour types decode to premultiplied BGRA:\n");
     uint32_t w = 0, h = 0;
@@ -541,7 +580,7 @@ int main(void) {
     t10_url_parse(); t11_url_resolve();
     t11b_entities(); t12_attrs_and_style_block(); t13_declarations(); t14_selectors();
     t15_cascade(); t16_origin_order(); t17_bounded();
-    t18_png_basics(); t19_png_palette_and_filters(); t20_png_hostile();
+    t17b_image_sizing(); t18_png_basics(); t19_png_palette_and_filters(); t20_png_hostile();
     printf("=== html-test: %s (%d failures) ===\n", failures ? "FAIL" : "OK", failures);
     return failures ? 1 : 0;
 }

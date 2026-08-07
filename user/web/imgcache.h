@@ -24,8 +24,14 @@
 #include <stddef.h>
 
 #define IMG_SLOTS      8
-#define IMG_MAX_W    900
-#define IMG_MAX_H    900
+
+/* The real cost of a picture is its PIXEL COUNT, not either dimension: a
+ * 1400x200 banner is ordinary and was being refused by a 900px-per-side cap,
+ * while 900x900 (four times the pixels) sailed through. So the budget is in
+ * pixels, with a generous per-side cap kept only to catch an absurd header
+ * before the multiply can overflow anything. */
+#define IMG_MAX_PX  (1600u * 1024u)     /* 6.4 MB of BGRA -- the arena size */
+#define IMG_MAX_DIM  4096
 
 enum img_state {
     IMG_EMPTY = 0,

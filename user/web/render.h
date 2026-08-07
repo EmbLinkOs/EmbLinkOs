@@ -24,6 +24,12 @@ const char *vellum_render_styled(struct html_doc *doc, int root,
 const char *vellum_render_page(struct html_doc *doc, int root,
                                const struct css_sheet *sheet, const char *base);
 
+/* ...and with the COLUMN WIDTH, so an oversized picture is scaled to fit
+ * instead of overflowing. 0 = do not clamp. */
+const char *vellum_render_sized(struct html_doc *doc, int root,
+                                const struct css_sheet *sheet, const char *base,
+                                float content_w);
+
 /* Non-NULL enables link rendering (words become clickable). */
 void vellum_set_link_handler(void (*fn)(const char *href));
 
