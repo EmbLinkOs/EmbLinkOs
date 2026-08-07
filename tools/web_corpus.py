@@ -6,6 +6,7 @@ the markup it is about instead of in a table somewhere else:
 
     <!-- EXPECT-TEXT: DEEPLINK-A -->            a run containing this must exist
     <!-- EXPECT-NO-TEXT: lorem -->              ...and this one must not
+    <!-- EXPECT-LINE: STORED dark count=2 -->   a whole LINE contains this
     <!-- EXPECT-COLOR: HEADING #e0604a -->      the run containing HEADING is that colour
     <!-- EXPECT-ORDER: FIRST SECOND -->         FIRST's run comes before SECOND's
     <!-- EXPECT-LEFT-OF: RANK TITLE -->         RANK's run starts left of TITLE's
@@ -56,6 +57,16 @@ def check_page(path):
         elif kind == "EXPECT-NO-TEXT":
             if find(runs, arg):
                 print("      FAIL %s: a run contains %r" % (kind, arg)); fails += 1
+        elif kind == "EXPECT-LINE":
+            # Runs are WORDS, so a sentence spans several. Join them by row --
+            # which is also the only way to assert on text a script composed,
+            # since the words it produced were never adjacent in the source.
+            rows = {}
+            for r in runs:
+                rows.setdefault(round(r["y"], 1), []).append((r["x"], r["text"]))
+            joined = ["".join(t for _, t in sorted(v)) for v in rows.values()]
+            if not any(arg in " ".join(line.split()) for line in joined):
+                print("      FAIL %s: no line contains %r" % (kind, arg)); fails += 1
         elif kind == "EXPECT-COLOR":
             hit = find(runs, parts[0])
             if not hit:

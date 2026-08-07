@@ -1,4 +1,19 @@
-# Vellum inherits the session namespace: it needs to READ /system (its font and
-# its built-in documents) and nothing more in this milestone. When it gains a
-# network it will still not need a wider namespace -- a browser that cannot
-# write to the filesystem is a browser whose bugs cannot cost you a file.
+# What Vellum may NAME. The other half is vellum.caps, which says what it may
+# DO; the kernel enforces both, and a grant here can only ever narrow what the
+# session already holds.
+#
+# This file used to be comments only, which means INHERIT -- the browser could
+# name the whole session namespace. It could not persist anything, so nothing
+# was lost by that; now that it keeps a cookie jar and localStorage, the right
+# move was not to widen it but to write the grant down. A browser that can name
+# two places is strictly more confined than one that inherits everything, so
+# gaining persistence made it LESS able to reach your files, not more.
+#
+# $HOME, not /data/apps/vellum. The session makes the app directory READ-ONLY
+# on purpose -- an application rewriting its own installed files is what a
+# package manager exists to prevent -- and a browser's cookies are the USER's
+# data anyway, not the program's. The launcher expands $HOME to whoever is
+# logged in, so this declaration never has to name a person.
+
+ro /system                  # its font, and the documents that ship with the OS
+rw $HOME/.vellum            # its own state: the cookie jar, localStorage

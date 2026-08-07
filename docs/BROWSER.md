@@ -1095,3 +1095,52 @@ That is a deliberate stopping point: writing cookies to disk means deciding
 where, deciding who else may read them, and deciding when they expire on a
 machine whose clock may not have been set. This OS's answer to all three should
 be the capability system, not a path hard-coded here.
+
+
+## State that outlives the process
+
+The jar is persisted now, and so is localStorage. The three questions the
+previous section raised got answers rather than a shrug:
+
+**Where:** `$HOME/.vellum`, and the browser may name nothing else. `vellum.ns`
+used to be comments only -- which means INHERIT the whole session namespace --
+so writing the grant down made the browser MORE confined than it was when it
+could not persist at all.
+
+It is `$HOME` and not `/data/apps/vellum` because the session grants
+`ro /data/apps` deliberately: an application rewriting its own installed files
+is what a package manager exists to prevent. A browser's cookies are the user's
+data anyway, not the program's. That needed a new `$HOME` token in the manifest
+format -- an app cannot hard-code a user name, and on a machine with two users
+there are two answers -- which the launcher expands to whoever is logged in.
+
+**Who may read it:** whoever can name that directory, which is the session's own
+tree -- the same boundary that already separates one user's documents from
+another's.
+
+**When things expire:** by the wall clock, and only when there is one. An unset
+clock reads as "no opinion" everywhere in this browser rather than as 1970, so a
+machine whose RTC was never set does not silently throw away every saved session
+on boot.
+
+`Expires` is now a real RFC 1123 date with the leap-year rule, checked to the
+second against independently computed values. Session cookies -- the ones with
+no expiry -- are deliberately NOT saved: they are defined to end with the
+browsing session, and writing them to disk would make "session" mean something
+the user never agreed to.
+
+Proven across a reboot on one disk: `SERVERSAW keeper=LIVES`, with the session
+cookie correctly absent.
+
+### Two things that made this take longer than it should have
+
+A `.ns` prefix had to start with `/`, and that check ran BEFORE `$HOME` was
+expanded -- so the grant vanished from the manifest with no error anywhere, and
+the app started with one binding fewer than it asked for. A manifest that
+silently drops a line it does not understand is the same hazard as a check that
+cannot fail.
+
+And a granted prefix must EXIST at spawn time, because the kernel resolves it
+in the parent's namespace. An app cannot create what it has not been granted,
+and cannot be granted what does not exist; `mkfs` ships `$HOME/.vellum` to break
+the cycle. That wants a real answer before a second app hits it.

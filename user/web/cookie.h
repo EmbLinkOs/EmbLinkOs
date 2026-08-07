@@ -23,8 +23,26 @@
 
 #include <stddef.h>
 
+/* Where "now" comes from. INJECTED rather than called directly, so this file
+ * depends on no syscall layer -- which is what lets the whole jar, including
+ * every expiry rule, be tested on a host in milliseconds instead of in a
+ * five-minute boot. With no clock installed the jar behaves as if the machine's
+ * clock were unset: nothing expires, which errs toward keeping a live session
+ * rather than throwing one away. */
+void cookie_set_clock(unsigned long long (*now_unix)(void));
+
 /* Forget everything. */
 void cookie_reset(void);
+
+/* Persist the jar / restore it, through store.c's blob interface -- so a
+ * session survives a restart and not merely a click. Cookies whose expiry has
+ * PASSED are dropped on load rather than written back, and a machine with no
+ * clock keeps everything (see cookie_set_clock). Session cookies -- the ones
+ * with no expiry at all -- are deliberately NOT saved: they are defined to end
+ * with the browsing session, and writing them to disk would make a "session"
+ * mean something the user never agreed to. */
+int cookie_save(void);
+int cookie_load(void);
 
 /* Take one `Set-Cookie:` value ("id=abc; Path=/; Max-Age=3600"), as sent by
  * `host`. Understood attributes: Path, Domain, Max-Age, Expires (only well
@@ -47,5 +65,16 @@ size_t cookie_header(const char *host, const char *path, int secure,
  * value of the flag, so it is enforced here rather than at the call site. */
 size_t cookie_for_script(const char *host, const char *path,
                          char *out, size_t cap);
+
+/* An HTTP date to seconds since the epoch, or COOKIE_DATE_BAD for one this
+ * does not understand.
+ *
+ * The failure value is NOT 0, and that distinction is load-bearing: the epoch
+ * is a real date, and it is exactly the date a server sends to DELETE a
+ * cookie. Conflating "1970" with "I could not read this" makes every logout
+ * silently do nothing. Failure still means "no opinion" and never "expired" --
+ * guessing wrong in that direction throws away a live session. */
+#define COOKIE_DATE_BAD ((unsigned long long)-1)
+unsigned long long cookie_parse_date(const char *s, size_t n);
 
 #endif /* _EMBLINK_WEB_COOKIE_H_ */

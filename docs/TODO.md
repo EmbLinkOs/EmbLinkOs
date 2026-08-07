@@ -2476,16 +2476,38 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Metal-proven against a real server: the browser stored two cookies from
       one response and the next request came back "SERVERSAW sid=SESSION42;
       pref=dark".
-- [ ] The cookie jar is NOT PERSISTED: a session survives navigation but not a
-      restart. Writing it to disk means deciding where, who else may read it,
-      and when things expire on a machine whose clock may not be set -- and
-      this OS's answer to all three should be the capability system, not a
-      hard-coded path.
-- [ ] No localStorage / sessionStorage. Same questions as the cookie jar, plus
-      an origin-keyed store on disk.
-- [ ] Expires= is not parsed as a DATE; only the epoch spelling is recognised
-      (which is what a deletion looks like). Everything else becomes a session
-      cookie, erring toward keeping it.
+- [x] ~~The jar is not persisted / no localStorage / Expires is not parsed~~
+      ALL THREE DONE 2026-08-08, and the three questions the last entry raised
+      were answered rather than dodged:
+        WHERE: $HOME/.vellum, and the browser may name nothing else. vellum.ns
+          used to be comments only -- which means INHERIT the whole session --
+          so writing the grant down made the browser MORE confined than it was
+          when it could not persist at all.
+          It is $HOME and not /data/apps/vellum because the session grants
+          `ro /data/apps` on purpose: an application rewriting its own
+          installed files is what a package manager exists to prevent. A
+          browser's cookies are the USER's data anyway.
+        WHO MAY READ IT: whoever can name that directory -- the session's own
+          tree, the same boundary that separates one user's documents from
+          another's.
+        WHEN THINGS EXPIRE: by the wall clock (embk_now_unix, the CMOS RTC),
+          and only when there is one. An unset clock reads as "no opinion"
+          everywhere rather than as 1970, so a machine whose RTC was never set
+          does not silently throw away every saved session on boot.
+      Expires is parsed as a real RFC 1123 date, with the leap-year rule, and
+      checked to the second against independently computed values. Session
+      cookies (no expiry) are deliberately NOT saved: they are defined to end
+      with the session, and writing them would redefine what the user agreed to.
+      Metal-proven across a REBOOT on one disk: keeper=LIVES came back and the
+      session cookie did not.
+- [ ] The `$HOME` token in a .ns manifest is new and only Vellum uses it. Any
+      app keeping per-user state wants it; the alternative was hard-coding a
+      user name in a manifest, which is wrong on a machine with two users.
+- [ ] A granted prefix must EXIST at spawn time -- the kernel resolves it in
+      the PARENT's namespace -- so $HOME/.vellum is shipped by mkfs. An app
+      cannot create what it has not been granted, and cannot be granted what
+      does not exist. That chicken-and-egg wants a real answer (a spawn-time
+      "create if absent" grant?) before the second app hits it.
 - [ ] <textarea> renders as a SINGLE-LINE field. It submits correctly and it
       does not look like a text area; a multi-line control needs the toolkit to
       grow one.

@@ -24,6 +24,7 @@
 #include "form.h"
 #include "url.h"
 #include "cookie.h"
+#include "store.h"
 
 static JSRuntime *g_rt;
 static JSContext *g_ctx;
@@ -429,6 +430,79 @@ static JSValue doc_set_cookie(JSContext *ctx, JSValueConst this_val, JSValueCons
     return JS_UNDEFINED;
 }
 
+/* localStorage. Scoped to the page's ORIGIN, so one site cannot read another's
+ * -- which is the entire contract, and the reason this is not one global map.
+ * Persisted on every write: a page that stores something and then navigates
+ * must find it again, and there is no unload event here to flush on. */
+static void ls_origin(char *out, size_t cap) {
+    struct url u;
+    out[0] = 0;
+    if (!g_url || url_parse(g_url, &u) != 0) return;
+    /* A local file gets the empty origin: its own private area rather than one
+     * shared with every other file on the disk. */
+    if (u.kind != URL_LOCAL) snprintf(out, cap, "%s", u.host);
+}
+
+static JSValue ls_get(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NULL;
+    char o[128]; ls_origin(o, sizeof o);
+    const char *k = JS_ToCString(ctx, argv[0]);
+    if (!k) return JS_EXCEPTION;
+    const char *v = store_get(o, k);
+    JS_FreeCString(ctx, k);
+    return v ? JS_NewString(ctx, v) : JS_NULL;
+}
+
+static JSValue ls_set(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_UNDEFINED;
+    char o[128]; ls_origin(o, sizeof o);
+    const char *k = JS_ToCString(ctx, argv[0]);
+    const char *v = JS_ToCString(ctx, argv[1]);
+    int rc = (k && v) ? store_set(o, k, v) : -1;
+    if (k) JS_FreeCString(ctx, k);
+    if (v) JS_FreeCString(ctx, v);
+    if (rc != 0) return JS_ThrowInternalError(ctx, "localStorage is full");
+    store_save();
+    return JS_UNDEFINED;
+}
+
+static JSValue ls_remove(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_UNDEFINED;
+    char o[128]; ls_origin(o, sizeof o);
+    const char *k = JS_ToCString(ctx, argv[0]);
+    if (!k) return JS_EXCEPTION;
+    store_remove(o, k);
+    JS_FreeCString(ctx, k);
+    store_save();
+    return JS_UNDEFINED;
+}
+
+static JSValue ls_clear(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)ctx; (void)t; (void)argc; (void)argv;
+    char o[128]; ls_origin(o, sizeof o);
+    store_clear(o);
+    store_save();
+    return JS_UNDEFINED;
+}
+
+static JSValue ls_key(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NULL;
+    char o[128]; ls_origin(o, sizeof o);
+    int i = 0; JS_ToInt32(ctx, &i, argv[0]);
+    const char *k = store_key_at(o, i);
+    return k ? JS_NewString(ctx, k) : JS_NULL;
+}
+
+static JSValue ls_length(JSContext *ctx, JSValueConst t) {
+    (void)t;
+    char o[128]; ls_origin(o, sizeof o);
+    return JS_NewInt32(ctx, store_count(o));
+}
+
 static JSValue doc_create_element(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
     (void)this_val;
@@ -611,6 +685,21 @@ int jsdom_open(struct html_doc *doc, const struct css_sheet *sheet) {
     JS_SetPropertyStr(g_ctx, console, "log",
                       JS_NewCFunction(g_ctx, js_console_log, "log", 1));
     JS_SetPropertyStr(g_ctx, g, "console", console);
+
+    {
+        JSValue ls = JS_NewObject(g_ctx);
+        JS_SetPropertyStr(g_ctx, ls, "getItem",    JS_NewCFunction(g_ctx, ls_get, "getItem", 1));
+        JS_SetPropertyStr(g_ctx, ls, "setItem",    JS_NewCFunction(g_ctx, ls_set, "setItem", 2));
+        JS_SetPropertyStr(g_ctx, ls, "removeItem", JS_NewCFunction(g_ctx, ls_remove, "removeItem", 1));
+        JS_SetPropertyStr(g_ctx, ls, "clear",      JS_NewCFunction(g_ctx, ls_clear, "clear", 0));
+        JS_SetPropertyStr(g_ctx, ls, "key",        JS_NewCFunction(g_ctx, ls_key, "key", 1));
+        JSAtom la = JS_NewAtom(g_ctx, "length");
+        JS_DefinePropertyGetSet(g_ctx, ls, la,
+            JS_NewCFunction(g_ctx, (JSCFunction *)ls_length, "length", 0),
+            JS_UNDEFINED, JS_PROP_CONFIGURABLE);
+        JS_FreeAtom(g_ctx, la);
+        JS_SetPropertyStr(g_ctx, g, "localStorage", ls);
+    }
 
     JSValue d = JS_NewObject(g_ctx);
     JS_SetPropertyStr(g_ctx, d, "querySelector",

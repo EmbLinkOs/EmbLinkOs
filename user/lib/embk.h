@@ -653,6 +653,16 @@ static inline int embk_key_grab(int on) {
 }
 
 /* Monotonic milliseconds since boot -- the clock a UI animator ticks on. */
+/* Seconds since the Unix epoch, from the CMOS RTC -- the only wall clock this
+ * kernel has. Distinct from embk_uptime_ms, which is monotonic since BOOT and
+ * therefore useless for anything that must outlive the machine being on: a
+ * cookie's expiry, a cache's freshness, a file's age. */
+static inline uint64_t embk_now_unix(void) {
+    uint64_t tv[2] = { 0, 0 };
+    if (embk_syscall1(EMBK_SYS_gettimeofday, (int64_t)(intptr_t)tv) != 0) return 0;
+    return tv[0];
+}
+
 static inline uint64_t embk_uptime_ms(void) {
     return (uint64_t)embk_syscall0(EMBK_SYS_uptime_ms);
 }

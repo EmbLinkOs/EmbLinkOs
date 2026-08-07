@@ -677,9 +677,14 @@ static void t20_png_hostile(void) {
 
 /* ======================= cookies ======================================== */
 
+static unsigned long long fake_now(void) { return 1786500000ull; }  /* 2026-08-08 */
+
 static void t23_cookies(void) {
     printf("T23 the cookie jar: scope, and who may read it:\n");
     char out[512];
+    /* A FIXED clock, so an expiry test asserts a rule and not the date the
+     * suite happened to run on. 2026-08-08. */
+    cookie_set_clock(fake_now);
 
     cookie_reset();
     cookie_set("example.com", "sid=abc123; Path=/");
@@ -740,6 +745,31 @@ static void t23_cookies(void) {
     cookie_set("example.com", "k=; Max-Age=0");
     cookie_header("example.com", "/", 0, out, sizeof out);
     CHECK(out[0] == 0, "Max-Age=0 deletes it, which is how logout works");
+
+    /* DATES. Checked against values computed independently, because a date
+     * routine that is wrong by a day, or by a leap year, fails silently: the
+     * cookie simply goes missing one day earlier than the server meant. */
+    CHECK(cookie_parse_date("Thu, 01 Jan 1970 00:00:00 GMT", 29) == 0ull,
+          "the epoch is a real date, and reads as zero");
+    CHECK(cookie_parse_date("Fri, 02 Jan 1970 00:00:00 GMT", 29) == 86400ull,
+          "one day after the epoch");
+    CHECK(cookie_parse_date("Tue, 01 Jan 2019 00:00:00 GMT", 29) == 1546300800ull,
+          "2019-01-01 (past two leap years and a century rule)");
+    CHECK(cookie_parse_date("Sat, 01 Mar 2020 00:00:00 GMT", 29) == 1583020800ull,
+          "just after a LEAP day");
+    CHECK(cookie_parse_date("Wed, 09 Jun 2027 10:18:14 GMT", 29) == 1812536294ull,
+          "a real Expires value, to the second");
+    CHECK(cookie_parse_date("not a date at all", 17) == COOKIE_DATE_BAD,
+          "garbage is BAD, which is distinct from the epoch -- a deletion IS the epoch");
+
+    /* an Expires in the FUTURE keeps the cookie; one in the past deletes it */
+    cookie_reset();
+    cookie_set("example.com", "keep=1; Expires=Wed, 09 Jun 2099 10:18:14 GMT");
+    cookie_header("example.com", "/", 0, out, sizeof out);
+    CHECK(!strcmp(out, "keep=1"), "a future Expires keeps the cookie");
+    cookie_set("example.com", "keep=1; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+    cookie_header("example.com", "/", 0, out, sizeof out);
+    CHECK(out[0] == 0, "a past Expires deletes it -- which is what logout sends");
 
     /* a whole response block, with the comma inside Expires that is exactly
      * why Set-Cookie must not be comma-joined with its siblings */

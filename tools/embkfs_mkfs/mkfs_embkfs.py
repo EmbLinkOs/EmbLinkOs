@@ -1136,8 +1136,13 @@ def discover_userland_objects(build_dir="build"):
     # opened in a directory that did not exist -- which is why a bare `ls`
     # listed nothing at all. Give it a home with the usual folders in it.
     objects.append((b"home/yves", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    # .vellum: the browser's own state (cookie jar, localStorage). It has to
+    # EXIST on the image, not be created on first use, because the kernel
+    # resolves an ns-bind prefix in the PARENT's namespace at spawn time -- a
+    # directory that is not there yet cannot be granted, and an app cannot
+    # create what it has not been granted. Chicken and egg, broken here.
     for _d in (b"Desktop", b"Documents", b"Downloads",
-               b"Music", b"Pictures", b"Videos"):
+               b"Music", b"Pictures", b"Videos", b".vellum"):
         objects.append((b"home/yves/" + _d, L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"home/yves/readme.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
                     b"Welcome to EmbLink.\n\nThis is your home directory.\n"))

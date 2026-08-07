@@ -7,6 +7,8 @@
 #include "appauth.h"
 
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 #define MANIFEST_MAX 4096      /* a declaration of authority that needs more
                                 * than 4KB is not a declaration anyone reads */
@@ -90,10 +92,37 @@ int appauth_load_ns(const char *elf_path, struct embk_spawn_file_action *acts,
         int ps = i;
         while (i < len && buf[i]!=' ' && buf[i]!='\t' && buf[i]!='\n' && buf[i]!='\r') i++;
         int plen = i - ps;
-        if (plen <= 0 || buf[ps] != '/' || plen > 255) { skip_line(buf, len, &i); continue; }
+        /* A prefix is absolute -- or begins with $HOME, which expands to one
+         * just below. The check used to be `buf[ps] != '/'` alone, which threw
+         * every $HOME line away BEFORE the expansion could run: the grant
+         * simply vanished from the manifest, with no error anywhere, and the
+         * app started with one binding fewer than it asked for. */
+        if (plen <= 0 || plen > 255) { skip_line(buf, len, &i); continue; }
+        if (buf[ps] != '/' && !(plen >= 5 && !strncmp(buf + ps, "$HOME", 5))) {
+            skip_line(buf, len, &i); continue;
+        }
 
         char prefix[256];
         memcpy(prefix, buf + ps, (size_t)plen); prefix[plen] = 0;
+
+        /* `$HOME/...` expands to the SESSION USER's home.
+         *
+         * An app that keeps state for a person cannot name where it goes: the
+         * path contains a user name it must not hard-code, and on a machine
+         * with two users there are two answers. Without this the only
+         * writable place an app could DECLARE was its own install directory --
+         * which the session deliberately makes read-only, because an
+         * application rewriting its own binary is exactly what a package
+         * manager exists to prevent. So the declaration stays static and the
+         * launcher supplies the user. */
+        if (!strncmp(prefix, "$HOME", 5) && (prefix[5] == '/' || prefix[5] == 0)) {
+            const char *h = getenv("HOME");
+            if (!h || !h[0]) { skip_line(buf, len, &i); continue; }
+            char expanded[256];
+            snprintf(expanded, sizeof expanded, "%s%s", h, prefix + 5);
+            snprintf(prefix, sizeof prefix, "%s", expanded);
+            plen = (int)strlen(prefix);
+        }
         embk_action_ns_bind(&acts[n], prefix, mode);
 
         if (desc_cap && dn + (size_t)plen + 6 < desc_cap) {

@@ -35,6 +35,8 @@
 #include "fetchjob.h"
 #include "select.h"
 #include "cssref.h"
+#include "cookie.h"
+#include "store.h"
 
 /* One document at a time, in fixed arenas. A browser that can be handed a
  * hostile page needs a bounded appetite -- see docs/BROWSER.md §7. */
@@ -269,6 +271,10 @@ static void finish_load(const struct vnet_result *res) {
             snprintf(g_console, sizeof g_console, "%d script(s) threw", failed);
     }
 
+    /* A response may have set a cookie, so the jar is written after a load
+     * rather than on a timer: the moment it can have changed is the moment
+     * worth spending a write on. */
+    cookie_save();
     g_st.status = res->status;
     snprintf(g_st.via, sizeof g_st.via, "%s", res->via);
     g_st.bytes = n;
@@ -314,6 +320,49 @@ static void go_fwd(void) {
  * is tracked here rather than in select.c because the press/release EDGE is an
  * app-loop fact -- select.c is told what happened, not asked to guess. */
 static bool g_ptr_was_down;
+
+/* The two file operations store.c needs, and the only two this browser
+ * performs. They are injected rather than called from store.c so that module
+ * takes no syscall dependency -- the same shape as the cookie jar's clock. */
+static long web_state_read(const char *path, char *buf, size_t cap) {
+    int fd = (int)embk_open(path, EMBK_O_RDONLY, 0);
+    if (fd < 0) return -1;
+    size_t n = 0;
+    for (;;) {
+        int64_t got = embk_read(fd, buf + n, cap - n);
+        if (got <= 0) break;
+        n += (size_t)got;
+        if (n >= cap) break;
+    }
+    embk_close(fd);
+    return (long)n;
+}
+
+static long web_state_write(const char *path, const char *buf, size_t len) {
+    /* Make the directory if it is not there. It cannot be shipped on the image
+     * -- mkfs stages FILES, and an empty directory has none -- and the browser
+     * is the only thing that will ever put anything in it. embk_mkdir on an
+     * existing directory is harmless, so this needs no probe first.
+     *
+     * Both levels, because /data/apps/vellum exists (the app lives there) but
+     * its `state` child does not. */
+    /* Make the directory if it is not there. It cannot be shipped on the image
+     * -- mkfs stages FILES, and an empty directory has none -- and the browser
+     * is the only thing that will ever put anything in it. embk_mkdir on an
+     * existing directory is harmless, so this needs no probe first. */
+    char dir[192];
+    snprintf(dir, sizeof dir, "%s", path);
+    for (int i = (int)strlen(dir) - 1; i > 0; i--)
+        if (dir[i] == '/') { dir[i] = 0; break; }
+    embk_mkdir(dir);
+    int fd = (int)embk_open(path, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0);
+    if (fd < 0) return -1;
+    long w = (long)embk_write(fd, buf, len);
+    embk_close(fd);
+    return w;
+}
+
+static const struct store_io g_state_io = { web_state_read, web_state_write };
 
 static void selection_tick(void) {
     float px, py;
@@ -362,6 +411,23 @@ static void app(void) {
     if (first) {
         first = false;
         em_set_key_hook(vellum_key);
+        /* The jar's clock. cookie.c takes no syscall dependency of its own, so
+         * the app is what tells it what time it is. */
+        cookie_set_clock(embk_now_unix);
+        /* State that outlives the process: the jar, so a login survives a
+         * restart, and localStorage, which is the only place a page can keep
+         * anything of its own. Both live under /data/apps/vellum/state, which
+         * is the ONLY path this browser may write -- see vellum.ns. */
+        store_set_io(&g_state_io);
+        /* $HOME/.vellum -- the same path vellum.ns declares, and the launcher
+         * expanded the same $HOME to grant it. If there is no HOME there is no
+         * persistence, which is correct rather than a fallback to somewhere
+         * this process was never given. */
+        { const char *h = getenv("HOME");
+          if (h && h[0]) { char d[192]; snprintf(d, sizeof d, "%s/.vellum", h);
+                           store_set_dir(d); } }
+        store_load();
+        cookie_load();
         em_set_post_layout_hook(vsel_sync_geometry);
         vellum_set_link_handler(on_link);
         vellum_set_event_hooks(jsdom_has_listener, on_dom_click);
