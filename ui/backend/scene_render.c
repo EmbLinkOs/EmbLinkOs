@@ -118,7 +118,26 @@ struct noderec {
     int                own_dirty;
     int                moved;
     int                clips;
+    /* What this node can actually STAIN: `foot` intersected with every
+     * clipping ancestor. A node scrolled past the bottom of its container has
+     * a footprint below the clip and NOTHING visible there -- the scroll
+     * classifier has to reason about the latter, or a document taller than its
+     * viewport permanently vetoes its own fast path. Empty when fully clipped,
+     * and frect_overlap treats empty as touching nothing. */
+    struct frect       vis;
+    struct frect       clipbox;      /* the ancestor clip itself, for the OLD foot */
+    int                has_clipbox;
 };
+
+/* a ∩ b, empty if they miss */
+static struct frect frect_isect(struct frect a, struct frect b) {
+    float x0 = a.x > b.x ? a.x : b.x, y0 = a.y > b.y ? a.y : b.y;
+    float x1 = a.x + a.w < b.x + b.w ? a.x + a.w : b.x + b.w;
+    float y1 = a.y + a.h < b.y + b.h ? a.y + a.h : b.y + b.h;
+    if (x1 <= x0 || y1 <= y0) return frect_empty();
+    struct frect r = { x0, y0, x1 - x0, y1 - y0 };
+    return r;
+}
 
 /* the painted footprint: the AABB grown by shadow reach (mirrors paint_visual) */
 static struct frect node_footprint(const struct scene_node *n, struct frect ab) {
@@ -137,6 +156,7 @@ static struct frect node_footprint(const struct scene_node *n, struct frect ab) 
 
 static void gather(struct scene_arena *a, struct node_handle h, const float wparent[16],
                    int has_group, struct frect gbounds,
+                   int has_clip, struct frect clipr,
                    struct noderec *list, int *n, int cap) {
     struct scene_node *node = scene_resolve(a, h);
     if (!node || *n >= cap) return;
@@ -154,7 +174,15 @@ static void gather(struct scene_arena *a, struct node_handle h, const float wpar
     rec->dirty = 0;
     rec->has_old = 0; rec->own_dirty = 0; rec->moved = 0;
     rec->clips = node->clip_children ? 1 : 0;
+    rec->vis = has_clip ? frect_isect(rec->foot, clipr) : rec->foot;
+    rec->clipbox = clipr; rec->has_clipbox = has_clip;
 
+    int child_has_clip = has_clip;
+    struct frect child_clip = clipr;
+    if (node->clip_children) {
+        child_clip = has_clip ? frect_isect(clipr, rec->aabb) : rec->aabb;
+        child_has_clip = 1;
+    }
     int child_group = has_group;
     struct frect child_gb = gbounds;
     if (node->opacity < 1.0f) {      /* this node starts (or nests) a group */
@@ -166,7 +194,7 @@ static void gather(struct scene_arena *a, struct node_handle h, const float wpar
     while (!node_handle_is_null(c) && guard-- != 0) {
         struct scene_node *cn = scene_resolve(a, c);
         struct node_handle next = cn ? cn->next_sibling : NODE_HANDLE_NULL;
-        gather(a, c, world, child_group, child_gb, list, n, cap);
+        gather(a, c, world, child_group, child_gb, child_has_clip, child_clip, list, n, cap);
         c = next;
     }
 }
@@ -395,7 +423,7 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
     if (!recs) return;
     int nrec = 0;
     float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-    gather(a, root, ident, 0, frect_empty(), recs, &nrec, (int)cap);
+    gather(a, root, ident, 0, frect_empty(), 0, frect_empty(), recs, &nrec, (int)cap);
 
     /* --- Step 1: dirty accumulation (own dirty flag OR world rect moved OR
      * newly created); union BOTH the new footprint and the cached old one so a
@@ -538,9 +566,19 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
                                fabsf(recs[i].old.h - recs[i].foot.h) > 0.01f);
                 int is_content = recs[i].own_dirty || resized ||
                                  (recs[i].moved && !recs[i].has_old);
+                /* VISIBLE extents, not raw footprints: a node scrolled past the
+                 * bottom of its container stains nothing, so it can neither
+                 * smear the blit nor prove the frame was not a scroll. Using
+                 * the footprint meant any document taller than its viewport
+                 * vetoed its own fast path -- which is every real page. */
+                struct frect vnew = recs[i].vis;
+                struct frect vold = recs[i].has_old
+                    ? (recs[i].has_clipbox ? frect_isect(recs[i].old, recs[i].clipbox)
+                                           : recs[i].old)
+                    : frect_empty();
                 if (is_content) {
-                    if (frect_overlap(recs[i].foot, recs[ci].aabb) ||
-                        (recs[i].has_old && frect_overlap(recs[i].old, recs[ci].aabb))) {
+                    if (frect_overlap(vnew, recs[ci].aabb) ||
+                        frect_overlap(vold, recs[ci].aabb)) {
                         ok = 0;
 #ifdef SCROLL_DEBUG
                         struct scene_node *vn = scene_resolve(a, recs[i].h);
@@ -553,15 +591,27 @@ void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
                     continue;
                 }
                 if (!recs[i].moved) continue;
-                if (!frect_overlap(recs[i].foot, t) && !frect_overlap(recs[i].old, t)) continue;
-                struct frect both = recs[i].foot;
-                if (recs[i].has_old) {
-                    float x1 = both.x + both.w, y1 = both.y + both.h;
-                    if (recs[i].old.x < both.x) both.x = recs[i].old.x;
-                    if (recs[i].old.y < both.y) both.y = recs[i].old.y;
-                    if (recs[i].old.x + recs[i].old.w > x1) x1 = recs[i].old.x + recs[i].old.w;
-                    if (recs[i].old.y + recs[i].old.h > y1) y1 = recs[i].old.y + recs[i].old.h;
-                    both.w = x1 - both.x; both.h = y1 - both.y;
+                /* A moved node that CLIPS invalidates the reasoning above: its
+                 * descendants' visible extents were computed against a clip
+                 * that is itself in motion. Rare (a scrollable inside a
+                 * scrollable) and cheap to refuse. */
+                if (recs[i].clips) { ok = 0;
+#ifdef SCROLL_DEBUG
+                    fprintf(stderr, "veto: MOVED-CLIP\n");
+#endif
+                    continue; }
+                if (!frect_overlap(vnew, t) && !frect_overlap(vold, t)) continue;
+                struct frect both = vnew;
+                if (!frect_is_empty(vold)) {
+                    if (frect_is_empty(both)) both = vold;
+                    else {
+                        float x1 = both.x + both.w, y1 = both.y + both.h;
+                        if (vold.x < both.x) both.x = vold.x;
+                        if (vold.y < both.y) both.y = vold.y;
+                        if (vold.x + vold.w > x1) x1 = vold.x + vold.w;
+                        if (vold.y + vold.h > y1) y1 = vold.y + vold.h;
+                        both.w = x1 - both.x; both.h = y1 - both.y;
+                    }
                 }
                 if (!frect_overlap(both, recs[ci].aabb)) {
                     ok = 0;

@@ -2165,7 +2165,19 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       -- the blitted region is memmove'd and only the exposed strip (plus the
       clip's fractional edge rows) is repainted. Host-proven PIXEL-EXACT
       against a from-scratch render (`make browser-render` asserts it, and the
-      check watched the blit path actually being TAKEN). Needed a scene-level
+      check watched the blit path actually being TAKEN).
+      ...EXCEPT it was not being taken on any real page, and the check said
+      PIXEL-EXACT anyway because the two renders agreed by being the SAME
+      render. Fixed 2026-08-07: the classifier tested each moved node's raw
+      FOOTPRINT for "moved content visible outside the clip", but a document
+      taller than its viewport always has content scrolled past the bottom of
+      its container -- clipped away, staining nothing, and vetoing the fast
+      path on every page. `gather` now threads the inherited clip down the
+      tree so every node carries its VISIBLE extent (foot ∩ ancestor clips),
+      and the classifier reasons about that. A moved node that itself CLIPS
+      still aborts (its descendants' extents were computed against a clip in
+      motion). `make browser-render` now FAILS if the blit path is not
+      exercised, and exits non-zero so it is a test rather than a report. Needed a scene-level
       split of dirty into geometry-vs-content (dirty_content), because
       scrolling is itself a transform and was vetoing its own fast path.
 - [ ] Metal scroll-FEEL still not verifiable headless: QMP wheel synthesis does

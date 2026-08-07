@@ -703,3 +703,27 @@ are a 16.16 accumulator instead of a float divide per pixel.
 The lesson is the one this project keeps relearning: **measure, don't theorise.**
 The first fix was aimed at a real inefficiency that was not the problem, and
 only cost a day because the measurement was cheap once it was finally taken.
+
+
+### The scroll blit was dead code, and the check could not tell
+
+Step 1s in `scene_render.c` turns a wheel tick into a `memmove` plus a strip of
+glyphs instead of a full repaint. It had a host check asserting the incremental
+frame is pixel-identical to a from-scratch one, and that check read PIXEL-EXACT
+from the day it was written -- because the blit was never being taken on a real
+page, so the two renders agreed by being the same render.
+
+The classifier asks whether any node moved and is still visible OUTSIDE the
+scrolled clip, since that would mean the frame was not that clip's scroll. It
+asked using each node's raw footprint. But a document taller than its viewport
+ALWAYS has content scrolled past the bottom of its container -- clipped away,
+staining nothing -- so every real page vetoed its own fast path.
+
+`gather` now threads the inherited clip down the tree, so every node carries its
+visible extent (footprint intersected with every clipping ancestor) and the
+classifier reasons about that. A moved node that itself clips still aborts, since
+its descendants' extents were computed against a clip that is in motion.
+
+`make browser-render` now FAILS when the blit path is not exercised, and exits
+non-zero. A check that passes because the code under test never ran is not a
+check -- that is the property that hid this for as long as it was hidden.

@@ -191,6 +191,11 @@ static void survey(struct node_handle h, float oy, int depth) {
     }
 }
 
+/* Assertions that must HOLD, not merely print. `make browser-render` is the
+ * fast loop for this whole stack, and a loop that always exits 0 is a report,
+ * not a test. */
+static int g_fail;
+
 int main(int argc, char **argv) {
     const char *doc = argc > 1 ? argv[1] : "system/web/index.html";
     int W = argc > 2 ? atoi(argv[2]) : 940;
@@ -291,6 +296,15 @@ int main(int argc, char **argv) {
         if (diff) printf("    (differing rows: %d..%d)\n", dy0, dy1);
         printf("--- scroll blit: %s (blit path %s, %d differing px) ---\n",
                diff == 0 ? "PIXEL-EXACT" : "MISMATCH", blitted ? "TAKEN" : "not taken", diff);
+        /* A check that passes because the code under test never ran is not a
+         * check. This one read PIXEL-EXACT for as long as the classifier was
+         * vetoing every real page -- the two renders agreed because they were
+         * the same render. Not being taken is now a FAILURE. */
+        if (!blitted || diff) {
+            printf("*** scroll-blit check FAILED: %s ***\n",
+                   !blitted ? "the blit path was never exercised" : "pixels differ");
+            g_fail++;
+        }
         scene_render_destroy(&ra); scene_render_destroy(&rb);
         free(pa); free(pb);
     }
@@ -324,6 +338,18 @@ int main(int argc, char **argv) {
                y_before == y_after ? "NO REFLOW" : "PAGE MOVED",
                n_before, n_after,
                n_before != n_after ? "  [unsized images fell back to alt text]" : "");
+        /* Asserted only when the counts match. An image with NO stated size
+         * cannot reserve its box, so it shows alt text and then reflows when
+         * the real thing lands -- true here and true in every other browser,
+         * which is what width/height are for. A differing count is exactly
+         * that case, and failing on it would be asserting something the
+         * browser never claimed. */
+        if (n_before != n_after) {
+            printf("    (reflow NOT asserted: an unsized image fell back to alt text)\n");
+        } else if (y_before != y_after) {
+            printf("*** reflow check FAILED: the page moved when images arrived ***\n");
+            g_fail++;
+        }
     }
 
     if (png) {
@@ -349,7 +375,8 @@ int main(int argc, char **argv) {
         fclose(f);
         fprintf(stderr, "wrote %s (%dx%d)\n", png, W, H);
     }
-    return 0;
+    if (g_fail) fprintf(stderr, "\n*** browser-render: %d CHECK(S) FAILED ***\n", g_fail);
+    return g_fail ? 1 : 0;
 }
 
 /* --- imgcache, host flavour --------------------------------------------- *
