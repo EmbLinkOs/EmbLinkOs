@@ -241,9 +241,23 @@ static void emit_button(struct html_doc *d, int n, const struct vstyle *st);
  * any element) nested inside an inline wrapper was silently dropped -- a
  * <figure><img></figure> rendered as nothing at all, with no error anywhere.
  * Depth is bounded so hostile markup cannot recurse us to death. */
+/* Is this box one that BREAKS an inline formatting context? A block, a table,
+ * a row, a cell or a list item inside a run of inline content is not inline
+ * content -- CSS says the inline context ends and a block box begins, and a
+ * renderer that walks it as inline anyway flattens the whole subtree. */
+static int breaks_inline(unsigned char display) {
+    return display == VD_BLOCK || display == VD_LIST_ITEM || display == VD_TABLE ||
+           display == VD_ROW   || display == VD_CELL      || display == VD_CAPTION;
+}
+
 static void emit_inline(struct html_doc *d, int c, const struct vstyle *st,
                         const char *href, int depth) {
-    if (depth > 8) return;
+    /* Deep, because real markup is deep: Hacker News reaches nine levels of
+     * inline nesting before its first link, and the old bound of 8 silently
+     * dropped every one of their titles while the plain " | " between them --
+     * one level shallower -- came through. A bound this size is a runaway
+     * guard, not a policy about how documents may be written. */
+    if (depth > 24) return;
     if (d->nodes[c].kind == HTML_TEXT) {
         if (d->nodes[c].text) emit_text(d->nodes[c].text, st, href);
         return;
@@ -257,6 +271,12 @@ static void emit_inline(struct html_doc *d, int c, const struct vstyle *st,
     if (s.display == VD_IMAGE)  { emit_image(d, c, &s); return; }
     if (s.display == VD_FIELD)  { emit_field(d, c, &s); return; }
     if (s.display == VD_BUTTON) { emit_button(d, c, &s); return; }
+    /* A block-level box inside an inline run ends the run and becomes a block.
+     * Without this, a <table> that happens to sit inside an inline element gets
+     * walked as if it were text, and its rows and cells lose all their
+     * structure -- which is exactly what a page wrapped in <center> used to do
+     * to itself. */
+    if (breaks_inline(s.display)) { em_flush(); render_block(d, c, &s, href, 0); return; }
     const char *h = d->nodes[c].href ? d->nodes[c].href : href;
     for (int k = d->nodes[c].first_child; k >= 0; k = d->nodes[k].next_sibling)
         emit_inline(d, k, &s, h, depth + 1);

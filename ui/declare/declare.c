@@ -15,7 +15,13 @@
 /* globals + instance pool                                                   */
 /* ------------------------------------------------------------------------- */
 
-#define INST_MAX          4096
+/* One instance per emitted view -- and in a DOCUMENT that means one per WORD.
+ * 4096 was sized for an application's worth of widgets and a real web page
+ * walks straight through it: danluu.com's index alone is several thousand
+ * words. The failure was silent and ugly -- inst_alloc returned null, the
+ * caller carried on, and the nodes collapsed to 0x0 and painted on top of each
+ * other at the first row's origin, which reads as a renderer bug. */
+#define INST_MAX          65536
 #define CURSOR_STACK_MAX  64
 
 static struct instance g_inst[INST_MAX];
@@ -59,11 +65,18 @@ struct instance *instance_resolve(struct instance_handle h) {
     return s;
 }
 
+/* How many allocations the pool refused this frame. Zero on every UI this OS
+ * ships; non-zero means a view was DROPPED, and a caller that cares (the
+ * browser's harness) can say so instead of rendering the wreckage. */
+static uint32_t g_inst_overflow;
+uint32_t ui_instance_overflow(void) { return g_inst_overflow; }
+uint32_t ui_instance_used(void) { return g_inst_hw; }
+
 static struct instance_handle inst_alloc(void) {
     uint32_t idx;
     if (g_inst_free_top >= 0) idx = g_inst_free[g_inst_free_top--];
     else if (g_inst_hw < INST_MAX) idx = g_inst_hw++;
-    else return INSTANCE_HANDLE_NULL;
+    else { g_inst_overflow++; return INSTANCE_HANDLE_NULL; }
     struct instance *s = &g_inst[idx];
     uint32_t gen = s->self.generation; if (gen == 0) gen = 1;
     memset(s, 0, sizeof(*s));

@@ -152,6 +152,27 @@ static void first_last_text(struct node_handle h, int inside,
     }
 }
 
+/* The DOM, before any styling or layout touches it. The header of this file
+ * promises you can tell whether a fault is in the parse or in the emission --
+ * and until this existed you could only see the emission, so every parse bug
+ * had to be inferred from the shape of the wreckage downstream. Printed when
+ * DOM=1 is set. */
+static void dump_dom(struct html_doc *d, int node, int depth) {
+    if (node < 0 || node >= d->n || depth > 40) return;
+    struct html_node *n = &d->nodes[node];
+    if (n->kind == HTML_TEXT) {
+        const char *t = n->text ? n->text : "";
+        printf("%*s#text \"%.60s\"\n", depth * 2, "", t);
+    } else {
+        printf("%*s<%s>", depth * 2, "", n->tag);
+        if (n->klass) printf(" class=%s", n->klass);
+        if (n->href)  printf(" href=%.40s", n->href);
+        printf("\n");
+    }
+    for (int c = n->first_child; c >= 0; c = d->nodes[c].next_sibling)
+        dump_dom(d, c, depth + 1);
+}
+
 static const char *kindname(enum scene_node_kind k) {
     switch (k) {
     case SCENE_NODE_GROUP: return "group";
@@ -173,8 +194,14 @@ static void dump(struct node_handle h, float ox, float oy, int depth, int maxdep
     if (depth <= maxdepth) {
         printf("%*s%s %7.1f,%-7.1f %6.1fx%-6.1f", depth * 2, "", kindname(n->kind), x, y,
                n->width, n->height);
-        if (n->kind == SCENE_NODE_TEXT && n->data.text.utf8)
+        if (n->kind == SCENE_NODE_TEXT && n->data.text.utf8) {
             printf("  \"%s\"", n->data.text.utf8);
+            if (n->data.text.bg.a > 0.001f) printf("  [BG a=%.2f]", n->data.text.bg.a);
+        } else if (n->kind == SCENE_NODE_RECT) {
+            const struct paint *f = &n->data.rect.fill;
+            if (f->kind == PAINT_SOLID && f->solid.a > 0.001f)
+                printf("  [fill %.2f,%.2f,%.2f a=%.2f]", f->solid.r, f->solid.g, f->solid.b, f->solid.a);
+        }
         else if (n->clip_children)
             printf("  [clip]");
         printf("\n");
@@ -253,6 +280,7 @@ int main(int argc, char **argv) {
         allcss[n] = 0;
         css_sheet_parse(&g_sheet, n ? allcss : 0, n);
     }
+    if (getenv("DOM")) dump_dom(&g_doc, g_root, 0);
     printf("%s: %zu bytes -> %d nodes%s, root %d, %d css rule%s%s\n", doc, dl, g_doc.n,
            g_doc.truncated ? " (TRUNCATED)" : "", g_root, g_sheet.n,
            g_sheet.n == 1 ? "" : "s", g_sheet.truncated ? " (TRUNCATED)" : "");
@@ -489,6 +517,11 @@ int main(int argc, char **argv) {
          * renderer bug and is not one. */
         HDEFER = 0; imgcache_reset(); g_scroll = 0; g_busy = 0;
         vsel_reset();
+        /* Park the pointer off-screen. The checks above sweep it across the
+         * page, and whatever it lands on renders HOVERED -- which put an
+         * accent-filled box on one link of every page this harness drew and
+         * looked exactly like a rendering bug. */
+        em_feed_pointer(-10000.0f, -10000.0f, 0, 0, 0, 0);
         ui_frame_begin(); em_new_frame(); app(); em_flush(); ui_frame_end();
         ui_run_layout((float)W, (float)H);
         /* ...and UNPAINT any selection. vsel_reset drops the RANGE; taking the
@@ -517,6 +550,20 @@ int main(int argc, char **argv) {
         }
         fclose(f);
         fprintf(stderr, "wrote %s (%dx%d)\n", png, W, H);
+    }
+    /* Did any view get dropped for want of an instance? A page that overflows
+     * the pool renders INCOMPLETELY and silently -- collapsed boxes stacked at
+     * one origin -- so it is a failure, not a footnote. */
+    printf("--- instances: %u used, %u refused; layout containers overflowed: %d ---\n",
+           ui_instance_used(), ui_instance_overflow(), layout_children_dropped());
+    if (layout_children_dropped()) {
+        printf("*** layout dropped children in %d container(s): boxes left at 0x0 ***\n",
+               layout_children_dropped());
+        g_fail++;
+    }
+    if (ui_instance_overflow()) {
+        printf("*** instance pool OVERFLOWED: %u views dropped ***\n", ui_instance_overflow());
+        g_fail++;
     }
     if (g_fail) fprintf(stderr, "\n*** browser-render: %d CHECK(S) FAILED ***\n", g_fail);
     return g_fail ? 1 : 0;

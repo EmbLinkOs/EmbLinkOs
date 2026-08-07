@@ -111,6 +111,11 @@ struct instance_handle ui_first_child(struct instance_handle h);
 struct instance_handle ui_next_sibling(struct instance_handle h);
 struct node_handle     ui_scene_of(struct instance_handle h);
 struct scene_arena    *ui_scene_arena(void);
+/* Instance-pool telemetry. `overflow` counts allocations the pool REFUSED --
+ * any non-zero value means views were silently dropped and whatever is on
+ * screen is incomplete. */
+uint32_t               ui_instance_overflow(void);
+uint32_t               ui_instance_used(void);
 struct layout_handle   ui_layout_of(struct instance_handle h);
 
 #endif /* __EMBLINK_UI_UI_H__ */

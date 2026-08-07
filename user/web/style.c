@@ -86,6 +86,11 @@ void vstyle_for(const char *tag, const struct vstyle *p, struct vstyle *o) {
              ieq(tag,"document") || ieq(tag,"form") || ieq(tag,"table") ||
              ieq(tag,"tr") || ieq(tag,"tbody") || ieq(tag,"thead"))
                             { o->display=VD_BLOCK; }
+    /* <center> is presentational and ancient, and still holds up half the old
+     * web -- Hacker News wraps its entire page in one. Left as an unknown tag
+     * it defaulted to INLINE, which put a whole nested-table document inside an
+     * inline formatting context. */
+    else if (ieq(tag,"center")) { o->display=VD_BLOCK; o->align=VA_CENTER; }
     else if (ieq(tag,"blockquote")) { o->display=VD_BLOCK; o->indent=20; o->margin_bottom=12; }
     else if (ieq(tag,"hr")) { o->display=VD_BLOCK; o->margin_top=10; o->margin_bottom=10; }
 

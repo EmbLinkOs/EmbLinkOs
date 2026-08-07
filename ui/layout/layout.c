@@ -555,8 +555,44 @@ static float measure_grid_height(struct layout_arena *la, struct scene_arena *sa
     return total + n->padding_top + n->padding_bottom;
 }
 
+/* Children are gathered into a SHARED, depth-stacked scratch pool rather than
+ * onto the C stack.
+ *
+ * They used to live in `kids[64]` and friends, four fixed arrays per arrange()
+ * frame. Sixty-four is plenty for an application's dialog and nowhere near
+ * enough for a document: a <ul> with a hundred items, or a table with thirty
+ * rows, walked straight past it -- and the overflow was SILENT. The extra
+ * children were never arranged, so they kept their default 0x0 and every one
+ * of them painted at the parent's origin, stacked on top of the first row.
+ * That is what the "overlapping first list item" on danluu.com was.
+ *
+ * They cannot simply be made bigger: arrange() recurses once per nesting
+ * level, so a 1024-entry set of stack arrays would be megabytes deep on a real
+ * document. arrange() is strictly depth-first, so a bump allocator restored on
+ * exit is exactly the right shape -- and the wrapper below is what guarantees
+ * the restore happens on every one of the several return paths. */
+#define LAYOUT_KID_POOL 8192
+static struct layout_handle g_kid_pool[LAYOUT_KID_POOL];
+static float g_base_pool[LAYOUT_KID_POOL], g_final_pool[LAYOUT_KID_POOL],
+             g_cross_pool[LAYOUT_KID_POOL];
+static int   g_kid_top;
+static int   g_kid_dropped;   /* containers whose children did not fit */
+
+int layout_children_dropped(void) { return g_kid_dropped; }
+void layout_reset_children_dropped(void) { g_kid_dropped = 0; }
+
+static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
+                          struct layout_handle h, float W, float H);
+
 static void arrange(struct layout_arena *la, struct scene_arena *sa,
                     struct layout_handle h, float W, float H) {
+    int save = g_kid_top;
+    arrange_inner(la, sa, h, W, H);
+    g_kid_top = save;                 /* pop, whichever way the callee returned */
+}
+
+static void arrange_inner(struct layout_arena *la, struct scene_arena *sa,
+                          struct layout_handle h, float W, float H) {
     struct layout_node *n = layout_resolve(la, h);
     if (!n) return;
     n->resolved_w = W; n->resolved_h = H;
@@ -571,14 +607,20 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
     float main_pad0  = is_row ? n->padding_left : n->padding_top;
     float cross_pad0 = is_row ? n->padding_top : n->padding_left;
 
-    /* gather children into a small array */
-    struct layout_handle kids[64]; int nk = 0;
-    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c) && nk < 64; ) {
+    /* gather children into the shared scratch pool (popped by arrange()) */
+    int room = LAYOUT_KID_POOL - g_kid_top;
+    struct layout_handle *kids = g_kid_pool + g_kid_top;
+    int nk = 0;
+    for (struct layout_handle c = n->first_child; !layout_handle_is_null(c); ) {
         struct layout_node *cn = layout_resolve(la, c);
         if (!cn) break;
+        if (nk >= room) { g_kid_dropped++; break; }   /* bounded, and COUNTED */
         kids[nk++] = c;
         c = cn->next_sibling;
     }
+    float *base = g_base_pool + g_kid_top, *finalm = g_final_pool + g_kid_top,
+          *crossv = g_cross_pool + g_kid_top;
+    g_kid_top += nk;
     if (nk == 0) return;
 
     /* --- 2D grid: N equal columns, children auto-flow left-to-right / top-to-
@@ -628,7 +670,6 @@ static void arrange(struct layout_arena *la, struct scene_arena *sa,
         return;
     }
 
-    float base[64], finalm[64], crossv[64];
     float sum_base = 0, sum_grow = 0;
 
     for (int i = 0; i < nk; i++) {

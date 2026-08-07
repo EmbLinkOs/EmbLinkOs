@@ -796,3 +796,43 @@ now justifies on its own -- which is what text-align means: centre every line,
 not the paragraph as a block.
 
 `line-height` is parsed and stored but layout does not use it yet.
+
+
+## Hacker News, and the bug under it
+
+HN turned 1307 DOM nodes into `1. by | 2. by |`. The DOM was perfect -- adding
+a `DOM=1` dump to `make browser-render` showed every story title sitting in its
+`<a>` exactly where it should be -- so the fault was entirely in emission, and
+it had two halves.
+
+`<center>` was not in the tag table, so it defaulted to INLINE. HN wraps its
+whole page in one, which put a nested-table document inside an inline
+formatting context. And `emit_inline` refused to recurse past depth 8. With
+`<center><table><tr><td><table><tr><td><span><b><a>` being nine levels deep,
+every link's text was dropped -- while the plain `" | "` between the links, one
+level shallower, came through. That is why the page read as punctuation.
+
+`<center>` is now a block that centres its text, which is what it means. And a
+block-level box inside an inline run now ENDS the run and renders as a block,
+which is what CSS says happens and what stops a table being walked as if it
+were a sentence.
+
+## The 64-child cap
+
+Chasing an "overlapping first list item" on danluu.com led somewhere much
+worse. `arrange()` gathered a container's children into `kids[64]` on the C
+stack. Past sixty-four they were never positioned, kept their default 0x0, and
+every one of them painted at the parent's origin -- so a hundred-item list drew
+its first row correctly and piled the remaining thirty-six on top of it.
+
+Sixty-four is generous for an application's dialog and nothing for a document.
+The arrays could not simply be grown: `arrange()` recurses once per nesting
+level, so 1024-entry stack arrays would be megabytes deep on a real page. They
+now come from a shared bump pool that `arrange()` pops on exit, which is exactly
+right because the walk is strictly depth-first.
+
+The general lesson is the failure MODE, not the number. Both this and the
+declarative instance pool silently produced a wrong page instead of saying they
+had run out. Both now count what they refused, and `make browser-render` fails
+on either -- because a renderer that quietly drops content is worse than one
+that stops.

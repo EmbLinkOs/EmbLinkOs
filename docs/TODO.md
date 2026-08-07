@@ -2181,12 +2181,15 @@ Encrypt/RSA), `test wget https`, `test pypi`.
            calc(), media queries, :hover/:focus, ::before/::after, var(), and
            per-edge borders (border-left alone paints all four).
            line-height is PARSED and stored but not yet used by layout.
-        3. Nested tables collapse (HN).
-        3b. UNEXPLAINED: danluu.com's FIRST list item renders as overlapping
-           text with a stray filled box. Layout geometry for that row is
-           correct ("xx/xx" at x=37.4, "Patreon " at 75.2, "posts" at 134.0,
-           no overlap), so the fault is below layout. It does not reproduce on
-           any other page tested. Not chased further yet.
+        3. ~~Nested tables collapse (HN)~~ FIXED (see below).
+        3b. ~~danluu's first list item renders as overlapping text~~ EXPLAINED
+           and FIXED: it was the 64-child cap in layout (see below).
+        3c. Table columns are still equal-width, so HN's rank column is as wide
+           as its title column. And every non-header CELL gets a faint border
+           from the UA stylesheet, which is right for a data table and wrong
+           for the layout tables the old web is built from -- HTML's own
+           `border="0"` attribute is the mechanism that turns it off and we do
+           not parse it.
         4. JS is 'click' only -- no bubbling, no createElement/appendChild,
            no querySelector.
         5. Form controls are text and submit only -- no checkbox, radio,
@@ -2207,6 +2210,34 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       Also fixed: the status line composed its rule count ONCE at load and so
       reported "1 css rule" on a page with seven, three of which were already
       on screen -- it is now recomposed whenever a sheet lands.
+- [x] ~~A container with more than 64 children silently lost the rest~~ FIXED
+      2026-08-07, and this was the single worst bug found so far. `arrange()`
+      gathered children into `kids[64]` on the C STACK; past 64 they were never
+      positioned, so they kept their default 0x0 and every one of them painted
+      at the PARENT'S ORIGIN, stacked on top of the first row. A <ul> with a
+      hundred items, or a table with thirty rows, walks straight through it --
+      i.e. any real document. It looked like a renderer bug (danluu.com's first
+      list item was a pile of overlapping text) and was a layout one.
+      They could not simply be made bigger: arrange() recurses per nesting
+      level, so 1024-entry stack arrays would be megabytes deep on a real page.
+      The four arrays now come from a shared bump pool that arrange() pops on
+      exit -- correct because arrange() is strictly depth-first -- and overflow
+      past the pool is COUNTED (`layout_children_dropped()`), so browser-render
+      fails instead of quietly drawing wreckage. Same for the declarative
+      instance pool: `ui_instance_overflow()` now reports refused allocations,
+      and INST_MAX went 4096 -> 65536 because a document needs one instance per
+      WORD (danluu: 2214, HN: 1255).
+- [x] ~~Hacker News rendered as "1. by | 2. by |" -- 1307 nodes, no content~~
+      FIXED 2026-08-07. TWO causes, neither of them tables. <center> was an
+      unknown tag and so defaulted to INLINE, which put HN's entire nested-table
+      document inside one inline formatting context; and emit_inline had a
+      depth>8 guard, so with <center><table><tr><td><table><tr><td><span><b><a>
+      being nine levels, every link's TEXT was dropped while the plain " | "
+      between them -- one level shallower -- came through. <center> is now a
+      block (with text-align:center, which is what it means), a block-level box
+      inside an inline run now BREAKS the run and renders as a block, and the
+      guard is 24. HN now renders its nav, ranks, titles, sites and subtext;
+      text nodes went from ~30 to 776.
 - [x] ~~text-align did nothing, on any page~~ FIXED 2026-08-07, and the bug
       was in the LAYOUT ENGINE, not the CSS. arrange()'s wrap arm started every
       line at the padding edge and never consulted `justify`; the non-wrap arm
