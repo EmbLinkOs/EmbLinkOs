@@ -43,7 +43,9 @@ def find(runs, needle):
 def check_page(path):
     src = open(path, encoding="utf-8", errors="replace").read()
     expects = re.findall(r"<!--\s*(EXPECT-[A-Z-]+):\s*(.*?)\s*-->", src)
-    runs, harness_fails, rc = runs_for(path)
+    m = re.search(r"<!--\s*CORPUS-WIDTH:\s*(\d+)\s*-->", src)
+    width = int(m.group(1)) if m else 940
+    runs, harness_fails, rc = runs_for(path, w=width)
     fails = harness_fails
 
     for kind, arg in expects:
@@ -86,8 +88,8 @@ def check_page(path):
         else:
             print("      FAIL: unknown expectation %s" % kind); fails += 1
 
-    print("  %-22s %3d runs, %2d expectations, %s"
-          % (os.path.basename(path), len(runs), len(expects),
+    print("  %-22s %4dpx %3d runs, %2d expectations, %s"
+          % (os.path.basename(path), width, len(runs), len(expects),
              "OK" if fails == 0 else "%d FAILED" % fails))
     return fails
 

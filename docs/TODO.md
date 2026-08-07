@@ -2277,6 +2277,28 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       declaration block, and `:root {` begins with a COLON -- so the commonest
       place in the world to define a variable was the one place it was missed.
       It scans brace blocks now.
+- [x] ~~@media blocks were skipped whole, losing every desktop rule~~ FIXED
+      2026-08-07: `user/web/css/media.c`. Media types (`all`/`screen`/`print`/
+      `speech`, `only`), `and`, comma-separated alternatives, a leading `not`,
+      and the features that decide layout: min/max width and height,
+      orientation, prefers-color-scheme. A matching block's rules are parsed
+      IN PLACE so they keep their source position -- which is what lets a media
+      override beat the base rule it overrides. An unrecognised feature makes
+      its conjunction false (what CSS says, and the safe direction).
+      Skipping was right while nothing could evaluate the condition, and stops
+      being right the moment real pages are the target: most stylesheets are
+      mobile-first, so the base rules ARE the phone layout and everything else
+      lives behind a min-width. Skipping them renders the phone version at
+      desktop size.
+      The environment is set by the app, so Vellum answers with its own content
+      width and the user's dark/light preference -- and RE-PARSES when the
+      window is resized past a breakpoint, which a parse-once scheme gets wrong.
+      Pinned by tests/web/media.html and its NARROW TWIN at 360px: the same
+      rules must give opposite answers, which is what tests evaluation rather
+      than parsing.
+- [ ] @media is evaluated at PARSE time, so a var or rule behind a query is
+      re-read on resize but a `@media` nested inside another is not handled.
+      Also unsupported: @supports, @font-face (web fonts), @keyframes.
 - [ ] Custom properties are DOCUMENT-scoped, not element-scoped: one table for
       the sheet, last definition wins. Correct for a single `:root` block (the
       overwhelmingly common shape) and wrong for per-component theming

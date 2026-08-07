@@ -299,6 +299,10 @@ int main(int argc, char **argv) {
     g_root = html_parse(&g_doc, (const char *)src, dl, g_nodes, NODE_MAX, g_strs, STR_MAX);
     /* external sheets first, then the document's own <style> -- the same
      * order (and the same concatenation) the app builds its cascade with */
+    /* the environment a media query is asked about -- the same content width
+     * the document is laid out at, so `(min-width: N)` means what the page
+     * thinks it means */
+    css_media_set((float)W, (float)H, 1);
     cssref_start(&g_doc, g_doc_base);
     {
         static char allcss[320 * 1024];

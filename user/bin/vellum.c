@@ -16,6 +16,7 @@
 #include <stdbool.h>
 
 #include "embk.h"
+#include "oscfg.h"   /* the user's dark/light choice answers prefers-color-scheme */
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
@@ -60,7 +61,14 @@ static struct css_sheet g_sheet;   /* the page's own <style>, cascaded */
  * <link> lands, because css_sheet_parse replaces a sheet rather than extending
  * it -- and because a page must be readable before the last stylesheet does. */
 static char g_allcss[160 * 1024];
+/* The width a media query is evaluated against: the document's content box,
+ * which is the window minus the ScrollView's padding -- what the page actually
+ * gets to lay out in. */
+static float sheet_viewport_w(void) { return em_viewport_width() - 44.0f; }
+
 static void rebuild_sheet(void) {
+    struct oscfg cfg; oscfg_load(&cfg);
+    css_media_set(sheet_viewport_w(), em_viewport_height() - 132.0f, cfg.dark != 0);
     size_t n = 0, extn = 0;
     const char *ext = cssref_text(&extn);
     if (ext && extn) {
@@ -359,6 +367,11 @@ static void app(void) {
      * reader a wrong-looking page and then rearranges it. Style first is also
      * the order a browser's own preload scanner uses, for the same reason. */
     if (cssref_pump()) { rebuild_sheet(); update_status(); em_request_frame(); }
+    /* A RESIZE changes what the media queries answer, and the sheet was parsed
+     * against the old width. Re-parse when the viewport actually moves --
+     * otherwise a window dragged past a breakpoint keeps the other layout. */
+    { static float last_w; float w = sheet_viewport_w();
+      if (w != last_w) { last_w = w; rebuild_sheet(); em_request_frame(); } }
 
     /* ...and the page's pictures, one at a time on the same worker. Each one
      * that lands changes the page, so ask for a frame. */

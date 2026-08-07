@@ -33,6 +33,13 @@ static size_t skip_junk(const char *s, size_t len, size_t i) {
     }
 }
 
+/* Append `text`'s rules to `sheet`, continuing the source-order counter.
+ * Split out from css_sheet_parse so a matching @media block can be parsed
+ * IN PLACE -- its rules keep their position in the cascade, which is what
+ * makes a media override actually beat the base rule it overrides. */
+static unsigned short css_sheet_parse_into(struct css_sheet *sheet, const char *text,
+                                           size_t len, unsigned short order);
+
 void css_sheet_parse(struct css_sheet *sheet, const char *text, size_t len) {
     if (!sheet) return;
     memset(sheet, 0, sizeof *sheet);
@@ -40,28 +47,50 @@ void css_sheet_parse(struct css_sheet *sheet, const char *text, size_t len) {
     if (!text || !len) return;
     /* Collect custom properties across the WHOLE sheet first, so a rule can
      * use a var defined below it -- which CSS allows and a resolve-as-you-go
-     * pass would get wrong. */
+     * pass would get wrong. (Inside @media too: a var behind a query the page
+     * does not match is a corner this does not chase.) */
     css_vars_collect(text, len);
+    css_sheet_parse_into(sheet, text, len, 0);
+}
 
+static unsigned short css_sheet_parse_into(struct css_sheet *sheet, const char *text,
+                                           size_t len, unsigned short order) {
     size_t i = 0;
-    unsigned short order = 0;
     while (i < len) {
         i = skip_junk(text, len, i);
         if (i >= len) break;
 
-        /* An at-rule (@media, @import, @font-face). We cannot evaluate the
-         * condition, so we SKIP the whole thing rather than apply rules that
-         * were meant for print or for a phone. Dropping is the safe direction
-         * here -- unlike a combinator, a wrongly-applied @media block can
-         * rewrite the entire page. */
+        /* An at-rule. @media is EVALUATED -- a mobile-first sheet keeps its
+         * desktop rules behind one, and skipping them renders the phone
+         * layout at desktop size. Everything else (@import, @font-face,
+         * @keyframes, @supports) is still skipped whole: we cannot honour the
+         * condition, and a wrongly-applied block rewrites the page. */
         if (text[i] == '@') {
-            int depth = 0;
-            while (i < len) {
+            size_t kw_s = ++i;
+            while (i < len && text[i] != ' ' && text[i] != '\t' && text[i] != '\n' &&
+                   text[i] != '\r' && text[i] != '{' && text[i] != ';') i++;
+            int is_media = (i - kw_s == 5) &&
+                           (text[kw_s]=='m'||text[kw_s]=='M') &&
+                           !strncmp(text + kw_s + 1, "edia", 4);
+            size_t q_s = i;
+            while (i < len && text[i] != '{' && text[i] != ';') i++;
+            if (i >= len || text[i] == ';') { if (i < len) i++; continue; }
+            size_t q_e = i;
+            i++;                                   /* past '{' */
+            size_t body_s = i;
+            int depth = 1;
+            while (i < len && depth) {
                 if (text[i] == '{') depth++;
-                else if (text[i] == '}') { depth--; if (depth <= 0) { i++; break; } }
-                else if (text[i] == ';' && depth == 0) { i++; break; }
+                else if (text[i] == '}') { depth--; if (!depth) break; }
                 i++;
             }
+            size_t body_e = i;
+            if (i < len) i++;                      /* past the closing '}' */
+            /* A matching block's rules are parsed INTO THIS SHEET, in place,
+             * so they keep their source position -- which is what makes a
+             * media override beat the base rule it is overriding. */
+            if (is_media && css_media_matches(text + q_s, q_e - q_s))
+                order = css_sheet_parse_into(sheet, text + body_s, body_e - body_s, order);
             continue;
         }
 
@@ -91,7 +120,7 @@ void css_sheet_parse(struct css_sheet *sheet, const char *text, size_t len) {
             while (ce > cs && (text[ce-1]==' '||text[ce-1]=='\t'||text[ce-1]=='\n'||text[ce-1]=='\r')) ce--;
             if (ce <= cs) continue;
 
-            if (sheet->n >= CSS_MAX_RULES) { sheet->truncated = 1; return; }
+            if (sheet->n >= CSS_MAX_RULES) { sheet->truncated = 1; return order; }
             struct css_rule *r = &sheet->rules[sheet->n];
             if (css_sel_parse(text + cs, ce - cs, &r->sel) != 0) continue;
             r->decls = text + ds;
@@ -100,6 +129,7 @@ void css_sheet_parse(struct css_sheet *sheet, const char *text, size_t len) {
             sheet->n++;
         }
     }
+    return order;
 }
 
 void css_sheet_apply(const struct css_sheet *sheet, struct html_doc *doc,

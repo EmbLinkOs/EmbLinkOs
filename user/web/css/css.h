@@ -73,6 +73,13 @@ const char *css_var_get(const char *name, size_t nn);
 /* Expand var() in a value. Returns 1 if anything was substituted. */
 int         css_var_expand(const char *val, size_t vn, char *out, size_t cap);
 
+/* ---- media.c: @media ---------------------------------------------------- *
+ * The environment is set by the APP (the window's content width, and whether
+ * the desktop is dark), because the browser is not the only thing that will
+ * want to ask. Set it before parsing a sheet; a resize means parsing again. */
+void css_media_set(float w, float h, int dark);
+int  css_media_matches(const char *query, size_t n);
+
 /* Parse ONE selector ("nav ul li.item"). Returns 0, or -1 if unusable. */
 int css_sel_parse(const char *s, size_t len, struct css_sel *out);
 
