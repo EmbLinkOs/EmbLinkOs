@@ -165,20 +165,20 @@ static void app(void) {
     if (fetchjob_poll(&res) == 1) finish_load(&res);
 
     /* While a fetch is in flight the view has to keep being built, or the
-     * runtime -- which only draws on input by design -- would never poll again
-     * and the page would land invisibly.
-     *
-     * THROTTLED, though. Asking for a frame every iteration rebuilds and
-     * re-renders the whole document as fast as the loop can go, and on a single
-     * core it does that against a worker running a TLS handshake: the two
-     * starve each other and the window paints in pieces. Five polls a second is
-     * far more than enough to notice a fetch landing, and it leaves the CPU to
-     * the thing the user is actually waiting for. */
-    if (fetchjob_busy()) {
-        static uint64_t last_poll_ms;
-        uint64_t now = embk_uptime_ms();
-        if (now - last_poll_ms >= 200) { last_poll_ms = now; em_request_frame(); }
-    }
+     * runtime -- which draws on input by design -- would never poll again and
+     * the page would land invisibly. A periodic tick, not a per-frame request:
+     * five a second is plenty to notice a fetch landing, and it leaves the CPU
+     * to the thing the user is actually waiting for. */
+    static bool ticking = false;
+    bool busy_now = fetchjob_busy() != 0;
+    if (busy_now != ticking) { ticking = busy_now; em_app_set_refresh(busy_now ? 200 : -1); }
+
+    /* Deliberately NOT forcing a full repaint here. The app renders straight
+     * into the shared window buffer, so a full repaint begins by CLEARING the
+     * pixels the compositor is showing -- and while a crypto-heavy worker has
+     * the core, the redraw that follows takes long enough that an empty window
+     * is what the user actually sees. Leaving the old pixels alone means the
+     * page stays readable and only what changed is overwritten. */
 
     /* The progress report goes in the status line that is ALREADY THERE, and
      * that is a deliberate design choice rather than a compromise. A row that

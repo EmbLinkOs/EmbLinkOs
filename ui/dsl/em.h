@@ -629,6 +629,13 @@ int em_app_run(const EmApp *app);
  * window first, so the next screen never inherits stale pixels. */
 void em_app_request_exit(int code);
 
+/* Tick the view every `ms` regardless of input; -1 restores the app's own
+ * refresh_ms. For work the app is WAITING on rather than driving -- a fetch in
+ * flight, a job it is polling. em_request_frame() cannot express this: it is
+ * set from inside the view, so the first frame that does not ask stops the
+ * view running at all, and nothing can ask again. */
+void em_app_set_refresh(int ms);
+
 #define EM_APPLICATION     static EmApp em_app_spec_;     int main(void) { return em_app_run(&em_app_spec_); }     static EmApp em_app_spec_ =
 
 /* --- retained updates ---------------------------------------------------- *

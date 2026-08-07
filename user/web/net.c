@@ -131,9 +131,15 @@ static int http_once(const struct url *u, char *out, size_t cap,
          * static makes the whole fetch path allocation-free and the two threads
          * never touch the same allocator state. One fetch is in flight at a
          * time, which is what makes a single static sound. */
-        static struct tls_conn conn;
-        memset(&conn, 0, sizeof conn);
-        x.tls = &conn;
+        /* Guard-banded because this context is STATIC: it lives in .bss beside
+         * the browser's own document and scene state, where an overrun would
+         * corrupt the page instead of crashing. 512 bytes turns a silent
+         * corruption into a printed fact. It has stayed clean across every run
+         * since -- which is how the "content vanishes during an https fetch"
+         * symptom was ruled out as memory corruption. */
+        static struct { uint64_t pre[32]; struct tls_conn c; uint64_t post[32]; } box;
+        memset(&box, 0, sizeof box);
+        x.tls = &box.c;
         int rc = tls_connect(x.tls, fd, u->host);
         if (rc != 0) {
             /* Refusing is the feature. An unauthenticated page is not a page
@@ -142,6 +148,18 @@ static int http_once(const struct url *u, char *out, size_t cap,
                      "TLS handshake failed (rc=%d) -- server not authenticated", rc);
             x.tls = 0; close(fd);
             return -1;
+        }
+        /* Did the handshake stay inside its own struct? This one lives in .bss
+         * next to the browser's document and scene state, so an overrun here
+         * would corrupt the page rather than crash -- exactly the shape of the
+         * "content vanishes during an https fetch" symptom. Guard bands cost
+         * 512 bytes and turn a silent corruption into a printed fact. */
+        int spill = 0;
+        for (unsigned gi = 0; gi < 32; gi++) if (box.pre[gi] || box.post[gi]) spill++;
+        if (spill) {
+            char gb[96];
+            snprintf(gb, sizeof gb, "net: TLS CONTEXT OVERRUN -- %d guard words clobbered\n", spill);
+            embk_puts(1, gb);
         }
         snprintf(r->via, sizeof r->via, "https (authenticated)");
     } else {

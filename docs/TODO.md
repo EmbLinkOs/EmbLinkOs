@@ -1988,17 +1988,26 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       the page lands without a freeze. Three real bugs BELOW the browser had to
       be fixed to get there -- see the commit; all three were latent for anyone
       who tried the same thing.
-- [ ] OPEN, and the last rough edge of that work: while a fetch is in flight the
-      DOCUMENT AREA goes blank (chrome paints fine, the load lands fine, the
-      final page is correct). The previous page should stay on screen until the
-      new one replaces it. Known NOT to be: layout (host harness renders both
-      states correctly at the exact window size), the viewport (logged 792x504
-      in both states), buffer aliasing (fetch and display buffers are now
-      separate), or in-place text staleness (fixed + locked by scene-test).
-      Next thing to try: instrument `scene_render_frame`'s dirty accounting on
-      the first frame after a force_full clear -- the symptom is "buffer was
-      cleared, only some nodes repainted", so the question is which nodes the
-      cache thought were clean.
+- [ ] OPEN: an app renders DIRECTLY INTO THE SHARED WINDOW BUFFER, so a slow
+      frame is visible to the compositor while it is still being drawn. It does
+      not matter while a view builds in milliseconds; it matters the moment an
+      app competes with a busy worker thread for one core, which is what a
+      browser fetching over TLS does. A full repaint makes it worst of all,
+      because it CLEARS the pixels the compositor is showing and only then
+      starts redrawing them -- that is why forcing one turned "a torn band" into
+      "an empty window".
+      Vellum now avoids the clear while loading and keeps its page readable, but
+      a band across the window still tears during a fetch. The real fix is for
+      em_app to render into a BACK buffer and copy the finished frame into the
+      shared one; the copy is cheap next to the render.
+      Eliminated by measurement first, so none of these needs revisiting:
+      layout (the host harness renders both states correctly at the exact window
+      size), the viewport (logged 792x504 in both), buffer aliasing (fetch and
+      display buffers are separate now), in-place text staleness (fixed, locked
+      by scene-test), incremental repaint (forcing a full one does not help),
+      the mere existence of a second thread (an idle worker leaves the page
+      perfect -- it is the ACTIVITY), allocation on the fetch path (there is
+      none), and TLS-context overrun (guard bands, clean every run).
 - [ ] Nothing caches. Every navigation, including Back, refetches.
 - [ ] No Content-Type handling: everything is parsed as HTML. An image or a
       binary will be rendered as garbage rather than refused or downloaded.

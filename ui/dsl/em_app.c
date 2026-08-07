@@ -77,6 +77,9 @@ static void (*g_em_idle_hook)(void)   = 0;
 void em_set_key_hook(int (*fn)(int ch)) { g_em_key_hook = fn; }
 void em_set_idle_hook(void (*fn)(void)) { g_em_idle_hook = fn; }
 
+static int g_refresh_override = -1;
+void em_app_set_refresh(int ms) { g_refresh_override = ms; }
+
 int em_app_run(const EmApp *app) {
     g_app_exit_requested = 0;
     g_app_exit_code = 0;
@@ -286,8 +289,14 @@ int em_app_run(const EmApp *app) {
          * menu bar sampling the wallpaper under it -- only updated when the
          * user happened to move the mouse. Same field, same meaning, both
          * paths. 0 keeps the pure input-driven behaviour. */
-        int app_tick = app->refresh_ms > 0 &&
-                       (em_now_ms() - last_app_tick) >= (uint64_t)app->refresh_ms;
+        /* An app that is BUSY wants to be ticked even though its refresh_ms is
+         * 0 the rest of the time -- a browser polling a fetch, say. It cannot
+         * do that with em_request_frame(), because that is set FROM THE VIEW
+         * and the view only runs when a frame was already requested: the first
+         * frame that does not ask ends the loop for good. A periodic tick is
+         * computed out here, independent of whether the view ran. */
+        int rms = g_refresh_override >= 0 ? g_refresh_override : app->refresh_ms;
+        int app_tick = rms > 0 && (em_now_ms() - last_app_tick) >= (uint64_t)rms;
         if (app_tick) last_app_tick = em_now_ms();
         int build = first || input_edge || em_take_frame_request() || app_tick ||
                     em_ui_epoch() != prev_epoch || em_nav_transitioning() ||
