@@ -2090,3 +2090,21 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 - [ ] The wrap-height memo keys on ONE width. A node measured at two widths
       alternately (never observed; would need the same text in two differently
       sized parents) would thrash the memo -- correct, just uncached.
+
+### Scroll latency (2026-08-07, after the blit)
+- [x] ~~Wheel scroll lagged ~4s behind the hand~~ IMPROVED: usb_core_poll
+      drained ONE HID report per kernel tick, and QEMU queues every wheel notch
+      as its own report -- a flick took seconds of guest time to trickle in,
+      worse under TCG where the guest clock runs slow. The poll now drains the
+      whole queue per tick (bounded at 32); the deltas coalesce in the pointer
+      state and the app sees one jump. Expected effect: the wheel lag drops to
+      roughly one frame (~0.3s under TCG). The user's hunch stands: under KVM
+      all of this would be ~10-30x faster and feel instant.
+- [ ] UNVERIFIED: Vellum gained Space/b page-scrolling (vellum_key hook +
+      ui_any_focus accessor). Compiled and shipped, but the QMP probe showed
+      the page NOT moving on Space, cause not yet established -- could be the
+      hook not firing, space not delivered as a char to GUI apps, or the
+      ui_scroll_end clamp. The wheel path (which users actually use) is
+      unaffected either way. Verify by pressing Space in Vellum with the URL
+      bar unfocused; if it does not page, instrument vellum_key with a serial
+      print first.

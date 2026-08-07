@@ -92,6 +92,7 @@ void ui_input_char(int c);                        /* loop feeds each key byte he
 int  ui_input_take(char *dst, int max);           /* focused field drains queued chars */
 void ui_request_focus(struct instance_handle h);
 bool ui_has_focus(struct instance_handle h);
+bool ui_any_focus(void);       /* is ANY text field focused? (app key hooks) */
 
 /* --- scroll --- */
 void  ui_set_scroll_offset(float dy);             /* shift open box's children up by dy */

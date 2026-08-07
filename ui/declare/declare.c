@@ -848,6 +848,7 @@ int ui_input_take(char *dst, int max) {
     return n;
 }
 void ui_request_focus(struct instance_handle h) { g_focused = h; g_focus_claimed = true; }
+bool ui_any_focus(void) { return !instance_handle_is_null(g_focused); }
 bool ui_has_focus(struct instance_handle h) {
     return h.index == g_focused.index && h.generation == g_focused.generation && h.index != 0;
 }

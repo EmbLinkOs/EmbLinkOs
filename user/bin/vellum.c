@@ -149,12 +149,28 @@ static void go_fwd(void) {
     load(to);
 }
 
+/* Keyboard paging: Space a page down, 'b' a page up -- every browser's oldest
+ * shortcut, and it scrolls without touching the wheel at all. (It also makes
+ * scrolling drivable from the test harness, where wheel events cannot be
+ * synthesized -- a feature and an instrument in one.) Consumed only while no
+ * text field has focus, or typing a space in the URL bar would jump the page. */
+static int vellum_key(int ch) {
+    if (ui_any_focus()) return 0;
+    float page = (em_viewport_height() - 132.0f) * 0.85f;
+    if (ch == ' ')      { g_scroll += page; }
+    else if (ch == 'b') { g_scroll -= page; }
+    else return 0;
+    if (g_scroll < 0) g_scroll = 0;
+    return 1;
+}
+
 /* --- the window --------------------------------------------------------- */
 
 static void app(void) {
     static bool first = true;
     if (first) {
         first = false;
+        em_set_key_hook(vellum_key);
         vellum_set_link_handler(on_link);
         const char *start = getenv("VELLUM_URL");
         navigate(start && start[0] ? start : "/system/web/index.html");

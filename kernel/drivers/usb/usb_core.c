@@ -186,16 +186,25 @@ void usb_core_poll(void) {
         struct usb_device *dev = &g_usb_devices[i];
         if (!dev->in_use || !dev->hid_active) continue;
 
-        uint8_t report[8];
-        int rc = dev->ops->int_poll(dev, dev->hid_ep, report, sizeof(report));
-        if (rc == USB_ERR_PENDING) continue;
-        if (rc >= 0) {
-            usb_hid_process_report(dev, report, rc);
-        } else if (rc == USB_ERR_STALL) {
-            usb_clear_halt(dev, dev->hid_ep);
+        /* Drain the WHOLE queue, not one report per tick. QEMU's HID device
+         * queues each wheel notch as its own report; at one report per kernel
+         * tick, a flick of the wheel took seconds of guest time to trickle in
+         * -- scrolling lagged ~4s behind the hand, worse under TCG where the
+         * guest clock itself runs slow. Draining until PENDING delivers the
+         * whole burst in one tick; the deltas then coalesce in the pointer
+         * state and the app sees one jump. The bound is just a runaway guard. */
+        for (int burst = 0; burst < 32; burst++) {
+            uint8_t report[8];
+            int rc = dev->ops->int_poll(dev, dev->hid_ep, report, sizeof(report));
+            if (rc == USB_ERR_PENDING) break;
+            if (rc >= 0) {
+                usb_hid_process_report(dev, report, rc);
+            } else if (rc == USB_ERR_STALL) {
+                usb_clear_halt(dev, dev->hid_ep);
+            }
+            // Always re-arm so the stream keeps flowing.
+            dev->ops->int_submit(dev, dev->hid_ep, dev->hid_mps);
         }
-        // Always re-arm so the stream keeps flowing.
-        dev->ops->int_submit(dev, dev->hid_ep, dev->hid_mps);
     }
 }
 
