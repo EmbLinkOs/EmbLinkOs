@@ -9,6 +9,11 @@ nav > p          { color: #ff0000 }
 /* Structural pseudo-classes. */
 ul li:first-child { color: #ffb000 }
 ul li:last-child  { color: #c060ff }
+/* An INHERITED colour must not outrank the user-agent's link colour. Most
+   pages set a body colour, and if inheritance won they would lose every link
+   they have. A rule naming the link itself still wins. */
+body             { color: #d8d8e0 }
+a.styled         { color: #ff8000 }
 /* Specificity: the id must beat the class, whichever order they are written. */
 .spec            { color: #ff0000 }
 #spec            { color: #30c0a0 }
@@ -31,14 +36,24 @@ ul li:last-child  { color: #c060ff }
 </ul>
 
 <p class="spec" id="spec">SPECIFICITY: the id wins, so this is teal.</p>
+<p>PLAINPROSE inherits the body colour, and
+   <a href="/x">LINKKEEPSBLUE</a> does not &mdash; while
+   <a class="styled" href="/y">LINKSTYLED</a> takes the colour named on it.</p>
 
 <!-- EXPECT-COLOR: CHILDHIT #ff0000 -->
-<!-- EXPECT-COLOR: GRANDCHILD #ecedf1 -->
+<!-- EXPECT-COLOR: GRANDCHILD #d8d8e0 -->
 <!-- EXPECT-COLOR: ADJACENTHIT #00c000 -->
-<!-- EXPECT-COLOR: ADJACENTMISS #ecedf1 -->
+<!-- EXPECT-COLOR: ADJACENTMISS #d8d8e0 -->
 <!-- EXPECT-COLOR: SIBLINGHIT #00a0ff -->
 <!-- EXPECT-COLOR: FIRSTITEM #ffb000 -->
-<!-- EXPECT-COLOR: MIDDLEITEM #ecedf1 -->
+<!-- EXPECT-COLOR: MIDDLEITEM #d8d8e0 -->
 <!-- EXPECT-COLOR: LASTITEM #c060ff -->
 <!-- EXPECT-COLOR: SPECIFICITY #30c0a0 -->
+<!-- ...which is the body colour this page sets: these three say
+     "the rule under test did not apply here", and unstyled text on this
+     page inherits from body. -->
+<!-- EXPECT-COLOR: PLAINPROSE #d8d8e0 -->
+<!-- the theme's accent, NOT the inherited body colour -->
+<!-- EXPECT-COLOR: LINKKEEPSBLUE #7c82ff -->
+<!-- EXPECT-COLOR: LINKSTYLED #ff8000 -->
 </body></html>

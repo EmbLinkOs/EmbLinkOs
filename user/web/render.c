@@ -69,7 +69,9 @@ static Color color_for(const struct vstyle *s) {
     /* An AUTHOR colour wins -- that is what the cascade decided. Absent one,
      * the THEME decides, so an unstyled page follows the desktop into dark
      * mode instead of being black-on-white in the middle of it. */
-    if (s->color) {
+    /* A colour set ON this element wins. An INHERITED one does not outrank the
+     * user-agent's link colour -- see style.h. */
+    if (s->color && (s->color_own || !s->link)) {
         Color c;
         c.r = (float)((s->color >> 16) & 0xFF) / 255.0f;
         c.g = (float)((s->color >>  8) & 0xFF) / 255.0f;

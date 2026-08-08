@@ -2537,7 +2537,35 @@ Encrypt/RSA), `test wget https`, `test pypi`.
       for another frame, so typing "browser" left "1 of 24" -- which is the
       answer for "b". The host said 3 and the metal said 24, which is what made
       it obvious.
-- [ ] Still C5: tabs, persistent history, zoom, downloads, favicon.
+- [x] ~~Persistent history~~ SHIPPED 2026-08-08. Back/forward was never
+      history: it is a stack that dies with the window. `user/web/history.c`
+      keeps the list you consult when you cannot remember what a page was
+      called, newest first, one entry per URL (revisiting MOVES a row rather
+      than adding a second -- a history where an address appears forty times is
+      one you cannot read, and reading it is the only thing it is for).
+      Persisted through the same store, directory and three answers as the jar.
+      Shown as `about:history`, a page the BROWSER writes and then parses with
+      its own engine -- which is why there is no history widget anywhere in the
+      app. A list of links is a page. It also means the history is styled by
+      the same cascade, selectable by the same selection and searchable by the
+      same find. Titles are HTML-escaped: a title comes off the network, and
+      the browser vouches for this document.
+- [x] ~~An inherited colour outranked the user-agent's LINK colour~~ FIXED, and
+      it was general rather than cosmetic: `body { color: ... }` inherits into
+      every <a>, so on most pages -- most pages set a body colour -- every link
+      lost its colouring. CSS gives the UA's `a` rule precedence over
+      inheritance, and only a rule naming the link itself beats the UA.
+      vstyle now records whether a colour was set ON the element or inherited.
+- [ ] TABS, and why they are not done. A tab needs its own parse arenas AND its
+      own JS context; jsdom is built around one global g_ctx/g_doc. Doing it by
+      re-parsing on switch would re-run every page's scripts, so a tab would
+      silently lose its state on every switch -- a feature that looks right and
+      behaves wrongly, which is the failure this project keeps catching. It
+      wants jsdom made multi-instance first.
+- [ ] Still C5: zoom, downloads, favicon. Zoom needs page-level font scaling
+      that render.c does not currently express (the toolkit's scale moves the
+      chrome too, which is UI zoom and not page zoom -- worth naming rather
+      than shipping under the wrong label).
 - [ ] Selection is WORD granular, not character. The renderer emits one node per
       word, so that is the grain available without measuring glyph prefixes
       through the font engine on every pointer move. Also missing: double-click

@@ -204,7 +204,7 @@ int css_apply_decls(const char *text, size_t len, struct vstyle *out) {
         int ok = 0;
         if (tok_eq(p, pn, "color")) {
             unsigned c = css_color(v, vn);
-            if (c) { out->color = c; ok = 1; }
+            if (c) { out->color = c; out->color_own = 1; ok = 1; }
         } else if (tok_eq(p, pn, "font-weight")) {
             if (tok_eq(v, vn, "bold") || tok_eq(v, vn, "bolder")) { out->bold = 1; ok = 1; }
             else if (tok_eq(v, vn, "normal") || tok_eq(v, vn, "lighter")) { out->bold = 0; ok = 1; }

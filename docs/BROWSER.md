@@ -1174,3 +1174,37 @@ it froze showing the count for a shorter prefix. 24 is the answer for "b".
 The harness is what made that obvious: `FIND=<text> browser_render` prints the
 count, so the matcher could be checked independently of the UI drawing it. On a
 screenshot you only ever see the highlight, never the number.
+
+
+## History, and a page the browser writes itself
+
+Back and forward were never history: they are a stack that dies with the
+window. `history.c` keeps the list you consult when you cannot remember what a
+page was called -- newest first, one entry per URL, and revisiting MOVES a row
+rather than adding a second, because a history where an address appears forty
+times is one you cannot read.
+
+It is shown as `about:history`, a page the browser writes and then parses with
+its own engine. That is why there is no history widget anywhere in the app: a
+list of links is a page, and this program already knows how to draw one. It also
+means the history is styled by the same cascade, selectable by the same
+selection, and searchable by the same find. Titles are HTML-escaped, because a
+title comes off the network and this is a document the browser vouches for.
+
+### The link colour bug it exposed
+
+The history page set `body { color: ... }` and every link went grey. That was
+not a bug in the page: an inherited colour was outranking the user-agent's link
+colour, so ANY page setting a body colour -- which is most pages -- lost all its
+link colouring. CSS gives the UA's `a` rule precedence over inheritance, and
+only a rule naming the link itself beats the UA. `vstyle` now records whether a
+colour was set on the element or inherited, and `tests/web/selectors.html` pins
+all three cases.
+
+### Why tabs are not here
+
+A tab needs its own parse arenas AND its own JS context, and `jsdom` is built
+around one global `g_ctx`/`g_doc`. Implementing tabs by re-parsing on switch
+would re-run every page's scripts, so a tab would silently lose its state every
+time you left it -- a feature that looks right and behaves wrongly. It wants
+jsdom made multi-instance first, and that is worth doing on its own.

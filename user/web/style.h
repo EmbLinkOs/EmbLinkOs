@@ -65,6 +65,14 @@ struct vstyle {
      * accident), so the renderer only overrides its palette when this is set.
      * Inherited like every other text property. */
     unsigned int color;
+    /* Was that colour set ON THIS ELEMENT, or inherited from an ancestor?
+     *
+     * The distinction decides whether a link is still blue. `body { color:
+     * #333 }` inherits into every <a>, and if an inherited colour outranks the
+     * user-agent's link colour then a page that sets a body colour -- which is
+     * most pages -- loses every link it has. In CSS the UA rule for `a` beats
+     * inheritance, and only a rule that names the link itself beats the UA. */
+    unsigned char color_own;
     /* A stated box size in px, 0 = auto. Only images use it today, and only
      * because a picture is the one thing whose natural size arrives LATER
      * than the layout that has to hold it. */

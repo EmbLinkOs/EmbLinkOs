@@ -37,6 +37,7 @@
 #include "cssref.h"
 #include "cookie.h"
 #include "find.h"
+#include "history.h"
 #include "store.h"
 
 /* One document at a time, in fixed arenas. A browser that can be handed a
@@ -214,10 +215,14 @@ static void load_error(const char *url, const char *why) {
  * round trips and each one is a frame the window does not draw -- from the
  * outside that is an application that has died. The fetch runs on a worker
  * (fetchjob.c) and the view keeps drawing, showing what it is waiting for. */
+static int about_page(const char *url);
+
 static void load(const char *url) {
     snprintf(g_url, sizeof g_url, "%s", url);
     snprintf(g_bar, sizeof g_bar, "%s", url);
     g_scroll = 0;
+    /* A generated page needs no worker, no socket and no wait. */
+    if (about_page(url)) return;
     int started = g_have_post
         ? fetchjob_start_post(url, g_post, g_incoming, sizeof g_incoming, DOC_TAG)
         : fetchjob_start(url, g_incoming, sizeof g_incoming, DOC_TAG);
@@ -276,6 +281,20 @@ static void finish_load(const struct vnet_result *res) {
      * rather than on a timer: the moment it can have changed is the moment
      * worth spending a write on. */
     cookie_save();
+    /* Record the visit, with the page's own title -- a history listed by URL
+     * is a history you have to decode. Generated pages are excluded inside
+     * hist_add: about:history inside the history is a mirror facing a mirror. */
+    {
+        const char *t = "";
+        for (int i = 0; i < g_doc.n; i++)
+            if (g_doc.nodes[i].kind == HTML_ELEM && !strcmp(g_doc.nodes[i].tag, "title")) {
+                int c = g_doc.nodes[i].first_child;
+                if (c >= 0 && g_doc.nodes[c].text) t = g_doc.nodes[c].text;
+                break;
+            }
+        hist_add(g_url, t, embk_now_unix());
+        hist_save();
+    }
     g_st.status = res->status;
     snprintf(g_st.via, sizeof g_st.via, "%s", res->via);
     g_st.bytes = n;
@@ -287,6 +306,31 @@ static void navigate_post(const char *url, const char *body) {
     snprintf(g_post, sizeof g_post, "%s", body ? body : "");
     g_have_post = 1;
     navigate(url);
+}
+
+/* about: -- a page the BROWSER writes and the browser then parses with its own
+ * engine. There is no history widget anywhere in this app because a list of
+ * links is a page, and this program already knows how to draw one. It also
+ * means the history is styled by the same cascade, selectable by the same
+ * selection, and searchable by the same find. */
+static int about_page(const char *url) {
+    if (!url || strncmp(url, "about:", 6)) return 0;
+    static char page[48 * 1024];
+    size_t n = 0;
+    if (!strcmp(url + 6, "history")) n = hist_as_html(page, sizeof page);
+    else n = (size_t)snprintf(page, sizeof page,
+             "<html><head><title>%s</title></head><body><h1>Not a page</h1>"
+             "<p>This browser has no <code>%s</code>. It has "
+             "<a href=\"about:history\">about:history</a>.</p></body></html>",
+             url, url);
+    struct vnet_result r;
+    memset(&r, 0, sizeof r);
+    r.status = 200; r.len = n;
+    snprintf(r.via, sizeof r.via, "generated");
+    snprintf(r.final_url, sizeof r.final_url, "%s", url);
+    if (n < sizeof g_incoming) memcpy(g_incoming, page, n + 1);
+    finish_load(&r);
+    return 1;
 }
 
 static void navigate(const char *url) {
@@ -449,6 +493,7 @@ static void app(void) {
                            store_set_dir(d); } }
         store_load();
         cookie_load();
+        hist_load();
         em_set_post_layout_hook(vsel_sync_geometry);
         vsel_set_mark_hook(find_mark);
         vellum_set_link_handler(on_link);
@@ -557,6 +602,8 @@ static void app(void) {
             if (IconButton(IconChevronL).clicked()) go_back();
             if (IconButton(IconChevronR).clicked()) go_fwd();
             if (IconButton(IconArrowR).clicked())   load(g_url);
+            if (Button("History").ghost().font(Caption).py(2).clicked())
+                navigate("about:history");
         }
 
         /* the address row: the widest thing in the chrome, as it should be */
