@@ -21,6 +21,7 @@
 
 #include "bits.h"
 #include "frame.h"
+#include "sideinfo.h"
 
 static int g_fail;
 
@@ -122,6 +123,86 @@ static void test_frames(const char *path)
     double secs = h.samplerate ? (double)samples / h.samplerate : 0;
     snprintf(msg, sizeof msg, "%.1f s of audio from %.1f KB", secs, sz / 1024.0);
     ok("F1b the walk covers the whole file", secs > 1.0, msg);
+
+    /* S -- the side info of every frame in the file.
+     *
+     * Two properties worth more than any hand-written assertion:
+     *
+     * S1: every frame's side info parses with all fields in range. The reader
+     * rejects out-of-range values because they INDEX TABLES -- a bad one is an
+     * out-of-bounds read on input the decoder did not write -- so "all 8490
+     * parsed" also says the layout (which differs by version AND channel
+     * count) was read correctly every time.
+     *
+     * S2: the BIT RESERVOIR balances. main_data_begin says the granule's data
+     * starts that many bytes before the end of the previous frame's data, so
+     * it can never ask for more history than the file has actually produced.
+     * If any field width above were wrong, main_data_begin would be shifted
+     * and this would go negative almost immediately -- it is the reservoir
+     * arithmetic checking the parser, using nothing I supplied. */
+    {
+        size_t p = (size_t)first;
+        unsigned parsed = 0, bad = 0;
+        long reservoir = 0, worst_short = 0;
+        unsigned long long total_bits = 0;
+
+        while (p + 4 <= got) {
+            Mp3Header fh;
+            if (!mp3_parse_header(buf + p, got - p, &fh)) break;
+
+            size_t si = p + 4 + (fh.crc ? 2 : 0);
+            Mp3SideInfo s;
+            if (si + (size_t)fh.side_info_bytes <= got &&
+                mp3_parse_sideinfo(buf + si, (int)(got - si), &fh, &s)) {
+                parsed++;
+
+                /* Can this frame reach back as far as it claims? The bytes it
+                 * asks for must already have been produced by frames before
+                 * it. (The first few frames of a file legitimately ask for
+                 * nothing, which is why the reservoir starts empty.) */
+                if ((long)s.main_data_begin > reservoir) {
+                    long shortfall = (long)s.main_data_begin - reservoir;
+                    if (shortfall > worst_short) worst_short = shortfall;
+                }
+
+                long used = 0;
+                for (int gr = 0; gr < s.granules; gr++)
+                    for (int c = 0; c < fh.channels; c++)
+                        used += s.gr[gr][c].part2_3_length;
+                total_bits += (unsigned long long)used;
+
+                /* The reservoir grows by this frame's main-data slot and
+                 * shrinks by what its granules actually spent. The format
+                 * bounds it at 511 bytes -- that is what main_data_begin's
+                 * 9 bits can address. */
+                long avail = fh.frame_bytes - 4 - (fh.crc ? 2 : 0)
+                           - fh.side_info_bytes;
+                reservoir += avail - (used + 7) / 8;
+                if (reservoir > 511) reservoir = 511;
+                if (reservoir < 0) reservoir = 0;
+            } else {
+                bad++;
+            }
+            p += (size_t)fh.frame_bytes;
+        }
+
+        snprintf(msg, sizeof msg, "%u parsed, %u rejected", parsed, bad);
+        ok("S1 every frame's side info parses in range",
+           parsed > 10 && bad == 0, msg);
+
+        snprintf(msg, sizeof msg, "worst shortfall %ld bytes", worst_short);
+        ok("S1b the bit reservoir never asks for absent history",
+           worst_short == 0, msg);
+
+        double kbps = secs > 0 ? total_bits / secs / 1000.0 : 0;
+        snprintf(msg, sizeof msg, "granule bits average %.0f kbit/s of a "
+                 "%d kbit/s stream", kbps, h.bitrate / 1000);
+        /* The granules cannot spend more than the stream carries, and a
+         * decoder reading part2_3_length wrongly shows up here immediately as
+         * a nonsense rate rather than as noise ten stages later. */
+        ok("S2 granule bit budgets fit the stream's bitrate",
+           kbps > 1.0 && kbps <= h.bitrate / 1000.0 + 1.0, msg);
+    }
 
     /* F2 -- the encoder's own frame count, if it left one. */
     uint32_t xing = mp3_xing_frames(buf + first, got - (size_t)first, &h);
