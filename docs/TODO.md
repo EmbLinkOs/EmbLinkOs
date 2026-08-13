@@ -3936,6 +3936,15 @@ scoping is recorded here rather than discovered later.
       no picture glyph -- the art is user-supplied (`icons/masters/`).
 - [ ] Decoding is SYNCHRONOUS: a very large JPEG stalls the frame it lands on.
       The resampler is already viewport-bounded, so this is decode only.
+- [ ] A MANIFEST LINT is missing, and it would have caught the launch failure
+      below before a boot. Every prefix in an app's `.ns` must (a) exist on the
+      image and (b) be nameable by the SESSION, because the kernel resolves
+      each one in the PARENT's namespace at spawn -- so an unsatisfiable prefix
+      is not a narrower grant, it is `spawn FAILED: -2` with no clue which line
+      caused it. settings.ns and now photos.ns both carry hand-written warnings
+      about making this exact mistake; a check would beat a third comment.
+- [ ] Relatedly: home reports the spawn errno but not WHICH bind failed. The
+      kernel knows; it could say.
 
 ### MP3 player — NEXT
 - [ ] MPEG-1 Layer III decoder from nothing: bit reservoir, Huffman tables,

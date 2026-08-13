@@ -850,11 +850,20 @@ def discover_userland_objects(build_dir="build"):
     # browser must have something to open before it can reach a network.
     objects.extend(_tree_objects("system/web", b"system/web/", (".html", ".png", ".jpg", ".json", ".css")))
     objects.extend(_tree_objects("system/js", b"system/js/", (".js",)))
-    # The sample album Photos opens when it is launched with no argument (from
-    # the dock, which is how it is normally launched). Under /data because it
-    # is USER content the viewer only reads -- see user/bin/photos.ns -- and
-    # generated at build time by tools/mkpictures.py rather than checked in.
-    objects.extend(_tree_objects("data/pictures", b"data/pictures/",
+    # The sample album Photos opens when launched with no argument (which is
+    # how the dock launches it). Generated at build time by tools/mkpictures.py
+    # rather than checked in; the host directory is only a staging area.
+    #
+    # It lands in the USER'S HOME, and that placement is load-bearing rather
+    # than tidy. The kernel resolves an ns-bind prefix in the PARENT's
+    # namespace at spawn time, and the session holds exactly
+    #   ro /system, ro /data/apps, rw /home/<user>, rw /run
+    # so an app asking for a prefix outside that set cannot be launched from
+    # the desktop at all -- home's spawn fails before the ELF is even read.
+    # These first went to /data/pictures and the launcher returned -2, which is
+    # the same mistake settings.ns already carries a warning about. Pictures
+    # are the user's own data anyway; this is where they belong.
+    objects.extend(_tree_objects("data/pictures", b"home/yves/Pictures/",
                                  (".png", ".jpg", ".jpeg")))
     # NetSurf's own resources: its user-agent stylesheet and the pages it
     # serves for about:. The core fetches these through resource: URLs at
