@@ -22,6 +22,7 @@
 #include "bits.h"
 #include "frame.h"
 #include "sideinfo.h"
+#include "tables.h"
 
 static int g_fail;
 
@@ -61,6 +62,78 @@ static void test_bits(void)
     uint32_t tail = bits_read(&b, 16);
     snprintf(msg, sizeof msg, "got 0x%X, overrun=%d", tail, (int)b.overrun);
     ok("B3 reading past the end clamps and flags", b.overrun, msg);
+}
+
+/* --- the ISO tables, as committed ---------------------------------------- *
+ * tools/mkmp3tables.py validates what it emits, but the file it emitted is
+ * what actually gets compiled, and a generator's guarantee says nothing about
+ * a file after it has been edited, merged or truncated. These checks are cheap
+ * and they are about the artifact rather than the process.
+ *
+ * A Huffman table is not merely a list -- it is a PREFIX CODE, and that is a
+ * property that can be verified without knowing a single correct value: no
+ * code may be a prefix of another (or decoding is ambiguous), and the lengths
+ * must satisfy Kraft equality (or the code is incomplete and some bit pattern
+ * decodes to nothing). A table with a wrong entry almost always breaks one of
+ * the two. */
+static void test_tables(void)
+{
+    char msg[160];
+    int bad_kraft = 0, bad_prefix = 0, tables = 0, codes = 0;
+    int worst_table = -1;
+
+    for (int t = 0; t < 34; t++) {
+        const Mp3HuffTable *ht = &mp3_huff_tables[t];
+        if (ht->count == 0) continue;
+        tables++;
+        codes += ht->count;
+
+        double kraft = 0;
+        for (int i = 0; i < ht->count; i++)
+            kraft += 1.0 / (double)(1u << mp3_huff_entries[ht->start + i].bits);
+        if (kraft < 0.9999999 || kraft > 1.0000001) {
+            bad_kraft++;
+            if (worst_table < 0) worst_table = t;
+        }
+
+        for (int i = 0; i < ht->count && !bad_prefix; i++) {
+            const Mp3HuffEntry *a = &mp3_huff_entries[ht->start + i];
+            for (int j = 0; j < ht->count; j++) {
+                if (i == j) continue;
+                const Mp3HuffEntry *b = &mp3_huff_entries[ht->start + j];
+                if (b->bits < a->bits) continue;
+                /* is a's code the leading `a->bits` bits of b's? */
+                if ((b->code >> (b->bits - a->bits)) == a->code) {
+                    bad_prefix++;
+                    if (worst_table < 0) worst_table = t;
+                    break;
+                }
+            }
+        }
+    }
+
+    snprintf(msg, sizeof msg, "%d tables, %d codes", tables, codes);
+    ok("H1 the ISO tables are present", tables == 31 && codes > 4000, msg);
+
+    snprintf(msg, sizeof msg, "%d incomplete%s", bad_kraft,
+             worst_table >= 0 ? "" : "");
+    ok("H2 every table is a COMPLETE code (Kraft = 1)", bad_kraft == 0, msg);
+
+    snprintf(msg, sizeof msg, "%d violations", bad_prefix);
+    ok("H3 no code is a prefix of another", bad_prefix == 0, msg);
+
+    /* The scalefactor bands must be increasing and end at 576 -- they are
+     * boundaries into the coefficient array, and one out of order is an
+     * out-of-bounds walk during requantisation. */
+    int sf_ok = 1;
+    for (int r = 0; r < 3; r++) {
+        for (int i = 1; i < 23; i++)
+            if (mp3_sf_bands[r].l[i] <= mp3_sf_bands[r].l[i - 1]) sf_ok = 0;
+        if (mp3_sf_bands[r].l[22] != 576) sf_ok = 0;
+        for (int i = 1; i < 14; i++)
+            if (mp3_sf_bands[r].s[i] <= mp3_sf_bands[r].s[i - 1]) sf_ok = 0;
+    }
+    ok("H4 scalefactor bands rise and end at 576", sf_ok, "");
 }
 
 /* --- the frame layer, against a real file --------------------------------- */
@@ -226,6 +299,7 @@ int main(int argc, char **argv)
 {
     printf("=== mp3\n");
     test_bits();
+    test_tables();
     if (argc > 1) test_frames(argv[1]);
     else printf("  (no file given -- frame tests skipped)\n");
 

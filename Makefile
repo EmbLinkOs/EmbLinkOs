@@ -1247,7 +1247,7 @@ MP3 ?=
 test-mp3: | $(BUILD)
 	$(HOSTCC) -O2 -Wall -Iuser/audio/mp3 -o build/mp3_test \
 	    user/audio/mp3/mp3_test.c user/audio/mp3/bits.c user/audio/mp3/frame.c \
-	    user/audio/mp3/sideinfo.c
+	    user/audio/mp3/sideinfo.c user/audio/mp3/tables.c
 	./build/mp3_test $(MP3)
 
 .PHONY: test-photos
