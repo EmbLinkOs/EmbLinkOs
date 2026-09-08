@@ -1247,8 +1247,25 @@ MP3 ?=
 test-mp3: | $(BUILD)
 	$(HOSTCC) -O2 -Wall -Iuser/audio/mp3 -o build/mp3_test \
 	    user/audio/mp3/mp3_test.c user/audio/mp3/bits.c user/audio/mp3/frame.c \
-	    user/audio/mp3/sideinfo.c user/audio/mp3/tables.c
-	./build/mp3_test $(MP3)
+	    user/audio/mp3/sideinfo.c user/audio/mp3/tables.c \
+	    user/audio/mp3/huffman.c user/audio/mp3/scalefac.c user/audio/mp3/reservoir.c
+	@if [ -n "$(MP3)" ]; then ./build/mp3_test "$(MP3)"; else \
+	  $(MAKE) --no-print-directory mp3-vectors; \
+	  fail=0; for f in build/mp3ref/*.mp3; do \
+	    printf "  %-16s " "$$(basename $$f)"; \
+	    if ./build/mp3_test "$$f" > build/mp3ref/last.log 2>&1; then \
+	      grep -hoE "[0-9]+ granules.*cold" build/mp3ref/last.log | tr -d "\n"; echo "  OK"; \
+	    else echo "FAIL"; cat build/mp3ref/last.log; fail=1; fi; \
+	  done; \
+	  echo "=== test-mp3: $$( [ $$fail = 0 ] && echo OK || echo FAIL )"; exit $$fail; fi
+
+# The MP3 corpus: several ENCODERS' worth of habits, not one big file.
+# A whole 8490-frame song passed while two 2-second clips failed, because the
+# song never used SCFSI and they did. Coverage here is variety -- mono, high
+# and low bitrate, VBR, noise (which forces short blocks), a sweep -- not size.
+.PHONY: mp3-vectors
+mp3-vectors: | $(BUILD)
+	@sh tools/mkmp3vectors.sh
 
 .PHONY: test-photos
 test-photos: | $(BUILD)

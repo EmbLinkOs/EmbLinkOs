@@ -23,6 +23,9 @@
 #include "frame.h"
 #include "sideinfo.h"
 #include "tables.h"
+#include "huffman.h"
+#include "scalefac.h"
+#include "reservoir.h"
 
 static int g_fail;
 
@@ -275,6 +278,149 @@ static void test_frames(const char *path)
          * a nonsense rate rather than as noise ten stages later. */
         ok("S2 granule bit budgets fit the stream's bitrate",
            kbps > 1.0 && kbps <= h.bitrate / 1000.0 + 1.0, msg);
+    }
+
+    /* D -- ENTROPY DECODE the whole file, and let the bit count grade it.
+     *
+     * This is the strongest check available before there is any audio to
+     * compare against, and it grades six things at once: the ISO tables, the
+     * region boundaries, the scalefactor widths, SCFSI inheritance, the count1
+     * loop, and the reservoir. All of them have to be right SIMULTANEOUSLY or
+     * the granule does not end where the side info said it would.
+     *
+     * The side info states part2_3_length -- exactly how many bits the granule
+     * spent on scalefactors plus Huffman data. We decode, then compare. An
+     * encoder may leave a few stuffing bits unused, and count1 may overrun by
+     * up to one quadruple because whole codes are written, so the tolerance is
+     * one-sided and small. A wrong table does not land near the mark: it
+     * desynchronises and the error is hundreds of bits, or no code matches at
+     * all. */
+    {
+        Mp3Reservoir res;
+        mp3_res_reset(&res);
+
+        size_t p = (size_t)first;
+        unsigned granules = 0, exact = 0, close = 0, wrong = 0;
+        unsigned failed = 0, cold = 0;
+        long worst = 0;
+        /* Details of the FIRST granule that missed, so a failure names the
+         * case to look at instead of only its size. */
+        int bad_frame = -1, bad_gr = 0, bad_ch = 0, bad_bt = 0, bad_p23 = 0;
+        long bad_diff = 0;
+        unsigned frame_i = 0;
+        unsigned long long coeffs = 0;
+
+        while (p + 4 <= got) {
+            Mp3Header fh;
+            if (!mp3_parse_header(buf + p, got - p, &fh)) break;
+            if (fh.version != MPEG_1) break;          /* MPEG-2 sf not done yet */
+
+            size_t si_off = p + 4 + (fh.crc ? 2 : 0);
+            Mp3SideInfo s;
+            if (si_off + (size_t)fh.side_info_bytes > got ||
+                !mp3_parse_sideinfo(buf + si_off, (int)(got - si_off), &fh, &s))
+                break;
+
+            const uint8_t *md = buf + si_off + fh.side_info_bytes;
+            int mdlen = fh.frame_bytes - 4 - (fh.crc ? 2 : 0) - fh.side_info_bytes;
+            if (md + mdlen > buf + got) break;
+
+            long startbit = mp3_res_add(&res, md, mdlen, s.main_data_begin);
+            if (startbit < 0) { cold++; p += (size_t)fh.frame_bytes; continue; }
+
+            BitReader b;
+            bits_init(&b, res.buf, res.len);
+            bits_seek(&b, (size_t)startbit);
+
+            Mp3Scalefac sf[2][2];
+            int sr_index = fh.samplerate == 44100 ? 0 : fh.samplerate == 48000 ? 1 : 2;
+
+            for (int gr = 0; gr < s.granules; gr++) {
+                for (int c = 0; c < fh.channels; c++) {
+                    const Mp3Granule *g = &s.gr[gr][c];
+                    size_t gstart = bits_pos(&b);
+                    size_t gend = gstart + g->part2_3_length;
+
+                    int sfbits = mp3_read_scalefactors(&b, &s, gr, c, true,
+                                                       &sf[gr][c],
+                                                       gr == 1 ? &sf[0][c] : NULL);
+                    if (sfbits < 0) { failed++; break; }
+
+                    int32_t coef[576];
+                    int n = mp3_huffman_granule(&b, gend, g, sr_index, coef);
+                    if (n < 0) {
+                        if (failed == 0)
+                            printf("       first FAIL: frame %u gr %d ch %d bt %d, "
+                                   "phase %s table %d at coef %d; tables %d/%d/%d, "
+                                   "big %d, r0 %d r1 %d, count1 tab %d, switch %d\n",
+                                   frame_i, gr, c, g->block_type,
+                                   mp3_huff_err_phase ? "count1" : "big",
+                                   mp3_huff_err_table, mp3_huff_err_index,
+                                   g->table_select[0], g->table_select[1],
+                                   g->table_select[2], g->big_values,
+                                   g->region0_count, g->region1_count,
+                                   g->count1table_select ? 33 : 32,
+                                   (int)g->window_switching);
+                        failed++;
+                    }
+                    else        coeffs += (unsigned long long)n;
+
+                    long diff = (long)bits_pos(&b) - (long)gend;
+                    /* EXACT, or it is a bug. No tolerance.
+                     *
+                     * This began with slack in it -- an allowance for "the
+                     * encoder padded its bit budget" and another for the count1
+                     * loop overrunning by a quadruple. Both sounded reasonable
+                     * and both were wrong: with the decoder actually correct,
+                     * every granule of every file tested lands on the mark to
+                     * the bit. The 483 granules that had been sitting inside
+                     * that tolerance were the SCFSI bit-order bug, and the
+                     * tolerance is what let a whole song look like it passed.
+                     *
+                     * A margin invented to explain a discrepancy, rather than
+                     * derived from the format, is a place for bugs to live. */
+                    if (diff == 0)                   exact++;
+                    else if (diff > -32 && diff < 40) close++;
+                    else {
+                        wrong++;
+                        if (diff > worst || -diff > worst)
+                            worst = diff < 0 ? -diff : diff;
+                        if (bad_frame < 0) {
+                            bad_frame = (int)frame_i; bad_gr = gr; bad_ch = c;
+                            bad_bt = g->block_type; bad_p23 = g->part2_3_length;
+                            bad_diff = diff;
+                        }
+                    }
+                    granules++;
+
+                    /* Reposition EXACTLY. Whatever the granule did with its
+                     * bits, the next one starts where the side info says --
+                     * carrying an error forward is how one bad frame becomes
+                     * a whole bad file. */
+                    bits_seek(&b, gend);
+                }
+            }
+            p += (size_t)fh.frame_bytes;
+            frame_i++;
+        }
+
+        snprintf(msg, sizeof msg, "%u granules, %u failed, %u cold",
+                 granules, failed, cold);
+        ok("D1 every granule decodes without a bad code",
+           granules > 20 && failed == 0, msg);
+
+        snprintf(msg, sizeof msg, "%u exact, %u near, %u off (worst %ld bits)",
+                 exact, close, wrong, worst);
+        ok("D2 granules end where part2_3_length says, EXACTLY",
+           granules > 20 && exact == granules, msg);
+        if (bad_frame >= 0)
+            printf("       first miss: frame %d gr %d ch %d, block_type %d, "
+                   "part2_3 %d bits, off by %+ld\n",
+                   bad_frame, bad_gr, bad_ch, bad_bt, bad_p23, bad_diff);
+
+        snprintf(msg, sizeof msg, "%llu coefficients (%.0f per granule)",
+                 coeffs, granules ? (double)coeffs / granules : 0);
+        ok("D3 the spectrum is populated", coeffs > 0 && granules > 0, msg);
     }
 
     /* F2 -- the encoder's own frame count, if it left one. */
