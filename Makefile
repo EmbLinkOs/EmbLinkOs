@@ -1243,6 +1243,12 @@ build/photos.elf: build/crt0.o build/syscalls.o $(PHOTOS_OBJS) build/libembk.so
 # word proves every bitrate/samplerate/padding field was read correctly, a few
 # thousand times in a row, on a file nobody wrote for this test.
 MP3 ?=
+MP3_OBJS_SRC := user/audio/mp3/bits.c user/audio/mp3/frame.c \
+                user/audio/mp3/sideinfo.c user/audio/mp3/tables.c \
+                user/audio/mp3/huffman.c user/audio/mp3/scalefac.c \
+                user/audio/mp3/reservoir.c user/audio/mp3/spectrum.c \
+                user/audio/mp3/imdct.c user/audio/mp3/synth.c \
+                user/audio/mp3/decode.c
 .PHONY: test-mp3
 test-mp3: | $(BUILD)
 	$(HOSTCC) -O2 -Wall -Iuser/audio/mp3 -o build/mp3_test \
@@ -1258,6 +1264,22 @@ test-mp3: | $(BUILD)
 	    else echo "FAIL"; cat build/mp3ref/last.log; fail=1; fi; \
 	  done; \
 	  echo "=== test-mp3: $$( [ $$fail = 0 ] && echo OK || echo FAIL )"; exit $$fail; fi
+
+# THE decoder check: our PCM against ffmpeg's, sample by sample.
+# Bit accounting proves the granules were parsed; only this proves they were
+# turned into the right SOUND. A wrong table or a sign error in the IMDCT
+# produces confident, plausible audio that no amount of listening separates
+# from correct -- so the reference decodes the same file and the waveforms are
+# subtracted. Needs ffmpeg (and ffprobe); skipped with a note if absent.
+.PHONY: test-mp3-pcm
+test-mp3-pcm: mp3-vectors | $(BUILD)
+	@command -v ffmpeg >/dev/null || { echo "  (ffmpeg not installed -- skipping PCM check)"; exit 0; }
+	$(HOSTCC) -O2 -Wall -Iuser/audio/mp3 -o build/mp3dec \
+	    user/audio/mp3/mp3dec.c $(MP3_OBJS_SRC) -lm
+	@fail=0; for f in build/mp3ref/*.mp3; do \
+	  python3 tools/mp3_check.py "$$f" || fail=1; \
+	done; \
+	echo "=== test-mp3-pcm: $$( [ $$fail = 0 ] && echo OK || echo FAIL )"; exit $$fail
 
 # The MP3 corpus: several ENCODERS' worth of habits, not one big file.
 # A whole 8490-frame song passed while two 2-second clips failed, because the
