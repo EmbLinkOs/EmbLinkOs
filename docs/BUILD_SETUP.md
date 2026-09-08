@@ -10,10 +10,11 @@ first-time setup and the *why*, not day-to-day usage.
 
 ## Which host you are on
 
-The OS is x86_64 **today**, and the machine you BUILD it on is a separate
-question — two hosts are in use. (A second *target*, aarch64, is planned rather
-than built: `docs/ARM64.md`. Keep the two axes apart when reading this file —
-everything below is about the build HOST, not the target architecture.)
+The OS is x86_64 by default, and the machine you BUILD it on is a separate
+question — two hosts are in use. (A second *target*, aarch64, now boots to a
+console: `make ARCH=aarch64`, see the section at the end of this file and
+`docs/ARM64.md`. Keep the two axes apart when reading this file — unless a
+sentence says `ARCH`, it is about the build HOST, not the target architecture.)
 
 | | Linux (x86_64) | macOS (Apple Silicon) |
 |---|---|---|
@@ -134,6 +135,24 @@ Give `-smp` a couple of cores and expect to lengthen `--settle`.
 
 For either of those, a Linux VM (UTM, Lima, Docker) is the honest answer rather
 than a workaround: they are host-tooling gaps, not OS features that regressed.
+
+**Known, not yet fixed:** macOS ships **GNU Make 3.81** (2006) as `/usr/bin/make`,
+and 3.81 does not understand *grouped targets* (`a b &: deps`, GNU Make 4.3+).
+Two rules use them — `build/pkgprobe.{embx,ns,pkg} &:` and
+`embkfs.img embkfs_tree.img &:` — so on the Mac every build prints:
+
+```
+Makefile:1706: warning: overriding commands for target `&'
+Makefile:913:  warning: ignoring old commands for target `&'
+```
+
+3.81 reads `&` as a literal target name shared by both rules (hence the
+override), and treats the rest as an ordinary multi-target rule, where the
+recipe runs **once per target** instead of once for the group. The build works —
+mkfs is idempotent — but it is doing avoidable work and the warnings are noise
+that trains you to ignore warnings. `brew install make` gives `gmake` 4.x, which
+handles them correctly. Not yet made the default because that would change the
+tool every contributor invokes.
 
 ### Host-tool differences already handled
 
@@ -596,3 +615,52 @@ desktop, and a compile+link that is ~1 s native is tens of seconds here.
   [above](#tcc-needs-our-patch----a-pristine-tcc-silently-produces-crashing-binaries)).
 - **A tcc-built program dies instantly at a nonsense address** — unpatched tcc.
   Rebuild it with `tools/tcc/build-tcc-emblink.sh`.
+
+## Building for aarch64 (`ARCH=aarch64`)
+
+A **second target architecture**, not a second host. Orthogonal to everything
+above: you cross-compile it from the same Linux or macOS box you already build
+x86 on. The campaign, its phasing and its open questions live in
+[ARM64.md](ARM64.md); this section is only how to run it.
+
+Status: **phase A0** — it boots to a serial console at EL1 on QEMU `virt` and
+reads the device tree. There is no MMU, no interrupt controller and no userland
+yet, so `run-arm64` prints a register dump and parks. That is the whole feature.
+
+```sh
+# 1. toolchain  (prebuilt bottle on macOS; ~1 min, not the ~30 the x86 one costs)
+brew install aarch64-elf-gcc            # macOS
+sudo apt install gcc-aarch64-linux-gnu  # Debian/Ubuntu: see AARCH64_PREFIX below
+
+make ARCH=aarch64 check-tools-arm64     # preflight, same idea as check-tools
+
+# 2. build + boot
+make ARCH=aarch64                       # -> build/aarch64/kernel.{elf,img}
+make ARCH=aarch64 run-arm64             # serial on stdio; quit with Ctrl-A X
+make ARCH=aarch64 test-arm64-boot       # headless; asserts the A0 "done when"
+make ARCH=aarch64 run-arm64-hvf         # Apple Silicon: hardware virtualization
+make ARCH=aarch64 clean-arm64
+```
+
+Things worth knowing before they cost you an afternoon:
+
+* **`ARCH` defaults to `x86_64` and changes nothing when unset.** The aarch64
+  rules live in `kernel/arch/aarch64/arch.mk`, included at the bottom of the
+  Makefile and *only* for a non-default `ARCH`. Checked, not assumed: `make -n all`
+  emits byte-identical recipes with and without that hook, on both hosts.
+* **The `.img` is what boots; the `.elf` is what gdb reads.** Only the flat image
+  carries the 64-byte arm64 `Image` header, and only that header makes QEMU pass
+  the device-tree pointer in `x0`. Boot the ELF and it comes up fine with `x0 = 0`
+  — a failure that stays invisible until something asks for the memory map.
+* **TCG is the default even on Apple Silicon.** `-accel hvf` is real and works
+  (`run-arm64-hvf`), but under TCG `-d int,unimp` tells you what the CPU actually
+  did, and the phases being written now are exactly the ones where "it hangs" has
+  to become "it took a data abort at this address." Speed matters once there is
+  something to be slow at.
+* **A different toolchain prefix:** `make ARCH=aarch64 AARCH64_PREFIX=aarch64-linux-gnu-`.
+  Any bare-metal-capable aarch64 gcc works; the build is `-ffreestanding
+  -nostdlib` and links its own script, so a Linux-targeting cross gcc is fine.
+* **`-mgeneral-regs-only` is mandatory** and is already in `ARM_CFLAGS`. FP/SIMD
+  traps at EL1 until someone enables it, and gcc emits FP registers for ordinary
+  struct copies. Removing that flag produces a hang with no relation to any
+  floating-point code in the source.

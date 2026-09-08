@@ -1555,6 +1555,16 @@ substantially complete.
   (no inb/outb, no direct page-table pokes, no x86 asm in logic); route
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
+  - **That campaign is underway: `docs/ARM64.md`** (target QEMU `virt`, HVF
+    available and confirmed working). **Phase A0 is done** — `make ARCH=aarch64`
+    boots an aarch64 kernel to a serial console at EL1 with the DTB handed over,
+    verified by `make ARCH=aarch64 test-arm64-boot`. A1 (exception vectors) is
+    next. The audit there says the discipline largely held —
+    `arch/x86_64/` is 11% of the kernel and port I/O never escaped into core
+    logic — with **one** real exception: the 89 syscall handlers in
+    `arch/x86_64/syscall/syscall.c` read their arguments through 187 direct
+    `r->rdi`/`r->rsi`/… accesses. Neutralising that (ARM64.md §2.4, phase A4) is
+    the one refactor that lands on x86 *before* any ARM code exists.
 - [x] ~~**embbuild** — the native build tool (the make-equivalent)~~ —
   **BUILT AND SHIPPED**, not merely designed. `shell/tools/embbuild.c`; proven
   by `test embbuild` (cases a–f including the §3 `/system` install refusal),

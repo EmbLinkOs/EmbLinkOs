@@ -89,6 +89,20 @@ $(shell mkdir -p $(BUILD); \
         [ -f '$(BUILD)/.fb_cap' ] && [ "$$(cat '$(BUILD)/.fb_cap')" = "$$want" ] \
           || printf '%s' "$$want" > '$(BUILD)/.fb_cap')
 
+# --- target architecture -----------------------------------------------------
+# ARCH selects the TARGET architecture, not the build host (that is $(UNAME_S)
+# above, and the two are independent -- an x86 kernel is cross-compiled on an
+# Apple Silicon Mac every day here).
+#
+# x86_64 is the default and stays the default: with ARCH unset, NOTHING below
+# behaves differently than it did before this line existed, and `make` on a
+# Linux box produces the same bytes it always has. That is docs/ARM64.md §2.9,
+# and it is a rule, not an aspiration.
+#
+# The second architecture is carried in a per-arch FRAGMENT, included at the
+# bottom of this file -- see the include and its note there. docs/ARM64.md §6.4.
+ARCH ?= x86_64
+
 # Userland rules appear before `all`, so pin the default goal explicitly.
 .DEFAULT_GOAL := all
 
@@ -329,6 +343,10 @@ check-tools:
 	echo; \
 	if [ $$miss -gt 0 ]; then echo "==> $$miss REQUIRED item(s) MISSING -- see docs/BUILD_SETUP.md, then re-run: make check-tools"; exit 1; \
 	else echo "==> all required tools present.  Build + boot:  make && make run-embkfs"; fi
+	@echo; echo "SECOND TARGET -- aarch64 (docs/ARM64.md, phase A0: boots to a serial console):"; \
+	if command -v aarch64-elf-gcc >/dev/null 2>&1; then \
+	  printf '  [ ok ]  aarch64-elf-gcc   -- make ARCH=aarch64 && make ARCH=aarch64 run-arm64\n'; \
+	else printf '  [ -- ]  aarch64-elf-gcc  (absent => the x86 build is unaffected; brew install aarch64-elf-gcc)\n'; fi
 NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/x86_64-elf/include,)
 NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
 # -ftrivial-auto-var-init=zero: zero every uninitialized auto variable. Defence
@@ -2415,6 +2433,29 @@ build/browser_render: $(BROWSER_RENDER_SRCS) $(BROWSER_RENDER_HDRS)
 # Whatever the compiler recorded last time. Missing on a clean tree, which is
 # exactly when it is not needed.
 -include $(wildcard $(BUILD)/*.o.d) $(wildcard $(BUILD)/qjs/*.o.d)
+
+# --- second architecture ------------------------------------------------------
+# Everything above this line is the x86_64 build, and it is untouched by the
+# aarch64 campaign. A non-default ARCH pulls in that architecture's fragment,
+# which supplies its own rules and resets .DEFAULT_GOAL -- so `make
+# ARCH=aarch64` builds an aarch64 kernel rather than falling into `all` and
+# trying to assemble a BIOS boot sector for it.
+#
+# Included LAST, and guarded, on purpose:
+#   * guarded, so a plain `make` never even reads the file. The x86 build
+#     cannot be broken by a fragment it does not parse (docs/ARM64.md §2.9).
+#   * last, so the fragment can override .DEFAULT_GOAL, which is set at the
+#     top of this file and would otherwise win.
+#   * a fragment rather than ifeqs threaded through 2,400 lines of boot image,
+#     EMBKFS packing and userland -- none of which aarch64 has yet. Settles
+#     docs/ARM64.md §6.4.
+ifneq ($(ARCH),x86_64)
+ARCH_MK := kernel/arch/$(ARCH)/arch.mk
+ifeq ($(wildcard $(ARCH_MK)),)
+$(error unknown ARCH '$(ARCH)': no $(ARCH_MK). Known: x86_64, aarch64)
+endif
+include $(ARCH_MK)
+endif
 
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(KERNEL_BIN) $(IMG)
