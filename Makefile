@@ -1271,6 +1271,14 @@ test-mp3: | $(BUILD)
 # produces confident, plausible audio that no amount of listening separates
 # from correct -- so the reference decodes the same file and the waveforms are
 # subtracted. Needs ffmpeg (and ffprobe); skipped with a note if absent.
+# The audio resampler: 44100 into the speaker's fixed 48000, measured against
+# an ideal tone. See the file for why the phase search must be fractional.
+.PHONY: test-resample
+test-resample: | $(BUILD)
+	$(HOSTCC) -O2 -Wall -Iuser/audio -o build/resample_test \
+	    user/audio/resample_test.c user/audio/resample.c -lm
+	./build/resample_test
+
 .PHONY: test-mp3-pcm
 test-mp3-pcm: mp3-vectors | $(BUILD)
 	@command -v ffmpeg >/dev/null || { echo "  (ffmpeg not installed -- skipping PCM check)"; exit 0; }
