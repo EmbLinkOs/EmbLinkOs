@@ -1,5 +1,18 @@
 ASM       = nasm
 ASM_FLAGS = -f bin
+# --- host portability -------------------------------------------------------
+# This repo is developed on Linux and on macOS (Apple Silicon), and the two
+# disagree about the coreutils that build scripts lean on. Decided ONCE here
+# rather than sprinkled through recipes, so a broken host tool is one edit.
+#
+#   stat: GNU is `$(STATSZ)`, BSD/macOS is `stat -f%z`.
+#   truncate: GNU coreutils only, and `-s %1M` (round UP to a multiple) is a
+#             GNU extension on top of that. python3 is already required, does
+#             it in one line, and behaves identically on both.
+STATSZ := $(shell stat -c%s Makefile >/dev/null 2>&1 && echo 'stat -c%s' || echo 'stat -f%z')
+# Round $(1) up to a whole number of MB, never down -- see the boot image rule.
+PADMB = python3 -c "import os,sys;p=sys.argv[1];m=1<<20;s=os.path.getsize(p);n=max(m,-(-s//m)*m);f=open(p,'r+b');f.truncate(n);f.close()"
+
 CC = x86_64-elf-gcc
 # -Ikernel makes every kernel translation unit include project headers by
 # their canonical path from the kernel/ root (e.g. #include
@@ -572,7 +585,7 @@ build/js.elf: build/crt0.o build/syscalls.o build/qjs/js.o $(QJS_OBJS) user/lib/
 
 .PHONY: js
 js: build/js.elf
-	@echo "js.elf: $$(stat -c%s build/js.elf) bytes"
+	@echo "js.elf: $$($(STATSZ) build/js.elf) bytes"
 
 build/web_style.o: user/web/style.c user/web/style.h user/web/css/css.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
@@ -1432,12 +1445,12 @@ all: $(IMG) embkfs.img
 images: $(IMG) embkfs.img
 
 $(STAGE1_BIN): $(STAGE1_SRC) $(STAGE2_BIN)
-	@stage2_sectors=$$(( ($$(stat -c%s $(STAGE2_BIN)) + 511) / 512 )); \
+	@stage2_sectors=$$(( ($$($(STATSZ) $(STAGE2_BIN)) + 511) / 512 )); \
 	echo "Building stage1 with STAGE2_LOAD_SECTORS=$$stage2_sectors"; \
 	$(ASM) $(ASM_FLAGS) -D STAGE2_LOAD_SECTORS=$$stage2_sectors $< -o $@
 
 $(STAGE2_BIN): $(STAGE2_SRC) $(KERNEL_BIN)
-	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
+	@kernel_sectors=$$(( ($$($(STATSZ) $(KERNEL_BIN)) + 511) / 512 )); \
 	echo "Building stage2 with KERNEL_LOAD_SECTORS=$$kernel_sectors"; \
 	$(ASM) $(ASM_FLAGS) -D KERNEL_LOAD_SECTORS=$$kernel_sectors $< -o $@
 
@@ -1492,9 +1505,9 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN)
 	@# `%1M` pads small kernels to 1 MB exactly as before, but grows to 2 MB, 3 MB,
 	@# ... as the kernel does, so it can never be truncated. (Stage1/2 load by
 	@# sector count, not image size, so any padded size is fine.)
-	truncate -s %1M $(IMG)
-	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
-	kernel_top=$$(( 0x100000 + $$(stat -c%s $(KERNEL_BIN)) )); \
+	$(PADMB) $(IMG)
+	@kernel_sectors=$$(( ($$($(STATSZ) $(KERNEL_BIN)) + 511) / 512 )); \
+	kernel_top=$$(( 0x100000 + $$($(STATSZ) $(KERNEL_BIN)) )); \
 	stage_base=$$(( 0x1000000 )); \
 	echo "Kernel is $$kernel_sectors sectors; stage2 stages the ELF at 0x1000000 (16 MB, unreal-mode high load)"; \
 	if [ $$kernel_top -ge $$stage_base ]; then \

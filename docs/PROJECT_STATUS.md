@@ -2268,8 +2268,27 @@ What's left:
 
 ## Build Environment
 
-- OS: Ubuntu Linux. Toolchain: x86_64-elf cross compiler at `/usr/local/cross/bin`.
-- NASM, QEMU, GNU Make, VS Code, GDB (`docs/GDB_CHEATSHEET.md`).
+TWO hosts, one target. The OS is x86_64 whichever machine builds it; see
+`docs/BUILD_SETUP.md` for the setup of each and for the host-tool differences
+that are already handled in-tree.
+
+- **Linux (x86_64)** — the daily host. Toolchain: x86_64-elf cross compiler at
+  `/usr/local/cross/bin`, built from source. Everything works here, including
+  the partitioned/USB images and UEFI boot.
+- **macOS (Apple Silicon)** — cross compiler from Homebrew
+  (`x86_64-elf-gcc`), no source build needed. Kernel, apps and every host test
+  are portable. Two gaps, both host tooling rather than OS features:
+  `sfdisk` does not exist (no partitioned/USB images) and there is no GNU
+  `objcopy` with the `efi-app-x86_64` target (no UEFI build). BIOS boot and
+  `make run` are unaffected.
+  - **Timings do not transfer.** QEMU on ARM translates an x86_64 guest across
+    architectures and HVF cannot accelerate it, so it is slower than the
+    x86-on-x86 TCG the numbers in this document were measured under. Where a
+    result here is a duration -- first-frame times, the MP3 player keeping
+    ahead of the speaker, `make test-audio` -- re-baseline it rather than
+    changing working code to hit a figure from other hardware.
+- NASM, QEMU, GNU Make, VS Code, GDB (`docs/GDB_CHEATSHEET.md`), python3,
+  ffmpeg (for the MP3 reference checks).
 - Repository: `github.com/teo1747/EmbLinkOs`.
 
 ## Build / Run Commands

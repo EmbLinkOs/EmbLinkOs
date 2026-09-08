@@ -8,14 +8,107 @@ everything set up and just want the list of `make` targets, see
 [CONTRIBUTING.md](../CONTRIBUTING.md#build--run) instead — this doc is about
 first-time setup and the *why*, not day-to-day usage.
 
-## TL;DR — the exact order, on a fresh machine
+## Which host you are on
+
+The OS is x86_64 and always will be; the machine you BUILD it on is a separate
+question, and two are in use:
+
+| | Linux (x86_64) | macOS (Apple Silicon) |
+|---|---|---|
+| cross toolchain | build it (~30 min, § below) | `brew install x86_64-elf-gcc` |
+| `make` → bootable image | yes | yes |
+| `make run` / QEMU | x86-on-x86 TCG | **cross-arch TCG — slower**, see below |
+| partitioned / USB images | yes | **no** (`sfdisk` is Linux-only) |
+| UEFI boot (`make run-uefi`) | yes | **no** (needs GNU `objcopy` with `efi-app-x86_64`) |
+
+Everything else — the kernel, every app, every host test (`test-mp3-pcm`,
+`test-photos`, `test-resample`, the TLS suites) — is portable and expected to
+work on both.
+
+> **Honesty about this table:** the Linux column is what this repo is built and
+> tested on daily. The macOS column is derived from what the build actually
+> requires, and the portability fixes it needed have been made and verified —
+> but **it has not yet been run end to end on a Mac.** The first person to do
+> that should correct this file rather than work around it.
+
+## macOS (Apple Silicon) setup
+
+```sh
+# 1. host tools. The cross compiler is PREBUILT here, which skips the ~30
+#    minutes step 2 costs on Linux.
+brew install x86_64-elf-gcc x86_64-elf-binutils x86_64-elf-gdb \
+             nasm qemu python3 mtools ffmpeg
+
+# 2. newlib-c99 still has to be rebuilt from source (§ below) -- it is not a
+#    formula, and the reason it exists is our own C99 configuration.
+make NEWLIB_PREFIX=$HOME/cross/newlib-c99
+```
+
+### The thing that will surprise you: it is slower
+
+On the Linux box QEMU runs an x86_64 guest on an x86_64 host. On Apple Silicon
+it runs an x86_64 guest on ARM, so every guest instruction is *translated
+across architectures*. HVF does not help — hardware acceleration only applies
+when guest and host share an architecture, so `-accel hvf` is not an option for
+this image and TCG is the only path.
+
+That matters here more than it would in most projects, because several results
+in this repo are TIMINGS rather than pass/fail:
+
+* first-frame times (`Photos: first frame presented (+1749ms)`)
+* the MP3 player staying ahead of the speaker — the whole point of its queue
+* `make test-audio`, which asserts a duration
+* `tools/app_shot.py`, whose `--settle` decides how long an app gets to draw
+
+None of those numbers transfer. If a test that passes on Linux fails on the Mac
+by being *slow* rather than *wrong*, raise the timeout and re-baseline the
+number; do not "fix" working code to hit a figure measured on other hardware.
+Give `-smp` a couple of cores and expect to lengthen `--settle`.
+
+### What does not work, and why
+
+* **`sfdisk`** (util-linux) has no macOS equivalent, so the partitioned and USB
+  images are out: `tools/mkbootdisk.sh`, `make run-usb`, `make run-usb-ide` and
+  the partition-table tests. The plain `myos.img` + `embkfs.img` pair that
+  `make run` uses is unaffected, which is the daily path.
+* **UEFI** (`make run-uefi`) needs a GNU `objcopy` that knows the
+  `efi-app-x86_64` target to turn our ELF into an EFI application. Homebrew's
+  `binutils` provides `gobjcopy`, but not that target on this platform. BIOS
+  boot is unaffected.
+
+For either of those, a Linux VM (UTM, Lima, Docker) is the honest answer rather
+than a workaround: they are host-tooling gaps, not OS features that regressed.
+
+### Host-tool differences already handled
+
+These were real breakages and are fixed in-tree, listed so nobody re-introduces
+them:
+
+* `stat -c%s` is GNU; BSD/macOS is `stat -f%z`. The Makefile picks one into
+  `$(STATSZ)` at parse time, and `tools/mkbootdisk.sh` has its own `fsize()`.
+* `truncate -s %1M` is GNU coreutils *and* a GNU extension on top of it. The
+  boot image is padded by `$(PADMB)`, one line of python3, which the build
+  already depends on and which behaves the same on both hosts.
+* `sed -i` takes no argument on GNU and a mandatory one on BSD. Only
+  `tools/cpython/configure-py-emblink.sh` uses it (an optional port).
+* `cc` is clang on macOS and gcc on Linux. Host tests use `$(HOSTCC)`, which is
+  `cc` by default; both work, and warnings differ slightly.
+* `/usr/bin/time -f` and `nproc` are GNU-only. Neither is in the build; keep it
+  that way.
+
+APFS is **case-insensitive by default**. This repo currently has no filenames
+that differ only by case (checked: `git ls-files | tr A-Z a-z | sort | uniq -d`
+is empty) and it should stay that way — a collision would be invisible on the
+Mac and break the Linux build.
+
+## TL;DR — the exact order, on a fresh machine (Linux)
 
 Everything below is explained further down; this is the checklist. **Steps 1-4
 are all you need for a bootable OS.** Steps 5+ are the optional ports, and
 skipping them costs you nothing but those four apps.
 
 ```sh
-# 1. host packages (Debian/Ubuntu)
+# 1. host packages (Debian/Ubuntu -- for macOS see the section above)
 sudo apt install nasm qemu-system-x86 gdb python3 python3-pil mtools \
                  dosfstools fdisk make build-essential texinfo bison flex \
                  libgmp-dev libmpfr-dev libmpc-dev

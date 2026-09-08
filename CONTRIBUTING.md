@@ -182,9 +182,14 @@ hardware changes, docs synced, and gaps left behind. Fill it honestly — the
 
 ## Build & run
 
-- **Environment:** Ubuntu, `x86_64-elf` cross compiler (`/usr/local/cross/bin`),
-  a C99-enabled newlib rebuild (`NEWLIB_PREFIX`), NASM, QEMU, GDB, Python 3.
-  First-time setup for all of this: [`docs/BUILD_SETUP.md`](docs/BUILD_SETUP.md).
+- **Environment:** Linux (Ubuntu) or macOS on Apple Silicon. Either way:
+  an `x86_64-elf` cross compiler, a C99-enabled newlib rebuild
+  (`NEWLIB_PREFIX`), NASM, QEMU, GDB, Python 3 — built from source on Linux,
+  `brew install x86_64-elf-gcc` on macOS. First-time setup for both, and the
+  two things that do NOT work on macOS (partitioned/USB images, UEFI boot):
+  [`docs/BUILD_SETUP.md`](docs/BUILD_SETUP.md).
+  Note that QEMU on Apple Silicon emulates x86_64 ACROSS architectures, so it
+  is slower and none of the timing figures quoted in the docs transfer.
 - **Build the kernel + bootloader:** `make`
 - **Build userland + the UI toolkit + pack a disk image:** `make embkfs.img`
   (every app in `user/bin/`, the shared `libembk.so` toolkit, and `font.ttf`,

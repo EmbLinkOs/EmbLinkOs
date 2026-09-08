@@ -3974,3 +3974,30 @@ scoping is recorded here rather than discovered later.
       actually decode in real time -- MJPEG reuses the JPEG decoder we already
       have and ship. That is real video playback and it is not H.264, and the
       difference should be stated in the app rather than glossed.
+
+
+## Host portability (macOS / Apple Silicon)
+
+The project is now built from two machines. The core build was made portable
+(see docs/BUILD_SETUP.md); these are the parts that are not, and they are host
+TOOLING gaps rather than anything wrong with the OS.
+
+- [ ] `sfdisk` is Linux-only, so partitioned + USB images cannot be built on
+      macOS: `tools/mkbootdisk.sh`, `make run-usb`, `run-usb-ide`, and the
+      partition-table tests. A replacement would have to write the MBR/GPT
+      bytes directly -- which we already know how to parse (see
+      docs/PORTS.md and the GPT+EBR work), so writing them is not research.
+      Doing that would remove the dependency on BOTH hosts, which is the
+      better outcome than special-casing one.
+- [ ] UEFI (`make run-uefi`) needs a GNU `objcopy` that supports
+      `efi-app-x86_64`. Homebrew's binutils does not provide that target.
+      Our own EFI app is ELF until that step, so emitting the PE/COFF wrapper
+      ourselves is the durable fix -- and we already write an ELF loader, a
+      packfile writer and an EMBX emitter, so a PE header is in scope.
+- [ ] Re-baseline the TIMING-dependent tests on the Mac: `make test-audio`
+      durations, `tools/app_shot.py --settle`, the MP3 player's queue depth
+      (QUEUE_AHEAD). Cross-architecture TCG is slower than x86-on-x86 TCG and
+      none of the recorded numbers transfer.
+- [ ] Keep the tree free of case-only filename collisions -- APFS is
+      case-insensitive by default, so a collision is invisible on macOS and
+      breaks Linux. Check: `git ls-files | tr A-Z a-z | sort | uniq -d`.
