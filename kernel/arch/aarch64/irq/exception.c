@@ -1,5 +1,6 @@
 #include "arch/aarch64/irq/exception.h"
 #include "arch/aarch64/drivers/pl011.h"
+#include "arch/aarch64/irq/gicv3.h"
 
 /* Fault decoding -- docs/ARM64.md phase A1.
  *
@@ -163,6 +164,20 @@ static void dump_frame(uint64_t which, struct aarch64_frame *f) {
 
 void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
     uint64_t ec = (f->esr >> 26) & 0x3F;
+
+    /* An IRQ is not a fault and must not be decoded like one: ESR_EL1 is not
+     * even updated for it. Vectors 1, 5, 9 and 13 are the IRQ slot of each
+     * group; the controller knows which line actually fired.
+     *
+     * This returns normally, and the vector epilogue then restores the frame
+     * and erets -- which is how a preempted thread resumes exactly where it
+     * was. It may also NOT return: the timer handler can context-switch, in
+     * which case some other thread's epilogue runs instead. Both are correct;
+     * see gic_dispatch()'s note on why the interrupt is ended first. */
+    if ((which & 3) == 1) {
+        gic_dispatch();
+        return;
+    }
 
     /* Recoverable probe: step over the offending instruction and continue.
      * Restricted to SYNCHRONOUS exceptions, because for an IRQ or an SError

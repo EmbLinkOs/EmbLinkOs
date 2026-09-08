@@ -623,13 +623,18 @@ above: you cross-compile it from the same Linux or macOS box you already build
 x86 on. The campaign, its phasing and its open questions live in
 [ARM64.md](ARM64.md); this section is only how to run it.
 
-Status: **phases A0–A2** — it boots at EL1 on QEMU `virt`, decodes its own
+Status: **phases A0–A3** — it boots at EL1 on QEMU `virt`, decodes its own
 faults (`ESR`/`FAR`/`ELR`, down to the fault status code) instead of hanging,
-and runs in the higher half with the MMU on: memory map from the device tree,
-the shared `kernel/mm/pmm.c` allocating, per-section kernel permissions, no
-identity map. There is no interrupt controller and no userland yet, so
-`run-arm64` prints its state, runs a self-test that deliberately faults four
-different ways and recovers from each, and parks.
+runs in the higher half with the MMU on (memory map from the device tree, the
+shared `kernel/mm/pmm.c` allocating, per-section kernel permissions, no
+identity map), and preemptively switches between kernel threads on a
+GICv3-delivered generic-timer tick. There is no userland yet, so `run-arm64`
+prints its state, deliberately faults four different ways and recovers from
+each, runs three kernel threads against each other for 400 ms, and parks.
+
+Note the run targets pass `-M virt,gic-version=3`. Under TCG, `virt` still
+defaults to a GICv2 and this kernel has no GICv2 driver — it detects that case
+and says so rather than failing obscurely.
 
 ```sh
 # 1. toolchain  (prebuilt bottle on macOS; ~1 min, not the ~30 the x86 one costs)

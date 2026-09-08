@@ -5,13 +5,14 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A2 done.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
-its own faults, and now **runs in the higher half with the MMU on**: page
-tables built in assembly before any allocator exists, the memory map read from
-the device tree, `kernel/mm/pmm.c` — the *existing, shared* physical allocator —
-running unmodified, per-section kernel permissions applied through a C
-page-table manager, and the boot identity map dropped. Everything from A3 on is
-still unwritten. Gaps A2 knowingly left are listed in `TODO.md`, not here.
+**Status: A0–A3 done.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
+its own faults, runs in the higher half with the MMU on — page tables built in
+assembly before any allocator exists, memory map from the device tree,
+`kernel/mm/pmm.c` (the *existing, shared* allocator) running unmodified,
+per-section kernel permissions, no identity map — and **preemptively switches
+between kernel threads on a timer interrupt**, with GICv3 and the ARM generic
+timer both configured from the device tree. Everything from A4 on is still
+unwritten. Gaps each phase knowingly left are listed in `TODO.md`, not here.
 
 ```sh
 brew install aarch64-elf-gcc          # Linux: gcc-aarch64-none-elf
@@ -174,9 +175,9 @@ building and still booting. **No phase is done if it broke the other arch.**
   console                           16550 @ 0x3F8            PL011 @ 0x9000000              [A0]
   exceptions                        IDT + ISR stubs          VBAR_EL1 + 16-entry vectors    [A1]
   paging                            PML4, CR3, invlpg        TTBR0/1_EL1, 4KB/48-bit, TLBI  [A2]
-  interrupt ctrl                    PIC / IOAPIC / LAPIC     GICv3 (distributor + redistributor)
-  timer                             PIT / HPET / TSC         generic timer (CNTP_TVAL/CNTVCT)
-  context switch                    kcontext.asm (131 ln)    x19-x30, sp, ELR/SPSR
+  interrupt ctrl                    PIC / IOAPIC / LAPIC     GICv3 (distributor + redistrib)[A3]
+  timer                             PIT / HPET / TSC         generic timer (CNTV_TVAL/CNTVCT)[A3]
+  context switch                    kcontext.asm (131 ln)    x19-x29, sp, pc, DAIF       [A3]
   user entry                        iretq / int 0x80         eret / svc #0
   SMP                               INIT-SIPI-SIPI           PSCI CPU_ON
   ─────────────────── everything above this line is shared ───────────────────
@@ -338,8 +339,83 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
   mapped Normal it becomes legal. It now targets the MMIO window instead —
   which is a *better* test, because it verifies the window really is
   Device-nGnRnE rather than accidentally Normal.
-* **A3 ❌ GICv3 + generic timer.** **Done when:** the existing timer-preemptive
-  scheduler switches between two kthreads with no scheduler code changed.
+* **A3 ✅ GICv3 + generic timer.** `irq/gicv3.c`, `drivers/timer_generic.c`,
+  `cpu/kcontext.S` + `cpu/kcontext.h`, `sched/bringup.c`.
+
+  **The "done when" as written was wrong, and it is worth saying why rather
+  than quietly restating it.** It said *"the existing timer-preemptive scheduler
+  switches between two kthreads with no scheduler code changed."* That
+  presumed `kernel/process/process.c` is portable. It is not — not because of
+  its own logic, but because of its **dependency set**: 3,700 lines that
+  include the compositor, the surface layer, IPC channels and pipes, the ELF
+  and EMBX loaders, the GDT and the LAPIC. Reaching it is A5–A6.
+
+  So A3 proves the three things underneath it instead, each of which
+  `process.c` will simply use: **the GIC delivers**, **the timer fires
+  periodically**, and **`kernel_ctx_switch()` actually switches**. Those are
+  exercised by `sched/bringup.c` — a round-robin scheduler with a scheduled
+  deletion date, written against the interfaces `process.c` already uses
+  (`struct kcontext`, `kernel_ctx_switch`, a timer tick calling the scheduler)
+  so that what is proven transfers. `TODO.md` records that it is deleted at A5,
+  and its own header says so at length. Finding out that the GIC is misrouted
+  *while also* bringing up `process.c` is the failure this avoids.
+
+  What the run actually shows:
+
+  ```
+  gic: GICD 0x08000000 (64 KiB), GICR 0x080a0000 [from the device tree]
+  timer: device tree says virtual timer is PPI 11
+  gic: INTID 27 -> generic timer
+    worker 1 resumed: slice 4, uptime 124 ms, 2686085 spins
+    worker 2 finishing after 4 slices
+  sched:   0 boot       18 slices
+  sched:   1 worker-A   18 slices
+  sched:   2 worker-B    4 slices (done)
+  gic:   INTID 27   generic timer    40 deliveries,  spurious: 0
+  ```
+
+  Five things A3 taught:
+  1. **`-M virt` does NOT default to GICv3 under TCG** — §6.2 said it did, and
+     that is only true under KVM/HVF. Under TCG you get a GICv2 and the kernel
+     finds no `arm,gic-v3` node at all. The run targets now pass
+     `gic-version=3` explicitly, which is more honest anyway: the machine we
+     target is a GICv3 machine and that should be visible on the command line.
+     `gic_init()` detects the v2 case and says exactly that, because "node not
+     found" alone sends you looking in the wrong place.
+  2. **End the interrupt BEFORE running the handler.** Not the obvious order,
+     and load-bearing: the timer handler *context-switches*, so it does not
+     return. With EOI afterwards, the interrupt stays active until that thread
+     is scheduled again, the GIC refuses to deliver another at the same
+     priority meanwhile, and the other thread never gets a tick — one
+     preemption, then silence. Safe here because everything runs at one
+     priority with `PSTATE.I` masked, so nothing can nest.
+  3. **A new thread must start with interrupts ENABLED, explicitly.** It is
+     first entered from inside the IRQ handler, where the exception itself set
+     `PSTATE.I` — and unlike every later resumption it never returns through
+     the vector epilogue's `eret` to have PSTATE restored. Inherit the
+     handler's DAIF and the thread runs forever without being preempted: the
+     scheduler appears to work exactly once. Hence `daif = 0` in
+     `kernel_ctx_prepare()`.
+  4. **Re-arm the timer first, tick second.** `CNTV_TVAL` is a *down* counter
+     that keeps going negative after firing, and the interrupt stays asserted
+     until it is reloaded. Reload after calling the scheduler and the interrupt
+     re-fires immediately on return — a livelock that presents as a timer
+     running impossibly fast.
+  5. **Three x86 devices collapse into one.** x86 needs the PIT for a tick, the
+     HPET for a monotonic clock and the TSC for cheap high-resolution time —
+     and `tsc_calibrate()` exists because the TSC's frequency can only be
+     *measured*, so the kernel spends 10 ms at boot timing one clock against
+     another. The ARM generic timer is one device that does all three and
+     `CNTFRQ_EL0` **states** its frequency. `tsc_calibrate()` on this side is a
+     no-op because the measurement is genuinely unnecessary, not unwritten.
+
+  The virtual timer (`CNTV_*`, PPI 11) is used rather than the physical one:
+  under HVF or KVM the hypervisor owns the physical timer and a guest is
+  expected to use the virtual, and `boot.S` already zeroed `CNTVOFF_EL2` so
+  they read alike under TCG. Which PPI that is comes from `/timer`'s
+  `interrupts` property — `virt` lists four (secure physical, non-secure
+  physical, virtual, hypervisor) and picking by index without decoding is a
+  guess.
 * **A4 ❌ The `sysargs` refactor (on x86).** §2.4. **Done when:** x86 boots to the
   desktop with zero `r->rdi` left in a handler, and the 89 handlers no longer live
   under `arch/`.
@@ -379,8 +455,11 @@ during A3–A5, when both sides exist and the seam is visible. See §2.3.
    device tree, so this was never really a free choice). UEFI stays open for
    later, once there is something worth booting properly, and `boot.S`'s EL2
    drop is already there for it.
-2. **GICv2 or GICv3?** v3 is the modern default and what `virt` gives by
-   default; v2 is simpler to write. Lean v3, accept the extra day.
+2. ~~**GICv2 or GICv3?**~~ **Settled at A3: v3** — and the premise was wrong.
+   `virt` gives GICv3 by default only under KVM/HVF; under TCG it still gives a
+   **GICv2**, so `gic-version=3` is passed explicitly on every run target. No
+   v2 fallback exists on purpose: a half-configured controller is worse than
+   none, because interrupts then appear enabled and simply never arrive.
 3. **Where does `sysargs` live** — a new `kernel/include/syscall_abi.h`, or
    inside the existing syscall header once it is hoisted out of `arch/`?
 4. ~~**Does `ARCH` select via directory or via a per-arch fragment `.mk`?**~~

@@ -1556,14 +1556,15 @@ substantially complete.
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
   - **That campaign is underway: `docs/ARM64.md`** (target QEMU `virt`, HVF
-    available and confirmed working). **Phases A0-A2 are done** — `make ARCH=aarch64`
+    available and confirmed working). **Phases A0-A3 are done** — `make ARCH=aarch64`
     boots an aarch64 kernel to a serial console at EL1 with the DTB handed over,
     decodes its own faults (ESR/FAR/ELR down to the fault status code) and
-    recovers from them, and runs in the higher half with the MMU on, its memory
-    map read from the device tree, `kernel/mm/pmm.c` allocating, per-section
-    kernel permissions applied and the identity map dropped. Verified by
-    `make ARCH=aarch64 test-arm64-boot` (fourteen assertions across the three
-    phases). A3 (GICv3 + generic timer) is next. The audit there says the discipline largely held —
+    recovers from them, runs in the higher half with the MMU on with its memory
+    map read from the device tree and `kernel/mm/pmm.c` allocating, and
+    **preemptively switches between kernel threads** on a GICv3-delivered
+    generic-timer interrupt. Verified by `make ARCH=aarch64 test-arm64-boot`
+    (twenty-one assertions across the four phases). A4 (the `sysargs` refactor,
+    which lands on x86) is next. The audit there says the discipline largely held —
     `arch/x86_64/` is 11% of the kernel and port I/O never escaped into core
     logic — with **one** real exception: the 89 syscall handlers in
     `arch/x86_64/syscall/syscall.c` read their arguments through 187 direct
@@ -1606,6 +1607,52 @@ substantially complete.
     - [ ] **`MAX_MMAP` is 32 ranges** in the device-tree producer. Overflow
       warns loudly and drops rather than corrupting, but a NUMA machine could
       plausibly exceed it.
+  - **Known gaps left by A3.** The first one is not debt, it is a scheduled
+    deletion, and it is the most important line in this list:
+    - [ ] **DELETE `kernel/arch/aarch64/sched/bringup.c` AT A5.** It is a
+      round-robin scheduler that exists only to prove the GIC delivers, the
+      timer fires and `kernel_ctx_switch()` switches — because finding out one
+      of those is wrong *while also* bringing up `process.c` is much harder.
+      `kernel/process/process.c` is the scheduler and is going to be the
+      aarch64 scheduler; it cannot compile yet only because of its dependency
+      set (compositor, surfaces, IPC channels and pipes, the ELF and EMBX
+      loaders, the GDT, the LAPIC), which A5/A6 resolve. **Do not add
+      priorities, sleeping or wait queues to `bringup.c`** — that is how a
+      codebase ends up with two schedulers and a quiet disagreement between
+      them.
+    - [ ] **`kernel_ctx_switch()` saves no FP/SIMD state on aarch64.** Correct
+      today: the kernel is built `-mgeneral-regs-only` and FP is still trapped
+      at EL1 (`CPACR_EL1.FPEN = 0`), so a kernel thread has no FP state. A5
+      opens CPACR for EL0 and must add the V-register half — and must do it in
+      the same commit, because a user thread whose FP registers are not saved
+      corrupts silently and intermittently. The x86 signature takes two extra
+      FXSAVE pointers; the aarch64 one deliberately does not, rather than
+      accepting arguments it ignores.
+    - [ ] **`kernel/arch/x86_64/irq/irq.h` cannot describe a GIC.** It is
+      shaped for the 8259: `irq_register(uint8_t irq, ...)` with a 16-line
+      table. The GIC has 1020 INTIDs and needs the handler to know which line
+      fired. aarch64 therefore uses its own `gic_register()` rather than
+      forcing itself into that interface. Widen the shared one when the IRQ
+      seam is factored (A5+), the same way `arch_pmm_reserve_fixed()` was
+      factored — do not widen it speculatively now.
+    - [ ] **`drivers/timer/timer.h` names its high-resolution clock `tsc_*`.**
+      x86 nomenclature in a shared header. aarch64 implements it faithfully
+      (`tsc_read()` reads `CNTVCT_EL0`, `tsc_calibrate()` is a genuine no-op
+      because `CNTFRQ_EL0` states the frequency). Rename to something neutral
+      when the timer seam is factored.
+    - [ ] **Every interrupt runs at one GIC priority, so none can nest.**
+      Deliberate: nesting needs a stack per priority level and there is exactly
+      one IRQ stack. Revisit only if something genuinely needs a
+      higher-priority line, and add the stacks in the same change.
+    - [ ] **No SGIs / inter-processor interrupts.** The GICv3 driver configures
+      SGI 0-15 but nothing sends them. A9, with PSCI CPU_ON.
+    - [ ] **GICv2 is not supported**, and `-M virt` under TCG still defaults to
+      it — the run targets pass `gic-version=3` explicitly. `gic_init()`
+      detects a v2 and says so rather than failing obscurely. Adding a v2
+      driver is only worth it for a specific board that needs it.
+    - [ ] **`find_redistributor()` assumes a 0x20000 redistributor stride.**
+      Correct for GICv3; GICv4 adds VLPI frames and makes it 0x40000. The
+      `GICR_TYPER.VLPIS` bit says which, and nothing reads it yet.
 - [x] ~~**embbuild** — the native build tool (the make-equivalent)~~ —
   **BUILT AND SHIPPED**, not merely designed. `shell/tools/embbuild.c`; proven
   by `test embbuild` (cases a–f including the §3 `/system` install refusal),

@@ -90,6 +90,20 @@ void fdt_reg_cells(fdt_node_t node, uint32_t *addr_cells, uint32_t *size_cells);
  * when the index is past the end. */
 bool fdt_reg(fdt_node_t node, uint32_t index, uint64_t *addr, uint64_t *size);
 
+/* One entry of an `interrupts` property, decoded against the interrupt
+ * controller's `#interrupt-cells`. For the ARM GIC that is three cells:
+ *
+ *   type  0 = SPI (shared, from a device), 1 = PPI (per-CPU, e.g. the timer)
+ *   num   the number WITHIN that space, not the INTID -- see gic_intid()
+ *   flags edge/level and polarity
+ *
+ * Reading this rather than hardcoding is the difference between a timer that
+ * works and one that is silently wired to the wrong line: the four entries in
+ * `virt`'s /timer node are secure-physical, non-secure-physical, virtual and
+ * hypervisor, in that order, and picking by index without decoding is a guess. */
+bool fdt_interrupt(fdt_node_t node, uint32_t index,
+                   uint32_t *type, uint32_t *num, uint32_t *flags);
+
 /* --- the memory reservation block ------------------------------------------
  * A list, separate from the tree, of physical ranges firmware says must not be
  * touched. Entry `index`; returns false past the end. */

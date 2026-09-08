@@ -2,6 +2,7 @@
 #define _AARCH64_EXCEPTION_H
 
 #include <stdint.h>
+#include "include/types.h"   /* bool -- the kernel's own, not <stdbool.h> */
 
 /* aarch64 exception handling -- docs/ARM64.md phase A1.
  *
@@ -47,6 +48,16 @@ enum {
  * jump to whatever VBAR happens to hold -- which on a cold `virt` is 0, and
  * looks exactly like a hang. Call it early. */
 void exception_init(void);
+
+/* PSTATE.I -- the master interrupt enable for this CPU. Nothing arrives until
+ * arch_irq_enable() is called, no matter what the controller thinks, so the
+ * order at boot is: vectors, then controller, then this. */
+static inline void arch_irq_enable(void)  { __asm__ volatile("msr daifclr, #2" ::: "memory"); }
+static inline void arch_irq_disable(void) { __asm__ volatile("msr daifset, #2" ::: "memory"); }
+static inline bool arch_irq_enabled(void) {
+    uint64_t d; __asm__ volatile("mrs %0, daif" : "=r"(d));
+    return (d & (1UL << 7)) == 0;
+}
 
 /* Run `fn` with faults made RECOVERABLE: a synchronous exception inside it
  * advances past the offending instruction and carries on, instead of panicking.

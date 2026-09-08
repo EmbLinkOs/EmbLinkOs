@@ -3,6 +3,9 @@
 #include "arch/aarch64/irq/exception.h"
 #include "arch/aarch64/boot/fdt.h"
 #include "arch/aarch64/mm/pagetable.h"
+#include "arch/aarch64/irq/gicv3.h"
+#include "arch/aarch64/sched/bringup.h"
+#include "drivers/timer/timer.h"
 #include "boot/boot_protocol.h"
 #include "mm/pmm.h"
 #include "include/kprintf.h"
@@ -144,6 +147,93 @@ static void selftest_pmm(void) {
     pmm_free_page(b);
 }
 
+/* --- A3 self-test: is preemption real? ------------------------------------
+ *
+ * Two threads that do nothing but spin. The claim being tested is not that
+ * they compute anything -- it is that a timer interrupt takes the CPU away
+ * from one and gives it to another WITHOUT either of them cooperating, and
+ * then gives it back. Only the scheduler's slice counts can show that, which
+ * is why they are counted rather than inferred from output appearing. */
+
+static void worker(void *arg) {
+    int id = (int)(uintptr_t)arg;
+    uint64_t seen = 0;
+    volatile uint64_t spins = 0;
+
+    for (;;) {
+        spins++;
+
+        /* Print on the SLICE boundary, not every N iterations. The interesting
+         * event is "I was taken off the CPU and given it back", and how many
+         * times a spin loop went round between those is a fact about TCG's
+         * speed, not about the scheduler. */
+        uint64_t sl = bringup_thread_slices(id);
+        if (sl != seen) {
+            seen = sl;
+            kprintf("  worker %d resumed: slice %d, uptime %d ms, %d spins\n",
+                    id, (int)sl, (int)timer_uptime_ms(), (int)spins);
+        }
+
+        /* One of the two returns, so the "a thread finished" path is exercised
+         * rather than assumed. */
+        if (id == 2 && sl >= 4) {
+            kprintf("  worker %d finishing after %d slices\n", id, (int)sl);
+            return;
+        }
+    }
+}
+
+static void selftest_preemption(void) {
+    uint64_t start = timer_get_ticks();
+    uint64_t ms0   = timer_uptime_ms();
+
+    /* Wait 40 ticks = 400 ms of guest time. wfi rather than a spin so the two
+     * workers get the CPU; if preemption were broken this loop would simply
+     * never finish, which is itself the clearest possible failure. */
+    while (timer_get_ticks() - start < 40)
+        __asm__ volatile("wfi");
+
+    uint64_t ms1 = timer_uptime_ms();
+    bringup_sched_stop();
+
+    kprintf("\n--- self-test: preemption ---\n");
+
+    uint64_t t = timer_get_ticks();
+    kprintf("  [%s] timer fired: %d ticks in %d ms\n",
+            t >= 40 ? " ok " : "FAIL", (int)t, (int)(ms1 - ms0));
+    if (t < 40) selftest_fails++;
+
+    /* The counter and the interrupt are independent sources of time; if they
+     * disagree, one of them is wrong. 40 ticks at 100 Hz is 400 ms, and TCG
+     * makes the wall clock elastic, so this is a sanity band and not a
+     * precision claim. */
+    uint64_t elapsed = ms1 - ms0;
+    bool sane = elapsed >= 300 && elapsed <= 900;
+    kprintf("  [%s] CNTVCT and the tick count agree (%d ms for %d ticks)\n",
+            sane ? " ok " : "FAIL", (int)elapsed, (int)(t - start));
+    if (!sane) selftest_fails++;
+
+    for (int id = 1; id <= 2; id++) {
+        uint64_t sl = bringup_thread_slices(id);
+        kprintf("  [%s] worker %d was scheduled %d times\n",
+                sl > 0 ? " ok " : "FAIL", id, (int)sl);
+        if (!sl) selftest_fails++;
+    }
+
+    /* The one that is easy to miss: getting back. A scheduler that switches
+     * away and never returns looks fine from the worker's side and has lost
+     * the boot thread forever. */
+    uint64_t boot_slices = bringup_thread_slices(0);
+    kprintf("  [%s] boot thread was scheduled back %d times\n",
+            boot_slices > 0 ? " ok " : "FAIL", (int)boot_slices);
+    if (!boot_slices) selftest_fails++;
+
+    bringup_sched_dump();
+    gic_dump();
+
+    kprintf("\n--- self-test done: %d failure(s) total ---\n", (int)selftest_fails);
+}
+
 void arch_early_main(uint64_t dtb_phys);
 
 void arch_early_main(uint64_t dtb_phys) {
@@ -153,7 +243,7 @@ void arch_early_main(uint64_t dtb_phys) {
     pl011_init();
     pl011_use_mmio_window(MMIO_BASE + PL011_PHYS);
 
-    kprintf("\nEmbLinkOS aarch64 -- phase A2 (MMU, higher half, device tree)\n");
+    kprintf("\nEmbLinkOS aarch64 -- phase A3 (GICv3, generic timer, preemption)\n");
     kprintf("  see docs/ARM64.md\n\n");
 
     kprintf("  CurrentEL   : EL%d\n",   (int)read_sysreg_currentel());
@@ -201,7 +291,27 @@ void arch_early_main(uint64_t dtb_phys) {
     kprintf("\n--- self-test done: %d failure(s) ---\n", (int)selftest_fails);
     pmm_print_stats();
 
-    kprintf("\nA2 reached. Parking (no interrupt controller until A3).\n");
+    /* --- A3: interrupts and preemption ------------------------------------ */
+    kprintf("\n");
+    if (gic_init() != 0) {
+        kprintf("gic: FATAL no interrupt controller\n");
+        for (;;) __asm__ volatile("wfi");
+    }
+
+    bringup_sched_init();
+    timer_init();
+
+    bringup_thread_create("worker-A", worker, (void *)(uintptr_t)1);
+    bringup_thread_create("worker-B", worker, (void *)(uintptr_t)2);
+
+    /* Only now. The controller is configured and the timer is armed, so the
+     * first thing PSTATE.I unmasking can produce is a tick we are ready for. */
+    arch_irq_enable();
+    kprintf("sched: interrupts enabled -- preemption starts here\n\n");
+
+    selftest_preemption();
+
+    kprintf("\nA3 reached. Parking (no user mode until A5).\n");
 
     for (;;)
         __asm__ volatile("wfi");

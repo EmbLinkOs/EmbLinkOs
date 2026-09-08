@@ -20,12 +20,16 @@ ARM_IMG     := $(ARM_BUILD)/kernel.img
 ARM_LINKER  := kernel/arch/aarch64/boot/linker.ld
 
 ARM_ASM_SRC := kernel/arch/aarch64/boot/boot.S \
-               kernel/arch/aarch64/irq/vectors.S
+               kernel/arch/aarch64/irq/vectors.S \
+               kernel/arch/aarch64/cpu/kcontext.S
 # The aarch64-specific sources...
 ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/boot/fdt.c \
                kernel/arch/aarch64/boot/boot_protocol_dtb.c \
                kernel/arch/aarch64/irq/exception.c \
+               kernel/arch/aarch64/irq/gicv3.c \
+               kernel/arch/aarch64/sched/bringup.c \
+               kernel/arch/aarch64/drivers/timer_generic.c \
                kernel/arch/aarch64/cpu/spinlock.c \
                kernel/arch/aarch64/mm/pagetable.c \
                kernel/arch/aarch64/mm/pmm_arch.c \
@@ -121,7 +125,13 @@ arm64: $(ARM_ELF) $(ARM_IMG)
 # where "it hangs" needs to become "it took a data abort at this address."
 # HVF gives you neither. Once there is a desktop to be slow at, `run-arm64-hvf`
 # is the target that makes this machine fast.
-ARM_MACHINE ?= virt
+# gic-version=3 is NOT redundant. docs/ARM64.md §6.2 said "v3 is what `virt`
+# gives by default" -- that is true under KVM/HVF and FALSE under TCG, where
+# QEMU still defaults to GICv2 and the kernel finds no arm,gic-v3 node at all.
+# Asking for it explicitly is also more honest: the machine we target is a
+# GICv3 machine, and that should be visible in the command line rather than
+# inherited from an accelerator's default.
+ARM_MACHINE ?= virt,gic-version=3
 ARM_CPU     ?= cortex-a72
 ARM_MEM     ?= 512M
 
@@ -163,7 +173,7 @@ test-arm64-boot: $(ARM_IMG)
 	@log=$(ARM_BUILD)/boot.log; rm -f $$log; \
 	qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU) -m $(ARM_MEM) \
 	    -display none -serial file:$$log -kernel $(ARM_IMG) & \
-	qpid=$$!; sleep 5; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
+	qpid=$$!; sleep 12; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
 	echo "--- serial ---"; cat $$log; echo "--- end ---"; \
 	fail=0; \
 	chk() { grep -q "$$1" $$log || { echo "FAIL($$2): $$3"; fail=1; }; }; \
@@ -179,7 +189,13 @@ test-arm64-boot: $(ARM_IMG)
 	chk 'permission fault, on a WRITE'   A2 '.rodata is still writable -- section permissions are not real'; \
 	chk 'wrote and read back via the direct map' A2 'the physical allocator or the direct map is broken'; \
 	chk 'self-test done: 0 failure'      A2 'a self-test case failed'; \
-	chk 'A2 reached'                     A2 'did not reach the end of arch_early_main'; \
+	chk 'gic: initialised (GICv3' A3 'the interrupt controller did not come up'; \
+	chk 'generic timer'                  A3 'the timer never registered an interrupt line'; \
+	chk '100 Hz tick'                    A3 'the generic timer was not programmed'; \
+	chk 'worker 1 was scheduled'         A3 'no preemption report'; \
+	chk 'boot thread was scheduled back' A3 'the scheduler never returned to the boot thread'; \
+	chk 'spurious: 0'                    A3 'the GIC delivered spurious interrupts'; \
+	chk 'A3 reached'                     A3 'did not reach the end of arch_early_main'; \
 	n=$$(grep -c 'matches KV2P' $$log); \
 	  [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
 	if grep -q 'MISMATCH' $$log; then echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
@@ -188,6 +204,7 @@ test-arm64-boot: $(ARM_IMG)
 	  echo "PASS: A0 (banner, EL1, DTB handoff)"; \
 	  echo "      A1 (vectors, ESR/FAR decode, recovery)"; \
 	  echo "      A2 (higher half, DTB memory map, pmm, section permissions, no identity map)"; \
+	  echo "      A3 (GICv3, generic timer, preemptive context switching)"; \
 	else exit 1; fi
 
 .PHONY: check-tools-arm64

@@ -397,6 +397,39 @@ bool fdt_reg(fdt_node_t node, uint32_t index, uint64_t *addr, uint64_t *size) {
     return true;
 }
 
+bool fdt_interrupt(fdt_node_t node, uint32_t index,
+                   uint32_t *type, uint32_t *num, uint32_t *flags) {
+    uint32_t len = 0;
+    const uint8_t *p = (const uint8_t *)fdt_prop(node, "interrupts", &len);
+    if (!p)
+        return false;
+
+    /* #interrupt-cells belongs to the interrupt CONTROLLER, not to this node.
+     * Everything on `virt` hangs off the one GIC, so ask it directly rather
+     * than following interrupt-parent phandles -- a phandle resolver is a
+     * device-tree framework, which docs/ARM64.md §5 rules out. If no GIC is
+     * found, 3 is the ARM binding's value and the only one that could apply. */
+    uint32_t cells = 3;
+    fdt_node_t gic = fdt_find_compatible("arm,gic-v3");
+    if (gic == FDT_NONE)
+        gic = fdt_find_compatible("arm,cortex-a15-gic");   /* GICv2 */
+    if (gic != FDT_NONE)
+        cells = fdt_prop_u32(gic, "#interrupt-cells", 3);
+
+    if (cells < 2 || cells > 4)
+        return false;
+
+    uint32_t stride = cells * 4;
+    if ((uint64_t)(index + 1) * stride > len)
+        return false;
+
+    const uint8_t *e = p + (uint64_t)index * stride;
+    if (type)  *type  = be32_at(e);
+    if (num)   *num   = be32_at(e + 4);
+    if (flags) *flags = cells >= 3 ? be32_at(e + 8) : 0;
+    return true;
+}
+
 bool fdt_mem_rsv(uint32_t index, uint64_t *addr, uint64_t *size) {
     if (!blob)
         return false;
