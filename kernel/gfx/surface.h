@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 #include "include/types.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "ipc/handle.h"   /* the shared obj_handle table (enum handle_kind,
                            * struct obj_handle, OBJ_HANDLE_MAX,
                            * USER_SHARED_VA_BASE, obj_handle_* API) */

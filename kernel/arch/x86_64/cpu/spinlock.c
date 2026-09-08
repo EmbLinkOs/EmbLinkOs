@@ -1,4 +1,4 @@
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 
 
 void spinlock_init(spinlock_t *lock) {

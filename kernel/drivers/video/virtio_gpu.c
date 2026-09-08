@@ -17,7 +17,7 @@
 #include "include/kstring.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 
 // ---- virtio PCI capability layout ------------------------------------------
 #define VIRTIO_PCI_CAP_COMMON_CFG  1

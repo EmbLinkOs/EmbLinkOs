@@ -1,192 +1,207 @@
 #include <stdint.h>
 #include "arch/aarch64/drivers/pl011.h"
 #include "arch/aarch64/irq/exception.h"
+#include "arch/aarch64/boot/fdt.h"
+#include "arch/aarch64/mm/pagetable.h"
+#include "boot/boot_protocol.h"
+#include "mm/pmm.h"
+#include "include/kprintf.h"
 
-/* Early aarch64 bring-up entry -- docs/ARM64.md phase A0.
+/* Early aarch64 bring-up entry -- docs/ARM64.md phases A0-A2.
  *
  * This file is TEMPORARY BY DESIGN. It exists because kernel/main.c cannot run
- * yet: it wants a GDT, an IDT, a PIC and an APIC on its first page. As A1-A3
- * land exceptions, the MMU and the GIC, the work here migrates into the shared
- * kernel/main.c behind the arch_* seam and this file shrinks to nothing. Do not
- * grow it into a second kernel entry point.
+ * yet: it wants a GDT, an IDT, a PIC and an APIC on its first page. As the
+ * remaining phases land the GIC, the timer and user mode, the work here
+ * migrates into the shared kernel/main.c behind the arch_* seam and this file
+ * shrinks to nothing. Do not grow it into a second kernel entry point.
  *
- * Called from boot.S with x0 = the device tree pointer QEMU planted. */
+ * Called from boot.S AFTER the MMU is on and the kernel has jumped to the
+ * higher half, with x0 = the PHYSICAL device tree address QEMU planted. */
 
-/* Flat device tree header, the only two fields A0 needs. Both are big-endian
- * on every platform -- that is the format, not the machine -- so they are
- * byte-swapped rather than cast. (docs/ARM64.md §5: little-endian only. This
- * is not a counter-example; DTB is a wire format.) */
-#define FDT_MAGIC 0xd00dfeedu
+#define PL011_PHYS 0x09000000UL
 
-static uint32_t be32(const void *p) {
-    const unsigned char *b = (const unsigned char *)p;
-    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
-           ((uint32_t)b[2] << 8)  |  (uint32_t)b[3];
+static uint64_t read_sysreg_currentel(void) {
+    uint64_t v; __asm__ volatile("mrs %0, CurrentEL" : "=r"(v)); return v >> 2;
 }
-
-static uint64_t read_currentel(void) {
-    uint64_t v;
-    __asm__ volatile("mrs %0, CurrentEL" : "=r"(v));
-    return v >> 2;
+static uint64_t read_sysreg_midr(void) {
+    uint64_t v; __asm__ volatile("mrs %0, midr_el1" : "=r"(v)); return v;
 }
-
-static uint64_t read_midr(void) {
-    uint64_t v;
-    __asm__ volatile("mrs %0, midr_el1" : "=r"(v));
-    return v;
+static uint64_t read_sysreg_sctlr(void) {
+    uint64_t v; __asm__ volatile("mrs %0, sctlr_el1" : "=r"(v)); return v;
 }
-
-static uint64_t read_sctlr(void) {
-    uint64_t v;
-    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(v));
-    return v;
-}
-
-/* Counter frequency, in Hz, as firmware programmed it. A3 builds the tick on
- * this; printing it now is a free check that boot.S's CNTHCTL_EL2 handling
- * left EL1 able to read the timer registers at all. */
-static uint64_t read_cntfrq(void) {
-    uint64_t v;
-    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
-    return v;
+static uint64_t read_sysreg_cntfrq(void) {
+    uint64_t v; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v;
 }
 
 extern char kernel_end[];
 
-/* --- A1 self-test ----------------------------------------------------------
+/* --- self-test -------------------------------------------------------------
  *
  * A fault handler that has never fired is a fault handler that does not work,
- * and "it booted" is not evidence about code that only runs when something
- * goes wrong. So A1 deliberately breaks things, three ways, and recovers.
+ * and "it booted" is no evidence about code that only runs when something goes
+ * wrong. So the kernel deliberately breaks itself on the way up and recovers.
  *
  * exception_probe() makes synchronous faults recoverable for the duration of
- * one function (see exception.h). That mechanism is not built for this test --
- * A2 needs exactly it to ask "is there memory at this address?" while walking
- * the device tree -- but the test is what proves it before A2 depends on it. */
+ * one call (see exception.h). It was not built for this test -- it is the
+ * shape a memory prober needs -- but the test is what proves it. */
+
+static unsigned selftest_fails;
 
 /* A software breakpoint. ELR points AT the brk, so the handler's +4 lands on
- * the next instruction. EC should decode as 0x3C. */
+ * the next instruction. EC decodes as 0x3C. */
 static void fault_brk(void) {
     __asm__ volatile("brk #0");
 }
 
-/* An unaligned 64-bit load. This faults for a reason specific to where we are
- * in the campaign: with the MMU OFF, the architecture treats every access as
- * Device-nGnRnE memory, and unaligned Device accesses are not permitted. So
- * this is a guaranteed data abort with a FAR, at A1, without a single page
- * table existing yet -- which is exactly what is needed to prove FAR/FSC
- * decoding before A2 starts producing translation faults for real.
+/* An unaligned 64-bit load from the UART's MMIO window.
  *
- * (It will STOP faulting at A2, once this range is mapped Normal memory. That
- * is not a regression; it is the test noticing that the MMU turned on.) */
+ * At A1 this test used ordinary RAM, because with the MMU off the architecture
+ * treats every access as Device memory and unaligned Device accesses are
+ * illegal. A2 turned the MMU on and mapped RAM as Normal, where unaligned is
+ * perfectly legal -- so the old test stopped faulting, exactly as predicted.
+ * Aiming it at a genuinely Device-mapped address restores the guarantee and,
+ * better, now tests the thing that is actually true: the MMIO window really is
+ * Device-nGnRnE and not accidentally Normal. */
 static void fault_unaligned(void) {
-    volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)0x40200003UL;
+    volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)(MMIO_BASE + PL011_PHYS + 0x19);
     volatile uint64_t sink;
     sink = *p;
     (void)sink;
 }
 
-/* A read from a physical address `virt` has nothing behind it. Informational
- * only: QEMU may either raise an external abort or quietly return zero, and
- * which one it does is worth KNOWING before A2 writes a memory prober that
- * assumes an answer. */
-static void fault_unassigned(void) {
-    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)0x0E000000UL;
+/* A read from a low address, after the identity map has been dropped. TTBR0 is
+ * now completely empty, so this is a level-0 translation fault -- and it is
+ * also what a null pointer dereference does from here on, which is the point:
+ * before A2 dropped the identity map, *(int *)0x40200000 read real memory. */
+static void fault_unmapped(void) {
+    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)0x40200000UL;
     volatile uint32_t sink;
     sink = *p;
     (void)sink;
 }
 
-static void report(const char *what, unsigned n, unsigned expect) {
-    pl011_puts(n == expect ? "  [ ok ] " : "  [FAIL] ");
-    pl011_puts(what);
-    pl011_puts("  (");
-    pl011_putdec(n);
-    pl011_puts(" caught, expected ");
-    pl011_putdec(expect);
-    pl011_puts(")\n");
+/* A write to .rodata. This can only fault because vm_protect_kernel_sections()
+ * ran: until then the whole kernel lived in one RWX 1 GiB block. It is the
+ * single most direct evidence that the permissions are real. */
+extern char __rodata_start[];
+static void fault_rodata_write(void) {
+    volatile char *p = (volatile char *)__rodata_start;
+    *p = 0x55;
 }
 
-static void a1_selftest(void) {
-    unsigned n;
+static void expect(const char *what, unsigned got, unsigned want) {
+    if (got != want)
+        selftest_fails++;
+    kprintf("  [%s] %s  (%d caught, expected %d)\n",
+            got == want ? " ok " : "FAIL", what, (int)got, (int)want);
+}
 
-    pl011_puts("\n--- A1 self-test: deliberately faulting ---\n");
+static void selftest_faults(void) {
+    kprintf("\n--- self-test: deliberately faulting ---\n");
+    expect("brk #0 -> breakpoint, recovered",
+           exception_probe(fault_brk, 1), 1);
+    expect("unaligned load on Device memory -> alignment fault",
+           exception_probe(fault_unaligned, 1), 1);
+    expect("read of unmapped low VA -> translation fault",
+           exception_probe(fault_unmapped, 1), 1);
+    expect("write to .rodata -> permission fault",
+           exception_probe(fault_rodata_write, 1), 1);
+}
 
-    n = exception_probe(fault_brk, 1);
-    report("brk #0 -> breakpoint, recovered", n, 1);
+/* Does the allocator the device tree just fed actually work? Allocating,
+ * writing through the direct map, reading back and freeing exercises the DTB
+ * memory map, pmm's bitmap, and the direct-map mapping in one go -- any of
+ * which being wrong would otherwise show up much later as corruption. */
+static void selftest_pmm(void) {
+    kprintf("\n--- self-test: physical allocator ---\n");
 
-    n = exception_probe(fault_unaligned, 1);
-    report("unaligned load -> data abort with FAR, recovered", n, 1);
+    uint64_t a = pmm_alloc_page();
+    uint64_t b = pmm_alloc_page();
 
-    /* Quiet, and not asserted: this one is a question, not a claim. */
-    n = exception_probe(fault_unassigned, 0);
-    pl011_puts("  [info] read of unassigned physical 0x0E000000: ");
-    if (n) {
-        pl011_puts("aborted (QEMU raises an external abort)\n");
-    } else {
-        pl011_puts("NO fault -- QEMU returns 0 for unassigned reads.\n");
-        pl011_puts("         A2 cannot probe for RAM by reading; use the DTB memory node.\n");
+    if (!a || !b || a == b) {
+        kprintf("  [FAIL] pmm_alloc_page returned %p / %p\n",
+                (void *)(uintptr_t)a, (void *)(uintptr_t)b);
+        selftest_fails++;
+        return;
     }
 
-    pl011_puts("--- self-test done, kernel still running ---\n");
+    volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)P2V(a);
+    *p = 0xA2A2A2A2A2A2A2A2ULL;
+
+    if (*p != 0xA2A2A2A2A2A2A2A2ULL) {
+        kprintf("  [FAIL] direct-map readback of %p wrong\n", (void *)(uintptr_t)a);
+        selftest_fails++;
+    } else if (vm_translate(P2V(a)) != a) {
+        kprintf("  [FAIL] direct map does not translate %p back to %p\n",
+                (void *)(uintptr_t)P2V(a), (void *)(uintptr_t)a);
+        selftest_fails++;
+    } else {
+        kprintf("  [ ok ] allocated %p and %p, wrote and read back via the direct map\n",
+                (void *)(uintptr_t)a, (void *)(uintptr_t)b);
+    }
+
+    pmm_free_page(a);
+    pmm_free_page(b);
 }
 
-void arch_early_main(uint64_t dtb);
+void arch_early_main(uint64_t dtb_phys);
 
-void arch_early_main(uint64_t dtb) {
+void arch_early_main(uint64_t dtb_phys) {
+    /* The UART still answers at its physical address -- TTBR0's identity map is
+     * alive -- but that map is about to go away, so move to the MMIO window
+     * before printing anything we would miss. */
     pl011_init();
+    pl011_use_mmio_window(MMIO_BASE + PL011_PHYS);
 
-    pl011_puts("\n");
-    pl011_puts("EmbLinkOS aarch64 -- phase A1 (console + exception vectors)\n");
-    pl011_puts("  see docs/ARM64.md\n\n");
+    kprintf("\nEmbLinkOS aarch64 -- phase A2 (MMU, higher half, device tree)\n");
+    kprintf("  see docs/ARM64.md\n\n");
 
-    pl011_puts("  CurrentEL   : EL");
-    pl011_putdec(read_currentel());
-    pl011_puts("\n");
+    kprintf("  CurrentEL   : EL%d\n",   (int)read_sysreg_currentel());
+    kprintf("  MIDR_EL1    : %p\n",     (void *)(uintptr_t)read_sysreg_midr());
+    kprintf("  SCTLR_EL1   : %p   (M=1 => MMU ON)\n",
+            (void *)(uintptr_t)read_sysreg_sctlr());
+    kprintf("  CNTFRQ_EL0  : %d Hz\n",  (int)read_sysreg_cntfrq());
 
-    pl011_puts("  MIDR_EL1    : ");
-    pl011_puthex64(read_midr());
-    pl011_puts("\n");
+    /* The A2 claim, stated as an address rather than an assertion: this code's
+     * own location. Anything below 0xFFFF... means the jump to the higher half
+     * did not happen and everything after it is a coincidence. */
+    kprintf("  running at  : %p  (higher half: %s)\n",
+            (void *)(uintptr_t)&arch_early_main,
+            ((uint64_t)(uintptr_t)&arch_early_main >= KERNEL_VIRTUAL_BASE)
+                ? "YES" : "NO -- A2 FAILED");
+    kprintf("  kernel_end  : %p -> phys %p\n",
+            (void *)kernel_end, (void *)(uintptr_t)KV2P((uint64_t)(uintptr_t)kernel_end));
+    kprintf("  DTB (x0)    : %p\n", (void *)(uintptr_t)dtb_phys);
 
-    pl011_puts("  SCTLR_EL1   : ");
-    pl011_puthex64(read_sctlr());
-    pl011_puts("   (M=0 => MMU off, as A0 intends)\n");
-
-    pl011_puts("  CNTFRQ_EL0  : ");
-    pl011_putdec(read_cntfrq());
-    pl011_puts(" Hz\n");
-
-    pl011_puts("  kernel_end  : ");
-    pl011_puthex64((uint64_t)(uintptr_t)kernel_end);
-    pl011_puts("\n");
-
-    /* The DTB check is the real content of A0. A banner only proves the UART
-     * works; this proves the FIRMWARE HANDOFF works -- that x0 survived the
-     * EL2 drop, the bss zeroing and the stack switch. A2 reads the memory map
-     * from this same pointer, and diagnosing a bad x0 there, after the MMU is
-     * on, is enormously harder than diagnosing it here. */
-    pl011_puts("  DTB (x0)    : ");
-    pl011_puthex64(dtb);
-    if (dtb && be32((const void *)(uintptr_t)dtb) == FDT_MAGIC) {
-        pl011_puts("   magic ok, ");
-        pl011_putdec(be32((const void *)(uintptr_t)(dtb + 4)));
-        pl011_puts(" bytes\n");
-    } else {
-        pl011_puts("   NO FDT MAGIC -- firmware handoff is wrong\n");
-    }
-
-    /* --- A1: exception vectors ---------------------------------------------
-     *
-     * Installed here, as early as there is a console to report through,
-     * because until VBAR_EL1 is set ANY fault jumps to whatever it happens to
-     * hold -- zero on a cold `virt` -- and the symptom is an unexplained hang
-     * with no output. Everything after this point fails LOUDLY. */
     exception_init();
-    pl011_puts("\n  VBAR_EL1 installed -- faults are now decoded, not fatal silence.\n");
+    kprintf("  VBAR_EL1 installed -- faults are decoded, not fatal silence.\n\n");
 
-    a1_selftest();
+    /* Firmware handoff -> memory map -> allocator. Each step is useless
+     * without the one before it, and each is fatal on its own if it fails,
+     * which is why none of them has a fallback path. */
+    boot_protocol_capture(dtb_phys);
+    boot_protocol_dump();
+    pmm_init();
 
-    pl011_puts("\nA1 reached. Parking (no scheduler until A3).\n");
+    /* Take the boot tables over and make them describe reality: per-section
+     * permissions instead of one RWX gigabyte, and no identity map. */
+    kprintf("\n");
+    vm_init();
+    if (vm_protect_kernel_sections() != PT_OK) {
+        kprintf("vm: FATAL could not apply kernel section permissions\n");
+        for (;;) __asm__ volatile("wfi");
+    }
+    vm_drop_identity_map();
+    kprintf("vm: identity map dropped -- low addresses now fault\n");
+    vm_dump_kernel_mapping();
+
+    selftest_pmm();
+    selftest_faults();
+
+    kprintf("\n--- self-test done: %d failure(s) ---\n", (int)selftest_fails);
+    pmm_print_stats();
+
+    kprintf("\nA2 reached. Parking (no interrupt controller until A3).\n");
 
     for (;;)
         __asm__ volatile("wfi");

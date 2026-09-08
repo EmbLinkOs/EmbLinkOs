@@ -1,4 +1,5 @@
 #include "drivers/video/console.h"
+#include "include/kprintf.h"   /* kprintf_set_secondary() */
 #include "drivers/video/framebuffer.h"
 #include "drivers/video/font_8x16.h"
 #include "drivers/char/serial.h"
@@ -38,6 +39,11 @@ void console_init(void) {
     fb_clear(bg_r, bg_g, bg_b);
     fb_present();
     g_console_ready = true;
+
+    /* Take over kernel log output from the serial port. Registered rather than
+     * called from kprintf, so kprintf keeps no link dependency on the graphics
+     * stack -- see kprintf_set_secondary(). */
+    kprintf_set_secondary(console_is_ready, console_putchar);
 }
 
 bool console_is_ready(void)

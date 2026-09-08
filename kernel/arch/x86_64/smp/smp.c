@@ -176,3 +176,14 @@ void smp_bringup(void) {
 
     kprintf("=== SMP bring-up done ===\n");
 }
+
+
+/* pmm.h's arch hook. The AP trampoline is already covered incidentally by
+ * pmm_init()'s blanket reservation of everything below kernel_end (which is
+ * always above 1 MB), but that is an accident of where that loop starts, not a
+ * deliberate low-memory carve-out. Reserving it explicitly means it stays
+ * reserved if that ever changes. */
+void arch_pmm_reserve_fixed(void)
+{
+    pmm_reserve_page(AP_TRAMPOLINE_PHYS);
+}

@@ -1,4 +1,5 @@
 #include "arch/aarch64/drivers/pl011.h"
+#include "drivers/char/serial.h"
 
 /* PL011 on QEMU `-M virt`. Hardcoded, and honestly so: `virt`'s memory map is
  * a documented, stable contract (hw/arm/virt.c, VIRT_UART), and docs/ARM64.md
@@ -6,7 +7,19 @@
  * -- we read the few nodes we need and hardcode the rest of one board.
  *
  * Register offsets: ARM PrimeCell UART (PL011) Technical Reference Manual. */
-#define PL011_BASE      0x09000000UL
+#define PL011_PHYS      0x09000000UL
+
+/* Where the UART is REACHED from, which is not the same as where it is.
+ *
+ * Before the MMU there is only the physical address. After it, the physical
+ * address happens to still work -- TTBR0 holds an identity map -- but only
+ * until A5 gives TTBR0 to user space, at which point every device access in
+ * the kernel would fault at once. So the base is switched to the MMIO window
+ * (kernel/mm/pmm.h's MMIO_BASE) as soon as there is one, and the identity map
+ * is never depended on for anything that has to outlive it.
+ *
+ * volatile, and written exactly once from pl011_use_mmio_window(). */
+static volatile unsigned long pl011_base = PL011_PHYS;
 
 #define UARTDR          0x00    /* data */
 #define UARTFR          0x18    /* flag */
@@ -31,10 +44,14 @@
 /* volatile, and via a function, so the compiler cannot reorder or elide device
  * accesses the way it may for ordinary memory. */
 static inline void mmio_w32(unsigned long off, uint32_t v) {
-    *(volatile uint32_t *)(PL011_BASE + off) = v;
+    *(volatile uint32_t *)(pl011_base + off) = v;
 }
 static inline uint32_t mmio_r32(unsigned long off) {
-    return *(volatile uint32_t *)(PL011_BASE + off);
+    return *(volatile uint32_t *)(pl011_base + off);
+}
+
+void pl011_use_mmio_window(unsigned long base) {
+    pl011_base = base;
 }
 
 void pl011_init(void) {
@@ -113,3 +130,19 @@ char pl011_getc(void) {
         ;
     return (char)(mmio_r32(UARTDR) & 0xff);
 }
+
+/* --- kernel/drivers/char/serial.h ------------------------------------------
+ *
+ * The 16550 on x86 and the PL011 here implement the SAME header, which is what
+ * makes kernel/lib/kprintf.c and kernel/mm/pmm.c compile unchanged for both.
+ * That header was written for a specific UART and turned out to describe a
+ * console; adopting it rather than inventing a new interface is docs/ARM64.md
+ * §2.3 in miniature -- the seam was already there, it just had one
+ * implementation. */
+
+void serial_init(void)               { pl011_init(); }
+void serial_write_char(char c)       { pl011_putc(c); }
+void serial_write_string(const char *s) { pl011_puts(s); }
+void serial_write_hex(uint64_t v)    { pl011_puthex64(v); }
+int  serial_has_char(void)           { return pl011_has_char(); }
+char serial_read_char(void)          { return pl011_getc(); }

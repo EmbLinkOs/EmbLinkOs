@@ -3,7 +3,7 @@
 #include "gfx/compositor.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/input/mouse.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "process/process.h"   /* struct process (shared_next_va, pml4_phys) for zero-copy */
 #include "mm/pmm.h"            /* pmm_alloc_page / pmm_free_page / PAGE_SIZE */
 #include "mm/vmm.h"            /* vmm_kmap_pages / vmm_map_in for shared windows */

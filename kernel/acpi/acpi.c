@@ -2,7 +2,7 @@
 #include "drivers/char/serial.h"
 #include "mm/pmm.h"
 #include "include/kprintf.h"
-#include "arch/x86_64/boot/boot_protocol.h"   /* boot_acpi_rsdp — UEFI RSDP */
+#include "boot/boot_protocol.h"   /* boot_acpi_rsdp — UEFI RSDP */
 #include <stdint.h>
 
 

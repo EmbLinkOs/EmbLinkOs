@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 #include "include/types.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "process/process.h"   /* struct wait_queue */
 #include "ipc/handle.h"        /* enum handle_kind */
 

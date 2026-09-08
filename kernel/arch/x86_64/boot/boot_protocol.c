@@ -1,4 +1,4 @@
-#include "arch/x86_64/boot/boot_protocol.h"
+#include "boot/boot_protocol.h"
 #include "mm/pmm.h"                  /* KP2V */
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"

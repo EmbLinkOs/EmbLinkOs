@@ -5,11 +5,13 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A1 done.** An aarch64 kernel builds and boots to a console on QEMU
-`virt`, at EL1, with the device tree handed over intact, and it decodes its own
-faults: `VBAR_EL1` is installed and a deliberate breakpoint and a deliberate
-data abort are caught, printed with `ESR`/`FAR`/`ELR` decoded down to the fault
-status code, and recovered from. Everything from A2 on is still unwritten.
+**Status: A0–A2 done.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
+its own faults, and now **runs in the higher half with the MMU on**: page
+tables built in assembly before any allocator exists, the memory map read from
+the device tree, `kernel/mm/pmm.c` — the *existing, shared* physical allocator —
+running unmodified, per-section kernel permissions applied through a C
+page-table manager, and the boot identity map dropped. Everything from A3 on is
+still unwritten. Gaps A2 knowingly left are listed in `TODO.md`, not here.
 
 ```sh
 brew install aarch64-elf-gcc          # Linux: gcc-aarch64-none-elf
@@ -143,7 +145,7 @@ timer** (`CNTVCT_EL0`/`CNTP_*`), **GICv3** (interrupts), **PCIe ECAM** +
 INIT-SIPI-SIPI). This follows the rule the build already lives by: absent means
 absent, not broken. The arch gate decides which drivers are even compiled.
 
-### 2.7 EL1, 4KB granule, 48-bit VA, higher-half at TTBR1
+### 2.7 EL1, 4KB granule, 48-bit VA, higher-half at TTBR1 — *built (A2)*
 The kernel runs at **EL1** (we are a guest OS, not a hypervisor; drop from EL2
 at boot if the firmware leaves us there). 4KB granule, 4 levels, 48-bit VA —
 the closest analogue to the existing PML4 layout, which keeps `vmm.c`'s shape
@@ -168,10 +170,10 @@ building and still booting. **No phase is done if it broke the other arch.**
 
 ```
                                     x86_64 (built)          aarch64 (this campaign)
-  firmware handoff    boot_protocol BIOS stage1/2, UEFI      DTB from -kernel, later UEFI
-  console                           16550 @ 0x3F8            PL011 @ 0x9000000
-  exceptions                        IDT + ISR stubs          VBAR_EL1 + 16-entry vector table
-  paging                            PML4, CR3, invlpg        TTBR0/1_EL1, 4KB/48-bit, TLBI
+  firmware handoff    boot_protocol BIOS stage1/2, UEFI      DTB from -kernel, later UEFI   [A2]
+  console                           16550 @ 0x3F8            PL011 @ 0x9000000              [A0]
+  exceptions                        IDT + ISR stubs          VBAR_EL1 + 16-entry vectors    [A1]
+  paging                            PML4, CR3, invlpg        TTBR0/1_EL1, 4KB/48-bit, TLBI  [A2]
   interrupt ctrl                    PIC / IOAPIC / LAPIC     GICv3 (distributor + redistributor)
   timer                             PIT / HPET / TSC         generic timer (CNTP_TVAL/CNTVCT)
   context switch                    kcontext.asm (131 ln)    x19-x30, sp, ELR/SPSR
@@ -263,14 +265,79 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
   does not quietly return zero). So probing for RAM by reading is possible —
   but the DTB memory node remains the right source, and now that is a choice
   rather than an assumption.
-* **A2 ❌ MMU + higher half.** Build tables, enable the MMU, jump to the virtual
-  kernel. **Done when:** the kernel runs from `0xFFFF...` and the DTB memory node
-  drives the existing `pmm`. Inherits from A1 a fault decoder that names
-  translation and permission faults by level, which is most of what debugging
-  new page tables consists of. Note that A1's unaligned-load self-test will
-  *stop* faulting here — with the MMU off every access is Device memory, where
-  unaligned is illegal; once this range is mapped Normal it becomes legal. That
-  is the test noticing the MMU came on, not a regression.
+* **A2 ✅ MMU + higher half.** `boot/linker.ld` (link high, load physical),
+  `boot/boot.S`'s assembly bootstrap, `boot/fdt.c` (a device-tree reader),
+  `boot/boot_protocol_dtb.c` (the third producer of §2.5), `mm/pagetable.c`
+  (four-level tables in C), `mm/pmm_arch.c`, `cpu/spinlock.c`.
+  **Done when:** the kernel runs from `0xFFFF…` and the DTB memory node drives
+  the existing `pmm` — both asserted by `test-arm64-boot`, along with the
+  section permissions and the absence of the identity map.
+
+  **The headline is what did NOT have to change.** `kernel/mm/pmm.c` — 300
+  lines of allocator, written for x86, never touched for this — compiles and
+  runs on aarch64 with *one* change, and that change was to stop it hardcoding
+  an x86 fact (see below). Same for `kernel/lib/kprintf.c` and
+  `kernel/lib/kstring.c`. The virtual address layout in `kernel/mm/pmm.h`
+  (`KERNEL_VIRTUAL_BASE`, `DIRECT_MAP_BASE`, `MMIO_BASE`, `P2V`/`V2P`/`KV2P`)
+  was adopted **unchanged**, which is why. §1's claim that the tree is ~80%
+  portable stops being an estimate here.
+
+  Three seams opened, each because a second implementation made the first one's
+  assumption visible — §2.3 working exactly as intended:
+  1. **`arch_pmm_reserve_fixed()`.** `pmm_init()` ended with
+     `pmm_reserve_page(AP_TRAMPOLINE_PHYS)` — an x86 SMP detail welded into
+     portable code. It is now a hook: x86 reserves the AP trampoline, aarch64
+     reserves the **device tree** (which firmware puts inside the RAM `/memory`
+     reports as usable, so the allocator would otherwise hand out the only
+     description of the machine) and firmware's reservations. "aarch64 reserves
+     no trampoline" is a *fact* about PSCI, not a stub.
+  2. **`kprintf_set_secondary()`.** `kprintf` called `console_is_ready()` and
+     `console_putchar()` directly, so the log path — the thing you need when
+     everything else is broken — carried a link dependency on the framebuffer
+     console, the font data and the compositor. The console now *registers*
+     itself. On x86 that was merely distasteful; on a second architecture it is
+     fatal, because the memory manager needs `kprintf` long before there is a
+     display.
+  3. **`boot_protocol.h` moved to `kernel/boot/`** and gained `BOOT_FW_DTB`.
+     §2.5 predicted "a third producer, not a replacement"; that is exactly what
+     it took. `kernel/drivers/char/serial.h` had the same latent property —
+     written for a 16550, it turned out to describe a *console*, and PL011
+     implements it verbatim.
+
+  Four things A2 taught:
+  1. **Everything before the MMU must be position-independent, so it is
+     assembly.** The kernel is linked at its virtual address and loaded at its
+     physical one, so in that window only `adrp`/`add` and literal pools are
+     correct; a pointer stored in `.rodata` is a link-time absolute and is
+     wrong. C cannot be trusted there — the compiler will happily emit an
+     absolute pointer table for a `static const char *const[]` — so the whole
+     bootstrap is `.text.boot`, and the beacon it prints (`ABPM`) exists
+     because "died before the console" and "died after it" are otherwise
+     indistinguishable.
+  2. **1 GiB blocks are what makes the bootstrap tractable.** With a 4 KiB
+     granule a level-1 entry maps 1 GiB directly, so the entire initial address
+     space is one L0 table, four L1 tables and about twenty stores — no
+     allocator required, which matters because there cannot be one yet.
+     Refinement to 4 KiB pages happens later, in C, and needs *block
+     splitting*: replacing a block with a table of equivalent finer entries,
+     which is safe to do to live mappings including the one you are executing.
+  3. **`AF` (bit 10) is the one everyone forgets.** Without `FEAT_HAFDBS`
+     enabled, hardware does not *set* the access flag, it **faults**. An
+     otherwise perfect descriptor missing `AF` gives an "access flag fault" on
+     first touch, which reads like a permission bug and is not one.
+  4. **Dropping the identity map is a security change, not tidiness.** While it
+     exists every physical address is also a valid kernel virtual address — so
+     the read-only `.text` established moments earlier still has a *writable
+     alias*, and a null-pointer dereference reads real memory instead of
+     faulting. The self-test proves both: a write to `.rodata` now takes a
+     permission fault, and a read of a low address now takes a translation
+     fault.
+
+  A1's unaligned-load test had to move, exactly as predicted: with the MMU off
+  every access is Device memory where unaligned is illegal, and once RAM is
+  mapped Normal it becomes legal. It now targets the MMIO window instead —
+  which is a *better* test, because it verifies the window really is
+  Device-nGnRnE rather than accidentally Normal.
 * **A3 ❌ GICv3 + generic timer.** **Done when:** the existing timer-preemptive
   scheduler switches between two kthreads with no scheduler code changed.
 * **A4 ❌ The `sysargs` refactor (on x86).** §2.4. **Done when:** x86 boots to the

@@ -36,10 +36,11 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   **Now audited and planned in `docs/ARM64.md`** — the claim measured true
   (`arch/x86_64/` is 11% of 58k kernel lines; the asm that leaked out collapses
   into seven repeated primitives), with the syscall argument-passing seam as the
-  one genuine exception. **Phases A0-A1 are built:** `make ARCH=aarch64` produces
-  a kernel that boots to a serial console at EL1 on QEMU `virt` with the device
-  tree handed over intact, and that decodes and survives its own faults, checked
-  by `make ARCH=aarch64 test-arm64-boot`. The
+  one genuine exception. **Phases A0-A2 are built:** `make ARCH=aarch64` produces
+  a kernel that boots at EL1 on QEMU `virt`, decodes and survives its own
+  faults, and runs in the higher half with the MMU on -- reading its memory map
+  from the device tree and driving the SAME `kernel/mm/pmm.c` the x86 build
+  uses, unmodified. Checked by `make ARCH=aarch64 test-arm64-boot`. The
   x86 build is untouched by it (`ARCH` defaults to `x86_64`, and the aarch64
   rules are in a fragment the default build never parses).
 - See `ARCHITECTURE.md` §1 for the full governing principle ("bless the clean

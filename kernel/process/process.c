@@ -15,7 +15,7 @@
 #include "arch/x86_64/cpu/fsbase.h"   /* fsbase_set() -- the thread pointer, reinstalled per switch */
 #include "arch/x86_64/cpu/kcontext.h"
 #include "arch/x86_64/irq/lapic.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "process/ksync.h"       /* mutex_init for each process's fd_lock */
 #include "process/debug.h"       /* debug_session_spawn, debug_notify_exit */
 

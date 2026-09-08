@@ -8,8 +8,8 @@
 #include "include/kprintf.h"
 #include <stdint.h>
 #include "drivers/video/font_8x16.h"
-#include "arch/x86_64/cpu/spinlock.h"
-#include "arch/x86_64/boot/boot_protocol.h"
+#include "include/spinlock.h"
+#include "boot/boot_protocol.h"
 
 
 static fb_info_t fb;

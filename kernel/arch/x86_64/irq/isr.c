@@ -1,6 +1,6 @@
 #include <stdint.h>
 #include "drivers/char/serial.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "process/process.h"   /* current_thread, struct process/thread */
 #include "process/debug.h"     /* debug_on_exception (§6.6 exception routing) */
 #include "lib/ksym.h"          /* the panic symbolizer (§7) */

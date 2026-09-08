@@ -1,8 +1,7 @@
 #include "mm/pmm.h"
 #include "drivers/char/serial.h"
-#include "arch/x86_64/smp/smp.h"
-#include "arch/x86_64/cpu/spinlock.h"
-#include "arch/x86_64/boot/boot_protocol.h"
+#include "include/spinlock.h"
+#include "boot/boot_protocol.h"
 
 /* Guards pmm_bitmap/free_pages/used_pages -- unused until SMP (Phase 3,
  * docs/architecture/process-and-scheduling.md), same "add the lock, don't
@@ -70,10 +69,18 @@ void pmm_print_map(void) {
         }
         serial_write_string("\n");
 
-}
+        if (entry->type == E820_USABLE)
+            total_usable += entry->length;
+    }
 
-
-
+    /* The number the map is actually FOR. It was computed and then thrown
+     * away, which is also why -Wall (now on, via the aarch64 build) flagged
+     * it: a running total nobody prints is either a bug or dead weight, and
+     * here it was the former -- "entries: 1" tells you nothing about whether
+     * the machine has the memory you asked for. */
+    serial_write_string("usable total: ");
+    serial_write_hex(total_usable);
+    serial_write_string(" bytes\n");
 }
 
 
@@ -182,13 +189,12 @@ void pmm_init(void) {
 
     // step 7: explicitly reserve fixed-address pages that something OUTSIDE
     // this allocator's own bookkeeping needs to own at a known physical
-    // address. Today this is only the AP trampoline (kernel/cpu/smp.h) --
-    // already covered incidentally by step 6's blanket reservation of
-    // everything below kernel_end (which is always > 1MB), but that's an
-    // accident of where step 6's loop happens to start (page 0), not a
-    // deliberate low-memory carve-out. Reserving it explicitly here means
-    // it stays reserved even if step 6 is ever changed to start later.
-    pmm_reserve_page(AP_TRAMPOLINE_PHYS);
+    // address. WHICH pages those are is the one genuinely architecture-specific
+    // thing in this file, so it is asked rather than assumed: on x86 it is the
+    // AP trampoline (SMP bring-up pokes machine code into a fixed low page); on
+    // aarch64 it is nothing at all, because PSCI starts secondary CPUs at an
+    // address we choose. See arch_pmm_reserve_fixed() in pmm.h.
+    arch_pmm_reserve_fixed();
 
     pmm_print_stats();
 

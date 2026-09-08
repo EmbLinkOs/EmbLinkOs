@@ -1556,16 +1556,56 @@ substantially complete.
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
   - **That campaign is underway: `docs/ARM64.md`** (target QEMU `virt`, HVF
-    available and confirmed working). **Phases A0-A1 are done** — `make ARCH=aarch64`
+    available and confirmed working). **Phases A0-A2 are done** — `make ARCH=aarch64`
     boots an aarch64 kernel to a serial console at EL1 with the DTB handed over,
-    and it decodes its own faults (ESR/FAR/ELR down to the fault status code)
-    and recovers from them, verified by `make ARCH=aarch64 test-arm64-boot`.
-    A2 (MMU + higher half) is next. The audit there says the discipline largely held —
+    decodes its own faults (ESR/FAR/ELR down to the fault status code) and
+    recovers from them, and runs in the higher half with the MMU on, its memory
+    map read from the device tree, `kernel/mm/pmm.c` allocating, per-section
+    kernel permissions applied and the identity map dropped. Verified by
+    `make ARCH=aarch64 test-arm64-boot` (fourteen assertions across the three
+    phases). A3 (GICv3 + generic timer) is next. The audit there says the discipline largely held —
     `arch/x86_64/` is 11% of the kernel and port I/O never escaped into core
     logic — with **one** real exception: the 89 syscall handlers in
     `arch/x86_64/syscall/syscall.c` read their arguments through 187 direct
     `r->rdi`/`r->rsi`/… accesses. Neutralising that (ARM64.md §2.4, phase A4) is
     the one refactor that lands on x86 *before* any ARM code exists.
+  - **Known gaps left by A2**, each deliberate, each recorded rather than
+    discovered later. None affects `-M virt` with <= 4 GiB of RAM, which is why
+    they are debt and not bugs:
+    - [ ] **The direct map covers only the first 4 GiB of physical space**, and
+      the kernel window only the first 2 GiB. `boot.S` builds four 1 GiB blocks
+      because there is no allocator yet when it runs. On a machine with more
+      RAM, that RAM is reported by the device tree, counted by `pmm`, handed
+      out — and then faults on first touch through `P2V`. Fix: after
+      `pmm_init`, walk the memory map and extend the direct map with
+      `vm_map_range`; the C page-table code already does everything needed.
+      **Do this before anyone runs `-m 8G`.**
+    - [ ] **`fdt_reg_cells()` uses the ROOT node's `#address-cells` /
+      `#size-cells` for every node.** Correct for every node this kernel reads
+      today (all of them are children of the root) and wrong for anything
+      deeper — wrong SILENTLY, because a mismatched cell count halves or
+      doubles an address rather than failing. Needs parent tracking in the
+      walker. First likely victim: PCIe `ranges` in A7.
+    - [ ] **`fdt_find_compatible()` searches two levels only** (root children
+      and their children). Enough for `virt`'s flat tree; will quietly miss a
+      device behind a deeper bus.
+    - [ ] **`vm_unmap_page()` does not free page tables that become empty.**
+      Leaks one to three pages per fully-unmapped 2 MiB region. Harmless while
+      nothing unmaps in a loop; A5's process teardown is where that stops.
+    - [ ] **No TLB shootdown between CPUs.** `pagetable.c` already uses the
+      inner-shareable `tlbi` variants, so the invalidation is broadcast, but
+      nothing synchronises a remote CPU that is mid-walk. A9.
+    - [ ] **aarch64 has its own `mm/pagetable.c` alongside x86's `mm/vmm.c`.**
+      Intentional per ARM64.md §2.3 — the shared interface is factored from two
+      WORKING implementations, and the aarch64 one is not finished until A5
+      shows what user address spaces need. Do not merge them early.
+    - [ ] **The boot protocol's framebuffer, boot-disk and ACPI fields are zero
+      on aarch64.** `virt` has no firmware framebuffer and no BIOS drive; A7
+      fills the framebuffer fields from virtio-gpu. Each field already has a
+      documented "unknown" value, so this is honest rather than missing.
+    - [ ] **`MAX_MMAP` is 32 ranges** in the device-tree producer. Overflow
+      warns loudly and drops rather than corrupting, but a NUMA machine could
+      plausibly exceed it.
 - [x] ~~**embbuild** — the native build tool (the make-equivalent)~~ —
   **BUILT AND SHIPPED**, not merely designed. `shell/tools/embbuild.c`; proven
   by `test embbuild` (cases a–f including the §3 `/system` install refusal),

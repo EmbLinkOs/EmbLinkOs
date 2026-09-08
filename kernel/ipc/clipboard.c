@@ -3,7 +3,7 @@
 #include "arch/x86_64/syscall/usercopy.h"
 #include "include/errno.h"
 #include "include/kstring.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 
 /* Static storage, not kmalloc: 64KB of bss buys a clipboard that can never
  * fail to exist, and the lock is held only across bounded memcpys (the user

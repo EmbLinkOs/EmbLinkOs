@@ -19,7 +19,7 @@
 #include "include/kstring.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "arch/x86_64/irq/irq.h"   /* irq_register for the RX MSI-X interrupt */
 
 /* ---- virtio PCI capability + common-config layout (as virtio_gpu.c) ------ */

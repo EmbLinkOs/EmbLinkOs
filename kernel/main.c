@@ -25,7 +25,7 @@
 #include "arch/x86_64/cpu/gdt.h"
 #include "arch/x86_64/cpu/percpu.h"
 #include "arch/x86_64/smp/smp.h"
-#include "arch/x86_64/boot/boot_protocol.h"
+#include "boot/boot_protocol.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/syscall/syscall.h"
 #include "arch/x86_64/irq/pic.h"

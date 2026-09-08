@@ -15,6 +15,12 @@
  * drivers/ when A2 reads that address out of the device tree instead. */
 
 void pl011_init(void);
+
+/* Re-point the driver at the MMIO window once the MMU is on, so it stops
+ * depending on the boot identity map (which A5 removes). Pass
+ * MMIO_BASE + 0x09000000. Safe to call at any time; the UART is stateless
+ * between accesses. */
+void pl011_use_mmio_window(unsigned long base);
 void pl011_putc(char c);
 void pl011_puts(const char *s);
 

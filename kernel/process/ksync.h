@@ -10,7 +10,7 @@
  *
  * WHY THESE EXIST, AND WHY THEY ARE NOT SPINLOCKS
  * -----------------------------------------------
- * The kernel already has spinlock_t (kernel/arch/x86_64/cpu/spinlock.h). A
+ * The kernel already has spinlock_t (kernel/include/spinlock.h). A
  * spinlock is correct only when the holder CANNOT sleep while holding it: the
  * waiter burns a core spinning, so if the holder yields/blocks, the waiter can
  * deadlock the core (single-CPU) or waste it (SMP). That rules a spinlock OUT

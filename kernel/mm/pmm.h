@@ -6,7 +6,7 @@
 
 
 // The memory map now arrives via the boot protocol (struct boot_mmap_entry in
-// arch/x86_64/boot/boot_protocol.h), not a fixed buffer stage2 writes. The old
+// boot/boot_protocol.h), not a fixed buffer stage2 writes. The old
 // `struct e820_entry` and the E820_*_ADDR buffer pointers below are retired --
 // only the TYPE constants survive, because boot_mmap_entry.type reuses them.
 
@@ -64,6 +64,24 @@ void pmm_free_page(uint64_t phys_addr);
 // pmm_alloc_page() happens to return. Idempotent: reserving an
 // already-reserved page is a harmless no-op.
 void pmm_reserve_page(uint64_t phys_addr);
+
+/* Reserve the fixed physical pages THIS ARCHITECTURE cannot allocate normally,
+ * called near the end of pmm_init() once the bitmap exists.
+ *
+ * Implemented once per architecture, because the answer genuinely differs and
+ * there is no sensible portable default:
+ *   x86_64   -- the AP trampoline at AP_TRAMPOLINE_PHYS: SMP bring-up copies
+ *               real-mode startup code to a fixed low page that INIT-SIPI-SIPI
+ *               jumps to, so the allocator must never hand it out.
+ *   aarch64  -- nothing. PSCI CPU_ON takes the entry point as an argument, so
+ *               secondary CPUs start wherever we already are. An empty
+ *               implementation here is a FACT about the architecture, not a
+ *               stub waiting to be filled in.
+ *
+ * A new architecture must provide this; leaving it out is a link error, which
+ * is the correct outcome -- silently reserving nothing would be a bug that only
+ * appears when a second CPU starts. */
+void arch_pmm_reserve_fixed(void);
 
 
 

@@ -11,6 +11,68 @@
  * physical addresses the linker script assigns. The higher half is A2.
  */
 
+/* ---------------------------------------------------------------------------
+ * Constants and macros for the physical-mode window.
+ * ------------------------------------------------------------------------- */
+
+/* Address-space layout. These are kernel/mm/pmm.h's constants, repeated here
+ * because the assembler cannot include a C header -- and asserted against it
+ * from mm/pagetable.c, which CAN see both, so the duplication is checked
+ * rather than trusted. */
+    .set L0_IDX_KERNEL, 511         /* 0xFFFFFFFF80000000 >> 39 & 0x1FF */
+    .set L0_IDX_DIRECT, 256         /* 0xFFFF800000000000 >> 39 & 0x1FF */
+    .set L0_IDX_MMIO,   384         /* 0xFFFFC00000000000 >> 39 & 0x1FF */
+
+/* Descriptor bits (Arm ARM D8.3). A table descriptor is valid+table; a BLOCK
+ * descriptor at level 1 maps 1 GiB and is valid+!table. */
+    .set PTE_TABLE_BITS,  3         /* VALID | TABLE                        */
+
+/* AF (bit 10) is the one everybody forgets: with FEAT_HAFDBS off -- and it is
+ * off unless enabled -- hardware does NOT set the access flag, it FAULTS. An
+ * otherwise perfect descriptor without AF gives an "access flag fault" on
+ * first touch, which reads like a permission bug and is not one. */
+    .set BLOCK_DEVICE,     0x60000000000401   /* attr0, AF, PXN|UXN, SH=0    */
+    .set BLOCK_RAM_EXEC,   0x40000000000705   /* attr1, AF, SH=inner, UXN    */
+    .set BLOCK_RAM_NOEXEC, 0x60000000000705   /* ...and PXN                  */
+
+/* MAIR_EL1 attr0 = 0x00 Device-nGnRnE, attr1 = 0xFF Normal write-back RWA. */
+    .set MAIR_VALUE, 0xFF00
+
+/* TCR_EL1: T0SZ = T1SZ = 16 (48-bit VAs both halves), 4 KiB granule both
+ * halves (TG0=0b00, TG1=0b10 -- the two fields are encoded DIFFERENTLY, which
+ * is a genuine trap), inner-shareable write-back cacheable walks. IPS is OR'd
+ * in at runtime from ID_AA64MMFR0_EL1.PARange. */
+    .set TCR_VALUE, 0xb5103510
+
+/* SCTLR_EL1: M (MMU), C (data cache), I (instruction cache). */
+    .set SCTLR_ENABLE, 0x1005
+
+/* The physical address of a symbol, while running with the MMU off.
+ *
+ * adrp+add is PC-RELATIVE: it computes (symbol - instruction) at link time and
+ * adds it to the real PC, so it yields wherever the image actually IS. That is
+ * the physical address here, and it is why this window can name kernel symbols
+ * at all despite them being linked high. `ldr \reg, =symbol` would give the
+ * link-time virtual address instead -- which is exactly what is wanted after
+ * the MMU is on, and exactly wrong before. */
+.macro PHYS_OF reg, sym
+    adrp    \reg, \sym
+    add     \reg, \reg, :lo12:\sym
+.endm
+
+/* Emit one character on the PL011 at its physical address, clobbering only
+ * x9/x10. Used solely as a boot beacon in the physical window (see at_el1).
+ * ASCII codes rather than character literals: `#'X'` is not portable across
+ * assembler syntaxes and this file cannot afford a surprise. */
+.macro PUTC code
+    mov     x9, #0x09000000
+.Lputc_wait\@:
+    ldr     w10, [x9, #0x18]            /* UARTFR */
+    tbnz    w10, #5, .Lputc_wait\@      /* TXFF: transmit FIFO full */
+    mov     w10, #\code
+    str     w10, [x9]                   /* UARTDR */
+.endm
+
     .section .text.boot, "ax"
     .globl _start
 _start:
@@ -106,22 +168,77 @@ header_end:
     msr     elr_el2, x1
     eret
 
+/* ============================================================================
+ * EVERYTHING FROM HERE TO `mmu_on` RUNS AT THE PHYSICAL ADDRESS WITH THE MMU
+ * OFF, WHILE EVERY SYMBOL IN THE IMAGE IS LINKED AT A VIRTUAL ONE.
+ *
+ * That means exactly one rule, and breaking it produces a jump into nowhere
+ * with no console: only PC-RELATIVE references are valid here. `adrp`+`add`
+ * and `ldr` from a literal pool are PC-relative and therefore yield the real
+ * physical address; a pointer stored in .rodata or .data is a link-time
+ * absolute and is wrong. There is no C in this window for the same reason --
+ * the compiler will happily emit an absolute pointer table.
+ *
+ * `ldr xN, =CONSTANT` is fine: that is a VALUE, not an address.
+ * `ldr xN, =symbol` yields the VIRTUAL address -- correct only after mmu_on,
+ * which is precisely how the jump to the higher half is made.
+ * ==========================================================================*/
 at_el1:
-    /* Zero .bss BEFORE installing the stack: the stack LIVES in .bss (see
-     * below), so doing it the other way round means the zeroing loop walks
-     * over the frame we are standing on. Both symbols are 8-byte aligned by
-     * the linker script, so the 8-bytes-at-a-time loop cannot overrun. */
-    ldr     x1, =__bss_start
-    ldr     x2, =__bss_end
+    mov     x19, x0                     /* stash the DTB pointer across all of this */
+
+    /* A boot beacon. There is no console yet -- pl011.c is C and runs later --
+     * so these single characters are the only evidence available if the MMU
+     * bring-up below dies. Each one costs three instructions and has already
+     * earned them: "prints A then nothing" and "prints nothing at all" are
+     * completely different bugs, and without this they look identical. */
+    PUTC    0x41                        /* 'A' -- reached EL1 */
+
+    /* Zero .bss BEFORE installing the stack (the stack LIVES in .bss, so the
+     * other order has the zeroing loop walk over the frame we stand on) and
+     * before building the page tables (which also live in .bss, and would be
+     * erased by it). Both symbols are 8-byte aligned by the linker script, so
+     * the 8-bytes-at-a-time loop cannot overrun. */
+    PHYS_OF x1, __bss_start
+    PHYS_OF x2, __bss_end
 1:  cmp     x1, x2
     b.hs    2f
     str     xzr, [x1], #8
     b       1b
 
-2:  ldr     x1, =__stack_top
+2:  PHYS_OF x1, __stack_top
+    mov     sp, x1
+    PUTC    0x42                        /* 'B' -- .bss zeroed, stack up */
+
+    bl      build_page_tables
+    PUTC    0x50                        /* 'P' -- page tables built */
+
+    bl      enable_mmu
+    /* Still executing physically -- that is what the TTBR0 identity map is
+     * for. The very next thing is to stop. */
+    PUTC    0x4D                        /* 'M' -- MMU on, still physical */
+
+    /* THE JUMP. `ldr =mmu_on` reads a link-time absolute from the literal
+     * pool, which is the VIRTUAL address, which is now mapped. Everything
+     * after this line is ordinary code at ordinary addresses. */
+    ldr     x0, =mmu_on
+    br      x0
+
+mmu_on:
+    /* Virtual from here. Re-point the stack at the kernel window's alias of
+     * the same memory -- the physical alias still works while TTBR0 holds the
+     * identity map, but it stops working the moment A5 gives TTBR0 to user
+     * space, and a stack pointer that dies later is far worse than one that
+     * dies now. */
+    ldr     x1, =__stack_top
     mov     sp, x1
 
-    /* x0 still holds the DTB pointer QEMU put there. */
+    /* Frame pointer and link register have no meaningful values from the
+     * physical world; zero them so a backtrace stops here instead of walking
+     * into garbage. */
+    mov     x29, xzr
+    mov     x30, xzr
+
+    mov     x0, x19                     /* PHYSICAL DTB address; C converts */
     bl      arch_early_main
 
     /* arch_early_main() is not expected to return. If it does, fall into the
@@ -130,18 +247,169 @@ park:
     wfe
     b       park
 
-    /* The `ldr xN, =symbol` pseudo-instructions above need their literal pool
-     * within reach; place it here rather than wherever the assembler decides. */
+/* ---------------------------------------------------------------------------
+ * Page tables for the initial address space.
+ *
+ * 1 GiB blocks at level 1, which is the whole reason this is tractable in
+ * assembly: with a 4 KiB granule and 48-bit VAs, a level-1 entry maps 1 GiB
+ * directly, so the entire initial address space is a level-0 table plus four
+ * level-1 tables and about twenty stores. No level-2, no level-3, no page
+ * allocator -- and there could not be one, because the physical memory manager
+ * does not exist until the DTB has been read, which cannot happen until there
+ * is an address space to read it in.
+ *
+ * Refinement to 4 KiB pages with real permissions happens later, in C, in
+ * mm/pagetable.c, once pmm can hand out page frames.
+ *
+ * The layout is kernel/mm/pmm.h's, unchanged, because it is not x86-specific:
+ *
+ *   TTBR0  identity            VA == PA, 0..4 GiB. Required: the instruction
+ *                              after the MMU is enabled is still at a physical
+ *                              PC, so that PC must translate to itself.
+ *   TTBR1  0xFFFFFFFF80000000  kernel window, VA = PA + base, 2 GiB
+ *          0xFFFF800000000000  direct map of physical memory, 4 GiB
+ *          0xFFFFC00000000000  MMIO window for device space, 1 GiB
+ * ------------------------------------------------------------------------- */
+build_page_tables:
+    stp     x29, x30, [sp, #-16]!
+
+    /* --- TTBR0: identity ------------------------------------------------- */
+    PHYS_OF x0, boot_l0_ttbr0
+    PHYS_OF x1, boot_l1_ident
+    orr     x2, x1, #PTE_TABLE_BITS
+    str     x2, [x0]                            /* l0[0] -> l1_ident */
+
+    ldr     x3, =BLOCK_DEVICE
+    str     x3, [x1]                            /* PA 0..1G: device space */
+    ldr     x4, =BLOCK_RAM_EXEC
+    mov     x5, #1
+3:  lsl     x6, x5, #30
+    orr     x6, x6, x4
+    str     x6, [x1, x5, lsl #3]                /* PA 1..4G: RAM, executable */
+    add     x5, x5, #1
+    cmp     x5, #4
+    b.lo    3b
+
+    /* --- TTBR1: kernel window, direct map, MMIO -------------------------- */
+    PHYS_OF x0, boot_l0_ttbr1
+
+    PHYS_OF x1, boot_l1_kern
+    orr     x2, x1, #PTE_TABLE_BITS
+    str     x2, [x0, #(L0_IDX_KERNEL * 8)]
+    ldr     x3, =BLOCK_DEVICE
+    str     x3, [x1, #(510 * 8)]                /* VA base+0    -> PA 0..1G  */
+    ldr     x3, =BLOCK_RAM_EXEC
+    ldr     x4, =0x40000000
+    orr     x3, x3, x4
+    str     x3, [x1, #(511 * 8)]                /* VA base+1G   -> PA 1..2G  */
+
+    PHYS_OF x1, boot_l1_dmap
+    orr     x2, x1, #PTE_TABLE_BITS
+    str     x2, [x0, #(L0_IDX_DIRECT * 8)]
+    ldr     x3, =BLOCK_DEVICE
+    str     x3, [x1]
+    /* The direct map is data, never instructions: PXN|UXN. A kernel that can
+     * execute through its own linear map of all physical memory is a kernel
+     * where any write primitive is also a code-injection primitive. */
+    ldr     x4, =BLOCK_RAM_NOEXEC
+    mov     x5, #1
+4:  lsl     x6, x5, #30
+    orr     x6, x6, x4
+    str     x6, [x1, x5, lsl #3]
+    add     x5, x5, #1
+    cmp     x5, #4
+    b.lo    4b
+
+    PHYS_OF x1, boot_l1_mmio
+    orr     x2, x1, #PTE_TABLE_BITS
+    str     x2, [x0, #(L0_IDX_MMIO * 8)]
+    ldr     x3, =BLOCK_DEVICE
+    str     x3, [x1]                            /* PA 0..1G as Device memory */
+
+    /* The tables were built with the MMU and caches OFF, so these stores went
+     * straight to memory -- but the page-table walker is a separate observer
+     * and there is no guarantee it sees them without a barrier. Skipping this
+     * produces a translation fault on the first instruction after the MMU is
+     * enabled, i.e. a silent hang. */
+    dsb     ishst
+
+    ldp     x29, x30, [sp], #16
+    ret
+
+/* ---------------------------------------------------------------------------
+ * Turn the MMU on.
+ * ------------------------------------------------------------------------- */
+enable_mmu:
+    /* MAIR_EL1: the attribute table page-table entries index into.
+     *   attr0 = 0x00  Device-nGnRnE      (MMIO: no gathering/reordering/early ack)
+     *   attr1 = 0xFF  Normal, write-back, read+write allocate, inner+outer     */
+    ldr     x0, =MAIR_VALUE
+    msr     mair_el1, x0
+
+    /* TCR_EL1. IPS must describe the machine, not a guess: an IPS smaller than
+     * the implemented physical address size silently truncates output
+     * addresses, which is a fault at an address that looks almost right. */
+    mrs     x0, id_aa64mmfr0_el1
+    and     x0, x0, #0xf                        /* PARange */
+    lsl     x0, x0, #32                         /* TCR_EL1.IPS */
+    ldr     x1, =TCR_VALUE
+    orr     x0, x0, x1
+    msr     tcr_el1, x0
+
+    PHYS_OF x0, boot_l0_ttbr0
+    msr     ttbr0_el1, x0
+    PHYS_OF x0, boot_l0_ttbr1
+    msr     ttbr1_el1, x0
+
+    /* Whatever was in the TLBs describes an address space that no longer
+     * exists. `vmalle1` invalidates all stage-1 EL1 entries; the barriers are
+     * not optional -- the isb is what makes the new TCR/TTBR visible to
+     * instruction fetch before the MMU is switched on. */
+    dsb     ishst
+    tlbi    vmalle1
+    dsb     ish
+    isb
+
+    mrs     x0, sctlr_el1
+    ldr     x1, =SCTLR_ENABLE
+    orr     x0, x0, x1
+    msr     sctlr_el1, x0
+    isb
+
+    ret
+
+/* Dump the `ldr =` literal pool here, inside .text.boot and within range of
+ * every instruction that uses it, rather than wherever the assembler would
+ * otherwise put it. */
     .ltorg
 
-    /* 16 KiB of boot stack. In .bss so it costs nothing in the image, and
-     * 16-byte aligned because the AArch64 procedure call standard requires
-     * SP to be 16-byte aligned at every public interface -- an unaligned SP
-     * raises an SP alignment fault, which in A0 (no exception vectors yet)
-     * would look exactly like a hang. */
+/* ---------------------------------------------------------------------------
+ * Storage.
+ * ------------------------------------------------------------------------- */
     .bss
     .balign 16
 __stack_bottom:
     .space 16384
     .globl __stack_top
 __stack_top:
+
+    /* The initial translation tables. In .bss, so they cost nothing in the
+     * image and are already zeroed by the time build_page_tables runs -- a
+     * zero entry is an invalid one, which is exactly the right default for
+     * every slot we do not fill.
+     *
+     * Global because mm/pagetable.c adopts them: these ARE the kernel's page
+     * tables from here on, not a throwaway bootstrap set. */
+    .balign 4096
+    .globl boot_l0_ttbr0
+boot_l0_ttbr0:  .space 4096
+    .globl boot_l0_ttbr1
+boot_l0_ttbr1:  .space 4096
+    .globl boot_l1_ident
+boot_l1_ident:  .space 4096
+    .globl boot_l1_kern
+boot_l1_kern:   .space 4096
+    .globl boot_l1_dmap
+boot_l1_dmap:   .space 4096
+    .globl boot_l1_mmio
+boot_l1_mmio:   .space 4096

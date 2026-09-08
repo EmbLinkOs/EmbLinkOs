@@ -21,11 +21,29 @@ ARM_LINKER  := kernel/arch/aarch64/boot/linker.ld
 
 ARM_ASM_SRC := kernel/arch/aarch64/boot/boot.S \
                kernel/arch/aarch64/irq/vectors.S
+# The aarch64-specific sources...
 ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
+               kernel/arch/aarch64/boot/fdt.c \
+               kernel/arch/aarch64/boot/boot_protocol_dtb.c \
                kernel/arch/aarch64/irq/exception.c \
+               kernel/arch/aarch64/cpu/spinlock.c \
+               kernel/arch/aarch64/mm/pagetable.c \
+               kernel/arch/aarch64/mm/pmm_arch.c \
                kernel/arch/aarch64/drivers/pl011.c
 
-ARM_HDRS    := $(shell find kernel/arch/aarch64 -name '*.h' 2>/dev/null)
+# ...and the SHARED kernel, compiled for a second architecture with no #ifdef
+# in it. This list is the honest measure of how portable the tree really is,
+# and it is meant to grow every phase until it is most of kernel/. Anything
+# that appears here and then needs an #ifdef to build is a design question, not
+# a build question -- the answer is usually an arch hook, as pmm.c's
+# arch_pmm_reserve_fixed() ended up being.
+ARM_SHARED_SRC := kernel/mm/pmm.c \
+                  kernel/lib/kprintf.c \
+                  kernel/lib/kstring.c
+
+# Coarse on purpose, exactly as $(KERNEL_HDRS) is on the x86 side: one
+# compile, no per-TU depfiles, so a header-only change must rebuild it all.
+ARM_HDRS    := $(shell find kernel -name '*.h' 2>/dev/null)
 
 # -std=gnu11 for the same reason the x86 side pins it, and known in advance
 # this time rather than discovered: aarch64-elf-gcc is GCC 16, which defaults
@@ -42,8 +60,15 @@ ARM_HDRS    := $(shell find kernel/arch/aarch64 -name '*.h' 2>/dev/null)
 # -fno-stack-protector: no __stack_chk_guard exists in a freestanding kernel.
 # -Wall -Wextra: this tree is 300 lines old. Everything the compiler is willing
 # to notice is cheaper to fix now than after it has 6,000 lines of company.
+# -mno-outline-atomics: gcc 10+ compiles C11 atomics into calls to libgcc
+# helpers (__aarch64_swp4_acq and friends) that pick between LSE and LL/SC at
+# RUN time by reading a global. A freestanding kernel links no libgcc, so the
+# first spinlock is an undefined reference -- and even if it linked, a hidden
+# indirect call inside the lock path is not something a kernel wants. This
+# makes gcc emit LDAXR/STXR inline, which is what the code was written to be.
 ARM_CFLAGS  = -ffreestanding -nostdlib -nostartfiles \
-              -std=gnu11 -mgeneral-regs-only -fno-stack-protector \
+              -std=gnu11 -mgeneral-regs-only -mno-outline-atomics \
+              -fno-stack-protector \
               -Wall -Wextra \
               -Ikernel \
               -Wl,--no-warn-rwx-segments \
@@ -60,8 +85,8 @@ $(ARM_BUILD):
 
 # One compile, like the x86 kernel: every header is a prerequisite because
 # there are no per-TU depfiles to consult. Same reasoning as $(KERNEL_HDRS).
-$(ARM_ELF): $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_BUILD)
-	$(AARCH64_CC) $(ARM_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC)
+$(ARM_ELF): $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_BUILD)
+	$(AARCH64_CC) $(ARM_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC)
 
 # The flat Image. QEMU boots the ELF directly, so this is not on the run path
 # -- it exists because a real ARM board loads a headerless blob at a fixed
@@ -142,17 +167,27 @@ test-arm64-boot: $(ARM_IMG)
 	echo "--- serial ---"; cat $$log; echo "--- end ---"; \
 	fail=0; \
 	chk() { grep -q "$$1" $$log || { echo "FAIL($$2): $$3"; fail=1; }; }; \
-	chk 'EmbLinkOS aarch64'          A0 'no banner -- PL011 or the entry point is wrong'; \
-	chk 'CurrentEL   : EL1'          A0 'not running at EL1'; \
-	chk 'magic ok'                   A0 'the DTB pointer did not survive to arch_early_main'; \
-	chk 'VBAR_EL1 installed'         A1 'exception vectors were never installed'; \
-	chk 'BRK instruction'            A1 'brk was not decoded (ESR EC 0x3C)'; \
-	chk 'alignment fault, on a READ' A1 'the data abort was not decoded down to FSC + direction'; \
-	chk 'FAR_EL1   : 0x0000000040200003' A1 'FAR_EL1 did not report the faulting address'; \
-	chk 'A1 reached'                 A1 'did not survive its own faults -- recovery is broken'; \
-	if grep -q '\[FAIL\]' $$log; then echo "FAIL(A1): a self-test case reported failure"; fail=1; fi; \
+	chk 'EmbLinkOS aarch64'              A0 'no banner -- PL011 or the entry point is wrong'; \
+	chk 'CurrentEL   : EL1'              A0 'not running at EL1'; \
+	chk 'fdt: blob at phys'              A0 'the DTB pointer did not survive the handoff'; \
+	chk 'VBAR_EL1 installed'             A1 'exception vectors were never installed'; \
+	chk 'BRK instruction'                A1 'brk was not decoded (ESR EC 0x3C)'; \
+	chk 'alignment fault, on a READ'     A1 'the abort was not decoded down to FSC + direction'; \
+	chk 'higher half: YES'               A2 'the kernel is not executing from the kernel window'; \
+	chk 'boot: dtb memory'               A2 'the device tree did not yield a memory map'; \
+	chk 'translation fault, on a READ'   A2 'low addresses still resolve -- identity map not dropped'; \
+	chk 'permission fault, on a WRITE'   A2 '.rodata is still writable -- section permissions are not real'; \
+	chk 'wrote and read back via the direct map' A2 'the physical allocator or the direct map is broken'; \
+	chk 'self-test done: 0 failure'      A2 'a self-test case failed'; \
+	chk 'A2 reached'                     A2 'did not reach the end of arch_early_main'; \
+	n=$$(grep -c 'matches KV2P' $$log); \
+	  [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
+	if grep -q 'MISMATCH' $$log; then echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
+	if grep -q '\[FAIL\]' $$log; then echo "FAIL: a self-test case reported failure"; fail=1; fi; \
 	if [ $$fail -eq 0 ]; then \
-	  echo "PASS: A0 (banner, EL1, DTB handoff) + A1 (vectors, ESR/FAR decode, recovery)"; \
+	  echo "PASS: A0 (banner, EL1, DTB handoff)"; \
+	  echo "      A1 (vectors, ESR/FAR decode, recovery)"; \
+	  echo "      A2 (higher half, DTB memory map, pmm, section permissions, no identity map)"; \
 	else exit 1; fi
 
 .PHONY: check-tools-arm64

@@ -1,5 +1,5 @@
-#ifndef _ARCH_X86_64_BOOT_PROTOCOL_H_
-#define _ARCH_X86_64_BOOT_PROTOCOL_H_
+#ifndef _BOOT_PROTOCOL_H_
+#define _BOOT_PROTOCOL_H_
 
 #include <stdint.h>
 #include <stddef.h>
@@ -11,12 +11,16 @@
  * so where it lives becomes the loader's private business, not a number the
  * kernel has to agree on.
  *
- * Two loaders fill this in: boot/stage2/stage2.asm (BIOS) and, later, the
- * UEFI loader. stage2 stores the fields at these exact offsets BY HAND, so
- * the %defines at the top of stage2.asm and the _Static_asserts at the
- * bottom of this file must stay in lockstep. Same discipline the old
- * bootinfo_raw used, now with the offsets machine-checked instead of
- * asserted in a comment.
+ * Three producers fill this in: boot/stage2/stage2.asm (BIOS), the UEFI
+ * loader, and -- since docs/ARM64.md phase A2 --
+ * kernel/arch/aarch64/boot/boot_protocol_dtb.c, which SYNTHESISES the record
+ * from the flattened device tree QEMU hands us in x0. That third producer is
+ * why this header lives in kernel/boot/ rather than under arch/x86_64/: it
+ * always was firmware-neutral, and a second architecture is what made that
+ * worth acting on (docs/ARM64.md §2.5). The x86 loaders store the fields at
+ * these exact offsets BY HAND, so the %defines at the top of stage2.asm and
+ * the _Static_asserts at the bottom of this file must stay in lockstep.
+ * (aarch64 fills a C struct, so it is immune to that particular hazard.)
  *
  * Growing this struct: add fields at the END, bump BOOT_PROTOCOL_VERSION,
  * and check `size` before reading anything new. Never reorder. */
@@ -29,6 +33,7 @@
  * difference leaked out of the loader where it belongs. */
 #define BOOT_FW_BIOS  1
 #define BOOT_FW_UEFI  2
+#define BOOT_FW_DTB   3   /* aarch64: a flattened device tree, from x0 */
 
 /* One memory-map entry. Deliberately the same shape and the same TYPE
  * NUMBERING as the old struct e820_entry (E820_USABLE and friends in pmm.h
@@ -108,10 +113,12 @@ void boot_protocol_dump(void);
 
 /* Memory map access.
  *
- * ORDERING CONSTRAINT: the ENTRIES are not copied -- they are still sitting
- * at mmap_phys and are read through KP2V, so this only works before the PMM
- * can hand those frames out. Exactly the constraint the old KP2V(0x7004)
- * read lived under; now it is written down. */
+ * ORDERING CONSTRAINT (x86): the ENTRIES are not copied -- they are still
+ * sitting at mmap_phys and are read through KP2V, so this only works before
+ * the PMM can hand those frames out. Exactly the constraint the old
+ * KP2V(0x7004) read lived under; now it is written down. The aarch64 producer
+ * copies into a kernel-owned array instead and has no such constraint, because
+ * it is decoding a device tree rather than passing through a loader's buffer. */
 uint32_t boot_mmap_count(void);
 const struct boot_mmap_entry *boot_mmap_at(uint32_t index);
 
@@ -125,4 +132,4 @@ uint8_t bootinfo_boot_drive(void);
  * nothing because the RSDP is in the EFI configuration table. */
 uint64_t boot_acpi_rsdp(void);
 
-#endif /* _ARCH_X86_64_BOOT_PROTOCOL_H_ */
+#endif /* _BOOT_PROTOCOL_H_ */

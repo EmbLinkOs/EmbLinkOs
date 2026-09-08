@@ -1,8 +1,8 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
-#include "arch/x86_64/boot/boot_protocol.h"   /* memory map now arrives via the boot protocol */
+#include "boot/boot_protocol.h"   /* memory map now arrives via the boot protocol */
 #include "drivers/char/serial.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include <stdint.h>
 
 

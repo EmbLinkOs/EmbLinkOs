@@ -1,7 +1,6 @@
 #include "include/kprintf.h"
 #include "drivers/char/serial.h"
-#include "drivers/video/console.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include <stdint.h>
 #include "include/types.h"   // for size_t
 
@@ -42,13 +41,31 @@ struct out_sink {
     size_t written;  // total chars the format produced (for return value)
 };
 
-// Serial sink: write straight to COM1
+/* Where kernel log output goes.
+ *
+ * The serial port is the FLOOR: it exists from the first line of boot, on
+ * every architecture, and it is the only thing still working when the
+ * graphics stack is what broke. Anything better registers itself.
+ *
+ * This used to call console_is_ready()/console_putchar() directly, which made
+ * the log path -- the thing you need when everything else is broken -- carry a
+ * hard link dependency on the framebuffer console, and through it on the font
+ * data, the compositor and the video drivers. On x86 that was merely
+ * distasteful; on a second architecture it is fatal, because kprintf() is
+ * needed by the memory manager long before there is a display of any kind. */
+static void (*log_secondary_put)(char);
+static bool (*log_secondary_ready)(void);
+
+void kprintf_set_secondary(bool (*ready)(void), void (*put)(char)) {
+    log_secondary_put   = put;
+    log_secondary_ready = ready;
+}
+
 static void sink_serial_put(struct out_sink *s, char c) {
-    if (console_is_ready()) {
-        console_putchar(c);
-    } else {
+    if (log_secondary_ready && log_secondary_ready() && log_secondary_put)
+        log_secondary_put(c);
+    else
         serial_write_char(c);
-    }
     s->written++;
 }
 
