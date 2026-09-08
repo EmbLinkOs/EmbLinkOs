@@ -423,6 +423,15 @@ static bool vgpu_get_mode(struct gpu_mode *out) {
             s->height = info.pmodes[0].r.height;
         }
     }
+#if defined(EMBK_VGPU_CAP_W) && defined(EMBK_VGPU_CAP_H)
+    /* Dev cap: some host display backends (e.g. -display gtk) report the
+     * window/monitor geometry here and ignore the -device virtio-vga xres/yres
+     * hint, so the VM window opens huge. Cap it in-guest. virtio-gpu is a
+     * VM-only device (real hardware uses UEFI GOP / bochs / VBE), so this never
+     * touches a physical machine. Set via FB_W/FB_H in the Makefile. */
+    if (s->width  > (EMBK_VGPU_CAP_W)) s->width  = (EMBK_VGPU_CAP_W);
+    if (s->height > (EMBK_VGPU_CAP_H)) s->height = (EMBK_VGPU_CAP_H);
+#endif
     kprintf("virtio-gpu: scanout %ux%u\n",
             (unsigned int)s->width, (unsigned int)s->height);
 

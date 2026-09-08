@@ -8,10 +8,16 @@
 
 #define TH (ui_theme())
 
-static struct layout_size sz_fixed(float v) { return (struct layout_size){ SIZE_FIXED, v, 0, 0, 0 }; }
-static struct layout_size sz_grow(void)     { return (struct layout_size){ SIZE_FLEX, 0, 1, 0, 0 }; }
-static struct layout_size sz_flex(float w)  { return (struct layout_size){ SIZE_FLEX, 0, w, 0, 0 }; }
-static struct layout_size sz_intrinsic(void){ return (struct layout_size){ SIZE_INTRINSIC, 0, 0, 0, 0 }; }
+/* One colour from the control palette, or the theme's when unset. Declared up
+ * here because ui_field is above the palette's storage. */
+static struct ui_ctl_palette g_ctl;
+static int g_ctl_on;
+#define CP(field, dflt) ((g_ctl_on && g_ctl.field.a > 0) ? g_ctl.field : (dflt))
+
+static struct layout_size sz_fixed(float v) { return (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = v }; }
+static struct layout_size sz_grow(void)     { return (struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 }; }
+static struct layout_size sz_flex(float w)  { return (struct layout_size){ .mode = SIZE_FLEX, .flex_grow = w }; }
+static struct layout_size sz_intrinsic(void){ return (struct layout_size){ .mode = SIZE_INTRINSIC }; }
 
 static struct paint solid(struct color c) {
     struct paint p; p.kind = PAINT_SOLID; p.solid = c; p.n_stops = 0; return p;
@@ -118,6 +124,8 @@ static bool button_impl(const char *label, struct color fill, struct color text_
         ui_set_paint(solid(f));
     } else if (hovered) {                 /* ghost: soft wash on hover */
         ui_set_paint(solid(shade(t->accent_soft, pressed ? 0.9f : 1.0f)));
+    } else {
+        ui_set_paint(solid((struct color){0, 0, 0, 0}));   /* reset: un-hover cleanly */
     }
     ui_set_corner_radius(t->radius_md);
     if (border_w > 0) ui_set_border(border_w, hovered ? t->accent : border_c);
@@ -174,12 +182,14 @@ bool ui_checkbox(bool on) {
     ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), press = ui_is_pressed();
-    struct color fill = on ? (press ? shade(t->accent, 0.86f) : t->accent)
-                           : (hov  ? shade(t->surface_alt, 1.15f) : t->surface_alt);
+    struct color acc  = CP(focus, t->accent);
+    struct color surf = CP(surface, t->surface_alt);
+    struct color fill = on ? (press ? shade(acc, 0.86f) : acc)
+                           : (hov  ? shade(surf, 1.15f) : surf);
     ui_set_paint(solid(fill));
     ui_set_corner_radius(t->radius_sm);
     ui_set_size(sz_fixed(20), sz_fixed(20));
-    if (!on) ui_set_border(1.0f, hov ? t->accent : t->border_strong);
+    if (!on) ui_set_border(1.0f, hov ? acc : CP(border, t->border_strong));
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     if (on) text_role(t->font_bold, t->text_caption, t->on_accent, "\xE2\x9C\x93");  /* U+2713 check */
@@ -192,15 +202,16 @@ bool ui_radio(bool selected) {
     ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered();
-    ui_set_paint(solid(selected ? t->accent_soft : t->surface_alt));
+    ui_set_paint(solid(selected ? t->accent_soft : CP(surface, t->surface_alt)));
     ui_set_corner_radius(t->radius_pill);
     ui_set_size(sz_fixed(20), sz_fixed(20));
-    ui_set_border(1.5f, selected ? t->accent : (hov ? t->accent : t->border_strong));
+    ui_set_border(1.5f, selected ? CP(focus, t->accent)
+                                 : (hov ? CP(focus, t->accent) : CP(border, t->border_strong)));
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
     if (selected) {
         ui_box_begin(0);
-        ui_set_paint(solid(t->accent));
+        ui_set_paint(solid(CP(focus, t->accent)));
         ui_set_corner_radius(t->radius_pill);
         ui_set_size(sz_fixed(10), sz_fixed(10));
         ui_box_end();
@@ -292,6 +303,8 @@ int ui_segmented(const char *const *labels, int count, int selected) {
             ui_set_shadow(true, t->shadow_sm.dx, t->shadow_sm.dy, t->shadow_sm.blur, t->shadow_sm.color);
         } else if (ui_is_hovered()) {
             ui_set_paint(solid(shade(t->surface_alt, 1.10f)));
+        } else {
+            ui_set_paint(solid((struct color){0, 0, 0, 0}));   /* reset: un-hover cleanly */
         }
         ui_set_corner_radius(t->radius_sm);
         ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp3);
@@ -337,8 +350,39 @@ void ui_avatar(const char *initials) {
 
 /* --- text field --------------------------------------------------------- */
 
-bool ui_text_field(char *buf, unsigned long cap, const char *placeholder) {
+/* Enter, seen by the field that had focus when it was typed.
+ *
+ * One global rather than per-field state, because exactly one field can hold
+ * focus -- so exactly one field can see a Return. The caller reads it right
+ * after emitting its field, and reading CLEARS it: a submit is an edge, and an
+ * edge that stays set fires again on every later frame. */
+static bool g_field_submit;
+
+bool ui_text_field_submitted(void) { bool s = g_field_submit; g_field_submit = false; return s; }
+
+/* An emphasised span inside the next field's value, drawn when it is NOT being
+ * edited: the span in the normal text colour, everything around it dimmed.
+ *
+ * It exists for one job -- an address bar has to make the HOST legible and let
+ * the scheme and path recede, because the host is the part that says who you
+ * are actually talking to, and the part a hostile URL pads out to hide. A field
+ * that renders its value in one flat colour cannot say that.
+ *
+ * One-shot, like the submit edge: set immediately before the field, consumed by
+ * it. While focused the value is drawn plain, because what you are editing is
+ * the whole string and dimming two thirds of it would be lying about that. */
+static unsigned g_emph_start, g_emph_len;
+static bool     g_emph_on;
+
+void ui_text_field_emphasis(unsigned start, unsigned len) {
+    g_emph_start = start; g_emph_len = len; g_emph_on = (len > 0);
+}
+
+static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool masked) {
     const struct ui_theme *t = TH;
+    bool     emph  = g_emph_on;
+    unsigned emph_s = g_emph_start, emph_n = g_emph_len;
+    g_emph_on = false;                    /* consumed, whether or not it is used */
     ui_box_begin(0);
     struct instance_handle self = ui_open();
     if (ui_consume_click(self)) ui_request_focus(self);
@@ -352,7 +396,8 @@ bool ui_text_field(char *buf, unsigned long cap, const char *placeholder) {
         for (int i = 0; i < n; i++) {
             char c = in[i];
             if (c == '\b') { if (len > 0) buf[--len] = 0; }
-            else if (c == '\n' || c == '\t') { /* single-line: ignore submit/tab */ }
+            else if (c == '\n') { g_field_submit = true; }   /* submit; see above */
+            else if (c == '\t') { /* single-line: no tab traversal yet */ }
             else if ((unsigned char)c >= 32 && (unsigned char)c < 127 && len + 1 < cap) {
                 buf[len++] = c; buf[len] = 0;
             }
@@ -360,23 +405,62 @@ bool ui_text_field(char *buf, unsigned long cap, const char *placeholder) {
     }
 
     /* the input well */
-    ui_set_paint(solid(t->surface_alt));
+    ui_set_paint(solid(CP(surface, t->surface_alt)));
     ui_set_corner_radius(t->radius_md);
-    ui_set_border(focused ? 1.5f : 1.0f, focused ? t->accent : t->border_strong);
+    ui_set_border(focused ? 1.5f : 1.0f,
+                  focused ? CP(focus, t->accent) : CP(border, t->border_strong));
     ui_set_padding(t->sp2 + 1, t->sp3, t->sp2 + 1, t->sp3);
     ui_set_size(sz_grow(), sz_intrinsic());
     ui_set_align(ALIGN_CENTER);
 
     ui_begin_hstack(0);
     ui_set_align(ALIGN_CENTER);
-    ui_set_spacing(1);
+    /* The runs of an emphasised value must sit flush; the 1px is the gap the
+     * caret needs and there is no caret when this draws. */
+    unsigned long emph_fits = 0;
+    if (emph && !focused && !masked) {
+        emph_fits = strlen(buf);
+        if (emph_s >= emph_fits || emph_s + emph_n > emph_fits) emph_fits = 0;
+    }
+    ui_set_spacing(emph_fits ? 0 : 1);
     if (buf[0] == 0 && !focused) {
-        text_role(t->font_regular, t->text_body, t->text_tertiary, placeholder);
+        text_role(t->font_regular, t->text_body, CP(placeholder, t->text_tertiary), placeholder);
+    } else if (emph_fits) {
+        /* dim head, bright span, dim tail -- up to three runs, any of which
+         * may be empty and is then simply not emitted */
+        char part[256];
+        struct color dim = CP(placeholder, t->text_tertiary);
+        struct color lit = CP(text, t->text);
+        if (emph_s) {
+            unsigned n = emph_s < sizeof part - 1 ? emph_s : (unsigned)sizeof part - 1;
+            memcpy(part, buf, n); part[n] = 0;
+            text_role(t->font_regular, t->text_body, dim, part);
+        }
+        {
+            unsigned n = emph_n < sizeof part - 1 ? emph_n : (unsigned)sizeof part - 1;
+            memcpy(part, buf + emph_s, n); part[n] = 0;
+            text_role(t->font_regular, t->text_body, lit, part);
+        }
+        if (emph_s + emph_n < emph_fits) {
+            const char *tail = buf + emph_s + emph_n;
+            snprintf(part, sizeof part, "%s", tail);
+            text_role(t->font_regular, t->text_body, dim, part);
+        }
+        ui_flex_spacer();
     } else {
-        text_role(t->font_regular, t->text_body, t->text, buf);
+        char hidden[128];
+        const char *shown = buf;
+        if (masked) {
+            unsigned long n = strlen(buf);
+            if (n >= sizeof hidden) n = sizeof hidden - 1;
+            for (unsigned long i = 0; i < n; i++) hidden[i] = '*';
+            hidden[n] = 0;
+            shown = hidden;
+        }
+        text_role(t->font_regular, t->text_body, CP(text, t->text), shown);
         if (focused) {                    /* caret */
             ui_box_begin(0);
-            ui_set_paint(solid(t->accent));
+            ui_set_paint(solid(CP(focus, t->accent)));
             ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
             ui_box_end();
         }
@@ -385,6 +469,28 @@ bool ui_text_field(char *buf, unsigned long cap, const char *placeholder) {
     ui_end_stack();
     ui_box_end();
     return focused;
+}
+
+void ui_set_control_palette(const struct ui_ctl_palette *p) {
+    if (p) { g_ctl = *p; g_ctl_on = 1; } else g_ctl_on = 0;
+}
+
+struct color ui_ctl_color_(int which, struct color dflt) {
+    if (!g_ctl_on) return dflt;
+    struct color c = which == UI_CTL_SURFACE     ? g_ctl.surface
+                   : which == UI_CTL_BORDER      ? g_ctl.border
+                   : which == UI_CTL_FOCUS       ? g_ctl.focus
+                   : which == UI_CTL_TEXT        ? g_ctl.text
+                                                 : g_ctl.placeholder;
+    return c.a > 0 ? c : dflt;
+}
+
+bool ui_text_field(char *buf, unsigned long cap, const char *placeholder) {
+    return ui_field(buf, cap, placeholder, false);
+}
+
+bool ui_password_field(char *buf, unsigned long cap, const char *placeholder) {
+    return ui_field(buf, cap, placeholder, true);
 }
 
 /* --- scroll view -------------------------------------------------------- */
@@ -425,6 +531,7 @@ void ui_overlay_begin(uint64_t key) {
     g_overlay_h = ui_open();
     struct color scrim = { 0.0f, 0.0f, 0.0f, 0.55f };   /* dim the content behind */
     ui_set_overlay(true);                 /* fill the screen, out of flow (paints on top) */
+    ui_set_layer(1);                      /* elevated: paints above + hits above the flow */
     ui_set_paint(solid(scrim));
     ui_set_size(sz_grow(), sz_grow());
     ui_set_align(ALIGN_CENTER);

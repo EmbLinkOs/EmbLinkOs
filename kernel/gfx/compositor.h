@@ -72,6 +72,13 @@ int64_t compositor_win_create_glass(struct process *client, uint32_t cw, uint32_
                                     int32_t x, int32_t y, const char *title,
                                     uint64_t *out_client_va);
 
+/* TRANSLUCENT window: chromeless, per-pixel transparent, NO blur -- composited
+ * over the sharp backdrop like the desktop but raisable. A thin bar with a tall
+ * invisible canvas for its dropdowns. */
+int64_t compositor_win_create_translucent(struct process *client, uint32_t cw, uint32_t ch,
+                                          int32_t x, int32_t y, const char *title,
+                                          uint64_t *out_client_va);
+
 /* Resize a shared window's content: fresh page backing, new client VA out.
  * The caller must switch to the new pointer immediately. */
 int64_t compositor_win_resize(struct process *client, uint32_t id,
@@ -84,6 +91,25 @@ int compositor_win_is_shared(int pid, uint32_t id);
  * cursor: returns 1 (focused) with content-local x/y, buttons, win id and the
  * accrued scroll wheel filled (wheel is consumed), or 0. Lets an app inside a
  * window read its own mouse. */
+/* pid owning the FRONT window -- who the keyboard belongs to (0 = none). */
+uint32_t compositor_focused_pid(void);
+/* exit-time: hide + repaint a dying pid's windows (reap frees them later) */
+void compositor_exit_pid(int pid);
+/* Un-minimize and raise a process's windows (the dock's click-to-restore). */
+int  compositor_restore_pid(int pid);
+/* An app parking its own window (chromeless apps have no kernel button). */
+int  compositor_win_minimize(int pid, uint32_t id);
+/* Lift the DESKTOP layer above every app window (on) or return it to the ground
+ * (off). For the shell's own full-screen surfaces -- the Applications launcher
+ * is drawn by the desktop process, and at z=0 it opened behind whatever the
+ * user already had open. Refused for any process but the layer's owner. */
+int  compositor_desktop_front(int pid, int on);
+/* Advance window open/park motion one frame; no-op when nothing is moving. */
+void compositor_anim_tick(void);
+/* Average luminance (0-255) of what is composed under a screen rect, or -1. */
+int  compositor_backdrop_luma(int x, int y, int w, int h);
+/* frost the backdrop behind a window-local sub-rect (translucent windows) */
+int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
                          uint32_t *buttons, uint32_t *win, int32_t *wheel);
 

@@ -1,0 +1,41 @@
+<html><head><title>Page zoom</title><style>
+/* This page sets LIGHT text, so it has to state the ground that goes under
+   it. The browser's canvas is white -- the initial value every page on the web
+   is written against -- and a document that assumes otherwise is a document
+   that only works in one browser's dark mode. Stating it here is what a real
+   page has to do, and it keeps every colour expectation below unchanged.
+
+   The GROUND and the INK go together: declaring one without the other leaves
+   everything the page did not colour explicitly -- a table cell, a list item --
+   still using the browser's dark default, unreadable on this dark ground. */
+html, body { background: #16161c; color: #d8d8e0 }
+
+body    { color: #d8d8e0; padding: 0 }
+.panel  { background: #1a1a24; padding: 20px; width: 300px }
+h1      { color: #58a6ff }
+.small  { color: #808090 }
+</style></head><body>
+<!-- Page zoom scales the DOCUMENT: the text and the lengths the author stated.
+     Two renders of this one page, at 1.0 and at 2.0, are compared against each
+     other -- so the assertion is about the SCALE and not about any absolute
+     number, which is what makes it survive a font change. -->
+<div class="panel">
+  <h1>ZOOMHEAD</h1>
+  <p>ZOOMBODY at the browser's normal size.</p>
+  <p class="small">ZOOMSMALL is smaller, and stays proportionally smaller.</p>
+</div>
+
+<!-- EXPECT-TEXT: ZOOMHEAD -->
+<!-- Text scales with the zoom... -->
+<!-- EXPECT-ZOOM: ZOOMHEAD 2.0 -->
+<!-- EXPECT-ZOOM: ZOOMBODY 2.0 -->
+<!-- ...at every size, so the page keeps its own hierarchy rather than
+     flattening to one size. -->
+<!-- EXPECT-ZOOM: ZOOMSMALL 2.0 -->
+<!-- A third factor, because a scale that only ever worked at 2 would be a
+     doubling and not a zoom. -->
+<!-- EXPECT-ZOOM: ZOOMBODY 1.5 -->
+<!-- Unzoomed, the small text really is smaller than the heading -- the thing
+     the ratios above are preserving. -->
+<!-- EXPECT-BELOW: ZOOMSMALL ZOOMHEAD -->
+</body></html>

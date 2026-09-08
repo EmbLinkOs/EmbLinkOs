@@ -6,6 +6,250 @@ left to do.
 
 ---
 
+## The Applications launcher
+
+- [x] Opens every time, in FRONT of app windows, full-screen and searchable
+      with 72px icons.
+- [x] ~~Re-opening it painted nothing~~ -- the cause was in the LAYOUT ARENA,
+      not the launcher, the compositor or the window order:
+      `layout_destroy_node` freed a node without unlinking it from its parent's
+      child list. The parent kept pointing at a slot on the free list, and the
+      moment that slot was reissued with a bumped generation the parent's link
+      resolved to nothing and the child walk STOPPED THERE. Every sibling after
+      the destroyed node quietly left the tree -- still built, still linked in
+      the instance tree, never measured, never arranged. It affected ANY
+      subtree that is removed and later rebuilt; the launcher is just where it
+      was noticed.
+- [ ] The menu bar is covered while the launcher is up rather than staying
+      above it. Lifting translucent bars above the layer is the obvious move
+      and needs care: the bar's window GROWS to 792x340 for its dropdowns, so
+      naively it covers the launcher instead.
+
+## Note++ -- the OS's own editor
+
+- [x] ~~Ctrl+V deleted a line instead of pasting~~ -- the runtime replays a
+      paste through the key hook while Ctrl is still physically held, so every
+      pasted character was read as a shortcut and a clipboard containing an 'l'
+      ran delete-line. A printable byte is never a shortcut now; Ctrl+letter
+      arrives as a control code.
+- [x] ~~Pasting flattened newlines to spaces~~ -- correct for a terminal, wrong
+      here. The key hook gets first refusal on 0x16 so an editor can take the
+      clipboard raw.
+- [x] ~~Uneven line spacing over the first few lines~~ (twice: the EmZero fix
+      was necessary and not sufficient -- rows also needed min == max == the
+      line height, because a stated height alone was not being honoured) -- EmProps' EmZero
+      ("explicitly zero") was tested with `> 0` everywhere in em_apply_box and
+      thrown away with the unset values, so asking for no padding got the
+      default padding. It is honoured now, which fixes it for every app.
+
+Working and verified on the metal: multi-file tabs, line numbers, syntax
+colouring for C/Python/JS/shell/Markdown, auto-indent, current-line highlight,
+undo, select-all, CLICK TO PLACE THE CARET and DRAG TO SELECT, wheel scrolling,
+find/replace, the shortcut set (Ctrl+S/N/O/W/A/Z/Y/F/H/D/L, Ctrl+arrows), and a
+status bar tracking line, column, selection size and language. The engine
+(user/note/edit.c) has 45 host tests; `make edit-test`.
+
+Honest score from the person using it: 0.1/10 -- a base, not an editor. What is
+missing, roughly in the order a user meets it:
+
+- [x] ~~No horizontal scrolling~~ -- a long line is WINDOWED now rather than
+      clipped, and the caret drags the window sideways with a few columns of
+      margin ahead of it. The 512-byte draw cap is gone with it: only the
+      visible columns are ever emitted, so the limit that remains is the
+      highlighter's (4096 per line, past which a line is uncoloured but still
+      whole, editable and saved).
+- [ ] Still no horizontal SCROLLBAR, and no way to scroll sideways with the
+      wheel or a gesture -- only the caret moves the window.
+- [x] ~~WORD WRAP~~ -- DONE, and done as the one change it had to be. The
+      arithmetic was already tested (`ed_wrap_line`, 7 cases: breaks at the
+      last space that fits, cuts a word longer than the view rather than
+      pushing text off the edge, rows reassemble into the line exactly); the
+      view half is now wired through a VISUAL-ROW model in notepp.c
+      (`line_rows`/`vis_total`/`vis_row_at`/`vis_row_of`), and all five places
+      that assumed `row == line` moved together: the row loop in
+      document_view, `offset_at_point`, up/down (`move_visual`),
+      `scroll_to_caret` + `g_rows`, and the scrollbar's total. Off is a status
+      bar toggle away ("Wrap" / "No wrap"), which re-anchors the view on the
+      caret because the toggle changes what a row IS.
+      Two details worth keeping:
+        * only a line's FIRST visual row carries its gutter number -- a number
+          repeated down a wrapped paragraph says the line is four lines;
+        * the highlighter's state is threaded row by row, not line by line, so
+          a block comment opened on a wrapped line's first row is still open
+          on its second. The single top-down walk carries it; the old
+          "re-scan the lines above the viewport" pass was deleted because it
+          advanced the same state a second time.
+      Verified on the metal: typed long lines wrap and re-flow, a click lands
+      on the right visual row, up/down walk rows and keep the goal column
+      across a clamp, and a 60-line file scrolls to a last line that stops at
+      the bottom of the viewport.
+- [x] ~~The wheel could scroll a file until one row was left on screen~~ --
+      `first` was clamped to `total - 1`; it is now `total - g_rows`, so
+      scrolling ends when the end of the file is on screen rather than when
+      the file has been pushed off the top. (Pre-existing; it only became
+      obvious once wrapped rows made `total` bigger than the line count.)
+- [x] ~~Find shows no match count~~ -- it says "3 of 12", or "none".
+- [x] ~~Find does not highlight the other matches~~ -- every hit on every
+      visible line is tinted, with the current one still the brighter
+      selection. Runs break at match boundaries as well as selection ones so a
+      hit that starts mid-token is highlighted exactly.
+- [ ] Ctrl+F and the other shortcuts cannot be driven through QMP: a
+      synthesized Ctrl+letter arrives as a printable character with the
+      modifier set, and a printable character is deliberately never treated as
+      a shortcut (that rule is what stopped a paste running delete-line). Real
+      hardware sends control codes and works. To see the find bar in a test,
+      default g_find_open to 1 for that build.
+- [x] ~~Ctrl+G hijacked the find box~~ -- it is its own dialog, showing the
+      file's real line range, and it puts the line in the MIDDLE of the view
+      rather than at the top.
+- [x] ~~The sheets dismissed on the first click outside them~~ -- all three
+      debounce now, the way the launcher already did. The unsaved-changes sheet
+      deliberately has no click-off dismiss at all: a question about losing
+      work should not be answerable by missing.
+- [x] ~~No auto-close, no comment toggle~~ -- an opener brings its partner and
+      typing the closer steps over it; Ctrl+/ comments a block and uncomments
+      it only when every line already is.
+- [x] ~~No prompt when closing a modified file~~ -- Cancel / Save / Discard.
+- [x] ~~The confirm sheet drew top-left over the tab bar~~ -- two layout bugs,
+      neither sufficient alone: layout_run set the initial containing block to
+      ZERO while its own comment said it was the viewport, and place_positioned
+      preferred an out-of-flow box's INTRINSIC size over the block even when
+      the box had asked to grow. A full-screen scrim therefore took the size of
+      the dialog inside it and sat in the corner. Fixed for every overlay in
+      the OS, not just this one.
+- [x] ~~Double and triple click~~ -- CONFIRMED BY HAND on a real mouse. It
+      could not be verified here: a tap held ~90ms never reaches the guest at
+      all, and one held long enough to be seen (450ms) puts the presses 700ms
+      apart, outside the window. Too fast to see or too slow to pair, with
+      nothing in between -- so the last word had to come from a person.
+      Five real defects were found underneath it, and the first is OS-WIDE:
+        1. ui_pointer() compared against LAST FRAME's button state and ran once
+           a frame, so a press+release between frames was never an edge. The
+           app loop samples in 5ms slices through both sleeps now. EVERY APP
+           was dropping fast clicks, not just this one.
+        2. g_clicked keeps only the most recent press, so it could not tell one
+           click from three. Edges are counted.
+        3. The streak counted FRAMES rather than clicks, and edges arrive
+           batched.
+        4. The window was timed between frames, and a frame here can outlast
+           the whole 500ms window. The press carries its own timestamp.
+        5. TWO edge detectors watching one button disagreed about the previous
+           state, so the DSL counted zero for presses the toolkit had
+           registered. One detector.
+      A probe mistake worth not repeating: an early version printed
+      g_last_click_off AFTER assigning it, so `at == last` was guaranteed by
+      the probe. CAPTURE BEFORE YOU MUTATE.
+- [x] ~~No shift-click to extend~~ -- a shifted press moves the caret and
+      keeps the anchor. NOT verified here (holding shift across a synthesized
+      click is another thing QMP will not do); the rule is one branch and the
+      engine's half is tested.
+- [x] ~~No scrollbar~~ -- a thin track beside the text, thumb sized to the
+      visible fraction, shown only when there is something to scroll, and
+      DRAGGABLE -- the thumb brightens while held.
+- [ ] Undo cannot redo an insert (the pool stores removed text only), and undo
+      is per-document only while that document is bound.
+- [ ] No column selection, no multiple carets, no folding, no minimap.
+- [ ] The tab bar does not scroll and caps at 8 documents.
+- [x] ~~Nothing is remembered between runs~~ -- which files were open, which
+      one was in front, and the caret in each, in $HOME/.notepp-session. A flat
+      text file on purpose: it is a list of paths, and a format nobody can read
+      is one nobody can fix.
+- [x] ~~No file picker~~ -- Browse lists the directory, folders bright and
+      files dimmed, `..` to go up, click a file to open it. It starts where the
+      current file lives, else at $HOME.
+- [x] ~~The picker does not mark which subtrees are writable~~ -- it says
+      `writable` or `read-only` beside the path, decided by TRYING (create a
+      probe file, remove it) rather than by keeping a second copy of what
+      notepp.ns already declares.
+- [x] ~~The picker cannot create a file~~ -- a name field, offered only where a
+      write would actually succeed. Nothing touches the disk until Save, so a
+      mistyped name costs nothing.
+- [x] ~~Cannot create a directory from the picker~~ -- a name ending in `/`
+      makes a folder, in the same field. Made immediately, unlike a file: an
+      empty directory is the whole object, so there is no later Save to create
+      it at.
+
+## The JavaScript gap -- it is the PLATFORM, not the engine
+
+QuickJS (ES2020) is already complete; nothing is left to port. What real pages
+die on is the web platform around it, and nobody ships that as a portable
+library -- every browser's DOM is welded to its own engine, so V8 or
+SpiderMonkey would arrive with no more of it than we have. Ranked by what the
+corpus actually throws:
+
+- [ ] `window` is not defined. The global alias nearly every script touches in
+      its first ten lines; jsdom.c exposes `document`, `console`, `fetch`,
+      `location`, `localStorage` and element-level `addEventListener` but not
+      this. Close to a one-liner, and it unblocks scripts that currently die
+      before doing anything.
+- [ ] `URL` is not defined.
+- [ ] `addEventListener` at global scope (it exists on elements only).
+- [ ] Considered and rejected: porting LibCSS (NetSurf). It is genuinely
+      portable and does parsing/selection/cascade well, but it stops at
+      COMPUTED STYLE -- and our measured gap is properties that need PAINTING
+      (opacity, box-shadow, transform), which it would hand us and not draw.
+      It is also roughly CSS 2.1 + Selectors 3, so it would not have given us
+      `:is`/`:where`/`:not` either, which took ~150 lines to write.
+
+## What still makes a page look older than it is
+
+Measured against the CSS of the seventeen real sites, ranked by how often the
+web asks for them and how much they change a page:
+
+- [ ] `opacity` (900 uses) and `box-shadow` (886). Shadow is most of what
+      reads as "depth" on a modern page; without it every card is a flat
+      rectangle.
+- [ ] `transform` (782). Used for layout offsets as often as for effects.
+- [ ] SVG is parsed but not DRAWN, so every logo and icon on a modern site is
+      alt text or nothing. rust-lang.org's header is the word "Rust Logo".
+- [ ] No `@font-face` (80 uses): every page renders in DejaVu Sans whatever it
+      asked for, which alone dates a design.
+- [ ] `background-image` (465), including gradients.
+- [ ] `z-index` (629) -- painting is still document order.
+- [ ] `white-space` (456), `min-width`/`min-height`/`max-height` (~1100).
+- [ ] `margin-right` has nowhere to go: the box model carries
+      `margin_top/bottom` and a left `indent` only.
+
+## Browser chrome -- what is still missing
+
+- [x] ~~The address field shows the whole URL in one weight~~ -- the host is
+      emphasised and the scheme and path recede, via a one-shot span the kit's
+      field draws when it is not being edited. Plain again while editing: what
+      you are editing is the whole string.
+- [x] ~~No favicon anywhere~~ -- one per ORIGIN, cached across navigation,
+      downsampled to 32px and drawn at 14. Needed an .ico decoder, because
+      that is what the web actually serves: of nine sites checked, six answer
+      /favicon.ico with an .ico container holding DIBs at 32, 8 and 4 bits per
+      pixel, or a whole PNG.
+- [ ] A site whose ONLY icon is an SVG shows none. Both candidates are tried
+      (declared link, then /favicon.ico) and an SVG declaration is skipped
+      rather than fetched-and-failed, so this only bites a site with no .ico
+      at all.
+- [ ] The search engine is compiled in (`SEARCH_URL` in vellum.c). It should be
+      a setting. Google is not the default and the reason is measured, not
+      chosen: it answers a scriptless browser with a 302 to a consent page, and
+      DuckDuckGo with a CAPTCHA. Mojeek answers with results.
+- [ ] The address bar has no completion -- no history matching, no suggestions.
+      Every visit is fully typed.
+- [x] ~~Large pages render blank on the metal~~ -- root cause found and fixed,
+      and it was not rendering at all: the kernel's blocking TCP receive
+      returned 0 on TIMEOUT, which every layer above reads as end-of-stream.
+      A Brave results page arrived as 8192 of 291486 bytes with status 200 and
+      no error anywhere. Now 291486/291486. See net_tcp_recv.
+- [ ] A large page over HTTPS is SLOW: ~90-200s for 291KB under TCG. Now that
+      the transfer completes instead of being cut short, throughput is the next
+      wall. Unmeasured which of these dominates -- our AES-GCM decrypt cost, the
+      TCP receive window, or the 4KB read chunk in net.c. Measure before
+      theorising.
+- [ ] Wikipedia's "Operating system" article is 666KB and TAB_SRC_MAX is 512KB,
+      so it is truncated before the parser sees it regardless of the above.
+- [ ] The status line still reports node and rule counts -- developer
+      telemetry as a permanent resting state. Useful here, but not what a
+      reader wants the bottom of the window to say.
+- [ ] Tabs do not scroll or shrink: six is the cap and the strip would simply
+      run out of room before that on a narrow window.
+- [ ] No context menu, no bookmarks, no downloads UI.
+
 ## Bootloader
 
 ### Stage 1
@@ -855,6 +1099,14 @@ renders — and since the same day EmbBuild **builds** one from a manifest
 covers the GUI, not just static C. See `docs/PORTS.md` § "The GUI wall, and
 how it came down" and BUILD.md §6.
 
+- [ ] **The menu bar's drag-and-drop is one-directional** (`user/bin/topbar.c`
+  + `em_dock`). You can drag a status chip to reorder it or pull it out of the
+  bar to remove it, but you cannot yet drag a *new* item **into** the bar from
+  an external tray — that needs either a same-window chip palette the dock
+  accepts drops from, or true cross-window drag transfer (the compositor would
+  have to hand a drag payload from the tray window to the bar window). The
+  reorder/drag-out half is built and live; the drag-in half is the open piece
+  of the user's "drag stuff into it or out of it" request.
 - [ ] **Only ONE EmUI app has a build manifest** (clockw). home/uidemo/wmdemo
   and the rest of `user/bin/*.c` are still host-built only. This is now
   breadth, not capability — each needs the same three-stanza shape plus its
@@ -1803,3 +2055,1903 @@ Encrypt/RSA), `test wget https`, `test pypi`.
   public-value** use and are **NOT constant-time**. Before any *signing* or private-
   key handling on the OS (client certs, our own CA, key storage) they need constant-
   time review. `getentropy` is RDRAND-only (fine; documented).
+
+### Terminal / shell (post "complete terminal" pass, 2026-08-05)
+- [ ] Copy/paste in the terminal -- blocked on an OS clipboard (none exists yet)
+- [ ] Ctrl+C interrupting a RUNNING command from the GUI terminal (needs the
+      async-signal gap closed, or the interrupt-route delegated across the pipe)
+- [ ] Resizable terminal window (T_COLS/T_ROWS fixed; needs reflow on resize)
+- [ ] Wheel scrollback direction untested on real hardware (sign chosen from
+      ui_scroll_begin's convention; flip in term_view if it feels inverted)
+- [ ] SGR: only fg colour + bold honoured; backgrounds/underline dropped
+
+### Minimize / restore (shipped 2026-08-06)
+- [ ] No minimize ANIMATION -- the window vanishes and reappears instantly.
+      The Mac genie is the obvious want; a scale+fade toward the dock icon is
+      the cheap version. Blocked on the same window-motion work as the reverted
+      open/close animation below.
+- [ ] Restore is per-PROCESS, not per-window: an app with two windows gets both
+      back. Fine while apps are single-window; revisit with a real window list.
+- [ ] No keyboard path (Super+M) and no "minimize all" -- the dock icon is the
+      only way back.
+- [ ] A minimized app still runs its render loop if it is timer-driven (a clock
+      widget keeps painting into a buffer nobody composites). Retained-update
+      apps idle correctly; a `minimized` bit in win_input would let the rest
+      stop too.
+
+### Window depth: drop shadow + rounded corners (shipped 2026-08-06)
+- [ ] Focused-vs-unfocused shadow depth is code-verified, not photographed:
+      every metal pairing so far had the back window fully covered, and the
+      desktop is a fallback focus owner so clicking wallpaper cannot defocus a
+      window. Compare the two bands side by side next time two windows overlap.
+- [ ] WIN_RADIUS is a compositor constant (9px), not a theme token -- it should
+      come from theme.c alongside the toolkit's own corner radii, or in-window
+      cards and the window frame will drift apart.
+- [ ] Glass/widget/translucent windows are excluded from BOTH shadow and
+      rounding (they draw their own rounded pill in-surface). Fine today, but
+      a glass APP window would want the compositor treatment.
+- [ ] The carve costs ~324 px/window/repaint. Invisible against a full window
+      blit, but if per-frame cost is ever profiled, this is a candidate for
+      caching the coverage mask (it only changes with the radius).
+
+### UI framework: menu-scrim / click-through (investigated 2026-08-05, reverted)
+- [ ] Clicking the top bar's transparent canvas under an open dropdown does
+      NOTHING (menu stays open). TWO stacked causes found:
+      1. the menu's dismiss scrim is an overlay, and overlays size to their
+         PARENT -- here the 28px menubar strip, so the scrim covers almost
+         nothing. Overlays honouring an explicit fixed size fixes this half
+         (layout.c grid+stack overlay arms).
+      2. the hit test has NO layering: "topmost" = last in document order, so
+         the bar's trailing Spacer wins the point over the earlier scrim.
+      A "modal hit layer" flag (2-pass instance_at: modal subtrees first) was
+      prototyped and REVERTED: marking kit's Overlay + the menu scrim modal
+      made the bar's own content vanish while a menu was open and broke
+      launcher grid clicks -- interaction with reconciliation/epoch or with
+      paint order not understood yet. Needs a designed z-layer story (paint
+      AND hit), not a flag bolted onto hit only.
+
+### Z-layers: metal menu-dismiss anomaly (2026-08-06, OPEN — evidence attached)
+- [ ] On metal ONLY, while a top-bar dropdown is open, presses into the bar's
+      window stop having any effect: the viewport-sized layer-1 scrim resolves
+      the hit (traced: "PRESS -> inst 9.1 layer=1", and g_menu_scrim == 9.1,
+      same index AND generation), yet ui_consume_click(g_menu_scrim) never
+      closes the menu; in later runs presses stopped arriving at all (no PRESS
+      trace despite QMP button events). Host repro (build/menurepro pattern:
+      dispatch_click -> frame) passes all three checks: open, canvas-dismiss,
+      settle+reopen. Every link re-derived sound; suspect an em_app input-feed
+      / build-gate interaction under TCG, or a consume between press and
+      em_menu_end_. Escape hatch meanwhile: selecting a menu item closes.
+      Menus render correctly open+closed (identity fix); launcher/dock/ghost
+      unaffected with menus closed.
+
+### Essential apps (Files / Settings / Terminal, 2026-08-06)
+- [x] ~~RIGHT-CLICK NEVER REACHES AN APPLICATION~~ -- WRONG, and worth keeping
+      as a caution. Right-click works fine; the observation was made during the
+      window when `timeout 200 make embkfs.img` was silently producing no image
+      and the VM was booting a stale one (see Harness). The whole chain --
+      compositor button mask, sys_win_input, em_feed_pointer, em_right_clicked
+      -- was correct all along. A negative result from an unverified build is
+      not a result.
+- [ ] Button labels are always CENTRED. em_button_impl uses ui_box_begin, and
+      justify appears not to apply to a box the way it does to a stack, so
+      .leading() still leaves a file name centred in its column. Needs the
+      button's label to live in a stack, or box justify to work.
+- [ ] Files list view has no column headers and no sort-by-column.
+- [ ] ContextMenu's anchor is PARENT-relative while em_right_clicked reports
+      WINDOW-local coordinates, so a menu emitted inside a pane opens offset by
+      that pane's origin. Emitting it at the window's top level fixes the
+      anchor and breaks the menu -- the dismiss scrim then covers the press
+      point and eats the opening click. em_menu_panel_open should subtract its
+      overlay's resolved origin (available a frame late via ui_open_rect), or
+      take window coordinates outright.
+- [ ] Files' status line ("N items") may still sit tight against the window's
+      bottom edge. The viewport-height bug that caused the worst of it is fixed
+      (em_app published height 0 until the first resize); re-check and, if it
+      persists, measure the resolved rects rather than guessing constants.
+- [ ] Files has no delete, rename, copy or move. unlink/rmdir/rename syscalls
+      all exist -- what is missing is the confirmation design, and a delete
+      that ships before its confirmation is a bug with a keyboard shortcut.
+- [ ] Files opens a file by spawning the editor; there is no "open with", and
+      a file whose kind we name (Image, Archive) still opens in the editor.
+- [ ] Settings' light theme is applied but has never been looked at seriously
+      -- the whole shell was designed on the dark ground.
+- [ ] Settings changes reach a RUNNING application only if it is the desktop
+      (which polls). Other apps pick up the accent at their next launch. A
+      config-changed broadcast would fix it; the IPC exists.
+- [ ] The Terminal still has no tabs, no text selection and no font-size
+      control. Tabs need a second shell process per tab, which is the real work.
+- [ ] The Terminal's prompt is inline now, but the transcript does not scroll
+      on its own as output arrives past the bottom -- it re-windows to the last
+      N lines. Fine at a screenful; a real pty would want a scrolling region.
+- [ ] `$(wildcard build/*.elf)` in the embkfs.img rule is evaluated at parse
+      time, so the FIRST build after adding an app packs an image without it
+      (spawn fails -ENOENT). Second `make` is correct. Cost me a boot cycle.
+
+### Adaptive menu-bar ink (shipped 2026-08-06)
+- [ ] Only the LIGHT ink is verified against a real wallpaper; the dark branch
+      was proven by temporarily inverting the threshold (bar text went
+      near-black, docs say it works, but no light wallpaper exists yet to see
+      it in earnest). Revisit when wallpapers are user-selectable.
+- [ ] The sample is one 6px band directly under the bar. A wallpaper that is
+      light at the left and dark at the right gets one ink for the whole bar;
+      per-item sampling would be the real answer.
+
+### Harness
+- [ ] `make embkfs.img` takes ~110s after a wide rebuild. A `timeout 200` around
+      it is NOT generous -- it killed the build mid-flight, left no image, and
+      the following `cp embkfs.img ...` failed silently, so the VM booted the
+      PREVIOUS image and several "the fix didn't work" observations were really
+      "the fix was never in the image". Always `test -f` the artifact before
+      copying it, and give the image build 900s.
+
+### Host test rot
+- [ ] `make font-test` does not compile: font_test.c calls `be->draw_text` with
+      8 arguments against the 11-argument backend signature (box_w/box_h/paint
+      were added for gradient + clipped text). Pre-existing -- it fails at HEAD
+      too -- but it means the font suite has not run in a while. The other five
+      suites (scene/layout/backend/declare/reactive) are green.
+
+### Window motion (shipped 2026-08-06, compositor-side)
+- [ ] Closing animates via a full-window pixel COPY (~1.4MB kmalloc per close;
+      the live buffer is freed under the ghost when the process is reaped).
+      Cheap enough at one motion at a time, but if closes ever overlap or
+      windows get much bigger, a deferred free of the shared buffer would beat
+      copying it.
+- [ ] The park target is the bottom CENTRE of the screen, not the app's actual
+      dock icon: the dock is drawn by home and the kernel has no idea where its
+      icons are. Plumbing the icon rect through (win_set_park_target?) would
+      make it land on the right icon.
+- [ ] Only one motion runs at a time; a second window animating while one is in
+      flight is simply not animated (anim_start returns).
+- [ ] The window is un-hittable for the 170-200ms it is in flight (it is hidden
+      and the ghost takes no input). Fine at these durations, wrong if they grow.
+- [ ] Frame pacing rides the main loop's ~100Hz timer wake. Under heavy TCG load
+      the loop can be slower, and the motion degrades to fewer frames rather
+      than slowing down (it is time-based, so it still lands on schedule).
+
+### Window-materialize motion (2026-08-06, reverted -- findings attached)
+- [ ] Wrapping the app view in an opacity/offset wrapper (fade+rise on open)
+      left the window CROPPED to ~content-text width with an offset ghost of
+      the input row, and it never settled. Suspect the opacity<1 group path:
+      whole-window subtree -> cpu_scratch_acquire at full window size, plus
+      moved-wrapper dirty across animated frames. Chase it in the host
+      harness (menurepro pattern) before re-attempting; the menu drop-in
+      (small area, same mechanism) works fine, so it is scale-related.
+      SUPERSEDED for window open/close: doing the motion in the COMPOSITOR
+      (see above) avoids the toolkit group path entirely. This entry stands
+      only for in-APP whole-view transitions, if one is ever wanted.
+
+### Vellum, the browser (B1 shipped 2026-08-07) -- what B1 does NOT do
+- [x] ~~**B2: the network.**~~ DONE 2026-08-07: `user/web/net.{c,h}` +
+      `url.{c,h}`, http:// and https:// live on the metal.
+- [ ] No chunked transfer-encoding. The client is HTTP/1.0 with
+      `Connection: close`, so a server that chunks anyway would confuse it.
+      Deliberate for now (see BROWSER.md); needed before HTTP/1.1 keep-alive.
+- [x] ~~The fetch is SYNCHRONOUS~~ DONE 2026-08-07: it runs on a worker thread
+      (`user/web/fetchjob.{c,h}`) and the view polls. The window stays alive and
+      the page lands without a freeze. Three real bugs BELOW the browser had to
+      be fixed to get there -- see the commit; all three were latent for anyone
+      who tried the same thing.
+- [x] ~~An app renders DIRECTLY INTO THE SHARED WINDOW BUFFER~~ FIXED
+      2026-08-07: em_app renders into a private back buffer and copies the
+      FINISHED frame across (only the presented band). The compositor can no
+      longer see a frame mid-draw. Vellum keeps its page, its chrome and its
+      loading indicator intact for the whole of an https fetch.
+- [x] ~~em_widget_run still renders straight into the shared buffer~~ FIXED
+      2026-08-07, same back buffer as em_app_run. NOTE ON PROOF: the app
+      runtime's version is metal-verified through a live https fetch; the
+      widget version is compile- and review-verified only, because no widget
+      runs at boot and the terminal would not launch through QMP to start one.
+      To exercise it: run `clockw` from the shell and watch for "widget up" on
+      serial. A glass widget is the case that matters -- it clears its whole
+      window on every build.
+- [ ] Under ONE emulated core the loading counter updates only once or twice
+      during a fetch: each frame competes with the crypto worker for the core,
+      so few complete. Correct, just coarse -- and a real machine or -smp 2 does
+      not have the problem. If it ever matters, the fix is to make the view
+      cheap while loading (skip re-rendering the document, which has not
+      changed) rather than to tick harder.
+- [ ] Nothing caches. Every navigation, including Back, refetches.
+- [ ] No Content-Type handling: everything is parsed as HTML. An image or a
+      binary will be rendered as garbage rather than refused or downloaded.
+- [ ] The response buffer is 512KB (SRC_MAX); larger pages are truncated and
+      say so. Fine, but a real limit worth revisiting with images.
+- [x] ~~**Capabilities for a GUI app.**~~ DONE 2026-08-07: `<name>.caps`
+      sidecar, parsed with the `.ns` one by `user/lib/appauth.{c,h}`
+      (docs/USERSPACE_v2.md UP5). Vellum is born holding exactly
+      {filesystem, network, gpu}.
+- [ ] Only `home` reads the sidecars. The shell spawns apps too and grants
+      whatever it holds; it should ask `appauth` the same question.
+- [ ] An EMBX binary should carry its declaration inline (a section beside its
+      capability table) instead of as a sidecar file -- the carrier note in
+      USERSPACE_v2 UP4. Sidecars are the ELF-shaped answer.
+- [ ] Nothing tells the USER what an app asked for. The launcher knows the mask
+      at spawn time and could show it, which is the point of declaring it.
+- [x] ~~No CSS~~ DONE 2026-08-07 (B5): user/web/css/{decl,sel,sheet}.c --
+      declarations, selectors, cascade. 47 host assertions.
+- [ ] CSS gaps, each deliberate: no percentages (need a containing block the
+      box model does not expose), no float/position (the layout engine has no
+      such concept), no `!important`, no pseudo-elements, no `@media`
+      evaluation (dropped, not misapplied). `>` `+` `~` parse as descendant.
+- [ ] font-size maps onto four toolkit roles by px threshold. Honest, but a
+      continuum would need the text leaf to take a size directly.
+- [x] ~~images~~ DONE 2026-08-07 (B6): user/web/png.c + imgcache.c. 24 host
+      assertions on the decoder alone.
+- [ ] PNG only. JPEG is the other half of the real web and is a DCT decoder,
+      not an afternoon. GIF/WebP not considered.
+- [ ] No interlaced (Adam7) PNG -- refused, not half-decoded.
+- [x] ~~Images are not SIZED by the markup~~ DONE 2026-08-07: width/height
+      attributes + CSS width/height/max-width, cascade order, aspect-preserving
+      clamp to the column, and a reserved placeholder box so a sized picture
+      causes NO reflow (proven by the reflow check in `make browser-render`).
+- [ ] An image with no stated size still reflows when it lands -- unavoidable
+      without knowing its dimensions, and true of every browser. CSS
+      `aspect-ratio` would be the modern answer if a page supplies it.
+- [ ] The image arena is 6.4MB for 8 slots, per page. A page wanting more gets
+      alt text for the rest.
+- [x] ~~tables~~ DONE 2026-08-07: data tables over the layout engine's grid --
+      aligned columns, header rows, colspan, captions, ragged rows. Revisits
+      the BROWSER.md §5 exclusion with evidence (documentation pages ARE
+      tables); "tables as layout" is still refused.
+- [ ] Table columns are EQUAL width. Content-proportional tracks need weighted
+      grid tracks in the layout engine -- the renderer cannot measure, it emits.
+- [ ] rowspan is parsed but ignored (colspan works). A rowspan needs the grid
+      to reserve a cell in a LATER row, which auto-flow has no way to express.
+- [ ] Cells do not stretch to their row's height, so a short cell's border box
+      is shorter than a tall neighbour's. Cosmetic; needs per-row stretch.
+- [x] ~~no JS~~ ENGINE DONE 2026-08-07: QuickJS 2024-01-13 runs on the OS
+      (`js.elf`, `make js`, one two-hunk patch). Absent source => skipped.
+- [x] ~~JS has NO DOM BINDINGS~~ DONE 2026-08-07: user/web/jsdom.c --
+      querySelector(All), document.title, textContent, setText, getAttribute,
+      setStyle, console.log. Scripts run at load; mutations re-render.
+- [x] ~~NO EVENTS~~ DONE 2026-08-07: addEventListener('click'), setTimeout,
+      setInterval, clearTimeout/clearInterval. The renderer asks the engine
+      which elements listen and makes ONLY those clickable.
+- [ ] Only 'click'. No keyboard, focus, hover or form events -- an unsupported
+      event name THROWS rather than registering silently.
+- [ ] No event bubbling: a click reaches the element that has the listener,
+      not its ancestors. Fine for buttons, wrong for delegation.
+- [x] ~~No fetch() binding~~ DONE 2026-08-07: real Promises, shared worker,
+      microtask drain (JS_ExecutePendingJob every frame). Response = {ok,
+      status, text()} -- deliberately small.
+- [ ] The DOM surface is read-mostly: no createElement/appendChild/remove, no
+      classList, no attribute WRITES except style. Each absent rather than
+      faked -- a binding that accepts a call and changes nothing observable is
+      worse than a missing one.
+- [ ] `js -e` needs shell quoting (`js "-e" "2+2"`): the structured shell reads
+      a bare `-e` as a unary minus. Either the shell should pass through
+      unknown leading-dash tokens, or js should take a different flag.
+- [ ] No Atomics.* (SharedArrayBuffer across threads) -- disabled by the port.
+- [x] ~~forms~~ DONE 2026-08-07: user/web/form.{c,h} -- text fields, submit
+      buttons, GET and POST, Enter to submit, el.value from script. 11 host
+      assertions on the encoding and method rules.
+- [ ] Only text inputs and buttons. No checkbox, radio, select, textarea
+      (parsed as a field but rendered single-line), or file upload.
+- [ ] No client-side validation (required, pattern, type=email).
+- [ ] No form.submit() / onsubmit from script -- a script can read and set
+      values but cannot submit or intercept.
+- [ ] Link words are separate ghost Buttons (one per word, for per-word hit
+      testing when a link wraps). Their 2px padding makes a link's inter-word
+      gaps slightly wider than body text. Cosmetic; a per-run hit region would
+      be the real fix.
+- [ ] `make browser-render` renders with DejaVu from the host, so the on-metal
+      metrics differ slightly from the host PNG. Good enough for geometry --
+      do not use it to judge kerning.
+
+### Dock / desktop input (2026-08-07)
+- [x] ~~App windows covered the top of the dock~~ FIXED: em_app reserved a
+      hard-coded 64px bottom strip while the dock band is dock_size+32+14 --
+      84px at the default and 106 at the largest. The dock is drawn by the
+      DESKTOP window, which sits behind every app window, and pointer input
+      goes to the topmost window under the cursor, so anything overlapping the
+      dock silently ate its clicks. The band is now one formula in oscfg.h
+      (`oscfg_dock_band`) that both the desktop and every app window obey.
+      Verified: Files' window is now 792x484 (600-32-84) and the dock is fully
+      clear of it.
+- [x] ~~The dock's magnifier and label named the WRONG icon~~ FIXED: three
+      places computed the slot pitch as DOCK_BASE+10 while the layout uses a
+      slot of DOCK_BASE+8 separated by spacing 10, i.e. DOCK_BASE+18. Proven
+      from the captured world rect: the dock is 238px wide for four slots and
+      4*(38+8)+3*10+2*12 is exactly 238, while the +10 formula predicts 216.
+      The error compounds with the slot index -- 8px off at slot 1, 24px at
+      slot 3 -- so the wrong icon swelled and the label named the wrong app.
+      One helper, dock_slot_x0(), now serves all three.
+- [x] ~~Dock clicks died while the magnifier animated~~ FIXED + locked by
+      declare-test T8. em_image_button keyed its image LEAF by the PIXEL
+      POINTER, which names the mip level -- and a magnifying icon swaps levels
+      as it swells, so the leaf's identity churned during animation. A press
+      edge captures LAST frame's instance; when the press landed on the same
+      frame as a level flip, the captured handle was destroyed by that very
+      build and ui_is_active() walked up from a dead instance. Clicks died
+      exactly while the magnifier animated, which is exactly when a person
+      clicks; the launcher grid never magnifies, so it never missed. Found by
+      HOST repro after five metal boots of instrumentation narrowed it; the
+      host test failed in two seconds and the fix is one stable key.
+- [x] ~~Scrolling a document in Vellum is slow~~ IMPROVED 3.5x at the measured
+      cost center (2026-08-07): text measurement is now MEMOIZED on the layout
+      node, keyed by the scene node's content hash (+ font, size, width). A
+      wheel tick used to re-measure every word of the document through the font
+      engine -- one-line widths in the intrinsic pass, and the full wrap
+      SIMULATION from seven call sites. All of it is a pure function of
+      (content, font, size, width), none of which change while scrolling.
+      Host-measured on the browser's real document: 0.75 -> 0.21 ms per
+      build+layout pass (`make browser-render` now prints this). Every text-
+      heavy surface benefits -- terminal, Files, the editor.
+- [x] ~~A page with a photograph took 21 SECONDS to appear~~ FIXED 2026-08-07,
+      and the fix was nowhere near where it looked. Suspicion fell on the new
+      JPEG decoder's float IDCT (float is emulated under TCG). Rewriting it in
+      fixed point with a DC-only fast path won 1.75x on the host and NOTHING on
+      the metal -- 21.1s became 20.2s. Instrumented instead: `net 6ms, dec
+      96ms, poll 4758ms` -- the image sat decoded for four and a half seconds
+      waiting for a frame. One frame took 4.7s; all of it was
+      `scene_render_frame`; all of THAT was `draw_rect`, 5262ms over 136 rects.
+      `cpu_draw_rect` had no early-out for a fill that paints nothing, so every
+      invisible block background walked its whole box (clip coverage, rounded
+      SDF + sqrtf, paint, float blend) and threw the result away at the end.
+      Never seen in our own apps, where an unstyled box is not emitted; a
+      DOCUMENT emits one per block element. Frame render 4946ms -> 170-483ms,
+      image round trip 4773ms -> 343ms, scroll ~4s -> 0.74s.
+      Landed with two related hoists: `box_fully_covered()` answers "is coverage
+      trivially 1?" once per primitive instead of once per pixel (the old test
+      was `no dirty region AND no clips at all`, which a scrollable view makes
+      permanently false), used by the image blit, the solid fill and the glyph
+      blit; and the image blit steps its source coordinates in 16.16 fixed point
+      rather than a float divide per pixel.
+- [x] ~~You cannot copy anything out of the browser~~ SHIPPED 2026-08-07:
+      drag to select, Ctrl+A, Ctrl+C to the system clipboard, Esc to clear.
+      `user/web/select.c`, all post-layout over the scene. Proven on the metal
+      end to end (copied in Vellum, pasted into the shell with Ctrl+V).
+      Two bugs found building it, both worth remembering: `scene_mark_dirty`
+      sets `dirty` but NOT `dirty_content`, so the highlight was applied and
+      copied correctly while drawing zero pixels; and having the declarative
+      build clear each run's background made a live selection re-dirty every
+      selected word twice per frame (a full repaint per frame). Whoever sets a
+      background owns removing it.
+- [ ] HOW FAR VELLUM IS FROM A BROWSER, measured 2026-08-07 against four real
+      pages rather than our own documents. example.com: correct.
+      motherfuckingwebsite.com: essentially perfect. danluu.com: readable, but
+      its `d{width:4em}` and `li{display:flex}` do nothing so dates weld onto
+      titles. news.ycombinator.com: 1307 nodes in, "1. by | 2. by |" out --
+      the story titles ARE in the DOM and the renderer drops them, which is a
+      nested-<table> bug, not a CSS one. In priority order, what is missing:
+        1. ~~External stylesheets are never fetched~~ FIXED (see below).
+        2. PARTLY CLOSED 2026-08-07: added background/background-color (incl.
+           the shorthand, scanned for a colour), border + border-width/color/
+           style, border-radius, real padding (padding-top/right/bottom/left,
+           and the shorthand no longer aliased onto margin -- once a box can be
+           painted, inside-vs-outside is visible), text-align, line-height,
+           and rgb()/rgba() colours. Still missing: position/top/left/z-index,
+           float, any flex-*, gap, overflow, box-sizing, opacity, %/vh/vw/
+           calc(), media queries, :hover/:focus, ::before/::after, var(), and
+           per-edge borders (border-left alone paints all four).
+           line-height is PARSED and stored but not yet used by layout.
+        3. ~~Nested tables collapse (HN)~~ FIXED (see below).
+        3b. ~~danluu's first list item renders as overlapping text~~ EXPLAINED
+           and FIXED: it was the 64-child cap in layout (see below).
+        3c. ~~Table columns are equal-width; every cell gets a UA border~~ BOTH
+           FIXED 2026-08-07. Columns are now sized to content (a miniature of
+           CSS's automatic table layout: a column is as wide as its widest
+           cell, surplus and shortfall shared out in proportion), and cell
+           rules are drawn only when the table asks with <table border=N> --
+           the web's default is no border, which is why half the old web can
+           use tables for LAYOUT.
+        4. JS is 'click' only -- no bubbling, no createElement/appendChild,
+           no querySelector.
+        5. Form controls are text and submit only -- no checkbox, radio,
+           select, textarea, file.
+        6. No cookies, no cache, no charset handling beyond UTF-8, no iframe,
+           canvas, svg, video or audio.
+- [x] ~~<link rel=stylesheet> is parsed and thrown away~~ FIXED 2026-08-07:
+      the parser records the hrefs (doc->cssref, document order, capped at 8
+      and truncating rather than overrunning -- T22), and `user/web/cssref.c`
+      fetches them on the shared worker, one at a time, BEFORE the page's
+      images: a page that paints pictures before it knows what colour anything
+      is shows the reader a wrong page and then rearranges it. A sheet that
+      404s is not fatal -- the page renders with whatever styling arrived.
+      Cascade order is every external sheet in document order, then the
+      document's own <style>; the true CSS order interleaves them as they
+      appear in the source, and that difference is written down in cssref.h
+      rather than pretended away. Metal-proven on /system/web/styled.html.
+      Also fixed: the status line composed its rule count ONCE at load and so
+      reported "1 css rule" on a page with seven, three of which were already
+      on screen -- it is now recomposed whenever a sheet lands.
+- [x] ~~`make` did not build the browser~~ FIXED 2026-08-07, and this one cost
+      most of an afternoon. mkfs AUTO-DISCOVERS every build/*.elf, and
+      build/vellum.elf was never a prerequisite of anything -- it survived from
+      an old explicit `make build/vellum.elf`. When a link failed and deleted
+      it, `make` reported "Nothing to be done" and every image after that
+      packed either NOTHING or a stale vellum.elf against a freshly built
+      libembk.so. EmProps crosses that library boundary BY VALUE, so a stale
+      app is a wild-pointer crash: a ring-3 page fault at CR2=0x9FFFFFFFF
+      inside strlen, deterministic, on the second frame. It was bisected
+      against four subsystems before the build was suspected -- the lesson is
+      to check that the binary under test is the binary you just built.
+      build/vellum.elf is now in the staged-app list. Any app reachable only by
+      an explicit target has the same hazard; see docs/TODO.md.
+- [ ] The instance pool (ui/declare) is a fixed INST_MAX array in libembk.so's
+      .bss, so raising it costs every process on the desktop (65536 -> a 48MB
+      shared library). It should be PAGED like the scene and layout arenas.
+      8192 covers the worst real page measured (danluu 2752) with headroom.
+- [x] ~~A container with more than 64 children silently lost the rest~~ FIXED
+      2026-08-07, and this was the single worst bug found so far. `arrange()`
+      gathered children into `kids[64]` on the C STACK; past 64 they were never
+      positioned, so they kept their default 0x0 and every one of them painted
+      at the PARENT'S ORIGIN, stacked on top of the first row. A <ul> with a
+      hundred items, or a table with thirty rows, walks straight through it --
+      i.e. any real document. It looked like a renderer bug (danluu.com's first
+      list item was a pile of overlapping text) and was a layout one.
+      They could not simply be made bigger: arrange() recurses per nesting
+      level, so 1024-entry stack arrays would be megabytes deep on a real page.
+      The four arrays now come from a shared bump pool that arrange() pops on
+      exit -- correct because arrange() is strictly depth-first -- and overflow
+      past the pool is COUNTED (`layout_children_dropped()`), so browser-render
+      fails instead of quietly drawing wreckage. Same for the declarative
+      instance pool: `ui_instance_overflow()` now reports refused allocations,
+      and INST_MAX went 4096 -> 65536 because a document needs one instance per
+      WORD (danluu: 2214, HN: 1255).
+- [x] ~~Hacker News rendered as "1. by | 2. by |" -- 1307 nodes, no content~~
+      FIXED 2026-08-07. TWO causes, neither of them tables. <center> was an
+      unknown tag and so defaulted to INLINE, which put HN's entire nested-table
+      document inside one inline formatting context; and emit_inline had a
+      depth>8 guard, so with <center><table><tr><td><table><tr><td><span><b><a>
+      being nine levels, every link's TEXT was dropped while the plain " | "
+      between them -- one level shallower -- came through. <center> is now a
+      block (with text-align:center, which is what it means), a block-level box
+      inside an inline run now BREAKS the run and renders as a block, and the
+      guard is 24. HN now renders its nav, ranks, titles, sites and subtext;
+      text nodes went from ~30 to 776.
+- [x] ~~text-align did nothing, on any page~~ FIXED 2026-08-07, and the bug
+      was in the LAYOUT ENGINE, not the CSS. arrange()'s wrap arm started every
+      line at the padding edge and never consulted `justify`; the non-wrap arm
+      always had. A paragraph of text IS a wrapping row, so `text-align:center`
+      could not work anywhere. Each line box now justifies on its own, which is
+      what text-align means -- centre every line, not the paragraph as a block.
+- [x] ~~`>` `+` `~` were parsed as DESCENDANT, so every scoped rule over-matched~~
+      FIXED 2026-08-07: real child, adjacent-sibling and general-sibling
+      combinators, plus `:first-child` / `:last-child`. Pinned by
+      tests/web/selectors.html, which asserts what must NOT match as well --
+      the old behaviour turns GRANDCHILD red and the corpus says so.
+- [x] ~~var() was unsupported, so a modern stylesheet resolved to no colours~~
+      FIXED 2026-08-07: `user/web/css/vars.c`. Custom properties are collected
+      across the WHOLE sheet before any rule is applied (so a rule may use a
+      var defined below it), and var() is expanded in decl.c before a value is
+      interpreted -- which gives every property support for free instead of
+      each one remembering. `var(--x, fallback)` honoured.
+      Found while writing the test: the collector treated the sheet as one
+      declaration block, and `:root {` begins with a COLON -- so the commonest
+      place in the world to define a variable was the one place it was missed.
+      It scans brace blocks now.
+- [x] ~~@media blocks were skipped whole, losing every desktop rule~~ FIXED
+      2026-08-07: `user/web/css/media.c`. Media types (`all`/`screen`/`print`/
+      `speech`, `only`), `and`, comma-separated alternatives, a leading `not`,
+      and the features that decide layout: min/max width and height,
+      orientation, prefers-color-scheme. A matching block's rules are parsed
+      IN PLACE so they keep their source position -- which is what lets a media
+      override beat the base rule it overrides. An unrecognised feature makes
+      its conjunction false (what CSS says, and the safe direction).
+      Skipping was right while nothing could evaluate the condition, and stops
+      being right the moment real pages are the target: most stylesheets are
+      mobile-first, so the base rules ARE the phone layout and everything else
+      lives behind a min-width. Skipping them renders the phone version at
+      desktop size.
+      The environment is set by the app, so Vellum answers with its own content
+      width and the user's dark/light preference -- and RE-PARSES when the
+      window is resized past a breakpoint, which a parse-once scheme gets wrong.
+      Pinned by tests/web/media.html and its NARROW TWIN at 360px: the same
+      rules must give opposite answers, which is what tests evaluation rather
+      than parsing.
+- [ ] @media is evaluated at PARSE time, so a var or rule behind a query is
+      re-read on resize but a `@media` nested inside another is not handled.
+      Also unsupported: @supports, @font-face (web fonts), @keyframes.
+- [x] ~~display:flex and display:grid from CSS~~ SHIPPED 2026-08-07 (C2).
+      flex-direction, flex-wrap, justify-content, align-items, gap/row-gap/
+      column-gap, flex/flex-grow, grid-template-columns (the track COUNT --
+      `repeat(3, 1fr)` and `1fr 1fr 1fr` are both three, and the widths come
+      from content). Cheap because the layout engine has done flex and grid
+      since it was written: this is the CSS spelling of machinery the whole
+      toolkit already runs on.
+      Two things CSS requires that had to be added: element children of a flex
+      container are BLOCKIFIED (without it a nav bar's links merge into one
+      inline run, so the gap and the justification apply to the strip instead
+      of between the links), and whitespace-only text makes NO anonymous item
+      (the newline between two <div>s was becoming a third grid cell, landing
+      every card one column late).
+      space-around / space-evenly fall back to space-between: the gap is in the
+      wrong place but the items are still spread.
+- [x] ~~FLEX WAS BOOLEAN~~ SHIPPED 2026-08-09. Everything above was accepted
+      by the parser and then flattened by the mapping: an item either grew or
+      it did not. `flex: 2` and `flex: 1` produced identical boxes, so every
+      two-to-one split on the web came out even, and `flex: 0 0 240px` lost its
+      240px and became a sidebar as wide as its longest word. Now shipped, each
+      with a NUMBER in tests/web/flex2.html rather than a screenshot to squint
+      at (15 expectations):
+        * flex-grow WEIGHTS -- 2:1:1 across 900px is 450/225/225;
+        * flex-basis, from the shorthand and the longhand. `flex: 1` is
+          `1 1 0%`, which is what makes three of them equal columns whatever
+          they contain;
+        * flex-shrink, but only a weight ABOVE the default: CSS's initial 1 is
+          what the engine's implicit default already does, and better -- it
+          gives up flexible boxes' space before intrinsic ones, so a toolbar
+          squashes its content pane rather than its buttons. Stating the
+          default on every item flattened that priority;
+        * align-self, per item, overriding the container;
+        * justify-content space-around and space-evenly, which differ only at
+          the two ends -- the entire reason an author picks one of them;
+        * `gap: 40px 10px`, both values: on a wrapping row the first separates
+          the LINES and the second separates the items;
+        * `order`, stable within equal values, taken only when someone stated
+          one and every item is an element (a bare text node is an anonymous
+          item this cannot name, and reordering around it would drop it).
+      Two ENGINE bugs fell out of it, both of them one loop disagreeing with
+      another:
+        * measure_subtree_height counted a child as flexible on flex_grow but
+          then sized it by its basis, so a `flex: 1` item (basis 0) was
+          measured at width 0, wrapped to five lines there and one on screen,
+          and its row was drawn five lines tall with four of them empty;
+        * measure_wrap_height stepped between lines by the MAIN gap while
+          arrange stepped by the cross one, so a wrapping container was the
+          wrong height and its second line was painted below its own box, on
+          top of whatever came next.
+      Verified: 25 corpus pages green, 17 real sites re-rendered and diffed
+      against the pre-change tree (14 byte-identical, rust-lang structurally
+      correct, bbc -- already broken -- marginally less overlapped).
+
+- [x] ~~EVERY `/>` PUT A STRAY `>` ON SCREEN~~ FIXED 2026-08-09, and it was
+      disfiguring every real page. The attribute scan BREAKS on the slash of a
+      self-closing tag, leaving the cursor ON it -- so the self-closing test
+      read the space before the slash (and said no), and the single step past
+      "the bracket" stepped past the SLASH instead, leaving the `>` in the
+      stream as a TEXT NODE. `<input />`, `<img />`, `<br/>` and every `<path/>`
+      in an inline SVG drew a bracket beside themselves; Brave's search page was
+      more angle brackets than text. Wikipedia shed 130 junk text nodes, bbc 86.
+      The corpus had the bug BAKED INTO A REFERENCE IMAGE (details.html's
+      `<path/>`), which is worth remembering: a golden image only pins what the
+      renderer did, not what it should have done.
+- [x] ~~WE RAN EVERY `<script>`, WHATEVER ITS TYPE~~ FIXED 2026-08-09.
+      `<script type="application/ld+json">` is data a page STORES in a script
+      tag precisely so the browser will not run it -- and bbc, Wikipedia and
+      craigslist all carry one. We handed it to the interpreter, which threw a
+      SyntaxError on its first colon. HTML5's rule now applies: absent, empty,
+      "module" or a JavaScript MIME runs, anything else is data.
+- [x] ~~THE DOM USED NAMES NO PAGE ON THE WEB USES~~ FIXED 2026-08-09.
+      `setText()`, `setValue()` and `setStyle()` are this DOM's own spellings;
+      a real script writes `el.textContent = ...`, `el.value = ...` and
+      `el.style.display = 'none'`. The methods stay (our own pages call them)
+      but the PROPERTIES exist now, along with the globals every page assumes:
+        * `textContent` / `innerText` and `value` as settable properties;
+        * `document.getElementById`, `getElementsByTagName`,
+          `getElementsByClassName` -- getElementById is the most-used call on
+          the web and this DOM did not have it;
+        * `document.documentElement` / `body` / `head` / `title`;
+        * `el.style` as a real object (a Proxy over the existing setStyle, JS
+          spelling folded to CSS, declarations accumulating);
+        * `window` (=== globalThis), `URL` and `URLSearchParams` -- URL over
+          url.c's own resolver rather than a second, differently-wrong parser
+          in script.
+      Script failures across the 17 real sites: 23 -> 5. bbc 8 -> 0,
+      Wikipedia 4 -> 0 (and its reflow check, long red, went green), lobsters,
+      rust-lang and sqlite to 0. Remaining: pythonorg 2, mdn 1, craigslist 2.
+- [x] ~~A COMPOUND KEPT ONLY ITS LAST CLASS~~ FIXED 2026-08-09, and this was
+      the one that emptied whole pages. `struct css_sel_part` had ONE `klass`,
+      so `.logo-small.svelte-1i43yzn` was parsed as `.svelte-1i43yzn` -- and a
+      rule meant for one logo applied to every element the component had
+      scoped. On Brave's search page that rule carries `display:none`, and the
+      page rendered as a BLANK WHITE BOX with its stylesheet applied and
+      rendered fine without it. Multi-class compounds are not exotic: Tailwind,
+      CSS modules and Svelte scoped styles all emit them by the thousand.
+      A part now holds CSS_SEL_CLASSES (4) of them and needs ALL of them, and
+      a compound with more classes than fit sets `overflow` and matches
+      NOTHING -- because a selector we cannot represent in full must not be
+      applied at all. Too narrow shows too little; too WIDE hands somebody
+      else's declarations to the whole document. Covered by four new
+      expectations in tests/web/selectors.html.
+- [x] ~~A 1 MB STYLESHEET ARRIVED CUT IN HALF~~ FIXED 2026-08-09. CSS_ONE_MAX
+      was 512 KB; Brave's single sheet is 1.02 MB. The metal saw 3192 rules
+      where the host saw 7257 -- and the half that was missing held the layout,
+      so the same build rendered a search results page on one and a column of
+      form controls on the other. Sized from what the web serves now (2 MB per
+      sheet, 3 MB total), and an oversized sheet is dropped WHOLE rather than
+      severed: CSS cut mid-rule leaves a dangling brace that eats every rule
+      after it, so half a sheet can style less than none of it.
+- [x] ~~SVG~~ SHIPPED 2026-08-09 (`user/web/svg.{c,h}`), and it is a RENDERER,
+      not a decoder: an SVG arrives as instructions, so something has to follow
+      them. Covers what icons are actually made of -- the M/L/H/V/C/S/Q/T/A/Z
+      path grammar in both cases, rect/circle/ellipse/line/polygon/polyline,
+      <g> nesting with translate/scale/rotate/matrix, fill (hex, names, none,
+      currentColor), fill-rule, opacity, and stroke as a width along the path.
+      Scanline fill with 4x vertical subsampling and fractional horizontal
+      coverage, so a 24px icon has edges rather than stairs. No gradients,
+      filters, clip paths, masks or text: an icon uses none of them and a
+      renderer that half-did them would draw a WRONG picture instead of a plain
+      one.
+      Two entry points, because an SVG arrives two ways:
+        * `<img src="*.svg">` -- imgcache dispatches on the bytes (SVG is text,
+          so it is what is neither PNG nor JPEG and contains an `<svg`);
+        * inline `<svg>` -- html.c now keeps its SOURCE whole, the way <style>
+          already does, because SVG is not HTML and parsing it as HTML made a
+          subtree of unknown inline boxes that drew as nothing. Rasterised once
+          per (node, size) and cached: following a path grammar on every frame
+          would turn a scroll into a slideshow.
+      Three things it turned up on the way:
+        * an icon-only `<button>` never drew its icon, because a button builds
+          a text LABEL and never renders children. It builds its box from the
+          same primitives Button does now, with the drawing inside;
+        * a button written across lines has a text child of " ", and treating
+          whitespace as a label skipped the icon path entirely;
+        * `moveto` never recorded its own point, so a two-point line had ONE
+          point in it and stroked to nothing. Subpath breaks are marked now, or
+          a two-subpath icon grows a line joining them.
+      Verified: 16 checks in html_test that SAMPLE THE RENDERED ALPHA (a
+      renderer can parse a document perfectly and paint nothing), and on the
+      metal Brave's wordmark draws where a grey placeholder used to be.
+- [x] ~~@media RANGE SYNTAX~~ SHIPPED 2026-08-09, and it was the cascade answer
+      to "why is Brave's header wrong". `(width <= 885px)` is what every modern
+      build tool emits: 224 of the media queries in that stylesheet are written
+      that way and a handful use min-width. An unrecognised feature is reported
+      as NOT MATCHING, so the ENTIRE responsive layer of such a sheet evaluated
+      to false -- and at a wide viewport that is accidentally right for the
+      max-width cases and wrong for every min-width one, which is the worst way
+      to be wrong: correct on whatever you check first.
+      Both operand orders (`width <= 885px` and `885px < width`), strict and
+      inclusive, and the two-sided `(600px <= width <= 1200px)`. Plus
+      `(hover: hover)` and `(pointer: fine)`, which is how a page asks whether
+      it is on a desktop -- 42 more queries that were all being answered "no",
+      handing every one of them the touch layout.
+      The visible consequence: at the browser's real window width (~790px)
+      Brave's NARROW header is now the one that applies, which is what its own
+      CSS asks for. The doubled logo was the same bug -- the page ships two and
+      hides one by width -- and there is one of them now.
+- [x] ~~WHAT THE EMPTY BOXES ACTUALLY ARE~~ ANSWERED 2026-08-09, by measuring
+      instead of guessing a fourth time. The status line now reports how the
+      pictures went -- `img 3ok 1fail 2wait 1noslot` -- because a failed image,
+      one still arriving, and one the cache had no slot for all draw the SAME
+      grey box, and telling them apart from a screenshot is guesswork.
+      The reading: `img 0x` on Brave's narrow header. It requests NO images at
+      all, so the boxes were never pictures. They are Brave's own bordered
+      buttons whose icons live in subtrees its CSS hides at that width -- only
+      two of the page's 34 inline <svg> elements are reachable there, and both
+      draw. Whether every one of those hidings is RIGHT needs an element-by-
+      element comparison against a real browser, which is a different exercise
+      from this one.
+      Two bugs fell out of building the instrument, and both had been quietly
+      wasting readings all session:
+        * the status line and a script's message were drawn ON TOP OF EACH
+          OTHER whenever the row overflowed -- which is exactly when the status
+          carries the most. The left string is truncated now; a shortened
+          reading beats two superimposed ones.
+        * the image summary was composed in install_document, BEFORE any frame
+          had asked for a picture, so it always read zero. It is recomputed per
+          frame now. A statistic gathered before the thing it measures happens
+          is not a small error -- it sent this diagnosis off in the wrong
+          direction entirely.
+- [x] ~~A DECLINED LISTENER SHOUTED AT THE READER~~ FIXED 2026-08-09. Every
+      page that registers a DOMContentLoaded handler -- which is most of them --
+      put "listener for 'x' declined" on the status line and pushed everything
+      else off the end. It is a note for whoever is building the browser, not
+      for the person reading the page, who cannot act on it. Counted now
+      (`jsdom_declined_listeners()`) and printed by the host harness.
+- [ ] The next missing DOM pieces, named by the errors that are left:
+      `parentElement`/`parentNode` (what Brave's page reaches for now),
+      `classList`, `children`, `insertBefore`, `dataset`. Each one is the same
+      shape as the batch above.
+- [ ] `make browser-render` could not show a script error -- the harness never
+      installed a console hook, so the one loop fast enough to debug JavaScript
+      in was the one place the message was invisible and it had to be read off
+      a screenshot of the metal. It prints `JS| ...` now. FIXED 2026-08-09.
+
+- [x] ~~A 1 MB PAGE TOOK TWO MINUTES~~ FIXED 2026-08-09, in the KERNEL, and
+      it was never the crypto. Measured first, because "the browser is slow"
+      has too many suspects: `fetchjob` now charges every transfer to the
+      caller that asked for it, and the status line reports
+      `[doc 277K/26s  css 1020K/85s  img ...]` -- 111 of the 146 seconds in two
+      transfers, about 8 KB/s. The decisive experiment was serving a 1 MB file
+      over PLAIN HTTP from the host: 119.8 s, the same rate, with no TLS
+      anywhere near it. That moved the search from the cipher to TCP.
+      The bug: the receive window we advertise is `TCP_RXBUF - rx_len`, and it
+      only reached the wire from `tcp_seg`, which runs WHEN A SEGMENT ARRIVES.
+      So once the buffer filled we advertised zero, the sender stopped;
+      because it stopped nothing arrived; because nothing arrived we never
+      sent the ACK that would have said the application had drained the
+      buffer. The transfer then advanced only when the peer's persist timer
+      fired, roughly twice a second -- which is exactly the ~470 ms per read
+      the arithmetic pointed at. `tcp_window_update` now sends a pure ACK when
+      the application frees space and the peer thinks it has less than a
+      segment's worth, and TCP_RXBUF went 16 KB -> 64 KB so a sender can keep
+      four times as much in flight before it has to ask.
+      Measured after: the 1 MB plain-HTTP document went **119.8 s -> under a
+      second**; Brave's 277 KB document **26 s -> 3 s**; the whole page,
+      including a 1 MB stylesheet and its images over TLS, **146 s -> under
+      70 s**. Verified functionally by the same page loading end to end over
+      HTTPS -- handshake, 284 KB document, 1 MB sheet, images, 7257 rules,
+      byte-identical to the host render.
+- [ ] What is LEFT of that 70 s is the 1 MB stylesheet and the images, each of
+      which pays its own TCP+TLS handshake: net.c opens a new connection per
+      resource ("no keep-alive state machine to write"). Connection reuse is
+      the next big lever, and it is a real feature rather than a bug fix.
+- [ ] 96 of the 100 images on Brave's page are `loading="lazy"` and we ignore
+      the attribute -- we would eagerly fetch every one if there were slots for
+      them. There are only 8 slots, so today the page gets the first eight and
+      alt text for the rest, which accidentally limits the damage. Honouring
+      `lazy` (fetch when the box is near the viewport, the way select.c already
+      reads laid-out geometry) is the correct fix and would also make the
+      8-slot cap stop mattering.
+- [ ] The shell cannot take a URL or a short flag. `wget https://x/y` fails at
+      the `:` ("unexpected character" -- the lexer has no case for it) and
+      `wget -O file` parses as unary minus applied to `O`. Both need quoting
+      today, which is a papercut on the two tools most likely to want them.
+
+- [x] ~~EVERY ACCENT WAS A REPLACEMENT CHARACTER~~ FIXED 2026-08-09. The whole
+      pipeline assumed UTF-8, and google.com serves THIS browser
+      `Content-Type: charset=ISO-8859-1`, in which an e-acute is the single
+      byte 0xE9 -- an invalid sequence to a UTF-8 reader. "Confidentialité"
+      came out "Confidentialit<?>", which looks like a missing glyph and is
+      nothing of the kind: nobody had asked what encoding the bytes were in.
+      `user/web/charset.{c,h}` now answers that one question and performs one
+      conversion (windows-1252 -> UTF-8), reading the declaration from the HTTP
+      header first and the document's <meta> second, as HTTP and HTML specify.
+      Two decisions worth keeping:
+        * ISO-8859-1 is decoded as WINDOWS-1252, because every browser does and
+          because the C1 range is where real pages keep their smart quotes,
+          dashes and ellipses -- decoding those as control codes deletes the
+          punctuation out of the text;
+        * a page that declares UTF-8 and then contains bytes that CANNOT be
+          UTF-8 is converted anyway. google.com does exactly this (an
+          ISO-8859-1 header, a `<meta charset=utf-8>`, and Latin-1 bytes). The
+          spec's answer is one replacement character per accent; a document
+          already self-contradictory has no third reading worth protecting.
+      A sequence cut off by the END of the buffer is inconclusive rather than
+      invalid -- our own fetch truncates large documents, and judging a good
+      UTF-8 page "not UTF-8" would transcode it and mangle every accent in it.
+      Covered by 16 unit checks in html_test and a Latin-1 corpus page.
+- [x] ~~`display: inline-block` WAS FOLDED INTO `inline`~~ FIXED 2026-08-09,
+      and it threw the box away with it: padding, width, height, border and
+      background all stopped existing. It is neither of the two it was being
+      made into -- a block takes the whole line, an inline has no box at all --
+      so a row of nav links written as inline-blocks welded into one word.
+      google.com's header read "GmailImages" and its footer
+      "PublicitéSolutions d'entrepriseÀ propos de GoogleGoogle.fr".
+      VD_INLINE_BLOCK now goes through the ordinary block emitter, so it keeps
+      everything a box has, but INSIDE the inline run's Flow and sized to its
+      content -- the same shrink-to-fit a float already used. Its "Connexion"
+      button is a blue pill again, because there is finally a box to paint the
+      background on.
+
+- [x] ~~`document.currentScript` DID NOT EXIST~~ FIXED 2026-08-09. The parser
+      captured a script's TEXT and never made a node for the element, so there
+      was nothing for `currentScript` to be -- and a modern page uses it to
+      find where it was written. SvelteKit's whole bootstrap is
+      `document.currentScript.parentElement`, which is the line Brave's search
+      page died on. Each script now gets a node (`js_node[]`), display:none
+      like every other <script>, and jsdom sets `document.currentScript` around
+      each evaluation and clears it after, as the DOM specifies.
+      Two things fell out of giving <script> a node, both worth remembering:
+        * FLUSHING the accumulated text at the script boundary split one text
+          node into two, and two whitespace runs where there was one opened an
+          extra line box -- three corpus pages grew 3px. The element is
+          display:none, so whether it sorts before or after the text around it
+          changes nothing visible; the flush was dropped.
+        * a display:none element must be skipped BEFORE anything decides
+          whether an inline run starts or ends. Left in, it counted as a block
+          and split the run around it. Skipping it inside `is_inline` instead
+          was WORSE -- it welded runs across hidden blocks and moved four
+          pages -- so the skip lives in render_range, which is where "removed
+          from the box tree" actually means something.
+- [x] ~~`addEventListener` THREW on an event we do not deliver~~ FIXED
+      2026-08-09. Refusing loudly was right when the scripts were ours; on a
+      real page it is fatal. `addEventListener('DOMContentLoaded', ...)` is the
+      first line of a great many scripts, and throwing there destroyed
+      everything the script went on to do. The listener is now DECLINED -- it
+      will never fire -- and the console says which type was dropped, so it is
+      not silent either. A listener that never runs is a hard bug to see; a
+      page that stops executing is a harder one. Brave went from 2 script
+      errors to 0 (two informational notices remain, for `error` and
+      `unhandledrejection`). A bare top-level `addEventListener` also exists
+      now, forwarding to the document element.
+- [x] ~~AN INLINE-BLOCK PAINTED ITS OWN MARGIN~~ FIXED 2026-08-09. The block
+      emitter folds margin into padding -- invisible on a full-width block,
+      unmissable on a box with a background and a rounded corner: google.com's
+      "Connexion" pill came out half again too tall and too wide, painting its
+      12px margin blue. An inline-block is now wrapped in a transparent box
+      that carries the margin, putting the paint back on the border box where
+      CSS says it lives.
+- [ ] The BLOCK path still folds margin into padding, so any block with a
+      background paints over its own margin. Same bug, wider blast radius, and
+      the corpus references encode the current behaviour -- worth doing as its
+      own change with its own before/after rather than as a rider on this one.
+
+- [x] ~~A TRAILING SPACE INSIDE AN INLINE ELEMENT WAS TRIMMED~~ FIXED
+      2026-08-09. `trim_tail` stripped the last text child's trailing spaces
+      whenever ANY element closed. That is right for a block -- CSS drops
+      whitespace at the end of a line -- and wrong for an inline element in the
+      middle of one, where the space is what separates it from the next thing.
+      Brave writes `<span>Data from </span><a>Wikipedia</a>` and it read "Data
+      fromWikipedia"; the shape is on every page that puts a label before a
+      link. Trimming is now scoped to block-level tags, with everything not
+      named (span, a, b, i, and every custom element a framework invents)
+      treated as inline, which is CSS's own default.
+- [x] ~~A BUTTON WITH NO TEXT SAID "Submit"~~ FIXED 2026-08-09. A button with
+      neither a value nor text is an ICON button -- the icon being an inline
+      <svg> we cannot draw -- and writing "Submit" on it states something the
+      page never said. Brave's header read as six Submit buttons. It also gave
+      every one of them `.id("Submit")`: identical keys in a retained,
+      reconciled tree, so six distinct buttons claimed to be one instance. Both
+      fixed; the key is the node index now.
+
+- [x] ~~A BUTTON RENDERED ITS CAPTION AND NOTHING ELSE~~ FIXED 2026-08-09.
+      `Button()` takes a string, so a <button> was drawn as one: its label, or
+      (once icons could be drawn) its first icon. A real page's button is a BOX
+      WITH CHILDREN -- an icon and a word, two icons, a wrapper around either --
+      and everything past the first was never walked. A button with an icon and
+      text lost the icon; one with two icons showed one.
+      A button with element children is now built from the primitives Button is
+      itself built from -- a styled box that reports its own clicks -- with its
+      children rendered inside. Text-only buttons keep the toolkit's Button,
+      which knows how a caption should look.
+- [x] ~~WHAT THE 38x38 BOXES ARE~~ ANSWERED 2026-08-09 by `WHATIS=x,y`, a
+      render_host mode that NAMES the element covering a point (tag, id, class,
+      whether it carries SVG) instead of leaving it to be inferred. Written
+      because three separate explanations for that one box -- "an image", "a
+      button", "the svg inside it" -- were each disproved only after being
+      acted on. The renderer already knew which element made which box; nothing
+      could ask it.
+      The answer, in one command: `<button id=clear-query-button>` with a
+      `<div class=noscript-hide>` inside it. Which turned up two real bugs:
+        * `<noscript>` WAS PARSED AS ORDINARY MARKUP. Its contents are for a
+          browser with scripting off -- and we run scripts. Brave ships
+          `<noscript><style>.noscript-hide{display:none!important}...</style>`,
+          so a stylesheet written for a scriptless browser was going into our
+          cascade, and the fallback markup was being rendered on top of the
+          real page. Skipped whole now, the way a comment is. bbc went from
+          1837 nodes to 1530, and craigslist's scroll-blit check -- red for as
+          long as it has been measured -- went green.
+        * `:focus-within`, `:focus-visible` and `:target` were IGNORED, which
+          makes a selector broader, and those three are how a page reveals
+          things: a dropdown, a panel, a skipped-to section. Ignoring them
+          showed content the reader never asked for. They are false in a render
+          and match nothing now. `:hover` and `:focus` deliberately stay
+          lenient -- that is a decision this project already made and holds a
+          test for (tests/web/pseudo.html); those are cosmetic, and a link in
+          the wrong blue is not content appearing out of nowhere.
+      The clear-query button itself is CORRECT to be visible: the search box
+      holds a query, so `:not(:placeholder-shown)` is true. Its ✕ is an inline
+      <svg> the walk still does not reach, which is the one thread left.
+
+- [x] ~~A PAGE VERIFIER~~ BUILT 2026-08-09: `make web-verify` (tools/
+      web_verify.py). The corpus checks what somebody thought to assert, which
+      cannot find a gap nobody has noticed. This asks the other question and
+      needs no expectation written first: FIREFOX renders the same local page
+      under WebDriver and is asked for `document.body.innerText` -- the visible
+      text and only the visible text -- and the two are compared BOTH ways.
+        MISSING = visible to a reader, absent from ours: content lost.
+        EXTRA   = in ours, invisible to a reader: content we revealed that the
+                  page hid, which is what a mishandled <noscript>, an ignored
+                  :focus-within or an unparsed media query looks like from
+                  outside.
+      Two lessons are baked into it. Comparing against the DOCUMENT instead of
+      the visible text scores MDN's reference pages at 32% for rendering
+      perfectly -- every hidden mega-menu counts as loss. And word BOUNDARIES
+      differ legitimately (innerText welds adjacent inline runs: Google's header
+      comes back as one word "GmailImages"), so a word absent from the other's
+      set is checked against its letters before being called missing.
+      Firefox is never consulted about STYLE -- only about what a page amounts
+      to. geckodriver is spoken to over plain HTTP; selenium is not installed
+      here, and a tool that needs installing first is a tool nobody runs.
+- [x] ~~github.com SEGFAULTED THE RENDERER~~ FIXED 2026-08-09. `imgcache_want`
+      in the HOST harness handed a decoder `HARENA + HUSED` without ever
+      checking that the image fitted -- the metal's imgcache has always checked
+      -- so a page with enough pictures ran png_decode past the end of the
+      arena and over whatever global came next. On github that was the DOCUMENT,
+      wiped mid-render, and the crash landed three frames away in code doing
+      nothing wrong. Found with AddressSanitizer in one run after an hour of
+      reading stack traces that all pointed at innocent code.
+      github went from 0% (nothing rendered at all) to 99.5% of its visible
+      words. Also raised the harness's CSS buffers from 1 MB to 3 MB to match
+      cssref on the metal -- it was silently dropping a 297 KB sheet, so the
+      fast loop was rendering a page the metal would not -- and CSS_MAX_RULES
+      from 8192 to 16384, which github alone exceeds.
+- [x] ~~A `<link media="print">` STYLESHEET WAS APPLIED ON SCREEN~~ FIXED
+      2026-08-09, and it is the best single find the verifier has made. gnu.org
+      links two sheets, `media="screen"` and `media="print"`, and nothing
+      looked at the attribute -- so the print sheet applied, and its
+      `#header,#navigation,#links,...{display:none}` took the whole navigation,
+      header and breadcrumbs off the page. It read as a layout bug for as long
+      as anyone had looked at it. The parser keeps the `media` each sheet was
+      linked with; cssref and the host loader both skip a sheet whose media
+      does not match, using the media-query matcher that already exists.
+      gnu.org: 84.7% -> 99.7% of its visible words.
+- [x] ~~A NESTED TABLE ATE EVERYTHING AFTER IT~~ FIXED 2026-08-09.
+      `render_table` kept its row list in a `static` array and RECURSES: a table
+      inside a cell overwrote the outer table's rows, so on return the outer
+      carried on reading the INNER table's. Hacker News (whose third row holds a
+      92-row table and whose fourth is the footer) rendered a repeated item row
+      where its footer should be, and guidelines/FAQ/lists/API/security/legal
+      were never drawn. On the stack now; the nesting is shallow and 128 ints is
+      half a kilobyte. hackernews 94.5% -> 100%.
+- [x] ~~THREE WAYS TO MATCH TOO MUCH~~ FIXED 2026-08-09, all the same mistake:
+      dropping a constraint makes a selector BROADER, and a broad `display:none`
+      empties a page.
+        * ATTRIBUTE SELECTORS were skipped entirely. They are parsed and
+          evaluated now against the attributes the parser keeps (class, id,
+          href/src, alt, style, name, value, type) with =, ~=, ^=, $=, *= and
+          bare presence; a test against an attribute we do not store (data-*,
+          aria-*, role) matches NOTHING, because a question we cannot answer
+          must not be answered yes.
+        * An unknown FUNCTIONAL pseudo was skipped, which turned MDN's
+          `.code-example:has(.hidden, ...)` into `.code-example{display:none}`
+          and took every code block on the site off the page. One that took an
+          argument now matches nothing; a bare unknown pseudo stays lenient,
+          which is the decision tests/web/pseudo.html already holds for :hover.
+      Wikipedia 91.6% -> 99.5%, and the fix is why.
+- [x] ~~A <pre> WAS ONLY ITS DIRECT TEXT~~ FIXED 2026-08-09. Element children
+      were skipped, so a <pre> whose lines are wrapped in <span>s rendered as
+      NOTHING -- and highlighting IS spans, so that is every syntax-highlighted
+      code block on the web. MDN's formal-syntax section was blank on every
+      reference page. The text is gathered from the whole subtree now, with
+      <br> as a line break. mdn 93.7% -> 100%, pythonorg 97.9% -> 100%.
+- [x] ~~THE HIDDEN REPORT COULD NOT NAME A SELECTOR~~ FIXED 2026-08-09: it
+      printed a bare "." for every rule, because `klass` became an array and
+      `klass[0]` is a pointer that is never null. It prints every class by name
+      now, plus `*` for a universal compound and a marker for one that matches
+      nothing. A diagnostic that cannot name what it found sends you to grep the
+      stylesheet -- which is the search it exists to end, and it cost an hour
+      before it was noticed.
+- [x] ~~A LONG WORD WAS TRUNCATED~~ FIXED 2026-08-09: the per-word pool held
+      strings of a fixed length, and suckless.org's forty-character git URLs
+      ran past it. Widened; suckless 99.6% -> 100%.
+- [x] ~~`@media(` WITH NO SPACE WAS A DIFFERENT AT-RULE~~ FIXED 2026-08-09.
+      The at-rule keyword was read up to whitespace, so a MINIFIED sheet --
+      which is every sheet a build tool emits -- gave the keyword as
+      "media(min-width:45em)", which is not "media", and the whole block was
+      skipped. gnu.org lost a paragraph to it. gnu 99.7% -> 100%; the case is
+      pinned by two rules in `tests/web/media.html`, one that must apply and
+      one that must not.
+- [ ] What the verifier says is left, 2026-08-10. SIXTEEN of nineteen sites
+      now render 100% of their visible text (craigslist, danluu, example, gnu,
+      google, hackernews, kernelorg, lobsters, mdn, nginx, pythonorg,
+      rust-lang, sqlite, suckless, xkcd). The rest:
+        wikipedia 99.6% -- 8 words
+        github    99.5% -- 2, and both are word-boundary artifacts
+        brave     98.4% -- 8 words, the infobox's Factsheet rows. NOT A BUG so
+                  far as HTML goes: they are inside a <details> that is closed
+                  by default, and Brave opens it with a control of its own.
+                  Our closed-by-default behaviour is what the markup says.
+      The EXTRA column is still dominated by one cause: menus a page collapses
+      with an external `<script src>` we do not fetch.
+      bbc cannot be scored -- Firefox itself throws on the saved copy.
+
+- [x] ~~The loader refused the bigger binary with EINVAL~~ NOT A LOADER BUG,
+      2026-08-10. The glyph atlas was innocent: `make embkfs.img` had FAILED
+      (the stripped binary's debug twin was named *.debug.elf, so mkfs packed
+      it and the drift guard stopped the build), and the boot therefore ran a
+      STALE image. The refusal was real -- the kernel really did read something
+      that was not an ET_EXEC -- it just was not the binary being built.
+      The debug copy is named `.debug` now, outside the *.elf glob.
+
+      Kept from it: the loader used to refuse a binary EIGHT ways and return
+      the same EINVAL for all of them, so "can't run (err 22)" named nothing.
+      Each refusal now says which check it was, on the serial log -- which is
+      what turned this into a two-minute answer instead of another evening.
+
+### NetSurf port ✅ COMPLETE -- network to pixels, on the OS
+
+The port fetches over the network, parses, cascades, lays out and draws text,
+on EmbLinkOS: `nsemblink "http://example.com/" 800 600 out.ppm` prints
+[Example Domain] and writes the page.
+
+Deferred, each named where it bites rather than left to be found:
+- [ ] The fetcher BLOCKS. vnet_fetch returns a whole response, so a poll that
+      starts a fetch does not return until the page has arrived -- the browser
+      is unresponsive for the duration and one slow server stops the clock for
+      everything. Fixing it means an incremental vnet API (connect / pump /
+      done), not a change in the fetcher.
+- [ ] COOKIES do not persist. NetSurf keeps its own jar in urldb and applies it
+      inside its own fetchers; ours goes through the OS's HTTP client, which
+      asks the host program for the header. ports/netsurf/fetch/resolve.c
+      answers with nothing rather than with something wrong, so a login does
+      not stick.
+- [ ] A multipart POST (a file upload) is DECLINED at setup rather than sent as
+      a GET, so the form reports a failure the user can see instead of losing
+      their data to a server that never receives it.
+- [x] ~~No JavaScript~~ ON, 2026-08-11. Duktape is built (278 symbols in the
+      binary) and nsgenbind -- the host tool that turns NetSurf's WebIDL into
+      its DOM bindings -- is built from the same bundle by build.sh. TWO steps
+      were needed and the second is the one that looks like a broken
+      interpreter: `NSOPTION_BOOL(enable_javascript, false)`, so linking the
+      engine in is necessary and not sufficient. Proved by a page that sets its
+      own text from a script: SCRIPTDIDNOTRUN -> "JAVASCRIPTRAN 5", on the host
+      and on the metal.
+      It did NOT move the corpus scores. That is expected and worth knowing:
+      the saved pages' missing words are the <details> accordion and
+      word-boundary artefacts already diagnosed for the other browser, not
+      script-generated content -- and a saved copy's external <script src> is
+      not on disk to run.
+- [ ] Image decoders are still off (PNG/JPEG/GIF) -- the OS has its own and
+      NetSurf has its own handlers; connecting them is bounded work.
+- [ ] `make web-shots` / `web-verify` can now be pointed at either engine
+      (RENDERER=...), but the two scores are NOT comparable yet: Vellum's
+      harness reports every text node in the document, while NetSurf plots only
+      what is inside the viewport it was given. Wikipedia at 1100x7200 emits
+      1225 runs and is taller still. The fix is in main.c -- ask
+      browser_window_get_extents for the document height and size the surface
+      to it before redrawing -- and until then a NetSurf number means "of the
+      text in the first 7200 pixels".
+- [x] ~~NetSurf is not an APP~~ IT IS ONE, 2026-08-11.
+      `nsemblink window <url>` opens a titled window on the desktop with the
+      page live inside it: scroll by wheel or PgUp/PgDn/arrows/Home/End,
+      pointer tracking and clicks into browser_window_mouse_click, keys into
+      browser_window_key_press. ZERO-COPY -- embk_win_create_shared maps the
+      compositor's own pages in, so a redraw lands in what the screen scans out
+      and present() is a damage call rather than a 760x500 memcpy per frame.
+      window.c was written so the only change was adopting a different buffer,
+      which is what it means for the core never to learn where its pixels live.
+- [x] ~~The app has NO CHROME~~ IT HAS SOME, 2026-08-11: a toolbar with back,
+      forward, reload and an address field you can click, type into and press
+      Enter on. What you type is interpreted the way an address bar has to be
+      -- a leading slash is a file, a bare host is http -- because a field
+      that only accepts what a program would have written is not an address
+      bar. Drawn with the same plotters and font as the document; there is no
+      second drawing stack here and four buttons do not justify one.
+- [x] ~~The address field has no caret~~ It has one: left/right/home/end move
+      it, and typing and backspace act AT it rather than only at the end.
+- [x] ~~No scrollbar~~ There is one, and it took two goes: the first used a
+      near-white track on a white page, so the affordance existed and told
+      nobody anything.
+- [x] ~~No loading indication~~ A bar under the address field while the
+      throbber is running. A browser that looks identical whether it is
+      fetching or finished is one you press Enter on twice.
+- [x] ~~Cookies do not persist~~ Wired to NetSurf's own jar (urldb): the OS's
+      HTTP client asks for the Cookie header and hands back the Set-Cookie
+      lines, and urldb does expiry, domain/path matching and HttpOnly. IN
+      MEMORY ONLY -- urldb's file is neither loaded nor saved, so a cookie
+      lives as long as the process. That is the difference between a session
+      cookie and a persistent one and it is the remaining half.
+- [x] ~~No images at all~~ GIF and BMP are on: libnsgif and libnsbmp are
+      NetSurf's own decoders and were already in the cross-built stack, so
+      these cost nothing but the switch.
+- [ ] PNG and JPEG -- the two formats that actually matter -- are still off,
+      because NetSurf's handlers for them want libpng and libjpeg. The OS has
+      its own decoders (user/web/png.c, jpeg.c); writing content handlers over
+      them replaces two ports with one bounded piece of work, and is now the
+      single biggest gap between this and a browser you would use.
+- [x] ~~SHIFTED PUNCTUATION was dropped~~ FIXED, and it was the reason the
+      browser could not be used. embk_key_event.code is the UNSHIFTED ASCII
+      with the shift state in .mods, and app.c read code alone -- so ':' typed
+      as ';', '?' as '/', and every capital came out lower case. You could not
+      type "https://" or any host with a capital in it. A US shift map (which
+      dvorak shares for punctuation) plus caps-lock-affects-letters-only, and
+      shift XOR caps rather than shift OR caps. Verified with a real shift
+      press through QMP: the field now reads http://example.com and navigates.
+      OLD NOTE, kept because it was the misdiagnosis: Typing `https://...` through the QMP harness
+      produced `https;//...` -- a `;` where the `:` should be -- and the fetch
+      failed with "Cannot resolve https;", which is the HTTP client telling
+      the exact truth about a hostname it was really given. That was the
+      HARNESS not holding shift, but the same failure would occur if app.c's
+      key handling drops the shift modifier: it reads ev.code and ignores
+      ev.mods entirely. Check EMBK_KM_* against a real keyboard before
+      trusting `:` `/` `?` `&` from the address bar.
+- [ ] The chrome uses the desktop's PALETTE (ui/theme light theme) but not the
+      toolkit: it is drawn with NetSurf's plotters, so there are no rounded
+      corners, no hover states and no EmUI widgets. Drawing it with em.h would
+      mean running two retained-mode UIs in one process; the realistic path is
+      a chromeless window (EMBK_WINF_CHROMELESS exists) with the app drawing
+      an EmUI-shaped bar itself.
+- [ ] Still no TABS, no bookmarks, no find-in-page, no downloads UI, no
+      text selection in the page, and no dragging the scrollbar (it shows
+      position; the wheel and keys do the scrolling).
+- [ ] `nsemblink -w` does not work from the shell, which parses a leading dash
+      as a unary minus; `window` is accepted as a dash-free spelling. That is a
+      workaround for the shell, not a preference -- the same gap that makes a
+      bare URL need quoting.
+- [ ] The SHELL cannot pass a bare URL: `nsemblink http://x/` fails in the
+      shell's parser at the colon-slash-slash, and the URL has to be quoted.
+      That is the shell's gap, already logged, and this is the first thing that
+      hits it routinely.
+
+### NetSurf port: earlier notes -- and the first bug was staleness
+
+- [x] ~~The OS build faulted on a deterministic bad pointer (0x1f4cb0)~~ FIXED
+      2026-08-10, by a full rebuild -- and the reason is worth more than the
+      fix. patches/0002 edits utils/config.h, the header that decides which
+      POSIX functions NetSurf believes it has. NetSurf's buildsystem does not
+      treat that header as a dependency of every object, so objects compiled
+      before the patch kept believing the old answers: half the program thought
+      the platform had mmap and the *at family, the other half knew it did not,
+      and they disagreed about code paths and struct contents.
+
+      From the outside that is not a build error. It is a DETERMINISTIC bad
+      pointer at run time -- the same value every boot, unmoved by recompiling
+      whatever file you happen to touch, in a program that works perfectly when
+      built for the host. Every property that made it look like memory
+      corruption was really a property of half a binary.
+
+      ports/netsurf/build.sh now stamps the patch set and discards the build
+      directory when it changes, so this cannot recur.
+
+      Kept from the hunt, because each stands on its own:
+        * the kernel was handing out UNZEROED heap pages -- a real leak between
+          processes, fixed
+        * the port now builds with -g and -ftrivial-auto-var-init=zero, the
+          latter matching the rest of this OS's userland
+        * `make` packs the image with no manual flags again
+
+Still open in flex:
+- [x] ~~align-items' CSS INITIAL VALUE IS STRETCH~~ SHIPPED 2026-08-10, once
+      the thing it "broke" was diagnosed. It was withheld for two milestones
+      because it collapsed rust-lang.org's <main> to nothing -- and <main> was
+      already a box ZERO PIXELS WIDE for an unrelated reason (`flex: 1` on a
+      child of an auto-height column was being read as a width; see below).
+      Stretch was only making an existing zero visible. With that fixed the
+      default is CSS's, tests/web/flex2.html keeps its stated align-items as
+      the explicit case, and `WIDE=1` reports nothing overflowing its parent
+      on every real site but one.
+- [x] ~~A PERCENTAGE-SIZED FLEX ITEM NEVER SHRANK~~ FIXED 2026-08-10. The two
+      shrink passes were eligible on SIZE_FLEX and SIZE_INTRINSIC; `width:100%`
+      is neither, so three children each asking for the full width took 300% of
+      the row and CSS's default flex-shrink of 1 never ran. SIZE_FIXED stays
+      out deliberately (a 24px traffic light is a decision); a percentage is a
+      proportion OF THE CONTAINER, which is the thing that divides.
+- [x] ~~ONE FLAG ANSWERED TWO QUESTIONS ABOUT A COLUMN~~ FIXED 2026-08-10.
+      Which axis flex-basis/flex-grow land on is the container's DIRECTION
+      alone; whether it can hand out space needs a DEFINITE size. They were the
+      same flag, so `body { display:flex; flex-direction:column;
+      min-height:100vh }` (no stated height) made `body > main { flex: 1 }` a
+      WIDTH -- and `flex: 1` means basis 0, so <main> was zero pixels wide and
+      its whole subtree fell back to intrinsic width. rust-lang.org laid out
+      15000px across an 1100px page.
+- [x] ~~`max-width` WAS WRITTEN INTO `width`~~ FIXED 2026-08-10, plus the
+      second half of the same bug: `ui_set_size` assigns the whole
+      `layout_size`, so it ERASED the min/max that `ui_set_size_bounds` had set
+      moments earlier -- the browser sets a cap when it opens a box and the
+      size when it closes it, so every max-width on the web was dropped between
+      the two calls. `vstyle.max_width` is its own field now and the engine's
+      bound is honoured on both axes.
+- [x] ~~A ROW'S HEIGHT WAS MEASURED AT WIDTHS NOBODY GETS~~ FIXED 2026-08-10,
+      the same disagreement in a third place. `measure_subtree_height`'s row
+      arm sized a percentage child by its INTRINSIC width and ignored the
+      shrink that arrange applies -- so three `width: 100%` sections measured
+      one line of text each, were arranged at a third of the width, wrapped to
+      four lines, and the row (already sized for one) had its children's
+      HEIGHTS squeezed to fit: every heading came out 10px tall with its own
+      paragraph drawn on top of it. The measurement resolves percentages and
+      applies the same scale the arranger does.
+- [ ] `max-width`/`min-width` as a PERCENTAGE are still ignored: the engine's
+      bound is a pixel floor/ceiling with nothing to resolve a percentage
+      against. `max-width: 100%` on an image is the responsive-image idiom and
+      reaches nothing. `min-width` has no vstyle field at all.
+- [ ] MDN's three-column app shell still renders as one column. Nothing
+      overflows any more -- the shell is built from CUSTOM ELEMENTS with
+      `<template shadowroot="open">`, so its layout CSS lives in a declarative
+      shadow root we neither scope nor apply. Its breadcrumb <ol> is numbered
+      by us and unnumbered by Firefox for the same reason.
+- [ ] flex-grow down a column only grows the height when the column has a
+      STATED height. Free space needs an axis with a size to be free of, and on
+      an auto-height column there is none -- the height comes from the children.
+      Worse, the weight then makes the child the FIRST thing squashed when the
+      column overflows (layout.c spends flexible boxes' space before intrinsic
+      ones), which is the other half of what collapsed rust-lang's <main>. An
+      auto-height column keeps the width behaviour it always had. Same
+      diagnosis unblocks both.
+- [ ] Still no `flex-basis` as a PERCENTAGE (`flex: 1 1 50%` reads as a zero
+      basis), no `row-reverse`/`column-reverse`/`wrap-reverse` (all treated as
+      forward), no `align-content` for a multi-line container, and
+      `align-items: baseline` is start.
+- [ ] `flex: none` on an item with no basis can still be shrunk: the engine
+      expresses never-shrink through SIZE_FIXED, which needs a basis. With one
+      (`flex: 0 0 240px`) it is exact.
+- [x] ~~A widget kept the SIZE it was given on a previous frame~~ FIXED, and
+      this is a TOOLKIT bug that reached every EmUI app. em_apply_box calls
+      ui_set_size only when a prop asks for one, so a reused instance keeps
+      whatever size it last had. Invisible in a harness that renders one tree a
+      few times; very visible in an app, which builds an empty view first and
+      the document second -- instances are matched by POSITION across two
+      different trees, so a box inherited `grow` from whatever held its slot
+      before, ate the row's leftover and shoved its siblings to the right edge.
+      The browser now states each box's size explicitly every frame
+      (render.c size_box). The general fix -- em_apply_box always stating a
+      size -- is still open, because every existing app is written against the
+      current behaviour and would need re-checking.
+- [x] ~~Makefile header dependencies were written by hand~~ FIXED: -MMD -MP.
+      build/web_jsdom.o listed jsdom.c/jsdom.h/html.h but not style.h, so when
+      `struct vstyle` grew, jsdom.o kept the OLD layout and was linked into the
+      same binary as everything using the new one. Nothing about that symptom
+      points at a Makefile. Found while chasing the flex divergence above; it
+      was not the cause, and it was a real bug either way.
+- [x] ~~Percentage widths, vw/vh, and box-sizing~~ SHIPPED 2026-08-07 (C3,
+      first half). `width: 50%` travels as a PERCENTAGE through vstyle and is
+      resolved by layout against the containing block, because that number does
+      not exist while the stylesheet is being read -- a new SIZE_PERCENT mode
+      whose fixed_value holds the fraction. Anywhere the mode is not handled it
+      degrades to intrinsic, which is a sane fallback rather than a wrong
+      number. vw/vh read the same viewport a media query asks about, so there
+      is one environment and not two copies of it.
+      box-sizing turned out to be the reverse of the expected job: the layout
+      engine subtracts padding from a node's size to get its content box, so a
+      layout node IS a border box. `border-box` was therefore already right and
+      the CSS DEFAULT (content-box) was the broken case -- a stated width is
+      the CONTENT, and the border box is that much wider. Pinned side by side
+      in tests/web/sizing.html: 200px content-box renders 240 wide, 200px
+      border-box renders 200.
+      The corpus gained EXPECT-X, which pins a resolved position -- so a
+      percentage is tested for the NUMBER it produced (22 + 30% of 896 = 290.8)
+      and not merely for not crashing.
+- [x] ~~THE BUILD SYSTEM~~ FIXED 2026-08-07, after three of one afternoon's
+      four bugs turned out to be build problems rather than code. Four changes,
+      each verified to FAIL when its trap is re-introduced:
+        1. The drift guard FAILS the build instead of warning. It already
+           existed, and on the day build/vellum.elf stopped being rebuilt it
+           printed exactly the right warning -- which scrolled past unread. A
+           check that cannot stop the build is not a check.
+        2. ...and the reverse: every app named in EMBKFS_APPS must EXIST after
+           the build, so a recipe that "succeeds" while producing nothing is
+           caught rather than packed as an absent file.
+        3. -MMD -MP -MF $@.d on every remaining compiler (user, emlibc; newlib
+           was done earlier), with `-include build/*.o.d`. Hand-written header
+           lists go stale: build/web_jsdom.o did not name style.h, so when
+           struct vstyle grew, jsdom kept the OLD layout inside a binary where
+           everything else had the new one. The kernel was already safe -- it
+           is one compile with every kernel header as a prerequisite, and its
+           comment records that trap costing two 35-minute boots.
+        4. build/browser_render got real prerequisites. It had NONE, so it only
+           rebuilt when missing, and only worked because it was deleted by hand
+           before each run. A harness that does not rebuild is worse than no
+           harness: it reports the previous build's answer with total
+           confidence.
+      Verified from a clean tree (2m39s): touching style.h rebuilds
+      web_jsdom.o; touching ui/dsl/em.h rebuilds libembk.so AND every app that
+      links it (the EmProps-by-value hazard); an orphan .elf in build/ fails
+      the build; a deleted app is rebuilt rather than silently dropped.
+- [x] ~~C3 REMAINDER: position, overflow, calc()~~ SHIPPED 2026-08-07, except
+      float. `position: relative` offsets a box AFTER the flow has placed it,
+      so its siblings never notice -- which is the whole difference from
+      absolute and the reason relative is safe to apply late. `absolute` and
+      `fixed` go out of flow through the engine's existing overlay path, now
+      taught CSS's insets: a stated edge pins that side, both edges on an axis
+      give the size, neither leaves the box at the content origin.
+      `overflow: hidden/auto/scroll` all CLIP (the difference between them is a
+      scrollbar this renderer does not draw on an arbitrary box; the clipping
+      is the part that changes the layout, and leaving it out is how an
+      overflowing box paints across the rest of the page).
+      calc() reduces to a LINEAR EXPRESSION -- pct% of the container plus px --
+      because the percentage is against a block that does not exist when the
+      sheet is read. `calc(100% - 240px)` is width_pct 100 with width -240.
+      Real operator precedence: getting `calc(100% - 2 * 20px)` wrong is off by
+      exactly one gap, which looks like a rounding bug.
+- [x] ~~float / clear~~ SHIPPED 2026-08-07, as a ROW rather than as exclusion
+      regions, and the difference is worth stating. CSS floats shorten the LINE
+      BOXES of everything that follows, so text wraps around a floated image
+      and then RECLAIMS THE FULL WIDTH below it. This renderer has no exclusion
+      regions -- an inline run is a wrapping row that knows nothing about boxes
+      beside it -- so a float and the content flowing beside it become an
+      actual row: [float][the rest], or [the rest][float] for float:right, with
+      `clear` ending the row.
+      That is exactly right for the two shapes floats are really used in (an
+      image with text beside it, and float-based columns) and WRONG in one
+      visible way: the text never reclaims the full width below the float, it
+      stays in its column. A tall float beside a short paragraph therefore
+      leaves a gap that a real browser would fill.
+      Doing it properly means teaching the wrap arm about exclusion rects --
+      it already walks lines with a y cursor, so it is reachable; the hard part
+      is that the floats live in an ancestor block and the text is in a nested
+      Flow, i.e. a coordinate-space problem rather than an algorithm one.
+      2026-08-10, three things the float ROW got wrong, all found by
+      `make web-verify` on kernel.org and all fixed: the group collected at
+      most EIGHT floats and SKIPPED the rest (kernel.org floats nine footer
+      links; the ninth did not exist -- a full group now stops collecting and
+      the overflow opens the next group); a floats-only group is a float GRID
+      and must WRAP, where a non-wrapping row silently clipped whatever ran
+      past the edge (it is a Flow now; with in-flow content beside them the
+      non-wrapping row is still right, that being the image-with-text shape);
+      and `measure_wrap_height` sized a PERCENTAGE-width child by its
+      intrinsic width, so nine 30%-wide boxes measured one line and arranged
+      three, leaving the container two lines short and the next block painted
+      over the overflow.
+- [x] ~~`list-style`, `<ol>` numbering, and the list item's own box~~ SHIPPED
+      2026-08-10. Every list item drew one hardcoded bullet, which was three
+      wrongs at once: `list-style: none` (on essentially every navigation menu
+      on the web) was neither parsed nor honoured, an `<ol>` was bulleted
+      instead of numbered, and the item was drawn through a PRIVATE path that
+      returned before the ordinary box code -- so its width, background,
+      padding, border and float were all ignored and `.blogroll li { float:
+      left; width: 33% }` sized to its text. Now: `list-style` /
+      `list-style-type` parse to VM_*, the type INHERITS (the list states it,
+      the item reads it -- which is the only way `ul { list-style: none }`
+      reaches the <li> that draws the marker), and the item runs the same box
+      path as any block with the marker emitted inside it.
+      VM_NONE had to stop being 0: `none` and "nobody said" were the same
+      value, so the item's own default put the bullet straight back.
+- [ ] `list-style-position: inside`, `list-style-image`, and the alphabetic /
+      roman counters are not honoured -- an unrecognised type keeps the bullet
+      rather than losing the marker to a spelling. `<ol start=N>` and `reversed`
+      are ignored too: numbering counts items from one.
+- [ ] `position: fixed` is treated as ABSOLUTE against the nearest positioned
+      ancestor, not the viewport. The difference only shows when the page
+      scrolls under a fixed header. `sticky` is treated as relative.
+- [ ] `position: relative` on an INLINE element does nothing -- an inline run
+      has no box to offset. Absolute DOES work on one, because CSS blockifies
+      an absolutely positioned box and the renderer now does too.
+- [ ] z-index is not honoured; paint order is document order. An absolutely
+      positioned box written later in the source paints on top, which is what
+      most pages expect anyway.
+- [x] ~~C4 part 1: the DOM a script BUILDS, and events that bubble~~ SHIPPED
+      2026-08-08. document.createElement / createTextNode / body,
+      el.appendChild / removeChild / remove / setAttribute, el.className and
+      el.classList.{add,remove,toggle,contains}. Nodes come from the SAME
+      arenas the parse used, so a script's nodes live exactly as long as the
+      document and there is no second lifetime; when an arena is full they FAIL
+      and set `truncated` rather than growing into a page's hands. A node
+      cannot be appended into its own subtree -- every walker in this browser
+      recurses without a visited set.
+      Events BUBBLE: click, submit, input and change fire on the node and then
+      on each ancestor, with `event.target` staying the node it happened on,
+      `currentTarget` the one listening, and stopPropagation ending the walk.
+      An event name we cannot deliver is still refused LOUDLY.
+      Two bugs found doing it, both of the same shape -- a feature that appears
+      to work while being useless:
+        * jsdom_has_listener asked only about the node itself, so a DELEGATED
+          listener (the way most pages are written) left its children unclickable.
+        * render_block returned early for list items, images, tables and
+          controls, all BEFORE the clickable-box code -- so a click on an <li>
+          inside a listening <ul> was consumed by the ul and arrived with
+          event.target set to the ul. Delegation exists precisely to ask which
+          item was clicked. The hit box now wraps every display path, and the
+          INNERMOST listening box consumes.
+- [x] ~~preventDefault, and 'input'/'change' never firing~~ BOTH CLOSED
+      2026-08-08. preventDefault is a real veto on `submit`: the browser asks
+      after dispatching and does not navigate if a handler said no, which is
+      how a page validates a form or submits it with fetch() itself.
+      'input'/'change' fire from a per-frame POLL of the value table
+      (form_take_changed) rather than a callback, because the toolkit writes
+      into the value buffer in place and there is no edit event to hook -- so
+      the only way to know is to have kept what the field used to say.
+- [x] ~~No checkbox / radio / select~~ SHIPPED 2026-08-08. A boolean control
+      keeps a stable bool per node (the toolkit binds a pointer to it) with the
+      FORM's copy still the source of truth for submission; the working copy is
+      synced in before the control draws and out straight after, so a click is
+      visible to form_submit in the same frame. Radios clear their group by
+      `name`, which is the whole difference between a radio and a round
+      checkbox. A <select> is its <option> children -- labels from their text,
+      the submitted value from `value` or the text -- and an <option> is
+      display:none so it cannot leak into the page as stray text.
+- [x] ~~No cookies~~ SHIPPED 2026-08-08: `user/web/cookie.c`. A cookie is how a
+      site remembers you between two requests, and without one every page load
+      is a stranger arriving. Sent on every request for a matching host+path,
+      taken from Set-Cookie BEFORE a redirect is followed (the hop carries the
+      session the next request needs), and exposed as document.cookie with
+      HttpOnly cookies EXCLUDED -- that exclusion is the whole security value
+      of the flag.
+      16 host assertions (T23) pin the scoping rules, and one caught a real
+      bug: a cookie with no Domain must be HOST-ONLY. Defaulting it to
+      domain-scoped quietly widens every cookie a site sets, handing a session
+      set on example.com to any subdomain including one an attacker controls.
+      Also pinned: a suffix match must fall on a dot (else evil-example.com
+      claims example.com's cookies), /app must not match /applesauce, a host
+      cannot set a cookie for another domain, Secure stays off plain http, and
+      Max-Age=0 deletes -- which is how logout works.
+      Metal-proven against a real server: the browser stored two cookies from
+      one response and the next request came back "SERVERSAW sid=SESSION42;
+      pref=dark".
+- [x] ~~The jar is not persisted / no localStorage / Expires is not parsed~~
+      ALL THREE DONE 2026-08-08, and the three questions the last entry raised
+      were answered rather than dodged:
+        WHERE: $HOME/.vellum, and the browser may name nothing else. vellum.ns
+          used to be comments only -- which means INHERIT the whole session --
+          so writing the grant down made the browser MORE confined than it was
+          when it could not persist at all.
+          It is $HOME and not /data/apps/vellum because the session grants
+          `ro /data/apps` on purpose: an application rewriting its own
+          installed files is what a package manager exists to prevent. A
+          browser's cookies are the USER's data anyway.
+        WHO MAY READ IT: whoever can name that directory -- the session's own
+          tree, the same boundary that separates one user's documents from
+          another's.
+        WHEN THINGS EXPIRE: by the wall clock (embk_now_unix, the CMOS RTC),
+          and only when there is one. An unset clock reads as "no opinion"
+          everywhere rather than as 1970, so a machine whose RTC was never set
+          does not silently throw away every saved session on boot.
+      Expires is parsed as a real RFC 1123 date, with the leap-year rule, and
+      checked to the second against independently computed values. Session
+      cookies (no expiry) are deliberately NOT saved: they are defined to end
+      with the session, and writing them would redefine what the user agreed to.
+      Metal-proven across a REBOOT on one disk: keeper=LIVES came back and the
+      session cookie did not.
+- [ ] The `$HOME` token in a .ns manifest is new and only Vellum uses it. Any
+      app keeping per-user state wants it; the alternative was hard-coding a
+      user name in a manifest, which is wrong on a machine with two users.
+- [ ] A granted prefix must EXIST at spawn time -- the kernel resolves it in
+      the PARENT's namespace -- so $HOME/.vellum is shipped by mkfs. An app
+      cannot create what it has not been granted, and cannot be granted what
+      does not exist. That chicken-and-egg wants a real answer (a spawn-time
+      "create if absent" grant?) before the second app hits it.
+- [ ] <textarea> renders as a SINGLE-LINE field. It submits correctly and it
+      does not look like a text area; a multi-line control needs the toolkit to
+      grow one.
+- [ ] Custom properties are DOCUMENT-scoped, not element-scoped: one table for
+      the sheet, last definition wins. Correct for a single `:root` block (the
+      overwhelmingly common shape) and wrong for per-component theming
+      (`.dark { --bg: black }` re-theming one panel). Needs the table to hang
+      off the element and inherit.
+- [ ] Still unsupported in selectors: attribute selectors (`[type=checkbox]`),
+      every pseudo-class other than the two above, and pseudo-elements. All are
+      SKIPPED rather than dropped -- `a:hover` still styles `a`, which is
+      closer to the author's page than no rule.
+- [x] ~~No find-in-page~~ SHIPPED 2026-08-08 (C5): Ctrl+F, a bar with a live
+      count ("2 of 4"), Prev/Next that WRAP, Enter for next, Esc to close, and
+      every match highlighted with the CURRENT one a different colour -- without
+      that, "next" moves an indicator you cannot see, which is the one thing
+      find has to show.
+      `user/web/find.c` reuses the runs select.c already collected rather than
+      walking the scene again: two walks would be two chances to disagree about
+      what is page text and what is chrome, and the first bug that produces is
+      "find highlights the address bar". Matching is case-insensitive and SPANS
+      RUNS -- the renderer emits one box per word, so "operating system" is two
+      boxes and a matcher confined to one fails on every phrase anyone searches
+      for; the page is flattened into one string with a run index per byte.
+      A real bug the harness caught: the count on screen was ONE FRAME STALE
+      (the view draws it before the post-layout hook rescans) and nothing asked
+      for another frame, so typing "browser" left "1 of 24" -- which is the
+      answer for "b". The host said 3 and the metal said 24, which is what made
+      it obvious.
+- [x] ~~Persistent history~~ SHIPPED 2026-08-08. Back/forward was never
+      history: it is a stack that dies with the window. `user/web/history.c`
+      keeps the list you consult when you cannot remember what a page was
+      called, newest first, one entry per URL (revisiting MOVES a row rather
+      than adding a second -- a history where an address appears forty times is
+      one you cannot read, and reading it is the only thing it is for).
+      Persisted through the same store, directory and three answers as the jar.
+      Shown as `about:history`, a page the BROWSER writes and then parses with
+      its own engine -- which is why there is no history widget anywhere in the
+      app. A list of links is a page. It also means the history is styled by
+      the same cascade, selectable by the same selection and searchable by the
+      same find. Titles are HTML-escaped: a title comes off the network, and
+      the browser vouches for this document.
+- [x] ~~An inherited colour outranked the user-agent's LINK colour~~ FIXED, and
+      it was general rather than cosmetic: `body { color: ... }` inherits into
+      every <a>, so on most pages -- most pages set a body colour -- every link
+      lost its colouring. CSS gives the UA's `a` rule precedence over
+      inheritance, and only a rule naming the link itself beats the UA.
+      vstyle now records whether a colour was set ON the element or inherited.
+- [ ] TABS, and why they are not done. A tab needs its own parse arenas AND its
+      own JS context; jsdom is built around one global g_ctx/g_doc. Doing it by
+      re-parsing on switch would re-run every page's scripts, so a tab would
+      silently lose its state on every switch -- a feature that looks right and
+      behaves wrongly, which is the failure this project keeps catching. It
+      wants jsdom made multi-instance first.
+- [ ] Still C5: zoom, downloads, favicon. Zoom needs page-level font scaling
+      that render.c does not currently express (the toolkit's scale moves the
+      chrome too, which is UI zoom and not page zoom -- worth naming rather
+      than shipping under the wrong label).
+- [ ] Selection is WORD granular, not character. The renderer emits one node per
+      word, so that is the grain available without measuring glyph prefixes
+      through the font engine on every pointer move. Also missing: double-click
+      to select a word, triple-click for a paragraph, shift-click to extend, and
+      selecting inside the chrome (address bar / status line -- excluded on
+      purpose, the walk only counts nodes inside the document's clip). Copy is
+      plain text; there is no text/html flavour. A document past WORD_MAX (4096)
+      words has an unselectable tail.
+- [ ] JPEG is BASELINE only. Progressive is refused, not half-decoded (it is a
+      different decoder: coefficients arrive across multiple scans and the whole
+      coefficient buffer must stay live between them). Also no arithmetic
+      coding, no CMYK/YCCK, no EXIF orientation, no restart-marker resync after
+      corrupt data (a bad scan decodes as far as it can and stops).
+- [x] ~~The raster was the remaining scroll cost~~ FIXED: the renderer now has
+      a SCROLL BLIT (scene_render.c Step 1s). When a frame is provably a pure
+      scroll -- many nodes translated by one shared delta, no content change,
+      no vacated ghost, and nothing moved-but-visible outside the scrolled clip
+      -- the blitted region is memmove'd and only the exposed strip (plus the
+      clip's fractional edge rows) is repainted. Host-proven PIXEL-EXACT
+      against a from-scratch render (`make browser-render` asserts it, and the
+      check watched the blit path actually being TAKEN).
+      ...EXCEPT it was not being taken on any real page, and the check said
+      PIXEL-EXACT anyway because the two renders agreed by being the SAME
+      render. Fixed 2026-08-07: the classifier tested each moved node's raw
+      FOOTPRINT for "moved content visible outside the clip", but a document
+      taller than its viewport always has content scrolled past the bottom of
+      its container -- clipped away, staining nothing, and vetoing the fast
+      path on every page. `gather` now threads the inherited clip down the
+      tree so every node carries its VISIBLE extent (foot ∩ ancestor clips),
+      and the classifier reasons about that. A moved node that itself CLIPS
+      still aborts (its descendants' extents were computed against a clip in
+      motion). `make browser-render` now FAILS if the blit path is not
+      exercised, and exits non-zero so it is a test rather than a report. Needed a scene-level
+      split of dirty into geometry-vs-content (dirty_content), because
+      scrolling is itself a transform and was vetoing its own fast path.
+- [ ] Metal scroll-FEEL still not verifiable headless: QMP wheel synthesis does
+      not reach the guest's USB-HID path. Feel it in an interactive run.
+- [ ] The scroll blit keys on ONE clip region per frame; two views scrolling in
+      the same frame fall back to the full repaint (correct, just slower).
+- [ ] The wrap-height memo keys on ONE width. A node measured at two widths
+      alternately (never observed; would need the same text in two differently
+      sized parents) would thrash the memo -- correct, just uncached.
+
+### Scroll latency (2026-08-07, after the blit)
+- [x] ~~Wheel scroll lagged ~4s behind the hand~~ IMPROVED: usb_core_poll
+      drained ONE HID report per kernel tick, and QEMU queues every wheel notch
+      as its own report -- a flick took seconds of guest time to trickle in,
+      worse under TCG where the guest clock runs slow. The poll now drains the
+      whole queue per tick (bounded at 32); the deltas coalesce in the pointer
+      state and the app sees one jump. Expected effect: the wheel lag drops to
+      roughly one frame (~0.3s under TCG). The user's hunch stands: under KVM
+      all of this would be ~10-30x faster and feel instant.
+- [ ] UNVERIFIED: Vellum gained Space/b page-scrolling (vellum_key hook +
+      ui_any_focus accessor). Compiled and shipped, but the QMP probe showed
+      the page NOT moving on Space, cause not yet established -- could be the
+      hook not firing, space not delivered as a char to GUI apps, or the
+      ui_scroll_end clamp. The wheel path (which users actually use) is
+      unaffected either way. Verify by pressing Space in Vellum with the URL
+      bar unfocused; if it does not page, instrument vellum_key with a serial
+      print first.
+
+### Browser: tabs and zoom (shipped; the parts deliberately left out)
+
+- [ ] A background tab's SCRIPTS do not run and its DOM is rebuilt from source
+      when you return to it -- so a clock in a background tab is not ticking,
+      and what a script wrote into the DOM (or what you typed into a form)
+      is gone on return. This is the stated design in `user/web/tabs.h`, not an
+      oversight: one bounded document arena is shared by whichever tab is on
+      screen. Lifting it means a document arena per tab, which is the real
+      work behind "tabs stay alive".
+- [ ] Tabs do not persist across a restart, unlike the cookie jar and
+      localStorage. The machinery to do it exists (`store_put_blob`); what is
+      missing is a decision about whether restoring a session should re-fetch.
+- [ ] TAB_MAX is 6, and each slot reserves a 512KB source buffer up front --
+      3MB of the browser's BSS. A tab pool that allocated on demand would cost
+      nothing for the common one-or-two-tab case.
+- [ ] Switching tabs while a fetch is in flight is REFUSED (the status line
+      says so) because the worker's bytes would land in whichever tab is
+      current when they arrive. A per-tab fetch slot would remove the refusal.
+- [ ] No tab reordering (drag), no "reopen closed tab", no middle-click to
+      open a link in a background tab -- `tab_open` deliberately does not steal
+      focus, so the model is ready for that; nothing calls it that way yet.
+- [ ] Zoom is bound to bare `+`/`-`/`0` rather than `Ctrl+=`/`Ctrl+-`/`Ctrl+0`
+      because the keyboard driver turns Ctrl+LETTER into a control byte and
+      passes Ctrl+SYMBOL through unchanged (`keyboard.c` is explicit about
+      this). The real fix is a driver that reports modifiers alongside symbol
+      keys; then the zoom keys can be the chord everyone already knows.
+- [ ] Zoom scales text and stated lengths, and is NOT persisted per site --
+      every browser remembers zoom per origin, this one remembers it per tab
+      for the life of the process.
+- [ ] Image and border-width lengths do not scale with zoom; only text and the
+      box lengths render.c states (padding, margin, width/height, gap).
+
+### Browser: what a run against 17 real sites turned up (2026-08-08)
+
+Method: fetch real pages WITH their stylesheets, render each through
+`build/browser_render`, and rank what breaks. Everything below was found this
+way and is not in any corpus page, because the corpus was written by the same
+person who wrote the engine. Five bugs were fixed on the spot (deep-tree
+segfault, pseudo-elements matching real elements, display:table dropping its
+subtree, over-long selectors applying to an ancestor, and the cascade's
+unsigned-char rule index). These are what remain.
+
+- [x] ~~STYLE RESOLUTION IS O(rules x elements)~~ -- DONE, plus two costs that
+      were bigger and were not where anyone would have guessed. Per pass, on
+      the host: Wikipedia 315 -> 88ms, bbc 194 -> 24, python.org 104 -> 12,
+      rust-lang 56 -> 2.4, mdn 67 -> 12.5. Three separate fixes, each measured:
+      the selector index (rules filed by their subject's most selective name);
+      a no-op guard in the reconciler's relink, which had been unlinking every
+      child every frame by walking the parent's list to find its predecessor
+      (O(N^2) per parent -- 2000 sibling divs went 58.7 -> 5.7ms); and a
+      per-pass memo on computed style, because the renderer asked for the same
+      element's style from sixteen call sites and was running the whole cascade
+      each time.
+- [ ] Wikipedia is still the outlier at 88ms a pass, and it is now BUILD, not
+      style and not layout (78ms build, 9ms layout). It is also the only page
+      that fills the 8192-node arena. Worth a profile with something better
+      than gprof, whose call counts on an inlined -O2 build were wrong by two
+      orders of magnitude and sent this chase down a wrong path once already.
+- [ ] The DOM arena (8192 nodes) truncates Wikipedia and bbc.com. The string
+      arena (256KB) truncates bbc.com first -- both are reported as
+      "TRUNCATED" without saying which ran out, which cost time to work out.
+      Report them separately.
+- [ ] The declare layer's instance pool (INST_MAX 8192) overflows on Wikipedia:
+      1452 views dropped. Bounded and reported, but it means the bottom of a
+      long page is not built. Paging that arena is the fix (already noted at
+      the top of declare.c).
+- [ ] python.org fails the scroll-blit pixel-exactness check ("pixels differ").
+      Not yet diagnosed -- the blit path is taken and disagrees with a full
+      repaint, which is a correctness bug in the fast path.
+- [ ] `:is()`, `:not()` and `:has()` with a COMMA inside are split on that
+      comma by the selector-group scanner, which produces one bogus selector
+      per argument. They currently fail to match rather than mis-matching, so
+      the damage is limited, but the rules are silently lost.
+- [ ] Selector matching keeps the rightmost 6 compounds (99.97% of real
+      selectors). Longer ones drop their outermost ancestor constraints and so
+      match a SUPERSET -- correct element, looser condition. Documented in
+      css_sel_parse rather than fixed.
+- [ ] github.com ships 6.9MB of CSS across 41 sheets and 40942 rules. It is
+      capped and reported, not crashed, and chasing that number is not the
+      plan; noted so the limit is a known one.
+- [ ] Several sites serve a bot-check page rather than content to a plain
+      fetch. That is not a rendering bug and the triage has to keep separating
+      the two: acmqueue was 45 nodes of "enable JavaScript", not a parse
+      failure.
+
+### Browser C6: looking at the pages instead of counting them
+
+The previous run proved every real site produced text runs. It could not prove
+any of them LOOKED right, because a run count says a word reached the screen
+and nothing about where. Rendering them to images found five defects in the
+first two pages looked at, all of which had been passing every check.
+
+Fixed: a table no longer inherits text-align (so <center> around a layout
+table centres the table, not its cells); link words carry no horizontal
+padding (they had 2px a side, setting linked text looser than the text beside
+it); whitespace-only text nodes between inline elements are a real space
+("tosh7 hours ago"), collapsed into the following word so a line never opens
+with one; bgcolor/align/color attributes map to CSS declarations; and a table
+cell paints its own background.
+
+Both follow-ups are DONE: every site has been looked at (`make web-real
+SHOTS=1`, and the fetcher lives in tools/web_real.py so the run is repeatable),
+and the corpus now compares each page against a stored reference image. Looking
+found the biggest fidelity bug yet -- the page was drawn with the DESKTOP's
+palette, so Wikipedia's own white background carried our light-grey text.
+
+Still open, from looking:
+- [ ] Wikipedia now lays out in two columns above its own 1120px breakpoint --
+      title, tabs, infobox and sidebar all in place -- but the article's BODY
+      text is squeezed into a column a few characters wide, and the header
+      overlaps itself. Both look like `position` (sticky/absolute) rather than
+      grid; that is the next layer and it has not been diagnosed yet.
+- [x] ~~Wikipedia's chrome renders as full-width stacked rows~~ -- FOUR things
+      were wrong, none of them the layout engine. The first was not a layout bug at all:
+      entities were not decoded in ATTRIBUTE values, so its stylesheet URL
+      (`load.php?lang=en&amp;modules=...`) was requested literally and
+      MediaWiki replied "no modules were requested" -- 196 bytes instead of
+      216KB. The page really was unstyled. With the CSS in, what remains is
+      NAMED GRID AREAS: `.mw-page-container-inner` is
+      `grid-template-areas: 'siteNotice siteNotice' 'columnStart pageContent'
+      'footer footer'` and its children carry `grid-area: columnStart` etc.
+      Track SIZES now work; placement by name does not, so the children
+      auto-flow and stack. Measured across the seventeen sites:
+      grid-template-columns 363 uses / 6 sites (done), grid-area 361 / 3,
+      grid-template-areas 125 / 3. That is the next piece and it is bounded:
+      parse the area grid on the container, the name on the child, place.
+- [ ] python.org draws its no-JS fallback with every dropdown menu in flow and
+      overlapping the article -- `position: absolute` on menus that a real
+      browser also hides. Untangling which of those two is ours needs a
+      separate look.
+- [x] ~~FORM CONTROLS come from the theme~~ -- done: the kit takes a scoped
+      control palette (ui_set_control_palette), which the browser opens around
+      the document the way it opens the zoom bracket. Fields, buttons,
+      checkboxes, radios and selects all follow it.
+- [x] ~~sqlite.org welds "Reliable.Choose any three."~~ -- it was a <br>, which
+      had no style at all and rendered as nothing. It is a block with nothing
+      in it now, so it splits the inline run, which is the only line-breaking
+      machinery there is.
+- [ ] The kit's remaining controls (toggle, slider, stepper, segmented,
+      progress) do not consult the control palette. Nothing in a document
+      reaches them yet -- <input type=range> is not implemented -- so this is
+      a gap that will matter when one does, not a visible bug.
+- [ ] The visual references are pixel-exact and the font comes from the host's
+      DejaVu, so a machine with a different build of it will see every page
+      differ. `make web-corpus BLESS=1` regenerates them; a font-independent
+      signature would be better and is not obviously worth the loss of
+      precision.
+- [ ] Presentational hints ride the INLINE style, so they beat author CSS
+      instead of losing to it. Correct for the common case (a page that has
+      the attribute and no rule) and wrong for a page whose stylesheet
+      contradicts its own bgcolor.
+- [ ] HN's rank column is align=right in the markup and now maps to CSS, but
+      table cells do not yet honour text-align for their own content in every
+      path -- worth checking against the real page.
+
+### Sizes, and why they are all measured now
+
+Every arena that a real page can fill is sized from a count taken across the
+seventeen sites rather than from a round number, and every one of them that can
+overflow says so:
+
+- DOM nodes 8192 -> 16384 (Wikipedia needs ~9400, MDN ~8100). A full node arena
+  STOPS THE DOCUMENT; it is not a truncation, and `trunc_nodes` now says which
+  arena ran out so the two are distinguishable.
+- Document strings 256KB -> 1MB.
+- Declare instances 8192 -> 24576 (Wikipedia builds ~18000 views).
+- CSS rules 256 -> 4096, external CSS 128KB -> 1MB, one sheet 64KB -> 512KB.
+  A sheet that does not fit is counted (`cssref_dropped`) instead of vanishing.
+
+Vellum's BSS is 28MB as a result, up from 20MB. The remaining known overflow is
+github, which ships 6.9MB of CSS across 41 sheets; that bound is reported and
+not worth chasing.
+
+### C7: positioning and stacking
+
+- [x] ~~An absolutely positioned box is placed against its IMMEDIATE PARENT~~ --
+      fixed. CSS places it against the nearest POSITIONED ancestor, which is
+      the entire reason a page writes `position: relative` on a wrapper with no
+      offsets of its own. Every dropdown, tooltip and badge on the web is built
+      that way, and python.org's menus were landing on top of its article.
+      `position: fixed` now lands against the root (the viewport) as a
+      consequence, which is what fixed means.
+- [ ] Z-INDEX is still not honoured; paint order is document order within a
+      layer. Worth saying what it would and would not fix: the overlap left on
+      python.org is menus a real browser HIDES until hover, not menus painted
+      in the wrong order, so z-index is not what that page is waiting for. The
+      scene supports layers 0..3 and CSS z-index is an arbitrary integer, so a
+      faithful mapping needs a stacking-context pass, and the page must not be
+      able to paint over the browser's own chrome.
+- [ ] `position: sticky` is treated as `relative`, so a sticky header scrolls
+      away instead of pinning. 68 uses across 6 sites.
+- [ ] Negative z-index (paint BEHIND the parent's background) has nowhere to go
+      in a layer scheme that starts at the flow.
+- [ ] Wikipedia's article body is still squeezed into a narrow column and its
+      header overlaps itself, at 206ms a frame with the full stylesheet in.
+      Not yet diagnosed; positioning was not the whole of it.
+
+### <details>, <svg>, and the MDN mystery
+
+Looking at the rendered images again found three real bugs and one thing I
+could not explain, which is written down here rather than guessed at.
+
+- [x] ~~`<details>` renders every collapsed section expanded~~ -- implemented.
+      A disclosure shows its <summary> always and the rest only when open, the
+      summary toggles it, and the open set is dropped with the rest of the
+      per-page UI state.
+- [x] ~~BOOLEAN attributes were never read~~ -- `<details open>` carries no
+      value, and the check for it sat inside the branch that only runs when
+      there is an `=`. It never fired for any boolean attribute.
+- [x] ~~`<svg>` children render as document blocks~~ -- it is a REPLACED
+      element; its paths and groups are a different rendering model. MDN's
+      83x24 logo came out 3340 pixels tall. It reserves its stated box now.
+      Drawing the vector is a renderer this browser does not have.
+- [x] ~~MDN'S TEXT IS PLACED OUTSIDE ITS BOXES~~ -- FOUND AND FIXED. A
+      PERCENTAGE HEIGHT WAS RESOLVING AGAINST AN AUTO-HEIGHT PARENT.
+      `height: 100%` inside a parent whose own height is auto does not mean "as
+      tall as the parent" -- the parent has no height yet, it is about to get
+      one from those very children. CSS computes such a percentage to auto, and
+      that rule is what stops the feedback: without it every child is handed
+      the height the parent just measured, they stack, and the parent's height
+      no longer matches what is inside it. MDN went 307394px -> 14859px, which
+      is its document box. Pinned by tests/web/pct-height.html, which also
+      checks that a percentage against a DEFINITE height still resolves.
+
+### C8: real pages at usable speed
+
+The style memo now SURVIVES ACROSS FRAMES. A frame that scrolls changes
+nobody's computed style -- same document, same sheet, a different offset -- so
+recomputing it was work whose answer was already known. Wikipedia was
+re-parsing 2267KB of declaration text every frame for a page nothing had
+changed. Per build+layout pass on the host:
+
+    wikipedia  206 -> 37ms      github     42 -> 4.1ms
+    bbc         20 -> 5.2ms     mdn        13 -> 5.2ms
+    python.org  26 -> 2.2ms     lobste.rs  ~7 -> 1.9ms
+
+Invalidated on the three things that can change an answer: a new document, a
+stylesheet arriving, and a script mutating the DOM. Inheritance needs no
+announcement -- the key already hashes the parent style, so a changed ancestor
+misses by construction. Verified interactively on the metal
+(`/system/web/restyle.html`: a click sets a class, the box restyles).
+
+- [ ] Wikipedia is still the outlier at 37ms, and it is LAYOUT now (21ms) not
+      build (16ms). measure_wrap_height and layout_measure_height_at_width are
+      the top entries after the cascade; both are height-at-width measurements
+      that a page of 10900 nodes does a great many of. Whether they are
+      redundant has not been established.
+- [ ] The style memo is direct-mapped on the node index and sized to NODE_MAX,
+      so collisions are impossible rather than rare -- but that ties 2.6MB of
+      BSS to the arena size. Both grow together if the arena does.
+- [ ] github still parses 5711 rules of a 6.9MB stylesheet. It renders; nobody
+      has looked at whether it renders RIGHT.
+
+### C9: the real web, on the machine
+
+Everything before this was verified on a host harness. Vellum now fetches and
+renders LIVE SITES on the metal over the OS's own TLS: example.com and Hacker
+News both render authenticated, with current content.
+
+Three things were in the way, and only one of them was TLS.
+
+- [x] ~~The trust store had four hand-transcribed roots~~ -- tools/mkroots.py
+      generates roots.h from the host's CA bundle, so adding a root is adding a
+      line. 22 anchors now. Four roots means a browser reaches the fraction of
+      the web that happens to chain to those four.
+- [x] ~~example.com refused~~ -- and NOT for the reason assumed. It chains to
+      SSL.com TLS ECC Root CA 2022, not DigiCert; one `openssl s_client` said
+      so in a second, after a guess had already been implemented.
+- [x] ~~A MAKEFILE ORDERING BUG kept shipping a stale browser~~ --
+      `TLS_LIB_OBJS` was defined AFTER the rule that lists it as a
+      prerequisite, and make expands prerequisites when it reads the rule, so
+      it expanded to nothing. Changing a trust anchor rebuilt the object and
+      never relinked vellum. The OS kept refusing a site the host verifier
+      accepted.
+
+Still open:
+- [x] ~~No page has been seen WITH ITS IMAGES~~ -- they are now, on both sides.
+      `make web-real` fetches a page's images alongside its stylesheets, and
+      the harness could not load ANY of them: it stripped the leading slash off
+      every image path to make it repo-relative, which is right for the corpus
+      and wrong for an absolute path, so every real page rendered with grey
+      boxes. xkcd's comic and kernel.org's icon render on the host; kernel.org
+      renders WITH ITS IMAGE on the metal, fetched over the network.
+
+      What the web actually serves, counted across the seventeen sites:
+      png 73, webp 28, svg 23, jpeg 13, gif 1. We decode PNG and JPEG.
+
+- [ ] WEBP IS 28 OF 138 IMAGES and decodes as nothing -- bbc serves 12, github
+      16. It is the one missing format that matters; GIF is a single image in
+      the whole sample and SVG needs a vector renderer, not a decoder.
+- [x] ~~TLS 1.2 IS NOT SPOKEN~~ -- it is now, alongside 1.3, in its own files
+      (prf12/record12/tls12). One ClientHello offers both; the server's choice
+      decides which half of the client runs. xkcd.com renders on the metal.
+      Scope: ECDHE + AES-128-GCM + SHA-256, RSA or ECDSA server key, full
+      certificate verification plus the ServerKeyExchange signature. No static
+      RSA, no CBC, no renegotiation, no resumption.
+- [x] ~~Navigating from one page to the next leaves the previous page showing
+      through~~ -- and it was not a repaint problem at all, which is what the
+      first two attempted fixes assumed. The view was being RECONCILED against
+      the page that had been there: a reused instance keeps whatever size
+      nobody restated, so the second document came out with the right boxes and
+      the previous page's text positions. The document's container is keyed by
+      a per-load counter now, so a new page is a new subtree. A fresh load was
+      always correct, which is exactly why only the second navigation showed
+      it.
+- [ ] The trust set is 23 anchors and five of the listed roots are not in the
+      host's bundle at all (DigiCert Global Root CA, High Assurance EV,
+      Baltimore, GTS R2, Entrust G2) -- so the generator's list should be
+      checked against what a current bundle actually holds rather than from
+      memory of which CAs matter.
+- [ ] Only two live sites have been tried. The seventeen-site corpus is
+      fetched by curl and rendered on the host; the same list run on the metal
+      would be a different test and would find different things (memory at
+      521MB, TCG speed, decode cost).
+- [ ] No revocation checking of any kind, and the trust set is compiled in.
+      docs/TLS.md already logs both; the packaging story is where a
+      user-growable, verified-boot-sealed root set belongs.
+
+### A ring-3 backtrace
+
+The kernel prints a symbolized backtrace on a KERNEL fault and stopped at the
+kernel's own .text, which is no help at all when the faulting code is an
+application -- and "RIP=0" says a call went through a null pointer without
+saying whose. It walks the user rbp chain now, through access_ok so a corrupt
+frame ends the walk rather than faulting the fault handler, and prints raw
+addresses; `nm build/<app>.elf` names them, and an ET_EXEC app loads at bias 0
+so they match directly.
+
+It found a bug in one boot that an afternoon of elimination had not:
+`gctr <- gcm_seal <- tls_record_seal <- tls_close <- vnet_fetch`.
+
+## Media apps (Photos, and what comes next)
+
+Three apps were asked for, from scratch rather than ported: a picture viewer,
+an MP3 player, and video. They are not the same size of job and the honest
+scoping is recorded here rather than discovered later.
+
+### Photos — SHIPPED
+- [x] PNG + JPEG over our own decoders, EXIF orientation, folder as album,
+      zoom/fit/1:1, drag to pan, our chrome (traffic lights).
+- [x] AREA-AVERAGE resampling (`user/photos/resample.c`) instead of the
+      compositor's bilinear, which is right for magnifying and aliases when
+      shrinking. Measured: area off by 1 where bilinear is off by 101 on a
+      checkerboard (`make test-photos`); on the metal, a band-limited zone
+      plate at 50% gives std 0.7 in the outer field and std 86.5 in the centre.
+- [ ] No GIF, no BMP, no WebP, no interlaced PNG, no progressive JPEG (the
+      decoders say EUNSUP honestly rather than showing something wrong).
+- [ ] No rotate/crop/save -- the namespace grant is READ-ONLY on purpose, so
+      adding editing means widening authority, which should be a decision and
+      not a side effect.
+- [ ] No thumbnail strip, no slideshow, no full-screen mode.
+- [ ] A viewer icon. `photos.app` points at `file.eic` because the icon set has
+      no picture glyph -- the art is user-supplied (`icons/masters/`).
+- [ ] Decoding is SYNCHRONOUS: a very large JPEG stalls the frame it lands on.
+      The resampler is already viewport-bounded, so this is decode only.
+
+### MP3 player — NEXT
+- [ ] MPEG-1 Layer III decoder from nothing: bit reservoir, Huffman tables,
+      scalefactors, requantisation, stereo modes, alias reduction, IMDCT and
+      the polyphase synthesis filterbank. This is a real DSP job, not a
+      weekend's parsing, and it is the reason the audio stack was built first.
+- [ ] Verify by MEASUREMENT, the way audio already is: decode a known tone on
+      the HOST, compare against the reference, and only then put it on metal.
+
+### Video — SCOPED HONESTLY, NOT PROMISED
+- [ ] The MP4/ISO-BMFF container is a parser and is achievable.
+- [ ] H.264 is NOT. A conformant decoder is tens of thousands of lines
+      (CABAC, deblocking, B-frames, multiple reference frames) and would run
+      far slower than real time under TCG even if written. Claiming "like VLC"
+      and delivering a slideshow would be worse than saying this now.
+- [ ] The achievable version is a container demuxer plus a codec we can
+      actually decode in real time -- MJPEG reuses the JPEG decoder we already
+      have and ship. That is real video playback and it is not H.264, and the
+      difference should be stated in the app rather than glossed.

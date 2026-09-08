@@ -1,0 +1,26 @@
+<html><head><title>Form controls</title></head><body>
+<form id="f" action="/apply">
+  <p><input type="checkbox" name="news" value="yes" alt="CHECKNEWS"></p>
+  <p><input type="radio" name="plan" value="free"  alt="RADIOFREE">
+     <input type="radio" name="plan" value="pro"   alt="RADIOPRO"></p>
+  <p><select name="size">
+       <option value="s">SIZESMALL</option>
+       <option value="m">SIZEMEDIUM</option>
+       <option value="l">SIZELARGE</option>
+     </select></p>
+  <p><textarea name="notes" alt="NOTESAREA"></textarea></p>
+  <p><input type="submit" value="APPLYNOW"></p>
+</form>
+<p id="out">CONTROLSREADY</p>
+
+<!-- the controls render, and an <option> does NOT leak out as page text -->
+<!-- EXPECT-TEXT: CHECKNEWS -->
+<!-- EXPECT-TEXT: RADIOFREE -->
+<!-- EXPECT-TEXT: RADIOPRO -->
+<!-- EXPECT-TEXT: APPLYNOW -->
+<!-- EXPECT-TEXT: CONTROLSREADY -->
+<!-- the select shows its FIRST option, and the others are inside the control
+     rather than spilled into the document -->
+<!-- EXPECT-TEXT: SIZESMALL -->
+<!-- EXPECT-NO-TEXT: SIZELARGE -->
+</body></html>

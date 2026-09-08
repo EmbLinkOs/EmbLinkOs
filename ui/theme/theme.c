@@ -5,6 +5,9 @@
 #define C(r,g,b)     ((struct color){ (r)/255.0f, (g)/255.0f, (b)/255.0f, 1.0f })
 #define CA(r,g,b,a)  ((struct color){ (r)/255.0f, (g)/255.0f, (b)/255.0f, (a) })
 
+static bool  g_dark_pref = true;
+static float g_ui_scale  = 1.0f;   /* the user's interface size, 1.0 = default */
+
 static struct ui_theme light_theme(void) {
     struct ui_theme t = {0};
     t.bg            = C(251,251,252);
@@ -55,8 +58,13 @@ static struct ui_theme dark_theme(void) {
 static void apply_metrics(struct ui_theme *t) {
     t->radius_sm = 6;  t->radius_md = 9;  t->radius_lg = 14;  t->radius_pill = 999;
     t->sp1 = 4; t->sp2 = 8; t->sp3 = 12; t->sp4 = 16; t->sp5 = 24; t->sp6 = 32; t->sp7 = 48;
-    t->text_caption = 12.5f; t->text_body = 14.0f; t->text_body_lg = 15.5f;
-    t->text_title = 19.0f; t->text_heading = 26.0f;
+    /* The type scale, multiplied by the user's interface size. Everything the
+     * UI measures is derived from these -- including the Terminal's character
+     * grid -- so scaling here scales the whole system rather than one app's
+     * idea of "bigger text". */
+    t->text_caption = 12.5f * g_ui_scale; t->text_body = 14.0f * g_ui_scale;
+    t->text_body_lg = 15.5f * g_ui_scale;
+    t->text_title = 19.0f * g_ui_scale; t->text_heading = 26.0f * g_ui_scale;
 }
 
 static struct ui_theme g_current;
@@ -75,7 +83,39 @@ const struct ui_theme *ui_theme(void) {
     if (!g_init) rebuild(false);
     return &g_current;
 }
-void ui_theme_use_dark(bool dark) { rebuild(dark); }
+void ui_theme_use_dark(bool dark) { g_dark_pref = dark; rebuild(dark); }
+
+/* Interface size. Clamped hard: below ~0.8 the UI stops being legible and
+ * above ~1.3 the chrome starts colliding with itself, and a preference that
+ * can break the desktop is not a preference, it is a trap. */
+void ui_theme_set_scale(float s) {
+    if (s < 0.80f) s = 0.80f;
+    if (s > 1.30f) s = 1.30f;
+    if (s == g_ui_scale) return;
+    g_ui_scale = s;
+    struct color a = g_current.accent;     /* rebuild() resets the accent... */
+    rebuild(g_dark_pref);
+    ui_theme_set_accent(a);                /* ...so put the user's back */
+}
+
+/* Re-tint the accent without touching anything else. The accent is the one
+ * place the design spends boldness, so it is also the one thing worth letting
+ * a user choose -- and choosing it must not mean editing a palette. The three
+ * derived tones move with it (hover brighter, soft as a low-alpha wash, and
+ * the ink that goes ON the accent), because a user picking "Teal" is not
+ * volunteering to pick four colours that agree. */
+void ui_theme_set_accent(struct color c) {
+    g_current.accent = c;
+    g_current.accent_hover = (struct color){ c.r + (1.f - c.r) * 0.18f,
+                                             c.g + (1.f - c.g) * 0.18f,
+                                             c.b + (1.f - c.b) * 0.18f, c.a };
+    g_current.accent_soft  = (struct color){ c.r, c.g, c.b, 0.18f };
+    /* white on a dark accent, near-black on a light one -- luminance decides,
+     * not taste */
+    float l = c.r * 0.2126f + c.g * 0.7152f + c.b * 0.0722f;
+    g_current.on_accent = l > 0.62f ? (struct color){ 0.08f, 0.08f, 0.09f, 1.f }
+                                    : (struct color){ 1.f, 1.f, 1.f, 1.f };
+}
 void ui_theme_set_fonts(uint32_t regular, uint32_t bold) {
     g_font_regular = regular; g_font_bold = bold;
     if (!g_init) rebuild(false);

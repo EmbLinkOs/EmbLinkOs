@@ -1,0 +1,8 @@
+# term namespace manifest (docs/USERSPACE_v2.md UP4).
+#
+# The Terminal HOSTS the structured shell (/system/bin/shell.elf), which runs
+# arbitrary commands on the user's behalf -- build, edit, browse, spawn external
+# pipeline tools. So it legitimately needs the SESSION'S full view: read the
+# system + installed apps, write the user's home + /run, exactly what the logged
+# -in user can see. Declaring NO bindings keeps that full inherit explicit and
+# intentional (same pattern as files.ns) rather than a silent default.

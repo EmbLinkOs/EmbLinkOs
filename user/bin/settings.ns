@@ -1,0 +1,12 @@
+# Settings inherits the authenticated session's namespace -- deliberately, and
+# for the same reason Files does.
+#
+# The first version asked for "ro /system, rw /data" and every spawn failed
+# with -ENOENT. That is the namespace model working: a manifest may only
+# ATTENUATE what the session already holds, never widen it, and the session
+# does not hold a blanket rw on /data to give away. Asking for less than you
+# need fails loudly; asking for more fails just as loudly, which is the point.
+#
+# Inheriting gives Settings exactly the user's own view: the system tree to
+# read, and the user's own writable space -- which is where the preferences
+# file lives.

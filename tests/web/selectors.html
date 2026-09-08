@@ -1,0 +1,96 @@
+<html><head><title>Selectors</title><style>
+/* This page sets LIGHT text, so it has to state the ground that goes under
+   it. The browser's canvas is white -- the initial value every page on the web
+   is written against -- and a document that assumes otherwise is a document
+   that only works in one browser's dark mode. Stating it here is what a real
+   page has to do, and it keeps every colour expectation below unchanged.
+
+   The GROUND and the INK go together: declaring one without the other leaves
+   everything the page did not colour explicitly -- a table cell, a list item --
+   still using the browser's dark default, unreadable on this dark ground. */
+html, body { background: #16161c; color: #d8d8e0 }
+
+/* A child combinator must NOT reach a grandchild. Parsed as a descendant --
+   which is what this browser used to do -- the deep word turns red too. */
+nav > p          { color: #ff0000 }
+/* Adjacent sibling: only the paragraph immediately after the marker. */
+.mark + p        { color: #00c000 }
+/* General sibling: every later sibling, but nothing before. */
+.mark ~ blockquote { color: #00a0ff }
+/* Structural pseudo-classes. */
+ul li:first-child { color: #ffb000 }
+ul li:last-child  { color: #c060ff }
+/* An INHERITED colour must not outrank the user-agent's link colour. Most
+   pages set a body colour, and if inheritance won they would lose every link
+   they have. A rule naming the link itself still wins. */
+body             { color: #d8d8e0 }
+a.styled         { color: #ff8000 }
+/* Specificity: the id must beat the class, whichever order they are written. */
+.spec            { color: #ff0000 }
+#spec            { color: #30c0a0 }
+
+/* A COMPOUND WITH MORE THAN ONE CLASS. Only the last was stored, so
+   `.logo.scoped` degraded to `.scoped` and matched every element the component
+   had scoped -- and when such a rule carries display:none, the page empties.
+   Brave's search results rendered as a blank white box for exactly this. */
+.logo.scoped   { color: #cc3355 }
+.scoped        { color: #2244cc }
+.mc1.mc2.mc3   { color: #11aa66 }
+</style></head><body>
+
+<nav>
+  <p>CHILDHIT is a direct child of nav and must be red.</p>
+  <div><p>GRANDCHILD is a level deeper and must NOT be red.</p></div>
+</nav>
+
+<p class="mark">MARKER</p>
+<p>ADJACENTHIT immediately follows the marker and must be green.</p>
+<p>ADJACENTMISS is two paragraphs later and must not be green.</p>
+<blockquote>SIBLINGHIT follows the marker and must be blue.</blockquote>
+
+<ul>
+  <li>FIRSTITEM must be amber</li>
+  <li>MIDDLEITEM must be neither</li>
+  <li>LASTITEM must be purple</li>
+</ul>
+
+<p class="spec" id="spec">SPECIFICITY: the id wins, so this is teal.</p>
+<p>PLAINPROSE inherits the body colour, and
+   <a href="/x">LINKKEEPSBLUE</a> does not &mdash; while
+   <a class="styled" href="/y">LINKSTYLED</a> takes the colour named on it.</p>
+
+<!-- EXPECT-COLOR: CHILDHIT #ff0000 -->
+<!-- EXPECT-COLOR: GRANDCHILD #d8d8e0 -->
+<!-- EXPECT-COLOR: ADJACENTHIT #00c000 -->
+<!-- EXPECT-COLOR: ADJACENTMISS #d8d8e0 -->
+<!-- EXPECT-COLOR: SIBLINGHIT #00a0ff -->
+<!-- EXPECT-COLOR: FIRSTITEM #ffb000 -->
+<!-- EXPECT-COLOR: MIDDLEITEM #d8d8e0 -->
+<!-- EXPECT-COLOR: LASTITEM #c060ff -->
+<!-- EXPECT-COLOR: SPECIFICITY #30c0a0 -->
+<!-- ...which is the body colour this page sets: these three say
+     "the rule under test did not apply here", and unstyled text on this
+     page inherits from body. -->
+<!-- EXPECT-COLOR: PLAINPROSE #d8d8e0 -->
+<!-- the theme's accent, NOT the inherited body colour -->
+<!-- ...the user-agent's link colour, which is the WEB's blue and not the
+     desktop theme's accent: a document is drawn on its own white canvas with
+     its own palette, so its unstated colours have to come from that world.
+     This expectation used to name the theme's accent, and was asserting the
+     bug rather than the rule. -->
+<!-- EXPECT-COLOR: LINKKEEPSBLUE #1a0dab -->
+<!-- EXPECT-COLOR: LINKSTYLED #ff8000 -->
+
+<p class="logo scoped">TWOCLASS is matched by the two-class rule</p>
+<p class="scoped">ONECLASS keeps the single-class colour</p>
+<p class="mc1 mc2 mc3">THREECLASS needs all three</p>
+<p class="mc1 mc2">TWOOFTHREE must NOT take the three-class rule</p>
+<!-- The two-class rule is more specific AND names both, so it wins on the
+     element that has both -- and must not touch the one that has only one. -->
+<!-- EXPECT-COLOR: TWOCLASS #cc3355 -->
+<!-- EXPECT-COLOR: ONECLASS #2244cc -->
+<!-- EXPECT-COLOR: THREECLASS #11aa66 -->
+<!-- An element missing one of the three classes falls through to the colour it
+     inherits: a compound is an AND, not a bag to pick from. -->
+<!-- EXPECT-COLOR: TWOOFTHREE #d8d8e0 -->
+</body></html>

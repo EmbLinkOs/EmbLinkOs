@@ -268,6 +268,162 @@ static void gapp(void) {
     }
 }
 
+/* ======================================================================= */
+/* Pickers gallery ("pk" as argv[3]) -- ColorPicker (+ future pickers).     */
+/* ======================================================================= */
+static float g_hsv[3]  = { 0.58f, 0.74f, 0.92f };   /* a pleasant blue */
+static int   g_date[3] = { 2026, 8, 3 };            /* selected day */
+static char  g_cb_buf[32] = "Sta";                  /* filters to Staging */
+static bool  g_cb_open = true;                      /* render menu open */
+static char  g_tags[8][EM_TAG_LEN] = { "kernel", "graphics", "wip", "audio", "network" };
+static int   g_tag_n = 5;
+static char  g_tag_entry[EM_TAG_LEN] = "";
+static void pkapp(void) {
+    static const char *const envs[] = { "Development", "Staging", "Production", "Sandbox" };
+    Screen(.justify = Center, .align = Center) {
+        VStack(.spacing = 16, .align = Center) {
+            HStack(.spacing = 16, .align = Leading) {
+                Card(.width = 320, .spacing = 14) {
+                    Text("Color Picker").title();
+                    Text("HSV square + hue bar, live swatch").caption().secondary();
+                    ColorPicker(g_hsv);
+                }
+                Card(.width = 280, .spacing = 12) {
+                    Text("Date Picker").title();
+                    Text("Inline month grid").caption().secondary();
+                    Calendar(g_date);
+                }
+            }
+            HStack(.spacing = 16, .align = Leading) {
+                Card(.width = 320, .spacing = 12) {
+                    Text("Combobox").title();
+                    Text("Editable + filtered options").caption().secondary();
+                    Combobox(g_cb_buf, sizeof g_cb_buf, envs, 4, "Environment", &g_cb_open);
+                }
+                Card(.width = 280, .spacing = 12) {
+                    Text("Tag Input").title();
+                    Text("Removable chips + entry").caption().secondary();
+                    TagInput(g_tags, &g_tag_n, 8, g_tag_entry, sizeof g_tag_entry);
+                }
+            }
+        }
+    }
+}
+
+/* ======================================================================= */
+/* Gradient-border gallery ("b" as argv[3]) -- the new render-engine feature.*/
+/* ======================================================================= */
+static void gbapp(void) {
+    const struct ui_theme *t = ui_theme();
+    Color pink = { 0.93f, 0.28f, 0.60f, 1.0f };
+    Color cyan = { 0.13f, 0.83f, 0.93f, 1.0f };
+    Color viol = { 0.55f, 0.36f, 0.96f, 1.0f };
+    Screen(.justify = Center, .align = Center) {
+        VStack(.spacing = 20, .align = Center) {
+            GradientText("Gradient Text", em_lgrad3(cyan, viol, pink, 0), .font = Heading);
+            GradientBorder(2.5f, em_lgrad(t->accent, pink, 45),
+                           .corner = 18, .padding = 22, .background = t->surface) {
+                Text("Gradient ring").title();
+                Text("A border stroked with a linear gradient").caption().secondary();
+            }
+            GradientBorder(3.0f, em_lgrad3(cyan, viol, pink, 90),
+                           .corner = 999, .padding = 14, .background = t->surface) {
+                Text("Pill outline").heading();
+            }
+            HStack(.spacing = 14) {
+                GradientBorder(2.0f, em_lgrad(cyan, t->accent, 0), .corner = 16, .padding = 16, .background = t->surface) { Icon(IconStar); }
+                GradientBorder(2.0f, em_lgrad(pink, viol, 0),      .corner = 16, .padding = 16, .background = t->surface) { Icon(IconHeart); }
+                GradientBorder(2.0f, em_lgrad(viol, cyan, 0),      .corner = 16, .padding = 16, .background = t->surface) { Icon(IconBolt); }
+            }
+        }
+    }
+}
+
+/* ======================================================================= */
+/* min/max constraints ("m") + 2D Grid ("r") -- layout-engine level-ups.    */
+/* ======================================================================= */
+static void mmapp(void) {
+    const struct ui_theme *t = ui_theme();
+    Screen(.justify = Center, .align = Center, .padding = 20) {
+        VStack(.spacing = 14, .align = Fill) {
+            Text("Clamped-responsive").heading();
+            Text("grow to fill, but never exceed maxw").caption().secondary();
+            HStack(.align = Fill) {
+                VStack(.grow = 1, .maxw = 320, .padding = 18, .background = t->surface,
+                       .corner = 14, .spacing = 4) {
+                    Text("max 320px").title();
+                    Text("I fill the row, but stop at 320px wide.").caption().secondary();
+                }
+            }
+            HStack(.align = Fill) {
+                VStack(.grow = 1, .minw = 220, .padding = 18, .background = t->accent_soft,
+                       .corner = 14) {
+                    Text("min 220px floor").title();
+                }
+            }
+        }
+    }
+}
+static void gridapp(void) {
+    static const float spark[] = { 3, 5, 4, 7, 6, 9, 8, 11 };
+    Screen(.padding = 20) {
+        VStack(.spacing = 14, .align = Fill) {
+            Text("Dashboard grid").heading();
+            Grid(3, .spacing = 12) {
+                StatCard("CPU", "37%", "+2.1%", spark, 8);
+                StatCard("MEM", "1.2 GB", "-0.4%", spark, 8);
+                StatCard("NET", "88 ms", "+5 ms", spark, 8);
+                Card(.span = 2, .padding = 16, .spacing = 6) {
+                    Text("Activity").title();
+                    Chart(spark, 8, .height = 64);
+                }
+                Card(.padding = 14, .align = Center) {
+                    Gauge(0.72f, "72%", .height = 90);
+                }
+                Card(.span = 3, .padding = 14) {
+                    Banner(IconCheck, "All systems nominal.").success();
+                }
+            }
+        }
+    }
+}
+
+/* ======================================================================= */
+/* Apple-modern top bar ("a") -- glass strip, menus left + status right.    */
+/* ======================================================================= */
+static int  g_bar_items[8] = { IconStar, IconBolt, IconGear };
+static int  g_bar_n = 3;
+static void bar_chip(int id) { Icon(id).secondary(); }
+static void barapp(void) {
+    const struct ui_theme *t = ui_theme();
+    Screen(.padding = 0, .background = (Color){ 0.09f, 0.11f, 0.17f, 1 }) {
+        VStack(.grow = 1, .align = Fill, .spacing = 0) {
+            /* the bar: a thin glass strip pinned to the top */
+            Glass(.align = Fill, .py = 5, .px = 12) {
+                HStack(.align = Center, .spacing = 10, .grow = 1) {
+                    Icon(IconBolt).color(t->text);
+                    MenuBar() {
+                        Menu("EmbLink") { MenuItem("About EmbLink"); MenuSeparator(); MenuItem("Quit"); }
+                        Menu("File")    { MenuItem("New"); MenuItem("Open"); }
+                        Menu("Edit")    { MenuItem("Undo"); MenuItem("Redo"); }
+                        Menu("View")    { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
+                    }
+                    Spacer();
+                    Dock(g_bar_items, &g_bar_n, bar_chip);   /* drag to reorder / drag out to remove */
+                    Text("100%").caption().secondary();
+                    Text("9:41").bold();
+                }
+            }
+            /* a little "desktop" under the bar for context */
+            VStack(.grow = 1, .align = Center) {
+                Spacer();
+                Text("Desktop").heading().color((Color){ 1, 1, 1, 0.45f });
+                Spacer();
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     int W = 480, H = 1080;
     const char *out = argc > 1 ? argv[1] : "v2.ppm";
@@ -276,10 +432,20 @@ int main(int argc, char **argv) {
     bool v6   = (argc > 3 && argv[3][0] == '6');
     bool v7   = (argc > 3 && argv[3][0] == '7');
     bool gl   = (argc > 3 && argv[3][0] == 'g');
+    bool pk   = (argc > 3 && argv[3][0] == 'p');
+    bool gb   = (argc > 3 && argv[3][0] == 'b');
+    bool mm   = (argc > 3 && argv[3][0] == 'm');
+    bool gr   = (argc > 3 && argv[3][0] == 'r');
+    bool bar  = (argc > 3 && argv[3][0] == 'a');
     if (v4) { W = 660; H = 900; }
     if (v6) { W = 560; H = 420; }
     if (v7) { W = 560; H = 420; }
     if (gl) { W = 620; H = 460; }
+    if (pk) { W = 700; H = 900; }
+    if (gb) { W = 460; H = 520; }
+    if (mm) { W = 480; H = 380; }
+    if (gr) { W = 620; H = 520; }
+    if (bar) { W = 760; H = 420; }
 
     size_t rl = 0, bl = 0;
     uint8_t *reg  = read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", &rl);
@@ -296,7 +462,7 @@ int main(int argc, char **argv) {
     ui_init(&sa, &la);
 
     if (v4) em_toast("Snapshot created", Success);   /* host clock is 0 -> stays visible */
-    ui_frame_begin(); em_new_frame(); if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
+    ui_frame_begin(); em_new_frame(); if (bar) barapp(); else if (gr) gridapp(); else if (mm) mmapp(); else if (gb) gbapp(); else if (pk) pkapp(); else if (gl) gapp(); else if (v7) v7app(); else if (v6) v6app(); else if (v4) v4app(); else app(); em_flush(); ui_frame_end();
     ui_run_layout((float)W, (float)H);
 
     struct render_target rt;

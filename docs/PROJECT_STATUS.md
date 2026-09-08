@@ -639,7 +639,18 @@ newlib-based libc port.*
   through the app runtime), and V7 (a focusable, scrolling, multi-line
   `TextEditor` with full caret navigation — the kernel keyboard driver gained
   extended-scancode arrow/Home/End/Delete keys, delivered as `EMBK_KEY_*`
-  codes, to support it). The backend also got a **performance pass** this
+  codes, to support it), and V8 — a **deepening pass** across three axes: the
+  **layout engine** grew flex-wrap (real container wrapping), per-child
+  min/max size constraints, and a true 2D `Grid`; the **render engine** grew
+  sharper SDF-based rounded-rect anti-aliasing and gradient fills for text,
+  icons, and borders; and the toolkit got its first **drag-and-drop** — a
+  `Dock` container whose chips you drag to reorder or pull out to remove
+  (`em_dock`) — which powers a **dynamic Apple-modern menu bar**
+  (`user/bin/topbar.c`, auto-spawned by home): a chromeless glass strip with a
+  leading logo, a `File`/`Edit`/`View` menu bar, a `DragHandle` middle that
+  moves the whole bar, and a right-side dock of status chips + clock + a pin
+  control that snaps the bar to a screen anchor (`em_window_move_to`). The
+  backend also got a **performance pass** this
   cycle (see `EMUI_INTERNALS.md`): table-based gamma text blending (~5× on
   the text path, replacing 3 per-pixel Newton-loop `sqrtf`s) and an integer
   premultiplied source-over fast path in `draw_image`. The toolkit also gained
@@ -655,7 +666,51 @@ newlib-based libc port.*
   not just an in-window blur. The desktop itself became an **aurora** — a soft
   mesh-gradient of overlapping color blobs (`aurora_build` in the compositor)
   shown through the home launcher's translucent scrim, so the acrylic windows
-  now blur a colorful field and the frosted glass genuinely glows. A V4.1 app-runtime
+  now blur a colorful field and the frosted glass genuinely glows. Windows are
+  also **physical objects** rather than pasted rectangles: the compositor gives
+  every app window a black **drop shadow** (offset downward, deeper and wider on
+  the focused window than on those behind it — depth, not colour, is the focus
+  indicator) and **antialiased rounded corners**, arc, shadow and border ring
+  all following the same curve (`corners_save`/`corners_carve`, which stash the
+  backdrop under the four corner boxes, let every existing paint path run, then
+  blend it back by 4x4-supersampled arc coverage). Windows can also be
+  **minimized**: kernel-chromed windows via their title-bar button (painted
+  since V4 but until now pure decoration -- it had no hit rect at all), and
+  chromeless EmUI apps via the toolkit's `MinimizeButton` (syscall 90,
+  `embk_win_minimize`). A parked window keeps its process running and its dock
+  dot lit; clicking that dock icon calls `embk_win_restore` (syscall 89, which
+  takes the SPAWN HANDLE rather than a pid, so a launcher can only bring back
+  apps it started) to un-park and raise it -- which also fixed the dock click
+  on an already-running app doing nothing at all. And windows **move**: opening
+  grows a window in from 88% with a fade, closing collapses it to 92% and
+  fades out, parking flies it down to the dock, un-parking flies it back (`compositor_anim_tick`, driven from the boot CPU's
+  main loop). The motion is a scale+fade of the window's own finished pixels
+  (`fb_blit_scaled_uniform`), so the app is not involved and no scene-graph
+  work happens per frame -- which is why this succeeded where the earlier
+  toolkit-side attempt did not. A window is also no longer PAINTED until it has
+  presented a real frame, so launching an app no longer parks a black slab on
+  the desktop for the seconds an app takes to render its first frame under TCG. The system **menu bar** follows the Mac
+  model literally -- it spans the display, sits flush with no margin or
+  rounding, is 26px, bolds the owning app's name, and carries bare status
+  glyphs in equal-width slots rather than boxed chips. It paints NOTHING at all
+  -- no fill, no frost: the menu bar is its text and glyphs sitting directly on
+  the wallpaper. The dock names the app under the pointer in a floating glass
+  label, and its band is the pill plus a gap so it reads as floating rather
+  than as a taskbar welded to the screen edge; window controls are
+  **traffic lights** (red close, green minimize) whose symbol appears only on
+  hover, drawn as a small dot inside a deliberately larger invisible hit area.
+  The three essential applications share one
+  house style (`AppBar`): traffic lights leading, a centred title, the app's
+  own controls trailing. **Files** is a real file manager (places sidebar,
+  back/forward/up, live search that FILTERS rather than navigates, grid/list
+  views, human sizes and named kinds, New Folder); **Settings** is built to the
+  rule that every control changes something -- accent and light/dark apply
+  instantly and persist to `/data/settings.conf`, dock size and the running
+  indicator are re-read live by the desktop, and the System pane is measured
+  rather than typed; the **Terminal** titles itself with the working directory.
+  Preferences are one schema (`user/lib/oscfg.h`) that em_app_run applies at
+  launch, so an application does not opt in to being themed -- it simply is.
+  A V4.1 app-runtime
   layer (`ui/dsl/em_app.c`, `EM_APPLICATION`/`EM_WIDGET`) collapses what
   used to be ~150 lines of per-app boilerplate (font loading, arena setup,
   window creation, the event loop, dirty-rect presenting, teardown) into
@@ -698,6 +753,8 @@ newlib-based libc port.*
 ### Phase 23 — Networking: a from-scratch TCP/IP stack ✅
 
 A whole network stack, hand-written in `kernel/net/` (split per-protocol, one
+
+And something now STANDS on it: `httpd` (`user/httpd/` + `user/bin/httpd.c`) is a real HTTP/1.1 server that serves the OS's own filesystem -- request parsing, percent-decoded paths, directory listings, content types by extension, 403/404/405, and files streamed in 32KB bites. Point a browser on the host at a SLIRP-forwarded port and you are reading EMBKFS through our own virtio-net, IPv4, TCP and socket layer (`test httpserve`).
 concern per file). virtio-net driver (mirrors the virtio-gpu transport, split
 virtqueues, KV2P DMA, MSI-X RX interrupt) under Ethernet/ARP/IPv4/ICMP, then
 UDP + a DHCP client (real DORA lease at boot) + a minimal DNS resolver, then
@@ -974,6 +1031,915 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
 
 ---
 
+### Phase 30 — Vellum: the OS's own web browser (B1) ✅
+
+The OS renders HTML it parsed itself, on a layout engine it wrote itself, in a
+font engine it wrote itself. `user/web/` is split per concern behind a header
+that is the contract: `html.c` parses into bounded arenas (a browser handed a
+hostile page needs a bounded appetite), `style.c` computes a `struct vstyle`
+from a user-agent stylesheet, `render.c` maps the CSS box model onto EmUI --
+blocks become columns, an inline run becomes a wrapping row holding ONE TEXT
+NODE PER WORD, list items become [marker][column] so wrapped text hangs under
+itself, `<pre>` neither collapses nor wraps. `user/bin/vellum.c` is the app:
+URL bar, back/forward, clickable links, a status line. The renderer reads only
+`struct vstyle` and never a tag name, so real CSS changes how that struct is
+FILLED and nothing else.
+
+**JavaScript runs IN THE PAGE (B7).** QuickJS plus `user/web/jsdom.c`: a
+document's own `<script>` can query the tree with the browser's CSS selector
+engine, read and rewrite text, restyle elements through the cascade, and log to
+the status line. One document, one world per page, an index (never a pointer)
+across the boundary, and a memory budget so a stranger's loop cannot hang the
+window. Clicks and timers reach the page too: `addEventListener('click')`,
+`setTimeout`/`setInterval`, with the renderer making only listening elements
+clickable so a page's links keep working.
+
+**The engine half.** QuickJS 2024-01-13 cross-compiled
+against newlib and hosted by ~100 lines of our own (`user/bin/js.c`) -- one
+patch of two hunks for the whole 58k-line engine, both hunks merely widening
+existing `#ifdef`s. `js hello.js` runs closures, regexps, Array.sort and
+JSON from the OS's shell. The DOM bindings, which are the point, are next.
+
+**Forms.** Text fields, submit buttons, GET and POST over the browser's own
+network layer. Values live apart from the DOM (they are the user's, not the
+document's), so a re-render never wipes a half-filled form.
+
+**Data tables.** A `<table>` becomes one grid of the layout engine's own --
+aligned columns across rows, header rows, colspan, captions -- which is what
+made it a contained feature rather than a box-model rewrite.
+
+**Pictures (B6).** PNG decodes through our own DEFLATE straight into the
+compositor's premultiplied BGRA, and a small cache fetches a page's images one
+at a time on the browser's worker thread -- so they appear as they arrive and
+the window never stops drawing. Alt text stands in until then.
+
+**CSS is live (B5).** `user/web/css/` implements declarations, selectors and a
+real cascade -- user-agent < author < inline, specificity with document-order
+tie-breaks, descendant selectors, selector lists. The seam held: it needed ONE
+parser change (keep class/id/style, keep `<style>` bodies) and nothing
+downstream moved.
+
+An app now also DECLARES the capability classes it needs, in a `<name>.caps`
+sidecar parsed alongside the `<name>.ns` one by `user/lib/appauth.{c,h}` -- the
+capable half of "permission = nameable AND capable" (docs/USERSPACE_v2.md UP5).
+Vellum is born holding exactly {filesystem, network, gpu} and nothing else: no
+audio, camera, USB, raw disk, kernel extension or debug. A bug in its HTML
+parser cannot reach a device that was never granted. No manifest still means
+inherit, so nothing un-declared changed.
+
+**And it is on the network (B2).** `user/web/net.c` fetches over our own TCP
+and our own TLS 1.3; `user/web/url.c` decides what a location means. One entry
+point, so the address bar takes a filesystem path and a URL alike. Proven on the
+metal: a page served from the host over plain HTTP, a relative link resolved
+against a network base, and `https://valid-isrgrootx1.letsencrypt.org/` --
+a real page off the internet, authenticated to ISRG Root X1 by our own X.509
+verification, rendered by our own engine
+(`200  https (authenticated)  4067 bytes  62 nodes`). Two toolkit bugs and one layout-engine bug
+were found by building it, all fixed and locked by host tests; a wrap row is
+now exempt from flex-shrink, and a row measures a wrapping child at the width
+it will get.
+
+**`make browser-render`** runs the entire pipeline -- parse, style, render,
+layout, geometry dump, PNG -- on the dev host in two seconds, because nothing
+between document bytes and pixel rectangles needs a syscall. It is the fast
+loop for anything in this stack.
+
+**And it shows photographs (JPEG).** `user/web/jpeg.c` is a from-scratch
+baseline JPEG decoder -- canonical Huffman rebuilt from code lengths, a
+fixed-point inverse DCT, chroma upsampling and the YCbCr conversion. Which
+decoder runs is chosen by the file's SIGNATURE, not its extension. Progressive
+is refused rather than half-decoded. Fifteen host assertions pin it against real
+encoder output, including every truncation of a valid file.
+
+**And you can take text out of it.** Drag to select, Ctrl+A, Ctrl+C to the
+system clipboard -- proven on the metal by copying from Vellum and pasting into
+the shell with Ctrl+V. `user/web/select.c` works entirely after layout: it reads
+the laid-out scene for where the words are and writes a background onto the
+selected ones, so render.c does not participate. Word granularity (the renderer
+already emits one node per word); the limits are in TODO.md.
+
+**The raster is ~25x cheaper, and the number came from measuring rather than
+guessing.** A page with a photograph took 21 seconds to appear; the float IDCT
+was the obvious suspect and was the wrong one. Instrumenting said the fetch took
+6ms, the decode 96ms, and the image then sat finished for 4.7 SECONDS waiting
+for a frame -- because `cpu_draw_rect` had no early-out for a fill that paints
+nothing, and a document emits a transparent background for every block element.
+Each one walked its whole box through a rounded-box SDF and a float blend to
+write nothing. Frame render went 4946ms -> 170-483ms and scrolling ~4s ->
+0.74s. Landed with `box_fully_covered()`, which answers "is coverage trivially
+1?" once per primitive instead of once per pixel, and a fixed-point stepper in
+the image blit. Every EmUI surface benefits, not just the browser.
+
+**It holds more than one page, and it zooms.** `user/web/tabs.c` is the tab
+model: a tab keeps its URL, title, scroll position, zoom and its own
+back/forward stack, plus the SOURCE BYTES it was built from. It does not keep a
+parsed document -- that arena is bounded at 8192 nodes precisely because a page
+can be hostile, and six of those is six times a bound chosen to be safe. So
+switching re-parses from the retained bytes: no network, no re-POST, and no
+chance of getting a different page than the one you left. The honest cost,
+stated in `tabs.h` rather than discovered later, is that a background tab's
+scripts stop and its DOM is rebuilt on return.
+
+Zoom is PAGE zoom, not UI zoom: `em_set_text_scale` is a bracket the browser
+opens around the document it emits, so the text and the author's stated lengths
+scale while the address bar does not. Bound to `+` / `-` / `0` as bare keys --
+not `Ctrl+=`, because the keyboard driver passes Ctrl+symbol through unchanged
+and binding a chord it cannot distinguish would be a lie about what was pressed.
+The corpus pins it by rendering one page at two zooms and comparing (`EXPECT-ZOOM`);
+a single render could say nothing about a scale factor.
+
+**A toolkit bug the browser made visible.** EmUI matched a container's children
+to last frame's by POSITION, so inserting a row displaced every sibling below
+it -- each adopting its neighbour's retained instance, and with it whatever size
+nobody restated that frame. The browser's find bar had been drawing over its
+address bar for this reason. `EmProps.key` gives a container a reconciliation
+identity, and the rule is to key the rows that STAY, not just the one that comes
+and goes: it is the stable rows that get displaced. `declare-test` T5b pins both
+halves, including an unkeyed control that demonstrates the displacement
+(`48 30 12 0` for rows declared `48 20 30 12`) -- an earlier version of that test
+restated every size each frame and passed while the browser was visibly broken.
+
+**Pointed at the real web, it broke in five places -- so those are fixed.**
+Everything before this had been verified against pages written by the same
+person who wrote the engine, which can only confirm what was already
+understood. Rendering seventeen real sites (with their stylesheets) found, in
+order of severity: a SEGFAULT on Wikipedia, where the reconciler's cursor stack
+overflowed on a deep tree and every refused push was still matched by a pop
+until the top walked off the bottom into a null dereference; pseudo-element
+selectors matching the element they hang off, so the clearfix
+`.container:after { display: table }` styled the container and python.org
+rendered zero words; `display: table` on anything without rows dropping its
+whole subtree; selectors longer than the parser holds keeping their FIRST
+compounds instead of their last, so a rule was applied to an ancestor of its
+target -- with `display:none` on the end of it, that deletes a page; and a
+cascade whose match list was an `unsigned char` array, exactly wide enough at
+256 rules and silent corruption above it.
+
+That last one only appeared because the rule cap was raised -- from 256 to
+4096, a number that came from counting: the median real page needs 132 rules,
+but bbc wants 781, mdn 1020, rust-lang 2570 and python.org 4314, and a page
+styled by an arbitrary first 256 of its rules is styled arbitrarily. The
+harness grew a `HIDDEN=1` mode that reports which elements the cascade turned
+off and which rule did it, because "the page is blank" should be a lookup
+rather than an evening of bisecting a stylesheet.
+
+All seventeen now render, and then the run's other finding -- that a frame cost
+315ms on Wikipedia -- turned out to be three separate costs, only one of them
+the obvious one. Rules are now filed in a SELECTOR INDEX under their subject's
+most selective name, so an element tests only the rules that could match it.
+The reconciler no longer unlinks every child every frame: relink walked the
+parent's child list to find each child's predecessor, which is quadratic in
+siblings, and a page that is one long list is most pages worth reading. And
+computed style is memoised per pass, because the renderer asks for the same
+element's style from sixteen places and was running the whole cascade each
+time. Per pass on the host: Wikipedia 315 -> 88ms, bbc 194 -> 24, python.org
+104 -> 12, rust-lang 56 -> 2.4.
+
+The reconciler fixes are EmUI-wide, not browser-only -- every app builds its
+tree through the same relink.
+
+What is left is in `TODO.md` under its own heading.
+
+**Then the pages were LOOKED at, and that found five more.** Every check up to
+this point counted text runs, which says a word reached the screen and nothing
+about where it landed -- so the first real page rendered to an image came out
+as a column of centred headlines with its rank numbers stranded at the left,
+having passed everything. A table was inheriting text-align, so <center> around
+a layout table -- how half the old web is built -- centred every cell instead of
+centring the table. Link words carried 2px of padding a side, setting linked
+text looser than the text beside it. Removing that padding then exposed what it
+had been hiding: a whitespace-only text node between two inline elements was
+being dropped entirely, so "tosh 7 hours ago" read "tosh7 hours ago" -- one bug
+concealing another, with the page looking wrong-but-plausible throughout. The
+space is now owed to the following word, which is also what makes it collapse
+at the start of a line the way CSS says it must. And bgcolor/align/color are
+mapped to the CSS they are defined to mean, so the old web's colours arrive:
+Hacker News paints its header with an attribute, not a stylesheet.
+
+One of these was an API defect rather than a browser one. EmProps uses 0 to
+mean "unset, take the theme's value", which left no way to ask for zero -- so
+`.px(0)` on a link word silently got 16px. `EmZero` says it explicitly.
+
+**And then the pages were drawn with the wrong palette, which looking found
+too.** A document is written against a white canvas with dark text -- that is
+not a preference, it is the initial value every page on the web assumes, and it
+is why a page can set a background and say nothing about colour. Drawing it on
+the desktop's dark surface with the desktop's light text produced Wikipedia as
+pale headings on the white background the page itself had set: our foreground
+over their background, readable in neither direction. The document now keeps a
+browser's palette (white canvas, near-black ink, the web's blue) and the
+chrome keeps the desktop's -- which is what a desktop browser does in dark
+mode, and the reason a page looks the same there as anywhere else.
+
+**The corpus now compares each page against a stored reference image**
+(`tests/web/refs`, 420KB gzipped; `make web-corpus BLESS=1` to regenerate).
+Every expectation before this was about words and where they are, and none of
+them caught any of the six defects that looking found -- each changed how a
+page LOOKED without changing which words existed or their order. The new check
+catches a one-pixel padding change on three pages. `make web-real` fetches
+seventeen real sites with their stylesheets and renders them; `SHOTS=1` writes
+a PNG of each, because "did it produce text" and "does it look right" are
+different questions and only the second one needed asking.
+
+**Controls follow the page too, and a <br> is a line break.** The palette fix
+had a layer under it: the kit's controls take their colours from the theme,
+which is right for an application and wrong inside a rendered document, so a
+text field on a white page was a dark rounded box with the desktop's accent.
+The kit now takes a scoped CONTROL PALETTE that the browser opens around the
+document exactly as it opens the zoom bracket -- fields, buttons, checkboxes,
+radios and selects all follow it, and a form on a page looks like part of the
+page. And `<br>` had no style at all, so it rendered as nothing and welded the
+lines either side ("Small. Fast. Reliable.Choose any three." on sqlite.org); it
+is a block with nothing in it now, which splits the inline run and is the only
+line-breaking machinery there is.
+
+Eight of the browser's own demo pages under `system/web/` were written when the
+canvas was dark and now declare the ground and ink they assume -- the same
+correction the corpus fixtures needed, and the same one a real page has to make.
+
+**Grid tracks are sizes now, and Wikipedia's "hardest layout bug" was an
+ampersand.** Before writing any layout code the page was checked, and its two
+stylesheets were 196 bytes each: MediaWiki answering "in this request, no
+modules were requested". Entities were decoded in text and not in ATTRIBUTE
+values, so `href="load.php?lang=en&amp;modules=..."` was fetched literally and
+the server read one parameter called `lang` with the rest of the query inside
+its value. Every `&` in a query string is written `&amp;` in HTML; this is not
+an edge case, and the page really was unstyled.
+
+With 216KB of CSS actually arriving, the remaining half is real. Grid tracks
+were sized from their content -- a table's rule, right for a table and wrong
+for `grid-template-columns: 12.25rem minmax(0,1fr)`, where the first number is
+a decision the author already made. Track sizes are parsed and honoured now
+(px/rem, fr, minmax→max, repeat, auto), which is 363 uses across six of the
+seventeen sites. What Wikipedia additionally needs is placement by NAME
+(`grid-template-areas` + `grid-area`), measured at 3 sites, and logged with
+that number rather than guessed at.
+
+**Wikipedia's layout was four bugs, none of them the layout engine.** It had
+been logged as the hardest layout case in the corpus. It was: entities not
+decoded in attribute values, so its stylesheet URL was requested with `&amp;`
+in it and MediaWiki replied "no modules were requested"; the DOM arena filling
+up inside its HEADER, so the article was never parsed at all -- the ARENA-FULL
+flag had been sitting in the triage output for days being read as "the tail is
+cut"; the external-stylesheet buffer being 128KB against a 216KB sheet and
+dropping it WHOLE AND SILENTLY; and `grid-template`, the shorthand Wikipedia
+uses, not being parsed, so its named areas had no widths.
+
+What the layout engine did need was real: grid tracks are sizes rather than a
+count, and `grid-template-areas` + `grid-area` place a child by NAME, which is
+how a sidebar and an article that are siblings in document order end up side by
+side. Both are shared by one resolver so the measure and arrange passes cannot
+disagree -- the code already carried a scar from the last time they were
+written twice. Wikipedia now lays out in two columns above its own 1120px
+breakpoint, with the title, tabs, infobox and sidebar in place; the body text
+is still squeezed and the header overlaps itself, which looks like `position`
+and is the next layer.
+
+Every arena a real page can fill is now sized from a COUNT taken across the
+seventeen sites, and every one that can overflow says so. See TODO.md for the
+numbers; the browser's BSS is 28MB as a result.
+
+**C7, positioning: an absolutely positioned box was placed against its parent
+rather than against the nearest POSITIONED ancestor.** That is not a near miss.
+`position: relative` on a wrapper with no offsets of its own exists precisely
+so a descendant several levels down can be placed against IT -- every dropdown,
+tooltip and badge on the web is built that way -- and placing against whatever
+happens to contain the box instead is how python.org's menus ended up sprayed
+across its article. The containing block is now tracked through `arrange` and
+saved/restored per subtree, the same discipline the child pool uses, and
+`position: fixed` lands against the root as a consequence, which is what fixed
+means. python.org now renders as python.org: notice bar, nav, hero, four
+columns.
+
+The corpus had a `position.html` that passed the entire time, because it only
+ever placed a box inside its direct parent. It covers the nested case now.
+
+**`<details>` and `<svg>`, from another look at the images.** A disclosure is
+real HTML, not a widget a page builds, and leaving it out does not degrade
+gracefully -- it renders every collapsed section expanded, and MDN's CSS
+reference has 112 of them. It works now, summary and toggle and all. Getting
+there turned up that BOOLEAN attributes were never read at all: `<details open>`
+carries no value, and the check for it sat inside the branch that only runs for
+`name=value`. And `<svg>` is a REPLACED element whose children are a different
+rendering model; walking into them as document blocks gave MDN's 83x24 logo a
+height of 3340 pixels.
+
+**And MDN's 307000-pixel page was a percentage height.** `height: 100%` inside
+a parent whose own height is auto does not mean "as tall as the parent": the
+parent has no height yet, it is about to get one from those very children. CSS
+computes such a percentage to auto, and that rule is not a nicety -- without it
+every child is handed the height the parent just measured, they stack, and the
+parent's height stops matching what is inside it. Three children in a 119px box
+each came out 119 tall and reached 357. MDN did that at several levels and put
+text 307394 pixels down a document whose own box was 14781. It is 14859 now.
+
+Finding it took building the diagnostic first: `TALL=<px>` reports the elements
+that own a page's height, via a box hook render.c offers so that no geometry
+changes. The first version reported nothing, because render.c only keys a box
+when a script is listening to the element. Once it worked it turned the
+question over -- the document box was RIGHT and the text was outside it -- and
+the cause fell out of a four-line reproduction.
+
+**C8, speed on real pages: the computed styles now survive between frames.** A
+frame that scrolls changes nobody's style -- same document, same sheet, a
+different offset -- and the memo was being thrown away every pass, so Wikipedia
+re-parsed 2267KB of declaration text per frame for a page nothing had touched.
+It is dropped on the three things that can change an answer instead: a new
+document, a stylesheet arriving, a script mutating the DOM. Inheritance needs
+no announcement, because the key already hashes the parent style and a changed
+ancestor misses by construction.
+
+Then the memo turned out to be half the size of the arena it serves, so on a
+page with more elements than slots the tail evicted the head every frame and it
+stopped being a memo at all. Sized to NODE_MAX, collisions are impossible
+rather than rare.
+
+Per build+layout pass on the host: Wikipedia 206 -> 37ms, github 42 -> 4.1,
+bbc 20 -> 5.2, MDN 13 -> 5.2, python.org 26 -> 2.2. Every real site except
+Wikipedia is now under six milliseconds, and Wikipedia's remaining cost is
+layout rather than style. Interactive restyling is verified on the metal:
+`/system/web/restyle.html` sets a class on click and the box restyles.
+
+**C9: the OS is on the live web.** Everything up to here was verified against a
+host harness rendering saved pages. Vellum now fetches and renders real sites
+on the metal over this OS's own TLS, its own X.509, its own HTML and CSS
+engine: example.com and Hacker News both come up authenticated with current
+content.
+
+Three things were in the way. The trust store held four roots, transcribed by
+hand as hex arrays, which is why there were four -- `tools/mkroots.py`
+generates them from the host's CA bundle now, and adding a root is adding a
+line (22 anchors). example.com turned out to chain to SSL.com, not DigiCert,
+which one `openssl s_client` established in a second after a guess had already
+been implemented. And a MAKEFILE ORDERING BUG had been shipping a stale
+browser: `TLS_LIB_OBJS` was defined after the rule that lists it, and make
+expands prerequisites when it reads the rule, so it expanded to nothing --
+changing a trust anchor rebuilt the object and never relinked the binary.
+
+**And the pages have now been seen WITH THEIR IMAGES.** The harness could not
+load a single one: it stripped the leading slash off every image path to make
+it repo-relative, which is right for the corpus in the checkout and wrong for
+the absolute path a fetched page resolves to, so every real page rendered with
+grey boxes where its pictures should be. xkcd's comic and kernel.org's icon
+render on the host now, and kernel.org renders with its image ON THE METAL,
+fetched over the network and decoded on the machine.
+
+What the web actually serves, counted rather than assumed: png 73, webp 28,
+svg 23, jpeg 13, gif 1 across the seventeen sites. This browser decodes PNG and
+JPEG, so WebP is the one missing format that matters.
+
+Two more things the live web said. Matching a trust anchor by its CN is not
+enough -- several GlobalSign roots share `CN=GlobalSign` and differ only by
+OU, so the generator had silently bundled the wrong key and kernel.org and
+python.org were refused by a browser that believed it trusted their root; roots
+are matched on the whole subject now. And xkcd.com speaks only TLS 1.2, which
+this stack does not: not a bug, a missing protocol version, and logged as the
+thing that decides reachability.
+
+**TLS 1.2, alongside 1.3.** A browser that speaks only 1.3 cannot open
+xkcd.com, and "most of the web has moved" is not the same as "the site you
+wanted". The two versions share the cipher and the certificate format and
+essentially nothing else -- different key schedule (PRF vs HKDF), different
+record framing (an explicit nonce on the wire, different additional data),
+different message flow, and a signature over the key exchange parameters rather
+than the transcript -- so 1.2 lives in its own files and tls.c dispatches on
+what the server chose. One ClientHello offers both. Certificates are verified
+by exactly the same code, plus the ServerKeyExchange signature, which is what
+binds the ephemeral key to the certificate.
+
+**And the kernel grew a RING-3 BACKTRACE**, which is what actually finished the
+job. Its existing backtrace stopped at the kernel's own .text, so an
+application fault printed `RIP=0` and nothing else. Walking the user rbp chain
+named the caller in one boot -- `gctr <- gcm_seal <- tls_record_seal <-
+tls_close` -- after an afternoon of ruling things out one at a time had not.
+
+**And a second page loaded in one session came out wearing the first page's
+layout.** It looked like stale pixels and was not: the view was being
+reconciled against the document that had been there, and a reused instance
+keeps whatever size nobody restated -- so the boxes were right and the text sat
+where the previous page's text had. The document's container is keyed by a
+per-load counter now, which makes a new page a new subtree rather than a diff
+against the old one. It is the same reconciliation rule the browser's own
+chrome needed, one level up.
+
+**The browser's own chrome was rebuilt.** It had grown three stacked rows --
+a title bar saying "Vellum", an address row, a status row -- which spent a
+quarter of a 620px window on chrome and still had nowhere to put the page
+title. It is two rows now: the lights share the tab strip, the tab carries the
+title, and back/forward/reload sit beside the address they act on rather than
+at the far right of a different row. Return in the address bar navigates, and
+the bar accepts `example.com` rather than requiring a scheme.
+
+Two real bugs fell out of building it, both of which had been hidden by the
+mouse. **A page fetched while the pointer was still never appeared**: the
+repaint clock is armed at the top of the frame loop, but every navigation
+starts inside the view build, so the frame that started a fetch ended with
+nothing scheduled to look at it again -- with a moving mouse, pointer events
+kept producing frames and hid it completely. And **DragHandle was the one
+container that could not be keyed**, so a control appearing before it in a
+toolbar inherited the single property that defines a drag zone: grow.
+
+**Seven of the toolkit's icons had no glyph in the shipped font** -- a bell, a
+clock, a magnifier, a folder, a document, a trash can, a person, all of them in
+the emoji planes DejaVu does not cover. Each drew a tofu box in every app that
+asked for it. `make icon-check` now fails the build for a codepoint the font
+cannot draw, because nothing else ever would: a missing glyph is not a compile
+error and not a run-time error either.
+
+**The address bar became one that behaves like a browser's.** Return
+navigates; `example.com` is understood without a scheme; and anything that is
+not host-shaped is a SEARCH, which is the one thing the field could not do
+before. The engine is Mojeek, and that was measured rather than preferred:
+Google answers a scriptless browser with a 302 to a consent page, DuckDuckGo
+with a CAPTCHA ("select all squares containing a duck"), searx with a browser
+check, Bing with 600KB and fourteen scripts. Mojeek answers with 20KB of
+results. The host is drawn in the text colour with the scheme and path dimmed,
+which is the half of anti-phishing the security dot does not cover.
+
+**Tabs have favicons**, one per ORIGIN rather than per page, cached across
+navigation and downsampled to 32px on arrival -- Hacker News's is 256x256, a
+quarter of a megabyte to hold something drawn fourteen pixels wide. Getting
+there meant writing an .ico decoder, because that is what the web serves: of
+nine sites checked, six answer /favicon.ico with an .ico container, holding
+DIBs at 32, 8 or 4 bits per pixel or an entire PNG. Two details in that format
+are silent when wrong -- the header claims double the real height, and below 32
+bits the packed AND mask is the only transparency there is. `make ico-test`
+builds its own fixtures, malformed ones included, because a favicon is bytes
+from a stranger and every field in its directory is an offset into somewhere
+else.
+
+**And then the search page did not render, which turned out to be the most
+important bug found in a while.** A Brave results page arrived as 8192 bytes of
+291486, with status 200 and no error anywhere in the system; Wikipedia the
+same. The kernel's blocking TCP receive returned **0 on timeout**, and 0 means
+end-of-stream -- so three seconds with nothing arriving was reported all the way
+up as "the peer is done". `io_recv_exact` turned it into -1, `tls_read` into
+-1, and the HTTP loop into "the response ended here". The bigger the page the
+worse it got, which is exactly backwards.
+
+A timeout now reports itself as one (-2, the code the non-blocking path already
+used), the fd layer maps it to EAGAIN, and a reader that is mid-record waits
+instead of truncating. Separately, the HTTP client now **checks Content-Length**:
+a short body is reported rather than rendered as the page, because until this
+check existed a truncated download was indistinguishable from a complete one.
+That is why a networking bug spent this long looking like a rendering bug.
+
+**Modern CSS started applying.** Two gaps, both found by counting what the real
+corpus asks for rather than by guessing. `:where()` appears **4196** times in
+those sites' stylesheets, `:not()` 2693 and `:is()` 508 -- and the selector
+parser knew none of them. Worse than unsupported: the compound scanner ran to
+the next space, and `:where(.a, .b)` contains one, so `.b)` was read as a whole
+new compound and the rule attached to the wrong element or to nothing.
+Functional pseudos now consume their balanced parentheses even when their
+meaning is not implemented, which also stops `:nth-child(2n + 1)` corrupting
+whatever follows it.
+
+The other gap is **logical properties** -- `padding-inline`, `margin-block-start`
+and the rest, about **4800** uses, which is most of the spacing on any page
+built this decade. For the documents this renderer lays out (horizontal, LTR)
+each one is a physical property under another name, so a rename is the whole
+implementation, and it is stated in the code that this becomes a lie the day
+anything else is laid out.
+
+python.org went from a wall of unstyled text to its actual design: dark
+navigation bar, blue hero, the four-column footer grid.
+
+### Phase 31 — A verifier that finds what nobody asserted ✅
+
+`make web-verify` renders the same local page in Firefox under WebDriver, asks
+it for `document.body.innerText` — the visible text and only the visible text —
+and compares both ways: content we dropped, and content we revealed that the
+page had hidden. The corpus can only check what somebody thought to assert;
+this needs no expectation written first, which is the only way to find a gap
+nobody has noticed.
+
+It paid for itself immediately. **github.com segfaulted the renderer** — the
+host harness handed a decoder a pointer past the end of its image arena (the
+metal's imgcache has always checked), which wrote over the document mid-render
+and crashed three frames away in innocent code; AddressSanitizer found it in one
+run. github went 0% → 99.5%.
+
+And **a `<link media="print">` stylesheet was being applied on screen**: gnu.org
+links a screen sheet and a print sheet, nothing looked at the attribute, and the
+print sheet's `#header,#navigation,…{display:none}` took the entire navigation
+off the page. 84.7% → 99.7%.
+
+Working the list it produced found four more bugs, each of which had been
+invisible: a **nested table's static row array** (a table inside a cell
+overwrote the outer's rows, so Hacker News lost its whole footer), **attribute
+selectors being skipped** and **unknown functional pseudos being skipped**
+(both make a selector broader, and MDN hid every code block on the site with
+`.code-example:has(…)`), and a **`<pre>` reading only its direct text** — which
+is every syntax-highlighted code block on the web, since highlighting is spans.
+
+Thirteen of nineteen sampled sites now render **100%** of their visible text,
+and no remaining gap is larger than ten words.
+
+### Phase 31 — SVG, and the responsive layer that never matched ✅
+
+**`<noscript>` was parsed as ordinary markup.** Its contents are meant for a
+browser with scripting *off*, and we run scripts — so Brave's
+`<noscript><style>.noscript-hide{display:none!important}</style>` was going
+straight into our cascade, and its fallback markup was rendering over the real
+page. Skipped whole now: bbc dropped from 1837 nodes to 1530, and craigslist's
+scroll-blit check went green after being red for as long as it has been
+measured.
+
+**`WHATIS=x,y`** names the element covering a point — tag, id, class — because
+three separate explanations for one empty box were each disproved only after
+being acted on. The renderer always knew which element made which box; nothing
+could ask it.
+
+**A button is a box with children, not a caption.** `Button()` takes a string,
+so a `<button>` was drawn as one — its label, or its first icon. A real page's
+button holds an icon *and* a word, and everything past the first child was never
+walked. Buttons with element children now render their content inside a styled
+box that reports its own clicks.
+
+**The browser can now say how a page went.** The status line reports where the
+seconds went (`doc 259K/4s  css 1020K/13s`) and how the pictures went
+(`img 3ok 1fail 2wait 1noslot`) — because a failed image, one still arriving,
+and one the cache had no room for all draw the same grey box. That instrument
+immediately answered a question three fixes had guessed at: Brave's narrow
+header reports `img 0x`, so those empty boxes were never pictures at all.
+
+Building it exposed two bugs that had been wasting readings: the status and a
+script's message were drawn *on top of each other* whenever the row overflowed
+(the left string truncates now), and the image summary was composed before any
+frame had requested a picture, so it always read zero.
+
+**`@media` range syntax.** `(width <= 885px)` is what every modern build tool
+emits — 224 of the media queries in Brave's stylesheet are written that way and
+a handful use `min-width`. An unrecognised feature reports *not matching*, so
+the entire responsive layer of such a sheet evaluated to false; at a wide
+viewport that is accidentally right for the max-width cases and wrong for every
+min-width one, which is the worst way to be wrong. Both operand orders, strict
+and inclusive, two-sided ranges, plus `(hover: hover)` and `(pointer: fine)` —
+42 more queries that were being answered "no", handing every one the touch
+layout. Brave's narrow header is now the one that applies at the browser's real
+window width, which is what its own CSS asks for.
+
+#### SVG: the pictures that are described, not sampled ✅
+
+PNG and JPEG arrive as pixels; an SVG arrives as instructions, and until
+something followed them every icon on the modern web was a grey box — 23 of the
+138 images across the seventeen sites in `make web-real`, plus every inline
+icon, which is nearly every button on a page written this decade.
+
+`user/web/svg.{c,h}` is a renderer, deliberately a small one. It covers what
+icons are made of: the full path grammar including arcs, the basic shapes, `<g>`
+nesting with transforms, fill/fill-rule/opacity, and stroke as a width along the
+path — filled by a scanline rasteriser with 4× vertical subsampling and
+fractional horizontal coverage, so a 24px icon has edges rather than stairs. No
+gradients, filters, masks or text: an icon uses none of them, and half-doing
+them would draw a *wrong* picture instead of a plain one.
+
+Two entry points, because an SVG arrives two ways: `<img src="*.svg">` goes
+through imgcache, which dispatches on the bytes; and inline `<svg>`, whose
+source `html.c` now keeps whole the way `<style>` already does — SVG is not
+HTML, and parsing it as HTML built a subtree of unknown inline boxes that drew
+as nothing. Inline drawings are rasterised once per (node, size) and cached;
+following a path grammar every frame would turn a scroll into a slideshow.
+
+It also turned up three bugs that had nothing to do with SVG: an icon-only
+`<button>` never drew its icon (a button builds a text label and never renders
+children), a button written across lines has a text child of `" "` that counted
+as a label, and `moveto` never recorded its own point — so a two-point line had
+one point in it and stroked to nothing.
+
+### Phase 32 — What the bytes mean, and boxes that flow ✅
+
+**`document.currentScript` did not exist.** The parser captured a script's text
+and never made a node for the element, so a page could not find where it was
+written — SvelteKit's whole bootstrap is `document.currentScript.parentElement`,
+and that is the line Brave's search page died on. Each script has a node now.
+
+**`addEventListener` threw on event types we don't deliver**, which is fatal on
+a real page: it is the first line of a great many scripts, and throwing there
+destroys everything after it. Unsupported listeners are declined and reported
+on the console instead. Brave's search results render.
+
+**A trailing space inside an inline element was trimmed.** `trim_tail` ran when
+any element closed, which is right for a block (CSS drops line-end whitespace)
+and wrong mid-line, where that space separates the element from what follows —
+`<span>Data from </span><a>Wikipedia</a>` read "Data fromWikipedia". Trimming is
+scoped to block-level tags now.
+
+**A button with no text said "Submit"** — it is an icon button, and the label was
+a fabrication; it also keyed every such button identically in a retained tree.
+
+**An inline-block painted its own margin** — the block emitter folds margin into
+padding, invisible on a full-width block and unmissable on a rounded button.
+Google's "Connexion" pill was half again too big, painting its margin blue.
+
+
+**Every accent was a replacement character.** The pipeline assumed UTF-8, and
+google.com serves *this* browser `charset=ISO-8859-1`, where an e-acute is one
+byte that UTF-8 reads as broken. "Confidentialité" rendered
+"Confidentialit�" — which looks like a missing glyph and is nothing of the
+kind. `user/web/charset.{c,h}` answers the one question nobody was asking, and
+converts windows-1252 to UTF-8: header first, `<meta>` second. ISO-8859-1 is
+decoded as windows-1252 because every browser does, and because that range is
+where real pages keep their smart quotes and dashes. A page that declares UTF-8
+while containing bytes that cannot be UTF-8 is converted anyway — google.com
+does exactly that, and a self-contradictory document has no third reading worth
+protecting.
+
+**`display: inline-block` was folded into `inline`**, which threw away the box:
+padding, size, border and background all stopped existing, so rows of nav links
+welded into one word ("GmailImages"). It now goes through the ordinary block
+emitter — keeping everything a box has — but inside the inline run's flow and
+sized to its content, the same shrink-to-fit a float already used.
+
+### Phase 33 — A 1 MB page took two minutes, and it was TCP ✅
+
+"The browser is slow" has too many suspects to guess at, so the first change
+was measurement: every transfer is charged to the caller that asked for it and
+the status line reports where the seconds went. It said `doc 277K/26s  css
+1020K/85s` — 111 of 146 seconds in two transfers, about 8 KB/s. The decisive
+experiment was serving a 1 MB file over **plain HTTP**: 119.8 s, the same rate,
+with no TLS anywhere near it. That moved the search from the cipher to TCP.
+
+The receive window we advertise is `TCP_RXBUF - rx_len`, and it only reached
+the wire from `tcp_seg`, which runs when a segment *arrives*. Once the buffer
+filled we advertised zero, so the sender stopped; because it stopped nothing
+arrived; because nothing arrived we never sent the ACK saying the application
+had drained the buffer. The transfer advanced only when the peer's persist
+timer fired, about twice a second — exactly the ~470 ms per read the arithmetic
+pointed at. A window-update ACK on drain, plus a 64 KB buffer, fixed it.
+
+The 1 MB plain-HTTP document went **119.8 s → under a second**, Brave's
+document **26 s → 3 s**, and the whole page — 284 KB of HTML, a 1 MB
+stylesheet and its images, all over TLS — **146 s → under 70 s**. What remains
+is one TCP+TLS handshake per resource: `net.c` has no keep-alive, and that is
+the next lever.
+
+### Phase 34 — Three bugs that disfigured every real page ✅
+
+**Every `/>` drew a stray `>`.** The attribute scan stops on the slash of a
+self-closing tag, so the self-closing test read the space before it and the
+step "past the bracket" stepped past the slash instead — leaving the `>` in the
+stream as a text node. Every `<input />`, `<img />`, `<br/>` and every `<path/>`
+in an inline SVG put a bracket beside itself. Wikipedia shed 130 junk text
+nodes, bbc 86. The corpus had the bug baked into a reference image, which is
+worth remembering: a golden image pins what the renderer did, not what it
+should have done.
+
+**We ran every `<script>`, whatever its type.** JSON-LD is data a page stores in
+a script tag precisely so the browser will not run it, and bbc, Wikipedia and
+craigslist all carry one; we handed it to the interpreter, which threw on its
+first colon and took the page's real scripts down with it. HTML5's rule applies
+now.
+
+**The DOM used names no page on the web uses.** `setText()`, `setValue()` and
+`setStyle()` are this DOM's own spellings; a real script writes
+`el.textContent = ...`, `el.value = ...` and `el.style.display = 'none'`. Those
+are properties now, alongside `document.getElementById` (the most-used call on
+the web, and it did not exist), `documentElement`/`body`/`head`/`title`,
+`el.style` as a real object, and the `window`, `URL` and `URLSearchParams`
+globals — `URL` built on `url.c`'s own resolver rather than a second,
+differently-wrong parser written in script.
+
+**A compound selector kept only its last class.** `struct css_sel_part` held
+one `klass`, so `.logo-small.svelte-1i43yzn` parsed as `.svelte-1i43yzn` and a
+rule meant for one logo applied to every element its component had scoped. That
+rule carries `display:none`, so Brave's search page rendered as a blank white
+box *with* its stylesheet and correctly *without* it. Multi-class compounds are
+what Tailwind, CSS modules and Svelte scoped styles emit by the thousand. A
+compound now holds four classes and requires all of them, and one too complex
+to store matches nothing — a selector we cannot represent in full must not be
+applied at all.
+
+**A 1 MB stylesheet arrived cut in half.** Brave's sheet is 1.02 MB against a
+512 KB buffer, so the metal saw 3192 rules where the host saw 7257 — and the
+missing half held the layout. An oversized sheet is now dropped whole rather
+than severed, because CSS cut mid-rule leaves a dangling brace that eats every
+rule after it.
+
+Script failures across the 17 real sites went **23 → 2**: bbc 8→0, Wikipedia
+4→0 (and its long-red reflow check went green), lobsters, rust-lang, sqlite,
+mdn and pythonorg to 0. The two that remain are craigslist reaching for a
+global that an external `<script src>` would have defined — and external
+scripts are not fetched, which is a feature rather than a bug to fix.
+
+### Phase 35 — Flexbox, properly ✅
+
+`display: flex` has worked since C2, but the ITEM side of it was a flag: an
+element either took the leftover space or it did not. `flex: 2` and `flex: 1`
+were the same box, so every two-to-one split on the web came out even, and
+`flex: 0 0 240px` lost its 240px and became a sidebar as wide as its longest
+word. The whole shorthand is now read and mapped -- grow weights, basis,
+shrink -- along with `align-self`, `order`, `justify-content: space-around` and
+`space-evenly` (which differ only at the two ends, the entire reason an author
+picks one), and both values of `gap`, which on a wrapping row land on different
+axes: the first separates the lines, the second the items.
+
+The engine grew three things to carry it (`align_self` per node, a cross-axis
+gap, the two spread keywords) and gave up two bugs, both of them one loop
+disagreeing with another: a height-measuring helper counted a child as flexible
+on `flex_grow` but then sized it by its basis, so a `flex: 1` item was measured
+at width 0 and its row drawn five lines tall with four of them empty; and the
+wrap measurer stepped between lines by the main gap while the arranger stepped
+by the cross one, so a wrapped line was painted below its own container, on top
+of whatever came next.
+
+Held back deliberately: `align-items`' CSS initial value is stretch, and
+switching to it fixes a real bug and breaks rust-lang.org's front page. The
+code for it is written, the measurement is in `docs/TODO.md`, and the default
+stays where it was until the page is diagnosed -- a bug nobody has hit is not
+worth trading for one that is visible.
+
+Every claim above is a number in `tests/web/flex2.html` rather than a
+screenshot to squint at, and the whole set was re-rendered against 17 real
+sites and diffed against the pre-change tree.
+
+### Phase 36 — NetSurf, ported: a second browser, on our own stack ✅
+
+`nsemblink "http://example.com/" 800 600 out.ppm` on the booted OS prints
+**[Example Domain]** and writes the page. Fetch, parse, cascade, layout, text,
+pixels — a real browser engine, running on EmbLinkOS.
+
+**Ten libraries cross-built with zero patches to their sources** — wapcaplet,
+parserutils, hubbub (the HTML5 parser), css, dom, nsgif, nsbmp, nsutils,
+utf8proc, nslog. NetSurf's buildsystem cross-compiles on `HOST=x86_64-elf`,
+which is our toolchain's own triple. Their entire external surface is **36
+symbols and our libc already had 31**; the five it lacked were `iconv`
+(a deliberate non-iconv: windows-1252 ↔ UTF-8 from the tables the other
+browser proved, and `EINVAL` for anything else) and `pread`/`pwrite`, which
+belonged in the libc rather than in a port.
+
+Two host tools this machine lacks were **answered rather than acquired**:
+`nsgperf.py` emits what gperf emits (verified against all 106 keywords of
+hubbub's element table, both cases, no false hits on prefixes), and a
+`pkg-config` that answers the only question asked — where the sibling library
+we just built put its headers.
+
+**Two patches, both one line in spirit.** `content/fetch.c` guards the curl
+*include* the way its call site already was; and `utils/config.h` — the file
+that exists so a platform can declare what its libc lacks, with SerenityOS
+already in three of those lists — gains EmbLinkOS for REGEX, SCANDIR,
+REALPATH, INETATON, MMAP and the `*at` family.
+
+**No libcurl and no openssl.** The fetcher is ours, over the kernel's TCP and
+our own TLS 1.3 — so the browser authenticates with the same code the package
+manager does, and two large dependencies never entered the port.
+
+**The frontend is one file per table**, because the table is the seam: a
+scheduler whose re-register *replaces* rather than queues, a viewport that
+does not know whether it is on a screen, text measurement and drawing from a
+single source (answer those from two and the caret lands beside its glyph),
+and twelve plotters — including NetSurf's inverted alpha, where 0 means
+opaque, and its `0xAABBGGRR` colour word, which is red-low against our
+red-high surface. Copying it straight through is a bug that looks like a
+design decision: the first page came out in believable, wrong colours.
+
+It renders in **the OS's own typeface**: `ui/backend/font.c` compiles straight
+into the browser behind a one-line `FONT_NO_BACKEND` seam, so a program with
+no EmUI in it draws with the same rasteriser as the desktop.
+
+Three things the port pushed back into the OS. The kernel was **handing out
+unzeroed heap pages** — a real leak between processes. The **ELF loader
+refused a binary eight ways and returned the same EINVAL for all of them**, so
+"can't run (err 22)" named nothing; each refusal now says which check it was.
+And `make` packs the image with no manual flags again.
+
+The two bugs that cost the most were both **staleness**, and neither was in
+the code being debugged: objects compiled before the config.h patch (half the
+program believing the platform had mmap), and a stale image after packing
+failed while compiling succeeded. Each presented as a deterministic wild
+pointer in a program that was correct on the host. `build.sh` stamps the patch
+set and discards the build directory when it changes.
+
+### Phase 37 — Lists, and the floats that were quietly dropped ✅
+
+Four fixes, all found by pointing `make web-verify` at the sites that were not
+yet at 100% and asking what the missing word had in common.
+
+**Every list item drew one hardcoded bullet.** That is three wrongs from one
+string: `list-style: none` — which is on essentially every navigation menu on
+the web — was neither parsed nor honoured, an `<ol>` was bulleted instead of
+numbered, and the item was drawn through a *private* path that returned before
+the ordinary box code, so its width, background, padding, border and float were
+all ignored. `list-style-type` inherits, because the list states it and the
+item draws it; `VM_NONE` had to stop being zero, or `none` and "nobody said"
+are the same value and the item's own default puts the bullet straight back.
+
+**The float group collected at most eight boxes and skipped the rest.**
+kernel.org floats nine footer links; the ninth did not exist. A full group now
+stops collecting and the overflow opens the next one — bounded work, nothing
+lost. And a group that is *only* floats is a float grid, the second commonest
+thing a `<ul>` is, so it wraps: a non-wrapping row does not merely misplace
+what runs past the edge, it clips it.
+
+**A percentage-width child was measured at its intrinsic width.** Nine 30%
+boxes measured one line and arranged three, so the container came out two lines
+short and the next block was painted over the overflow. The wrap measurer
+resolves percentages the same way the arranger does now.
+
+kernel.org went 98.4% → 100%, and with the previous two fixes (a word pool too
+narrow for suckless's forty-character URLs, and a minified `@media(` read as a
+different at-rule) **sixteen of nineteen sampled sites now render 100% of their
+visible text**. Of the three that do not, brave's eight words are inside a
+`<details>` the page opens with a control of its own — closed by default is
+what the markup says.
+
+### Phase 37 — Where the words are: the layout half of the verifier ✅
+
+`make web-verify` scores 100% on a page that renders as one long column when
+the design is three columns and a hero — because it only asks whether the
+content is *there*. `make web-shots` asks the other half: it puts our render
+and Firefox's side by side as pictures and compares where every word ended up,
+reporting COLUMN (a word in a different third of the page), ORDER (a reading
+order we inverted) and OFFPAGE. Not a pixel diff — our fonts and colours are
+our own, and a number that can never reach zero is a number nobody reads. The
+WebDriver client moved into `tools/ff_driver.py` so both verifiers ask the same
+Firefox the same way.
+
+It found rust-lang.org laying out **15000 pixels wide** inside an 1100px page,
+with the third of three columns beginning at x=14792. Four bugs, in a chain:
+
+**`max-width` was written into `width`.** They are different statements and
+they coexist on the same element constantly. `.w-100 { width: 100% }` stores
+`width_pct=100` with `width` as the calc "+px" term, so a following
+`max-width: 96rem` was read as *100% PLUS 1536px* — the header came out 2592px
+inside 1056, and every box under it inherited the mistake.
+
+**`ui_set_size` erased the bounds `ui_set_size_bounds` had just set**, because
+it assigns the whole struct. The browser sets a cap when it opens a box and the
+size when it closes it, so every `max-width` on the web was being dropped
+between the two calls.
+
+**A percentage-sized flex item never gave up space.** The shrink passes were
+eligible on SIZE_FLEX and SIZE_INTRINSIC; `width: 100%` is neither, so three
+children each asking for the full width took 300% of the row and CSS's default
+flex-shrink of 1 never ran. SIZE_FIXED still stays out — a 24px traffic light
+is a decision, not a preference — but a percentage is a proportion *of the
+container*, which is exactly the thing that divides.
+
+**One flag answered two questions.** Which axis `flex-basis` lands on is the
+container's direction alone; whether the container can hand out space needs a
+definite size. `body { display:flex; flex-direction:column; min-height:100vh }`
+states no height, so the flag was false and `body > main { flex: 1 }` was read
+as a *width* — and `flex: 1` means basis 0, so `<main>` was a box zero pixels
+wide and everything inside it fell back to its own content width.
+
+With those four fixed, **`align-items: stretch` finally shipped as the default**
+it is in CSS. It had been written and withheld for two milestones because it
+"collapsed rust-lang.org's `<main>` to nothing" — that collapse was the
+zero-width `<main>` above, and the diagnosis was the thing that was missing.
+
+rust-lang.org now renders as its own front page: nav across the top, the hero
+with its button, and Performance / Reliability / Productivity as three columns.
+`WIDE=1` reports **nothing overflows its parent** on every real site but one.
+
+A fifth, once the columns divided: **a row's height was measured at widths
+nobody gets.** The measurement sized a percentage child by its intrinsic width
+and ignored the shrink that follows, so each section measured one line, was
+arranged at a third of the width, wrapped to four lines — and the row, already
+sized for one, had its children's *heights* squeezed to fit. Every heading came
+out 10px tall with its own paragraph drawn on top of it. Three separate places
+now resolve percentages and apply the arranger's scale; the measurement and the
+arrangement have to agree or the disagreement is always visible.
+
+Two more, found on the way: **Ctrl+A stopped after 4096 text runs** — a third
+of a Wikipedia article, mid-word, silently (63547 bytes copied now, not 24445,
+and the overflow is reportable rather than indistinguishable from a complete
+copy); and the selection-order check compared its *last* text node untrimmed
+while trimming the first, so a page whose last node ends in a space failed an
+order check over a space the copier does not emit.
+
+### Phase 38 — Note++: the OS's own code editor ✅
+
+`user/bin/edit.c` is the one-file editor: a buffer, a Save button, the path
+Files handed it. Note++ is the other thing — eight documents at once, a caret
+you drive from the keyboard, selection, undo/redo, find and replace, and code
+coloured by the same keyword tables the OS's own compiler reads.
+
+The split is the point. Everything that happens to TEXT lives in `user/note/`
+behind headers that are the contract — `edit.c` (the buffer, selection, undo,
+movement, find/replace, bracket matching, comment toggling, wrap arithmetic),
+`doc.c` (which files are open, which are dirty), `syntax.c` (a highlighter that
+is a pure function of one line and an incoming state) — and is covered by host
+tests: `make edit-test` and `make syntax-test` run on the build machine in
+under a second. An editor is mostly edge cases (a selection dragged backwards,
+an undo that restores the cursor as well as the characters, a replace-all whose
+replacement contains the search term) and none of them are worth discovering on
+a screen. `user/bin/notepp.c` is the part that cannot be tested that way:
+pixels, keys and files.
+
+It draws its own text rather than using the toolkit's TextEditor, which cannot
+show a selection, a current line or a match, and owns the keyboard in a way an
+editor's shortcuts cannot share.
+
+**Word wrap** is a visual-row model: with wrap on a screen row is no longer a
+line, and the five places that assumed otherwise — the row loop, click-to-caret,
+up/down, scroll-to-caret, and the scrollbar's total — all count rows through
+`vis_total`/`vis_row_at`/`vis_row_of`. Only a line's first visual row carries
+its gutter number, the highlighter's state threads row by row so a wrapped
+block comment stays a comment, and a status bar toggle turns the whole thing
+off. Long lines that are not wrapped are WINDOWED rather than truncated: the
+part off the right edge is reached by scrolling, not lost.
+
 ## Major To-Do Buckets (Rough Priority)
 
 Full detail lives in `TODO.md`, organized by subsystem. Rough priority order:
@@ -1068,6 +2034,23 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
 - ATA: both IDE channels now fully interrupt-driven and DMA-capable
   (Phase 21 fixed the secondary channel — see Phase 21 above); AHCI is
   still port-0-only.
+- Audio: AC'97 output works end to end — driver (`kernel/drivers/audio/`),
+  a device-independent PCM sink, and syscalls 93/94/95 gated on
+  `EMBK_CAP_AUDIO`. `beep` is a ring-3 program that asks for the speaker
+  and gets it. ONE stream at a time by design (a second opener gets
+  `EBUSY`): mixing needs a resampling/clipping policy, and a wrong mixer
+  makes every program quieter and none of them correct. No capture, no
+  userspace volume, no Intel HDA. Verified by MEASURING the WAV QEMU
+  writes (`make test-audio`), never by ear.
+- Photos: the picture viewer (`user/bin/photos.c` + `user/photos/`) reads
+  PNG and JPEG through the browser's own decoders and resamples by AREA
+  AVERAGE rather than leaving it to the compositor's bilinear blitter —
+  which is right for magnifying and aliases badly when shrinking. On the
+  metal, the outer field of a band-limited zone plate at 50% measures
+  std 0.7 (flat, as it must be) while the centre measures std 86.5 (every
+  representable ring kept). EXIF orientation applied; the folder is an
+  album; read-only namespace. `make test-photos`, `make photo-probe`,
+  `tools/app_shot.py`.
 
 ### User Mode / Process
 - User pointers are now validated (`access_ok`/`copy_from_user`/

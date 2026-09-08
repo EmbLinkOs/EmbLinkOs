@@ -1,0 +1,21 @@
+<html><head><title>Forms and scripts</title></head><body>
+<form id="f" action="/search">
+  <input id="q" name="q" type="text" value="seed">
+  <input type="submit" value="Go">
+</form>
+<p id="out">OUTPLACEHOLDER</p>
+<script>
+var out = document.querySelector("#out");
+document.querySelector("#f").addEventListener("submit", function (e) {
+  /* the browser must NOT navigate after this */
+  e.preventDefault();
+  out.setText("HANDLED " + document.querySelector("#q").value);
+});
+document.querySelector("#q").addEventListener("input", function (e) {
+  out.setText("TYPED " + e.target.value);
+});
+out.setText("ARMED value=" + document.querySelector("#q").value);
+</script>
+<!-- EXPECT-TEXT: ARMED -->
+<!-- EXPECT-NO-TEXT: OUTPLACEHOLDER -->
+</body></html>

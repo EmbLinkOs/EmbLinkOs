@@ -16,6 +16,7 @@
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/rtc.h"
 #include "drivers/bus/pci.h"
+#include "drivers/audio/ac97.h"
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
@@ -1753,6 +1754,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // --- Devices ---
     
     pci_init();
+    ac97_init();   // sound out; harmless when no AC97 device is attached
     usb_init();
     ata_init();    // registers ATA drives as block devices internally
     ahci_init();   // runs IDENTIFY per port, stores sector counts
@@ -2002,6 +2004,9 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // compositor spinlock is never taken from an IRQ handler. No-op until a
         // window exists.
         compositor_pointer_tick();
+        // Advance any window open/minimize motion. Same reasoning as above: it
+        // repaints, so it must run in schedulable context, not an IRQ.
+        compositor_anim_tick();
         // Kernel DEBUG CONSOLE over SERIAL (COM1). The keyboard + screen belong
         // to userspace now (the launcher, and the shell that reads fd 0); the
         // kernel keeps a SERIAL-ONLY console so selftests + state inspection stay

@@ -481,6 +481,57 @@ void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
     fb_mark_dirty((uint32_t)cx, (uint32_t)cy, (uint32_t)cw, (uint32_t)ch);
 }
 
+// Scale a source image into an arbitrary destination rect and composite it at a
+// uniform alpha, clipped to [clx0,cly0)-(clx1,cly1) as well as the screen. This
+// is the window-motion primitive: the compositor already owns a window's
+// finished pixels, so a scale+fade of that buffer is all an open/minimize
+// animation needs -- no app involvement, no scene graph, no per-frame layout.
+// Nearest-neighbour with a 16.16 source step: the frames are in motion and the
+// whole thing is over in a few hundred ms, so filtering would cost more than
+// anyone can see.
+void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
+                            const uint32_t *argb, int32_t sw, int32_t sh,
+                            uint32_t stride, uint32_t alpha,
+                            int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1) {
+    if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 || !argb || alpha == 0) return;
+    int32_t x0 = dx, y0 = dy, x1 = dx + dw, y1 = dy + dh;
+    if (x0 < clx0) x0 = clx0; if (y0 < cly0) y0 = cly0;
+    if (x1 > clx1) x1 = clx1; if (y1 > cly1) y1 = cly1;
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > (int32_t)fb.width)  x1 = (int32_t)fb.width;
+    if (y1 > (int32_t)fb.height) y1 = (int32_t)fb.height;
+    if (x1 <= x0 || y1 <= y0) return;
+
+    uint32_t stepx = ((uint32_t)sw << 16) / (uint32_t)dw;
+    uint32_t stepy = ((uint32_t)sh << 16) / (uint32_t)dh;
+    uint32_t inv = 255 - alpha;
+    uint8_t *row = fb_pixel_ptr(fb_draw, (uint32_t)x0, (uint32_t)y0);
+
+    for (int32_t y = y0; y < y1; y++) {
+        uint32_t sy = ((uint32_t)(y - dy) * stepy) >> 16;
+        if (sy >= (uint32_t)sh) sy = (uint32_t)sh - 1;
+        const uint32_t *srow = argb + (uint64_t)sy * stride;
+        uint32_t sx_fx = (uint32_t)(x0 - dx) * stepx;
+        uint8_t *p = row;
+        for (int32_t x = x0; x < x1; x++, p += fb_bypp, sx_fx += stepx) {
+            uint32_t sx = sx_fx >> 16;
+            if (sx >= (uint32_t)sw) sx = (uint32_t)sw - 1;
+            uint32_t sp = srow[sx];
+            if (alpha >= 255) {
+                fb_store(p, fb_pack(FB_RGB((sp >> 16) & 0xFF, (sp >> 8) & 0xFF, sp & 0xFF)));
+            } else {
+                fb_color_t d = fb_unpack(fb_load(p));
+                uint32_t r = (((sp >> 16) & 0xFF) * alpha + ((d >> 16) & 0xFF) * inv) / 255;
+                uint32_t g = (((sp >>  8) & 0xFF) * alpha + ((d >>  8) & 0xFF) * inv) / 255;
+                uint32_t b = (( sp        & 0xFF) * alpha + ( d        & 0xFF) * inv) / 255;
+                fb_store(p, fb_pack(FB_RGB(r, g, b)));
+            }
+        }
+        row += fb.pitch;
+    }
+    fb_mark_dirty((uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+}
+
 // In-place separable box blur of an fb_draw region (the backdrop behind a glass
 // window). Two passes (H then V) with a rolling per-channel sum ~= a small
 // Gaussian. Clamped-edge sampling. Silently no-ops if scratch can't be had.

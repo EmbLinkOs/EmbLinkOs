@@ -1,0 +1,43 @@
+<html><head><title>Boxes</title><style>
+/* This page sets LIGHT text, so it has to state the ground that goes under
+   it. The browser's canvas is white -- the initial value every page on the web
+   is written against -- and a document that assumes otherwise is a document
+   that only works in one browser's dark mode. Stating it here is what a real
+   page has to do, and it keeps every colour expectation below unchanged.
+
+   The GROUND and the INK go together: declaring one without the other leaves
+   everything the page did not colour explicitly -- a table cell, a list item --
+   still using the browser's dark default, unreadable on this dark ground. */
+html, body { background: #16161c; color: #d8d8e0 }
+
+body { background: #14141c }
+.card { background: #1e2230; border: 2px solid #4a6fd0; border-radius: 10px;
+        padding: 16px; margin-bottom: 14px }
+.warn { background: rgb(70, 40, 20); border-left: 4px solid orange;
+        padding: 12px; color: #f0c080 }
+h1   { text-align: center; color: #e8e8f0 }
+.mid { text-align: center; color: #a0a0b0 }
+.rt  { text-align: right; color: #a0a0b0 }
+p    { line-height: 1.6 }
+</style></head><body>
+<h1>Boxes, borders and alignment</h1>
+<div class="card"><p>A card: it has a background the cascade chose, a two pixel
+blue border, rounded corners, and sixteen pixels of padding holding the text off
+its own edge.</p></div>
+<div class="warn"><p>A warning panel, coloured with rgb() rather than a hex
+literal &mdash; which is how most real stylesheets write a colour.</p></div>
+<p class="mid">This line is centred.</p>
+<p class="rt">And this one is aligned right.</p>
+<!-- EXPECT-COLOR: centred #a0a0b0 -->
+<!-- EXPECT-COLOR: warning #f0c080 -->
+<!-- EXPECT-TEXT: rounded -->
+
+<!-- A <pre> is not only its direct text. Highlighted code IS spans, so reading
+     only text children rendered every syntax-highlighted block on the web as
+     nothing -- MDN's formal-syntax section was blank on every reference page.
+     <br> inside one is a line break, not a box. -->
+<pre><span>PREFIRST</span><br>  <span class="tok">PRESECOND</span></pre>
+<!-- EXPECT-TEXT: PREFIRST -->
+<!-- EXPECT-TEXT: PRESECOND -->
+<!-- EXPECT-BELOW: PRESECOND PREFIRST -->
+</body></html>

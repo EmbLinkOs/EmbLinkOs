@@ -1,0 +1,302 @@
+/* ports/netsurf/frontend/main.c -- start the core, load one page, draw it.
+ *
+ * The smallest thing that is a browser: register the tables, initialise the
+ * core, ask it to navigate, pump the scheduler until the page settles, then
+ * ask it to redraw into our surface and write the result out as a PPM.
+ *
+ * Headless on purpose for this milestone. The pipeline being proved here is
+ * fetch -> parse -> cascade -> LAYOUT -> plot, and a window adds nothing to
+ * that proof while adding a compositor, an event loop and input handling to
+ * the list of things that can be wrong. The image it writes is the same format
+ * `make web-shots` already grades, so the port is measurable against Firefox
+ * from its first frame -- the same instrument, pointed at a different renderer.
+ *
+ *   nsemblink <file-or-url> [width] [height] [out.ppm]
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "utils/errors.h"
+#include "utils/messages.h"
+#include "netsurf/netsurf.h"
+#include "netsurf/browser_window.h"
+#include "netsurf/misc.h"
+#include "netsurf/window.h"
+#include "netsurf/fetch.h"
+#include "netsurf/layout.h"
+#include "netsurf/bitmap.h"
+#include "netsurf/plotters.h"
+#include "netsurf/content.h"
+#include "utils/nsurl.h"
+#include "utils/nsoption.h"
+#include "desktop/gui_table.h"
+#include "emblink.h"
+
+#ifdef EMBLINK_NET
+nserror emblink_fetch_register(void);
+int     emblink_app_run(struct gui_window *gw, const char *title);
+#endif
+
+
+static struct netsurf_table emblink_table = {
+    .misc   = NULL,       /* filled in main: the tables live in their own files */
+    .window = NULL,
+    .fetch  = NULL,
+    .bitmap = NULL,
+    .layout = NULL,
+};
+
+/* STAGE MARKERS. A port fails by faulting somewhere in a stack it did not
+ * write, and "exited with code -270" names no phase at all. Each of these is
+ * one line on the serial log, and between two of them is where to look. */
+static void stage(const char *what)
+{
+    fprintf(stderr, "nsemblink: %s\n", what);
+    fflush(stderr);
+}
+
+static bool write_ppm(const struct emblink_surface *s, const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) return false;
+    fprintf(f, "P6\n%d %d\n255\n", s->width, s->height);
+    for (int y = 0; y < s->height; y++) {
+        const uint32_t *row = s->px + (size_t)y * s->stride;
+        for (int x = 0; x < s->width; x++) {
+            uint32_t p = row[x];
+            unsigned char rgb[3] = {
+                (unsigned char)((p >> 16) & 0xFF),
+                (unsigned char)((p >> 8) & 0xFF),
+                (unsigned char)(p & 0xFF),
+            };
+            if (fwrite(rgb, 1, 3, f) != 3) { fclose(f); return false; }
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+int main(int argc, char **argv)
+{
+    /* -w: be an APPLICATION rather than a one-shot renderer. Same engine, same
+     * frontend; the only difference is where the pixels go and whether anyone
+     * can click on them. */
+    /* `window` as well as `-w`, because the OS's shell parses a leading dash
+     * as a unary minus and refuses the argument before this program is even
+     * started -- the same gap that makes a bare URL need quoting. Supporting
+     * the dash-free spelling is a workaround for the shell, and it is written
+     * down as one in docs/TODO.md rather than left looking like a preference. */
+    /* WINDOWED IS THE DEFAULT, because this is an application: the launcher
+     * spawns it with no arguments at all, and a browser that starts by writing
+     * a file nobody asked for is not one. Headless is what you get when you
+     * NAME an output file -- which is exactly the grading path
+     * (`make web-shots`) and nothing else.
+     *
+     * `window` is also accepted as an explicit first argument: the OS's shell
+     * parses a leading dash as a unary minus, so `-w` never reaches this
+     * program. That is a workaround for the shell, logged as one. */
+    if (argc > 1 && (strcmp(argv[1], "-w") == 0 || strcmp(argv[1], "window") == 0)) {
+        argv++; argc--;
+    }
+    /* NetSurf's OWN welcome page, not the OS's start page -- that one is
+     * Vellum's, titled "Vellum", which made this browser look like it had
+     * opened the other one. A program's default document should be its own. */
+    const char *target = argc > 1 ? argv[1] : "file:///system/netsurf/welcome.html";
+    int width  = argc > 2 ? atoi(argv[2]) : 1100;
+    int height = argc > 3 ? atoi(argv[3]) : 900;
+    const char *out = argc > 4 ? argv[4] : NULL;
+    bool windowed = (out == NULL);
+    nserror err;
+
+    g_textdump = getenv("TEXTDUMP") != NULL;
+
+    emblink_table.misc   = emblink_misc_table;
+    emblink_table.window = emblink_window_table;
+    emblink_table.fetch  = emblink_fetch_table;
+    emblink_table.bitmap = emblink_bitmap_table;
+    emblink_table.layout = emblink_layout_table;
+
+    stage("register");
+    err = netsurf_register(&emblink_table);
+    if (err != NSERROR_OK) {
+        fprintf(stderr, "nsemblink: table rejected: %s\n", messages_get_errorcode(err));
+        return 1;
+    }
+
+    stage("options");
+    err = nsoption_init(NULL, NULL, NULL);
+    if (err != NSERROR_OK) {
+        fprintf(stderr, "nsemblink: options: %s\n", messages_get_errorcode(err));
+        return 1;
+    }
+
+    /* JAVASCRIPT IS AN OPTION, and its default is false -- building with
+     * Duktape linked in is necessary and not sufficient, which is exactly the
+     * kind of gap that looks like a broken interpreter. A page that sets its
+     * own text from a script proves the difference. */
+    nsoption_set_bool(enable_javascript, true);
+
+    emblink_window_set_size(width, height);
+
+    stage("core init");
+    err = netsurf_init(NULL);
+    if (err != NSERROR_OK) {
+        fprintf(stderr, "nsemblink: core init: %s\n", messages_get_errorcode(err));
+        return 1;
+    }
+
+    /* A BARE PATH IS NOT A URL, and typing one is what people do. Every
+     * browser turns a leading slash into file://, and the alternative here is
+     * an error message that tells a user their own filename is malformed. */
+    char urlbuf[1024];
+    if (target[0] == '/') {
+        snprintf(urlbuf, sizeof urlbuf, "file://%s", target);
+        target = urlbuf;
+    }
+
+    struct nsurl *url = NULL;
+    err = nsurl_create(target, &url);
+    if (err != NSERROR_OK) {
+        fprintf(stderr, "nsemblink: bad url [%s]\n", target);
+        return 1;
+    }
+
+    /* http and https, over the OS's own TCP and TLS. Only on the OS: the
+     * host build has no such stack, and a fetcher that cannot fetch is worse
+     * than an absent one -- the core would stop asking the file: fetcher. */
+#ifdef EMBLINK_NET
+    {
+        nserror ferr = emblink_fetch_register();
+        if (ferr != NSERROR_OK)
+            fprintf(stderr, "nsemblink: no network fetcher: %s\n",
+                    messages_get_errorcode(ferr));
+    }
+#endif
+
+    stage("navigate");
+    /* IS THE nsurl SOUND THE MOMENT IT IS MADE? The OS build hands
+     * win_set_title a pointer that is neither heap nor image, and the string
+     * it should be handing over comes from nsurl_access() when the document
+     * has no <title> yet. So ask before anything else has run: if the pointer
+     * is already wrong here, nothing about the page load is involved. */
+    {
+        const char *acc = nsurl_access(url);
+        fprintf(stderr, "nsemblink: nsurl_access -> %p  len=%zu\n",
+                (const void *)acc, acc ? strlen(acc) : (size_t)0);
+        if (acc != NULL) fprintf(stderr, "nsemblink: url = [%.80s]\n", acc);
+        fflush(stderr);
+    }
+
+    struct browser_window *bw = NULL;
+    err = browser_window_create(BW_CREATE_HISTORY, url, NULL, NULL, &bw);
+    nsurl_unref(url);
+    if (err != NSERROR_OK) {
+        fprintf(stderr, "nsemblink: navigate: %s\n", messages_get_errorcode(err));
+        return 1;
+    }
+
+    /* PUMP UNTIL IT SETTLES. There is no event loop to block in: everything
+     * that makes progress is a scheduled callback, and the fetch subsystem
+     * re-schedules its own poll every 10ms (content/fetch.c). So run what is
+     * due and then SLEEP for what the scheduler asked for.
+     *
+     * Sleeping rather than spinning is the whole difference. A busy loop over
+     * the clock burns thousands of syscalls to advance a few milliseconds of
+     * guest time -- under TCG that is most of a second per hundred ms of
+     * progress -- and the first version of this exhausted its iteration count
+     * before the file had even been read.
+     *
+     * "Settled" is the core telling us it stopped the throbber, which it does
+     * whether the page loaded or failed. Bounded by a deadline, because a page
+     * that polls forever is not a reason to refuse to draw the first frame. */
+    stage("pump");
+    struct gui_window *gw = emblink_window_get();
+    {
+        const int64_t deadline_ms = 30000;
+        int64_t waited = 0;
+        while (waited < deadline_ms) {
+            int next = emblink_schedule_run();
+            if (emblink_window_settled(gw)) break;
+            if (next < 0) next = 10;      /* nothing pending yet: let it arrive */
+            if (next < 1) next = 1;
+            usleep((useconds_t)next * 1000);
+            waited += next;
+        }
+        if (!emblink_window_settled(gw))
+            fprintf(stderr, "nsemblink: page did not settle in %llds\n",
+                    (long long)(deadline_ms / 1000));
+    }
+
+    struct emblink_surface *surf = emblink_window_surface(gw);
+    if (gw == NULL || surf == NULL) {
+        fprintf(stderr, "nsemblink: the core never asked for a window\n");
+        return 1;
+    }
+
+#ifdef EMBLINK_NET
+    if (windowed) {
+        stage("window");
+        return emblink_app_run(gw, emblink_window_title(gw));
+    }
+#else
+    (void)windowed;
+#endif
+
+    /* THE WHOLE DOCUMENT, not the first screenful. Now that it has loaded, the
+     * core knows how tall it is; without this a headless render stops at the
+     * fold and every long page scores as if the engine had lost the text
+     * below it. Only ever grows -- a short page keeps the window it asked
+     * for, which is what a windowed frontend will want. */
+    {
+        int dw = 0, dh = 0;
+        if (browser_window_get_extents(emblink_window_bw(gw), true, &dw, &dh) == NSERROR_OK) {
+            if (dh > surf->height || dw > surf->width) {
+                int nw = dw > surf->width ? dw : surf->width;
+                int nh = dh > surf->height ? dh : surf->height;
+                if (emblink_window_resize(gw, nw, nh)) {
+                    surf = emblink_window_surface(gw);
+                    fprintf(stderr, "nsemblink: document is %dx%d -- surface grown\n",
+                            dw, dh);
+                }
+            }
+        }
+    }
+
+    stage("redraw");
+    struct redraw_context ctx = {
+        .interactive = false,
+        .background_images = true,
+        .plot = &emblink_plotters,
+    };
+    struct rect clip = { 0, 0, surf->width, surf->height };
+
+    /* browser_window_redraw returns a BOOL, not an nserror -- the one call in
+     * this file that does. Reading its `true` as an error code printed
+     * "redraw: Unknown" on a redraw that had worked perfectly, and sent the
+     * search into the layout for a bug that was in this line. */
+    emblink_target = surf;
+    emblink_surface_clip(surf, 0, 0, surf->width, surf->height);
+    bool drawn = browser_window_redraw(emblink_window_bw(gw), 0, 0, &clip, &ctx);
+    emblink_target = NULL;
+    if (!drawn) {
+        fprintf(stderr, "nsemblink: redraw refused\n");
+        return 1;
+    }
+
+    printf("nsemblink: [%s] %dx%d -> %s\n", emblink_window_title(gw),
+           surf->width, surf->height, out);
+    if (!write_ppm(surf, out)) {
+        fprintf(stderr, "nsemblink: cannot write %s\n", out);
+        return 1;
+    }
+
+    stage("done");
+    browser_window_destroy(bw);
+    netsurf_exit();
+    emblink_schedule_finalise();
+    return 0;
+}

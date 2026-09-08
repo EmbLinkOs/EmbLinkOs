@@ -1,0 +1,18 @@
+# notepp namespace manifest (docs/USERSPACE_v2.md UP4).
+#
+# Modelled on vellum.ns, which is the GUI app whose authority is known to work.
+#
+# `rw $HOME`, not `rw /data`. The session holds
+#   ro /system, ro /data/apps, rw /home/<user>, rw /run
+# and a child can only be granted a SUBSET of what its grantor holds -- so a
+# manifest naming /data asks the desktop for authority it does not have, and
+# the spawn is refused before the app runs. An editor's business is the user's
+# own files, and those are $HOME.
+#
+# Broader than the browser's `rw $HOME/.vellum` on purpose: Vellum writes only
+# its own state, while an editor exists to write files the person chose. That
+# is the widest grant in this tree and it is still bounded -- it cannot name
+# /system to write, /run at all, or another user's home.
+
+ro /system                  # the font it draws with, and libembk.so
+rw $HOME                    # the files being edited

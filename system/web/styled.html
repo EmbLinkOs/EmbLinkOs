@@ -1,0 +1,14 @@
+<html><head>
+<title>Styled from a file</title>
+<link rel="stylesheet" href="styled.css">
+<style>.lead { font-style: italic }</style>
+</head><body>
+<h1>This page is styled by a separate file</h1>
+<p class="lead">Blue and bold from <code>styled.css</code>, italic from the page's own
+&lt;style&gt; block &mdash; two sheets, one cascade.</p>
+<p class="gone">If the external stylesheet had not loaded, this line would be visible,
+and the heading above would be plain white body text.</p>
+<p class="note">Nearly every site on the web keeps its CSS in a file like this one.
+Until the browser fetched them, all of that styling was simply missing.</p>
+<p><a href="/system/web/index.html">Back to the start page</a></p>
+</body></html>

@@ -133,6 +133,9 @@ struct glyph_cache_entry *glyph_cache_lookup_or_rasterize(
 /* Point cpu_backend_get()->draw_text at the real implementation. Call once at
  * startup (the vtable ships with draw_text == NULL until then). */
 void font_install_backend(void);
+/* The renderer's own UTF-8 decoder. Anything that MEASURES text must step the
+ * string with this, or it will measure a different string than gets drawn. */
+int  font_utf8_decode(const char *s, uint32_t *cp);
 
 /* Exposed for tests: the shared process-wide atlas draw_text uses. */
 struct glyph_atlas *font_global_atlas(void);

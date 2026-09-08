@@ -116,11 +116,19 @@ struct scene_node {
 
     /* --- clipping --- */
     bool  clip_children;
+    uint8_t layer;  /* z-LAYER of the subtree this node roots: 0 = flow, higher
+                     * = elevated (popovers 1, drag ghosts 2). One field drives
+                     * BOTH paint and hit: elevated subtrees paint AFTER the
+                     * flow (ascending layer, document order within a layer) and
+                     * hit-test BEFORE it (descending), so what you see on top
+                     * is what your click lands on. Elevated subtrees also
+                     * escape ancestor clips -- popover semantics. */
 
     /* --- border (RECT; a hairline stroke drawn INSIDE the rounded edge, on
      * top of the fill) --- */
     float border_width;        /* 0 = no border */
-    struct color border_color;
+    struct color border_color; /* used when border_paint.kind == PAINT_NONE */
+    struct paint border_paint; /* PAINT_*_GRADIENT -> the stroke is a gradient */
 
     /* --- effects --- */
     bool  shadow_enabled;
@@ -135,12 +143,37 @@ struct scene_node {
     /* --- kind-specific payload --- */
     union {
         struct { struct paint fill; } rect;
-        struct { const void *pixels; uint32_t w, h; enum embk_pixfmt fmt; } image;
-        struct { const char *utf8; uint32_t font_handle; float size_px; struct color color; } text;
+        /* tinted: paint `tint` using the image's ALPHA as coverage, so a
+         * single-colour icon behaves exactly like a glyph and follows the
+         * theme. Untinted images draw their own colours. */
+        struct { const void *pixels; uint32_t w, h; enum embk_pixfmt fmt;
+                 bool tinted; struct color tint; } image;
+        struct { const char *utf8; uint32_t font_handle; float size_px; struct color color;
+                 struct paint paint; /* PAINT_*_GRADIENT -> gradient glyph fill */
+                 /* Content hash of `utf8` as it was when last set. A node holds
+                  * a POINTER to the caller's buffer, so when that buffer is
+                  * edited IN PLACE there is nothing left to compare against --
+                  * the stored pointer already sees the new bytes. This is the
+                  * only record that the text used to be something else, and
+                  * without it an in-place update is invisible to dirty
+                  * tracking. See scene_set_text. */
+                 uint32_t hash;
+                 /* An optional background painted BEHIND the glyphs. a==0 is
+                  * none, which is every run in an ordinary UI. It exists for
+                  * SELECTION: a highlighted run is a property of the run, not
+                  * a separate overlay tree that would have to be kept in sync
+                  * with where layout actually put the words. */
+                 struct color bg; } text;
     } data;
 
     bool  dirty;   /* any mutation sets this; lets a caching traversal skip an
                     * unchanged subtree's world recompute */
+    bool  dirty_content;   /* dirty MINUS pure transforms. A transform is a
+                            * MOVE: the pixels are still valid, just elsewhere,
+                            * and a scroll can blit them. Every other mutation
+                            * (paint, text, image, border...) invalidates the
+                            * pixels themselves. The renderer's scroll fast
+                            * path tells the two apart with this bit. */
 
     /* Opaque tag Piece 3 never interprets -- exists purely so a consumer above
      * (Piece 7's declarative layer) can stash its own identifier (e.g. a packed
@@ -188,14 +221,24 @@ void scene_set_size(struct scene_arena *a, struct node_handle h, float w, float 
 void scene_set_paint(struct scene_arena *a, struct node_handle h, const struct paint *p); /* RECT */
 void scene_set_text(struct scene_arena *a, struct node_handle h, const char *utf8,
                     uint32_t font_handle, float size_px, struct color color);
+void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const struct paint *paint);
+/* Paint `bg` behind this run's glyphs; alpha 0 removes it. */
+void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color bg);
 
 /* Force-dirty a node whose (aliased) content was edited in place. */
 void scene_mark_dirty(struct scene_arena *a, struct node_handle h);
 void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pixels,
                      uint32_t w, uint32_t ht, enum embk_pixfmt fmt);
+/* Draw the image as a MASK filled with `tint` (alpha = coverage). enabled=false
+ * restores normal full-colour drawing. */
+void scene_set_image_tint(struct scene_arena *a, struct node_handle h,
+                          bool enabled, struct color tint);
+void scene_set_layer(struct scene_arena *a, struct node_handle h, uint8_t layer);
 void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
                       float dx, float dy, float blur, struct color color);
 void scene_set_border(struct scene_arena *a, struct node_handle h, float width, struct color color);
+void scene_set_border_gradient(struct scene_arena *a, struct node_handle h,
+                               float width, const struct paint *paint);
 void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool enabled, float radius);
 void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacity);
 void scene_set_clip_children(struct scene_arena *a, struct node_handle h, bool clip);

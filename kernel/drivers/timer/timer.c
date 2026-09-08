@@ -117,3 +117,16 @@ uint64_t time_get_us(void)
     uint64_t rem     = elapsed % tsc_freq_hz;
     return sec * 1000000ULL + rem * 1000000ULL / tsc_freq_hz;
 }
+/* See timer.h. Kept here rather than in the syscall layer so the compositor can
+ * time its window animations without reaching into ring-3 plumbing. */
+uint64_t timer_uptime_ms(void) {
+    if (hpet_available()) {
+        uint64_t pf = hpet_period_fs();              /* femtoseconds per tick */
+        if (pf) {
+            uint64_t tpms = 1000000000000ULL / pf;   /* ticks per millisecond */
+            if (tpms == 0) tpms = 1;
+            return hpet_read_counter() / tpms;
+        }
+    }
+    return timer_get_ticks();
+}

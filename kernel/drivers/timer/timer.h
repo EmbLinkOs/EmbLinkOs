@@ -8,6 +8,10 @@ void timer_init(void);
 
 /* Get the raw LAPIC 100-Hz tick count (used by the heartbeat loop). */
 uint64_t timer_get_ticks(void);
+/* Monotonic milliseconds since boot (HPET where available, coarse ticks
+ * otherwise). The clock both the ring-3 UI animator and the compositor's own
+ * window motion run on. */
+uint64_t timer_uptime_ms(void);
 
 /*
  * TSC-based high-resolution time.

@@ -173,6 +173,164 @@ static void t5_keyed_reorder(void) {
     done();
 }
 
+/* ---- T5b: a row that APPEARS must not displace its siblings ------------- *
+ *
+ * The failure this pins down cost a browser two evenings. Its chrome is a
+ * column of rows, one of which -- a find bar -- appears when you open it.
+ * Unkeyed children are matched to last frame's by POSITION, so the moment that
+ * row was inserted every row below it adopted its neighbour's retained
+ * instance, and since a reused instance keeps whatever size nobody restated,
+ * the whole window came back laid out as something else: the find bar drawn
+ * over the address bar, the document's viewport wearing the divider's height.
+ *
+ * It looked like a repaint bug for as long as it was only ever LOOKED at.
+ *
+ * The rule the fix rests on: give a key to the rows that STAY, not only to the
+ * one that comes and goes -- it is the stable rows that get displaced.
+ */
+static int g_t5b_extra;
+static int g_t5b_keys = 1;
+
+/* A row whose size is RETAINED rather than restated every frame.
+ *
+ * That is what makes the displacement visible, and it is not contrived: the
+ * toolkit's box only writes a size when a prop asks for one, so a row that
+ * settled at a height keeps it until something says otherwise. A test whose
+ * rows restate their size every frame cannot see this bug at all -- the first
+ * version of this test did exactly that and passed while the browser on the
+ * other screen was visibly broken. */
+static int g_t5b_state_sizes = 1;
+
+static void row(uint64_t key, float h) {
+    ui_box_begin(key);
+    if (g_t5b_state_sizes)
+        ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 200 },
+                    (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = h });
+    ui_box_end();
+}
+
+static void app_optional_row(void) {
+    ui_begin_vstack(0);
+    row(g_t5b_keys ? 0xA1 : 0, 48);              /* header */
+    if (g_t5b_extra) row(g_t5b_keys ? 0xEE : 0, 20);   /* the row that comes and goes */
+    row(g_t5b_keys ? 0xB2 : 0, 30);              /* body   */
+    row(g_t5b_keys ? 0xC3 : 0, 12);              /* footer */
+    ui_end_stack();
+}
+
+static struct instance_handle child_by_key(struct instance_handle parent, uint64_t key) {
+    for (struct instance_handle c = ui_first_child(parent); !instance_handle_is_null(c); c = ui_next_sibling(c)) {
+        struct instance *ci = instance_resolve(c);
+        if (ci && ci->explicit_key == key) return c;
+    }
+    return INSTANCE_HANDLE_NULL;
+}
+
+static void t5b_inserted_row(void) {
+    printf("T5b an inserted row does not displace keyed siblings:\n");
+    fresh();
+    g_t5b_extra = 0;
+    ui_frame_begin(); app_optional_row(); ui_frame_end();
+    ui_run_layout(400, 300);
+    struct instance_handle col = ui_first_child(ui_root());
+    struct instance_handle h0 = child_by_key(col, 0xA1);
+    struct instance_handle b0 = child_by_key(col, 0xB2);
+    struct instance_handle f0 = child_by_key(col, 0xC3);
+    struct scene_node *bn = scene_resolve(&SA, ui_scene_of(b0));
+    float body_h = bn ? bn->height : -1;
+    CHECK(body_h == 30, "the body starts at the height it asked for");
+
+    /* ...now the row appears, which is the whole test */
+    g_t5b_extra = 1; g_t5b_state_sizes = 0;
+    ui_frame_begin(); app_optional_row(); ui_frame_end();
+    ui_run_layout(400, 300);
+    col = ui_first_child(ui_root());
+    CHECK(heq(child_by_key(col, 0xA1), h0) &&
+          heq(child_by_key(col, 0xB2), b0) &&
+          heq(child_by_key(col, 0xC3), f0),
+          "every stable row keeps its own instance when a row is inserted above it");
+
+    struct scene_node *hn = scene_resolve(&SA, ui_scene_of(child_by_key(col, 0xA1)));
+    struct scene_node *b2 = scene_resolve(&SA, ui_scene_of(child_by_key(col, 0xB2)));
+    struct scene_node *f2 = scene_resolve(&SA, ui_scene_of(child_by_key(col, 0xC3)));
+    CHECK(hn && hn->height == 48, "the header is still 48 tall, not the inserted row's 20");
+    CHECK(b2 && b2->height == 30, "the body is still 30 -- not its neighbour's height");
+    CHECK(f2 && f2->height == 12, "and the footer is still 12");
+
+    /* the inserted row is really there, or the checks above prove nothing */
+    CHECK(!instance_handle_is_null(child_by_key(col, 0xEE)), "the new row was actually inserted");
+    done();
+
+    /* THE CONTROL. The same column with no keys at all, to show that the keys
+     * above are what is doing the work rather than the layout happening to be
+     * right anyway. Unkeyed rows match by position, so the footer inherits the
+     * body's instance and comes back 30 tall instead of 12 -- and a test that
+     * did not demonstrate this would be asserting nothing. */
+    fresh();
+    g_t5b_extra = 0; g_t5b_keys = 0; g_t5b_state_sizes = 1;
+    ui_frame_begin(); app_optional_row(); ui_frame_end();
+    ui_run_layout(400, 300);
+    g_t5b_extra = 1; g_t5b_state_sizes = 0;
+    ui_frame_begin(); app_optional_row(); ui_frame_end();
+    ui_run_layout(400, 300);
+    col = ui_first_child(ui_root());
+    float hs[8]; int n = 0;
+    for (struct instance_handle c = ui_first_child(col);
+         !instance_handle_is_null(c) && n < 8; c = ui_next_sibling(c)) {
+        struct scene_node *sn = scene_resolve(&SA, ui_scene_of(c));
+        hs[n++] = sn ? sn->height : -1;
+    }
+    CHECK(n == 4, "unkeyed: four rows, as declared");
+    printf("      (unkeyed heights: %.0f %.0f %.0f %.0f -- declared 48 20 30 12)\n",
+           hs[0], hs[1], hs[2], hs[3]);
+    CHECK(!(n == 4 && hs[0] == 48 && hs[1] == 20 && hs[2] == 30 && hs[3] == 12),
+          "unkeyed: the rows are DISPLACED -- this is the bug the keys exist for");
+    g_t5b_keys = 1; g_t5b_state_sizes = 1;
+    done();
+}
+
+/* ---- T5c: re-declaring N children costs O(N), not O(N^2) ---------------- *
+ *
+ * An immediate-mode reconciler re-declares the same children every frame, and
+ * relink_after used to unlink each one before putting it back -- finding its
+ * predecessor by walking the parent's list from the front. O(k) for the k'th
+ * child is O(N^2) for the parent, which a page that is one long list pays in
+ * full every frame. It was most of a browser frame on a real article.
+ *
+ * A timing test would be flaky, so this counts WORK instead: the reconciler
+ * exposes how many sibling links it walked, and re-declaring an unchanged list
+ * must walk none of them.
+ */
+static void t5c_relink_cost(void) {
+    printf("T5c re-declaring an unchanged list walks no sibling links:\n");
+    fresh();
+    const int N = 400;
+    for (int frame = 0; frame < 2; frame++) {
+        if (frame) ui_relink_walks_reset();
+        ui_frame_begin();
+        ui_begin_vstack(0);
+        for (int i = 0; i < N; i++) row((uint64_t)(0x1000 + i), 10);
+        ui_end_stack();
+        ui_frame_end();
+        ui_run_layout(400, 4000);
+    }
+    CHECK(ui_relink_walks() == 0,
+          "a second identical frame relinks nothing -- no walk, no N^2");
+
+    /* ...and the guard is not simply always-true: moving a child really does
+     * relink, or the reconciler would have stopped reordering anything. */
+    ui_relink_walks_reset();
+    ui_frame_begin();
+    ui_begin_vstack(0);
+    row((uint64_t)(0x1000 + N - 1), 10);              /* last one first now */
+    for (int i = 0; i < N - 1; i++) row((uint64_t)(0x1000 + i), 10);
+    ui_end_stack();
+    ui_frame_end();
+    ui_run_layout(400, 4000);
+    CHECK(ui_relink_walks() > 0, "...but a child that actually moves is relinked");
+    done();
+}
+
 /* ---- T6: hit-test clip-awareness --------------------------------------- */
 static void t6_hit_clip(void) {
     printf("T6 hit-test clip-awareness:\n");
@@ -181,10 +339,10 @@ static void t6_hit_clip(void) {
      * outside), clipped away past x=50. */
     ui_frame_begin();
     ui_box_begin(0);
-      ui_set_size((struct layout_size){SIZE_FIXED,50,0,0,0}, (struct layout_size){SIZE_FIXED,50,0,0,0});
+      ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 50 }, (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 50 });
       ui_set_clip_children(true);
       ui_box_begin(0);
-        ui_set_size((struct layout_size){SIZE_FIXED,40,0,0,0}, (struct layout_size){SIZE_FIXED,40,0,0,0});
+        ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 40 }, (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 40 });
       ui_box_end();
     ui_box_end();
     ui_frame_end();
@@ -204,6 +362,33 @@ static void t6_hit_clip(void) {
     /* a click at x=60 (inside inner's rect 30..70 but OUTSIDE clip 0..50) misses */
     ui_dispatch_click(60, 20);
     CHECK(!ui_consume_click(inner), "click in the clipped-away part does NOT hit");
+    done();
+}
+
+/* ---- T6b: z-layers -- an early elevated box beats a later flow box ------ */
+static void t6b_hit_layers(void) {
+    printf("T6b hit-test z-layers:\n");
+    fresh();
+    ui_frame_begin();
+    ui_box_begin(0);                       /* an early scrim raised to layer 1 */
+      ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 100 }, (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 100 });
+      ui_set_layer(1);
+    ui_box_end();
+    ui_box_begin(0);                       /* a LATER flow box over the same pixels */
+      ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 100 }, (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 100 });
+    ui_box_end();
+    ui_frame_end();
+
+    struct instance_handle scrim = ui_first_child(ui_root());
+    struct instance_handle later = ui_next_sibling(scrim);
+    ui_run_layout(200, 200);
+    /* stack both at the origin so they overlap (layout would stagger them) */
+    scene_set_transform(&SA, ui_scene_of(later), 0, 0, 0, 0,0,0,1, 1,1,1);
+
+    ui_dispatch_click(50, 50);
+    CHECK(ui_consume_click(scrim), "the elevated (layer 1) box wins the point");
+    ui_dispatch_click(50, 50);
+    CHECK(!ui_consume_click(later), "the later flow box does NOT win it");
     done();
 }
 
@@ -237,14 +422,74 @@ static void t7_button_pulse(void) {
     done();
 }
 
+/* ---- T8: a press must latch on a MAGNIFYING icon --------------------------
+ * The dock repro, boiled down. A dock icon is [box [imgbutton [image]]] where
+ * the IMAGE LEAF is keyed by its pixel pointer -- and a magnifying icon swaps
+ * mip levels as it swells, so that key CHANGES while the pointer approaches.
+ * The press edge captures whatever last frame's tree had under the pointer;
+ * this asserts the box still recognises that capture as its own. */
+static uint32_t px_a[64], px_b[64];    /* two "mip levels" of one icon */
+
+static int t8_active;
+static void t8_app(int which_level, float size) {
+    ui_begin_vstack(0xB0B0);                       /* the dock pill */
+      ui_begin_vstack(0xD0C1);                     /* the slot */
+        ui_begin_vstack(0xFACE);                   /* drag_icon's box */
+          ui_begin_vstack(0x1C0);                  /* em_image_button's box */
+            void *px = which_level ? (void *)px_b : (void *)px_a;
+            /* keyed like the FIXED em_image_button: stable identity, varying
+             * pixels. Flip this back to (uintptr_t)px to watch T8 fail. */
+            ui_image_sized(0x1CA7, px, 8, 8, size - 8, size - 8);
+          ui_end_stack();
+          t8_active = ui_is_active();              /* what drag_icon reads */
+        ui_end_stack();
+      ui_end_stack();
+    ui_end_stack();
+}
+
+static void t8_frame(int level, float size, float px_, float py_, int down) {
+    ui_pointer(px_, py_, down != 0);
+    ui_frame_begin(); t8_app(level, size); ui_frame_end();
+    ui_run_layout(200, 200);
+}
+
+static void t8_magnifier_press(void) {
+    printf("T8 press latch across a mip-level swap (the dock magnifier):\n");
+    fresh();
+
+    /* frame 1: pointer far away, small icon, level A */
+    t8_frame(0, 40, 190, 190, 0);
+    /* frame 2: pointer arrives over the icon; still level A geometry retained */
+    t8_frame(0, 40, 16, 16, 0);
+    /* frame 3: the magnifier crosses a level boundary: level B, bigger */
+    t8_frame(1, 56, 16, 16, 0);
+    /* frame 4: THE PRESS. The edge is hit-tested against frame 3's tree. */
+    t8_frame(1, 56, 16, 16, 1);
+    CHECK(t8_active, "press latches when the level flipped BEFORE the press");
+
+    /* release cleanly */
+    t8_frame(1, 56, 16, 16, 0);
+
+    /* now the nastier order: the level flips ON the press frame itself */
+    t8_frame(0, 40, 16, 16, 0);      /* retained tree back to level A */
+    t8_frame(1, 56, 16, 16, 1);      /* press + flip in the same frame */
+    CHECK(t8_active, "press latches when the level flips ON the press frame");
+
+    done();
+}
+
 int main(void) {
+    t8_magnifier_press();
     printf("=== EmbLink UI Piece 7: declarative-API selftests ===\n");
     t1_reuse();
     t2_sweep();
     t3_fine_grained();
     t4_props_change();
     t5_keyed_reorder();
+    t5b_inserted_row();
+    t5c_relink_cost();
     t6_hit_clip();
+    t6b_hit_layers();
     t7_button_pulse();
     printf("=== declare-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

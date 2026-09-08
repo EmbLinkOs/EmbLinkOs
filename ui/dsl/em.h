@@ -40,11 +40,21 @@ typedef struct color Color;
 /* ------------------------------------------------------------------------- */
 
 typedef enum {                 /* .font = Title / Body / ... */
-    FontDefault = 0, Body, BodyBold, Title, Heading, Caption
+    FontDefault = 0, Body, BodyBold, Title, Heading, Caption,
+    /* Title size at REGULAR weight. Title and Heading are both hardwired to
+     * the bold face, which is right for headings and wrong for everything
+     * else that is merely large -- a lead paragraph, a quiet stat. CSS made
+     * the gap obvious (`font-size: 19px` with no `font-weight` came out bold),
+     * but it was always there. Appended, so every existing value is unchanged. */
+    Subtitle
 } EmFont;
 
 typedef enum {                 /* .align / .justify (shared) */
-    AlignDefault = 0, Leading, Center, Trailing, Fill, SpaceBetween
+    AlignDefault = 0, Leading, Center, Trailing, Fill, SpaceBetween,
+    /* Justify only. AROUND gives every item an equal share of the leftover
+     * with half of it on each side; EVENLY makes all n+1 gaps equal. They
+     * differ only at the two ends, which is exactly why an author picks one. */
+    SpaceAround, SpaceEvenly
 } EmAlign;
 
 typedef enum {                 /* .style on Button */
@@ -60,13 +70,20 @@ typedef enum {                 /* .tone on Badge / Tag / Banner */
 /* A zero field means "not set"; the view falls back to a sensible default.   */
 /* ------------------------------------------------------------------------- */
 
+/* An EXPLICIT zero for a length prop, where a plain 0 means "unset -- use
+ * the theme's value". See the note inside EmProps. */
+#define EmZero (-1.0f)
+
 typedef struct {
     /* layout */
     float spacing;                       /* gap between children */
     float padding, px, py;               /* all / horizontal / vertical */
     float pt, pr, pb, pl;                /* per-edge overrides */
     float width, height;                 /* fixed size (0 = intrinsic) */
+    float minw, maxw, minh, maxh;        /* size bounds (0 = unset); maxw + grow
+                                          * = a clamped-responsive box */
     int   grow;                          /* fill available space (main axis) */
+    int   span;                          /* grid child: columns to span (default 1) */
 
     /* surface */
     Color background, color, border_color;
@@ -86,6 +103,38 @@ typedef struct {
     /* variants */
     EmStyle style;
     EmTone  tone;
+
+    /* Sizes and spacings below use 0 to mean "unset -- take the theme's
+     * value", which is what makes designated initialisers pleasant to write
+     * and leaves no way at all to ask for ZERO. Pass EmZero when zero is what
+     * you mean.
+     *
+     * It is not a hypothetical gap: a browser sets its link words with no
+     * horizontal padding, because the word already carries the space that
+     * followed it in the source. Asking for .px(0) silently got the theme's
+     * 16px instead and every linked headline came out visibly gappy -- which
+     * looked like a text-metrics bug and was an API that could only override
+     * upwards. */
+
+    /* RECONCILIATION KEY. Optional, and only matters for a container whose
+     * PRESENCE varies -- a bar that appears when you open it, a row that shows
+     * up when there are two of something.
+     *
+     * Instances are otherwise matched to last frame's by POSITION, which is
+     * right until a row is inserted: then every sibling after it adopts its
+     * neighbour's retained instance, and since a reused instance keeps the
+     * size nobody restated, the whole panel comes back wearing the wrong
+     * geometry. (This is exactly what a browser's find bar and tab strip did:
+     * one appeared and the rows below it were laid out as each other.)
+     *
+     * A key makes the match by identity instead. Give one to every child of a
+     * container that some sibling can be inserted into -- the STABLE rows as
+     * much as the optional one, since it is the stable rows that get displaced.
+     *
+     * ADDED AT THE END on purpose: EmProps is passed by value across
+     * libembk.so, and a field inserted in the middle silently reinterprets
+     * every positional initializer that already exists. */
+    const char *key;
 } EmProps;
 
 /* ------------------------------------------------------------------------- */
@@ -131,6 +180,41 @@ const EmTokens *em_tokens_(void);
 #define Section(title, ...) EM_SCOPE_(em_section_((title), (EmProps){__VA_ARGS__}), em_end_())
 #define ScrollView(bind, height, ...) EM_SCOPE_(em_scroll_((bind), (height), (EmProps){__VA_ARGS__}), em_scroll_end_())
 
+/* Flow: a horizontal stack whose children WRAP onto new lines when they overflow
+ * the width (real flex-wrap in the layout engine -- e.g. chips, tag lists). */
+void em_flow_(EmProps p);
+#define Flow(...) EM_SCOPE_(em_flow_((EmProps){__VA_ARGS__}), em_end_())
+
+/* Dock: a drag-to-REORDER + drag-out-to-REMOVE row of chips (EmUI drag-and-drop).
+ * `ids` = the display order (length *n); render(id) draws one chip's content.
+ * Drag a chip to reorder; pull it below the row and release to remove it. */
+void em_dock(int *ids, int *n, void (*render)(int id), EmProps p);
+int  em_dock_dragging(void);   /* id currently being dragged, or -1 */
+#define Dock(ids, n, render, ...) em_dock((ids), (n), (render), (EmProps){__VA_ARGS__})
+
+/* Grid: a true 2D grid -- `cols` equal columns, children auto-flow with an
+ * optional per-child .span. Fills the parent width; row heights auto-size to
+ * content. Gaps come from .spacing.   Grid(3, .spacing=12){ Card(.span=2){} ...} */
+void em_grid_(int cols, EmProps p);
+#define Grid(cols, ...) EM_SCOPE_(em_grid_((cols), (EmProps){__VA_ARGS__}), em_end_())
+
+/* Gradient borders (render-engine feature): stroke a container's border with a
+ * linear gradient. em_lgrad/em_lgrad3 build the paint; GradientBorder wraps
+ * content in a box whose border is that gradient.
+ *   GradientBorder(2.0f, em_lgrad(t->accent, pink, 45), .corner=16, .padding=16){...} */
+struct paint em_lgrad(Color a, Color b, float angle_deg);
+struct paint em_lgrad3(Color a, Color b, Color c, float angle_deg);
+void em_gborder_(float width, struct paint g, EmProps p);
+void em_gborder_end_(void);
+#define GradientBorder(width, grad, ...) \
+    EM_SCOPE_(em_gborder_((width), (grad), (EmProps){__VA_ARGS__}), em_gborder_end_())
+
+/* Gradient-filled text / icon (e.g. a gradient heading). */
+void em_gtext(const char *s, struct paint g, EmProps p);
+void em_gicon(int cp, struct paint g, EmProps p);
+#define GradientText(s, grad, ...)  em_gtext((s), (grad), (EmProps){__VA_ARGS__})
+#define GradientIcon(cp, grad, ...) em_gicon((cp), (grad), (EmProps){__VA_ARGS__})
+
 void em_vstack_(EmProps p);
 void em_hstack_(EmProps p);
 void em_zstack_(EmProps p);
@@ -175,6 +259,10 @@ struct EmV {
     EmV  (*id)(const char *);
     bool (*clicked)(void);
     bool (*focused)(void);
+    /* Return pressed in a TextField. Appended, so every existing chain is
+     * unchanged. A field without it is a field you can only leave by clicking
+     * something else, which is why the browser had an "Open" button. */
+    bool (*submitted)(void);
 };
 
 #define Text(...)        em_text(__VA_ARGS__)
@@ -192,9 +280,16 @@ struct EmV {
 #define Slider(...)      em_slider(__VA_ARGS__)
 #define Stepper(...)     em_stepper(__VA_ARGS__)
 #define TextField(...)   em_text_field(__VA_ARGS__)
+/* Emphasise a span of the next TextField's value while it is not being edited.
+ * See ui_text_field_emphasis. */
+void em_field_emphasis(unsigned start, unsigned len);
+#define PasswordField(...) em_password_field(__VA_ARGS__)
 #define Segmented(...)   em_segmented(__VA_ARGS__)
 #define Spacer()         em_spacer_()
-#define Divider()        em_divider_()
+/* Divider() as before; Divider("key") when it sits among rows that come and
+ * go -- see EmProps.key. The concatenation makes the no-argument form pass an
+ * empty key, so every existing call is unchanged. */
+#define Divider(...)     em_divider_k_("" __VA_ARGS__)
 
 EmV em_text(const char *s);
 EmV em_icon(int codepoint);
@@ -211,9 +306,12 @@ EmV em_checkbox(const char *label, bool *bind);
 EmV em_slider(float *bind);
 EmV em_stepper(const char *label, int *bind, int lo, int hi);
 EmV em_text_field(char *buf, size_t cap, const char *placeholder);
+EmV em_password_field(char *buf, size_t cap, const char *placeholder);
 EmV em_segmented(const char *const *labels, int count, int *bind);
 void em_spacer_(void);
 void em_divider_(void);
+void em_divider_k_(const char *key);
+uint64_t em_key_hash(const char *key);
 
 /* --- richer components --- */
 /* Chart: a mini bar chart (values scaled to the max; last bar emphasised). */
@@ -262,9 +360,26 @@ void em_window_(const char *title, EmProps p);
 void em_window_end_(void);
 void em_windowbar_(const char *title, EmProps p);
 void em_windowbar_end_(void);
+/* AppBar -- the standard chrome for an OS application window. One definition
+ * so Files, Settings and the Terminal are visibly the same product: traffic
+ * lights leading (close, then minimize, Mac order), the title centred in the
+ * space between, and whatever the app puts in the scope trailing. The whole
+ * bar is a drag zone except where a control sits.
+ *
+ *     Window("Files") {
+ *         AppBar("Files") { SearchField(q, sizeof q, "Search"); }
+ *         Split(220) { Sidebar() {...} Content() {...} }
+ *     }                                                                      */
+#define AppBar(title, ...)  EM_SCOPE_(em_appbar_((title), (EmProps){__VA_ARGS__}), em_appbar_end_())
+void em_appbar_(const char *title, EmProps p);
+void em_appbar_end_(void);
+
 #define CloseButton(...)  em_close_button()
 EmV  em_close_button(void);            /* modern single round close control; chainable (.clicked()) */
 int  em_window_closed(void);           /* 1 if the built-in CloseButton fired this frame */
+#define MinimizeButton(...) em_min_button()
+EmV  em_min_button(void);              /* park the window; the dock icon brings it back */
+int  em_window_minimized(void);        /* 1 if the built-in MinimizeButton fired this frame */
 /* CloseGrip: EmbLink's own close GESTURE (not a fixed button). Put it in the
  * WindowBar; the user PULLS it -- the window fades + slides toward the drag and
  * closes once pulled past the threshold (springs back if released early), the
@@ -276,6 +391,14 @@ int  em_window_take_close(void);       /* 1 the frame the close gesture committe
 int  em_window_pulling(void);          /* 1 while a close pull is animating (fade/slide) */
 void em_window_set_mover(void (*mover)(int win, int32_t x, int32_t y));
 void em_window_bind(int win, int32_t x, int32_t y);
+void em_window_move_to(int32_t x, int32_t y);   /* snap/pin the bound window */
+void em_window_pos(int32_t *x, int32_t *y);     /* current bound-window top-left */
+int  em_window_moved(void);                     /* read-and-clear: window moved since last poll */
+
+/* DragHandle: a placeable strip that drags the bound window (menu-bar move). */
+void em_drag_handle_(EmProps p);
+void em_drag_handle_end_(void);
+#define DragHandle(...) EM_SCOPE_(em_drag_handle_((EmProps){__VA_ARGS__}), em_drag_handle_end_())
 
 /* Resizable windows (V5): the runtime enables the grip; Window() then draws a
  * corner handle whose drag, ON RELEASE, records a size delta the runtime
@@ -302,6 +425,35 @@ EmV  em_spinner(void);
 #define Spinner(...)  em_spinner()
 void em_gauge(float frac, const char *center, EmProps p);
 #define Gauge(frac, center, ...)  em_gauge((frac), (center), (EmProps){__VA_ARGS__})
+
+/* ColorPicker: an HSV square + rainbow hue bar, both draggable, with a live
+ * swatch + hex readout. Binds to float hsv[3] = { hue, saturation, value },
+ * all in 0..1. `em_hsv` converts an HSV triple to a Color for use elsewhere. */
+Color em_hsv(float h, float s, float v);
+void  em_colorpicker(float *hsv, EmProps p);
+#define ColorPicker(hsv, ...)  em_colorpicker((hsv), (EmProps){__VA_ARGS__})
+
+/* Calendar / DatePicker: an inline month grid. Binds to int date[3] =
+ * { year, month(1..12), day(1..31) }; tap a day to select, ‹ / › page months. */
+void em_calendar(int *date, EmProps p);
+#define Calendar(date, ...)    em_calendar((date), (EmProps){__VA_ARGS__})
+#define DatePicker(date, ...)  em_calendar((date), (EmProps){__VA_ARGS__})
+
+/* Combobox: an editable field whose menu shows only the options containing the
+ * typed text (case-insensitive); picking one fills the buffer. `open` is
+ * app-owned (like Disclosure); the chevron toggles it. */
+void em_combobox(char *buf, size_t cap, const char *const *labels, int count,
+                 const char *placeholder, bool *open, EmProps p);
+#define Combobox(buf, cap, labels, count, ph, open, ...) \
+    em_combobox((buf), (cap), (labels), (count), (ph), (open), (EmProps){__VA_ARGS__})
+
+/* TagInput: removable chips + an entry field. `tags` is char[max][EM_TAG_LEN];
+ * *count is the live count; `entry` holds the in-progress tag. */
+#define EM_TAG_LEN 24
+void em_taginput(char (*tags)[EM_TAG_LEN], int *count, int max,
+                 char *entry, size_t ecap, EmProps p);
+#define TagInput(tags, count, max, entry, ecap, ...) \
+    em_taginput((tags), (count), (max), (entry), (ecap), (EmProps){__VA_ARGS__})
 EmV  em_search_field(char *buf, size_t cap, const char *placeholder);
 #define SearchField(buf, cap, ph)  em_search_field((buf), (cap), (ph))
 
@@ -371,6 +523,7 @@ void em_menubar_end_(void);
 #define Menu(label, ...)  EM_SCOPE_(em_menu_((label), (EmProps){__VA_ARGS__}), em_menu_end_())
 void em_menu_(const char *label, EmProps p);
 void em_menu_end_(void);
+int  em_menu_any_open(void);   /* is any MenuBar dropdown open? (app runtime grows the window) */
 
 /* MenuItem: one row; returns true the frame it's clicked (which also closes the
  * open menu). MenuItemK adds a right-aligned shortcut hint ("Ctrl+S"). */
@@ -412,6 +565,23 @@ void em_feed_right_button(float x, float y, bool down);
  *   static int   cur = 0;
  *   TextEditor(doc, sizeof doc, &cur, 240);
  */
+/* SYNTAX COLOURING, and the line-number gutter that goes with it.
+ *
+ * The editor draws a line at a time, so colouring one is a matter of drawing it
+ * as several runs instead of one. What the runs MEAN is not the toolkit's
+ * business: it hands out a line and takes back a list of coloured spans, and
+ * the app supplies the language. That is the same split as everywhere else here
+ * -- the kit knows how to draw, the caller knows what it is drawing.
+ *
+ * Both settings are ONE-SHOT, consumed by the next editor, like the field
+ * emphasis in ui_text_field_emphasis. */
+struct em_span { int len; Color color; };
+/* Fill `out` with spans covering exactly the `n` bytes of `line`; return how
+ * many were written. Returning 0 draws the line in the ordinary text colour. */
+typedef int (*EmSyntaxFn)(const char *line, int n, struct em_span *out, int max, void *ud);
+void em_editor_syntax(EmSyntaxFn fn, void *ud);
+void em_editor_gutter(int on);
+
 bool em_text_editor(char *buf, size_t cap, int *cursor, float height);
 #define TextEditor(buf, cap, cursor, height) em_text_editor((buf), (cap), (cursor), (height))
 
@@ -419,6 +589,17 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height);
  * (dropdown/menu open/close, toast raise/expiry, disclosure toggle, tab switch).
  * An app's loop compares it across frames and forces a full repaint on change. */
 int em_ui_epoch(void);
+
+/* An APP restructuring its OWN view must say so, for exactly the same reason
+ * the built-in components do. Adding or removing a row changes where every
+ * later row sits, and the runtime's partial repaint only knows about the boxes
+ * it was told changed -- so the frame lands with the new layout drawn over the
+ * old pixels. A browser inserting a "loading" strip showed this perfectly: the
+ * app bar vanished and the previous page appeared 56px out of place.
+ *
+ * Call this on the EDGE, when the shape changes, not every frame -- a
+ * permanent bump means a permanent full repaint. */
+void em_structure_changed(void);
 
 /* ======================================================================= */
 /* EmApplication -- the declarative app runtime (V4.1).                     */
@@ -441,8 +622,11 @@ typedef enum { ChromeKernel = 0, Chromeless } EmChrome;
 typedef enum { FixedSize = 0, Resizable } EmResize;
 /* Window material. Acrylic = a frosted GLASS window: the compositor blurs the
  * desktop behind it and composites the window's translucent pixels over it, so
- * the title bar and gaps show the wallpaper frosted (implies Chromeless). */
-typedef enum { MaterialSolid = 0, Acrylic } EmMaterial;
+ * the title bar and gaps show the wallpaper frosted (implies Chromeless).
+ * Translucent = per-pixel transparent, NO blur: the window's empty pixels reveal
+ * the SHARP desktop, so a thin bar can carry a tall invisible canvas whose only
+ * painted pixels are the bar strip and its open dropdowns (implies Chromeless). */
+typedef enum { MaterialSolid = 0, Acrylic, Translucent } EmMaterial;
 
 typedef struct {
     const char *title;
@@ -452,10 +636,33 @@ typedef struct {
     EmResize    resize;          /* Resizable -> Window() shows a corner grip;
                                   * dragging it resizes the OS window (V5) */
     EmMaterial  material;        /* Acrylic -> frosted glass window (V8) */
+    int         fullscreen;      /* occupy the current display, without a frame */
     void      (*view)(void);     /* the whole UI, rebuilt only when needed */
     const char *font;            /* resource path; default "/system/fonts/font.ttf" */
     int         pace_ms;         /* loop pace while active; default 10 */
+    int         refresh_ms;      /* rebuild the view this often even with no
+                                  * input -- for a view showing something the
+                                  * WORLD changes (a clock, the wallpaper's
+                                  * brightness). 0 = input/animation only, the
+                                  * default and right answer for most apps.
+                                  * Same meaning as EmWidget's field. */
 } EmApp;
+
+void  em_set_viewport(float w, float h);   /* the app runtime feeds this */
+/* Feed one frame of pointer state to the toolkit (pointer + right button +
+ * wheel). Any loop that is not em_app_run MUST call this -- see em.c. */
+/* Press edges since this was last asked, and WHEN the most recent one
+ * happened -- measured at the press, not at the frame that noticed it. An
+ * app deciding whether two clicks are a double click must compare the
+ * CLICKS; comparing frames measures how slow the machine is, which on an
+ * emulator is longer than the whole double-click window. */
+int   em_take_clicks(uint64_t *when_ms);
+
+void  em_feed_pointer(float x, float y, int left_down, int right_down,
+                      int wheel, int focused);
+void  em_window_blur_rect(int x, int y, int w, int h);  /* frost behind a sub-rect */
+float em_viewport_width(void);
+float em_viewport_height(void);
 
 /* ---- terminal-shaped runtime hooks (V8) --------------------------------- *
  * For apps whose real input/output is a byte stream (the Terminal hosting
@@ -468,6 +675,19 @@ typedef struct {
  * Both are target-runtime features (em_app.c); NULL = off (the default). */
 void em_set_key_hook(int (*fn)(int ch));
 void em_set_idle_hook(void (*fn)(void));
+/* Runs after LAYOUT and before the frame is rendered -- the only moment at
+ * which every node's resolved position is known and the pixels have not been
+ * produced yet. That is exactly what a text SELECTION needs: where the words
+ * ended up, in time to mark the selected ones. NULL = off. */
+void em_set_post_layout_hook(void (*fn)(void));
+
+/* PAGE ZOOM. A bracket the caller opens around the content it emits, not a
+ * global setting -- so a browser can scale the document and leave its own
+ * chrome alone, which is the difference between page zoom and UI zoom. 1.0 is
+ * off; set it back when the content ends. */
+float em_len(float v, float dflt);
+void  em_set_text_scale(float s);
+float em_text_scale(void);
 
 /* ---- desktop widgets (V5) ----------------------------------------------- *
  * A widget is a small always-on-desktop window: chromeless, z-banded ABOVE
@@ -499,6 +719,17 @@ int em_widget_run(const EmWidget *wg);
 /* Runs the app until its CloseButton/ESC quits. Defined in em_app.c, which is
  * only linked on-target (it speaks the EmbLink SDK); host tests never call it. */
 int em_app_run(const EmApp *app);
+/* Ask the EM_APPLICATION runtime to close cleanly after the current UI pass.
+ * Unlike calling exit() from a view callback, this destroys the compositor
+ * window first, so the next screen never inherits stale pixels. */
+void em_app_request_exit(int code);
+
+/* Tick the view every `ms` regardless of input; -1 restores the app's own
+ * refresh_ms. For work the app is WAITING on rather than driving -- a fetch in
+ * flight, a job it is polling. em_request_frame() cannot express this: it is
+ * set from inside the view, so the first frame that does not ask stops the
+ * view running at all, and nothing can ask again. */
+void em_app_set_refresh(int ms);
 
 #define EM_APPLICATION     static EmApp em_app_spec_;     int main(void) { return em_app_run(&em_app_spec_); }     static EmApp em_app_spec_ =
 
@@ -521,9 +752,35 @@ int  em_take_frame_request(void);   /* runtime-internal: read-and-clear */
  * palette (Auto currently = Dark). */
 void em_res_set_loader(uint8_t *(*load)(const char *path, size_t *out_len));
 uint32_t em_font(const char *path);
+
+/* The pixel width of `s` in the app's regular face at `size_px`, measured the
+ * way the renderer draws it -- by codepoint, not by byte, which for anything
+ * non-ASCII is a different and much larger number.
+ *
+ * For a caller that has to map pixels back to characters: an editor turning a
+ * click into a caret position cannot do it without knowing how wide the text
+ * is, and nothing else in the toolkit will tell it. */
+float em_text_width(const char *s, float size_px);
 const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h);
+/* Icon resolved at the size it will be DRAWN: a .eic container (docs/ICONS.md)
+ * carries the icon at several resolutions and this returns the level that fits
+ * want_px, so the blit is 1:1 rather than a resample of one oversized master.
+ * Non-.eic paths fall through to em_image, so .ppm/.pam art still works. */
+const uint32_t *em_image_at(const char *path, uint32_t want_px,
+                            uint32_t *out_w, uint32_t *out_h);
 void em_image_view(const char *path, EmProps p);
 #define Image(path, ...)  em_image_view((path), (EmProps){__VA_ARGS__})
+bool em_image_button(const char *path, float size);
+#define ImageButton(path, size) em_image_button((path), (size))
+/* Icon button drawn from real art but COLOURED BY THE THEME (the image is used
+ * as a stencil), so it sits beside glyph controls and follows theme changes. */
+bool em_image_button_tinted(const char *path, float size, Color tint);
+#define ImageButtonTinted(path, size, tint) em_image_button_tinted((path), (size), (tint))
+bool em_image_button_key(const char *path, float size, uint64_t key);
+#define ImageButtonKey(path, size, key) \
+    em_image_button_key((path), (size), (uint64_t)(uintptr_t)(key))
+void em_background_image(const char *path);
+#define BackgroundImage(path) em_background_image(path)
 void em_theme_use(EmTheme t);
 
 /* frame + interaction plumbing */
@@ -593,12 +850,17 @@ void em_dialog_end_(void);
 #define IconPlus      0x002B
 #define IconMinus     0x2212   /* minus sign */
 #define IconGear      0x2699   /* gear */
-#define IconBell      0x1F514  /* bell (may fall back) */
+/* Every codepoint below is present in DejaVuSans, which is the font the OS
+ * ships -- CHECKED against its cmap, not assumed. The ones that used to live in
+ * the emoji planes (a bell, a clock, a magnifier, a folder) are not in that
+ * font and never were: each one drew a tofu box, in every app that asked for
+ * it. An icon set whose glyphs the renderer cannot draw is not an icon set. */
+#define IconBell      0x266B   /* beamed notes -- stands in for an alert */
 #define IconInfo      0x2139   /* information source */
 #define IconWarn      0x26A0   /* warning sign */
 #define IconBolt      0x26A1   /* high voltage */
-#define IconSearch    0x1F50D
-#define IconUser      0x1F464
+#define IconSearch    0x26B2  /* the magnifier DejaVu has */
+#define IconUser      0x263A  /* a face, rather than a bust */
 #define IconDot       0x2022   /* bullet */
 #define IconArrowR    0x2192
 #define IconChevronD  0x2304   /* down arrowhead (Dropdown/Disclosure) */
@@ -609,10 +871,11 @@ void em_dialog_end_(void);
 #define IconGrid      0x25A6   /* squared grid (dashboard tab) */
 #define IconList      0x2630   /* trigram / list (list tab) */
 #define IconHome      0x2302   /* house */
-#define IconClock     0x1F550
-#define IconFolder    0x1F4C1
-#define IconDoc       0x1F4C4
-#define IconTrash     0x1F5D1
+#define IconClock     0x21BA  /* anticlockwise arrow = back in time */
+#define IconFolder    0x229E  /* squared plus -- a container */
+#define IconDoc       0x25AD  /* a sheet */
+#define IconTrash     0x2327  /* X in a rectangle = delete */
 #define IconCloud     0x2601
+#define IconReload    0x27F3   /* clockwise open circle arrow */
 
 #endif /* __EMBLINK_EM_UI_H__ */

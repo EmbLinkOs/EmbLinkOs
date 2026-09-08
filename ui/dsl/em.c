@@ -23,6 +23,26 @@
 static struct paint solid(Color c) {
     struct paint p; p.kind = PAINT_SOLID; p.solid = c; p.n_stops = 0; return p;
 }
+
+/* 2- and 3-stop linear gradients (angle in degrees). Usable as a fill or, via
+ * GradientBorder, as a border stroke. */
+struct paint em_lgrad(Color a, Color b, float angle_deg) {
+    struct paint p = {0};
+    p.kind = PAINT_LINEAR_GRADIENT; p.solid = a;
+    p.stops[0].offset = 0.0f; p.stops[0].color = a;
+    p.stops[1].offset = 1.0f; p.stops[1].color = b;
+    p.n_stops = 2; p.angle_deg = angle_deg;
+    return p;
+}
+struct paint em_lgrad3(Color a, Color b, Color c, float angle_deg) {
+    struct paint p = {0};
+    p.kind = PAINT_LINEAR_GRADIENT; p.solid = a;
+    p.stops[0].offset = 0.0f; p.stops[0].color = a;
+    p.stops[1].offset = 0.5f; p.stops[1].color = b;
+    p.stops[2].offset = 1.0f; p.stops[2].color = c;
+    p.n_stops = 3; p.angle_deg = angle_deg;
+    return p;
+}
 static Color shade(Color c, float k) {
     Color o = { c.r * k, c.g * k, c.b * k, c.a };
     if (o.r > 1) o.r = 1;
@@ -32,9 +52,9 @@ static Color shade(Color c, float k) {
 }
 static Color tint(Color c, float a) { Color o = c; o.a = a; return o; }
 
-static struct layout_size sz_fixed(float v)  { return (struct layout_size){ SIZE_FIXED, v, 0, 0, 0 }; }
-static struct layout_size sz_grow(void)      { return (struct layout_size){ SIZE_FLEX, 0, 1, 0, 0 }; }
-static struct layout_size sz_intrinsic(void) { return (struct layout_size){ SIZE_INTRINSIC, 0, 0, 0, 0 }; }
+static struct layout_size sz_fixed(float v)  { return (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = v }; }
+static struct layout_size sz_grow(void)      { return (struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 }; }
+static struct layout_size sz_intrinsic(void) { return (struct layout_size){ .mode = SIZE_INTRINSIC }; }
 
 static void utf8_enc(int cp, char *out) {
     unsigned c = (unsigned)cp;
@@ -44,15 +64,35 @@ static void utf8_enc(int cp, char *out) {
     else { out[0] = 0xF0 | (c >> 18); out[1] = 0x80 | ((c >> 12) & 0x3F); out[2] = 0x80 | ((c >> 6) & 0x3F); out[3] = 0x80 | (c & 0x3F); out[4] = 0; }
 }
 
+/* PAGE ZOOM, not UI zoom.
+ *
+ * The toolkit's theme scale moves everything, chrome included -- which is what
+ * you want when the whole desktop is too small, and NOT what a browser means
+ * by zoom. A browser scales the DOCUMENT and leaves its own address bar alone.
+ *
+ * So the scale is a bracket the caller opens around the content it is
+ * emitting, rather than a global setting: the browser turns it on before
+ * rendering the page and off afterwards, and the chrome emitted outside those
+ * brackets never sees it. */
+static float g_text_scale = 1.0f;
+void em_set_text_scale(float s) { g_text_scale = (s > 0.05f && s < 20.0f) ? s : 1.0f; }
+float em_text_scale(void) { return g_text_scale; }
+
+/* Resolve a length prop: 0 means "unset, use the default", EmZero means an
+ * explicit zero. See EmProps. */
+float em_len(float v, float dflt) { return v < 0.0f ? 0.0f : (v > 0.0f ? v : dflt); }
+
 static void em_resolve_font(EmFont role, uint32_t *fh, float *sz) {
     const struct ui_theme *t = TH;
     switch (role) {
         case Title:    *fh = t->font_bold;    *sz = t->text_title;   break;
+        case Subtitle: *fh = t->font_regular; *sz = t->text_title;   break;
         case Heading:  *fh = t->font_bold;    *sz = t->text_heading; break;
         case Caption:  *fh = t->font_regular; *sz = t->text_caption; break;
         case BodyBold: *fh = t->font_bold;    *sz = t->text_body;    break;
         default:       *fh = t->font_regular; *sz = t->text_body;    break;
     }
+    *sz *= g_text_scale;
 }
 static enum layout_align  map_align(EmAlign a) {
     switch (a) { case Leading: return ALIGN_START; case Center: return ALIGN_CENTER;
@@ -60,7 +100,10 @@ static enum layout_align  map_align(EmAlign a) {
 }
 static enum layout_justify map_justify(EmAlign a) {
     switch (a) { case Leading: return JUSTIFY_START; case Center: return JUSTIFY_CENTER;
-                 case Trailing: return JUSTIFY_END; case SpaceBetween: return JUSTIFY_SPACE_BETWEEN; default: return JUSTIFY_START; }
+                 case Trailing: return JUSTIFY_END; case SpaceBetween: return JUSTIFY_SPACE_BETWEEN;
+                 case SpaceAround: return JUSTIFY_SPACE_AROUND;
+                 case SpaceEvenly: return JUSTIFY_SPACE_EVENLY;
+                 default: return JUSTIFY_START; }
 }
 
 /* True when the active theme is dark (glass tint/edge differ by ground). */
@@ -90,17 +133,27 @@ static void em_glass_apply(float blur) {
     ui_set_border(1.0f, edge);
 }
 
+/* EmZero (-1) means "explicitly zero", and every test below used to be `> 0`,
+ * which threw it away with the unset values -- so a caller asking for no
+ * padding got the default padding, which is the opposite of what it asked for.
+ * That is the entire reason EmZero exists (see em.h) and it was honoured
+ * nowhere. */
+static float em_z(float v) { return v == EmZero ? 0.0f : v; }
+static int   em_set(float v) { return v > 0 || v == EmZero; }
+
 static void em_apply_box(EmProps p) {
-    if (p.spacing > 0) ui_set_spacing(p.spacing);
-    int any_pad = (p.padding > 0 || p.px > 0 || p.py > 0 || p.pt > 0 || p.pr > 0 || p.pb > 0 || p.pl > 0);
+    if (em_set(p.spacing)) ui_set_spacing(em_z(p.spacing));
+    int any_pad = (em_set(p.padding) || em_set(p.px) || em_set(p.py) ||
+                   em_set(p.pt) || em_set(p.pr) || em_set(p.pb) || em_set(p.pl));
     if (any_pad) {
-        float t = p.padding, r = p.padding, b = p.padding, l = p.padding;
-        if (p.px > 0) l = r = p.px;
-        if (p.py > 0) t = b = p.py;
-        if (p.pt > 0) t = p.pt;
-        if (p.pr > 0) r = p.pr;
-        if (p.pb > 0) b = p.pb;
-        if (p.pl > 0) l = p.pl;
+        float base = em_z(p.padding);
+        float t = base, r = base, b = base, l = base;
+        if (em_set(p.px)) l = r = em_z(p.px);
+        if (em_set(p.py)) t = b = em_z(p.py);
+        if (em_set(p.pt)) t = em_z(p.pt);
+        if (em_set(p.pr)) r = em_z(p.pr);
+        if (em_set(p.pb)) b = em_z(p.pb);
+        if (em_set(p.pl)) l = em_z(p.pl);
         ui_set_padding(t, r, b, l);
     }
     if (p.width > 0 || p.height > 0 || p.grow) {
@@ -108,7 +161,24 @@ static void em_apply_box(EmProps p) {
         struct layout_size h = p.height > 0 ? sz_fixed(p.height) : sz_intrinsic();
         ui_set_size(w, h);
     }
-    if (p.background.a > 0) ui_set_paint(solid(p.background));
+    if (p.minw > 0 || p.maxw > 0 || p.minh > 0 || p.maxh > 0)
+        ui_set_size_bounds(p.minw, p.maxw, p.minh, p.maxh);
+    if (p.span > 0) ui_set_grid_span(p.span);   /* grid-cell column span */
+    /* ALWAYS set a paint, even when there is no background.
+     *
+     * This used to be `if (a > 0)`, which meant a container with a transparent
+     * background set NOTHING -- and the reconciler reuses instances, so the box
+     * kept whatever fill it had last frame. Any highlight that toggles was
+     * therefore one-way: press a sidebar row and it lit, press another and BOTH
+     * stayed lit, because the row losing selection never said "no fill". It cost
+     * us the same bug twice (the dock's running dot, then the Settings and Files
+     * sidebars) before it was worth fixing at the source.
+     *
+     * EmProps cannot distinguish "unset" from "transparent" -- both are alpha 0 --
+     * so the fix is that they MEAN THE SAME THING: no fill. Containers that want
+     * a default (Card, Sidebar, Window...) now pass it through p.background
+     * above rather than pre-painting behind this function's back. */
+    ui_set_paint(p.background.a > 0 ? solid(p.background) : (struct paint){ 0 });
     if (p.corner > 0)       ui_set_corner_radius(p.corner);
     if (p.border > 0)       ui_set_border(p.border, p.border_color.a > 0 ? p.border_color : TH->border);
     if (p.shadow > 0) {
@@ -144,14 +214,46 @@ void em_flush(void);
 
 /* ---- containers (flush the pending leaf, then open) -------------------- */
 
-void em_vstack_(EmProps p) { em_flush(); ui_begin_vstack(0); em_apply_box(p); }
-void em_hstack_(EmProps p) { em_flush(); ui_begin_hstack(0); if (!p.align) ui_set_align(ALIGN_CENTER); em_apply_box(p); }
+void em_vstack_(EmProps p) { em_flush(); ui_begin_vstack(em_key_hash(p.key)); em_apply_box(p); }
+void em_hstack_(EmProps p) { em_flush(); ui_begin_hstack(em_key_hash(p.key)); if (!p.align) ui_set_align(ALIGN_CENTER); em_apply_box(p); }
+/* Flow: a horizontal stack whose children wrap onto new lines (flex-wrap). */
+/* Flow FILLS its width, like Grid right below it. A wrap container sized to
+ * its content has nothing to wrap against -- the sum of the children IS its
+ * width, so the overflow that would cause a line break can never happen. It
+ * looked fine for chips and tags, which never overflow; the browser's inline
+ * runs, which exist to overflow, ran off the edge of the page. */
+void em_flow_(EmProps p)   {
+    em_flush(); ui_begin_hstack(0); ui_set_wrap(true);
+    if (!p.align) ui_set_align(ALIGN_START);
+    em_apply_box(p);
+    if (p.width <= 0 && !p.grow) ui_set_size(sz_grow(), sz_intrinsic());
+}
+/* Grid: N equal columns, children auto-flow with optional .span; fills width. */
+void em_grid_(int cols, EmProps p) {
+    em_flush();
+    float gap = p.spacing > 0 ? p.spacing : TH->sp3;
+    ui_begin_vstack(0);
+    em_apply_box(p);
+    ui_set_grid(cols, gap, gap);
+    if (p.width <= 0) ui_set_size(sz_grow(), sz_intrinsic());
+}
 void em_zstack_(EmProps p) { em_flush(); ui_begin_vstack(0); em_apply_box(p); }
 void em_glass_(EmProps p)  { em_flush(); ui_begin_vstack(0); p.glass = 1;
-                             if (p.corner <= 0) p.corner = TH->radius_lg;
+                             if (p.corner == 0) p.corner = TH->radius_lg;
                              em_apply_box(p); }
 void em_row_(EmProps p)    { em_flush(); ui_begin_hstack(0); ui_set_align(ALIGN_CENTER); if (!p.spacing) ui_set_spacing(TH->sp3); em_apply_box(p); }
 void em_end_(void)         { em_flush(); ui_end_stack(); }
+
+/* Container whose border is stroked with a gradient. Box props (bg, corner,
+ * padding, ...) arrive via EmProps; the gradient border is applied last so it
+ * wins over any solid .border. */
+void em_gborder_(float width, struct paint g, EmProps p) {
+    em_flush();
+    ui_begin_vstack(0);
+    em_apply_box(p);
+    ui_set_border_gradient(width, &g);
+}
+void em_gborder_end_(void) { em_flush(); ui_end_stack(); }
 
 /* The page-transition transform (opacity/slide), resolved by em_nav each frame.
  * Applied to the PAGE'S OWN root Screen -- em_nav no longer wraps the page in a
@@ -163,9 +265,10 @@ void em_screen_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_vstack(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->bg));
+    if (p.background.a <= 0) p.background = t->bg;
     ui_set_size(sz_grow(), sz_grow());
     ui_set_padding(t->sp6, t->sp6, t->sp6, t->sp6);
+    if (p.padding < 0) ui_set_padding(0, 0, 0, 0);
     ui_set_spacing(t->sp5);
     em_apply_box(p);
     /* carry the active page transition on the Screen itself (see g_nav_cur_*).
@@ -178,7 +281,7 @@ void em_card_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_box_begin(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface));
+    if (p.background.a <= 0) p.background = t->surface;
     ui_set_corner_radius(p.corner > 0 ? p.corner : t->radius_lg);
     ui_set_border(1.0f, t->border);
     if (p.shadow >= 0) ui_set_shadow(true, t->shadow_md.dx, t->shadow_md.dy, t->shadow_md.blur, t->shadow_md.color);
@@ -213,7 +316,7 @@ void em_navbar_(const char *title, EmProps p) {
     }
     ui_spacer();
 }
-void em_scroll_(float *scroll_y, float viewport_h, EmProps p) { em_flush(); ui_scroll_begin(0, viewport_h, scroll_y); em_apply_box(p); }
+void em_scroll_(float *scroll_y, float viewport_h, EmProps p) { em_flush(); ui_scroll_begin(em_key_hash(p.key), viewport_h, scroll_y); em_apply_box(p); }
 void em_scroll_end_(void) { em_flush(); ui_scroll_end(); }
 
 /* ======================================================================= */
@@ -222,8 +325,8 @@ void em_scroll_end_(void) { em_flush(); ui_scroll_end(); }
 
 typedef enum { PK_NONE, PK_TEXT, PK_ICON, PK_LABEL, PK_BADGE, PK_TAG, PK_AVATAR,
                PK_BANNER, PK_PROGRESS, PK_BUTTON, PK_ICONBTN, PK_TOGGLE, PK_CHECK,
-               PK_SLIDER, PK_STEPPER, PK_FIELD, PK_SEGMENTED, PK_LISTROW,
-               PK_CLOSEBTN, PK_SEARCH, PK_SPINNER, PK_DROPDOWN } PKind;
+               PK_SLIDER, PK_STEPPER, PK_FIELD, PK_PASSWORD, PK_SEGMENTED, PK_LISTROW,
+               PK_CLOSEBTN, PK_MINBTN, PK_SEARCH, PK_SPINNER, PK_DROPDOWN } PKind;
 
 static struct {
     int active; PKind kind; EmProps props; const char *id;
@@ -252,12 +355,18 @@ static void em_checkbox_impl(const char *l, bool *b, EmProps p);
 static void em_slider_impl(float *b, EmProps p);
 static void em_stepper_impl(const char *l, int *b, int lo, int hi, EmProps p);
 static bool em_field_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *hov);
+static bool em_password_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *hov);
 static void em_segmented_impl(const char *const *labels, int count, int *b, EmProps p);
 static bool em_listrow_impl(int cp, const char *title, const char *value, EmProps p, bool *hov);
 static bool em_closebtn_impl(bool *hov);
+static bool em_minbtn_impl(bool *hov);
 static bool em_search_impl(char *buf, size_t cap, const char *ph, bool *hov);
 static void em_spinner_impl(void);
 static bool em_dropdown_impl(const char *const *labels, int count, int *sel, bool *hov);
+
+/* Set when the field emitted by the last flush saw a Return; read by
+ * .submitted() on the chain that produced it. */
+static bool g_field_submit;
 
 void em_flush(void) {
     if (!P.active) return;
@@ -279,10 +388,16 @@ void em_flush(void) {
         case PK_CHECK:    em_checkbox_impl(P.str, (bool *)P.bind, pr); break;
         case PK_SLIDER:   em_slider_impl((float *)P.bind, pr); break;
         case PK_STEPPER:  em_stepper_impl(P.str, (int *)P.bind, P.lo, P.hi, pr); break;
-        case PK_FIELD:    clicked = em_field_impl(P.buf, P.cap, P.str, pr, &hovered); break;  /* clicked == focused */
+        /* clicked == focused for a field. The submit edge is read here, right
+         * after the field is emitted, because reading it clears it -- see
+         * ui_text_field_submitted. */
+        case PK_FIELD:    clicked = em_field_impl(P.buf, P.cap, P.str, pr, &hovered);
+                          g_field_submit = ui_text_field_submitted(); break;
+        case PK_PASSWORD: clicked = em_password_impl(P.buf, P.cap, P.str, pr, &hovered); break;
         case PK_SEGMENTED:em_segmented_impl(P.labels, P.count, (int *)P.bind, pr); break;
         case PK_LISTROW:  clicked = em_listrow_impl(P.cp, P.str, P.str2, pr, &hovered); break;
         case PK_CLOSEBTN: clicked = em_closebtn_impl(&hovered); break;
+        case PK_MINBTN:   clicked = em_minbtn_impl(&hovered); break;
         case PK_SEARCH:   clicked = em_search_impl(P.buf, P.cap, P.str, &hovered); break;
         case PK_SPINNER:  em_spinner_impl(); break;
         case PK_DROPDOWN: clicked = em_dropdown_impl(P.labels, P.count, (int *)P.bind, &hovered); break;
@@ -299,6 +414,7 @@ void em_flush(void) {
  * (the dirty-rect renderer doesn't erase a removed subtree's pixels). */
 static int g_em_epoch;
 int em_ui_epoch(void) { return g_em_epoch; }
+void em_structure_changed(void) { g_em_epoch++; }
 
 /* Retained updates: live animations ask for the NEXT frame while active; the
  * app runtime skips all UI work on frames nobody asked for (see em_app.c). */
@@ -466,6 +582,9 @@ static EmV m_align(EmAlign a){ P.props.align = a; return em_v; }
 static EmV m_id(const char *s){ P.id = s; return em_v; }
 static bool m_clicked(void){ em_flush(); return P.result; }
 static bool m_focused(void){ em_flush(); return P.result; }
+/* Return was pressed in this field. See g_field_submit -- the flag is set by
+ * the flush that emitted the field, so flushing first is what makes it true. */
+static bool m_submitted(void){ em_flush(); return g_field_submit; }
 
 static const EmV em_v = {
     .title=m_title, .heading=m_heading, .body=m_body, .bold=m_bold, .caption=m_caption, .font=m_font,
@@ -475,7 +594,7 @@ static const EmV em_v = {
     .bg=m_bg, .padding=m_padding, .px=m_px, .py=m_py, .frame=m_frame, .width=m_width, .height=m_height, .grow=m_grow,
     .corner=m_corner, .border=m_border, .shadow=m_shadow,
     .center=m_center, .leading=m_leading, .trailing=m_trailing, .align=m_align,
-    .id=m_id, .clicked=m_clicked, .focused=m_focused,
+    .id=m_id, .clicked=m_clicked, .focused=m_focused, .submitted=m_submitted,
 };
 
 /* ---- creators (stage a pending element, return the chain) -------------- */
@@ -496,15 +615,40 @@ EmV em_toggle(const char *l, bool *b){ EmV v = stage(PK_TOGGLE); P.str = l; P.bi
 EmV em_checkbox(const char *l, bool *b){ EmV v = stage(PK_CHECK); P.str = l; P.bind = b; return v; }
 EmV em_slider(float *b){ EmV v = stage(PK_SLIDER); P.bind = b; return v; }
 EmV em_stepper(const char *l, int *b, int lo, int hi){ EmV v = stage(PK_STEPPER); P.str = l; P.bind = b; P.lo = lo; P.hi = hi; return v; }
+void em_field_emphasis(unsigned start, unsigned len){ em_flush(); ui_text_field_emphasis(start, len); }
 EmV em_text_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_FIELD); P.buf = buf; P.cap = cap; P.str = ph; return v; }
+EmV em_password_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_PASSWORD); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_segmented(const char *const *labels, int count, int *b){ EmV v = stage(PK_SEGMENTED); P.labels = labels; P.count = count; P.bind = b; return v; }
 EmV em_listrow(int icon, const char *title, const char *value){ EmV v = stage(PK_LISTROW); P.cp = icon; P.str = title; P.str2 = value; return v; }
 EmV em_close_button(void){ EmV v = stage(PK_CLOSEBTN); P.id = "__em_win_close"; return v; }
+EmV em_min_button(void){ EmV v = stage(PK_MINBTN); P.id = "__em_win_min"; return v; }
 EmV em_search_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_SEARCH); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_spinner(void){ return stage(PK_SPINNER); }
 EmV em_dropdown(const char *const *labels, int count, int *sel){ EmV v = stage(PK_DROPDOWN); P.labels = labels; P.count = count; P.bind = sel; return v; }
 void em_spacer_(void){ em_flush(); ui_spacer(); }
+
+/* A key string to the integer the declare layer matches on. FNV-1a, and never
+ * zero -- zero is how ui_begin_* spells "no key", so a string that hashed to it
+ * would silently go back to positional matching. */
+uint64_t em_key_hash(const char *k) {
+    if (!k || !k[0]) return 0;
+    uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)k; *p; p++) {
+        h ^= *p; h *= 1099511628211ULL;
+    }
+    return h ? h : 1;
+}
 void em_divider_(void){ em_flush(); ui_divider(); }
+void em_divider_k_(const char *key) {
+    if (!key || !key[0]) { em_divider_(); return; }
+    /* A divider is a one-pixel box, so it is the easiest thing in a column for
+     * an inserted row to be mistaken for. Wrapping it in a keyed box is what
+     * stops that. */
+    em_flush();
+    ui_box_begin(em_key_hash(key));
+    ui_divider();
+    ui_box_end();
+}
 
 /* ======================================================================= */
 /* emitters                                                                */
@@ -527,6 +671,7 @@ static void em_text_impl(const char *s, EmProps p) {
         ui_box_end();
     } else {
         ui_set_font(fh); ui_set_text_size(sz); ui_set_text_color(col);
+        if (p.background.a > 0) ui_set_text_bg(p.background);
         ui_text("%s", s);
     }
 }
@@ -534,6 +679,21 @@ static void em_icon_impl(int cp, EmProps p) {
     char g[5]; utf8_enc(cp, g);
     if (!p.font) p.font = Body;
     em_text_impl(g, p);
+}
+/* Gradient text / icon: glyphs filled with a gradient over the run's own box.
+ * One-shot -- ui_set_text_gradient is consumed by the ui_text() that follows. */
+void em_gtext(const char *s, struct paint g, EmProps p) {
+    em_flush();
+    uint32_t fh; float sz; em_resolve_font(p.font, &fh, &sz);
+    Color col = p.color.a > 0 ? p.color : TH->text;
+    ui_set_font(fh); ui_set_text_size(sz); ui_set_text_color(col);
+    ui_set_text_gradient(&g);
+    ui_text("%s", s);
+}
+void em_gicon(int cp, struct paint g, EmProps p) {
+    char buf[5]; utf8_enc(cp, buf);
+    if (!p.font) p.font = Body;
+    em_gtext(buf, g, p);
 }
 static void em_label_impl(int cp, const char *s, EmProps p) {
     ui_begin_hstack(0);
@@ -591,7 +751,11 @@ static void em_progress_impl(float frac, EmProps p) { (void)p; ui_progress(frac)
 
 static bool em_button_impl(const char *s, EmProps p, bool *out_hov) {
     const struct ui_theme *t = TH;
-    ui_box_begin(0);
+    /* An hstack, not a box: justify positions a container's children along the
+     * main axis, and a box does not lay children out that way -- so .leading()
+     * set the prop and the label stayed stubbornly centred. Every file name in
+     * a list column was centred in its column because of this. */
+    ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
     if (out_hov) *out_hov = hov;
@@ -607,16 +771,29 @@ static bool em_button_impl(const char *s, EmProps p, bool *out_hov) {
     if (p.color.a > 0) txt = p.color;
     if (has_fill) { Color f = pressed ? shade(fill, 0.86f) : hov ? shade(fill, 1.10f) : fill; ui_set_paint(solid(f)); }
     else if (hov) ui_set_paint(solid(shade(t->accent_soft, pressed ? 0.9f : 1.0f)));
+    else          ui_set_paint(solid((Color){0, 0, 0, 0}));   /* reset: a ghost button un-hovers cleanly */
     ui_set_corner_radius(p.corner > 0 ? p.corner : t->radius_md);
     if (has_border || p.border > 0) ui_set_border(p.border > 0 ? p.border : 1.0f, hov ? t->accent : bcol);
-    ui_set_padding(t->sp2 + 1, t->sp4, t->sp2 + 1, t->sp4);
-    ui_set_align(ALIGN_CENTER);
-    ui_set_justify(JUSTIFY_CENTER);
+    /* Padding is overridable. A button's default is sized for a control you
+     * aim at, which is right for a dialog and wrong for a dense list row --
+     * and since the button's padding IS the row's height, a caller that could
+     * not change it could not make a compact list at all, however tight the
+     * container asked to be. */
+    { float pv = em_len(p.py, p.padding > 0 ? p.padding : (float)(t->sp2 + 1));
+      float ph = em_len(p.px, p.padding > 0 ? p.padding : (float)t->sp4);
+      ui_set_padding(pv, ph, pv, ph); }
+    /* And so is alignment. .leading() sets the ALIGN prop, but a button's
+     * label sits on the MAIN axis, which justify controls -- so a caller
+     * asking for a left-aligned label got a centred one and no way to say
+     * otherwise. A label in a list column must start where the column does. */
+    ui_set_align(p.align ? map_align(p.align) : ALIGN_CENTER);
+    ui_set_justify(p.justify ? map_justify(p.justify)
+                             : p.align ? map_justify(p.align) : JUSTIFY_CENTER);
     if (p.grow || p.width > 0) { struct layout_size w = p.width > 0 ? sz_fixed(p.width) : sz_grow(); ui_set_size(w, sz_intrinsic()); }
     uint32_t fh; float sz; em_resolve_font(p.font ? p.font : BodyBold, &fh, &sz);
     ui_set_font(fh); ui_set_text_size(sz); ui_set_text_color(txt);
     ui_text("%s", s);
-    ui_box_end();
+    ui_end_stack();
     return ui_consume_click(self);
 }
 static bool em_iconbtn_impl(int cp, EmProps p, bool *out_hov) {
@@ -631,6 +808,9 @@ static bool em_iconbtn_impl(int cp, EmProps p, bool *out_hov) {
     ui_set_padding(t->sp2, t->sp2, t->sp2, t->sp2);
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
+    if (p.width > 0 || p.height > 0)
+        ui_set_size(p.width > 0 ? sz_fixed(p.width) : sz_intrinsic(),
+                    p.height > 0 ? sz_fixed(p.height) : sz_intrinsic());
     EmProps ip = { .font = p.font ? p.font : Body, .color = p.color.a > 0 ? p.color : t->text_secondary };
     em_icon_impl(cp, ip);
     ui_end_stack();
@@ -648,7 +828,13 @@ static void em_checkbox_impl(const char *label, bool *bind, EmProps p) {
     ui_begin_hstack(0); ui_set_align(ALIGN_CENTER); ui_set_spacing(TH->sp3);
     em_apply_box(p);
     if (ui_checkbox(bind ? *bind : false) && bind) *bind = !*bind;
-    if (label && label[0]) { EmProps tp = { .font = Body }; em_text_impl(label, tp); }
+    /* The label takes the caller's colour when it gave one. Without this a
+     * checkbox inside a rendered document kept the DESKTOP's text colour and
+     * its label vanished into the page's white canvas. */
+    if (label && label[0]) {
+        EmProps tp = { .font = Body, .color = p.color };
+        em_text_impl(label, tp);
+    }
     ui_spacer();
     ui_end_stack();
 }
@@ -676,6 +862,10 @@ static void em_stepper_impl(const char *label, int *bind, int lo, int hi, EmProp
 static bool em_field_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
     (void)p; if (out_hov) *out_hov = false;
     return ui_text_field(buf, cap, ph);
+}
+static bool em_password_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
+    (void)p; if (out_hov) *out_hov = false;
+    return ui_password_field(buf, cap, ph);
 }
 static void em_segmented_impl(const char *const *labels, int count, int *bind, EmProps p) {
     (void)p; int cur = bind ? *bind : 0; int nv = ui_segmented(labels, count, cur); if (bind) *bind = nv;
@@ -776,7 +966,7 @@ void em_list_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_vstack(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface_alt));
+    if (p.background.a <= 0) p.background = t->surface_alt;
     ui_set_corner_radius(p.corner > 0 ? p.corner : t->radius_md);
     ui_set_border(1.0f, t->border);
     ui_set_clip_children(true);
@@ -820,11 +1010,22 @@ static int      g_win_id;
 static int32_t  g_win_x, g_win_y;      /* window's current screen top-left */
 static int      g_win_dragging;
 static float    g_win_grab_x, g_win_grab_y;   /* pointer-at-grab, content-local */
+static int      g_win_moved;                  /* set whenever the window moved -> force a full repaint */
 
 void em_window_set_mover(void (*mover)(int win, int32_t x, int32_t y)) { g_win_mover = mover; }
 void em_window_bind(int win, int32_t x, int32_t y) {
     g_win_id = win; g_win_x = x; g_win_y = y; g_win_bound = 1;
 }
+/* Read-and-clear: did the bound window move since the last poll? The app runtime
+ * force-repaints on a move so a drag/snap can't leave dirty-rect ghost trails. */
+int em_window_moved(void) { int m = g_win_moved; g_win_moved = 0; return m; }
+/* Programmatically move the bound window (e.g. a pin/snap-to-anchor control). */
+void em_window_move_to(int32_t x, int32_t y) {
+    if (!g_win_bound || !g_win_mover || (x == g_win_x && y == g_win_y)) return;
+    g_win_mover(g_win_id, x, y);
+    g_win_x = x; g_win_y = y; g_win_moved = 1;
+}
+void em_window_pos(int32_t *x, int32_t *y) { if (x) *x = g_win_x; if (y) *y = g_win_y; }
 
 /* resizable-window plumbing (V5): the grip accumulates a drag delta and, on
  * RELEASE, parks it here for the runtime to apply (live re-backing every frame
@@ -915,7 +1116,7 @@ void em_window_(const char *title, EmProps p) {
     if (g_win_glass) { Color a = t->accent;
         bg = (Color){ bg.r * 0.92f + a.r * 0.08f, bg.g * 0.92f + a.g * 0.08f,
                       bg.b * 0.92f + a.b * 0.08f, 1.0f }; }
-    ui_set_paint(solid(bg));
+    p.background = bg;          /* em_apply_box owns the paint (see its note) */
     ui_set_size(sz_grow(), sz_grow());
     ui_set_align(ALIGN_STRETCH);
     ui_set_spacing(0);
@@ -936,7 +1137,7 @@ void em_window_end_(void) {
          * delta for the runtime. */
         const struct ui_theme *t = TH;
         ui_begin_hstack(0);
-        ui_set_size(sz_grow(), (struct layout_size){ SIZE_FIXED, 0, 0, 0, 0 });
+        ui_set_size(sz_grow(), (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
         ui_set_justify(JUSTIFY_END);
         {
             ui_begin_hstack(1);
@@ -981,7 +1182,7 @@ static void em_window_drag_(void) {
             int ny = g_win_y + (int)(py - g_win_grab_y);
             if ((nx != g_win_x || ny != g_win_y) && g_win_mover) {
                 g_win_mover(g_win_id, nx, ny);
-                g_win_x = nx; g_win_y = ny;
+                g_win_x = nx; g_win_y = ny; g_win_moved = 1;
             }
         }
     } else {
@@ -997,7 +1198,7 @@ void em_windowbar_(const char *title, EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_hstack(0);                              /* the bar */
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface_alt));
+    if (p.background.a <= 0) p.background = t->surface_alt;
     ui_set_padding(t->sp2, t->sp3, t->sp2, t->sp3);
     ui_set_align(ALIGN_CENTER);
     ui_set_spacing(t->sp2);
@@ -1018,27 +1219,110 @@ void em_windowbar_(const char *title, EmProps p) {
 }
 void em_windowbar_end_(void) { em_flush(); ui_end_stack(); }
 
-/* A modern single circular close control (no traffic-light trio). Hover tints
- * it danger-red. Chainable: `CloseButton().clicked()`. */
-static bool em_closebtn_impl(bool *out_hov) {
+/* The standard application title bar (see em.h). Deliberately NOT a variant of
+ * WindowBar: WindowBar is the general "put what you like in a bar" container,
+ * while this one is a house style with opinions -- lights leading in Mac
+ * order, a centred title, a hairline under it -- and the point of a house
+ * style is that apps do not get to disagree about it. */
+void em_appbar_(const char *title, EmProps p) {
+    em_flush();
     const struct ui_theme *t = TH;
+    ui_begin_hstack(0);                              /* the bar */
+    if (p.background.a <= 0) p.background = t->surface_alt;
+    ui_set_padding(t->sp2, t->sp3, t->sp2, t->sp2);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp2);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_set_border(0, t->border);
+    em_apply_box(p);
+
+    /* the lights, leading */
+    em_close_button(); em_flush();
+    em_min_button();   em_flush();
+
+    /* Title, centred in whatever space is left between the lights and the
+     * app's own controls, and the drag zone at the same time -- so the bar is
+     * grabbable everywhere a control is not. */
+    ui_begin_hstack(0);
+    ui_open();
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    ui_set_spacing(t->sp2);
+    em_window_drag_();
+    { EmProps tp = { .font = BodyBold, .color = t->text }; em_text_impl(title && title[0] ? title : " ", tp); }
+    ui_end_stack();
+}
+void em_appbar_end_(void) { em_flush(); ui_end_stack(); }
+
+/* DragHandle: a placeable draggable strip -- press-and-move anywhere on it drags
+ * the bound window (like WindowBar's zone, but the app positions it: e.g. the
+ * empty middle of a menu bar). Grows by default; put controls to either side. */
+void em_drag_handle_(EmProps p) {
+    em_flush();
+    /* Keyed like every other container. It was not, and a drag handle lives at
+     * the END of a toolbar -- exactly where the sibling count changes -- so a
+     * control appearing before it took its retained instance and inherited the
+     * one property that makes a drag zone what it is: grow. A tab's close
+     * button came out as wide as the strip. */
+    ui_begin_hstack(em_key_hash(p.key));
+    ui_open();
+    if (p.width <= 0) ui_set_size(sz_grow(), sz_intrinsic());
+    ui_set_align(ALIGN_CENTER);
+    em_apply_box(p);
+    em_window_drag_();
+}
+void em_drag_handle_end_(void) { em_flush(); ui_end_stack(); }
+
+/* ---- window controls: traffic lights ------------------------------------ *
+ * Colour IS the affordance, which is the whole point of the Mac design: red
+ * means this window goes away, green means it comes back. That reads instantly
+ * and at any size, where two identical grey pills distinguished only by a tiny
+ * glyph do not -- you had to look at the symbol to know which was which.
+ *
+ * So the glyph is only shown on hover, and the resting state is pure colour.
+ * The visible dot is small (13px, Mac's is 12) but the CONTROL is 24px: the
+ * case is deliberately larger than the dot and completely transparent, so
+ * Fitts' law is satisfied by the hit area while the eye sees a small tidy
+ * light. That separation is why an oversized case is correct here -- it just
+ * has to be invisible, and the dot has to be genuinely centred in it. */
+#define TL_DOT  13
+#define TL_HIT  24
+
+static bool em_light_impl(int cp, Color base, bool *out_hov) {
     ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
     if (out_hov) *out_hov = hov;
-    Color bg = hov ? (pressed ? shade(t->danger, 0.86f) : t->danger) : t->surface;
-    Color fg = hov ? t->on_accent : t->text_secondary;
-    ui_set_paint(solid(bg));
-    ui_set_corner_radius(t->radius_pill);
-    ui_set_border(hov ? 0.0f : 1.0f, t->border);
-    ui_set_size(sz_fixed(26), sz_fixed(26));
+    ui_set_size(sz_fixed(TL_HIT), sz_fixed(TL_HIT));
+    ui_set_paint(solid((Color){ 0.f, 0.f, 0.f, 0.f }));   /* the case is invisible */
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
-    { EmProps ip = { .font = BodyBold, .color = fg }; em_icon_impl(IconClose, ip); }
+
+    ui_box_begin(1);
+    ui_set_size(sz_fixed(TL_DOT), sz_fixed(TL_DOT));
+    ui_set_paint(solid(pressed ? shade(base, 0.80f) : hov ? shade(base, 1.10f) : base));
+    ui_set_corner_radius((float)TL_DOT / 2.0f);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    /* the symbol appears only under the pointer -- at rest the colour says it */
+    if (hov) { EmProps ip = { .font = Caption, .color = { 0.f, 0.f, 0.f, 0.68f } };
+               em_icon_impl(cp, ip); }
+    ui_box_end();
+
     ui_end_stack();
     return ui_consume_click(self);
 }
+
+/* #FF5F57 / #28C840 -- close is red, minimize green, as asked. */
+static bool em_closebtn_impl(bool *out_hov) {
+    return em_light_impl(IconClose, (Color){ 1.00f, 0.373f, 0.341f, 1.f }, out_hov);
+}
+static bool em_minbtn_impl(bool *out_hov) {
+    return em_light_impl(IconMinus, (Color){ 0.157f, 0.784f, 0.251f, 1.f }, out_hov);
+}
 int em_window_closed(void) { return Clicked("__em_win_close"); }
+int em_window_minimized(void) { return Clicked("__em_win_min"); }
 
 /* ---- Spinner: phase-animated dots (indeterminate activity) ------------- */
 static void em_spinner_impl(void) {
@@ -1123,6 +1407,498 @@ void em_gauge(float frac, const char *center, EmProps p) {
         ui_text("%s", center);
     }
     ui_end_stack();
+}
+
+/* ---- ColorPicker: an HSV square + hue bar, rasterised like the Gauge ------ *
+ * Binds to float hsv[3] = { hue, saturation, value }, all 0..1. The square
+ * (saturation x value, for the current hue) re-rasterises only when the hue
+ * changes; the rainbow hue bar is rasterised once. Cursors are composited into
+ * per-frame display copies (cheap integer memcpy + ring), so moving a cursor
+ * never triggers the expensive float rasterisation. Drag either surface. */
+#define CP_W    176
+#define CP_SVH  140
+#define CP_HUEH 18
+static uint32_t g_cp_sv[CP_W * CP_SVH];    /* SV square base (cached on hue)   */
+static uint32_t g_cp_svd[CP_W * CP_SVH];   /* + SV cursor, per frame           */
+static uint32_t g_cp_hue[CP_W * CP_HUEH];  /* rainbow hue bar (rasterised once)*/
+static uint32_t g_cp_hued[CP_W * CP_HUEH]; /* + hue cursor, per frame          */
+
+/* HSV (all 0..1) -> straight-alpha Color. */
+Color em_hsv(float h, float s, float v) {
+    h -= (float)(int)h;
+    if (h < 0) h += 1.0f;
+    if (s < 0) s = 0;
+    if (s > 1) s = 1;
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    float hh = h * 6.0f; int i = (int)hh; float f = hh - i;
+    float p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
+    float r, g, b;
+    switch (i % 6) {
+        case 0:  r = v; g = t; b = p; break;
+        case 1:  r = q; g = v; b = p; break;
+        case 2:  r = p; g = v; b = t; break;
+        case 3:  r = p; g = q; b = v; break;
+        case 4:  r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+    }
+    return (Color){ r, g, b, 1.0f };
+}
+
+/* 2px ring (distance test in a bounding box), used for the SV cursor. */
+static void cp_ring(uint32_t *buf, int w, int h, int cx, int cy, int rad, uint32_t col) {
+    for (int y = cy - rad - 1; y <= cy + rad + 1; y++) {
+        if (y < 0 || y >= h) continue;
+        for (int x = cx - rad - 1; x <= cx + rad + 1; x++) {
+            if (x < 0 || x >= w) continue;
+            int dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
+            if (d2 <= (rad + 1) * (rad + 1) && d2 >= (rad - 1) * (rad - 1)) buf[y * w + x] = col;
+        }
+    }
+}
+
+/* Map the live pointer into the currently-open box while it is pressed;
+ * writes normalised (fx,fy) in [0,1]. Returns true when it updated. */
+static bool cp_drag(float *fx, float *fy) {
+    if (!(ui_is_pressed() || ui_is_active())) return false;
+    float px, py, bx, by, bw, bh;
+    ui_pointer_pos(&px, &py);
+    if (!ui_open_rect(&bx, &by, &bw, &bh) || bw <= 0 || bh <= 0) return false;
+    float x = (px - bx) / bw, y = (py - by) / bh;
+    if (x < 0) x = 0;
+    if (x > 1) x = 1;
+    if (y < 0) y = 0;
+    if (y > 1) y = 1;
+    *fx = x; *fy = y;
+    return true;
+}
+
+void em_colorpicker(float *hsv, EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    float H = hsv ? hsv[0] : 0.0f, S = hsv ? hsv[1] : 1.0f, V = hsv ? hsv[2] : 1.0f;
+
+    /* hue bar: rasterise once (never changes). */
+    static int hue_ready;
+    if (!hue_ready) {
+        hue_ready = 1;
+        for (int x = 0; x < CP_W; x++) {
+            uint32_t c = argb_premul(em_hsv((float)x / (CP_W - 1), 1.0f, 1.0f), 1.0f);
+            for (int y = 0; y < CP_HUEH; y++) g_cp_hue[y * CP_W + x] = c;
+        }
+    }
+    /* SV square: rasterise only when the hue actually changes. */
+    static uint32_t sv_key = 0xFFFFFFFFu;
+    uint32_t hk = (uint32_t)(H * 4096.0f);
+    if (hk != sv_key) {
+        sv_key = hk;
+        for (int y = 0; y < CP_SVH; y++) {
+            float v = 1.0f - (float)y / (CP_SVH - 1);
+            for (int x = 0; x < CP_W; x++) {
+                float s = (float)x / (CP_W - 1);
+                g_cp_sv[y * CP_W + x] = argb_premul(em_hsv(H, s, v), 1.0f);
+            }
+        }
+    }
+    /* per-frame display copies + cursors. */
+    for (int i = 0; i < CP_W * CP_SVH; i++) g_cp_svd[i] = g_cp_sv[i];
+    cp_ring(g_cp_svd, CP_W, CP_SVH, (int)(S * (CP_W - 1)), (int)((1.0f - V) * (CP_SVH - 1)),
+            6, (V > 0.6f && S < 0.5f) ? 0xFF000000u : 0xFFFFFFFFu);
+    for (int i = 0; i < CP_W * CP_HUEH; i++) g_cp_hued[i] = g_cp_hue[i];
+    int hcx = (int)(H * (CP_W - 1));
+    for (int y = 0; y < CP_HUEH; y++) {
+        uint32_t *row = &g_cp_hued[y * CP_W];
+        if (hcx > 0)        row[hcx - 1] = 0xFF000000u;
+        row[hcx] = 0xFFFFFFFFu;
+        if (hcx + 1 < CP_W) row[hcx + 1] = 0xFF000000u;
+    }
+
+    ui_begin_vstack(0);
+    ui_set_spacing(t->sp2);
+    em_apply_box(p);
+
+    /* SV square (draggable) */
+    ui_box_begin(0xC010D1);
+    ui_set_size(sz_fixed(CP_W), sz_fixed(CP_SVH));
+    ui_set_corner_radius(t->radius_md);
+    ui_image((uint64_t)(uintptr_t)&g_cp_svd, g_cp_svd, CP_W, CP_SVH, (float)CP_SVH);
+    { float fx, fy; if (hsv && cp_drag(&fx, &fy)) { hsv[1] = fx; hsv[2] = 1.0f - fy; } }
+    ui_box_end();
+
+    /* hue bar (draggable) */
+    ui_box_begin(0xC010D2);
+    ui_set_size(sz_fixed(CP_W), sz_fixed(CP_HUEH));
+    ui_set_corner_radius(t->radius_md);
+    ui_image((uint64_t)(uintptr_t)&g_cp_hued, g_cp_hued, CP_W, CP_HUEH, (float)CP_HUEH);
+    { float fx, fy; if (hsv && cp_drag(&fx, &fy)) { (void)fy; hsv[0] = fx; } }
+    ui_box_end();
+
+    /* preview: swatch + hex readout */
+    ui_begin_hstack(0);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp2);
+    ui_box_begin(0xC010D3);
+    ui_set_size(sz_fixed(30), sz_fixed(30));
+    ui_set_paint(solid(em_hsv(H, S, V)));
+    ui_set_corner_radius(t->radius_md);
+    ui_set_border(1.0f, t->border);
+    ui_box_end();
+    { Color c = em_hsv(H, S, V);
+      char hex[10];
+      snprintf(hex, sizeof hex, "#%02X%02X%02X",
+               (int)(c.r * 255 + 0.5f), (int)(c.g * 255 + 0.5f), (int)(c.b * 255 + 0.5f));
+      EmProps tp = { .font = BodyBold };
+      em_text_impl(hex, tp); }
+    ui_end_stack();
+
+    ui_end_stack();
+}
+
+/* ---- Calendar / DatePicker: an inline month grid ------------------------- *
+ * Binds to int date[3] = { year, month(1..12), day(1..31) }. Header with
+ * prev/next month, a weekday row, then a 6x7 grid of day cells; the selected
+ * day is filled with the accent. Month navigation carries its own view state
+ * (defaults to the selected month), so paging months doesn't move the pick. */
+static const char *const CAL_MON[12] = {
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December" };
+static const char *const CAL_WD[7] = { "S", "M", "T", "W", "T", "F", "S" };
+
+static int cal_leap(int y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+static int cal_dim(int y, int m) {
+    static const int d[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    return (m == 2 && cal_leap(y)) ? 29 : d[(m - 1) % 12];
+}
+/* Sakamoto's algorithm: weekday of the 1st (0 = Sunday). */
+static int cal_dow1(int y, int m) {
+    static const int t[12] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    int yy = y;
+    if (m < 3) yy -= 1;
+    return (yy + yy / 4 - yy / 100 + yy / 400 + t[(m - 1) % 12] + 1) % 7;
+}
+
+void em_calendar(int *date, EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    int sy = date ? date[0] : 2026, sm = date ? date[1] : 1, sd = date ? date[2] : 1;
+    if (sm < 1) sm = 1;
+    if (sm > 12) sm = 12;
+    static int vy, vm, inited;
+    if (!inited) { inited = 1; vy = sy; vm = sm; }
+
+    ui_begin_vstack(0);
+    ui_set_spacing(t->sp2);
+    em_apply_box(p);
+
+    /* header: ‹  Month Year  › */
+    ui_begin_hstack(0);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    if (em_iconbtn_impl(IconChevronL, (EmProps){0}, 0)) { if (--vm < 1) { vm = 12; vy--; } }
+    ui_spacer();
+    { char hdr[32];
+      snprintf(hdr, sizeof hdr, "%s %d", CAL_MON[vm - 1], vy);
+      EmProps hp = { .font = BodyBold };
+      em_text_impl(hdr, hp); }
+    ui_spacer();
+    if (em_iconbtn_impl(IconChevronR, (EmProps){0}, 0)) { if (++vm > 12) { vm = 1; vy++; } }
+    ui_end_stack();
+
+    /* weekday labels */
+    ui_begin_hstack(0);
+    ui_set_spacing(0);
+    for (int i = 0; i < 7; i++) {
+        ui_box_begin(0);
+        ui_set_size(sz_fixed(34), sz_fixed(22));
+        ui_set_align(ALIGN_CENTER);
+        ui_set_justify(JUSTIFY_CENTER);
+        EmProps wp = { .font = Caption, .color = t->text_tertiary };
+        em_text_impl(CAL_WD[i], wp);
+        ui_box_end();
+    }
+    ui_end_stack();
+
+    /* 6 weeks x 7 days */
+    int dow = cal_dow1(vy, vm), dim = cal_dim(vy, vm);
+    int day = 1 - dow;                       /* first cell's number (<=0 -> blank) */
+    for (int w = 0; w < 6; w++) {
+        ui_begin_hstack(0);
+        ui_set_spacing(0);
+        for (int c = 0; c < 7; c++, day++) {
+            ui_box_begin((uint64_t)(0xDA7E0000u + w * 7 + c));
+            struct instance_handle self = ui_open();
+            bool inmonth = (day >= 1 && day <= dim);
+            bool sel = inmonth && (vy == sy && vm == sm && day == sd);
+            bool hov = inmonth && ui_is_hovered();
+            ui_set_size(sz_fixed(34), sz_fixed(30));
+            ui_set_align(ALIGN_CENTER);
+            ui_set_justify(JUSTIFY_CENTER);
+            if (sel)      { ui_set_paint(solid(t->accent));      ui_set_corner_radius(t->radius_md); }
+            else if (hov) { ui_set_paint(solid(t->surface_alt)); ui_set_corner_radius(t->radius_md); }
+            else          { ui_set_paint(solid((Color){0, 0, 0, 0})); }   /* reset when neither */
+            if (inmonth) {
+                char ds[12];
+                snprintf(ds, sizeof ds, "%d", day);
+                EmProps dp = { .font = sel ? BodyBold : Body, .color = sel ? t->on_accent : t->text };
+                em_text_impl(ds, dp);
+            }
+            ui_box_end();
+            if (inmonth && ui_consume_click(self) && date) { date[0] = vy; date[1] = vm; date[2] = day; }
+        }
+        ui_end_stack();
+    }
+    ui_end_stack();
+}
+
+/* ---- Combobox: an editable field with a filtered option menu ------------- *
+ * Binds an editable text buffer + a list of options; the menu shows only the
+ * options containing the typed text (case-insensitive), and picking one fills
+ * the buffer. `open` (app-owned, like Disclosure) controls the menu; the
+ * chevron toggles it. */
+static char cb_lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+static int  cb_contains(const char *hay, const char *ndl) {
+    if (!ndl || !ndl[0]) return 1;
+    for (const char *h = hay; *h; h++) {
+        const char *a = h, *b = ndl;
+        while (*a && *b && cb_lc(*a) == cb_lc(*b)) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+void em_combobox(char *buf, size_t cap, const char *const *labels, int count,
+                 const char *placeholder, bool *open, EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    bool is_open = open ? *open : false;
+
+    ui_begin_vstack(0);
+    ui_set_align(ALIGN_STRETCH);
+    ui_set_spacing(t->sp1);
+    em_apply_box(p);
+
+    /* field row: text input (grows) + chevron toggle */
+    ui_begin_hstack(0);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp2);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_begin_hstack(0);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_text_field(buf, cap, placeholder);
+    ui_end_stack();
+    if (em_iconbtn_impl(is_open ? IconChevronU : IconChevronD, (EmProps){0}, 0) && open) {
+        *open = !is_open;
+        is_open = *open;
+        g_em_epoch++;
+    }
+    ui_end_stack();
+
+    /* filtered menu */
+    if (is_open) {
+        ui_begin_vstack(0);
+        ui_set_paint(solid(t->surface));
+        ui_set_corner_radius(t->radius_md);
+        ui_set_border(1.0f, t->border);
+        ui_set_clip_children(true);
+        ui_set_align(ALIGN_STRETCH);
+        ui_set_spacing(0);
+        ui_set_shadow(true, t->shadow_md.dx, t->shadow_md.dy, t->shadow_md.blur, t->shadow_md.color);
+        int shown = 0;
+        for (int i = 0; i < count; i++) {
+            if (!cb_contains(labels[i], buf)) continue;
+            shown++;
+            ui_begin_hstack((uint64_t)(i + 1));
+            struct instance_handle row = ui_open();
+            bool rhov = ui_is_hovered(), rpr = ui_is_pressed();
+            ui_set_paint(solid(rpr ? shade(t->accent_soft, 0.94f) : rhov ? t->accent_soft : t->surface));
+            ui_set_padding(t->sp2 + 1, t->sp3, t->sp2 + 1, t->sp3);
+            ui_set_align(ALIGN_CENTER);
+            ui_set_size(sz_grow(), sz_intrinsic());
+            { EmProps lp = { .font = Body, .color = t->text }; em_text_impl(labels[i], lp); }
+            ui_end_stack();
+            if (ui_consume_click(row)) {
+                size_t n = 0;
+                for (const char *s = labels[i]; *s && n + 1 < cap; s++) buf[n++] = *s;
+                buf[n] = 0;
+                if (open) *open = false;
+                is_open = false;
+                g_em_epoch++;
+            }
+        }
+        if (shown == 0) {
+            ui_begin_hstack(0);
+            ui_set_padding(t->sp2 + 1, t->sp3, t->sp2 + 1, t->sp3);
+            EmProps lp = { .font = Body, .color = t->text_tertiary };
+            em_text_impl("No matches", lp);
+            ui_end_stack();
+        }
+        ui_end_stack();
+    }
+    ui_end_stack();
+}
+
+/* ---- TagInput: removable chips + an entry field -------------------------- *
+ * tags is char[max][EM_TAG_LEN]; *count is the live tag count; `entry` is the
+ * text buffer for a new tag. The + button (or a non-empty entry) commits a
+ * tag; each chip's ✕ removes it. */
+static void ti_copy(char *dst, const char *src, size_t cap) {
+    size_t n = 0;
+    for (; src[n] && n + 1 < cap; n++) dst[n] = src[n];
+    dst[n] = 0;
+}
+
+void em_taginput(char (*tags)[EM_TAG_LEN], int *count, int max,
+                 char *entry, size_t ecap, EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    int n = count ? *count : 0;
+
+    ui_begin_vstack(0);
+    ui_set_align(ALIGN_STRETCH);
+    ui_set_spacing(t->sp2);
+    em_apply_box(p);
+
+    /* chips: a real flex-wrap row -- the layout engine flows them onto new lines
+     * (pixel-accurate, no width estimate). Removal is deferred to after render so
+     * the list isn't mutated mid-layout. */
+    int remove_idx = -1;
+    if (n > 0) {
+        ui_begin_hstack(0);
+        ui_set_wrap(true);
+        ui_set_spacing(t->sp2);
+        ui_set_align(ALIGN_CENTER);
+        ui_set_size(sz_grow(), sz_intrinsic());
+        for (int i = 0; i < n; i++) {
+            ui_begin_hstack((uint64_t)(0x7A6C0000u + i));
+            ui_set_paint(solid(t->accent_soft));
+            ui_set_corner_radius(t->radius_pill);
+            ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp2 + 2);
+            ui_set_align(ALIGN_CENTER);
+            ui_set_spacing(t->sp1);
+            { EmProps lp = { .font = Body, .color = t->accent }; em_text_impl(tags[i], lp); }
+            ui_box_begin((uint64_t)(0x7A6F0000u + i));
+            struct instance_handle rm = ui_open();
+            { EmProps xp = { .font = Caption, .color = t->accent }; em_icon_impl(IconClose, xp); }
+            ui_box_end();
+            ui_end_stack();
+            if (ui_consume_click(rm)) remove_idx = i;
+        }
+        ui_end_stack();
+    }
+    if (remove_idx >= 0 && count) {
+        for (int j = remove_idx; j < n - 1; j++) ti_copy(tags[j], tags[j + 1], EM_TAG_LEN);
+        (*count)--;
+        n--;
+        g_em_epoch++;
+    }
+
+    /* entry row: field (grows) + add button */
+    ui_begin_hstack(0);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(t->sp2);
+    ui_begin_hstack(0);
+    ui_set_size(sz_grow(), sz_intrinsic());
+    ui_text_field(entry, ecap, "Add tag...");
+    ui_end_stack();
+    if (em_iconbtn_impl(IconPlus, (EmProps){0}, 0) && count && entry && entry[0] && n < max) {
+        ti_copy(tags[n], entry, EM_TAG_LEN);
+        (*count)++;
+        entry[0] = 0;
+        g_em_epoch++;
+    }
+    ui_end_stack();
+    ui_end_stack();
+}
+
+/* ---- Dock: a drag-REORDER + drag-OUT-to-remove row of chips --------------- *
+ * `ids` holds the display order (length *n); render(id) draws one chip's inner
+ * content. Press-drag a chip: it lifts (shadow), snaps between slots as the
+ * pointer crosses them (the others flow), and if pulled below the row it dims
+ * and, on release, is removed. This is EmUI's first real drag-and-drop. */
+static int   g_dock_id = -1;      /* id being dragged, -1 = none */
+static float g_dock_grab_x, g_dock_grab_y;   /* pointer at grab (screen) */
+static float g_dock_ptr_y;        /* live pointer y (for drag-out) */
+static int   g_dock_out;          /* pulled below the row -> pending remove */
+
+int em_dock_dragging(void) { return g_dock_id; }   /* id being dragged, or -1 */
+
+void em_dock(int *ids, int *n, void (*render)(int id), EmProps p) {
+    em_flush();
+    const struct ui_theme *t = TH;
+    int cnt = n ? *n : 0;
+
+    ui_begin_hstack(0);
+    (void)ui_open();
+    ui_set_spacing(p.spacing > 0 ? p.spacing : t->sp2);
+    ui_set_align(ALIGN_CENTER);
+    em_apply_box(p);
+    float dx0, dy0, dw, dh;
+    int have = ui_open_rect(&dx0, &dy0, &dw, &dh);
+
+    int any_active = 0, active_i = -1, target = -1;
+
+    for (int i = 0; i < cnt; i++) {
+        int id = ids[i];
+        int dragged = (id == g_dock_id);
+        ui_box_begin((uint64_t)(0xD0C00000u + (unsigned)id));   /* stable key by id */
+        struct instance_handle self = ui_open();
+        int active = ui_is_active();
+        bool hov = ui_is_hovered();
+        /* A status item is a GLYPH, not a button: boxing each one in its own
+         * grey chip turned a menu bar into a row of widgets. The surface
+         * appears only when the pointer is on it (or while dragging), which is
+         * also the only time it means anything. */
+        Color chip = dragged ? shade(t->surface_alt, 1.18f)
+                   : hov     ? t->surface_alt
+                             : (Color){ 0.f, 0.f, 0.f, 0.f };
+        ui_set_paint(solid(chip));
+        ui_set_corner_radius(t->radius_md);
+        ui_set_padding(t->sp1, t->sp2, t->sp1, t->sp2);
+        ui_set_align(ALIGN_CENTER);
+        if (dragged) {
+            ui_set_shadow(true, 0, 4, 12, t->shadow_md.color);      /* lift */
+            if (g_dock_out) ui_set_offset(0, g_dock_ptr_y - g_dock_grab_y);  /* follow out */
+        }
+        render(id);
+        ui_box_end();
+        (void)self;
+
+        if (active) {
+            any_active = 1; active_i = i;
+            float px, py; ui_pointer_pos(&px, &py);
+            g_dock_ptr_y = py;
+            if (g_dock_id != id) { g_dock_id = id; g_dock_grab_x = px; g_dock_grab_y = py; g_dock_out = 0; }
+            if (have && dw > 0) {
+                int tgt = (int)(((px - dx0) / dw) * cnt);
+                if (tgt < 0) tgt = 0;
+                if (tgt >= cnt) tgt = cnt - 1;
+                target = tgt;
+            }
+            g_dock_out = (have && py > dy0 + dh + 16.0f);
+        }
+    }
+    ui_end_stack();
+
+    /* reorder (after the loop, so no mid-loop mutation); not while removing */
+    if (active_i >= 0 && target >= 0 && target != active_i && !g_dock_out) {
+        int tmp = ids[active_i];
+        if (target > active_i) for (int k = active_i; k < target; k++) ids[k] = ids[k + 1];
+        else                   for (int k = active_i; k > target; k--) ids[k] = ids[k - 1];
+        ids[target] = tmp;
+        g_em_epoch++;
+    }
+    /* release: remove if it was pulled out */
+    if (g_dock_id != -1 && !any_active) {
+        if (g_dock_out && n) {
+            for (int i = 0; i < *n; i++) if (ids[i] == g_dock_id) {
+                for (int k = i; k < *n - 1; k++) ids[k] = ids[k + 1];
+                (*n)--;
+                break;
+            }
+        }
+        g_dock_id = -1; g_dock_out = 0;
+        g_em_epoch++;
+    }
 }
 
 /* ---- StatCard: label / big value / signed delta / mini sparkline -------- */
@@ -1230,7 +2006,7 @@ void em_toast_host(void) {
     ui_begin_hstack(0);
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
-    ui_set_size(sz_grow(), (struct layout_size){ SIZE_FIXED, 0, 0, 0, 0 });
+    ui_set_size(sz_grow(), (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 0 });
     ui_set_offset(0, -62.0f + (1.0f - op) * 16.0f);   /* rise above the tab bar */
     ui_set_opacity(op < 1.0f ? op : 1.0f);
     {
@@ -1333,16 +2109,21 @@ static bool em_dropdown_impl(const char *const *labels, int count, int *sel, boo
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
     if (out_hov) *out_hov = hov;
-    ui_set_paint(solid(pressed ? shade(t->surface_alt, 0.94f) : hov ? t->surface_alt : t->surface));
+    /* Through the control palette, so a <select> inside a rendered document
+     * is a page control and not a piece of the desktop -- see kit.h. */
+    { struct color face = ui_ctl_color_(UI_CTL_SURFACE, t->surface);
+      ui_set_paint(solid(pressed ? shade(face, 0.94f) : hov ? shade(face, 1.06f) : face)); }
     ui_set_corner_radius(t->radius_md);
-    ui_set_border(1.0f, is_open ? t->accent : t->border);
+    ui_set_border(1.0f, is_open ? ui_ctl_color_(UI_CTL_FOCUS, t->accent)
+                                : ui_ctl_color_(UI_CTL_BORDER, t->border));
     ui_set_padding(t->sp2 + 1, t->sp3, t->sp2 + 1, t->sp3);
     ui_set_align(ALIGN_CENTER);
     ui_set_spacing(t->sp2);
     ui_set_size(sz_grow(), sz_intrinsic());
-    { EmProps vp = { .font = Body, .color = t->text }; em_text_impl(count > 0 ? labels[cur] : "", vp); }
+    { EmProps vp = { .font = Body, .color = ui_ctl_color_(UI_CTL_TEXT, t->text) };
+      em_text_impl(count > 0 ? labels[cur] : "", vp); }
     ui_spacer();
-    { EmProps cp = { .font = Body, .color = t->text_secondary };
+    { EmProps cp = { .font = Body, .color = ui_ctl_color_(UI_CTL_PLACEHOLDER, t->text_secondary) };
       em_icon_impl(is_open ? IconChevronU : IconChevronD, cp); }
     ui_end_stack();
     if (ui_consume_click(self)) {
@@ -1457,7 +2238,7 @@ void em_sidebar_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_vstack(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface));
+    if (p.background.a <= 0) p.background = t->surface;
     ui_set_border(1.0f, t->border);
     ui_set_size(sz_fixed(g_split_w), sz_grow());
     ui_set_align(ALIGN_STRETCH);
@@ -1485,30 +2266,53 @@ void em_res_set_loader(uint8_t *(*load)(const char *path, size_t *out_len)) {
     g_res_load = load;
 }
 
-#define EM_RES_MAX 8
+/* One slot per distinct image path. A desktop with a real icon per app blows
+ * straight past the old 8 -- and a full cache used to mean re-decoding every
+ * frame forever, so this bound is load-bearing, not cosmetic. */
+#define EM_RES_MAX 32
 
 uint32_t em_font(const char *path) {
-    static struct { const char *path; uint32_t handle; } cache[EM_RES_MAX];
+    static struct { char path[128]; int used; uint32_t handle; } cache[EM_RES_MAX];
     static int installed;
     if (!path) return 0;
     for (int i = 0; i < EM_RES_MAX; i++)
-        if (cache[i].path && strcmp(cache[i].path, path) == 0) return cache[i].handle;
+        if (cache[i].used && strcmp(cache[i].path, path) == 0) return cache[i].handle;
     if (!g_res_load) return 0;
     size_t len = 0;
     uint8_t *data = g_res_load(path, &len);       /* kept alive: font parses in place */
     uint32_t h = (data && len) ? font_load(data, len) : 0;
     if (h && !installed) { font_install_backend(); installed = 1; }
     for (int i = 0; i < EM_RES_MAX; i++)
-        if (!cache[i].path) { cache[i].path = path; cache[i].handle = h; break; }
+        if (!cache[i].used) {
+            snprintf(cache[i].path, sizeof cache[i].path, "%s", path);
+            cache[i].used = 1; cache[i].handle = h; break;
+        }
     return h;
 }
+float em_text_width(const char *s, float size_px) {
+    if (!s || !*s) return 0.0f;
+    struct font *f = font_for_handle(TH->font_regular);
+    if (!f) return 0.0f;
+    float w = 0;
+    for (const char *p = s; *p; ) {
+        uint32_t cp;
+        p += font_utf8_decode(p, &cp);
+        struct glyph_cache_entry *e =
+            glyph_cache_lookup_or_rasterize(font_global_atlas(), f, cp, size_px);
+        if (e) w += e->advance_px;
+    }
+    return w;
+}
 
-/* Minimal P6 (binary) .ppm decoder into malloc'd BGRA-premul, cached by path. */
+
+/* Minimal P6 RGB + P7 RGB_ALPHA decoder into BGRA-premul, cached by path. */
 const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h) {
-    static struct { const char *path; uint32_t *px, w, h; } cache[EM_RES_MAX];
+    /* Own a COPY of the path: callers may pass a reused stack/heap buffer (e.g.
+     * an app's icon field), so caching the pointer would alias distinct icons. */
+    static struct { char path[128]; int used; uint32_t *px, w, h; } cache[EM_RES_MAX];
     if (!path) return 0;
     for (int i = 0; i < EM_RES_MAX; i++)
-        if (cache[i].path && strcmp(cache[i].path, path) == 0) {
+        if (cache[i].used && strcmp(cache[i].path, path) == 0) {
             if (out_w) *out_w = cache[i].w;
             if (out_h) *out_h = cache[i].h;
             return cache[i].px;
@@ -1516,30 +2320,128 @@ const uint32_t *em_image(const char *path, uint32_t *out_w, uint32_t *out_h) {
     if (!g_res_load) return 0;
     size_t len = 0;
     uint8_t *d = g_res_load(path, &len);
-    if (!d || len < 16 || d[0] != 'P' || d[1] != '6') return 0;
-    size_t o = 2; uint32_t vals[3] = {0,0,0}; int nv = 0;
-    while (o < len && nv < 3) {                        /* width height maxval */
-        while (o < len && (d[o]==' '||d[o]=='\n'||d[o]=='\r'||d[o]=='\t')) o++;
-        if (o < len && d[o] == '#') { while (o < len && d[o] != '\n') o++; continue; }
-        uint32_t v = 0; int any = 0;
-        while (o < len && d[o] >= '0' && d[o] <= '9') { v = v*10 + (d[o]-'0'); o++; any = 1; }
-        if (!any) return 0;
-        vals[nv++] = v;
+    if (!d || len < 16 || d[0] != 'P') return 0;
+    size_t o = 0; uint32_t w = 0, h = 0, depth = 3;
+    if (d[1] == '6') {
+        o = 2; uint32_t vals[3] = {0,0,0}; int nv = 0;
+        while (o < len && nv < 3) {                    /* width height maxval */
+            while (o < len && (d[o]==' '||d[o]=='\n'||d[o]=='\r'||d[o]=='\t')) o++;
+            if (o < len && d[o] == '#') { while (o < len && d[o] != '\n') o++; continue; }
+            uint32_t v = 0; int any = 0;
+            while (o < len && d[o] >= '0' && d[o] <= '9') { v = v*10 + (d[o]-'0'); o++; any = 1; }
+            if (!any) return 0;
+            vals[nv++] = v;
+        }
+        o++;                                           /* whitespace after maxval */
+        w = vals[0]; h = vals[1];
+        if (vals[2] == 0) return 0;
+    } else if (d[1] == '7') {
+        /* PAM headers are textual and small. Copy only the header so string
+         * parsing never walks into the binary (often NUL-filled) pixel data. */
+        size_t hn = len < 255 ? len : 255;
+        char hdr[256];
+        memcpy(hdr, d, hn); hdr[hn] = 0;
+        char *end = strstr(hdr, "ENDHDR\n");
+        char *pw = strstr(hdr, "WIDTH ");
+        char *ph = strstr(hdr, "HEIGHT ");
+        char *pd = strstr(hdr, "DEPTH ");
+        char *pm = strstr(hdr, "MAXVAL ");
+        if (!end || !pw || !ph || !pd || !pm) return 0;
+        w = (uint32_t)strtoul(pw + 6, 0, 10);
+        h = (uint32_t)strtoul(ph + 7, 0, 10);
+        depth = (uint32_t)strtoul(pd + 6, 0, 10);
+        if (strtoul(pm + 7, 0, 10) != 255 || (depth != 3 && depth != 4)) return 0;
+        o = (size_t)(end - hdr) + 7;
+    } else {
+        return 0;
     }
-    o++;                                               /* single whitespace after maxval */
-    uint32_t w = vals[0], h = vals[1];
-    if (!w || !h || vals[2] == 0 || o + (size_t)w*h*3 > len) return 0;
+    if (!w || !h || o + (size_t)w*h*depth > len) return 0;
+    /* Claim the cache slot BEFORE decoding: with no free slot the old code
+     * still malloc'd, returned an uncached buffer, and did it again on the
+     * NEXT frame -- an unbounded per-frame leak once the desktop had more
+     * distinct images than slots. Refusing to draw is the honest failure. */
+    int slot = -1;
+    for (int i = 0; i < EM_RES_MAX; i++) if (!cache[i].used) { slot = i; break; }
+    if (slot < 0) return 0;
     uint32_t *px = (uint32_t *)malloc((size_t)w*h*4);
     if (!px) return 0;
     for (size_t i = 0; i < (size_t)w*h; i++) {
-        uint8_t r = d[o+i*3], g = d[o+i*3+1], b = d[o+i*3+2];
-        px[i] = 0xFF000000u | ((uint32_t)r<<16) | ((uint32_t)g<<8) | b;  /* opaque = premul */
+        uint8_t r = d[o+i*depth], g = d[o+i*depth+1], b = d[o+i*depth+2];
+        uint8_t a = depth == 4 ? d[o+i*depth+3] : 255;
+        uint8_t pr = (uint8_t)(((uint32_t)r * a) / 255);
+        uint8_t pg = (uint8_t)(((uint32_t)g * a) / 255);
+        uint8_t pb = (uint8_t)(((uint32_t)b * a) / 255);
+        px[i] = ((uint32_t)a<<24) | ((uint32_t)pr<<16) | ((uint32_t)pg<<8) | pb;
     }
-    for (int i = 0; i < EM_RES_MAX; i++)
-        if (!cache[i].path) { cache[i].path = path; cache[i].px = px; cache[i].w = w; cache[i].h = h; break; }
+    snprintf(cache[slot].path, sizeof cache[slot].path, "%s", path);
+    cache[slot].used = 1; cache[slot].px = px; cache[slot].w = w; cache[slot].h = h;
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
     return px;
+}
+
+/* ---- .eic multi-resolution icons (docs/ICONS.md) ------------------------ */
+
+#define EM_ICON_MAX 24
+
+static uint32_t eic_rd16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+static uint32_t eic_rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Resolve an icon at the size actually being drawn.
+ *
+ * A .eic holds the same icon at several sizes; we hand back the level that
+ * best fits `want_px` so the renderer blits it 1:1 instead of resampling one
+ * oversized master down to whatever the widget asked for. The pixels point
+ * straight INTO the cached file image -- .eic stores premultiplied BGRA, the
+ * exact layout the renderer consumes, so there is no decode and no second
+ * allocation. Anything that isn't a .eic falls through to the .ppm/.pam
+ * decoder, so existing art keeps working. */
+const uint32_t *em_image_at(const char *path, uint32_t want_px,
+                            uint32_t *out_w, uint32_t *out_h) {
+    static struct { char path[128]; int used; uint8_t *file; size_t len; } cache[EM_ICON_MAX];
+    if (!path) return 0;
+    size_t n = strlen(path);
+    if (n < 4 || strcmp(path + n - 4, ".eic") != 0)
+        return em_image(path, out_w, out_h);
+
+    uint8_t *f = 0; size_t len = 0;
+    int slot = -1;
+    for (int i = 0; i < EM_ICON_MAX; i++) {
+        if (cache[i].used && strcmp(cache[i].path, path) == 0) {
+            f = cache[i].file; len = cache[i].len; break;
+        }
+        if (slot < 0 && !cache[i].used) slot = i;
+    }
+    if (!f) {
+        if (slot < 0 || !g_res_load) return 0;
+        f = g_res_load(path, &len);
+        if (!f || len < 32) return 0;
+        snprintf(cache[slot].path, sizeof cache[slot].path, "%s", path);
+        cache[slot].used = 1; cache[slot].file = f; cache[slot].len = len;
+    }
+    if (f[0] != 'E' || f[1] != 'I' || f[2] != 'C' || f[3] != 'O') return 0;
+    uint32_t nlev = eic_rd16(f + 6);
+    if (!nlev || 32 + (size_t)nlev * 16 > len) return 0;
+
+    /* Smallest level that still covers the request: shrinking a bigger level a
+     * little stays sharp, stretching a smaller one never does. */
+    const uint8_t *best = 0;
+    for (uint32_t i = 0; i < nlev; i++) {
+        const uint8_t *e = f + 32 + (size_t)i * 16;
+        best = e;                                  /* table is ascending */
+        if (eic_rd16(e) >= want_px) break;         /* first that covers it */
+    }
+    if (!best) return 0;
+
+    uint32_t w = eic_rd16(best), h = eic_rd16(best + 2);
+    uint32_t off = eic_rd32(best + 8), nb = eic_rd32(best + 12);
+    if (!w || !h || nb != w * h * 4 || (size_t)off + nb > len || (off & 3)) return 0;
+
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return (const uint32_t *)(const void *)(f + off);
 }
 
 void em_image_view(const char *path, EmProps p) {
@@ -1557,6 +2459,86 @@ void em_image_view(const char *path, EmProps p) {
     ui_image((uint64_t)(uintptr_t)px, px, w, h, p.height > 0 ? p.height : (float)h);
 }
 
+bool em_image_button_key(const char *path, float size, uint64_t key) {
+    em_flush();
+    uint32_t w = 0, h = 0;
+    /* The glyph is drawn into size-8 (the padding below), so ask for the level
+     * that matches THAT -- asking for `size` would fetch one level too large
+     * and reintroduce the downscale this format exists to avoid. */
+    float inner = size - 8;
+    const uint32_t *px = em_image_at(path, inner > 1 ? (uint32_t)inner : 1, &w, &h);
+    if (!px) return false;
+    ui_begin_vstack(key ? key : (uint64_t)(uintptr_t)path);
+    struct instance_handle self = ui_open();
+    bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    ui_set_size(sz_fixed(size), sz_fixed(size));
+    ui_set_padding(4, 4, 4, 4);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    ui_set_corner_radius(12);
+    /* ALWAYS set the paint: a hover highlight set only on hover is retained and
+     * would stay lit after the pointer leaves. Transparent when not hovered. */
+    ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
+                     : solid((Color){0, 0, 0, 0}));
+    /* The leaf's key must be STABLE, and the pixel pointer is not: it names
+     * the mip level, and an icon that magnifies swaps levels as it swells. A
+     * key that changes destroys and recreates the instance -- and a press edge
+     * captures LAST frame's instance, so a click landing on the same frame as
+     * a level flip held a handle to an instance the build then threw away.
+     * ui_is_active() walked up from a dead handle and found nothing.
+     *
+     * That was the dock: hover engages the magnifier, the magnifier animates
+     * levels, and clicks died exactly while it animated -- which is exactly
+     * when a person clicks. The launcher grid never magnifies, so it never
+     * missed. Locked by declare-test T8. The leaf is the box's only image
+     * child, so any nonzero constant is unique here. */
+    ui_image_sized(0x1CA7, px, w, h, size - 8, size - 8);
+    ui_end_stack();
+    return ui_consume_click(self);
+}
+
+bool em_image_button(const char *path, float size) {
+    return em_image_button_key(path, size, (uint64_t)(uintptr_t)path);
+}
+
+/* An icon button drawn from real art but coloured by the THEME: the image is
+ * used as a stencil, so it sits beside glyph-based controls (which take their
+ * colour from the palette) without looking like a foreign object, and it
+ * follows a theme change instead of staying whatever colour it was authored. */
+bool em_image_button_tinted(const char *path, float size, Color tint) {
+    em_flush();
+    uint32_t w = 0, h = 0;
+    float inner = size - 8;
+    const uint32_t *px = em_image_at(path, inner > 1 ? (uint32_t)inner : 1, &w, &h);
+    if (!px) return false;
+    ui_begin_vstack((uint64_t)(uintptr_t)path ^ 0x71E70000ULL);
+    struct instance_handle self = ui_open();
+    bool hov = ui_is_hovered(), pressed = ui_is_pressed();
+    ui_set_size(sz_fixed(size), sz_fixed(size));
+    ui_set_padding(4, 4, 4, 4);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    ui_set_corner_radius(10);
+    ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
+                     : solid((Color){0, 0, 0, 0}));
+    /* key on the tint too: the same pixels drawn in a new colour must not be
+     * mistaken for an unchanged node and skipped by the dirty tracker */
+    uint64_t k = (uint64_t)(uintptr_t)px
+               ^ ((uint64_t)(uint32_t)(tint.r * 255.0f) << 16)
+               ^ ((uint64_t)(uint32_t)(tint.g * 255.0f) << 8)
+               ^ ((uint64_t)(uint32_t)(tint.b * 255.0f));
+    ui_image_sized_tinted(k, px, w, h, inner, inner, tint);
+    ui_end_stack();
+    return ui_consume_click(self);
+}
+
+void em_background_image(const char *path) {
+    em_flush();
+    uint32_t w = 0, h = 0;
+    const uint32_t *px = em_image(path, &w, &h);
+    if (px) ui_image_fill((uint64_t)(uintptr_t)px, px, w, h);
+}
+
 void em_theme_use(EmTheme t) { ui_theme_use_dark(t != Light); }
 
 /* ======================================================================= */
@@ -1566,6 +2548,55 @@ void em_theme_use(EmTheme t) { ui_theme_use_dark(t != Light); }
 /* One menu is open at a time, keyed by the Menu's label pointer. The open
  * menu's items float in an out-of-flow overlay anchored where the button was
  * clicked (ui_pointer_pos at open time -- no layout query needed). */
+/* the window's content size, owned HERE so em.c never depends on the ring-3
+ * app runtime (host tools set it directly) */
+static float g_vp_w, g_vp_h;
+void  em_set_viewport(float w, float h) { g_vp_w = w; g_vp_h = h; }
+
+/* THE input feed. Every host loop routes its pointer state through here --
+ * em_app_run and the desktop's own loop alike -- because "what the toolkit
+ * needs told each frame" is a fact about the toolkit, not about any one loop.
+ * Two hand-written copies drifted twice: the desktop silently lacked
+ * right-button delivery (context menus dead) and, before that, viewport
+ * mirroring. One function, one truth. */
+/* Press edges, TIMESTAMPED WHEN THEY HAPPEN. The runtime samples the pointer
+ * in fine slices between frames, so it knows when a button actually went
+ * down -- and an app comparing FRAME times was measuring the wrong interval
+ * entirely: a frame can take longer than the whole double-click window, so
+ * two clicks 200ms apart looked half a second apart and never paired. */
+static uint64_t g_press_at_ms;
+static int      g_prev_left_down;   /* last seen ui_press_edge_total */
+
+/* The COUNT comes from ui_pointer, which is the one that actually sees the
+ * edge -- a duplicate detector here counted zero for presses the toolkit
+ * plainly registered (ui_is_active saw them), because two detectors
+ * tracking the same button from different call sites disagree about what
+ * the previous state was. One detector, one truth; this only adds the
+ * timestamp, which declare has no clock to take. */
+int em_take_clicks(uint64_t *when_ms) {
+    if (when_ms) *when_ms = g_press_at_ms;
+    return ui_take_press_edges();
+}
+
+void em_feed_pointer(float x, float y, int left_down, int right_down,
+                     int wheel, int focused) {
+    if (focused) {
+        ui_pointer(x, y, left_down != 0);
+        em_feed_right_button(x, y, right_down != 0);
+        /* Timestamp the press AT THE PRESS. ui_pointer has just run, so if the
+         * total moved, the edge happened in this sample -- microseconds ago,
+         * not whenever the next frame gets around to noticing. */
+        { int t = ui_press_edge_total();
+          if (t != g_prev_left_down) { g_prev_left_down = t; g_press_at_ms = em_now_ms(); } }
+        if (wheel) ui_wheel((float)wheel);
+    } else {
+        ui_pointer(-100.0f, -100.0f, false);
+        em_feed_right_button(0, 0, false);
+    }
+}
+float em_viewport_width(void)  { return g_vp_w; }
+float em_viewport_height(void) { return g_vp_h; }
+
 static const void *g_menu_open;          /* label ptr of the open Menu, or NULL */
 static float g_menu_ax, g_menu_ay;       /* anchor (window-content coords) */
 static int   g_menu_cur_open;            /* is the Menu being emitted right now open? */
@@ -1593,27 +2624,75 @@ void em_menubar_(EmProps p) {
     em_flush();
     const struct ui_theme *t = TH;
     ui_begin_hstack(0);
-    ui_set_paint(solid(p.background.a > 0 ? p.background : t->surface_alt));
+    /* No surface of its own, and no growing. A menu bar is a ROW OF MENUS --
+     * whatever hosts it owns the material and decides how wide the row is. It
+     * used to paint surface_alt and sz_grow(), so inside the system bar it
+     * claimed half the width (an even split with the trailing Spacer) and
+     * filled it with an opaque slab. That was invisible while the bar had its
+     * own dark fill; the moment the bar went transparent it became a grey
+     * rectangle over the left half of the screen. A caller that does want a
+     * surface still passes .background. */
     ui_set_border(0, t->border);
     ui_set_padding(t->sp1, t->sp2, t->sp1, t->sp2);
     ui_set_align(ALIGN_CENTER);
     ui_set_spacing(t->sp1);
-    ui_set_size(sz_grow(), sz_intrinsic());
-    em_apply_box(p);
+    em_apply_box(p);            /* paints only if the caller asked for a fill */
 }
 void em_menubar_end_(void) { em_flush(); ui_end_stack(); }
 
-/* Shared: open the floating popover panel for the currently-open menu at
- * (ax, ay). Items emit into it; em_*_menu_end_ closes it + handles dismiss. */
+/* One container per menu, SAME EXPLICIT KEY in both states.
+ *
+ * Open and closed used to emit structurally different children (a keyed
+ * overlay vs an anonymous hidden box), so toggling a menu changed the child
+ * LIST SHAPE. Positional (key-0) siblings then slid one slot in the
+ * reconciler, and because reused instances RETAIN scene props a widget
+ * doesn't explicitly set, the drift smeared stale 0x0 sizes and clip flags
+ * across the neighbouring menus -- squashed buttons, item lists escaping
+ * their clipped hidden box. The corruption was latent for as long as the
+ * menus existed; z-layer paint deferral merely changed who covered whom and
+ * made it visible.
+ *
+ * With one keyed container per menu the list shape never changes, and every
+ * property that DIFFERS between the two states is set explicitly in BOTH
+ * branches, so a state flip can never inherit the other state's leftovers. */
 static void em_menu_panel_open(uint64_t key, float ax, float ay) {
     const struct ui_theme *t = TH;
     ui_begin_vstack(key);                 /* the out-of-flow overlay layer */
     g_menu_scrim = ui_open();
     ui_set_overlay(true);
+    ui_set_layer(1);                      /* elevated: paints above + hits above the flow */
+    ui_set_clip_children(false);
     ui_set_paint(solid((Color){0,0,0,0}));        /* transparent: catches outside clicks, no dim */
-    ui_set_size(sz_grow(), sz_grow());
+    /* WINDOW-sized, not parent-sized: the dismiss surface must cover the
+     * window, and this overlay's parent is a 28px menu strip. Overlays honour
+     * an explicit fixed size (layout.c) precisely for this. */
+    ui_set_size(sz_fixed(em_viewport_width()), sz_fixed(em_viewport_height()));
+    /* The panel's offset below is measured from THIS overlay's origin, but
+     * callers pass WINDOW coordinates -- em_right_clicked reports them, and so
+     * does any hit test. Emitted inside a pane, the two disagreed by that
+     * pane's origin and the menu opened down and right of the pointer.
+     * Subtracting the overlay's own resolved origin makes the anchor
+     * window-absolute wherever the menu is emitted. One frame stale, which is
+     * invisible: the menu is not on screen the frame it opens. */
+    float ovx = 0, ovy = 0, ovw, ovh;
+    if (!ui_open_rect(&ovx, &ovy, &ovw, &ovh)) { ovx = 0; ovy = 0; }
+    /* drop-in motion: the panel fades in while settling down its last 8px.
+     * Keyed on WHICH menu is open, so switching between menus re-plays it;
+     * with no clock (host renders) it snaps to settled, like em_nav. */
+    static uint64_t s_anim_key, s_anim_t0;
+    uint64_t mnow = em_now_ms();
+    if (s_anim_key != key) { s_anim_key = key; s_anim_t0 = mnow; }
+    float mt = 1.0f;
+    if (mnow && s_anim_t0) {
+        float e = (float)(mnow - s_anim_t0) / 150.0f;
+        mt = e < 0 ? 0 : e > 1.0f ? 1.0f : e;
+        float inv = 1.0f - mt;
+        mt = 1.0f - inv * inv * inv;
+        if (mt < 1.0f) em_request_frame();
+    }
     ui_begin_vstack(1);                   /* the menu panel -- frosted glass */
-    ui_set_offset(ax, ay);
+    ui_set_opacity(mt);
+    ui_set_offset(ax - ovx, ay - ovy - 8.0f * (1.0f - mt));
     ui_set_corner_radius(t->radius_md);
     ui_set_shadow(true, t->shadow_lg.dx, t->shadow_lg.dy, t->shadow_lg.blur, t->shadow_lg.color);
     em_glass_apply(12.0f);                 /* blur behind + tint + edge highlight */
@@ -1630,15 +2709,26 @@ static int em_menu_panel_close(void) {
     ui_end_stack();                       /* overlay */
     return scrim_hit;
 }
-/* the hidden container a CLOSED menu's items emit into (built but invisible) */
-static void em_menu_hidden_open(void) {
-    ui_begin_vstack(0);
+/* the hidden container a CLOSED menu's items emit into (built but invisible).
+ * SAME key as the open overlay -- one instance per menu, two dressings -- and
+ * every open-state prop explicitly reversed (overlay, layer, paint, offset). */
+static void em_menu_hidden_open(uint64_t key) {
+    ui_begin_vstack(key);
+    ui_set_overlay(false);
+    ui_set_layer(0);
+    ui_set_paint(solid((Color){0,0,0,0}));
     ui_set_size(sz_fixed(0), sz_fixed(0));
     ui_set_clip_children(true);
+    ui_begin_vstack(1);                   /* mirror the panel level */
+    ui_set_offset(0, 0);
+    ui_set_shadow(false, 0, 0, 0, (Color){0,0,0,0});
+    ui_set_backdrop_blur(false, 0);
+    ui_set_paint(solid((Color){0,0,0,0}));
+    ui_set_clip_children(true);
+    ui_set_size(sz_fixed(0), sz_fixed(0));
 }
 
 void em_menu_(const char *label, EmProps p) {
-    (void)p;
     em_flush();
     const struct ui_theme *t = TH;
     int is_open = (g_menu_open == (const void *)label);
@@ -1651,7 +2741,13 @@ void em_menu_(const char *label, EmProps p) {
     ui_set_corner_radius(t->radius_sm);
     ui_set_padding(t->sp1, t->sp3, t->sp1, t->sp3);
     ui_set_align(ALIGN_CENTER);
-    { EmProps lp = { .font = Body, .color = is_open ? t->accent : t->text }; em_text_impl(label, lp); }
+    /* .font honoured: a menu bar bolds the ACTIVE APP's name and leaves the
+     * rest regular -- that weight difference is what tells you which
+     * application the menus belong to. */
+    { EmProps lp = { .font = p.font ? p.font : Body,
+                     .color = is_open ? t->accent
+                            : (p.color.a > 0 ? p.color : t->text) };
+      em_text_impl(label, lp); }
     ui_end_stack();
     if (ui_consume_click(btn)) {
         if (is_open) g_menu_open = 0;
@@ -1662,13 +2758,31 @@ void em_menu_(const char *label, EmProps p) {
     }
     g_menu_cur_open = is_open;
     if (is_open) em_menu_panel_open((uint64_t)(uintptr_t)label, g_menu_ax, g_menu_ay);
-    else         em_menu_hidden_open();
+    else         em_menu_hidden_open((uint64_t)(uintptr_t)label);
 }
 void em_menu_end_(void) {
     em_flush();
-    if (g_menu_cur_open) { if (em_menu_panel_close()) { g_menu_open = 0; g_em_epoch++; } }
-    else ui_end_stack();                  /* hidden box */
+    if (g_menu_cur_open) {
+        if (em_menu_panel_close()) { g_menu_open = 0; g_em_epoch++; }
+    }
+    else {
+        ui_end_stack();                       /* inner mirror */
+        /* Swallow clicks resolved against LAST frame's stale scrim. Hit tests
+         * run on the last-built tree, and the frame that DISMISSES a menu
+         * still built the open tree -- so a click in that one-frame window
+         * lands on a scrim whose menu is already closed. Same keyed instance
+         * in both states, so consuming it here is exact, and the stray click
+         * dies instead of leaking into whatever sat beneath the scrim. */
+        struct instance_handle box = ui_open();
+        ui_end_stack();                       /* hidden box */
+        (void)ui_consume_click(box);
+    }
 }
+
+/* Is any MenuBar dropdown currently open? The app runtime uses this to grow a
+ * thin translucent menu-bar window tall enough to show the dropdown, then
+ * shrink it back on close -- so the bar stays a thin strip when idle. */
+int em_menu_any_open(void) { return g_menu_open != 0; }
 
 bool em_menu_item(const char *label, const char *shortcut) {
     em_flush();
@@ -1714,7 +2828,7 @@ void em_context_menu_(bool *open, float x, float y, EmProps p) {
     g_ctx_open_flag = open;
     g_menu_item_chosen = 0;               /* fresh: only THIS frame's item clicks count */
     if (g_ctx_cur_open) em_menu_panel_open((uint64_t)(uintptr_t)open, x, y);
-    else                em_menu_hidden_open();
+    else                em_menu_hidden_open((uint64_t)(uintptr_t)open);
 }
 void em_context_menu_end_(void) {
     em_flush();
@@ -1725,7 +2839,7 @@ void em_context_menu_end_(void) {
             g_em_epoch++;
         }
     } else {
-        ui_end_stack();                   /* hidden box */
+        ui_end_stack(); ui_end_stack();   /* inner mirror + hidden box */
     }
 }
 
@@ -1772,9 +2886,89 @@ static int te_line_end(const char *buf, int len, int cur) {
     return i;
 }
 
+/* One-shot editor settings; see em_editor_syntax. */
+static EmSyntaxFn g_syn_fn;
+static void      *g_syn_ud;
+static int        g_gutter;
+
+void em_editor_syntax(EmSyntaxFn fn, void *ud) { g_syn_fn = fn; g_syn_ud = ud; }
+void em_editor_gutter(int on) { g_gutter = on; }
+
+/* Draw one line: the gutter number, then the line's coloured spans, with the
+ * caret box dropped in at `caret` (-1 for none) -- splitting whichever span it
+ * lands inside, so the line being edited keeps its colours. Drawing that line
+ * plain would make the one line you are looking at the only uncoloured one. */
+static void te_draw_line(const char *buf, int i, int e, int caret, int lineno,
+                         int gutter, const struct ui_theme *t) {
+    char tmp[512];
+    ui_begin_hstack((uint64_t)(lineno + 1));
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(0);
+    if (gutter) {
+        char num[16];
+        snprintf(num, sizeof num, "%4d ", lineno + 1);
+        EmProps gp = { .font = Body, .color = t->text_tertiary };
+        em_text_impl(num, gp);
+    }
+
+    int n = e - i;
+    if (n > (int)sizeof tmp - 1) n = (int)sizeof tmp - 1;
+
+    struct em_span spans[128];
+    int ns = 0;
+    if (g_syn_fn && n > 0) ns = g_syn_fn(buf + i, n, spans, 128, g_syn_ud);
+    if (ns <= 0) { spans[0].len = n; spans[0].color = t->text; ns = n > 0 ? 1 : 0; }
+
+    int off = 0;
+    for (int k = 0; k < ns; k++) {
+        int sl = spans[k].len;
+        if (off + sl > n) sl = n - off;
+        if (sl <= 0) continue;
+        int rel = caret - off;                 /* caret position within this span */
+        if (caret >= 0 && rel >= 0 && rel < sl) {
+            if (rel > 0) {
+                memcpy(tmp, buf + i + off, (size_t)rel); tmp[rel] = 0;
+                EmProps tp = { .font = Body, .color = spans[k].color };
+                em_text_impl(tmp, tp);
+            }
+            ui_box_begin(0);
+            ui_set_paint(solid(t->accent));
+            ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
+            ui_box_end();
+            int rest = sl - rel;
+            memcpy(tmp, buf + i + off + rel, (size_t)rest); tmp[rest] = 0;
+            EmProps tp = { .font = Body, .color = spans[k].color };
+            em_text_impl(tmp, tp);
+        } else {
+            memcpy(tmp, buf + i + off, (size_t)sl); tmp[sl] = 0;
+            EmProps tp = { .font = Body, .color = spans[k].color };
+            em_text_impl(tmp, tp);
+        }
+        off += sl;
+    }
+    /* caret at (or past) the end of the line, including an empty line */
+    if (caret >= 0 && caret >= off) {
+        ui_box_begin(0);
+        ui_set_paint(solid(t->accent));
+        ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
+        ui_box_end();
+    }
+    /* An all-empty row collapses in an ALIGN_CENTER hstack, so an empty,
+     * caret-less line still needs something with a height. */
+    if (!off && caret < 0 && !gutter) {
+        EmProps tp = { .font = Body, .color = t->text };
+        em_text_impl(" ", tp);
+    }
+    ui_spacer();
+    ui_end_stack();
+}
+
 bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
     em_flush();                       /* emit any pending staged leaf first */
     const struct ui_theme *t = TH;
+    EmSyntaxFn syn = g_syn_fn; void *syn_ud = g_syn_ud; int gutter = g_gutter;
+    (void)syn; (void)syn_ud;
+    g_gutter = 0;                     /* one-shot: consumed by this editor */
     int len = (int)strlen(buf);
     int cur = cursor ? *cursor : 0;
     if (cur > len) cur = len;
@@ -1852,36 +3046,8 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
         while (i <= len) {
             int e = i; while (e < len && buf[e] != '\n') e++;
             int is_cur = (cur >= i && cur <= e);
-            char tmp[512];
-            if (is_cur && focused) {
-                ui_begin_hstack((uint64_t)(line + 1));
-                ui_set_align(ALIGN_CENTER);
-                ui_set_spacing(0);
-                int bn = cur - i; if (bn > (int)sizeof tmp - 1) bn = sizeof tmp - 1;
-                memcpy(tmp, buf + i, (size_t)bn); tmp[bn] = 0;
-                /* skip empty text nodes: an empty string in an ALIGN_CENTER hstack
-                 * collapses the row's layout (same reason the plain-line path below
-                 * substitutes a space). Cursor at line start -> no before-text;
-                 * cursor at line end -> no after-text; the caret always draws. */
-                if (bn > 0) { EmProps tp = { .font = Body, .color = t->text }; em_text_impl(tmp, tp); }
-                ui_box_begin(0);              /* caret */
-                ui_set_paint(solid(t->accent));
-                ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
-                ui_box_end();
-                int an = e - cur; if (an > (int)sizeof tmp - 1) an = sizeof tmp - 1;
-                memcpy(tmp, buf + cur, (size_t)an); tmp[an] = 0;
-                if (an > 0) { EmProps tp = { .font = Body, .color = t->text }; em_text_impl(tmp, tp); }
-                ui_spacer();
-                ui_end_stack();
-            } else {
-                int ln = e - i; if (ln > (int)sizeof tmp - 1) ln = sizeof tmp - 1;
-                memcpy(tmp, buf + i, (size_t)ln); tmp[ln] = 0;
-                ui_begin_hstack((uint64_t)(line + 1));
-                ui_set_align(ALIGN_CENTER);
-                { EmProps tp = { .font = Body, .color = t->text }; em_text_impl(tmp[0] ? tmp : " ", tp); }
-                ui_spacer();
-                ui_end_stack();
-            }
+            te_draw_line(buf, i, e, (is_cur && focused) ? cur - i : -1,
+                         line, gutter, t);
             line++;
             i = e + 1;
             if (e == len) break;

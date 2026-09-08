@@ -1,0 +1,33 @@
+<html><head><title>Custom properties</title><style>
+:root {
+  --ink:     #e8e8f0;
+  --accent:  #58a6ff;
+  --warn:    #f0a050;
+  --pad:     14px;
+}
+/* A rule written ABOVE the definition it uses must still resolve: vars are
+   collected across the whole sheet before any rule is applied. */
+.early   { color: var(--late) }
+body     { color: var(--ink) }
+.a       { color: var(--accent) }
+.w       { color: var(--warn); padding: var(--pad) }
+/* An undefined variable falls back, which is how a stylesheet stays readable
+   on a browser that never defined it. */
+.fb      { color: var(--nope, #40c090) }
+/* ...and with no fallback either, the declaration is simply not applied and
+   the inherited colour stands. */
+.none    { color: var(--alsonope) }
+:root { --late: #d05070 }
+</style></head><body>
+<p class="a">ACCENTED text uses var(--accent).</p>
+<p class="w">WARNED text uses var(--warn) and a var padding.</p>
+<p class="fb">FALLBACK text: the variable is undefined, so the fallback wins.</p>
+<p class="none">NOVALUE text: undefined and no fallback, so it inherits.</p>
+<p class="early">EARLY text uses a variable defined lower in the sheet.</p>
+
+<!-- EXPECT-COLOR: ACCENTED #58a6ff -->
+<!-- EXPECT-COLOR: WARNED #f0a050 -->
+<!-- EXPECT-COLOR: FALLBACK #40c090 -->
+<!-- EXPECT-COLOR: NOVALUE #e8e8f0 -->
+<!-- EXPECT-COLOR: EARLY #d05070 -->
+</body></html>

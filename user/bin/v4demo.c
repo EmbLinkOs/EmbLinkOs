@@ -23,6 +23,13 @@ static int   g_env = 1;
 static bool  g_adv = false, g_verbose = true, g_telemetry = false;
 static char  g_query[48] = "";
 static float g_load = 0.72f;
+/* pickers-tab state */
+static float g_hsv[3]   = { 0.58f, 0.74f, 0.92f };
+static char  g_cbbuf[32] = "";
+static bool  g_cbopen    = false;
+static char  g_tags[6][EM_TAG_LEN] = { "kernel", "wip" };
+static int   g_tagn      = 2;
+static char  g_tagentry[EM_TAG_LEN] = "";
 
 /* ---- pages -------------------------------------------------------------- */
 static void Dashboard(void) {
@@ -72,17 +79,30 @@ static void About(void) {
     }
 }
 
+static void Pickers(void) {
+    static const char *const envs[] = { "Development", "Staging", "Production", "Sandbox" };
+    VStack(.spacing = 12, .padding = 18, .align = Fill) {
+        DividerLabel("COLOR");
+        ColorPicker(g_hsv);
+        DividerLabel("ENVIRONMENT");
+        Combobox(g_cbbuf, sizeof g_cbbuf, envs, 4, "Pick or type", &g_cbopen);
+        DividerLabel("TAGS");
+        TagInput(g_tags, &g_tagn, 6, g_tagentry, sizeof g_tagentry);
+    }
+}
+
 static void app(void) {
     static const EmTab tabs[] = {
         { IconGrid,  "Dashboard", Dashboard },
         { IconGear,  "Controls",  Controls },
+        { IconStar,  "Pickers",   Pickers },
         { IconInfo,  "About",     About },
     };
     Window("V4 Demo") {
         WindowBar("V4 Demo") {
             CloseGrip();   /* pull to dismiss -- the runtime handles teardown */
         }
-        TabView(&g_tab, tabs, 3);
+        TabView(&g_tab, tabs, 4);
         ToastHost();
     }
 }

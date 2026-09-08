@@ -699,7 +699,8 @@ def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
 # test binaries). Fonts and the format fixtures are NOT *.elf and are placed
 # separately (fonts at root, fixtures at root -- they test the format, not the
 # layout).
-_SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf"}   # -> /system/bin/
+_SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf",
+               "setup.elf", "login.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
@@ -720,7 +721,7 @@ def discover_userland_objects(build_dir="build"):
       - the ABI (crt0/syscalls/libc.a) -> /system/abi/
       - installed apps       -> /data/apps/<name>/
       - demos, fonts, fixtures -> root (unmoved, see above)
-      - empty /data/tmp and /data/users/teo."""
+      - empty /data/tmp, /home, and the account databases."""
     init = _read_file(f"{build_dir}/init.elf")
     if init is None:
         raise SystemExit(f"mkfs: {build_dir}/init.elf not found -- run `make` first")
@@ -743,6 +744,22 @@ def discover_userland_objects(build_dir="build"):
         if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
             dest = f"data/apps/{base}/{base}.ns".encode()
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
+        # Per-app CAPABILITY MANIFEST: the other half of the same declaration
+        # (user/lib/appauth.h). <name>.caps names the capability CLASSES the app
+        # needs -- what it may DO, where the .ns says what it may NAME. The
+        # session grants exactly that; the kernel refuses any mask that is not a
+        # subset of the grantor's, so the file can only ever narrow.
+        capm = _read_file(f"user/bin/{base}.caps")
+        if capm is not None and _elf_dest(name).startswith(b"data/apps/"):
+            dest = f"data/apps/{base}/{base}.caps".encode()
+            objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, capm))
+        # Per-app PRESENTATION MANIFEST: an app describes itself (display name +
+        # icon) in user/bin/<name>.app, packed as /data/apps/<name>/<name>.app.
+        # The desktop reads it instead of hard-coding each app's name and icon.
+        appm = _read_file(f"user/bin/{base}.app")
+        if appm is not None and _elf_dest(name).startswith(b"data/apps/"):
+            dest = f"data/apps/{base}/{base}.app".encode()
+            objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, appm))
     # `test gitpush` LIVE credentials (LOCAL build artifact ONLY, env-gated so
     # they never touch the source tree or git). A GitHub PAT + target repo URL,
     # placed by the developer running the live push test:
@@ -827,6 +844,23 @@ def discover_userland_objects(build_dir="build"):
     mono = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
     if mono is not None:
         objects.append((b"system/fonts/mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
+    # Sealed visual assets used by full-screen system experiences (login/setup).
+    objects.extend(_tree_objects("system/images", b"system/images/", (".ppm", ".pam", ".eic")))
+    # Vellum's built-in documents (docs/BROWSER.md). Sealed with the OS: the
+    # browser must have something to open before it can reach a network.
+    objects.extend(_tree_objects("system/web", b"system/web/", (".html", ".png", ".jpg", ".json", ".css")))
+    objects.extend(_tree_objects("system/js", b"system/js/", (".js",)))
+    # The sample album Photos opens when it is launched with no argument (from
+    # the dock, which is how it is normally launched). Under /data because it
+    # is USER content the viewer only reads -- see user/bin/photos.ns -- and
+    # generated at build time by tools/mkpictures.py rather than checked in.
+    objects.extend(_tree_objects("data/pictures", b"data/pictures/",
+                                 (".png", ".jpg", ".jpeg")))
+    # NetSurf's own resources: its user-agent stylesheet and the pages it
+    # serves for about:. The core fetches these through resource: URLs at
+    # startup and a page never finishes loading without them -- which looks
+    # exactly like a hung fetch, not a missing file.
+    objects.extend(_tree_objects("system/netsurf", b"system/netsurf/", (".css", ".html")))
     # THE ABI, sealed under /system/abi (docs/USERSPACE.md D2 §3.1): crt0.o
     # (_start), syscalls.o (the newlib retargeting layer) and libc.a ARE the
     # definition of "targeting EmbLinkOS". tcc READS them (read-only reach into
@@ -1106,24 +1140,26 @@ def discover_userland_objects(build_dir="build"):
 
     # Empty user/scratch directories the layout commits to now (D4 §5, D3 §4.1),
     # so a session can chdir into a home and tcc has a scratch dir to write to.
-    objects.append((b"data/tmp",          L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
-    objects.append((b"data/users/teo",    L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
-    objects.append((b"data/users/guest",  L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
-    # Per-user SESSION PROFILES (docs/USERSPACE_v2.md UP3). Multi-user here is
-    # namespace domains, not uid/gid: a "user" is a home subtree + a session
-    # namespace, declared in the SAME manifest format as the app manifests (UP4).
-    # init (the session manager) reads the default user's profile and launches
-    # the desktop confined to it. A session bound only to its own
-    # /data/users/<name> literally cannot NAME another user's home.
-    #   teo   -- the machine owner: the live desktop runs here. Broad (mirrors the
-    #            global seed: /, /run rw + /system ro) so the desktop is unchanged.
-    #   guest -- a confined session: read-only system + apps, and ONLY its own home.
-    objects.append((b"data/users/teo/user.ns",   L.DT_REG, L.S_IFREG | L.PERM_FILE,
-                    b"# teo -- the machine owner (the desktop session; broad but sealed)\n"
-                    b"rw /\nro /system\nrw /run\n"))
-    objects.append((b"data/users/guest/user.ns", L.DT_REG, L.S_IFREG | L.PERM_FILE,
-                    b"# guest -- a confined session: system + apps read-only, own home only\n"
-                    b"ro /system\nro /data/apps\nrw /data/users/guest\n"))
+    objects.append((b"data/tmp", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"home",     L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    # ...and the dev user's home INSIDE it. init sets HOME=/home/<user> and the
+    # terminal starts the shell there, so with only an empty /home the shell
+    # opened in a directory that did not exist -- which is why a bare `ls`
+    # listed nothing at all. Give it a home with the usual folders in it.
+    objects.append((b"home/yves", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    # .vellum: the browser's own state (cookie jar, localStorage). It has to
+    # EXIST on the image, not be created on first use, because the kernel
+    # resolves an ns-bind prefix in the PARENT's namespace at spawn time -- a
+    # directory that is not there yet cannot be granted, and an app cannot
+    # create what it has not been granted. Chicken and egg, broken here.
+    for _d in (b"Desktop", b"Documents", b"Downloads",
+               b"Music", b"Pictures", b"Videos", b".vellum"):
+        objects.append((b"home/yves/" + _d, L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"home/yves/readme.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"Welcome to EmbLink.\n\nThis is your home directory.\n"))
+    objects.append((b"etc",      L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"etc/passwd", L.DT_REG, L.S_IFREG | 0o644, b""))
+    objects.append((b"etc/shadow", L.DT_REG, L.S_IFREG | 0o600, b""))
     return objects
 
 

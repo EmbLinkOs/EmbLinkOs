@@ -1,0 +1,43 @@
+<html><head><title>Media queries, narrow</title><style>
+/* Mobile-first, the way most stylesheets are written: the base rules are the
+   narrow layout and everything else lives behind a min-width. Skipping the
+   blocks renders the phone version at desktop size. */
+.resp   { color: #ff0000 }
+@media (min-width: 700px) { .resp { color: #30c060 } }
+@media (min-width: 5000px) { .resp { color: #ff00ff } }
+
+/* max-width must NOT match a wide viewport */
+.narrow { color: #40c0ff }
+@media (max-width: 400px) { .narrow { color: #ff0000 } }
+
+/* print must never restyle a screen */
+.printy { color: #c0a020 }
+@media print { .printy { color: #ff0000 } }
+
+/* a comma-separated list matches if ANY alternative does */
+.anyof  { color: #ff0000 }
+@media print, screen and (min-width: 300px) { .anyof { color: #a070ff } }
+
+/* an unknown feature cannot be claimed to hold */
+.unknown { color: #70c0a0 }
+@media (hover: hover) and (min-resolution: 2dppx) { .unknown { color: #ff0000 } }
+
+/* the desktop is dark, so this one DOES apply */
+.scheme { color: #ff0000 }
+@media (prefers-color-scheme: dark) { .scheme { color: #e0e060 } }
+</style></head><body>
+<p class="resp">RESPONSIVE is RED here: 360px is below the 700px breakpoint.</p>
+<p class="narrow">NARROWTEST is red here: a max-width of 400px DOES match 360px.</p>
+<p class="printy">PRINTTEST stays gold: a print block must not restyle a screen.</p>
+<p class="anyof">ANYOF is violet: the second alternative in the list matches.</p>
+<p class="unknown">UNKNOWNFEAT stays green: a feature we cannot evaluate is false.</p>
+<p class="scheme">SCHEME is yellow: this desktop is dark.</p>
+
+<!-- CORPUS-WIDTH: 360 -->
+<!-- EXPECT-COLOR: RESPONSIVE #ff0000 -->
+<!-- EXPECT-COLOR: NARROWTEST #ff0000 -->
+<!-- EXPECT-COLOR: PRINTTEST #c0a020 -->
+<!-- EXPECT-COLOR: ANYOF #a070ff -->
+<!-- EXPECT-COLOR: UNKNOWNFEAT #70c0a0 -->
+<!-- EXPECT-COLOR: SCHEME #e0e060 -->
+</body></html>

@@ -6,11 +6,20 @@ CC = x86_64-elf-gcc
 # "drivers/char/serial.h", "arch/x86_64/irq/idt.h"), independent of where the
 # including file itself lives -- the standard approach and what keeps a move
 # like this one from being fragile.
+# Dev VM display size. FB_W/FB_H both (a) hint the virtio-vga host mode and
+# (b) hard-cap the guest virtio-gpu scanout, so the QEMU window can't open
+# bigger than this even when -display gtk ignores the xres/yres hint. virtio-gpu
+# is VM-only, so real hardware (UEFI GOP / bochs / VBE) is unaffected. Override
+# per build: `make FB_W=640 FB_H=480` (then re-run run-embkfs-cow).
+FB_W ?= 800
+FB_H ?= 600
+
 CFLAGS = -ffreestanding -nostdlib -nostartfiles \
          -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
          -mcmodel=kernel \
          -Ikernel \
          -Iuser/lib/tls/crypto \
+         -DEMBK_VGPU_CAP_W=$(FB_W) -DEMBK_VGPU_CAP_H=$(FB_H) \
          -g -O0
 
 IMG = myos.img
@@ -74,6 +83,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/video/gpu.c \
              kernel/drivers/video/bochs_vbe.c \
              kernel/drivers/video/virtio_gpu.c \
+             kernel/drivers/audio/ac97.c \
+             kernel/drivers/audio/audio.c \
              kernel/drivers/video/font_8x16.c \
              kernel/drivers/video/console.c \
              kernel/drivers/video/bootanim.c \
@@ -128,6 +139,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/epfs.c \
              kernel/ipc/handle.c \
              kernel/ipc/channel.c \
+             kernel/ipc/clipboard.c \
              kernel/ipc/endpoint.c \
              kernel/ipc/pipe.c \
              kernel/kworker/kworker.c \
@@ -180,7 +192,7 @@ ASM_GAS      = x86_64-elf-as   # GNU as for the dynstubs (.set/.weak)
 USER_LD      = x86_64-elf-ld
 USER_INC     = -Iuser/lib
 # Freestanding programs (init.elf, primtest.elf): own _start, no libc, no SSE.
-USER_CFLAGS  = -ffreestanding -nostdlib -fno-pic -mno-red-zone \
+USER_CFLAGS  = -MMD -MP -MF $@.d -ffreestanding -nostdlib -fno-pic -mno-red-zone \
                -fno-stack-protector -mno-mmx -mno-sse -mno-sse2 -O2 $(USER_INC)
 
 # The real pid-1 init: kernel spawns it first; it brings up the desktop session
@@ -263,7 +275,16 @@ NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
 # an uninitialized stack `bn` whose garbage happened to be benign on the host but
 # broke github's P-256 leaf verification under QEMU (rc=-103). Cheap; belongs on
 # security-critical crypto anyway.
-NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall $(USER_INC) $(NEWLIB_INC)
+# -MMD -MP: let the COMPILER write the header dependencies.
+#
+# They were written by hand, and a hand-written list is a list that goes stale.
+# build/web_jsdom.o named jsdom.c, jsdom.h and html.h but not style.h -- so
+# when `struct vstyle` grew, jsdom.o kept the OLD layout and was linked into
+# the same binary as everything that had the new one. The browser then laid
+# out flex containers wrongly on the metal and correctly on the host, because
+# the host harness does not link jsdom at all. Nothing about that symptom
+# points at a Makefile.
+NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
 # gcc as the link driver so it finds libc.a/libgcc; -nostartfiles because
 # crt0.c provides _start (no standard crtX). newlib.ld places it at 0x400000.
 # NEWLIB_LIB is a -L searched BEFORE the toolchain's default lib dir, so our
@@ -403,6 +424,16 @@ build/python.elf._pth: | $(BUILD)
 	printf 'python314.zip\npip.zip\n.\n' > $@
 else
 PY_APPS =
+# The CPython toolchain is not on this machine, so nothing here can rebuild
+# these -- but a PREVIOUS build's artifacts may still be sitting in build/,
+# and mkfs packs every build/*.elf it finds. That is exactly the situation the
+# drift guard is meant to catch, and exactly the situation STAGED_APPS exists
+# for: "built outside this tree". Named one by one rather than wildcarded, so
+# the guard stays armed for everything else -- and kept OUT of STAGED_APPS
+# itself so a `make STAGED_APPS=...` on the command line does not silently
+# drop them.
+PREBUILT_APPS += $(wildcard build/python.elf) $(wildcard build/python314.zip) \
+                 $(wildcard build/pip.zip) $(wildcard build/python.elf._pth)
 endif
 
 # Dynamic-link flags (Phase 2): an ET_EXEC app that imports the toolkit from
@@ -501,13 +532,158 @@ build/nbsock.o: user/bin/nbsock.c user/lib/sys/socket.h user/lib/netdb.h | $(BUI
 build/nbsock.elf: build/crt0.o build/syscalls.o build/nbsock.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/nbsock.o -lc -lgcc -o $@
 
+# Vellum -- the browser (docs/BROWSER.md). user/web/ = the engine: html (the
+# parser), style (the user-agent stylesheet), render (document -> EmUI).
+build/web_html.o: user/web/html.c user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+# ---- QuickJS: JavaScript on the OS (docs/BROWSER.md B7) ---------------------
+# Ported, not written: §9's position is own the CORE, port the TOOLS, and this
+# OS already ports CPython, TCC and git. Absent source => js.elf is simply not
+# built, the same bargain every other port makes here.
+#
+# The engine needs TWO switches to build against a freestanding libc, both
+# added by tools/quickjs/0001-*.patch (which only widens existing #ifdefs):
+#   CONFIG_NO_ATOMICS    Atomics.* is SharedArrayBuffer across OS threads.
+#                        We have threads, but a single-context engine has
+#                        nothing to share with; pthread_mutex is the only
+#                        thing quickjs.c wanted from POSIX.
+#   CONFIG_NO_TM_GMTOFF  struct tm::tm_gmtoff is a BSD/GNU extension newlib
+#                        does not carry. QuickJS already has a portable
+#                        gmtime/mktime path for it -- this takes that one.
+QJS_SRC ?= $(HOME)/cross/quickjs-2024-01-13
+QJS_OBJS := build/qjs/quickjs.o build/qjs/libregexp.o build/qjs/libunicode.o \
+            build/qjs/cutils.o build/qjs/libbf.o
+QJS_CFLAGS := -D_GNU_SOURCE -DCONFIG_VERSION='"2024-01-13"' -DCONFIG_BIGNUM \
+              -DCONFIG_NO_ATOMICS -DCONFIG_NO_TM_GMTOFF -I$(QJS_SRC)
+HAVE_QJS := $(if $(wildcard $(QJS_SRC)/quickjs.c),1,)
+
+build/qjs:
+	@mkdir -p $@
+
+build/qjs/%.o: $(QJS_SRC)/%.c | build/qjs
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Wno-array-bounds $(QJS_CFLAGS) -c $< -o $@
+
+build/qjs/js.o: user/bin/js.c $(QJS_SRC)/quickjs.h | build/qjs
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 $(QJS_CFLAGS) -c $< -o $@
+
+build/js.elf: build/crt0.o build/syscalls.o build/qjs/js.o $(QJS_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/qjs/js.o \
+	    $(QJS_OBJS) -lc -lm -lgcc -o $@
+
+.PHONY: js
+js: build/js.elf
+	@echo "js.elf: $$(stat -c%s build/js.elf) bytes"
+
+build/web_style.o: user/web/style.c user/web/style.h user/web/css/css.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/web/html.h user/web/css/css.h user/web/imgcache.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css -c $< -o $@
+build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/render.h \
+                user/web/url.h user/web/net.h user/web/fetchjob.h user/web/css/css.h \
+                user/web/jsdom.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css -c $< -o $@
+# B2: url.c is pure string work; net.c reaches the network, so it needs the TLS
+# include set (same as wget) for tls.h.
+build/web_url.o: user/web/url.c user/web/url.h user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+# forms: the first part of the web that is not read-only (user/web/form.h)
+build/web_form.o: user/web/form.c user/web/form.h user/web/html.h user/web/url.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+# CSS (B5): three concerns, three files -- declarations, selectors, cascade.
+build/web_css_decl.o: user/web/css/decl.c user/web/css/css.h user/web/style.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_css_sel.o: user/web/css/sel.c user/web/css/css.h user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_css_sheet.o: user/web/css/sheet.c user/web/css/css.h user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_css_vars.o: user/web/css/vars.c user/web/css/css.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_css_media.o: user/web/css/media.c user/web/css/css.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_css_calc.o: user/web/css/calc.c user/web/css/css.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+build/web_net.o: user/web/net.c user/web/net.h user/web/url.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/web -c $< -o $@
+# fetchjob: the fetch runs on a worker thread so the window keeps drawing.
+build/web_fetchjob.o: user/web/fetchjob.c user/web/fetchjob.h user/web/net.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+# B7 bindings: the DOM as JavaScript sees it. Only built with QuickJS present.
+build/web_jsdom.o: user/web/jsdom.c user/web/jsdom.h user/web/html.h | build/qjs
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Iuser/web -Iuser/web/css $(QJS_CFLAGS) -c $< -o $@
+# B6: PNG over our own DEFLATE, and the cache that fetches a page's pictures.
+build/web_png.o: user/web/png.c user/web/png.h user/lib/inflate.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+# JPEG: the format the web actually has (Huffman + IDCT + chroma, all ours)
+build/web_jpeg.o: user/web/jpeg.c user/web/jpeg.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_imgcache.o: user/web/imgcache.c user/web/imgcache.h user/web/png.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+# .ico -- the format the web's favicons are actually in, and the cache that
+# keeps one per SITE rather than per page.
+build/web_ico.o: user/web/ico.c user/web/ico.h user/web/png.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_favicon.o: user/web/favicon.c user/web/favicon.h user/web/ico.h user/web/png.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_svg.o: user/web/svg.c user/web/svg.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_charset.o: user/web/charset.c user/web/charset.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_cookie.o: user/web/cookie.c user/web/cookie.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_store.o: user/web/store.c user/web/store.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_find.o: user/web/find.c user/web/find.h user/web/select.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -c $< -o $@
+build/web_history.o: user/web/history.c user/web/history.h user/web/store.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_tabs.o: user/web/tabs.c user/web/tabs.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
+build/web_select.o: user/web/select.c user/web/select.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -c $< -o $@
+build/web_cssref.o: user/web/cssref.c user/web/cssref.h user/web/html.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
+VELLUM_OBJS := build/vellum.o build/web_html.o build/web_style.o build/web_render.o \
+               build/web_url.o build/web_net.o build/web_fetchjob.o \
+               build/web_css_decl.o build/web_css_sel.o build/web_css_sheet.o build/web_css_vars.o build/web_css_media.o build/web_css_calc.o \
+               build/web_png.o build/web_jpeg.o build/web_imgcache.o build/pkg_inflate.o \
+               build/web_ico.o build/web_favicon.o \
+               build/web_form.o build/web_select.o build/web_cssref.o build/web_cookie.o build/web_store.o build/web_find.o build/web_history.o build/web_tabs.o build/web_charset.o build/web_svg.o
+VELLUM_JS := $(if $(HAVE_QJS),build/web_jsdom.o $(QJS_OBJS),)
+# DEFINED BEFORE ITS FIRST USE, and that is not style. Make expands a rule's
+# PREREQUISITES when the rule is read, so a := variable defined later expands
+# to NOTHING there -- build/vellum.elf listed $(TLS_LIB_OBJS) and depended on
+# none of it. Changing a trust anchor rebuilt the object and never relinked the
+# browser, so the OS kept refusing a site the host verifier accepted, and the
+# binary under test was not the binary just built. That is the same trap the
+# image drift guard exists for, one level down.
+TLS_LIB_OBJS := build/tls_sha256.o build/tls_hmac.o build/tls_aes.o \
+                build/tls_hkdf.o build/tls_gcm.o build/tls_x25519.o \
+                build/tls_sha512.o build/tls_bignum.o build/tls_ecdsa.o build/tls_rsa.o \
+                build/tls_asn1.o build/tls_cert.o build/tls_trust.o \
+                build/tls_keysched.o build/tls_record.o build/tls_handshake.o build/tls_tls.o \
+                build/tls_prf12.o build/tls_record12.o build/tls_tls12.o \
+                build/tls_handle.o
+
+build/vellum.elf: build/crt0.o build/syscalls.o $(VELLUM_OBJS) $(VELLUM_JS) $(TLS_LIB_OBJS) build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $(VELLUM_OBJS) \
+	    $(VELLUM_JS) $(TLS_LIB_OBJS) build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
 # httpd -- the M5 server witness: an on-OS HTTP server (bind/listen/accept over
 # the native socket syscalls). `test httpd` spawns it; the host curls it via a
 # SLIRP hostfwd. Auto-discovered by mkfs.
-build/httpd.o: user/bin/httpd.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/httpd.elf: build/crt0.o build/syscalls.o build/httpd.o user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpd.o -lc -lgcc -o $@
+# user/httpd/ = the server's modules, one concern per file: http (the
+# protocol), mime (content types), serve (which files a URL may reach).
+build/httpd_http.o: user/httpd/http.c user/httpd/http.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
+build/httpd_mime.o: user/httpd/mime.c user/httpd/mime.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
+build/httpd_serve.o: user/httpd/serve.c user/httpd/serve.h user/httpd/http.h user/httpd/mime.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
+build/httpd.o: user/bin/httpd.c user/httpd/http.h user/httpd/serve.h user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
+HTTPD_OBJS := build/httpd.o build/httpd_http.o build/httpd_mime.o build/httpd_serve.o
+build/httpd.elf: build/crt0.o build/syscalls.o $(HTTPD_OBJS) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(HTTPD_OBJS) -lc -lgcc -o $@
 
 # udptest -- the M5 ring-3 UDP witness: a userspace DNS resolver over a
 # SOCK_DGRAM socket (sendto/recvfrom). Auto-discovered by mkfs.
@@ -522,15 +698,62 @@ build/udptest.elf: build/crt0.o build/syscalls.o build/udptest.o user/lib/newlib
 # -Ikernel so include/{types,kstring,kprintf}.h resolve to the shims. Defined
 # BEFORE the consumers (wget, tlstest) so their prerequisite lists see it.
 TLS_LIB_INC  := -Iuser/lib/tls/kshim -Ikernel -Iuser/lib/tls/crypto -Iuser/lib/tls -Iuser/lib/tls/x509
-TLS_LIB_OBJS := build/tls_sha256.o build/tls_hmac.o build/tls_aes.o \
-                build/tls_hkdf.o build/tls_gcm.o build/tls_x25519.o \
-                build/tls_sha512.o build/tls_bignum.o build/tls_ecdsa.o build/tls_rsa.o \
-                build/tls_asn1.o build/tls_cert.o build/tls_trust.o \
-                build/tls_keysched.o build/tls_record.o build/tls_handshake.o build/tls_tls.o \
-                build/tls_handle.o
 
 # wget -- a real HTTP/HTTPS downloader (networking + TLS meets the filesystem).
 # Links libtls so https:// does an authenticated TLS 1.3 fetch. Auto-packed.
+# --- NetSurf port ------------------------------------------------------------
+# The engine (libhubbub/libdom/libcss and their dependencies) is cross-built
+# OUTSIDE this repo by ports/netsurf/build.sh; see docs/PORTS.md. What is built
+# here is the code we write: the compat shims, and -- for now -- the probe that
+# proves the engine parses and cascades on the metal rather than merely linking.
+NS_PREFIX ?= $(HOME)/cross/netsurf/netsurf-all-3.11/inst-emblink
+NS_INC     = -isystem $(NS_PREFIX)/include
+# Link order is dependency order: dom before hubbub before parserutils, and
+# wapcaplet last because everything interns strings through it.
+NS_LIBS    = -L$(NS_PREFIX)/lib -ldom -lhubbub -lcss -lparserutils -lwapcaplet
+
+build/ns_iconv.o: ports/netsurf/compat/iconv.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/nsprobe.o: ports/netsurf/nsprobe.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(NS_INC) -c $< -o $@
+# nsemblink: NetSurf itself. Built by the port's own script (it drives
+# NetSurf's buildsystem, which this Makefile has no business reimplementing),
+# then copied in so the image rule can depend on it like any other binary.
+# Copying rather than symlinking because mkfs reads build/*.elf and a dangling
+# link there is a packing failure three steps later.
+NS_TREE ?= $(HOME)/cross/netsurf/netsurf-all-3.11
+build/nsemblink.elf: $(wildcard ports/netsurf/frontend/*.c) $(wildcard ports/netsurf/frontend/*.h) \
+                     ports/netsurf/compat/iconv.c ports/netsurf/build.sh | $(BUILD)
+	./ports/netsurf/build.sh netsurf
+	# STRIPPED for the image, with the debug copy kept beside it. The kernel's
+	# ELF loader refuses the unstripped 5MB binary outright (err 22), and the
+	# debug sections are no use to it anyway -- but they are exactly what
+	# addr2line needs to turn a ring-3 backtrace into line numbers, so they go
+	# to build/nsemblink.debug.elf rather than into the bin.
+	# The debug copy is NOT named *.elf: mkfs packs every build/*.elf it
+	# finds, so an unstripped 6MB twin would be shipped on the image AND trip
+	# the drift guard. Same bytes, different suffix, never packed.
+	cp -f $(NS_TREE)/netsurf/nsemblink-x86_64-elf build/nsemblink.debug
+	$(STRIP) -o $@ build/nsemblink.debug
+
+build/nsprobe.elf: build/crt0.o build/syscalls.o build/nsprobe.o build/ns_iconv.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/nsprobe.o \
+	    build/ns_iconv.o $(NS_LIBS) -lc -lgcc -o $@
+
+# The iconv shim on the HOST, in a second -- the conversion a browser does most.
+iconv-test:
+	@gcc -O1 -Wall -o build/iconv_test ports/netsurf/compat/iconv_test.c \
+	    ports/netsurf/compat/iconv.c && ./build/iconv_test
+
+.PHONY: iconv-test
+
+# beep: the first program to use the audio syscalls, and the first user of
+# EMBK_CAP_AUDIO. Plain newlib link -- sound needs no toolkit.
+build/beep.o: user/bin/beep.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/beep.elf: build/crt0.o build/syscalls.o build/beep.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/beep.o -lc -lgcc -o $@
+
 build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/wget.elf: build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) user/lib/newlib.ld
@@ -652,6 +875,12 @@ build/tls_cert.o: user/lib/tls/x509/cert.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tls_trust.o: user/lib/tls/x509/trust.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_prf12.o: user/lib/tls/prf12.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_record12.o: user/lib/tls/record12.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
+build/tls_tls12.o: user/lib/tls/tls12.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tls_keysched.o: user/lib/tls/keysched.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tls_record.o: user/lib/tls/record.c | $(BUILD)
@@ -682,7 +911,7 @@ EMLIBC_INC    := -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include -Iuse
 # do heavy FP), and x86-64 passes float/double in XMM, so FP is impossible with
 # it. crt0 already realigns the stack (and $-16) for SSE. emlibc's non-FP code
 # is unaffected; math.c needs this.
-EMLIBC_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
+EMLIBC_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
                  -fno-stack-protector -O2 -Wall -Wextra $(EMLIBC_INC)
 
 # emlibc's math = a thin glue (emlibc_math.o) over LIFTED fdlibm (Sun's freely-
@@ -692,7 +921,7 @@ EMLIBC_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone \
 EMLIBC_FD_DIR  := $(EMLIBC_DIR)/math/fdlibm
 EMLIBC_FD_SRCS := $(wildcard $(EMLIBC_FD_DIR)/*.c)
 EMLIBC_FD_OBJS := $(patsubst $(EMLIBC_FD_DIR)/%.c,build/emlibc_fd_%.o,$(EMLIBC_FD_SRCS))
-EMLIBC_FD_CFLAGS := -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
+EMLIBC_FD_CFLAGS := -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin -mno-red-zone -fno-stack-protector \
                     -O2 -w -nostdinc -isystem $(GCC_FREEINC) -I$(EMLIBC_DIR)/include \
                     -Iuser/lib -I$(EMLIBC_FD_DIR)
 
@@ -937,11 +1166,13 @@ $(BUILD)/picobj_dsl_em.o: ui/dsl/em.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_dsl_em_app.o: ui/dsl/em_app.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_auth.o: user/lib/auth.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 LIBEMBK_OBJS = $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
                $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
                $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
                $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
-               $(BUILD)/picobj_dsl_em.o $(BUILD)/picobj_dsl_em_app.o
+               $(BUILD)/picobj_dsl_em.o $(BUILD)/picobj_dsl_em_app.o $(BUILD)/picobj_auth.o
 
 build/libembk.so: $(LIBEMBK_OBJS)
 	$(USER_LD) -shared -soname libembk.so --hash-style=sysv $(LIBEMBK_OBJS) -o $@
@@ -960,7 +1191,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/vellum.c user/bin/js.c user/bin/photos.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -977,6 +1208,99 @@ build/%.o: user/bin/%.c user/lib/embk.h | $(BUILD)
 # PT_INTERP); --hash-style=sysv: DT_HASH for symcount.
 build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
 	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $< \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
+# Photos -- the picture viewer. Like vellum it needs more than one object, so
+# it gets an explicit rule and is filtered out of the generic EmUI link above.
+# It shares the browser's decoders rather than carrying its own: png.c and
+# jpeg.c already decode to exactly the premultiplied BGRA the toolkit blits,
+# and a second copy of a JPEG decoder is a second place for a bug to live.
+build/photos.o: user/bin/photos.c user/photos/photo.h user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/photos -c $< -o $@
+build/photo_decode.o: user/photos/decode.c user/photos/photo.h user/web/png.h user/web/jpeg.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/photos -Iuser/web -c $< -o $@
+build/photo_resample.o: user/photos/resample.c user/photos/photo.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/photos -c $< -o $@
+build/photo_album.o: user/photos/album.c user/photos/photo.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/photos -c $< -o $@
+
+PHOTOS_OBJS := build/photos.o build/photo_decode.o build/photo_resample.o \
+               build/photo_album.o build/web_png.o build/web_jpeg.o build/pkg_inflate.o
+
+build/photos.elf: build/crt0.o build/syscalls.o $(PHOTOS_OBJS) build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o $(PHOTOS_OBJS) \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
+# The viewer's resampler, measured on the HOST. The claim the app makes is
+# checkable arithmetic -- shrinking produces the area average of the pixels
+# each output pixel covers -- and this reports it as a number next to what the
+# compositor's bilinear blitter would have produced on the same input. See
+# user/photos/photo_test.c for why the comparison is the point.
+# The MP3 frame layer, on the host. Point it at any real .mp3:
+#   make test-mp3 MP3=/path/to/file.mp3
+# The frame chain is SELF-CHECKING -- where the next frame starts is computed
+# from this one's header, so walking a whole file without hunting for a sync
+# word proves every bitrate/samplerate/padding field was read correctly, a few
+# thousand times in a row, on a file nobody wrote for this test.
+MP3 ?=
+.PHONY: test-mp3
+test-mp3: | $(BUILD)
+	$(HOSTCC) -O2 -Wall -Iuser/audio/mp3 -o build/mp3_test \
+	    user/audio/mp3/mp3_test.c user/audio/mp3/bits.c user/audio/mp3/frame.c
+	./build/mp3_test $(MP3)
+
+.PHONY: test-photos
+test-photos: | $(BUILD)
+	$(HOSTCC) -O2 -Wall -Iuser/photos -o build/photo_test \
+	    user/photos/photo_test.c user/photos/resample.c
+	./build/photo_test
+
+# photo_probe -- the whole decode/orient/resample path on the host, so a
+# picture that renders wrong can be diagnosed in two seconds instead of a boot.
+# The same reflex as `make browser-render`.
+build/photo_probe: user/photos/photo_probe.c user/photos/decode.c \
+                   user/photos/resample.c user/web/png.c user/web/jpeg.c \
+                   user/lib/inflate.c | $(BUILD)
+	$(HOSTCC) -O2 -w -Iuser/photos -Iuser/web -Iuser/lib -o $@ $^
+.PHONY: photo-probe
+photo-probe: build/photo_probe $(PICTURES_STAMP)
+	@for f in data/pictures/*; do ./build/photo_probe "$$f"; done
+
+# The sample album, generated rather than checked in -- see tools/mkpictures.py.
+PICTURES_STAMP := build/.pictures.stamp
+$(PICTURES_STAMP): tools/mkpictures.py system/web/photo.jpg | $(BUILD)
+	python3 tools/mkpictures.py
+	@touch $@
+.PHONY: pictures
+pictures: $(PICTURES_STAMP)
+
+# home links one thing the generic rule does not: the shared reader for an
+# app's declared authority (user/lib/appauth.c). An explicit rule beats the
+# pattern rule, so this is the whole override.
+build/appauth.o: user/lib/appauth.c user/lib/appauth.h user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+
+# Note++ links the editor's own two modules (the documents model and the syntax
+# highlighter), which live in user/note/ rather than beside the app -- they are
+# testable without a screen and syntax.c is exercised by `make syntax-test`.
+# An explicit rule beats the generic one, so this is the whole override.
+build/note_syntax.o: user/note/syntax.c user/note/syntax.h user/note/ckeywords.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/note -c $< -o $@
+build/note_doc.o: user/note/doc.c user/note/doc.h user/note/syntax.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/note -c $< -o $@
+build/note_edit.o: user/note/edit.c user/note/edit.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/note -c $< -o $@
+build/notepp.o: user/bin/notepp.c user/note/doc.h user/note/syntax.h user/note/edit.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/note -c $< -o $@
+build/notepp.elf: build/notepp.o build/note_syntax.o build/note_doc.o build/note_edit.o \
+                  build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o \
+	    build/notepp.o build/note_syntax.o build/note_doc.o build/note_edit.o \
+	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
+
+build/home.elf: build/home.o build/appauth.o build/crt0.o build/syscalls.o build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o \
+	    build/home.o build/appauth.o \
 	    build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # Build every discovered app.
@@ -1004,6 +1328,20 @@ DRIVES = -drive format=raw,file=$(IMG),if=ide,index=0 \
 # ARP + ICMP, so `test net` pings the gateway out of the box. Appended to the
 # run targets below. Add hostfwd=tcp::HOST-:GUEST here once TCP (M3) lands.
 NET = -netdev user,id=net0 -device virtio-net,netdev=net0
+
+# AUDIO. AC'97 because it is the smallest device that makes a noise (see
+# kernel/drivers/audio/ac97.c). The BACKEND is the interesting part for
+# testing: `-audiodev wav` writes what the guest played to a file on the host,
+# so `make test-audio` can MEASURE the tone -- frequency and amplitude -- and
+# pass or fail on a number instead of on whether somebody heard something.
+# Override AUDIO_BACKEND=pa (or sdl/alsa) to actually listen.
+AUDIO_BACKEND ?= wav
+AUDIO_WAV     ?= build/audio-out.wav
+ifeq ($(AUDIO_BACKEND),wav)
+  AUDIO = -device AC97,audiodev=snd0 -audiodev wav,id=snd0,path=$(AUDIO_WAV)
+else
+  AUDIO = -device AC97,audiodev=snd0 -audiodev $(AUDIO_BACKEND),id=snd0
+endif
 
 # `make` builds a COMPLETE, CURRENT system: the boot image AND the userland
 # image. embkfs.img was deliberately absent here before, so a plain `make` could
@@ -1141,10 +1479,14 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf build/gitpush.elf \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
-               build/shell.elf build/sysinfo.elf build/tally.elf \
-               build/embbuild.elf build/pkg.elf build/pkgbuild.elf build/pkgprobe.embx build/pkgprobe.pkg \
+               build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf \
+               build/embbuild.elf build/pkg.elf build/pkgbuild.elf \
+               build/pkgprobe.elf build/pkgprobe.embx build/pkgprobe.pkg \
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
-               $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS)
+               $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS) \
+               $(if $(HAVE_QJS),build/js.elf,) \
+               build/vellum.elf build/photos.elf \
+               $(if $(wildcard $(NS_PREFIX)/lib/libdom.a),build/nsprobe.elf build/nsemblink.elf,)
 
 # STAGED_APPS: binaries built OUTSIDE this tree and dropped into build/ to be
 # judged by the machine rather than by their author's host -- e.g. EmbCC (a
@@ -1173,19 +1515,68 @@ STAGED_APPS ?=
 # is empty (nothing built yet) and EMBKFS_APPS drives the first build; on an
 # incremental build it catches every packed .elf/.embx, closing the drift-guard
 # gap so a rebuilt app (e.g. pkg.elf) always re-packs. See the guard below.
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx)
+# Icons: one master in icons/masters/<name>.svg becomes system/images/<name>.eic
+# carrying every size the shell asks for (docs/ICONS.md). Regenerated whenever a
+# master -- or the generator -- changes, so dropping in new art is just `make`.
+# Falls back to the legacy .pam art for icons that have no master yet.
+# Recursive: icons/masters may be organised into subfolders, and an icon is
+# known by its FILENAME wherever it sits (see tools/mkicons.py).
+ICON_MASTERS := $(shell find icons/masters -type f \( -name '*.svg' -o -name '*.png' \) 2>/dev/null)
+ICON_DIRS    := $(shell find icons/masters -type d 2>/dev/null)
+ICON_LEGACY  := $(wildcard system/images/*.pam)
+ICONS_STAMP  := build/.icons.stamp
+# The master DIRECTORIES are prerequisites in their own right: a directory's
+# mtime moves when an entry is added or REMOVED, and deleting a master otherwise
+# leaves the stamp newer than everything left behind, so a stale .eic would
+# survive with art whose master is gone. Every subfolder counts, not just the
+# root, or a delete inside one would go unnoticed.
+$(ICONS_STAMP): tools/mkicons.py $(ICON_DIRS) $(ICON_MASTERS) $(ICON_LEGACY)
+	@mkdir -p build
+	python3 tools/mkicons.py
+	@touch $@
+.PHONY: icons
+icons: $(ICONS_STAMP)
+
+# The CONTENT trees mkfs stages, not just the binaries. system/ is walked by
+# mkfs and was a prerequisite of nothing, so adding a page to system/web left
+# the image "up to date" and the OS could not open the file -- the same silent
+# staleness as an unbuilt .elf, wearing different clothes. The DIRECTORIES are
+# prerequisites too: a directory's mtime moves when an entry is added or
+# removed, which is what catches a NEW file (a wildcard alone is evaluated
+# before it exists).
+EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
+                  $(shell find system data -type d 2>/dev/null)
+
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(EMBKFS_CONTENT)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
-	@# otherwise completely silent. Warn loudly rather than let it rot.
-	@for f in build/*.elf; do \
-	  case " $(EMBKFS_APPS) $(STAGED_APPS) " in \
+	@# otherwise completely silent.
+	@#
+	@# It FAILS THE BUILD. It used to print a warning, and a warning is what it
+	@# was doing on the day build/vellum.elf stopped being rebuilt: the browser
+	@# had never been a prerequisite of anything, so a failed link deleted it,
+	@# `make` said "Nothing to be done", and every image after that packed a
+	@# stale binary against a fresh libembk.so. The guard was right and nobody
+	@# read it. A check that cannot stop the build is not a check.
+	@fail=0; for f in build/*.elf; do \
+	  case " $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) " in \
 	    *" $$f "*) ;; \
-	    *) echo "*** WARNING: $$f is packed onto the image but is NOT a"; \
-	       echo "***          prerequisite of embkfs.img -- changes to it will"; \
-	       echo "***          NOT rebuild the image. Add it to EMBKFS_APPS."; ;; \
+	    *) echo "*** BUILD DRIFT: $$f is packed onto the image but is NOT a"; \
+	       echo "***   prerequisite of embkfs.img, so changes to it will NOT"; \
+	       echo "***   rebuild the image. Add it to EMBKFS_APPS, or name it in"; \
+	       echo "***   STAGED_APPS if it was built outside this tree."; \
+	       fail=1; ;; \
 	  esac; \
-	done
+	done; \
+	if [ $$fail = 1 ]; then exit 1; fi
+	@# ...and the other direction: every app make believes in must EXIST. A
+	@# recipe that "succeeded" while producing nothing is otherwise packed as
+	@# an absent file and only noticed when the OS cannot spawn it.
+	@miss=0; for f in $(EMBKFS_APPS); do \
+	  if [ ! -f "$$f" ]; then echo "*** MISSING: $$f is required by the image but was not built"; miss=1; fi; \
+	done; \
+	if [ $$miss = 1 ]; then exit 1; fi
 	@# EMBK_NEWLIB_LIBC: where mkfs finds the libc.a it packs into /system/abi
 	@# for tcc to link against ON the OS. Derived from the ONE NEWLIB_PREFIX so a
 	@# checkout on another machine needs no mkfs edit -- see docs/BUILD_SETUP.md.
@@ -1235,25 +1626,33 @@ EMBKFS_SCRATCH := embkfs_scratch.img
 #    Override per run: `make run-embkfs-cow XRES=1920 YRES=1080`.
 #  - zoom-to-fit=off: show guest pixels 1:1 instead of stretching them to the
 #    window (stretching is what made the display look blurry/badly scaled).
-XRES ?= 1280
-YRES ?= 800
+XRES ?= $(FB_W)
+YRES ?= $(FB_H)
 VGA_VIRTIO = -vga none -device virtio-vga,xres=$(XRES),yres=$(YRES)
 DISPLAY_1TO1 = -display gtk,zoom-to-fit=off
+# Default to full software emulation (TCG) so this runs on any machine without
+# KVM. `-cpu max` still exposes RDRAND (which getentropy() needs) under TCG.
+# On a host WITH KVM, opt in for host-CPU speed:
+#   make run-embkfs-cow QEMU_ACCEL=kvm QEMU_CPU=host
+QEMU_ACCEL ?= tcg,thread=multi
+QEMU_CPU ?= max
 
 run-embkfs-cow: $(IMG) $(DISK) $(EMBKFS_MASTER)
 	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)
-	qemu-system-x86_64 -cpu max \
+	qemu-system-x86_64 \
+	    -cpu $(QEMU_CPU) \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
-	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel tcg,thread=multi $(NET)
+	    -serial stdio -no-reboot -no-shutdown -m 521m -smp 1 -accel $(QEMU_ACCEL) $(NET)
 	@echo "--- grading the post-COW image ---"
 	python3 embkfs_mkfs/verify_embkfs.py $(EMBKFS_SCRATCH)
 
 
 run-embkfs-tree: $(IMG) $(DISK) embkfs_tree.img
 	qemu-system-x86_64 \
+	    -cpu $(QEMU_CPU) \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=embkfs_tree.img,if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown
@@ -1261,6 +1660,7 @@ run-embkfs-tree: $(IMG) $(DISK) embkfs_tree.img
 
 run-embkfs: $(IMG) $(DISK) embkfs.img
 	qemu-system-x86_64 \
+	    -cpu $(QEMU_CPU) \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
 	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown $(NET)
@@ -1645,6 +2045,20 @@ scene-test:
 
 # Piece 4a: the CPU render backend + dirty-rect driver. Same host-test posture
 # as Piece 3 -- operates on in-memory render_target buffers, no QEMU/ring-3.
+# html-test -- the browser's HTML parser, tested on the HOST. A parser is the
+# one part of a browser that needs no network, window or font, so it is tested
+# in seconds rather than through an image build and a boot.
+html-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iuser/web \
+	    -Iuser/web/css \
+	    -Iuser/lib \
+	    user/web/html.c user/web/url.c user/web/style.c \
+	    user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
+	    user/web/png.c user/web/jpeg.c user/lib/inflate.c user/web/form.c \
+	    user/web/cookie.c user/web/store.c user/web/tabs.c user/web/charset.c user/web/svg.c \
+	    user/web/html_test.c -lm -o $(BUILD)/html_test
+	$(BUILD)/html_test
+
 backend-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene -Iui/backend \
 	    ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/scene_render.c \
@@ -1672,6 +2086,42 @@ reactive-test:
 	$(BUILD)/reactive_test
 
 # Piece 7: the declarative API (capstone). Ties scene/layout/reactive together.
+# Every Icon* in the toolkit must be a codepoint the shipped font can draw.
+# Seven of them were not, and nothing anywhere would have said so: a missing
+# glyph is not a build error and not a run-time error either -- it is a box on
+# screen, in whichever app happened to ask for that icon.
+# The .ico decoder, against fixtures the test builds itself -- including the
+# malformed ones, which are the point: a favicon is bytes from a stranger and
+# every field in its directory is an offset into somewhere else.
+ico-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iuser/web -Iuser/lib \
+	    user/web/ico.c user/web/png.c user/lib/inflate.c user/web/ico_test.c \
+	    -o $(BUILD)/ico_test
+	$(BUILD)/ico_test
+
+# The syntax highlighter -- a pure function, so it needs no screen. The cases
+# that matter are the ones a compiler is allowed to refuse and an editor is not.
+# The editing engine: a selection dragged backwards, an undo that must restore
+# the caret, a replace-all whose replacement contains the search term. All of it
+# is testable without a screen, and all of it is where editors get bugs.
+edit-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iuser/note \
+	    user/note/edit.c user/note/edit_test.c -o $(BUILD)/edit_test
+	$(BUILD)/edit_test
+
+syntax-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iuser/note \
+	    user/note/syntax.c user/note/syntax_test.c -o $(BUILD)/syntax_test
+	$(BUILD)/syntax_test
+
+# Which words are C is the compiler's fact, not the editor's. Regenerate with
+# `python3 tools/mkkeywords.py` after EmbCC's keyword table changes.
+keyword-check:
+	python3 tools/mkkeywords.py --check
+
+icon-check:
+	python3 tools/checkicons.py
+
 declare-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 -Iui/scene -Iui/backend -Iui/layout -Iui/reactive -Iui/declare \
 	    ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c ui/layout/layout.c \
@@ -1708,22 +2158,120 @@ showcase-v2:
 	$(BUILD)/showcase_v2 $(BUILD)/v6_dark.ppm  dark  6
 	$(BUILD)/showcase_v2 $(BUILD)/v7_light.ppm light 7
 	$(BUILD)/showcase_v2 $(BUILD)/v7_dark.ppm  dark  7
-	python3 -c "from PIL import Image; \
-	  Image.open('$(BUILD)/v2_light.ppm').save('$(BUILD)/v2_light.png'); \
-	  Image.open('$(BUILD)/v2_dark.ppm').save('$(BUILD)/v2_dark.png'); \
-	  Image.open('$(BUILD)/v4_light.ppm').save('$(BUILD)/v4_light.png'); \
-	  Image.open('$(BUILD)/v4_dark.ppm').save('$(BUILD)/v4_dark.png'); \
-	  Image.open('$(BUILD)/v6_light.ppm').save('$(BUILD)/v6_light.png'); \
-	  Image.open('$(BUILD)/v6_dark.ppm').save('$(BUILD)/v6_dark.png'); \
-	  Image.open('$(BUILD)/v7_light.ppm').save('$(BUILD)/v7_light.png'); \
-	  Image.open('$(BUILD)/v7_dark.ppm').save('$(BUILD)/v7_dark.png'); \
-	  print('wrote v2_{light,dark}.png + v4_{light,dark}.png')"
+	$(BUILD)/showcase_v2 $(BUILD)/pk_light.ppm light pk
+	$(BUILD)/showcase_v2 $(BUILD)/pk_dark.ppm  dark  pk
+	$(BUILD)/showcase_v2 $(BUILD)/gb_light.ppm light b
+	$(BUILD)/showcase_v2 $(BUILD)/gb_dark.ppm  dark  b
+	$(BUILD)/showcase_v2 $(BUILD)/mm_light.ppm light m
+	$(BUILD)/showcase_v2 $(BUILD)/mm_dark.ppm  dark  m
+	$(BUILD)/showcase_v2 $(BUILD)/grid_light.ppm light r
+	$(BUILD)/showcase_v2 $(BUILD)/grid_dark.ppm  dark  r
+	$(BUILD)/showcase_v2 $(BUILD)/bar_light.ppm light a
+	$(BUILD)/showcase_v2 $(BUILD)/bar_dark.ppm  dark  a
+	python3 -c "from PIL import Image; import glob, os; \
+	  [Image.open(p).save(p[:-4]+'.png') for p in glob.glob('$(BUILD)/*.ppm')]; \
+	  print('wrote', len(glob.glob('$(BUILD)/*.png')), 'PNGs to $(BUILD)/ (v2 v4 v6 v7 pk gb mm grid, light+dark)')"
+
+# browser-render -- the browser's WHOLE pipeline on the host: parse, style,
+# render, layout, and a dump of the resolved geometry. Everything from document
+# bytes to pixel rects is syscall-free, so it runs here in two seconds instead
+# of in a five-minute boot. DOC/W/H/DEPTH/PNG override the defaults.
+DOC   ?= system/web/index.html
+BW    ?= 940
+BH    ?= 620
+DEPTH ?= 6
+browser-render:
+	@$(MAKE) --no-print-directory build/browser_render
+	$(BUILD)/browser_render $(DOC) $(BW) $(BH) $(DEPTH) $(PNG) $(BUSY)
+
+# web-corpus -- render every page in tests/web and check what each one claims
+# about itself (see tools/web_corpus.py). Pass CORPUS=<dir> to point it at
+# pages fetched from the real web instead; anything it finds there should come
+# back here as a page that reproduces the SHAPE.
+# web-real -- the same engine against pages nobody here wrote. Fetches into
+# build/webreal (gitignored, refetch by deleting it); SHOTS=1 also writes a PNG
+# of each so they can be LOOKED at, which is a different question from whether
+# they produced text. See tools/web_real.py.
+# web-verify -- our render against what FIREFOX says is visible on the page.
+# The corpus checks what somebody thought to assert; this needs no expectation
+# written first, and reports both directions: content we dropped, and content
+# we revealed that the page had hidden. See tools/web_verify.py.
+web-verify:
+	@$(MAKE) --no-print-directory build/browser_render
+	@python3 tools/web_verify.py $(PAGES)
+
+# web-verify asks whether the CONTENT is there. This asks the other half a
+# reader actually judges -- whether it is in the right PLACE -- by putting our
+# render and Firefox's side by side as pictures and comparing where the words
+# ended up. Not a pixel diff: our fonts and colours are our own.
+# Sound, end to end and MEASURED: boots headless with an AC'97 and a WAV sink,
+# drives the kernel's serial console to play a tone, then checks the file's
+# frequency and amplitude on this machine. Nobody has to listen, and a driver
+# that reports success while emitting silence fails here.
+test-audio: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/audio_test.py
+	@# ...and the STREAMING path, which is a different thing: the kernel
+	@# self-test fills every descriptor before starting, so it never exercised
+	@# extending the range under a running device -- where the real bug was.
+	@AUDIO_CMD="run /data/apps/beep/beep.elf" python3 tools/audio_test.py
+
+.PHONY: test-audio
+
+web-shots:
+	@$(MAKE) --no-print-directory build/browser_render
+	@python3 tools/web_shots.py $(PAGES)
+
+web-real:
+	@$(MAKE) --no-print-directory build/browser_render
+	@python3 tools/web_real.py
+
+CORPUS ?= tests/web
+web-corpus:
+	@$(MAKE) --no-print-directory build/browser_render
+	@python3 tools/web_corpus.py $(CORPUS)
+
+# Every source and header it is built from. Written out because this rule
+# compiles in ONE command with no object files, so there are no depfiles to
+# lean on -- and a harness that does not rebuild is worse than no harness: it
+# reports the previous build's answer with total confidence. (This one had no
+# prerequisites at all for a while, and only worked because it was deleted by
+# hand before each run.)
+# QuickJS in the HOST harness too, when it is available. Without it the corpus
+# cannot test a single line of a page's JavaScript -- and a page that builds
+# its own DOM would render empty here and correctly on the metal, which is the
+# exact divergence a two-second loop exists to catch.
+BROWSER_RENDER_JS := $(if $(HAVE_QJS),user/web/jsdom.c $(QJS_SRC)/quickjs.c \
+                       $(QJS_SRC)/libregexp.c $(QJS_SRC)/libunicode.c \
+                       $(QJS_SRC)/cutils.c $(QJS_SRC)/libbf.c,)
+BROWSER_RENDER_JSFLAGS := $(if $(HAVE_QJS),-DHAVE_JSDOM -I$(QJS_SRC) $(QJS_CFLAGS),)
+
+BROWSER_RENDER_SRCS := $(V2_SRC) user/web/html.c user/web/style.c user/web/render.c \
+                       user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
+                       user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
+                       user/web/url.c user/web/png.c user/web/jpeg.c user/lib/inflate.c \
+                       user/web/form.c user/web/select.c user/web/cookie.c user/web/charset.c user/web/svg.c \
+                       user/web/store.c user/web/find.c user/web/history.c \
+                       user/web/tabs.c \
+                       user/web/render_host.c \
+                       $(BROWSER_RENDER_JS)
+BROWSER_RENDER_HDRS := $(wildcard user/web/*.h) $(wildcard user/web/css/*.h) \
+                       $(wildcard ui/*/*.h)
+
+build/browser_render: $(BROWSER_RENDER_SRCS) $(BROWSER_RENDER_HDRS)
+	@mkdir -p $(BUILD)
+	$(HOSTCC) -std=gnu11 -Wall -O1 -g $(V2_INC) -Iuser/web \
+	    -Iuser/web/css -Iuser/lib $(BROWSER_RENDER_JSFLAGS) \
+	    $(BROWSER_RENDER_SRCS) -lm -o $@
+
+# Whatever the compiler recorded last time. Missing on a clean tree, which is
+# exactly when it is not needed.
+-include $(wildcard $(BUILD)/*.o.d) $(wildcard $(BUILD)/qjs/*.o.d)
 
 clean:
 	rm -f $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_ELF) $(KERNEL_BIN) $(IMG)
 	rm -rf $(BUILD)
 
-.PHONY: all run debug clean scene-test backend-test font-test layout-test reactive-test declare-test showcase run-ui run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted
+.PHONY: all run debug clean web-real web-corpus scene-test backend-test html-test font-test layout-test reactive-test declare-test showcase run-ui run-smp run-bigmem run-kvm run-ahci run-fat run-all run-embkfs run-embkfs-tree run-embkfs-cow run-part-fat run-part-embkfs run-usb-embkfs run-multivol run-embkfs-encrypted
 # --- TLS crypto host tests (docs/TLS.md T1): the SAME crypto that runs on the OS,
 # compiled + vector-checked on the dev host (fast, no boot). Grows per primitive.
 .PHONY: test-tls-crypto
@@ -1763,6 +2311,10 @@ test-tls-crypto:
 	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
 	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
 	    tools/tls/test_chain.c -o /tmp/embk_test_chain && /tmp/embk_test_chain
+	@cc -w -Iuser/lib/tls -Iuser/lib/tls/kshim -Ikernel kernel/crypto/sha256.c kernel/crypto/hmac.c \
+	    user/lib/tls/prf12.c tools/tls/test_prf12.c -o /tmp/embk_test_prf12 && /tmp/embk_test_prf12
+	@cc -w -Iuser/lib/tls -Iuser/lib/tls/kshim -Ikernel kernel/crypto/aes.c user/lib/tls/crypto/gcm.c \
+	    user/lib/tls/record12.c tools/tls/test_record12.c -o /tmp/embk_test_rec12 && /tmp/embk_test_rec12
 	@cc -w -Iuser/lib/tls/kshim -Iuser/lib/tls/x509 -Iuser/lib/tls/crypto -Ikernel -Itools/tls \
 	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
 	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
@@ -1771,3 +2323,4 @@ test-tls-crypto:
 	    user/lib/tls/x509/asn1.c user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c kernel/crypto/sha256.c \
 	    user/lib/tls/crypto/sha512.c user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c user/lib/tls/crypto/rsa.c \
 	    tools/tls/test_constraints.c -o /tmp/embk_test_constraints && /tmp/embk_test_constraints
+

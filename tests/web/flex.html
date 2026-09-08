@@ -1,0 +1,76 @@
+<html><head><title>Flex and grid</title><style>
+.bar   { display: flex; gap: 20px; background: #1c2030; padding: 10px }
+.right { display: flex; justify-content: flex-end; gap: 12px; background: #1c2030; padding: 10px }
+.spread{ display: flex; justify-content: space-between; background: #1c2030; padding: 10px }
+.col   { display: flex; flex-direction: column; gap: 6px; background: #202436; padding: 10px }
+.grow  { flex: 1 }
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px }
+.card  { background: #232838; border: 1px solid #3a4258; border-radius: 8px; padding: 10px }
+
+/* Explicit TRACK SIZES, not just a track count. A stated width is a decision
+   the author already made; sizing the track from its content instead is a
+   table's rule, and it put a 200px sidebar and an article in two columns
+   divided by how much text each happened to hold. */
+.tracks { display: grid; grid-template-columns: 200px minmax(0,1fr); column-gap: 20px }
+
+/* NAMED AREAS. The children are siblings in document order; the template says
+   which of them sit side by side. Wikipedia's whole chrome is one of these,
+   and without the map they auto-flow and stack. Stated through the
+   `grid-template` SHORTHAND, because that is how Wikipedia states it and
+   reading only grid-template-columns left the areas with no widths. */
+.pg   { display: grid; grid-template: auto auto auto / 180px minmax(0,1fr); column-gap: 12px }
+.pg   { grid-template-areas: 'notice notice' 'side main' 'foot foot' }
+.a-n  { grid-area: notice } .a-s { grid-area: side }
+.a-m  { grid-area: main }   .a-f { grid-area: foot }
+</style></head><body>
+
+<nav class="bar"><a href="/a">NAVONE</a><a href="/b">NAVTWO</a><a href="/c">NAVTHREE</a></nav>
+<div class="right"><span>RIGHTA</span><span>RIGHTB</span></div>
+<div class="spread"><span>SPREADLEFT</span><span>SPREADRIGHT</span></div>
+<div class="col"><span>COLONE</span><span>COLTWO</span></div>
+<div class="bar"><span class="grow">GROWER takes the leftover</span><span>TAIL</span></div>
+
+<div class="cards">
+  <div class="card">GRIDA first column</div>
+  <div class="card">GRIDB second column</div>
+  <div class="card">GRIDC third column</div>
+</div>
+
+<!-- a flex row lays its items out SIDE BY SIDE, so each link starts to the
+     right of the last; merged into one inline run they would share an x -->
+<!-- EXPECT-LEFT-OF: NAVONE NAVTWO -->
+<!-- EXPECT-LEFT-OF: NAVTWO NAVTHREE -->
+<!-- a column stacks them, so the second is BELOW rather than beside -->
+<!-- EXPECT-BELOW: COLTWO COLONE -->
+<!-- space-between pins the last item to the right edge -->
+<!-- EXPECT-LEFT-OF: SPREADLEFT SPREADRIGHT -->
+<!-- a grid puts its three cards on ONE row, left to right -->
+<!-- EXPECT-LEFT-OF: GRIDA GRIDB -->
+<!-- EXPECT-LEFT-OF: GRIDB GRIDC -->
+<!-- EXPECT-TEXT: GROWER -->
+<div class="tracks"><div>GRIDTRACKSIDE</div><div>GRIDTRACKMAIN and a good deal more text than the sidebar holds</div></div>
+
+<!-- The fixed track is 200px wide, so the second column starts at the page
+     padding + 200 + the 20px gap, wherever the text inside it ends up. It must
+     NOT depend on how much text either side holds. -->
+<!-- EXPECT-X: GRIDTRACKSIDE 20 26 -->
+<!-- EXPECT-X: GRIDTRACKMAIN 240 246 -->
+<!-- ...and they are on the same row, which is what makes it a sidebar. -->
+<!-- EXPECT-LEFT-OF: GRIDTRACKSIDE GRIDTRACKMAIN -->
+<div class="pg">
+  <div class="a-n">AREANOTICE</div>
+  <div class="a-s">AREASIDE</div>
+  <div class="a-m">AREAMAIN with a great deal more text than the sidebar holds</div>
+  <div class="a-f">AREAFOOT</div>
+</div>
+
+<!-- The sidebar and the main column are on the SAME row, in the order the
+     template gives -- not the order the children appear in. -->
+<!-- EXPECT-LEFT-OF: AREASIDE AREAMAIN -->
+<!-- The fixed 180px track puts the main column at padding + 180 + 12, and
+     that must not depend on how much text either side holds. -->
+<!-- EXPECT-X: AREAMAIN 210 218 -->
+<!-- The notice spans both columns above them, the footer below. -->
+<!-- EXPECT-BELOW: AREASIDE AREANOTICE -->
+<!-- EXPECT-BELOW: AREAFOOT AREAMAIN -->
+</body></html>

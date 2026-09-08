@@ -7,6 +7,14 @@
  * reinvented (invariant N2). */
 
 #include "scene.h"
+#ifdef SCROLL_DEBUG
+#include <stdio.h>
+#define DMARK(n) do { if (!(n)->dirty) \
+    fprintf(stderr, "dirty-by %s kind=%d %.0fx%.0f\n", __func__, (int)(n)->kind, \
+            (double)(n)->width, (double)(n)->height); } while (0)
+#else
+#define DMARK(n) do {} while (0)
+#endif
 
 /* ---- pluggable page allocator (default malloc/free on a hosted build) ---- */
 
@@ -243,7 +251,7 @@ void scene_reparent(struct scene_arena *a, struct node_handle h,
                 n->next_sibling = NODE_HANDLE_NULL;
         }
     }
-    n->dirty = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
 }
 
 /* ---- mutation setters --------------------------------------------------- */
@@ -275,7 +283,7 @@ void scene_set_transform(struct scene_arena *a, struct node_handle h,
     n->tx = tx; n->ty = ty; n->tz = tz;
     n->qx = qx; n->qy = qy; n->qz = qz; n->qw = qw;
     n->sx = sx; n->sy = sy; n->sz = sz;
-    n->dirty = true;
+    DMARK(n); n->dirty = true;   /* geometry only: pixels remain valid */
 }
 
 void scene_set_size(struct scene_arena *a, struct node_handle h, float w, float ht) {
@@ -290,33 +298,76 @@ void scene_set_paint(struct scene_arena *a, struct node_handle h, const struct p
     if (!n || !p) return;
     if (paint_eq(&n->data.rect.fill, p)) return;
     n->data.rect.fill = *p;
-    n->dirty = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
+}
+
+/* FNV-1a over the string. Short strings, called once per text node per frame. */
+static uint32_t text_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    if (s) while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    return h;
 }
 
 void scene_set_text(struct scene_arena *a, struct node_handle h, const char *utf8,
                     uint32_t font_handle, float size_px, struct color color) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n) return;
-    /* Content-aware no-op guard: comparing only the POINTER hid in-place edits
-     * (e.g. the home's clock snprintf's into the same buffer every second --
-     * the text never re-rendered). Compare bytes; when equal, still adopt the
-     * new pointer (the old one's lifetime belongs to the caller), no dirty. */
-    int same_text = (n->data.text.utf8 == utf8);
-    if (!same_text && n->data.text.utf8 && utf8) {
-        const char *p = n->data.text.utf8, *q = utf8;
-        while (*p && *p == *q) { p++; q++; }
-        same_text = (*p == *q);
-    }
+    /* Content-aware no-op guard, by HASH rather than by pointer or by bytes.
+     *
+     * Comparing the pointer hid in-place edits. Comparing bytes was the first
+     * fix and it is not enough either, because it cannot see the case that
+     * matters most: when the caller passes back the SAME buffer it just wrote
+     * into, the stored pointer already points at the new bytes, so comparing
+     * them finds them equal to themselves and reports "unchanged". The node
+     * keeps no copy of the old string, so a hash of it is the only record that
+     * the text used to be something else.
+     *
+     * That is not hypothetical. A browser's status line updating "Loading...
+     * 1.2s" in a static buffer never repainted for the whole fetch -- the app
+     * was rebuilding correctly and the screen simply never heard about it.
+     *
+     * A 32-bit collision would drop one repaint and self-correct on the next
+     * change; a missed repaint every four billion updates is a fair trade for
+     * not copying every string in the tree every frame. */
+    uint32_t nh = text_hash(utf8);
+    int same_text = (nh == n->data.text.hash) &&
+                    ((n->data.text.utf8 == 0) == (utf8 == 0));
     if (same_text && n->data.text.font_handle == font_handle &&
         n->data.text.size_px == size_px && color_eq(n->data.text.color, color)) {
         n->data.text.utf8 = utf8;
         return;
     }
     n->data.text.utf8 = utf8;
+    n->data.text.hash = nh;
     n->data.text.font_handle = font_handle;
     n->data.text.size_px = size_px;
     n->data.text.color = color;
-    n->dirty = true;
+    n->data.text.paint.kind = PAINT_NONE;   /* solid unless a gradient is set next */
+    DMARK(n); n->dirty = true; n->dirty_content = true;
+}
+
+/* Fill the glyphs with a gradient (over the text's own box) instead of a flat
+ * color. First stop becomes the fallback solid color. */
+void scene_set_text_gradient(struct scene_arena *a, struct node_handle h, const struct paint *paint) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || !paint) return;
+    n->data.text.paint = *paint;
+    if (paint->n_stops > 0) n->data.text.color = paint->stops[0].color;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
+}
+
+void scene_set_text_bg(struct scene_arena *a, struct node_handle h, struct color bg) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || n->kind != SCENE_NODE_TEXT) return;
+    struct color *cur = &n->data.text.bg;
+    if (cur->r == bg.r && cur->g == bg.g && cur->b == bg.b && cur->a == bg.a) return;
+    *cur = bg;
+    /* dirty_content, not just dirty. `dirty` alone means "something about this
+     * node changed", and the renderer reads a node that is dirty-but-not-
+     * content as MOVED -- which is exactly right for a transform and exactly
+     * wrong here. Marked only `dirty`, a selection highlight was applied to the
+     * scene, copied correctly, and never drew a single pixel. */
+    DMARK(n); n->dirty = true; n->dirty_content = true;
 }
 
 /* Explicit dirty for callers whose new content ALIASES the stored pointer (the
@@ -335,7 +386,27 @@ void scene_set_image(struct scene_arena *a, struct node_handle h, const void *pi
         n->data.image.h == ht && n->data.image.fmt == fmt) return;
     n->data.image.pixels = pixels;
     n->data.image.w = w; n->data.image.h = ht; n->data.image.fmt = fmt;
-    n->dirty = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
+}
+
+void scene_set_image_tint(struct scene_arena *a, struct node_handle h,
+                          bool enabled, struct color tint) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n) return;
+    if (n->data.image.tinted == enabled &&
+        (!enabled || (n->data.image.tint.r == tint.r && n->data.image.tint.g == tint.g &&
+                      n->data.image.tint.b == tint.b && n->data.image.tint.a == tint.a)))
+        return;                                  /* unchanged -> stay clean */
+    n->data.image.tinted = enabled;
+    n->data.image.tint = tint;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
+}
+
+void scene_set_layer(struct scene_arena *a, struct node_handle h, uint8_t layer) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || n->layer == layer) return;
+    n->layer = layer;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
 }
 
 void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
@@ -347,15 +418,29 @@ void scene_set_shadow(struct scene_arena *a, struct node_handle h, bool enabled,
     n->shadow_enabled = enabled;
     n->shadow_dx = dx; n->shadow_dy = dy; n->shadow_blur_radius = blur;
     n->shadow_color = color;
-    n->dirty = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
 }
 
 void scene_set_border(struct scene_arena *a, struct node_handle h, float width, struct color color) {
     struct scene_node *n = scene_resolve(a, h);
     if (!n) return;
-    if (n->border_width == width && color_eq(n->border_color, color)) return;
+    if (n->border_width == width && color_eq(n->border_color, color) &&
+        n->border_paint.kind == PAINT_NONE) return;
     n->border_width = width; n->border_color = color;
-    n->dirty = true;
+    n->border_paint.kind = PAINT_NONE;   /* solid mode */
+    DMARK(n); n->dirty = true; n->dirty_content = true;
+}
+
+/* Stroke the border with a gradient paint (linear/radial). Falls back to the
+ * first stop as the solid color for any consumer that ignores border_paint. */
+void scene_set_border_gradient(struct scene_arena *a, struct node_handle h,
+                               float width, const struct paint *paint) {
+    struct scene_node *n = scene_resolve(a, h);
+    if (!n || !paint) return;
+    n->border_width  = width;
+    n->border_paint  = *paint;
+    n->border_color  = paint->n_stops > 0 ? paint->stops[0].color : n->border_color;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
 }
 
 void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool enabled, float radius) {
@@ -364,7 +449,7 @@ void scene_set_backdrop_blur(struct scene_arena *a, struct node_handle h, bool e
     if (n->backdrop_blur_enabled == enabled && n->backdrop_blur_radius == radius) return;
     n->backdrop_blur_enabled = enabled;
     n->backdrop_blur_radius = radius;
-    n->dirty = true;
+    DMARK(n); n->dirty = true; n->dirty_content = true;
 }
 
 void scene_set_opacity(struct scene_arena *a, struct node_handle h, float opacity) {

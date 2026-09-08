@@ -1,0 +1,35 @@
+<html><head><title>Percentages and box-sizing</title><style>
+.wrap  { width: 600px; background: #181c28 }
+.half  { width: 50%;  background: #243050 }
+.third { width: 25%;  background: #2a3a20 }
+/* content-box is the CSS DEFAULT: the stated width is the CONTENT, so this
+   box is 200 + 20 + 20 of padding = 240 wide. */
+.cbox  { width: 200px; padding: 20px; background: #402030 }
+/* border-box: the 200 INCLUDES the padding, so the box is 200 wide. */
+.bbox  { width: 200px; padding: 20px; box-sizing: border-box; background: #204030 }
+.row   { display: flex; gap: 0 }
+.p30   { width: 30%; background: #303a50 }
+.p70   { width: 70%; background: #3a3050 }
+</style></head><body>
+<div class="wrap">
+  <div class="half">HALFWIDTH is half of its 600px container</div>
+  <div class="third">QUARTERWIDTH is a quarter of it</div>
+</div>
+<div class="cbox">CONTENTBOX</div>
+<div class="bbox">BORDERBOX</div>
+<div class="row"><div class="p30">PTHIRTY</div><div class="p70">PSEVENTY</div></div>
+
+<!-- a percentage resolves against the CONTAINING BLOCK, so the quarter box
+     starts at the same x but is narrower than the half box -->
+<!-- EXPECT-TEXT: HALFWIDTH -->
+<!-- EXPECT-TEXT: QUARTERWIDTH -->
+<!-- EXPECT-BELOW: QUARTERWIDTH HALFWIDTH -->
+<!-- percentages in a flex row lay out side by side -->
+<!-- EXPECT-LEFT-OF: PTHIRTY PSEVENTY -->
+<!-- the flex row fills 896px of content, so a 30% item is 268.8 wide and the
+     70% item starts at 22 + 268.8 -->
+<!-- EXPECT-X: PTHIRTY 22 24 -->
+<!-- EXPECT-X: PSEVENTY 286 296 -->
+<!-- EXPECT-TEXT: CONTENTBOX -->
+<!-- EXPECT-TEXT: BORDERBOX -->
+</body></html>

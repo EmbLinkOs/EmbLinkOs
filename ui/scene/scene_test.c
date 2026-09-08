@@ -145,7 +145,44 @@ static void s5_reparent(void) {
     scene_arena_destroy(&a);
 }
 
+/* An in-place edit of the SAME buffer must dirty the node.
+ *
+ * This is the case a pointer comparison cannot see and a byte comparison
+ * cannot see either: the node stores a pointer INTO the caller's buffer, so
+ * once the caller overwrites it, the "old" text the node reports is already
+ * the new text. Only a hash taken at set time remembers otherwise.
+ *
+ * It shipped as a browser whose status line froze at "Loading...  0.0s" for
+ * the entire fetch while the app rebuilt that string correctly every frame. */
+static void t_inplace_text(void) {
+    printf("T: in-place text edit marks the node dirty:\n");
+    struct scene_arena a; scene_arena_init(&a);
+    struct node_handle t = scene_create_node(&a, SCENE_NODE_TEXT, NODE_HANDLE_NULL);
+    struct color c = {1,1,1,1};
+
+    static char buf[64];
+    snprintf(buf, sizeof buf, "Loading...  0.0s");
+    scene_set_text(&a, t, buf, 1, 12.0f, c);
+    scene_resolve(&a, t)->dirty = false;             /* the frame was drawn */
+
+    /* same POINTER, different CONTENT -- the whole point */
+    snprintf(buf, sizeof buf, "Loading...  1.2s");
+    scene_set_text(&a, t, buf, 1, 12.0f, c);
+    CHECK(scene_resolve(&a, t)->dirty == true,
+          "editing the buffer in place is a change, and is seen as one");
+
+    /* and setting genuinely identical text still does NOT dirty it, or every
+     * static label in the tree would repaint on every frame */
+    scene_resolve(&a, t)->dirty = false;
+    scene_set_text(&a, t, buf, 1, 12.0f, c);
+    CHECK(scene_resolve(&a, t)->dirty == false,
+          "re-setting unchanged text is still a no-op");
+
+    scene_arena_destroy(&a);
+}
+
 int main(void) {
+    t_inplace_text();
     printf("=== EmbLink UI Piece 3: scene-tree selftests ===\n");
     s1_transform_composition();
     s2_paint_order();

@@ -19,6 +19,10 @@
 /* Rounded-rect clip; the clip stack intersects these. corner_radius 0 = sharp. */
 struct clip_rect { float x, y, w, h, corner_radius; };
 
+/* Sample a paint (solid/gradient) at node-local (u,v) over a w*h box. Public so
+ * the text backend can stroke glyphs with a gradient (gradient headings). */
+struct color cpu_paint_at(const struct paint *p, float u, float v, float w, float h);
+
 struct render_backend {
     void (*begin_frame)(struct render_target *rt, const struct clip_rect *dirty_rects, uint32_t n_dirty);
     void (*end_frame)(struct render_target *rt);
@@ -28,9 +32,12 @@ struct render_backend {
 
     void (*draw_rect)(struct render_target *rt, float x, float y, float w, float h,
                       float corner_radius, const struct paint *fill, float opacity);
+    /* tint != NULL draws the image as a MASK filled with that colour, using the
+     * source alpha as coverage -- what lets a themed icon behave like a glyph. */
     void (*draw_image)(struct render_target *rt, float x, float y, float w, float h,
                        const void *pixels, uint32_t src_w, uint32_t src_h,
-                       uint32_t src_stride, enum embk_pixfmt src_fmt, float opacity);
+                       uint32_t src_stride, enum embk_pixfmt src_fmt, float opacity,
+                       const struct color *tint);
     void (*draw_shadow)(struct render_target *rt, float x, float y, float w, float h,
                         float corner_radius, float dx, float dy, float blur_radius,
                         struct color color);
@@ -39,10 +46,13 @@ struct render_backend {
     /* A hairline stroke along the rounded-rect edge, INSIDE the bounds, drawn
      * over the fill. `width` px thick. Antialiased via the same SDF as fills. */
     void (*draw_border)(struct render_target *rt, float x, float y, float w, float h,
-                        float corner_radius, float width, struct color color);
+                        float corner_radius, float width, struct color color,
+                        const struct paint *paint);   /* paint!=NONE -> gradient stroke */
 
     void (*draw_text)(struct render_target *rt, float x, float y, const char *utf8,
-                      uint32_t font_handle, float size_px, struct color color, float opacity);
+                      uint32_t font_handle, float size_px, struct color color, float opacity,
+                      const struct paint *paint, float box_w, float box_h);
+                      /* paint!=NONE -> glyphs stroked with a gradient over box_w*box_h */
 };
 
 /* The CPU backend singleton (its clip stack + scratch pool are module state). */
@@ -62,6 +72,10 @@ void cpu_set_dirty(const struct clip_rect *rects, uint32_t n);
  * the Piece-4b text blit (a separate translation unit) gates its glyph output
  * by the same clip/dirty state every other primitive respects. */
 float cpu_coverage_at(float fx, float fy);
+/* ...and the same question asked once for a whole integer box: 1 iff EVERY
+ * pixel in it is provably at coverage 1.0. Conservative -- never claims more
+ * coverage than cpu_coverage_at would give. */
+int cpu_box_fully_covered(int x0, int y0, int x1, int y1);
 
 /* Clip-stack + dirty-region save/clear/restore -- the driver isolates a group's
  * offscreen render (which draws in the SCRATCH buffer's own coordinate space)

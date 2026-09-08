@@ -1,0 +1,42 @@
+<html><head><title>Position, overflow and calc</title><style>
+.host   { position: relative; height: 120px; background: #1b2030; margin-bottom: 14px }
+.pin-tr { position: absolute; top: 8px;  right: 8px;  background: #40305a; padding: 6px }
+.pin-bl { position: absolute; bottom: 8px; left: 8px; background: #2a4038; padding: 6px }
+.nudge  { position: relative; left: 60px; top: 4px; color: #f0b060 }
+.clipbox{ overflow: hidden; height: 40px; background: #24283a; margin-bottom: 14px }
+/* calc reduces to a linear expression: 100% of the container minus 240px */
+.side   { width: 240px; background: #303a50 }
+.rest   { width: calc(100% - 240px); background: #3a3050 }
+.row    { display: flex }
+</style></head><body>
+
+<div class="host">
+  <p>HOSTTEXT sits in the normal flow.</p>
+  <div class="pin-tr">PINNEDTR</div>
+  <div class="pin-bl">PINNEDBL</div>
+</div>
+
+<div class="nudge">NUDGED is shifted 60px right of where the flow put it.</div>
+<p>AFTERNUDGE must NOT move: a relative offset does not disturb its siblings.</p>
+
+<div class="clipbox">
+  <p>CLIPPEDONE is visible.</p>
+  <p>CLIPPEDTWO is past the 40px box and must be clipped away.</p>
+</div>
+
+<div class="row"><div class="side">SIDEBAR</div><div class="rest">CALCREST</div></div>
+
+<!-- absolutely positioned boxes pin to the edges of their positioned host -->
+<!-- EXPECT-TEXT: PINNEDTR -->
+<!-- EXPECT-TEXT: PINNEDBL -->
+<!-- EXPECT-LEFT-OF: PINNEDBL PINNEDTR -->
+<!-- EXPECT-BELOW: PINNEDBL PINNEDTR -->
+<!-- a relative offset moves the box and nothing else. NOTE: this is a BLOCK.
+     position:relative on an inline element is not supported -- an inline run
+     has no box to offset -- and is recorded in docs/TODO.md. -->
+<!-- EXPECT-X: NUDGED 80 92 -->
+<!-- EXPECT-X: AFTERNUDGE 20 24 -->
+<!-- calc(100% - 240px): the sidebar is 240 wide, so the rest starts at 22+240 -->
+<!-- EXPECT-X: SIDEBAR 22 24 -->
+<!-- EXPECT-X: CALCREST 260 266 -->
+</body></html>

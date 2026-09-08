@@ -1,0 +1,20 @@
+<html><head><title>Find in page</title></head><body>
+<h1>FINDTARGET at the top</h1>
+<p>A phrase that spans two runs: this operating system wrote its own browser.
+The renderer emits one box per WORD, so "operating system" is two boxes and a
+matcher confined to one of them fails on every phrase anyone searches for.</p>
+<p>FINDTARGET again, and once more: FINDTARGET.</p>
+<p>Case must not matter: findtarget in lower case counts too.</p>
+
+<!-- four spellings of the same word, one of them lower case -->
+<!-- EXPECT-FIND: FINDTARGET 4 -->
+<!-- A phrase that crosses a run boundary. TWICE on this page: once in the
+     prose and once inside the quotation marks below -- counted by reading the
+     page, not by running the finder and writing down what it said. -->
+<!-- EXPECT-FIND: operating system 2 -->
+<!-- a word that is not there is not found -->
+<!-- EXPECT-FIND: zzzznotpresent 0 -->
+<!-- a substring inside a word still counts, as in every browser: "renderer"
+     contains "render", and appears once -->
+<!-- EXPECT-FIND: render 1 -->
+</body></html>

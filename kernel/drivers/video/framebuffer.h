@@ -69,6 +69,12 @@ void fb_blit_over(int32_t x, int32_t y, int32_t w, int32_t h,
 // Blit with a UNIFORM window alpha over the destination -- for glass windows.
 void fb_blit_uniform(int32_t x, int32_t y, int32_t w, int32_t h,
                      const uint32_t *argb, uint32_t stride, uint32_t alpha);
+// Scale an image into a destination rect and composite it at a uniform alpha,
+// clipped to [clx0,cly0)-(clx1,cly1). The window open/minimize motion.
+void fb_blit_scaled_uniform(int32_t dx, int32_t dy, int32_t dw, int32_t dh,
+                            const uint32_t *argb, int32_t sw, int32_t sh,
+                            uint32_t stride, uint32_t alpha,
+                            int32_t clx0, int32_t cly0, int32_t clx1, int32_t cly1);
 // In-place box blur of a framebuffer region (the backdrop behind a glass window).
 void fb_blur_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius);
 // Soft accent glow band around the OUTSIDE of a rect (the focused-window halo),

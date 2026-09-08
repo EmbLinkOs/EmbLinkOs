@@ -653,6 +653,16 @@ static inline int embk_key_grab(int on) {
 }
 
 /* Monotonic milliseconds since boot -- the clock a UI animator ticks on. */
+/* Seconds since the Unix epoch, from the CMOS RTC -- the only wall clock this
+ * kernel has. Distinct from embk_uptime_ms, which is monotonic since BOOT and
+ * therefore useless for anything that must outlive the machine being on: a
+ * cookie's expiry, a cache's freshness, a file's age. */
+static inline uint64_t embk_now_unix(void) {
+    uint64_t tv[2] = { 0, 0 };
+    if (embk_syscall1(EMBK_SYS_gettimeofday, (int64_t)(intptr_t)tv) != 0) return 0;
+    return tv[0];
+}
+
 static inline uint64_t embk_uptime_ms(void) {
     return (uint64_t)embk_syscall0(EMBK_SYS_uptime_ms);
 }
@@ -698,6 +708,10 @@ static inline int embk_win_create_shared(uint32_t cw, uint32_t ch, int32_t x, in
                                              * blurs the backdrop behind the window
                                              * and composites its translucent pixels
                                              * over it (frosted acrylic). */
+#define EMBK_WINF_TRANSLUCENT (1ULL << 35)  /* TRANSLUCENT: chromeless, per-pixel
+                                             * transparent, NO blur -- composited
+                                             * over the sharp backdrop. A thin bar
+                                             * with a tall invisible dropdown canvas. */
 
 /* Resize a shared window's content to w x h. The window's pixel pages are
  * REPLACED: *out_pixels receives the NEW mapping base and the old pointer is
@@ -797,6 +811,7 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * over THIS process's window content (then x,y are window-local pixels and
  * buttons is the mouse state -- EMBK_MOUSE_LEFT etc.), 0 otherwise. The home
  * launcher reads this to make its tiles clickable. */
+#define EMBK_WIN_ACTION_MAXIMIZE  0x80000001u
 struct embk_win_input { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win; int32_t wheel; };
 static inline int embk_win_input(struct embk_win_input *out) {
     return (int)embk_syscall1(EMBK_SYS_win_input, (int64_t)(intptr_t)out);
@@ -897,6 +912,90 @@ static inline int64_t embk_puts(int fd, const char *s) {
 
 /* TTY mode: 0 = cooked (line-buffered, echo), 1 = raw (unbuffered, no echo).
  * Returns the previous mode (0/1) or -EMBK_* on error. */
+/* Frost the backdrop behind a window-local sub-rect. For TRANSLUCENT windows
+ * (a menu bar is a thin strip inside a window tall enough for its dropdowns):
+ * full-window glass would blur a slab of desktop the window never paints, so
+ * the app declares the part that is actually opaque. w<=0 clears it. */
+static inline int embk_win_blur_rect(int win, int x, int y, int w, int h) {
+    return (int)embk_syscall5(EMBK_SYS_win_blur_rect, win, x, y, w, h);
+}
+
+/* Bring back an app you started: un-minimizes any window it parked and raises
+ * its windows to the front. Takes the SPAWN HANDLE (like embk_proc_alive), not
+ * a pid -- a launcher never learns pids, and going through the handle keeps
+ * this scoped to apps you actually spawned. Returns 1 if anything changed. */
+static inline int embk_win_restore(int handle) {
+    return (int)embk_syscall1(EMBK_SYS_win_restore, handle);
+}
+
+/* How bright is what is already composed under this screen rect (0-255, or
+ * -1)? For a window that paints no background of its own and must still stay
+ * legible over whatever wallpaper it happens to sit on. */
+static inline int embk_screen_luma(int x, int y, int w, int h) {
+    return (int)embk_syscall4(EMBK_SYS_screen_luma, x, y, w, h);
+}
+
+/* Park my own window. The process keeps running and its dock dot stays lit;
+ * clicking that dock icon calls embk_win_restore and brings it back. */
+/* --- sound ------------------------------------------------------------------
+ * Interleaved stereo, 16-bit signed, at embk_audio_rate(). One process owns
+ * the device at a time; a second gets EBUSY rather than a silently shared
+ * stream. Every call needs the `audio` capability -- declare it in the app's
+ * .caps or these return -EPERM before touching the hardware.
+ *
+ * The write is SHORT-WRITE by design: it returns how many frames the ring
+ * took, and a program feeds the rest next time round. Treating a short write
+ * as an error is how a caller ends up dropping the middle of a sound. */
+static inline uint32_t embk_audio_rate(void) {
+    return (uint32_t)embk_syscall1(EMBK_SYS_audio_open, 1);   /* query, no claim */
+}
+static inline int embk_audio_open(void) {
+    return (int)embk_syscall1(EMBK_SYS_audio_open, 0);
+}
+/* Returns frames accepted (may be 0 when the ring is full), or -errno. */
+static inline int embk_audio_write(const int16_t *frames, uint32_t nframes) {
+    return (int)embk_syscall2(EMBK_SYS_audio_write,
+                              (int64_t)(intptr_t)frames, (int64_t)nframes);
+}
+/* 1 once the hardware has played everything queued. Ask before exiting, or
+ * the tail of the sound goes with the process. */
+static inline int embk_audio_drained(void) {
+    return (int)embk_syscall1(EMBK_SYS_audio_close, 1);
+}
+static inline int embk_audio_close(void) {
+    return (int)embk_syscall1(EMBK_SYS_audio_close, 0);
+}
+
+static inline int embk_win_minimize(int win) {
+    return (int)embk_syscall1(EMBK_SYS_win_minimize, win);
+}
+
+/* Lift the DESKTOP layer above every app window, or drop it back to the ground.
+ *
+ * The desktop is pinned at z=0 because it is the ground: everything is supposed
+ * to be in front of it. That is right until the shell itself needs the whole
+ * screen -- the Applications launcher is drawn by the desktop process, so with
+ * an app window open it opened BEHIND that window and looked like it had not
+ * opened at all. Launchpad is full-screen and in front, and this is what lets
+ * the same program draw it.
+ *
+ * Only the desktop layer's owner may call it, and it is a MODE rather than a
+ * raise: nothing else re-orders while it is set, and clearing it puts the layer
+ * back on the ground rather than leaving it somewhere in the stack. */
+static inline int embk_win_desktop_front(int on) {
+    return (int)embk_syscall1(EMBK_SYS_win_desktop_front, on);
+}
+
+/* --- the system clipboard: one machine-global text buffer ----------------
+ * Set replaces it whole; get copies up to cap bytes OUT and returns how many
+ * bytes the clipboard HOLDS -- more than cap means the caller saw a prefix. */
+static inline int embk_clip_set(const void *buf, size_t len) {
+    return (int)embk_syscall2(EMBK_SYS_clip_set, (int64_t)(intptr_t)buf, (int64_t)len);
+}
+static inline int64_t embk_clip_get(void *buf, size_t cap) {
+    return embk_syscall2(EMBK_SYS_clip_get, (int64_t)(intptr_t)buf, (int64_t)cap);
+}
+
 static inline int embk_tty_mode(int mode) {
     return (int)embk_syscall1(EMBK_SYS_tty_mode, mode);
 }

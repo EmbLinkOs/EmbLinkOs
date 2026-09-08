@@ -1,0 +1,13 @@
+# What Vellum may DO. Its namespace (vellum.ns) says what it may NAME; this is
+# the other half of the same declaration. Every class here is one the session
+# already holds -- the kernel refuses a mask that is not a subset of the
+# grantor's, so this file can only ever narrow what the browser gets.
+#
+# A browser is the most exposed program on a machine: it runs whatever the
+# network hands it. So it gets three classes and nothing else. No audio, no
+# camera, no USB, no raw disk, no kernel extension, no debug. A bug in the HTML
+# parser cannot reach a device that was never granted.
+
+filesystem     # read documents, and the font it renders them with
+network        # B2: fetch over our own TCP and TLS
+gpu            # a window is a GPU resource -- without this it cannot draw

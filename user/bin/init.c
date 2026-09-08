@@ -31,8 +31,17 @@
 #include "embk.h"
 
 #define DESKTOP      "/system/bin/home.elf"
-#define DEFAULT_USER "teo"           /* the session the desktop runs as (UP3) */
+#define SETUP        "/system/bin/setup.elf"
+#define LOGIN        "/system/bin/login.elf"
+#define SHADOW       "/etc/shadow"
 #define NS_ACTS_MAX  8
+#define SESSION_FD   9
+
+/* Development shortcut: authentication is already validated, so UI work can
+ * boot straight into this disposable session. Set to 0 to restore the normal
+ * first-boot setup + password login flow. */
+#define DEV_AUTOLOGIN 1
+#define DEV_USER      "yves"
 
 static void log_line(const char *s) { embk_puts(1, s); }
 
@@ -63,7 +72,7 @@ static int read_small(const char *path, char *buf, int cap) {
     return n;
 }
 
-/* Load user <user>'s SESSION PROFILE -- /data/users/<user>/user.ns -- into
+/* Load user <user>'s SESSION PROFILE -- /home/<user>/user.ns -- into
  * NS_BIND spawn actions (docs/USERSPACE_v2.md UP3). Same "<ro|rw> <prefix>"
  * manifest format as the app manifests (UP4); '#' comments and blanks ignored.
  * Returns the binding count (0 => no profile, so the caller launches the desktop
@@ -74,7 +83,7 @@ static int load_user_profile(const char *user,
                              struct embk_spawn_file_action *acts, int max,
                              char *desc, int desc_cap) {
     char path[128], *p = path;
-    p = put_str(p, "/data/users/");
+    p = put_str(p, "/home/");
     p = put_str(p, user);
     p = put_str(p, "/user.ns");
     *p = 0;
@@ -141,51 +150,125 @@ void _start(long argc, char **argv, char **envp) {
     log_line("init: up -- root of EmbLink userspace authority\n");
     ns_selfcheck();
 
-    /* Session manager (UP3): the desktop runs as a NAMED USER's session, its
-     * namespace read from that user's profile. Computed once -- the profile does
-     * not change between restarts. */
-    struct embk_spawn_file_action sacts[NS_ACTS_MAX];
-    char nsdesc[192];
-    int snacts = load_user_profile(DEFAULT_USER, sacts, NS_ACTS_MAX, nsdesc, sizeof nsdesc);
-    {
-        char b[256], *p = b;
-        p = put_str(p, "init: session user '" DEFAULT_USER "' -> ");
-        if (snacts) { p = put_str(p, "ns["); p = put_str(p, nsdesc); *p++ = ']'; }
-        else          p = put_str(p, "full inherit (no profile)");
-        *p++ = '\n'; *p = 0;
-        log_line(b);
-    }
-
     for (;;) {
-        char *dargv[] = { (char *)DESKTOP, NULL };
-        /* Launch the desktop confined to the user's session namespace. If a
-         * profiled launch ever fails (e.g. a profile names an unmountable root),
-         * fall back to a plain full-inherit launch so the desktop always comes
-         * up -- availability wins over confinement for pid-1's one job. */
-        int h = (int)embk_spawn(DESKTOP, dargv, snacts ? sacts : (void *)0, snacts);
-        if (h < 0 && snacts) {
-            log_line("init: profiled session launch failed; falling back to full inherit\n");
-            h = (int)embk_spawn(DESKTOP, dargv, (void *)0, 0);
+#if DEV_AUTOLOGIN
+        char user[32] = DEV_USER;
+        log_line("init: DEV auto-login as '" DEV_USER "'\n");
+#else
+        struct embk_stat shadow;
+        if (embk_stat(SHADOW, &shadow) < 0 || shadow.size == 0) {
+            char *argv_setup[] = { (char *)SETUP, NULL };
+            int setup = (int)embk_spawn(SETUP, argv_setup, NULL, 0);
+            if (setup < 0) {
+                log_line("init: could not launch first-boot setup; retrying\n");
+                embk_sleep_ms(1000);
+                continue;
+            }
+            log_line("init: no account found; first-boot setup started\n");
+            if (embk_wait(setup) != 0) {
+                log_line("init: setup closed without creating an account\n");
+                continue;
+            }
         }
-        if (h < 0) {
-            log_line("init: could not spawn the desktop; retrying in 1s\n");
+
+        int pipe_handles[2];
+        if (embk_pipe(pipe_handles) != 0) {
+            log_line("init: could not create login channel\n");
             embk_sleep_ms(1000);
             continue;
         }
-        log_line("init: desktop session started ('" DEFAULT_USER "', " DESKTOP ")\n");
+        struct embk_spawn_file_action login_action = {0};
+        login_action.kind = EMBK_SPAWN_ACTION_INSTALL_OBJ;
+        login_action.target_fd = 3;
+        login_action.src_obj_handle = pipe_handles[1];
+        char *login_argv[] = { (char *)LOGIN, NULL };
+        int login = (int)embk_spawn(LOGIN, login_argv, &login_action, 1);
+        embk_close_handle(pipe_handles[1]);
+        if (login < 0) {
+            embk_close_handle(pipe_handles[0]);
+            log_line("init: could not launch login\n");
+            embk_sleep_ms(1000);
+            continue;
+        }
+        embk_fd_install_obj(pipe_handles[0], SESSION_FD);
+        embk_close_handle(pipe_handles[0]);
+        int login_code = embk_wait(login);
+        char user[32];
+        int64_t user_len = embk_read(SESSION_FD, user, sizeof user - 1);
+        embk_close(SESSION_FD);
+        if (login_code != 0 || user_len <= 0 || user_len >= (int64_t)sizeof user) {
+            log_line("init: login ended without an authenticated user\n");
+            continue;
+        }
+        user[user_len] = 0;
+#endif
+
+        struct embk_spawn_file_action sacts[NS_ACTS_MAX];
+        char nsdesc[192];
+#if DEV_AUTOLOGIN
+        /* A fresh COW image has no account directories. Create only the home
+         * required by the development desktop and give it the same namespace
+         * policy as a real session profile. */
+        (void)embk_mkdir("/home/" DEV_USER);
+        (void)embk_mkdir("/home/" DEV_USER "/Desktop");
+        (void)embk_mkdir("/home/" DEV_USER "/Documents");
+        (void)embk_mkdir("/home/" DEV_USER "/Downloads");
+        (void)embk_mkdir("/home/" DEV_USER "/Music");
+        (void)embk_mkdir("/home/" DEV_USER "/Pictures");
+        (void)embk_mkdir("/home/" DEV_USER "/Videos");
+        (void)embk_mkdir("/home/" DEV_USER "/Trash");
+        embk_action_ns_bind(&sacts[0], "/system", EMBK_NS_RO);
+        embk_action_ns_bind(&sacts[1], "/data/apps", EMBK_NS_RO);
+        embk_action_ns_bind(&sacts[2], "/home/" DEV_USER, EMBK_NS_RW);
+        embk_action_ns_bind(&sacts[3], "/run", EMBK_NS_RW);
+        int snacts = 4;
+        char *nd = nsdesc;
+        nd = put_str(nd, "ro /system, ro /data/apps, rw /home/" DEV_USER ", rw /run");
+        *nd = 0;
+#else
+        int snacts = load_user_profile(user, sacts, NS_ACTS_MAX, nsdesc, sizeof nsdesc);
+        if (snacts <= 0) {
+            log_line("init: authenticated user has no valid session profile\n");
+            continue;
+        }
+#endif
+
+        char home[80], env_user[48], env_home[96], env_pwd[96];
+        char *p = home;
+        p = put_str(p, "/home/"); p = put_str(p, user); *p = 0;
+        p = env_user; p = put_str(p, "USER="); p = put_str(p, user); *p = 0;
+        p = env_home; p = put_str(p, "HOME="); p = put_str(p, home); *p = 0;
+        p = env_pwd; p = put_str(p, "PWD="); p = put_str(p, home); *p = 0;
+        char *session_env[] = { env_user, env_home, env_pwd, NULL };
+
+        {
+            char b[256], *q = b;
+            q = put_str(q, "init: authenticated session '"); q = put_str(q, user);
+            q = put_str(q, "' -> ns["); q = put_str(q, nsdesc); q = put_str(q, "]\n"); *q = 0;
+            log_line(b);
+        }
+
+        char *dargv[] = { (char *)DESKTOP, NULL };
+        int h = (int)embk_spawn_env(DESKTOP, dargv, session_env, sacts, snacts);
+        if (h < 0) {
+            log_line("init: could not spawn the confined desktop\n");
+            embk_sleep_ms(1000);
+            continue;
+        }
+        log_line("init: desktop session started\n");
 
         /* Block until the desktop exits, then reap it. The wait frees BOTH the
          * zombie process slot and this spawn handle -- without it, every restart
          * would leak one of init's 16 handles. */
         int code = embk_wait(h);
 
-        char b[96], *p = b;
+        char b[96], *q = b;
         const char *pre = "init: desktop exited (code ";
-        while (*pre) *p++ = *pre++;
-        p = put_dec(p, code);
-        const char *post = ") -- restarting session\n";
-        while (*post) *p++ = *post++;
-        *p = 0;
+        while (*pre) *q++ = *pre++;
+        q = put_dec(q, code);
+        const char *post = ") -- returning to login\n";
+        while (*post) *q++ = *post++;
+        *q = 0;
         log_line(b);
 
         embk_sleep_ms(200);   /* never a hot crash-loop */

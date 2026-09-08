@@ -1,0 +1,20 @@
+<html><head><title>localStorage</title></head><body>
+<p id="out">STORAGEPLACEHOLDER</p>
+<script>
+localStorage.clear();
+localStorage.setItem("visits", "1");
+localStorage.setItem("theme", "dark");
+var a = localStorage.getItem("theme");
+var missing = localStorage.getItem("nope");
+var n = localStorage.length;
+localStorage.removeItem("visits");
+var after = localStorage.length;
+document.querySelector("#out").setText(
+  "STORED " + a + " missing=" + (missing === null ? "null" : missing) +
+  " count=" + n + " after=" + after);
+</script>
+<!-- getItem returns what was set; an absent key is NULL, not "" -- a page
+     testing `if (v === null)` is the commonest use there is -->
+<!-- EXPECT-LINE: STORED dark missing=null count=2 after=1 -->
+<!-- EXPECT-NO-TEXT: STORAGEPLACEHOLDER -->
+</body></html>

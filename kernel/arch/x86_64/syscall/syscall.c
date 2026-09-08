@@ -17,6 +17,7 @@
 #include "tty/tty.h"
 #include "gfx/surface.h"
 #include "gfx/compositor.h"
+#include "ipc/clipboard.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/input/mouse.h"
 #include "drivers/input/keyboard.h"
@@ -1206,8 +1207,61 @@ static int64_t sys_ui_input(struct regs *r) {
 /* Non-blocking keystroke poll: returns the next ASCII byte (incl. '\b' 0x08 and
  * '\n'), or 0 if the keyboard buffer is empty. The ring-3 UI loop drains this
  * each frame and routes chars to the focused text field. */
+/* screen_luma(x,y,w,h) -- how bright is what is already on screen there. */
+static int64_t sys_screen_luma(struct regs *r) {
+    return (int64_t)compositor_backdrop_luma((int)r->rdi, (int)r->rsi,
+                                             (int)r->rdx, (int)r->r10);
+}
+
+/* win_desktop_front(on) -- the shell lifting its own full-screen surface above
+ * the app windows (the Applications launcher) and putting it back after. */
+static int64_t sys_win_desktop_front(struct regs *r) {
+    return compositor_desktop_front(current_process ? (int)current_process->pid : 0,
+                                    (int)r->rdi);
+}
+
+/* win_minimize(win) -- an app parking its OWN window. */
+static int64_t sys_win_minimize(struct regs *r) {
+    return compositor_win_minimize(current_process ? (int)current_process->pid : 0,
+                                   (uint32_t)r->rdi);
+}
+
+/* win_restore(handle) -- un-minimize and raise the windows of the process the
+ * SPAWN HANDLE names. A handle, not a pid: the launcher is handed handles by
+ * spawn and never learns pids (same contract as proc_alive), and resolving
+ * through the handle table keeps this authority-scoped -- you can only bring
+ * back an app you started. */
+static int64_t sys_win_restore(struct regs *r) {
+    uint32_t pid;
+    if (process_handle_resolve(current_process, (int)r->rdi, &pid) != 0)
+        return -EMBK_EINVAL;
+    return (int64_t)compositor_restore_pid((int)pid);
+}
+
+static int64_t sys_win_blur_rect(struct regs *r) {
+    return compositor_win_blur_rect(current_process ? (int)current_process->pid : 0,
+                                    (uint32_t)r->rdi, (int)r->rsi, (int)r->rdx,
+                                    (int)r->r10, (int)r->r8);
+}
+
+/* ---- the system clipboard (ipc/clipboard.c) ---------------------------- */
+static int64_t sys_clip_set(struct regs *r) {
+    return clipboard_set_user((const void *)r->rdi, (size_t)r->rsi);
+}
+static int64_t sys_clip_get(struct regs *r) {
+    return clipboard_get_user((void *)r->rdi, (size_t)r->rsi);
+}
+
 static int64_t sys_key_poll(struct regs *r) {
     (void)r;
+    /* Keys belong to the FRONT window's process. The character queue is a
+     * single global one, so without this every UI process that polls drains it
+     * and they race for each keystroke -- with two app loops running (a top bar
+     * and an app) a terminal received roughly one press in ten and typing felt
+     * like the keyboard was broken. Anyone who isn't focused reads nothing
+     * rather than stealing somebody else's input. */
+    uint32_t focus = compositor_focused_pid();
+    if (focus && current_process && current_process->pid != focus) return 0;
     if (keyboard_has_char()) return (int64_t)(unsigned char)keyboard_getchar();
     return 0;
 }
@@ -1312,9 +1366,10 @@ static int64_t sys_win_create(struct regs *r) {
     if (cg) return cg;
     /* Window-style flags ride the high bits of rdi (cw is <= 16 bits real). */
     uint32_t cw = (uint32_t)(r->rdi & 0xFFFFFFFFULL), ch = (uint32_t)r->rsi;
-    int chromeless = (r->rdi >> 32) & 1;   /* EMBK_WINF_CHROMELESS */
-    int widget     = (r->rdi >> 33) & 1;   /* EMBK_WINF_WIDGET */
-    int glass      = (r->rdi >> 34) & 1;   /* EMBK_WINF_GLASS */
+    int chromeless  = (r->rdi >> 32) & 1;   /* EMBK_WINF_CHROMELESS */
+    int widget      = (r->rdi >> 33) & 1;   /* EMBK_WINF_WIDGET */
+    int glass       = (r->rdi >> 34) & 1;   /* EMBK_WINF_GLASS */
+    int translucent = (r->rdi >> 35) & 1;   /* EMBK_WINF_TRANSLUCENT */
     int32_t x = (int32_t)r->rdx, y = (int32_t)r->r10;
     char title[COMP_TITLE_MAX + 1];
     int i = 0;
@@ -1333,6 +1388,8 @@ static int64_t sys_win_create(struct regs *r) {
         uint64_t cva = 0;
         int64_t id = widget
             ? compositor_win_create_widget(current_process, cw, ch, x, y, title, glass, &cva)
+            : translucent
+            ? compositor_win_create_translucent(current_process, cw, ch, x, y, title, &cva)
             : glass
             ? compositor_win_create_glass(current_process, cw, ch, x, y, title, &cva)
             : chromeless
@@ -1726,7 +1783,88 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_net_recvfrom   83
 #define SYS_fcntl          84
 #define SYS_fd_poll        85
+#define SYS_clip_set       86
+#define SYS_clip_get       87
+#define SYS_win_blur_rect  88
+#define SYS_win_restore    89
+#define SYS_win_minimize   90
+#define SYS_screen_luma    91
+#define SYS_win_desktop_front 92
+/* Sound. cap_id 4 has existed in capabilities.h since the model was written
+ * with nothing behind it; these are the first syscalls to gate on it. */
+#define SYS_audio_open     93
+#define SYS_audio_write    94
+#define SYS_audio_close    95
 
+
+/* --- sound -----------------------------------------------------------------
+ * Every one of these is refused without EMBK_CAP_AUDIO. The capability is not
+ * a formality here: a program that can write to the speaker can be heard by
+ * whoever is in the room, and it is the second device class (after the GPU)
+ * where "can this process do it" is a question with a physical answer.
+ *
+ * The device has ONE owner and the kernel remembers which pid it is, so a
+ * program cannot write into another's stream by guessing, and a process that
+ * dies holding the device has it reclaimed (audio_reap_pid). */
+static bool audio_permitted(void)
+{
+    return (process_current_caps() & EMBK_CAP_BIT(EMBK_CAP_AUDIO)) != 0;
+}
+
+/* audio_open() -> 0, or -errno. Also the query: rdi non-zero asks for the
+ * sample rate instead of claiming the device, so a program can size its
+ * buffers before it commits to owning the speaker. */
+static int64_t sys_audio_open(struct regs *r) {
+    if (!audio_permitted()) return -EMBK_EPERM;
+    if (r->rdi != 0) return (int64_t)audio_sample_rate();
+
+    struct process *proc = current_process_atomic();
+    if (!proc) return -EMBK_ENOMEM;   /* no process context: nothing to own the stream */
+    return audio_open(proc->pid);
+}
+
+/* audio_write(frames, nframes) -> frames ACCEPTED, or -errno.
+ * A short result is normal: the ring is full and the caller comes back. */
+static int64_t sys_audio_write(struct regs *r) {
+    if (!audio_permitted()) return -EMBK_EPERM;
+
+    const int16_t *user = (const int16_t *)r->rdi;
+    uint32_t nframes = (uint32_t)r->rsi;
+
+    struct process *proc = current_process_atomic();
+    if (!proc) return -EMBK_ENOMEM;   /* no process context: nothing to own the stream */
+    if (nframes == 0) return 0;
+
+    /* Copy through a kernel staging buffer rather than letting the DMA engine
+     * read user memory: the descriptor holds a PHYSICAL address, and a user
+     * page can be unmapped or reused between the write and the moment the
+     * hardware reaches it. One buffer's worth at a time, which is also the
+     * most audio_write can accept per call. */
+    static int16_t stage[8192];
+    uint32_t cap_frames = (uint32_t)(sizeof stage / sizeof stage[0]) / 2;
+    if (nframes > cap_frames) nframes = cap_frames;
+
+    if (copy_from_user(stage, user, (size_t)nframes * 2 * sizeof(int16_t)) != EMBK_OK)
+        return -EMBK_EFAULT;
+
+    uint32_t accepted = 0;
+    int rc = audio_write(proc->pid, stage, nframes, &accepted);
+    if (rc != EMBK_OK) return rc;
+    return (int64_t)accepted;
+}
+
+/* audio_close() -> 0. rdi non-zero asks "has it all been played yet?" instead,
+ * which is what a program needs before it exits: closing while the hardware
+ * still has buffers cuts the end off every sound. */
+static int64_t sys_audio_close(struct regs *r) {
+    if (!audio_permitted()) return -EMBK_EPERM;
+    struct process *proc = current_process_atomic();
+    if (!proc) return -EMBK_ENOMEM;   /* no process context: nothing to own the stream */
+
+    if (r->rdi != 0) return audio_drained(proc->pid) ? 1 : 0;
+    audio_close(proc->pid);
+    return 0;
+}
 
 static syscall_handler_t syscall_table[] = {
     [SYS_write]   = sys_write,
@@ -1807,6 +1945,16 @@ static syscall_handler_t syscall_table[] = {
     [SYS_net_recvfrom]   = sys_net_recvfrom,
     [SYS_fcntl]          = sys_fcntl,
     [SYS_fd_poll]        = sys_fd_poll,
+    [SYS_clip_set]       = sys_clip_set,
+    [SYS_clip_get]       = sys_clip_get,
+    [SYS_win_blur_rect]  = sys_win_blur_rect,
+    [SYS_win_restore]    = sys_win_restore,
+    [SYS_win_minimize]   = sys_win_minimize,
+    [SYS_screen_luma]    = sys_screen_luma,
+    [SYS_audio_open]     = sys_audio_open,
+    [SYS_audio_write]    = sys_audio_write,
+    [SYS_audio_close]    = sys_audio_close,
+    [SYS_win_desktop_front] = sys_win_desktop_front,
     [SYS_debug_attach]   = sys_debug_attach,
     [SYS_debug_wait]     = sys_debug_wait,
     [SYS_debug_cont]     = sys_debug_cont,

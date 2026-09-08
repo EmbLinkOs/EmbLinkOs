@@ -94,9 +94,36 @@ static inline long recvfrom(int fd, void *buf, unsigned long len, int flags,
     return n;
 }
 
-/* Resolve a hostname to a network-order in_addr (a gethostbyname in miniature). */
+/* "10.0.2.2" -> 0x0A000202, or -1 if it is not a dotted quad. Strict: four
+ * parts, each 0-255, digits only, nothing trailing -- so a hostname that merely
+ * starts with a digit still goes to DNS where it belongs. */
+static inline int emb_parse_ipv4(const char *s, unsigned int *out) {
+    unsigned int ip = 0;
+    for (int part = 0; part < 4; part++) {
+        if (*s < '0' || *s > '9') return -1;
+        unsigned int v = 0, digits = 0;
+        while (*s >= '0' && *s <= '9') {
+            v = v * 10 + (unsigned)(*s++ - '0');
+            if (++digits > 3 || v > 255) return -1;
+        }
+        ip = (ip << 8) | v;
+        if (part < 3) { if (*s != '.') return -1; s++; }
+    }
+    if (*s) return -1;
+    *out = ip;
+    return 0;
+}
+
+/* Resolve a hostname to a network-order in_addr (a gethostbyname in miniature).
+ *
+ * A dotted-quad LITERAL is answered here rather than sent to DNS. Asking a name
+ * server to resolve "10.0.2.2" is asking the wrong question, and it fails --
+ * which is how a browser typing a literal address got "cannot resolve
+ * 10.0.2.2" from a machine that could reach it perfectly well. Every caller
+ * wants this, so it belongs in the resolver, not in each of them. */
 static inline int emb_resolve(const char *name, struct in_addr *out) {
     unsigned int ip_host = 0;
+    if (emb_parse_ipv4(name, &ip_host) == 0) { out->s_addr = htonl(ip_host); return 0; }
     int rc = embk_net_resolve(name, &ip_host);
     if (rc != 0) return rc;
     out->s_addr = htonl(ip_host);

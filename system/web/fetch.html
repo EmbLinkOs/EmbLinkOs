@@ -1,0 +1,32 @@
+<!doctype html>
+<html><head><title>Fetch</title>
+<style>
+/* Written when the browser's canvas was the desktop's dark surface. It is
+   white now -- the initial value every page on the web is written against --
+   so this page states the dark ground it assumes, and the ink that goes with
+   it. Declaring one without the other leaves anything the page does not
+   colour explicitly using the browser's dark default, on a dark ground. */
+html, body { background: #14141a; color: #d8d8e0 }
+ h1{color:#88c0d0} .out{color:#a3be8c} .muted{color:#7b8394;font-size:13px} </style></head>
+<body>
+<h1>fetch() over our own stack</h1>
+<p class="muted">A script asks for a URL; the browser fetches it on the same
+worker the document uses, and resolves the page's Promise when the bytes land.</p>
+<p>Status: <span id="status" class="out">fetching...</span></p>
+<p>Parsed name: <span id="name" class="out">--</span></p>
+<p>Milestones: <span id="ms" class="out">--</span></p>
+<script>
+  fetch("/system/web/data.json")
+    .then(r => {
+      document.querySelector("#status").setText(r.status + (r.ok ? " OK" : " ERR"));
+      return r.text();
+    })
+    .then(body => {
+      const d = JSON.parse(body);
+      document.querySelector("#name").setText(d.name + " / " + d.browser);
+      document.querySelector("#ms").setText(d.milestones.join(" → "));
+      console.log("fetched + parsed " + d.milestones.length + " milestones");
+    })
+    .catch(e => document.querySelector("#status").setText("failed: " + e.message));
+</script>
+</body></html>

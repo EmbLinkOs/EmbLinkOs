@@ -1,0 +1,6 @@
+# The file manager does exactly one thing to the world, and it is in the name.
+# files.ns bounds WHICH files it can reach; this bounds the kind of reach it has
+# at all -- no network, no devices.
+
+filesystem
+gpu            # a window is a GPU resource

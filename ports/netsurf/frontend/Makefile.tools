@@ -1,0 +1,101 @@
+# -*- mode: makefile-gmake -*-
+##
+## EmbLinkOS target tool setup.
+##
+## Every frontend supplies one of these; it names the toolchain and the
+## pkg-config to use for THIS target. Ours is the same cross compiler the rest
+## of the OS's userland is built with (see the Makefile at the repo root), and
+## the pkg-config is the shim in ports/netsurf/tools that build.sh puts on PATH
+## -- this machine has no real one, and the only question being asked is where
+## a sibling library we just built put its headers.
+##
+
+PKG_CONFIG := pkg-config
+
+# THE SAME FRONTEND, BUILT FOR THE BUILD MACHINE. Everything above the syscall
+# layer is portable C, and the OS's own browser proved what that is worth:
+# render_host.c runs the whole pipeline in two seconds, and the last heap bug
+# of the kind this port is now chasing was found by AddressSanitizer in one run
+# after an hour of stack traces pointing at innocent code. A five-minute boot
+# is the wrong instrument for a wild pointer.
+#
+# Selected by HOST=x86_64-linux-gnu, in which case none of the freestanding
+# setup below applies -- there is a real libc, real startup files, and no
+# linker script.
+EMBLINK_HOSTBUILD := $(filter-out x86_64-elf,$(HOST))
+
+# HOST is x86_64-elf, which is our cross toolchain's own triple, so the
+# buildsystem's default $(HOST)-gcc already resolves correctly. Named here
+# anyway: a frontend that leaves its compiler to be inferred is one environment
+# change away from silently building for the build machine instead.
+ifeq ($(EMBLINK_HOSTBUILD),)
+CC  := $(HOST)-gcc
+CXX := $(HOST)-g++
+AR  := $(HOST)-ar
+endif
+
+# Freestanding userland: the OS's own crt0 provides _start (user/lib/crt0.c),
+# newlib.ld places the image at 0x400000, and libc.a comes from our rebuilt
+# newlib rather than the toolchain's stock one -- the -L must come first for
+# that to be true. These mirror NEWLIB_CFLAGS/NEWLIB_LDFLAGS in the root
+# Makefile; if those change, this has to follow.
+EMBLINK_ROOT    ?= $(HOME)/myos
+EMBLINK_NEWLIB  ?= $(HOME)/cross/newlib-c99
+
+# zlib: gzip transfer encoding, and utils/hashtable.c's crc. Built by
+# ports/netsurf/build.sh into the port's own prefix, complete with the gzip
+# file API -- the copy already on the machine was missing it.
+EMBLINK_ZLIB ?= $(PREFIX)
+
+# The OS's font module's headers. OUTSIDE the freestanding branch below,
+# because text.c needs them in BOTH builds -- putting them in the cross-only
+# arm is what made the host build fail on a header the cross build could see.
+CFLAGS += -I$(EMBLINK_ROOT)/ui/backend -I$(EMBLINK_ROOT)/ui/scene \
+          -I$(EMBLINK_ROOT)/ui/layout -I$(EMBLINK_ROOT)/ui/declare
+
+ifeq ($(EMBLINK_HOSTBUILD),)
+# EMBLINK_AUTOINIT: what an uninitialised local holds. The rest of this OS's
+# userland is built with `=zero` (NEWLIB_CFLAGS in the root Makefile) and the
+# netsurf build was not, which is the asymmetry that makes this port the only
+# thing hitting the bug. `=pattern` is the DIAGNOSTIC form -- it fills locals
+# with 0xAA bytes, so if the faulting address turns into that pattern the read
+# is uninitialised and the question is answered in one boot.
+EMBLINK_AUTOINIT ?= -ftrivial-auto-var-init=pattern
+# -g on the OS build too. It costs nothing at run time (the kernel loads only
+# the PT_LOAD segments) and it is the difference between a backtrace that
+# names a function and one that names a LINE -- which is the whole value of
+# the kernel's ring-3 backtrace.
+# EMBLINK_NET: the OS build has a network fetcher (http/https over the kernel's
+# TCP stack and our own TLS). The host build does not, and main.c is #ifdef'd
+# on this rather than on the triple.
+CFLAGS  += -g -DEMBLINK_NET $(EMBLINK_AUTOINIT) -mno-red-zone -fno-stack-protector
+
+# The TLS implementation the OS already builds -- our own AES-GCM, X25519,
+# ECDSA, RSA and X.509 chain validation (docs/TLS.md). Objects rather than an
+# archive because that is how the root Makefile produces them.
+# tls_*.o ONLY: url.c is compiled into libemnet above, and naming build/web_url.o
+# here as well is a duplicate definition, not a fallback.
+EMBLINK_TLS_OBJS := $(wildcard $(EMBLINK_ROOT)/build/tls_*.o)
+
+# THE COMPILE FLAGS, which belong here and not in a list of object files. An
+# earlier edit folded these three includes into EMBLINK_TLS_OBJS above, so
+# CFLAGS silently lost -I user/lib -- and every core file that includes
+# <sys/socket.h> (which this libc provides as an override header) stopped
+# compiling. It only surfaced on a clean rebuild, because the objects from
+# before the edit were still on disk and being linked.
+CFLAGS  += -I$(EMBLINK_ROOT)/user/lib \
+           -isystem $(EMBLINK_NEWLIB)/x86_64-elf/include \
+           -I$(EMBLINK_ZLIB)/include
+# The OS's startup and syscall layer, exactly as the root Makefile links every
+# other userland binary: crt0.c provides _start (there is no crtX here) and
+# syscalls.c is the whole libc-to-kernel boundary. Without them the link has no
+# entry symbol and every read(), open() and stat() in the core is undefined.
+LDFLAGS += -nostartfiles -static -T $(EMBLINK_ROOT)/user/lib/newlib.ld \
+           -L$(EMBLINK_NEWLIB)/x86_64-elf/lib -L$(EMBLINK_ZLIB)/lib \
+           $(EMBLINK_ROOT)/build/crt0.o $(EMBLINK_ROOT)/build/syscalls.o \
+           -lz -lm -lemfont -lemnet $(EMBLINK_TLS_OBJS)
+else
+# The host build: a real libc, and the sanitizers that are the point of it.
+CFLAGS  += $(EMBLINK_SAN)
+LDFLAGS += $(EMBLINK_SAN) -L$(PREFIX)/lib -lz -lm -lemfont
+endif

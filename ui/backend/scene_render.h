@@ -23,6 +23,12 @@ struct scene_renderer {
     struct clip_rect       dirty[16];  /* this frame's accumulator (Section 6) */
     int                    n_dirty;
     int                    full;       /* cap exceeded -> one full-screen rect */
+    /* Scroll-blit result (Section 6b): when a frame was resolved as a pure
+     * scroll, only the exposed STRIP was repainted -- but the whole blitted
+     * region's pixels changed, so a consumer that copies/presents by dirty
+     * rect must cover THIS rect too. Valid when has_scroll_present. */
+    float                  sp_x, sp_y, sp_w, sp_h;
+    int                    has_scroll_present;
 };
 
 void scene_render_init(struct scene_renderer *r, struct render_backend *be);
@@ -32,5 +38,16 @@ void scene_render_destroy(struct scene_renderer *r);
  * regions (everything on the first frame, since nothing is cached yet). */
 void scene_render_frame(struct scene_renderer *r, struct scene_arena *a,
                         struct node_handle root, struct render_target *target);
+
+/* Forget every cached rect, so the next frame repaints the whole tree.
+ *
+ * For a caller that knows the surface changed for a reason the cache cannot
+ * see. The cache is keyed by NODE INDEX, and indices are reused: a subtree that
+ * is destroyed and later rebuilt identically -- a launcher opening a second
+ * time with the same apps in the same places -- lands on the same indices
+ * holding still-valid entries with the same geometry, so every node compares
+ * equal and not one pixel is painted. The declarative pass runs, the app
+ * believes it drew, and the screen keeps the frame from before. */
+void scene_render_invalidate(struct scene_renderer *r);
 
 #endif /* __EMBLINK_UI_SCENE_RENDER_H__ */
