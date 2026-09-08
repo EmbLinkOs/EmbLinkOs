@@ -1,5 +1,18 @@
 ASM       = nasm
 ASM_FLAGS = -f bin
+# --- host portability -------------------------------------------------------
+# This repo is developed on Linux and on macOS (Apple Silicon), and the two
+# disagree about the coreutils that build scripts lean on. Decided ONCE here
+# rather than sprinkled through recipes, so a broken host tool is one edit.
+#
+#   stat: GNU is `$(STATSZ)`, BSD/macOS is `stat -f%z`.
+#   truncate: GNU coreutils only, and `-s %1M` (round UP to a multiple) is a
+#             GNU extension on top of that. python3 is already required, does
+#             it in one line, and behaves identically on both.
+STATSZ := $(shell stat -c%s Makefile >/dev/null 2>&1 && echo 'stat -c%s' || echo 'stat -f%z')
+# Round $(1) up to a whole number of MB, never down -- see the boot image rule.
+PADMB = python3 -c "import os,sys;p=sys.argv[1];m=1<<20;s=os.path.getsize(p);n=max(m,-(-s//m)*m);f=open(p,'r+b');f.truncate(n);f.close()"
+
 CC = x86_64-elf-gcc
 # -Ikernel makes every kernel translation unit include project headers by
 # their canonical path from the kernel/ root (e.g. #include
@@ -572,7 +585,7 @@ build/js.elf: build/crt0.o build/syscalls.o build/qjs/js.o $(QJS_OBJS) user/lib/
 
 .PHONY: js
 js: build/js.elf
-	@echo "js.elf: $$(stat -c%s build/js.elf) bytes"
+	@echo "js.elf: $$($(STATSZ) build/js.elf) bytes"
 
 build/web_style.o: user/web/style.c user/web/style.h user/web/css/css.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
@@ -1191,7 +1204,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/vellum.c user/bin/js.c user/bin/photos.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/vellum.c user/bin/js.c user/bin/photos.c user/bin/mp3play.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1243,11 +1256,59 @@ build/photos.elf: build/crt0.o build/syscalls.o $(PHOTOS_OBJS) build/libembk.so
 # word proves every bitrate/samplerate/padding field was read correctly, a few
 # thousand times in a row, on a file nobody wrote for this test.
 MP3 ?=
+MP3_OBJS_SRC := user/audio/mp3/bits.c user/audio/mp3/frame.c \
+                user/audio/mp3/sideinfo.c user/audio/mp3/tables.c \
+                user/audio/mp3/huffman.c user/audio/mp3/scalefac.c \
+                user/audio/mp3/reservoir.c user/audio/mp3/spectrum.c \
+                user/audio/mp3/imdct.c user/audio/mp3/synth.c \
+                user/audio/mp3/decode.c
 .PHONY: test-mp3
 test-mp3: | $(BUILD)
 	$(HOSTCC) -O2 -Wall -Iuser/audio/mp3 -o build/mp3_test \
-	    user/audio/mp3/mp3_test.c user/audio/mp3/bits.c user/audio/mp3/frame.c
-	./build/mp3_test $(MP3)
+	    user/audio/mp3/mp3_test.c user/audio/mp3/bits.c user/audio/mp3/frame.c \
+	    user/audio/mp3/sideinfo.c user/audio/mp3/tables.c \
+	    user/audio/mp3/huffman.c user/audio/mp3/scalefac.c user/audio/mp3/reservoir.c
+	@if [ -n "$(MP3)" ]; then ./build/mp3_test "$(MP3)"; else \
+	  $(MAKE) --no-print-directory mp3-vectors; \
+	  fail=0; for f in build/mp3ref/*.mp3; do \
+	    printf "  %-16s " "$$(basename $$f)"; \
+	    if ./build/mp3_test "$$f" > build/mp3ref/last.log 2>&1; then \
+	      grep -hoE "[0-9]+ granules.*cold" build/mp3ref/last.log | tr -d "\n"; echo "  OK"; \
+	    else echo "FAIL"; cat build/mp3ref/last.log; fail=1; fi; \
+	  done; \
+	  echo "=== test-mp3: $$( [ $$fail = 0 ] && echo OK || echo FAIL )"; exit $$fail; fi
+
+# THE decoder check: our PCM against ffmpeg's, sample by sample.
+# Bit accounting proves the granules were parsed; only this proves they were
+# turned into the right SOUND. A wrong table or a sign error in the IMDCT
+# produces confident, plausible audio that no amount of listening separates
+# from correct -- so the reference decodes the same file and the waveforms are
+# subtracted. Needs ffmpeg (and ffprobe); skipped with a note if absent.
+# The audio resampler: 44100 into the speaker's fixed 48000, measured against
+# an ideal tone. See the file for why the phase search must be fractional.
+.PHONY: test-resample
+test-resample: | $(BUILD)
+	$(HOSTCC) -O2 -Wall -Iuser/audio -o build/resample_test \
+	    user/audio/resample_test.c user/audio/resample.c -lm
+	./build/resample_test
+
+.PHONY: test-mp3-pcm
+test-mp3-pcm: mp3-vectors | $(BUILD)
+	@command -v ffmpeg >/dev/null || { echo "  (ffmpeg not installed -- skipping PCM check)"; exit 0; }
+	$(HOSTCC) -O2 -Wall -Iuser/audio/mp3 -o build/mp3dec \
+	    user/audio/mp3/mp3dec.c $(MP3_OBJS_SRC) -lm
+	@fail=0; for f in build/mp3ref/*.mp3; do \
+	  python3 tools/mp3_check.py "$$f" || fail=1; \
+	done; \
+	echo "=== test-mp3-pcm: $$( [ $$fail = 0 ] && echo OK || echo FAIL )"; exit $$fail
+
+# The MP3 corpus: several ENCODERS' worth of habits, not one big file.
+# A whole 8490-frame song passed while two 2-second clips failed, because the
+# song never used SCFSI and they did. Coverage here is variety -- mono, high
+# and low bitrate, VBR, noise (which forces short blocks), a sweep -- not size.
+.PHONY: mp3-vectors
+mp3-vectors: | $(BUILD)
+	@sh tools/mkmp3vectors.sh
 
 .PHONY: test-photos
 test-photos: | $(BUILD)
@@ -1267,12 +1328,39 @@ photo-probe: build/photo_probe $(PICTURES_STAMP)
 	@for f in data/pictures/*; do ./build/photo_probe "$$f"; done
 
 # The sample album, generated rather than checked in -- see tools/mkpictures.py.
+MUSIC_STAMP := build/.music.stamp
+$(MUSIC_STAMP): tools/mkmusic.sh | $(BUILD)
+	@sh tools/mkmusic.sh
+	@touch $@
+.PHONY: music
+music: $(MUSIC_STAMP)
+
 PICTURES_STAMP := build/.pictures.stamp
 $(PICTURES_STAMP): tools/mkpictures.py system/web/photo.jpg | $(BUILD)
 	python3 tools/mkpictures.py
 	@touch $@
 .PHONY: pictures
 pictures: $(PICTURES_STAMP)
+
+# Music -- the MP3 player. The decoder and resampler are the SAME sources the
+# host tests exercise (make test-mp3-pcm proves them against ffmpeg); only the
+# app around them is new. One implementation, verified on the build machine and
+# then run on the metal, rather than a second one written for the target.
+MP3_APP_OBJS := build/mp3_bits.o build/mp3_frame.o build/mp3_sideinfo.o \
+                build/mp3_tables.o build/mp3_huffman.o build/mp3_scalefac.o \
+                build/mp3_reservoir.o build/mp3_spectrum.o build/mp3_imdct.o \
+                build/mp3_synth.o build/mp3_decode.o build/au_resample.o
+
+build/mp3_%.o: user/audio/mp3/%.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/audio/mp3 -c $< -o $@
+build/au_resample.o: user/audio/resample.c user/audio/resample.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/audio -c $< -o $@
+build/mp3play.o: user/bin/mp3play.c user/audio/mp3/mp3.h user/audio/resample.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/audio/mp3 -Iuser/audio -c $< -o $@
+
+build/mp3play.elf: build/crt0.o build/syscalls.o build/mp3play.o $(MP3_APP_OBJS) build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/mp3play.o \
+	    $(MP3_APP_OBJS) build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # home links one thing the generic rule does not: the shared reader for an
 # app's declared authority (user/lib/appauth.c). An explicit rule beats the
@@ -1357,12 +1445,12 @@ all: $(IMG) embkfs.img
 images: $(IMG) embkfs.img
 
 $(STAGE1_BIN): $(STAGE1_SRC) $(STAGE2_BIN)
-	@stage2_sectors=$$(( ($$(stat -c%s $(STAGE2_BIN)) + 511) / 512 )); \
+	@stage2_sectors=$$(( ($$($(STATSZ) $(STAGE2_BIN)) + 511) / 512 )); \
 	echo "Building stage1 with STAGE2_LOAD_SECTORS=$$stage2_sectors"; \
 	$(ASM) $(ASM_FLAGS) -D STAGE2_LOAD_SECTORS=$$stage2_sectors $< -o $@
 
 $(STAGE2_BIN): $(STAGE2_SRC) $(KERNEL_BIN)
-	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
+	@kernel_sectors=$$(( ($$($(STATSZ) $(KERNEL_BIN)) + 511) / 512 )); \
 	echo "Building stage2 with KERNEL_LOAD_SECTORS=$$kernel_sectors"; \
 	$(ASM) $(ASM_FLAGS) -D KERNEL_LOAD_SECTORS=$$kernel_sectors $< -o $@
 
@@ -1417,9 +1505,9 @@ $(IMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN)
 	@# `%1M` pads small kernels to 1 MB exactly as before, but grows to 2 MB, 3 MB,
 	@# ... as the kernel does, so it can never be truncated. (Stage1/2 load by
 	@# sector count, not image size, so any padded size is fine.)
-	truncate -s %1M $(IMG)
-	@kernel_sectors=$$(( ($$(stat -c%s $(KERNEL_BIN)) + 511) / 512 )); \
-	kernel_top=$$(( 0x100000 + $$(stat -c%s $(KERNEL_BIN)) )); \
+	$(PADMB) $(IMG)
+	@kernel_sectors=$$(( ($$($(STATSZ) $(KERNEL_BIN)) + 511) / 512 )); \
+	kernel_top=$$(( 0x100000 + $$($(STATSZ) $(KERNEL_BIN)) )); \
 	stage_base=$$(( 0x1000000 )); \
 	echo "Kernel is $$kernel_sectors sectors; stage2 stages the ELF at 0x1000000 (16 MB, unreal-mode high load)"; \
 	if [ $$kernel_top -ge $$stage_base ]; then \
@@ -1485,7 +1573,7 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS) \
                $(if $(HAVE_QJS),build/js.elf,) \
-               build/vellum.elf build/photos.elf \
+               build/vellum.elf build/photos.elf build/mp3play.elf \
                $(if $(wildcard $(NS_PREFIX)/lib/libdom.a),build/nsprobe.elf build/nsemblink.elf,)
 
 # STAGED_APPS: binaries built OUTSIDE this tree and dropped into build/ to be
@@ -1547,7 +1635,7 @@ icons: $(ICONS_STAMP)
 EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
                   $(shell find system data -type d 2>/dev/null)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(EMBKFS_CONTENT)
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is

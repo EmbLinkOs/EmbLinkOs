@@ -5,7 +5,16 @@
 # that here means a bug in it cannot damage a picture even in principle, which
 # is a stronger statement than "the code has no write calls in it" -- that is a
 # property of today's code, and this is a property of the process.
+#
+# EVERY PREFIX HERE MUST BE ONE THE SESSION CAN ALREADY NAME. The kernel
+# resolves each one in the PARENT's namespace at spawn time, so a prefix the
+# desktop does not hold is not a narrower grant -- it is a spawn that fails
+# with -2 before the program is ever loaded. The session holds
+#   ro /system, ro /data/apps, rw /home/<user>, rw /run
+# and this asked for `ro /data/pictures`, which is outside it: the launcher
+# reported "spawn FAILED: -2" and nothing opened. settings.ns carries a comment
+# about making exactly this mistake with `rw /data`. Hence $HOME, which is
+# where the pictures live now anyway.
 
 ro /system                  # its font and chrome resources
-ro /data/pictures           # the sample album it opens with no argument
-ro $HOME                    # the user's own pictures, wherever they keep them
+ro $HOME                    # the user's pictures, including $HOME/Pictures

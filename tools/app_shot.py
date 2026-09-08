@@ -37,7 +37,7 @@ def sock_path(name, kind):
     return os.path.join(BUILD, "shot-%s-%s.sock" % (name, kind))
 
 
-def boot(name, scratch):
+def boot(name, scratch, audio=None):
     ser, qmp = sock_path(name, "ser"), sock_path(name, "qmp")
     for p in (ser, qmp):
         if os.path.exists(p):
@@ -57,6 +57,12 @@ def boot(name, scratch):
         "-no-reboot", "-no-shutdown", "-m", "1024m", "-smp", "2",
         "-accel", "tcg,thread=multi",
     ]
+    if audio:
+        # The guest's audio written to a FILE on this machine. The same trick
+        # `make test-audio` uses: what a speaker did is not observable from a
+        # test, but what the device was handed is.
+        argv += ["-device", "AC97,audiodev=snd0",
+                 "-audiodev", "wav,id=snd0,path=%s" % audio]
     log = open(os.path.join(BUILD, "shot-%s-qemu.log" % name), "wb")
     return subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=log), ser, qmp
 
@@ -157,11 +163,16 @@ def main():
     ap.add_argument("--boot-wait", type=int, default=80)
     ap.add_argument("--settle", type=int, default=45)
     ap.add_argument("--keys", default="", help="comma-separated chars to type after launch")
+    ap.add_argument("--audio", action="store_true",
+                    help="attach an AC97 and capture what it plays to a WAV")
     args = ap.parse_args()
 
     scratch = os.path.join(BUILD, "shot-%s.img" % args.name)
     print("=== app-shot: booting for %s" % args.app)
-    q, ser_path, qmp_path = boot(args.name, scratch)
+    wav = os.path.join(BUILD, "shot-%s.wav" % args.name) if args.audio else None
+    if wav and os.path.exists(wav):
+        os.remove(wav)
+    q, ser_path, qmp_path = boot(args.name, scratch, wav)
     before = os.path.join(BUILD, "shot-%s-desktop.ppm" % args.name)
     after = os.path.join(BUILD, "shot-%s.ppm" % args.name)
     seen = b""
@@ -242,6 +253,19 @@ def main():
             print("     FAIL: %s" % f)
         print("=== app-shot: FAIL (%d)" % len(fails))
         return 1
+    if wav:
+        # Measure it here rather than asserting a tone: a player's output is
+        # music, so what matters is that it is LONG enough (no starvation) and
+        # not silent (the decode reached the device).
+        rc = subprocess.call([sys.executable,
+                              os.path.join(ROOT, "tools", "audio_check.py"),
+                              wav, "--hz", "0",
+                              "--min-seconds", os.environ.get("SHOT_MIN_SECONDS", "3")],
+                             cwd=ROOT)
+        if rc != 0:
+            print("=== app-shot: FAIL -- the audio it played is wrong")
+            return 1
+
     print("=== app-shot: OK  (%s)" % after)
     return 0
 

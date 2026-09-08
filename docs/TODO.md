@@ -3936,14 +3936,33 @@ scoping is recorded here rather than discovered later.
       no picture glyph -- the art is user-supplied (`icons/masters/`).
 - [ ] Decoding is SYNCHRONOUS: a very large JPEG stalls the frame it lands on.
       The resampler is already viewport-bounded, so this is decode only.
+- [ ] A MANIFEST LINT is missing, and it would have caught the launch failure
+      below before a boot. Every prefix in an app's `.ns` must (a) exist on the
+      image and (b) be nameable by the SESSION, because the kernel resolves
+      each one in the PARENT's namespace at spawn -- so an unsatisfiable prefix
+      is not a narrower grant, it is `spawn FAILED: -2` with no clue which line
+      caused it. settings.ns and now photos.ns both carry hand-written warnings
+      about making this exact mistake; a check would beat a third comment.
+- [ ] Relatedly: home reports the spawn errno but not WHICH bind failed. The
+      kernel knows; it could say.
 
-### MP3 player — NEXT
-- [ ] MPEG-1 Layer III decoder from nothing: bit reservoir, Huffman tables,
-      scalefactors, requantisation, stereo modes, alias reduction, IMDCT and
-      the polyphase synthesis filterbank. This is a real DSP job, not a
-      weekend's parsing, and it is the reason the audio stack was built first.
-- [ ] Verify by MEASUREMENT, the way audio already is: decode a known tone on
-      the HOST, compare against the reference, and only then put it on metal.
+### MP3 player — SHIPPED
+- [x] MPEG-1 Layer III from nothing, verified against ffmpeg sample by sample
+      (0.00% error, worst 1 LSB, five encodings + a 3.4-minute song).
+- [x] Windowed-sinc resampling to the speaker's fixed 48 kHz.
+- [x] Plays on the metal with zero dropouts across 55 half-second windows.
+- [ ] MPEG-2 and 2.5 (a different scalefactor scheme entirely). The decoder
+      refuses them rather than producing audio -- half-implementing this would
+      make wrong sound, not an error.
+- [ ] The IMDCT is the direct O(n^2) form with precomputed cosines. It keeps up
+      under TCG with headroom, so a fast factorisation is not yet worth the
+      bug surface -- but it is where the time goes if that changes.
+- [ ] No seeking. The reservoir and the IMDCT overlap both carry state, so a
+      seek needs a few frames of muted decode to prime -- known, not written.
+- [ ] No ID3 display (artist/title), no album art, no shuffle/repeat, no
+      volume control (the kernel has no mixer -- one stream at a time).
+- [ ] The player holds the WHOLE file in memory. Fine for songs, wrong for a
+      podcast; streaming needs the reservoir to work off a sliding window.
 
 ### Video — SCOPED HONESTLY, NOT PROMISED
 - [ ] The MP4/ISO-BMFF container is a parser and is achievable.
@@ -3955,3 +3974,30 @@ scoping is recorded here rather than discovered later.
       actually decode in real time -- MJPEG reuses the JPEG decoder we already
       have and ship. That is real video playback and it is not H.264, and the
       difference should be stated in the app rather than glossed.
+
+
+## Host portability (macOS / Apple Silicon)
+
+The project is now built from two machines. The core build was made portable
+(see docs/BUILD_SETUP.md); these are the parts that are not, and they are host
+TOOLING gaps rather than anything wrong with the OS.
+
+- [ ] `sfdisk` is Linux-only, so partitioned + USB images cannot be built on
+      macOS: `tools/mkbootdisk.sh`, `make run-usb`, `run-usb-ide`, and the
+      partition-table tests. A replacement would have to write the MBR/GPT
+      bytes directly -- which we already know how to parse (see
+      docs/PORTS.md and the GPT+EBR work), so writing them is not research.
+      Doing that would remove the dependency on BOTH hosts, which is the
+      better outcome than special-casing one.
+- [ ] UEFI (`make run-uefi`) needs a GNU `objcopy` that supports
+      `efi-app-x86_64`. Homebrew's binutils does not provide that target.
+      Our own EFI app is ELF until that step, so emitting the PE/COFF wrapper
+      ourselves is the durable fix -- and we already write an ELF loader, a
+      packfile writer and an EMBX emitter, so a PE header is in scope.
+- [ ] Re-baseline the TIMING-dependent tests on the Mac: `make test-audio`
+      durations, `tools/app_shot.py --settle`, the MP3 player's queue depth
+      (QUEUE_AHEAD). Cross-architecture TCG is slower than x86-on-x86 TCG and
+      none of the recorded numbers transfer.
+- [ ] Keep the tree free of case-only filename collisions -- APFS is
+      case-insensitive by default, so a collision is invisible on macOS and
+      breaks Linux. Check: `git ls-files | tr A-Z a-z | sort | uniq -d`.

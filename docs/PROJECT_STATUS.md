@@ -2042,6 +2042,17 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
   makes every program quieter and none of them correct. No capture, no
   userspace volume, no Intel HDA. Verified by MEASURING the WAV QEMU
   writes (`make test-audio`), never by ear.
+- Music: an MP3 player, decoder and all (`user/audio/mp3/` + `user/bin/
+  mp3play.c`). MPEG-1 Layer III from nothing -- bit reservoir, Huffman,
+  requantisation, joint stereo, alias reduction, IMDCT, polyphase synthesis
+  filterbank -- verified against ffmpeg SAMPLE BY SAMPLE: 0.00% error, worst
+  difference 1 LSB, on five encodings and a 3.4-minute song. The ISO constants
+  are extracted and validated by `tools/mkmp3tables.py` (Kraft equality +
+  symbol counts), not retyped. Output is resampled to the speaker's fixed
+  48 kHz by a windowed-sinc filter (`user/audio/resample.c`, 0.05% error).
+  On the metal: 27.3 s of continuous audio, zero dropouts in 55 half-second
+  windows. MPEG-2/2.5 not done (says so rather than guessing).
+  `make test-mp3`, `make test-mp3-pcm`, `make test-resample`.
 - Photos: the picture viewer (`user/bin/photos.c` + `user/photos/`) reads
   PNG and JPEG through the browser's own decoders and resamples by AREA
   AVERAGE rather than leaving it to the compositor's bilinear blitter —
@@ -2257,8 +2268,27 @@ What's left:
 
 ## Build Environment
 
-- OS: Ubuntu Linux. Toolchain: x86_64-elf cross compiler at `/usr/local/cross/bin`.
-- NASM, QEMU, GNU Make, VS Code, GDB (`docs/GDB_CHEATSHEET.md`).
+TWO hosts, one target. The OS is x86_64 whichever machine builds it; see
+`docs/BUILD_SETUP.md` for the setup of each and for the host-tool differences
+that are already handled in-tree.
+
+- **Linux (x86_64)** — the daily host. Toolchain: x86_64-elf cross compiler at
+  `/usr/local/cross/bin`, built from source. Everything works here, including
+  the partitioned/USB images and UEFI boot.
+- **macOS (Apple Silicon)** — cross compiler from Homebrew
+  (`x86_64-elf-gcc`), no source build needed. Kernel, apps and every host test
+  are portable. Two gaps, both host tooling rather than OS features:
+  `sfdisk` does not exist (no partitioned/USB images) and there is no GNU
+  `objcopy` with the `efi-app-x86_64` target (no UEFI build). BIOS boot and
+  `make run` are unaffected.
+  - **Timings do not transfer.** QEMU on ARM translates an x86_64 guest across
+    architectures and HVF cannot accelerate it, so it is slower than the
+    x86-on-x86 TCG the numbers in this document were measured under. Where a
+    result here is a duration -- first-frame times, the MP3 player keeping
+    ahead of the speaker, `make test-audio` -- re-baseline it rather than
+    changing working code to hit a figure from other hardware.
+- NASM, QEMU, GNU Make, VS Code, GDB (`docs/GDB_CHEATSHEET.md`), python3,
+  ffmpeg (for the MP3 reference checks).
 - Repository: `github.com/teo1747/EmbLinkOs`.
 
 ## Build / Run Commands

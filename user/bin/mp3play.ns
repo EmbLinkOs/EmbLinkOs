@@ -1,0 +1,14 @@
+# Music -- what the player may NAME.
+#
+# READ-ONLY. A player does not write: no library database, no play counts, no
+# transcoding. Declaring that makes it a property of the process rather than of
+# today's code.
+#
+# Every prefix must be one the SESSION can already name, because the kernel
+# resolves them in the PARENT's namespace at spawn -- a prefix the desktop does
+# not hold is not a narrower grant, it is a spawn that fails with -2 before the
+# program loads. The session holds ro /system, ro /data/apps, rw /home/<user>,
+# rw /run. Photos learned this the hard way by asking for /data/pictures.
+
+ro /system                  # its font and chrome resources
+ro $HOME                    # the music, in $HOME/Music

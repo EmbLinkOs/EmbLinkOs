@@ -39,7 +39,10 @@ done
 # signature stage2 captures, whatever it is); a stable one is just hygiene.
 DISK_ID="0x454D424B"   # 'EMBK'
 
-sec() { echo $(( ( $(stat -c%s "$1") + 511 ) / 512 )); }
+# GNU stat is -c%s, BSD/macOS is -f%z. Picked once; see docs/BUILD_SETUP.md
+# for the rest of the Linux/macOS host differences.
+fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1"; }
+sec() { echo $(( ( $(fsize "$1") + 511 ) / 512 )); }
 roundup() { echo $(( ( ($1 + $2 - 1) / $2 ) * $2 )); }
 
 S1=$(sec "$STAGE1"); S2=$(sec "$STAGE2"); KS=$(sec "$KERNEL"); ES=$(sec "$EMBKFS")

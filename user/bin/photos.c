@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <dirent.h>
 
 #include "embk.h"
 #include "ui.h"
@@ -41,8 +42,12 @@
 #define ZOOM_MAX  32.0f
 #define ZOOM_STEP 1.25f
 
-/* Where to look when nothing was named on the command line. */
-#define DEFAULT_DIR "/data/pictures"
+/* Where to look when nothing was named on the command line -- which is the
+ * normal case, because the dock launches apps with no arguments. Resolved from
+ * $HOME at runtime rather than compiled in: the viewer must not contain a
+ * person's name, and the session already passes HOME at spawn. */
+#define DEFAULT_SUBDIR "/Pictures/"
+static char g_default_dir[256];
 
 static Album g_album;
 static Photo g_img;
@@ -98,6 +103,57 @@ static void load_index(int i)
 {
     char buf[320];
     if (album_path(&g_album, i, buf, sizeof buf)) load_path(buf);
+}
+
+/* Open `dir` as the album if it holds anything we can show. */
+static bool try_dir(const char *dir)
+{
+    snprintf(g_default_dir, sizeof g_default_dir, "%s", dir);
+    album_open(&g_album, g_default_dir);
+    if (g_album.count <= 0) return false;
+    g_album.index = 0;
+    load_index(0);
+    return g_rc == PHOTO_OK;
+}
+
+/* FIND the pictures rather than assume where they are.
+ *
+ * $HOME/Pictures is the answer whenever the launcher started us, because the
+ * session passes HOME. But `run` from the shell passes no environment at all,
+ * and the first version fell back to a compiled-in "/home" and displayed
+ * "/home/Pictures/ -- cannot read that file", which is a correct message about
+ * a path nobody asked for. Naming a user in the fallback was not an option
+ * either: the viewer must not contain a person's name.
+ *
+ * So it DISCOVERS one. /home is readable, it has the users in it, and the
+ * first one with a Pictures folder is a better guess than any constant. */
+static bool open_default(void)
+{
+    char cand[400];   /* > g_default_dir + the longest name a listing can hold */
+    const char *home = getenv("HOME");
+
+    if (home && home[0]) {
+        snprintf(cand, sizeof cand, "%s/Pictures/", home);
+        if (try_dir(cand)) return true;
+        snprintf(cand, sizeof cand, "%s/", home);
+        if (try_dir(cand)) return true;
+    }
+
+    DIR *d = opendir("/home");
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            snprintf(cand, sizeof cand, "/home/%.200s/Pictures/", e->d_name);
+            if (try_dir(cand)) { closedir(d); return true; }
+        }
+        closedir(d);
+    }
+
+    /* Nothing found. Report the place we would have expected them. */
+    snprintf(g_default_dir, sizeof g_default_dir, "%s/Pictures",
+             (home && home[0]) ? home : "/home/<user>");
+    return false;
 }
 
 /* --- the visible tile ----------------------------------------------------- */
@@ -329,9 +385,10 @@ int main(int argc, char **argv)
         /* No argument: open the folder rather than refusing. A viewer started
          * from a launcher has no argument by definition, and "usage:" on a
          * window is not a thing a person can act on. */
-        album_open(&g_album, DEFAULT_DIR "/");
-        if (g_album.count > 0) { g_album.index = 0; load_index(0); }
-        else { g_rc = PHOTO_ENOENT; snprintf(g_name, sizeof g_name, "%s", DEFAULT_DIR); }
+        if (!open_default()) {
+            g_rc = PHOTO_ENOENT;
+            snprintf(g_name, sizeof g_name, "%.90s", g_default_dir);
+        }
     }
 
     em_set_key_hook(on_key);

@@ -21,6 +21,11 @@
 
 #include "bits.h"
 #include "frame.h"
+#include "sideinfo.h"
+#include "tables.h"
+#include "huffman.h"
+#include "scalefac.h"
+#include "reservoir.h"
 
 static int g_fail;
 
@@ -60,6 +65,78 @@ static void test_bits(void)
     uint32_t tail = bits_read(&b, 16);
     snprintf(msg, sizeof msg, "got 0x%X, overrun=%d", tail, (int)b.overrun);
     ok("B3 reading past the end clamps and flags", b.overrun, msg);
+}
+
+/* --- the ISO tables, as committed ---------------------------------------- *
+ * tools/mkmp3tables.py validates what it emits, but the file it emitted is
+ * what actually gets compiled, and a generator's guarantee says nothing about
+ * a file after it has been edited, merged or truncated. These checks are cheap
+ * and they are about the artifact rather than the process.
+ *
+ * A Huffman table is not merely a list -- it is a PREFIX CODE, and that is a
+ * property that can be verified without knowing a single correct value: no
+ * code may be a prefix of another (or decoding is ambiguous), and the lengths
+ * must satisfy Kraft equality (or the code is incomplete and some bit pattern
+ * decodes to nothing). A table with a wrong entry almost always breaks one of
+ * the two. */
+static void test_tables(void)
+{
+    char msg[160];
+    int bad_kraft = 0, bad_prefix = 0, tables = 0, codes = 0;
+    int worst_table = -1;
+
+    for (int t = 0; t < 34; t++) {
+        const Mp3HuffTable *ht = &mp3_huff_tables[t];
+        if (ht->count == 0) continue;
+        tables++;
+        codes += ht->count;
+
+        double kraft = 0;
+        for (int i = 0; i < ht->count; i++)
+            kraft += 1.0 / (double)(1u << mp3_huff_entries[ht->start + i].bits);
+        if (kraft < 0.9999999 || kraft > 1.0000001) {
+            bad_kraft++;
+            if (worst_table < 0) worst_table = t;
+        }
+
+        for (int i = 0; i < ht->count && !bad_prefix; i++) {
+            const Mp3HuffEntry *a = &mp3_huff_entries[ht->start + i];
+            for (int j = 0; j < ht->count; j++) {
+                if (i == j) continue;
+                const Mp3HuffEntry *b = &mp3_huff_entries[ht->start + j];
+                if (b->bits < a->bits) continue;
+                /* is a's code the leading `a->bits` bits of b's? */
+                if ((b->code >> (b->bits - a->bits)) == a->code) {
+                    bad_prefix++;
+                    if (worst_table < 0) worst_table = t;
+                    break;
+                }
+            }
+        }
+    }
+
+    snprintf(msg, sizeof msg, "%d tables, %d codes", tables, codes);
+    ok("H1 the ISO tables are present", tables == 31 && codes > 4000, msg);
+
+    snprintf(msg, sizeof msg, "%d incomplete%s", bad_kraft,
+             worst_table >= 0 ? "" : "");
+    ok("H2 every table is a COMPLETE code (Kraft = 1)", bad_kraft == 0, msg);
+
+    snprintf(msg, sizeof msg, "%d violations", bad_prefix);
+    ok("H3 no code is a prefix of another", bad_prefix == 0, msg);
+
+    /* The scalefactor bands must be increasing and end at 576 -- they are
+     * boundaries into the coefficient array, and one out of order is an
+     * out-of-bounds walk during requantisation. */
+    int sf_ok = 1;
+    for (int r = 0; r < 3; r++) {
+        for (int i = 1; i < 23; i++)
+            if (mp3_sf_bands[r].l[i] <= mp3_sf_bands[r].l[i - 1]) sf_ok = 0;
+        if (mp3_sf_bands[r].l[22] != 576) sf_ok = 0;
+        for (int i = 1; i < 14; i++)
+            if (mp3_sf_bands[r].s[i] <= mp3_sf_bands[r].s[i - 1]) sf_ok = 0;
+    }
+    ok("H4 scalefactor bands rise and end at 576", sf_ok, "");
 }
 
 /* --- the frame layer, against a real file --------------------------------- */
@@ -123,6 +200,229 @@ static void test_frames(const char *path)
     snprintf(msg, sizeof msg, "%.1f s of audio from %.1f KB", secs, sz / 1024.0);
     ok("F1b the walk covers the whole file", secs > 1.0, msg);
 
+    /* S -- the side info of every frame in the file.
+     *
+     * Two properties worth more than any hand-written assertion:
+     *
+     * S1: every frame's side info parses with all fields in range. The reader
+     * rejects out-of-range values because they INDEX TABLES -- a bad one is an
+     * out-of-bounds read on input the decoder did not write -- so "all 8490
+     * parsed" also says the layout (which differs by version AND channel
+     * count) was read correctly every time.
+     *
+     * S2: the BIT RESERVOIR balances. main_data_begin says the granule's data
+     * starts that many bytes before the end of the previous frame's data, so
+     * it can never ask for more history than the file has actually produced.
+     * If any field width above were wrong, main_data_begin would be shifted
+     * and this would go negative almost immediately -- it is the reservoir
+     * arithmetic checking the parser, using nothing I supplied. */
+    {
+        size_t p = (size_t)first;
+        unsigned parsed = 0, bad = 0;
+        long reservoir = 0, worst_short = 0;
+        unsigned long long total_bits = 0;
+
+        while (p + 4 <= got) {
+            Mp3Header fh;
+            if (!mp3_parse_header(buf + p, got - p, &fh)) break;
+
+            size_t si = p + 4 + (fh.crc ? 2 : 0);
+            Mp3SideInfo s;
+            if (si + (size_t)fh.side_info_bytes <= got &&
+                mp3_parse_sideinfo(buf + si, (int)(got - si), &fh, &s)) {
+                parsed++;
+
+                /* Can this frame reach back as far as it claims? The bytes it
+                 * asks for must already have been produced by frames before
+                 * it. (The first few frames of a file legitimately ask for
+                 * nothing, which is why the reservoir starts empty.) */
+                if ((long)s.main_data_begin > reservoir) {
+                    long shortfall = (long)s.main_data_begin - reservoir;
+                    if (shortfall > worst_short) worst_short = shortfall;
+                }
+
+                long used = 0;
+                for (int gr = 0; gr < s.granules; gr++)
+                    for (int c = 0; c < fh.channels; c++)
+                        used += s.gr[gr][c].part2_3_length;
+                total_bits += (unsigned long long)used;
+
+                /* The reservoir grows by this frame's main-data slot and
+                 * shrinks by what its granules actually spent. The format
+                 * bounds it at 511 bytes -- that is what main_data_begin's
+                 * 9 bits can address. */
+                long avail = fh.frame_bytes - 4 - (fh.crc ? 2 : 0)
+                           - fh.side_info_bytes;
+                reservoir += avail - (used + 7) / 8;
+                if (reservoir > 511) reservoir = 511;
+                if (reservoir < 0) reservoir = 0;
+            } else {
+                bad++;
+            }
+            p += (size_t)fh.frame_bytes;
+        }
+
+        snprintf(msg, sizeof msg, "%u parsed, %u rejected", parsed, bad);
+        ok("S1 every frame's side info parses in range",
+           parsed > 10 && bad == 0, msg);
+
+        snprintf(msg, sizeof msg, "worst shortfall %ld bytes", worst_short);
+        ok("S1b the bit reservoir never asks for absent history",
+           worst_short == 0, msg);
+
+        double kbps = secs > 0 ? total_bits / secs / 1000.0 : 0;
+        snprintf(msg, sizeof msg, "granule bits average %.0f kbit/s of a "
+                 "%d kbit/s stream", kbps, h.bitrate / 1000);
+        /* The granules cannot spend more than the stream carries, and a
+         * decoder reading part2_3_length wrongly shows up here immediately as
+         * a nonsense rate rather than as noise ten stages later. */
+        ok("S2 granule bit budgets fit the stream's bitrate",
+           kbps > 1.0 && kbps <= h.bitrate / 1000.0 + 1.0, msg);
+    }
+
+    /* D -- ENTROPY DECODE the whole file, and let the bit count grade it.
+     *
+     * This is the strongest check available before there is any audio to
+     * compare against, and it grades six things at once: the ISO tables, the
+     * region boundaries, the scalefactor widths, SCFSI inheritance, the count1
+     * loop, and the reservoir. All of them have to be right SIMULTANEOUSLY or
+     * the granule does not end where the side info said it would.
+     *
+     * The side info states part2_3_length -- exactly how many bits the granule
+     * spent on scalefactors plus Huffman data. We decode, then compare. An
+     * encoder may leave a few stuffing bits unused, and count1 may overrun by
+     * up to one quadruple because whole codes are written, so the tolerance is
+     * one-sided and small. A wrong table does not land near the mark: it
+     * desynchronises and the error is hundreds of bits, or no code matches at
+     * all. */
+    {
+        Mp3Reservoir res;
+        mp3_res_reset(&res);
+
+        size_t p = (size_t)first;
+        unsigned granules = 0, exact = 0, close = 0, wrong = 0;
+        unsigned failed = 0, cold = 0;
+        long worst = 0;
+        /* Details of the FIRST granule that missed, so a failure names the
+         * case to look at instead of only its size. */
+        int bad_frame = -1, bad_gr = 0, bad_ch = 0, bad_bt = 0, bad_p23 = 0;
+        long bad_diff = 0;
+        unsigned frame_i = 0;
+        unsigned long long coeffs = 0;
+
+        while (p + 4 <= got) {
+            Mp3Header fh;
+            if (!mp3_parse_header(buf + p, got - p, &fh)) break;
+            if (fh.version != MPEG_1) break;          /* MPEG-2 sf not done yet */
+
+            size_t si_off = p + 4 + (fh.crc ? 2 : 0);
+            Mp3SideInfo s;
+            if (si_off + (size_t)fh.side_info_bytes > got ||
+                !mp3_parse_sideinfo(buf + si_off, (int)(got - si_off), &fh, &s))
+                break;
+
+            const uint8_t *md = buf + si_off + fh.side_info_bytes;
+            int mdlen = fh.frame_bytes - 4 - (fh.crc ? 2 : 0) - fh.side_info_bytes;
+            if (md + mdlen > buf + got) break;
+
+            long startbit = mp3_res_add(&res, md, mdlen, s.main_data_begin);
+            if (startbit < 0) { cold++; p += (size_t)fh.frame_bytes; continue; }
+
+            BitReader b;
+            bits_init(&b, res.buf, res.len);
+            bits_seek(&b, (size_t)startbit);
+
+            Mp3Scalefac sf[2][2];
+            int sr_index = fh.samplerate == 44100 ? 0 : fh.samplerate == 48000 ? 1 : 2;
+
+            for (int gr = 0; gr < s.granules; gr++) {
+                for (int c = 0; c < fh.channels; c++) {
+                    const Mp3Granule *g = &s.gr[gr][c];
+                    size_t gstart = bits_pos(&b);
+                    size_t gend = gstart + g->part2_3_length;
+
+                    int sfbits = mp3_read_scalefactors(&b, &s, gr, c, true,
+                                                       &sf[gr][c],
+                                                       gr == 1 ? &sf[0][c] : NULL);
+                    if (sfbits < 0) { failed++; break; }
+
+                    int32_t coef[576];
+                    int n = mp3_huffman_granule(&b, gend, g, sr_index, coef);
+                    if (n < 0) {
+                        if (failed == 0)
+                            printf("       first FAIL: frame %u gr %d ch %d bt %d, "
+                                   "phase %s table %d at coef %d; tables %d/%d/%d, "
+                                   "big %d, r0 %d r1 %d, count1 tab %d, switch %d\n",
+                                   frame_i, gr, c, g->block_type,
+                                   mp3_huff_err_phase ? "count1" : "big",
+                                   mp3_huff_err_table, mp3_huff_err_index,
+                                   g->table_select[0], g->table_select[1],
+                                   g->table_select[2], g->big_values,
+                                   g->region0_count, g->region1_count,
+                                   g->count1table_select ? 33 : 32,
+                                   (int)g->window_switching);
+                        failed++;
+                    }
+                    else        coeffs += (unsigned long long)n;
+
+                    long diff = (long)bits_pos(&b) - (long)gend;
+                    /* EXACT, or it is a bug. No tolerance.
+                     *
+                     * This began with slack in it -- an allowance for "the
+                     * encoder padded its bit budget" and another for the count1
+                     * loop overrunning by a quadruple. Both sounded reasonable
+                     * and both were wrong: with the decoder actually correct,
+                     * every granule of every file tested lands on the mark to
+                     * the bit. The 483 granules that had been sitting inside
+                     * that tolerance were the SCFSI bit-order bug, and the
+                     * tolerance is what let a whole song look like it passed.
+                     *
+                     * A margin invented to explain a discrepancy, rather than
+                     * derived from the format, is a place for bugs to live. */
+                    if (diff == 0)                   exact++;
+                    else if (diff > -32 && diff < 40) close++;
+                    else {
+                        wrong++;
+                        if (diff > worst || -diff > worst)
+                            worst = diff < 0 ? -diff : diff;
+                        if (bad_frame < 0) {
+                            bad_frame = (int)frame_i; bad_gr = gr; bad_ch = c;
+                            bad_bt = g->block_type; bad_p23 = g->part2_3_length;
+                            bad_diff = diff;
+                        }
+                    }
+                    granules++;
+
+                    /* Reposition EXACTLY. Whatever the granule did with its
+                     * bits, the next one starts where the side info says --
+                     * carrying an error forward is how one bad frame becomes
+                     * a whole bad file. */
+                    bits_seek(&b, gend);
+                }
+            }
+            p += (size_t)fh.frame_bytes;
+            frame_i++;
+        }
+
+        snprintf(msg, sizeof msg, "%u granules, %u failed, %u cold",
+                 granules, failed, cold);
+        ok("D1 every granule decodes without a bad code",
+           granules > 20 && failed == 0, msg);
+
+        snprintf(msg, sizeof msg, "%u exact, %u near, %u off (worst %ld bits)",
+                 exact, close, wrong, worst);
+        ok("D2 granules end where part2_3_length says, EXACTLY",
+           granules > 20 && exact == granules, msg);
+        if (bad_frame >= 0)
+            printf("       first miss: frame %d gr %d ch %d, block_type %d, "
+                   "part2_3 %d bits, off by %+ld\n",
+                   bad_frame, bad_gr, bad_ch, bad_bt, bad_p23, bad_diff);
+
+        snprintf(msg, sizeof msg, "%llu coefficients (%.0f per granule)",
+                 coeffs, granules ? (double)coeffs / granules : 0);
+        ok("D3 the spectrum is populated", coeffs > 0 && granules > 0, msg);
+    }
+
     /* F2 -- the encoder's own frame count, if it left one. */
     uint32_t xing = mp3_xing_frames(buf + first, got - (size_t)first, &h);
     if (xing) {
@@ -145,6 +445,7 @@ int main(int argc, char **argv)
 {
     printf("=== mp3\n");
     test_bits();
+    test_tables();
     if (argc > 1) test_frames(argv[1]);
     else printf("  (no file given -- frame tests skipped)\n");
 
