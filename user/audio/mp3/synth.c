@@ -1,4 +1,5 @@
 /* user/audio/mp3/synth.c -- see synth.h. */
+#include <stdbool.h>
 #include <math.h>
 #include <string.h>
 

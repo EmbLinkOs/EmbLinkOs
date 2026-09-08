@@ -1191,7 +1191,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/vellum.c user/bin/js.c user/bin/photos.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/vellum.c user/bin/js.c user/bin/photos.c user/bin/mp3play.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1315,12 +1315,39 @@ photo-probe: build/photo_probe $(PICTURES_STAMP)
 	@for f in data/pictures/*; do ./build/photo_probe "$$f"; done
 
 # The sample album, generated rather than checked in -- see tools/mkpictures.py.
+MUSIC_STAMP := build/.music.stamp
+$(MUSIC_STAMP): tools/mkmusic.sh | $(BUILD)
+	@sh tools/mkmusic.sh
+	@touch $@
+.PHONY: music
+music: $(MUSIC_STAMP)
+
 PICTURES_STAMP := build/.pictures.stamp
 $(PICTURES_STAMP): tools/mkpictures.py system/web/photo.jpg | $(BUILD)
 	python3 tools/mkpictures.py
 	@touch $@
 .PHONY: pictures
 pictures: $(PICTURES_STAMP)
+
+# Music -- the MP3 player. The decoder and resampler are the SAME sources the
+# host tests exercise (make test-mp3-pcm proves them against ffmpeg); only the
+# app around them is new. One implementation, verified on the build machine and
+# then run on the metal, rather than a second one written for the target.
+MP3_APP_OBJS := build/mp3_bits.o build/mp3_frame.o build/mp3_sideinfo.o \
+                build/mp3_tables.o build/mp3_huffman.o build/mp3_scalefac.o \
+                build/mp3_reservoir.o build/mp3_spectrum.o build/mp3_imdct.o \
+                build/mp3_synth.o build/mp3_decode.o build/au_resample.o
+
+build/mp3_%.o: user/audio/mp3/%.c | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/audio/mp3 -c $< -o $@
+build/au_resample.o: user/audio/resample.c user/audio/resample.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/audio -c $< -o $@
+build/mp3play.o: user/bin/mp3play.c user/audio/mp3/mp3.h user/audio/resample.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/audio/mp3 -Iuser/audio -c $< -o $@
+
+build/mp3play.elf: build/crt0.o build/syscalls.o build/mp3play.o $(MP3_APP_OBJS) build/libembk.so
+	$(USER_CC) $(NEWLIB_DYN_LDFLAGS) build/crt0.o build/syscalls.o build/mp3play.o \
+	    $(MP3_APP_OBJS) build/libembk.so -lc -lm -lgcc $(NEWLIB_DYN_WL) -o $@
 
 # home links one thing the generic rule does not: the shared reader for an
 # app's declared authority (user/lib/appauth.c). An explicit rule beats the
@@ -1533,7 +1560,7 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
                $(CXX_APPS) $(PY_APPS) $(GIT_APPS) $(TCC_APPS) $(EMUI_APPS) \
                $(if $(HAVE_QJS),build/js.elf,) \
-               build/vellum.elf build/photos.elf \
+               build/vellum.elf build/photos.elf build/mp3play.elf \
                $(if $(wildcard $(NS_PREFIX)/lib/libdom.a),build/nsprobe.elf build/nsemblink.elf,)
 
 # STAGED_APPS: binaries built OUTSIDE this tree and dropped into build/ to be
@@ -1595,7 +1622,7 @@ icons: $(ICONS_STAMP)
 EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
                   $(shell find system data -type d 2>/dev/null)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(EMBKFS_CONTENT)
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is

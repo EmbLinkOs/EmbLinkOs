@@ -2042,6 +2042,17 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
   makes every program quieter and none of them correct. No capture, no
   userspace volume, no Intel HDA. Verified by MEASURING the WAV QEMU
   writes (`make test-audio`), never by ear.
+- Music: an MP3 player, decoder and all (`user/audio/mp3/` + `user/bin/
+  mp3play.c`). MPEG-1 Layer III from nothing -- bit reservoir, Huffman,
+  requantisation, joint stereo, alias reduction, IMDCT, polyphase synthesis
+  filterbank -- verified against ffmpeg SAMPLE BY SAMPLE: 0.00% error, worst
+  difference 1 LSB, on five encodings and a 3.4-minute song. The ISO constants
+  are extracted and validated by `tools/mkmp3tables.py` (Kraft equality +
+  symbol counts), not retyped. Output is resampled to the speaker's fixed
+  48 kHz by a windowed-sinc filter (`user/audio/resample.c`, 0.05% error).
+  On the metal: 27.3 s of continuous audio, zero dropouts in 55 half-second
+  windows. MPEG-2/2.5 not done (says so rather than guessing).
+  `make test-mp3`, `make test-mp3-pcm`, `make test-resample`.
 - Photos: the picture viewer (`user/bin/photos.c` + `user/photos/`) reads
   PNG and JPEG through the browser's own decoders and resamples by AREA
   AVERAGE rather than leaving it to the compositor's bilinear blitter —

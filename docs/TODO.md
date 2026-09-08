@@ -3946,13 +3946,23 @@ scoping is recorded here rather than discovered later.
 - [ ] Relatedly: home reports the spawn errno but not WHICH bind failed. The
       kernel knows; it could say.
 
-### MP3 player — NEXT
-- [ ] MPEG-1 Layer III decoder from nothing: bit reservoir, Huffman tables,
-      scalefactors, requantisation, stereo modes, alias reduction, IMDCT and
-      the polyphase synthesis filterbank. This is a real DSP job, not a
-      weekend's parsing, and it is the reason the audio stack was built first.
-- [ ] Verify by MEASUREMENT, the way audio already is: decode a known tone on
-      the HOST, compare against the reference, and only then put it on metal.
+### MP3 player — SHIPPED
+- [x] MPEG-1 Layer III from nothing, verified against ffmpeg sample by sample
+      (0.00% error, worst 1 LSB, five encodings + a 3.4-minute song).
+- [x] Windowed-sinc resampling to the speaker's fixed 48 kHz.
+- [x] Plays on the metal with zero dropouts across 55 half-second windows.
+- [ ] MPEG-2 and 2.5 (a different scalefactor scheme entirely). The decoder
+      refuses them rather than producing audio -- half-implementing this would
+      make wrong sound, not an error.
+- [ ] The IMDCT is the direct O(n^2) form with precomputed cosines. It keeps up
+      under TCG with headroom, so a fast factorisation is not yet worth the
+      bug surface -- but it is where the time goes if that changes.
+- [ ] No seeking. The reservoir and the IMDCT overlap both carry state, so a
+      seek needs a few frames of muted decode to prime -- known, not written.
+- [ ] No ID3 display (artist/title), no album art, no shuffle/repeat, no
+      volume control (the kernel has no mixer -- one stream at a time).
+- [ ] The player holds the WHOLE file in memory. Fine for songs, wrong for a
+      podcast; streaming needs the reservoir to work off a sliding window.
 
 ### Video — SCOPED HONESTLY, NOT PROMISED
 - [ ] The MP4/ISO-BMFF container is a parser and is achievable.

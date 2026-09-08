@@ -1,0 +1,14 @@
+# Music -- what the player may DO.
+#
+# It runs a DECODER over files it did not write, which is the same exposure the
+# browser and the picture viewer have: a malformed frame is attacker input
+# reaching a Huffman decoder. So it gets exactly three classes.
+#
+# `audio` is the one that matters, and it is why EMBK_CAP_AUDIO exists. The
+# kernel refuses the speaker to a process that has not declared it, so a bug in
+# the MP3 decoder cannot make a noise, and a program that never asked for audio
+# cannot be turned into one that does.
+
+filesystem     # read the music, and the font the chrome is set in
+gpu            # a window is a GPU resource -- without this it cannot draw
+audio          # the speaker; one program owns it at a time

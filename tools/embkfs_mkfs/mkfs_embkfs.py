@@ -865,6 +865,10 @@ def discover_userland_objects(build_dir="build"):
     # are the user's own data anyway; this is where they belong.
     objects.extend(_tree_objects("data/pictures", b"home/yves/Pictures/",
                                  (".png", ".jpg", ".jpeg")))
+    # The sample library the Music player opens with no argument. Same
+    # placement reasoning as the pictures: it is the user's own data, and the
+    # session can name /home/<user> while it cannot name /data/music.
+    objects.extend(_tree_objects("data/music", b"home/yves/Music/", (".mp3",)))
     # NetSurf's own resources: its user-agent stylesheet and the pages it
     # serves for about:. The core fetches these through resource: URLs at
     # startup and a page never finishes loading without them -- which looks

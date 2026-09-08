@@ -1,4 +1,5 @@
 /* user/audio/mp3/spectrum.c -- see spectrum.h. */
+#include <stdbool.h>
 #include <math.h>
 #include <string.h>
 

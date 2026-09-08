@@ -1,4 +1,5 @@
 /* user/audio/mp3/imdct.c -- see imdct.h. */
+#include <stdbool.h>
 #include <math.h>
 #include <string.h>
 
