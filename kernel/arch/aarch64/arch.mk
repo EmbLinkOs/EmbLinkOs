@@ -19,8 +19,10 @@ ARM_ELF     := $(ARM_BUILD)/kernel.elf
 ARM_IMG     := $(ARM_BUILD)/kernel.img
 ARM_LINKER  := kernel/arch/aarch64/boot/linker.ld
 
-ARM_ASM_SRC := kernel/arch/aarch64/boot/boot.S
+ARM_ASM_SRC := kernel/arch/aarch64/boot/boot.S \
+               kernel/arch/aarch64/irq/vectors.S
 ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
+               kernel/arch/aarch64/irq/exception.c \
                kernel/arch/aarch64/drivers/pl011.c
 
 ARM_HDRS    := $(shell find kernel/arch/aarch64 -name '*.h' 2>/dev/null)
@@ -125,9 +127,9 @@ debug-arm64: $(ARM_IMG)
 	qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU) -m $(ARM_MEM) \
 	    -nographic -kernel $(ARM_IMG) -d int,unimp,guest_errors -D $(ARM_BUILD)/qemu.log
 
-# --- the A0 acceptance test -------------------------------------------------
-# "Done when" from docs/ARM64.md phase A0, made machine-checkable so it stays
-# true. No `timeout(1)`: it is GNU coreutils and this repo builds on macOS,
+# --- the acceptance test ----------------------------------------------------
+# Every phase's "done when" from docs/ARM64.md, made machine-checkable so it
+# stays true. Cumulative on purpose: A1 must not quietly break A0. No `timeout(1)`: it is GNU coreutils and this repo builds on macOS,
 # where it is absent unless someone installed gtimeout. Backgrounding qemu and
 # killing it is portable to both hosts, which is the same rule the top-level
 # Makefile applies to stat and truncate.
@@ -139,11 +141,19 @@ test-arm64-boot: $(ARM_IMG)
 	qpid=$$!; sleep 5; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
 	echo "--- serial ---"; cat $$log; echo "--- end ---"; \
 	fail=0; \
-	grep -q 'phase A0' $$log || { echo "FAIL: no banner (PL011 or entry is wrong)"; fail=1; }; \
-	grep -q 'CurrentEL   : EL1' $$log || { echo "FAIL: not at EL1"; fail=1; }; \
-	grep -q 'magic ok' $$log || { echo "FAIL: DTB pointer did not survive to arch_early_main"; fail=1; }; \
-	grep -q 'A0 reached' $$log || { echo "FAIL: did not reach the end of arch_early_main"; fail=1; }; \
-	if [ $$fail -eq 0 ]; then echo "PASS: A0 (banner, EL1, DTB handoff)"; else exit 1; fi
+	chk() { grep -q "$$1" $$log || { echo "FAIL($$2): $$3"; fail=1; }; }; \
+	chk 'EmbLinkOS aarch64'          A0 'no banner -- PL011 or the entry point is wrong'; \
+	chk 'CurrentEL   : EL1'          A0 'not running at EL1'; \
+	chk 'magic ok'                   A0 'the DTB pointer did not survive to arch_early_main'; \
+	chk 'VBAR_EL1 installed'         A1 'exception vectors were never installed'; \
+	chk 'BRK instruction'            A1 'brk was not decoded (ESR EC 0x3C)'; \
+	chk 'alignment fault, on a READ' A1 'the data abort was not decoded down to FSC + direction'; \
+	chk 'FAR_EL1   : 0x0000000040200003' A1 'FAR_EL1 did not report the faulting address'; \
+	chk 'A1 reached'                 A1 'did not survive its own faults -- recovery is broken'; \
+	if grep -q '\[FAIL\]' $$log; then echo "FAIL(A1): a self-test case reported failure"; fail=1; fi; \
+	if [ $$fail -eq 0 ]; then \
+	  echo "PASS: A0 (banner, EL1, DTB handoff) + A1 (vectors, ESR/FAR decode, recovery)"; \
+	else exit 1; fi
 
 .PHONY: check-tools-arm64
 check-tools-arm64:

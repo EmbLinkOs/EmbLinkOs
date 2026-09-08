@@ -24,6 +24,16 @@ SECTIONS {
      * at all and enters at offset 0 -- and that is the path a real board takes. */
     .text ALIGN(4096) : {
         KEEP(*(.text.boot))
+
+        /* The exception vector table gets its own explicit 2 KiB alignment
+         * rather than trusting `.balign 2048` inside the input section to
+         * survive placement. VBAR_EL1 discards the low 11 bits of what it is
+         * given, so a misaligned table does not fail -- it dispatches every
+         * exception to an address a little way off, which looks like the
+         * handler being subtly, randomly wrong. */
+        . = ALIGN(2048);
+        KEEP(*(.text.vectors))
+
         *(.text .text.*)
     }
 
@@ -48,6 +58,13 @@ SECTIONS {
 
     . = ALIGN(4096);
     kernel_end = .;
+
+    /* The two things about the vector table that cannot be checked in the
+     * assembler (see irq/vectors.S) and must not be discovered at runtime. */
+    ASSERT(aarch64_vectors_end - aarch64_vectors == 0x800,
+           "aarch64 vector table is not 2 KiB: an EXC_ENTRY stub overflowed its 128-byte slot")
+    ASSERT((aarch64_vectors & 0x7FF) == 0,
+           "aarch64 vector table is not 2 KiB aligned: VBAR_EL1 would silently truncate it")
 
     /* Toolchain metadata that would otherwise land in an allocated segment and
      * be loaded into RAM for nothing. */

@@ -5,9 +5,11 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0 done.** An aarch64 kernel builds and boots to a console on QEMU
-`virt`, at EL1, with the device tree handed over intact. Everything from A1 on
-is still unwritten.
+**Status: A0–A1 done.** An aarch64 kernel builds and boots to a console on QEMU
+`virt`, at EL1, with the device tree handed over intact, and it decodes its own
+faults: `VBAR_EL1` is installed and a deliberate breakpoint and a deliberate
+data abort are caught, printed with `ESR`/`FAR`/`ELR` decoded down to the fault
+status code, and recovered from. Everything from A2 on is still unwritten.
 
 ```sh
 brew install aarch64-elf-gcc          # Linux: gcc-aarch64-none-elf
@@ -206,13 +208,69 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
   3. **`virt` enters at EL1 already**, so the EL2→EL1 drop in `boot.S` is dead
      code today. It is kept because `virtualization=on` and the UEFI path of
      §6.1 both enter at EL2, and the failure without it is silent.
-* **A1 ❌ Exceptions.** `VBAR_EL1`, the 16-entry vector table, a panic path that
-  prints ESR/ELR/FAR. **Done when:** a deliberate bad access prints a decoded fault
-  instead of hanging. *(Debuggability before capability — everything after this is
-  cheaper because of it.)*
+* **A1 ✅ Exceptions.** `irq/vectors.S` (the 16-entry table + one shared frame
+  builder) and `irq/exception.c` (the decoder). **Done when:** a deliberate bad
+  access prints a decoded fault instead of hanging — extended in practice to
+  *and then carries on running*, which is a stronger claim and a more useful
+  mechanism. Covered by `test-arm64-boot`, which now asserts A0 and A1 together.
+
+  What it actually prints, for an unaligned load:
+
+  ```
+  === aarch64 exception ===
+    vector    : 4  sync, from EL1h (current EL, kernel)
+    ESR_EL1   : 0x0000000096000021
+                EC=0x00000025  data abort, same EL
+                FSC=0x00000021  alignment fault, on a READ
+    FAR_EL1   : 0x0000000040200003   <- the address that faulted
+    ELR_EL1   : 0x00000000400818ec   <- the instruction
+  ```
+
+  This is where ARM is simply better than the architecture we came from, and it
+  is worth being explicit about: x86 hands you `#PF` plus a 4-bit error code and
+  you infer the rest. `ESR_EL1` carries an exception class *and* a fault status
+  code, so the handler can say "level 2 translation fault, on a write" without
+  guessing. At A2, when the page tables are new and wrong, that is the entire
+  diagnosis. `kernel/lib/ksym.c` exists on the x86 side because a panic that
+  prints only hex is a panic you cannot act on; here most of that comes free.
+
+  Four things worth recording:
+  1. **A vector slot is 128 bytes — 32 instructions — and building the frame
+     takes about fifty.** Inlining the save assembles *without complaint* and
+     silently overruns into the next entry, so the table still looks right and
+     every exception but the first executes the tail of its predecessor. Each
+     stub is therefore four instructions and branches to shared code, and the
+     table's size and 2 KiB alignment are asserted **in the linker script**
+     (`.if` on a label difference across `.balign` is not an assembly-time
+     constant, but it is a link-time one). Both assertions were negative-tested
+     — deliberately broken, and they fire.
+  2. **`VBAR_EL1` ignores the low 11 bits of what you write to it.** A
+     misaligned table does not fail; it dispatches every exception a little way
+     off. Hence the alignment assertion rather than a comment.
+  3. **SVC and BRK disagree about `ELR`.** For a breakpoint or an abort, `ELR`
+     points *at* the instruction; for `SVC` it already points *past* it. The
+     recovery path's "+4" is therefore conditional — get it wrong and it skips
+     an innocent instruction, with the damage appearing somewhere unrelated.
+  4. **The recovery mechanism is not a debugging toy.** `exception_probe()`
+     makes synchronous faults recoverable for the duration of one call, and A2
+     needs exactly that shape to ask "is there memory here?" while walking the
+     device tree. Building it at A1 means it is proven before A2 relies on it —
+     and it is what lets the self-test *demonstrate* the handler rather than
+     assert it. A fault handler that has never fired does not work.
+
+  It also answered a question A2 was going to have to ask: **QEMU `virt` raises
+  a synchronous external abort on a read from unassigned physical space** (it
+  does not quietly return zero). So probing for RAM by reading is possible —
+  but the DTB memory node remains the right source, and now that is a choice
+  rather than an assumption.
 * **A2 ❌ MMU + higher half.** Build tables, enable the MMU, jump to the virtual
   kernel. **Done when:** the kernel runs from `0xFFFF...` and the DTB memory node
-  drives the existing `pmm`.
+  drives the existing `pmm`. Inherits from A1 a fault decoder that names
+  translation and permission faults by level, which is most of what debugging
+  new page tables consists of. Note that A1's unaligned-load self-test will
+  *stop* faulting here — with the MMU off every access is Device memory, where
+  unaligned is illegal; once this range is mapped Normal it becomes legal. That
+  is the test noticing the MMU came on, not a regression.
 * **A3 ❌ GICv3 + generic timer.** **Done when:** the existing timer-preemptive
   scheduler switches between two kthreads with no scheduler code changed.
 * **A4 ❌ The `sysargs` refactor (on x86).** §2.4. **Done when:** x86 boots to the

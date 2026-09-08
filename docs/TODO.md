@@ -1556,10 +1556,11 @@ substantially complete.
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
   - **That campaign is underway: `docs/ARM64.md`** (target QEMU `virt`, HVF
-    available and confirmed working). **Phase A0 is done** — `make ARCH=aarch64`
+    available and confirmed working). **Phases A0-A1 are done** — `make ARCH=aarch64`
     boots an aarch64 kernel to a serial console at EL1 with the DTB handed over,
-    verified by `make ARCH=aarch64 test-arm64-boot`. A1 (exception vectors) is
-    next. The audit there says the discipline largely held —
+    and it decodes its own faults (ESR/FAR/ELR down to the fault status code)
+    and recovers from them, verified by `make ARCH=aarch64 test-arm64-boot`.
+    A2 (MMU + higher half) is next. The audit there says the discipline largely held —
     `arch/x86_64/` is 11% of the kernel and port I/O never escaped into core
     logic — with **one** real exception: the 89 syscall handlers in
     `arch/x86_64/syscall/syscall.c` read their arguments through 187 direct

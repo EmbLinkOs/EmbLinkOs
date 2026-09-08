@@ -1,0 +1,212 @@
+#include "arch/aarch64/irq/exception.h"
+#include "arch/aarch64/drivers/pl011.h"
+
+/* Fault decoding -- docs/ARM64.md phase A1.
+ *
+ * The whole value of this file is that it turns a hang into a sentence. The
+ * x86 side learned this the expensive way (kernel/lib/ksym.c exists because a
+ * panic that prints only hex addresses is a panic you cannot act on); here we
+ * get most of the way there for free, because ESR_EL1 is a DECODED syndrome
+ * rather than x86's bare error code. */
+
+extern char aarch64_vectors[];
+void aarch64_set_vbar(void *vbar);           /* vectors.S */
+void aarch64_exception(uint64_t which, struct aarch64_frame *f);
+
+/* The frame is built by hand in assembly; if the struct grows a field or the
+ * stub's offsets drift, every register in every dump is silently wrong. */
+_Static_assert(sizeof(struct aarch64_frame) == 288,
+               "aarch64_frame must match FRAME_SIZE in vectors.S");
+_Static_assert(__builtin_offsetof(struct aarch64_frame, esr) == 272,
+               "F_ESR in vectors.S disagrees with struct aarch64_frame");
+
+/* Set while exception_probe() is running: see the header. Deliberately a
+ * plain global -- there is one CPU running kernel code at A1, and making this
+ * per-CPU before per-CPU state exists would be inventing an abstraction from
+ * zero implementations. A9 revisits it. */
+static volatile int probe_active;
+static volatile int probe_verbose;
+static volatile unsigned probe_faults;
+
+static const char *vector_name(uint64_t which) {
+    static const char *const kind[] = { "sync", "IRQ", "FIQ", "SError" };
+    return which > 15 ? "?" : kind[which & 3];
+}
+
+static const char *vector_group(uint64_t which) {
+    switch (which >> 2) {
+    case 0:  return "EL1t (current EL on SP_EL0 -- should be impossible)";
+    case 1:  return "EL1h (current EL, kernel)";
+    case 2:  return "EL0 AArch64 (from user space)";
+    default: return "EL0 AArch32 (should be impossible -- we never run A32)";
+    }
+}
+
+/* ESR_EL1.EC, Arm ARM D17.2.37. Only the classes that can actually reach this
+ * kernel are named; anything else prints its raw EC, which is still enough to
+ * look up. Note EC 0x07 in particular: with -mgeneral-regs-only it should be
+ * unreachable, so seeing it means a build lost that flag. */
+static const char *ec_name(uint64_t ec) {
+    switch (ec) {
+    case 0x00: return "unknown / undefined instruction";
+    case 0x01: return "trapped WFI/WFE";
+    case 0x07: return "SIMD/FP access trapped (CPACR_EL1.FPEN -- lost -mgeneral-regs-only?)";
+    case 0x0E: return "illegal execution state";
+    case 0x15: return "SVC from AArch64";
+    case 0x18: return "trapped MSR/MRS/system instruction";
+    case 0x20: return "instruction abort, lower EL";
+    case 0x21: return "instruction abort, same EL";
+    case 0x22: return "PC alignment fault";
+    case 0x24: return "data abort, lower EL";
+    case 0x25: return "data abort, same EL";
+    case 0x26: return "SP alignment fault";
+    case 0x2C: return "trapped floating-point exception";
+    case 0x2F: return "SError";
+    case 0x30: return "breakpoint, lower EL";
+    case 0x31: return "breakpoint, same EL";
+    case 0x32: return "software step, lower EL";
+    case 0x33: return "software step, same EL";
+    case 0x34: return "watchpoint, lower EL";
+    case 0x35: return "watchpoint, same EL";
+    case 0x3C: return "BRK instruction";
+    default:   return "(unnamed exception class)";
+    }
+}
+
+/* ESR_EL1.ISS.DFSC/IFSC for aborts -- the field x86 simply does not have. It
+ * is the difference between "page fault" and "level 2 translation fault on a
+ * write", and at A2, when the page tables are new, it is the whole diagnosis. */
+static const char *fsc_name(uint64_t fsc) {
+    switch (fsc) {
+    case 0x00: case 0x01: case 0x02: case 0x03:
+        return "address size fault";
+    case 0x04: case 0x05: case 0x06: case 0x07:
+        return "translation fault";
+    case 0x08: case 0x09: case 0x0A: case 0x0B:
+        return "access flag fault";
+    case 0x0C: case 0x0D: case 0x0E: case 0x0F:
+        return "permission fault";
+    case 0x10: return "synchronous external abort (nothing is mapped there)";
+    case 0x11: return "synchronous tag check fault";
+    case 0x21: return "alignment fault";
+    case 0x30: return "TLB conflict abort";
+    default:   return "(unnamed fault status)";
+    }
+}
+
+static int is_abort(uint64_t ec) {
+    return ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25;
+}
+
+static void dump_frame(uint64_t which, struct aarch64_frame *f) {
+    uint64_t ec  = (f->esr >> 26) & 0x3F;
+    uint64_t iss = f->esr & 0x1FFFFFF;
+
+    pl011_puts("\n=== aarch64 exception ===\n");
+
+    pl011_puts("  vector    : ");
+    pl011_putdec(which);
+    pl011_puts("  ");
+    pl011_puts(vector_name(which));
+    pl011_puts(", from ");
+    pl011_puts(vector_group(which));
+    pl011_puts("\n");
+
+    pl011_puts("  ESR_EL1   : ");
+    pl011_puthex64(f->esr);
+    pl011_puts("\n              EC=");
+    pl011_puthex32((uint32_t)ec);
+    pl011_puts("  ");
+    pl011_puts(ec_name(ec));
+    pl011_puts("\n");
+
+    if (is_abort(ec)) {
+        pl011_puts("              FSC=");
+        pl011_puthex32((uint32_t)(iss & 0x3F));
+        pl011_puts("  ");
+        pl011_puts(fsc_name(iss & 0x3F));
+        /* WnR is meaningful for data aborts only. */
+        if (ec == 0x24 || ec == 0x25) {
+            pl011_puts(", on a ");
+            pl011_puts((iss & (1u << 6)) ? "WRITE" : "READ");
+        }
+        pl011_puts("\n");
+        pl011_puts("  FAR_EL1   : ");
+        pl011_puthex64(f->far);
+        pl011_puts("   <- the address that faulted\n");
+    }
+
+    pl011_puts("  ELR_EL1   : ");
+    pl011_puthex64(f->elr);
+    pl011_puts("   <- the instruction\n");
+    pl011_puts("  SPSR_EL1  : ");
+    pl011_puthex64(f->spsr);
+    pl011_puts("\n  SP        : ");
+    pl011_puthex64(f->sp);
+    pl011_puts("\n");
+
+    /* Four per line: 31 registers in a wall of one-per-line is a screen and a
+     * half of scrollback, and the thing you are looking for is never on the
+     * part you can still see. */
+    pl011_puts("\n");
+    for (int i = 0; i < 31; i++) {
+        if ((i & 3) == 0)
+            pl011_puts("  ");
+        pl011_puts("x");
+        pl011_putdec((uint64_t)i);
+        pl011_puts(i < 10 ? " =" : "=");
+        pl011_puthex64(f->x[i]);
+        pl011_puts((i & 3) == 3 ? "\n" : "  ");
+    }
+    pl011_puts("\n  (x30 is LR: the address the faulting function returns to)\n");
+}
+
+void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
+    uint64_t ec = (f->esr >> 26) & 0x3F;
+
+    /* Recoverable probe: step over the offending instruction and continue.
+     * Restricted to SYNCHRONOUS exceptions, because for an IRQ or an SError
+     * "the offending instruction" is not a meaningful idea -- ELR points at
+     * innocent code that would then be skipped. */
+    if (probe_active && (which & 3) == 0) {
+        probe_faults++;
+        if (probe_verbose)
+            dump_frame(which, f);
+
+        /* Step over the offending instruction. Every A64 instruction is 4
+         * bytes, which is one of the genuinely pleasant things about this
+         * architecture -- the x86 equivalent needs a disassembler to know how
+         * far to step.
+         *
+         * EXCEPT for SVC (and HVC/SMC), where ELR already points PAST the
+         * instruction, because a syscall is meant to resume after it. Adding 4
+         * there skips an innocent instruction instead, and the damage shows up
+         * somewhere unrelated. Same asymmetry as x86 traps vs. faults; ARM
+         * just does not name it in the encoding, so it has to be known. */
+        if (ec != 0x15)
+            f->elr += 4;
+        return;
+    }
+
+    dump_frame(which, f);
+
+    pl011_puts("\nkernel halted (A1 has no recovery path -- that is A2 and later).\n");
+    for (;;)
+        __asm__ volatile("wfi");
+}
+
+void exception_init(void) {
+    aarch64_set_vbar(aarch64_vectors);
+}
+
+unsigned exception_probe(void (*fn)(void), int verbose) {
+    unsigned before = probe_faults;
+
+    probe_verbose = verbose;
+    probe_active  = 1;
+    fn();
+    probe_active  = 0;
+    probe_verbose = 0;
+
+    return probe_faults - before;
+}

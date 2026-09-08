@@ -623,9 +623,11 @@ above: you cross-compile it from the same Linux or macOS box you already build
 x86 on. The campaign, its phasing and its open questions live in
 [ARM64.md](ARM64.md); this section is only how to run it.
 
-Status: **phase A0** — it boots to a serial console at EL1 on QEMU `virt` and
-reads the device tree. There is no MMU, no interrupt controller and no userland
-yet, so `run-arm64` prints a register dump and parks. That is the whole feature.
+Status: **phases A0–A1** — it boots to a serial console at EL1 on QEMU `virt`,
+reads the device tree, and decodes its own faults (`ESR`/`FAR`/`ELR`, down to
+the fault status code) instead of hanging. There is no MMU, no interrupt
+controller and no userland yet, so `run-arm64` prints a register dump, runs a
+short self-test that deliberately faults twice and recovers, and parks.
 
 ```sh
 # 1. toolchain  (prebuilt bottle on macOS; ~1 min, not the ~30 the x86 one costs)
