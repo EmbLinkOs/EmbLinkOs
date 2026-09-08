@@ -10,14 +10,18 @@ first-time setup and the *why*, not day-to-day usage.
 
 ## Which host you are on
 
-The OS is x86_64 and always will be; the machine you BUILD it on is a separate
-question, and two are in use:
+The OS is x86_64 **today**, and the machine you BUILD it on is a separate
+question — two hosts are in use. (A second *target*, aarch64, is planned rather
+than built: `docs/ARM64.md`. Keep the two axes apart when reading this file —
+everything below is about the build HOST, not the target architecture.)
 
 | | Linux (x86_64) | macOS (Apple Silicon) |
 |---|---|---|
 | cross toolchain | build it (~30 min, § below) | `brew install x86_64-elf-gcc` |
 | `make` → bootable image | yes | yes |
 | `make run` / QEMU | x86-on-x86 TCG | **cross-arch TCG — slower**, see below |
+| QEMU display backend | `gtk` | `cocoa` (no gtk in Homebrew's qemu) |
+| default dev window | 800x600 (gtk ignores the size hint) | 1280x800 (cocoa honours it) |
 | partitioned / USB images | yes | **no** (`sfdisk` is Linux-only) |
 | UEFI boot (`make run-uefi`) | yes | **no** (needs GNU `objcopy` with `efi-app-x86_64`) |
 
@@ -26,10 +30,12 @@ Everything else — the kernel, every app, every host test (`test-mp3-pcm`,
 work on both.
 
 > **Honesty about this table:** the Linux column is what this repo is built and
-> tested on daily. The macOS column is derived from what the build actually
-> requires, and the portability fixes it needed have been made and verified —
-> but **it has not yet been run end to end on a Mac.** The first person to do
-> that should correct this file rather than work around it.
+> tested on daily. The macOS column has now been run end to end — `make` reaches
+> a bootable `myos.img` + `embkfs.img` on Apple Silicon. Doing that surfaced one
+> class of breakage worth its own section (a newer host compiler, below) and
+> three optional ports that broke the build instead of being skipped; those are
+> fixed in-tree. What is still unverified on the Mac is BOOT and the timing
+> tests — correct this line when you have run those.
 
 ## macOS (Apple Silicon) setup
 
@@ -37,12 +43,62 @@ work on both.
 # 1. host tools. The cross compiler is PREBUILT here, which skips the ~30
 #    minutes step 2 costs on Linux.
 brew install x86_64-elf-gcc x86_64-elf-binutils x86_64-elf-gdb \
-             nasm qemu python3 mtools ffmpeg
+             nasm qemu python3 mtools ffmpeg cryptography
+
+# `cryptography` is NOT optional: tools/embx/pkgsign.py signs pkgprobe's .pkg
+# fixtures, which are part of the base image, so `make` fails without it. It is
+# a brew formula rather than a pip install because Homebrew's python is
+# PEP-668 "externally managed" and plain `pip install` refuses.
 
 # 2. newlib-c99 still has to be rebuilt from source (§ below) -- it is not a
 #    formula, and the reason it exists is our own C99 configuration.
 make NEWLIB_PREFIX=$HOME/cross/newlib-c99
 ```
+
+### The thing that actually breaks first: a NEWER compiler
+
+Homebrew ships `x86_64-elf-gcc` 16; the Linux box was several majors behind.
+That version gap, not macOS, is what produces most "errors we never had on
+Linux", because **gcc 14 promoted three long-standing warnings to errors**:
+
+| now an error | what it caught here |
+|---|---|
+| `-Wimplicit-function-declaration` | four real missing `#include`s that older gcc accepted silently |
+| `-Wincompatible-pointer-types` | `uint64_t (*)(void)` passed where `unsigned long long (*)(void)` was expected — same width on LP64, distinct types |
+| `bool` is a keyword in C23 | gcc 14+ defaults to `-std=gnu23`, so `typedef _Bool bool;` in `kernel/include/types.h` is invalid |
+
+The last one is why `CFLAGS` pins `-std=gnu11` explicitly. **Pin the language,
+do not chase the default** — an unpinned kernel silently changes dialect every
+time someone upgrades a compiler, and C23 also removes unprototyped functions
+and changes `bool`, `true`, `false` and `nullptr`.
+
+None of these were macOS bugs and none were newly-broken code: they were latent
+defects that an older compiler tolerated. Fixing them is strictly correct on
+both hosts. If you hit a new one, fix the code — do not add `-Wno-error=`.
+
+The same gap bites the optional ports, which are third-party and older still:
+QuickJS calls `malloc_usable_size` while only including `<malloc.h>` under
+`#ifdef __linux__`, so on our `x86_64-elf` target the declaration was never
+visible. That is the third hunk in `tools/quickjs/`'s patch.
+
+### Optional ports must be ABSENT, not BROKEN
+
+Three ports were gated wrongly and failed the build on a machine that did not
+have them — the exact promise "Absent means absent, not broken" makes below.
+All three are fixed, and the shape of the bug is worth recognising:
+
+* **zlib** — the Makefile looked for `$(ZLIB_BUILD)/libz.a`, but
+  `build-zlib-emblink.sh` installs to `$(ZLIB_BUILD)/lib/libz.a`. Now `$(ZLIB_A)`,
+  and `gitclone`/`gitpush` drop out of the image when it is missing.
+* **EmbCC** — `mathself.embx` was gated on `embcc` alone but its rule also needs
+  `embld`. A machine with one and not the other broke. Gated on both now.
+* **QuickJS** — `vellum.c` calls `jsdom_*` unconditionally while `VELLUM_JS`
+  expands to nothing without the engine, so the browser failed to LINK over an
+  optional port. `jsdom.h` now supplies no-op stubs unless `HAVE_JSDOM`, and
+  vellum builds either way (with JS: ~2.4M, without: ~1.1M).
+
+`make check-tools` now reports QuickJS alongside the other ports; it was the one
+optional dependency the report never mentioned.
 
 ### The thing that will surprise you: it is slower
 
@@ -95,6 +151,26 @@ them:
   `cc` by default; both work, and warnings differ slightly.
 * `/usr/bin/time -f` and `nproc` are GNU-only. Neither is in the build; keep it
   that way.
+* **`-display gtk` does not exist on macOS.** Homebrew's qemu lists only
+  `none/curses/cocoa/dbus`, so every interactive target would have died on its
+  display flag. `$(QEMU_DISPLAY)` now picks `cocoa` on Darwin and `gtk`
+  elsewhere; both spell `zoom-to-fit=off` the same way, so the 1:1 pixel intent
+  is unchanged. Override it per run like anything else.
+* **The 800x600 window cap was a GTK workaround, and macOS does not need it.**
+  gtk reports the window/monitor geometry to virtio-gpu and *ignores* the
+  `virtio-vga` xres/yres hint (commit `c207ee1`), so under gtk the in-guest
+  `EMBK_VGPU_CAP_W/H` cap is the only thing deciding the resolution — and it had
+  to stay small or the window opened huge. cocoa honours the hint, so the Mac
+  defaults to the roomier 1280x800 the tree wanted before that workaround, while
+  **Linux keeps 800x600 exactly as before**. This is a per-host DEFAULT, not a
+  per-host feature: either host can pick either size with `make FB_W=… FB_H=…`,
+  and on slow cross-arch TCG dropping back to 800x600 is the cheapest speedup
+  you have (fewer pixels to composite).
+* `FB_W`/`FB_H` reach the kernel as **compile-time** `-D` defines, but
+  `kernel.elf` depends only on sources — so changing them used to rebuild
+  nothing and silently boot the old cap, contradicting the "override per build"
+  note in the Makefile. `build/.fb_cap` now stamps the pair and the kernel hangs
+  off it, so the documented knob actually works.
 
 APFS is **case-insensitive by default**. This repo currently has no filenames
 that differ only by case (checked: `git ls-files | tr A-Z a-z | sort | uniq -d`

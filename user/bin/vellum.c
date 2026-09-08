@@ -854,6 +854,13 @@ static Color scheme_color(void) {
     return chrome_rgb(0xFF636366U);                                         /* local file   */
 }
 
+/* embk_now_unix() returns uint64_t -- `unsigned long` on this LP64 target --
+ * while the jar's clock hook is declared `unsigned long long`. Same width,
+ * distinct types, and gcc 14+ makes that mismatch an error rather than a
+ * warning. Adapt through a shim rather than casting the function pointer:
+ * the cast would be the one form of this that is undefined behaviour. */
+static unsigned long long vellum_now_unix(void) { return embk_now_unix(); }
+
 static void app(void) {
     static bool first = true;
     if (first) {
@@ -862,7 +869,7 @@ static void app(void) {
         tab_init();                  /* one tab, before anything can load into it */
         /* The jar's clock. cookie.c takes no syscall dependency of its own, so
          * the app is what tells it what time it is. */
-        cookie_set_clock(embk_now_unix);
+        cookie_set_clock(vellum_now_unix);
         /* State that outlives the process: the jar, so a login survives a
          * restart, and localStorage, which is the only place a page can keep
          * anything of its own. Both live under /data/apps/vellum/state, which

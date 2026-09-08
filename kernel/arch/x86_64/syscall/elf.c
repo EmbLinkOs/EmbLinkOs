@@ -18,6 +18,7 @@
 #include "mm/pmm.h"
 #include "drivers/char/serial.h"
 #include "include/errno.h"
+#include "include/kprintf.h"   /* load_segments diagnostics */
 
 #define PAGE_SIZE_4K 0x1000ULL
 #define PAGE_DOWN(x) ((x) & ~(PAGE_SIZE_4K - 1))

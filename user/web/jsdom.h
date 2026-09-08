@@ -21,6 +21,13 @@
 struct html_doc;
 struct css_sheet;
 
+/* HAVE_JSDOM is defined only when QuickJS (QJS_SRC) is present, which is also
+ * the only case where jsdom.c is compiled. Without it the real prototypes are
+ * replaced by the no-op stubs at the bottom of this file -- see the note
+ * there. Declaring both would be a static-follows-extern conflict, so the two
+ * halves are mutually exclusive rather than additive. */
+#ifdef HAVE_JSDOM
+
 /* Create a runtime + context bound to `doc`. Returns 0, or -1 if the engine
  * could not be created. One per document: a new page gets a new world, which
  * is also how a script cannot outlive the page that wrote it. */
@@ -91,5 +98,46 @@ void jsdom_set_console(void (*fn)(const char *line));
  * deliver. A note for whoever is building the browser: the reader of the page
  * cannot act on it, so it does not belong on their status line. */
 int  jsdom_declined_listeners(void);
+
+#else /* !HAVE_JSDOM */
+/* ---- no engine in this build -------------------------------------------
+ * QuickJS is an OPTIONAL port (QJS_SRC), and without it build/web_jsdom.o is
+ * never compiled -- so every call above would be an undefined symbol at link
+ * time and the whole browser would fail to build over a port that is supposed
+ * to be skippable. These no-ops are what make "absent" mean absent rather than
+ * broken, the same bargain the other ports make (docs/BUILD_SETUP.md).
+ *
+ * This does NOT violate the rule at the top of this file -- that a binding
+ * which accepts a call and does nothing observable is worse than a missing
+ * one. That rule is about lying to a SCRIPT AUTHOR. Here there is no script
+ * author, because there is no engine to run their script: the page renders as
+ * a no-script page, which is a state the web has always defined and which the
+ * reader can see. The dishonest version would be shipping an engine that
+ * silently drops what it cannot do.
+ *
+ * jsdom_open() returns -1 -- "the engine could not be created" -- which is the
+ * answer its own contract already specifies and which vellum.c already
+ * handles. Nothing else here needs a special case.
+ */
+static inline int  jsdom_open(struct html_doc *d, const struct css_sheet *s)
+                                              { (void)d; (void)s; return -1; }
+static inline void jsdom_set_url(const char *u)          { (void)u; }
+static inline int  jsdom_run_scripts(void)               { return 0; }
+static inline int  jsdom_eval(const char *src, const char *name)
+                                              { (void)src; (void)name; return -1; }
+static inline int  jsdom_take_dirty(void)                { return 0; }
+static inline int  jsdom_has_listener(int n)             { (void)n; return 0; }
+static inline int  jsdom_dispatch_click(int n)           { (void)n; return 0; }
+/* 0 == nobody called preventDefault, so the caller navigates -- a form still
+ * submits without JS, which is the behaviour a no-script page must have. */
+static inline int  jsdom_dispatch_submit(int n)          { (void)n; return 0; }
+static inline int  jsdom_dispatch_input(int n)           { (void)n; return 0; }
+static inline int  jsdom_pump(unsigned long long now_ms) { (void)now_ms; return 0; }
+static inline unsigned long long jsdom_next_timer(void)  { return 0; }
+static inline int  jsdom_busy(void)                      { return 0; }
+static inline void jsdom_close(void)                     { }
+static inline void jsdom_set_console(void (*fn)(const char *line)) { (void)fn; }
+static inline int  jsdom_declined_listeners(void)        { return 0; }
+#endif /* HAVE_JSDOM */
 
 #endif /* _EMBLINK_WEB_JSDOM_H_ */

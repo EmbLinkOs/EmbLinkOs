@@ -21,6 +21,7 @@
 #include "drivers/video/framebuffer.h"
 #include "drivers/input/mouse.h"
 #include "drivers/input/keyboard.h"
+#include "drivers/audio/audio.h"  /* sys_audio_* handlers below */
 #include "include/kmalloc.h"
 #include "ipc/channel.h"
 #include "ipc/endpoint.h"

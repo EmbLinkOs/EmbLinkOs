@@ -9,6 +9,10 @@ ASM_FLAGS = -f bin
 #   truncate: GNU coreutils only, and `-s %1M` (round UP to a multiple) is a
 #             GNU extension on top of that. python3 is already required, does
 #             it in one line, and behaves identically on both.
+#   qemu display: Linux has gtk, macOS has cocoa and NOT gtk -- see
+#             $(QEMU_DISPLAY) and the FB_W/FB_H note below, where that choice
+#             also decides whether the guest has to cap its own scanout.
+UNAME_S := $(shell uname -s)
 STATSZ := $(shell stat -c%s Makefile >/dev/null 2>&1 && echo 'stat -c%s' || echo 'stat -f%z')
 # Round $(1) up to a whole number of MB, never down -- see the boot image rule.
 PADMB = python3 -c "import os,sys;p=sys.argv[1];m=1<<20;s=os.path.getsize(p);n=max(m,-(-s//m)*m);f=open(p,'r+b');f.truncate(n);f.close()"
@@ -20,16 +24,48 @@ CC = x86_64-elf-gcc
 # including file itself lives -- the standard approach and what keeps a move
 # like this one from being fragile.
 # Dev VM display size. FB_W/FB_H both (a) hint the virtio-vga host mode and
-# (b) hard-cap the guest virtio-gpu scanout, so the QEMU window can't open
-# bigger than this even when -display gtk ignores the xres/yres hint. virtio-gpu
-# is VM-only, so real hardware (UEFI GOP / bochs / VBE) is unaffected. Override
-# per build: `make FB_W=640 FB_H=480` (then re-run run-embkfs-cow).
+# (b) hard-cap the guest virtio-gpu scanout. virtio-gpu is VM-only, so real
+# hardware (UEFI GOP / bochs / VBE) is unaffected. Override per build:
+# `make FB_W=640 FB_H=480` (then re-run run-embkfs-cow).
+#
+# WHY THE DEFAULT DIFFERS BY HOST. The small default is a GTK workaround, not a
+# taste: -display gtk reports the WINDOW/MONITOR geometry to virtio-gpu and
+# ignores the -device virtio-vga xres/yres hint (commit c207ee1), so under gtk
+# the guest cap is the only thing that decides the resolution -- and it had to
+# be small or the window opened huge. macOS has no gtk at all; -display cocoa
+# HONOURS the hint, so the window is whatever we ask for and the cap is merely
+# redundant at the same value. That is why the Mac gets the roomier default the
+# tree wanted before the workaround, and then some.
+#
+# WHY THE MAC NUMBER IS BIG. -display cocoa with zoom-to-fit=off draws one guest
+# pixel per PHYSICAL pixel, and Mac laptop panels are Retina -- so on a 3024x1964
+# display a 1280x800 guest fills only ~640x400 points and looks half-size. The
+# guest resolution has to roughly double to LOOK normal. 1920x1200 is the chosen
+# middle: visibly bigger, and 2.25x the pixels of 1280x800 rather than the 4x a
+# full 2560x1600 would cost -- and pixels are exactly what cross-arch TCG is slow
+# at. If it feels sluggish, drop it; that is the cheapest speedup available:
+#     make FB_W=1280 FB_H=800 run-embkfs-cow      # or 800x600
+#
+# Keep both columns honest: this is a per-HOST default, not a per-host feature.
+# Either number works on either machine -- a Linux dev who wants the bigger
+# desktop can `make FB_W=1920 FB_H=1200` and gtk will honour it through the cap.
+ifeq ($(UNAME_S),Darwin)
+FB_W ?= 1920
+FB_H ?= 1200
+else
 FB_W ?= 800
 FB_H ?= 600
+endif
 
+# -std=gnu11 is pinned, not incidental. GCC 14+ defaults to gnu23, where `bool`,
+# `true` and `false` are keywords -- which makes kernel/include/types.h's
+# `typedef _Bool bool;` a hard error. Pinning the language keeps the build
+# identical across host toolchains (Linux's older gcc vs. Homebrew's gcc 16 on
+# macOS) instead of tracking whatever the newest compiler defaults to. gnu11,
+# not c11: the kernel uses GNU extensions.
 CFLAGS = -ffreestanding -nostdlib -nostartfiles \
          -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
-         -mcmodel=kernel \
+         -mcmodel=kernel -std=gnu11 \
          -Ikernel \
          -Iuser/lib/tls/crypto \
          -DEMBK_VGPU_CAP_W=$(FB_W) -DEMBK_VGPU_CAP_H=$(FB_H) \
@@ -40,6 +76,18 @@ DISK = disk.img
 # All intermediate build artifacts (assembled .o, the AP trampoline .bin) land
 # here, out of the source tree.
 BUILD = build
+
+# FB_W/FB_H reach the kernel as COMPILE-TIME defines (-DEMBK_VGPU_CAP_*), but
+# $(KERNEL_ELF)'s prerequisites are source files only -- so `make FB_W=640` would
+# rebuild nothing and silently boot the OLD cap, contradicting the "override per
+# build" note where those are defined. Stamp the pair into a file whose mtime
+# moves only when the values actually change, and hang the kernel off it.
+# Evaluated at parse time so the stamp is already correct before any rule runs.
+FB_STAMP := $(BUILD)/.fb_cap
+$(shell mkdir -p $(BUILD); \
+        want='$(FB_W)x$(FB_H)'; \
+        [ -f '$(BUILD)/.fb_cap' ] && [ "$$(cat '$(BUILD)/.fb_cap')" = "$$want" ] \
+          || printf '%s' "$$want" > '$(BUILD)/.fb_cap')
 
 # Userland rules appear before `all`, so pin the default goal explicitly.
 .DEFAULT_GOAL := all
@@ -273,6 +321,7 @@ check-tools:
 	echo; echo "OPTIONAL -- language ports (absent => that port is simply skipped, no error):"; \
 	if [ -x "$(USER_CXX)" ]; then printf '  [ ok ]  C++\n'; else printf '  [ -- ]  C++    (CXX_PREFIX=$(CXX_PREFIX))\n'; fi; \
 	if [ -x "$(EMBCC_ROOT)/embcc" ] && [ -x "$(EMBCC_ROOT)/embld" ]; then printf '  [ ok ]  EmbCC\n'; else printf '  [ -- ]  EmbCC  (EMBCC_ROOT=$(EMBCC_ROOT))\n'; fi; \
+	if [ -n "$(HAVE_QJS)" ]; then printf '  [ ok ]  QuickJS\n'; else printf '  [ -- ]  QuickJS (source absent: $(QJS_SRC)) -- vellum builds, without JS\n'; fi; \
 	for pair in "Python:$(PY_SRC)" "git:$(GIT_SRC)" "tcc:$(TCC_SRC)"; do \
 	  n=$${pair%%:*}; p=$${pair#*:}; \
 	  if [ -e "$$p" ]; then printf '  [ ok ]  %s\n' "$$n"; else printf '  [ -- ]  %-6s (source absent: %s)\n' "$$n" "$$p"; fi; \
@@ -371,6 +420,9 @@ HAVE_PY  := $(if $(wildcard $(PY_BIN)),yes,)
 GIT_SRC  ?= $(HOME)/cross/git-2.49.1
 GIT_BIN  ?= $(GIT_SRC)/git
 ZLIB_BUILD ?= $(HOME)/cross/build-zlib
+# tools/zlib/build-zlib-emblink.sh installs <outdir>/include/*.h and
+# <outdir>/lib/libz.a -- the archive is under lib/, not at the top level.
+ZLIB_A ?= $(ZLIB_BUILD)/lib/libz.a
 GIT_BUILD_SH ?= $(CURDIR)/tools/git/build-git-emblink.sh
 
 # TCC -- a C compiler that RUNS ON the OS. Chosen because it is compiler +
@@ -567,7 +619,8 @@ QJS_SRC ?= $(HOME)/cross/quickjs-2024-01-13
 QJS_OBJS := build/qjs/quickjs.o build/qjs/libregexp.o build/qjs/libunicode.o \
             build/qjs/cutils.o build/qjs/libbf.o
 QJS_CFLAGS := -D_GNU_SOURCE -DCONFIG_VERSION='"2024-01-13"' -DCONFIG_BIGNUM \
-              -DCONFIG_NO_ATOMICS -DCONFIG_NO_TM_GMTOFF -I$(QJS_SRC)
+              -DCONFIG_NO_ATOMICS -DCONFIG_NO_TM_GMTOFF -DCONFIG_MALLOC_H \
+              -I$(QJS_SRC)
 HAVE_QJS := $(if $(wildcard $(QJS_SRC)/quickjs.c),1,)
 
 build/qjs:
@@ -594,7 +647,7 @@ build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/we
 build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/render.h \
                 user/web/url.h user/web/net.h user/web/fetchjob.h user/web/css/css.h \
                 user/web/jsdom.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css -c $< -o $@
+	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css $(if $(HAVE_QJS),-DHAVE_JSDOM,) -c $< -o $@
 # B2: url.c is pure string work; net.c reaches the network, so it needs the TLS
 # include set (same as wget) for tls.h.
 build/web_url.o: user/web/url.c user/web/url.h user/web/html.h | $(BUILD)
@@ -622,7 +675,7 @@ build/web_fetchjob.o: user/web/fetchjob.c user/web/fetchjob.h user/web/net.h | $
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
 # B7 bindings: the DOM as JavaScript sees it. Only built with QuickJS present.
 build/web_jsdom.o: user/web/jsdom.c user/web/jsdom.h user/web/html.h | build/qjs
-	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Iuser/web -Iuser/web/css $(QJS_CFLAGS) -c $< -o $@
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Iuser/web -Iuser/web/css -DHAVE_JSDOM $(QJS_CFLAGS) -c $< -o $@
 # B6: PNG over our own DEFLATE, and the cache that fetches a page's pictures.
 build/web_png.o: user/web/png.c user/web/png.h user/lib/inflate.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -c $< -o $@
@@ -791,15 +844,15 @@ build/git_push.o: user/git/push.c user/git/push.h user/git/pack.h user/git/sha1.
 build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h user/git/repo.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
 GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_repo.o
-build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
+build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) -lc -lgcc -o $@
 
 # gitpush -- push a first commit over HTTPS (git-receive-pack + pack_write + auth).
 build/gitpush.o: user/bin/gitpush.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/push.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
 GITPUSH_OBJS := build/gitpush.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_push.o
-build/gitpush.elf: build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a user/lib/newlib.ld
-	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_BUILD)/libz.a -lc -lgcc -o $@
+build/gitpush.elf: build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) -lc -lgcc -o $@
 
 # pkg -- the package manager (docs/PACKAGING_AND_SDK.md, PK1). Verifies an EMBX's
 # build_id (SHA-256 via tls_sha256.o; -Ikernel for crypto/sha256.h) against its
@@ -1489,7 +1542,7 @@ $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BU
 # coarse (any header touch rebuilds the whole kernel) but the kernel is one
 # compile anyway, so the granularity is already all-or-nothing; correctness wins.
 KERNEL_HDRS := $(shell find kernel -name '*.h')
-$(KERNEL_ELF): $(KERNEL_SRC) $(KERNEL_HDRS) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
+$(KERNEL_ELF): $(FB_STAMP) $(KERNEL_SRC) $(KERNEL_HDRS) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
 	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
 
 # Boot image carries the stripped kernel (see KERNEL_BIN note above).
@@ -1565,8 +1618,8 @@ endif
 
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capchild.embx \
-               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf build/gitclone.elf build/gitpush.elf \
-               build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(wildcard $(HOST_EMBCC)),build/mathself.embx,) \
+               build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
+               build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf \
                build/embbuild.elf build/pkg.elf build/pkgbuild.elf \
                build/pkgprobe.elf build/pkgprobe.embx build/pkgprobe.pkg \
@@ -1712,12 +1765,20 @@ EMBKFS_SCRATCH := embkfs_scratch.img
 #  - XRES/YRES: the virtio-gpu scanout size (the whole stack -- fb, compositor,
 #    mouse clamp, home launcher -- adapts to whatever the device reports).
 #    Override per run: `make run-embkfs-cow XRES=1920 YRES=1080`.
-#  - zoom-to-fit=off: show guest pixels 1:1 instead of stretching them to the
-#    window (stretching is what made the display look blurry/badly scaled).
 XRES ?= $(FB_W)
 YRES ?= $(FB_H)
 VGA_VIRTIO = -vga none -device virtio-vga,xres=$(XRES),yres=$(YRES)
-DISPLAY_1TO1 = -display gtk,zoom-to-fit=off
+# zoom-to-fit=off: show guest pixels 1:1 instead of stretching them to the
+# window (stretching is what made the display look blurry/badly scaled). Both
+# gtk and cocoa spell that suboption the same way; the BACKEND is the part that
+# differs, because Homebrew's qemu has no gtk at all (`-display help` lists only
+# none/curses/cocoa/dbus) and -display gtk fails outright there.
+ifeq ($(UNAME_S),Darwin)
+QEMU_DISPLAY ?= cocoa,zoom-to-fit=off
+else
+QEMU_DISPLAY ?= gtk,zoom-to-fit=off
+endif
+DISPLAY_1TO1 = -display $(QEMU_DISPLAY)
 # Default to full software emulation (TCG) so this runs on any machine without
 # KVM. `-cpu max` still exposes RDRAND (which getentropy() needs) under TCG.
 # On a host WITH KVM, opt in for host-CPU speed:

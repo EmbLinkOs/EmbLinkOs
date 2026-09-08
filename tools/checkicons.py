@@ -18,8 +18,25 @@ import os, re, struct, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEADER = os.path.join(ROOT, "ui", "dsl", "em.h")
-# The same file mkfs bakes in as /system/fonts/font.ttf.
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+# The same file mkfs bakes in as /system/fonts/font.ttf -- so it must be found
+# the same way, on every host. See mkfs_embkfs.py's FONT_DIRS for the why.
+FONT_DIRS = [
+    os.environ.get("EMBK_FONT_DIR"),
+    "/usr/share/fonts/truetype/dejavu",     # Debian/Ubuntu
+    "/usr/share/fonts/dejavu",              # Fedora
+    "/usr/share/fonts/TTF",                 # Arch
+    os.path.expanduser("~/Library/Fonts"),  # macOS, per-user (brew cask)
+    "/Library/Fonts",                       # macOS, system-wide
+]
+FONT = next((os.path.join(d, "DejaVuSans.ttf") for d in FONT_DIRS
+             if d and os.path.exists(os.path.join(d, "DejaVuSans.ttf"))), None)
+if FONT is None:
+    raise SystemExit(
+        "checkicons: DejaVuSans.ttf not found -- searched %s\n"
+        "  Debian/Ubuntu: sudo apt install fonts-dejavu\n"
+        "  macOS:         brew install --cask font-dejavu\n"
+        "  or set EMBK_FONT_DIR=/dir/containing/DejaVuSans.ttf"
+        % ", ".join(d for d in FONT_DIRS if d))
 
 
 def cmap_of(path):

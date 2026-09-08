@@ -661,6 +661,50 @@ def _read_file(path):
         return None
 
 
+# Where DejaVu lives depends on the HOST, not on the OS we are building. The
+# Debian path was hard-coded here and returned None anywhere else -- and because
+# a missing font was skipped silently, the image built fine and then booted with
+# no text in any app ("home: FONT MISSING" on the serial console, nothing on
+# screen). That is the worst possible failure shape for a build asset, so this
+# searches the known locations and SAYS SO when it comes up empty.
+#
+#   Debian/Ubuntu  /usr/share/fonts/truetype/dejavu   (apt install fonts-dejavu)
+#   Arch/Fedora    /usr/share/fonts/{dejavu,TTF}
+#   macOS          ~/Library/Fonts, /Library/Fonts    (brew install --cask font-dejavu)
+#
+# Override with EMBK_FONT_DIR=/path/to/dir to use a font tree of your own.
+FONT_DIRS = [
+    os.environ.get("EMBK_FONT_DIR"),
+    "/usr/share/fonts/truetype/dejavu",     # Debian/Ubuntu
+    "/usr/share/fonts/dejavu",              # Fedora
+    "/usr/share/fonts/TTF",                 # Arch
+    os.path.expanduser("~/Library/Fonts"),  # macOS, per-user (brew cask)
+    "/Library/Fonts",                       # macOS, system-wide
+]
+
+_font_warned = set()
+
+
+def _read_font(name):
+    """Read a DejaVu face from wherever this host keeps it, or warn loudly."""
+    for d in FONT_DIRS:
+        if not d:
+            continue
+        blob = _read_file(os.path.join(d, name))
+        if blob is not None:
+            return blob
+    if name not in _font_warned:
+        _font_warned.add(name)
+        sys.stderr.write(
+            "\n*** mkfs_embkfs: %s NOT FOUND -- the image will have no text.\n"
+            "***   searched: %s\n"
+            "***   Debian/Ubuntu: sudo apt install fonts-dejavu\n"
+            "***   macOS:         brew install --cask font-dejavu\n"
+            "***   or set EMBK_FONT_DIR=/dir/containing/%s\n\n"
+            % (name, ", ".join(d for d in FONT_DIRS if d), name))
+    return None
+
+
 def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
     """Walk a HOST directory tree and emit (name, dtype, mode, data) objects
     placing every file under `image_prefix` on the image, preserving relative
@@ -836,12 +880,12 @@ def discover_userland_objects(build_dir="build"):
     # UI fonts are part of the sealed OS, not root stragglers: they live under
     # /system/fonts (USERSPACE_v2 UP1 -- nothing at bare /). The EmUI runtime
     # (ui/dsl/em_app.c) and the explicit readers default to these paths.
-    font = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    font = _read_font("DejaVuSans.ttf")
     if font is not None:
         objects.append((b"system/fonts/font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
     # The terminal's MONOSPACE face (same DejaVu family, so the same
     # rasterizer tech) -- shell tables align only in fixed-pitch glyphs.
-    mono = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+    mono = _read_font("DejaVuSansMono.ttf")
     if mono is not None:
         objects.append((b"system/fonts/mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
     # Sealed visual assets used by full-screen system experiences (login/setup).

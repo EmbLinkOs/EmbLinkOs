@@ -4,7 +4,7 @@
  * is the textbook bit-serial GHASH -- correct and small, not fast; a table-driven
  * version can replace it if AEAD throughput ever matters. */
 #include "gcm.h"
-#include <string.h>
+#include "include/kstring.h"   /* memcpy/memset/memcmp -- kshim forwards to <string.h> on hosted builds */
 
 static void put_be64(uint8_t *p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (56 - 8 * i));
