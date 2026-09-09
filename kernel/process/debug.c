@@ -17,6 +17,7 @@
  * typed handle is a later refinement. Everything is gated on EMBK_CAP_DEBUG. */
 
 #include "process/debug.h"
+#include "include/arch_irq.h"   /* arch_fault_addr() */
 #include "process/process.h"
 #include "arch/x86_64/syscall/syscall.h"
 #include "include/usercopy.h"
@@ -92,9 +93,7 @@ int debug_on_exception(struct thread *t, struct regs *frame) {
         s->event.reason = DBG_EV_FAULT;      /* crashed into the debugger */
         s->event.pc = frame->rip;
         if (vec == 14) {
-            uint64_t cr2;
-            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-            s->event.fault_addr = cr2;
+            s->event.fault_addr = arch_fault_addr();
         }
     }
     wait_queue_wake_one(&s->debugger_wq);

@@ -3,6 +3,7 @@
 #include "mm/pmm.h"
 #include "include/io.h"
 #include "include/kprintf.h"
+#include "include/arch_irq.h"
 #include "drivers/char/serial.h"
 #include "arch/x86_64/irq/irq.h"
 #include "arch/x86_64/irq/ioapic.h"
@@ -113,9 +114,7 @@ static int ata_wait_irq(uint16_t io_base){
        * interrupts into process context again (the sched_block_current_locked
        * class of bug -- see process.c); the sti;hlt below survives it, but it
        * must never be silent. */
-        uint64_t rf;
-        __asm__ volatile ("pushfq; popq %0" : "=r"(rf));
-        if (!(rf & (1ULL << 9)))
+        if (!arch_irq_enabled())
             kprintf("ATA WARN: ata_wait_irq entered with IF=0 (leaked by a blocking path)\n");
     }
     while (!*flag) {

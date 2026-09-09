@@ -11,8 +11,14 @@ assembly before any allocator exists, memory map from the device tree,
 `kernel/mm/pmm.c` (the *existing, shared* allocator) running unmodified,
 per-section kernel permissions, no identity map — and **preemptively switches
 between kernel threads on a timer interrupt**, with GICv3 and the ARM generic
-timer both configured from the device tree. Everything from A4 on is still
-unwritten. Gaps each phase knowingly left are listed in `TODO.md`, not here.
+timer both configured from the device tree, and **runs a program at EL0** that
+makes system calls through the same architecture-neutral handlers x86 uses.
+Everything from A6 on is still unwritten; gaps each phase knowingly left are
+listed in `TODO.md`, not here.
+
+**61 of the 76 shared kernel source files — 31,465 lines — now compile for
+aarch64** (§2.3). Of the fifteen that do not, eleven are x86 device drivers
+that will never be ported, because the devices do not exist on this machine.
 
 ```sh
 brew install aarch64-elf-gcc          # Linux: gcc-aarch64-none-elf
@@ -125,7 +131,7 @@ be faster on this machine than the native-architecture port is** — and it make
 the timing-sensitive tests (`test-audio`, first-frame budgets) meaningful again
 on a Mac. This is a genuine engineering payoff, not a nice-to-have.
 
-### 2.3 The HAL is *derived*, not invented
+### 2.3 The HAL is *derived*, not invented — *first pieces extracted, and measured*
 `TODO.md` says it outright: *"don't pre-abstract against a single
 architecture."* We honour that. The `arch_*` interfaces are **not** designed up
 front from the x86 side; we bring up aarch64 far enough to see what both
@@ -133,6 +139,54 @@ architectures actually need, then factor the seam that two real implementations
 reveal. An abstraction invented from one implementation is that implementation
 wearing a hat. **Cost:** some x86 code gets touched twice. Cheaper than a wrong
 interface welded into 58k lines.
+
+**Done after A5, and the measurement is the point.** Rather than guess which
+abstractions were needed, every shared (non-`arch/`) kernel source file was
+compiled for aarch64 to see what actually broke:
+
+| | files | lines |
+|---|---:|---:|
+| compiled for aarch64 unmodified | 52 | 18,681 |
+| after extracting `arch_irq_*` | 59 | 31,062 |
+| after `arch_cpu_idle*` + `arch_fault_addr` | **61** | **31,465** |
+
+**One `static inline` was worth 12,381 lines.** `current_thread_atomic()` in
+`kernel/process/process.h` contained `__asm__("pushfq; popq %0; cli")`, and
+half the kernel includes that header — so nine files, including
+`kernel/syscall/syscalls.c`, `fs/fd.c`, all of `ipc/` and `embkfs.c`, failed to
+compile **not because they use it, but because they include the header it sits
+in**. Nothing about that is visible from reading the code; it took compiling to
+find. The same idiom had also been copy-pasted as a local `save_if`/`restore_if`
+pair into `ipc/channel.c` and `ipc/endpoint.c` — and the real coupling in all of
+them was not the assembly but `if (flags & (1ULL << 9))`, because bit 9 is a
+fact about one CPU.
+
+`kernel/include/arch_irq.h` is the result: a contract, plus a six-line dispatch
+to `arch/<arch>/cpu/irqflags.h`. It is the only place in the tree where an
+architecture is chosen by a compiler predefine rather than by the build, and
+that is deliberate — these are two or three instructions inside spinlocks and
+the scheduler's hot path, so a function call would cost more than the work.
+
+Two of its members exist in the shape they do because the machines genuinely
+disagree, which is what §2.3 is for:
+
+* **`arch_irq_restore()` is not symmetric.** It enables interrupts if the saved
+  state had them enabled, and otherwise does nothing — it never disables. That
+  is what *both* implementations already did independently, before there was a
+  shared interface to agree on.
+* **`arch_cpu_idle_irq_on()` is one call, not `enable(); idle();`** On x86,
+  `sti; hlt` relies on `sti`'s one-instruction interrupt shadow; split them and
+  an interrupt arriving in the gap leaves `hlt` waiting for one already
+  delivered, and the core sleeps forever. On aarch64 that hazard *cannot* occur
+  — WFI returns immediately on a pending event, masked or not. A HAL derived
+  from the ARM side alone would have exposed two calls and silently broken x86.
+
+**What is left is now a short, honest list.** Fifteen shared files still do not
+compile: eleven are legacy x86 device drivers that §2.6 says are *absent* on
+ARM rather than portable, and four have real architecture in them — `main.c`,
+`mm/vmm.c`, `process/process.c`, `selftests.c` (CR3, `invlpg`, the
+GDT/IDT/LAPIC). Those four are A6's actual work, and they are now the only
+thing between here and compiling the real syscall table.
 
 ### 2.4 The syscall seam is the one refactor that must happen on x86 first
 The 187 register reads (§1) are the exception to §2.3, because their fix does

@@ -1703,6 +1703,26 @@ substantially complete.
       x86 side has the same shape plus a retry loop; both want a fault-fixup
       table — an exception handler that resumes at a recovery label — instead.
       **Do this before SMP (A9), not after.**
+  - **The HAL, so far** (`kernel/include/arch_irq.h`, extracted after A5 and
+    measured rather than guessed — see ARM64.md §2.3). 61 of 76 shared kernel
+    files now compile for aarch64. What is left:
+    - [ ] **Four files with real architecture in them:** `kernel/main.c`
+      (GDT/IDT/PIC/LAPIC init), `kernel/mm/vmm.c` (CR3, `invlpg`),
+      `kernel/process/process.c` (CR3 on switch, LAPIC, `hlt` loops) and
+      `kernel/selftests.c`. These are A6's real work — the only thing between
+      here and compiling `kernel/syscall/syscalls.c` for aarch64. The
+      primitives they still need are `arch_addr_space_switch()` (CR3 /
+      TTBR0_EL1) and `arch_tlb_flush_page()` (`invlpg` / `tlbi vaae1is`).
+    - [ ] **Eleven legacy x86 device drivers do not compile, and must not.**
+      PIT, RTC, ATA, AC97, PS/2 keyboard and mouse, UHCI, bochs VBE, the 16550,
+      port-CF8 PCI, and `drivers/timer/timer.c`'s x86 glue. ARM64.md §2.6:
+      absent, not ported. They need EXCLUDING from the aarch64 source list,
+      which is a build change rather than a code change.
+    - [ ] **`hlt` is still written inline in `main.c`, `selftests.c` and
+      `process.c`** (about a dozen sites) rather than through
+      `arch_cpu_idle()`. Left alone deliberately: those files fail for other
+      reasons too, so converting them now would be churn no compiler could
+      check. Convert each as part of making its file build.
 - [x] ~~**embbuild** — the native build tool (the make-equivalent)~~ —
   **BUILT AND SHIPPED**, not merely designed. `shell/tools/embbuild.c`; proven
   by `test embbuild` (cases a–f including the §3 `/system` install refusal),

@@ -1,4 +1,5 @@
 #include "process/process.h"
+#include "include/arch_irq.h"
 #include "drivers/input/keyboard.h"   /* keyboard_release_grab_pid() on reap */
 #include "gfx/surface.h"   /* surface_transfer_to() for SPAWN_ACTION_INHERIT_SURFACE */
 #include "gfx/compositor.h"   /* compositor_reap_pid() on process teardown */
@@ -893,8 +894,7 @@ int process_wait(uint32_t pid) {
      * forever -- a real observed hang, intermittent only because the
      * blocking path itself is (the zombie is often already handed off by
      * the time we look, and the non-blocking path never switches). */
-    uint64_t entry_flags;
-    __asm__ volatile ("pushfq; pop %0" : "=r"(entry_flags) :: "memory");
+    uint64_t entry_flags = arch_irq_flags();
 
     for (;;) {
 retry:
@@ -2651,8 +2651,7 @@ int thread_join(struct process *proc, int tid) {
      * from schedule_locked() with no iretq/int-0x80-frame to restore the
      * caller's interrupt state from, so it has to snapshot and restore it
      * itself. */
-    uint64_t entry_flags;
-    __asm__ volatile ("pushfq; pop %0" : "=r"(entry_flags) :: "memory");
+    uint64_t entry_flags = arch_irq_flags();
 
     for (;;) {
 retry:

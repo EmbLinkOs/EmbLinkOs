@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "include/types.h"   /* bool -- the kernel's own, not <stdbool.h> */
+#include "include/arch_irq.h"  /* arch_irq_enable/disable/enabled */
 
 /* aarch64 exception handling -- docs/ARM64.md phase A1.
  *
@@ -49,15 +50,12 @@ enum {
  * looks exactly like a hang. Call it early. */
 void exception_init(void);
 
-/* PSTATE.I -- the master interrupt enable for this CPU. Nothing arrives until
- * arch_irq_enable() is called, no matter what the controller thinks, so the
- * order at boot is: vectors, then controller, then this. */
-static inline void arch_irq_enable(void)  { __asm__ volatile("msr daifclr, #2" ::: "memory"); }
-static inline void arch_irq_disable(void) { __asm__ volatile("msr daifset, #2" ::: "memory"); }
-static inline bool arch_irq_enabled(void) {
-    uint64_t d; __asm__ volatile("mrs %0, daif" : "=r"(d));
-    return (d & (1UL << 7)) == 0;
-}
+/* PSTATE.I -- the master interrupt enable for this CPU -- now lives in the
+ * shared kernel/include/arch_irq.h, which both architectures implement.
+ * Nothing arrives until arch_irq_enable() is called, no matter what the
+ * controller thinks, so the order at boot is: vectors, then controller, then
+ * that. (These three used to be defined HERE as well, which would have been a
+ * redefinition the moment any file included both headers.) */
 
 /* Run `fn` with faults made RECOVERABLE: a synchronous exception inside it
  * advances past the offending instruction and carries on, instead of panicking.

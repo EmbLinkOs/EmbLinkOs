@@ -5,6 +5,7 @@
  * "block" is never lost. */
 
 #include "ipc/endpoint.h"
+#include "include/arch_irq.h"
 #include "ipc/handle.h"
 #include "process/process.h"
 #include "fs/vfs.h"
@@ -12,12 +13,11 @@
 #include "include/kstring.h"
 #include "include/errno.h"
 
-static inline uint64_t save_if(void) {
-    uint64_t f; __asm__ volatile ("pushfq; pop %0" : "=r"(f) :: "memory"); return f;
-}
-static inline void restore_if(uint64_t f) {
-    if (f & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
-}
+/* Was: a local copy of the x86 pushfq/sti pair, in this file and in the other
+ * one next door. Both are now the shared primitive -- the duplication was the
+ * real problem, not the instruction. */
+static inline uint64_t save_if(void)          { return arch_irq_flags(); }
+static inline void     restore_if(uint64_t f) { arch_irq_restore(f); }
 
 static int32_t g_endpoint_live;
 static spinlock_t g_endpoint_glock;

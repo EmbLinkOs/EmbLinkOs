@@ -2,6 +2,7 @@
 #define __PROCESS_H__
 
 #include <stdint.h>
+#include "include/arch_irq.h"   /* arch_irq_save/restore -- see current_thread_atomic() */
 #include "include/types.h"
 #include "process/capabilities.h"   /* per-process capability set */
 #include "fs/namespace.h"           /* per-process namespace (the OTHER born grant) */
@@ -1093,14 +1094,15 @@ int process_handle_reap_dead(struct process *owner);
  * stack pointer (thread-owned => migration-safe by construction) -- not to
  * hand the footgun back to every caller. */
 static inline struct thread *current_thread_atomic(void) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    /* arch_irq_save() disables and returns the previous state;
+     * arch_irq_restore() re-enables only if it had been enabled, so this never
+     * turns interrupts on inside a caller that had them off. See
+     * kernel/include/arch_irq.h -- and note that THIS FUNCTION is why that
+     * header exists: as raw x86 asm it made every file that includes
+     * process.h unbuildable for a second architecture. */
+    uint64_t flags = arch_irq_save();
     struct thread *t = this_cpu()->cur_thread;   /* no IRQ -> no migration */
-    if (flags & (1ULL << 9)) {                    /* restore IF only if it was set:
-                                                   * never enable interrupts inside
-                                                   * a caller that had them off */
-        __asm__ volatile("sti" ::: "memory");
-    }
+    arch_irq_restore(flags);
     return t;
 }
 

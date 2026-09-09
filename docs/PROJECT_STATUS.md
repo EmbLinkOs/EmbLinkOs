@@ -45,7 +45,10 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   `make ARCH=aarch64 test-arm64-boot`. On the x86 side, A4 took the 95 syscall
   handlers out of `arch/x86_64/` -- they read `struct sysargs` now, not machine
   registers, so `arch/x86_64/syscall/syscall.c` is 88 lines instead of 2,019.
-  A5 then ran an aarch64 program at EL0 through those same neutral handlers. The
+  A5 then ran an aarch64 program at EL0 through those same neutral handlers.
+  With the first HAL piece extracted (`kernel/include/arch_irq.h`), **61 of the
+  76 shared kernel files -- 31,465 lines -- compile for aarch64**; eleven of the
+  fifteen that do not are x86 drivers for hardware ARM does not have. The
   x86 build is untouched by it (`ARCH` defaults to `x86_64`, and the aarch64
   rules are in a fragment the default build never parses).
 - See `ARCHITECTURE.md` §1 for the full governing principle ("bless the clean
