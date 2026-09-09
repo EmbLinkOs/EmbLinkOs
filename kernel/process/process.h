@@ -154,6 +154,19 @@ struct thread {
      * first floating-point op. */
     unsigned char fpu_state[KCONTEXT_FPU_SIZE]
         __attribute__((aligned(KCONTEXT_FPU_ALIGN)));
+
+    /* The recovery point for a copy to or from user memory, and whether one is
+     * armed. PER THREAD because such a copy is preemptible: a thread resumed on
+     * another core must find its OWN recovery point. See
+     * include/uaccess_guard.h for why this exists at all. */
+    struct kcontext uaccess_ctx;
+    /* VOLATILE, and it is the classic setjmp rule rather than caution: this is
+     * written before a call that can RETURN TWICE and read from an exception
+     * handler. The compiler does not know either of those things about
+     * kernel_ctx_save(), so a plain bool is free to be sunk past the very
+     * access it is meant to be guarding -- which is exactly what happened:
+     * the thread was right, the flag was still 0, and the fault panicked. */
+    volatile bool   uaccess_armed;
     uint64_t kstack_top;       /**< Virtual address of the top of this thread's kernel stack */
     uint64_t entry_point;      /**< Ring-3 user entry (process_trampoline) OR the real
                                  *   kthread function (kthread_trampoline stashes it here) */

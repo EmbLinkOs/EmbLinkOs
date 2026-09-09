@@ -27,6 +27,7 @@
 #include "drivers/input/keyboard.h"
 #include "drivers/audio/ac97.h"
 #include "drivers/audio/audio.h"
+#include "include/uaccess_guard.h"
 #include "arch/aarch64/smp/smp.h"
 #include "include/arch_irq.h"
 #include "include/kmalloc.h"
@@ -762,6 +763,50 @@ void arch_early_main(uint64_t dtb_phys) {
             selftest_fails++;
         } else {
             gic_set_post_eoi(schedule);
+
+    /* --- the user-copy recovery guard ---------------------------------------
+     * Proven by CAUSING the fault it exists for. access_ok() cannot be made to
+     * pass on an unmapped page, so the race it protects against cannot be
+     * staged from here honestly -- but the RECOVERY can: arm the guard, touch
+     * an address that is guaranteed to fault at EL1, and check we come back
+     * with an error instead of a panic.
+     *
+     * That is the whole claim. Without the guard this exact sequence is an
+     * unhandled kernel data abort, which is what a user program racing its own
+     * threads could provoke on purpose.
+     *
+     * AFTER process_adopt_current(), and that is not incidental: the recovery
+     * point lives in the THREAD (a copy is preemptible, so a per-CPU slot
+     * would be the wrong one after a migration). With no current thread the
+     * guard correctly declines to arm -- and nothing can race a kernel that
+     * has no processes yet, which is why declining is right rather than a
+     * hole. Run before the adopt, this test armed nothing and panicked. */
+    kprintf("\n--- user-copy fault recovery ---\n");
+    {
+        uint64_t before = uaccess_recoveries();
+        volatile int sink = 0;
+        bool recovered = false;
+
+        if (uaccess_arm()) {
+            /* A user-half address with nothing mapped at it. The kernel may
+             * read the user half (PAN is not enabled here), so this reaches
+             * the page tables and finds nothing -- a translation fault at
+             * EL1, which is precisely the shape of the race. */
+            sink = *(volatile int *)(uintptr_t)0x0000700000ABC000ULL;
+            uaccess_disarm();
+        } else {
+            recovered = true;
+        }
+        (void)sink;
+
+        bool ok = recovered && uaccess_recoveries() == before + 1;
+        kprintf("  [%s] a kernel fault on user memory returned an error "
+                "instead of panicking (%d recovery/ies)\n",
+                ok ? " ok " : "FAIL", (int)uaccess_recoveries());
+        if (!ok)
+            selftest_fails++;
+    }
+
 
             char *hargv[] = { (char *)"/system/bin/hello.elf", NULL };
             int pid = process_create("/system/bin/hello.elf", hargv, 1, NULL, 0);

@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "drivers/char/serial.h"
+#include "include/uaccess_guard.h"
 #include "include/spinlock.h"
 #include "process/process.h"   /* current_thread, struct process/thread */
 #include "process/debug.h"     /* debug_on_exception (§6.6 exception routing) */
@@ -106,6 +107,20 @@ static void dump_fault(struct registers *regs) {
     serial_write_string("RBP: ");
     serial_write_hex(regs->rbp);
     serial_write_string("\n");
+    /* A GUARDED user copy that faulted -- the kernel touched user memory that
+     * access_ok() had just proved was mapped, and another core unmapped it in
+     * between (include/uaccess_guard.h). This does not return: it longjmps
+     * back into copy_from_user()/copy_to_user(), which reports -EFAULT.
+     *
+     * Vector 14 (#PF) and KERNEL mode only -- error_code bit 2 clear. A user
+     * -mode fault is the program's own and belongs to the handling below.
+     * Checked before the panic printing, because it is the only fault here
+     * that can legitimately happen. */
+    if (regs->vector == 14 && !(regs->error_code & 0x4) &&
+        uaccess_fault_recover()) {
+        /* not reached */
+    }
+
 
     // Page Fault (vector 14): CR2 holds the faulting address, and the
     // error code's low bits explain the cause.

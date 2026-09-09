@@ -1,4 +1,5 @@
 #include "include/usercopy.h"
+#include "include/uaccess_guard.h"
 #include "arch/aarch64/mm/pagetable.h"
 #include "mm/pmm.h"
 #include "include/errno.h"
@@ -68,17 +69,30 @@ bool access_ok(const void *user_ptr, size_t len) {
     return true;
 }
 
+/* access_ok() proves every page is mapped; the GUARD survives it stopping
+ * being true between then and the copy. Another thread of the same process, on
+ * another core, can unmap underneath us -- and since A9 there ARE other cores.
+ * See include/uaccess_guard.h. Without it that is an EL1 data abort inside
+ * memcpy, which is a panic a user program can cause on purpose. */
 int copy_from_user(void *kernel_dst, const void *user_src, size_t len) {
     if (!access_ok(user_src, len))
         return -EMBK_EFAULT;
+
+    if (!uaccess_arm())
+        return -EMBK_EFAULT;          /* raced: the page went away mid-copy */
     memcpy(kernel_dst, user_src, len);
+    uaccess_disarm();
     return EMBK_OK;
 }
 
 int copy_to_user(void *user_dst, const void *kernel_src, size_t len) {
     if (!access_ok(user_dst, len))
         return -EMBK_EFAULT;
+
+    if (!uaccess_arm())
+        return -EMBK_EFAULT;
     memcpy(user_dst, kernel_src, len);
+    uaccess_disarm();
     return EMBK_OK;
 }
 

@@ -1,4 +1,5 @@
 #include "arch/aarch64/irq/exception.h"
+#include "include/uaccess_guard.h"
 #include "arch/aarch64/drivers/pl011.h"
 #include "arch/aarch64/irq/gicv3.h"
 #include "process/process.h"
@@ -195,6 +196,21 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
     if (which == EXC_EL0_64_SYNC && ec == 0x15) {
         aarch64_syscall(f);
         return;
+    }
+
+    /* A GUARDED user copy that faulted. The kernel touched user memory that
+     * access_ok() had just proved was mapped, and another core unmapped it in
+     * between -- see include/uaccess_guard.h. This does not return: it
+     * longjmps back into copy_from_user()/copy_to_user(), which then reports
+     * -EFAULT to the syscall that asked.
+     *
+     * Restricted to a SYNCHRONOUS exception FROM EL1: a fault at EL0 is the
+     * program's own and belongs to the code below, and an IRQ is not a fault
+     * at all. Checked before the probe and before the panic, because it is the
+     * only one of the three that can legitimately happen at any moment. */
+    if (which == EXC_EL1H_SYNC && (ec == 0x25 || ec == 0x21) &&
+        uaccess_fault_recover()) {
+        /* not reached */
     }
 
     /* Recoverable probe: step over the offending instruction and continue.

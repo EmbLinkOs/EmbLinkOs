@@ -1,5 +1,6 @@
 #include "include/kprintf.h"
 #include "include/usercopy.h"
+#include "include/uaccess_guard.h"
 #include "process/process.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -167,15 +168,28 @@ static bool access_ok_counted(const void *p, size_t len) {
     return false;
 }
 
+/* access_ok() proves every page is mapped; the GUARD survives it stopping
+ * being true between then and the copy. Another thread of the same process,
+ * on another core, can unmap underneath us -- see include/uaccess_guard.h.
+ * Without the guard that is a kernel-mode page fault inside memcpy, which is a
+ * panic a user program can cause on purpose. */
 int copy_from_user(void *kernel_dst, const void *user_src, size_t len) {
     if (!access_ok_counted(user_src, len)) return -EMBK_EFAULT;
+
+    if (!uaccess_arm())
+        return -EMBK_EFAULT;          /* raced: the page went away mid-copy */
     memcpy(kernel_dst, user_src, len);
+    uaccess_disarm();
     return EMBK_OK;
 }
 
 int copy_to_user(void *user_dst, const void *kernel_src, size_t len) {
     if (!access_ok_counted(user_dst, len)) return -EMBK_EFAULT;
+
+    if (!uaccess_arm())
+        return -EMBK_EFAULT;
     memcpy(user_dst, kernel_src, len);
+    uaccess_disarm();
     return EMBK_OK;
 }
 

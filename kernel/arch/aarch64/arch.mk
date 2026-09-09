@@ -59,6 +59,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
 # a build question -- the answer is usually an arch hook, as pmm.c's
 # arch_pmm_reserve_fixed() ended up being.
 ARM_SHARED_SRC := kernel/mm/pmm.c \
+                  kernel/mm/uaccess_guard.c \
                   kernel/mm/kheap.c \
                   kernel/mm/kmalloc.c \
                   kernel/lib/kprintf.c \
@@ -826,6 +827,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'embk thread create/join: OK'    A6 'a second EL0 thread could not be created or joined'; \
 	  chk 'hello: 5/5 checks passed'       A6 'the userland witness did not pass every check'; \
 	  chk 'exited with 5 (checks passed)'  A6 'the process did not exit cleanly with its status'; \
+	  chk 'instead of panicking'           A6 'a kernel fault on user memory was not recovered'; \
 	  chk 'posixdemo: ALL PASS'            A6 'the POSIX conformance suite reported failures'; \
 	  chk 'posixdemo exited 0'             A6 'posixdemo did not exit clean'; \
 	  chk 'libembk.so linked'              A6 'the dynamic link failed -- no EmUI app can load'; \
@@ -877,6 +879,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "  A7 PCIe ECAM, virtio-blk, and the REAL filesystem mounted + read"; \
 	  echo "  A6 a newlib program from that filesystem, at EL0: argv, printf,"; \
 	  echo "     malloc, snprintf, time, a second thread, and a clean exit(5)"; \
+	  echo "  A6 a kernel fault on user memory RECOVERS (the copy_to/from_user"; \
+	  echo "     time-of-check/time-of-use hole SMP made reachable)"; \
 	  echo "  A6 posixdemo: the whole POSIX suite, ALL PASS -- including"; \
 	  echo "     variant-I TLS (TPIDR_EL0, block above the pointer)"; \
 	  echo "  A6 the REAL session: init -> auth -> a namespace-confined desktop,"; \
