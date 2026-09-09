@@ -299,6 +299,11 @@ void arch_early_main(uint64_t dtb_phys) {
     }
 
     bringup_sched_init();
+
+    /* The scheduler runs on the way OUT of an interrupt, after the EOI, not
+     * from inside the timer handler. gic_dispatch() explains why at length. */
+    gic_set_post_eoi(bringup_sched_tick);
+
     timer_init();
 
     bringup_thread_create("worker-A", worker, (void *)(uintptr_t)1);

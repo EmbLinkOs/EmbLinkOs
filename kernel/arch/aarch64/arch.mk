@@ -118,13 +118,6 @@ arm64: $(ARM_ELF) $(ARM_IMG)
 .DEFAULT_GOAL := arm64
 
 # --- running ----------------------------------------------------------------
-# TCG with an explicit -cpu is the DEFAULT even on an Apple Silicon host, which
-# looks like leaving §2.2's headline performance win on the table. It is a
-# bring-up choice, not a permanent one: under TCG, `-d int,mmu` and `-d
-# unimp` actually report what the CPU did, and A1/A2 are exactly the phases
-# where "it hangs" needs to become "it took a data abort at this address."
-# HVF gives you neither. Once there is a desktop to be slow at, `run-arm64-hvf`
-# is the target that makes this machine fast.
 # gic-version=3 is NOT redundant. docs/ARM64.md §6.2 said "v3 is what `virt`
 # gives by default" -- that is true under KVM/HVF and FALSE under TCG, where
 # QEMU still defaults to GICv2 and the kernel finds no arm,gic-v3 node at all.
@@ -132,8 +125,38 @@ arm64: $(ARM_ELF) $(ARM_IMG)
 # GICv3 machine, and that should be visible in the command line rather than
 # inherited from an accelerator's default.
 ARM_MACHINE ?= virt,gic-version=3
-ARM_CPU     ?= cortex-a72
 ARM_MEM     ?= 512M
+
+# WHICH ACCELERATOR, and why it is a per-HOST default rather than a fixed one.
+#
+# On Apple Silicon an aarch64 guest can run on aarch64 hardware: -accel hvf,
+# which needs -cpu host because HVF cannot emulate a core it is not running on.
+# Measured against TCG on the same machine, same kernel: identical wall-clock
+# for a timer-bound workload (both run in real time), and ~8x the computation
+# per unit of time for a CPU-bound one -- 93.4M loop iterations per scheduler
+# slice against 11.6M. From A7 on, when there are pixels to composite, that is
+# the difference between usable and not.
+#
+# Everywhere else -- including the Linux box this project is also developed on,
+# where an aarch64 guest cannot be accelerated at all -- it is TCG, and nothing
+# about the default changes for that host.
+#
+# TCG IS NOT A FALLBACK, IT IS A SECOND OPINION. `-d int,unimp` reports what the
+# CPU actually did and HVF offers no equivalent, so `run-arm64-tcg` stays one
+# word away. More to the point, the two disagree in ways that find bugs: A3's
+# level-triggered-interrupt ordering error was invisible under TCG and obvious
+# under HVF. That is why test-arm64-boot runs BOTH where both exist.
+ARM_HOST_ARCH := $(shell uname -m)
+ifeq ($(UNAME_S)-$(ARM_HOST_ARCH),Darwin-arm64)
+ARM_ACCEL       ?= hvf
+ARM_TEST_ACCELS ?= hvf tcg
+else
+ARM_ACCEL       ?= tcg
+ARM_TEST_ACCELS ?= tcg
+endif
+
+ARM_CPU_tcg ?= cortex-a72
+ARM_CPU_hvf ?= host
 
 # -nographic wires the PL011 to this terminal's stdio (quit with Ctrl-A X).
 # There is no framebuffer to show until A7, so a window would be an empty one.
@@ -142,69 +165,93 @@ ARM_MEM     ?= 512M
 # the arm64 Image header, and only the Image header makes QEMU hand us the
 # device tree pointer in x0 -- see the long note at the top of boot.S. The ELF
 # is still what you point gdb at: same addresses, plus symbols.
+ARM_QEMU_hvf = qemu-system-aarch64 -M $(ARM_MACHINE),accel=hvf -cpu $(ARM_CPU_hvf) -m $(ARM_MEM)
+ARM_QEMU_tcg = qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU_tcg) -m $(ARM_MEM)
 
 .PHONY: run-arm64
 run-arm64: $(ARM_IMG)
-	qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU) -m $(ARM_MEM) \
-	    -nographic -kernel $(ARM_IMG)
+	$(ARM_QEMU_$(ARM_ACCEL)) -nographic -kernel $(ARM_IMG)
 
-# Hardware-virtualized, Apple Silicon only. -cpu host is not optional: HVF
-# cannot emulate a CPU model it is not running on.
+# Force one or the other regardless of host.
 .PHONY: run-arm64-hvf
 run-arm64-hvf: $(ARM_IMG)
-	qemu-system-aarch64 -M $(ARM_MACHINE),accel=hvf -cpu host -m $(ARM_MEM) \
-	    -nographic -kernel $(ARM_IMG)
+	$(ARM_QEMU_hvf) -nographic -kernel $(ARM_IMG)
 
-# Interrupt/exception tracing, for when something hangs and A1's vectors are
-# not written yet (or are the thing that is broken).
+.PHONY: run-arm64-tcg
+run-arm64-tcg: $(ARM_IMG)
+	$(ARM_QEMU_tcg) -nographic -kernel $(ARM_IMG)
+
+# Interrupt/exception tracing. TCG only -- this is the capability HVF does not
+# have, and the reason TCG stays a first-class target rather than a fallback.
 .PHONY: debug-arm64
 debug-arm64: $(ARM_IMG)
-	qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU) -m $(ARM_MEM) \
-	    -nographic -kernel $(ARM_IMG) -d int,unimp,guest_errors -D $(ARM_BUILD)/qemu.log
+	$(ARM_QEMU_tcg) -nographic -kernel $(ARM_IMG) \
+	    -d int,unimp,guest_errors -D $(ARM_BUILD)/qemu.log
 
 # --- the acceptance test ----------------------------------------------------
 # Every phase's "done when" from docs/ARM64.md, made machine-checkable so it
-# stays true. Cumulative on purpose: A1 must not quietly break A0. No `timeout(1)`: it is GNU coreutils and this repo builds on macOS,
-# where it is absent unless someone installed gtimeout. Backgrounding qemu and
-# killing it is portable to both hosts, which is the same rule the top-level
-# Makefile applies to stat and truncate.
+# stays true. Cumulative on purpose: a later phase must not quietly break an
+# earlier one.
+#
+# Run under EVERY available accelerator, not just the default. This is not
+# thoroughness for its own sake: TCG and HVF disagree, and the disagreements are
+# where the bugs are. A3's interrupt-ordering error (ending a level-triggered
+# interrupt before the device de-asserted) passed cleanly under TCG for an
+# entire phase and failed immediately under HVF.
+#
+# No `timeout(1)`: it is GNU coreutils and this repo builds on macOS, where it
+# is absent unless someone installed gtimeout. Backgrounding qemu and killing it
+# is portable to both hosts -- the same rule the top-level Makefile applies to
+# stat and truncate.
 .PHONY: test-arm64-boot
 test-arm64-boot: $(ARM_IMG)
-	@log=$(ARM_BUILD)/boot.log; rm -f $$log; \
-	qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU) -m $(ARM_MEM) \
-	    -display none -serial file:$$log -kernel $(ARM_IMG) & \
-	qpid=$$!; sleep 12; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
-	echo "--- serial ---"; cat $$log; echo "--- end ---"; \
-	fail=0; \
-	chk() { grep -q "$$1" $$log || { echo "FAIL($$2): $$3"; fail=1; }; }; \
-	chk 'EmbLinkOS aarch64'              A0 'no banner -- PL011 or the entry point is wrong'; \
-	chk 'CurrentEL   : EL1'              A0 'not running at EL1'; \
-	chk 'fdt: blob at phys'              A0 'the DTB pointer did not survive the handoff'; \
-	chk 'VBAR_EL1 installed'             A1 'exception vectors were never installed'; \
-	chk 'BRK instruction'                A1 'brk was not decoded (ESR EC 0x3C)'; \
-	chk 'alignment fault, on a READ'     A1 'the abort was not decoded down to FSC + direction'; \
-	chk 'higher half: YES'               A2 'the kernel is not executing from the kernel window'; \
-	chk 'boot: dtb memory'               A2 'the device tree did not yield a memory map'; \
-	chk 'translation fault, on a READ'   A2 'low addresses still resolve -- identity map not dropped'; \
-	chk 'permission fault, on a WRITE'   A2 '.rodata is still writable -- section permissions are not real'; \
-	chk 'wrote and read back via the direct map' A2 'the physical allocator or the direct map is broken'; \
-	chk 'self-test done: 0 failure'      A2 'a self-test case failed'; \
-	chk 'gic: initialised (GICv3' A3 'the interrupt controller did not come up'; \
-	chk 'generic timer'                  A3 'the timer never registered an interrupt line'; \
-	chk '100 Hz tick'                    A3 'the generic timer was not programmed'; \
-	chk 'worker 1 was scheduled'         A3 'no preemption report'; \
-	chk 'boot thread was scheduled back' A3 'the scheduler never returned to the boot thread'; \
-	chk 'spurious: 0'                    A3 'the GIC delivered spurious interrupts'; \
-	chk 'A3 reached'                     A3 'did not reach the end of arch_early_main'; \
-	n=$$(grep -c 'matches KV2P' $$log); \
-	  [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
-	if grep -q 'MISMATCH' $$log; then echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
-	if grep -q '\[FAIL\]' $$log; then echo "FAIL: a self-test case reported failure"; fail=1; fi; \
-	if [ $$fail -eq 0 ]; then \
-	  echo "PASS: A0 (banner, EL1, DTB handoff)"; \
-	  echo "      A1 (vectors, ESR/FAR decode, recovery)"; \
-	  echo "      A2 (higher half, DTB memory map, pmm, section permissions, no identity map)"; \
-	  echo "      A3 (GICv3, generic timer, preemptive context switching)"; \
+	@overall=0; \
+	for acc in $(ARM_TEST_ACCELS); do \
+	  case $$acc in \
+	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=8;;  \
+	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=15;; \
+	  esac; \
+	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \
+	  echo "=== $$acc ==="; \
+	  $$qcmd -display none -serial file:$$log -kernel $(ARM_IMG) 2>/dev/null & \
+	  qpid=$$!; sleep $$secs; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
+	  fail=0; \
+	  chk() { grep -q "$$1" $$log || { echo "FAIL($$2): $$3"; fail=1; }; }; \
+	  chk 'EmbLinkOS aarch64'              A0 'no banner -- PL011 or the entry point is wrong'; \
+	  chk 'CurrentEL   : EL1'              A0 'not running at EL1'; \
+	  chk 'fdt: blob at phys'              A0 'the DTB pointer did not survive the handoff'; \
+	  chk 'VBAR_EL1 installed'             A1 'exception vectors were never installed'; \
+	  chk 'BRK instruction'                A1 'brk was not decoded (ESR EC 0x3C)'; \
+	  chk 'alignment fault, on a READ'     A1 'the abort was not decoded down to FSC + direction'; \
+	  chk 'higher half: YES'               A2 'the kernel is not executing from the kernel window'; \
+	  chk 'boot: dtb memory'               A2 'the device tree did not yield a memory map'; \
+	  chk 'translation fault, on a READ'   A2 'low addresses still resolve -- identity map not dropped'; \
+	  chk 'permission fault, on a WRITE'   A2 '.rodata is still writable -- section permissions are not real'; \
+	  chk 'wrote and read back via the direct map' A2 'the physical allocator or the direct map is broken'; \
+	  chk 'gic: initialised (GICv3'        A3 'the interrupt controller did not come up'; \
+	  chk 'generic timer'                  A3 'the timer never registered an interrupt line'; \
+	  chk '100 Hz tick'                    A3 'the generic timer was not programmed'; \
+	  chk 'worker 1 was scheduled'         A3 'no preemption report'; \
+	  chk 'boot thread was scheduled back' A3 'the scheduler never returned to the boot thread'; \
+	  chk 'spurious: 0'                    A3 'the GIC delivered spurious interrupts'; \
+	  chk 'A3 reached'                     A3 'did not reach the end of arch_early_main'; \
+	  n=$$(grep -c 'matches KV2P' $$log); \
+	    [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
+	  if grep -q 'MISMATCH' $$log; then echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
+	  if grep -q '\[FAIL\]' $$log; then echo "FAIL: a self-test case reported failure"; fail=1; fi; \
+	  if [ $$fail -ne 0 ]; then \
+	    echo "--- serial ($$acc) ---"; cat $$log; echo "--- end ---"; overall=1; \
+	  else \
+	    grep -E 'timer fired|CNTVCT and the tick|was scheduled|spurious:' $$log | sed 's/^/  /'; \
+	    echo "  PASS ($$acc)"; \
+	  fi; \
+	done; \
+	if [ $$overall -eq 0 ]; then \
+	  echo; echo "PASS on [$(ARM_TEST_ACCELS)]:"; \
+	  echo "  A0 banner, EL1, DTB handoff"; \
+	  echo "  A1 vectors, ESR/FAR decode, recovery"; \
+	  echo "  A2 higher half, DTB memory map, pmm, section permissions, no identity map"; \
+	  echo "  A3 GICv3, generic timer, preemptive context switching"; \
 	else exit 1; fi
 
 .PHONY: check-tools-arm64

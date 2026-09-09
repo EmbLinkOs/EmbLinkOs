@@ -661,11 +661,18 @@ Things worth knowing before they cost you an afternoon:
   carries the 64-byte arm64 `Image` header, and only that header makes QEMU pass
   the device-tree pointer in `x0`. Boot the ELF and it comes up fine with `x0 = 0`
   — a failure that stays invisible until something asks for the memory map.
-* **TCG is the default even on Apple Silicon.** `-accel hvf` is real and works
-  (`run-arm64-hvf`), but under TCG `-d int,unimp` tells you what the CPU actually
-  did, and the phases being written now are exactly the ones where "it hangs" has
-  to become "it took a data abort at this address." Speed matters once there is
-  something to be slow at.
+* **HVF is the default on Apple Silicon; TCG everywhere else.** Same
+  host-conditional pattern as `QEMU_DISPLAY` and `FB_W`, so the Linux box —
+  where an aarch64 guest cannot be accelerated at all — is unaffected. Measured
+  on the same kernel: identical wall clock for a timer-bound workload (both run
+  in real time) and **~8x the computation per unit of time** for a CPU-bound one.
+  `run-arm64-tcg` forces emulation and `debug-arm64` adds `-d int,unimp`, which
+  HVF has no equivalent for.
+* **`test-arm64-boot` runs under every available accelerator**, not just the
+  default. TCG and HVF disagree, and the disagreements are where the bugs are:
+  an interrupt-ordering error (ending a level-triggered interrupt before the
+  device de-asserted) passed cleanly under TCG for a whole phase and failed
+  immediately under HVF.
 * **A different toolchain prefix:** `make ARCH=aarch64 AARCH64_PREFIX=aarch64-linux-gnu-`.
   Any bare-metal-capable aarch64 gcc works; the build is `-ffreestanding
   -nostdlib` and links its own script, so a Linux-targeting cross gcc is fine.

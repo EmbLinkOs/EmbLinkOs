@@ -17,9 +17,10 @@ unwritten. Gaps each phase knowingly left are listed in `TODO.md`, not here.
 ```sh
 brew install aarch64-elf-gcc          # Linux: gcc-aarch64-none-elf
 make ARCH=aarch64                     # build
-make ARCH=aarch64 run-arm64           # boot it (Ctrl-A X to quit)
-make ARCH=aarch64 test-arm64-boot     # the A0 acceptance test, headless
-make ARCH=aarch64 run-arm64-hvf       # Apple Silicon: hardware-accelerated
+make ARCH=aarch64 run-arm64           # boot it (HVF on Apple Silicon, else TCG)
+make ARCH=aarch64 test-arm64-boot     # acceptance test, headless, every accelerator
+make ARCH=aarch64 run-arm64-tcg       # force emulation
+make ARCH=aarch64 debug-arm64         # TCG + -d int,unimp
 ```
 
 ## 0. Thesis
@@ -93,9 +94,30 @@ right CI target forever regardless.
 ### 2.2 HVF changes the economics, and is half the reason to do this now
 `qemu-system-aarch64` on this Mac supports **`-accel hvf`**: an aarch64 guest
 runs on aarch64 hardware with hardware virtualization. **Confirmed at A0** —
-under `make ARCH=aarch64 run-arm64-hvf` the guest reads `MIDR_EL1` =
-`0x610f0000`, which is the host's own Apple core answering, not an emulated
-Cortex-A72 (`0x410fd083`). Today's x86 build runs
+the guest reads `MIDR_EL1` = `0x610f0000`, the host's own Apple core answering,
+not an emulated Cortex-A72 (`0x410fd083`).
+
+**Measured at A3, and now the default on Apple Silicon.** Same kernel, same
+machine, `test-arm64-boot`'s workload:
+
+| | wall clock to A3 | work per scheduler slice |
+|---|---|---|
+| TCG | 0.46 s | 11.6M loop iterations |
+| HVF | 0.58 s | **93.4M loop iterations** |
+
+Wall clock is a tie because that test is *timer*-bound and both run in real
+time; the second column is the real number — **~8x the computation per unit of
+time**. From A7 on, when there are pixels to composite, that is the difference
+between usable and not. `ARM_ACCEL` follows the host the same way
+`QEMU_DISPLAY` and `FB_W` already do, so the Linux box — where an aarch64 guest
+cannot be accelerated at all — sees no change.
+
+**TCG is not a fallback, it is a second opinion,** and `run-arm64-tcg` and
+`debug-arm64` keep it one word away. `-d int,unimp` reports what the CPU
+actually did and HVF has no equivalent. More importantly the two *disagree*,
+and the disagreements are where the bugs are: A3's interrupt-ordering error
+passed cleanly under TCG for an entire phase and failed immediately under HVF.
+`test-arm64-boot` therefore runs under **both** wherever both exist. Today's x86 build runs
 under cross-arch TCG, which `BUILD_SETUP.md` already documents as the reason
 every timing number on the Mac is untrustworthy. **The ARM port is expected to
 be faster on this machine than the native-architecture port is** — and it makes
@@ -382,13 +404,26 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
      target is a GICv3 machine and that should be visible on the command line.
      `gic_init()` detects the v2 case and says exactly that, because "node not
      found" alone sends you looking in the wrong place.
-  2. **End the interrupt BEFORE running the handler.** Not the obvious order,
-     and load-bearing: the timer handler *context-switches*, so it does not
-     return. With EOI afterwards, the interrupt stays active until that thread
-     is scheduled again, the GIC refuses to deliver another at the same
-     priority meanwhile, and the other thread never gets a tick — one
-     preemption, then silence. Safe here because everything runs at one
-     priority with `PSTATE.I` masked, so nothing can nest.
+  2. **Handler, then EOI, then scheduler — and the first version of this got it
+     wrong.** A3 originally ended the interrupt *before* running the handler,
+     reasoning that the timer handler context-switches and therefore never
+     returns to do the EOI itself. That reasoning was right and the conclusion
+     was wrong, because it ignored the other half: the generic timer is
+     **level-triggered**, and the line stays asserted until the deadline moves
+     forward. Ending the interrupt while the device is still asserting makes
+     the GIC latch another one immediately — a 10 ms tick arriving every 6.4 ms,
+     and a thread that could be re-preempted before executing a single
+     instruction.
+
+     The two requirements genuinely pull opposite ways: the handler must run
+     **first** so the device de-asserts, and the scheduler must run **last**
+     because it does not return. They are reconciled by making the scheduler a
+     *post-EOI hook on the controller* rather than something the timer handler
+     calls — `gic_set_post_eoi()`. Switching inside the handler can only satisfy
+     one of the two.
+
+     **This is the bug that TCG hid and HVF exposed** (§2.2), which is why the
+     acceptance test now runs under both.
   3. **A new thread must start with interrupts ENABLED, explicitly.** It is
      first entered from inside the IRQ handler, where the exception itself set
      `PSTATE.I` — and unlike every later resumption it never returns through
@@ -396,11 +431,17 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
      handler's DAIF and the thread runs forever without being preempted: the
      scheduler appears to work exactly once. Hence `daif = 0` in
      `kernel_ctx_prepare()`.
-  4. **Re-arm the timer first, tick second.** `CNTV_TVAL` is a *down* counter
-     that keeps going negative after firing, and the interrupt stays asserted
-     until it is reloaded. Reload after calling the scheduler and the interrupt
-     re-fires immediately on return — a livelock that presents as a timer
-     running impossibly fast.
+  4. **Re-arm with an ABSOLUTE deadline, not a relative one.** `CNTV_TVAL` says
+     "fire N counts from now", so every period is the interval *plus* however
+     long it took to get into the handler, and the error accumulates: measured
+     11.1 ms per programmed 10 ms tick, an 11% drift that a monotonic clock
+     would inherit. `CNTV_CVAL` takes an absolute counter value, so advancing
+     the deadline makes the tick exact regardless of handler latency — late
+     once, not late forever. After the change, 40 ticks measure 399 ms under
+     HVF and 400 ms under TCG against a nominal 400 ms.
+
+     (This also corrected a claim made earlier in this file: the ~24% timing
+     error attributed to TCG in the A2 notes was this drift, not the emulator.)
   5. **Three x86 devices collapse into one.** x86 needs the PIT for a tick, the
      HPET for a monotonic clock and the TSC for cheap high-resolution time —
      and `tsc_calibrate()` exists because the TSC's frequency can only be

@@ -53,6 +53,12 @@ void gic_unregister(uint32_t intid);
 void gic_enable(uint32_t intid);
 void gic_disable(uint32_t intid);
 
+/* Work to run AFTER the interrupt has been fully retired, on the way out of
+ * every interrupt. This is where a scheduler belongs, and the ordering is not
+ * a detail -- see gic_dispatch() for why the handler, the EOI and this have to
+ * happen in exactly this order. Pass 0 to clear. */
+void gic_set_post_eoi(void (*fn)(void));
+
 /* Called from the IRQ vector. Acknowledges, dispatches and ends the interrupt.
  * Not for general use. */
 void gic_dispatch(void);

@@ -1,7 +1,6 @@
 #include "drivers/timer/timer.h"
 #include "arch/aarch64/irq/gicv3.h"
 #include "arch/aarch64/boot/fdt.h"
-#include "arch/aarch64/sched/bringup.h"
 #include "include/kprintf.h"
 
 /* The ARM generic timer -- docs/ARM64.md phase A3.
@@ -26,6 +25,7 @@ static uint64_t timer_freq;       /* Hz, from CNTFRQ_EL0                */
 static uint64_t reload;           /* counter units per tick             */
 static uint64_t ticks;
 static uint64_t boot_count;       /* CNTVCT at init, so uptime starts 0 */
+static uint64_t next_deadline;    /* absolute CNTVCT value of the next tick  */
 static uint32_t timer_intid;
 
 /* The VIRTUAL timer (CNTV_*), not the physical one. Under HVF or KVM the
@@ -46,15 +46,36 @@ static inline uint64_t cntvct(void) {
 static void timer_tick(uint32_t intid) {
     (void)intid;
 
-    /* Re-arm first. CNTV_TVAL is a DOWN counter that fired at zero and keeps
-     * going negative; the interrupt stays asserted until it is reloaded, so
-     * doing this after the scheduler call below would mean an interrupt that
-     * re-fires the instant we return -- a livelock that looks like the timer
-     * running impossibly fast. */
-    __asm__ volatile("msr cntv_tval_el0, %0" :: "r"(reload));
+    /* Re-arm FIRST, before anything else: the timer interrupt is LEVEL
+     * triggered and the line stays asserted until the deadline moves into the
+     * future. gic_dispatch() ends the interrupt as soon as this returns, and
+     * ending it while the line is still high makes the GIC latch another one
+     * immediately.
+     *
+     * An ABSOLUTE deadline (CNTV_CVAL) rather than a relative one (CNTV_TVAL,
+     * "fire N counts from now"). With TVAL, every period is 10 ms PLUS however
+     * long it took to get here, so the error accumulates: measured 11.1 ms per
+     * tick under HVF, an 11% drift that a monotonic clock would inherit.
+     * Advancing a deadline instead makes the tick exact regardless of handler
+     * latency -- late once, not late forever. */
+    next_deadline += reload;
+
+    /* If we fell so far behind that the next deadline is already past --
+     * possible under TCG, or after a long period with interrupts masked --
+     * resynchronise rather than spending the next N interrupts catching up in
+     * a burst that starves everything else. */
+    uint64_t now = cntvct();
+    if (next_deadline <= now)
+        next_deadline = now + reload;
+
+    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(next_deadline));
 
     ticks++;
-    bringup_sched_tick();
+
+    /* No scheduler call here. Preemption happens from the GIC's post-EOI hook
+     * instead -- see gic_dispatch(). This handler's whole job is to make the
+     * timer stop asserting and to count; anything that does not return must
+     * not run until the interrupt has been retired. */
 }
 
 void timer_init(void) {
@@ -88,7 +109,8 @@ void timer_init(void) {
 
     gic_register(timer_intid, timer_tick, "generic timer");
 
-    __asm__ volatile("msr cntv_tval_el0, %0" :: "r"(reload));
+    next_deadline = boot_count + reload;
+    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(next_deadline));
     __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)1));  /* ENABLE, unmasked */
     __asm__ volatile("isb" ::: "memory");
 

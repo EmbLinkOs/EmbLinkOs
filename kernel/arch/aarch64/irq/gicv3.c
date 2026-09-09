@@ -63,6 +63,7 @@ static struct {
 } handlers[MAX_INTID];
 
 static uint64_t spurious;
+static void (*post_eoi)(void);
 
 static inline uint32_t d_read(uint32_t off)            { return *(volatile uint32_t *)(gicd + off); }
 static inline void     d_write(uint32_t off, uint32_t v){ *(volatile uint32_t *)(gicd + off) = v; }
@@ -303,6 +304,10 @@ void gic_unregister(uint32_t intid) {
     handlers[intid].fn = 0;
 }
 
+void gic_set_post_eoi(void (*fn)(void)) {
+    post_eoi = fn;
+}
+
 void gic_dispatch(void) {
     uint64_t iar = SYSREG_READ(ICC_IAR1_EL1);
     uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
@@ -312,25 +317,40 @@ void gic_dispatch(void) {
         return;                        /* no EOI for a spurious ID       */
     }
 
-    /* END OF INTERRUPT FIRST, THEN THE HANDLER.
+    /* THE ORDER OF THE NEXT THREE STEPS IS THE WHOLE DESIGN, and getting it
+     * wrong produces two different bugs that look nothing like each other.
      *
-     * Not the obvious order, and it is load-bearing: the timer handler
-     * CONTEXT-SWITCHES, so it does not return. With EOI after the handler,
-     * the interrupt would stay active until this thread was scheduled again,
-     * the GIC would refuse to deliver another at the same priority in the
-     * meantime, and the other thread would never get a tick -- one preemption
-     * and then silence.
+     * 1. HANDLER FIRST, so the device stops asserting. A PPI like the generic
+     *    timer is LEVEL-triggered: the timer holds the line high until
+     *    CNTV_TVAL is reloaded. End the interrupt while the line is still
+     *    high and the GIC immediately latches another one -- the timer then
+     *    fires faster than it was programmed to (measured: 6.4 ms for a 10 ms
+     *    tick under HVF), and the extra interrupt arrives at a moment nothing
+     *    expects.
      *
-     * Safe here because every interrupt runs at one priority (IRQ_PRIORITY)
-     * with PSTATE.I masked for the whole exception, so nothing can nest in
-     * between and there is no ordering requirement to violate. */
-    SYSREG_WRITE(ICC_EOIR1_EL1, iar);
-
+     * 2. THEN EOI, retiring the interrupt completely.
+     *
+     * 3. THEN the post-EOI hook -- the scheduler. It must come after the EOI
+     *    because it CONTEXT-SWITCHES and does not return: with the EOI still
+     *    pending, the interrupt would stay active until this thread was
+     *    scheduled again, the GIC would refuse to deliver another at the same
+     *    priority meanwhile, and the other thread would never get a tick --
+     *    one preemption, then silence.
+     *
+     * Steps 1 and 3 pull in opposite directions, which is exactly why the
+     * scheduler is a separate hook here rather than something the timer
+     * handler calls. Switching inside the handler satisfies 3 only by
+     * breaking 1. */
     handlers[intid].count++;
     if (handlers[intid].fn)
         handlers[intid].fn(intid);
     else
         kprintf("gic: unhandled INTID %d\n", (int)intid);
+
+    SYSREG_WRITE(ICC_EOIR1_EL1, iar);
+
+    if (post_eoi)
+        post_eoi();
 }
 
 uint64_t gic_count(uint32_t intid) {
