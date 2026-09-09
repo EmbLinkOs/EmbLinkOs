@@ -9,6 +9,8 @@
 #include "drivers/timer/timer.h"
 #include "boot/boot_protocol.h"
 #include "mm/pmm.h"
+#include "mm/kheap.h"
+#include "include/kmalloc.h"
 #include "include/kprintf.h"
 
 /* Early aarch64 bring-up entry -- docs/ARM64.md phases A0-A2.
@@ -98,6 +100,60 @@ static void expect(const char *what, unsigned got, unsigned want) {
         selftest_fails++;
     kprintf("  [%s] %s  (%d caught, expected %d)\n",
             got == want ? " ok " : "FAIL", what, (int)got, (int)want);
+}
+
+/* Does the SHARED kernel heap work on this architecture?
+ *
+ * kernel/mm/kheap.c is 619 lines of x86-era allocator -- slabs, canaries,
+ * coalescing -- compiled here unchanged. The only thing it needed was for
+ * kernel/mm/vmm.h to mean something on aarch64, which mm/pagetable.c now
+ * implements. Exercising it matters more than the usual "it linked": a heap
+ * that is subtly wrong corrupts something far away and much later. */
+static void selftest_kheap(void) {
+    kprintf("\n--- self-test: shared kernel heap ---\n");
+    kheap_init();
+
+    /* Sizes that straddle the slab/large-block boundary, so both paths run. */
+    static const uint64_t sizes[] = { 16, 64, 512, 4096, 40000 };
+    void *p[5];
+    bool bad = false;
+
+    for (int i = 0; i < 5; i++) {
+        p[i] = kmalloc(sizes[i]);
+        if (!p[i]) {
+            kprintf("  [FAIL] kmalloc(%d) returned null\n", (int)sizes[i]);
+            bad = true;
+            continue;
+        }
+        /* Fill with a per-allocation pattern: if two allocations overlap, the
+         * later fill corrupts the earlier one and the readback below catches
+         * it. A test that only checks the pointer is non-null would not. */
+        for (uint64_t b = 0; b < sizes[i]; b++)
+            ((volatile unsigned char *)p[i])[b] = (unsigned char)(i * 31 + (b & 0xFF));
+    }
+
+    for (int i = 0; i < 5 && !bad; i++) {
+        for (uint64_t b = 0; b < sizes[i]; b++) {
+            if (((volatile unsigned char *)p[i])[b] !=
+                (unsigned char)(i * 31 + (b & 0xFF))) {
+                kprintf("  [FAIL] allocation %d corrupted at byte %d\n",
+                        i, (int)b);
+                bad = true;
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < 5; i++)
+        if (p[i]) kfree(p[i]);
+
+    /* The allocator's own integrity check -- canaries and block chain. */
+    kheap_check();
+
+    kprintf("  [%s] kmalloc/kfree across 5 size classes, contents intact\n",
+            bad ? "FAIL" : " ok ");
+    if (bad)
+        selftest_fails++;
 }
 
 static void selftest_faults(void) {
@@ -287,6 +343,7 @@ void arch_early_main(uint64_t dtb_phys) {
     vm_dump_kernel_mapping();
 
     selftest_pmm();
+    selftest_kheap();
     selftest_faults();
 
     kprintf("\n--- self-test done: %d failure(s) ---\n", (int)selftest_fails);

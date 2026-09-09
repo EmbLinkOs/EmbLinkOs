@@ -150,6 +150,18 @@ compiled for aarch64 to see what actually broke:
 | after extracting `arch_irq_*` | 59 | 31,062 |
 | after `arch_cpu_idle*` + `arch_fault_addr` | **61** | **31,465** |
 
+A twelfth extraction followed for free: `arch_cpu_relax()` (`pause` / `yield`),
+which had five hand-written copies in `process.c` alone.
+
+**And one file was simply in the wrong place.** `kernel/mm/vmm.c` was counted as
+a shared file that failed to compile; it is 817 lines of PML4 walking with 72
+mentions of `pml4` and three `mov %0, %%cr3`. It is not portable code that needs
+fixing, it is x86 code in a portable directory, and it now sits at
+`kernel/arch/x86_64/mm/vmm.c` next to its aarch64 counterpart
+(`arch/aarch64/mm/pagetable.c`). `kernel/mm/vmm.h` stays where it is: the
+*interface* is shared, and aarch64 now implements the part of it that shared
+code actually calls.
+
 **One `static inline` was worth 12,381 lines.** `current_thread_atomic()` in
 `kernel/process/process.h` contained `__asm__("pushfq; popq %0; cli")`, and
 half the kernel includes that header — so nine files, including
@@ -181,12 +193,24 @@ disagree, which is what §2.3 is for:
   — WFI returns immediately on a pending event, masked or not. A HAL derived
   from the ARM side alone would have exposed two calls and silently broken x86.
 
-**What is left is now a short, honest list.** Fifteen shared files still do not
-compile: eleven are legacy x86 device drivers that §2.6 says are *absent* on
-ARM rather than portable, and four have real architecture in them — `main.c`,
-`mm/vmm.c`, `process/process.c`, `selftests.c` (CR3, `invlpg`, the
-GDT/IDT/LAPIC). Those four are A6's actual work, and they are now the only
-thing between here and compiling the real syscall table.
+**What is left is now a short, honest list.** Fourteen of the 75 shared files
+still do not compile: **eleven are legacy x86 device drivers** that §2.6 says
+are *absent* on ARM rather than portable, and **three have real architecture in
+them** — `main.c` (GDT/IDT/PIC/LAPIC bring-up order), `process/process.c` and
+`selftests.c`.
+
+`process.c` is the gate, and its remaining couplings are now enumerable rather
+than vague: the TSS (`tss_set_rsp0`), the LAPIC (end-of-interrupt), the ELF and
+EMBX loaders, `%xmm`-based FPU-context test code, and a user-entry trampoline
+written with named x86 registers. Everything cheaper than those is already
+gone.
+
+**Meanwhile the shared kernel heap now runs on aarch64.** `kernel/mm/kheap.c` —
+619 lines of slab allocator with canaries and coalescing, written years before
+any of this — compiles unchanged and passes a five-size-class allocate/fill/
+verify/free test on ARM. The only thing it needed was for `kernel/mm/vmm.h` to
+mean something here, which `mm/pagetable.c` now provides. That is the whole
+argument for the portability discipline, in one file.
 
 ### 2.4 The syscall seam is the one refactor that must happen on x86 first
 The 187 register reads (§1) are the exception to §2.3, because their fix does

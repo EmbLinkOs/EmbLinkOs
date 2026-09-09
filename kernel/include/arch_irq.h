@@ -52,6 +52,14 @@ static inline bool arch_irq_enabled(void);
 static inline void arch_irq_enable(void);
 static inline void arch_irq_disable(void);
 
+/* A hint that this CPU is spinning on something another CPU will change.
+ * `pause` / `yield`. Not a delay and not a barrier: it tells the core to stop
+ * speculating so hard down a loop it is about to lose, which on x86 also
+ * avoids the memory-order-violation pipeline flush when the value finally
+ * lands. Omitting it is correct but slow; using it where there is no spin is
+ * merely useless. */
+static inline void arch_cpu_relax(void);
+
 /* Stop the CPU until an interrupt arrives, WITHOUT changing the mask.
  * `hlt` / `wfi`. */
 static inline void arch_cpu_idle(void);

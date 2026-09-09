@@ -192,7 +192,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/block/block.c \
              kernel/block/partition.c \
              kernel/mm/pmm.c \
-             kernel/mm/vmm.c \
+             kernel/arch/x86_64/mm/vmm.c \
              kernel/mm/kheap.c \
              kernel/mm/kmalloc.c \
              kernel/crypto/sha256.c \

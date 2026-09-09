@@ -47,8 +47,11 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
 # a build question -- the answer is usually an arch hook, as pmm.c's
 # arch_pmm_reserve_fixed() ended up being.
 ARM_SHARED_SRC := kernel/mm/pmm.c \
+                  kernel/mm/kheap.c \
+                  kernel/mm/kmalloc.c \
                   kernel/lib/kprintf.c \
-                  kernel/lib/kstring.c
+                  kernel/lib/kstring.c \
+                  kernel/lib/errno.c
 
 # Coarse on purpose, exactly as $(KERNEL_HDRS) is on the x86 side: one
 # compile, no per-TU depfiles, so a header-only change must rebuild it all.
@@ -258,6 +261,7 @@ test-arm64-boot: $(ARM_IMG)
 	  chk 'worker 1 was scheduled'         A3 'no preemption report'; \
 	  chk 'boot thread was scheduled back' A3 'the scheduler never returned to the boot thread'; \
 	  chk 'spurious: 0'                    A3 'the GIC delivered spurious interrupts'; \
+	  chk 'kmalloc/kfree across 5 size'    A6 'the shared kernel heap does not work here'; \
 	  chk 'hello from EL0'                 A5 'user code never ran at EL0'; \
 	  chk 'REFUSED write'                  A5 'the kernel accepted an unmapped user pointer'; \
 	  chk 'exited with 42'                 A5 'the exit argument did not survive the trip to a handler'; \
@@ -280,6 +284,7 @@ test-arm64-boot: $(ARM_IMG)
 	  echo "  A2 higher half, DTB memory map, pmm, section permissions, no identity map"; \
 	  echo "  A3 GICv3, generic timer, preemptive context switching"; \
 	  echo "  A5 EL0, svc, user-pointer boundary, arch-neutral handlers"; \
+	  echo "  A6 the shared kernel heap (kheap/kmalloc), compiled unchanged"; \
 	else exit 1; fi
 
 .PHONY: check-tools-arm64

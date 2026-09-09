@@ -1,5 +1,6 @@
 #include "arch/aarch64/mm/pagetable.h"
 #include "mm/pmm.h"
+#include "mm/vmm.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
 
@@ -325,4 +326,55 @@ void vm_dump_kernel_mapping(void) {
                 (void *)(uintptr_t)va, (void *)(uintptr_t)pa,
                 pa == KV2P(va) ? "(matches KV2P)" : "*** MISMATCH ***");
     }
+}
+
+/* --- kernel/mm/vmm.h, the shared VM interface ------------------------------
+ *
+ * The x86 implementation is kernel/arch/x86_64/mm/vmm.c (moved there from
+ * kernel/mm/ once it was clear it is PML4 code, not portable code). This is
+ * the aarch64 half, and today it is exactly as much of that header as shared
+ * code actually calls: `kernel/mm/kheap.c` maps one page at a time as the heap
+ * grows, and nothing else outside arch/ calls into vmm.h at all.
+ *
+ * TWO THINGS ABOUT THE FLAGS ARE x86 SHOWING THROUGH, and both are recorded in
+ * docs/TODO.md rather than papered over:
+ *
+ *   VMM_PRESENT / VMM_WRITABLE / VMM_NX are not abstract names -- they ARE the
+ *   x86 page-table bit positions (0, 1, and 63). aarch64 reads them as an
+ *   ordinary flag word, which works, but the header is describing one
+ *   machine's hardware and calling it an interface.
+ *
+ *   VMM_NX is INVERTED with respect to how a permission should read: absent
+ *   means executable. So a caller that asks for a writable page and says
+ *   nothing about execution gets a WRITABLE, EXECUTABLE page -- which is what
+ *   the kernel heap is on x86 today. This implementation does NOT reproduce
+ *   that: a mapping here is non-executable unless something explicitly asks
+ *   otherwise, and nothing can yet, because vmm.h has no way to say "I want to
+ *   run code here". A W^X heap is the right default and the wrong place to
+ *   inherit a bug from.
+ */
+int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
+    uint32_t f = 0;
+
+    if (flags & VMM_WRITABLE)
+        f |= PT_WRITE;
+    if (flags & VMM_USER)
+        f |= PT_USER;
+    if (flags & (VMM_NOCACHE | VMM_WRITETHROUGH))
+        f |= PT_DEVICE;
+
+    /* No PT_EXEC: see the note above. */
+    return vm_map_page(virt, phys, f) == PT_OK ? 0 : -1;
+}
+
+void vmm_unmap(uint64_t virt) {
+    vm_unmap_page(virt);
+}
+
+uint64_t vmm_get_phys(uint64_t virt) {
+    return vm_translate(virt);
+}
+
+void vmm_flush_tlb(uint64_t virt) {
+    tlb_flush_page(virt);
 }

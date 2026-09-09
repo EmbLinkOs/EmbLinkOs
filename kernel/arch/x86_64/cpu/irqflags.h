@@ -36,6 +36,8 @@ static inline bool arch_irq_enabled(void) {
 static inline void arch_irq_enable(void)  { __asm__ volatile("sti" ::: "memory"); }
 static inline void arch_irq_disable(void) { __asm__ volatile("cli" ::: "memory"); }
 
+static inline void arch_cpu_relax(void) { __asm__ volatile("pause" ::: "memory"); }
+
 static inline void arch_cpu_idle(void) { __asm__ volatile("hlt" ::: "memory"); }
 
 /* One asm block, so the sti/hlt pair keeps its interrupt shadow. See the

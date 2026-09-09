@@ -48,7 +48,9 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   A5 then ran an aarch64 program at EL0 through those same neutral handlers.
   With the first HAL piece extracted (`kernel/include/arch_irq.h`), **61 of the
   76 shared kernel files -- 31,465 lines -- compile for aarch64**; eleven of the
-  fifteen that do not are x86 drivers for hardware ARM does not have. The
+  fourteen that do not are x86 drivers for hardware ARM does not have. The
+  shared kernel heap (`kernel/mm/kheap.c`, slabs and canaries and all) runs
+  unchanged on aarch64. The
   x86 build is untouched by it (`ARCH` defaults to `x86_64`, and the aarch64
   rules are in a fragment the default build never parses).
 - See `ARCHITECTURE.md` §1 for the full governing principle ("bless the clean

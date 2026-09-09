@@ -921,7 +921,7 @@ retry:
                  * nothing would ever wake us again). */
                 if (z->running_cpu != -1) {
                     spin_unlock(&g_sched_lock);
-                    __asm__ volatile ("pause");
+                    arch_cpu_relax();
                     goto retry;
                 }
                 *link = z->zombie_next;   // unlink from our zombie list
@@ -2670,7 +2670,7 @@ retry:
              * hasn't yet confirmed it switched away. */
             if (t->running_cpu != -1) {
                 spin_unlock(&g_sched_lock);
-                __asm__ volatile ("pause");
+                arch_cpu_relax();
                 goto retry;
             }
             int code = t->exit_code;
@@ -3332,7 +3332,7 @@ static void smp_sched_kthread_entry(void) {
         g_smp_sched_core[slot] = lapic_get_id();
     }
     while (!g_smp_sched_stop) {
-        __asm__ volatile ("pause");
+        arch_cpu_relax();
     }
     process_exit_self(0);
 }
@@ -3624,12 +3624,12 @@ int process_test_thread_smp(void) {
  * switch just widened the window enough to hit it regularly.) */
 static volatile bool g_thread_exit_a_go;
 static void thread_exit_entry_a(void) {
-    while (!g_thread_exit_a_go) { __asm__ volatile ("pause"); }
+    while (!g_thread_exit_a_go) { arch_cpu_relax(); }
     process_exit_self(0);
 }
 static volatile bool g_thread_exit_b_stop;
 static void thread_exit_entry_b(void) {
-    while (!g_thread_exit_b_stop) { __asm__ volatile ("pause"); }
+    while (!g_thread_exit_b_stop) { arch_cpu_relax(); }
     process_exit_self(0);
 }
 

@@ -48,6 +48,10 @@ static inline bool arch_irq_enabled(void) {
 static inline void arch_irq_enable(void)  { __asm__ volatile("msr daifclr, #2" ::: "memory"); }
 static inline void arch_irq_disable(void) { __asm__ volatile("msr daifset, #2" ::: "memory"); }
 
+/* `yield` is the architectural spin hint. On a core without SMT it may be a
+ * no-op, which is fine -- so is `pause` on most x86 parts. */
+static inline void arch_cpu_relax(void) { __asm__ volatile("yield" ::: "memory"); }
+
 static inline void arch_cpu_idle(void) { __asm__ volatile("wfi" ::: "memory"); }
 
 /* No interrupt-shadow problem to solve here: WFI is defined to return

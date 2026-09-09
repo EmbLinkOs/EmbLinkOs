@@ -1706,13 +1706,31 @@ substantially complete.
   - **The HAL, so far** (`kernel/include/arch_irq.h`, extracted after A5 and
     measured rather than guessed — see ARM64.md §2.3). 61 of 76 shared kernel
     files now compile for aarch64. What is left:
-    - [ ] **Four files with real architecture in them:** `kernel/main.c`
-      (GDT/IDT/PIC/LAPIC init), `kernel/mm/vmm.c` (CR3, `invlpg`),
-      `kernel/process/process.c` (CR3 on switch, LAPIC, `hlt` loops) and
-      `kernel/selftests.c`. These are A6's real work — the only thing between
-      here and compiling `kernel/syscall/syscalls.c` for aarch64. The
-      primitives they still need are `arch_addr_space_switch()` (CR3 /
-      TTBR0_EL1) and `arch_tlb_flush_page()` (`invlpg` / `tlbi vaae1is`).
+    - [ ] **`kernel/process/process.c` is the gate**, and its remaining
+      couplings are now enumerable rather than vague: `tss_set_rsp0()` (the
+      TSS), the LAPIC end-of-interrupt, the ELF and EMBX loaders, `%xmm`-based
+      FPU-context test code, and a user-entry trampoline written with named x86
+      registers. It needs `arch_addr_space_switch()` (CR3 / TTBR0_EL1),
+      `arch_kernel_stack_set()` (TSS.rsp0 / nothing at all on aarch64, where
+      SP_EL1 is a separate register) and a neutral ELF-loader interface.
+      `kernel/main.c` and `kernel/selftests.c` follow it, not the other way
+      round.
+    - [x] ~~`kernel/mm/vmm.c` does not compile for aarch64~~ — it was never
+      supposed to. 817 lines of PML4 walking counted as a *shared* file that
+      failed; it is now `kernel/arch/x86_64/mm/vmm.c`, next to its aarch64
+      counterpart. `kernel/mm/vmm.h` remains shared and aarch64 implements the
+      part of it that shared code calls.
+    - [ ] **`kernel/mm/vmm.h`'s flags are x86 page-table bits wearing
+      interface names.** `VMM_PRESENT`, `VMM_WRITABLE` and `VMM_NX` are bit
+      positions 0, 1 and 63 — the actual hardware layout — and `VMM_NX` is
+      inverted with respect to how a permission reads: absent means
+      *executable*. A caller asking for a writable page and saying nothing
+      about execution therefore gets a writable, executable one, which is what
+      the x86 kernel heap is today. The aarch64 implementation deliberately
+      does NOT reproduce that (its mappings are non-executable unless asked),
+      so the two architectures currently disagree about heap permissions. Fix
+      the header: name the flags for what they mean and make execute
+      opt-in.
     - [ ] **Eleven legacy x86 device drivers do not compile, and must not.**
       PIT, RTC, ATA, AC97, PS/2 keyboard and mouse, UHCI, bochs VBE, the 16550,
       port-CF8 PCI, and `drivers/timer/timer.c`'s x86 glue. ARM64.md §2.6:
