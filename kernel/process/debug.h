@@ -16,6 +16,7 @@
  * only delivers the stop and single-steps on resume. */
 
 #include "process/process.h"           /* struct process/thread, wait_queue */
+#include "include/syscall_abi.h"   /* struct sysargs -- these are syscall handlers */
 #include "arch/x86_64/syscall/syscall.h" /* struct regs — the frame layout */
 #include "include/debug_abi.h"         /* embk_debug_event + constants */
 
@@ -54,12 +55,12 @@ void debug_notify_exit(struct process *proc, int code);
 
 /* The syscalls (69-75). Registered in syscall_table. Each takes the register
  * frame and returns an int64_t the dispatcher writes to rax. */
-int64_t sys_debug_attach(struct regs *r);
-int64_t sys_debug_wait(struct regs *r);
-int64_t sys_debug_cont(struct regs *r);
-int64_t sys_debug_regs(struct regs *r);
-int64_t sys_debug_mem(struct regs *r);
-int64_t sys_debug_hwbp(struct regs *r);
-int64_t sys_debug_detach(struct regs *r);
+int64_t sys_debug_attach(const struct sysargs *a);
+int64_t sys_debug_wait(const struct sysargs *a);
+int64_t sys_debug_cont(const struct sysargs *a);
+int64_t sys_debug_regs(const struct sysargs *a);
+int64_t sys_debug_mem(const struct sysargs *a);
+int64_t sys_debug_hwbp(const struct sysargs *a);
+int64_t sys_debug_detach(const struct sysargs *a);
 
 #endif /* __PROCESS_DEBUG_H__ */

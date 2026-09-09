@@ -1556,15 +1556,18 @@ substantially complete.
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
   - **That campaign is underway: `docs/ARM64.md`** (target QEMU `virt`, HVF
-    available and confirmed working). **Phases A0-A3 are done** — `make ARCH=aarch64`
+    available and confirmed working). **Phases A0-A4 are done** — `make ARCH=aarch64`
     boots an aarch64 kernel to a serial console at EL1 with the DTB handed over,
     decodes its own faults (ESR/FAR/ELR down to the fault status code) and
     recovers from them, runs in the higher half with the MMU on with its memory
     map read from the device tree and `kernel/mm/pmm.c` allocating, and
     **preemptively switches between kernel threads** on a GICv3-delivered
-    generic-timer interrupt. Verified by `make ARCH=aarch64 test-arm64-boot`
-    (twenty-one assertions across the four phases). A4 (the `sysargs` refactor,
-    which lands on x86) is next. The audit there says the discipline largely held —
+    generic-timer interrupt. Verified by `make ARCH=aarch64 test-arm64-boot`,
+    which runs every available accelerator (HVF and TCG on a Mac) because the
+    two disagree in ways that find bugs. **A4 landed on x86:** the syscall
+    handlers no longer read machine registers, and 2,019 of the 6,479 lines
+    that `arch/x86_64/` was credited with have moved out of it. A5 (EL0 + `svc`)
+    is next. The audit there says the discipline largely held —
     `arch/x86_64/` is 11% of the kernel and port I/O never escaped into core
     logic — with **one** real exception: the 89 syscall handlers in
     `arch/x86_64/syscall/syscall.c` read their arguments through 187 direct
@@ -1653,6 +1656,25 @@ substantially complete.
     - [ ] **`find_redistributor()` assumes a 0x20000 redistributor stride.**
       Correct for GICv3; GICv4 adds VLPI frames and makes it 0x40000. The
       `GICR_TYPER.VLPIS` bit says which, and nothing reads it yet.
+  - **Known gaps left by A4** (the `sysargs` refactor):
+    - [ ] **`kernel/process/debug.h` still includes
+      `arch/x86_64/syscall/syscall.h`,** for `struct regs`. This one is
+      LEGITIMATE, not laziness: `stopped_frame` is the *debuggee's* saved
+      register frame and `debug_on_exception()` is called from the exception
+      path, so a debugger that exposes machine registers is machine-specific by
+      definition. It is the only arch include left in `kernel/process/`. When
+      A5 factors the exception seam, the register-exposing part of debug.c
+      should move under `arch/` (or gain an arch-neutral register view) and the
+      seven *handlers* — already converted to `struct sysargs` — stay put.
+    - [ ] **`SYS_*` numbers are defined in `kernel/syscall/syscalls.c`** and
+      mirrored by hand in `user/lib/embk.h`. Two lists that must agree and
+      nothing checks that they do. They belong in one header both sides
+      include; it was left alone here because A4 was meant to be a mechanical
+      move that the desktop boot could vouch for, and renumbering the ABI in
+      the same change would have made a boot failure ambiguous.
+    - [ ] **`kernel/syscall/syscalls.c` is not compiled for aarch64 yet.** It
+      needs `process.c`, the VFS, the compositor and the IPC layer, which is
+      exactly what A5/A6 bring up. Nothing about the file blocks it.
 - [x] ~~**embbuild** — the native build tool (the make-equivalent)~~ —
   **BUILT AND SHIPPED**, not merely designed. `shell/tools/embbuild.c`; proven
   by `test embbuild` (cases a–f including the §3 `/system` install refusal),

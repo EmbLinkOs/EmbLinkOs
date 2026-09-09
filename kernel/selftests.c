@@ -6,7 +6,7 @@
 #include "fs/embkfs/embkfs.h"
 #include "block/block.h"   /* blkstat request counters (test ioperf) */
 #include "net/net.h"       /* g_netif, net_ping (test net) */
-#include "arch/x86_64/syscall/usercopy.h"   /* transient-EFAULT retry counters */
+#include "include/usercopy.h"   /* transient-EFAULT retry counters */
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
 #include "drivers/char/serial.h"      /* serial_write_char: test tcc real heartbeat */

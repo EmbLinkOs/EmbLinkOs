@@ -1,5 +1,5 @@
 #include "include/kprintf.h"
-#include "arch/x86_64/syscall/usercopy.h"
+#include "include/usercopy.h"
 #include "process/process.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"

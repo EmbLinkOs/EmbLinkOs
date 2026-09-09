@@ -19,7 +19,7 @@
 #include "include/errno.h"
 #include "fs/embkfs/crc32c.h"        /* embk_crc32c -- the house checksum */
 #include "process/capabilities.h"
-#include "arch/x86_64/syscall/usercopy.h"   /* USER_VA_LIMIT */
+#include "include/usercopy.h"   /* USER_VA_LIMIT */
 
 #define PAGE_SIZE_4K 0x1000ULL
 #define PAGE_DOWN(x) ((x) & ~(PAGE_SIZE_4K - 1))

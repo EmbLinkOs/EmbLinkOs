@@ -4,7 +4,7 @@
 #include "process/process.h"   /* current_thread, struct process/thread */
 #include "process/debug.h"     /* debug_on_exception (§6.6 exception routing) */
 #include "lib/ksym.h"          /* the panic symbolizer (§7) */
-#include "arch/x86_64/syscall/usercopy.h"   /* access_ok, for the ring-3 walk */
+#include "include/usercopy.h"   /* access_ok, for the ring-3 walk */
 
 /* Serializes the exception dump so two faulting cores don't interleave their
  * reports byte-by-byte over the lockless UART (observed directly as two

@@ -1,6 +1,6 @@
 /* kernel/ipc/clipboard.c -- see clipboard.h. */
 #include "ipc/clipboard.h"
-#include "arch/x86_64/syscall/usercopy.h"
+#include "include/usercopy.h"
 #include "include/errno.h"
 #include "include/kstring.h"
 #include "include/spinlock.h"

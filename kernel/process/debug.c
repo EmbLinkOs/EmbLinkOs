@@ -19,7 +19,7 @@
 #include "process/debug.h"
 #include "process/process.h"
 #include "arch/x86_64/syscall/syscall.h"
-#include "arch/x86_64/syscall/usercopy.h"
+#include "include/usercopy.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "include/errno.h"
@@ -132,10 +132,10 @@ static struct debug_session *dbg_resolve(int handle) {
     return p->debug_session;
 }
 
-int64_t sys_debug_wait(struct regs *r) {
-    struct debug_session *s = dbg_resolve((int)r->rdi);
+int64_t sys_debug_wait(const struct sysargs *a) {
+    struct debug_session *s = dbg_resolve((int)a->arg[0]);
     if (!s) return -EMBK_EINVAL;
-    void *uev = (void *)r->rsi;
+    void *uev = (void *)a->arg[1];
 
     sched_lock();
     while (!(s->stopped || s->exited)) {
@@ -149,10 +149,10 @@ int64_t sys_debug_wait(struct regs *r) {
     return (int64_t)ev.tid;
 }
 
-int64_t sys_debug_cont(struct regs *r) {
-    struct debug_session *s = dbg_resolve((int)r->rdi);
+int64_t sys_debug_cont(const struct sysargs *a) {
+    struct debug_session *s = dbg_resolve((int)a->arg[0]);
     if (!s) return -EMBK_EINVAL;
-    int action = (int)r->rdx;                /* (dbg, tid, action, data) */
+    int action = (int)a->arg[2];                /* (dbg, tid, action, data) */
     if (s->exited) return -EMBK_EINVAL;
 
     sched_lock();
@@ -167,12 +167,12 @@ int64_t sys_debug_cont(struct regs *r) {
     return 0;
 }
 
-int64_t sys_debug_regs(struct regs *r) {
-    struct debug_session *s = dbg_resolve((int)r->rdi);
+int64_t sys_debug_regs(const struct sysargs *a) {
+    struct debug_session *s = dbg_resolve((int)a->arg[0]);
     if (!s) return -EMBK_EINVAL;
-    void *buf = (void *)r->rdx;               /* (dbg, tid, buf, len, write) */
-    uint64_t len = r->r10;
-    int write = (int)r->r8;
+    void *buf = (void *)a->arg[2];               /* (dbg, tid, buf, len, write) */
+    uint64_t len = a->arg[3];
+    int write = (int)a->arg[4];
     if (!s->stopped || !s->stopped_frame) return -EMBK_EINVAL;  /* no live frame */
     if (len > sizeof(struct regs)) len = sizeof(struct regs);
     if (write) {
@@ -188,13 +188,13 @@ int64_t sys_debug_regs(struct regs *r) {
  * or from the debugger's buffer. This is what plants breakpoints and reads
  * variables (§6.4). Writes hit the physical frame directly, bypassing the
  * target's page protections — exactly a debugger's job. */
-int64_t sys_debug_mem(struct regs *r) {
-    struct debug_session *s = dbg_resolve((int)r->rdi);
+int64_t sys_debug_mem(const struct sysargs *a) {
+    struct debug_session *s = dbg_resolve((int)a->arg[0]);
     if (!s) return -EMBK_EINVAL;
-    uint64_t addr = r->rsi;                   /* (dbg, addr, buf, len, write) */
-    uint8_t *ubuf = (uint8_t *)r->rdx;
-    uint64_t len = r->r10;
-    int write = (int)r->r8;
+    uint64_t addr = a->arg[1];                   /* (dbg, addr, buf, len, write) */
+    uint8_t *ubuf = (uint8_t *)a->arg[2];
+    uint64_t len = a->arg[3];
+    int write = (int)a->arg[4];
     struct process *tgt = s->target;
     if (!tgt) return -EMBK_EINVAL;
 
@@ -218,10 +218,10 @@ int64_t sys_debug_mem(struct regs *r) {
     return (int64_t)done;
 }
 
-int64_t sys_debug_detach(struct regs *r) {
-    struct debug_session *s = dbg_resolve((int)r->rdi);
+int64_t sys_debug_detach(const struct sysargs *a) {
+    struct debug_session *s = dbg_resolve((int)a->arg[0]);
     if (!s) return -EMBK_EINVAL;
-    int disp = (int)r->rsi;
+    int disp = (int)a->arg[1];
     struct process *tgt = s->target;
 
     sched_lock();
@@ -239,5 +239,5 @@ int64_t sys_debug_detach(struct regs *r) {
 
 /* M1 stubs: attach-to-running and hardware watchpoints are refinements the
  * born-under-debug + software-breakpoint path does not need. Named, not faked. */
-int64_t sys_debug_attach(struct regs *r) { (void)r; return -EMBK_ENOSYS; }
-int64_t sys_debug_hwbp(struct regs *r)   { (void)r; return -EMBK_ENOSYS; }
+int64_t sys_debug_attach(const struct sysargs *a) { (void)a; return -EMBK_ENOSYS; }
+int64_t sys_debug_hwbp(const struct sysargs *a)   { (void)a; return -EMBK_ENOSYS; }

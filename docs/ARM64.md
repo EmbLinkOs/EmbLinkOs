@@ -5,7 +5,7 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A3 done.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
+**Status: A0–A4 done.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
 its own faults, runs in the higher half with the MMU on — page tables built in
 assembly before any allocator exists, memory map from the device tree,
 `kernel/mm/pmm.c` (the *existing, shared* allocator) running unmodified,
@@ -61,7 +61,8 @@ Measured, not assumed:
 **Where it did not hold** — one place, and it is the campaign's real work:
 
 * **`arch/x86_64/syscall/syscall.c` is 2,019 lines, and most of it is not
-  arch-specific at all.** It holds **89 syscall handlers** — `sys_open`,
+  arch-specific at all.** *(Fixed by A4; the counts below were measured by
+  grepping that one file and were wrong in both directions — see A4.)* It holds **89 syscall handlers** — `sys_open`,
   `sys_write`, the gfx and audio calls — whose *policy* is entirely portable.
   They are welded to x86 only by how they read their arguments: **187 direct
   reads of `r->rdi`, `r->rsi`, `r->rdx`, `r->r10`, `r->r8`, `r->r9`.** The
@@ -457,9 +458,57 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
   `interrupts` property — `virt` lists four (secure physical, non-secure
   physical, virtual, hypervisor) and picking by index without decoding is a
   guess.
-* **A4 ❌ The `sysargs` refactor (on x86).** §2.4. **Done when:** x86 boots to the
-  desktop with zero `r->rdi` left in a handler, and the 89 handlers no longer live
-  under `arch/`.
+* **A4 ✅ The `sysargs` refactor (on x86).** §2.4.
+  `kernel/include/syscall_abi.h`, `kernel/syscall/syscalls.c`, and an
+  `arch/x86_64/syscall/syscall.c` that shrank from **2,019 lines to 88**.
+  **Done when:** x86 boots to the desktop with zero `r->rdi` left in a handler,
+  and the handlers no longer live under `arch/`. Both true, and the boot is the
+  real test — this change touches every system call the desktop makes.
+
+  **The audit's number was wrong in both directions, and the refactor is what
+  found out.** §1 said *187 reads across 89 handlers*. Actually:
+
+  | | handlers | argument reads |
+  |---|---:|---:|
+  | `arch/x86_64/syscall/syscall.c` | 88 | 184 |
+  | `kernel/process/debug.c` | **7** | **15** |
+  | total | **95** | **199** |
+
+  The 187 counted three `r->rax` uses that are the *dispatcher's* own (the
+  syscall number and the return value — those are supposed to be there), and
+  missed seven handlers entirely because they had grown in `process/debug.c`,
+  next to the debugger state they manipulate, rather than in the file anyone
+  thought to grep. A count taken by grepping one file measures that file, not
+  the problem.
+
+  What is left under `arch/x86_64/syscall/` is 88 lines, and the entire
+  x86-ness of the system call interface is now six of them:
+
+  ```c
+  a->arg[0] = r->rdi;   a->arg[3] = r->r10;
+  a->arg[1] = r->rsi;   a->arg[4] = r->r8;
+  a->arg[2] = r->rdx;   a->arg[5] = r->r9;
+  ```
+
+  aarch64 will write the same six slots from `x0..x5` and nothing above that
+  line will notice.
+
+  Two decisions worth recording:
+  1. **No pointer to the trap frame in `struct sysargs`.** It was checked
+     first: not one of the 95 handlers read anything from `struct regs` except
+     an argument register. An escape hatch nobody needs is one somebody
+     eventually uses, and a single handler reaching into the frame puts the
+     whole file back under `arch/`. Settles §6.3 — `sysargs` lives in a new
+     neutral `kernel/include/syscall_abi.h`, not in the arch syscall header,
+     precisely because that header's reason to exist is `struct regs`.
+  2. **`kernel/drivers/char/usercopy.h` moved to `kernel/include/`** for the
+     same reason `spinlock.h` and `boot_protocol.h` did: `access_ok`,
+     `copy_from_user`, `copy_to_user` describe a *privilege boundary*, not a
+     machine, and every handler needs them. The implementation stays per-arch.
+
+  The debugger keeps `struct regs`, legitimately: exposing a stopped thread's
+  registers is machine-specific by definition. That is the one remaining arch
+  include in `kernel/process/`, and `TODO.md` records it.
 * **A5 ❌ EL0 + `svc`.** Address-space switch on TTBR0, `eret` to user, syscalls
   land in the now-neutral handlers. **Done when:** a static aarch64 binary runs and
   calls `write`.
@@ -501,8 +550,10 @@ during A3–A5, when both sides exist and the seam is visible. See §2.3.
    **GICv2**, so `gic-version=3` is passed explicitly on every run target. No
    v2 fallback exists on purpose: a half-configured controller is worse than
    none, because interrupts then appear enabled and simply never arrive.
-3. **Where does `sysargs` live** — a new `kernel/include/syscall_abi.h`, or
-   inside the existing syscall header once it is hoisted out of `arch/`?
+3. ~~**Where does `sysargs` live?**~~ **Settled at A4: a new
+   `kernel/include/syscall_abi.h`.** The arch syscall header's whole reason to
+   exist is `struct regs`, so putting the machine-independent contract in it
+   would have meant every handler including the thing it was being freed from.
 4. ~~**Does `ARCH` select via directory or via a per-arch fragment `.mk`?**~~
    **Settled at A0: a fragment**, `kernel/arch/$(ARCH)/arch.mk`, included at the
    bottom of the top-level Makefile and *only* when `ARCH != x86_64`. The x86
