@@ -6,6 +6,16 @@
 /* Install the timer IRQ handler (IRQ0 / PIT keeps running at BIOS default). */
 void timer_init(void);
 
+#if defined(__aarch64__)
+/* Bring THIS core's timer up: enable its PPI in its own redistributor and arm
+ * its comparator. The generic timer's control and compare registers are banked
+ * per core, so a secondary must do this for itself -- core 0 cannot do it on
+ * its behalf. Global setup (frequency, the device-tree interrupt, the handler)
+ * belongs to timer_init() and is done once. */
+void timer_init_this_cpu(void);
+void timer_arm_this_cpu(void);
+#endif
+
 /* Get the raw LAPIC 100-Hz tick count (used by the heartbeat loop). */
 uint64_t timer_get_ticks(void);
 

@@ -74,6 +74,11 @@ int vm_protect_kernel_sections(void);
  * dereference reads real memory instead of faulting. */
 void vm_drop_identity_map(void);
 
+/* Put the identity map back for the duration of an SMP bring-up, then drop it
+ * again. A secondary enables its MMU while executing physically and needs the
+ * identity map for the very next instruction fetch. See pagetable.c. */
+void vm_restore_identity_map(void);
+
 /* Print the kernel's mappings and their permissions, resolved through an
  * actual table walk rather than from what we believe we asked for. */
 void vm_dump_kernel_mapping(void);

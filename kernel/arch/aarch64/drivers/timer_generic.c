@@ -109,13 +109,37 @@ void timer_init(void) {
 
     gic_register(timer_intid, timer_tick, "generic timer");
 
-    next_deadline = boot_count + reload;
-    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(next_deadline));
-    __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)1));  /* ENABLE, unmasked */
-    __asm__ volatile("isb" ::: "memory");
+    timer_arm_this_cpu();
 
     kprintf("timer: %d Hz counter, %d Hz tick (reload %d), INTID %d\n",
             (int)timer_freq, TICK_HZ, (int)reload, (int)timer_intid);
+}
+
+/* Arm THIS core's comparator and enable its timer.
+ *
+ * Split out of timer_init() because the generic timer is PER-CORE STATE:
+ * CNTV_CTL_EL0 and CNTV_CVAL_EL0 are banked per core, so core 0 programming
+ * them says nothing about core 1. A secondary that skips this simply never
+ * receives a tick -- and therefore never preempts anything, which looks like a
+ * scheduler bug rather than a missing register write.
+ *
+ * What is NOT here is everything that is global and already done: reading
+ * CNTFRQ, finding the interrupt in the device tree, and registering the
+ * handler. Those are the machine's properties, not the core's. */
+void timer_arm_this_cpu(void) {
+    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(cntvct() + reload));
+    __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)1));  /* ENABLE, unmasked */
+    __asm__ volatile("isb" ::: "memory");
+}
+
+void timer_init_this_cpu(void) {
+    if (!timer_freq)
+        return;                 /* timer_init() failed or never ran */
+
+    /* The timer's PPI is per-core in the GIC too: enabling INTID 27 on core 0
+     * enables it in core 0's redistributor only. */
+    gic_enable(timer_intid);
+    timer_arm_this_cpu();
 }
 
 uint64_t timer_get_ticks(void) { return ticks; }

@@ -54,6 +54,13 @@
 
 static volatile uint8_t *gicd;
 static volatile uint8_t *gicr;      /* this CPU's redistributor */
+
+/* The redistributor ARRAY, kept so a secondary can find its OWN frame. Each
+ * core has one, selected by matching its MPIDR against GICR_TYPER -- which is
+ * exactly what find_redistributor() already does, it just needs to be called
+ * again on the core that is asking. */
+static volatile uint8_t *gicr_array;
+static uint64_t          gicr_array_size;
 static bool gic_ready;
 
 static struct {
@@ -171,6 +178,9 @@ int gic_init(void) {
             (void *)(uintptr_t)d_base, (int)(d_size / 1024),
             (void *)(uintptr_t)r_base, (int)(r_size / 1024));
 
+    gicr_array      = rbase;
+    gicr_array_size = r_size;
+
     gicr = find_redistributor((uint64_t)(uintptr_t)rbase, r_size);
     if (!gicr) {
         kprintf("gic: no redistributor frame matches this CPU's MPIDR\n");
@@ -210,7 +220,37 @@ int gic_init(void) {
     d_write(GICD_CTLR, GICD_CTLR_ARE | GICD_CTLR_ENGRP1 | GICD_CTLR_ENGRP0);
     gicd_wait_rwp();
 
-    /* --- this CPU's redistributor ----------------------------------------- */
+    if (gic_init_this_cpu() != 0)
+        return -1;
+
+    gic_ready = true;
+    kprintf("gic: initialised (GICv3, system register CPU interface)\n");
+    return 0;
+}
+
+/* Everything in the controller that belongs to ONE CORE rather than to the
+ * machine: waking its redistributor, configuring its 32 SGIs and PPIs, and
+ * enabling its ICC_* system register CPU interface.
+ *
+ * Split out of gic_init() for SMP (A9). The distributor above is configured
+ * once, by core 0; this half must be run BY each core, because every register
+ * it touches is either in that core's own redistributor frame or is a banked
+ * system register. A secondary that skips it has a GIC that looks initialised
+ * from core 0's point of view and delivers it nothing. */
+int gic_init_this_cpu(void) {
+    if (!gicr_array) {
+        kprintf("gic: gic_init_this_cpu() before gic_init()\n");
+        return -1;
+    }
+
+    /* Find THIS core's frame -- find_redistributor() reads the caller's own
+     * MPIDR, so calling it again here is the whole of "per core". */
+    gicr = find_redistributor((uint64_t)(uintptr_t)gicr_array, gicr_array_size);
+    if (!gicr) {
+        kprintf("gic: no redistributor frame matches this CPU's MPIDR\n");
+        return -1;
+    }
+
     uint32_t waker = r_read(GICR_WAKER);
     r_write(GICR_WAKER, waker & ~GICR_WAKER_SLEEP);
     {
@@ -253,8 +293,6 @@ int gic_init(void) {
     SYSREG_WRITE(ICC_IGRPEN1_EL1, 1);
     __asm__ volatile("isb" ::: "memory");
 
-    gic_ready = true;
-    kprintf("gic: initialised (GICv3, system register CPU interface)\n");
     return 0;
 }
 

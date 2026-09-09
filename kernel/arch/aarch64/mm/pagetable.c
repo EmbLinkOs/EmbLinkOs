@@ -408,10 +408,38 @@ int vm_protect_kernel_sections(void) {
     return PT_OK;
 }
 
+/* The identity entry, kept so SMP can put it back for the length of a
+ * bring-up. See vm_restore_identity_map(). */
+static uint64_t g_ident_entry;
+
 void vm_drop_identity_map(void) {
     /* Only entry 0 was ever populated: 4 GiB of identity map through one
      * level-0 slot. */
+    if (boot_l0_ttbr0[0])
+        g_ident_entry = boot_l0_ttbr0[0];
     boot_l0_ttbr0[0] = 0;
+    __asm__ volatile("dsb ishst" ::: "memory");
+    tlb_flush_all();
+}
+
+/* Put the identity map back, temporarily.
+ *
+ * A SECONDARY CORE CANNOT START WITHOUT IT. It begins executing physically
+ * with the MMU off, and boot.S's enable_mmu -- the same code core 0 ran --
+ * installs boot_l0_ttbr0 and sets SCTLR_EL1.M. The instruction fetch
+ * immediately after that is still at a PHYSICAL address, and translating it is
+ * exactly what the identity map is for. With entry 0 zeroed, that fetch is a
+ * translation fault on a core with no console, no handler and no stack: it
+ * simply disappears. PSCI returns SUCCESS either way, which is why the symptom
+ * was three cores "started" and none reporting in.
+ *
+ * So the window is opened for bring-up and closed again after -- rather than
+ * the identity map being kept forever, which would leave every user process
+ * with 4 GiB of physical memory mapped at address 0 in its own TTBR0 half. */
+void vm_restore_identity_map(void) {
+    if (!g_ident_entry)
+        return;
+    boot_l0_ttbr0[0] = g_ident_entry;
     __asm__ volatile("dsb ishst" ::: "memory");
     tlb_flush_all();
 }

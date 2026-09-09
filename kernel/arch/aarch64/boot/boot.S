@@ -262,6 +262,96 @@ mmu_on:
 
     /* arch_early_main() is not expected to return. If it does, fall into the
      * same park loop rather than executing whatever bytes follow. */
+/* ============================================================================
+ * SECONDARY CPU ENTRY -- ARM64.md phase A9.
+ *
+ * PSCI CPU_ON hands the target core a PHYSICAL entry address and one context
+ * value. It arrives here exactly as the primary arrived at _start: MMU off,
+ * caches off, executing physically while every symbol in the image is linked
+ * at a virtual address -- so the same one rule applies (see the long note
+ * above: PHYS_OF for addresses, `ldr =CONST` for values).
+ *
+ * What is DIFFERENT from the primary, and why each difference exists:
+ *
+ *   - It does NOT build the page tables. They already exist, in .bss, built by
+ *     core 0 before it ever called PSCI. Building them again would be a race
+ *     against every core already using them.
+ *   - It does NOT zero .bss, for the same reason and a worse one: .bss now
+ *     holds the entire running kernel's state.
+ *   - It gets its OWN STACK, from the table core 0 filled in before starting
+ *     it. Sharing __stack_top would have two cores writing the same frames,
+ *     which is not a subtle failure but is a confusing one.
+ *   - x0 on entry is the CONTEXT ID PSCI was given: this core's index. It is
+ *     the only thing distinguishing one secondary from another this early,
+ *     because MPIDR needs decoding and the index is what the C side wants.
+ * ==========================================================================*/
+    .globl secondary_entry
+secondary_entry:
+    mov     x20, x0                     /* the CPU index, across all of this */
+
+    /* Same EL2 drop as the primary, and dead code for the same reason: QEMU's
+     * PSCI starts a secondary at the EL of the caller, and we call from EL1.
+     * It is here so `-M virt,virtualization=on` does not silently start every
+     * secondary in a state where system-register writes go to the EL2 alias. */
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.ne    sec_at_el1
+
+    mov     x1, #(1 << 31)
+    msr     hcr_el2, x1
+    ldr     x1, =0x30d00800
+    msr     sctlr_el1, x1
+    mrs     x1, cnthctl_el2
+    orr     x1, x1, #3
+    msr     cnthctl_el2, x1
+    msr     cntvoff_el2, xzr
+    mov     x1, #0x3c5
+    msr     spsr_el2, x1
+    adr     x1, sec_at_el1
+    msr     elr_el2, x1
+    eret
+
+sec_at_el1:
+    /* FP/SIMD usable, exactly as the primary sets it: EL0 code on THIS core
+     * needs it just as much, and CPACR_EL1 is per-core state. */
+    mov     x1, #(3 << 20)
+    msr     cpacr_el1, x1
+    isb
+
+    /* This core's stack, from the table core 0 filled in before starting it.
+     *
+     * PHYS_OF reaches the TABLE physically (adrp/add is PC-relative, and the PC
+     * is physical here). The VALUE in it is a kernel-window virtual address --
+     * that is what the allocator handed out -- so it is converted down by the
+     * kernel virtual base, which is the one constant this needs and the same
+     * one the linker script and KV2P() use. */
+    PHYS_OF x1, smp_stack_top
+    ldr     x2, [x1, x20, lsl #3]
+    ldr     x3, =KERNEL_VIRT_BASE
+    sub     x2, x2, x3
+    mov     sp, x2
+
+    bl      enable_mmu                  /* the tables are already built */
+
+    ldr     x0, =sec_mmu_on
+    br      x0
+
+sec_mmu_on:
+    /* Virtual from here. Re-point the stack at the kernel window's alias of
+     * the same memory, for the reason the primary does: the physical alias
+     * dies the moment TTBR0 belongs to a user process. */
+    ldr     x1, =smp_stack_top
+    ldr     x2, [x1, x20, lsl #3]
+    mov     sp, x2                      /* already the virtual address */
+
+    mov     x29, xzr
+    mov     x30, xzr
+
+    mov     x0, x20
+    bl      smp_secondary_main
+
+    /* Not expected to return; park rather than execute whatever follows. */
 park:
     wfe
     b       park

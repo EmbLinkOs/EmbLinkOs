@@ -24,6 +24,7 @@
 #include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
 #include "drivers/input/keyboard.h"
+#include "arch/aarch64/smp/smp.h"
 #include "include/arch_irq.h"
 #include "include/kmalloc.h"
 #include "include/kprintf.h"
@@ -688,6 +689,12 @@ void arch_early_main(uint64_t dtb_phys) {
         mouse_init(fbi ? fbi->width : 1024, fbi ? fbi->height : 768);
         virtio_input_init();
     }
+
+    /* --- A9: the other cores -------------------------------------------------
+     * After the GIC, the timer and the scheduler, and before userland: a
+     * secondary needs all three to exist before it can join, and the work it
+     * then picks up is user work. */
+    smp_bringup();
 
     kprintf("\n--- userland (A6) ---\n");
     {

@@ -42,6 +42,12 @@ static inline uint32_t gic_intid(uint32_t type, uint32_t num) {
  * the caller must not enable interrupts. */
 int gic_init(void);
 
+/* The per-core half: this core's redistributor and its ICC_* CPU interface.
+ * gic_init() calls it for core 0; every secondary calls it for itself, because
+ * every register involved is either in that core's own redistributor frame or
+ * is a banked system register. Returns 0 on success. */
+int gic_init_this_cpu(void);
+
 /* Handlers take the INTID so one function can serve several lines. */
 typedef void (*gic_handler_t)(uint32_t intid);
 

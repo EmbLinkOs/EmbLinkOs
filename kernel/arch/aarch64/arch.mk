@@ -37,6 +37,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/irq/exception.c \
                kernel/arch/aarch64/irq/gicv3.c \
                kernel/arch/aarch64/sched/bringup.c \
+               kernel/arch/aarch64/smp/smp.c \
                kernel/arch/aarch64/drivers/timer_generic.c \
                kernel/arch/aarch64/drivers/pci_ecam.c \
                kernel/arch/aarch64/drivers/pl031.c \
@@ -544,6 +545,12 @@ arm64-rootfs: $(ARM_ROOTFS)
 ARM_MACHINE ?= virt,gic-version=3
 ARM_MEM     ?= 512M
 
+# FOUR CORES BY DEFAULT (A9). Not a demo setting: SMP is where the locking is
+# either right or silently wrong, and a kernel only ever exercised on one core
+# is one where every missing lock passes. Override with ARM_SMP=1 to reproduce
+# a single-core failure.
+ARM_SMP     ?= 4
+
 # WHICH ACCELERATOR, and why it is a per-HOST default rather than a fixed one.
 #
 # On Apple Silicon an aarch64 guest can run on aarch64 hardware: -accel hvf,
@@ -582,8 +589,8 @@ ARM_CPU_hvf ?= host
 # the arm64 Image header, and only the Image header makes QEMU hand us the
 # device tree pointer in x0 -- see the long note at the top of boot.S. The ELF
 # is still what you point gdb at: same addresses, plus symbols.
-ARM_QEMU_hvf = qemu-system-aarch64 -M $(ARM_MACHINE),accel=hvf -cpu $(ARM_CPU_hvf) -m $(ARM_MEM)
-ARM_QEMU_tcg = qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU_tcg) -m $(ARM_MEM)
+ARM_QEMU_hvf = qemu-system-aarch64 -M $(ARM_MACHINE),accel=hvf -cpu $(ARM_CPU_hvf) -smp $(ARM_SMP) -m $(ARM_MEM)
+ARM_QEMU_tcg = qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU_tcg) -smp $(ARM_SMP) -m $(ARM_MEM)
 
 # The root filesystem is attached on every run target: without a disk there is
 # no /system/bin/hello.elf, so the kernel reaches A6 and has nothing to run.
@@ -714,6 +721,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'is a keyboard'                  A7 'virtio-input found no keyboard'; \
 	  chk 'is a tablet'                    A7 'virtio-input found no pointer'; \
 	  chk 'statusq (LEDs)'                 A7 'the keyboard has no status queue -- the lock LEDs cannot work'; \
+	  chk 'PSCI via'                       A9 'no PSCI conduit found in the device tree'; \
+	  chk "$(ARM_SMP) of $(ARM_SMP) core(s) online" A9 'not every secondary core came up'; \
 	  keyn=$$(sed -n 's/.*virtio-input: \([0-9][0-9]*\) key event.*/\1/p' $$log | tail -1); \
 	  ptrn=$$(sed -n 's/.*virtio-input: [0-9][0-9]* key event(s), \([0-9][0-9]*\) pointer.*/\1/p' $$log | tail -1); \
 	  [ -n "$$keyn" ] && [ "$$keyn" -gt 0 ] 2>/dev/null || \
@@ -749,6 +758,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "     dynamically linked against libembk.so"; \
 	  echo "  A7 virtio-gpu 1280x800, the compositor presenting a frame"; \
 	  echo "  A7 virtio-input: keyboard + tablet, events injected and RECEIVED"; \
+	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
+	  echo "     own GIC redistributor and timer, all reporting in themselves"; \
 	else exit 1; fi
 
 # The USERLAND libc is probed the way the x86 check-tools does it: by actually
