@@ -15,6 +15,30 @@
 #define VMM_GLOBAL        (1ULL << 8)
 #define VMM_NX            (1ULL << 63)
 
+/* VMM_EXEC -- "code will run here", asked for POSITIVELY.
+ *
+ * Every flag above is an x86 page-table BIT POSITION wearing an interface
+ * name, and VMM_NX is the one that does not survive the trip to a second
+ * architecture: it is INVERTED (absent means executable), so a caller that
+ * asks for a writable page and says nothing about execution gets a writable,
+ * EXECUTABLE page. On x86 that is the hardware's own default and the reason
+ * the kernel heap is W+X today. aarch64's page tables spell the same
+ * permission the other way round (UXN/PXN set means "no execute", and the
+ * aarch64 mapper sets them unless told otherwise), so "say nothing" means the
+ * OPPOSITE there -- and a user text segment mapped by the SHARED ELF loader
+ * came out non-executable, faulting on the program's first instruction.
+ *
+ * Bit 9 is one of the three positions x86-64 leaves available to software, so
+ * setting it costs the x86 path nothing: the hardware ignores it, and that
+ * path keeps deciding execution from VMM_NX exactly as before. aarch64 reads
+ * it and clears UXN. Both architectures now get the same answer to the same
+ * question, and the question is asked in the direction a permission reads.
+ *
+ * docs/TODO.md asked for this ("name the flags for what they mean and make
+ * execute opt-in"). This is the opt-in half; renaming the rest is still open.
+ */
+#define VMM_EXEC          (1ULL << 9)
+
 // Address mask for physical addresses in page table entries
 #define VMM_ADDR_MASK 0x0000fffffffff000ULL
 

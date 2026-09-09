@@ -72,11 +72,6 @@ exc_common:
     stp     x28, x29, [sp, #16 * 14]
     str     x30,      [sp, #F_X30]
 
-    /* The SP the exception interrupted, which is what a stack trace needs --
-     * not the one we are standing on now. */
-    add     x2, sp, #FRAME_SIZE
-    str     x2, [sp, #F_SP]
-
     /* Snapshot the syndrome registers into the frame. They must be read before
      * anything can take a nested exception and overwrite them, which is why
      * this happens here and not in C. */
@@ -87,6 +82,32 @@ exc_common:
     mrs     x3, far_el1
     stp     x2, x3, [sp, #F_ESR]
 
+    /* The SP the exception interrupted -- and WHICH REGISTER that is depends on
+     * where the exception came from. From EL1 it is the stack we are standing
+     * on, so the interrupted value is our SP plus the frame we just cut. From
+     * EL0 it is SP_EL0, an ENTIRELY DIFFERENT REGISTER that the exception did
+     * not touch.
+     *
+     * Saving it is not merely so a fault report prints the right number. SP_EL0
+     * is per-thread user state and NOTHING ELSE PRESERVES IT: the scheduler
+     * switches kernel contexts (kcontext.S saves x19-x28/SP_EL1/LR/DAIF), and
+     * SP_EL0 is in none of them. Without this, preempting a thread at EL0,
+     * running another thread of the same process, and returning leaves the
+     * FIRST thread running on the SECOND one's stack -- which is what happened:
+     * hello.elf's main() returned onto a joined thread's freed stack and took a
+     * translation fault in its own epilogue, five instructions from a clean
+     * exit. x86 never has this bug because the user RSP rides in the iretq
+     * frame the hardware itself builds.
+     *
+     * SPSR.M[3:0] == 0 is EL0t; EL1t/EL1h are 0b0100/0b0101. x3 still holds the
+     * SPSR read just above. */
+    and     x2, x3, #0xF
+    cbnz    x2, 1f
+    mrs     x2, sp_el0
+    b       2f
+1:  add     x2, sp, #FRAME_SIZE
+2:  str     x2, [sp, #F_SP]
+
     mov     x1, sp
     bl      aarch64_exception
 
@@ -96,6 +117,19 @@ exc_common:
     ldp     x0, x1, [sp, #F_ELR]
     msr     elr_el1, x0
     msr     spsr_el1, x1
+
+    /* Restore SP_EL0 when we are returning to EL0 -- the other half of the save
+     * above, and the reason a preempted user thread comes back to its OWN
+     * stack. Reloaded from the frame rather than simply left alone, so it
+     * survives having been switched away from; a handler that rewrites the
+     * frame's sp redirects the user stack, exactly as rewriting elr redirects
+     * execution. Skipped entirely when returning to EL1, where SP_EL0 is not
+     * the stack in use and writing it would be meaningless. */
+    and     x0, x1, #0xF
+    cbnz    x0, 3f
+    ldr     x0, [sp, #F_SP]
+    msr     sp_el0, x0
+3:
 
     ldp     x0,  x1,  [sp, #16 * 0]
     ldp     x2,  x3,  [sp, #16 * 1]

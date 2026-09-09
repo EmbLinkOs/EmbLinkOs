@@ -125,12 +125,29 @@
                                        * surface (the launcher) is up, and drop
                                        * it back to the ground when it closes */
 
-/* The raw int-0x80 register convention (mirrors kernel/cpu/syscall_entry.asm
- * + struct regs): number in rax, args in rdi, rsi, rdx, r10, r8; result back
- * in rax. r10/r8 (not rcx/r9) for args 4/5 -- rcx and r11 are clobbered by
- * the syscall-entry path, exactly like the Linux x86-64 int-0x80/syscall
- * convention this deliberately echoes. Every wrapper returns int64_t so the
- * kernel's negative -EMBK_* error codes survive sign-extension intact. */
+/* --- the raw trap, once per architecture ---------------------------------
+ *
+ * Everything ABOVE this line is machine-independent: the syscall NUMBERS are
+ * the contract, and they are the same on both architectures. Only the
+ * instruction that carries them into the kernel differs, so only these seven
+ * wrappers are written twice. Every one returns int64_t so the kernel's
+ * negative -EMBK_* error codes survive sign-extension intact.
+ *
+ *              | x86_64                      | aarch64
+ *   trap       | int $0x80                   | svc #0
+ *   number     | rax                         | x8
+ *   args 1..6  | rdi rsi rdx r10 r8 r9       | x0 x1 x2 x3 x4 x5
+ *   result     | rax                         | x0
+ *
+ * The kernel halves these mirror are kernel/arch/x86_64/syscall/syscall.c and
+ * kernel/arch/aarch64/syscall/syscall.c, which both fill the same struct
+ * sysargs -- so the 95 handlers never learn which of these ran. */
+
+#if defined(__x86_64__)
+
+/* r10/r8 (not rcx/r9) for args 4/5 -- rcx and r11 are clobbered by the
+ * syscall-entry path, exactly like the Linux x86-64 int-0x80/syscall
+ * convention this deliberately echoes. */
 
 static inline int64_t embk_syscall0(int64_t n) {
     int64_t ret;
@@ -234,6 +251,99 @@ static inline int64_t embk_syscall5(int64_t n, int64_t a1, int64_t a2, int64_t a
 }
 
 #endif /* __TINYC__ */
+
+#elif defined(__aarch64__)
+
+/* aarch64 -- ARM64.md phase A6.
+ *
+ * x8 carries the number so all six argument registers stay free, which is the
+ * choice Linux/aarch64 makes and a small improvement on x86, where rax is both
+ * the number IN and the result OUT.
+ *
+ * x0 is an in-out operand ("+r") for every arity above zero: it is argument 1
+ * on the way in and the result on the way out, and tying them is what stops
+ * the compiler from putting the argument somewhere it would be overwritten.
+ *
+ * "memory" and nothing else. The kernel's vector epilogue restores the ENTIRE
+ * saved frame (x0..x30) and PSTATE from SPSR_EL1, so no register and no
+ * condition flag is clobbered across the trap -- x0 is written back
+ * deliberately, and it is already named as an output. There is no __TINYC__
+ * branch here because tcc is the ON-OS compiler and the on-OS compiler is
+ * x86-only; when an aarch64 tcc exists, this is where its branch goes. */
+
+static inline int64_t embk_syscall0(int64_t n) {
+    register int64_t x8 __asm__("x8") = n;
+    register int64_t x0 __asm__("x0");
+    __asm__ volatile ("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline int64_t embk_syscall1(int64_t n, int64_t a1) {
+    register int64_t x8 __asm__("x8") = n;
+    register int64_t x0 __asm__("x0") = a1;
+    __asm__ volatile ("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline int64_t embk_syscall2(int64_t n, int64_t a1, int64_t a2) {
+    register int64_t x8 __asm__("x8") = n;
+    register int64_t x0 __asm__("x0") = a1;
+    register int64_t x1 __asm__("x1") = a2;
+    __asm__ volatile ("svc #0" : "+r"(x0) : "r"(x8), "r"(x1) : "memory");
+    return x0;
+}
+
+static inline int64_t embk_syscall3(int64_t n, int64_t a1, int64_t a2, int64_t a3) {
+    register int64_t x8 __asm__("x8") = n;
+    register int64_t x0 __asm__("x0") = a1;
+    register int64_t x1 __asm__("x1") = a2;
+    register int64_t x2 __asm__("x2") = a3;
+    __asm__ volatile ("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;
+}
+
+static inline int64_t embk_syscall4(int64_t n, int64_t a1, int64_t a2, int64_t a3,
+                                     int64_t a4) {
+    register int64_t x8 __asm__("x8") = n;
+    register int64_t x0 __asm__("x0") = a1;
+    register int64_t x1 __asm__("x1") = a2;
+    register int64_t x2 __asm__("x2") = a3;
+    register int64_t x3 __asm__("x3") = a4;
+    __asm__ volatile ("svc #0" : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3) : "memory");
+    return x0;
+}
+
+static inline int64_t embk_syscall5(int64_t n, int64_t a1, int64_t a2, int64_t a3,
+                                     int64_t a4, int64_t a5) {
+    register int64_t x8 __asm__("x8") = n;
+    register int64_t x0 __asm__("x0") = a1;
+    register int64_t x1 __asm__("x1") = a2;
+    register int64_t x2 __asm__("x2") = a3;
+    register int64_t x3 __asm__("x3") = a4;
+    register int64_t x4 __asm__("x4") = a5;
+    __asm__ volatile ("svc #0" : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4) : "memory");
+    return x0;
+}
+
+static inline int64_t embk_syscall6(int64_t n, int64_t a1, int64_t a2, int64_t a3,
+                                     int64_t a4, int64_t a5, int64_t a6) {
+    register int64_t x8 __asm__("x8") = n;
+    register int64_t x0 __asm__("x0") = a1;
+    register int64_t x1 __asm__("x1") = a2;
+    register int64_t x2 __asm__("x2") = a3;
+    register int64_t x3 __asm__("x3") = a4;
+    register int64_t x4 __asm__("x4") = a5;
+    register int64_t x5 __asm__("x5") = a6;
+    __asm__ volatile ("svc #0" : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5) : "memory");
+    return x0;
+}
+
+#else
+#error "embk_syscall.h: no system-call convention known for this architecture"
+#endif
 
 /* The kernel returns a small negative value (-EMBK_*, all < 4096 in
  * magnitude) on failure and a normal value (fd, byte count, address, pid,

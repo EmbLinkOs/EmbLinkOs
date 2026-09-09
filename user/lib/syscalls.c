@@ -1033,6 +1033,18 @@ void *sbrk(ptrdiff_t incr) {
  * Implemented on RDRAND: the CPU's on-die entropy source, an UNPRIVILEGED
  * instruction, so this needs no syscall at all.
  *
+ * ON AARCH64 THERE IS NO SUCH INSTRUCTION WE CAN REACH, and this returns
+ * ENOSYS. The architectural equivalent is FEAT_RNG's RNDR (ARMv8.5), which is
+ * readable at EL0 -- but only when it is implemented, and the feature bit that
+ * says so lives in ID_AA64ISAR0_EL1, which EL0 may NOT read: an MRS of an ID
+ * register from EL0 traps to EL1, and this kernel does not emulate those the
+ * way Linux does. So there is no way to ASK before executing, and executing
+ * RNDR on a part without it is simply UNDEFINED -- the probe would be a dead
+ * process. QEMU's cortex-a72 does not implement it either way.
+ * Two ways out, neither of them a userland change, both recorded in
+ * docs/TODO.md: emulate the ID registers for EL0, or give the kernel an
+ * entropy syscall and let it be the one to read RNDR at EL1.
+ *
  * DELIBERATELY FAILS (ENOSYS) rather than substituting uptime/pid mixing when
  * RDRAND is absent. getentropy is a SECURITY primitive -- its whole contract
  * is unpredictable bytes. A plausible-looking fallback built from a clock is
@@ -1040,6 +1052,7 @@ void *sbrk(ptrdiff_t incr) {
  * crypto with attacker-predictable state. A caller that gets -1 can decide;
  * one that gets fake entropy cannot. If a soft RNG is ever wanted, it must be
  * a differently-named function nobody mistakes for this one. */
+#if defined(__x86_64__)
 static int cpu_has_rdrand(void) {
     uint32_t eax, ebx, ecx, edx;
     __asm__ volatile("cpuid"
@@ -1060,6 +1073,7 @@ static int rdrand64(uint64_t *out) {
     }
     return 0;
 }
+#endif /* __x86_64__ */
 
 int getentropy(void *buf, size_t len) {
     if (len > 256) {          /* the documented cap; POSIX/OpenBSD agree */
@@ -1070,6 +1084,7 @@ int getentropy(void *buf, size_t len) {
         errno = EFAULT;
         return -1;
     }
+#if defined(__x86_64__)
     if (!cpu_has_rdrand()) {
         errno = ENOSYS;       /* honest: we have no entropy source */
         return -1;
@@ -1089,6 +1104,14 @@ int getentropy(void *buf, size_t len) {
         done += n;
     }
     return 0;
+#else
+    /* No reachable entropy source on this architecture -- see the note above.
+     * The SAME refusal the x86 path makes when RDRAND is absent, for the same
+     * reason: a caller that gets -1 can decide what to do, a caller handed
+     * predictable bytes cannot. */
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 
 /* ------------------------------------------------------------------ */

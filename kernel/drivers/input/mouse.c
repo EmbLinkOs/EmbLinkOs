@@ -5,8 +5,15 @@
  * a button bitmask that ring-3 polls via sys_ui_input. */
 
 #include "drivers/input/mouse.h"
+/* Same split as keyboard.c: the PS/2 aux-device driver is x86, the CURSOR STATE
+ * (position, clamp, buttons, wheel) is shared. mouse_set_absolute() below was
+ * already the arch-neutral way in -- it was written for a USB tablet -- and
+ * virtio-input's tablet uses it unchanged, which is why this file needed no new
+ * entry point the way keyboard.c did. */
+#if defined(__x86_64__)
 #include "arch/x86_64/irq/irq.h"
 #include "include/io.h"
+#endif
 #include "drivers/char/serial.h"
 
 #define PS2_DATA   0x60
@@ -48,6 +55,7 @@ int32_t mouse_take_wheel(void) {
 }
 
 /* controller handshake helpers (bounded spins so a wedged 8042 can't hang) */
+#if defined(__x86_64__)
 static void ps2_wait_write(void) { for (int i = 0; i < 100000; i++) if (!(inb(PS2_STATUS) & PS2_ST_INPUT_FULL)) return; }
 static void ps2_wait_read(void)  { for (int i = 0; i < 100000; i++) if (  inb(PS2_STATUS) & PS2_ST_OUTPUT_FULL) return; }
 
@@ -73,7 +81,10 @@ static void apply_motion(void) {
     g_buttons = g_pkt[0] & (PKT_LEFT | PKT_RIGHT | PKT_MIDDLE);
 }
 
-/* Absolute pointer update (USB tablet): map [0,range] -> screen and set the
+#endif /* __x86_64__ */
+
+/* Absolute pointer update (USB tablet, virtio-input tablet): map [0,range] ->
+ * screen and set
  * cursor directly. Same clamped g_x/g_y the compositor reads; whichever device
  * (PS/2 or tablet) produces events wins. Aligned 32-bit stores are atomic on
  * x86, so this races harmlessly with the IRQ12 PS/2 writer. */
@@ -89,6 +100,7 @@ void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
     if (wheel) g_wheel += wheel;
 }
 
+#if defined(__x86_64__)
 static void mouse_handler(void) {
     /* On IRQ12 the pending byte is mouse data; read it directly. (Some 8042
      * emulations don't set the AUX status bit reliably, so we don't gate on it.) */
@@ -118,11 +130,21 @@ static void mouse_handler(void) {
     }
 }
 
+#endif /* __x86_64__ */
+
 void mouse_init(uint32_t screen_w, uint32_t screen_h) {
     serial_write_string("\n=== Mouse init ===\n");
     g_w = (int32_t)screen_w; g_h = (int32_t)screen_h;
     g_x = g_w / 2; g_y = g_h / 2;
     g_cycle = 0; g_buttons = 0;
+
+#if !defined(__x86_64__)
+    /* The clamp bounds and the centred cursor ARE the whole of mouse_init()
+     * where there is no PS/2 controller to bring up. Everything below this
+     * point talks to the 8042. */
+    serial_write_string("Mouse: no PS/2 controller here; virtio-input drives the cursor\n");
+    return;
+#else
 
     /* enable the auxiliary (mouse) device */
     ps2_wait_write(); outb(PS2_CMD, 0xA8);
@@ -152,4 +174,5 @@ void mouse_init(uint32_t screen_w, uint32_t screen_h) {
 
     irq_register(12, mouse_handler);
     serial_write_string("Mouse registered on IRQ 12\n");
+#endif /* __x86_64__ */
 }

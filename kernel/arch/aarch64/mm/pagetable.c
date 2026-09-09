@@ -406,8 +406,9 @@ int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
         f |= PT_USER;
     if (flags & (VMM_NOCACHE | VMM_WRITETHROUGH))
         f |= PT_DEVICE;
+    if (flags & VMM_EXEC)
+        f |= PT_EXEC;
 
-    /* No PT_EXEC: see the note above. */
     return vm_map_page(virt, phys, f) == PT_OK ? 0 : -1;
 }
 
@@ -514,10 +515,11 @@ int vmm_map_in(uint64_t root_phys, uint64_t virt, uint64_t phys, uint64_t flags)
     if (flags & VMM_WRITABLE) f |= PT_WRITE;
     if (flags & VMM_USER)     f |= PT_USER;
     if (flags & (VMM_NOCACHE | VMM_WRITETHROUGH)) f |= PT_DEVICE;
-    /* VMM_NX is inverted on x86 (absent means executable) and this deliberately
-     * does not reproduce that -- see the note on vmm_map above. A user mapping
-     * that must run code has to say so, and vmm.h cannot yet. Until it can,
-     * user TEXT is mapped through vm_map_page() with PT_EXEC directly. */
+    /* VMM_EXEC is how a caller says "code runs here" -- vmm.h now has the word,
+     * and the shared ELF loader uses it for every PF_X segment. Absent, the
+     * mapping stays non-executable, which is what makes the user stack, heap
+     * and data segments W^X here without anyone asking. */
+    if (flags & VMM_EXEC) f |= PT_EXEC;
     return vm_map_page_in(root_phys, virt, phys, f) == PT_OK ? 0 : -1;
 }
 

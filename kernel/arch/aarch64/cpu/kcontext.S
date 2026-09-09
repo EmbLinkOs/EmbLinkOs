@@ -175,8 +175,17 @@ aarch64_eret_to_el0:
     msr     spsr_el1, xzr
 
     /* The three user arguments arrive in x2/x3/x4 and must LEAVE in x0/x1/x2,
-     * which overlaps -- so they are parked in registers the zeroing loop below
-     * has not reached yet before anything is overwritten. */
+     * which overlaps -- so they are parked in x9/x10/x11 before anything is
+     * overwritten, and moved into place after the zeroing below.
+     *
+     * x9/x10/x11 are therefore DELIBERATELY ABSENT from the zeroing sequence
+     * that follows: they are zeroed at the very end, after the transfer. An
+     * earlier version zeroed them in the sequence with the rest -- the comment
+     * claimed the loop "has not reached them yet" and it plainly had -- so the
+     * transfer moved three zeroes into x0/x1/x2 and EVERY process started with
+     * argc = 0, argv = NULL, envp = NULL. It looked like a loader bug (the
+     * program ran fine, it just had no arguments) and it was three lines here.
+     * Nothing caught it earlier because the A5 EL0 probe took no arguments. */
     mov     x9,  x2
     mov     x10, x3
     mov     x11, x4
@@ -190,9 +199,7 @@ aarch64_eret_to_el0:
     mov     x6,  xzr
     mov     x7,  xzr
     mov     x8,  xzr
-    mov     x9,  xzr
-    mov     x10, xzr
-    mov     x11, xzr
+    /* x9/x10/x11 hold the arguments -- zeroed after the transfer below. */
     mov     x12, xzr
     mov     x13, xzr
     mov     x14, xzr

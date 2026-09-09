@@ -1,7 +1,18 @@
 #include "drivers/input/keyboard.h"
+/* PS/2 is an x86 device, and this file is now TWO things: the PS/2 controller
+ * driver, and the keyboard POLICY every input source shares -- the char ring,
+ * the key-event ring, modifier tracking, layouts, the Ctrl-C route and the
+ * grab. Only the first half is x86, and only the first half is behind the
+ * guards below. ARM64.md §2.6 said virtio-input "replaces" the PS/2 keyboard;
+ * it replaces the HARDWARE half, and duplicating the other 300 lines to say so
+ * would have been the real mistake -- two ring buffers, two grab rules, two
+ * places for a stuck-modifier bug to live. See keyboard_inject_event(). */
+#if defined(__x86_64__)
 #include "arch/x86_64/irq/irq.h"
 #include "include/io.h"
+#endif
 #include "drivers/char/serial.h"
+#include "include/arch_irq.h"   /* arch_cpu_idle() -- see keyboard_getchar() */
 #include "process/process.h"
 #include "include/errno.h"
 
@@ -200,6 +211,7 @@ static void lock_toggle(uint8_t ekm, uint16_t code, int pressed)
     kbd_event_push(code, pressed);
 }
 
+#if defined(__x86_64__)
 static void keyboard_handler(void) {
     uint8_t sc = inb(KBD_DATA_PORT);
     static int extended = 0;     /* the previous byte was the 0xE0 prefix */
@@ -415,6 +427,64 @@ void keyboard_init(void) {
     serial_write_string("Keyboard registered on IRQ 1\n");
 }
 
+#else  /* !__x86_64__ ---------------------------------------------------------
+ * No PS/2 controller, so no scancode decode, no IRQ1 and no LED command. The
+ * POLICY above is untouched and fully live; it is fed by keyboard_inject_event()
+ * instead of by an interrupt.
+ *
+ * The LEDs are the one visible loss, and it is a real one rather than a stub:
+ * virtio-input has a status queue that can drive them, and nothing here uses it
+ * yet (docs/TODO.md). Caps Lock still LATCHES correctly -- g_mods flips and
+ * every consumer sees it -- the user just gets no light for it. */
+static void kbd_set_leds(void) { }
+
+void keyboard_init(void) {
+    g_mods = 0;
+}
+#endif /* __x86_64__ */
+
+/* ---- the injection seam --------------------------------------------------
+ * ONE decoded key, from whatever hardware decoded it, into the two streams.
+ *
+ * This is what makes a second keyboard driver a translation table rather than a
+ * second keyboard driver. virtio-input (arch/aarch64/drivers/virtio_input.c)
+ * turns Linux evdev codes into EKC_* / ASCII and calls this; the PS/2 handler
+ * above reaches the same rings by the same rules, and USB HID's
+ * keyboard_inject_char() is the char-only special case of it.
+ *
+ * `ascii` is 0 for a key with no character (F5, the arrows already carry their
+ * EK_* through it, a modifier). It is delivered only on the MAKE: a key
+ * RELEASE has never produced a character on any of these paths, and emitting
+ * one would double every keystroke. */
+void keyboard_inject_event(uint16_t code, int pressed, char ascii) {
+    switch (code) {
+    case EKC_LSHIFT: mod_update(SIDE_LSHIFT, SIDE_LSHIFT | SIDE_RSHIFT,
+                                EKM_SHIFT, code, pressed); return;
+    case EKC_RSHIFT: mod_update(SIDE_RSHIFT, SIDE_LSHIFT | SIDE_RSHIFT,
+                                EKM_SHIFT, code, pressed); return;
+    case EKC_LCTRL:  mod_update(SIDE_LCTRL,  SIDE_LCTRL  | SIDE_RCTRL,
+                                EKM_CTRL,  code, pressed); return;
+    case EKC_RCTRL:  mod_update(SIDE_RCTRL,  SIDE_LCTRL  | SIDE_RCTRL,
+                                EKM_CTRL,  code, pressed); return;
+    case EKC_LALT:   mod_update(SIDE_LALT,   SIDE_LALT   | SIDE_RALT,
+                                EKM_ALT,   code, pressed); return;
+    case EKC_RALT:   mod_update(SIDE_RALT,   SIDE_LALT   | SIDE_RALT,
+                                EKM_ALT,   code, pressed); return;
+    case EKC_LWIN:   mod_update(SIDE_LGUI,   SIDE_LGUI   | SIDE_RGUI,
+                                EKM_GUI,   code, pressed); return;
+    case EKC_RWIN:   mod_update(SIDE_RGUI,   SIDE_LGUI   | SIDE_RGUI,
+                                EKM_GUI,   code, pressed); return;
+    case EKC_CAPS:   lock_toggle(EKM_CAPS,   code, pressed); return;
+    case EKC_NUM:    lock_toggle(EKM_NUM,    code, pressed); return;
+    case EKC_SCROLL: lock_toggle(EKM_SCROLL, code, pressed); return;
+    default: break;
+    }
+
+    kbd_event_push(code, pressed);
+    if (pressed && ascii)
+        keyboard_deliver(ascii);
+}
+
 /* --- layouts -------------------------------------------------------------- */
 static const struct keymap g_layouts[] = {
     { "us",     scan_to_ascii,        scan_to_ascii_shift        },
@@ -446,7 +516,11 @@ char keyboard_getchar(void) {
     char c;
     // spin until a character is available in the buffer
     while (!buffer_pop(&c)) {
-        __asm__ volatile ("hlt"); // No character available, halt until next interrupt
+        /* Idle until the next interrupt. Through the HAL rather than a bare
+         * `hlt`: the instruction is x86's spelling (aarch64's is `wfi`), and
+         * this file is compiled for both now. docs/TODO.md asked for exactly
+         * this conversion, "as part of making its file build". */
+        arch_cpu_idle();
     }
     
     return c;

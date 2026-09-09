@@ -147,6 +147,14 @@ int keyboard_getchar_blocking_cancelable(char *out);
 // Inject a character into the keyboard buffer (used by USB HID driver).
 void keyboard_inject_char(char c);
 
+/* Deliver one DECODED key from any hardware -- the seam every input driver that
+ * is not PS/2 comes in through (virtio-input today, and where USB HID belongs).
+ * `code` is an unshifted ASCII or an EKC_*; `ascii` is the character the key
+ * produces, or 0 for keys that produce none, and is delivered only on a make.
+ * Modifiers and locks are recognised by their EKC_* and update the live
+ * modifier bitmap, so a caller never has to track Shift itself. */
+void keyboard_inject_event(uint16_t code, int pressed, char ascii);
+
 // Keyboard grab: while grabbed, the kernel shell stops draining the buffer so a
 // ring-3 UI app has exclusive keystrokes. Auto-released when the grabber exits.
 void keyboard_set_grab(int grab, uint32_t pid);

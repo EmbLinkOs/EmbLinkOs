@@ -5,7 +5,7 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A7. The real kernel runs on ARM and mounts the real filesystem.**
+**Status: A0–A7 COMPLETE. The desktop runs on ARM.**
 
 **The whole shared kernel links and runs on aarch64** — the real scheduler, the
 real 95-handler syscall table, EMBKFS, the VFS, IPC, the compositor and the
@@ -24,6 +24,30 @@ VFS: mounted fs at "/" (root ino 1)
 That image was built by the x86 toolchain and never touched. The B-tree walk,
 the directory lookup, the extent map, the block layer, virtio-blk, PCI and ECAM
 all agree with it.
+
+**And it now RUNS a program out of that filesystem.** `hello.elf` is an ordinary
+newlib binary -- the same `user/lib/crt0.c`, the same `user/lib/syscalls.c`, the
+same `user/lib/newlib.ld` the x86 userland uses, compiled for a second machine:
+
+```
+--- userland (A6) ---
+  [ ok ] /system/bin/hello.elf launched as pid 2
+hello from newlib! argc=1 argv0=/system/bin/hello.elf
+malloc/free of 4096 bytes (0xdeadbeefcafe): OK
+snprintf: OK ("42-beef-ok")
+time() = 1788962341 (plausible wall clock)
+  [embk thread] running as a native thread of the newlib process
+embk thread create/join: OK (tid=2)
+hello: 5/5 checks passed
+[syscall] exit code=0x0000000000000005
+  [ ok ] hello.elf exited with 5 (checks passed)
+```
+
+Every line there is a different subsystem answering: `printf` through `_write`
+to the PL011, `malloc` through `_sbrk`, `%zu` proving the C99-formats libc,
+`time()` through the PL031, a **second EL0 thread** created and joined, and an
+exit status that carries a value back. `make ARCH=aarch64 test-arm64-boot`
+asserts all of it, under **both** HVF and TCG.
  An aarch64 kernel builds, boots on QEMU `virt`, decodes
 its own faults, runs in the higher half with the MMU on — page tables built in
 assembly before any allocator exists, memory map from the device tree,
@@ -786,11 +810,159 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
   FP instruction is a loud fault; user code cannot be built that way, because a
   stock compiler emits `str q0` to copy a 16-byte struct — so an EL0 program
   that never mentions a float still traps on its first `memcpy`.
-* **A6 ❌ Userland toolchain.** newlib for aarch64, `EM_AARCH64` + the
-  `R_AARCH64_*` relocations mirroring today's `R_X86_64_*` set, `libembk.so`.
-  **Done when:** a dynamically-linked EmUI app loads.
-* **A7 ◐ virtio on ECAM.** PCIe ECAM probe done; drivers next. **Done when:**
-  the compositor presents a frame on `virt`.
+* **A6 ✅ Userland toolchain.** **Done when: a dynamically-linked EmUI app
+  loads.** It does -- `uidemo.elf`, ET_EXEC + PT_DYNAMIC + DT_NEEDED
+  libembk.so, 56 `R_AARCH64_JUMP_SLOT` relocations applied by the kernel acting
+  as its own dynamic loader:
+
+  ```
+  ELF dynlink: /system/lib/libembk.so linked
+    [ ok ] /data/apps/uidemo/uidemo.elf launched as pid 3
+  uidemo: font loaded (+43ms)
+  compositor: shared window 1 created (560x760, 416 pages) for pid 3
+  uidemo: first frame presented (+467ms)
+  ```
+
+  Not one line of `elf.c` was written for it. The two-way link -- the app's
+  imports resolving to the toolkit's exports, and the toolkit's libc imports
+  (`malloc`, `memcpy`, `sinf`) resolving BACK into the app, where newlib was
+  statically pulled in -- is the same code x86 runs, behind the neutral
+  `ELF_RELOC_*` names A4 introduced.
+
+  **The libc was the whole first half, and it was a configuration problem, not a
+  porting one.** `tools/newlib/build-newlib-emblink.sh` builds newlib for either
+  target from one recipe, because two hand-typed sets of configure flags are two
+  things to get subtly wrong -- and they had already diverged in a way nobody
+  chose. newlib's `configure.host` gives `x86_64-elf` and `aarch64-elf`
+  DIFFERENT syscall contracts:
+
+  | | x86_64-elf (default `*)` case) | aarch64-\*-\*(its own case) |
+  |---|---|---|
+  | `syscall_dir` | empty -- libc supplies no syscall layer | `syscalls` -- libc **defines** `write()` |
+  | `MISSING_SYSCALL_NAMES` | defined, so `_write` → `write` | **not** defined, so `_write_r` calls `_write` |
+
+  `user/lib/syscalls.c` defines the bare POSIX names, so against a stock aarch64
+  newlib every one of them is the wrong name: ten `undefined reference to
+  _write`-shaped errors, with libc's own colliding `write()` waiting in the
+  archive behind them. The script patches that one case to match x86 and then
+  **checks the result** (`nm` must show libc asking for `write` and not defining
+  it) rather than trusting the patch took.
+
+  **The ELF loader needed nothing.** `elf.h` already carried `EM_AARCH64` and the
+  `R_AARCH64_*` set behind the neutral `ELF_RELOC_*` names, and `elf.c` was
+  already written against them -- work done during A4/A5 that paid off here as a
+  file that did not have to be opened.
+
+  **What was actually written:** an `svc #0` branch in `embk_syscall.h` (x8 for
+  the number, x0-x5 for arguments -- so all six argument registers stay free,
+  which x86 cannot say); an aarch64 `_start` in `crt0.c`; and variant-I TLS
+  beside x86's variant II, which is the one place the two userlands genuinely
+  disagree --
+
+      x86-64, VARIANT II            aarch64, VARIANT I
+      [ .tdata | .tbss ][ TCB ]     [ TCB ][ .tdata | .tbss ]
+                        ^TP         ^TP
+      addr = TP - align(memsz)+o    addr = TP + align_up(16, a) + o
+
+  -- where the 16 is not a number we chose but `TCB_SIZE` in binutils'
+  `elfNN_aarch64_tpoff_base()`, which is how every TPREL offset in the binary was
+  computed. Reserve "a bit extra for safety" there and every thread-local lands
+  at the wrong address with no fault to show for it.
+
+  **Three bugs the first run found, each invisible until real user code ran:**
+
+  1. **Every process started with `argc = 0`.** `kcontext.S` parked the three
+     user arguments in x9/x10/x11 "in registers the zeroing loop below has not
+     reached yet" -- and the loop plainly had. Three zeroes were moved into
+     x0/x1/x2. Nothing caught it earlier because the A5 EL0 probe took no
+     arguments.
+  2. **User text was mapped non-executable**, so the program faulted on its
+     first instruction fetch -- a permission fault at the entry point, which
+     reads like a loader bug and is a flag bug. `VMM_NX` is INVERTED (absent
+     means executable), so the shared ELF loader saying nothing meant
+     "executable" on x86 and "not executable" here. Fixed as `TODO.md` had
+     already prescribed: a positive `VMM_EXEC`, asked for in the direction a
+     permission reads. It costs x86 nothing -- bit 9 is software-available
+     there, and that path still decides execution from `VMM_NX`.
+  3. **`SP_EL0` was neither saved nor restored across an EL0 exception**, and
+     nothing else preserves it: `kcontext.S` saves x19-x28, SP_EL1, LR and DAIF,
+     and SP_EL0 is in none of them. Preempt a thread at EL0, run another thread
+     of the same process, come back, and the first thread is running on the
+     second one's stack. `hello.elf` took a translation fault in `main`'s own
+     epilogue, five instructions from a clean exit, reading a joined thread's
+     freed stack. **x86 never has this bug** because the user RSP rides in the
+     `iretq` frame the hardware itself builds; aarch64 has to say it. The vector
+     stub now saves SP_EL0 when `SPSR.M[3:0] == 0` and restores it on the way
+     back -- which also makes a user fault report print the USER stack pointer
+     rather than the kernel's.
+
+  **The build system** carries the userland for both targets from one set of
+  rules: `USER_CC`, `NEWLIB_PREFIX`, `NEWLIB_INC/LIB`, `NEWLIB_CFLAGS` and
+  `NEWLIB_LDFLAGS` all derive from `$(USER_TRIPLE)`. The x86 flag lists are
+  written out in full per architecture rather than factored, because factoring
+  would REORDER them and `make -n all` would stop being byte-identical -- which
+  it still is, all 184 recipe lines of it (§2.9). aarch64 objects live under
+  `build/aarch64/user/`, because `build/crt0.o` cannot mean two machines.
+
+  Programs are declared by NAME (`ARM_NEWLIB_PROGS`, `ARM_PLAIN_PROGS`) and get
+  EXPLICIT generated rules, not pattern rules: the top-level `build/%.elf`
+  pattern for EmUI apps matches `build/aarch64/user/hello.elf` with the stem
+  `aarch64/user/hello`, and it won -- the first dry run linked hello.elf against
+  x86 machine code and an aarch64 `libembk.so` it had helpfully just built.
+
+  `tools/embkfs_mkfs/mkfs_arm64.py` packs a minimal root image, reusing the
+  SAME `make_image()`/`build_root_items()` formatter as the x86 image so the
+  on-disk format cannot drift between architectures. It refuses to pack a
+  binary whose `e_machine` is not `EM_AARCH64`, because the two build trees sit
+  side by side and an x86 binary would otherwise get all the way to the
+  kernel's loader before anything noticed.
+* **A7 ✅ virtio on ECAM.** **Done when: the compositor presents a frame on
+  `virt`.** It does, at 1280x800, and there is a keyboard and a pointer to
+  drive it with.
+
+  * **virtio-gpu came up unmodified** -- `gpu_init()`, `fb_init()`,
+    `console_init()` in the order `main.c` uses them, on a driver already in the
+    shared source list. `bochs_gpu_probe()` returns NULL here and always will
+    (§6.5 settled: virtio-gpu only, `virt` has no VGA).
+  * **virtio-input is new, and deliberately NOT a second keyboard driver.**
+    `drivers/input/keyboard.c` was SPLIT: its PS/2 half is behind
+    `#if defined(__x86_64__)`, and its policy half -- the char ring, the
+    key-event ring, modifier tracking, layouts, the Ctrl-C route, the grab -- is
+    now shared and compiled for both machines. The new driver is a translation
+    table from Linux evdev codes into `keyboard_inject_event()`, the seam that
+    split created. The pointer needed less still: `mouse_set_absolute()` already
+    existed for USB tablets, and QEMU's `virtio-tablet-pci` reports ABSOLUTE
+    coordinates, so the guest cursor tracks the host's 1:1 instead of drifting.
+    Both devices are identified by CAPABILITY -- does it report `KEY_ESC`, does
+    it report `ABS_X` -- rather than by the name string, which belongs to QEMU.
+    `absent.c`'s eleven keyboard stubs and two mouse stubs are DELETED, as that
+    file's own warning demands: a leftover definition there would have won at
+    link time and given the machine a working driver and no keyboard.
+  * **`drivers/bus/virtio_pci.c` is the shared transport** `TODO.md` asked for
+    "when a fourth appears, not before". virtio-input was the fourth, so it was
+    written INSTEAD of the fourth copy of the capability walk. The three
+    existing drivers still carry their own and should migrate; folding a
+    refactor of three working drivers into a bring-up would have made any
+    regression ambiguous.
+
+  **Two bugs found by looking at the SCREEN rather than the log:**
+
+  1. **Five PCI devices on four interrupt lines was reported as a FAILURE.** The
+     routing self-test asserted `distinct == routed`, true when this machine had
+     two PCI devices and still true at three. `virt` rotates slots over the FOUR
+     INTx pins, so the expected count is `min(routed, 4)`. The assertion had
+     outgrown its assumption, not the code -- five distinct lines are not
+     available to be wrong about.
+  2. **Input worked for five seconds and then stopped.** The boot path ended in
+     `for (;;) wfi`, which was right when there was nothing to pump and wrong
+     the moment there was a desktop: virtio-input is POLLED, so a kernel that
+     stops calling `virtio_input_poll()` has a keyboard that works for exactly
+     as long as the self-test window. A screenshot taken twelve seconds in
+     showed a cursor sitting where the test had left it, ignoring everything
+     sent since. The boot CPU now runs `main.c`'s loop -- drain input, tick the
+     compositor pointer, advance animation, idle -- for the reasons that file
+     gives, chief among them that all three repaint and so must run in
+     schedulable context, never from an IRQ handler.
 
   `arch/aarch64/drivers/pci_ecam.c`. The bus enumerates and its devices are
   addressable:

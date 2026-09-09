@@ -644,15 +644,42 @@ and says so rather than failing obscurely.
 brew install aarch64-elf-gcc            # macOS
 sudo apt install gcc-aarch64-linux-gnu  # Debian/Ubuntu: see AARCH64_PREFIX below
 
-make ARCH=aarch64 check-tools-arm64     # preflight, same idea as check-tools
+# 2. a libc for the USERLAND. The toolchain above ships NONE -- Homebrew's
+#    aarch64-elf-gcc has no newlib at all -- so this step is not optional if you
+#    want anything to run at EL0. Same script, same options, same source tree as
+#    the x86 libc; only the target argument differs.
+tools/newlib/build-newlib-emblink.sh ~/cross/src/newlib-4.4.0.20231231 aarch64-elf
+#    -> $HOME/cross/newlib-aarch64-c99, which is the Makefile's default for
+#       NEWLIB_PREFIX when ARCH=aarch64. Nothing to set if you use that path.
 
-# 2. build + boot
-make ARCH=aarch64                       # -> build/aarch64/kernel.{elf,img}
+make ARCH=aarch64 check-tools-arm64     # preflight -- probes the libc by
+                                        # COMPILING an #include, so a missing
+                                        # or wrong newlib is caught here
+
+# 3. build + boot
+make ARCH=aarch64                       # -> build/aarch64/kernel.{elf,img},
+                                        #    the userland, and the root image
 make ARCH=aarch64 run-arm64             # serial on stdio; quit with Ctrl-A X
-make ARCH=aarch64 test-arm64-boot       # headless; asserts the A0 "done when"
+make ARCH=aarch64 test-arm64-boot       # headless; asserts every phase's
+                                        # "done when", under every accelerator
 make ARCH=aarch64 run-arm64-hvf         # Apple Silicon: hardware virtualization
 make ARCH=aarch64 clean-arm64
 ```
+
+**The run targets attach a disk, a GPU and two input devices** (`ARM_DISK`,
+`ARM_GPU`, `ARM_INPUT` in `arch.mk`). `virt` has no VGA and no firmware
+framebuffer, so without `-device virtio-gpu-pci` the machine simply has no
+screen; without the two `virtio-*-pci` input devices it has no keyboard and no
+pointer. The TABLET rather than `virtio-mouse-pci` on purpose: it reports
+ABSOLUTE coordinates, so the guest cursor tracks the host's 1:1 instead of
+drifting away from it.
+
+**The userland is built from the same sources as x86's.** `user/lib/crt0.c`,
+`user/lib/syscalls.c`, `user/lib/newlib.ld` and `user/lib/embk_syscall.h` are
+one implementation with two branches, and `USER_CC`/`NEWLIB_*` all derive from
+`$(USER_TRIPLE)`. Objects land in `build/aarch64/user/` — `build/crt0.o` cannot
+mean two machines at once. Programs are declared by name in `arch.mk`
+(`ARM_NEWLIB_PROGS`, `ARM_PLAIN_PROGS`); adding one needs no other edit.
 
 Things worth knowing before they cost you an afternoon:
 
@@ -671,6 +698,15 @@ Things worth knowing before they cost you an afternoon:
   in real time) and **~8x the computation per unit of time** for a CPU-bound one.
   `run-arm64-tcg` forces emulation and `debug-arm64` adds `-d int,unimp`, which
   HVF has no equivalent for.
+* **`test-arm64-boot` injects real input.** Every other check is a line the
+  kernel prints about itself; input is the one thing the machine cannot test
+  alone, because virtio-input can enumerate both devices, arm its queue and
+  report "polled" while delivering nothing. `tools/arm64_input_probe.py` drives
+  keys and pointer motion over QMP for the whole run, and the test asserts the
+  driver's event COUNTERS are non-zero. It injects continuously rather than once
+  because the kernel's input window is a few seconds somewhere inside the boot:
+  the first version sent four keys at a fixed moment, missed the window, and
+  reported zero against a driver that was working.
 * **`test-arm64-boot` runs under every available accelerator**, not just the
   default. TCG and HVF disagree, and the disagreements are where the bugs are:
   an interrupt-ordering error (ending a level-triggered interrupt before the
@@ -682,4 +718,17 @@ Things worth knowing before they cost you an afternoon:
 * **`-mgeneral-regs-only` is mandatory** and is already in `ARM_CFLAGS`. FP/SIMD
   traps at EL1 until someone enables it, and gcc emits FP registers for ordinary
   struct copies. Removing that flag produces a hang with no relation to any
-  floating-point code in the source.
+  floating-point code in the source. **It is a KERNEL flag only** — user code is
+  deliberately built without it, because a stock compiler emits `str q0` to copy
+  a 16-byte struct and an EL0 program that never mentions a float would trap on
+  its first `memcpy`. `CPACR_EL1.FPEN` is opened for EL0 for exactly this.
+* **The two newlibs are not configured the same by default, and it matters.**
+  newlib's `configure.host` gives `aarch64-*-*` its own case with
+  `syscall_dir=syscalls` and no `MISSING_SYSCALL_NAMES`, while `x86_64-elf`
+  falls through to the default case which does the opposite. Left alone, libc
+  calls `_write` (which we do not define) and defines `write` (which we do) —
+  ten undefined references and a collision waiting behind them.
+  `tools/newlib/build-newlib-emblink.sh` patches that one case so both targets
+  get the same contract, idempotently, and then VERIFIES it with `nm` rather
+  than trusting the patch. Build the aarch64 libc any other way and expect
+  `undefined reference to _write`.

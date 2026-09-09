@@ -51,6 +51,7 @@ extern void exit(int code);   /* newlib's real exit() -- NOT user/init.c's
  * touches rdi/rsi/rdx, so argc/argv/envp arrive at start_c() exactly as
  * process_trampoline left them. start_c()/exit() never return in practice;
  * the trailing hang loop is only a defensive backstop. */
+#if defined(__x86_64__)
 __asm__(
     ".global _start\n"
     "_start:\n"
@@ -58,6 +59,39 @@ __asm__(
     "    call start_c\n"
     "1:  jmp 1b\n"
 );
+#elif defined(__aarch64__)
+/* The aarch64 entry stub -- ARM64.md phase A6.
+ *
+ * The alignment argument above is an X86 argument, and it does not carry over:
+ * aarch64's PCS requires SP to be 16-byte aligned at ALL times, not 8-mod-16
+ * inside a called function, because there is no return address on the stack to
+ * account for -- `bl` puts it in x30. So `bl` versus `b` changes nothing about
+ * alignment here, and start_c() sees the same SP whichever is used. The `and`
+ * is kept for the same defensive reason x86 keeps it: a raw ELF entry point is
+ * responsible for the alignment it hands on, and SCTLR_EL1.SA makes a
+ * misaligned SP a fault rather than a slow path.
+ *
+ * x29/x30 are zeroed to TERMINATE THE FRAME CHAIN. A debugger (or the kernel's
+ * own backtrace) walks frame pointers until it sees zero; entering with
+ * whatever the eret left there makes the first backtrace of any crashing
+ * program run off into nonsense. x86 gets this free -- process.c's iretq frame
+ * has no rbp to inherit -- and aarch64 has to say it.
+ *
+ * x0/x1/x2 (argc, argv, envp) are untouched: x9 is a scratch register in the
+ * PCS and deliberately not one of the argument registers. */
+__asm__(
+    ".global _start\n"
+    "_start:\n"
+    "    mov  x29, #0\n"
+    "    mov  x30, #0\n"
+    "    mov  x9, sp\n"
+    "    and  sp, x9, #-16\n"
+    "    bl   start_c\n"
+    "1:  b    1b\n"
+);
+#else
+#error "crt0.c: no entry-point stub for this architecture"
+#endif
 
 /* ---- the crt-stuff a -nostartfiles link doesn't get --------------------
  * `__dso_handle` normally comes from crtbegin.o. We link -nostartfiles (crt0
@@ -141,26 +175,45 @@ extern void *malloc(unsigned long size);
 extern void *memcpy(void *dst, const void *src, unsigned long n);
 extern void *memset(void *dst, int c, unsigned long n);
 
-/* Room reserved at the thread pointer for the Thread Control Block. Only the
- * self-pointer at offset 0 is architecturally required (`mov %fs:0x0,%reg` is
- * how every TLS access starts), but the psABI's TCB conventionally holds more
- * -- notably a DTV pointer at +8 and the stack-protector canary at +0x28. We
- * reserve and ZERO 64 bytes so anything that pokes at those reads a defined
- * zero rather than heap garbage. */
+/* Room reserved at the thread pointer for the Thread Control Block.
+ *
+ * x86-64 (variant II): only the self-pointer at offset 0 is architecturally
+ * required (`mov %fs:0x0,%reg` is how every TLS access starts), but the psABI's
+ * TCB conventionally holds more -- notably a DTV pointer at +8 and the
+ * stack-protector canary at +0x28. We reserve and ZERO 64 bytes so anything
+ * that pokes at those reads a defined zero rather than heap garbage. The TCB is
+ * ABOVE the thread pointer there, so its size is ours to choose.
+ *
+ * aarch64 (variant I): 16, and NOT a free choice -- see setup_tls(). The TCB
+ * sits BELOW the block, so its size is part of every variable's address, and
+ * the linker has already committed to 16. Reserving "a bit extra for safety"
+ * would move every TLS variable and silently corrupt them. */
+#if defined(__x86_64__)
 #define TCB_SIZE 64
+#elif defined(__aarch64__)
+#define TCB_SIZE 16
+#endif
 
-/* Build this thread's static TLS block and point %fs at it.
+/* Build this thread's static TLS block and point the thread pointer at it.
  *
- * x86-64 uses TLS VARIANT II: the block sits BELOW the thread pointer, and the
- * linker resolves a variable at TLS offset `o` to  TP - ALIGN(memsz, align) + o.
- * That formula is why we must round `memsz` up with the linker's OWN align value
- * (__tls_align) -- pick a different one and every TLS variable silently lands at
- * the wrong address, which is far worse than a fault.
+ * THE TWO ARCHITECTURES DISAGREE HERE, and this is the one place in the
+ * userland where they genuinely do -- docs/TODO.md has been saying so since
+ * A5. Both are "static TLS, one module, no dynamic loading", but the ELF TLS
+ * variants put the block on opposite sides of the thread pointer:
  *
- * Layout built here:
+ *   x86-64, VARIANT II            aarch64, VARIANT I
+ *   [ .tdata | .tbss ][ TCB ]     [ TCB ][ .tdata | .tbss ]
+ *                     ^TP         ^TP
+ *   addr = TP - align(memsz)+o    addr = TP + align_up(16, a) + o
  *
- *     [ .tdata copy | zeroed .tbss ][ TCB ]
- *     ^block                        ^TP == fs_base, *(void**)TP == TP
+ * Get the arithmetic wrong and there is no fault to debug: every TLS variable
+ * quietly resolves to the wrong address. Both formulas are the LINKER's, so
+ * both must use the linker's own alignment (__tls_align) rather than a guess.
+ *
+ * On aarch64 the 16 is not a constant we picked -- it is TCB_SIZE in binutils'
+ * elfNN_aarch64_tpoff_base(), which computes every TPREL offset as
+ * align_power(16, tls_align) + the variable's offset in the segment. It is why
+ * TCB_SIZE above is 16 there and must stay 16.
  *
  * Called before the constructors: a C++ ctor may touch a __thread variable.
  * malloc() is safe this early -- newlib is built --enable-threads=single, so its
@@ -172,7 +225,8 @@ static void setup_tls(void)
     unsigned long align  = (unsigned long)(unsigned long *)__tls_align;
 
     if (memsz == 0) {
-        return;             /* no PT_TLS: nothing to set up, %fs stays unused */
+        return;             /* no PT_TLS: nothing to set up, the thread pointer
+                             * stays unused */
     }
     if (align == 0) {
         align = 8;
@@ -180,28 +234,54 @@ static void setup_tls(void)
 
     unsigned long tls_size = (memsz + align - 1) & ~(align - 1);
 
-    /* + align of slack so TP can be rounded UP to the linker's alignment while
-     * the block below it still fits inside the allocation. */
+    /* + align of slack so TP can be rounded to the linker's alignment while
+     * the whole block still fits inside the allocation. */
     char *base = (char *)malloc(tls_size + TCB_SIZE + align);
     if (!base) {
         return;             /* nothing sane to do this early; a TLS read will
                              * fault loudly rather than read someone else's data */
     }
 
-    unsigned long tp = ((unsigned long)base + tls_size + align - 1) & ~(align - 1);
-    char *block = (char *)(tp - tls_size);
+    unsigned long tp;
+    char *block;
+
+#if defined(__x86_64__)
+    /* TP is the TOP of the block; the data grows down from it. */
+    tp    = ((unsigned long)base + tls_size + align - 1) & ~(align - 1);
+    block = (char *)(tp - tls_size);
+
+    memset((void *)tp, 0, TCB_SIZE);
+    *(unsigned long *)tp = tp;   /* the self-pointer `mov %fs:0x0,%reg` reads */
+#elif defined(__aarch64__)
+    /* TP is the BOTTOM: the TCB is at TP, the data starts after it, rounded up
+     * to the segment's alignment exactly as the linker rounded it. Aligning TP
+     * itself to `align` is what makes that sum aligned too. */
+    unsigned long tcb_off = (TCB_SIZE + align - 1) & ~(align - 1);
+
+    tp    = ((unsigned long)base + align - 1) & ~(align - 1);
+    block = (char *)(tp + tcb_off);
+
+    /* Zero the whole TCB. Nothing here writes a self-pointer: variant I has no
+     * such requirement -- a TLS access is `mrs x, tpidr_el0` plus an immediate,
+     * with no indirection through the TCB at all. The first word is where a
+     * dynamic loader would keep the DTV, and zero is the honest value for a
+     * program that has no dynamic TLS. */
+    memset((void *)tp, 0, tcb_off);
+#endif
 
     if (filesz) {
         memcpy(block, __tls_image, filesz);        /* the .tdata initialisers */
     }
     memset(block + filesz, 0, tls_size - filesz);  /* .tbss + alignment tail */
-    memset((void *)tp, 0, TCB_SIZE);
 
-    *(unsigned long *)tp = tp;   /* the self-pointer `mov %fs:0x0,%reg` reads */
-
-    /* Only the kernel can write IA32_FS_BASE: CR4.FSGSBASE is off, so WRFSBASE
-     * would #UD here. Ignore the return -- if it fails the first TLS access
-     * faults, which is a better signal than anything we could print now. */
+    /* The kernel is the thread pointer's owner on BOTH architectures, and for
+     * different reasons. On x86 it has no choice: CR4.FSGSBASE is off, so
+     * WRFSBASE would #UD here. On aarch64 EL0 CAN write TPIDR_EL0 directly --
+     * but it must not, because process.c reinstalls thread::fs_base on every
+     * context switch, so a base this process set behind the kernel's back would
+     * survive exactly until the next preemption. One syscall, one owner, one
+     * value that stays true. Ignore the return -- if it fails the first TLS
+     * access faults, which is a better signal than anything we could print. */
     embk_syscall1(EMBK_SYS_set_fs_base, (int64_t)tp);
 }
 

@@ -1568,8 +1568,12 @@ substantially complete.
     handlers no longer read machine registers, and 2,019 of the 6,479 lines
     that `arch/x86_64/` was credited with have moved out of it. **A5 reached
     EL0:** an aarch64 user program runs, calls `write` and `exit`, and has an
-    unmapped pointer refused at the boundary. A6 (newlib, ELF, real processes)
-    is next. The audit there says the discipline largely held —
+    unmapped pointer refused at the boundary. **A6 now runs a real newlib
+    program at EL0 off the real filesystem** — `hello.elf`, built from the same
+    `user/lib` sources as the x86 userland, doing printf/malloc/snprintf/time
+    and creating and joining a second EL0 thread, exiting with a status the
+    kernel reads back. What is left of A6 is `libembk.so` and a dynamically
+    linked EmUI app, which need A7's compositor first. The audit there says the discipline largely held —
     `arch/x86_64/` is 11% of the kernel and port I/O never escaped into core
     logic — with **one** real exception: the 89 syscall handlers in
     `arch/x86_64/syscall/syscall.c` read their arguments through 187 direct
@@ -1674,9 +1678,55 @@ substantially complete.
       include; it was left alone here because A4 was meant to be a mechanical
       move that the desktop boot could vouch for, and renumbering the ABI in
       the same change would have made a boot failure ambiguous.
-    - [ ] **`kernel/syscall/syscalls.c` is not compiled for aarch64 yet.** It
-      needs `process.c`, the VFS, the compositor and the IPC layer, which is
-      exactly what A5/A6 bring up. Nothing about the file blocks it.
+    - [x] ~~**`kernel/syscall/syscalls.c` is not compiled for aarch64 yet.**~~ —
+      it is, and a user program reaches it: `hello.elf`'s printf lands in the
+      real `sys_write`, its malloc in the real `sys_sbrk`.
+  - **Known gaps left by A6** (the userland):
+    - [x] ~~**No `libembk.so` and no dynamically-linked app on aarch64.**~~ —
+      `uidemo.elf` loads, relocates and presents a frame. The loader needed no
+      aarch64-specific line, exactly as this entry predicted.
+    - [ ] **The aarch64 userland is FOUR programs** (`hello.elf`, `init.elf`,
+      `uidemo.elf`, plus `libembk.so`), named in `ARM_NEWLIB_PROGS` /
+      `ARM_PLAIN_PROGS` / `ARM_UI_PROGS` in `arch.mk`. Adding a name is the
+      whole of adding a program now — the rules are generated. The console
+      programs (`posixdemo`, `ioracer`, `capchild`, `sockdemo`) are the
+      cheapest way to widen the ABI's test surface; the remaining EmUI apps
+      (`files`, `term`, `settings`, `notepp`) should now build unchanged.
+    - [ ] **`getentropy()` returns ENOSYS on aarch64.** The architectural
+      equivalent of RDRAND is FEAT_RNG's `RNDR`, which EL0 may execute but only
+      when it exists — and the feature bit is in `ID_AA64ISAR0_EL1`, which EL0
+      may NOT read (an MRS of an ID register from EL0 traps to EL1, and this
+      kernel does not emulate those the way Linux does). So there is no way to
+      ASK before executing, and executing it on a part without it is UNDEFINED.
+      Two ways out, both kernel-side: emulate the ID registers for EL0, or add
+      an entropy syscall and let EL1 read `RNDR`. Deliberately NOT faked from a
+      clock — the x86 path refuses that too, and for the same reason.
+    - [ ] **No aarch64 `tcc`, so nothing compiles ON the OS there.** The
+      on-OS toolchain (`/system/abi`'s libc.a + headers, `libtcc1.o`,
+      `emlink_dynstubs.o`, EmbBuild) is x86-only, and `mkfs_arm64.py` packs
+      none of it. `embk_syscall.h`'s `__TINYC__` branch is x86-only too — the
+      place an aarch64 one would go is marked.
+    - [ ] **The aarch64 root image is a SEPARATE, minimal one**
+      (`build/aarch64/embkfs-arm64.img`, `tools/embkfs_mkfs/mkfs_arm64.py`)
+      rather than a second output of `mkfs_embkfs.py`. That is right today —
+      three-quarters of the x86 image is x86 machine code or desktop content —
+      and it will stop being right once the aarch64 side has a desktop. The two
+      already share the FORMATTER (`make_image`/`build_root_items`), so the
+      on-disk format cannot drift; only the file list is duplicated.
+    - [ ] **`VMM_EXEC` fixed the direction of ONE flag, not the header.**
+      `VMM_PRESENT`/`VMM_WRITABLE`/`VMM_NX` are still x86 page-table bit
+      positions wearing interface names, and `VMM_NX` is still inverted — which
+      is why the x86 kernel heap is still W+X. The rename is still open; what
+      is closed is that a caller can now ask for execution positively, and the
+      shared ELF loader does.
+    - [ ] **`SP_EL0` is saved in the exception frame, but `TPIDR_EL0` is
+      restored from `thread::fs_base` on every switch** — which means EL0 CAN
+      write its own thread pointer (unlike x86, where FSGSBASE is off and the
+      instruction faults) and the write survives only until the next
+      preemption. crt0 goes through the syscall, so nothing is broken; but
+      "userspace can write it and the kernel silently overrides it" is a sharp
+      edge that x86 does not have. Either trap it or document it as the ABI.
+
   - **Known gaps left by A5** (EL0 and `svc`):
     - [ ] **DELETE `kernel/arch/aarch64/syscall/bringup_syscalls.c` AT A6.**
       Four handlers (`write`, `exit`, `getpid`, `uptime_ms`) that exist only to
@@ -1747,10 +1797,35 @@ substantially complete.
       virtio-blk (new, shared, polled) gives it a disk; a real PL031 driver
       gives it a wall clock; `arch/aarch64/drivers/absent.c` answers "no such
       device" for the PS/2 keyboard and mouse, AC'97 and bochs VGA.
-    - [ ] **Replace `absent.c` entry by entry as virtio drivers land**, and
-      DELETE each entry when its driver arrives — a leftover definition there
-      would silently win at link time over the real one. virtio-input is the
-      one that matters first: without it the ARM machine has no keyboard.
+    - [x] ~~**Replace `absent.c` entry by entry as virtio drivers land**~~ —
+      the keyboard and mouse entries are GONE and virtio-input answers instead.
+      What remains there is AC'97 and bochs VGA, and both stay: virtio-snd is
+      not written, and virtio-gpu is already the display path.
+    - [ ] **No virtio-snd, so aarch64 has no audio.** `absent.c` still answers
+      "no AC'97" and every caller handles that, so nothing is broken — there is
+      simply no sound. Copy the pattern virtio-input established: a translation
+      layer into the SHARED driver, not a second audio stack.
+    - [ ] **The three older virtio drivers still carry their own PCI capability
+      walk.** `drivers/bus/virtio_pci.c` now exists — written instead of the
+      FOURTH copy, which is what this file asked for — but `virtio_blk.c`,
+      `virtio_net.c` and `virtio_gpu.c` have not been migrated onto it. A
+      deliberate, recorded choice: folding a refactor of three working drivers
+      into an ARM bring-up would have made any regression ambiguous. Migrate
+      them one at a time, each with a boot to vouch for it.
+    - [ ] **virtio-input's status queue is unused, so the lock LEDs do
+      nothing.** Caps Lock still LATCHES correctly on aarch64 — `g_mods` flips
+      and every consumer sees it — but there is no light, because
+      `kbd_set_leds()` is empty off x86. Queue 1 is what drives it.
+    - [ ] **virtio-input translates the US layout only.** `keyboard.c` owns
+      layouts for the SCANCODE world (`struct keymap`, `keyboard_set_layout`)
+      and the evdev path carries its own small shift table instead of going
+      through them. Wiring evdev into the layout tables is the right fix, and a
+      separate change from the bring-up.
+    - [ ] **aarch64 has no `init.elf` session, so the desktop is one app.**
+      `early.c` spawns `uidemo.elf` directly. On x86 init spawns login, the
+      session and `home.elf`, and those need an account database, the setup
+      flow and the launcher — all of which are EmUI apps that would now BUILD
+      for aarch64 (add them to `ARM_UI_PROGS`). Nothing blocks it but the work.
     - [ ] **virtio-blk is polled and sets `VRING_AVAIL_F_NO_INTERRUPT`.** Fine
       at one outstanding request; an interrupt-driven version needs a wait
       queue and buys nothing until requests overlap.
@@ -1773,8 +1848,12 @@ substantially complete.
       ever really needed.
     - [ ] **TLS relocations are the one ELF family the two architectures
       genuinely disagree about** — x86 counts down from the thread pointer,
-      aarch64 counts up. Nothing emits them yet, so `elf.h` deliberately has no
-      `ELF_RELOC_TLS`. Add it when newlib's TLS lands (A6), not before.
+      aarch64 counts up. Still no `ELF_RELOC_TLS` in `elf.h`, and still
+      correctly so: A6 handled the disagreement in **crt0**, which builds the
+      static TLS block for both variants itself (variant II below the thread
+      pointer, variant I above it, with the 16-byte TCB that binutils'
+      `elfNN_aarch64_tpoff_base()` assumed). No program has yet needed a TLS
+      RELOCATION resolved at load time. Add it when one does.
     - [ ] **No ASIDs, so `vmm_switch_address_space` flushes the whole TLB.**
       With an ASID per address space the hardware would keep both processes'
       entries and the switch would need no flush at all. Pure performance;
@@ -1784,8 +1863,9 @@ substantially complete.
       failed; it is now `kernel/arch/x86_64/mm/vmm.c`, next to its aarch64
       counterpart. `kernel/mm/vmm.h` remains shared and aarch64 implements the
       part of it that shared code calls.
-    - [ ] **`kernel/mm/vmm.h`'s flags are x86 page-table bits wearing
-      interface names.** `VMM_PRESENT`, `VMM_WRITABLE` and `VMM_NX` are bit
+    - [~] **`kernel/mm/vmm.h`'s flags are x86 page-table bits wearing
+      interface names.** (Half-fixed at A6: `VMM_EXEC` exists and the ELF
+      loader uses it. The rest stands as written below.) `VMM_PRESENT`, `VMM_WRITABLE` and `VMM_NX` are bit
       positions 0, 1 and 63 — the actual hardware layout — and `VMM_NX` is
       inverted with respect to how a permission reads: absent means
       *executable*. A caller asking for a writable page and saying nothing

@@ -1,5 +1,3 @@
-#include "drivers/input/keyboard.h"
-#include "drivers/input/mouse.h"
 #include "drivers/audio/ac97.h"
 #include "drivers/video/gpu.h"
 #include "include/types.h"
@@ -30,28 +28,16 @@
  * WHEN A REAL DRIVER LANDS, DELETE ITS ENTRIES FROM THIS FILE. A leftover
  * definition here would silently win over the real one at link time. */
 
-/* --- PS/2 keyboard: virtio-input replaces it ------------------------------ */
-int  keyboard_event_pop(struct key_event *ev)          { (void)ev; return 0; }
-uint8_t keyboard_mods(void)                            { return 0; }
-char keyboard_getchar(void)                            { return 0; }
-int  keyboard_has_char(void)                           { return 0; }
-void keyboard_set_interrupt_target(uint32_t pid)       { (void)pid; }
-void keyboard_inject_char(char c)                      { (void)c; }
-void keyboard_set_grab(int grab, uint32_t pid)         { (void)grab; (void)pid; }
-void keyboard_release_grab_pid(uint32_t pid)           { (void)pid; }
-
-/* Returns "cancelled" rather than blocking: a caller that waits forever for a
- * keyboard that cannot exist is a hung process, and every caller of this
- * already handles the cancelled case. */
-int  keyboard_getchar_blocking_cancelable(char *out)   { (void)out; return -1; }
-
-/* --- PS/2 mouse ----------------------------------------------------------- */
-void mouse_get_state(int32_t *x, int32_t *y, uint32_t *buttons) {
-    if (x) *x = 0;
-    if (y) *y = 0;
-    if (buttons) *buttons = 0;
-}
-int32_t mouse_take_wheel(void)                         { return 0; }
+/* --- PS/2 keyboard and mouse: GONE FROM HERE, and that is the point -------
+ * virtio-input landed (drivers/input/virtio_input.c), so the eleven keyboard
+ * stubs and the two mouse stubs that used to sit here are deleted, exactly as
+ * the warning above says to do. They now resolve to the REAL implementations
+ * in drivers/input/keyboard.c and drivers/input/mouse.c, whose PS/2 halves are
+ * behind `#if defined(__x86_64__)` and whose policy halves are shared.
+ *
+ * Deleting them was not optional once the real drivers linked: a definition
+ * left here would silently WIN at link time, and the machine would have had a
+ * working keyboard driver and no keyboard. */
 
 /* --- AC'97 audio: virtio-snd replaces it ---------------------------------- */
 bool     ac97_present(void)                            { return false; }

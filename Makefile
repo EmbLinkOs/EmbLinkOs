@@ -266,13 +266,42 @@ build/kernel.embdbg: $(KERNEL_ELF) | $(BUILD)
 # linker scripts. user/bin/ holds the actual programs. Built artifacts (.o,
 # .elf) go to $(BUILD), out of the source tree. -Iuser/lib lets a program in
 # user/bin include the SDK as "embk.h". See user/README.md.
-USER_CC      = x86_64-elf-gcc
-ASM_GAS      = x86_64-elf-as   # GNU as for the dynstubs (.set/.weak)
-USER_LD      = x86_64-elf-ld
-USER_INC     = -Iuser/lib
+#
+# THE USERLAND IS BUILT FOR $(ARCH), like the kernel. Everything below derives
+# from $(USER_TRIPLE) rather than naming x86_64-elf, because user/lib is ONE
+# implementation for both machines: embk_syscall.h has an `svc #0` branch beside
+# the `int $0x80` one, crt0.c has an aarch64 _start and variant-I TLS beside the
+# x86 ones, and nothing else in user/ knows which machine it is on.
+# docs/ARM64.md phase A6.
+#
+# The x86 flag lists are written out IN FULL per architecture rather than
+# assembled from a shared part plus an arch part. That is deliberate: -mno-sse
+# and -fno-stack-protector are interleaved in the x86 list, so factoring the
+# common flags out would REORDER them, and `make -n` would stop being
+# byte-identical to what it produced before this change. §2.9 says the x86 build
+# must not be taxed by the second architecture; a diff in every compile line is
+# a tax, even when the flags mean the same thing.
+ifeq ($(ARCH),aarch64)
+USER_TRIPLE  = aarch64-elf
+# No -mno-red-zone: the AAPCS has no red zone, so there is nothing below SP for
+# an interrupt to clobber. No -mno-sse/-mno-mmx: those are x86 spellings, and
+# the aarch64 equivalent (-mgeneral-regs-only) is deliberately NOT used here --
+# the kernel is built with it so a stray FP instruction faults loudly, but USER
+# code must be allowed FP, because a stock compiler emits `str q0` to copy a
+# 16-byte struct. CPACR_EL1.FPEN is opened for EL0 at A5 for exactly this.
+USER_CFLAGS  = -MMD -MP -MF $@.d -ffreestanding -nostdlib -fno-pic \
+               -fno-stack-protector -O2 $(USER_INC)
+else
+USER_TRIPLE  = x86_64-elf
 # Freestanding programs (init.elf, primtest.elf): own _start, no libc, no SSE.
 USER_CFLAGS  = -MMD -MP -MF $@.d -ffreestanding -nostdlib -fno-pic -mno-red-zone \
                -fno-stack-protector -mno-mmx -mno-sse -mno-sse2 -O2 $(USER_INC)
+endif
+
+USER_CC      = $(USER_TRIPLE)-gcc
+ASM_GAS      = $(USER_TRIPLE)-as   # GNU as for the dynstubs (.set/.weak)
+USER_LD      = $(USER_TRIPLE)-ld
+USER_INC     = -Iuser/lib
 
 # The real pid-1 init: kernel spawns it first; it brings up the desktop session
 # and supervises. Freestanding (no libc) -- init stays minimal (USERSPACE_v2 UP1).
@@ -301,7 +330,15 @@ build/primtest.elf: build/primtest.o user/lib/user.ld
 # long-long into this user-owned prefix; pointing -L/-isystem here uses that
 # fuller libc.a instead. Set NEWLIB_PREFIX= (empty) to fall back to the stock
 # toolchain newlib (and re-lose %z/%ll). See user/README.md.
+#
+# Per TARGET architecture: the two libcs are built from the SAME source by the
+# SAME script (tools/newlib/build-newlib-emblink.sh) with the same options, and
+# they live in separate prefixes because they are separate machine code.
+ifeq ($(ARCH),aarch64)
+NEWLIB_PREFIX ?= $(HOME)/cross/newlib-aarch64-c99
+else
 NEWLIB_PREFIX ?= $(HOME)/cross/newlib-c99
+endif
 
 # Let scripts ask the Makefile where newlib is, so NEWLIB_PREFIX stays the ONE
 # source of truth and tools/tcc/build-tcc-emblink.sh cannot drift from the build.
@@ -351,8 +388,8 @@ check-tools:
 	if command -v aarch64-elf-gcc >/dev/null 2>&1; then \
 	  printf '  [ ok ]  aarch64-elf-gcc   -- make ARCH=aarch64 && make ARCH=aarch64 run-arm64\n'; \
 	else printf '  [ -- ]  aarch64-elf-gcc  (absent => the x86 build is unaffected; brew install aarch64-elf-gcc)\n'; fi
-NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/x86_64-elf/include,)
-NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
+NEWLIB_INC    = $(if $(NEWLIB_PREFIX),-isystem $(NEWLIB_PREFIX)/$(USER_TRIPLE)/include,)
+NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/$(USER_TRIPLE)/lib,)
 # -ftrivial-auto-var-init=zero: zero every uninitialized auto variable. Defence
 # in depth against uninitialized-read UB -- and the concrete fix for a git-over-
 # HTTPS heisenbug where libtls's ECDSA verify (user/lib/tls/crypto/ecdsa.c) read
@@ -368,12 +405,27 @@ NEWLIB_LIB    = $(if $(NEWLIB_PREFIX),-L$(NEWLIB_PREFIX)/x86_64-elf/lib,)
 # out flex containers wrongly on the metal and correctly on the host, because
 # the host harness does not link jsdom at all. Nothing about that symptom
 # points at a Makefile.
+ifeq ($(ARCH),aarch64)
+NEWLIB_CFLAGS = -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
+else
 NEWLIB_CFLAGS = -mno-red-zone -fno-stack-protector -ftrivial-auto-var-init=zero -O2 -Wall -MMD -MP -MF $@.d $(USER_INC) $(NEWLIB_INC)
+endif
 # gcc as the link driver so it finds libc.a/libgcc; -nostartfiles because
 # crt0.c provides _start (no standard crtX). newlib.ld places it at 0x400000.
 # NEWLIB_LIB is a -L searched BEFORE the toolchain's default lib dir, so our
 # rebuilt libc.a wins over the stock one.
+#
+# -z max-page-size=0x1000 on aarch64: ld's aarch64 emulation defaults to a 64KB
+# max page, so it aligns each LOAD segment -- and pads the FILE -- to 64KB. This
+# kernel is 4KB-granule only (ARM64.md §5), so the padding buys nothing and
+# costs 60KB in every binary on an image we care about the size of. The x86 side
+# does not need the flag: its default is already 4KB.
+ifeq ($(ARCH),aarch64)
+NEWLIB_LDFLAGS = -nostartfiles -static -T user/lib/newlib.ld \
+                 -Wl,-z,max-page-size=0x1000 $(NEWLIB_LIB)
+else
 NEWLIB_LDFLAGS = -nostartfiles -static -T user/lib/newlib.ld $(NEWLIB_LIB)
+endif
 
 # --- C++ (optional toolchain) -------------------------------------------------
 # The stock /usr/local/cross gcc is `--enable-languages=c` only, so there is no

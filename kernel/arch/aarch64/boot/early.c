@@ -17,6 +17,14 @@
 #include "mm/pmm.h"
 #include "mm/kheap.h"
 #include "mm/vmm.h"
+#include "drivers/video/gpu.h"
+#include "drivers/video/framebuffer.h"
+#include "drivers/video/console.h"
+#include "gfx/compositor.h"
+#include "drivers/input/virtio_input.h"
+#include "drivers/input/mouse.h"
+#include "drivers/input/keyboard.h"
+#include "include/arch_irq.h"
 #include "include/kmalloc.h"
 #include "include/kprintf.h"
 
@@ -501,15 +509,27 @@ void arch_early_main(uint64_t dtb_phys) {
             if (!dup) distinct++;
         }
 
-        kprintf("  [%s] %d of %d devices routed to the GIC, on %d distinct line(s)\n",
-                (routed && distinct == routed) ? " ok " : "FAIL",
-                (int)routed, (int)n, (int)distinct);
+        /* Distinctness is the real check. `virt` wires slots in a ROTATING
+         * pattern, so devices in different slots must land on different SPIs
+         * -- and an interrupt-map walked with the wrong stride happily reports
+         * every device routed, to the same line. That is the bug this caught
+         * once already (A7's "a bug that looked like success").
+         *
+         * The rotation is over the FOUR INTx pins, so the expected count is
+         * min(routed, 4), not `routed`. It was written as `distinct == routed`
+         * when this machine had two PCI devices, and stayed true at three --
+         * then virtio-gpu, virtio-keyboard and virtio-tablet arrived and five
+         * routed devices on four lines was reported as a FAILURE. The
+         * assertion had outgrown its assumption, not the code: five distinct
+         * lines are not available to be wrong about. */
+        uint32_t expect = routed < 4 ? routed : 4;
 
-        /* Distinctness is the real check. `virt` wires slots in a rotating
-         * pattern, so two devices in different slots MUST land on different
-         * SPIs -- and an interrupt-map walked with the wrong stride happily
-         * reports every device routed, to the same line. */
-        if (!routed || distinct != routed)
+        kprintf("  [%s] %d of %d devices routed to the GIC, on %d distinct "
+                "line(s) of %d expected\n",
+                (routed && distinct == expect) ? " ok " : "FAIL",
+                (int)routed, (int)n, (int)distinct, (int)expect);
+
+        if (!routed || distinct != expect)
             selftest_fails++;
     }
 
@@ -590,22 +610,228 @@ void arch_early_main(uint64_t dtb_phys) {
      * enumerating this bus is what makes them available here at all. */
     selftest_preemption();
 
-    /* The EL0 probe that used to run here is gone, and deliberately.
+    /* --- A6: a REAL user process ---------------------------------------------
      *
-     * It existed to prove the `eret`/`svc` transition before there was
-     * anything real to run through it -- a hand-mapped address space, a
-     * four-entry syscall table and a hand-written assembly program. The real
-     * kernel/syscall/syscalls.c is now linked, so a second definition of
-     * syscall_invoke() could not coexist with it, and the probe's `exit` would
-     * reach the real sys_exit(), which wants a real process.
+     * The hand-written EL0 probe that used to sit here is gone. It proved the
+     * `eret`/`svc` transition against a hand-mapped address space and a
+     * four-entry syscall table; what runs now is a newlib program off the
+     * filesystem, through process_create(), into the real 95-handler table.
+     * docs/TODO.md scheduled the probe's deletion at exactly this point.
      *
-     * docs/TODO.md scheduled that deletion at this exact point. EL0 comes back
-     * when there is a filesystem holding a program worth entering it for. */
+     * THREE THINGS HAVE TO HAPPEN IN THIS ORDER, and each is a different kind
+     * of handover:
+     *
+     * 1. The boot context becomes a THREAD. schedule() returns immediately if
+     *    current_thread is NULL, so without this the timer would tick, the
+     *    scheduler would be called, and it would decline to do anything -- a
+     *    silent failure that looks exactly like a process that never runs.
+     *    process_adopt_current() is the same call main.c makes on x86.
+     *
+     * 2. The tick starts driving the REAL scheduler. Up to here the GIC's
+     *    post-EOI hook ran bringup_sched_tick(), the stand-in that owns the A3
+     *    preemption demo above. That demo is finished; from now on the hook is
+     *    process.c's schedule(), which is what x86's lapic_timer_handler()
+     *    calls at the same point in the same order (after the EOI, never from
+     *    inside the handler -- gicv3.c explains why at length).
+     *
+     * 3. Only THEN is the process created. process_create() marks it RUNNABLE
+     *    immediately, so doing it before step 2 would leave a runnable process
+     *    that nothing would ever pick up.
+     *
+     * hello.elf rather than init.elf, and that is an honest statement of where
+     * the port is. init is the desktop's supervisor: it spawns login, then the
+     * session, then home.elf, none of which exist for aarch64 until libembk.so
+     * and the compositor land (A7). hello.elf is a real newlib program --
+     * printf through _write, malloc through _sbrk, time() through
+     * _gettimeofday, and a native EmbLink thread -- and it EXITS WITH THE
+     * NUMBER OF CHECKS THAT PASSED, which is what makes it a test rather than
+     * a demo. */
+    /* --- A7: the display -----------------------------------------------------
+     * gpu_init() picks a driver; on this machine virtio_gpu_probe() is the only
+     * one that can answer, because absent.c's bochs_gpu_probe() returns NULL and
+     * `virt` has no VGA aperture for it to have found anyway (ARM64.md §6.5).
+     * Then the SHARED framebuffer and text console come up on top of it, exactly
+     * as kernel/main.c orders them: a driver, then a surface, then something
+     * that draws on it.
+     *
+     * After PCI, and that is not arbitrary -- virtio-gpu is a PCI device whose
+     * BARs this kernel assigned itself a few hundred lines up, because there is
+     * no firmware here to have done it. */
+    kprintf("\n--- display (A7) ---\n");
+    gpu_init();
+    fb_init();
+    console_init();
+    {
+        const fb_info_t *fbi = fb_get_info();
+        if (fbi && fbi->width && fbi->height) {
+            kprintf("  [ ok ] framebuffer %ux%u, %u bpp\n",
+                    (unsigned)fbi->width, (unsigned)fbi->height,
+                    (unsigned)fbi->bpp);
+        } else {
+            kprintf("  [info] no display device attached\n");
+        }
+
+        /* Input. virtio-input replaces the PS/2 keyboard and mouse that
+         * absent.c used to answer for -- its stubs are deleted now, so these
+         * are the real shared drivers.
+         *
+         * mouse_init() AFTER the framebuffer, and with its real size: it sets
+         * the cursor's clamp bounds, and clamping to a guessed 1024x768 on a
+         * 1280x800 screen leaves a band the pointer can never reach. Same
+         * ordering, same reason, as kernel/main.c. */
+        mouse_init(fbi ? fbi->width : 1024, fbi ? fbi->height : 768);
+        virtio_input_init();
+    }
+
+    kprintf("\n--- userland (A6) ---\n");
+    {
+        struct thread *self = process_adopt_current();
+        if (!self) {
+            kprintf("  [FAIL] could not adopt the boot context as a thread\n");
+            selftest_fails++;
+        } else {
+            gic_set_post_eoi(schedule);
+
+            char *hargv[] = { (char *)"/system/bin/hello.elf", NULL };
+            int pid = process_create("/system/bin/hello.elf", hargv, 1, NULL, 0);
+            if (pid < 0) {
+                kprintf("  [FAIL] could not launch /system/bin/hello.elf: %s\n",
+                        embk_strerror(pid));
+                selftest_fails++;
+            } else {
+                kprintf("  [ ok ] /system/bin/hello.elf launched as pid %d\n", pid);
+
+                /* Wait for it, rather than falling into the idle loop below.
+                 * The exit code IS the assertion: hello.c counts the checks it
+                 * passed and returns that count, so a number here says which
+                 * parts of the retargeting layer work, and the acceptance test
+                 * greps for it. */
+                int code = process_wait(pid);
+                kprintf("  [%s] hello.elf exited with %d (checks passed)\n",
+                        code > 0 ? " ok " : "FAIL", code);
+                if (code <= 0)
+                    selftest_fails++;
+            }
+        }
+    }
+
+    /* --- A6 + A7: a dynamically-linked EmUI app, and a frame on the screen ----
+     *
+     * This is BOTH phases' "done when" in one run, and they are one test
+     * because neither half means anything alone: A6 asks for a dynamically
+     * linked app to load, A7 asks for the compositor to present a frame on
+     * `virt`, and an app with no display would have nothing to present while a
+     * display with no app would have nothing to show.
+     *
+     * uidemo.elf is an ET_EXEC with PT_DYNAMIC and DT_NEEDED libembk.so. The
+     * kernel IS the dynamic loader -- there is no ld.so and no PT_INTERP -- so
+     * loading it exercises the whole two-way link: the app's imports resolve to
+     * the toolkit's exports, and the toolkit's libc imports (malloc, memcpy,
+     * sinf) resolve BACK into the app, which is where newlib was statically
+     * pulled in. 56 R_AARCH64_JUMP_SLOT relocations get applied by code that
+     * needed no aarch64-specific line: elf.c has been written against the
+     * neutral ELF_RELOC_* names since A4.
+     *
+     * The boot thread then pumps the compositor exactly as main.c's boot loop
+     * does on x86, and for the same reason stated there: these repaint, so they
+     * must run in schedulable context, never from an IRQ handler. */
+    kprintf("\n--- the desktop (A6 + A7) ---\n");
+    {
+        const char *app = "/data/apps/uidemo/uidemo.elf";
+        char *uargv[] = { (char *)app, NULL };
+
+        /* Hand the screen to userspace BEFORE the app becomes schedulable --
+         * the same call, in the same position, for the same reason main.c
+         * documents on x86: process_create() makes the app runnable
+         * immediately, and a timer preemption in the gap between the spawn and
+         * this call would let its first frame land on top of a boot log that
+         * is still painting. Serial keeps every line either way, which is
+         * where the acceptance test reads them from. */
+        console_set_fb_enabled(false);
+
+        int upid = process_create(app, uargv, 1, NULL, 0);
+
+        if (upid < 0) {
+            kprintf("  [FAIL] could not launch %s: %s\n", app,
+                    embk_strerror(upid));
+            selftest_fails++;
+        } else {
+            kprintf("  [ ok ] %s launched as pid %d\n", app, upid);
+
+            /* Bounded, not forever: this is a boot self-test, and a test that
+             * hangs when the thing it checks is broken reports nothing. Five
+             * seconds at 100 Hz is far more than the app needs -- on x86 the
+             * equivalent app presents its first frame about 900 ms in, and most
+             * of that is parsing the font. */
+            uint64_t start = timer_sched_ticks();
+            kprintf("  [info] input window OPEN at tick %u\n", (unsigned)start);
+            while (timer_sched_ticks() < start + 500) {
+                /* virtio-input is POLLED, and this is its cadence: the same
+                 * schedulable context the compositor ticks run in, never an
+                 * IRQ handler. main.c's boot loop drives usb_poll() from the
+                 * identical place for the identical reason. */
+                virtio_input_poll();
+                compositor_pointer_tick();
+                compositor_anim_tick();
+                arch_cpu_idle();
+            }
+
+            /* The assertion. A window that exists AND holds focus means the
+             * app got through the toolkit, asked the compositor for a surface,
+             * and the compositor accepted it -- which it only does once there
+             * is a framebuffer under it. */
+            uint32_t focused = compositor_focused_pid();
+            bool ok = (focused == (uint32_t)upid);
+            kprintf("  [%s] compositor: focused pid %u (app is %d)\n",
+                    ok ? " ok " : "FAIL", (unsigned)focused, upid);
+            if (!ok)
+                selftest_fails++;
+
+            /* INPUT ACTUALLY ARRIVED, which is a different claim from "the
+             * device enumerated". The acceptance test drives QEMU's monitor
+             * during the window above -- sendkey, then mouse_move -- so these
+             * counters are non-zero only if events crossed the queue, were
+             * decoded, and reached the shared keyboard/mouse state. Run by
+             * hand with no monitor driving it, they are legitimately zero;
+             * that is why this reports rather than fails. */
+            kprintf("  [info] input window CLOSED at tick %u\n",
+                    (unsigned)timer_sched_ticks());
+            uint32_t keys = 0, ptr = 0;
+            virtio_input_stats(&keys, &ptr);
+            int32_t mx = 0, my = 0; uint32_t mb = 0;
+            mouse_get_state(&mx, &my, &mb);
+            kprintf("  [info] virtio-input: %u key event(s), %u pointer "
+                    "event(s), cursor at %d,%d\n",
+                    (unsigned)keys, (unsigned)ptr, (int)mx, (int)my);
+        }
+    }
 
     kprintf("\n--- all self-tests done: %d failure(s) ---\n", (int)selftest_fails);
 
     kprintf("\nA7 reached: the whole shared kernel is linked and running here.\n");
 
-    for (;;)
-        __asm__ volatile("wfi");
+    /* --- the boot CPU's permanent loop --------------------------------------
+     * NOT `wfi` forever, which is what used to be here and was wrong the moment
+     * there was a desktop to use: virtio-input is POLLED, so a kernel that
+     * stops calling virtio_input_poll() has a keyboard and a mouse that work
+     * for exactly as long as the self-test window and then silently stop. The
+     * screenshot that caught this had a cursor sitting where the test had left
+     * it, ignoring every event QEMU sent afterwards.
+     *
+     * This is the aarch64 counterpart of main.c's boot loop, with the same
+     * three responsibilities and the same reasoning for each: drain the polled
+     * input devices, drive the compositor's pointer (cursor, click-to-focus,
+     * title-bar drag) and advance window animation -- all in SCHEDULABLE
+     * context, never from an IRQ handler, because they repaint and the
+     * compositor's lock must never be taken from an interrupt.
+     *
+     * arch_cpu_idle() between passes rather than a busy spin: the timer tick
+     * wakes us at 100 Hz, which is the cadence a cursor needs and a great deal
+     * cheaper than spinning. */
+    for (;;) {
+        virtio_input_poll();
+        compositor_pointer_tick();
+        compositor_anim_tick();
+        arch_cpu_idle();
+    }
 }

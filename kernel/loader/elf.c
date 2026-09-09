@@ -30,7 +30,17 @@ static uint64_t elf_flags_to_vmm(uint32_t p_flags)
 {
     uint64_t f = VMM_USER;
     if (p_flags & PF_W) f |= VMM_WRITABLE;
-    if (!(p_flags & PF_X)) f |= VMM_NX;     /* no exec permission -> set NX */
+    if (p_flags & PF_X) {
+        /* Ask POSITIVELY for execution as well as leaving VMM_NX clear. The
+         * two say the same thing to different machines: x86 reads the absent
+         * NX bit, aarch64 reads VMM_EXEC and clears UXN. Setting only one of
+         * them mapped this segment non-executable on aarch64 and the program
+         * faulted on its first instruction fetch -- a permission fault at the
+         * entry point, which reads like a loader bug and is a flag bug. */
+        f |= VMM_EXEC;
+    } else {
+        f |= VMM_NX;                        /* no exec permission -> set NX */
+    }
     return f;
 }
 

@@ -17,6 +17,13 @@ AARCH64_OBJCOPY:= $(AARCH64_PREFIX)objcopy
 ARM_BUILD   := $(BUILD)/aarch64
 ARM_ELF     := $(ARM_BUILD)/kernel.elf
 ARM_IMG     := $(ARM_BUILD)/kernel.img
+# Declared HERE, with the other output paths, and not beside the rule that
+# builds it further down: make expands a rule's prerequisites when it READS the
+# rule, so `arm64: ... $(ARM_ROOTFS)` below would expand to NOTHING if this line
+# came after it. It did, and `make ARCH=aarch64` on a clean tree built a kernel
+# with no userland and no disk for it to read -- which then failed only at run
+# time, as "no EMBKFS volume".
+ARM_ROOTFS  := $(ARM_BUILD)/embkfs-arm64.img
 ARM_LINKER  := kernel/arch/aarch64/boot/linker.ld
 
 ARM_ASM_SRC := kernel/arch/aarch64/boot/boot.S \
@@ -95,6 +102,10 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   user/lib/tls/crypto/gcm.c \
                   user/lib/tls/crypto/x25519.c \
                   user/lib/tls/crypto/selftest.c \
+                  kernel/drivers/bus/virtio_pci.c \
+                  kernel/drivers/input/virtio_input.c \
+                  kernel/drivers/input/keyboard.c \
+                  kernel/drivers/input/mouse.c \
                   kernel/drivers/video/framebuffer.c \
                   kernel/drivers/video/console.c \
                   kernel/drivers/video/font_8x16.c \
@@ -177,13 +188,157 @@ $(ARM_IMG): $(ARM_ELF)
 	@echo "aarch64: Image header ok (magic at byte 56)"
 
 .PHONY: arm64
-arm64: $(ARM_ELF) $(ARM_IMG)
+arm64: $(ARM_ELF) $(ARM_IMG) $(ARM_ROOTFS)
 	@echo "aarch64 kernel: $(ARM_ELF)"
 	@$(AARCH64_PREFIX)size $(ARM_ELF) 2>/dev/null || true
 
 # ARCH=aarch64 means the aarch64 kernel is what `make` builds. The top-level
 # `.DEFAULT_GOAL := all` would otherwise send us into the x86 boot image.
 .DEFAULT_GOAL := arm64
+
+# --- A6: the userland -------------------------------------------------------
+# docs/ARM64.md phase A6. user/lib is ONE implementation for both machines --
+# embk_syscall.h gained an `svc #0` branch, crt0.c an aarch64 _start and
+# variant-I TLS -- so there is nothing here but paths and a pattern rule. The
+# COMPILER FLAGS are the top-level Makefile's ($(NEWLIB_CFLAGS),
+# $(NEWLIB_LDFLAGS), $(USER_CFLAGS)), which now derive from $(USER_TRIPLE); they
+# are deliberately NOT restated here, because two lists of userland flags is how
+# the two architectures start drifting apart.
+#
+# The objects live under $(ARM_BUILD)/user rather than build/, and that is not
+# tidiness: `build/crt0.o` cannot mean both x86 and aarch64 machine code, and a
+# shared path would make `make` hand whichever was built last to the other
+# architecture's linker. The top-level Makefile hardcodes `build/` in 372
+# places; redirecting all of them is churn with a real chance of breaking the
+# x86 image, so the second architecture takes a subdirectory instead.
+ARM_USER      := $(ARM_BUILD)/user
+ARM_CRT0      := $(ARM_USER)/crt0.o
+ARM_SYSCALLS  := $(ARM_USER)/syscalls.o
+
+# The programs built for aarch64. This is SHORT ON PURPOSE and is the honest
+# statement of how much userland the second architecture has: hello.elf is a
+# real newlib program (printf, malloc, time, a native thread) and is the A6
+# witness; init.elf is the freestanding pid-1. The GUI apps are absent because
+# libembk.so and the compositor are A7 work -- see docs/TODO.md. Add a name here
+# and it builds; nothing else needs editing.
+ARM_NEWLIB_PROGS ?= hello
+ARM_PLAIN_PROGS  ?= init
+
+# The dynamically-linked EmUI apps -- A6's "done when". Declared HERE with the
+# other two lists, not beside the rules that build them further down, for the
+# same reason ARM_ROOTFS is declared at the top: ARM_USER_ELVES below is a `:=`
+# assignment, so a name that is not defined yet expands to nothing and the app
+# silently never builds.
+ARM_UI_PROGS     ?= uidemo
+
+ARM_USER_ELVES := $(patsubst %,$(ARM_USER)/%.elf,$(ARM_NEWLIB_PROGS)) \
+                  $(patsubst %,$(ARM_USER)/%.elf,$(ARM_PLAIN_PROGS)) \
+                  $(patsubst %,$(ARM_USER)/%.elf,$(ARM_UI_PROGS))
+
+$(ARM_USER):
+	mkdir -p $(ARM_USER)
+
+# The retargeting layer, once.
+$(ARM_USER)/crt0.o: user/lib/crt0.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+$(ARM_USER)/syscalls.o: user/lib/syscalls.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+# EXPLICIT rules, generated per program, NOT pattern rules -- and that is a
+# correctness requirement, not a style. The top-level Makefile defines
+#
+#     build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
+#
+# for the dynamically-linked EmUI apps, and `build/aarch64/user/hello.elf`
+# MATCHES it with the stem `aarch64/user/hello`. It won, too: the first dry run
+# of this fragment linked hello.elf against build/crt0.o (x86 machine code) and
+# an aarch64 libembk.so it had helpfully just built. An explicit rule always
+# takes precedence over a pattern rule, so generating one per program is what
+# makes the outcome depend on nothing but this file.
+define ARM_NEWLIB_PROG
+$(ARM_USER)/$(1).o: user/bin/$(1).c | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(ARM_CRT0) $(ARM_SYSCALLS) user/lib/newlib.ld
+	$$(USER_CC) $$(NEWLIB_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) $$< -lc -lgcc -o $$@
+endef
+$(foreach p,$(ARM_NEWLIB_PROGS),$(eval $(call ARM_NEWLIB_PROG,$(p))))
+
+# Freestanding programs (init.elf): own _start, no libc, linked with the raw ld
+# against user.ld exactly as x86 does -- $(USER_LD) is aarch64-elf-ld here.
+define ARM_PLAIN_PROG
+$(ARM_USER)/$(1).plain.o: user/bin/$(1).c | $(ARM_USER)
+	$$(USER_CC) $$(USER_CFLAGS) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).plain.o user/lib/user.ld
+	$$(USER_LD) -T user/lib/user.ld -z max-page-size=0x1000 $$< -o $$@
+endef
+$(foreach p,$(ARM_PLAIN_PROGS),$(eval $(call ARM_PLAIN_PROG,$(p))))
+
+.PHONY: arm64-user
+arm64-user: $(ARM_USER_ELVES)
+	@echo "aarch64 userland:"; for f in $(ARM_USER_ELVES); do \
+	  printf '  %-40s %s bytes\n' "$$f" "$$(wc -c < $$f | tr -d ' ')"; done
+
+# --- A6 + A7: libembk.so and the dynamically-linked EmUI apps ---------------
+# A6's "done when" is a dynamically-linked EmUI app loading, and it needed A7's
+# display first: an app with nothing to draw on is not a test of anything.
+#
+# The TOOLKIT is `ui/` -- scene graph, CPU raster backend, font, layout,
+# reactive, declare, theme, kit, the DSL -- plus user/lib/auth.c, built -fPIC
+# into one shared object. It is exactly the x86 object list, which is why it is
+# derived from ONE list of sources here rather than the twelve near-identical
+# three-line rules the x86 side still spells out.
+#
+# The kernel is the dynamic loader (there is no ld.so and no PT_INTERP), and it
+# already understood aarch64: elf.h has carried EM_AARCH64 and the R_AARCH64_*
+# set behind the neutral ELF_RELOC_* names since A4.
+ARM_LIBEMBK_SRC := ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c \
+                   ui/backend/scene_render.c ui/layout/layout.c \
+                   ui/reactive/reactive.c ui/declare/declare.c \
+                   ui/theme/theme.c ui/kit/kit.c ui/dsl/em.c ui/dsl/em_app.c \
+                   user/lib/auth.c
+
+# build/aarch64/user/pic_ui_scene_scene.o -- the source path flattened, so two
+# files with the same basename in different directories cannot collide.
+ARM_LIBEMBK_OBJ := $(patsubst %,$(ARM_USER)/pic_%.o,\
+                     $(subst /,_,$(basename $(ARM_LIBEMBK_SRC))))
+ARM_LIBEMBK     := $(ARM_USER)/libembk.so
+
+define ARM_PIC_OBJ
+$(ARM_USER)/pic_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) -fPIC $$(UIDEMO_INC) -c $$< -o $$@
+endef
+$(foreach src,$(ARM_LIBEMBK_SRC),$(eval $(call ARM_PIC_OBJ,$(src))))
+
+$(ARM_LIBEMBK): $(ARM_LIBEMBK_OBJ)
+	$(USER_LD) -shared -soname libembk.so --hash-style=sysv $(ARM_LIBEMBK_OBJ) -o $@
+
+# The EmUI apps. Same link shape as x86's: NO -static (it would forbid the .so)
+# and NO -T newlib.ld (the DEFAULT script is what emits the .dynamic/.dynsym/
+# .rela.plt/.got the in-kernel loader reads). libembk.so comes before -lc -lm so
+# ld pulls the libc the toolkit needs INTO the app, and --export-dynamic exports
+# it back to the .so. --no-dynamic-linker because the kernel is the loader.
+define ARM_UI_PROG
+$(ARM_USER)/$(1).o: user/bin/$(1).c user/lib/embk.h | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(ARM_CRT0) $(ARM_SYSCALLS) $(ARM_LIBEMBK)
+	$$(USER_CC) $$(NEWLIB_DYN_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) $$< \
+	    $(ARM_LIBEMBK) -lc -lm -lgcc $$(NEWLIB_DYN_WL) -o $$@
+endef
+$(foreach p,$(ARM_UI_PROGS),$(eval $(call ARM_UI_PROG,$(p))))
+
+# --- A6: the root filesystem ------------------------------------------------
+# A SEPARATE, MINIMAL image, not the x86 embkfs.img. tools/embkfs_mkfs's main
+# script packs the whole x86 desktop -- icons, wallpapers, music, CPython, tcc,
+# the newlib headers for on-OS compilation -- none of which exists for aarch64
+# yet, and most of which is machine code that would be silently wrong here. The
+# arm64 packer reuses the SAME make_image()/build_root_items() formatter (so the
+# on-disk format cannot drift between the two) and simply gives it a shorter
+# object list.
+$(ARM_ROOTFS): tools/embkfs_mkfs/mkfs_arm64.py $(ARM_USER_ELVES) $(ARM_LIBEMBK) | $(ARM_BUILD)
+	python3 tools/embkfs_mkfs/mkfs_arm64.py $@ $(ARM_USER)
+
+.PHONY: arm64-rootfs
+arm64-rootfs: $(ARM_ROOTFS)
 
 # --- running ----------------------------------------------------------------
 # gic-version=3 is NOT redundant. docs/ARM64.md §6.2 said "v3 is what `virt`
@@ -236,24 +391,41 @@ ARM_CPU_hvf ?= host
 ARM_QEMU_hvf = qemu-system-aarch64 -M $(ARM_MACHINE),accel=hvf -cpu $(ARM_CPU_hvf) -m $(ARM_MEM)
 ARM_QEMU_tcg = qemu-system-aarch64 -M $(ARM_MACHINE) -cpu $(ARM_CPU_tcg) -m $(ARM_MEM)
 
+# The root filesystem is attached on every run target: without a disk there is
+# no /system/bin/hello.elf, so the kernel reaches A6 and has nothing to run.
+ARM_DISK = -drive file=$(ARM_ROOTFS),format=raw,if=none,id=d0 \
+           -device virtio-blk-pci,drive=d0
+
+# The display. `virt` has no VGA and no firmware framebuffer -- there is no
+# legacy path to fall back to, so if this device is absent the machine simply
+# has no screen (ARM64.md §6.5 settled: virtio-gpu only).
+ARM_GPU  = -device virtio-gpu-pci
+
+# Input. TWO devices, because a keyboard and a pointer are two virtio-input
+# functions; the driver tells them apart by asking each what events it can
+# produce. The TABLET rather than virtio-mouse on purpose: it reports ABSOLUTE
+# coordinates, so the guest cursor tracks the host's 1:1 and never "escapes"
+# the window the way a relative device does.
+ARM_INPUT = -device virtio-keyboard-pci -device virtio-tablet-pci
+
 .PHONY: run-arm64
-run-arm64: $(ARM_IMG)
-	$(ARM_QEMU_$(ARM_ACCEL)) -nographic -kernel $(ARM_IMG)
+run-arm64: $(ARM_IMG) $(ARM_ROOTFS)
+	$(ARM_QEMU_$(ARM_ACCEL)) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) -kernel $(ARM_IMG)
 
 # Force one or the other regardless of host.
 .PHONY: run-arm64-hvf
-run-arm64-hvf: $(ARM_IMG)
-	$(ARM_QEMU_hvf) -nographic -kernel $(ARM_IMG)
+run-arm64-hvf: $(ARM_IMG) $(ARM_ROOTFS)
+	$(ARM_QEMU_hvf) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) -kernel $(ARM_IMG)
 
 .PHONY: run-arm64-tcg
-run-arm64-tcg: $(ARM_IMG)
-	$(ARM_QEMU_tcg) -nographic -kernel $(ARM_IMG)
+run-arm64-tcg: $(ARM_IMG) $(ARM_ROOTFS)
+	$(ARM_QEMU_tcg) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) -kernel $(ARM_IMG)
 
 # Interrupt/exception tracing. TCG only -- this is the capability HVF does not
 # have, and the reason TCG stays a first-class target rather than a fallback.
 .PHONY: debug-arm64
-debug-arm64: $(ARM_IMG)
-	$(ARM_QEMU_tcg) -nographic -kernel $(ARM_IMG) \
+debug-arm64: $(ARM_IMG) $(ARM_ROOTFS)
+	$(ARM_QEMU_tcg) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) -kernel $(ARM_IMG) \
 	    -d int,unimp,guest_errors -D $(ARM_BUILD)/qemu.log
 
 # --- the acceptance test ----------------------------------------------------
@@ -272,7 +444,7 @@ debug-arm64: $(ARM_IMG)
 # is portable to both hosts -- the same rule the top-level Makefile applies to
 # stat and truncate.
 .PHONY: test-arm64-boot
-test-arm64-boot: $(ARM_IMG)
+test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	@overall=0; \
 	for acc in $(ARM_TEST_ACCELS); do \
 	  case $$acc in \
@@ -281,12 +453,15 @@ test-arm64-boot: $(ARM_IMG)
 	  esac; \
 	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \
 	  echo "=== $$acc ==="; \
-	  disk=""; \
-	  if [ -f embkfs.img ]; then \
-	    disk="-drive file=embkfs.img,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0"; \
-	  fi; \
-	  $$qcmd $$disk -display none -serial file:$$log -kernel $(ARM_IMG) 2>/dev/null & \
-	  qpid=$$!; sleep $$secs; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
+	  disk="-drive file=$(ARM_ROOTFS),format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0"; \
+	  port=$$(awk 'BEGIN{srand();print 4500+int(rand()*400)}'); \
+	  $$qcmd $$disk $(ARM_GPU) $(ARM_INPUT) -display none -serial file:$$log \
+	      -qmp tcp:127.0.0.1:$$port,server,nowait -kernel $(ARM_IMG) 2>/dev/null & \
+	  qpid=$$!; \
+	  python3 tools/arm64_input_probe.py $$port $$secs >/dev/null 2>&1 & \
+	  ipid=$$!; \
+	  sleep $$secs; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
+	  kill $$ipid 2>/dev/null; wait $$ipid 2>/dev/null; \
 	  fail=0; \
 	  chk() { grep -q "$$1" $$log || { echo "FAIL($$2): $$3"; fail=1; }; }; \
 	  chk 'EmbLinkOS aarch64'              A0 'no banner -- PL011 or the entry point is wrong'; \
@@ -311,14 +486,33 @@ test-arm64-boot: $(ARM_IMG)
 	  chk 'pci: ECAM at'                   A7 'the PCIe host bridge was not found in the device tree'; \
 	  chk 'Network controller'             A7 'PCIe enumeration found no virtio device'; \
 	  chk 'pci: assigned'                  A7 'no BAR was assigned -- there is no firmware to do it here'; \
-	  if [ -f embkfs.img ]; then \
-	    chk 'virtio-blk: sda'              A7 'the virtio-blk device did not come up'; \
-	    chk 'written and read back'        A7 'the disk failed a write/read round trip'; \
-	    chk 'EMBKFS: sda: mounted'         A7 'the real filesystem did not mount'; \
-	    chk 'ELF magic intact'             A7 'could not read a file out of the mounted image'; \
-	  fi; \
+	  chk 'virtio-blk: sda'              A7 'the virtio-blk device did not come up'; \
+	  chk 'written and read back'        A7 'the disk failed a write/read round trip'; \
+	  chk 'EMBKFS: sda: mounted'         A7 'the real filesystem did not mount'; \
+	  chk 'ELF magic intact'             A7 'could not read a file out of the mounted image'; \
 	  chk 'distinct line'                  A7 'PCI interrupt routing was not exercised'; \
 	  chk 'all reclaimed'                  A6 'destroying an address space leaks pages'; \
+	  chk 'hello.elf launched as pid'      A6 'the kernel could not create a user process'; \
+	  chk 'hello from newlib'              A6 'printf never reached the console -- write(2) or the retargeting layer'; \
+	  chk 'argv0=/system/bin/hello.elf'    A6 'argc/argv did not survive the transition to EL0'; \
+	  chk 'malloc/free of 4096 bytes'      A6 'malloc/sbrk does not work in ring 3'; \
+	  chk 'snprintf: OK'                   A6 'libc formatting is broken (C99 formats?)'; \
+	  chk 'plausible wall clock'           A6 'time() did not reach the RTC'; \
+	  chk 'embk thread create/join: OK'    A6 'a second EL0 thread could not be created or joined'; \
+	  chk 'hello: 5/5 checks passed'       A6 'the userland witness did not pass every check'; \
+	  chk 'exited with 5 (checks passed)'  A6 'the process did not exit cleanly with its status'; \
+	  chk 'libembk.so linked'              A6 'the dynamic link failed -- no EmUI app can load'; \
+	  chk 'uidemo.elf launched as pid'     A6 'the dynamically-linked app did not start'; \
+	  chk 'first frame presented'          A7 'the compositor never presented a frame'; \
+	  chk 'framebuffer 1280x800'           A7 'virtio-gpu did not come up'; \
+	  chk 'is a keyboard'                  A7 'virtio-input found no keyboard'; \
+	  chk 'is a tablet'                    A7 'virtio-input found no pointer'; \
+	  keyn=$$(sed -n 's/.*virtio-input: \([0-9][0-9]*\) key event.*/\1/p' $$log | tail -1); \
+	  ptrn=$$(sed -n 's/.*virtio-input: [0-9][0-9]* key event(s), \([0-9][0-9]*\) pointer.*/\1/p' $$log | tail -1); \
+	  [ -n "$$keyn" ] && [ "$$keyn" -gt 0 ] 2>/dev/null || \
+	    { echo "FAIL(A7): no KEY events reached the driver ($${keyn:-none}) -- the queue is armed but empty"; fail=1; }; \
+	  [ -n "$$ptrn" ] && [ "$$ptrn" -gt 0 ] 2>/dev/null || \
+	    { echo "FAIL(A7): no POINTER events reached the driver ($${ptrn:-none})"; fail=1; }; \
 	  n=$$(grep -c 'matches KV2P' $$log); \
 	    [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
 	  if grep -q 'MISMATCH' $$log; then echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
@@ -339,8 +533,19 @@ test-arm64-boot: $(ARM_IMG)
 	  echo "  A3 GICv3, generic timer, preemptive context switching"; \
 	  echo "  A6 the shared kernel heap, per-process address spaces, clean teardown"; \
 	  echo "  A7 PCIe ECAM, virtio-blk, and the REAL filesystem mounted + read"; \
+	  echo "  A6 a newlib program from that filesystem, at EL0: argv, printf,"; \
+	  echo "     malloc, snprintf, time, a second thread, and a clean exit(5)"; \
+	  echo "  A6 a DYNAMICALLY-LINKED EmUI app: libembk.so loaded and relocated"; \
+	  echo "  A7 virtio-gpu 1280x800, the compositor presenting a frame"; \
+	  echo "  A7 virtio-input: keyboard + tablet, events injected and RECEIVED"; \
 	else exit 1; fi
 
+# The USERLAND libc is probed the way the x86 check-tools does it: by actually
+# COMPILING an #include with the build's own flags, so a wrong NEWLIB_PREFIX and
+# a toolchain that ships no libc are both caught. Homebrew's aarch64-elf-gcc
+# ships NO newlib at all, so this is the step people will miss -- and its
+# absence shows up otherwise as a wall of "undefined reference" at the first
+# link, a long way from "you have not built a libc yet".
 .PHONY: check-tools-arm64
 check-tools-arm64:
 	@miss=0; \
@@ -349,6 +554,14 @@ check-tools-arm64:
 	  if command -v $$t >/dev/null 2>&1; then printf '  [ ok ]  %s\n' "$$t"; \
 	  else printf '  [MISS]  %s\n' "$$t"; miss=$$((miss+1)); fi; \
 	done; \
+	if [ -z "$(NEWLIB_PREFIX)" ]; then \
+	  printf '  [ -- ]  userspace libc  (NEWLIB_PREFIX empty -- kernel only, no userland)\n'; \
+	elif echo '#include <string.h>' | $(USER_CC) $(NEWLIB_INC) -ffreestanding -x c -E - >/dev/null 2>&1; then \
+	  printf '  [ ok ]  userspace libc  (<string.h> resolves via NEWLIB_PREFIX=$(NEWLIB_PREFIX))\n'; \
+	else \
+	  printf '  [MISS]  userspace libc  for aarch64 -- build it with:\n'; \
+	  printf '            tools/newlib/build-newlib-emblink.sh <newlib-src> aarch64-elf\n'; \
+	  miss=1; fi; \
 	echo; \
 	if [ $$miss -gt 0 ]; then \
 	  echo "==> missing. macOS:  brew install aarch64-elf-gcc qemu"; \
