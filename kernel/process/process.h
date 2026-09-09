@@ -152,7 +152,8 @@ struct thread {
      * without that, a brand-new thread's first-ever FXRSTOR would load an
      * all-zero MXCSR (every exception UNmasked) and likely #XM on its very
      * first floating-point op. */
-    unsigned char fpu_state[512] __attribute__((aligned(16)));
+    unsigned char fpu_state[KCONTEXT_FPU_SIZE]
+        __attribute__((aligned(KCONTEXT_FPU_ALIGN)));
     uint64_t kstack_top;       /**< Virtual address of the top of this thread's kernel stack */
     uint64_t entry_point;      /**< Ring-3 user entry (process_trampoline) OR the real
                                  *   kthread function (kthread_trampoline stashes it here) */

@@ -234,10 +234,14 @@ aarch64_eret_to_el0:
      * FPSR is zeroed for the same reason the GPRs are: it is accumulated
      * status from whoever ran last, and none of it is this process's business.
      *
-     * KNOWN GAP, recorded in docs/TODO.md: kernel_ctx_switch does not save or
-     * restore FP/SIMD state, so FPCR is effectively shared between threads.
-     * Zeroing here is correct because every thread wants the same value; it
-     * stops being sufficient the moment anything sets a rounding mode. */
+     * This is BELT AND BRACES, not the mechanism: kernel_ctx_switch does save
+     * and restore the whole FP file including FPCR (FP_SAVE/FP_LOAD above), so
+     * a thread's control word already survives preemption. What it could not
+     * survive was struct thread::fpu_state being 512 bytes when this
+     * architecture needs 528 -- FPCR was written past the end of the buffer and
+     * read back out of a code address. That is fixed at the source
+     * (KCONTEXT_FPU_SIZE); zeroing here means a brand-new process starts from
+     * the AAPCS64 state no matter what the scheduler hands it. */
     msr     fpcr, xzr
     msr     fpsr, xzr
 

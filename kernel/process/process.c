@@ -260,8 +260,20 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
      * FXRSTOR (schedule_locked(), on its first-ever dispatch) is what reads
      * this buffer -- see struct thread::fpu_state's comment (process.h). */
     memset(t->fpu_state, 0, sizeof(t->fpu_state));
+#if defined(__x86_64__)
+    /* MXCSR at byte 24 and FCW at byte 0 of the FXSAVE image. Both offsets are
+     * x86's, and so are the values, which is why they are behind this guard:
+     * on aarch64 those two byte ranges are v0 and v1 -- ordinary vector
+     * registers -- and writing them there seeds a new thread with two garbage
+     * SIMD registers and no control word at all. */
     *(uint32_t *)(t->fpu_state + 24) = 0x1F80;
     *(uint16_t *)(t->fpu_state + 0) = 0x037F;
+#else
+    /* aarch64: all-zero IS the correct initial state. FPCR (at offset 520)
+     * zero means every IEEE trap disabled and round-to-nearest, which is the
+     * AAPCS64 startup state -- the exact opposite of x86, where an all-zero
+     * MXCSR would leave every exception UNmasked. Nothing to write. */
+#endif
 
     /* FABRICATE the kernel context so the first schedule()-in lands the
      * thread at the trampoline, on its own kernel stack. This is the

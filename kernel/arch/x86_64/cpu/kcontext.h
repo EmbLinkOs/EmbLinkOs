@@ -33,6 +33,21 @@ void kernel_ctx_restore(struct kcontext *ctx, uint64_t val);
  * Requires fpu_init_this_cpu() (kernel/cpu/fpu.h) to have already run on
  * THIS core, or the FXSAVE/FXRSTOR themselves fault with #UD.
 */
+/* Bytes, and alignment, of the area the two FP pointers above must address.
+ * 512 is the FXSAVE image; FXSAVE/FXRSTOR #GP on an unaligned operand, hence
+ * the 16.
+ *
+ * NAMED, rather than left as a literal 512 at the one place that allocates it,
+ * because the aarch64 counterpart is a DIFFERENT SIZE (528: v0-v31 plus FPSR
+ * and FPCR) and struct thread is shared. It was a literal, and aarch64's
+ * FP_SAVE therefore wrote FPSR and FPCR sixteen bytes PAST the buffer -- over
+ * struct thread's kstack_top and entry_point -- while FP_LOAD read FPCR back
+ * out of a code address. An FPCR with arbitrary bits in it enables arbitrary
+ * IEEE traps, which is how it announced itself: EC 0x2C, "trapped
+ * floating-point exception", from a user program doing ordinary arithmetic. */
+#define KCONTEXT_FPU_SIZE  512
+#define KCONTEXT_FPU_ALIGN 16
+
 void kernel_ctx_switch(struct kcontext *save_to, struct kcontext *restore_from,
                         void *fpu_save_to, void *fpu_restore_from);
 
