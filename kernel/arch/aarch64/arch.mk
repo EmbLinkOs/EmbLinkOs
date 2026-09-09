@@ -247,6 +247,13 @@ ARM_PLAIN_PROGS  ?= init primtest
 # crt0 -- which is a true statement about a program that has none.
 #
 # Override on the command line to build a subset:  make ARCH=aarch64 ARM_UI_PROGS=uidemo
+# Programs that link emlibc INSTEAD of newlib -- see the emlibc section below.
+# Declared here with the other lists, and not beside their rules, because
+# ARM_USER_ELVES is a `:=` assignment: a name defined later expands to nothing
+# and the program silently never builds. This fragment has produced that bug
+# four times now.
+ARM_EMLIBC_PROGS ?= emlibc_demo emlibc_net emlibc_caps emlibc_math emlibc_embxapp
+
 ARM_UI_PROGS     ?= $(filter-out beep primtest,\
                       $(patsubst user/bin/%.c,%,$(EMUI_APP_SRCS))) \
                     photos mp3play
@@ -430,6 +437,80 @@ $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
 	    $(ARM_LIBEMBK) -lc -lm -lgcc $$(NEWLIB_DYN_WL) -o $$@
 endef
 $(foreach p,$(ARM_UI_PROGS),$(eval $(call ARM_UI_PROG,$(p))))
+
+# --- emlibc: the ALTERNATIVE libc, and the programs that link it -------------
+# user/emlibc is a second C library -- not a wrapper over newlib but a
+# replacement for it -- and its headers DELIBERATELY SHADOW newlib's. That is
+# why it cannot simply join the app lists above: it compiles -nostdinc against
+# its own include tree, links no -lc and no crt0.o/syscalls.o, and its programs
+# take neither the static-newlib nor the dynamic-EmUI shape.
+#
+# Adding -Iuser/emlibc/include to the ordinary apps instead is the mistake that
+# looks like the fix -- it breaks every newlib program in the tree, because
+# emlibc's <stdio.h> is then the one they get.
+#
+# The flags are the x86 rules' with the x86 out of them: no -mno-red-zone
+# (AAPCS64 has no red zone) and no SSE note, everything else identical.
+EMLIBC_DIR       := user/emlibc
+ARM_GCC_FREEINC  := $(shell $(USER_CC) -print-file-name=include)
+ARM_EMLIBC_INC   := -nostdinc -isystem $(ARM_GCC_FREEINC) \
+                    -I$(EMLIBC_DIR)/include -Iuser/lib
+ARM_EMLIBC_CFLAGS = -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin \
+                    -fno-stack-protector -O2 -Wall -Wextra $(ARM_EMLIBC_INC)
+
+# fdlibm is vendored third-party (Sun's ~1-ulp library, the source newlib's
+# libm is built from). It compiles -w on purpose: we do not "fix" third-party
+# warnings.
+ARM_EMLIBC_FD_DIR := $(EMLIBC_DIR)/math/fdlibm
+ARM_EMLIBC_FD_SRC := $(wildcard $(ARM_EMLIBC_FD_DIR)/*.c)
+ARM_EMLIBC_FD_CFLAGS = -MMD -MP -MF $@.d -std=c99 -ffreestanding -fno-builtin \
+                       -fno-stack-protector -O2 -w -nostdinc \
+                       -isystem $(ARM_GCC_FREEINC) -I$(EMLIBC_DIR)/include \
+                       -Iuser/lib -I$(ARM_EMLIBC_FD_DIR)
+
+ARM_EMLIBC_SRC := $(EMLIBC_DIR)/string/string.c $(EMLIBC_DIR)/stdlib/stdlib.c \
+                  $(EMLIBC_DIR)/stdio/stdio.c $(EMLIBC_DIR)/rim/syscalls.c \
+                  $(EMLIBC_DIR)/rim/errno.c $(EMLIBC_DIR)/process/process.c \
+                  $(EMLIBC_DIR)/math/math.c $(EMLIBC_DIR)/net/net.c
+
+ARM_EMLIBC_OBJ := $(patsubst %,$(ARM_USER)/em_%.o,$(subst /,_,$(basename $(ARM_EMLIBC_SRC))))
+ARM_EMLIBC_FD_OBJ := $(patsubst $(ARM_EMLIBC_FD_DIR)/%.c,$(ARM_USER)/emfd_%.o,$(ARM_EMLIBC_FD_SRC))
+ARM_LIBEMLIBC  := $(ARM_USER)/libemlibc.a
+
+define ARM_EMLIBC_OBJ_RULE
+$(ARM_USER)/em_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
+	$$(USER_CC) $$(ARM_EMLIBC_CFLAGS) -c $$< -o $$@
+endef
+$(foreach src,$(ARM_EMLIBC_SRC),$(eval $(call ARM_EMLIBC_OBJ_RULE,$(src))))
+
+$(ARM_USER)/emfd_%.o: $(ARM_EMLIBC_FD_DIR)/%.c | $(ARM_USER)
+	$(USER_CC) $(ARM_EMLIBC_FD_CFLAGS) -c $< -o $@
+
+$(ARM_LIBEMLIBC): $(ARM_EMLIBC_OBJ) $(ARM_EMLIBC_FD_OBJ)
+	$(AARCH64_PREFIX)ar rcs $@ $(ARM_EMLIBC_OBJ) $(ARM_EMLIBC_FD_OBJ)
+
+# emlibc's own crt0: the SAME source as newlib's, compiled against emlibc's
+# headers so exit/malloc/environ resolve to emlibc's.
+$(ARM_USER)/emlibc_crt0.o: user/lib/crt0.c | $(ARM_USER)
+	$(USER_CC) $(ARM_EMLIBC_CFLAGS) -c $< -o $@
+
+# Each program's object name differs from its source basename in two cases,
+# both inherited from x86: emlibc_demo builds from emlibc_demo.c but the rim's
+# net.c already owns the name emlibc_net.o, and emlibc_math's object is
+# .elf.o. Naming them here keeps that quirk in one place.
+ARM_EMSRC_emlibc_net := user/bin/emlibc_net.c
+
+define ARM_EMLIBC_PROG
+$(ARM_USER)/app_$(1).o: $(if $(ARM_EMSRC_$(1)),$(ARM_EMSRC_$(1)),user/bin/$(1).c) | $(ARM_USER)
+	$$(USER_CC) $$(ARM_EMLIBC_CFLAGS) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/emlibc_crt0.o $(ARM_USER)/app_$(1).o \
+                      $(ARM_LIBEMLIBC) user/lib/newlib.ld
+	$$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+	    -Wl,-z,max-page-size=0x1000 \
+	    $(ARM_USER)/emlibc_crt0.o $(ARM_USER)/app_$(1).o \
+	    -L$(ARM_USER) -lemlibc -lgcc -o $$@
+endef
+$(foreach p,$(ARM_EMLIBC_PROGS),$(eval $(call ARM_EMLIBC_PROG,$(p))))
 
 # --- A6: the root filesystem ------------------------------------------------
 # A SEPARATE, MINIMAL image, not the x86 embkfs.img. tools/embkfs_mkfs's main

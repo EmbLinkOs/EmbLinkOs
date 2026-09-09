@@ -151,6 +151,7 @@ void *emlibc_sbrk(long incr)
 /* ------------------------------------------------------------------ */
 int getentropy(void *buf, size_t n)
 {
+#if defined(__x86_64__)
     unsigned char *p = buf;
     while (n) {
         unsigned long long v;
@@ -163,4 +164,21 @@ int getentropy(void *buf, size_t n)
         p += take; n -= take;
     }
     return 0;
+#else
+    /* No reachable entropy source on this architecture. The aarch64 equivalent
+     * of RDRAND is FEAT_RNG's RNDR, which EL0 may execute -- but only where it
+     * exists, and the feature bit that says so is in ID_AA64ISAR0_EL1, which
+     * EL0 may NOT read: an MRS of an ID register from EL0 traps to EL1 and this
+     * kernel does not emulate those. There is no way to ask before executing,
+     * and executing it on a part without it is UNDEFINED.
+     *
+     * So: fail, exactly as the x86 path fails when RDRAND is absent, and for
+     * the same non-negotiable reason (§3) -- a caller handed -1 can decide,
+     * a caller handed predictable bytes cannot. user/lib/syscalls.c makes the
+     * identical refusal; see docs/TODO.md for the two ways out, both of which
+     * are kernel-side. */
+    (void)buf; (void)n;
+    errno = ENOSYS;
+    return -1;
+#endif
 }
