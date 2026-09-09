@@ -1729,6 +1729,13 @@ substantially complete.
       `arch_pci_msi_message`) and is now portable; aarch64 reaches config space
       over ECAM. The bus enumerates and BARs are assigned from the device
       tree's window, because there is no firmware to do it.
+    - [ ] **The virtio drivers cannot come up on aarch64 until the scheduler
+      and network stack are in that build.** `virtio_net.c` compiles and its
+      PCI/BAR/interrupt path is all in place, but it references `net_rx()` and
+      `net_signal_rx()`, and `net.c` in turn needs `process_create_kthread`,
+      the wait queues and the IP/ARP/DHCP files. That is one linking step, not
+      a porting problem — do it when the driver-symbol list (below) is short
+      enough that the whole kernel links.
     - [ ] **No MSI on aarch64.** `arch_pci_msi_message()` returns false, so
       `pci_enable_msi/msix` fail and callers fall back to a legacy interrupt
       line — which works and is what `virt` provides. Real MSI needs the GIC

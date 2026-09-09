@@ -2,6 +2,7 @@
 #include "arch/aarch64/boot/fdt.h"
 #include "mm/vmm.h"
 #include "include/kprintf.h"
+#include "arch/aarch64/irq/gicv3.h"
 
 /* PCIe configuration space on aarch64 -- ECAM. docs/ARM64.md phase A7.
  *
@@ -155,4 +156,160 @@ void pci_ecam_assign_resources(void) {
     }
 
     kprintf("pci: no 32-bit MMIO window in `ranges`\n");
+}
+
+/* Big-endian, unaligned-safe. Local rather than exported from fdt.c: one
+ * caller does not justify widening that interface. */
+static uint32_t be32_at(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+}
+
+/* INTx handlers take no arguments; the GIC hands its handlers an INTID. Rather
+ * than cast between the two function types -- which is undefined behaviour the
+ * moment it is CALLED, not merely converted -- keep a small table and
+ * trampoline through it. Four entries because there are four INTx pins. */
+#define MAX_INTX 8
+static struct { uint32_t intid; void (*fn)(void); } intx[MAX_INTX];
+static uint32_t intx_used;
+
+static void pci_intx_trampoline(uint32_t intid) {
+    for (uint32_t i = 0; i < intx_used; i++)
+        if (intx[i].intid == intid && intx[i].fn) {
+            intx[i].fn();
+            return;
+        }
+}
+
+/* --- legacy interrupt routing, from the device tree ------------------------
+ *
+ * A PCI device's INTx pin reaches the GIC through the host bridge's
+ * `interrupt-map`, and there is no other way to find out which line it lands
+ * on: config space's PCI_INTERRUPT_LINE is meaningless here because no
+ * firmware ran to fill it in.
+ *
+ * The binding (Open Firmware PCI Bus Binding, §"Interrupt Mapping") is a table
+ * of entries, each laid out as
+ *
+ *     <#address-cells of the PCI node>       child unit address  -- 3
+ *     <#interrupt-cells of the PCI node>     child interrupt     -- 1, the INTx pin
+ *     1 cell                                 parent phandle
+ *     <#address-cells of the PARENT>         parent unit address
+ *     <#interrupt-cells of the PARENT>       parent interrupt
+ *
+ * and `interrupt-map-mask` says which bits of the child key to compare -- for
+ * PCI that is a couple of device-number bits and the pin, because slots are
+ * wired in a rotating pattern and the function number is irrelevant.
+ *
+ * THE STRIDE MUST BE COMPUTED, NOT ASSUMED. The first version of this assumed
+ * the interrupt controller had no unit address (`#address-cells = 0`, which is
+ * common) and used an 8-cell stride. QEMU `virt`'s GIC declares
+ * `#address-cells = <2>`, so entries are 10 cells, and the 8-cell walk
+ * misaligned after the first entry -- every device then matched the same stale
+ * bytes and was routed to SPI 0. It looked like it worked: two devices, two
+ * "routed" messages, one wrong answer each. The fix is to read all four cell
+ * counts out of the tree, which is also what makes this correct on a board
+ * that is not this one.
+ *
+ * Decoding it at all, rather than using `virt`'s well-known formula
+ * (SPI 3 + (slot + pin - 1) % 4), is the difference between a driver that
+ * works on this board and one that works on the board.
+ */
+bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void)) {
+    fdt_node_t n = fdt_find_compatible("pci-host-ecam-generic");
+    if (n == FDT_NONE)
+        return false;
+
+    uint32_t mlen = 0, klen = 0;
+    const uint8_t *map  = (const uint8_t *)fdt_prop(n, "interrupt-map", &mlen);
+    const uint8_t *mask = (const uint8_t *)fdt_prop(n, "interrupt-map-mask", &klen);
+    if (!map || !mask || klen < 16) {
+        kprintf("pci: host bridge has no interrupt-map; %d:%d.%d cannot interrupt\n",
+                dev->bus, dev->device, dev->function);
+        return false;
+    }
+
+    /* Every one of these comes from the tree. See the note above on why
+     * assuming any of them is how a routing table walks off its own entries. */
+    fdt_node_t gic = fdt_find_compatible("arm,gic-v3");
+    uint32_t child_ac  = fdt_prop_u32(n, "#address-cells", 3);
+    uint32_t child_ic  = fdt_prop_u32(n, "#interrupt-cells", 1);
+    uint32_t parent_ac = (gic != FDT_NONE) ? fdt_prop_u32(gic, "#address-cells", 0) : 0;
+    uint32_t parent_ic = (gic != FDT_NONE) ? fdt_prop_u32(gic, "#interrupt-cells", 3) : 3;
+
+    uint32_t stride_cells = child_ac + child_ic + 1 + parent_ac + parent_ic;
+    uint32_t stride = stride_cells * 4;
+    uint32_t pirq_off = (child_ac + child_ic + 1 + parent_ac) * 4;
+
+    if (child_ac < 1 || child_ic < 1 || parent_ic < 2 || stride_cells > 32) {
+        kprintf("pci: interrupt-map cell counts look wrong (%d/%d/%d/%d)\n",
+                (int)child_ac, (int)child_ic, (int)parent_ac, (int)parent_ic);
+        return false;
+    }
+
+    uint8_t pin = pci_read8(dev->bus, dev->device, dev->function, PCI_INTERRUPT_PIN);
+    if (pin == 0 || pin > 4)
+        return false;                     /* the device declares no INTx pin */
+
+    /* The child key this device presents, masked the way the bridge asks. */
+    uint32_t phys_hi = ((uint32_t)dev->bus << 16) |
+                       ((uint32_t)dev->device << 11) |
+                       ((uint32_t)dev->function << 8);
+    uint32_t m_hi  = be32_at(mask + 0);
+    uint32_t m_irq = be32_at(mask + child_ac * 4);
+    uint32_t key_hi  = phys_hi & m_hi;
+    uint32_t key_irq = (uint32_t)pin & m_irq;
+
+    for (uint32_t off = 0; off + stride <= mlen; off += stride) {
+        const uint8_t *e = map + off;
+        if ((be32_at(e + 0) & m_hi) != key_hi)
+            continue;
+        if ((be32_at(e + child_ac * 4) & m_irq) != key_irq)
+            continue;
+
+        /* The GIC's own interrupt specifier: {type, number, flags}. */
+        uint32_t type   = be32_at(e + pirq_off);
+        uint32_t number = be32_at(e + pirq_off + 4);
+        uint32_t intid  = gic_intid(type, number);
+
+        if (intx_used >= MAX_INTX) {
+            kprintf("pci: too many INTx handlers\n");
+            return false;
+        }
+        intx[intx_used].intid = intid;
+        intx[intx_used].fn    = handler;
+        intx_used++;
+
+        /* Shared line: several devices can land on the same SPI, and the
+         * trampoline calls whichever of them registered it. Registering twice
+         * for one INTID is harmless -- gic_register is idempotent about
+         * enabling. */
+        gic_register(intid, pci_intx_trampoline, "pci INTx");
+        kprintf("pci: %d:%d.%d INT%c -> %s %d (INTID %d) [from the device tree]\n",
+                dev->bus, dev->device, dev->function, 'A' + pin - 1,
+                type == GIC_TYPE_PPI ? "PPI" : "SPI", (int)number, (int)intid);
+        return true;
+    }
+
+    kprintf("pci: no interrupt-map entry for %d:%d.%d INT%c\n",
+            dev->bus, dev->device, dev->function, 'A' + pin - 1);
+    return false;
+}
+
+/* How many DISTINCT interrupt lines the routed devices ended up on.
+ *
+ * Exists because of a specific bug: an interrupt-map walk with the wrong
+ * stride routed every device to the same line and reported success for each.
+ * "Two devices routed" was true and useless; "two devices on two lines" is the
+ * claim that fails when the walk is wrong. */
+uint32_t pci_ecam_intx_distinct(void) {
+    uint32_t distinct = 0;
+    for (uint32_t i = 0; i < intx_used; i++) {
+        bool seen = false;
+        for (uint32_t j = 0; j < i; j++)
+            if (intx[j].intid == intx[i].intid) { seen = true; break; }
+        if (!seen)
+            distinct++;
+    }
+    return distinct;
 }

@@ -813,6 +813,27 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
      the device kept is not necessarily what was written; the code checks and
      prints `*** DID NOT TAKE ***` rather than trusting the write. The
      acceptance test fails on that string.
+  3. **A PCI device's interrupt line is not in config space here.** x86 reads
+     `PCI_INTERRUPT_LINE`, which firmware wrote. Nothing wrote it on this
+     machine, so the routing is in the host bridge's `interrupt-map` and has to
+     be decoded — a fourth seam, `arch_pci_irq_connect()`.
+
+     **The first version of that decode looked like it worked and did not.** It
+     assumed the interrupt controller had no unit address (`#address-cells = 0`,
+     which is common) and used an 8-cell stride. `virt`'s GIC declares
+     `#address-cells = <2>`, so entries are 10 cells; the walk misaligned after
+     the first entry and every device matched the same stale bytes. The output
+     was two devices, two "routed" lines, and both on SPI 0 — a passing-looking
+     result with a wrong answer in it. The fix reads all four cell counts out
+     of the tree, and the self-test now asserts the routed devices are on
+     **distinct** lines, because `virt` wires slots in a rotating pattern and
+     "N routed" was the claim that could not fail:
+
+     ```
+     pci: 0:1.0 INTA -> SPI 4 (INTID 36) [from the device tree]
+     pci: 0:2.0 INTA -> SPI 5 (INTID 37) [from the device tree]
+       [ ok ] 2 of 3 devices routed to the GIC, on 2 distinct line(s)
+     ```
 * **A8 ❌ EMBX `machine = 2`.** The spec already reserves it.
 * **A9 ❌ SMP via PSCI.** Last, deliberately — the x86 SMP work says per-CPU
   structures are the hard part, and those are already written.

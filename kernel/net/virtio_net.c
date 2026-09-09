@@ -20,7 +20,9 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "include/spinlock.h"
-#include "arch/x86_64/irq/irq.h"   /* irq_register for the RX MSI-X interrupt */
+/* The interrupt is connected through drivers/bus/pci.h's
+ * arch_pci_irq_connect(): where a PCI device's INTx line goes is a
+ * property of the MACHINE, not of this driver. */
 
 /* ---- virtio PCI capability + common-config layout (as virtio_gpu.c) ------ */
 #define VIRTIO_PCI_CAP_COMMON_CFG 1
@@ -251,9 +253,8 @@ static bool vnet_init_transport(const struct pci_device *dev) {
      * the 10 ms timer tick -- correct, just higher latency. RX interrupts are not
      * suppressed (avail.flags == 0), so the device signals every RX completion. */
     uint8_t line = pci_read8(dev->bus, dev->device, dev->function, PCI_INTERRUPT_LINE);
-    if (line < 16) {
+    if (arch_pci_irq_connect(dev, virtio_net_isr)) {
         uint8_t vector = (uint8_t)(32 + line);
-        irq_register(line, virtio_net_isr);
         if (pci_enable_msix(dev->bus, dev->device, dev->function, vector, 0)) {
             vw16(c, VC_MSIX_CONFIG, VIRTIO_MSI_NO_VECTOR);
             vw16(c, VC_QUEUE_SELECT, 0);                  /* the RX queue */

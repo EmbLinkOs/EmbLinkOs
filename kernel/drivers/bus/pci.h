@@ -120,6 +120,17 @@ struct pci_bar pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, uint8
  * forwards to the bus; on aarch64 they come from the device tree's `ranges`. */
 void pci_assign_resources(uint64_t window_base, uint64_t window_size);
 
+/* Connect this device's LEGACY (INTx) interrupt to `handler` and unmask it.
+ * Returns false if it could not be routed, in which case the driver must poll.
+ *
+ * The fourth architecture-specific thing about PCI, and the least obvious.
+ * x86 reads PCI_INTERRUPT_LINE -- firmware wrote the ISA IRQ number there --
+ * and hands it to the 8259/IOAPIC path. aarch64 has no such number: the line
+ * is nowhere in config space, because there is no firmware to have put it
+ * there. It is in the DEVICE TREE, as an `interrupt-map` from
+ * (device, INTx pin) to a GIC interrupt, and the driver cannot know that. */
+bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void));
+
  // Access the discovered PCI devices table
  uint32_t pci_devices_count(void);
  const struct pci_device *pci_get_device(uint32_t index);

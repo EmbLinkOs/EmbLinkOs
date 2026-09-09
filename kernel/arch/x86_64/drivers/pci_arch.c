@@ -1,5 +1,6 @@
 #include "drivers/bus/pci.h"
 #include "include/io.h"
+#include "arch/x86_64/irq/irq.h"
 
 /* The x86_64 half of the three PCI seams in drivers/bus/pci.h.
  *
@@ -34,5 +35,18 @@ bool arch_pci_msi_message(uint8_t vector, uint32_t cpu_id,
      * between machines while the capability walk around it does not. */
     *out_addr = 0xFEE00000ULL | ((uint64_t)cpu_id << 12);
     *out_data = vector;
+    return true;
+}
+
+bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void)) {
+    /* Firmware wrote the ISA IRQ number into config space before the kernel
+     * started, so the line is simply there to be read. That is the whole
+     * difference from aarch64, where nothing put it anywhere and it has to
+     * come out of the device tree. */
+    uint8_t line = pci_read8(dev->bus, dev->device, dev->function, PCI_INTERRUPT_LINE);
+    if (line >= 16)
+        return false;
+
+    irq_register(line, handler);
     return true;
 }

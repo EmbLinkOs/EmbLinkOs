@@ -270,6 +270,7 @@ test-arm64-boot: $(ARM_IMG)
 	  chk 'pci: ECAM at'                   A7 'the PCIe host bridge was not found in the device tree'; \
 	  chk 'Network controller'             A7 'PCIe enumeration found no virtio device'; \
 	  chk 'pci: assigned'                  A7 'no BAR was assigned -- there is no firmware to do it here'; \
+	  chk 'distinct line'                  A7 'PCI interrupt routing was not exercised'; \
 	  chk 'all reclaimed'                  A6 'destroying an address space leaks pages'; \
 	  chk 'hello from EL0'                 A5 'user code never ran at EL0'; \
 	  chk 'REFUSED write'                  A5 'the kernel accepted an unmapped user pointer'; \

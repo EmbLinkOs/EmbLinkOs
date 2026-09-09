@@ -213,6 +213,10 @@ static void selftest_address_spaces(void) {
     kprintf("  [ ok ] both address spaces destroyed\n");
 }
 
+/* A do-nothing INTx handler, used only to prove the routing resolves. Nothing
+ * should ever call it: no device has been told to interrupt yet. */
+static void pci_probe_isr(void) { }
+
 static void selftest_faults(void) {
     kprintf("\n--- self-test: deliberately faulting ---\n");
     expect("brk #0 -> breakpoint, recovered",
@@ -423,6 +427,40 @@ void arch_early_main(uint64_t dtb_phys) {
     kprintf("\n--- PCIe ---\n");
     pci_init();
     { extern void pci_ecam_assign_resources(void); pci_ecam_assign_resources(); }
+
+    /* Route every enumerated device's legacy interrupt.
+     *
+     * This is the part of PCI that has no counterpart in config space here:
+     * x86 reads PCI_INTERRUPT_LINE, which firmware filled in. Nothing filled
+     * it in on this machine, so the answer is in the device tree's
+     * `interrupt-map` and must be decoded. Doing it for every device at boot
+     * proves the decode against real entries rather than one lucky slot.
+     *
+     * (The virtio drivers themselves need the scheduler and the network stack
+     * linked before they can come up here -- see docs/TODO.md. This tests the
+     * seam they will use.) */
+    {
+        kprintf("\n--- PCI interrupt routing ---\n");
+        uint32_t routed = 0, n = pci_devices_count();
+        for (uint32_t i = 0; i < n; i++) {
+            const struct pci_device *d = pci_get_device(i);
+            if (d && arch_pci_irq_connect(d, pci_probe_isr))
+                routed++;
+        }
+        extern uint32_t pci_ecam_intx_distinct(void);
+        uint32_t distinct = pci_ecam_intx_distinct();
+
+        kprintf("  [%s] %d of %d devices routed to the GIC, on %d distinct line(s)\n",
+                (routed && distinct == routed) ? " ok " : "FAIL",
+                (int)routed, (int)n, (int)distinct);
+
+        /* Distinctness is the real check. `virt` wires slots in a rotating
+         * pattern, so two devices in different slots MUST land on different
+         * SPIs -- and an interrupt-map walked with the wrong stride happily
+         * reports every device routed, to the same line. */
+        if (!routed || distinct != routed)
+            selftest_fails++;
+    }
 
     bringup_sched_init();
 
