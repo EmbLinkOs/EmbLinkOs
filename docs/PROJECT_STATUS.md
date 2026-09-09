@@ -36,8 +36,9 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   **Now audited and planned in `docs/ARM64.md`** — the claim measured true
   (`arch/x86_64/` is 11% of 58k kernel lines; the asm that leaked out collapses
   into seven repeated primitives), with the syscall argument-passing seam as the
-  one genuine exception. **Phases A0-A7 are built, and the campaign is
-  finished: the REAL DESKTOP SESSION RUNS ON ARM.** `make ARCH=aarch64` produces
+  one genuine exception. **Phases A0-A9 are built and the campaign is
+  finished: the REAL DESKTOP SESSION RUNS ON ARM, on four cores.**
+  `make ARCH=aarch64` produces
   a kernel that boots at EL1 on QEMU `virt`, decodes and survives its own
   faults, runs in the higher half with the MMU on -- reading its memory map
   from the device tree and driving the SAME `kernel/mm/pmm.c` the x86 build
@@ -71,7 +72,12 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   desktop is init's child. Machine-checked end to end by
   `make ARCH=aarch64 test-arm64-boot`, which asserts every phase's "done when"
   under BOTH accelerators and injects real keyboard and pointer events over QMP
-  to prove input ARRIVES rather than merely enumerating.
+  to prove input ARRIVES rather than merely enumerating. **A9 brought up the
+  other cores over PSCI** -- four by default, each configuring its own GIC
+  redistributor, timer and per-CPU pointer -- and the machine now has every
+  device `virt` offers: virtio-blk, -gpu, -input, -snd, and MSI through the GIC
+  ITS (with a correct INTx fallback on HVF, which exposes no ITS). The userland
+  is at PARITY: all 52 programs x86 builds, plus two more.
   The x86 build is untouched by all of it (`ARCH` defaults to `x86_64`, the
   aarch64 rules are in a fragment the default build never parses, and
   `make -n all` is byte-identical to before the campaign).

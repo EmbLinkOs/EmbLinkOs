@@ -5,7 +5,12 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A7 COMPLETE. The REAL desktop session runs on ARM.**
+**Status: A0–A9 COMPLETE. The campaign is finished.**
+
+Four cores, the real `init` session, the full 52-program userland, and every
+device `virt` offers: virtio-blk, -gpu, -input, -snd, and MSI through the GIC
+ITS. `make ARCH=aarch64 test-arm64-boot` asserts all of it under both
+accelerators.
 
 **The whole shared kernel links and runs on aarch64** — the real scheduler, the
 real 95-handler syscall table, EMBKFS, the VFS, IPC, the compositor and the
@@ -1072,9 +1077,38 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
      pci: 0:2.0 INTA -> SPI 5 (INTID 37) [from the device tree]
        [ ok ] 2 of 3 devices routed to the GIC, on 2 distinct line(s)
      ```
-* **A8 ❌ EMBX `machine = 2`.** The spec already reserves it.
-* **A9 ❌ SMP via PSCI.** Last, deliberately — the x86 SMP work says per-CPU
-  structures are the hard part, and those are already written.
+* **A8 ❌ EMBX `machine = 2`.** The spec already reserves it. Still unclaimed:
+  nothing produces an aarch64 EMBX yet, and the ELF path is what the userland
+  uses on both machines.
+* **A9 ✅ SMP via PSCI.** Last, deliberately -- and the prediction held: the
+  per-CPU structures were already written and needed nothing. What the work
+  actually was is the three things a core must do FOR ITSELF, because each is
+  banked or per-frame state the primary cannot set on its behalf: its GIC
+  redistributor and ICC_* interface, its generic timer (CNTV_CTL_EL0 and
+  CNTV_CVAL_EL0 are banked -- a core that skips it never ticks and therefore
+  never preempts), and TPIDR_EL1, before anything calls `this_cpu()`.
+
+  PSCI itself is one call. The conduit -- `hvc` or `smc` -- is a property of
+  the machine that only the device tree knows, so it is read rather than
+  assumed.
+
+  **Three bugs, each a thing that "started successfully" while doing nothing.**
+  `fdt_find_device_type("cpu")` found ZERO cpus, because it searches the root's
+  direct children and `/cpus/cpu@N` are grandchildren -- it reported "0 cpu(s)"
+  and was truthful about a question asked wrong. The stacks came from
+  `kmalloc()`, and boot.S converts a stack address to physical by subtracting
+  KERNEL_VIRT_BASE, an identity that holds only for the kernel image window --
+  so every secondary faulted on its first push, with no console to say so. And
+  **the identity map was gone**: a secondary runs boot.S's `enable_mmu`, which
+  sets SCTLR_EL1.M while the PC is still physical, so the very next instruction
+  fetch translates through the identity map A2 deliberately dropped. PSCI
+  returned SUCCESS either way. It is reopened for the length of the bring-up
+  and dropped again after.
+
+  Four cores is the DEFAULT, not a demo setting: SMP is where locking is either
+  right or silently wrong, and a kernel only ever run on one core is one where
+  every missing lock passes. `ARM_SMP=1` reproduces the uniprocessor case, and
+  the test asserts both.
 
 The HAL (`arch_irq_save`, `arch_cpu_relax`, `arch_tlb_flush_page`,
 `arch_fault_addr`, `arch_timestamp`, …) is **not a phase**. It is extracted

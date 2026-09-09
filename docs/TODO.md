@@ -1602,9 +1602,17 @@ substantially complete.
     - [ ] **`vm_unmap_page()` does not free page tables that become empty.**
       Leaks one to three pages per fully-unmapped 2 MiB region. Harmless while
       nothing unmaps in a loop; A5's process teardown is where that stops.
-    - [ ] **No TLB shootdown between CPUs.** `pagetable.c` already uses the
-      inner-shareable `tlbi` variants, so the invalidation is broadcast, but
-      nothing synchronises a remote CPU that is mid-walk. A9.
+    - [ ] **No TLB shootdown between CPUs, and SMP now makes that REAL.**
+      This was theoretical while aarch64 ran one core; four cores share page
+      tables, so a mapping torn down on one core can live on in another's
+      TLB. `tlbi ... is` (inner-shareable) already broadcasts, which covers
+      the unmap paths in pagetable.c -- what is NOT covered is the ordering
+      around it and anything that assumes a local-only invalidate. Audit it
+      against the x86 side, which has the same problem and the same partial
+      answer.
+    - [ ] **No SGIs, so there is no way to interrupt another core** -- which
+      is what a real shootdown, a reschedule IPI or a panic-stop would need.
+      The GIC driver configures SGIs but nothing sends one.
     - [ ] **aarch64 has its own `mm/pagetable.c` alongside x86's `mm/vmm.c`.**
       Intentional per ARM64.md §2.3 — the shared interface is factored from two
       WORKING implementations, and the aarch64 one is not finished until A5
@@ -1618,25 +1626,17 @@ substantially complete.
       plausibly exceed it.
   - **Known gaps left by A3.** The first one is not debt, it is a scheduled
     deletion, and it is the most important line in this list:
-    - [ ] **DELETE `kernel/arch/aarch64/sched/bringup.c` AT A5.** It is a
-      round-robin scheduler that exists only to prove the GIC delivers, the
-      timer fires and `kernel_ctx_switch()` switches — because finding out one
-      of those is wrong *while also* bringing up `process.c` is much harder.
-      `kernel/process/process.c` is the scheduler and is going to be the
-      aarch64 scheduler; it cannot compile yet only because of its dependency
-      set (compositor, surfaces, IPC channels and pipes, the ELF and EMBX
-      loaders, the GDT, the LAPIC), which A5/A6 resolve. **Do not add
-      priorities, sleeping or wait queues to `bringup.c`** — that is how a
-      codebase ends up with two schedulers and a quiet disagreement between
-      them.
-    - [ ] **`kernel_ctx_switch()` saves no FP/SIMD state on aarch64.** Correct
-      today: the kernel is built `-mgeneral-regs-only` and FP is still trapped
-      at EL1 (`CPACR_EL1.FPEN = 0`), so a kernel thread has no FP state. A5
-      opens CPACR for EL0 and must add the V-register half — and must do it in
-      the same commit, because a user thread whose FP registers are not saved
-      corrupts silently and intermittently. The x86 signature takes two extra
-      FXSAVE pointers; the aarch64 one deliberately does not, rather than
-      accepting arguments it ignores.
+    - [ ] **DELETE `kernel/arch/aarch64/sched/bringup.c`.** Scheduled for
+      A5 and still here at the end of A9. It is the stand-in scheduler the
+      A3 preemption self-test still runs on; the REAL scheduler
+      (process.c) is what everything after it uses, and early.c switches
+      the GIC's post-EOI hook from one to the other mid-boot. Deleting it
+      means rewriting that self-test against process.c's kthreads, which
+      is worth doing and is not a portability gap.
+    - [x] ~~**`kernel_ctx_switch()` saves no FP/SIMD state on aarch64.**~~ —
+      it always did. The defect was the BUFFER: struct thread::fpu_state was
+      512 bytes (the x86 FXSAVE image) where aarch64 needs 528, so FPSR and
+      FPCR were written past its end. See the KCONTEXT_FPU_SIZE entry above.
     - [ ] **`kernel/arch/x86_64/irq/irq.h` cannot describe a GIC.** It is
       shaped for the 8259: `irq_register(uint8_t irq, ...)` with a 16-line
       table. The GIC has 1020 INTIDs and needs the handler to know which line
@@ -1653,8 +1653,8 @@ substantially complete.
       Deliberate: nesting needs a stack per priority level and there is exactly
       one IRQ stack. Revisit only if something genuinely needs a
       higher-priority line, and add the stacks in the same change.
-    - [ ] **No SGIs / inter-processor interrupts.** The GICv3 driver configures
-      SGI 0-15 but nothing sends them. A9, with PSCI CPU_ON.
+    - [x] ~~**No SGIs / inter-processor interrupts.**~~ — folded into the
+      TLB-shootdown entry above, which is what would use them.
     - [ ] **GICv2 is not supported**, and `-M virt` under TCG still defaults to
       it — the run targets pass `gic-version=3` explicitly. `gic_init()`
       detects a v2 and says so rather than failing obscurely. Adding a v2
@@ -1692,19 +1692,15 @@ substantially complete.
       are named in `arch.mk` (`beep` is static-newlib, `primtest` is
       freestanding) because x86 encodes those facts in explicit rules that
       shadow its generic pattern.
-    - [ ] **Twelve programs still do not build for aarch64**, and they split
-      into two honest groups. OPTIONAL PORTS whose libraries are x86-only:
-      `js` (QuickJS), `mp3play`, `photos`, `vellum`, `gitclone`/`gitpush`,
-      `pkg`/`pkgbuild`/`pkgfetch` — each needs its third-party dependency
-      cross-built for aarch64 first, exactly as x86 needed. And the `emlibc_*`
-      family, which links an ALTERNATIVE libc (`user/emlibc`) whose headers
-      deliberately shadow newlib's; it needs its own include set per app, not
-      a wider one (adding `-Iuser/emlibc/include` globally breaks every newlib
-      app instead).
-    - [ ] **`posixdemo` needs real work, not a build fix.** It contains x86
-      inline asm (`mov %fs:0x0`) for a direct TLS read and uses
-      `sig_atomic_t`. It is the POSIX conformance witness, so porting it is
-      worth doing properly rather than by deleting the assertions.
+    - [x] ~~**Twelve programs still do not build for aarch64**~~ — all of
+      them do. QuickJS, zlib and git cross-build for the target (their port
+      scripts take TARGET= now), and the emlibc family, the shell and its
+      tools are wired in. 54 programs against x86's 52; the difference is
+      emlibc_embxapp and mathself, which x86 builds through EmbCC into .embx.
+    - [x] ~~**`posixdemo` needs real work, not a build fix.**~~ — ported and
+      PASSING, all of it, including a variant-I TLS block (TPIDR_EL0, TLS
+      above the thread pointer, past a 16-byte TCB) that nothing else
+      checked. Its x86 inline asm is now one branch of two.
     - [ ] **`getentropy()` returns ENOSYS on aarch64.** The architectural
       equivalent of RDRAND is FEAT_RNG's `RNDR`, which EL0 may execute but only
       when it exists — and the feature bit is in `ID_AA64ISAR0_EL1`, which EL0
@@ -1756,10 +1752,10 @@ substantially complete.
       and a `TTBR0_EL1` write on context switch. The good news is that is the
       *whole* switch on this architecture — kernel mappings live in TTBR1 and
       are never copied into a process, unlike x86's PML4.
-    - [ ] **No ASIDs.** Every mapping is created with `nG` set but ASID stays 0,
-      so `vm_map_page`'s per-page `tlbi` does work a context switch would
-      otherwise need a full flush for. Allocating ASIDs is an A6/A9
-      optimisation, not a correctness fix.
+    - [x] ~~**No ASIDs.**~~ — one per address space, allocated and released
+      with the space, and the context switch no longer flushes. Note the nG
+      claim in the old entry was WRONG: nG was set only for PT_USER, so
+      kernel-only mappings in the user half were global. That is fixed too.
     - [ ] **`copy_from_user`/`copy_to_user` validate then `memcpy`.** Correct
       while nothing can unmap a page concurrently (one CPU, no demand paging)
       and a real time-of-check/time-of-use hole the moment either changes. The
@@ -1792,19 +1788,12 @@ substantially complete.
       `arch_pci_msi_message`) and is now portable; aarch64 reaches config space
       over ECAM. The bus enumerates and BARs are assigned from the device
       tree's window, because there is no firmware to do it.
-    - [ ] **The virtio drivers cannot come up on aarch64 until the scheduler
-      and network stack are in that build.** `virtio_net.c` compiles and its
-      PCI/BAR/interrupt path is all in place, but it references `net_rx()` and
-      `net_signal_rx()`, and `net.c` in turn needs `process_create_kthread`,
-      the wait queues and the IP/ARP/DHCP files. That is one linking step, not
-      a porting problem — do it when the driver-symbol list (below) is short
-      enough that the whole kernel links.
-    - [ ] **No MSI on aarch64.** `arch_pci_msi_message()` returns false, so
-      `pci_enable_msi/msix` fail and callers fall back to a legacy interrupt
-      line — which works and is what `virt` provides. Real MSI needs the GIC
-      ITS: a command queue, a device table and interrupt-translation tables.
-      Do it when a driver actually needs more than one interrupt source, not
-      before.
+    - [x] ~~**The virtio drivers cannot come up on aarch64 until the
+      scheduler runs.**~~ — blk, gpu, input and snd are all up.
+    - [x] ~~**No MSI on aarch64.**~~ — the GIC ITS is implemented
+      (arch/aarch64/irq/its.c) and proves itself at boot by translating and
+      delivering a software-triggered interrupt. HVF exposes no ITS at all,
+      and the INTx fallback is what covers it; the test asserts both.
     - [x] ~~undefined driver symbols~~ — **the whole shared kernel links and
       runs on aarch64, and mounts a real EMBKFS image over virtio-blk.**
       virtio-blk (new, shared, polled) gives it a disk; a real PL031 driver
@@ -1814,32 +1803,25 @@ substantially complete.
       the keyboard and mouse entries are GONE and virtio-input answers instead.
       What remains there is AC'97 and bochs VGA, and both stay: virtio-snd is
       not written, and virtio-gpu is already the display path.
-    - [ ] **No virtio-snd, so aarch64 has no audio.** `absent.c` still answers
-      "no AC'97" and every caller handles that, so nothing is broken — there is
-      simply no sound. Copy the pattern virtio-input established: a translation
-      layer into the SHARED driver, not a second audio stack.
-    - [ ] **The three older virtio drivers still carry their own PCI capability
-      walk.** `drivers/bus/virtio_pci.c` now exists — written instead of the
-      FOURTH copy, which is what this file asked for — but `virtio_blk.c`,
-      `virtio_net.c` and `virtio_gpu.c` have not been migrated onto it. A
-      deliberate, recorded choice: folding a refactor of three working drivers
-      into an ARM bring-up would have made any regression ambiguous. Migrate
-      them one at a time, each with a boot to vouch for it.
-    - [ ] **No FP/SIMD state is saved across a context switch on aarch64,**
-      so `FPCR` is effectively shared between threads. Zeroing it on entry to
-      EL0 (`aarch64_eret_to_el0`) is correct only because every thread wants
-      the same value; it stops being sufficient the moment anything sets a
-      rounding mode or uses SIMD across a preemption point. The x86 side
-      saves/restores FXSAVE state and this does not.
-    - [ ] **virtio-input's status queue is unused, so the lock LEDs do
-      nothing.** Caps Lock still LATCHES correctly on aarch64 — `g_mods` flips
-      and every consumer sees it — but there is no light, because
-      `kbd_set_leds()` is empty off x86. Queue 1 is what drives it.
-    - [ ] **virtio-input translates the US layout only.** `keyboard.c` owns
-      layouts for the SCANCODE world (`struct keymap`, `keyboard_set_layout`)
-      and the evdev path carries its own small shift table instead of going
-      through them. Wiring evdev into the layout tables is the right fix, and a
-      separate change from the bring-up.
+    - [x] ~~**No virtio-snd, so aarch64 has no audio.**~~ — it has sound.
+      drivers/audio/virtio_snd.c implements the same nine ac97_* functions
+      the shared audio layer calls, and the boot test pushes a real buffer
+      through audio_open/audio_write and waits for the device to retire it.
+    - [x] ~~**The three older virtio drivers still carry their own PCI
+      capability walk.**~~ — all three migrated to drivers/bus/virtio_pci.c.
+      274 lines deleted, 128 added, exactly one copy of the walk left.
+    - [x] ~~**No FP/SIMD state is saved across a context switch on
+      aarch64**~~ — it always was (FP_SAVE/FP_LOAD, whole file plus FPSR and
+      FPCR). The real defect was struct thread::fpu_state being 512 bytes
+      when this architecture needs 528, so those two words were written PAST
+      the buffer over kstack_top and entry_point. KCONTEXT_FPU_SIZE now.
+    - [x] ~~**virtio-input's status queue is unused, so the lock LEDs do
+      nothing.**~~ — the keyboard sets up queue 1 and kbd_set_leds() sends
+      EV_LED events, at the same moment the PS/2 path sends its 0xED.
+    - [x] ~~**virtio-input translates the US layout only.**~~ — it uses the
+      SAME layout tables the PS/2 path does. A Linux evdev keycode IS an AT
+      set-1 make code for the main key block, so `keyboard_set_layout dvorak`
+      applies to a virtio keyboard with no code of its own.
     - [x] ~~**aarch64 has no `init.elf` session**~~ — it runs the same pid 1
       x86 does: init authenticates, builds a confined namespace
       (`ro /system, ro /data/apps, rw /home/yves, rw /run`) and spawns
@@ -1847,9 +1829,9 @@ substantially complete.
     - [ ] **virtio-blk is polled and sets `VRING_AVAIL_F_NO_INTERRUPT`.** Fine
       at one outstanding request; an interrupt-driven version needs a wait
       queue and buys nothing until requests overlap.
-    - [ ] **The virtio-PCI capability walk is now written THREE times**
-      (virtio_net.c, virtio_gpu.c, virtio_blk.c). Factor it into a shared
-      virtio-pci transport when a fourth appears, not before.
+    - [x] ~~**The virtio-PCI capability walk is now written THREE times**~~ —
+      it is written ONCE, in drivers/bus/virtio_pci.c, and all four drivers
+      use it.
     - [ ] **A diagnostic must not arm anything.** The boot-time PCI routing
       check used to register a do-nothing handler on every device's line; once
       virtio-blk was configured it asserted a level-triggered INTx that nothing
@@ -1872,27 +1854,24 @@ substantially complete.
       pointer, variant I above it, with the 16-byte TCB that binutils'
       `elfNN_aarch64_tpoff_base()` assumed). No program has yet needed a TLS
       RELOCATION resolved at load time. Add it when one does.
-    - [ ] **No ASIDs, so `vmm_switch_address_space` flushes the whole TLB.**
-      With an ASID per address space the hardware would keep both processes'
-      entries and the switch would need no flush at all. Pure performance;
-      correctness is fine.
+    - [x] ~~**No ASIDs, so `vmm_switch_address_space` flushes the whole
+      TLB.**~~ — an ASID per address space, and the switch is now one
+      register write with no flush. It exposed a latent bug: nG was tied to
+      PT_USER rather than to the address HALF, so kernel-only mappings in the
+      user half were GLOBAL and matched in every address space.
     - [x] ~~`kernel/mm/vmm.c` does not compile for aarch64~~ — it was never
       supposed to. 817 lines of PML4 walking counted as a *shared* file that
       failed; it is now `kernel/arch/x86_64/mm/vmm.c`, next to its aarch64
       counterpart. `kernel/mm/vmm.h` remains shared and aarch64 implements the
       part of it that shared code calls.
     - [~] **`kernel/mm/vmm.h`'s flags are x86 page-table bits wearing
-      interface names.** (Half-fixed at A6: `VMM_EXEC` exists and the ELF
-      loader uses it. The rest stands as written below.) `VMM_PRESENT`, `VMM_WRITABLE` and `VMM_NX` are bit
-      positions 0, 1 and 63 — the actual hardware layout — and `VMM_NX` is
-      inverted with respect to how a permission reads: absent means
-      *executable*. A caller asking for a writable page and saying nothing
-      about execution therefore gets a writable, executable one, which is what
-      the x86 kernel heap is today. The aarch64 implementation deliberately
-      does NOT reproduce that (its mappings are non-executable unless asked),
-      so the two architectures currently disagree about heap permissions. Fix
-      the header: name the flags for what they mean and make execute
-      opt-in.
+      interface names.** The concrete HARM is fixed: VMM_EXEC exists, the
+      shared ELF loader asks for execution positively, and the kernel heap
+      is W^X on both machines (it was writable AND executable on x86 for as
+      long as kheap.c said only VMM_WRITABLE). What remains is cosmetic --
+      VMM_PRESENT/WRITABLE/NX are still bit positions 0, 1 and 63, and
+      VMM_NX is still inverted. vmm.h now states the rule for new code:
+      VMM_EXEC to run code, VMM_NX to forbid it, silence is not a policy.
     - [ ] **Eleven legacy x86 device drivers do not compile, and must not.**
       PIT, RTC, ATA, AC97, PS/2 keyboard and mouse, UHCI, bochs VBE, the 16550,
       port-CF8 PCI, and `drivers/timer/timer.c`'s x86 glue. ARM64.md §2.6:
