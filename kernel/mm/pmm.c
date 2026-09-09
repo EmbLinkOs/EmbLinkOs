@@ -206,6 +206,10 @@ void pmm_init(void) {
 // image plus its own bitmap. The bitmap lives at kernel_end and is written before
 // paging is rebuilt, so vmm_init must map at least this far in the kernel window
 // or the first bitmap access after the CR3 switch faults.
+uint64_t pmm_free_pages(void) {
+    return free_pages;
+}
+
 uint64_t pmm_reserved_phys_end(void) {
     uint64_t bitmap_phys_end = KV2P(pmm_bitmap) + bitmap_size;
     return (bitmap_phys_end + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);

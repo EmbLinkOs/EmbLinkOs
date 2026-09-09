@@ -53,6 +53,11 @@ uint64_t pmm_alloc_page(void);
  * See the rotating hint in pmm_alloc_page. */
 void pmm_scan_stats(uint64_t *out_bits, uint64_t *out_allocs);
 
+/* How many physical pages are currently free. Exists so that "this was freed"
+ * can be CHECKED rather than announced: take it before and after a teardown
+ * and the difference is the truth about whether anything leaked. */
+uint64_t pmm_free_pages(void);
+
 // takes a physical address and frees the corresponding virtual page
 void pmm_free_page(uint64_t phys_addr);
 

@@ -1714,15 +1714,21 @@ substantially complete.
       bring-up ORDER (GDT, IDT, PIC, LAPIC — and which of those exist at all
       differs), so it wants splitting into a shared sequence plus a per-arch
       `arch_early_init()`, not a hook per line. `selftests.c` follows it.
-    - [ ] **`process.c` still LINKS against x86-only symbols** even though it
-      compiles: `vmm_create_address_space`, `vmm_destroy_address_space`,
-      `vmm_map_in`, `vmm_alloc_kernel_stack`, `vmm_free_kernel_stack`,
-      `vmm_switch_address_space`, `vmm_get_kernel_pml4`, plus
-      `elf_load_from_file` and `embx_load_from_file`. The vmm ones are the
-      address-space half of `kernel/mm/vmm.h` and aarch64's `mm/pagetable.c`
-      should grow them; the loaders need a neutral interface (and the aarch64
-      relocation set, which is A6 proper). **Compiling is not linking** — do not
-      report process.c as ported until it links.
+    - [x] ~~the address-space half of `kernel/mm/vmm.h` is x86-only~~ —
+      **done.** `mm/pagetable.c` implements create/destroy/switch/map_in/
+      unmap_in/get_phys_in and guarded kernel stacks, with isolation and
+      leak-free teardown both checked by `test-arm64-boot`.
+    - [ ] **`process.c` compiles but still does not LINK for aarch64.** What is
+      missing now: `elf_load_from_file` and `embx_load_from_file` (a neutral
+      loader interface plus the `R_AARCH64_*` relocation set), and
+      `keyboard_release_grab_pid()` — the scheduler calls into a PS/2 driver on
+      process reap, which is an input-layer seam nobody has needed until now.
+      **Compiling is not linking**; do not report process.c as ported until it
+      links.
+    - [ ] **No ASIDs, so `vmm_switch_address_space` flushes the whole TLB.**
+      With an ASID per address space the hardware would keep both processes'
+      entries and the switch would need no flush at all. Pure performance;
+      correctness is fine.
     - [x] ~~`kernel/mm/vmm.c` does not compile for aarch64~~ — it was never
       supposed to. 817 lines of PML4 walking counted as a *shared* file that
       failed; it is now `kernel/arch/x86_64/mm/vmm.c`, next to its aarch64

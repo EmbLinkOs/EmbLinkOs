@@ -235,6 +235,30 @@ disagree, which is what §2.3 is for:
   — WFI returns immediately on a pending event, masked or not. A HAL derived
   from the ARM side alone would have exposed two calls and silently broken x86.
 
+**Address spaces followed, and they are the simplest part of the whole port.**
+`kernel/mm/vmm.h`'s address-space half — create, destroy, switch, map-in,
+get-phys-in, plus guarded kernel stacks — is now implemented on aarch64. On x86
+a process's PML4 must also contain the *kernel's* mappings: every address space
+carries a copy of the top half, they must be kept in step, and switching means
+reloading a root that describes both halves at once. Here `TTBR1_EL1` holds the
+kernel and `TTBR0_EL1` holds the process, permanently and separately. So
+creating an address space is **one zeroed page**, switching is **one register
+write that cannot disturb the kernel**, and destroying it is a walk that
+physically cannot reach kernel memory because kernel memory was never in the
+table. §2.7 said this would be better than x86's convention; this is where the
+difference is cashed.
+
+Two things are now checked rather than claimed:
+
+* **Isolation.** Two address spaces, one virtual address, two physical pages.
+  Reading `0x30000000` gives `0xAAAA…` in one and `0xBBBB…` in the other. That
+  a switch changes what an address *means* is the property every process
+  depends on, and "create returned non-zero" is not evidence of it.
+* **Teardown.** The EL0 probe now runs in its own address space, and destroying
+  it reports free pages **before and after**: 130,610 → 130,610, all reclaimed.
+  A walk that misses a level comes back short and says so, where "destroyed"
+  would have read as success.
+
 **What is left is now thirteen files, and eleven of them are meant to fail.**
 Those eleven are legacy x86 device drivers that §2.6 says are *absent* on ARM
 rather than portable — excluding them is a build change, not a code change. The

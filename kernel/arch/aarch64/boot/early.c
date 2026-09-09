@@ -10,6 +10,7 @@
 #include "boot/boot_protocol.h"
 #include "mm/pmm.h"
 #include "mm/kheap.h"
+#include "mm/vmm.h"
 #include "include/kmalloc.h"
 #include "include/kprintf.h"
 
@@ -154,6 +155,61 @@ static void selftest_kheap(void) {
             bad ? "FAIL" : " ok ");
     if (bad)
         selftest_fails++;
+}
+
+/* Two address spaces, one virtual address, two different physical pages.
+ *
+ * This is the property every process depends on and nothing else tests: that
+ * switching TTBR0 changes what an address MEANS. Reading the same VA before
+ * and after the switch and getting different bytes is the only evidence that
+ * matters -- "vmm_create_address_space returned non-zero" is not. */
+static void selftest_address_spaces(void) {
+    kprintf("\n--- self-test: address-space isolation ---\n");
+
+    const uint64_t VA = 0x0000000030000000ULL;   /* a user-half address */
+    uint64_t saved = 0;
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(saved));
+
+    uint64_t as_a = vmm_create_address_space();
+    uint64_t as_b = vmm_create_address_space();
+    uint64_t pa   = pmm_alloc_page();
+    uint64_t pb   = pmm_alloc_page();
+
+    if (!as_a || !as_b || !pa || !pb) {
+        kprintf("  [FAIL] could not create two address spaces\n");
+        selftest_fails++;
+        return;
+    }
+
+    /* Distinct contents, written through the direct map -- the kernel's own
+     * view of the frames, which does not depend on either address space. */
+    *(volatile uint64_t *)(uintptr_t)P2V(pa) = 0xAAAAAAAAAAAAAAAAULL;
+    *(volatile uint64_t *)(uintptr_t)P2V(pb) = 0xBBBBBBBBBBBBBBBBULL;
+
+    /* Mapped WITHOUT VMM_USER: the test runs at EL1, and a kernel-only
+     * mapping in the TTBR0 half proves the same thing without depending on
+     * whether privileged access to user pages is permitted. */
+    vmm_map_in(as_a, VA, pa, VMM_WRITABLE);
+    vmm_map_in(as_b, VA, pb, VMM_WRITABLE);
+
+    vmm_switch_address_space(as_a);
+    uint64_t seen_a = *(volatile uint64_t *)(uintptr_t)VA;
+    vmm_switch_address_space(as_b);
+    uint64_t seen_b = *(volatile uint64_t *)(uintptr_t)VA;
+
+    vmm_switch_address_space(saved & 0x0000FFFFFFFFF000ULL);
+
+    bool ok = (seen_a == 0xAAAAAAAAAAAAAAAAULL) && (seen_b == 0xBBBBBBBBBBBBBBBBULL);
+    kprintf("  [%s] %p reads %p in one space and %p in the other\n",
+            ok ? " ok " : "FAIL", (void *)(uintptr_t)VA,
+            (void *)(uintptr_t)seen_a, (void *)(uintptr_t)seen_b);
+    if (!ok)
+        selftest_fails++;
+
+    /* Destroying frees the frames AND the tables under each root. */
+    vmm_destroy_address_space(as_a);
+    vmm_destroy_address_space(as_b);
+    kprintf("  [ ok ] both address spaces destroyed\n");
 }
 
 static void selftest_faults(void) {
@@ -346,6 +402,7 @@ void arch_early_main(uint64_t dtb_phys) {
 
     selftest_pmm();
     selftest_kheap();
+    selftest_address_spaces();
     selftest_faults();
 
     kprintf("\n--- self-test done: %d failure(s) ---\n", (int)selftest_fails);

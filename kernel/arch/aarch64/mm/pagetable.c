@@ -93,9 +93,26 @@ static void tlb_flush_all(void) {
     __asm__ volatile("dsb ish; isb" ::: "memory");
 }
 
-/* Which root translates this address. Bit 63 decides, in hardware. */
-static uint64_t *root_for(uint64_t va) {
-    return (va >> 63) ? boot_l0_ttbr1 : boot_l0_ttbr0;
+/* The kernel's own root -- TTBR1's level-0 table. Never changes. */
+static uint64_t kernel_root_phys(void) {
+    return KV2P((uint64_t)(uintptr_t)boot_l0_ttbr1);
+}
+
+/* Whatever TTBR0_EL1 currently points at: THE address space this CPU is in.
+ * Read from the register rather than cached in a variable, so it cannot drift
+ * out of step with the hardware -- the one source of truth about which process
+ * is mapped is the register the MMU is using. */
+static uint64_t user_root_phys(void) {
+    uint64_t v;
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(v));
+    return v & PTE_ADDR_MASK;
+}
+
+/* Which root translates this address. Bit 63 decides, in hardware -- so
+ * unlike x86, a kernel address and a user address are never candidates for the
+ * same table, and a process's tables physically cannot describe kernel memory. */
+static uint64_t root_phys_for(uint64_t va) {
+    return (va >> 63) ? kernel_root_phys() : user_root_phys();
 }
 
 static uint64_t flags_to_pte(uint32_t flags) {
@@ -159,8 +176,8 @@ static int split_block(uint64_t *slot, int level) {
 
 /* Walk to the level-3 entry for `va`, creating tables (and splitting blocks)
  * when `create` is set. Returns a pointer to the slot, or NULL. */
-static uint64_t *walk(uint64_t va, bool create, int *err) {
-    uint64_t *tbl = root_for(va);
+static uint64_t *walk_in(uint64_t root_phys, uint64_t va, bool create, int *err) {
+    uint64_t *tbl = table_at(root_phys);
 
     for (int level = 0; level < 3; level++) {
         uint64_t *slot = &tbl[level_index(va, level)];
@@ -194,6 +211,10 @@ static uint64_t *walk(uint64_t va, bool create, int *err) {
     }
 
     return &tbl[level_index(va, 3)];
+}
+
+static uint64_t *walk(uint64_t va, bool create, int *err) {
+    return walk_in(root_phys_for(va), va, create, err);
 }
 
 int vm_map_page(uint64_t va, uint64_t pa, uint32_t flags) {
@@ -233,8 +254,8 @@ int vm_unmap_page(uint64_t va) {
     return PT_OK;
 }
 
-uint64_t vm_translate(uint64_t va) {
-    uint64_t *tbl = root_for(va);
+static uint64_t vm_translate_in(uint64_t root_phys, uint64_t va) {
+    uint64_t *tbl = table_at(root_phys);
 
     for (int level = 0; level < 4; level++) {
         uint64_t d = tbl[level_index(va, level)];
@@ -252,6 +273,10 @@ uint64_t vm_translate(uint64_t va) {
         tbl = table_at(d & PTE_ADDR_MASK);
     }
     return 0;
+}
+
+uint64_t vm_translate(uint64_t va) {
+    return vm_translate_in(root_phys_for(va), va);
 }
 
 static int protect_section(const char *name, char *start, char *end, uint32_t flags) {
@@ -300,6 +325,22 @@ void vm_drop_identity_map(void) {
     boot_l0_ttbr0[0] = 0;
     __asm__ volatile("dsb ishst" ::: "memory");
     tlb_flush_all();
+}
+
+/* Map one page into a SPECIFIC address space, creating tables as needed. */
+static int vm_map_page_in(uint64_t root_phys, uint64_t va, uint64_t pa,
+                          uint32_t flags) {
+    if ((va | pa) & (PAGE_SIZE - 1))
+        return PT_ERR_ALIGN;
+
+    int err = PT_OK;
+    uint64_t *slot = walk_in(root_phys, va, true, &err);
+    if (!slot)
+        return err;
+
+    *slot = (pa & PTE_ADDR_MASK) | flags_to_pte(flags) | PTE_TABLE;
+    tlb_flush_page(va);
+    return PT_OK;
 }
 
 void vm_init(void) {
@@ -377,4 +418,155 @@ uint64_t vmm_get_phys(uint64_t virt) {
 
 void vmm_flush_tlb(uint64_t virt) {
     tlb_flush_page(virt);
+}
+
+/* --- address spaces, kernel/mm/vmm.h --------------------------------------
+ *
+ * THE SIMPLEST PART OF THIS PORT, and worth saying why. On x86 a process's
+ * PML4 must contain the KERNEL's mappings too -- every address space carries a
+ * copy of the top half, they have to be kept in step, and switching address
+ * spaces means reloading a root that describes both halves at once. Here
+ * TTBR1_EL1 holds the kernel and TTBR0_EL1 holds the process, permanently and
+ * separately. A process address space is therefore a single level-0 table
+ * describing nothing but that process, creating it is one zeroed page, and
+ * switching is one register write that cannot possibly disturb the kernel's
+ * own mappings.
+ *
+ * vmm.h calls the handle a `pml4_phys`. It is the physical address of a
+ * level-0 table here. The name is x86's; docs/TODO.md has the rename. */
+
+/* A kernel stack window: bump-allocated VA with an unmapped guard page below
+ * each stack, so an overflow faults instead of quietly eating its neighbour.
+ * Level-0 index 508, chosen because 511 (kernel window), 384 (MMIO) and 256
+ * (direct map) are taken and 508 is not. */
+#define KSTACK_VA_BASE 0xFFFFFE0000000000ULL
+static uint64_t kstack_va_next = KSTACK_VA_BASE;
+
+uint64_t vmm_create_address_space(void) {
+    uint64_t root = pmm_alloc_page();
+    if (!root)
+        return 0;
+
+    /* Zero IS the address space: every entry invalid, nothing mapped. No
+     * kernel half to copy in, because there is no kernel half in TTBR0. */
+    memset(table_at(root), 0, PAGE_SIZE);
+    __asm__ volatile("dsb ishst" ::: "memory");
+    return root;
+}
+
+/* Recursively free a table and everything under it. Only ever called on a
+ * TTBR0 root, so everything it can reach is that process's own -- there is no
+ * shared kernel half to accidentally walk into, which is the failure mode the
+ * x86 version has to be careful about. */
+static void destroy_table(uint64_t table_phys, int level) {
+    uint64_t *t = table_at(table_phys);
+
+    for (int i = 0; i < ENTRIES; i++) {
+        uint64_t d = t[i];
+        if (!(d & PTE_VALID))
+            continue;
+
+        if (is_table(d, level))
+            destroy_table(d & PTE_ADDR_MASK, level + 1);
+        else
+            pmm_free_page(d & PTE_ADDR_MASK);   /* a leaf: the frame itself */
+    }
+    pmm_free_page(table_phys);
+}
+
+void vmm_destroy_address_space(uint64_t root_phys) {
+    if (!root_phys)
+        return;
+
+    /* Never tear down the address space we are standing in: the next
+     * instruction fetch would translate through freed tables. */
+    if (root_phys == user_root_phys())
+        vmm_switch_address_space(vmm_get_kernel_pml4());
+
+    destroy_table(root_phys, 0);
+}
+
+void vmm_switch_address_space(uint64_t root_phys) {
+    /* One register. The kernel's mappings are in TTBR1 and are not touched,
+     * so unlike a CR3 reload this cannot invalidate the code doing the switch.
+     *
+     * The full TLB invalidate is the price of not having allocated ASIDs yet
+     * (docs/TODO.md): with an ASID per address space the hardware would keep
+     * both processes' entries and this would need no flush at all. */
+    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(root_phys) : "memory");
+    __asm__ volatile("isb" ::: "memory");
+    tlb_flush_all();
+}
+
+uint64_t vmm_get_kernel_pml4(void) {
+    /* "The address space with no process in it." On x86 this is the kernel's
+     * own PML4; here it is the empty TTBR0 root the boot code left behind once
+     * the identity map was dropped. Switching to it has the same meaning --
+     * no user mappings are reachable -- which is all the callers want. */
+    return KV2P((uint64_t)(uintptr_t)boot_l0_ttbr0);
+}
+
+int vmm_map_in(uint64_t root_phys, uint64_t virt, uint64_t phys, uint64_t flags) {
+    uint32_t f = 0;
+    if (flags & VMM_WRITABLE) f |= PT_WRITE;
+    if (flags & VMM_USER)     f |= PT_USER;
+    if (flags & (VMM_NOCACHE | VMM_WRITETHROUGH)) f |= PT_DEVICE;
+    /* VMM_NX is inverted on x86 (absent means executable) and this deliberately
+     * does not reproduce that -- see the note on vmm_map above. A user mapping
+     * that must run code has to say so, and vmm.h cannot yet. Until it can,
+     * user TEXT is mapped through vm_map_page() with PT_EXEC directly. */
+    return vm_map_page_in(root_phys, virt, phys, f) == PT_OK ? 0 : -1;
+}
+
+void vmm_unmap_in(uint64_t root_phys, uint64_t virt) {
+    int err = PT_OK;
+    uint64_t *slot = walk_in(root_phys, virt, false, &err);
+    if (slot && (*slot & PTE_VALID)) {
+        *slot = 0;
+        tlb_flush_page(virt);
+    }
+}
+
+uint64_t vmm_get_phys_in(uint64_t root_phys, uint64_t virt) {
+    return vm_translate_in(root_phys, virt);
+}
+
+uint64_t vmm_alloc_kernel_stack(uint64_t size) {
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (!pages)
+        return 0;
+
+    /* One unmapped page below the stack. It is never mapped, so a thread that
+     * runs off the bottom of its stack takes a translation fault at a known
+     * address instead of writing into whatever VA happens to precede it -- and
+     * A1's decoder names it. Leaving a hole is cheaper than any check. */
+    uint64_t guard = kstack_va_next;
+    uint64_t base  = guard + PAGE_SIZE;
+    kstack_va_next = base + pages * PAGE_SIZE + PAGE_SIZE;
+    (void)guard;
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys)
+            return 0;             /* VA is bump-allocated and not reclaimed --
+                                   * same simplification vmm.h documents */
+        memset((void *)(uintptr_t)P2V(phys), 0, PAGE_SIZE);
+        if (vm_map_page(base + i * PAGE_SIZE, phys, PT_WRITE) != PT_OK)
+            return 0;
+    }
+    return base + pages * PAGE_SIZE;    /* the TOP: stacks grow down */
+}
+
+void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t base  = stack_top - pages * PAGE_SIZE;
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t va = base + i * PAGE_SIZE;
+        uint64_t phys = vm_translate(va);
+        if (phys) {
+            vm_unmap_page(va);
+            pmm_free_page(phys);
+        }
+    }
 }

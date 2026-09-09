@@ -2,6 +2,7 @@
 #include "arch/aarch64/cpu/kcontext.h"
 #include "arch/aarch64/mm/pagetable.h"
 #include "mm/pmm.h"
+#include "mm/vmm.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "include/errno.h"
@@ -24,6 +25,8 @@ extern const unsigned char el0_probe_blob_end[];
 static struct kcontext exit_ctx;
 static int64_t exit_code;
 static bool in_user;
+static uint64_t probe_as;      /* the program's own address space */
+static uint64_t free_before;   /* physical pages free before it was built */
 
 /* Assembly, because the transition cannot be expressed in C: it ends in `eret`
  * and never returns to its caller. kcontext.S. */
@@ -65,6 +68,22 @@ int64_t el0_probe_run(void) {
     uint64_t size = (uint64_t)(el0_probe_blob_end - el0_probe_blob);
     uint64_t code_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
 
+    /* Its OWN address space, not the boot one. A5 mapped the program into the
+     * global TTBR0 root because there was nothing else; there is now, and
+     * using it means the program's mappings vanish with it rather than
+     * accumulating in a table nothing owns.
+     *
+     * Switching is one register write and cannot disturb the kernel: kernel
+     * mappings live in TTBR1 and are never part of a process address space --
+     * the thing x86 has to arrange by copying the top half of every PML4. */
+    free_before = pmm_free_pages();
+    probe_as = vmm_create_address_space();
+    if (!probe_as) {
+        kprintf("el0: cannot create an address space\n");
+        return -EMBK_ENOMEM;
+    }
+    vmm_switch_address_space(probe_as);
+
     kprintf("el0: probe is %d bytes; mapping code at %p, stack at %p\n",
             (int)size, (void *)USER_CODE_VA,
             (void *)(USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE));
@@ -104,6 +123,26 @@ int64_t el0_probe_run(void) {
      * when el0_exit longjmps back into it. */
     if (kernel_ctx_save(&exit_ctx) != 0) {
         kprintf("el0: back in EL1, program exited with %d\n", (int)exit_code);
+
+        /* Tear the whole thing down: every frame the program touched is
+         * reachable from its root and nothing else is, so this frees the code,
+         * the stack and the page tables in one walk. */
+        vmm_switch_address_space(vmm_get_kernel_pml4());
+        vmm_destroy_address_space(probe_as);
+        probe_as = 0;
+
+        /* The number is the point. Destroying an address space walks its
+         * tables and frees both the page-table pages and the frames they
+         * point at; if the walk misses a level, this comes back short and says
+         * so, where "destroyed" would have looked like success. */
+        uint64_t after = pmm_free_pages();
+        kprintf("el0: address space destroyed -- free pages %d -> %d%s\n",
+                (int)free_before, (int)after,
+                after == free_before ? " (all reclaimed)"
+                                     : " *** LEAKED, see below ***");
+        if (after != free_before)
+            kprintf("el0: %d pages LEAKED by the teardown walk\n",
+                    (int)(free_before - after));
         return exit_code;
     }
 

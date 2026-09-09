@@ -604,6 +604,11 @@ void kheap_check(void) {
         current = current->next;
         i++;
     }
+
+    /* The count was computed and discarded, which is also why -Wall (now on,
+     * via the aarch64 build) flagged it. A check that says nothing on success
+     * cannot be told apart from a check that did not run. */
+    kprintf("kheap_check: %lu blocks, canaries intact\n", (unsigned long)i);
 }
 
 void kheap_slab_stats(void) {

@@ -263,6 +263,8 @@ test-arm64-boot: $(ARM_IMG)
 	  chk 'boot thread was scheduled back' A3 'the scheduler never returned to the boot thread'; \
 	  chk 'spurious: 0'                    A3 'the GIC delivered spurious interrupts'; \
 	  chk 'kmalloc/kfree across 5 size'    A6 'the shared kernel heap does not work here'; \
+	  chk 'in one space and'               A6 'address spaces are not isolated from each other'; \
+	  chk 'all reclaimed'                  A6 'destroying an address space leaks pages'; \
 	  chk 'hello from EL0'                 A5 'user code never ran at EL0'; \
 	  chk 'REFUSED write'                  A5 'the kernel accepted an unmapped user pointer'; \
 	  chk 'exited with 42'                 A5 'the exit argument did not survive the trip to a handler'; \
@@ -285,7 +287,7 @@ test-arm64-boot: $(ARM_IMG)
 	  echo "  A2 higher half, DTB memory map, pmm, section permissions, no identity map"; \
 	  echo "  A3 GICv3, generic timer, preemptive context switching"; \
 	  echo "  A5 EL0, svc, user-pointer boundary, arch-neutral handlers"; \
-	  echo "  A6 the shared kernel heap (kheap/kmalloc), compiled unchanged"; \
+	  echo "  A6 the shared kernel heap, per-process address spaces, clean teardown"; \
 	else exit 1; fi
 
 .PHONY: check-tools-arm64
