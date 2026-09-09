@@ -36,7 +36,8 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   **Now audited and planned in `docs/ARM64.md`** — the claim measured true
   (`arch/x86_64/` is 11% of 58k kernel lines; the asm that leaked out collapses
   into seven repeated primitives), with the syscall argument-passing seam as the
-  one genuine exception. **Phases A0-A5 are built:** `make ARCH=aarch64` produces
+  one genuine exception. **Phases A0-A7 are built, and the campaign is
+  finished: the REAL DESKTOP SESSION RUNS ON ARM.** `make ARCH=aarch64` produces
   a kernel that boots at EL1 on QEMU `virt`, decodes and survives its own
   faults, runs in the higher half with the MMU on -- reading its memory map
   from the device tree and driving the SAME `kernel/mm/pmm.c` the x86 build
@@ -57,9 +58,23 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   Per-process address spaces work there too, with isolation and leak-free
   teardown both machine-checked. **All 64 shared files LINK against the aarch64
   tree**; the 37 symbols still undefined are device drivers for hardware QEMU
-  `virt` does not have, which is A7's work rather than a portability gap. The
-  x86 build is untouched by it (`ARCH` defaults to `x86_64`, and the aarch64
-  rules are in a fragment the default build never parses).
+  `virt` does not have -- which A7 then supplied. **A6 gave aarch64 a
+  userland:** newlib built for the target by the same script and the same
+  options x86 uses (`tools/newlib/build-newlib-emblink.sh`), one `user/lib`
+  with an `svc #0` branch beside the `int $0x80` one, and THIRTY programs built
+  from a list DERIVED from the x86 app discovery rather than retyped. **A7 gave
+  it devices:** virtio-gpu at 1280x800, virtio-blk, and virtio-input as a
+  translation layer into the SHARED keyboard and mouse drivers (whose PS/2
+  halves are now behind `#if defined(__x86_64__)` and whose policy halves are
+  not). **`init.elf` is pid 1 there, the same one x86 runs** -- it
+  authenticates, builds a confined namespace and spawns `home.elf`, so the
+  desktop is init's child. Machine-checked end to end by
+  `make ARCH=aarch64 test-arm64-boot`, which asserts every phase's "done when"
+  under BOTH accelerators and injects real keyboard and pointer events over QMP
+  to prove input ARRIVES rather than merely enumerating.
+  The x86 build is untouched by all of it (`ARCH` defaults to `x86_64`, the
+  aarch64 rules are in a fragment the default build never parses, and
+  `make -n all` is byte-identical to before the campaign).
 - See `ARCHITECTURE.md` §1 for the full governing principle ("bless the clean
   native primitive; provide the compatible one as an opt-in layer") and §3 for
   the settled architectural decisions (`spawn()` over `fork()`, message ports

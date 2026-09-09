@@ -195,7 +195,7 @@ Smaller open items: pipe file-action API shape (at ABI design), init/PID 1 model
 
 ## 7. Deferred / Later (off the near-term critical path)
 
-buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · NVMe · USB isochronous transfers / xHCI hub support · lazy PLT binding for the dynamic linker (relocations are currently eager-only) · ARM64 portability · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib) · a real scrollback/line-editing TTY.
+buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · NVMe · USB isochronous transfers / xHCI hub support · lazy PLT binding for the dynamic linker (relocations are currently eager-only) · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib) · a real scrollback/line-editing TTY.
 
 *(GUI stack and SMP have shipped — see §2 rows 2 and 10 — and are removed from this list.)*
 
