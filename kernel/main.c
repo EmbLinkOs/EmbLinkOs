@@ -36,6 +36,7 @@
 
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "include/arch_ipi.h"
 #include "mm/kheap.h"
 
 #include "acpi/acpi.h"
@@ -1785,6 +1786,9 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     tsc_calibrate();
 
     // --- Timer (LAPIC) + retire PIC ---
+    /* The boot core's IPI vectors, before any AP exists to send it one. */
+    arch_ipi_init_this_cpu();
+
     lapic_timer_init(48);
     outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);

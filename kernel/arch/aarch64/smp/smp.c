@@ -1,9 +1,11 @@
 #include "arch/aarch64/boot/fdt.h"
 #include "arch/aarch64/cpu/percpu.h"
 #include "arch/aarch64/irq/gicv3.h"
+#include "arch/aarch64/irq/exception.h"
 #include "arch/aarch64/mm/pagetable.h"
 #include "drivers/timer/timer.h"
 #include "include/arch_irq.h"
+#include "include/arch_ipi.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "mm/pmm.h"
@@ -173,7 +175,21 @@ static void cpus_probe(void) {
 
 void smp_secondary_main(uint64_t index);
 void smp_secondary_main(uint64_t index) {
-    /* TPIDR_EL1 first: this_cpu() is a read of it, and everything below --
+    /* EXCEPTION VECTORS FIRST, before anything that could fault and before any
+     * interrupt can be unmasked. VBAR_EL1 is a BANKED, PER-CORE register: core
+     * 0 installing the table at A1 says nothing about core 1, whose VBAR_EL1 is
+     * whatever reset left in it.
+     *
+     * Without this a secondary comes up looking perfectly healthy -- it
+     * reports online, its redistributor is awake, its timer is armed, DAIF says
+     * interrupts are unmasked -- and takes ZERO interrupts, because every one
+     * of them vectors to an address with nothing at it. The core never
+     * preempts, never runs a scheduled thread, and never says so. That is
+     * exactly how this presented: "4 of 4 cores online" and three cores that
+     * had taken 0 interrupts between them. */
+    exception_init();
+
+    /* TPIDR_EL1 next: this_cpu() is a read of it, and everything below --
      * including anything that takes a lock or reports a failure -- wants a
      * correct answer from it. */
     percpu_init_this_cpu((uint32_t)index);
@@ -191,6 +207,11 @@ void smp_secondary_main(uint64_t index) {
      * and therefore never preempts anything. */
     timer_init_this_cpu();
 
+    /* This core's SGIs. Per core because SGIs live in each core's own
+     * redistributor -- enabling them on core 0 says nothing about core 1, and
+     * a core that skips this takes an unhandled interrupt on the first IPI. */
+    arch_ipi_init_this_cpu();
+
     this_cpu()->online = true;
     __atomic_add_fetch(&g_online, 1, __ATOMIC_RELEASE);
     kprintf("smp: cpu%d online\n", (int)index);
@@ -205,6 +226,12 @@ void smp_secondary_main(uint64_t index) {
     }
 
     arch_irq_enable();
+    {
+        uint64_t daif;
+        __asm__ volatile("mrs %0, daif" : "=r"(daif));
+        kprintf("smp: cpu%d scheduling, DAIF=%p\n", (int)index,
+                (void *)(uintptr_t)daif);
+    }
     for (;;)
         arch_cpu_idle();
 }

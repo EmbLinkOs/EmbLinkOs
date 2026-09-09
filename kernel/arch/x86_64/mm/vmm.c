@@ -1,4 +1,5 @@
 #include "mm/vmm.h"
+#include "include/arch_ipi.h"
 #include "mm/pmm.h"
 #include "boot/boot_protocol.h"   /* memory map now arrives via the boot protocol */
 #include "drivers/char/serial.h"
@@ -455,6 +456,25 @@ uint64_t vmm_get_phys(uint64_t virt_addr) {
 
 void vmm_flush_tlb(uint64_t virt_addr) {
     __asm__ volatile("invlpg (%0)" : : "r" (virt_addr) : "memory");
+
+    /* AND TELL THE OTHER CORES. `invlpg` invalidates THIS core's TLB and says
+     * nothing to the rest, so without this a page unmapped here stays mapped
+     * on every other core until something happens to evict it -- a
+     * use-after-free the hardware will happily perform, on memory the
+     * allocator has already handed to somebody else.
+     *
+     * That was a real hole from the day x86 gained a second core, hidden only
+     * by how rarely a mapping is torn down while another core is touching it.
+     *
+     * A blunt instrument on purpose: the receiving core reloads CR3 and throws
+     * away every non-global entry, because the IPI carries no payload to say
+     * WHICH page (see include/arch_ipi.h). A mailbox and a handshake would
+     * narrow it, and would be the right change once a shootdown is frequent
+     * enough to measure. It is not.
+     *
+     * aarch64 needs none of this: `tlbi ... is` broadcasts across the
+     * inner-shareable domain in hardware. */
+    arch_ipi_broadcast(IPI_TLB_SHOOTDOWN);
 }
 
 

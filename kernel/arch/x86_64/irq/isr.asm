@@ -4,8 +4,12 @@
 extern isr_handler
 extern irq_handler
 extern lapic_timer_handler
+extern lapic_ipi_handler
 global lapic_timer_stub
 global lapic_spurious_stub
+global lapic_ipi_stub_0
+global lapic_ipi_stub_1
+global lapic_ipi_stub_2
 
 
 ; LAPIC spurious-interrupt handler (the vector programmed into the SVR, 0xFF).
@@ -24,6 +28,8 @@ lapic_timer_stub:
     push qword 0 ; push dummy error code (not used for LAPIC timer, but we want to keep the stack layout consistent)
     push qword 48 ; push vector number for LAPIC timer (we can choose any unused vector, using 255 here)
     jmp irq_common_lapic
+
+
 
 
 %macro ISR_NOERR 1 ; macro for ISRs without error code
@@ -96,6 +102,32 @@ irq%1:
     pop rbx
     pop rax
 %endmacro
+
+; INTER-PROCESSOR INTERRUPTS. One stub per reason, because the vector IS the
+; message -- an IPI carries no payload, so the only way to say WHICH is to send
+; a different vector. 0xF0..0xF2 are above every device vector and below the
+; spurious vector (0xFF).
+;
+; Each stub passes its reason to C as an IMMEDIATE rather than handing over the
+; register frame. The frame would mean teaching this file about `struct
+; registers`, which is declared privately in TWO different .c files already;
+; the reason is the only thing the handler wants, and the stub is the one place
+; that knows it for certain.
+%macro IPI_STUB 2   ; %1 = stub suffix, %2 = reason passed to C
+lapic_ipi_stub_%1:
+    push qword 0            ; dummy error code, so the frame matches every
+    push qword %1           ; other stub's and `add rsp,16` means the same
+    PUSH_GPRS
+    mov rdi, %2             ; the REASON -- see enum ipi_reason
+    call lapic_ipi_handler
+    POP_GPRS
+    add rsp, 16
+    iretq
+%endmacro
+
+IPI_STUB 0, 0
+IPI_STUB 1, 1
+IPI_STUB 2, 2
 
 
 ISR_NOERR 0
@@ -192,3 +224,4 @@ irq_common_lapic:
     POP_GPRS
     add rsp, 16           ; skip the dummy error code + vector number pushed by the stub
     iretq
+

@@ -37,6 +37,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/irq/exception.c \
                kernel/arch/aarch64/irq/gicv3.c \
                kernel/arch/aarch64/irq/its.c \
+               kernel/arch/aarch64/irq/ipi.c \
                kernel/arch/aarch64/sched/bringup.c \
                kernel/arch/aarch64/smp/smp.c \
                kernel/arch/aarch64/drivers/timer_generic.c \
@@ -60,6 +61,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
 # arch_pmm_reserve_fixed() ended up being.
 ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/mm/uaccess_guard.c \
+                  kernel/mm/ipi.c \
                   kernel/mm/kheap.c \
                   kernel/mm/kmalloc.c \
                   kernel/lib/kprintf.c \
@@ -850,6 +852,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	    chk 'MSI unavailable, INTx still works' A7 'HVF has no ITS; the driver should have said so and fallen back'; \
 	  fi; \
 	  chk "$(ARM_SMP) of $(ARM_SMP) core(s) online" A9 'not every secondary core came up'; \
+	  chk 'other core(s) took the interrupt' A9 'an IPI reached nobody -- cross-core interrupts do not work'; \
+	  chk 'every core is taking interrupts on its own timer' A9 'a core is online but INERT -- no timer, so it never preempts'; \
 	  keyn=$$(sed -n 's/.*virtio-input: \([0-9][0-9]*\) key event.*/\1/p' $$log | tail -1); \
 	  ptrn=$$(sed -n 's/.*virtio-input: [0-9][0-9]* key event(s), \([0-9][0-9]*\) pointer.*/\1/p' $$log | tail -1); \
 	  [ -n "$$keyn" ] && [ "$$keyn" -gt 0 ] 2>/dev/null || \
@@ -892,7 +896,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "  A7 MSI: the GIC ITS translates and delivers (TCG; HVF has no ITS"; \
 	  echo "     and correctly falls back to INTx)"; \
 	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
-	  echo "     own GIC redistributor and timer, all reporting in themselves"; \
+	  echo "     own GIC redistributor, VECTORS and timer, all reporting in"; \
+	  echo "     themselves, all TICKING, and all reachable by IPI"; \
 	else exit 1; fi
 
 # The USERLAND libc is probed the way the x86 check-tools does it: by actually

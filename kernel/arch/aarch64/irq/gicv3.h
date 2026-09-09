@@ -72,6 +72,7 @@ uint32_t gic_processor_number(void);
 
 /* ITS bring-up diagnostics -- see gicv3.c. */
 uint32_t gic_redist_ctlr(void);
+uint64_t gic_percpu_irq_count(uint32_t cpu);
 int      gic_lpi_pending(uint32_t intid);
 void gic_unregister(uint32_t intid);
 

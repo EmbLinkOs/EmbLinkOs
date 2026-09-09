@@ -155,6 +155,22 @@ static void smp_min_delay(void) {
     }
 }
 
+/* Send `vector` to every core EXCEPT this one.
+ *
+ * "All excluding self" is a DESTINATION SHORTHAND the hardware understands
+ * (ICR bits 19:18 = 0b11), so this is one register write regardless of how
+ * many cores exist -- no loop, no list of APIC ids, and no chance of missing a
+ * core that came online after such a list was built.
+ *
+ * Kept here rather than exporting lapic_write(): the ICR is the one register
+ * where a careless write reaches every other core, and one named function is a
+ * smaller surface than a general accessor. */
+void lapic_send_ipi_all_but_self(uint8_t vector) {
+    lapic_write(LAPIC_REG_ICR_HIGH, 0);
+    lapic_write(LAPIC_REG_ICR_LOW, (uint32_t)vector | (3u << 18));
+    lapic_wait_icr_idle();
+}
+
 void lapic_start_ap(uint32_t dest_apic_id, uint64_t trampoline_phys) {
     uint32_t dest = dest_apic_id << LAPIC_ICR_DEST_SHIFT;
     uint8_t sipi_vector = (uint8_t)(trampoline_phys >> 12);

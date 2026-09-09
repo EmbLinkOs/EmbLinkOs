@@ -1,4 +1,5 @@
 #include "arch/aarch64/irq/gicv3.h"
+#include "arch/aarch64/cpu/percpu.h"
 #include "arch/aarch64/boot/fdt.h"
 #include "mm/pmm.h"
 #include "include/kprintf.h"
@@ -460,8 +461,17 @@ void gic_set_post_eoi(void (*fn)(void)) {
     post_eoi = fn;
 }
 
+/* Per-core interrupt tally, for diagnosing "does this core take interrupts at
+ * all" -- a question that is otherwise invisible, because every count the GIC
+ * driver keeps is shared. */
+static volatile uint64_t percpu_irqs[MAX_CPUS];
+uint64_t gic_percpu_irq_count(uint32_t cpu) {
+    return cpu < MAX_CPUS ? percpu_irqs[cpu] : 0;
+}
+
 void gic_dispatch(void) {
     uint64_t iar = SYSREG_READ(ICC_IAR1_EL1);
+    percpu_irqs[this_cpu()->cpu_index & (MAX_CPUS - 1)]++;
     uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
 
     /* An LPI -- an MSI that the ITS translated and delivered. Handled before

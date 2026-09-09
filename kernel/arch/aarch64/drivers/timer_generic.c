@@ -1,4 +1,5 @@
 #include "drivers/timer/timer.h"
+#include "arch/aarch64/cpu/percpu.h"
 #include "arch/aarch64/irq/gicv3.h"
 #include "arch/aarch64/boot/fdt.h"
 #include "include/kprintf.h"
@@ -25,7 +26,14 @@ static uint64_t timer_freq;       /* Hz, from CNTFRQ_EL0                */
 static uint64_t reload;           /* counter units per tick             */
 static uint64_t ticks;
 static uint64_t boot_count;       /* CNTVCT at init, so uptime starts 0 */
-static uint64_t next_deadline;    /* absolute CNTVCT value of the next tick  */
+/* PER CORE, and it has to be: CNTV_CVAL_EL0 is a BANKED register, so each
+ * core is tracking its own deadline. One shared variable meant four cores
+ * advancing the same number and writing it to four different comparators --
+ * whichever core got there last set everyone's idea of "next", and a secondary
+ * that fired once then re-armed to a deadline another core had already moved
+ * past never fired again. The symptom was three cores that took exactly one
+ * timer interrupt each and then went silent. */
+static uint64_t next_deadline[MAX_CPUS];    /* absolute CNTVCT value of the next tick  */
 static uint32_t timer_intid;
 
 /* The VIRTUAL timer (CNTV_*), not the physical one. Under HVF or KVM the
@@ -58,19 +66,24 @@ static void timer_tick(uint32_t intid) {
      * tick under HVF, an 11% drift that a monotonic clock would inherit.
      * Advancing a deadline instead makes the tick exact regardless of handler
      * latency -- late once, not late forever. */
-    next_deadline += reload;
+    uint32_t cpu = this_cpu()->cpu_index & (MAX_CPUS - 1);
+    next_deadline[cpu] += reload;
 
     /* If we fell so far behind that the next deadline is already past --
      * possible under TCG, or after a long period with interrupts masked --
      * resynchronise rather than spending the next N interrupts catching up in
      * a burst that starves everything else. */
     uint64_t now = cntvct();
-    if (next_deadline <= now)
-        next_deadline = now + reload;
+    if (next_deadline[cpu] <= now)
+        next_deadline[cpu] = now + reload;
 
-    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(next_deadline));
+    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(next_deadline[cpu]));
 
-    ticks++;
+    /* UPTIME IS COUNTED ONCE, by the boot core. Every core gets a tick -- that
+     * is what preempts it -- but `ticks` is a clock, and four cores
+     * incrementing it would make time run four times too fast. */
+    if (cpu == 0)
+        ticks++;
 
     /* No scheduler call here. Preemption happens from the GIC's post-EOI hook
      * instead -- see gic_dispatch(). This handler's whole job is to make the
@@ -127,7 +140,9 @@ void timer_init(void) {
  * CNTFRQ, finding the interrupt in the device tree, and registering the
  * handler. Those are the machine's properties, not the core's. */
 void timer_arm_this_cpu(void) {
-    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(cntvct() + reload));
+    uint32_t cpu = this_cpu()->cpu_index & (MAX_CPUS - 1);
+    next_deadline[cpu] = cntvct() + reload;
+    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(next_deadline[cpu]));
     __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)1));  /* ENABLE, unmasked */
     __asm__ volatile("isb" ::: "memory");
 }

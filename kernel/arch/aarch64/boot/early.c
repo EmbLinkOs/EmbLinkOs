@@ -28,6 +28,7 @@
 #include "drivers/audio/ac97.h"
 #include "drivers/audio/audio.h"
 #include "include/uaccess_guard.h"
+#include "include/arch_ipi.h"
 #include "arch/aarch64/smp/smp.h"
 #include "include/arch_irq.h"
 #include "include/kmalloc.h"
@@ -616,6 +617,9 @@ void arch_early_main(uint64_t dtb_phys) {
     arch_irq_enable();
     kprintf("sched: interrupts enabled -- preemption starts here\n\n");
 
+    /* The boot core's own SGIs, before any secondary exists to send it one. */
+    arch_ipi_init_this_cpu();
+
     /* The ITS: MSI. After the GIC (it targets a redistributor) and before the
      * PCI drivers that might want one. Absence is not a failure -- every
      * driver falls back to the legacy INTx line this machine also provides. */
@@ -754,6 +758,34 @@ void arch_early_main(uint64_t dtb_phys) {
      * secondary needs all three to exist before it can join, and the work it
      * then picks up is user work. */
     smp_bringup();
+
+    /* --- cross-core interrupts ----------------------------------------------
+     * "The SGI was sent" and "another core ran the handler" are different
+     * claims, and only the second one is worth making: a broadcast that
+     * reaches nobody looks exactly like a working one from here. So the count
+     * comes from the RECEIVING cores -- ipi_dispatch() increments it, and it
+     * is shared memory, so a non-zero delta means somebody else really did
+     * enter the handler.
+     *
+     * IPI_RESCHEDULE is the one to test with: its handler does nothing at all
+     * (the interrupt IS the point -- it drags a core into the interrupt path,
+     * whose exit already runs the scheduler), so counting it disturbs nothing. */
+    if (cpu_count > 1) {
+        uint64_t before = ipi_count(IPI_RESCHEDULE);
+        arch_ipi_broadcast(IPI_RESCHEDULE);
+
+        uint64_t deadline = timer_sched_ticks() + 100;
+        while (ipi_count(IPI_RESCHEDULE) < before + (cpu_count - 1) &&
+               timer_sched_ticks() < deadline)
+            arch_cpu_relax();
+
+        uint64_t got = ipi_count(IPI_RESCHEDULE) - before;
+        bool ok = got >= cpu_count - 1;
+        kprintf("  [%s] IPI: %d of %d other core(s) took the interrupt\n",
+                ok ? " ok " : "FAIL", (int)got, (int)(cpu_count - 1));
+        if (!ok)
+            selftest_fails++;
+    }
 
     kprintf("\n--- userland (A6) ---\n");
     {
@@ -972,6 +1004,25 @@ void arch_early_main(uint64_t dtb_phys) {
                     "event(s), cursor at %d,%d\n",
                     (unsigned)keys, (unsigned)ptr, (int)mx, (int)my);
         }
+    }
+
+    /* Sampled HERE, seconds after bring-up, because "a core takes interrupts"
+     * is a rate and not an event: the same counts read immediately after
+     * smp_bringup() are near zero on every core simply because no time has
+     * passed. Every core must be TICKING -- a core whose timer fired once and
+     * stopped is a core that will never preempt anything it is given. */
+    if (cpu_count > 1) {
+        bool all_ticking = true;
+        for (uint32_t c = 0; c < cpu_count; c++) {
+            uint64_t n = gic_percpu_irq_count(c);
+            kprintf("  cpu%d: %d interrupt(s)\n", (int)c, (int)n);
+            if (n < 10)
+                all_ticking = false;
+        }
+        kprintf("  [%s] every core is taking interrupts on its own timer\n",
+                all_ticking ? " ok " : "FAIL");
+        if (!all_ticking)
+            selftest_fails++;
     }
 
     kprintf("\n--- all self-tests done: %d failure(s) ---\n", (int)selftest_fails);

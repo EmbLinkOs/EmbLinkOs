@@ -3,6 +3,7 @@
 #include "arch/x86_64/cpu/gdt.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/irq/lapic.h"
+#include "include/arch_ipi.h"
 #include "arch/x86_64/cpu/fpu.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -71,6 +72,11 @@ void ap_main(void) {
     gdt_init_this_cpu();
     idt_load_this_cpu();
     lapic_init_this_cpu();
+
+    /* This core's IDT entries for the three IPI vectors. Done per core because
+     * a core that has not installed them takes an unhandled interrupt on the
+     * first shootdown -- and the sender has no way to notice. */
+    arch_ipi_init_this_cpu();
 
     struct cpu_data *me = this_cpu();
 

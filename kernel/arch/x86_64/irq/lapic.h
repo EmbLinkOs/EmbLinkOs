@@ -50,6 +50,10 @@ void lapic_init_this_cpu(void);
 // for the AP to come online itself -- the caller polls cpu_table[i].online.
 void lapic_start_ap(uint32_t dest_apic_id, uint64_t trampoline_phys);
 
+/* Send one vector to every core except this one -- the delivery half of an
+ * IPI. See include/arch_ipi.h for what the vectors MEAN. */
+void lapic_send_ipi_all_but_self(uint8_t vector);
+
 // Send an EOI to the local APIC to signal end of interrupt handling
 void lapic_send_eoi(void);
 

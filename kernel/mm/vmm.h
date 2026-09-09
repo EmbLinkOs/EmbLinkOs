@@ -88,6 +88,10 @@ uint64_t vmm_get_phys(uint64_t virt);
 // Invalidates the TLB entry for the given virtual address
 void vmm_flush_tlb(uint64_t virt);
 
+/* Flush THIS core's entire TLB, and only this core's. The IPI handler for a
+ * shootdown calls it; nothing else should. See include/arch_ipi.h. */
+void arch_tlb_flush_all_local(void);
+
 // Get the kernel's PML4 (for context switching)
 uint64_t vmm_get_kernel_pml4(void);
 
