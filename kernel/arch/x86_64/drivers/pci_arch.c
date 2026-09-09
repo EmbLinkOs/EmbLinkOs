@@ -27,8 +27,16 @@ void arch_pci_cfg_write32(uint8_t bus, uint8_t device, uint8_t function,
     outl(PCI_CONFIG_DATA, value);
 }
 
-bool arch_pci_msi_message(uint8_t vector, uint32_t cpu_id,
+bool arch_pci_msi_message(uint8_t bus, uint8_t device, uint8_t function,
+                          uint8_t vector, uint32_t cpu_id,
                           uint64_t *out_addr, uint32_t *out_data) {
+    /* WHO is asking does not matter here, and that is the whole difference
+     * from aarch64: an x86 MSI message is computable from the vector and the
+     * target CPU alone, because the doorbell is fixed and the data IS the
+     * vector. Nothing has to be told about this device in advance. On GICv3 it
+     * does -- see arch/aarch64/irq/its.c. */
+    (void)bus; (void)device; (void)function;
+
     /* The local APIC's doorbell. Writing `vector` to this address is what makes
      * the interrupt appear -- an MSI is literally a memory write aimed at the
      * interrupt controller, which is why the "message" differs completely

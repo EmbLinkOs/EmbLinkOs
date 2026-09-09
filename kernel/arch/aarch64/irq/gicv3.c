@@ -33,6 +33,15 @@
 #define GICR_WAKER_ASLEEP  (1u << 2)   /* ChildrenAsleep  */
 
 /* The SGI/PPI registers live in the redistributor's SECOND 64 KiB frame. */
+/* LPI control, in the redistributor's FIRST frame. LPIs are how an MSI
+ * arrives: the ITS translates a device's write into an LPI INTID and targets a
+ * redistributor, which needs a configuration table (one byte per LPI: priority
+ * and an enable bit) and a pending table (one bit) to hold that state. Both
+ * are in memory the GIC reads by DMA, not registers. */
+#define GICR_CTLR_ENABLE_LPIS  (1u << 0)
+#define GICR_PROPBASER     0x0070
+#define GICR_PENDBASER     0x0078
+
 #define GICR_SGI_BASE      0x10000
 #define GICR_IGROUPR0      (GICR_SGI_BASE + 0x0080)
 #define GICR_ISENABLER0    (GICR_SGI_BASE + 0x0100)
@@ -44,6 +53,28 @@
 
 #define SPURIOUS 1023
 #define MAX_INTID 1020
+
+/* LPIs live at 8192 and up, far outside the SPI/PPI range, so they cannot
+ * share the handlers[] array -- indexing it by INTID would need 8192 wasted
+ * entries before the first useful one. They get their own small table, indexed
+ * by LPI NUMBER (INTID - 8192), and gic_dispatch routes to it.
+ *
+ * 64 is generous: one MSI per device on a machine with a handful of virtio
+ * devices. The number is a table size, not a hardware limit. */
+#define LPI_BASE_INTID  8192
+#define LPI_MAX         64
+#define LPI_IDBITS      14                 /* INTIDs up to 16383 */
+#define LPI_PROP_BYTES  ((1u << LPI_IDBITS) - LPI_BASE_INTID)
+#define LPI_PEND_BYTES  (64u * 1024u)      /* PENDBASER is 64 KiB aligned+sized */
+
+/* The GIC reads both by DMA, so they must be where KV2P() works -- .bss, not
+ * the heap. Same constraint every virtqueue in this tree records. */
+static uint8_t lpi_prop[LPI_PROP_BYTES] __attribute__((aligned(4096)));
+static uint8_t lpi_pend[LPI_PEND_BYTES] __attribute__((aligned(65536)));
+
+static gic_handler_t lpi_handlers[LPI_MAX];
+static const char   *lpi_names[LPI_MAX];
+static uint64_t      lpi_counts[LPI_MAX];
 
 /* Middle priority for everything. A single priority means no interrupt can
  * preempt another, which is what we want while the kernel runs with a single
@@ -77,6 +108,7 @@ static inline void     d_write(uint32_t off, uint32_t v){ *(volatile uint32_t *)
 static inline void     d_write64(uint32_t off, uint64_t v){ *(volatile uint64_t *)(gicd + off) = v; }
 static inline uint32_t r_read(uint32_t off)            { return *(volatile uint32_t *)(gicr + off); }
 static inline void     r_write(uint32_t off, uint32_t v){ *(volatile uint32_t *)(gicr + off) = v; }
+static inline void     r_write64(uint32_t off, uint64_t v){ *(volatile uint64_t *)(gicr + off) = v; }
 static inline void     d_write8(uint32_t off, uint8_t v){ *(volatile uint8_t *)(gicd + off) = v; }
 static inline void     r_write8(uint32_t off, uint8_t v){ *(volatile uint8_t *)(gicr + off) = v; }
 
@@ -263,6 +295,38 @@ int gic_init_this_cpu(void) {
         }
     }
 
+    /* --- LPIs, which is what an MSI becomes -----------------------------
+     * The configuration table says which LPIs are enabled and at what
+     * priority; the pending table is the GIC's own scratch. Both are per
+     * redistributor in principle -- and shared here, deliberately: every core
+     * agrees about which LPIs exist and what they are worth, and one table is
+     * one thing to keep consistent rather than N.
+     *
+     * PROPBASER's low bits carry ID_bits-1, not a size in bytes, and the
+     * shareability/cacheability fields matter: a GIC told the table is
+     * non-cacheable will read stale bytes through a coherent interconnect.
+     * Inner-shareable, read-allocate write-back is what every other DMA
+     * structure in this kernel uses. */
+    if (!lpi_prop[0]) {
+        /* Priority in bits[7:2], bit0 = enable. Every LPI starts DISABLED and
+         * is turned on by gic_register_lpi(); a table of enabled interrupts
+         * with no handlers is how a machine wedges on its first MSI. */
+        for (uint32_t i = 0; i < LPI_PROP_BYTES; i++)
+            lpi_prop[i] = IRQ_PRIORITY & 0xFC;
+    }
+
+    r_write64(GICR_PROPBASER,
+              KV2P((uint64_t)(uintptr_t)lpi_prop)
+              | (uint64_t)(LPI_IDBITS - 1)
+              | (1ULL << 10)          /* InnerCache = RaWb */
+              | (1ULL << 7));         /* Shareability = Inner Shareable */
+    r_write64(GICR_PENDBASER,
+              KV2P((uint64_t)(uintptr_t)lpi_pend)
+              | (1ULL << 10) | (1ULL << 7));
+    __asm__ volatile("dsb sy" ::: "memory");
+    r_write(GICR_CTLR, r_read(GICR_CTLR) | GICR_CTLR_ENABLE_LPIS);
+    __asm__ volatile("dsb sy; isb" ::: "memory");
+
     r_write(GICR_ICENABLER0, 0xFFFFFFFFu);   /* all SGIs+PPIs off to start */
     r_write(GICR_ICPENDR0,   0xFFFFFFFFu);
     r_write(GICR_ICACTIVER0, 0xFFFFFFFFu);
@@ -294,6 +358,56 @@ int gic_init_this_cpu(void) {
     __asm__ volatile("isb" ::: "memory");
 
     return 0;
+}
+
+/* Claim an LPI: install a handler and ENABLE it in the configuration table.
+ *
+ * The table is memory the GIC caches, so a change to it is not visible until
+ * the redistributor is told to re-read -- which is what the ITS's INV command
+ * does. its.c issues that after calling this. */
+int gic_register_lpi(uint32_t intid, gic_handler_t handler, const char *name) {
+    if (intid < LPI_BASE_INTID || intid >= LPI_BASE_INTID + LPI_MAX)
+        return -1;
+    uint32_t l = intid - LPI_BASE_INTID;
+
+    lpi_handlers[l] = handler;
+    lpi_names[l]    = name;
+    lpi_prop[intid - LPI_BASE_INTID] = (IRQ_PRIORITY & 0xFC) | 1u;   /* enable */
+    __asm__ volatile("dsb sy" ::: "memory");
+    return 0;
+}
+
+/* The PHYSICAL address of this core's redistributor -- what the ITS's MAPC
+ * and SYNC commands target. The ITS addresses redistributors by address, not
+ * by CPU number. */
+uint64_t gic_redistributor_phys(void) {
+    return (uint64_t)(uintptr_t)gicr - MMIO_BASE;
+}
+
+/* This core's GIC processor number -- GICR_TYPER[23:8]. The ITS names a
+ * redistributor this way when GITS_TYPER.PTA is 0. It is NOT the CPU index and
+ * NOT the MPIDR; it is the GIC's own numbering. */
+/* Diagnostics for the ITS bring-up: did the redistributor accept LPIs, and did
+ * a translated interrupt actually reach its pending table? Those two answers
+ * separate "the ITS never translated it" from "it translated it and the CPU
+ * interface never delivered it", which look identical from the handler. */
+uint32_t gic_redist_ctlr(void) { return r_read(GICR_CTLR); }
+
+int gic_lpi_pending(uint32_t intid) {
+    if (intid < LPI_BASE_INTID) return -1;
+    uint32_t l = intid - LPI_BASE_INTID + LPI_BASE_INTID;   /* absolute INTID */
+    return (lpi_pend[l / 8] >> (l % 8)) & 1;
+}
+
+uint32_t gic_processor_number(void) {
+    uint64_t typer = *(volatile uint64_t *)(gicr + GICR_TYPER);
+    return (uint32_t)((typer >> 8) & 0xFFFF);
+}
+
+uint64_t gic_lpi_count(uint32_t intid) {
+    if (intid < LPI_BASE_INTID || intid >= LPI_BASE_INTID + LPI_MAX)
+        return 0;
+    return lpi_counts[intid - LPI_BASE_INTID];
 }
 
 void gic_enable(uint32_t intid) {
@@ -349,6 +463,25 @@ void gic_set_post_eoi(void (*fn)(void)) {
 void gic_dispatch(void) {
     uint64_t iar = SYSREG_READ(ICC_IAR1_EL1);
     uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+
+    /* An LPI -- an MSI that the ITS translated and delivered. Handled before
+     * the spurious check, because 8192+ is far above MAX_INTID and would
+     * otherwise be counted as spurious and never acknowledged. */
+    if (intid >= LPI_BASE_INTID) {
+        uint32_t l = intid - LPI_BASE_INTID;
+        if (l < LPI_MAX) {
+            lpi_counts[l]++;
+            if (lpi_handlers[l])
+                lpi_handlers[l](intid);
+        }
+        /* EOI regardless: an LPI nobody claimed still has to be retired, or
+         * the CPU interface stays busy at that priority and every later
+         * interrupt is blocked behind it. */
+        SYSREG_WRITE(ICC_EOIR1_EL1, iar);
+        if (post_eoi)
+            post_eoi();
+        return;
+    }
 
     if (intid >= MAX_INTID) {          /* 1020-1023: spurious or special */
         spurious++;

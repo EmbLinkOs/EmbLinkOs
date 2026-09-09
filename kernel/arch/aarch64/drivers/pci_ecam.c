@@ -1,4 +1,5 @@
 #include "drivers/bus/pci.h"
+#include "arch/aarch64/irq/its.h"
 #include "arch/aarch64/boot/fdt.h"
 #include "mm/vmm.h"
 #include "include/kprintf.h"
@@ -87,24 +88,47 @@ void arch_pci_cfg_write32(uint8_t bus, uint8_t device, uint8_t function,
         *p = value;
 }
 
-bool arch_pci_msi_message(uint8_t vector, uint32_t cpu_id,
-                          uint64_t *out_addr, uint32_t *out_data) {
-    (void)vector; (void)cpu_id; (void)out_addr; (void)out_data;
+static uint32_t g_last_msi_intid;
 
-    /* No MSI yet, and saying so is the correct behaviour rather than a gap.
+bool arch_pci_msi_message(uint8_t bus, uint8_t device, uint8_t function,
+                          uint8_t vector, uint32_t cpu_id,
+                          uint64_t *out_addr, uint32_t *out_data) {
+    (void)vector; (void)cpu_id;
+
+    /* An MSI here is a write to the ITS's translater register carrying an
+     * EVENT ID, and the ITS has to have been told about this device first --
+     * which is why the device address is a parameter at all. its_map_msi()
+     * does the MAPD/MAPTI/INV conversation and hands back the message.
      *
-     * On this architecture an MSI is a write to the GIC's ITS translater
-     * register carrying an EventID, and the ITS needs its own command queue,
-     * device table and interrupt-translation tables set up first. None of that
-     * exists (docs/TODO.md). Returning false makes pci_enable_msi() fail,
-     * which every caller already handles by falling back to a legacy
-     * interrupt line -- a path that works and is what `virt` provides anyway.
+     * The DeviceID is the PCI RID, bus<<8 | dev<<3 | fn: what the host bridge
+     * puts on the bus, which is what the ITS sees. `virt` declares that
+     * identity mapping in the device tree's msi-map and it is the only mapping
+     * this machine uses.
      *
-     * The alternative -- programming an address that means nothing here --
-     * would produce a device that appears to be configured and never
+     * Returning false when there is no ITS remains correct rather than a gap:
+     * every caller falls back to a legacy interrupt line, which works and is
+     * what this machine provides anyway. Programming an address that means
+     * nothing here would produce a device that appears configured and never
      * interrupts. */
-    return false;
+    if (!its_present())
+        return false;
+
+    uint32_t devid = ((uint32_t)bus << 8) | ((uint32_t)device << 3) | function;
+    uint32_t intid = 0;
+    if (!its_map_msi(devid, &intid, out_addr, out_data))
+        return false;
+
+    /* The caller asked for `vector`; what it GETS is an LPI number the ITS
+     * chose. Record it so a driver can find its own interrupt -- there is no
+     * vector space here to have asked for a particular number in. */
+    g_last_msi_intid = intid;
+    return true;
 }
+
+/* The LPI the most recent successful arch_pci_msi_message() allocated. A
+ * driver calls pci_enable_msi() and then asks what it got; on x86 it already
+ * knew, because it named the vector. */
+uint32_t arch_pci_msi_last_intid(void) { return g_last_msi_intid; }
 
 /* --- the MMIO window, from the device tree --------------------------------
  *

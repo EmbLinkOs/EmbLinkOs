@@ -36,6 +36,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/boot/boot_protocol_dtb.c \
                kernel/arch/aarch64/irq/exception.c \
                kernel/arch/aarch64/irq/gicv3.c \
+               kernel/arch/aarch64/irq/its.c \
                kernel/arch/aarch64/sched/bringup.c \
                kernel/arch/aarch64/smp/smp.c \
                kernel/arch/aarch64/drivers/timer_generic.c \
@@ -839,6 +840,12 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'virtio-snd: stream 0 ready'     A7 'virtio-snd did not accept its PCM parameters'; \
 	  chk 'frame(s) accepted at 44100 Hz'  A7 'audio buffers were not submitted or never retired'; \
 	  chk 'PSCI via'                       A9 'no PSCI conduit found in the device tree'; \
+	  if [ "$$acc" = tcg ]; then \
+	    chk 'software-triggered MSI'       A7 'the ITS did not deliver a translated interrupt'; \
+	    chk 'MSI -> LPI .* delivered'      A7 'the MSI was mapped but never arrived'; \
+	  else \
+	    chk 'MSI unavailable, INTx still works' A7 'HVF has no ITS; the driver should have said so and fallen back'; \
+	  fi; \
 	  chk "$(ARM_SMP) of $(ARM_SMP) core(s) online" A9 'not every secondary core came up'; \
 	  keyn=$$(sed -n 's/.*virtio-input: \([0-9][0-9]*\) key event.*/\1/p' $$log | tail -1); \
 	  ptrn=$$(sed -n 's/.*virtio-input: [0-9][0-9]* key event(s), \([0-9][0-9]*\) pointer.*/\1/p' $$log | tail -1); \
@@ -877,6 +884,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "  A7 virtio-input: keyboard + tablet, events injected and RECEIVED"; \
 	  echo "  A7 virtio-snd: a real buffer submitted through the shared audio"; \
 	  echo "     layer and retired by the device"; \
+	  echo "  A7 MSI: the GIC ITS translates and delivers (TCG; HVF has no ITS"; \
+	  echo "     and correctly falls back to INTx)"; \
 	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
 	  echo "     own GIC redistributor and timer, all reporting in themselves"; \
 	else exit 1; fi

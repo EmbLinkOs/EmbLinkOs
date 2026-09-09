@@ -65,7 +65,8 @@ bool pci_enable_msi(uint8_t bus, uint8_t device, uint8_t function,
             bool is64 = (ctrl & (1u << 7)) != 0;
             uint64_t msg_addr = 0;
             uint32_t msg_data = 0;
-            if (!arch_pci_msi_message(vector, apic_id, &msg_addr, &msg_data))
+            if (!arch_pci_msi_message(bus, device, function, vector, apic_id,
+                                      &msg_addr, &msg_data))
                 return false;   /* no MSI on this machine: caller falls back */
 
             pci_write32(bus, device, function, cap + 4, (uint32_t)msg_addr);
@@ -111,7 +112,8 @@ bool pci_enable_msix(uint8_t bus, uint8_t device, uint8_t function,
             if (!virt) { return false; }
             uint64_t msg_addr = 0;
             uint32_t msg_data = 0;
-            if (!arch_pci_msi_message(vector, apic_id, &msg_addr, &msg_data)) {
+            if (!arch_pci_msi_message(bus, device, function, vector, apic_id,
+                                      &msg_addr, &msg_data)) {
                 vmm_unmap_mmio(virt, 16);
                 return false;   /* no MSI on this machine: caller falls back */
             }

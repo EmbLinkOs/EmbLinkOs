@@ -35,10 +35,21 @@ void     arch_pci_cfg_write32(uint8_t bus, uint8_t device, uint8_t function, uin
                               uint32_t value);
 
 /* Fill in the address to write and the value to write there so that writing it
- * delivers `vector` to `cpu_id`. Returns false if this machine has no way to
- * do that yet, in which case the caller must use a legacy interrupt line --
- * which is why pci_enable_msi() has always been allowed to fail. */
-bool arch_pci_msi_message(uint8_t vector, uint32_t cpu_id,
+ * delivers an interrupt for THIS DEVICE to `cpu_id`. Returns false if this
+ * machine has no way to do that, in which case the caller must use a legacy
+ * interrupt line -- which is why pci_enable_msi() has always been allowed to
+ * fail.
+ *
+ * THE DEVICE ADDRESS IS A PARAMETER, and that is aarch64's doing. On x86 an
+ * MSI message is computable from the vector and the target CPU alone: the
+ * doorbell is fixed and the data IS the vector. GICv3 inverts that -- a device
+ * writes its event id to ONE address and the ITS translates (DeviceID,
+ * EventID) into (LPI, redistributor), which means a per-device table entry has
+ * to be CREATED first, and the ITS identifies the device by its PCI RID. So
+ * the seam has to carry who is asking. x86 ignores bus/device/function; it has
+ * nothing to look up. */
+bool arch_pci_msi_message(uint8_t bus, uint8_t device, uint8_t function,
+                          uint8_t vector, uint32_t cpu_id,
                           uint64_t *out_addr, uint32_t *out_data);
 
 // Common config space offsets

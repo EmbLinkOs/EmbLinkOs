@@ -4,6 +4,7 @@
 #include "arch/aarch64/boot/fdt.h"
 #include "arch/aarch64/mm/pagetable.h"
 #include "arch/aarch64/irq/gicv3.h"
+#include "arch/aarch64/irq/its.h"
 #include "arch/aarch64/sched/bringup.h"
 #include "drivers/timer/timer.h"
 #include "drivers/bus/pci.h"
@@ -613,6 +614,15 @@ void arch_early_main(uint64_t dtb_phys) {
      * first thing PSTATE.I unmasking can produce is a tick we are ready for. */
     arch_irq_enable();
     kprintf("sched: interrupts enabled -- preemption starts here\n\n");
+
+    /* The ITS: MSI. After the GIC (it targets a redistributor) and before the
+     * PCI drivers that might want one. Absence is not a failure -- every
+     * driver falls back to the legacy INTx line this machine also provides. */
+    /* Interrupts are already unmasked at this point in the boot, so the ITS
+     * can prove itself immediately: a delivery it cannot observe is not a
+     * proof. */
+    if (its_init() && !its_selftest())
+        selftest_fails++;
 
     /* --- A7: the PCIe bus ---------------------------------------------------
      * The existing virtio-gpu and virtio-net drivers are virtio-over-PCI, so

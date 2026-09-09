@@ -53,6 +53,26 @@ typedef void (*gic_handler_t)(uint32_t intid);
 
 /* Register (and enable) / unregister (and disable) a handler for one INTID. */
 int  gic_register(uint32_t intid, gic_handler_t handler, const char *name);
+
+/* --- LPIs: what an MSI becomes -------------------------------------------
+ * The ITS translates a device's memory write into an LPI INTID (8192 and up)
+ * and targets a redistributor. These are separate from gic_register() because
+ * LPIs are not in the SPI/PPI numbering and do not live in the same table. */
+#define GIC_LPI_BASE 8192
+
+int      gic_register_lpi(uint32_t intid, gic_handler_t handler, const char *name);
+uint64_t gic_lpi_count(uint32_t intid);   /* deliveries, for the boot test */
+
+/* This core's redistributor, PHYSICALLY -- the ITS targets them by address. */
+uint64_t gic_redistributor_phys(void);
+
+/* This core's GIC processor number (GICR_TYPER[23:8]) -- how the ITS names a
+ * redistributor when GITS_TYPER.PTA is 0. Not the CPU index, not the MPIDR. */
+uint32_t gic_processor_number(void);
+
+/* ITS bring-up diagnostics -- see gicv3.c. */
+uint32_t gic_redist_ctlr(void);
+int      gic_lpi_pending(uint32_t intid);
 void gic_unregister(uint32_t intid);
 
 /* Enable/disable one INTID at the controller without touching its handler. */
