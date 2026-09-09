@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import layout as L
 from mkfs_embkfs import (make_image, _read_font, _tree_objects,
+                          FIXTURE_OBJECTS,
                           _SYSTEM_BIN as _X86_SYSTEM_BIN)
 
 # /system/bin is the sealed system tree (docs/USERSPACE.md): the kernel spawns
@@ -40,10 +41,10 @@ from mkfs_embkfs import (make_image, _read_font, _tree_objects,
 # and the symptom would be init reporting a failure to launch a file that is
 # plainly on the image.
 #
-# hello.elf is the one addition: it is the A6 witness, spawned by the kernel
-# itself rather than by init, and it belongs in the sealed tree for the same
-# reason init does.
-_SYSTEM_BIN = _X86_SYSTEM_BIN | {"hello.elf"}
+# hello.elf and posixdemo.elf are the additions: both are boot WITNESSES,
+# spawned by the kernel itself rather than by init, and they belong in the
+# sealed tree for the same reason init does.
+_SYSTEM_BIN = _X86_SYSTEM_BIN | {"hello.elf", "posixdemo.elf"}
 
 # Must match DEV_USER in user/bin/init.c -- init auto-logs in as this name and
 # binds /home/<name> into the desktop's namespace.
@@ -151,6 +152,14 @@ def main(argv):
     # disagree about where an icon lives.
     objects.extend(_tree_objects("system/images", b"system/images/",
                                  (".ppm", ".pam", ".eic")))
+
+    # The on-disk FORMAT fixtures the x86 image also carries, IMPORTED rather
+    # than retyped: /hello.txt, a symlink, and the two files whose names share a
+    # CRC32C hash (wgyehkb/illoeuw -> one dir-entry item, the collision-chain
+    # regression). posixdemo reads /hello.txt by relative and absolute path, so
+    # without them its filesystem section fails for want of a file rather than
+    # for want of a working filesystem.
+    objects.extend(FIXTURE_OBJECTS)
 
     # The writable tree, and it is a CONTRACT rather than tidiness. A directory
     # that does not exist cannot be granted: the kernel resolves an ns-bind

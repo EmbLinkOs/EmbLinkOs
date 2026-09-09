@@ -744,6 +744,33 @@ void arch_early_main(uint64_t dtb_phys) {
      * The boot thread then pumps the compositor exactly as main.c's boot loop
      * does on x86, and for the same reason stated there: these repaint, so they
      * must run in schedulable context, never from an IRQ handler. */
+    /* The POSIX conformance witness, and specifically the TLS half of it.
+     * hello.elf above proves the retargeting layer works; posixdemo proves it
+     * is RIGHT -- 100-odd assertions over stdio, dirents, paths, clocks,
+     * signals and thread-local storage, exiting 0 only if every one passes.
+     *
+     * The TLS block is the part worth running HERE rather than trusting: it
+     * asserts variant I -- thread pointer in TPIDR_EL0, TLS variables ABOVE it,
+     * past a 16-byte TCB -- which is precisely what crt0.c had to implement
+     * differently from x86 and what nothing else checks. Build it on the wrong
+     * side of the thread pointer and there is no fault, just every
+     * thread-local silently resolving into the TCB. */
+    {
+        const char *pd = "/system/bin/posixdemo.elf";
+        char *pargv[] = { (char *)pd, NULL };
+        int ppid = process_create(pd, pargv, 1, NULL, 0);
+        if (ppid < 0) {
+            kprintf("  [FAIL] could not launch %s: %s\n", pd, embk_strerror(ppid));
+            selftest_fails++;
+        } else {
+            int code = process_wait(ppid);
+            kprintf("  [%s] posixdemo exited %d (0 == every assertion passed)\n",
+                    code == 0 ? " ok " : "FAIL", code);
+            if (code != 0)
+                selftest_fails++;
+        }
+    }
+
     kprintf("\n--- the desktop (A6 + A7) ---\n");
     {
         const char *app = "/system/bin/init.elf";

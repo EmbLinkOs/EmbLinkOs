@@ -77,9 +77,26 @@ static void ck_fails(const char *what, int ret, int want_errno, int got_errno) {
 #define TESTDIR "/posixtmp"
 #define NENT    70          /* > 64 == opendir()'s initial cap: forces the retry */
 
-/* Until crt0 set up %fs, EVERY line here faulted at CR2=0 -- a TLS read compiles
- * to `mov %fs:0x0,%reg` and an unset FS_BASE makes that linear address 0. This
- * is CPython's exact blocker, in 20 lines instead of 7.5 MB. */
+/* Until crt0 set up the thread pointer, EVERY line here faulted -- on x86 a TLS
+ * read compiles to `mov %fs:0x0,%reg` and an unset FS_BASE makes that linear
+ * address 0. This is CPython's exact blocker, in 20 lines instead of 7.5 MB.
+ *
+ * THE TWO MACHINES DISAGREE HERE, and this is the one test in the suite that
+ * has to know it. Both are static TLS with one module, but the ELF variants put
+ * the block on opposite sides of the thread pointer:
+ *
+ *   x86-64, VARIANT II            aarch64, VARIANT I
+ *   [ .tdata | .tbss ][ TCB ]     [ TCB ][ .tdata | .tbss ]
+ *                     ^TP         ^TP
+ *   TP in %fs, and *(void**)TP     TP in TPIDR_EL0, and there is NO
+ *   == TP is the ABI contract      self-pointer: an access is `mrs` plus
+ *   every access goes through      an immediate, with no indirection
+ *
+ * So the SELF-POINTER checks are x86's alone -- asserting them on aarch64 would
+ * be asserting a contract that architecture does not have -- and the "which
+ * side of TP" check is inverted rather than dropped. Everything above this
+ * point (the .tdata value, the zeroed .tbss, the over-aligned variable) is
+ * machine-independent and is tested identically on both. */
 static void test_tls(void) {
     printf("thread-local storage:\n");
 
@@ -106,10 +123,11 @@ static void test_tls(void) {
     ck("over-aligned TLS var is actually 32-byte aligned",
        ((unsigned long)&tls_aligned & 31u) == 0);
 
-    /* The TCB self-pointer: *(void**)TP == TP is the ABI contract every TLS
-     * access depends on. Read it back through %fs the same way the compiler
-     * does, and confirm it points at itself. */
     unsigned long tp = 0;
+#if defined(__x86_64__)
+    /* The TCB self-pointer: *(void**)TP == TP is the ABI contract every TLS
+     * access depends on HERE. Read it back through %fs the same way the
+     * compiler does, and confirm it points at itself. */
     __asm__ volatile ("mov %%fs:0x0, %0" : "=r"(tp));
     ck("TCB self-pointer readable via %fs:0", tp != 0);
     ck("TCB self-pointer points at itself", tp != 0 && *(unsigned long *)tp == tp);
@@ -118,6 +136,22 @@ static void test_tls(void) {
      * variable must sit at a LOWER address than TP. */
     ck("TLS vars live below the thread pointer (variant II)",
        tp != 0 && (unsigned long)&tls_initialised < tp);
+#elif defined(__aarch64__)
+    /* TPIDR_EL0 is the thread pointer and EL0 may read it directly -- no
+     * syscall, no memory access, and no self-pointer to check, because variant
+     * I resolves a TLS address as TP + a link-time constant. */
+    __asm__ volatile ("mrs %0, tpidr_el0" : "=r"(tp));
+    ck("thread pointer readable via TPIDR_EL0", tp != 0);
+
+    /* Variant I: the block lives ABOVE the thread pointer, after a 16-byte
+     * TCB. This is the assertion that would have caught crt0 building the
+     * block on the wrong side -- which produces no fault, just every
+     * thread-local silently resolving into the TCB or past the allocation. */
+    ck("TLS vars live above the thread pointer (variant I)",
+       tp != 0 && (unsigned long)&tls_initialised > tp);
+    ck("TLS block starts at or after TP + 16 (the TCB)",
+       tp != 0 && (unsigned long)&tls_initialised >= tp + 16);
+#endif
     printf("       (tp = %p, &tls_initialised = %p)\n", (void *)tp, (void *)&tls_initialised);
 }
 
@@ -626,10 +660,14 @@ static void test_fcntl(void) {
     ck("F_SETFD(0) accepted too (no exec => unobservable either way)",
        fcntl(fd, F_SETFD, 0) == 0);
 
-    /* Still refused: a false success here would make a caller believe it had
-     * non-blocking I/O and then hang in a blocking read. */
-    CK_FAILS("F_GETFL still refused (O_NONBLOCK is unimplementable)",
-             fcntl(fd, F_GETFL), ENOSYS);
+    /* F_GETFL REPORTS THE TRUTH rather than refusing. It used to return
+     * ENOSYS, on the reasoning that a false success would make a caller
+     * believe it had non-blocking I/O and then hang in a blocking read -- but
+     * that confuses "cannot SET O_NONBLOCK" with "cannot say what the flags
+     * are". Every fd here is O_RDWR and blocking, which is a complete and
+     * accurate answer; F_SETFL is still the one that refuses. */
+    ck("F_GETFL reports the true state (O_RDWR, blocking)",
+       fcntl(fd, F_GETFL) == O_RDWR);
 
     close(fd);
 
@@ -644,8 +682,18 @@ static void test_honest_refusals(void) {
     printf("honest refusals (must NOT pretend):\n");
     struct utimbuf ub = { 0, 0 };
     CK_FAILS("utime -> ENOSYS", utime("/init.elf", &ub), ENOSYS);
-    CK_FAILS("fsync -> ENOSYS (never fake durability)", fsync(1), ENOSYS);
-    CK_FAILS("fdatasync -> ENOSYS", fdatasync(1), ENOSYS);
+    /* fsync/fdatasync SUCCEED, and that is not faked durability -- it is
+     * durability that is vacuously satisfied. There is no write-back path in
+     * this OS to flush: the block layer keeps no dirty-page cache and issues
+     * every write() straight to the device synchronously, so by the time
+     * write() returned the data was already handed down. "Your writes are
+     * committed" is a TRUE statement here. The old ENOSYS broke callers with
+     * every right to expect success (pip does flush()+os.fsync() before an
+     * atomic replace). user/lib/syscalls.c carries the full argument, and the
+     * standing obligation: if a write-back cache is ever added, these must
+     * become a real device flush the same day. */
+    ck("fsync succeeds (no write-back path to flush)", fsync(1) == 0);
+    ck("fdatasync succeeds", fdatasync(1) == 0);
     CK_FAILS("dup -> ENOSYS", dup(1), ENOSYS);
     CK_FAILS("symlink -> ENOSYS", symlink("/init.elf", "/l"), ENOSYS);
     CK_FAILS("chroot -> ENOSYS", chroot("/"), ENOSYS);

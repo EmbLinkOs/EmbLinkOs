@@ -224,7 +224,8 @@ ARM_SYSCALLS  := $(ARM_USER)/syscalls.o
 # Static newlib console programs (-T newlib.ld, no libembk.so).
 ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capreload capspawn \
                     crasher ioracer sockdemo udptest nbsock httpget \
-                    tlstest wget pkgfetch pkg pkgbuild httpd
+                    tlstest wget pkgfetch pkg pkgbuild httpd \
+                    posixdemo
 
 # Freestanding: own _start, no libc at all (-T user.ld).
 ARM_PLAIN_PROGS  ?= init primtest
@@ -252,7 +253,14 @@ ARM_PLAIN_PROGS  ?= init primtest
 # ARM_USER_ELVES is a `:=` assignment: a name defined later expands to nothing
 # and the program silently never builds. This fragment has produced that bug
 # four times now.
-ARM_EMLIBC_PROGS ?= emlibc_demo emlibc_net emlibc_caps emlibc_math emlibc_embxapp
+# mathself belongs HERE, not with the newlib programs: it is an emlibc program
+# (its open()/O_WRONLY come from emlibc's <unistd.h>, where POSIX would put them
+# in <fcntl.h>), which is why x86 builds it only through EmbCC and never as a
+# newlib ELF. Putting it in the newlib list compiled it against newlib's headers
+# and failed on O_WRONLY -- and "fixing" that with #include <fcntl.h> then broke
+# the EmbCC build, whose header set has no fcntl.h. The list was the bug.
+ARM_EMLIBC_PROGS ?= emlibc_demo emlibc_net emlibc_caps emlibc_math \
+                    emlibc_embxapp mathself
 
 ARM_UI_PROGS     ?= $(filter-out beep primtest,\
                       $(patsubst user/bin/%.c,%,$(EMUI_APP_SRCS))) \
@@ -629,6 +637,11 @@ debug-arm64: $(ARM_IMG) $(ARM_ROOTFS)
 # is absent unless someone installed gtimeout. Backgrounding qemu and killing it
 # is portable to both hosts -- the same rule the top-level Makefile applies to
 # stat and truncate.
+# Each accelerator boots a COPY of the root filesystem, never the original.
+# posixdemo WRITES -- mkdir, create, rename, unlink -- so a run mutates the
+# image, and without a scratch copy the second accelerator inherits the first
+# one's leftovers and a re-run is not the same test as the first. It showed up
+# as an EMBKFS free-block count that disagreed with the superblock by one.
 .PHONY: test-arm64-boot
 test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	@overall=0; \
@@ -639,7 +652,9 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  esac; \
 	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \
 	  echo "=== $$acc ==="; \
-	  disk="-drive file=$(ARM_ROOTFS),format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0"; \
+	  scratch=$(ARM_BUILD)/rootfs-$$acc.img; \
+	  cp $(ARM_ROOTFS) $$scratch; \
+	  disk="-drive file=$$scratch,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0"; \
 	  port=$$(awk 'BEGIN{srand();print 4500+int(rand()*400)}'); \
 	  $$qcmd $$disk $(ARM_GPU) $(ARM_INPUT) -display none -serial file:$$log \
 	      -qmp tcp:127.0.0.1:$$port,server,nowait -kernel $(ARM_IMG) 2>/dev/null & \
@@ -687,6 +702,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'embk thread create/join: OK'    A6 'a second EL0 thread could not be created or joined'; \
 	  chk 'hello: 5/5 checks passed'       A6 'the userland witness did not pass every check'; \
 	  chk 'exited with 5 (checks passed)'  A6 'the process did not exit cleanly with its status'; \
+	  chk 'posixdemo: ALL PASS'            A6 'the POSIX conformance suite reported failures'; \
+	  chk 'posixdemo exited 0'             A6 'posixdemo did not exit clean'; \
 	  chk 'libembk.so linked'              A6 'the dynamic link failed -- no EmUI app can load'; \
 	  chk 'init.elf launched as pid'       A6 'pid 1 did not start'; \
 	  chk 'ns: /system is read-only'       A6 'init could not confine itself -- the namespace is not enforced'; \
@@ -705,7 +722,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	    { echo "FAIL(A7): no POINTER events reached the driver ($${ptrn:-none})"; fail=1; }; \
 	  n=$$(grep -c 'matches KV2P' $$log); \
 	    [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
-	  if grep -q 'MISMATCH' $$log; then echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
+	  if grep -q 'KV2P.*MISMATCH\|MISMATCH.*KV2P' $$log; then \
+	    echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
 	  if grep -q '\[FAIL\]' $$log; then echo "FAIL: a self-test case reported failure"; fail=1; fi; \
 	  if grep -q 'DID NOT TAKE' $$log; then echo "FAIL(A7): a BAR write did not stick"; fail=1; fi; \
 	  if [ $$fail -ne 0 ]; then \
@@ -725,6 +743,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "  A7 PCIe ECAM, virtio-blk, and the REAL filesystem mounted + read"; \
 	  echo "  A6 a newlib program from that filesystem, at EL0: argv, printf,"; \
 	  echo "     malloc, snprintf, time, a second thread, and a clean exit(5)"; \
+	  echo "  A6 posixdemo: the whole POSIX suite, ALL PASS -- including"; \
+	  echo "     variant-I TLS (TPIDR_EL0, block above the pointer)"; \
 	  echo "  A6 the REAL session: init -> auth -> a namespace-confined desktop,"; \
 	  echo "     dynamically linked against libembk.so"; \
 	  echo "  A7 virtio-gpu 1280x800, the compositor presenting a frame"; \

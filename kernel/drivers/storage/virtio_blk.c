@@ -8,6 +8,7 @@
 #include "include/kstring.h"
 #include "include/errno.h"
 #include "include/arch_irq.h"
+#include "process/ksync.h"    /* the single request slot needs a SLEEPING lock */
 
 /* virtio-blk over modern virtio-PCI.
  *
@@ -117,6 +118,26 @@ static struct {
 
 static struct embk_block_device g_blkdev;
 
+/* ONE REQUEST AT A TIME, and it has to be enforced rather than assumed.
+ *
+ * Everything this driver submits with lives in file-scope singletons -- one
+ * descriptor table, one avail ring, one header, one status byte, one
+ * last_used cursor. That was true and safe while the only caller was the boot
+ * thread. It stopped being either the moment there was a real userland: init,
+ * the desktop, TopBar and posixdemo all touch the filesystem, the syscall path
+ * runs with interrupts ENABLED, and this function SPINS waiting for the device
+ * -- which is exactly where a timer tick preempts it. A second thread then
+ * overwrites g_hdr and g_avail.idx underneath the first, and both wait for a
+ * completion that will never match. It shows up as
+ * "virtio-blk: request timed out", far from the cause.
+ *
+ * A SLEEPING lock, not a spinlock: the wait is a disk round trip, and holding
+ * a spinlock (with interrupts off) across one would stop the scheduler for its
+ * duration. ksync's mutex handles the pre-scheduler case -- current_thread is
+ * NULL then and the lock is uncontended, so it neither blocks nor complains --
+ * which matters because this driver is probed before process_init(). */
+static struct mutex g_vblk_lock;
+
 static inline uint8_t  vr8 (volatile uint8_t *b, uint32_t o) { return *(volatile uint8_t  *)(b + o); }
 static inline uint16_t vr16(volatile uint8_t *b, uint32_t o) { return *(volatile uint16_t *)(b + o); }
 static inline uint32_t vr32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
@@ -137,24 +158,45 @@ static int vblk_request(uint32_t type, uint64_t sector, void *data, uint32_t len
     if (!g_vblk.up)
         return -EMBK_EIO;
 
+    mutex_lock(&g_vblk_lock);
+
     g_hdr.type     = type;
     g_hdr.reserved = 0;
     g_hdr.sector   = sector;
     g_status       = 0xFF;          /* so "unchanged" is distinguishable */
 
+    /* TWO descriptors for a request with no payload, THREE otherwise.
+     *
+     * FLUSH carries no data, and the natural-looking thing -- keep the
+     * three-descriptor shape and set the middle one's length to zero -- is
+     * INVALID: the virtio spec has no zero-length descriptor, and QEMU rejects
+     * the whole request rather than completing it. The driver then spins out
+     * its (very generous) timeout, and the device stays in an error state, so
+     * EVERY REQUEST AFTER IT FAILS TOO. That is why the symptom was a wall of
+     * "request timed out (type 0 sector N)" reads with one flush buried at the
+     * top of it.
+     *
+     * Latent until userland could write: the desktop only reads, and the flush
+     * comes from EMBKFS's pre-commit. posixdemo's first mkdir found it. */
+    uint16_t status_desc = len ? 2 : 1;
+
     g_desc[0].addr  = dma(&g_hdr);
     g_desc[0].len   = sizeof(g_hdr);
     g_desc[0].flags = VRING_DESC_F_NEXT;
+    /* Always 1: with a payload that is the data descriptor and the status
+     * follows it at 2; without one, index 1 IS the status descriptor. */
     g_desc[0].next  = 1;
 
-    g_desc[1].addr  = dma(data);
-    g_desc[1].len   = len;
-    g_desc[1].flags = VRING_DESC_F_NEXT | (device_writes ? VRING_DESC_F_WRITE : 0);
-    g_desc[1].next  = 2;
+    if (len) {
+        g_desc[1].addr  = dma(data);
+        g_desc[1].len   = len;
+        g_desc[1].flags = VRING_DESC_F_NEXT | (device_writes ? VRING_DESC_F_WRITE : 0);
+        g_desc[1].next  = 2;
+    }
 
-    g_desc[2].addr  = dma(&g_status);
-    g_desc[2].len   = 1;
-    g_desc[2].flags = VRING_DESC_F_WRITE;
+    g_desc[status_desc].addr  = dma(&g_status);
+    g_desc[status_desc].len   = 1;
+    g_desc[status_desc].flags = VRING_DESC_F_WRITE;
     g_desc[2].next  = 0;
 
     uint16_t slot = g_avail.idx % g_vblk.qsize;
@@ -173,13 +215,16 @@ static int vblk_request(uint32_t type, uint64_t sector, void *data, uint32_t len
         if (g_used.idx != g_vblk.last_used) {
             g_vblk.last_used = g_used.idx;
             __sync_synchronize();
-            return (g_status == 0) ? EMBK_OK : -EMBK_EIO;
+            int rc = (g_status == 0) ? EMBK_OK : -EMBK_EIO;
+            mutex_unlock(&g_vblk_lock);
+            return rc;
         }
         arch_cpu_relax();
     }
 
     kprintf("virtio-blk: request timed out (type %d sector %d)\n",
             (int)type, (int)sector);
+    mutex_unlock(&g_vblk_lock);
     return -EMBK_EIO;
 }
 
@@ -219,7 +264,10 @@ static int vblk_write(struct embk_block_device *dev, uint64_t lba, uint32_t coun
 
 static int vblk_flush(struct embk_block_device *dev) {
     (void)dev;
-    return vblk_request(VIRTIO_BLK_T_FLUSH, 0, g_bounce, 0, false);
+    /* No buffer and no length: vblk_request() builds the two-descriptor chain
+     * a payload-free request requires. g_bounce used to be passed here as a
+     * dummy, which read as harmless and was not -- see the descriptor note. */
+    return vblk_request(VIRTIO_BLK_T_FLUSH, 0, 0, 0, false);
 }
 
 bool virtio_blk_init(void) {
@@ -247,6 +295,8 @@ bool virtio_blk_init(void) {
      * options is the one whose request format cannot be subtly wrong, and
      * nothing here needs discard, write-zeroes or multi-queue to read a
      * sector. */
+    mutex_init(&g_vblk_lock);
+
     if (!virtio_pci_attach(&g_vblk.vp, dev, "virtio-blk", 0, 0))
         return false;
 
