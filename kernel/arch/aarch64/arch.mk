@@ -445,7 +445,8 @@ $(foreach src,$(ARM_XSRC_ALL),$(eval $(call ARM_XOBJ_RULE,$(src))))
 
 ARM_USER_ELVES := $(patsubst %,$(ARM_USER)/%.elf,$(ARM_NEWLIB_PROGS)) \
                   $(patsubst %,$(ARM_USER)/%.elf,$(ARM_PLAIN_PROGS)) \
-                  $(patsubst %,$(ARM_USER)/%.elf,$(ARM_UI_PROGS))
+                  $(patsubst %,$(ARM_USER)/%.elf,$(ARM_UI_PROGS)) \
+                  $(patsubst %,$(ARM_USER)/%.elf,$(ARM_EMLIBC_PROGS))
 
 $(ARM_USER):
 	mkdir -p $(ARM_USER)
