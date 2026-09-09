@@ -3,7 +3,23 @@
 #include <stdint.h>
 
 
-// Page table entry flags
+/* Page-table entry flags.
+ *
+ * BE HONEST ABOUT WHAT THESE ARE: bits 0-8 and 63 are the x86-64 page-table
+ * BIT POSITIONS. They are not an abstraction over two machines; they are one
+ * machine's hardware layout, and the x86 mapper ORs them straight into a PTE.
+ * aarch64 reads them as an ordinary flag word and translates.
+ *
+ * That is survivable for PRESENT/WRITABLE/USER, whose meanings coincide. It is
+ * NOT survivable for execution, because VMM_NX is INVERTED -- absent means
+ * executable -- so a caller that says nothing gets "executable" on x86 and
+ * (correctly) "not executable" on aarch64. Two machines, opposite answers, same
+ * silence. VMM_EXEC exists for that: execution asked for POSITIVELY, in the
+ * direction a permission reads, meaning the same thing everywhere.
+ *
+ * RULE FOR NEW CODE: say what you mean and say it in both dialects --
+ * VMM_EXEC to run code, VMM_NX to forbid it. Silence is not a policy. */
+
 #define VMM_PRESENT       (1ULL << 0)
 #define VMM_WRITABLE      (1ULL << 1)
 #define VMM_USER          (1ULL << 2)

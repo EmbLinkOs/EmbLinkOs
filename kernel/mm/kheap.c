@@ -149,7 +149,15 @@ static uint64_t heap_grow(uint64_t bytes) {
             serial_write_string("kheap: PMM exhausted during grow\n");
             return 0; // Out of memory
         }
-        if (vmm_map(heap_end, phys, VMM_WRITABLE) < 0) {
+        /* W^X. VMM_NX is what x86 reads (absent means EXECUTABLE there, which
+         * is why the heap was writable AND executable for as long as this said
+         * only VMM_WRITABLE); aarch64 reads the absence of VMM_EXEC and was
+         * already non-executable. Both spellings are given so the page is
+         * non-executable on both machines for the same reason rather than by
+         * coincidence. Nothing executes out of the kernel heap -- there are no
+         * loadable modules and the SMP AP trampoline has its own mapping,
+         * which smp.c documents as deliberately executable. */
+        if (vmm_map(heap_end, phys, VMM_WRITABLE | VMM_NX) < 0) {
             serial_write_string("kheap: VMM failed to map page during grow\n");
             return 0; // Failed to map
         }
