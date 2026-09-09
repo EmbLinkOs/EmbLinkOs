@@ -13,6 +13,9 @@
 #endif
 #include "drivers/char/serial.h"
 #include "include/arch_irq.h"   /* arch_cpu_idle() -- see keyboard_getchar() */
+#if !defined(__x86_64__)
+#include "drivers/input/virtio_input.h"   /* the LEDs live on its status queue */
+#endif
 #include "process/process.h"
 #include "include/errno.h"
 
@@ -432,16 +435,64 @@ void keyboard_init(void) {
  * POLICY above is untouched and fully live; it is fed by keyboard_inject_event()
  * instead of by an interrupt.
  *
- * The LEDs are the one visible loss, and it is a real one rather than a stub:
- * virtio-input has a status queue that can drive them, and nothing here uses it
- * yet (docs/TODO.md). Caps Lock still LATCHES correctly -- g_mods flips and
- * every consumer sees it -- the user just gets no light for it. */
-static void kbd_set_leds(void) { }
+ * The LEDs go out over virtio-input's STATUS queue instead of a PS/2 0xED
+ * command -- same moment, same trigger, different wire. */
+static void kbd_set_leds(void) {
+    virtio_input_set_leds(g_mods);
+}
 
 void keyboard_init(void) {
     g_mods = 0;
 }
 #endif /* __x86_64__ */
+
+/* The layout, the shift table, Caps Lock and Ctrl -- applied ONCE, here, so
+ * every input source composes characters the same way.
+ *
+ * `make` is an AT SET-1 make code, which is also, and not by coincidence, a
+ * Linux evdev keycode: evdev's numbering for the main key block was taken from
+ * set 1, so KEY_ESC is 1, KEY_Q is 16 and KEY_A is 30 exactly as the scancodes
+ * are. That is what lets virtio-input index the SAME layout tables instead of
+ * carrying a second copy of them -- and what makes `keyboard_set_layout
+ * dvorak` apply to a virtio keyboard without another line of code.
+ *
+ * Returns 0 for a key that produces no character in this layout.
+ */
+char keyboard_compose(uint8_t make, uint8_t mods) {
+    if (make >= 128 || !g_layout)
+        return 0;
+
+    char ascii = (mods & EKM_SHIFT) ? g_layout->shift[make] : g_layout->normal[make];
+    if (!ascii)
+        return 0;
+
+    /* Caps Lock: LETTERS ONLY, and it XORs with Shift rather than adding to it
+     * (Caps+Shift+a is 'a', not 'A'). Applying it to the whole shift table --
+     * the obvious implementation -- would make Caps Lock type '!' for '1',
+     * which no keyboard on earth does. */
+    if (mods & EKM_CAPS) {
+        if      (ascii >= 'a' && ascii <= 'z') ascii = (char)(ascii - 'a' + 'A');
+        else if (ascii >= 'A' && ascii <= 'Z') ascii = (char)(ascii - 'A' + 'a');
+    }
+
+    /* Ctrl + letter -> the C0 control code. Gated on a real letter so
+     * Ctrl+digit / Ctrl+symbol pass through unchanged rather than becoming
+     * stray control bytes. */
+    if ((mods & EKM_CTRL) && ((ascii >= 'a' && ascii <= 'z') ||
+                              (ascii >= 'A' && ascii <= 'Z')))
+        ascii = (char)(ascii & 0x1f);
+
+    return ascii;
+}
+
+/* The unshifted key IDENTITY for an event code -- "which key", not "what
+ * character". Always the base layout, never the shift table, so an event says
+ * the same thing whether or not Shift was held. */
+char keyboard_keycode_of(uint8_t make) {
+    if (make >= 128 || !g_layout)
+        return 0;
+    return g_layout->normal[make];
+}
 
 /* ---- the injection seam --------------------------------------------------
  * ONE decoded key, from whatever hardware decoded it, into the two streams.

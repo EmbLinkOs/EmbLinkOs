@@ -155,6 +155,18 @@ void keyboard_inject_char(char c);
  * modifier bitmap, so a caller never has to track Shift itself. */
 void keyboard_inject_event(uint16_t code, int pressed, char ascii);
 
+/* Compose the CHARACTER an AT set-1 make code produces under `mods`, through
+ * the CURRENT layout -- shift table, Caps Lock and Ctrl all applied. Returns 0
+ * for a key with no character.
+ *
+ * A Linux evdev keycode is an AT set-1 make code for the main key block (evdev
+ * took its numbering from set 1), so a virtio-input driver can call this
+ * directly and inherits `keyboard_set_layout` for free. */
+char keyboard_compose(uint8_t make, uint8_t mods);
+
+/* The UNSHIFTED key identity for the same code -- what an event carries. */
+char keyboard_keycode_of(uint8_t make);
+
 // Keyboard grab: while grabbed, the kernel shell stops draining the buffer so a
 // ring-3 UI app has exclusive keystrokes. Auto-released when the grabber exits.
 void keyboard_set_grab(int grab, uint32_t pid);

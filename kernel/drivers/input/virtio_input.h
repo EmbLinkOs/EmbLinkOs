@@ -19,6 +19,11 @@ void virtio_input_poll(void);
 
 bool virtio_input_present(void);
 
+/* Set the three lock LEDs from an EKM_* modifier bitmap. Called by
+ * keyboard.c's kbd_set_leds() where there is no PS/2 controller to send an
+ * 0xED to. Safe with no keyboard attached: it does nothing. */
+void virtio_input_set_leds(uint8_t mods);
+
 /* How many events have actually ARRIVED, per class. The boot self-test asserts
  * on these: a device that enumerates but never delivers is indistinguishable
  * from a working one until a key is pressed, and that is precisely the failure

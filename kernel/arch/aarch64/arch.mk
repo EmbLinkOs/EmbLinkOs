@@ -547,6 +547,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'framebuffer 1280x800'           A7 'virtio-gpu did not come up'; \
 	  chk 'is a keyboard'                  A7 'virtio-input found no keyboard'; \
 	  chk 'is a tablet'                    A7 'virtio-input found no pointer'; \
+	  chk 'statusq (LEDs)'                 A7 'the keyboard has no status queue -- the lock LEDs cannot work'; \
 	  keyn=$$(sed -n 's/.*virtio-input: \([0-9][0-9]*\) key event.*/\1/p' $$log | tail -1); \
 	  ptrn=$$(sed -n 's/.*virtio-input: [0-9][0-9]* key event(s), \([0-9][0-9]*\) pointer.*/\1/p' $$log | tail -1); \
 	  [ -n "$$keyn" ] && [ "$$keyn" -gt 0 ] 2>/dev/null || \

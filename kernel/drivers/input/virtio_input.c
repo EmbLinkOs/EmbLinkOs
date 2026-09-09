@@ -35,6 +35,7 @@
 #define VIRTIO_INPUT_DEVID   0x1052
 #define VI_MAX_DEVS          4
 #define VI_QSIZE             64        /* eventq depth: a burst of keystrokes  */
+#define VI_SQSIZE            8         /* statusq: three LEDs, never a burst   */
 
 /* Device-config selects (virtio 1.1, 5.8.4). */
 #define VI_CFG_SELECT        0x00
@@ -51,6 +52,12 @@
 #define EV_KEY  0x01
 #define EV_REL  0x02
 #define EV_ABS  0x03
+#define EV_LED  0x11
+
+/* Linux LED ids, sent on the STATUS queue (driver -> device). */
+#define LED_NUML   0x00
+#define LED_CAPSL  0x01
+#define LED_SCROLLL 0x02
 
 #define REL_WHEEL 0x08
 #define ABS_X     0x00
@@ -70,6 +77,10 @@ struct vring_avail_q { uint16_t flags; uint16_t idx; uint16_t ring[VI_QSIZE]; }
     __attribute__((packed));
 struct vring_used_q  { uint16_t flags; uint16_t idx; struct vring_used_elem ring[VI_QSIZE]; }
     __attribute__((packed));
+struct vring_avail_s { uint16_t flags; uint16_t idx; uint16_t ring[VI_SQSIZE]; }
+    __attribute__((packed));
+struct vring_used_s  { uint16_t flags; uint16_t idx; struct vring_used_elem ring[VI_SQSIZE]; }
+    __attribute__((packed));
 
 /* One ring set per device. Static, not kmalloc'd: a descriptor addresses
  * PHYSICAL memory and KV2P() only works on the kernel image window, not on the
@@ -80,6 +91,18 @@ struct vi_dev {
     struct vring_avail_q  avail           __attribute__((aligned(2)));
     struct vring_used_q   used            __attribute__((aligned(4)));
     struct virtio_input_event ev[VI_QSIZE];
+
+    /* The STATUS queue (queue 1, driver -> device): how the lock LEDs are
+     * driven. Its own small ring, because a queue is a one-way channel and the
+     * event queue's descriptors are all device-WRITABLE. */
+    struct vring_desc     sdesc[VI_SQSIZE]  __attribute__((aligned(16)));
+    struct vring_avail_s  savail            __attribute__((aligned(2)));
+    struct vring_used_s   sused             __attribute__((aligned(4)));
+    struct virtio_input_event sev[VI_SQSIZE];
+    uint16_t sqsize;
+    uint16_t snotify_off;
+    uint16_t snext;             /* next status slot to use, round-robin */
+
     uint16_t qsize;
     uint16_t notify_off;
     uint16_t last_used;
@@ -108,37 +131,21 @@ static uint32_t g_key_events, g_ptr_events;
  * dropped, which is the honest answer for a key we cannot name -- injecting a
  * wrong code would be worse than injecting none. */
 static uint16_t vi_translate(uint16_t code, char *ascii) {
+    /* A Linux evdev keycode IS an AT set-1 make code for the main key block --
+     * evdev took its numbering from set 1 -- so the printable half of this
+     * table is not ours to own: keyboard_compose() applies the CURRENT layout,
+     * its shift table, Caps Lock and Ctrl, and a virtio keyboard therefore
+     * honours `keyboard_set_layout dvorak` without another line here. The
+     * hand-rolled US shift table this replaced was a second, worse answer to a
+     * question keyboard.c had already answered.
+     *
+     * What is left is the keys with no character at all, plus the navigation
+     * block, which carries BOTH an event code and a private control byte
+     * (keyboard.h's three-way contract with the shell's history recall and the
+     * terminal's scrollback). */
     *ascii = 0;
-    /* evdev's number row and letters are contiguous, so the common cases are
-     * arithmetic rather than table lookups. KEY_1..KEY_9 = 2..10, KEY_0 = 11. */
-    if (code >= 2 && code <= 10) { *ascii = (char)('1' + (code - 2)); return (uint16_t)*ascii; }
-    if (code == 11)              { *ascii = '0'; return '0'; }
-
-    static const char row_q[] = "qwertyuiop";
-    static const char row_a[] = "asdfghjkl";
-    static const char row_z[] = "zxcvbnm";
-    if (code >= 16 && code <= 25) { *ascii = row_q[code - 16]; return (uint16_t)*ascii; }
-    if (code >= 30 && code <= 38) { *ascii = row_a[code - 30]; return (uint16_t)*ascii; }
-    if (code >= 44 && code <= 50) { *ascii = row_z[code - 44]; return (uint16_t)*ascii; }
 
     switch (code) {
-    case 1:   *ascii = 0x1B; return 0x1B;              /* Esc        */
-    case 12:  *ascii = '-';  return '-';
-    case 13:  *ascii = '=';  return '=';
-    case 14:  *ascii = '\b'; return '\b';               /* Backspace  */
-    case 15:  *ascii = '\t'; return '\t';               /* Tab        */
-    case 26:  *ascii = '[';  return '[';
-    case 27:  *ascii = ']';  return ']';
-    case 28:  *ascii = '\n'; return '\n';               /* Enter      */
-    case 39:  *ascii = ';';  return ';';
-    case 40:  *ascii = '\''; return '\'';
-    case 41:  *ascii = '`';  return '`';
-    case 43:  *ascii = '\\'; return '\\';
-    case 51:  *ascii = ',';  return ',';
-    case 52:  *ascii = '.';  return '.';
-    case 53:  *ascii = '/';  return '/';
-    case 57:  *ascii = ' ';  return ' ';                /* Space      */
-
     case 29:  return EKC_LCTRL;
     case 42:  return EKC_LSHIFT;
     case 54:  return EKC_RSHIFT;
@@ -158,9 +165,6 @@ static uint16_t vi_translate(uint16_t code, char *ascii) {
     case 69: return EKC_NUM;
     case 70: return EKC_SCROLL;
 
-    /* Navigation. These carry BOTH an event code and a private control byte:
-     * the char stream is how the shell's history recall and the terminal's
-     * scrollback read them (keyboard.h's three-way contract). */
     case 102: *ascii = EK_HOME;  return EKC_HOME;
     case 103: *ascii = EK_UP;    return EKC_UP;
     case 104: *ascii = EK_PGUP;  return EKC_PGUP;
@@ -172,25 +176,20 @@ static uint16_t vi_translate(uint16_t code, char *ascii) {
     case 110: return EKC_INS;
     case 111: *ascii = EK_DEL;   return EKC_DEL;
 
-    default: return 0;
+    default: break;
     }
-}
 
-/* Shift a printable key's ASCII the way the PS/2 path's shift table does. Only
- * the US layout, and deliberately so: keyboard.c owns layouts for the scancode
- * world, and wiring evdev into that table is a separate change (docs/TODO.md). */
-static char vi_shift(char c) {
-    if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
-    switch (c) {
-    case '1': return '!'; case '2': return '@'; case '3': return '#';
-    case '4': return '$'; case '5': return '%'; case '6': return '^';
-    case '7': return '&'; case '8': return '*'; case '9': return '(';
-    case '0': return ')'; case '-': return '_'; case '=': return '+';
-    case '[': return '{'; case ']': return '}'; case '\\': return '|';
-    case ';': return ':'; case '\'': return '"'; case '`': return '~';
-    case ',': return '<'; case '.': return '>'; case '/': return '?';
-    default: return c;
+    /* Everything else: ask the layout. The EVENT carries the unshifted key
+     * ("which key"), the char stream the composed character ("what text") --
+     * the same split the PS/2 path makes, because it is now the same code. */
+    if (code < 128) {
+        char base = keyboard_keycode_of((uint8_t)code);
+        if (base) {
+            *ascii = keyboard_compose((uint8_t)code, keyboard_mods());
+            return (uint16_t)base;
+        }
     }
+    return 0;
 }
 
 /* Read one device-config field. select/subsel latch, then size says how many
@@ -241,22 +240,6 @@ static void vi_handle(const struct virtio_input_event *e) {
         char ascii = 0;
         uint16_t code = vi_translate(e->code, &ascii);
         if (!code) return;
-        if (ascii) {
-            uint8_t m = keyboard_mods();
-            /* Caps Lock affects letters only; Shift affects everything. The
-             * two XOR for letters, which is why a shifted letter under Caps is
-             * lower case -- the behaviour every other keyboard has. */
-            bool upper = (m & EKM_SHIFT) != 0;
-            if ((m & EKM_CAPS) && ascii >= 'a' && ascii <= 'z')
-                upper = !upper;
-            if (upper) ascii = vi_shift(ascii);
-            /* Ctrl+letter becomes the control code, exactly as the PS/2 path
-             * produces it -- user/lib depends on that (a printable byte is
-             * never treated as a shortcut; see Note++'s paste bug). */
-            if ((m & EKM_CTRL) && ((ascii >= 'a' && ascii <= 'z') ||
-                                   (ascii >= 'A' && ascii <= 'Z')))
-                ascii = (char)(ascii & 0x1F);
-        }
         keyboard_inject_event(code, e->value != 0, ascii);
         return;
     }
@@ -361,6 +344,16 @@ void virtio_input_init(void) {
             continue;
         }
 
+        /* The STATUS queue, on the keyboard only -- a tablet has no LEDs. Its
+         * absence is not an error: virtio-input devices are not required to
+         * offer one, and a keyboard without it simply has no lights. */
+        if (d->is_keyboard) {
+            d->sqsize = virtio_pci_setup_queue(&d->vd, 1, VI_SQSIZE, d->sdesc,
+                                               &d->savail, &d->sused,
+                                               &d->snotify_off);
+            d->savail.flags = VRING_AVAIL_F_NO_INTERRUPT;
+        }
+
         /* Polled: tell the device not to raise its INTx line. Without this a
          * level-triggered interrupt nothing acknowledges wedges the machine --
          * the exact failure the PCI routing self-test caused once already
@@ -372,10 +365,11 @@ void virtio_input_init(void) {
         d->up = true;
         g_vi_count++;
 
-        kprintf("virtio-input: %u:%u.%u is a %s, queue %u, polled\n",
+        kprintf("virtio-input: %u:%u.%u is a %s, queue %u, polled%s\n",
                 pci->bus, pci->device, pci->function,
                 d->is_keyboard ? "keyboard" : (is_tablet ? "tablet" : "device"),
-                d->qsize);
+                d->qsize,
+                d->sqsize ? ", statusq (LEDs)" : "");
     }
 
     if (g_vi_count == 0)
@@ -383,6 +377,52 @@ void virtio_input_init(void) {
 }
 
 bool virtio_input_present(void) { return g_vi_count > 0; }
+
+/* Drive the three lock LEDs. Called from keyboard.c's kbd_set_leds() on the
+ * architectures with no PS/2 controller, which is the same place and the same
+ * moment the PS/2 path sends its 0xED command -- so Caps Lock lights up for
+ * the same reason on both machines.
+ *
+ * One EV_LED event per lamp, then a notify. The descriptors are DEVICE-READABLE
+ * (no VRING_DESC_F_WRITE): this queue runs the other way from the event queue,
+ * driver to device.
+ *
+ * Fire and forget, deliberately. There is nothing useful to do with a failure
+ * to light an LED, and blocking the key path on a virtqueue round trip to find
+ * out would be a far worse trade than a lamp that is briefly wrong. */
+void virtio_input_set_leds(uint8_t mods) {
+    for (uint32_t i = 0; i < g_vi_count; i++) {
+        struct vi_dev *d = &g_vi[i];
+        if (!d->up || !d->is_keyboard || d->sqsize == 0)
+            continue;
+
+        static const struct { uint16_t code; uint8_t bit; } lamps[] = {
+            { LED_NUML,    EKM_NUM    },
+            { LED_CAPSL,   EKM_CAPS   },
+            { LED_SCROLLL, EKM_SCROLL },
+        };
+
+        for (unsigned l = 0; l < sizeof lamps / sizeof lamps[0]; l++) {
+            uint16_t slot = (uint16_t)(d->snext % d->sqsize);
+            d->snext++;
+
+            d->sev[slot].type  = EV_LED;
+            d->sev[slot].code  = lamps[l].code;
+            d->sev[slot].value = (mods & lamps[l].bit) ? 1 : 0;
+
+            d->sdesc[slot].addr  = KV2P((uint64_t)(uintptr_t)&d->sev[slot]);
+            d->sdesc[slot].len   = sizeof(struct virtio_input_event);
+            d->sdesc[slot].flags = 0;          /* device READS this one */
+            d->sdesc[slot].next  = 0;
+
+            uint16_t a = (uint16_t)(d->savail.idx % d->sqsize);
+            d->savail.ring[a] = slot;
+            __asm__ volatile("" ::: "memory");
+            d->savail.idx++;
+        }
+        virtio_pci_notify(&d->vd, d->snotify_off, 1);
+    }
+}
 
 void virtio_input_stats(uint32_t *keys, uint32_t *pointer) {
     if (keys)    *keys    = g_key_events;
