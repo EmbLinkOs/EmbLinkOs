@@ -227,7 +227,8 @@ ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capreload capspawn \
                     crasher ioracer sockdemo udptest nbsock httpget \
                     tlstest wget pkgfetch pkg pkgbuild httpd \
                     posixdemo pkgprobe shell sysinfo tally embbuild \
-                    $(if $(HAVE_QJS),js,)
+                    $(if $(HAVE_QJS),js,) \
+                    $(if $(HAVE_ZLIB_ARM),gitclone gitpush,)
 
 # Freestanding: own _start, no libc at all (-T user.ld).
 ARM_PLAIN_PROGS  ?= init primtest
@@ -282,6 +283,13 @@ ARM_UI_PROGS     ?= $(filter-out beep primtest,\
 # are separate .elf files on purpose -- the shell SPAWNS them as pipeline
 # stages rather than running them as builtins -- and each links the same three
 # SDK objects (value/wire/sval) that carry the shell's typed-record protocol.
+# zlib for THIS target -- a separate prefix from the x86 build, because it is
+# separate machine code. Gated: an absent optional port must leave the rest of
+# the userland building ("absent means absent, not broken").
+ZLIB_ARM_BUILD ?= $(HOME)/cross/build-zlib-arm
+ZLIB_ARM_A     := $(ZLIB_ARM_BUILD)/lib/libz.a
+HAVE_ZLIB_ARM  := $(if $(wildcard $(ZLIB_ARM_A)),1,)
+
 ARM_SHELL_SRC := shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
                  shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
                  shell/builtins/builtins.c shell/hist/hist.c \
@@ -361,6 +369,20 @@ ARM_INC_tally     := -Ishell
 ARM_INC_embbuild  := -Ishell
 
 # Where each one's main() lives, when it is not user/bin/<name>.c.
+# gitclone / gitpush: the in-tree git client. Both need the TLS stack (HTTPS),
+# the pack/pktline/sha1/repo layer, and libz -- the same cross-built zlib the
+# x86 side links, built for this target with
+#   TARGET=aarch64-elf tools/zlib/build-zlib-emblink.sh <src> <out>
+ARM_XSRC_gitclone := user/git/githttp.c user/git/pktline.c user/git/pack.c \
+                     user/git/sha1.c user/git/repo.c $(ARM_TLS_SRC)
+ARM_XSRC_gitpush  := user/git/githttp.c user/git/pktline.c user/git/pack.c \
+                     user/git/sha1.c user/git/repo.c user/git/push.c \
+                     $(ARM_TLS_SRC)
+ARM_INC_gitclone  := -Iuser/git -I$(ZLIB_ARM_BUILD)/include $(TLS_LIB_INC)
+ARM_INC_gitpush   := -Iuser/git -I$(ZLIB_ARM_BUILD)/include $(TLS_LIB_INC)
+ARM_EXTRAOBJ_gitclone := $(ZLIB_ARM_A)
+ARM_EXTRAOBJ_gitpush  := $(ZLIB_ARM_A)
+
 ARM_MAIN_shell    := shell/main.c
 ARM_MAIN_sysinfo  := shell/tools/sysinfo.c
 ARM_MAIN_tally    := shell/tools/tally.c

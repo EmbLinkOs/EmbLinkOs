@@ -22,13 +22,22 @@ SRC="${1:?usage: $0 /path/to/git-2.49.1 [make args...]}"; shift || true
 # tree is an argument. Same convention as tools/tcc/build-tcc-emblink.sh.
 HERE=$(cd "$(dirname "$0")" && pwd)
 M="${MYOS:-$(cd "$HERE/../.." && pwd)}"
-NEWLIB_PREFIX="${NEWLIB_PREFIX:-$(make -C "$M" -s --no-print-directory print-newlib-prefix)}"
-NL="$NEWLIB_PREFIX/x86_64-elf"        # the SAME libc the OS's apps link
+# TARGET picks the architecture and everything else derives from it. Defaults
+# to x86_64-elf, so an existing invocation is unchanged.
+#   aarch64:  TARGET=aarch64-elf ZLIB_BUILD=... tools/git/build-git-emblink.sh <src>
+TARGET="${TARGET:-x86_64-elf}"
+case "$TARGET" in
+  x86_64-elf)  ARCH_CFLAGS="-mno-red-zone"; MK_ARCH=x86_64;  OBJDIR="$M/build" ;;
+  aarch64-elf) ARCH_CFLAGS="";              MK_ARCH=aarch64; OBJDIR="$M/build/aarch64/user" ;;
+  *) echo "$0: unknown TARGET '$TARGET'" >&2; exit 2 ;;
+esac
+NEWLIB_PREFIX="${NEWLIB_PREFIX:-$(make -C "$M" ARCH=$MK_ARCH -s --no-print-directory print-newlib-prefix)}"
+NL="$NEWLIB_PREFIX/$TARGET"           # the SAME libc the OS's apps link
 export PATH="${CROSS_BIN:-/usr/local/cross/bin}:$PATH"   # target binutils (as/ld)
 Z="${ZLIB_BUILD:?set ZLIB_BUILD=/path/to/cross-built-zlib (see docs/BUILD_SETUP.md)}"
 
-for o in "$M/build/crt0.o" "$M/build/syscalls.o"; do
-    [ -f "$o" ] || { echo "missing $o -- run 'make' in $M first" >&2; exit 1; }
+for o in "$OBJDIR/crt0.o" "$OBJDIR/syscalls.o"; do
+    [ -f "$o" ] || { echo "missing $o -- run 'make' (or 'make ARCH=aarch64') in $M first" >&2; exit 1; }
 done
 
 # NOTE: this heredoc is deliberately UNQUOTED -- $M/$NL/$Z must expand. That also
@@ -37,8 +46,8 @@ done
 # "command not found" and silently vanished from the generated config.mak.
 cat > "$SRC/config.mak" <<EOF
 # EmbLinkOS -- written by build-git-emblink.sh; edit THAT, not this.
-CC = x86_64-elf-gcc
-AR = x86_64-elf-ar
+CC = $TARGET-gcc
+AR = $TARGET-ar
 
 # Same flag set CPython shipped with (see configure-py-emblink.sh for the
 # rationale on each: override headers first, newlib's gates opened by hand).
@@ -51,14 +60,14 @@ AR = x86_64-elf-ar
 # interrupts a syscall with a signal AT ALL (cancellation is observed, not
 # injected; docs/INTERRUPTION.md), so the request is VACUOUSLY satisfied and 0
 # is an honest value, same reasoning as FD_CLOEXEC.
-CFLAGS = -O2 -mno-red-zone -fno-stack-protector \
+CFLAGS = -O2 $ARCH_CFLAGS -fno-stack-protector \
          -I$M/user/lib -isystem $NL/include \
          -DSSIZE_MAX=0x7fffffffffffffffL \
          -D_POSIX_TIMERS=200809L -D_POSIX_MONOTONIC_CLOCK=200809L \
          -D__LINUX_ERRNO_EXTENSIONS__ \
          -DSA_RESTART=0
 LDFLAGS = -static -nostartfiles -T $M/user/lib/newlib.ld -L$NL/lib \
-          $M/build/crt0.o $M/build/syscalls.o
+          $OBJDIR/crt0.o $OBJDIR/syscalls.o
 
 ZLIB_PATH = $Z
 
