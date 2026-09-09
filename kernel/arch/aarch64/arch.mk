@@ -223,7 +223,8 @@ ARM_SYSCALLS  := $(ARM_USER)/syscalls.o
 # and it builds; nothing else needs editing.
 # Static newlib console programs (-T newlib.ld, no libembk.so).
 ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capreload capspawn \
-                    crasher ioracer sockdemo udptest nbsock httpget
+                    crasher ioracer sockdemo udptest nbsock httpget \
+                    tlstest wget pkgfetch pkg pkgbuild httpd
 
 # Freestanding: own _start, no libc at all (-T user.ld).
 ARM_PLAIN_PROGS  ?= init primtest
@@ -247,7 +248,93 @@ ARM_PLAIN_PROGS  ?= init primtest
 #
 # Override on the command line to build a subset:  make ARCH=aarch64 ARM_UI_PROGS=uidemo
 ARM_UI_PROGS     ?= $(filter-out beep primtest,\
-                      $(patsubst user/bin/%.c,%,$(EMUI_APP_SRCS)))
+                      $(patsubst user/bin/%.c,%,$(EMUI_APP_SRCS))) \
+                    photos mp3play
+
+# A few apps are more than one translation unit, exactly as they are on x86
+# (where each has an explicit rule with extra objects). Naming the extra
+# SOURCES per app keeps that fact in one place instead of a second explicit
+# rule per app down here.
+ARM_XSRC_home   := user/lib/appauth.c
+ARM_XSRC_notepp := user/note/syntax.c user/note/doc.c user/note/edit.c
+
+# The TLS stack, as SOURCES rather than the x86 side's object list, because the
+# objects are built into a different directory here. Same files, same order.
+ARM_TLS_SRC := kernel/crypto/sha256.c kernel/crypto/hmac.c kernel/crypto/aes.c \
+               user/lib/tls/crypto/hkdf.c user/lib/tls/crypto/gcm.c \
+               user/lib/tls/crypto/x25519.c user/lib/tls/crypto/sha512.c \
+               user/lib/tls/crypto/bignum.c user/lib/tls/crypto/ecdsa.c \
+               user/lib/tls/crypto/rsa.c user/lib/tls/x509/asn1.c \
+               user/lib/tls/x509/cert.c user/lib/tls/x509/trust.c \
+               user/lib/tls/keysched.c user/lib/tls/record.c \
+               user/lib/tls/handshake.c user/lib/tls/tls.c user/lib/tls/prf12.c \
+               user/lib/tls/record12.c user/lib/tls/tls12.c \
+               user/lib/tls/tls_handle.c
+
+# mp3_test.c and mp3dec.c are excluded because each has its OWN main(): they
+# are standalone host tools that live in the decoder's directory, not part of
+# the decoder. The x86 side spells the eleven decoder objects out one by one
+# and so never had to notice; a wildcard does, and links two extra main()s into
+# the app if it does not.
+ARM_MP3_SRC := $(filter-out user/audio/mp3/mp3_test.c user/audio/mp3/mp3dec.c,\
+                 $(wildcard user/audio/mp3/*.c)) \
+               user/audio/resample.c
+
+ARM_XSRC_photos   := user/photos/decode.c user/photos/resample.c \
+                     user/photos/album.c user/web/png.c user/web/jpeg.c \
+                     user/lib/inflate.c
+ARM_XSRC_mp3play  := $(ARM_MP3_SRC)
+ARM_XSRC_tlstest  := $(ARM_TLS_SRC)
+ARM_XSRC_wget     := $(ARM_TLS_SRC)
+ARM_XSRC_pkgfetch := user/lib/inflate.c user/lib/unzip.c $(ARM_TLS_SRC)
+ARM_XSRC_pkg      := user/pkg/manifest.c user/pkg/embxinfo.c \
+                     kernel/crypto/sha256.c user/lib/tls/crypto/ecdsa.c \
+                     user/lib/tls/crypto/bignum.c
+ARM_XSRC_pkgbuild := user/pkg/embxgen.c user/pkg/manifest.c kernel/crypto/sha256.c
+ARM_XSRC_httpd    := user/httpd/http.c user/httpd/mime.c user/httpd/serve.c
+
+# Per-app include paths. The EmUI set is added to every app anyway; this is the
+# extra a particular app needs, mirroring its explicit x86 rule.
+# Taken from each app's x86 compile rule, and reusing the Makefile's OWN
+# $(TLS_LIB_INC) rather than a second spelling of it -- the TLS tree's kshim
+# and -Ikernel paths are not obvious and are exactly the kind of thing two
+# copies would drift on.
+ARM_INC_photos   := -Iuser/photos -Iuser/web
+ARM_INC_mp3play  := -Iuser/audio/mp3 -Iuser/audio
+ARM_INC_tlstest  := $(TLS_LIB_INC)
+ARM_INC_wget     := $(TLS_LIB_INC)
+ARM_INC_pkgfetch := $(TLS_LIB_INC) -Iuser/lib -Iuser/pkg
+ARM_INC_pkg      := -Iuser/pkg -Iuser/lib -Iuser/lib/tls/crypto -Ikernel
+ARM_INC_pkgbuild := -Iuser/pkg -Iuser/lib
+ARM_INC_httpd    := -Iuser/httpd
+
+
+# The EmUI apps. Same link shape as x86's: NO -static (it would forbid the .so)
+# and NO -T newlib.ld (the DEFAULT script is what emits the .dynamic/.dynsym/
+# .rela.plt/.got the in-kernel loader reads). libembk.so comes before -lc -lm so
+# ld pulls the libc the toolkit needs INTO the app, and --export-dynamic exports
+# it back to the .so. --no-dynamic-linker because the kernel is the loader.
+# Every extra source any app needs, deduplicated -- two apps may share one.
+ARM_XSRC_ALL := $(sort $(foreach p,$(ARM_UI_PROGS) $(ARM_NEWLIB_PROGS),$(ARM_XSRC_$(p))))
+# The union of every per-app include, used when compiling a SHARED extra object
+# (one file may be pulled in by two apps -- kernel/crypto/sha256.c is pulled in
+# by three -- so it is compiled once with the superset rather than several
+# times with different sets).
+#
+# NOT $(sort). Sorting deduplicates, which would be welcome, but it also
+# REORDERS, and -I order is significant: $(TLS_LIB_INC) puts
+# user/lib/tls/kshim ahead of -Ikernel precisely so the shim's headers shadow
+# the kernel's for userspace builds. Sorted alphabetically, -Ikernel wins and
+# the TLS tree compiles against the wrong headers. Duplicate -I flags are
+# harmless; a reordered one is not.
+ARM_INC_ALL  := $(foreach p,$(ARM_UI_PROGS) $(ARM_NEWLIB_PROGS),$(ARM_INC_$(p)))
+ARM_XOBJ      = $(patsubst %,$(ARM_USER)/x_%.o,$(subst /,_,$(basename $(1))))
+
+define ARM_XOBJ_RULE
+$(ARM_USER)/x_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note $(ARM_INC_ALL) -c $$< -o $$@
+endef
+$(foreach src,$(ARM_XSRC_ALL),$(eval $(call ARM_XOBJ_RULE,$(src))))
 
 ARM_USER_ELVES := $(patsubst %,$(ARM_USER)/%.elf,$(ARM_NEWLIB_PROGS)) \
                   $(patsubst %,$(ARM_USER)/%.elf,$(ARM_PLAIN_PROGS)) \
@@ -275,9 +362,11 @@ $(ARM_USER)/syscalls.o: user/lib/syscalls.c | $(ARM_USER)
 # makes the outcome depend on nothing but this file.
 define ARM_NEWLIB_PROG
 $(ARM_USER)/$(1).o: user/bin/$(1).c | $(ARM_USER)
-	$$(USER_CC) $$(NEWLIB_CFLAGS) -c $$< -o $$@
-$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(ARM_CRT0) $(ARM_SYSCALLS) user/lib/newlib.ld
-	$$(USER_CC) $$(NEWLIB_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) $$< -lc -lgcc -o $$@
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $(ARM_INC_$(1)) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+                      $(ARM_CRT0) $(ARM_SYSCALLS) user/lib/newlib.ld
+	$$(USER_CC) $$(NEWLIB_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) \
+	    $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) -lc -lm -lgcc -o $$@
 endef
 $(foreach p,$(ARM_NEWLIB_PROGS),$(eval $(call ARM_NEWLIB_PROG,$(p))))
 
@@ -330,31 +419,10 @@ $(foreach src,$(ARM_LIBEMBK_SRC),$(eval $(call ARM_PIC_OBJ,$(src))))
 $(ARM_LIBEMBK): $(ARM_LIBEMBK_OBJ)
 	$(USER_LD) -shared -soname libembk.so --hash-style=sysv $(ARM_LIBEMBK_OBJ) -o $@
 
-# The EmUI apps. Same link shape as x86's: NO -static (it would forbid the .so)
-# and NO -T newlib.ld (the DEFAULT script is what emits the .dynamic/.dynsym/
-# .rela.plt/.got the in-kernel loader reads). libembk.so comes before -lc -lm so
-# ld pulls the libc the toolkit needs INTO the app, and --export-dynamic exports
-# it back to the .so. --no-dynamic-linker because the kernel is the loader.
-# A few apps are more than one translation unit, exactly as they are on x86
-# (where each has an explicit rule with extra objects). Naming the extra
-# SOURCES per app keeps that fact in one place instead of a second explicit
-# rule per app down here.
-ARM_XSRC_home   := user/lib/appauth.c
-ARM_XSRC_notepp := user/note/syntax.c user/note/doc.c user/note/edit.c
-
-# Every extra source any app needs, deduplicated -- two apps may share one.
-ARM_XSRC_ALL := $(sort $(foreach p,$(ARM_UI_PROGS),$(ARM_XSRC_$(p))))
-ARM_XOBJ      = $(patsubst %,$(ARM_USER)/x_%.o,$(subst /,_,$(basename $(1))))
-
-define ARM_XOBJ_RULE
-$(ARM_USER)/x_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
-	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note -c $$< -o $$@
-endef
-$(foreach src,$(ARM_XSRC_ALL),$(eval $(call ARM_XOBJ_RULE,$(src))))
 
 define ARM_UI_PROG
 $(ARM_USER)/$(1).o: user/bin/$(1).c user/lib/embk.h | $(ARM_USER)
-	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note -c $$< -o $$@
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note $(ARM_INC_$(1)) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
                       $(ARM_CRT0) $(ARM_SYSCALLS) $(ARM_LIBEMBK)
 	$$(USER_CC) $$(NEWLIB_DYN_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) \
