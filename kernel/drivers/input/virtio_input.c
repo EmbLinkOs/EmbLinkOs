@@ -317,8 +317,16 @@ void virtio_input_init(void) {
         struct vi_dev *d = &g_vi[g_vi_count];
         memset(d, 0, sizeof(*d));
 
-        if (!virtio_pci_attach(&d->vd, pci, "virtio-input"))
+        if (!virtio_pci_attach(&d->vd, pci, "virtio-input", 0, 0))
             continue;
+
+        /* virtio-input IS its device config: select/subsel/size is the only way
+         * to ask what the device is. Without that window there is nothing to
+         * probe and no way to tell a keyboard from a tablet. */
+        if (!d->vd.devcfg) {
+            kprintf("virtio-input: device %u exposes no config window\n", idx);
+            continue;
+        }
 
         /* WHAT IS THIS DEVICE? Ask what event types it can produce. A device
          * with EV_KEY bit 1 (KEY_ESC) set is a keyboard; one that reports

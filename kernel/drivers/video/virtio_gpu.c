@@ -12,6 +12,7 @@
 #include "drivers/video/gpu.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/bus/pci.h"
+#include "drivers/bus/virtio_pci.h"
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
@@ -58,22 +59,14 @@
 #define VRING_DESC_F_NEXT  1
 #define VRING_DESC_F_WRITE 2
 
-struct vring_desc {
-    uint64_t addr;
-    uint32_t len;
-    uint16_t flags;
-    uint16_t next;
-} __attribute__((packed));
-
+/* struct vring_desc and struct vring_used_elem now come from virtio_pci.h --
+ * they are the spec's layouts and belong with the transport. The two whose
+ * ring[] is sized by VQ_SIZE stay here, because a queue depth is this driver's
+ * choice. */
 struct vring_avail {
     uint16_t flags;
     uint16_t idx;
     uint16_t ring[VQ_SIZE];
-} __attribute__((packed));
-
-struct vring_used_elem {
-    uint32_t id;
-    uint32_t len;
 } __attribute__((packed));
 
 struct vring_used {
@@ -168,6 +161,7 @@ struct virtio_gpu_mem_entry {
 #define VGPU_CMD_BUF_SIZE (40 * 1024)
 
 struct virtio_gpu_state {
+    struct virtio_pci_dev vp;   /* the shared transport: windows + handshake */
     bool present;
     volatile uint8_t *common;         // common config window
     volatile uint8_t *notify_base;    // notify window base
@@ -286,117 +280,39 @@ static bool vgpu_simple_cmd(const void *cmd, uint32_t cmd_len) {
 }
 
 // ---- transport bring-up -------------------------------------------------------
-static volatile uint8_t *vgpu_map_cap(const struct pci_device *dev,
-                                      uint8_t bar, uint32_t offset,
-                                      uint32_t length) {
-    struct pci_bar b = pci_read_bar(dev->bus, dev->device, dev->function, bar);
-    if (!b.valid || !b.is_mmio) return 0;
-    uint64_t virt = vmm_map_mmio(b.address + offset, length);
-    return (volatile uint8_t *)virt;
-}
-
 static bool vgpu_init_transport(const struct pci_device *dev) {
     struct virtio_gpu_state *s = &g_vgpu;
 
-    // Walk the PCI capability list for virtio vendor caps (id 0x09).
-    uint16_t status = pci_read16(dev->bus, dev->device, dev->function, PCI_STATUS);
-    if (!(status & (1 << 4))) {
-        kprintf("virtio-gpu: no PCI capability list\n");
+    /* The capability walk, the config windows, bus mastering and the status
+     * handshake are drivers/bus/virtio_pci.c's now -- this driver carried the
+     * second of what became four near-identical copies.
+     *
+     * No bank-0 features are requested: this driver uses the 2D control queue
+     * only, and every optional virtio-gpu feature (virgl, EDID, resource UUIDs)
+     * would add an obligation it does not meet. */
+    if (!virtio_pci_attach(&s->vp, dev, "virtio-gpu", 0, 0))
         return false;
-    }
 
-    uint8_t cap_off = pci_read8(dev->bus, dev->device, dev->function, PCI_CAP_PTR) & 0xFC;
-    uint8_t common_bar = 0xFF, notify_bar = 0xFF;
-    uint32_t common_off = 0, common_len = 0;
-    uint32_t notify_off = 0, notify_len = 0;
-
-    while (cap_off) {
-        uint8_t cap_id  = pci_read8(dev->bus, dev->device, dev->function, cap_off);
-        uint8_t cap_nxt = pci_read8(dev->bus, dev->device, dev->function, cap_off + 1);
-        if (cap_id == 0x09) {   // vendor-specific: virtio structure cap
-            uint8_t cfg_type = pci_read8(dev->bus, dev->device, dev->function, cap_off + 3);
-            uint8_t bar      = pci_read8(dev->bus, dev->device, dev->function, cap_off + 4);
-            uint32_t offset  = pci_read32(dev->bus, dev->device, dev->function, cap_off + 8);
-            uint32_t length  = pci_read32(dev->bus, dev->device, dev->function, cap_off + 12);
-
-            if (cfg_type == VIRTIO_PCI_CAP_COMMON_CFG && common_bar == 0xFF) {
-                common_bar = bar; common_off = offset; common_len = length;
-            } else if (cfg_type == VIRTIO_PCI_CAP_NOTIFY_CFG && notify_bar == 0xFF) {
-                notify_bar = bar; notify_off = offset; notify_len = length;
-                s->notify_off_multiplier =
-                    pci_read32(dev->bus, dev->device, dev->function, cap_off + 16);
-            }
-        }
-        cap_off = cap_nxt & 0xFC;
-    }
-
-    if (common_bar == 0xFF || notify_bar == 0xFF) {
-        kprintf("virtio-gpu: missing common/notify capability (legacy device?)\n");
-        return false;
-    }
-
-    s->common = vgpu_map_cap(dev, common_bar, common_off, common_len);
-    s->notify_base = vgpu_map_cap(dev, notify_bar, notify_off,
-                                  notify_len ? notify_len : 4096);
-    if (!s->common || !s->notify_base) {
-        kprintf("virtio-gpu: failed to map config windows\n");
-        return false;
-    }
-
-    pci_enable_bus_mastering(dev->bus, dev->device, dev->function);
-
-    // Reset, then acknowledge + driver.
-    vw8(s->common, VC_DEVICE_STATUS, 0);
-    for (uint32_t i = 0; i < 1000000 && vr8(s->common, VC_DEVICE_STATUS) != 0; i++) { }
-    vw8(s->common, VC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
-    vw8(s->common, VC_DEVICE_STATUS,
-        VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
-
-    // Feature negotiation: we only need VIRTIO_F_VERSION_1.
-    vw32(s->common, VC_DEVICE_FEATURE_SELECT, VIRTIO_F_VERSION_1_BANK);
-    uint32_t feat_hi = vr32(s->common, VC_DEVICE_FEATURE);
-    if (!(feat_hi & VIRTIO_F_VERSION_1_BIT)) {
-        kprintf("virtio-gpu: device does not offer VERSION_1\n");
-        return false;
-    }
-    vw32(s->common, VC_DRIVER_FEATURE_SELECT, 0);
-    vw32(s->common, VC_DRIVER_FEATURE, 0);
-    vw32(s->common, VC_DRIVER_FEATURE_SELECT, VIRTIO_F_VERSION_1_BANK);
-    vw32(s->common, VC_DRIVER_FEATURE, VIRTIO_F_VERSION_1_BIT);
-
-    uint8_t st = vr8(s->common, VC_DEVICE_STATUS) | VIRTIO_STATUS_FEATURES_OK;
-    vw8(s->common, VC_DEVICE_STATUS, st);
-    if (!(vr8(s->common, VC_DEVICE_STATUS) & VIRTIO_STATUS_FEATURES_OK)) {
-        kprintf("virtio-gpu: FEATURES_OK rejected\n");
-        return false;
-    }
+    s->common      = s->vp.common;
+    s->notify_base = s->vp.notify;
+    s->notify_off_multiplier = s->vp.notify_multiplier;
 
     // Control queue (index 0).
-    vw16(s->common, VC_QUEUE_SELECT, 0);
-    uint16_t qsize = vr16(s->common, VC_QUEUE_SIZE);
-    if (qsize == 0) {
-        kprintf("virtio-gpu: controlq missing\n");
-        return false;
-    }
-    if (qsize > VQ_SIZE) {
-        vw16(s->common, VC_QUEUE_SIZE, VQ_SIZE);
-        qsize = VQ_SIZE;
-    }
-    s->vq_size = qsize;
     s->last_used_idx = 0;
-
     memset(s->desc, 0, sizeof(s->desc));
     memset((void *)&s->avail, 0, sizeof(s->avail));
     memset((void *)&s->used, 0, sizeof(s->used));
 
-    vw64(s->common, VC_QUEUE_DESC,   vgpu_dma(s->desc));
-    vw64(s->common, VC_QUEUE_DRIVER, vgpu_dma(&s->avail));
-    vw64(s->common, VC_QUEUE_DEVICE, vgpu_dma(&s->used));
-    s->queue_notify_off = vr16(s->common, VC_QUEUE_NOTIFY_OFF);
-    vw16(s->common, VC_QUEUE_ENABLE, 1);
+    uint16_t qsize = virtio_pci_setup_queue(&s->vp, 0, VQ_SIZE, s->desc,
+                                            (void *)&s->avail, (void *)&s->used,
+                                            &s->queue_notify_off);
+    if (qsize == 0) {
+        kprintf("virtio-gpu: controlq missing\n");
+        return false;
+    }
+    s->vq_size = qsize;
 
-    st = vr8(s->common, VC_DEVICE_STATUS) | VIRTIO_STATUS_DRIVER_OK;
-    vw8(s->common, VC_DEVICE_STATUS, st);
+    virtio_pci_driver_ok(&s->vp);
 
     kprintf("virtio-gpu: transport up, controlq size=%u notify_mult=%u\n",
             (unsigned int)qsize, (unsigned int)s->notify_off_multiplier);

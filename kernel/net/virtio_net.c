@@ -14,6 +14,7 @@
 
 #include "net/net.h"
 #include "drivers/bus/pci.h"
+#include "drivers/bus/virtio_pci.h"
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
@@ -62,9 +63,9 @@
 #define RX_BUFS   32                       /* receive buffers posted at once */
 #define NET_BUF_SZ 2048                    /* >= 12 (hdr) + 1514 (frame) */
 
-struct vring_desc { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; } __attribute__((packed));
+/* struct vring_desc and struct vring_used_elem come from virtio_pci.h -- the
+ * spec's layouts, owned by the transport. */
 struct vring_avail { uint16_t flags; uint16_t idx; uint16_t ring[VQ_SIZE]; } __attribute__((packed));
-struct vring_used_elem { uint32_t id; uint32_t len; } __attribute__((packed));
 struct vring_used { uint16_t flags; uint16_t idx; struct vring_used_elem ring[VQ_SIZE]; } __attribute__((packed));
 
 /* virtio 1.0 net header -- 12 bytes (num_buffers always present). Prepended to
@@ -89,6 +90,7 @@ struct virtq {
 };
 
 struct vnet_state {
+    struct virtio_pci_dev vp;   /* the shared transport: windows + handshake */
     bool present;
     volatile uint8_t *common;
     volatile uint8_t *notify_base;
@@ -121,13 +123,6 @@ static inline uint64_t vnet_dma(const volatile void *p) { return KV2P((uint64_t)
 static void vnet_notify(struct virtq *q, uint16_t queue_index) {
     vw16((volatile uint8_t *)g_vnet.notify_base,
          (uint32_t)q->notify_off * g_vnet.notify_off_multiplier, queue_index);
-}
-
-static volatile uint8_t *vnet_map_cap(const struct pci_device *dev, uint8_t bar,
-                                      uint32_t offset, uint32_t length) {
-    struct pci_bar b = pci_read_bar(dev->bus, dev->device, dev->function, bar);
-    if (!b.valid || !b.is_mmio) return 0;
-    return (volatile uint8_t *)vmm_map_mmio(b.address + offset, length ? length : 4096);
 }
 
 /* Program one virtqueue's desc/avail/used addresses into the common config. */
@@ -175,70 +170,31 @@ static void virtio_net_isr(void) {
 static bool vnet_init_transport(const struct pci_device *dev) {
     struct vnet_state *s = &g_vnet;
 
-    uint16_t status = pci_read16(dev->bus, dev->device, dev->function, PCI_STATUS);
-    if (!(status & (1 << 4))) { kprintf("virtio-net: no PCI capability list\n"); return false; }
+    /* The capability walk, the config windows, bus mastering and the status
+     * handshake are drivers/bus/virtio_pci.c's now -- this was the third of
+     * four near-identical copies.
+     *
+     * VIRTIO_NET_F_MAC is the one bank-0 feature this driver asks for, and it
+     * has to: reading the device's MAC out of config space is only meaningful
+     * if that feature was negotiated. Everything else -- checksum offload,
+     * mergeable receive buffers -- is deliberately declined, which is what
+     * keeps the RX path "one buffer is one frame". */
+    uint32_t got0 = 0;
+    if (!virtio_pci_attach(&s->vp, dev, "virtio-net", VIRTIO_NET_F_MAC_BIT, &got0))
+        return false;
 
-    uint8_t cap = pci_read8(dev->bus, dev->device, dev->function, PCI_CAP_PTR) & 0xFC;
-    uint8_t common_bar = 0xFF, notify_bar = 0xFF, dev_bar = 0xFF;
-    uint32_t common_off = 0, common_len = 0, notify_off = 0, notify_len = 0, dev_off = 0, dev_len = 0;
-
-    while (cap) {
-        uint8_t id  = pci_read8(dev->bus, dev->device, dev->function, cap);
-        uint8_t nxt = pci_read8(dev->bus, dev->device, dev->function, cap + 1);
-        if (id == 0x09) {
-            uint8_t type   = pci_read8 (dev->bus, dev->device, dev->function, cap + 3);
-            uint8_t bar    = pci_read8 (dev->bus, dev->device, dev->function, cap + 4);
-            uint32_t off   = pci_read32(dev->bus, dev->device, dev->function, cap + 8);
-            uint32_t len   = pci_read32(dev->bus, dev->device, dev->function, cap + 12);
-            if (type == VIRTIO_PCI_CAP_COMMON_CFG && common_bar == 0xFF) {
-                common_bar = bar; common_off = off; common_len = len;
-            } else if (type == VIRTIO_PCI_CAP_NOTIFY_CFG && notify_bar == 0xFF) {
-                notify_bar = bar; notify_off = off; notify_len = len;
-                s->notify_off_multiplier = pci_read32(dev->bus, dev->device, dev->function, cap + 16);
-            } else if (type == VIRTIO_PCI_CAP_DEVICE_CFG && dev_bar == 0xFF) {
-                dev_bar = bar; dev_off = off; dev_len = len;
-            }
-        }
-        cap = nxt & 0xFC;
-    }
-    if (common_bar == 0xFF || notify_bar == 0xFF || dev_bar == 0xFF) {
-        kprintf("virtio-net: missing common/notify/device capability\n"); return false;
-    }
-
-    s->common     = vnet_map_cap(dev, common_bar, common_off, common_len);
-    s->notify_base= vnet_map_cap(dev, notify_bar, notify_off, notify_len);
-    s->device_cfg = vnet_map_cap(dev, dev_bar,    dev_off,    dev_len);
-    if (!s->common || !s->notify_base || !s->device_cfg) {
-        kprintf("virtio-net: failed to map config windows\n"); return false;
-    }
-
-    pci_enable_bus_mastering(dev->bus, dev->device, dev->function);
-
+    s->common     = s->vp.common;
+    s->notify_base= s->vp.notify;
+    s->device_cfg = s->vp.devcfg;
+    s->notify_off_multiplier = s->vp.notify_multiplier;
     volatile uint8_t *c = s->common;
-    vw8(c, VC_DEVICE_STATUS, 0);
-    for (uint32_t i = 0; i < 1000000 && vr8(c, VC_DEVICE_STATUS) != 0; i++) { }
-    vw8(c, VC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
-    vw8(c, VC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-    /* Need VERSION_1 (bank 1 bit 0) + MAC (bank 0 bit 5). */
-    vw32(c, VC_DEVICE_FEATURE_SELECT, VIRTIO_F_VERSION_1_BANK);
-    if (!(vr32(c, VC_DEVICE_FEATURE) & VIRTIO_F_VERSION_1_BIT)) {
-        kprintf("virtio-net: device does not offer VERSION_1\n"); return false;
+    if (!s->device_cfg) {
+        kprintf("virtio-net: device exposes no config window (no MAC)\n");
+        return false;
     }
-    vw32(c, VC_DEVICE_FEATURE_SELECT, 0);
-    uint32_t feat0 = vr32(c, VC_DEVICE_FEATURE);
-    /* Accept MAC if offered; ask for nothing else (no checksum offload, no
-     * mergeable buffers -- keeps the RX path a plain 1 buffer = 1 frame). */
-    vw32(c, VC_DRIVER_FEATURE_SELECT, 0);
-    vw32(c, VC_DRIVER_FEATURE, feat0 & VIRTIO_NET_F_MAC_BIT);
-    vw32(c, VC_DRIVER_FEATURE_SELECT, VIRTIO_F_VERSION_1_BANK);
-    vw32(c, VC_DRIVER_FEATURE, VIRTIO_F_VERSION_1_BIT);
-
-    uint8_t st = vr8(c, VC_DEVICE_STATUS) | VIRTIO_STATUS_FEATURES_OK;
-    vw8(c, VC_DEVICE_STATUS, st);
-    if (!(vr8(c, VC_DEVICE_STATUS) & VIRTIO_STATUS_FEATURES_OK)) {
-        kprintf("virtio-net: FEATURES_OK rejected\n"); return false;
-    }
+    if (!(got0 & VIRTIO_NET_F_MAC_BIT))
+        kprintf("virtio-net: device offers no MAC; config-space MAC is not valid\n");
 
     if (!vnet_setup_queue(0, &s->rxq) || !vnet_setup_queue(1, &s->txq)) {
         kprintf("virtio-net: queue setup failed\n"); return false;

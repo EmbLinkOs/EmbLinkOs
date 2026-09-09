@@ -64,7 +64,7 @@ struct virtio_pci_dev {
     const struct pci_device *pci;
     volatile uint8_t *common;      /* common configuration                */
     volatile uint8_t *notify;      /* notification window                 */
-    volatile uint8_t *devcfg;      /* device-specific configuration       */
+    volatile uint8_t *devcfg;      /* device-specific config, or NULL     */
     uint32_t notify_multiplier;
 };
 
@@ -85,11 +85,22 @@ static inline void vp_w64(volatile uint8_t *b, uint32_t o, uint64_t v) {
 const struct pci_device *virtio_pci_find(uint16_t device_id, uint32_t index);
 
 /* Walk the capabilities, map the three windows, reset the device and negotiate
- * exactly VIRTIO_F_VERSION_1. `name` is used only for diagnostics. Leaves the
- * device in DRIVER|ACKNOWLEDGE|FEATURES_OK -- the caller sets up its queues and
- * then calls virtio_pci_driver_ok(). */
+ * features. `name` is used only for diagnostics. Leaves the device in
+ * DRIVER|ACKNOWLEDGE|FEATURES_OK -- the caller sets up its queues and then
+ * calls virtio_pci_driver_ok().
+ *
+ * VIRTIO_F_VERSION_1 (bank 1, bit 0) is always required: a device that does not
+ * offer it is refused, because every one of these drivers is written against
+ * the modern layout and nothing here implements the legacy one.
+ *
+ * `want0` is the bank-0 feature mask the caller would LIKE. What it gets is the
+ * intersection with what the device offers, reported through `got0` (may be
+ * null). Asking for zero is the common case and the safe one -- every optional
+ * feature adds an obligation, and virtio-blk/gpu/input all want none of them.
+ * virtio-net is the exception: it asks for VIRTIO_NET_F_MAC, because reading
+ * the device's MAC out of config space is only valid if that was negotiated. */
 bool virtio_pci_attach(struct virtio_pci_dev *vd, const struct pci_device *pci,
-                       const char *name);
+                       const char *name, uint32_t want0, uint32_t *got0);
 
 /* Register one virtqueue. `desc`/`avail`/`used` are the caller's ring memory
  * (physical addresses are taken with KV2P, so it must be static storage, not

@@ -1,5 +1,6 @@
 #include "drivers/storage/virtio_blk.h"
 #include "drivers/bus/pci.h"
+#include "drivers/bus/virtio_pci.h"
 #include "block/block.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -81,9 +82,11 @@ struct vblk_req_hdr {
 #define VIRTIO_BLK_T_OUT   1
 #define VIRTIO_BLK_T_FLUSH 4
 
-struct vring_desc  { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; } __attribute__((packed));
+/* struct vring_desc and struct vring_used_elem come from virtio_pci.h -- they
+ * are the SPEC's layouts and belong with the transport. The two below are this
+ * driver's, because their ring[] is sized by VQ_SIZE and a queue depth is a
+ * driver's choice, not the transport's. */
 struct vring_avail { uint16_t flags; uint16_t idx; uint16_t ring[VQ_SIZE]; } __attribute__((packed));
-struct vring_used_elem { uint32_t id; uint32_t len; } __attribute__((packed));
 struct vring_used  { uint16_t flags; uint16_t idx; struct vring_used_elem ring[VQ_SIZE]; } __attribute__((packed));
 
 /* Rings live in .bss so KV2P() can turn them into the physical addresses the
@@ -102,6 +105,7 @@ static struct vblk_req_hdr g_hdr   __attribute__((aligned(16)));
 static volatile uint8_t    g_status __attribute__((aligned(16)));
 
 static struct {
+    struct virtio_pci_dev vp;   /* the shared transport: windows + handshake */
     volatile uint8_t *common, *notify, *devcfg;
     uint32_t notify_multiplier;
     uint16_t notify_off;
@@ -126,14 +130,6 @@ static inline void vw64(volatile uint8_t *b, uint32_t o, uint64_t v) {
     vw32(b, o, (uint32_t)v); vw32(b, o + 4, (uint32_t)(v >> 32));
 }
 static inline uint64_t dma(const volatile void *p) { return KV2P((uint64_t)(uintptr_t)p); }
-
-static volatile uint8_t *map_cap(const struct pci_device *d, uint8_t bar,
-                                 uint32_t off, uint32_t len) {
-    struct pci_bar b = pci_read_bar(d->bus, d->device, d->function, bar);
-    if (!b.valid || !b.is_mmio)
-        return 0;
-    return (volatile uint8_t *)(uintptr_t)vmm_map_mmio(b.address + off, len ? len : 4096);
-}
 
 /* Submit one three-descriptor request and spin until the device retires it. */
 static int vblk_request(uint32_t type, uint64_t sector, void *data, uint32_t len,
@@ -241,73 +237,31 @@ bool virtio_blk_init(void) {
         return false;
     }
 
-    /* --- capability walk --------------------------------------------------- */
-    uint16_t status = pci_read16(dev->bus, dev->device, dev->function, PCI_STATUS);
-    if (!(status & (1u << 4))) { kprintf("virtio-blk: no capability list\n"); return false; }
+    /* --- the transport ------------------------------------------------------
+     * The capability walk, the three config windows, bus mastering and the
+     * status handshake all live in drivers/bus/virtio_pci.c now. This driver
+     * used to carry its own copy, and so did virtio-net and virtio-gpu; the
+     * fourth copy is what docs/TODO.md said would be one too many.
+     *
+     * Zero requested features, deliberately: a virtio-blk with no negotiated
+     * options is the one whose request format cannot be subtly wrong, and
+     * nothing here needs discard, write-zeroes or multi-queue to read a
+     * sector. */
+    if (!virtio_pci_attach(&g_vblk.vp, dev, "virtio-blk", 0, 0))
+        return false;
 
-    uint8_t cap = pci_read8(dev->bus, dev->device, dev->function, PCI_CAP_PTR) & 0xFC;
-    uint8_t cbar = 0xFF, nbar = 0xFF, dbar = 0xFF;
-    uint32_t coff = 0, clen = 0, noff = 0, nlen = 0, doff = 0, dlen = 0;
+    g_vblk.common = g_vblk.vp.common;
+    g_vblk.notify = g_vblk.vp.notify;
+    g_vblk.devcfg = g_vblk.vp.devcfg;
+    g_vblk.notify_multiplier = g_vblk.vp.notify_multiplier;
 
-    for (int guard = 0; cap && guard < 48; guard++) {
-        uint8_t id  = pci_read8(dev->bus, dev->device, dev->function, cap);
-        uint8_t nxt = pci_read8(dev->bus, dev->device, dev->function, cap + 1);
-        if (id == 0x09) {
-            uint8_t  t   = pci_read8 (dev->bus, dev->device, dev->function, cap + 3);
-            uint8_t  bar = pci_read8 (dev->bus, dev->device, dev->function, cap + 4);
-            uint32_t off = pci_read32(dev->bus, dev->device, dev->function, cap + 8);
-            uint32_t len = pci_read32(dev->bus, dev->device, dev->function, cap + 12);
-            if (t == VIRTIO_PCI_CAP_COMMON_CFG && cbar == 0xFF) { cbar = bar; coff = off; clen = len; }
-            else if (t == VIRTIO_PCI_CAP_NOTIFY_CFG && nbar == 0xFF) {
-                nbar = bar; noff = off; nlen = len;
-                g_vblk.notify_multiplier = pci_read32(dev->bus, dev->device, dev->function, cap + 16);
-            }
-            else if (t == VIRTIO_PCI_CAP_DEVICE_CFG && dbar == 0xFF) { dbar = bar; doff = off; dlen = len; }
-        }
-        cap = nxt & 0xFC;
-    }
-    if (cbar == 0xFF || nbar == 0xFF || dbar == 0xFF) {
-        kprintf("virtio-blk: missing a required capability\n"); return false;
-    }
-
-    g_vblk.common = map_cap(dev, cbar, coff, clen);
-    g_vblk.notify = map_cap(dev, nbar, noff, nlen);
-    g_vblk.devcfg = map_cap(dev, dbar, doff, dlen);
-    if (!g_vblk.common || !g_vblk.notify || !g_vblk.devcfg) {
-        kprintf("virtio-blk: could not map config windows\n"); return false;
-    }
-
-    pci_enable_bus_mastering(dev->bus, dev->device, dev->function);
-
-    /* --- the virtio handshake ---------------------------------------------- */
-    volatile uint8_t *c = g_vblk.common;
-    vw8(c, VC_DEVICE_STATUS, 0);                       /* reset */
-    while (vr8(c, VC_DEVICE_STATUS) != 0) { }
-    vw8(c, VC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
-    vw8(c, VC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
-
-    /* Accept exactly VIRTIO_F_VERSION_1 and nothing else: every optional
-     * feature (segment limits, discard, multi-queue) changes the request
-     * format or adds obligations, and none of them is needed to read a
-     * sector. Negotiating nothing is the version that cannot be subtly wrong. */
-    vw32(c, VC_DRIVER_FEATURE_SELECT, 0); vw32(c, VC_DRIVER_FEATURE, 0);
-    vw32(c, VC_DRIVER_FEATURE_SELECT, 1); vw32(c, VC_DRIVER_FEATURE, VIRTIO_F_VERSION_1_BIT);
-
-    vw8(c, VC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER |
-                             VIRTIO_STATUS_FEATURES_OK);
-    if (!(vr8(c, VC_DEVICE_STATUS) & VIRTIO_STATUS_FEATURES_OK)) {
-        kprintf("virtio-blk: device refused VIRTIO_F_VERSION_1\n");
-        vw8(c, VC_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
+    /* This driver DOES need the device config: capacity is its first field. */
+    if (!g_vblk.devcfg) {
+        kprintf("virtio-blk: device exposes no device-config window\n");
         return false;
     }
 
     /* --- queue 0 ------------------------------------------------------------ */
-    vw16(c, VC_QUEUE_SELECT, 0);
-    uint16_t qs = vr16(c, VC_QUEUE_SIZE);
-    if (qs == 0) { kprintf("virtio-blk: queue 0 has size 0\n"); return false; }
-    if (qs > VQ_SIZE) { vw16(c, VC_QUEUE_SIZE, VQ_SIZE); qs = VQ_SIZE; }
-    g_vblk.qsize = qs;
-
     memset(g_desc, 0, sizeof(g_desc));
     memset((void *)&g_avail, 0, sizeof(g_avail));
     memset((void *)&g_used, 0, sizeof(g_used));
@@ -321,15 +275,13 @@ bool virtio_blk_init(void) {
      * kernel the moment interrupts are enabled. */
     g_avail.flags = 1;
 
-    vw64(c, VC_QUEUE_DESC,   dma(g_desc));
-    vw64(c, VC_QUEUE_DRIVER, dma(&g_avail));
-    vw64(c, VC_QUEUE_DEVICE, dma(&g_used));
-    vw16(c, VC_QUEUE_MSIX_VECTOR, VIRTIO_MSI_NO_VECTOR);   /* polled */
-    g_vblk.notify_off = vr16(c, VC_QUEUE_NOTIFY_OFF);
-    vw16(c, VC_QUEUE_ENABLE, 1);
+    uint16_t qs = virtio_pci_setup_queue(&g_vblk.vp, 0, VQ_SIZE,
+                                         g_desc, (void *)&g_avail,
+                                         (void *)&g_used, &g_vblk.notify_off);
+    if (qs == 0) { kprintf("virtio-blk: queue 0 has size 0\n"); return false; }
+    g_vblk.qsize = qs;
 
-    vw8(c, VC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER |
-                             VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
+    virtio_pci_driver_ok(&g_vblk.vp);
 
     /* Capacity is the first field of the device-specific config, in sectors. */
     g_vblk.capacity = vr64(g_vblk.devcfg, 0);

@@ -35,8 +35,9 @@ static volatile uint8_t *map_cap(const struct pci_device *d, uint8_t bar,
 }
 
 bool virtio_pci_attach(struct virtio_pci_dev *vd, const struct pci_device *pci,
-                       const char *name)
+                       const char *name, uint32_t want0, uint32_t *got0)
 {
+    if (got0) *got0 = 0;
     vd->pci = pci;
     vd->common = vd->notify = vd->devcfg = 0;
     vd->notify_multiplier = 0;
@@ -73,15 +74,20 @@ bool virtio_pci_attach(struct virtio_pci_dev *vd, const struct pci_device *pci,
         }
         cap = nxt & 0xFC;
     }
-    if (cbar == 0xFF || nbar == 0xFF || dbar == 0xFF) {
-        kprintf("%s: missing a required capability\n", name);
+    /* COMMON and NOTIFY are mandatory -- there is no way to configure or kick a
+     * device without them. DEVICE_CFG is NOT: the spec allows a device with no
+     * device-specific configuration, and virtio-gpu is one. A driver that needs
+     * it checks vd->devcfg itself, which is a check it can make meaningfully
+     * and this function cannot. */
+    if (cbar == 0xFF || nbar == 0xFF) {
+        kprintf("%s: missing the common or notify capability\n", name);
         return false;
     }
 
     vd->common = map_cap(pci, cbar, coff, clen);
     vd->notify = map_cap(pci, nbar, noff, nlen);
-    vd->devcfg = map_cap(pci, dbar, doff, dlen);
-    if (!vd->common || !vd->notify || !vd->devcfg) {
+    vd->devcfg = (dbar == 0xFF) ? 0 : map_cap(pci, dbar, doff, dlen);
+    if (!vd->common || !vd->notify) {
         kprintf("%s: could not map config windows\n", name);
         return false;
     }
@@ -96,12 +102,25 @@ bool virtio_pci_attach(struct virtio_pci_dev *vd, const struct pci_device *pci,
     vp_w8(c, VP_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
     vp_w8(c, VP_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-    /* Exactly VIRTIO_F_VERSION_1 and nothing else -- the same choice
-     * virtio_blk.c documents: every optional feature adds an obligation, and
-     * negotiating nothing is the version that cannot be subtly wrong. */
-    vp_w32(c, VP_DRIVER_FEATURE_SELECT, 0); vp_w32(c, VP_DRIVER_FEATURE, 0);
+    /* VERSION_1 is mandatory: refuse a device that does not offer it rather
+     * than proceeding to interpret the legacy layout as if it were modern. */
+    vp_w32(c, VP_DEVICE_FEATURE_SELECT, 1);
+    if (!(vp_r32(c, VP_DEVICE_FEATURE) & VIRTIO_F_VERSION_1_BIT)) {
+        kprintf("%s: device does not offer VIRTIO_F_VERSION_1\n", name);
+        vp_w8(c, VP_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
+        return false;
+    }
+
+    /* Bank 0: the intersection of what we want and what is on offer. Every
+     * optional feature adds an obligation, so a caller asking for nothing --
+     * which is most of them -- gets the version that cannot be subtly wrong. */
+    vp_w32(c, VP_DEVICE_FEATURE_SELECT, 0);
+    uint32_t have0 = vp_r32(c, VP_DEVICE_FEATURE) & want0;
+
+    vp_w32(c, VP_DRIVER_FEATURE_SELECT, 0); vp_w32(c, VP_DRIVER_FEATURE, have0);
     vp_w32(c, VP_DRIVER_FEATURE_SELECT, 1);
     vp_w32(c, VP_DRIVER_FEATURE, VIRTIO_F_VERSION_1_BIT);
+    if (got0) *got0 = have0;
 
     vp_w8(c, VP_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER |
                                VIRTIO_STATUS_FEATURES_OK);

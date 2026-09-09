@@ -174,6 +174,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
              kernel/drivers/bus/pci.c \
+             kernel/drivers/bus/virtio_pci.c \
              kernel/net/net.c \
              kernel/net/virtio_net.c \
              kernel/net/ethernet/eth.c \
