@@ -1,6 +1,7 @@
 #include "arch/aarch64/irq/exception.h"
 #include "arch/aarch64/drivers/pl011.h"
 #include "arch/aarch64/irq/gicv3.h"
+#include "process/process.h"
 
 void aarch64_syscall(struct aarch64_frame *f);   /* syscall/syscall.c */
 
@@ -224,15 +225,11 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
 
     /* A fault from EL0 is the PROGRAM's fault, not the kernel's, and halting
      * the machine for it would be a denial of service any user program could
-     * trigger. Kill it and carry on -- which is what x86 does via
-     * process_exit_self() and what this will become once A6 has processes. */
+     * trigger. Kill it and carry on -- which is exactly what x86 does, through
+     * process_exit_self(), and that path is now linked here too. */
     if ((which >> 2) == 2) {
-        extern void el0_exit(int64_t code);
-        extern bool el0_in_user_mode(void);
-        if (el0_in_user_mode()) {
-            pl011_puts("\nel0: killing the faulting program; the kernel is fine.\n");
-            el0_exit(-1);
-        }
+        pl011_puts("\nel0: killing the faulting program; the kernel is fine.\n");
+        process_exit_self(-1);
     }
 
     pl011_puts("\nkernel halted (no recovery path for a fault at EL1).\n");

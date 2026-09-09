@@ -5,9 +5,14 @@
 #include "arch/aarch64/mm/pagetable.h"
 #include "arch/aarch64/irq/gicv3.h"
 #include "arch/aarch64/sched/bringup.h"
-#include "arch/aarch64/syscall/usermode.h"
 #include "drivers/timer/timer.h"
 #include "drivers/bus/pci.h"
+#include "drivers/storage/virtio_blk.h"
+#include "block/block.h"
+#include "fs/embkfs/embkfs.h"
+#include "fs/vfs.h"
+#include "process/process.h"
+#include "include/errno.h"
 #include "boot/boot_protocol.h"
 #include "mm/pmm.h"
 #include "mm/kheap.h"
@@ -168,6 +173,7 @@ static void selftest_address_spaces(void) {
     kprintf("\n--- self-test: address-space isolation ---\n");
 
     const uint64_t VA = 0x0000000030000000ULL;   /* a user-half address */
+    uint64_t free_before = pmm_free_pages();
     uint64_t saved = 0;
     __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(saved));
 
@@ -210,12 +216,52 @@ static void selftest_address_spaces(void) {
     /* Destroying frees the frames AND the tables under each root. */
     vmm_destroy_address_space(as_a);
     vmm_destroy_address_space(as_b);
-    kprintf("  [ ok ] both address spaces destroyed\n");
+
+    /* The number is the point: destroying an address space walks its tables
+     * and frees both the page-table pages and the frames they point at. A walk
+     * that misses a level comes back short and says so, where "destroyed"
+     * would read as success. */
+    uint64_t after = pmm_free_pages();
+    bool clean = (after == free_before);
+    kprintf("  [%s] both destroyed -- free pages %d -> %d%s\n",
+            clean ? " ok " : "FAIL", (int)free_before, (int)after,
+            clean ? " (all reclaimed)" : " *** LEAKED ***");
+    if (!clean)
+        selftest_fails++;
 }
 
-/* A do-nothing INTx handler, used only to prove the routing resolves. Nothing
- * should ever call it: no device has been told to interrupt yet. */
-static void pci_probe_isr(void) { }
+/* Read, write, read back. The write matters: a read-only test passes against a
+ * driver that returns the bounce buffer's previous contents, and this one
+ * cannot -- the pattern has to survive a round trip through the device. */
+static void selftest_blk(void) {
+    struct embk_block_device *d = embk_block_get(0);
+    if (!d) { kprintf("  [FAIL] no block device registered\n"); selftest_fails++; return; }
+
+    static uint8_t buf[512], back[512];
+    const uint64_t LBA = 4;          /* past anything a filesystem header uses */
+
+    if (embk_block_read(d, LBA, 1, buf) != EMBK_OK) {
+        kprintf("  [FAIL] read of LBA %d failed\n", (int)LBA); selftest_fails++; return;
+    }
+
+    for (int i = 0; i < 512; i++)
+        buf[i] = (uint8_t)(0xA7 ^ (i & 0xFF));
+
+    if (embk_block_write(d, LBA, 1, buf) != EMBK_OK) {
+        kprintf("  [FAIL] write of LBA %d failed\n", (int)LBA); selftest_fails++; return;
+    }
+    if (embk_block_read(d, LBA, 1, back) != EMBK_OK) {
+        kprintf("  [FAIL] read-back of LBA %d failed\n", (int)LBA); selftest_fails++; return;
+    }
+    for (int i = 0; i < 512; i++) {
+        if (back[i] != buf[i]) {
+            kprintf("  [FAIL] LBA %d byte %d: wrote %x read %x\n",
+                    (int)LBA, i, buf[i], back[i]);
+            selftest_fails++; return;
+        }
+    }
+    kprintf("  [ ok ] %s: 512 bytes written and read back byte-for-byte\n", d->name);
+}
 
 static void selftest_faults(void) {
     kprintf("\n--- self-test: deliberately faulting ---\n");
@@ -442,13 +488,18 @@ void arch_early_main(uint64_t dtb_phys) {
     {
         kprintf("\n--- PCI interrupt routing ---\n");
         uint32_t routed = 0, n = pci_devices_count();
+        uint32_t seen[16] = {0};
         for (uint32_t i = 0; i < n; i++) {
             const struct pci_device *d = pci_get_device(i);
-            if (d && arch_pci_irq_connect(d, pci_probe_isr))
-                routed++;
+            uint32_t intid = d ? arch_pci_irq_line(d) : 0;
+            if (intid) { seen[routed] = intid; routed++; }
         }
-        extern uint32_t pci_ecam_intx_distinct(void);
-        uint32_t distinct = pci_ecam_intx_distinct();
+        uint32_t distinct = 0;
+        for (uint32_t a = 0; a < routed; a++) {
+            bool dup = false;
+            for (uint32_t b = 0; b < a; b++) if (seen[b] == seen[a]) dup = true;
+            if (!dup) distinct++;
+        }
 
         kprintf("  [%s] %d of %d devices routed to the GIC, on %d distinct line(s)\n",
                 (routed && distinct == routed) ? " ok " : "FAIL",
@@ -459,6 +510,59 @@ void arch_early_main(uint64_t dtb_phys) {
          * SPIs -- and an interrupt-map walked with the wrong stride happily
          * reports every device routed, to the same line. */
         if (!routed || distinct != routed)
+            selftest_fails++;
+    }
+
+    /* A disk. `virt` has neither ATA nor AHCI, so this is the only path to
+     * one -- and without a disk there is no filesystem and nothing to run. */
+    kprintf("\n--- storage ---\n");
+    if (virtio_blk_init())
+        selftest_blk();
+    else
+        kprintf("  [info] no virtio-blk attached\n");
+
+    /* --- the real filesystem -------------------------------------------------
+     * process_init() first: EMBKFS takes sleeping locks, and a sleeping lock
+     * needs a scheduler to sleep on. Then vfs_init(), then embkfs_init(),
+     * which probes every registered block device and mounts what it finds --
+     * exactly the sequence kernel/main.c runs on x86, against exactly the same
+     * code. */
+    kprintf("\n--- filesystem ---\n");
+    process_init();
+    vfs_init();
+    embkfs_init();
+
+    /* embkfs_init() mounts the volume; registering it with the VFS at "/" is a
+     * separate step, exactly as kernel/main.c does it -- a mounted volume and a
+     * reachable filesystem are two different things. */
+    {
+        struct embkfs_volume *live = embkfs_live_volume();
+        bool ok = false;
+
+        if (live && embkfs_vfs_register("/", live) == EMBK_OK) {
+            /* Read a real file. That the superblock parsed proves the disk
+             * works; reading a path proves the B-tree walk, the directory
+             * lookup, the extent map and the block layer underneath all agree
+             * -- on an image built by the x86 toolchain and never touched
+             * since. */
+            uint8_t hdr[4] = {0};
+            size_t got = 0;
+            const char *path = "/system/bin/init.elf";
+            int rc = vfs_read(path, 0, hdr, sizeof hdr, &got);
+            if (rc != EMBK_OK) {
+                path = "/system/bin/shell.elf";
+                rc = vfs_read(path, 0, hdr, sizeof hdr, &got);
+            }
+
+            ok = (rc == EMBK_OK && got == 4 && hdr[0] == 0x7F &&
+                  hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F');
+            kprintf("  [%s] %s: %d bytes, %s\n", ok ? " ok " : "FAIL",
+                    path, (int)got,
+                    ok ? "ELF magic intact" : "unreadable or not an ELF");
+        } else {
+            kprintf("  [FAIL] no EMBKFS volume to register at /\n");
+        }
+        if (!ok)
             selftest_fails++;
     }
 
@@ -486,22 +590,21 @@ void arch_early_main(uint64_t dtb_phys) {
      * enumerating this bus is what makes them available here at all. */
     selftest_preemption();
 
-    /* --- A5: user mode ----------------------------------------------------- */
-    kprintf("\n--- self-test: EL0 ---\n");
-    int64_t rc = el0_probe_run();
-
-    /* 42 is the value the probe passed to exit(). Checking it -- rather than
-     * just "we got back" -- is what proves a syscall ARGUMENT travelled from
-     * an EL0 register, through the trap frame, into struct sysargs, into a
-     * handler that has no idea which machine it is on. */
-    kprintf("  [%s] EL0 program ran and exited with %d (expected 42)\n",
-            rc == 42 ? " ok " : "FAIL", (int)rc);
-    if (rc != 42)
-        selftest_fails++;
+    /* The EL0 probe that used to run here is gone, and deliberately.
+     *
+     * It existed to prove the `eret`/`svc` transition before there was
+     * anything real to run through it -- a hand-mapped address space, a
+     * four-entry syscall table and a hand-written assembly program. The real
+     * kernel/syscall/syscalls.c is now linked, so a second definition of
+     * syscall_invoke() could not coexist with it, and the probe's `exit` would
+     * reach the real sys_exit(), which wants a real process.
+     *
+     * docs/TODO.md scheduled that deletion at this exact point. EL0 comes back
+     * when there is a filesystem holding a program worth entering it for. */
 
     kprintf("\n--- all self-tests done: %d failure(s) ---\n", (int)selftest_fails);
 
-    kprintf("\nA5 reached. Parking (real processes and a libc are A6).\n");
+    kprintf("\nA7 reached: the whole shared kernel is linked and running here.\n");
 
     for (;;)
         __asm__ volatile("wfi");

@@ -131,6 +131,18 @@ void pci_assign_resources(uint64_t window_base, uint64_t window_size);
  * (device, INTx pin) to a GIC interrupt, and the driver cannot know that. */
 bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void));
 
+/* Which interrupt this device's INTx pin resolves to, WITHOUT installing a
+ * handler or unmasking anything. Returns 0 if it cannot be resolved.
+ *
+ * Separate from connect() because they are different questions, and answering
+ * the first by doing the second is a trap this code fell into: a boot-time
+ * check that "routing works" registered a do-nothing handler on every device's
+ * line. That was harmless until a driver actually configured a device -- at
+ * which point virtio-blk asserted its LEVEL-TRIGGERED interrupt, the do-nothing
+ * handler did not clear it, and the machine ground to a halt in an interrupt
+ * storm before the scheduler had run once. A diagnostic must not arm anything. */
+uint32_t arch_pci_irq_line(const struct pci_device *dev);
+
  // Access the discovered PCI devices table
  uint32_t pci_devices_count(void);
  const struct pci_device *pci_get_device(uint32_t index);

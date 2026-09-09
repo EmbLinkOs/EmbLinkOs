@@ -1,4 +1,5 @@
 #include "block/block.h"
+#include "drivers/timer/timer.h"
 #include "process/ksync.h"      /* the bounce buffer needs a SLEEPING lock: a mutex */
 #include "include/kprintf.h"
 #include "include/errno.h"
@@ -66,16 +67,16 @@ void embk_blkstat_reset(void) {
 }
 void embk_blkstat_get(struct embk_blkstat *out) { if (out) *out = blkstat; }
 
-// Microseconds, straight off the HPET. Only used to attribute wall time to the
-// device, so a 0 on a machine without an HPET just makes the attribution empty
-// rather than wrong.
+/* Microseconds, from drivers/timer/timer.h's high-resolution clock.
+ *
+ * Was a direct HPET read, which is an x86 device -- and this file is about
+ * block devices, not about which timer a machine happens to have. time_get_us()
+ * is the same clock on x86 (the TSC, calibrated against the HPET at boot) and
+ * the architectural counter on aarch64, and both already implement it. Only
+ * used to attribute wall time to the device, so a zero just makes the
+ * attribution empty rather than wrong. */
 static uint64_t blk_now_us(void) {
-    if (!hpet_available()) return 0;
-    uint64_t pf = hpet_period_fs();               // femtoseconds per tick
-    if (!pf) return 0;
-    uint64_t tpus = 1000000000ULL / pf;           // ticks per microsecond
-    if (tpus == 0) tpus = 1;
-    return hpet_read_counter() / tpus;
+    return time_get_us();
 }
 
 // Does `buf` satisfy `dev`'s DMA constraints?

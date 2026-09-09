@@ -159,3 +159,14 @@ uint64_t time_get_ns(void) {
 }
 
 uint64_t time_get_us(void) { return time_get_ns() / 1000ULL; }
+
+/* timer.h's portable delay, straight off the architectural counter -- no
+ * second device needed, which is the same collapse the file comment describes:
+ * one timer does every job x86 spreads over three. */
+void timer_delay_ms(uint32_t ms) {
+    if (!timer_freq)
+        return;
+    uint64_t target = cntvct() + ((uint64_t)ms * timer_freq) / 1000ULL;
+    while ((int64_t)(cntvct() - target) < 0)
+        __asm__ volatile("yield" ::: "memory");
+}

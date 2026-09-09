@@ -408,7 +408,21 @@ enable_mmu:
     .bss
     .balign 16
 __stack_bottom:
-    .space 16384
+    /* 64 KiB, not 16.
+     *
+     * The kernel's own boot path was fine on 16 KiB right up until the real
+     * filesystem was linked in: EMBKFS walks a B-tree recursively during
+     * mount, and that walk plus kprintf's formatter is far deeper than
+     * anything the bring-up code did. The overflow ran off the bottom of the
+     * stack into the .bss immediately below it -- which is where the initial
+     * PAGE TABLES live -- and the symptom was the first context switch after
+     * the mount jumping somewhere unmapped, nowhere near the corruption.
+     *
+     * There is no guard page here because this stack exists before the MMU
+     * does. Threads created later get vmm_alloc_kernel_stack(), which puts an
+     * unmapped page below each one and turns exactly this bug into an
+     * immediate, named translation fault. */
+    .space 65536
     .globl __stack_top
 __stack_top:
 

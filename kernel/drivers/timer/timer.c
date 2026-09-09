@@ -137,3 +137,9 @@ uint64_t timer_uptime_ms(void) {
 uint64_t timer_sched_ticks(void) {
     return lapic_timer_get_ticks();
 }
+
+/* timer.h's portable delay. On x86 the PIT is the thing that can busy-wait a
+ * known interval without an interrupt. */
+void timer_delay_ms(uint32_t ms) {
+    pit_delay_ms(ms);
+}

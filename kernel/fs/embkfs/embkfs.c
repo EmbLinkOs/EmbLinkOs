@@ -1,4 +1,5 @@
 #include "fs/embkfs/embkfs.h"
+#include "drivers/timer/timer.h"
 #include "fs/embkfs/crc32c.h"
 #include "block/block.h"
 #include "block/partition.h"   /* embk_partition_parent — reach a volume's disk MBR */
@@ -76,16 +77,13 @@ static struct wait_queue g_fs_wq;       /* zero-init = empty */
  * `wait_us` is the wall time they spent blocked. */
 static struct embkfs_lockstat g_lockstat;
 
-/* Same shape as block.c's blk_now_us: the HPET is the only wall clock here,
- * and a machine without one just reports 0 rather than a fabricated number. */
+/* Same shape as block.c's blk_now_us, and for the same reason it changed: this
+ * wants MICROSECONDS, not an HPET. drivers/timer/timer.h's clock is the TSC on
+ * x86 and the architectural counter on aarch64, and a machine without one
+ * reports 0 rather than a fabricated number. */
 static uint64_t fs_now_us(void)
 {
-    if (!hpet_available()) return 0;
-    uint64_t pf = hpet_period_fs();
-    if (!pf) return 0;
-    uint64_t tpus = 1000000000ULL / pf;
-    if (tpus == 0) tpus = 1;
-    return hpet_read_counter() / tpus;
+    return time_get_us();
 }
 
 void embkfs_lockstat_get(struct embkfs_lockstat *out) { if (out) *out = g_lockstat; }
@@ -6435,7 +6433,7 @@ static int embkfs_run_timestamp_selftests_impl(void)
      * would make "did the parent's mtime advance" indistinguishable from
      * "did nothing happen" by timestamp alone. Same reasoning as the delay
      * before the write step further down. */
-    pit_delay_ms(500); pit_delay_ms(500); pit_delay_ms(500); pit_delay_ms(500);
+    timer_delay_ms(500); timer_delay_ms(500); timer_delay_ms(500); timer_delay_ms(500);
 
     rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstts/f", &file_oid);
     if (rc != EMBK_OK) { kprintf("EMBKFS: %s: timestamps: create failed: %s\n", vol->dev->name, embk_strerror(rc)); return rc; }
@@ -6475,7 +6473,7 @@ static int embkfs_run_timestamp_selftests_impl(void)
 
     /* Wait out the RTC's own 1-second resolution, then write real content. */
     if (ok) {
-        pit_delay_ms(500); pit_delay_ms(500); pit_delay_ms(500); pit_delay_ms(500);
+        timer_delay_ms(500); timer_delay_ms(500); timer_delay_ms(500); timer_delay_ms(500);
         static const uint8_t data[] = { 'h', 'i' };
         rc = embkfs_write_object(vol, file_oid, data, sizeof data);
         if (rc != EMBK_OK) { kprintf("EMBKFS: %s: timestamps: write failed: %s\n", vol->dev->name, embk_strerror(rc)); ok = false; }

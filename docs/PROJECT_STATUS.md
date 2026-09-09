@@ -48,7 +48,9 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   A5 then ran an aarch64 program at EL0 through those same neutral handlers.
   With the first HAL piece extracted (`kernel/include/arch_irq.h`), **61 of the
   76 shared kernel files -- 31,465 lines -- compile for aarch64**; eleven of the
-  fourteen that do not are x86 drivers for hardware ARM does not have. The
+  fourteen that do not are x86 drivers for hardware ARM does not have. **The
+  whole shared kernel links and runs on aarch64**, mounting a real EMBKFS image
+  over virtio-blk and reading files out of it. The
   shared kernel heap (`kernel/mm/kheap.c`, slabs and canaries and all) runs
   unchanged on aarch64, and all 3,700 lines of `kernel/process/process.c` --
   the scheduler -- compile for it with zero inline assembly left in them.

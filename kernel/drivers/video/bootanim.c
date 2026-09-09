@@ -1,4 +1,5 @@
 #include "drivers/video/bootanim.h"
+#include "drivers/timer/timer.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/video/font_8x16.h"
 #include "drivers/timer/pit.h"
@@ -269,7 +270,7 @@ static bool animate_route_signal(const struct route *r,
             draw_brush(x, y, TRACE_HALF + 1, pulse_r, pulse_g, pulse_b);
             draw_via_glow_set(vias, nvias, ((i / STEP_STRIDE) & 1) != 0);
             fb_present();
-            pit_delay_ms(STEP_DELAY_MS);
+            timer_delay_ms(STEP_DELAY_MS);
             draw_brush(x, y, TRACE_HALF + 1, copper_r, copper_g, copper_b);
             if (check_skip()) return true;
         }
@@ -361,7 +362,7 @@ void boot_animation(void)
     if (!skipped) skipped = animate_route_signal(&out_mid, layer_vias, via_count);
     if (!skipped) skipped = animate_route_signal(&out_bot, layer_vias, via_count);
 
-    if (!skipped) pit_delay_ms(350);
+    if (!skipped) timer_delay_ms(350);
 
     if (skipped) {
         draw_board_background();
@@ -375,6 +376,6 @@ void boot_animation(void)
             draw_cross_layer_via(layer_vias[i].x, layer_vias[i].y);
         draw_emblinkos(scale);
         fb_present();
-        pit_delay_ms(120);
+        timer_delay_ms(120);
     }
 }

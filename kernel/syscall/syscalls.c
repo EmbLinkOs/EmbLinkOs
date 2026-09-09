@@ -1309,18 +1309,12 @@ static int64_t sys_key_grab(const struct sysargs *a) {
     return 0;
 }
 
-/* Monotonic milliseconds since boot, from the HPET counter -- the clock the
- * ring-3 UI animator ticks on. Falls back to the coarse timer tick count. */
+/* Monotonic milliseconds since boot -- the clock the ring-3 UI animator ticks
+ * on. timer_uptime_ms() is exactly this on both architectures (the HPET behind
+ * a TSC on x86, the architectural counter on aarch64), and naming the device
+ * here was the only thing that made this function x86-specific. */
 static uint64_t uptime_ms_now(void) {
-    if (hpet_available()) {
-        uint64_t pf = hpet_period_fs();                 /* femtoseconds per tick */
-        if (pf) {
-            uint64_t tpms = 1000000000000ULL / pf;      /* ticks per millisecond */
-            if (tpms == 0) tpms = 1;
-            return hpet_read_counter() / tpms;
-        }
-    }
-    return timer_get_ticks();
+    return timer_uptime_ms();
 }
 
 static int64_t sys_uptime_ms(const struct sysargs *a) {

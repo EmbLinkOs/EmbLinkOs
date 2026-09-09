@@ -50,3 +50,8 @@ bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void)) {
     irq_register(line, handler);
     return true;
 }
+
+uint32_t arch_pci_irq_line(const struct pci_device *dev) {
+    uint8_t line = pci_read8(dev->bus, dev->device, dev->function, PCI_INTERRUPT_LINE);
+    return (line < 16) ? line : 0;
+}

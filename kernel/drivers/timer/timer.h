@@ -20,6 +20,12 @@ uint64_t timer_get_ticks(void);
  * the two are equal -- which is exactly why this needed to be a named seam
  * rather than an assumption that they always are. */
 uint64_t timer_sched_ticks(void);
+
+/* Busy-wait for `ms` milliseconds. For device bring-up sequences that have to
+ * observe a spec'd settle time before the scheduler exists (or while holding a
+ * lock that forbids sleeping). Was `pit_delay_ms` at every call site, which
+ * named an x86 device in code that only wanted a delay. */
+void timer_delay_ms(uint32_t ms);
 /* Monotonic milliseconds since boot (HPET where available, coarse ticks
  * otherwise). The clock both the ring-3 UI animator and the compositor's own
  * window motion run on. */

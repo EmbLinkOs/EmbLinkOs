@@ -22,7 +22,7 @@ ARM_LINKER  := kernel/arch/aarch64/boot/linker.ld
 ARM_ASM_SRC := kernel/arch/aarch64/boot/boot.S \
                kernel/arch/aarch64/irq/vectors.S \
                kernel/arch/aarch64/cpu/kcontext.S \
-               kernel/arch/aarch64/syscall/el0_probe_blob.S
+
 # The aarch64-specific sources...
 ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/boot/fdt.c \
@@ -32,6 +32,8 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/sched/bringup.c \
                kernel/arch/aarch64/drivers/timer_generic.c \
                kernel/arch/aarch64/drivers/pci_ecam.c \
+               kernel/arch/aarch64/drivers/pl031.c \
+               kernel/arch/aarch64/drivers/absent.c \
                kernel/arch/aarch64/cpu/spinlock.c \
                kernel/arch/aarch64/cpu/arch_thread.c \
                kernel/arch/aarch64/cpu/percpu.c \
@@ -39,8 +41,6 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/mm/pmm_arch.c \
                kernel/arch/aarch64/mm/usercopy.c \
                kernel/arch/aarch64/syscall/syscall.c \
-               kernel/arch/aarch64/syscall/usermode.c \
-               kernel/arch/aarch64/syscall/bringup_syscalls.c \
                kernel/arch/aarch64/drivers/pl011.c
 
 # ...and the SHARED kernel, compiled for a second architecture with no #ifdef
@@ -50,12 +50,67 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
 # a build question -- the answer is usually an arch hook, as pmm.c's
 # arch_pmm_reserve_fixed() ended up being.
 ARM_SHARED_SRC := kernel/mm/pmm.c \
-                  kernel/drivers/bus/pci.c \
                   kernel/mm/kheap.c \
                   kernel/mm/kmalloc.c \
                   kernel/lib/kprintf.c \
                   kernel/lib/kstring.c \
-                  kernel/lib/errno.c
+                  kernel/lib/errno.c \
+                  kernel/lib/ksym.c \
+                  kernel/drivers/bus/pci.c \
+                  kernel/drivers/storage/virtio_blk.c \
+                  kernel/block/block.c \
+                  kernel/block/partition.c \
+                  kernel/process/process.c \
+                  kernel/process/ksync.c \
+                  kernel/process/debug.c \
+                  kernel/loader/elf.c \
+                  kernel/loader/embx.c \
+                  kernel/syscall/syscalls.c \
+                  kernel/fs/vfs.c \
+                  kernel/fs/fd.c \
+                  kernel/fs/namespace.c \
+                  kernel/fs/epfs.c \
+                  kernel/fs/embkfs/embkfs.c \
+                  kernel/fs/embkfs/embkfs_compress.c \
+                  kernel/fs/embkfs/crc32c.c \
+                  kernel/fs/embkfs/embk_vfs.c \
+                  kernel/fs/fat32.c \
+                  kernel/ipc/handle.c \
+                  kernel/ipc/channel.c \
+                  kernel/ipc/clipboard.c \
+                  kernel/ipc/endpoint.c \
+                  kernel/ipc/pipe.c \
+                  kernel/gfx/surface.c \
+                  kernel/gfx/compositor.c \
+                  kernel/kworker/kworker.c \
+                  kernel/tty/tty.c \
+                  kernel/acpi/acpi.c \
+                  kernel/drivers/audio/audio.c \
+                  kernel/crypto/sha256.c \
+                  kernel/crypto/hmac.c \
+                  kernel/crypto/pbkdf2.c \
+                  kernel/crypto/aes.c \
+                  kernel/crypto/xts.c \
+                  user/lib/tls/crypto/hkdf.c \
+                  user/lib/tls/crypto/gcm.c \
+                  user/lib/tls/crypto/x25519.c \
+                  user/lib/tls/crypto/selftest.c \
+                  kernel/drivers/video/framebuffer.c \
+                  kernel/drivers/video/console.c \
+                  kernel/drivers/video/font_8x16.c \
+                  kernel/drivers/video/gpu.c \
+                  kernel/drivers/video/bootanim.c \
+                  kernel/drivers/video/virtio_gpu.c \
+                  kernel/net/net.c \
+                  kernel/net/virtio_net.c \
+                  kernel/net/ethernet/eth.c \
+                  kernel/net/ethernet/arp.c \
+                  kernel/net/ip/ipv4.c \
+                  kernel/net/ip/icmp.c \
+                  kernel/net/udp/udp.c \
+                  kernel/net/dhcp/dhcp.c \
+                  kernel/net/dns/dns.c \
+                  kernel/net/tcp/tcp.c
 
 # Coarse on purpose, exactly as $(KERNEL_HDRS) is on the x86 side: one
 # compile, no per-TU depfiles, so a header-only change must rebuild it all.
@@ -99,28 +154,10 @@ ARM_CFLAGS  = -ffreestanding -nostdlib -nostartfiles \
 $(ARM_BUILD):
 	mkdir -p $(ARM_BUILD)
 
-# --- the EL0 probe ----------------------------------------------------------
-# User code, so it is built SEPARATELY from the kernel and embedded as bytes:
-# it is linked at address 0 and mapped wherever the kernel decides, which is
-# exactly what an ordinary kernel object file cannot be. Same shape as the x86
-# side's AP trampoline blob.
-#
-# -Ttext=0 rather than the kernel's link address, and -nostdlib because there
-# is no libc for this architecture until A6 -- which is the whole reason this
-# program is hand-written assembly.
-ARM_PROBE_SRC := kernel/arch/aarch64/syscall/el0_probe.S
-ARM_PROBE_BIN := $(ARM_BUILD)/el0_probe.bin
-
-$(ARM_PROBE_BIN): $(ARM_PROBE_SRC) | $(ARM_BUILD)
-	$(AARCH64_CC) -ffreestanding -nostdlib -nostartfiles \
-	    -Wl,-Ttext=0 -Wl,--build-id=none -Wl,-e,_probe_start \
-	    -o $(ARM_BUILD)/el0_probe.elf $<
-	$(AARCH64_OBJCOPY) -O binary $(ARM_BUILD)/el0_probe.elf $@
-	@echo "aarch64: EL0 probe is $$($(STATSZ) $@) bytes"
 
 # One compile, like the x86 kernel: every header is a prerequisite because
 # there are no per-TU depfiles to consult. Same reasoning as $(KERNEL_HDRS).
-$(ARM_ELF): $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) $(ARM_PROBE_BIN) | $(ARM_BUILD)
+$(ARM_ELF): $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_BUILD)
 	$(AARCH64_CC) $(ARM_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC)
 
 # The flat Image. QEMU boots the ELF directly, so this is not on the run path
@@ -239,12 +276,16 @@ test-arm64-boot: $(ARM_IMG)
 	@overall=0; \
 	for acc in $(ARM_TEST_ACCELS); do \
 	  case $$acc in \
-	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=8;;  \
-	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=15;; \
+	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=15;;  \
+	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=40;; \
 	  esac; \
 	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \
 	  echo "=== $$acc ==="; \
-	  $$qcmd -display none -serial file:$$log -kernel $(ARM_IMG) 2>/dev/null & \
+	  disk=""; \
+	  if [ -f embkfs.img ]; then \
+	    disk="-drive file=embkfs.img,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0"; \
+	  fi; \
+	  $$qcmd $$disk -display none -serial file:$$log -kernel $(ARM_IMG) 2>/dev/null & \
 	  qpid=$$!; sleep $$secs; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
 	  fail=0; \
 	  chk() { grep -q "$$1" $$log || { echo "FAIL($$2): $$3"; fail=1; }; }; \
@@ -270,12 +311,14 @@ test-arm64-boot: $(ARM_IMG)
 	  chk 'pci: ECAM at'                   A7 'the PCIe host bridge was not found in the device tree'; \
 	  chk 'Network controller'             A7 'PCIe enumeration found no virtio device'; \
 	  chk 'pci: assigned'                  A7 'no BAR was assigned -- there is no firmware to do it here'; \
+	  if [ -f embkfs.img ]; then \
+	    chk 'virtio-blk: sda'              A7 'the virtio-blk device did not come up'; \
+	    chk 'written and read back'        A7 'the disk failed a write/read round trip'; \
+	    chk 'EMBKFS: sda: mounted'         A7 'the real filesystem did not mount'; \
+	    chk 'ELF magic intact'             A7 'could not read a file out of the mounted image'; \
+	  fi; \
 	  chk 'distinct line'                  A7 'PCI interrupt routing was not exercised'; \
 	  chk 'all reclaimed'                  A6 'destroying an address space leaks pages'; \
-	  chk 'hello from EL0'                 A5 'user code never ran at EL0'; \
-	  chk 'REFUSED write'                  A5 'the kernel accepted an unmapped user pointer'; \
-	  chk 'exited with 42'                 A5 'the exit argument did not survive the trip to a handler'; \
-	  chk 'A5 reached'                     A5 'did not reach the end of arch_early_main'; \
 	  n=$$(grep -c 'matches KV2P' $$log); \
 	    [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
 	  if grep -q 'MISMATCH' $$log; then echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
@@ -294,9 +337,8 @@ test-arm64-boot: $(ARM_IMG)
 	  echo "  A1 vectors, ESR/FAR decode, recovery"; \
 	  echo "  A2 higher half, DTB memory map, pmm, section permissions, no identity map"; \
 	  echo "  A3 GICv3, generic timer, preemptive context switching"; \
-	  echo "  A5 EL0, svc, user-pointer boundary, arch-neutral handlers"; \
 	  echo "  A6 the shared kernel heap, per-process address spaces, clean teardown"; \
-	  echo "  A7 PCIe ECAM: enumeration and BAR assignment (no firmware to do it)"; \
+	  echo "  A7 PCIe ECAM, virtio-blk, and the REAL filesystem mounted + read"; \
 	else exit 1; fi
 
 .PHONY: check-tools-arm64

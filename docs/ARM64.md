@@ -5,7 +5,26 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A5 done, A7 begun.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
+**Status: A0–A7. The real kernel runs on ARM and mounts the real filesystem.**
+
+**The whole shared kernel links and runs on aarch64** — the real scheduler, the
+real 95-handler syscall table, EMBKFS, the VFS, IPC, the compositor and the
+network stack, 495 KB of text — and it **mounts a real EMBKFS image over
+virtio-blk and reads a file out of it**:
+
+```
+virtio-blk: sda, 262144 sectors (128 MiB), queue 64, polled
+  [ ok ] sda: 512 bytes written and read back byte-for-byte
+EMBKFS: sda: mounted  v1.0  block_size 4096  blocks 32768  free 15409
+EMBKFS: sda: allocator built: 17359 used, 15409 free  (superblock says 15409)  -- OK
+VFS: mounted fs at "/" (root ino 1)
+  [ ok ] /system/bin/init.elf: 4 bytes, ELF magic intact
+```
+
+That image was built by the x86 toolchain and never touched. The B-tree walk,
+the directory lookup, the extent map, the block layer, virtio-blk, PCI and ECAM
+all agree with it.
+ An aarch64 kernel builds, boots on QEMU `virt`, decodes
 its own faults, runs in the higher half with the MMU on — page tables built in
 assembly before any allocator exists, memory map from the device tree,
 `kernel/mm/pmm.c` (the *existing, shared* allocator) running unmodified,

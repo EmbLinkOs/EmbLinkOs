@@ -1742,7 +1742,28 @@ substantially complete.
       ITS: a command queue, a device table and interrupt-translation tables.
       Do it when a driver actually needs more than one interrupt source, not
       before.
-    - [ ] **28 undefined symbols remain, and every one is a device driver** for
+    - [x] ~~undefined driver symbols~~ — **the whole shared kernel links and
+      runs on aarch64, and mounts a real EMBKFS image over virtio-blk.**
+      virtio-blk (new, shared, polled) gives it a disk; a real PL031 driver
+      gives it a wall clock; `arch/aarch64/drivers/absent.c` answers "no such
+      device" for the PS/2 keyboard and mouse, AC'97 and bochs VGA.
+    - [ ] **Replace `absent.c` entry by entry as virtio drivers land**, and
+      DELETE each entry when its driver arrives — a leftover definition there
+      would silently win at link time over the real one. virtio-input is the
+      one that matters first: without it the ARM machine has no keyboard.
+    - [ ] **virtio-blk is polled and sets `VRING_AVAIL_F_NO_INTERRUPT`.** Fine
+      at one outstanding request; an interrupt-driven version needs a wait
+      queue and buys nothing until requests overlap.
+    - [ ] **The virtio-PCI capability walk is now written THREE times**
+      (virtio_net.c, virtio_gpu.c, virtio_blk.c). Factor it into a shared
+      virtio-pci transport when a fourth appears, not before.
+    - [ ] **A diagnostic must not arm anything.** The boot-time PCI routing
+      check used to register a do-nothing handler on every device's line; once
+      virtio-blk was configured it asserted a level-triggered INTx that nothing
+      cleared, and the kernel wedged in an interrupt storm before the scheduler
+      ran once. `arch_pci_irq_line()` (resolve) is now separate from
+      `arch_pci_irq_connect()` (arm). Keep them separate.
+    - [ ] ~~28 undefined symbols remain, and every one is a device driver~~ for
       hardware QEMU `virt` does not have: `keyboard_*` (9, PS/2), `ac97_*` (9),
       `mouse_*` (3), `rtc_*`, `pit_*`, `uhci_*`, `bochs_*`, `ioapic_*`,
       `irq_register`. Their replacements are the rest of A7: virtio-input,

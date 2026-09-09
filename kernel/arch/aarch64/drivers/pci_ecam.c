@@ -215,7 +215,7 @@ static void pci_intx_trampoline(uint32_t intid) {
  * (SPI 3 + (slot + pin - 1) % 4), is the difference between a driver that
  * works on this board and one that works on the board.
  */
-bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void)) {
+uint32_t arch_pci_irq_line(const struct pci_device *dev) {
     fdt_node_t n = fdt_find_compatible("pci-host-ecam-generic");
     if (n == FDT_NONE)
         return false;
@@ -226,7 +226,7 @@ bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void)) {
     if (!map || !mask || klen < 16) {
         kprintf("pci: host bridge has no interrupt-map; %d:%d.%d cannot interrupt\n",
                 dev->bus, dev->device, dev->function);
-        return false;
+        return 0;
     }
 
     /* Every one of these comes from the tree. See the note above on why
@@ -244,12 +244,12 @@ bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void)) {
     if (child_ac < 1 || child_ic < 1 || parent_ic < 2 || stride_cells > 32) {
         kprintf("pci: interrupt-map cell counts look wrong (%d/%d/%d/%d)\n",
                 (int)child_ac, (int)child_ic, (int)parent_ac, (int)parent_ic);
-        return false;
+        return 0;
     }
 
     uint8_t pin = pci_read8(dev->bus, dev->device, dev->function, PCI_INTERRUPT_PIN);
     if (pin == 0 || pin > 4)
-        return false;                     /* the device declares no INTx pin */
+        return 0;                         /* the device declares no INTx pin */
 
     /* The child key this device presents, masked the way the bridge asks. */
     uint32_t phys_hi = ((uint32_t)dev->bus << 16) |
@@ -270,30 +270,35 @@ bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void)) {
         /* The GIC's own interrupt specifier: {type, number, flags}. */
         uint32_t type   = be32_at(e + pirq_off);
         uint32_t number = be32_at(e + pirq_off + 4);
-        uint32_t intid  = gic_intid(type, number);
-
-        if (intx_used >= MAX_INTX) {
-            kprintf("pci: too many INTx handlers\n");
-            return false;
-        }
-        intx[intx_used].intid = intid;
-        intx[intx_used].fn    = handler;
-        intx_used++;
-
-        /* Shared line: several devices can land on the same SPI, and the
-         * trampoline calls whichever of them registered it. Registering twice
-         * for one INTID is harmless -- gic_register is idempotent about
-         * enabling. */
-        gic_register(intid, pci_intx_trampoline, "pci INTx");
         kprintf("pci: %d:%d.%d INT%c -> %s %d (INTID %d) [from the device tree]\n",
                 dev->bus, dev->device, dev->function, 'A' + pin - 1,
-                type == GIC_TYPE_PPI ? "PPI" : "SPI", (int)number, (int)intid);
-        return true;
+                type == GIC_TYPE_PPI ? "PPI" : "SPI", (int)number,
+                (int)gic_intid(type, number));
+        return gic_intid(type, number);
     }
 
     kprintf("pci: no interrupt-map entry for %d:%d.%d INT%c\n",
             dev->bus, dev->device, dev->function, 'A' + pin - 1);
-    return false;
+    return 0;
+}
+
+bool arch_pci_irq_connect(const struct pci_device *dev, void (*handler)(void)) {
+    uint32_t intid = arch_pci_irq_line(dev);
+    if (!intid || !handler)
+        return false;
+
+    if (intx_used >= MAX_INTX) {
+        kprintf("pci: too many INTx handlers\n");
+        return false;
+    }
+    intx[intx_used].intid = intid;
+    intx[intx_used].fn    = handler;
+    intx_used++;
+
+    /* Shared line: several devices can land on the same SPI, and the
+     * trampoline calls whichever of them registered it. */
+    gic_register(intid, pci_intx_trampoline, "pci INTx");
+    return true;
 }
 
 /* How many DISTINCT interrupt lines the routed devices ended up on.
