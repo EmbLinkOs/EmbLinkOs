@@ -6,8 +6,40 @@
 
 
 // Configuration space registers(port)
+/* x86's configuration-space access ports. Kept for that architecture's
+ * implementation; nothing portable may use them. */
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
+
+/* --- the only three architecture-specific things about PCI -----------------
+ *
+ * Everything else in this driver -- enumeration, BAR sizing, the capability
+ * walk, bus mastering -- is built on 32-bit configuration reads and writes and
+ * is the same on every machine. Only HOW a config read reaches the bus differs:
+ *
+ *   x86_64   writes an address to port 0xCF8 and reads port 0xCFC. Two I/O
+ *            instructions, and a lock would be needed if two cores ever did it
+ *            at once.
+ *   aarch64  has ECAM: configuration space is simply MEMORY, at
+ *            base + (bus<<20 | device<<15 | function<<12 | offset). A plain
+ *            load. There are no I/O ports on this architecture at all.
+ *
+ * The third is the MSI message itself, which is not a format at all but an
+ * address to write to: on x86 it is the local APIC's doorbell
+ * (0xFEE00000 | apic_id<<12) with the vector as data; on aarch64 it is the
+ * GIC ITS's translater register with an EventID. Those have nothing in common
+ * beyond "a write that raises an interrupt", so the message is asked for
+ * rather than computed. */
+uint32_t arch_pci_cfg_read32 (uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
+void     arch_pci_cfg_write32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset,
+                              uint32_t value);
+
+/* Fill in the address to write and the value to write there so that writing it
+ * delivers `vector` to `cpu_id`. Returns false if this machine has no way to
+ * do that yet, in which case the caller must use a legacy interrupt line --
+ * which is why pci_enable_msi() has always been allowed to fail. */
+bool arch_pci_msi_message(uint8_t vector, uint32_t cpu_id,
+                          uint64_t *out_addr, uint32_t *out_data);
 
 // Common config space offsets
 #define PCI_VENDOR_ID    0x00
@@ -73,6 +105,20 @@ struct pci_bar pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, uint8
 
  // Enumerate all PCI devices, fill internal table, print them
  void pci_init();
+
+/* Assign addresses to every BAR that has none, out of the given MMIO window,
+ * and enable memory decoding on the devices that get one.
+ *
+ * NOT CALLED ON x86, and that is the interesting part: there, firmware has
+ * already programmed every BAR before the kernel runs, so the addresses read
+ * back are real and this would be actively harmful. On a machine booted with
+ * `-kernel` there is no firmware at all -- the BARs read back as zero, the
+ * device decodes nothing, and any driver that maps BAR0 maps physical address
+ * zero. The kernel has to be its own PCI resource allocator.
+ *
+ * `window_base`/`window_size` describe host physical addresses the host bridge
+ * forwards to the bus; on aarch64 they come from the device tree's `ranges`. */
+void pci_assign_resources(uint64_t window_base, uint64_t window_size);
 
  // Access the discovered PCI devices table
  uint32_t pci_devices_count(void);

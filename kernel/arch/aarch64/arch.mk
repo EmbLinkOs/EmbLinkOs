@@ -31,6 +31,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/irq/gicv3.c \
                kernel/arch/aarch64/sched/bringup.c \
                kernel/arch/aarch64/drivers/timer_generic.c \
+               kernel/arch/aarch64/drivers/pci_ecam.c \
                kernel/arch/aarch64/cpu/spinlock.c \
                kernel/arch/aarch64/cpu/arch_thread.c \
                kernel/arch/aarch64/cpu/percpu.c \
@@ -49,6 +50,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
 # a build question -- the answer is usually an arch hook, as pmm.c's
 # arch_pmm_reserve_fixed() ended up being.
 ARM_SHARED_SRC := kernel/mm/pmm.c \
+                  kernel/drivers/bus/pci.c \
                   kernel/mm/kheap.c \
                   kernel/mm/kmalloc.c \
                   kernel/lib/kprintf.c \
@@ -265,6 +267,9 @@ test-arm64-boot: $(ARM_IMG)
 	  chk 'spurious: 0'                    A3 'the GIC delivered spurious interrupts'; \
 	  chk 'kmalloc/kfree across 5 size'    A6 'the shared kernel heap does not work here'; \
 	  chk 'in one space and'               A6 'address spaces are not isolated from each other'; \
+	  chk 'pci: ECAM at'                   A7 'the PCIe host bridge was not found in the device tree'; \
+	  chk 'Network controller'             A7 'PCIe enumeration found no virtio device'; \
+	  chk 'pci: assigned'                  A7 'no BAR was assigned -- there is no firmware to do it here'; \
 	  chk 'all reclaimed'                  A6 'destroying an address space leaks pages'; \
 	  chk 'hello from EL0'                 A5 'user code never ran at EL0'; \
 	  chk 'REFUSED write'                  A5 'the kernel accepted an unmapped user pointer'; \
@@ -274,6 +279,7 @@ test-arm64-boot: $(ARM_IMG)
 	    [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
 	  if grep -q 'MISMATCH' $$log; then echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
 	  if grep -q '\[FAIL\]' $$log; then echo "FAIL: a self-test case reported failure"; fail=1; fi; \
+	  if grep -q 'DID NOT TAKE' $$log; then echo "FAIL(A7): a BAR write did not stick"; fail=1; fi; \
 	  if [ $$fail -ne 0 ]; then \
 	    echo "--- serial ($$acc) ---"; cat $$log; echo "--- end ---"; overall=1; \
 	  else \
@@ -289,6 +295,7 @@ test-arm64-boot: $(ARM_IMG)
 	  echo "  A3 GICv3, generic timer, preemptive context switching"; \
 	  echo "  A5 EL0, svc, user-pointer boundary, arch-neutral handlers"; \
 	  echo "  A6 the shared kernel heap, per-process address spaces, clean teardown"; \
+	  echo "  A7 PCIe ECAM: enumeration and BAR assignment (no firmware to do it)"; \
 	else exit 1; fi
 
 .PHONY: check-tools-arm64

@@ -5,7 +5,7 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A5 done.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
+**Status: A0–A5 done, A7 begun.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
 its own faults, runs in the higher half with the MMU on — page tables built in
 assembly before any allocator exists, memory map from the device tree,
 `kernel/mm/pmm.c` (the *existing, shared* allocator) running unmodified,
@@ -770,8 +770,49 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
 * **A6 ❌ Userland toolchain.** newlib for aarch64, `EM_AARCH64` + the
   `R_AARCH64_*` relocations mirroring today's `R_X86_64_*` set, `libembk.so`.
   **Done when:** a dynamically-linked EmUI app loads.
-* **A7 ❌ virtio on ECAM.** PCIe ECAM probe + virtio-mmio; reuse virtio-gpu/net
-  as-is. **Done when:** the compositor presents a frame on `virt`.
+* **A7 ◐ virtio on ECAM.** PCIe ECAM probe done; drivers next. **Done when:**
+  the compositor presents a frame on `virt`.
+
+  `arch/aarch64/drivers/pci_ecam.c`. The bus enumerates and its devices are
+  addressable:
+
+  ```
+  pci: ECAM at 0x4010000000 (256 MiB) [from the device tree]
+  PCI 0:0.0 1b36:8    [6.0.0] Bridge device
+  PCI 0:1.0 1af4:1001 [1.0.0] Mass storage controller
+  PCI 0:2.0 1af4:1000 [2.0.0] Network controller
+  pci: 32-bit MMIO window 0x10000000 + 751 MiB [from the device tree]
+  pci: 0:1.0 BAR4 -> 0x10000000 (16384 bytes)
+  pci: 0:2.0 BAR4 -> 0x10004000 (16384 bytes)
+  ```
+
+  **`drivers/bus/pci.c` needed three seams and nothing else.** Enumeration, BAR
+  sizing, the capability walk and bus mastering are all built on 32-bit config
+  reads and writes, and only *how a config access reaches the bus* differs:
+
+  | | x86_64 | aarch64 |
+  |---|---|---|
+  | config access | write port `0xCF8`, read `0xCFC` | **ECAM: it is memory**, `base + (bus<<20 \| dev<<15 \| fn<<12 \| off)` |
+  | MSI message | LAPIC doorbell `0xFEE00000 \| apic<<12` | the GIC ITS translater — **not implemented, returns false** |
+
+  ECAM is not merely different, it is *better*: a config read is a load, needs
+  no lock, and cannot race the way a two-port address-then-data sequence can.
+
+  Two things worth recording:
+  1. **There is no firmware, so the kernel is its own PCI resource allocator.**
+     Every BAR read back as **zero**. On x86 the BIOS programs them before the
+     kernel exists; booting with `-kernel` on `virt` there is nobody to do it,
+     the device decodes nothing, and a driver mapping BAR0 would map physical
+     address zero. `pci_assign_resources()` walks the 32-bit MMIO window out of
+     the host bridge's `ranges` and places each BAR on its own size boundary
+     (which is not a convention — the device compares high address bits, so a
+     BAR of size N can only sit on an N boundary), then enables Memory Space
+     **and Bus Master**, without which a virtio device cannot complete a single
+     DMA. It is deliberately not called on x86.
+  2. **The assignment is read back.** A BAR's low bits are read-only, so what
+     the device kept is not necessarily what was written; the code checks and
+     prints `*** DID NOT TAKE ***` rather than trusting the write. The
+     acceptance test fails on that string.
 * **A8 ❌ EMBX `machine = 2`.** The spec already reserves it.
 * **A9 ❌ SMP via PSCI.** Last, deliberately — the x86 SMP work says per-CPU
   structures are the hard part, and those are already written.

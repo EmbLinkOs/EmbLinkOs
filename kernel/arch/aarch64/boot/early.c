@@ -7,6 +7,7 @@
 #include "arch/aarch64/sched/bringup.h"
 #include "arch/aarch64/syscall/usermode.h"
 #include "drivers/timer/timer.h"
+#include "drivers/bus/pci.h"
 #include "boot/boot_protocol.h"
 #include "mm/pmm.h"
 #include "mm/kheap.h"
@@ -415,6 +416,14 @@ void arch_early_main(uint64_t dtb_phys) {
         for (;;) __asm__ volatile("wfi");
     }
 
+    /* --- A7: the PCIe bus ---------------------------------------------------
+     * Before the scheduler starts, so the enumeration is not interleaved with
+     * preemption output. The existing virtio-gpu and virtio-net drivers are
+     * virtio-over-PCI, so this bus is what makes them reachable here at all. */
+    kprintf("\n--- PCIe ---\n");
+    pci_init();
+    { extern void pci_ecam_assign_resources(void); pci_ecam_assign_resources(); }
+
     bringup_sched_init();
 
     /* The scheduler runs on the way OUT of an interrupt, after the EOI, not
@@ -434,6 +443,9 @@ void arch_early_main(uint64_t dtb_phys) {
     arch_irq_enable();
     kprintf("sched: interrupts enabled -- preemption starts here\n\n");
 
+    /* --- A7: the PCIe bus ---------------------------------------------------
+     * The existing virtio-gpu and virtio-net drivers are virtio-over-PCI, so
+     * enumerating this bus is what makes them available here at all. */
     selftest_preemption();
 
     /* --- A5: user mode ----------------------------------------------------- */

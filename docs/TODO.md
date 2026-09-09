@@ -1724,11 +1724,22 @@ substantially complete.
       shared files link against the aarch64 tree; `process.c`, `syscalls.c`,
       `fs/`, `ipc/`, `gfx/`, `net/`, `block/` and the loaders resolve
       completely.
-    - [ ] **37 undefined symbols remain, and every one is a device driver** for
-      hardware QEMU `virt` does not have: `pci_*` (9, port-CF8 config space),
-      `keyboard_*` (9, PS/2), `ac97_*` (9), `mouse_*` (3), `rtc_*`, `pit_*`,
-      `uhci_*`, `bochs_*`, `ioapic_*`, `irq_register`. Their replacements are
-      A7: PCIe ECAM, virtio-input, virtio-blk, virtio-snd. **Do not stub them
+    - [x] ~~`pci_*` (9 symbols)~~ — **done.** `drivers/bus/pci.c` needed three
+      seams (`arch_pci_cfg_read32`, `arch_pci_cfg_write32`,
+      `arch_pci_msi_message`) and is now portable; aarch64 reaches config space
+      over ECAM. The bus enumerates and BARs are assigned from the device
+      tree's window, because there is no firmware to do it.
+    - [ ] **No MSI on aarch64.** `arch_pci_msi_message()` returns false, so
+      `pci_enable_msi/msix` fail and callers fall back to a legacy interrupt
+      line — which works and is what `virt` provides. Real MSI needs the GIC
+      ITS: a command queue, a device table and interrupt-translation tables.
+      Do it when a driver actually needs more than one interrupt source, not
+      before.
+    - [ ] **28 undefined symbols remain, and every one is a device driver** for
+      hardware QEMU `virt` does not have: `keyboard_*` (9, PS/2), `ac97_*` (9),
+      `mouse_*` (3), `rtc_*`, `pit_*`, `uhci_*`, `bochs_*`, `ioapic_*`,
+      `irq_register`. Their replacements are the rest of A7: virtio-input,
+      virtio-blk, virtio-snd. **Do not stub them
       to make a kernel link** — there is nothing for that kernel to run until
       A7 gives it a disk anyway, and a stub farm would hide which of them were
       ever really needed.
