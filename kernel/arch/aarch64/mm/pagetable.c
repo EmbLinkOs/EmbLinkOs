@@ -109,6 +109,76 @@ static uint64_t user_root_phys(void) {
     return v & PTE_ADDR_MASK;
 }
 
+/* --- ASIDs ---------------------------------------------------------------
+ *
+ * An ASID tags every TLB entry with the address space it came from, so two
+ * processes' translations coexist and switching between them needs NO FLUSH AT
+ * ALL. Without one, every context switch threw the entire TLB away and the
+ * next process faulted its working set back in from scratch.
+ *
+ * TCR_EL1.AS is 0 (see boot.S's TCR_VALUE), so ASIDs are 8 bits: 1..255, with
+ * 0 reserved for "no process" -- the empty TTBR0 the boot code leaves behind.
+ * There are more ASIDs than MAX_PROCESSES (64), so in practice every live
+ * address space holds one and the rollover path below is dead code; it is
+ * written anyway because "in practice" is not a guarantee, and a wrongly reused
+ * ASID is silent memory corruption rather than a fault.
+ *
+ * The table is indexed BY ASID and holds the root it belongs to, which makes
+ * both directions cheap: allocation scans for a free slot, and release is a
+ * single store. */
+#define ASID_MAX 256
+static uint64_t g_asid_root[ASID_MAX];   /* [asid] -> root_phys, 0 = free */
+
+/* Invalidate every TLB entry tagged with this ASID. Needed when an ASID is
+ * RELEASED: the number goes back in the pool, and the next address space to
+ * take it must not inherit the last one's translations. */
+static void tlb_flush_asid(uint16_t asid) {
+    __asm__ volatile("dsb ishst" ::: "memory");
+    __asm__ volatile("tlbi aside1is, %0" :: "r"((uint64_t)asid << 48) : "memory");
+    __asm__ volatile("dsb ish; isb" ::: "memory");
+}
+
+static uint16_t asid_for(uint64_t root_phys) {
+    if (!root_phys || root_phys == kernel_root_phys())
+        return 0;
+
+    for (uint16_t a = 1; a < ASID_MAX; a++)
+        if (g_asid_root[a] == root_phys)
+            return a;                       /* already has one */
+
+    for (uint16_t a = 1; a < ASID_MAX; a++) {
+        if (g_asid_root[a] == 0) {
+            g_asid_root[a] = root_phys;
+            /* A freshly allocated ASID may still carry entries from an address
+             * space that was destroyed without releasing it. Cheap insurance,
+             * once per allocation rather than once per switch. */
+            tlb_flush_asid(a);
+            return a;
+        }
+    }
+
+    /* ROLLOVER: every ASID is spoken for. Reclaim the whole space at once --
+     * forget every assignment and flush everything -- rather than evicting one
+     * victim, which would need to know which address spaces are still live and
+     * has no way to ask. */
+    for (uint16_t a = 1; a < ASID_MAX; a++)
+        g_asid_root[a] = 0;
+    tlb_flush_all();
+    g_asid_root[1] = root_phys;
+    return 1;
+}
+
+static void asid_release(uint64_t root_phys) {
+    for (uint16_t a = 1; a < ASID_MAX; a++) {
+        if (g_asid_root[a] == root_phys) {
+            g_asid_root[a] = 0;
+            tlb_flush_asid(a);
+            return;
+        }
+    }
+}
+
+
 /* Which root translates this address. Bit 63 decides, in hardware -- so
  * unlike x86, a kernel address and a user address are never candidates for the
  * same table, and a process's tables physically cannot describe kernel memory. */
@@ -116,7 +186,19 @@ static uint64_t root_phys_for(uint64_t va) {
     return (va >> 63) ? kernel_root_phys() : user_root_phys();
 }
 
-static uint64_t flags_to_pte(uint32_t flags) {
+/* `va` decides ONE thing here and it is not a permission: whether the entry is
+ * GLOBAL. An entry in the TTBR0 half belongs to exactly one address space, so
+ * it must be nG (non-global) and therefore ASID-tagged; an entry in the TTBR1
+ * half is the kernel's, identical in every address space, and is global so it
+ * survives every switch.
+ *
+ * nG used to be tied to PT_USER instead, which is a DIFFERENT question -- "may
+ * EL0 touch this" is not "which address space is this". A kernel-only mapping
+ * in the user half came out global, and once ASIDs stopped the full flush on
+ * every switch, that entry matched in every address space: the isolation
+ * self-test read address space A's page while standing in B. Before ASIDs the
+ * flush hid it. */
+static uint64_t flags_to_pte(uint64_t va, uint32_t flags) {
     uint64_t d = PTE_VALID | PTE_AF;
 
     if (flags & PT_DEVICE)
@@ -127,9 +209,13 @@ static uint64_t flags_to_pte(uint32_t flags) {
         d |= PTE_ATTR(MAIR_NORMAL) | PTE_SH(SH_INNER);
 
     if (flags & PT_USER)
-        d |= PTE_AP((flags & PT_WRITE) ? AP_RW_ALL : AP_RO_ALL) | PTE_NG;
+        d |= PTE_AP((flags & PT_WRITE) ? AP_RW_ALL : AP_RO_ALL);
     else
         d |= PTE_AP((flags & PT_WRITE) ? AP_RW_EL1 : AP_RO_EL1);
+
+    /* Non-global for everything the user half describes -- see above. */
+    if (!(va >> 63))
+        d |= PTE_NG;
 
     /* Execute permission is expressed as two separate NEVER bits, and both
      * have to be considered every time. A kernel page must always be UXN:
@@ -229,7 +315,7 @@ int vm_map_page(uint64_t va, uint64_t pa, uint32_t flags) {
     if (!slot)
         return err;
 
-    *slot = (pa & PTE_ADDR_MASK) | flags_to_pte(flags) | PTE_TABLE;
+    *slot = (pa & PTE_ADDR_MASK) | flags_to_pte(va, flags) | PTE_TABLE;
     tlb_flush_page(va);
     return PT_OK;
 }
@@ -341,7 +427,7 @@ static int vm_map_page_in(uint64_t root_phys, uint64_t va, uint64_t pa,
     if (!slot)
         return err;
 
-    *slot = (pa & PTE_ADDR_MASK) | flags_to_pte(flags) | PTE_TABLE;
+    *slot = (pa & PTE_ADDR_MASK) | flags_to_pte(va, flags) | PTE_TABLE;
     tlb_flush_page(va);
     return PT_OK;
 }
@@ -487,19 +573,26 @@ void vmm_destroy_address_space(uint64_t root_phys) {
     if (root_phys == user_root_phys())
         vmm_switch_address_space(vmm_get_kernel_pml4());
 
+    /* Give the ASID back BEFORE the tables go, and flush it: the number is
+     * about to be handed to a different address space, and a TLB entry that
+     * outlives the page table it describes is the one bug ASIDs can introduce
+     * that not having them could not. */
+    asid_release(root_phys);
+
     destroy_table(root_phys, 0);
 }
 
 void vmm_switch_address_space(uint64_t root_phys) {
-    /* One register. The kernel's mappings are in TTBR1 and are not touched,
-     * so unlike a CR3 reload this cannot invalidate the code doing the switch.
+    /* One register, and NO FLUSH. The kernel's mappings live in TTBR1 and are
+     * not touched, so unlike a CR3 reload this cannot invalidate the code doing
+     * the switch; and the ASID in the top 16 bits means the outgoing process's
+     * entries stay valid and tagged, ready for when it is scheduled again.
      *
-     * The full TLB invalidate is the price of not having allocated ASIDs yet
-     * (docs/TODO.md): with an ASID per address space the hardware would keep
-     * both processes' entries and this would need no flush at all. */
-    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(root_phys) : "memory");
+     * TTBR0_EL1[63:48] is the ASID and [47:1] the table base. The base is
+     * page-aligned so the two never overlap. */
+    uint64_t ttbr = root_phys | ((uint64_t)asid_for(root_phys) << 48);
+    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(ttbr) : "memory");
     __asm__ volatile("isb" ::: "memory");
-    tlb_flush_all();
 }
 
 uint64_t vmm_get_kernel_pml4(void) {
