@@ -7,7 +7,7 @@
 #include "process/capabilities.h"   /* per-process capability set */
 #include "fs/namespace.h"           /* per-process namespace (the OTHER born grant) */
 #include "include/arch_thread.h"   /* struct kcontext + the per-thread arch hooks */
-#include "arch/x86_64/cpu/percpu.h"
+#include "include/percpu.h"   /* this_cpu() -- the per-arch struct, shared field names */
 #include "fs/fd.h"
 #include "process/spawn.h"
 #include "ipc/handle.h"    /* struct obj_handle + OBJ_HANDLE_MAX + the typed

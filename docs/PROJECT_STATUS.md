@@ -53,7 +53,9 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   unchanged on aarch64, and all 3,700 lines of `kernel/process/process.c` --
   the scheduler -- compile for it with zero inline assembly left in them.
   Per-process address spaces work there too, with isolation and leak-free
-  teardown both machine-checked. The
+  teardown both machine-checked. **All 64 shared files LINK against the aarch64
+  tree**; the 37 symbols still undefined are device drivers for hardware QEMU
+  `virt` does not have, which is A7's work rather than a portability gap. The
   x86 build is untouched by it (`ARCH` defaults to `x86_64`, and the aarch64
   rules are in a fragment the default build never parses).
 - See `ARCHITECTURE.md` §1 for the full governing principle ("bless the clean

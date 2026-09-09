@@ -33,6 +33,10 @@
 #define PT_EXEC     0x02u       /* kernel-executable (PXN clear)             */
 #define PT_USER     0x04u       /* EL0 may access                            */
 #define PT_DEVICE   0x08u       /* Device-nGnRnE instead of Normal cacheable */
+#define PT_WC       0x10u       /* Normal NON-cacheable: the aarch64 answer to
+                                 * x86 write-combining. Not Device memory --
+                                 * Device forbids the unaligned and merged
+                                 * writes a framebuffer blit depends on. */
 
 #define PT_OK             0
 #define PT_ERR_NOMEM     -1     /* out of page frames for a table            */

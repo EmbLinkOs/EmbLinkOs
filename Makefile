@@ -149,8 +149,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/syscall/syscalls.c \
              kernel/arch/x86_64/syscall/usercopy.c \
              kernel/arch/x86_64/syscall/usermode.c \
-             kernel/arch/x86_64/syscall/elf.c \
-             kernel/arch/x86_64/syscall/embx.c \
+             kernel/loader/elf.c \
+             kernel/loader/embx.c \
              kernel/process/process.c \
              kernel/process/ksync.c \
              kernel/process/debug.c \

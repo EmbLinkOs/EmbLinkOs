@@ -36,6 +36,47 @@ struct elf64_phdr {
 #define PF_R      4
 #define ET_EXEC   2
 #define ET_DYN    3
+/* --- the only architecture-specific things in ELF loading ------------------
+ *
+ * Which machine this kernel's binaries are for, and five relocation type
+ * numbers. That is genuinely all: the loader's LOGIC is identical on both
+ * architectures, because the relocation SEMANTICS are identical and only the
+ * encodings differ.
+ *
+ *     RELATIVE    *where = load_base + addend
+ *     COPY        copy the symbol's bytes out of the shared object
+ *     ABS64       *where = symbol + addend
+ *     GLOB_DAT    *where = symbol
+ *     JUMP_SLOT   *where = symbol
+ *
+ * That correspondence is why kernel/loader/elf.c moved out of
+ * arch/x86_64/syscall/ unchanged: it compiled for aarch64 as it stood, and the
+ * only thing standing between it and working was five constants. Anyone adding
+ * a THIRD architecture should expect the same, and should be suspicious of a
+ * patch that needs more.
+ *
+ * (ELF_RELOC_TLS is deliberately absent. Thread-local relocations are the one
+ * family where the two architectures genuinely diverge -- x86 counts down from
+ * the thread pointer, aarch64 counts up from it -- and nothing in this kernel
+ * emits them yet. See docs/TODO.md.) */
+#if defined(__x86_64__)
+#define ELF_ARCH_MACHINE     0x3E    /* EM_X86_64                */
+#define ELF_RELOC_ABS64      1       /* R_X86_64_64              */
+#define ELF_RELOC_COPY       5       /* R_X86_64_COPY            */
+#define ELF_RELOC_GLOB_DAT   6       /* R_X86_64_GLOB_DAT        */
+#define ELF_RELOC_JUMP_SLOT  7       /* R_X86_64_JUMP_SLOT       */
+#define ELF_RELOC_RELATIVE   8       /* R_X86_64_RELATIVE        */
+#elif defined(__aarch64__)
+#define ELF_ARCH_MACHINE     0xB7    /* EM_AARCH64 (183)         */
+#define ELF_RELOC_ABS64      257     /* R_AARCH64_ABS64          */
+#define ELF_RELOC_COPY       1024    /* R_AARCH64_COPY           */
+#define ELF_RELOC_GLOB_DAT   1025    /* R_AARCH64_GLOB_DAT       */
+#define ELF_RELOC_JUMP_SLOT  1026    /* R_AARCH64_JUMP_SLOT      */
+#define ELF_RELOC_RELATIVE   1027    /* R_AARCH64_RELATIVE       */
+#else
+#error "elf.h: no relocation encoding known for this architecture"
+#endif
+
 #define EM_X86_64 0x3E
 
 /* --- dynamic linking (Phase 2): the app is ET_EXEC + DT_NEEDED libembk.so, the
@@ -64,6 +105,9 @@ struct elf64_rela { uint64_t r_offset; uint64_t r_info; int64_t r_addend; } __at
 #define DT_JMPREL 23
 
 /* x86-64 relocation types we handle */
+/* The x86 spellings, kept because they are what the ELF psABI calls them and
+ * what a reader debugging a relocation will look up. New code should use the
+ * ELF_RELOC_* names above, which mean the same thing on both machines. */
 #define R_X86_64_64        1
 #define R_X86_64_COPY      5
 #define R_X86_64_GLOB_DAT  6

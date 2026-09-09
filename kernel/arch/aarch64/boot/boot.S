@@ -35,8 +35,13 @@
     .set BLOCK_RAM_EXEC,   0x40000000000705   /* attr1, AF, SH=inner, UXN    */
     .set BLOCK_RAM_NOEXEC, 0x60000000000705   /* ...and PXN                  */
 
-/* MAIR_EL1 attr0 = 0x00 Device-nGnRnE, attr1 = 0xFF Normal write-back RWA. */
-    .set MAIR_VALUE, 0xFF00
+/* MAIR_EL1: attr0 = 0x00 Device-nGnRnE, attr1 = 0xFF Normal write-back RWA,
+ * attr2 = 0x44 Normal NON-CACHEABLE -- what vmm_map_mmio_wc() maps a
+ * framebuffer aperture with. There is no "write-combining" memory type on
+ * aarch64 the way x86's PAT has one; Normal non-cacheable is the equivalent,
+ * and unlike Device memory it permits the unaligned and merged writes a
+ * framebuffer blit depends on. */
+    .set MAIR_VALUE, 0x44FF00
 
 /* TCR_EL1: T0SZ = T1SZ = 16 (48-bit VAs both halves), 4 KiB granule both
  * halves (TG0=0b00, TG1=0b10 -- the two fields are encoded DIFFERENTLY, which

@@ -45,6 +45,7 @@ _Static_assert(((MMIO_BASE           >> 39) & 0x1FF) == 384, "boot.S L0_IDX_MMIO
 
 #define MAIR_DEVICE 0
 #define MAIR_NORMAL 1
+#define MAIR_NC     2   /* Normal non-cacheable -- see boot.S's MAIR_VALUE */
 
 /* Output address field of any descriptor: bits [47:12]. */
 #define PTE_ADDR_MASK 0x0000FFFFFFFFF000ULL
@@ -120,6 +121,8 @@ static uint64_t flags_to_pte(uint32_t flags) {
 
     if (flags & PT_DEVICE)
         d |= PTE_ATTR(MAIR_DEVICE) | PTE_SH(SH_NONE);
+    else if (flags & PT_WC)
+        d |= PTE_ATTR(MAIR_NC) | PTE_SH(SH_INNER);
     else
         d |= PTE_ATTR(MAIR_NORMAL) | PTE_SH(SH_INNER);
 
@@ -569,4 +572,89 @@ void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {
             pmm_free_page(phys);
         }
     }
+}
+
+/* --- the MMIO and kmap windows, kernel/mm/vmm.h ---------------------------
+ *
+ * boot.S maps the first gigabyte of physical space as Device memory at
+ * MMIO_BASE, which is enough for the PL011, the GIC and the virtio-mmio
+ * transports. It is NOT enough for everything: QEMU `virt` puts the PCIe ECAM
+ * window at 0x4010000000 and its 64-bit MMIO aperture above 0x8000000000, so
+ * a device discovered over PCIe in A7 needs a mapping made at runtime.
+ *
+ * Both windows bump-allocate virtual addresses and never reclaim them, which
+ * is the same simplification vmm.h documents for the x86 side. Physical pages
+ * ARE reclaimed; it is only the address space that is spent, and there is
+ * 512 GiB of it per level-0 slot. */
+#define MMIO_DYN_BASE  (MMIO_BASE + 0x40000000ULL)   /* above boot.S's 1 GiB block */
+#define KMAP_VA_BASE   0xFFFFFD0000000000ULL         /* L0 slot 506, unused */
+
+static uint64_t mmio_va_next = MMIO_DYN_BASE;
+static uint64_t kmap_va_next = KMAP_VA_BASE;
+
+static uint64_t map_mmio_common(uint64_t phys, uint64_t size, uint32_t flags) {
+    if (!size)
+        return 0;
+
+    /* Round the range OUT to whole pages at both ends: a device register at
+     * offset 0xF04 in a 0x100-byte request still has to be reachable. */
+    uint64_t first = phys & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t last  = (phys + size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t pages = (last - first) / PAGE_SIZE;
+
+    uint64_t va = mmio_va_next;
+    mmio_va_next += pages * PAGE_SIZE + PAGE_SIZE;   /* +1 page of separation */
+
+    for (uint64_t i = 0; i < pages; i++)
+        if (vm_map_page(va + i * PAGE_SIZE, first + i * PAGE_SIZE, flags) != PT_OK)
+            return 0;
+
+    return va + (phys - first);      /* hand back the exact address asked for */
+}
+
+uint64_t vmm_map_mmio(uint64_t phys, uint64_t size) {
+    /* Device-nGnRnE: no gathering, no reordering, no early write
+     * acknowledgement. Registers only -- anything weaker and a write to a
+     * command register can be split, merged or delayed past the read that
+     * checks whether it took effect. */
+    return map_mmio_common(phys, size, PT_WRITE | PT_DEVICE);
+}
+
+uint64_t vmm_map_mmio_wc(uint64_t phys, uint64_t size) {
+    /* Normal non-cacheable, NOT Device: a framebuffer aperture is written with
+     * ordinary stores, often unaligned and worth merging, and Device memory
+     * forbids exactly that. Never use this for registers. */
+    return map_mmio_common(phys, size, PT_WRITE | PT_WC);
+}
+
+void vmm_unmap_mmio(uint64_t virt, uint64_t size) {
+    uint64_t first = virt & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t last  = (virt + size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+
+    for (uint64_t va = first; va < last; va += PAGE_SIZE)
+        vm_unmap_page(va);
+    /* The VA is not returned to a free list -- see the window comment. The
+     * PHYSICAL pages were never ours: they are a device's. */
+}
+
+uint64_t vmm_kmap_pages(const uint64_t *phys, uint32_t n) {
+    if (!phys || !n)
+        return 0;
+
+    uint64_t va = kmap_va_next;
+    kmap_va_next += (uint64_t)n * PAGE_SIZE + PAGE_SIZE;
+
+    /* Scattered frames, one contiguous kernel view -- what the compositor
+     * wants for a surface whose pixel pages came from the allocator one at a
+     * time. Cached and never executable: it is pixels. */
+    for (uint32_t i = 0; i < n; i++)
+        if (vm_map_page(va + (uint64_t)i * PAGE_SIZE, phys[i], PT_WRITE) != PT_OK)
+            return 0;
+
+    return va;
+}
+
+void vmm_kunmap_pages(uint64_t virt_base, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        vm_unmap_page(virt_base + (uint64_t)i * PAGE_SIZE);
 }

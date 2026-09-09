@@ -1710,7 +1710,9 @@ substantially complete.
       lines compile for aarch64 with zero inline assembly, behind six named
       seams in `kernel/include/arch_thread.h` plus `timer_sched_ticks()`.
     - [ ] **`kernel/main.c` and `kernel/selftests.c`** are the last two shared
-      files that do not compile, and neither blocks anything. `main.c` is a
+      files that do not compile, and neither blocks anything. With the loader,
+      per-CPU and MMIO seams done, THE PORTABILITY WORK IS FINISHED: everything
+      left is hardware. `main.c` is a
       bring-up ORDER (GDT, IDT, PIC, LAPIC — and which of those exist at all
       differs), so it wants splitting into a shared sequence plus a per-arch
       `arch_early_init()`, not a hook per line. `selftests.c` follows it.
@@ -1718,13 +1720,22 @@ substantially complete.
       **done.** `mm/pagetable.c` implements create/destroy/switch/map_in/
       unmap_in/get_phys_in and guarded kernel stacks, with isolation and
       leak-free teardown both checked by `test-arm64-boot`.
-    - [ ] **`process.c` compiles but still does not LINK for aarch64.** What is
-      missing now: `elf_load_from_file` and `embx_load_from_file` (a neutral
-      loader interface plus the `R_AARCH64_*` relocation set), and
-      `keyboard_release_grab_pid()` — the scheduler calls into a PS/2 driver on
-      process reap, which is an input-layer seam nobody has needed until now.
-      **Compiling is not linking**; do not report process.c as ported until it
-      links.
+    - [x] ~~`process.c` compiles but does not link~~ — **it links.** All 64
+      shared files link against the aarch64 tree; `process.c`, `syscalls.c`,
+      `fs/`, `ipc/`, `gfx/`, `net/`, `block/` and the loaders resolve
+      completely.
+    - [ ] **37 undefined symbols remain, and every one is a device driver** for
+      hardware QEMU `virt` does not have: `pci_*` (9, port-CF8 config space),
+      `keyboard_*` (9, PS/2), `ac97_*` (9), `mouse_*` (3), `rtc_*`, `pit_*`,
+      `uhci_*`, `bochs_*`, `ioapic_*`, `irq_register`. Their replacements are
+      A7: PCIe ECAM, virtio-input, virtio-blk, virtio-snd. **Do not stub them
+      to make a kernel link** — there is nothing for that kernel to run until
+      A7 gives it a disk anyway, and a stub farm would hide which of them were
+      ever really needed.
+    - [ ] **TLS relocations are the one ELF family the two architectures
+      genuinely disagree about** — x86 counts down from the thread pointer,
+      aarch64 counts up. Nothing emits them yet, so `elf.h` deliberately has no
+      `ELF_RELOC_TLS`. Add it when newlib's TLS lands (A6), not before.
     - [ ] **No ASIDs, so `vmm_switch_address_space` flushes the whole TLB.**
       With an ASID per address space the hardware would keep both processes'
       entries and the switch would need no flush at all. Pure performance;

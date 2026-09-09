@@ -1,4 +1,4 @@
-/* kernel/arch/x86_64/syscall/embx.c -- the EMBX APP loader.
+/* kernel/loader/embx.c -- the EMBX APP loader.
  *
  * This file IS EMBX_Specification_v2 §6: embx_load_from_file walks the numbered
  * load sequence, and every rejection is a parse-time refusal (§8) BEFORE a
@@ -9,7 +9,7 @@
  * Mirrors elf.c's segment mapping (pmm_alloc_page + vmm_map_in, copy through
  * the direct map, W^X via the NX-is-absence-of-X inversion) -- the machinery is
  * the same, only the container it reads from differs. */
-#include "arch/x86_64/syscall/embx.h"
+#include "loader/embx.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
 #include "include/kmalloc.h"

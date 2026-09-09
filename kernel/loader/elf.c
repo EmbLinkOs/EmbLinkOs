@@ -1,4 +1,4 @@
-/* kernel/arch/x86_64/syscall/elf.c -- the user ELF loader.
+/* kernel/loader/elf.c -- the user ELF loader.
  *
  * Loads a static ET_EXEC, and (Phase 2) DYNAMICALLY-linked executables: an
  * ET_EXEC app with a PT_DYNAMIC + DT_NEEDED libembk.so. The kernel IS the
@@ -10,7 +10,7 @@
  *     the app's --export-dynamic'd static newlib (newlib is non-PIC, so libc
  *     can't live in the .so; it stays in each app and the .so binds to it).
  * Relocs are applied eagerly (no lazy PLT binding). */
-#include "arch/x86_64/syscall/elf.h"
+#include "loader/elf.h"
 #include "fs/vfs.h"
 #include "fs/fd.h"
 #include "include/kmalloc.h"
@@ -192,7 +192,7 @@ static int parse_dynamic(const uint8_t *image, const struct elf64_phdr *ph, uint
 }
 
 /* Resolve a DEFINED global symbol by name across the modules (skipping
- * `skip` if non-NULL -- an R_X86_64_COPY source must come from ANOTHER
+ * `skip` if non-NULL -- an ELF_RELOC_COPY source must come from ANOTHER
  * module, never the requester's own dynsym). Fills def_mod/def_sym when
  * provided.
  *
@@ -244,7 +244,7 @@ static int poke_user(uint64_t pml4, uint64_t va, uint64_t val)
     return EMBK_OK;
 }
 
-/* Arbitrary-length write into loaded user pages (R_X86_64_COPY payloads),
+/* Arbitrary-length write into loaded user pages (ELF_RELOC_COPY payloads),
  * page-by-page via the direct map. src == NULL writes zeroes (a copy source
  * that lives in the .so's .bss has no file bytes -- it IS zeroes). */
 static int poke_user_bytes(uint64_t pml4, uint64_t va, const uint8_t *src, uint64_t len)
@@ -278,9 +278,9 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
         uint64_t where = m->bias + r->r_offset;
         uint64_t val;
 
-        if (type == R_X86_64_RELATIVE) {
+        if (type == ELF_RELOC_RELATIVE) {
             val = m->bias + (uint64_t)r->r_addend;
-        } else if (type == R_X86_64_COPY) {
+        } else if (type == ELF_RELOC_COPY) {
             /* ET_EXEC app referencing a DATA object that lives in the .so: the
              * link editor reserved space in the APP (at r_offset, where the
              * app's own dynsym also defines the symbol -- so app-first symbol
@@ -301,8 +301,8 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
             const uint8_t *src = img_at(dm->image, dm->ph, dm->phnum, ds->st_value);
             if (poke_user_bytes(pml4, where, src, sz) != EMBK_OK) return -EMBK_EFAULT;
             continue;
-        } else if (type == R_X86_64_64 || type == R_X86_64_GLOB_DAT ||
-                   type == R_X86_64_JUMP_SLOT) {
+        } else if (type == ELF_RELOC_ABS64 || type == ELF_RELOC_GLOB_DAT ||
+                   type == ELF_RELOC_JUMP_SLOT) {
             const struct elf64_sym *s = &m->symtab[ELF64_R_SYM(r->r_info)];
             const char *name = m->strtab + s->st_name;
             uint64_t symval = 0;
@@ -319,7 +319,7 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
                 }
                 symval = 0;
             }
-            val = (type == R_X86_64_64) ? symval + (uint64_t)r->r_addend : symval;
+            val = (type == ELF_RELOC_ABS64) ? symval + (uint64_t)r->r_addend : symval;
         } else {
             serial_write_string("ELF dynlink: unhandled reloc type\n");
             return -EMBK_ENOEXEC;
@@ -345,7 +345,7 @@ static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
     const struct elf64_ehdr *soeh = (const struct elf64_ehdr *)so_buf;
     if (soeh->e_ident[0] != 0x7F || soeh->e_ident[1] != 'E' ||
         soeh->e_ident[2] != 'L'  || soeh->e_ident[3] != 'F' ||
-        soeh->e_ident[4] != 2 || soeh->e_type != ET_DYN || soeh->e_machine != EM_X86_64) {
+        soeh->e_ident[4] != 2 || soeh->e_type != ET_DYN || soeh->e_machine != ELF_ARCH_MACHINE) {
         kfree(so_buf); return -EMBK_ENOEXEC;
     }
     const struct elf64_phdr *so_ph = (const struct elf64_phdr *)(so_buf + soeh->e_phoff);
@@ -402,7 +402,7 @@ int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint6
         ELF_REFUSE("not an ELF (bad magic)");
     if (eh->e_ident[4] != 2)                              /* ELFCLASS64 */
         ELF_REFUSE("not ELFCLASS64");
-    if (eh->e_type != ET_EXEC || eh->e_machine != EM_X86_64)
+    if (eh->e_type != ET_EXEC || eh->e_machine != ELF_ARCH_MACHINE)
         ELF_REFUSE("not an x86-64 ET_EXEC");
     if (eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > image_len)
         ELF_REFUSE("program headers past the end of the image");

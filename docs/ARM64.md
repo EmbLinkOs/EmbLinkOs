@@ -150,7 +150,31 @@ compiled for aarch64 to see what actually broke:
 | compiled for aarch64 unmodified | 52 | 18,681 |
 | after extracting `arch_irq_*` | 59 | 31,062 |
 | after `arch_cpu_idle*` + `arch_fault_addr` | 61 | 31,465 |
-| after the scheduler's six seams | **62** | **35,112** |
+| after the scheduler's six seams | 62 | 35,112 |
+| after the loader, per-CPU and MMIO seams | **64** | **35,801** |
+
+**And it LINKS.** Compiling was never the finish line. Linking all 64 shared
+files against the aarch64 tree leaves **37 undefined symbols, and every single
+one is a device driver**:
+
+```
+  9  pci_*        port-CF8 configuration space
+  9  keyboard_*   PS/2
+  9  ac97_*       the audio codec
+  3  mouse_*      PS/2
+  2  rtc_*   1 pit_*      legacy timers
+  1  uhci_*  1 bochs_*    USB, VGA
+  1  ioapic_* 1 irq_register
+```
+
+Not one portability gap remains. `kernel/process/process.c`,
+`kernel/syscall/syscalls.c`, the whole of `fs/`, `ipc/`, `gfx/`, `net/`,
+`block/` and the loaders resolve completely. What is left is **§2.6 exactly as
+written** — devices that do not exist on this machine, whose replacements
+(virtio-input, virtio-blk, PCIe ECAM) are A7's job. `keyboard_release_grab_pid`,
+the scheduler's one call into an input driver, is in that list and belongs
+there: it is not a seam that was dodged, it is a driver that is genuinely
+absent.
 
 A twelfth extraction followed for free: `arch_cpu_relax()` (`pause` / `yield`),
 which had five hand-written copies in `process.c` alone.
@@ -235,6 +259,25 @@ disagree, which is what §2.3 is for:
   — WFI returns immediately on a pending event, masked or not. A HAL derived
   from the ARM side alone would have exposed two calls and silently broken x86.
 
+**The loader turned out to be portable already.** `kernel/loader/elf.c` — 440
+lines of ELF parsing, dynamic linking and relocation — compiled for aarch64
+*as it stood*, under `arch/x86_64/`, before anything was changed. The only
+architecture in it was five relocation numbers and a machine ID, because the
+relocation SEMANTICS are identical on both machines:
+
+| | x86_64 | aarch64 |
+|---|---:|---:|
+| `ELF_RELOC_RELATIVE` `*where = base + addend` | 8 | 1027 |
+| `ELF_RELOC_COPY` copy the symbol's bytes | 5 | 1024 |
+| `ELF_RELOC_ABS64` `*where = sym + addend` | 1 | 257 |
+| `ELF_RELOC_GLOB_DAT` / `JUMP_SLOT` `*where = sym` | 6 / 7 | 1025 / 1026 |
+
+So it moved to `kernel/loader/` unchanged apart from those names. Anyone adding
+a third architecture should expect the same, and should be suspicious of a
+patch that needs more. (TLS relocations are the one family where the two
+genuinely diverge — x86 counts *down* from the thread pointer, aarch64 counts
+*up* — and nothing emits them yet. `TODO.md`.)
+
 **Address spaces followed, and they are the simplest part of the whole port.**
 `kernel/mm/vmm.h`'s address-space half — create, destroy, switch, map-in,
 get-phys-in, plus guarded kernel stacks — is now implemented on aarch64. On x86
@@ -259,13 +302,18 @@ Two things are now checked rather than claimed:
   A walk that misses a level comes back short and says so, where "destroyed"
   would have read as success.
 
-**What is left is now thirteen files, and eleven of them are meant to fail.**
-Those eleven are legacy x86 device drivers that §2.6 says are *absent* on ARM
-rather than portable — excluding them is a build change, not a code change. The
-two that remain are `main.c` (the bring-up ORDER: GDT, IDT, PIC, LAPIC, and
-which of them even exist) and `selftests.c`. Neither blocks anything: the
-scheduler, the syscall layer, the filesystem, IPC, the heap and the network
+**What is left is thirteen files, and eleven of them are meant to fail.** Those
+eleven are legacy x86 device drivers that §2.6 says are *absent* on ARM rather
+than portable — excluding them is a build change, not a code change. The two
+that remain are `main.c` (the bring-up ORDER: GDT, IDT, PIC, LAPIC, and which
+of them even exist) and `selftests.c`. Neither blocks anything: the scheduler,
+the syscall layer, the filesystem, IPC, the heap, the loaders and the network
 stack are all through.
+
+**The portability campaign is therefore finished.** Everything remaining is
+hardware: A7's virtio drivers, and A6's newlib/userland. There is no more
+"this code assumes x86" left to find in the shared tree — the last of it was
+`this_cpu()`, and it was the last because it was measured, not guessed.
 
 **Meanwhile the shared kernel heap now runs on aarch64.** `kernel/mm/kheap.c` —
 619 lines of slab allocator with canaries and coalescing, written years before

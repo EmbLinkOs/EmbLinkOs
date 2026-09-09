@@ -10,8 +10,8 @@
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "include/kstring.h"
-#include "arch/x86_64/syscall/elf.h"
-#include "arch/x86_64/syscall/embx.h"   /* EMBX loader dispatch */
+#include "loader/elf.h"
+#include "loader/embx.h"   /* EMBX loader dispatch */
 #include "include/arch_thread.h"   /* struct kcontext + the four things a
                                     * scheduler needs from a CPU: the context
                                     * switch, the thread pointer, the kernel
