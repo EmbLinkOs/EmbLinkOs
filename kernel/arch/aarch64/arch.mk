@@ -226,7 +226,8 @@ ARM_SYSCALLS  := $(ARM_USER)/syscalls.o
 ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capreload capspawn \
                     crasher ioracer sockdemo udptest nbsock httpget \
                     tlstest wget pkgfetch pkg pkgbuild httpd \
-                    posixdemo
+                    posixdemo pkgprobe shell sysinfo tally embbuild \
+                    $(if $(HAVE_QJS),js,)
 
 # Freestanding: own _start, no libc at all (-T user.ld).
 ARM_PLAIN_PROGS  ?= init primtest
@@ -265,7 +266,27 @@ ARM_EMLIBC_PROGS ?= emlibc_demo emlibc_net emlibc_caps emlibc_math \
 
 ARM_UI_PROGS     ?= $(filter-out beep primtest,\
                       $(patsubst user/bin/%.c,%,$(EMUI_APP_SRCS))) \
-                    photos mp3play
+                    photos mp3play vellum
+
+# QuickJS's five translation units. DECLARED HERE, built by the rule in the
+# QuickJS section further down -- for the reason this file has now learned five
+# separate times: a `:=` assignment that references a variable defined LATER
+# expands to NOTHING, silently, and the feature simply does not happen. The
+# symptom is never an error about the variable; it is a link that is missing
+# objects, or a compile that is missing a flag.
+#
+# RULE FOR THIS FILE: every `:=` list lives above every `$(eval $(call ...))`
+# that reads it. Rules can go anywhere; DECLARATIONS cannot.
+# The SHELL and its external pipeline tools. They live in shell/, not
+# user/bin, so they are not in $(EMUI_APP_SRCS) and need naming here. The tools
+# are separate .elf files on purpose -- the shell SPAWNS them as pipeline
+# stages rather than running them as builtins -- and each links the same three
+# SDK objects (value/wire/sval) that carry the shell's typed-record protocol.
+ARM_SHELL_SRC := shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
+                 shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
+                 shell/builtins/builtins.c shell/hist/hist.c \
+                 shell/eval/eval_extern.c shell/builtins/builtins_os.c
+ARM_SHELL_SDK := shell/value/value.c shell/wire/wire.c shell/sval/sval.c
 
 # A few apps are more than one translation unit, exactly as they are on x86
 # (where each has an explicit rule with extra objects). Naming the extra
@@ -309,6 +330,42 @@ ARM_XSRC_pkg      := user/pkg/manifest.c user/pkg/embxinfo.c \
 ARM_XSRC_pkgbuild := user/pkg/embxgen.c user/pkg/manifest.c kernel/crypto/sha256.c
 ARM_XSRC_httpd    := user/httpd/http.c user/httpd/mime.c user/httpd/serve.c
 
+# vellum: the browser. Its 29 in-tree translation units, plus jsdom when
+# QuickJS is available. The list is the x86 $(VELLUM_OBJS) as SOURCES.
+ARM_XSRC_vellum   := user/web/html.c user/web/style.c user/web/render.c \
+                     user/web/url.c user/web/net.c user/web/fetchjob.c \
+                     user/web/css/decl.c user/web/css/sel.c user/web/css/sheet.c \
+                     user/web/css/vars.c user/web/css/media.c user/web/css/calc.c \
+                     user/web/png.c user/web/jpeg.c user/web/imgcache.c \
+                     user/lib/inflate.c user/web/ico.c user/web/favicon.c \
+                     user/web/form.c user/web/select.c user/web/cssref.c \
+                     user/web/cookie.c user/web/store.c user/web/find.c \
+                     user/web/history.c user/web/tabs.c user/web/charset.c \
+                     user/web/svg.c $(if $(HAVE_QJS),user/web/jsdom.c,) \
+                     $(ARM_TLS_SRC)
+# -DHAVE_JSDOM is what selects jsdom.c's REAL bindings over its stubs; without
+# it the file compiles both and the second set is a redefinition error.
+ARM_INC_vellum    := -Iuser/web -Iuser/web/css $(TLS_LIB_INC) \
+                     $(if $(HAVE_QJS),-DHAVE_JSDOM $(QJS_CFLAGS),)
+ARM_INC_js        := $(QJS_CFLAGS)
+
+# shell/ programs: their sources are outside user/bin, so each names its own
+# main and its own extra objects.
+ARM_XSRC_shell    := $(ARM_SHELL_SRC)
+ARM_XSRC_sysinfo  := $(ARM_SHELL_SDK)
+ARM_XSRC_tally    := $(ARM_SHELL_SDK)
+ARM_XSRC_embbuild := $(ARM_SHELL_SDK)
+ARM_INC_shell     := -Ishell
+ARM_INC_sysinfo   := -Ishell
+ARM_INC_tally     := -Ishell
+ARM_INC_embbuild  := -Ishell
+
+# Where each one's main() lives, when it is not user/bin/<name>.c.
+ARM_MAIN_shell    := shell/main.c
+ARM_MAIN_sysinfo  := shell/tools/sysinfo.c
+ARM_MAIN_tally    := shell/tools/tally.c
+ARM_MAIN_embbuild := shell/tools/embbuild.c
+
 # Per-app include paths. The EmUI set is added to every app anyway; this is the
 # extra a particular app needs, mirroring its explicit x86 rule.
 # Taken from each app's x86 compile rule, and reusing the Makefile's OWN
@@ -346,6 +403,16 @@ ARM_XSRC_ALL := $(sort $(foreach p,$(ARM_UI_PROGS) $(ARM_NEWLIB_PROGS),$(ARM_XSR
 ARM_INC_ALL  := $(foreach p,$(ARM_UI_PROGS) $(ARM_NEWLIB_PROGS),$(ARM_INC_$(p)))
 ARM_XOBJ      = $(patsubst %,$(ARM_USER)/x_%.o,$(subst /,_,$(basename $(1))))
 
+
+ARM_QJS_UNITS := quickjs libregexp libunicode cutils libbf
+ARM_QJS_OBJ   := $(patsubst %,$(ARM_USER)/qjs_%.o,$(ARM_QJS_UNITS))
+
+# Objects an app links that are NOT built from an in-tree source, so they
+# cannot go through ARM_XSRC (whose object names are derived from source
+# PATHS). QuickJS is the only such case: a third-party tree outside this repo.
+ARM_EXTRAOBJ_js     := $(if $(HAVE_QJS),$(ARM_QJS_OBJ),)
+ARM_EXTRAOBJ_vellum := $(if $(HAVE_QJS),$(ARM_QJS_OBJ),)
+
 define ARM_XOBJ_RULE
 $(ARM_USER)/x_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
 	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note $(ARM_INC_ALL) -c $$< -o $$@
@@ -377,14 +444,17 @@ $(ARM_USER)/syscalls.o: user/lib/syscalls.c | $(ARM_USER)
 # takes precedence over a pattern rule, so generating one per program is what
 # makes the outcome depend on nothing but this file.
 define ARM_NEWLIB_PROG
-$(ARM_USER)/$(1).o: user/bin/$(1).c | $(ARM_USER)
+$(ARM_USER)/$(1).o: $(if $(ARM_MAIN_$(1)),$(ARM_MAIN_$(1)),user/bin/$(1).c) | $(ARM_USER)
 	$$(USER_CC) $$(NEWLIB_CFLAGS) $(ARM_INC_$(1)) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+                      $(ARM_EXTRAOBJ_$(1)) \
                       $(ARM_CRT0) $(ARM_SYSCALLS) user/lib/newlib.ld
 	$$(USER_CC) $$(NEWLIB_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) \
-	    $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) -lc -lm -lgcc -o $$@
+	    $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+	    $(ARM_EXTRAOBJ_$(1)) -lc -lm -lgcc -o $$@
 endef
 $(foreach p,$(ARM_NEWLIB_PROGS),$(eval $(call ARM_NEWLIB_PROG,$(p))))
+
 
 # Freestanding programs (init.elf): own _start, no libc, linked with the raw ld
 # against user.ld exactly as x86 does -- $(USER_LD) is aarch64-elf-ld here.
@@ -440,12 +510,27 @@ define ARM_UI_PROG
 $(ARM_USER)/$(1).o: user/bin/$(1).c user/lib/embk.h | $(ARM_USER)
 	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note $(ARM_INC_$(1)) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+                      $(ARM_EXTRAOBJ_$(1)) \
                       $(ARM_CRT0) $(ARM_SYSCALLS) $(ARM_LIBEMBK)
 	$$(USER_CC) $$(NEWLIB_DYN_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) \
 	    $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+	    $(ARM_EXTRAOBJ_$(1)) \
 	    $(ARM_LIBEMBK) -lc -lm -lgcc $$(NEWLIB_DYN_WL) -o $$@
 endef
 $(foreach p,$(ARM_UI_PROGS),$(eval $(call ARM_UI_PROG,$(p))))
+
+# --- QuickJS: js and vellum's script engine ----------------------------------
+# QuickJS is a third-party tree OUTSIDE this repo ($(QJS_SRC)), compiled
+# straight from source by the top-level Makefile rather than pre-built into a
+# library. Everything about that is the same here -- the same five translation
+# units, the same $(QJS_CFLAGS) -- so all this adds is a build directory and
+# the arm compiler.
+#
+# GATED on the source actually being present, exactly as x86 gates it: an
+# absent optional port must leave the rest of the userland building. "Absent
+# means absent, not broken."
+$(ARM_USER)/qjs_%.o: $(QJS_SRC)/%.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Wno-array-bounds $(QJS_CFLAGS) -c $< -o $@
 
 # --- emlibc: the ALTERNATIVE libc, and the programs that link it -------------
 # user/emlibc is a second C library -- not a wrapper over newlib but a
