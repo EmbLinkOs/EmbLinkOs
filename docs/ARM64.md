@@ -16,9 +16,10 @@ makes system calls through the same architecture-neutral handlers x86 uses.
 Everything from A6 on is still unwritten; gaps each phase knowingly left are
 listed in `TODO.md`, not here.
 
-**61 of the 76 shared kernel source files — 31,465 lines — now compile for
-aarch64** (§2.3). Of the fifteen that do not, eleven are x86 device drivers
-that will never be ported, because the devices do not exist on this machine.
+**62 of the 75 shared kernel source files — 35,112 lines — now compile for
+aarch64** (§2.3), including all 3,700 lines of the scheduler. Of the thirteen
+that do not, eleven are x86 device drivers that will never be ported, because
+the devices do not exist on this machine.
 
 ```sh
 brew install aarch64-elf-gcc          # Linux: gcc-aarch64-none-elf
@@ -148,10 +149,51 @@ compiled for aarch64 to see what actually broke:
 |---|---:|---:|
 | compiled for aarch64 unmodified | 52 | 18,681 |
 | after extracting `arch_irq_*` | 59 | 31,062 |
-| after `arch_cpu_idle*` + `arch_fault_addr` | **61** | **31,465** |
+| after `arch_cpu_idle*` + `arch_fault_addr` | 61 | 31,465 |
+| after the scheduler's six seams | **62** | **35,112** |
 
 A twelfth extraction followed for free: `arch_cpu_relax()` (`pause` / `yield`),
 which had five hand-written copies in `process.c` alone.
+
+**Then the scheduler itself.** `kernel/process/process.c` is 3,700 lines and was
+the gate on everything downstream. It reached into `arch/x86_64/` for six
+things; naming each one took it to **zero lines of inline assembly**, and it now
+compiles for aarch64:
+
+| seam | x86_64 | aarch64 |
+|---|---|---|
+| `arch_kernel_stack_set()` | `TSS.rsp0`, mandatory every switch | **nothing** — `SP_EL1` is a separate register |
+| `arch_cpu_id()` | local APIC ID | `MPIDR_EL1.Aff0` |
+| `timer_sched_ticks()` | LAPIC timer | the one generic timer |
+| `kernel_ctx_prepare()` | `rip`/`rsp`/`rflags`, `sp - 8`, IF=**0** | `pc`/`sp`, aligned exactly, DAIF=**enabled** |
+| `arch_enter_user_mode()` | build an `iretq` frame, selectors carry privilege | `SPSR`/`ELR`/`SP_EL0` + `eret` |
+| `arch_fpu_pattern_load/store()` | `movdqa %xmm0` | `ldr/str q0` |
+
+Three of those rows are worth reading twice, because each is a place a HAL
+designed from one side would have been wrong:
+
+* **`arch_kernel_stack_set()` does nothing on aarch64, legitimately.** x86 must
+  rewrite `TSS.rsp0` on every switch because a ring transition fetches its
+  stack pointer from a per-CPU table; get it stale and the next syscall builds
+  its frame on the *previous thread's* kernel stack. aarch64 has `SP_EL1` as a
+  register distinct from `SP_EL0`, so the value is simply still there. An
+  interface derived from ARM alone would not have had this call at all.
+* **`kernel_ctx_prepare()` needs opposite answers to the same two questions.**
+  The stack pointer: x86 wants `kstack_top - 8`, because its trampoline is
+  entered by `jmp` while GCC compiles it expecting the 8-byte skew a `call`
+  would have left; aarch64 wants exactly 16-byte alignment, because its return
+  address is in `x30` and not on the stack. Interrupts on entry: x86 fabricates
+  **IF=0** (enabling them early races the trampoline's own `spin_unlock`, a bug
+  observed under `-smp 4`); aarch64 fabricates them **ENABLED** (a thread first
+  entered from inside an IRQ handler inherits `PSTATE.I` set and would never be
+  preempted again). Same function, same purpose, opposite constants — and both
+  were previously written inline in shared code.
+* **The FP-context self-test became portable for the price of two lines.** Two
+  kthreads hold distinct 16-byte patterns across real preemptions and check
+  them byte for byte. That test was written to validate x86's FXSAVE/FXRSTOR;
+  hoisting only the two vector instructions behind
+  `arch_fpu_pattern_load/store()` makes it validate aarch64's V-register save
+  too — the one A5 added and had no way to exercise.
 
 **And one file was simply in the wrong place.** `kernel/mm/vmm.c` was counted as
 a shared file that failed to compile; it is 817 lines of PML4 walking with 72
@@ -193,17 +235,13 @@ disagree, which is what §2.3 is for:
   — WFI returns immediately on a pending event, masked or not. A HAL derived
   from the ARM side alone would have exposed two calls and silently broken x86.
 
-**What is left is now a short, honest list.** Fourteen of the 75 shared files
-still do not compile: **eleven are legacy x86 device drivers** that §2.6 says
-are *absent* on ARM rather than portable, and **three have real architecture in
-them** — `main.c` (GDT/IDT/PIC/LAPIC bring-up order), `process/process.c` and
-`selftests.c`.
-
-`process.c` is the gate, and its remaining couplings are now enumerable rather
-than vague: the TSS (`tss_set_rsp0`), the LAPIC (end-of-interrupt), the ELF and
-EMBX loaders, `%xmm`-based FPU-context test code, and a user-entry trampoline
-written with named x86 registers. Everything cheaper than those is already
-gone.
+**What is left is now thirteen files, and eleven of them are meant to fail.**
+Those eleven are legacy x86 device drivers that §2.6 says are *absent* on ARM
+rather than portable — excluding them is a build change, not a code change. The
+two that remain are `main.c` (the bring-up ORDER: GDT, IDT, PIC, LAPIC, and
+which of them even exist) and `selftests.c`. Neither blocks anything: the
+scheduler, the syscall layer, the filesystem, IPC, the heap and the network
+stack are all through.
 
 **Meanwhile the shared kernel heap now runs on aarch64.** `kernel/mm/kheap.c` —
 619 lines of slab allocator with canaries and coalescing, written years before

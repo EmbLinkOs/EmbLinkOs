@@ -38,13 +38,3 @@ void aarch64_syscall(struct aarch64_frame *f) {
 
     arch_irq_disable();
 }
-
-/* syscall_abi.h's one architecture hook -- the thread pointer.
- *
- * x86 writes the IA32_FS_BASE MSR; here it is a plain system register, and
- * TPIDR_EL0 is what an aarch64 compiler's thread-local access reads through.
- * (TPIDRRO_EL0 is the read-only alias user code can also see; nothing uses it
- * yet.) */
-void arch_tls_base_set(uint64_t base) {
-    __asm__ volatile("msr tpidr_el0, %0" :: "r"(base));
-}

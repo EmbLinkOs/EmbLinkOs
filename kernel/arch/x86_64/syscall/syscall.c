@@ -1,6 +1,5 @@
 #include "arch/x86_64/syscall/syscall.h"
 #include "arch/x86_64/irq/idt.h"
-#include "arch/x86_64/cpu/fsbase.h"    /* arch_tls_base_set() */
 #include "include/syscall_abi.h"
 #include <stdint.h>
 
@@ -55,13 +54,6 @@ void syscall_dispatch(struct regs *r) {
     struct sysargs a;
     sysargs_from_regs(&a, r);
     r->rax = (uint64_t)syscall_invoke(&a);
-}
-
-/* syscall_abi.h's one architecture hook. fsbase_set() is a static inline in a
- * header the shared kernel must not include, so it is given a name here rather
- * than an #ifdef there. */
-void arch_tls_base_set(uint64_t base) {
-    fsbase_set(base);
 }
 
 /* type_attr byte for a 64-bit IDT gate: P(0x80) | DPL(bits 5-6) | type(0xE =

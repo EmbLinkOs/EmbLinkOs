@@ -32,6 +32,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/sched/bringup.c \
                kernel/arch/aarch64/drivers/timer_generic.c \
                kernel/arch/aarch64/cpu/spinlock.c \
+               kernel/arch/aarch64/cpu/arch_thread.c \
                kernel/arch/aarch64/mm/pagetable.c \
                kernel/arch/aarch64/mm/pmm_arch.c \
                kernel/arch/aarch64/mm/usercopy.c \

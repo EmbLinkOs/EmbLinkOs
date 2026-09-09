@@ -148,7 +148,8 @@ kernel_ctx_switch:
     FP_LOAD x3, .Lfpl_done
     ret
 
-/* void aarch64_eret_to_el0(uint64_t entry, uint64_t user_sp)
+/* void aarch64_eret_to_el0(uint64_t entry, uint64_t user_sp,
+ *                          uint64_t a0, uint64_t a1, uint64_t a2)
  *
  * The transition to EL0. Cannot be written in C: it ends in `eret` and never
  * returns to its caller.
@@ -172,6 +173,13 @@ aarch64_eret_to_el0:
     msr     sp_el0, x1
     msr     elr_el1, x0
     msr     spsr_el1, xzr
+
+    /* The three user arguments arrive in x2/x3/x4 and must LEAVE in x0/x1/x2,
+     * which overlaps -- so they are parked in registers the zeroing loop below
+     * has not reached yet before anything is overwritten. */
+    mov     x9,  x2
+    mov     x10, x3
+    mov     x11, x4
 
     mov     x0,  xzr
     mov     x1,  xzr
@@ -204,19 +212,26 @@ aarch64_eret_to_el0:
     mov     x28, xzr
     mov     x29, xzr
     mov     x30, xzr
+
+    /* Now place the arguments, after everything else is zero. */
+    mov     x0, x9
+    mov     x1, x10
+    mov     x2, x11
+    mov     x9,  xzr
+    mov     x10, xzr
+    mov     x11, xzr
     eret
 
 /* The first instruction a brand-new thread ever executes.
  *
- * kernel_ctx_prepare() parks the entry function in x19 and its argument in
- * x20 -- callee-saved registers, so the context restore above delivers them
- * for free and no stack frame has to be forged. */
+ * kernel_ctx_prepare() parks the entry function in x19 -- a callee-saved
+ * register, so the context restore above delivers it for free and no stack
+ * frame has to be forged. */
     .globl kthread_trampoline
 kthread_trampoline:
     mov     x29, xzr                /* end the frame chain: a backtrace from a
                                      * thread's first frame must stop, not walk
                                      * into whatever the stack page held */
     mov     x30, xzr
-    mov     x0, x20
     blr     x19
-    b       kthread_exited          /* fn returned: C decides what that means */
+    b       kthread_exited          /* entry returned: C decides what that means */

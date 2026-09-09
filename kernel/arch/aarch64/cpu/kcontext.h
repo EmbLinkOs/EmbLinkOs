@@ -60,11 +60,21 @@ void kernel_ctx_switch(struct kcontext *save_to, struct kcontext *restore_from,
 #define KCONTEXT_FPU_SIZE  528
 #define KCONTEXT_FPU_ALIGN 16
 
-/* Prepare a never-yet-run context: entering it calls fn(arg) on `stack_top`
- * with interrupts ENABLED. Interrupts matter -- a thread first entered from
- * inside an IRQ handler inherits PSTATE.I set, and would then never be
- * preempted again. */
-void kernel_ctx_prepare(struct kcontext *ctx, void (*fn)(void *), void *arg,
-                        uint64_t stack_top);
+/* Fabricate a context that has never run, so entering it calls `entry` on
+ * `kstack_top`. Same name and shape as the x86 counterpart, so the shared
+ * scheduler calls one function.
+ *
+ * Interrupts are ENABLED in the fabricated state, and that is not a free
+ * choice: a thread first entered from inside an IRQ handler inherits
+ * PSTATE.I set, and would then never be preempted again. (x86 does the
+ * OPPOSITE for an equally specific reason -- see its implementation. The two
+ * machines disagree because their trampolines reach spin_unlock differently,
+ * which is precisely the sort of thing that must not be in shared code.) */
+void kernel_ctx_prepare(struct kcontext *ctx, void (*entry)(void),
+                        uint64_t kstack_top);
+
+/* Read-only views for diagnostics; see the x86 header. */
+uint64_t kernel_ctx_pc(const struct kcontext *ctx);
+uint64_t kernel_ctx_fp(const struct kcontext *ctx);
 
 #endif /* _AARCH64_KCONTEXT_H */

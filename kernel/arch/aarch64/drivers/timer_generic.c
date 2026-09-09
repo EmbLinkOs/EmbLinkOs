@@ -120,6 +120,12 @@ void timer_init(void) {
 
 uint64_t timer_get_ticks(void) { return ticks; }
 
+/* Identical to timer_get_ticks() here, and that is the interesting part: this
+ * architecture has ONE timer, so the clock that preempts and the clock that
+ * counts uptime ticks are the same device. On x86 they are the LAPIC timer and
+ * the PIT respectively. See drivers/timer/timer.h. */
+uint64_t timer_sched_ticks(void) { return ticks; }
+
 uint64_t timer_uptime_ms(void) {
     if (!timer_freq)
         return 0;

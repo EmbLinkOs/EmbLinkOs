@@ -6,7 +6,7 @@
 #include "include/types.h"
 #include "process/capabilities.h"   /* per-process capability set */
 #include "fs/namespace.h"           /* per-process namespace (the OTHER born grant) */
-#include "arch/x86_64/cpu/kcontext.h"
+#include "include/arch_thread.h"   /* struct kcontext + the per-thread arch hooks */
 #include "arch/x86_64/cpu/percpu.h"
 #include "fs/fd.h"
 #include "process/spawn.h"

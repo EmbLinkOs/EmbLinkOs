@@ -27,7 +27,7 @@ static bool in_user;
 
 /* Assembly, because the transition cannot be expressed in C: it ends in `eret`
  * and never returns to its caller. kcontext.S. */
-void aarch64_eret_to_el0(uint64_t entry, uint64_t user_sp);
+#include "include/arch_thread.h"   /* arch_enter_user_mode() */
 
 /* Called by the bring-up sys_exit. Does not return. */
 void el0_exit(int64_t code) {
@@ -111,6 +111,6 @@ int64_t el0_probe_run(void) {
     kprintf("el0: eret to %p, sp %p\n",
             (void *)USER_CODE_VA, (void *)USER_STACK_TOP);
 
-    aarch64_eret_to_el0(USER_CODE_VA, USER_STACK_TOP);
+    arch_enter_user_mode(USER_CODE_VA, USER_STACK_TOP, 0, 0, 0);
     return -EMBK_EINVAL;   /* not reached */
 }

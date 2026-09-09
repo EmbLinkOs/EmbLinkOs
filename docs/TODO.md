@@ -1706,15 +1706,23 @@ substantially complete.
   - **The HAL, so far** (`kernel/include/arch_irq.h`, extracted after A5 and
     measured rather than guessed — see ARM64.md §2.3). 61 of 76 shared kernel
     files now compile for aarch64. What is left:
-    - [ ] **`kernel/process/process.c` is the gate**, and its remaining
-      couplings are now enumerable rather than vague: `tss_set_rsp0()` (the
-      TSS), the LAPIC end-of-interrupt, the ELF and EMBX loaders, `%xmm`-based
-      FPU-context test code, and a user-entry trampoline written with named x86
-      registers. It needs `arch_addr_space_switch()` (CR3 / TTBR0_EL1),
-      `arch_kernel_stack_set()` (TSS.rsp0 / nothing at all on aarch64, where
-      SP_EL1 is a separate register) and a neutral ELF-loader interface.
-      `kernel/main.c` and `kernel/selftests.c` follow it, not the other way
-      round.
+    - [x] ~~`kernel/process/process.c` is the gate~~ — **done.** All 3,700
+      lines compile for aarch64 with zero inline assembly, behind six named
+      seams in `kernel/include/arch_thread.h` plus `timer_sched_ticks()`.
+    - [ ] **`kernel/main.c` and `kernel/selftests.c`** are the last two shared
+      files that do not compile, and neither blocks anything. `main.c` is a
+      bring-up ORDER (GDT, IDT, PIC, LAPIC — and which of those exist at all
+      differs), so it wants splitting into a shared sequence plus a per-arch
+      `arch_early_init()`, not a hook per line. `selftests.c` follows it.
+    - [ ] **`process.c` still LINKS against x86-only symbols** even though it
+      compiles: `vmm_create_address_space`, `vmm_destroy_address_space`,
+      `vmm_map_in`, `vmm_alloc_kernel_stack`, `vmm_free_kernel_stack`,
+      `vmm_switch_address_space`, `vmm_get_kernel_pml4`, plus
+      `elf_load_from_file` and `embx_load_from_file`. The vmm ones are the
+      address-space half of `kernel/mm/vmm.h` and aarch64's `mm/pagetable.c`
+      should grow them; the loaders need a neutral interface (and the aarch64
+      relocation set, which is A6 proper). **Compiling is not linking** — do not
+      report process.c as ported until it links.
     - [x] ~~`kernel/mm/vmm.c` does not compile for aarch64~~ — it was never
       supposed to. 817 lines of PML4 walking counted as a *shared* file that
       failed; it is now `kernel/arch/x86_64/mm/vmm.c`, next to its aarch64

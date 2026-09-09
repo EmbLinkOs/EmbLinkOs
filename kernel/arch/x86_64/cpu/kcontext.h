@@ -36,4 +36,21 @@ void kernel_ctx_restore(struct kcontext *ctx, uint64_t val);
 void kernel_ctx_switch(struct kcontext *save_to, struct kcontext *restore_from,
                         void *fpu_save_to, void *fpu_restore_from);
 
+/* Fabricate a context that has never run, so the first schedule()-in lands
+ * `entry` on `kstack_top` with interrupts off. The counterpart on aarch64 is
+ * kernel/arch/aarch64/cpu/kcontext.h; the scheduler calls this one name.
+ *
+ * Replaces kernel/process/process.c poking ctx.rip/ctx.rsp/ctx.rflags by hand,
+ * which is a thing only x86 has fields for -- and the two subtle constants it
+ * needed (see the implementation) are properties of THIS machine's calling
+ * convention and interrupt model, so they belong on this side of the line. */
+void kernel_ctx_prepare(struct kcontext *ctx, void (*entry)(void),
+                        uint64_t kstack_top);
+
+/* Read-only views for diagnostics: where a parked thread would resume, and its
+ * frame pointer, without the caller naming a register. The panic symbolizer
+ * and the process viewer want these; nothing else should. */
+uint64_t kernel_ctx_pc(const struct kcontext *ctx);
+uint64_t kernel_ctx_fp(const struct kcontext *ctx);
+
 #endif /* __KCONTEXT_H__ */

@@ -138,6 +138,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/irq/lapic.c \
              kernel/arch/x86_64/cpu/gdt.c \
              kernel/arch/x86_64/cpu/percpu.c \
+             kernel/arch/x86_64/cpu/arch_thread.c \
+             kernel/arch/x86_64/cpu/kcontext.c \
              kernel/arch/x86_64/cpu/fpu.c \
              kernel/arch/x86_64/cpu/spinlock.c \
              kernel/arch/x86_64/cpu/rwlock.c \

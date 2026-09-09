@@ -34,7 +34,7 @@ void bringup_sched_init(void);
 
 /* Create a thread. Returns its id, or negative on failure. The thread runs
  * with interrupts enabled; returning from `fn` parks it. */
-int bringup_thread_create(const char *name, void (*fn)(void *), void *arg);
+int bringup_thread_create(const char *name, void (*entry)(void));
 
 /* Called from the timer interrupt handler. Picks the next runnable thread and
  * switches to it. Safe to call before init: it does nothing. */

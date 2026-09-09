@@ -212,8 +212,7 @@ static void selftest_pmm(void) {
  * then gives it back. Only the scheduler's slice counts can show that, which
  * is why they are counted rather than inferred from output appearing. */
 
-static void worker(void *arg) {
-    int id = (int)(uintptr_t)arg;
+static void worker(int id) {
     uint64_t seen = 0;
     volatile uint64_t spins = 0;
 
@@ -239,6 +238,9 @@ static void worker(void *arg) {
         }
     }
 }
+
+static void worker_a(void) { worker(1); }
+static void worker_b(void) { worker(2); }
 
 static void selftest_preemption(void) {
     uint64_t start = timer_get_ticks();
@@ -364,8 +366,11 @@ void arch_early_main(uint64_t dtb_phys) {
 
     timer_init();
 
-    bringup_thread_create("worker-A", worker, (void *)(uintptr_t)1);
-    bringup_thread_create("worker-B", worker, (void *)(uintptr_t)2);
+    /* Two no-argument entry points, because kernel_ctx_prepare() takes none:
+     * a thread's arguments belong in its own structure, which is what
+     * process.c already does and what this stands in for. */
+    bringup_thread_create("worker-A", worker_a);
+    bringup_thread_create("worker-B", worker_b);
 
     /* Only now. The controller is configured and the timer is armed, so the
      * first thing PSTATE.I unmasking can produce is a tick we are ready for. */

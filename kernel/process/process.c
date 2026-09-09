@@ -12,10 +12,11 @@
 #include "include/kstring.h"
 #include "arch/x86_64/syscall/elf.h"
 #include "arch/x86_64/syscall/embx.h"   /* EMBX loader dispatch */
-#include "arch/x86_64/cpu/gdt.h"
-#include "arch/x86_64/cpu/fsbase.h"   /* fsbase_set() -- the thread pointer, reinstalled per switch */
-#include "arch/x86_64/cpu/kcontext.h"
-#include "arch/x86_64/irq/lapic.h"
+#include "include/arch_thread.h"   /* struct kcontext + the four things a
+                                    * scheduler needs from a CPU: the context
+                                    * switch, the thread pointer, the kernel
+                                    * stack, and this core's id */
+#include "drivers/timer/timer.h"    /* timer_sched_ticks() -- the preempting clock */
 #include "include/spinlock.h"
 #include "process/ksync.h"       /* mutex_init for each process's fd_lock */
 #include "process/debug.h"       /* debug_session_spawn, debug_notify_exit */
@@ -130,7 +131,7 @@ static struct process *process_alloc(void) {
             process_table[i].live_thread_count = 0;
             process_table[i].thread_list = NULL;
             /* EmbDBG v2 lifetime: stamp creation; clear exit (slots are reused). */
-            process_table[i].born_tick = lapic_timer_get_ticks();
+            process_table[i].born_tick = timer_sched_ticks();
             process_table[i].exit_tick = 0;
             /* MUST be reset: slots are REUSED after reaping, so a stale `true`
              * from the previous occupant would make this process born cancelled
@@ -236,7 +237,7 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
     t->dispatch_count = 0;
     t->migrations = 0;
     t->last_ran_cpu = -1;         /* never run yet */
-    t->born_tick = lapic_timer_get_ticks();  /* 0 for pre-timer boot threads */
+    t->born_tick = timer_sched_ticks();  /* 0 for pre-timer boot threads */
     t->exit_tick = 0;             /* still alive */
     t->wait_next = NULL;
     t->wait_queue = NULL;
@@ -264,43 +265,16 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
 
     /* FABRICATE the kernel context so the first schedule()-in lands the
      * thread at the trampoline, on its own kernel stack. This is the
-     * "make ctx look like a freshly interrupted context" trick. */
-    t->ctx.rbx = t->ctx.rbp = 0;
-    t->ctx.r12 = t->ctx.r13 = t->ctx.r14 = t->ctx.r15 = 0;
-    t->ctx.rip = ctx_rip;
-    /* kstack_top - 8, not kstack_top: kernel_ctx_switch (kcontext.asm) enters
-     * a brand-new thread's trampoline (kthread_trampoline/process_trampoline,
-     * ctx_rip above) via a raw `jmp`, not a `call` -- there's no synthetic
-     * return address on the stack. kstack_top is page-aligned (0 mod 16,
-     * vmm_alloc_kernel_stack), but GCC compiles the trampoline as an
-     * ORDINARY C function, which always assumes the standard x86-64 SysV
-     * "entered via call" convention: RSP === 8 mod 16 at the function's own
-     * first instruction (as if a call just pushed an 8-byte return address).
-     * Left as kstack_top verbatim, every aligned-stack local variable
-     * anywhere in that thread's initial call chain -- not just in the
-     * trampoline itself, arbitrarily deep, e.g. a kthread's own locals --
-     * ends up 8 bytes off from where GCC assumed, and any aligned SSE
-     * store/load (movdqa, FXSAVE/FXRSTOR's implicit stack-neutral operands
-     * are fine, but a thread's OWN aligned locals are not) #GP's. Silent
-     * until now because nothing had ever used an aligned SSE instruction
-     * inside a kthread; the FPU/SSE selftest (process_test_fpu) is what
-     * first hit it. Sacrificing 8 bytes off the very top of a stack that
-     * never uses them (the trampoline's `ret` never executes -- both
-     * trampolines end in a noreturn call + __builtin_unreachable()) costs
-     * nothing and makes the real entry RSP match what GCC assumes. */
-    t->ctx.rsp = kstack_top - 8;
-    /* IF=0 (0x002), NOT 1 (0x202), on purpose: kernel_ctx_switch's popfq
-     * restores THIS rflags value into the LIVE flags register before
-     * jumping to ctx.rip -- if IF were already 1 here, interrupts would go
-     * live a few instructions before the trampoline reaches its own
-     * spin_unlock(&g_sched_lock) (its first action), opening a real window
-     * where this core's own next timer tick fires, re-enters schedule() on
-     * a lock this exact core still holds, and spins on it forever --
-     * observed directly under -smp 4 (docs §16, Bug 15). spin_unlock() is
-     * what turns interrupts back on (via its own saved RFLAGS from
-     * whoever originally called schedule()), at the point that's
-     * actually safe. */
-    t->ctx.rflags = 0x002;
+     * "make ctx look like a freshly interrupted context" trick.
+     *
+     * The two subtleties this used to spell out inline -- why the stack
+     * pointer is kstack_top MINUS EIGHT, and why the flags say interrupts-off
+     * -- are properties of one machine's calling convention and interrupt
+     * model, and they now live with that machine, in
+     * arch/<arch>/cpu/kcontext.c. aarch64 gets both answers different (SP
+     * aligned exactly at the entry point; interrupts ON) for reasons just as
+     * specific, which is why this line cannot decide them. */
+    kernel_ctx_prepare(&t->ctx, (void (*)(void))(uintptr_t)ctx_rip, kstack_top);
 
     // Link onto proc's thread list + bump the live count -- under
     // g_sched_lock since another thread of the SAME process (or a killer)
@@ -548,7 +522,7 @@ static struct process *thread_zombie_locked(struct thread *t) {
      * here), so stamping exit_tick once here covers them all. Idempotent: a
      * second call (already unlinked) just overwrites with the same-ish tick. */
     if (t->exit_tick == 0)
-        t->exit_tick = lapic_timer_get_ticks();
+        t->exit_tick = timer_sched_ticks();
 
     bool was_linked = false;
     struct thread **link = &proc->thread_list;
@@ -573,7 +547,7 @@ static struct process *thread_zombie_locked(struct thread *t) {
             /* EmbDBG v2 lifetime: the process itself is now exiting (its last
              * thread just died) -- stamp the process-level death here. */
             if (proc->exit_tick == 0)
-                proc->exit_tick = lapic_timer_get_ticks();
+                proc->exit_tick = timer_sched_ticks();
         }
         /* Phase 5: wake anyone thread_join()-ing a sibling of this process
          * -- including the common case where THIS thread isn't the last
@@ -969,7 +943,7 @@ retry:
          * the interrupt state our caller actually had, since neither the
          * context switch nor spin_unlock could know it. */
         if (entry_flags & (1ULL << 9)) {
-            __asm__ volatile ("sti" ::: "memory");
+            arch_irq_enable();
         }
     }
 }
@@ -1109,8 +1083,8 @@ int thread_inspect(uint32_t tid, struct thread_detail *out) {
     out->user_rsp = t->user_rsp;
     out->kstack_top = t->kstack_top;
     out->fs_base = t->fs_base;
-    out->ctx_rip = t->ctx.rip;
-    out->ctx_rbp = t->ctx.rbp;
+    out->ctx_rip = kernel_ctx_pc(&t->ctx);
+    out->ctx_rbp = kernel_ctx_fp(&t->ctx);
     /* Only a NOT-running thread has a meaningful saved context: a RUNNING thread's
      * ctx is stale (its live registers are on a CPU, not in the TCB), so walking
      * it would symbolize wherever it was LAST parked, not where it is now. */
@@ -1224,7 +1198,7 @@ int ipc_handles_snapshot(struct ipc_handle_snap *out, int max) {
 #define SCHED_EVENT_RING 64  /* power of two; recent-switch history depth */
 
 struct sched_event {
-    uint64_t ts;        /* lapic_timer_get_ticks() at the switch */
+    uint64_t ts;        /* timer_sched_ticks() at the switch */
     uint32_t from_tid;  /* thread_table index we switched away from */
     uint32_t to_tid;    /* thread_table index we switched to */
     uint16_t cpu;       /* core the switch happened on */
@@ -1250,7 +1224,7 @@ static void sched_record_switch(struct thread *prev, struct thread *next, int cp
     next->last_ran_cpu = cpu;
 
     struct sched_event *e = &g_sched_ring[g_sched_ring_head & (SCHED_EVENT_RING - 1)];
-    e->ts       = lapic_timer_get_ticks();
+    e->ts       = timer_sched_ticks();
     e->from_tid = (uint32_t)(prev - thread_table);
     e->to_tid   = (uint32_t)(next - thread_table);
     e->cpu      = (uint16_t)cpu;
@@ -1456,9 +1430,9 @@ void process_exit_self(int code) {
     current_thread->state = PROCESS_ZOMBIE;
     schedule();
 
-    __asm__ volatile("sti");
+    arch_irq_enable();
     for (;;) {
-        __asm__ volatile("hlt");
+        arch_cpu_idle();
     }
 }
 
@@ -1931,53 +1905,18 @@ static void process_trampoline(void) {
      * loading it unconditionally here is harmless for the common case --
      * see struct thread::user_arg's comment (process.h). */
     if (current_thread->has_argv) {
-       uint64_t argc = current_thread->argc;
-       uint64_t argv = current_thread->argv_uva;
-       uint64_t envp = current_thread->envp_uva;   /* 0 == no environment */
-
-       /* Set up the user stack and jump to the entry point.
-        * SysV: main(argc, argv, envp) == rdi, rsi, rdx. */
-        __asm__ volatile(
-        "movq %4, %%rdi\n"      // argc -> rdi, BEFORE the pushes below (which
-                                 // must not themselves land in rdi/rdx -- see the
-                                 // clobber list forcing the compiler to pick
-                                 // other registers for the other operands)
-        "movq %5, %%rsi\n"       // argv -> rsi
-        "movq %6, %%rdx\n"       // envp -> rdx
-        "pushq %0\n"            // ss = user data | 3
-        "pushq %1\n"            // rsp = user stack top
-        "pushq $0x202\n"        // rflags = IF=1
-        "pushq %2\n"            // cs = user code | 3
-        "pushq %3\n"            // rip = entry point
-        "iretq\n"               // return to user mode
-        :
-        : "r"((uint64_t)(0x18 | 3)), "r"(user_rsp),
-          "r"((uint64_t)(0x20 | 3)), "r"(entry),"r"(argc), "r"(argv), "r"(envp)
-        : "rdi", "rdx", "memory"
-    );
+        /* SysV main(argc, argv, envp) -- the process's own first thread. */
+        arch_enter_user_mode(entry, user_rsp,
+                             current_thread->argc,
+                             current_thread->argv_uva,
+                             current_thread->envp_uva);   /* 0 == no environment */
     } else {
-        uint64_t arg = current_thread->user_arg;
-        /* Set up the user stack and jump to the entry point */
-        __asm__ volatile(
-        "movq %4, %%rdi\n"      // arg -> rdi, BEFORE the pushes below (which
-                                 // must not themselves land in rdi -- see the
-                                 // "rdi" clobber forcing the compiler to pick
-                                 // other registers for the other operands)
-        "pushq %0\n"            // ss = user data | 3
-        "pushq %1\n"            // rsp = user stack top
-        "pushq $0x202\n"        // rflags = IF=1
-        "pushq %2\n"            // cs = user code | 3
-        "pushq %3\n"            // rip = entry point
-        "iretq\n"               // return to user mode
-        :
-        : "r"((uint64_t)(0x18 | 3)), "r"(user_rsp),
-          "r"((uint64_t)(0x20 | 3)), "r"(entry),"r"(arg)
-        : "rdi", "memory"
-        );
-
+        /* A thread created by thread_create_user(): one `void *arg`, mirroring
+         * pthread_create. Always 0 for a process's main thread, which never
+         * sets user_arg -- see struct thread::user_arg (process.h). */
+        arch_enter_user_mode(entry, user_rsp, current_thread->user_arg, 0, 0);
     }
 
-    
     __builtin_unreachable();  // Should never return
 }
 
@@ -2077,7 +2016,7 @@ static void kthread_trampoline(void) {
      * scheduler critical section, is supposed to have interrupts on --
      * this makes that unconditionally true instead of conditional on
      * whatever ISR context happened to dispatch it. */
-    __asm__ volatile ("sti");
+    arch_irq_enable();
 
     void (*entry)(void) = (void (*)(void))(uintptr_t)current_thread->entry_point;
     entry();
@@ -2399,14 +2338,14 @@ static void schedule_locked(void) {
      * then needs neither). safe window: kernel half is shared, so flapping CR3 while
      * still on prev's kernel stack keeps executing fine. */
     vmm_switch_address_space(next->proc->pml4_phys);
-    tss_set_rsp0(next->kstack_top);
+    arch_kernel_stack_set(next->kstack_top);
     /* The thread pointer is per-CPU state (an MSR), not per-thread, so it must
      * be reinstalled here with CR3 and rsp0 -- otherwise the next thread would
      * keep running against the PREVIOUS one's TLS block and quietly read and
      * write another thread's variables. No matching save on the way out: ring 3
      * cannot WRFSBASE (CR4.FSGSBASE is off), so next->fs_base is authoritative.
      * See cpu/fsbase.h. */
-    fsbase_set(next->fs_base);
+    arch_tls_base_set(next->fs_base);
 
     kernel_ctx_switch(&prev->ctx, &current_thread->ctx,
                        prev->fpu_state, current_thread->fpu_state);
@@ -2465,7 +2404,7 @@ void sched_block_current_locked(struct wait_queue *wq) {
      * is correct by contract: callers are voluntary process-context sleepers
      * (an IRQ handler cannot sleep), and none can mean to sleep with IF=0 --
      * on a single core it could never be woken. */
-    __asm__ volatile ("sti" ::: "memory");
+    arch_irq_enable();
 }
 
 void process_init(void) {
@@ -2682,7 +2621,7 @@ retry:
         wait_queue_block(&proc->join_wait, current_thread);
         schedule_locked();
         if (entry_flags & (1ULL << 9)) {
-            __asm__ volatile ("sti" ::: "memory");
+            arch_irq_enable();
         }
     }
 }
@@ -2704,9 +2643,9 @@ void thread_exit_self(int code) {
     current_thread->state = PROCESS_ZOMBIE;
     schedule();
 
-    __asm__ volatile("sti");
+    arch_irq_enable();
     for (;;) {
-        __asm__ volatile("hlt");
+        arch_cpu_idle();
     }
 }
 
@@ -2716,7 +2655,7 @@ void thread_exit_self(int code) {
  * which is exactly what re-enters schedule(). */
 static void idle_kthread_entry(void) {
     for (;;) {
-        __asm__ volatile ("hlt");
+        arch_cpu_idle();
     }
 }
 
@@ -2864,9 +2803,9 @@ static void selftest_release_self(struct thread *self, bool did_adopt) {
 }
 
 static void selftest_wait_ticks(uint64_t ticks) {
-    uint64_t start = lapic_timer_get_ticks();
-    while (lapic_timer_get_ticks() < start + ticks) {
-        __asm__ volatile("hlt");
+    uint64_t start = timer_sched_ticks();
+    while (timer_sched_ticks() < start + ticks) {
+        arch_cpu_idle();
     }
 }
 
@@ -2995,14 +2934,14 @@ static void fpu_kthread_body(const uint8_t *pattern, volatile uint64_t *iters,
                               volatile bool *corrupt) {
     uint8_t observed[16] __attribute__((aligned(16)));
     while (!g_fpu_stop) {
-        __asm__ volatile ("movdqa (%0), %%xmm0" :: "r"(pattern) : "memory");
+        arch_fpu_pattern_load(pattern);
 
         /* Deliberately plain C work here, no asm -- gives the timer plenty
          * of chances to preempt with xmm0 "in flight", which is exactly the
          * window kernel_ctx_switch has to get right. */
         (*iters)++;
 
-        __asm__ volatile ("movdqa %%xmm0, (%0)" :: "r"(observed) : "memory");
+        arch_fpu_pattern_store(observed);
 
         for (int i = 0; i < 16; i++) {
             if (observed[i] != pattern[i]) {
@@ -3329,7 +3268,7 @@ static void smp_sched_kthread_entry(void) {
      * entry points. */
     uint32_t slot = __atomic_fetch_add(&g_smp_sched_started, 1, __ATOMIC_RELAXED);
     if (slot < SMP_SCHED_KTHREADS) {
-        g_smp_sched_core[slot] = lapic_get_id();
+        g_smp_sched_core[slot] = arch_cpu_id();
     }
     while (!g_smp_sched_stop) {
         arch_cpu_relax();
@@ -3511,7 +3450,7 @@ static volatile uint64_t g_thread_smp_shared_counter;   // written by ALL thread
 static void thread_smp_entry(void) {
     uint32_t slot = __atomic_fetch_add(&g_thread_smp_started, 1, __ATOMIC_RELAXED);
     if (slot < THREAD_SMP_COUNT) {
-        g_thread_smp_core[slot] = lapic_get_id();
+        g_thread_smp_core[slot] = arch_cpu_id();
     }
     while (!g_thread_smp_stop) {
         __atomic_fetch_add(&g_thread_smp_shared_counter, 1, __ATOMIC_RELAXED);

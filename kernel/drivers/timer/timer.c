@@ -1,4 +1,5 @@
 #include "drivers/timer/timer.h"
+#include "arch/x86_64/irq/lapic.h"   /* timer_sched_ticks() */
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/pit.h"
 #include "arch/x86_64/irq/irq.h"
@@ -129,4 +130,10 @@ uint64_t timer_uptime_ms(void) {
         }
     }
     return timer_get_ticks();
+}
+
+/* timer.h's scheduler clock. On x86 that is the LOCAL APIC timer, not the PIT
+ * counter above -- see the header for why the distinction matters. */
+uint64_t timer_sched_ticks(void) {
+    return lapic_timer_get_ticks();
 }

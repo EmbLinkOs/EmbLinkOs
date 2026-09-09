@@ -31,22 +31,24 @@ static struct kthread threads[MAX_THREADS];
 static int current = -1;
 static bool running;
 
-void kernel_ctx_prepare(struct kcontext *ctx, void (*fn)(void *), void *arg,
-                        uint64_t stack_top) {
+void kernel_ctx_prepare(struct kcontext *ctx, void (*entry)(void),
+                        uint64_t kstack_top) {
     extern void kthread_trampoline(void);
 
     memset(ctx, 0, sizeof(*ctx));
 
-    /* x19/x20 are callee-saved, so restoring the context delivers them to the
-     * trampoline for free -- no stack frame has to be forged, which is the
-     * part of thread creation that is normally fiddly and machine-specific. */
-    ctx->x19 = (uint64_t)(uintptr_t)fn;
-    ctx->x20 = (uint64_t)(uintptr_t)arg;
+    /* x19 is callee-saved, so restoring the context delivers the entry point
+     * to the trampoline for free -- no stack frame has to be forged, which is
+     * the part of thread creation that is normally fiddly and
+     * machine-specific. */
+    ctx->x19 = (uint64_t)(uintptr_t)entry;
     ctx->pc  = (uint64_t)(uintptr_t)kthread_trampoline;
 
-    /* SP must be 16-byte aligned at every public interface, and an unaligned
-     * SP raises an SP alignment fault rather than misbehaving quietly. */
-    ctx->sp = stack_top & ~0xFULL;
+    /* SP 16-byte aligned AT the entry point -- the AArch64 procedure call
+     * standard's requirement, and an unaligned SP raises an SP alignment fault
+     * rather than misbehaving quietly. Note x86 needs `kstack_top - 8` for the
+     * same goal, because there the return address lives on the stack. */
+    ctx->sp = kstack_top & ~0xFULL;
 
     /* DAIF = 0: the thread starts with interrupts ENABLED. This is the
      * subtle one. A thread is first entered from inside the timer IRQ
@@ -72,7 +74,7 @@ void bringup_sched_init(void) {
     kprintf("sched: bring-up round-robin active, this context is thread 0\n");
 }
 
-int bringup_thread_create(const char *name, void (*fn)(void *), void *arg) {
+int bringup_thread_create(const char *name, void (*entry)(void)) {
     for (int i = 1; i < MAX_THREADS; i++) {
         if (threads[i].used)
             continue;
@@ -102,7 +104,7 @@ int bringup_thread_create(const char *name, void (*fn)(void *), void *arg) {
          * PXN|UXN -- a stack that is executable is a stack you can be made to
          * return into. */
         uint64_t top = P2V(base) + (uint64_t)STACK_PAGES * PAGE_SIZE;
-        kernel_ctx_prepare(&threads[i].ctx, fn, arg, top);
+        kernel_ctx_prepare(&threads[i].ctx, entry, top);
 
         threads[i].used = true;
         kprintf("sched: thread %d '%s' stack %p..%p\n", i, name,
@@ -179,3 +181,6 @@ void bringup_sched_dump(void) {
             kprintf("sched:   %d %-10s %d slices%s\n", i, threads[i].name,
                     (int)threads[i].slices, threads[i].done ? " (done)" : "");
 }
+
+uint64_t kernel_ctx_pc(const struct kcontext *ctx) { return ctx->pc; }
+uint64_t kernel_ctx_fp(const struct kcontext *ctx) { return ctx->fp; }

@@ -50,7 +50,8 @@ EmbLinkOS today is a 64-bit x86 kernel with:
   76 shared kernel files -- 31,465 lines -- compile for aarch64**; eleven of the
   fourteen that do not are x86 drivers for hardware ARM does not have. The
   shared kernel heap (`kernel/mm/kheap.c`, slabs and canaries and all) runs
-  unchanged on aarch64. The
+  unchanged on aarch64, and all 3,700 lines of `kernel/process/process.c` --
+  the scheduler -- compile for it with zero inline assembly left in them. The
   x86 build is untouched by it (`ARCH` defaults to `x86_64`, and the aarch64
   rules are in a fragment the default build never parses).
 - See `ARCHITECTURE.md` §1 for the full governing principle ("bless the clean

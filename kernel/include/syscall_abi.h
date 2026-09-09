@@ -54,17 +54,10 @@ typedef int64_t (*syscall_handler_t)(const struct sysargs *);
  * entry after it has filled in `a`. */
 int64_t syscall_invoke(const struct sysargs *a);
 
-/* --- the one genuinely per-architecture thing a handler still needs --------
- *
- * Install the calling thread's TLS base -- what a compiler-generated
- * thread-local access reads through. x86_64 writes the IA32_FS_BASE MSR;
- * aarch64 will write TPIDR_EL0. Same concept, no shared spelling, so it is a
- * named call rather than an #ifdef.
- *
- * It lives in this header rather than a HAL header because there is exactly
- * one of these today and inventing an arch_* header for one function would be
- * pre-abstracting against a single implementation (docs/ARM64.md §2.3). When
- * A5 factors the real seam, this moves with it. */
-void arch_tls_base_set(uint64_t base);
+/* The one genuinely per-architecture thing a handler still needs -- installing
+ * the calling thread's TLS base -- is declared in kernel/include/arch_thread.h
+ * now, alongside the rest of the per-thread machine state. Its comment here
+ * said it would move when the real seam was factored; A6 factored it. */
+#include "include/arch_thread.h"
 
 #endif /* _SYSCALL_ABI_H_ */
