@@ -137,7 +137,10 @@ void bringup_sched_tick(void) {
     /* Called from inside the timer IRQ handler, and it does not return here
      * until something switches back. The GIC has ALREADY been told the
      * interrupt is finished (see gic_dispatch) precisely so this is allowed. */
-    kernel_ctx_switch(&threads[prev].ctx, &threads[next].ctx);
+    /* No FP areas: every thread here is a KERNEL thread, and the kernel is
+     * built -mgeneral-regs-only, so there is no floating-point state to lose.
+     * A6's user threads pass real pointers. */
+    kernel_ctx_switch(&threads[prev].ctx, &threads[next].ctx, 0, 0);
 }
 
 void kthread_exited(void) {

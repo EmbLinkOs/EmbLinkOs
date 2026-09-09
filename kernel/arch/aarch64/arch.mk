@@ -21,7 +21,8 @@ ARM_LINKER  := kernel/arch/aarch64/boot/linker.ld
 
 ARM_ASM_SRC := kernel/arch/aarch64/boot/boot.S \
                kernel/arch/aarch64/irq/vectors.S \
-               kernel/arch/aarch64/cpu/kcontext.S
+               kernel/arch/aarch64/cpu/kcontext.S \
+               kernel/arch/aarch64/syscall/el0_probe_blob.S
 # The aarch64-specific sources...
 ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/boot/fdt.c \
@@ -33,6 +34,10 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/cpu/spinlock.c \
                kernel/arch/aarch64/mm/pagetable.c \
                kernel/arch/aarch64/mm/pmm_arch.c \
+               kernel/arch/aarch64/mm/usercopy.c \
+               kernel/arch/aarch64/syscall/syscall.c \
+               kernel/arch/aarch64/syscall/usermode.c \
+               kernel/arch/aarch64/syscall/bringup_syscalls.c \
                kernel/arch/aarch64/drivers/pl011.c
 
 # ...and the SHARED kernel, compiled for a second architecture with no #ifdef
@@ -87,9 +92,28 @@ ARM_CFLAGS  = -ffreestanding -nostdlib -nostartfiles \
 $(ARM_BUILD):
 	mkdir -p $(ARM_BUILD)
 
+# --- the EL0 probe ----------------------------------------------------------
+# User code, so it is built SEPARATELY from the kernel and embedded as bytes:
+# it is linked at address 0 and mapped wherever the kernel decides, which is
+# exactly what an ordinary kernel object file cannot be. Same shape as the x86
+# side's AP trampoline blob.
+#
+# -Ttext=0 rather than the kernel's link address, and -nostdlib because there
+# is no libc for this architecture until A6 -- which is the whole reason this
+# program is hand-written assembly.
+ARM_PROBE_SRC := kernel/arch/aarch64/syscall/el0_probe.S
+ARM_PROBE_BIN := $(ARM_BUILD)/el0_probe.bin
+
+$(ARM_PROBE_BIN): $(ARM_PROBE_SRC) | $(ARM_BUILD)
+	$(AARCH64_CC) -ffreestanding -nostdlib -nostartfiles \
+	    -Wl,-Ttext=0 -Wl,--build-id=none -Wl,-e,_probe_start \
+	    -o $(ARM_BUILD)/el0_probe.elf $<
+	$(AARCH64_OBJCOPY) -O binary $(ARM_BUILD)/el0_probe.elf $@
+	@echo "aarch64: EL0 probe is $$($(STATSZ) $@) bytes"
+
 # One compile, like the x86 kernel: every header is a prerequisite because
 # there are no per-TU depfiles to consult. Same reasoning as $(KERNEL_HDRS).
-$(ARM_ELF): $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_BUILD)
+$(ARM_ELF): $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) $(ARM_PROBE_BIN) | $(ARM_BUILD)
 	$(AARCH64_CC) $(ARM_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC)
 
 # The flat Image. QEMU boots the ELF directly, so this is not on the run path
@@ -234,7 +258,10 @@ test-arm64-boot: $(ARM_IMG)
 	  chk 'worker 1 was scheduled'         A3 'no preemption report'; \
 	  chk 'boot thread was scheduled back' A3 'the scheduler never returned to the boot thread'; \
 	  chk 'spurious: 0'                    A3 'the GIC delivered spurious interrupts'; \
-	  chk 'A3 reached'                     A3 'did not reach the end of arch_early_main'; \
+	  chk 'hello from EL0'                 A5 'user code never ran at EL0'; \
+	  chk 'REFUSED write'                  A5 'the kernel accepted an unmapped user pointer'; \
+	  chk 'exited with 42'                 A5 'the exit argument did not survive the trip to a handler'; \
+	  chk 'A5 reached'                     A5 'did not reach the end of arch_early_main'; \
 	  n=$$(grep -c 'matches KV2P' $$log); \
 	    [ "$$n" = "4" ] || { echo "FAIL(A2): $$n/4 kernel sections translate to KV2P"; fail=1; }; \
 	  if grep -q 'MISMATCH' $$log; then echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
@@ -252,6 +279,7 @@ test-arm64-boot: $(ARM_IMG)
 	  echo "  A1 vectors, ESR/FAR decode, recovery"; \
 	  echo "  A2 higher half, DTB memory map, pmm, section permissions, no identity map"; \
 	  echo "  A3 GICv3, generic timer, preemptive context switching"; \
+	  echo "  A5 EL0, svc, user-pointer boundary, arch-neutral handlers"; \
 	else exit 1; fi
 
 .PHONY: check-tools-arm64

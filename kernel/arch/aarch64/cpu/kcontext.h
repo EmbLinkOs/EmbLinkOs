@@ -19,13 +19,21 @@
  * Field order MUST match the offsets in kcontext.S. There is a _Static_assert
  * there in spirit and a comment here; the sizes are asserted in bringup.c.
  *
- * WHY THERE IS NO FPU ARGUMENT. The x86 kernel_ctx_switch() takes two extra
- * pointers to 512-byte FXSAVE images. This one does not, because the aarch64
- * kernel is compiled -mgeneral-regs-only and FP/SIMD is still TRAPPED at EL1
- * (CPACR_EL1.FPEN = 0) -- a kernel thread here has no floating-point state to
- * save, and adding a parameter that is always ignored would be a lie the
- * compiler cannot catch. A5 introduces EL0 threads, opens CPACR and adds the
- * FP half; docs/TODO.md records it. */
+ * THE FP STATE. Same four-argument shape as x86: two extra pointers to a
+ * saved register file, which may be null for a context that has none. On x86
+ * that area is a 512-byte FXSAVE image; here it is 528 bytes -- v0-v31 (512)
+ * plus FPSR and FPCR -- and must be 16-byte aligned.
+ *
+ * Null is the honest value for every KERNEL thread: the kernel is compiled
+ * -mgeneral-regs-only and cannot emit an FP instruction. It is not the honest
+ * value for a user thread, and A5 is where that stops being hypothetical --
+ * it opens CPACR_EL1.FPEN so EL0 may use FP at all, which is precisely why the
+ * save/restore had to land in the same change rather than after it.
+ *
+ * Note the callee-saved rules do NOT shrink this the way they shrink the
+ * general-register set: the AArch64 PCS preserves only the LOW 64 bits of
+ * v8-v15 across a call and says nothing about the rest, so a preempted
+ * thread's FP state is the whole file. */
 
 struct kcontext {
     uint64_t x19, x20, x21, x22, x23, x24, x25, x26, x27, x28;
@@ -43,8 +51,14 @@ uint64_t kernel_ctx_save(struct kcontext *ctx);
 void kernel_ctx_restore(struct kcontext *ctx, uint64_t val);
 
 /* Save the current context into `save_to` and resume `restore_from`. Returns
- * to its caller only when something switches back. */
-void kernel_ctx_switch(struct kcontext *save_to, struct kcontext *restore_from);
+ * to its caller only when something switches back. The two FP areas follow the
+ * same outgoing/incoming pairing and may be null. */
+void kernel_ctx_switch(struct kcontext *save_to, struct kcontext *restore_from,
+                       void *fpu_save_to, void *fpu_restore_from);
+
+/* Bytes, and alignment, of the area the two FP pointers above must address. */
+#define KCONTEXT_FPU_SIZE  528
+#define KCONTEXT_FPU_ALIGN 16
 
 /* Prepare a never-yet-run context: entering it calls fn(arg) on `stack_top`
  * with interrupts ENABLED. Interrupts matter -- a thread first entered from

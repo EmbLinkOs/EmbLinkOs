@@ -5,6 +5,7 @@
 #include "arch/aarch64/mm/pagetable.h"
 #include "arch/aarch64/irq/gicv3.h"
 #include "arch/aarch64/sched/bringup.h"
+#include "arch/aarch64/syscall/usermode.h"
 #include "drivers/timer/timer.h"
 #include "boot/boot_protocol.h"
 #include "mm/pmm.h"
@@ -243,7 +244,7 @@ void arch_early_main(uint64_t dtb_phys) {
     pl011_init();
     pl011_use_mmio_window(MMIO_BASE + PL011_PHYS);
 
-    kprintf("\nEmbLinkOS aarch64 -- phase A3 (GICv3, generic timer, preemption)\n");
+    kprintf("\nEmbLinkOS aarch64 -- phase A5 (EL0, svc, the neutral syscall path)\n");
     kprintf("  see docs/ARM64.md\n\n");
 
     kprintf("  CurrentEL   : EL%d\n",   (int)read_sysreg_currentel());
@@ -316,7 +317,22 @@ void arch_early_main(uint64_t dtb_phys) {
 
     selftest_preemption();
 
-    kprintf("\nA3 reached. Parking (no user mode until A5).\n");
+    /* --- A5: user mode ----------------------------------------------------- */
+    kprintf("\n--- self-test: EL0 ---\n");
+    int64_t rc = el0_probe_run();
+
+    /* 42 is the value the probe passed to exit(). Checking it -- rather than
+     * just "we got back" -- is what proves a syscall ARGUMENT travelled from
+     * an EL0 register, through the trap frame, into struct sysargs, into a
+     * handler that has no idea which machine it is on. */
+    kprintf("  [%s] EL0 program ran and exited with %d (expected 42)\n",
+            rc == 42 ? " ok " : "FAIL", (int)rc);
+    if (rc != 42)
+        selftest_fails++;
+
+    kprintf("\n--- all self-tests done: %d failure(s) ---\n", (int)selftest_fails);
+
+    kprintf("\nA5 reached. Parking (real processes and a libc are A6).\n");
 
     for (;;)
         __asm__ volatile("wfi");

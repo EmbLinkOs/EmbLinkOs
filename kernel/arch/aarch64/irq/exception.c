@@ -2,6 +2,8 @@
 #include "arch/aarch64/drivers/pl011.h"
 #include "arch/aarch64/irq/gicv3.h"
 
+void aarch64_syscall(struct aarch64_frame *f);   /* syscall/syscall.c */
+
 /* Fault decoding -- docs/ARM64.md phase A1.
  *
  * The whole value of this file is that it turns a hang into a sentence. The
@@ -179,6 +181,21 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
         return;
     }
 
+    /* A system call. EC 0x15 is `svc` from AArch64, and from a LOWER EL it can
+     * only be user space asking for something -- which is why this is checked
+     * against the vector group and not just the exception class: an `svc` from
+     * EL1 would be the kernel calling itself, which nothing does and which
+     * should therefore be a panic rather than a dispatch.
+     *
+     * ELR_EL1 already points PAST the svc (the architecture treats it as
+     * completed), so returning from here erets straight to the instruction
+     * after it -- no adjustment, unlike the +4 the fault-recovery path needs.
+     * That asymmetry is the same one exception_probe() documents. */
+    if (which == EXC_EL0_64_SYNC && ec == 0x15) {
+        aarch64_syscall(f);
+        return;
+    }
+
     /* Recoverable probe: step over the offending instruction and continue.
      * Restricted to SYNCHRONOUS exceptions, because for an IRQ or an SError
      * "the offending instruction" is not a meaningful idea -- ELR points at
@@ -205,7 +222,20 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
 
     dump_frame(which, f);
 
-    pl011_puts("\nkernel halted (A1 has no recovery path -- that is A2 and later).\n");
+    /* A fault from EL0 is the PROGRAM's fault, not the kernel's, and halting
+     * the machine for it would be a denial of service any user program could
+     * trigger. Kill it and carry on -- which is what x86 does via
+     * process_exit_self() and what this will become once A6 has processes. */
+    if ((which >> 2) == 2) {
+        extern void el0_exit(int64_t code);
+        extern bool el0_in_user_mode(void);
+        if (el0_in_user_mode()) {
+            pl011_puts("\nel0: killing the faulting program; the kernel is fine.\n");
+            el0_exit(-1);
+        }
+    }
+
+    pl011_puts("\nkernel halted (no recovery path for a fault at EL1).\n");
     for (;;)
         __asm__ volatile("wfi");
 }

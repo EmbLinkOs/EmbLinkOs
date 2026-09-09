@@ -5,7 +5,7 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A4 done.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
+**Status: A0–A5 done.** An aarch64 kernel builds, boots on QEMU `virt`, decodes
 its own faults, runs in the higher half with the MMU on — page tables built in
 assembly before any allocator exists, memory map from the device tree,
 `kernel/mm/pmm.c` (the *existing, shared* allocator) running unmodified,
@@ -201,7 +201,9 @@ building and still booting. **No phase is done if it broke the other arch.**
   interrupt ctrl                    PIC / IOAPIC / LAPIC     GICv3 (distributor + redistrib)[A3]
   timer                             PIT / HPET / TSC         generic timer (CNTV_TVAL/CNTVCT)[A3]
   context switch                    kcontext.asm (131 ln)    x19-x29, sp, pc, DAIF       [A3]
-  user entry                        iretq / int 0x80         eret / svc #0
+  user entry                        iretq / int 0x80         eret / svc #0              [A5]
+  syscall args        struct sysargs rdi,rsi,rdx,r10,r8,r9    x0..x5, number in x8   [A4/A5]
+  user pointer check  access_ok()   canonical + PML4 walk    bit 63 + TTBR0 walk        [A5]
   SMP                               INIT-SIPI-SIPI           PSCI CPU_ON
   ─────────────────── everything above this line is shared ───────────────────
   pmm/kheap, fs, block, net, ipc, process, gfx, crypto, tty, all of user/
@@ -509,9 +511,74 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
   The debugger keeps `struct regs`, legitimately: exposing a stopped thread's
   registers is machine-specific by definition. That is the one remaining arch
   include in `kernel/process/`, and `TODO.md` records it.
-* **A5 ❌ EL0 + `svc`.** Address-space switch on TTBR0, `eret` to user, syscalls
-  land in the now-neutral handlers. **Done when:** a static aarch64 binary runs and
-  calls `write`.
+* **A5 ✅ EL0 + `svc`.** `syscall/usermode.c` (the transition),
+  `syscall/syscall.c` (30 lines: trap frame → `struct sysargs`),
+  `mm/usercopy.c` (the privilege boundary), `syscall/el0_probe.S` (the first
+  program), `syscall/bringup_syscalls.c` (four handlers, temporary).
+  **Done when:** a static aarch64 binary runs and calls `write`. What it
+  actually prints:
+
+  ```
+  el0: probe is 112 bytes; mapping code at 0x400000, stack at 0x7fc000
+  el0: eret to 0x0000000000400000, sp 0x0000000000800000
+  hello from EL0 -- aarch64 user mode
+  el0: REFUSED write of 8 bytes from 0x1000 (not a mapped user address)
+  el0: back in EL1, program exited with 42
+  ```
+
+  Four claims, each with its own failure mode: user code ran at EL0; a syscall
+  with arguments came back; a syscall with **no** arguments came back (so the
+  number travelled independently of `x0..x5`); an unmapped pointer was
+  **refused** rather than faulting the kernel; and the exit code arrived as 42,
+  which means a value travelled from an EL0 register through the trap frame
+  into `struct sysargs` into a handler that has no idea which machine it is on.
+
+  **A4 paid off exactly as designed.** `syscall/syscall.c` on this side is
+  30 lines of substance — fill six slots, call `syscall_invoke()`, write the
+  result back — because the 95 handlers stopped reading registers a phase
+  earlier. When A6 compiles the real `kernel/syscall/syscalls.c` for aarch64,
+  the arch entry point does not change by a single line. That is the test of
+  whether A4 was done properly, and it is why `bringup_syscalls.c` implements
+  `syscall_invoke()` rather than being wired in some other way.
+
+  **The convention: number in `x8`, arguments in `x0..x5`, result in `x0`.**
+  `x8` rather than `x0` so all six argument registers stay free — the same
+  choice Linux/aarch64 makes, and a genuine improvement on x86, where `rax`
+  carries the number in and the result out and reading the wrong one has been a
+  real bug in this tree before.
+
+  Four things A5 taught:
+  1. **`SP_EL0` is a separate register from the kernel's stack pointer.** We
+     run at EL1h, i.e. on `SP_EL1`, so setting the user stack does not disturb
+     the kernel's — and when `svc` arrives, the vector builds its frame on
+     `SP_EL1`, still exactly where it was. That is x86's `TSS.rsp0`, except the
+     hardware keeps both pointers instead of reloading one from a table.
+  2. **The I-cache does not snoop the D-cache.** The kernel writes the
+     program's instructions through a *data* mapping; without
+     `dsb; ic iallu; dsb; isb` before entering it, EL0 can fetch stale bytes —
+     which on a fresh page means executing whatever was there before. x86
+     simply does not have this failure mode (its I-caches are coherent), and it
+     presents as an undefined-instruction fault at the entry point.
+  3. **Zero every register before `eret`.** Whatever is left in them is kernel
+     state, and handing user space a kernel pointer is the kind of leak that
+     makes every other mitigation pointless. `SPSR = 0` also matters for a
+     second reason: it means DAIF clear, so user code runs with interrupts
+     *enabled* — a program entered with them masked cannot be preempted and
+     owns the machine.
+  4. **The boundary check is easier here, and worth saying why rather than
+     leaving as an unexplained absence.** x86's `access_ok` reasons about
+     canonical addresses and one page-table root shared by both halves. Here
+     bit 63 selects the translation base in *hardware*, so "is this a user
+     address" is a single bit test the CPU itself agrees with. The check is
+     still needed — the bit says which half, not whether the page is mapped —
+     but it cannot be tricked by a clever address.
+
+  `CPACR_EL1.FPEN` is opened here, which is why the FP half of
+  `kernel_ctx_switch` had to land in the same change (`TODO.md` said so, and it
+  did). The kernel is built `-mgeneral-regs-only` on purpose so an accidental
+  FP instruction is a loud fault; user code cannot be built that way, because a
+  stock compiler emits `str q0` to copy a 16-byte struct — so an EL0 program
+  that never mentions a float still traps on its first `memcpy`.
 * **A6 ❌ Userland toolchain.** newlib for aarch64, `EM_AARCH64` + the
   `R_AARCH64_*` relocations mirroring today's `R_X86_64_*` set, `libembk.so`.
   **Done when:** a dynamically-linked EmUI app loads.

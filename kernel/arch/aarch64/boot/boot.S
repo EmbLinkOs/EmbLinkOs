@@ -186,6 +186,20 @@ header_end:
 at_el1:
     mov     x19, x0                     /* stash the DTB pointer across all of this */
 
+    /* Let FP/SIMD be used at all. CPACR_EL1.FPEN = 0b11 means "do not trap,
+     * at either EL". Out of reset it is 0b00, which traps every FP instruction
+     * from both EL0 and EL1 -- and the KERNEL wants that for itself (it is
+     * built -mgeneral-regs-only precisely so an accidental FP instruction is a
+     * loud fault rather than silent state nobody saves). But USER code cannot
+     * be built that way: a stock aarch64 compiler emits `str q0` to copy a
+     * 16-byte struct, so an EL0 program that never mentions a float still
+     * traps on its first memcpy. Opening this is therefore a prerequisite for
+     * EL0 existing at all, which is why it lands together with the FP half of
+     * kernel_ctx_switch and not before it. */
+    mov     x1, #(3 << 20)
+    msr     cpacr_el1, x1
+    isb
+
     /* A boot beacon. There is no console yet -- pl011.c is C and runs later --
      * so these single characters are the only evidence available if the MMU
      * bring-up below dies. Each one costs three instructions and has already

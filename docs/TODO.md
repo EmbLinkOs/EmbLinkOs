@@ -1556,7 +1556,7 @@ substantially complete.
   arch-specific operations through arch_* interfaces. Real ARM64 port is a
   later dedicated campaign — don't pre-abstract against a single architecture.
   - **That campaign is underway: `docs/ARM64.md`** (target QEMU `virt`, HVF
-    available and confirmed working). **Phases A0-A4 are done** — `make ARCH=aarch64`
+    available and confirmed working). **Phases A0-A5 are done** — `make ARCH=aarch64`
     boots an aarch64 kernel to a serial console at EL1 with the DTB handed over,
     decodes its own faults (ESR/FAR/ELR down to the fault status code) and
     recovers from them, runs in the higher half with the MMU on with its memory
@@ -1566,7 +1566,9 @@ substantially complete.
     which runs every available accelerator (HVF and TCG on a Mac) because the
     two disagree in ways that find bugs. **A4 landed on x86:** the syscall
     handlers no longer read machine registers, and 2,019 of the 6,479 lines
-    that `arch/x86_64/` was credited with have moved out of it. A5 (EL0 + `svc`)
+    that `arch/x86_64/` was credited with have moved out of it. **A5 reached
+    EL0:** an aarch64 user program runs, calls `write` and `exit`, and has an
+    unmapped pointer refused at the boundary. A6 (newlib, ELF, real processes)
     is next. The audit there says the discipline largely held —
     `arch/x86_64/` is 11% of the kernel and port I/O never escaped into core
     logic — with **one** real exception: the 89 syscall handlers in
@@ -1675,6 +1677,32 @@ substantially complete.
     - [ ] **`kernel/syscall/syscalls.c` is not compiled for aarch64 yet.** It
       needs `process.c`, the VFS, the compositor and the IPC layer, which is
       exactly what A5/A6 bring up. Nothing about the file blocks it.
+  - **Known gaps left by A5** (EL0 and `svc`):
+    - [ ] **DELETE `kernel/arch/aarch64/syscall/bringup_syscalls.c` AT A6.**
+      Four handlers (`write`, `exit`, `getpid`, `uptime_ms`) that exist only to
+      prove the transition. The real table is `kernel/syscall/syscalls.c` and
+      not one of its 95 handlers needs a line changed to run here — they are
+      uncompiled only because they need `process.c`, the VFS, the fd layer, the
+      compositor and IPC. When those build, this file goes and the arch entry
+      point above it does not change. **Do not grow it to avoid doing A6.**
+      `syscall/usermode.c`'s probe path and `syscall/el0_probe.S` go with it:
+      they hand-map one address space and enter it, standing in for
+      `process_create()` plus the ELF loader.
+    - [ ] **One user address space, and it is the global `boot_l0_ttbr0`.**
+      Fine while exactly one program can exist; A6 needs a per-process L0 table
+      and a `TTBR0_EL1` write on context switch. The good news is that is the
+      *whole* switch on this architecture — kernel mappings live in TTBR1 and
+      are never copied into a process, unlike x86's PML4.
+    - [ ] **No ASIDs.** Every mapping is created with `nG` set but ASID stays 0,
+      so `vm_map_page`'s per-page `tlbi` does work a context switch would
+      otherwise need a full flush for. Allocating ASIDs is an A6/A9
+      optimisation, not a correctness fix.
+    - [ ] **`copy_from_user`/`copy_to_user` validate then `memcpy`.** Correct
+      while nothing can unmap a page concurrently (one CPU, no demand paging)
+      and a real time-of-check/time-of-use hole the moment either changes. The
+      x86 side has the same shape plus a retry loop; both want a fault-fixup
+      table — an exception handler that resumes at a recovery label — instead.
+      **Do this before SMP (A9), not after.**
 - [x] ~~**embbuild** — the native build tool (the make-equivalent)~~ —
   **BUILT AND SHIPPED**, not merely designed. `shell/tools/embbuild.c`; proven
   by `test embbuild` (cases a–f including the §3 `/system` install refusal),
