@@ -94,6 +94,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/tty/tty.c \
                   kernel/acpi/acpi.c \
                   kernel/drivers/audio/audio.c \
+                  kernel/drivers/audio/virtio_snd.c \
                   kernel/crypto/sha256.c \
                   kernel/crypto/hmac.c \
                   kernel/crypto/pbkdf2.c \
@@ -716,24 +717,31 @@ ARM_GPU  = -device virtio-gpu-pci
 # the window the way a relative device does.
 ARM_INPUT = -device virtio-keyboard-pci -device virtio-tablet-pci
 
+# Sound. `none` is a real audio backend, not a way of disabling one: it
+# consumes samples at the correct rate and discards them, which is exactly what
+# a headless test wants -- the driver's buffers still round-trip through the
+# device and still retire on time. Use `-audiodev coreaudio,id=a0` (or pa/alsa)
+# to actually hear it.
+ARM_SND  = -device virtio-sound-pci,audiodev=a0 -audiodev none,id=a0
+
 .PHONY: run-arm64
 run-arm64: $(ARM_IMG) $(ARM_ROOTFS)
-	$(ARM_QEMU_$(ARM_ACCEL)) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) -kernel $(ARM_IMG)
+	$(ARM_QEMU_$(ARM_ACCEL)) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -kernel $(ARM_IMG)
 
 # Force one or the other regardless of host.
 .PHONY: run-arm64-hvf
 run-arm64-hvf: $(ARM_IMG) $(ARM_ROOTFS)
-	$(ARM_QEMU_hvf) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) -kernel $(ARM_IMG)
+	$(ARM_QEMU_hvf) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -kernel $(ARM_IMG)
 
 .PHONY: run-arm64-tcg
 run-arm64-tcg: $(ARM_IMG) $(ARM_ROOTFS)
-	$(ARM_QEMU_tcg) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) -kernel $(ARM_IMG)
+	$(ARM_QEMU_tcg) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -kernel $(ARM_IMG)
 
 # Interrupt/exception tracing. TCG only -- this is the capability HVF does not
 # have, and the reason TCG stays a first-class target rather than a fallback.
 .PHONY: debug-arm64
 debug-arm64: $(ARM_IMG) $(ARM_ROOTFS)
-	$(ARM_QEMU_tcg) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) -kernel $(ARM_IMG) \
+	$(ARM_QEMU_tcg) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -kernel $(ARM_IMG) \
 	    -d int,unimp,guest_errors -D $(ARM_BUILD)/qemu.log
 
 # --- the acceptance test ----------------------------------------------------
@@ -770,7 +778,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  cp $(ARM_ROOTFS) $$scratch; \
 	  disk="-drive file=$$scratch,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0"; \
 	  port=$$(awk 'BEGIN{srand();print 4500+int(rand()*400)}'); \
-	  $$qcmd $$disk $(ARM_GPU) $(ARM_INPUT) -display none -serial file:$$log \
+	  $$qcmd $$disk $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -display none -serial file:$$log \
 	      -qmp tcp:127.0.0.1:$$port,server,nowait -kernel $(ARM_IMG) 2>/dev/null & \
 	  qpid=$$!; \
 	  python3 tools/arm64_input_probe.py $$port $$secs >/dev/null 2>&1 & \
@@ -828,6 +836,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'is a keyboard'                  A7 'virtio-input found no keyboard'; \
 	  chk 'is a tablet'                    A7 'virtio-input found no pointer'; \
 	  chk 'statusq (LEDs)'                 A7 'the keyboard has no status queue -- the lock LEDs cannot work'; \
+	  chk 'virtio-snd: stream 0 ready'     A7 'virtio-snd did not accept its PCM parameters'; \
+	  chk 'frame(s) accepted at 44100 Hz'  A7 'audio buffers were not submitted or never retired'; \
 	  chk 'PSCI via'                       A9 'no PSCI conduit found in the device tree'; \
 	  chk "$(ARM_SMP) of $(ARM_SMP) core(s) online" A9 'not every secondary core came up'; \
 	  keyn=$$(sed -n 's/.*virtio-input: \([0-9][0-9]*\) key event.*/\1/p' $$log | tail -1); \
@@ -865,6 +875,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "     dynamically linked against libembk.so"; \
 	  echo "  A7 virtio-gpu 1280x800, the compositor presenting a frame"; \
 	  echo "  A7 virtio-input: keyboard + tablet, events injected and RECEIVED"; \
+	  echo "  A7 virtio-snd: a real buffer submitted through the shared audio"; \
+	  echo "     layer and retired by the device"; \
 	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
 	  echo "     own GIC redistributor and timer, all reporting in themselves"; \
 	else exit 1; fi

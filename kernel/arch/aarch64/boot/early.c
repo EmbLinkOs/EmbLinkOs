@@ -24,6 +24,8 @@
 #include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
 #include "drivers/input/keyboard.h"
+#include "drivers/audio/ac97.h"
+#include "drivers/audio/audio.h"
 #include "arch/aarch64/smp/smp.h"
 #include "include/arch_irq.h"
 #include "include/kmalloc.h"
@@ -688,6 +690,52 @@ void arch_early_main(uint64_t dtb_phys) {
          * ordering, same reason, as kernel/main.c. */
         mouse_init(fbi ? fbi->width : 1024, fbi ? fbi->height : 768);
         virtio_input_init();
+
+        /* Sound. Named ac97_init() because that is what the shared audio layer
+         * calls; what answers here is virtio_snd.c. Harmless with no device
+         * attached -- it says so and audio_available() stays false. */
+        ac97_init();
+
+        /* AUDIO, PROVEN RATHER THAN PROBED. "stream 0 ready" means the device
+         * accepted SET_PARAMS and PREPARE; it does not mean a single sample
+         * ever reached it. So push a real buffer through the SHARED audio
+         * layer -- the same audio_open/audio_write/audio_drained path a
+         * userland program uses -- and wait for the device to hand it back.
+         * A buffer that is submitted and never retired is the failure this
+         * catches, and it is invisible from the setup handshake. */
+        if (audio_available()) {
+            static int16_t tone[512 * 2];
+            for (int i = 0; i < 512; i++) {
+                /* A square wave: no math library in the kernel, and the point
+                 * is that bytes move, not that they sound pleasant. */
+                int16_t v = (i / 32) % 2 ? 6000 : -6000;
+                tone[i * 2] = tone[i * 2 + 1] = v;
+            }
+
+            uint32_t acc = 0;
+            int rc = audio_open(0);
+            if (rc == EMBK_OK)
+                rc = audio_write(0, tone, 512, &acc);
+
+            bool drained = false;
+            if (rc == EMBK_OK && acc > 0) {
+                uint64_t start = timer_sched_ticks();
+                while (timer_sched_ticks() < start + 200) {
+                    if (audio_drained(0)) { drained = true; break; }
+                    arch_cpu_idle();
+                }
+            }
+            audio_close(0);
+
+            kprintf("  [%s] audio: %u frame(s) accepted at %u Hz, buffer%s retired\n",
+                    (rc == EMBK_OK && acc > 0 && drained) ? " ok " : "FAIL",
+                    (unsigned)acc, (unsigned)audio_sample_rate(),
+                    drained ? "" : " NOT");
+            if (rc != EMBK_OK || acc == 0 || !drained)
+                selftest_fails++;
+        } else {
+            kprintf("  [info] no audio device attached\n");
+        }
     }
 
     /* --- A9: the other cores -------------------------------------------------

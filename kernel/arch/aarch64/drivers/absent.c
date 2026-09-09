@@ -1,4 +1,3 @@
-#include "drivers/audio/ac97.h"
 #include "drivers/video/gpu.h"
 #include "include/types.h"
 
@@ -39,16 +38,12 @@
  * left here would silently WIN at link time, and the machine would have had a
  * working keyboard driver and no keyboard. */
 
-/* --- AC'97 audio: virtio-snd replaces it ---------------------------------- */
-bool     ac97_present(void)                            { return false; }
-uint32_t ac97_sample_rate(void)                        { return 0; }
-uint32_t ac97_frames_per_buffer(void)                  { return 0; }
-uint32_t ac97_fill(int i, const int16_t *f, uint32_t n) { (void)i; (void)f; (void)n; return 0; }
-uint8_t  ac97_civ(void)                                { return 0; }
-void     ac97_set_last(int last)                       { (void)last; }
-void     ac97_play(int last)                           { (void)last; }
-bool     ac97_done(int last)                           { (void)last; return true; }
-void     ac97_stop(void)                               { }
+/* --- AC'97 audio: GONE FROM HERE TOO ---------------------------------------
+ * virtio-snd landed (drivers/audio/virtio_snd.c) and implements the same nine
+ * functions, so the stubs are deleted exactly as the keyboard's and mouse's
+ * were. Those nine names are not "the AC'97 driver's interface" -- they are
+ * THE audio driver interface this kernel has, and audio.c is written against
+ * them. */
 
 /* --- bochs VGA: virtio-gpu is the display path here ----------------------- */
 const struct gpu_driver *bochs_gpu_probe(void)         { return 0; }
