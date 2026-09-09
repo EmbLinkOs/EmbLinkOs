@@ -1737,34 +1737,26 @@ substantially complete.
       edge that x86 does not have. Either trap it or document it as the ABI.
 
   - **Known gaps left by A5** (EL0 and `svc`):
-    - [ ] **DELETE `kernel/arch/aarch64/syscall/bringup_syscalls.c` AT A6.**
-      Four handlers (`write`, `exit`, `getpid`, `uptime_ms`) that exist only to
-      prove the transition. The real table is `kernel/syscall/syscalls.c` and
-      not one of its 95 handlers needs a line changed to run here — they are
-      uncompiled only because they need `process.c`, the VFS, the fd layer, the
-      compositor and IPC. When those build, this file goes and the arch entry
-      point above it does not change. **Do not grow it to avoid doing A6.**
-      `syscall/usermode.c`'s probe path and `syscall/el0_probe.S` go with it:
-      they hand-map one address space and enter it, standing in for
-      `process_create()` plus the ELF loader.
-    - [ ] **One user address space, and it is the global `boot_l0_ttbr0`.**
-      Fine while exactly one program can exist; A6 needs a per-process L0 table
-      and a `TTBR0_EL1` write on context switch. The good news is that is the
-      *whole* switch on this architecture — kernel mappings live in TTBR1 and
-      are never copied into a process, unlike x86's PML4.
+    - [x] ~~**DELETE `kernel/arch/aarch64/syscall/bringup_syscalls.c` AT
+      A6.**~~ — deleted. syscall/ holds only syscall.c, the real arch entry
+      point, and the 95 shared handlers run behind it.
+    - [x] ~~**One user address space, and it is the global
+      `boot_l0_ttbr0`.**~~ — per-process L0 tables since A5, with a TTBR0_EL1
+      write on every switch. The prediction in the old entry held exactly:
+      that IS the whole switch here, because kernel mappings live in TTBR1
+      and are never copied into a process. With ASIDs it does not even flush.
     - [x] ~~**No ASIDs.**~~ — one per address space, allocated and released
       with the space, and the context switch no longer flushes. Note the nG
       claim in the old entry was WRONG: nG was set only for PT_USER, so
       kernel-only mappings in the user half were global. That is fixed too.
-    - [ ] **`copy_from_user`/`copy_to_user` validate then `memcpy`.** Correct
-      while nothing can unmap a page concurrently (one CPU, no demand paging)
-      and a real time-of-check/time-of-use hole the moment either changes. The
-      x86 side has the same shape plus a retry loop; both want a fault-fixup
-      table — an exception handler that resumes at a recovery label — instead.
-      **Do this before SMP (A9), not after.**
-  - **The HAL, so far** (`kernel/include/arch_irq.h`, extracted after A5 and
-    measured rather than guessed — see ARM64.md §2.3). 61 of 76 shared kernel
-    files now compile for aarch64. What is left:
+    - [ ] **`copy_from_user`/`copy_to_user` validate then `memcpy`, and SMP
+      makes that a real hole.** The old entry said "correct while nothing can
+      unmap a page concurrently (one CPU, no demand paging)". aarch64 now
+      runs four cores, so the first half of that condition is gone: another
+      core can unmap between the check and the copy. Same shape on x86, which
+      has had SMP longer and papers it with a retry loop. Both want a
+      fault-fixup table -- an exception handler that resumes at a recovery
+      address -- which is the honest fix and is not architecture-specific.
     - [x] ~~`kernel/process/process.c` is the gate~~ — **done.** All 3,700
       lines compile for aarch64 with zero inline assembly, behind six named
       seams in `kernel/include/arch_thread.h` plus `timer_sched_ticks()`.
@@ -1838,14 +1830,10 @@ substantially complete.
       cleared, and the kernel wedged in an interrupt storm before the scheduler
       ran once. `arch_pci_irq_line()` (resolve) is now separate from
       `arch_pci_irq_connect()` (arm). Keep them separate.
-    - [ ] ~~28 undefined symbols remain, and every one is a device driver~~ for
-      hardware QEMU `virt` does not have: `keyboard_*` (9, PS/2), `ac97_*` (9),
-      `mouse_*` (3), `rtc_*`, `pit_*`, `uhci_*`, `bochs_*`, `ioapic_*`,
-      `irq_register`. Their replacements are the rest of A7: virtio-input,
-      virtio-blk, virtio-snd. **Do not stub them
-      to make a kernel link** — there is nothing for that kernel to run until
-      A7 gives it a disk anyway, and a stub farm would hide which of them were
-      ever really needed.
+    - [x] ~~28 undefined symbols remain, and every one is a device driver~~ —
+      every one now has a real driver: virtio-input for the keyboard and
+      mouse, virtio-snd for AC'97, virtio-blk, PL031 for the RTC. The
+      checkbox simply never got ticked when the text was struck through.
     - [ ] **TLS relocations are the one ELF family the two architectures
       genuinely disagree about** — x86 counts down from the thread pointer,
       aarch64 counts up. Still no `ELF_RELOC_TLS` in `elf.h`, and still
@@ -1872,11 +1860,13 @@ substantially complete.
       VMM_PRESENT/WRITABLE/NX are still bit positions 0, 1 and 63, and
       VMM_NX is still inverted. vmm.h now states the rule for new code:
       VMM_EXEC to run code, VMM_NX to forbid it, silence is not a policy.
-    - [ ] **Eleven legacy x86 device drivers do not compile, and must not.**
-      PIT, RTC, ATA, AC97, PS/2 keyboard and mouse, UHCI, bochs VBE, the 16550,
-      port-CF8 PCI, and `drivers/timer/timer.c`'s x86 glue. ARM64.md §2.6:
-      absent, not ported. They need EXCLUDING from the aarch64 source list,
-      which is a build change rather than a code change.
+    - [ ] **NINE legacy x86 device drivers do not compile, and must not.**
+      PIT, RTC, ATA, AC97, UHCI, bochs VBE, the 16550, port-CF8 PCI, and
+      `drivers/timer/timer.c`'s x86 glue. ARM64.md §2.6: absent, not ported.
+      Was ELEVEN: the PS/2 keyboard and mouse came OFF this list, not by
+      being ported but by being SPLIT -- their hardware halves are behind
+      `#if defined(__x86_64__)` and their policy halves are shared, which is
+      what let virtio-input reuse them instead of duplicating them.
     - [ ] **`hlt` is still written inline in `main.c`, `selftests.c` and
       `process.c`** (about a dozen sites) rather than through
       `arch_cpu_idle()`. Left alone deliberately: those files fail for other
