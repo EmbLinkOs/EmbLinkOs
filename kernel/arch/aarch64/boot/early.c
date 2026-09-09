@@ -41,6 +41,12 @@
 
 #define PL011_PHYS 0x09000000UL
 
+/* How long the boot self-test waits for the desktop session to come up and for
+ * injected input to arrive, at the 100 Hz tick. Generous on purpose: it is a
+ * DEADLINE, not a delay -- the loop leaves the moment its conditions hold, so a
+ * healthy system never spends it, and a broken one fails rather than hangs. */
+#define DESKTOP_DEADLINE_TICKS 2500
+
 static uint64_t read_sysreg_currentel(void) {
     uint64_t v; __asm__ volatile("mrs %0, CurrentEL" : "=r"(v)); return v >> 2;
 }
@@ -723,21 +729,24 @@ void arch_early_main(uint64_t dtb_phys) {
      * `virt`, and an app with no display would have nothing to present while a
      * display with no app would have nothing to show.
      *
-     * uidemo.elf is an ET_EXEC with PT_DYNAMIC and DT_NEEDED libembk.so. The
-     * kernel IS the dynamic loader -- there is no ld.so and no PT_INTERP -- so
-     * loading it exercises the whole two-way link: the app's imports resolve to
-     * the toolkit's exports, and the toolkit's libc imports (malloc, memcpy,
-     * sinf) resolve BACK into the app, which is where newlib was statically
-     * pulled in. 56 R_AARCH64_JUMP_SLOT relocations get applied by code that
-     * needed no aarch64-specific line: elf.c has been written against the
-     * neutral ELF_RELOC_* names since A4.
+     * WHAT IS SPAWNED IS init.elf, the same pid 1 x86 starts, not a demo app.
+     * init is the root of userspace authority (docs/USERSPACE_v2.md UP1): it
+     * brings up the session and supervises it, so the DESKTOP is init's child
+     * rather than the first process. It reaches /system/bin/home.elf, which is
+     * an ET_EXEC with PT_DYNAMIC and DT_NEEDED libembk.so -- so this one spawn
+     * exercises the freestanding loader, the dynamic loader, and the two-way
+     * link between them: the app's imports resolve to the toolkit's exports,
+     * and the toolkit's libc imports (malloc, memcpy, sinf) resolve BACK into
+     * the app, where newlib was statically pulled in. Every one of those
+     * relocations is applied by code that needed no aarch64-specific line --
+     * elf.c has been written against the neutral ELF_RELOC_* names since A4.
      *
      * The boot thread then pumps the compositor exactly as main.c's boot loop
      * does on x86, and for the same reason stated there: these repaint, so they
      * must run in schedulable context, never from an IRQ handler. */
     kprintf("\n--- the desktop (A6 + A7) ---\n");
     {
-        const char *app = "/data/apps/uidemo/uidemo.elf";
+        const char *app = "/system/bin/init.elf";
         char *uargv[] = { (char *)app, NULL };
 
         /* Hand the screen to userspace BEFORE the app becomes schedulable --
@@ -763,9 +772,19 @@ void arch_early_main(uint64_t dtb_phys) {
              * seconds at 100 Hz is far more than the app needs -- on x86 the
              * equivalent app presents its first frame about 900 ms in, and most
              * of that is parsing the font. */
+            /* Pump until the session is UP and input has ARRIVED, with a
+             * deadline -- not for a fixed number of ticks.
+             *
+             * A fixed window was wrong twice over. Too short and the test fails
+             * on a working system: the session got slower the moment the image
+             * grew a 20 MB wallpaper, because virtio-blk is polled. Too long and
+             * every passing run pays the worst case. Waiting for the CONDITION
+             * costs what it costs and no more, and the deadline is what keeps a
+             * broken system from hanging the test instead of failing it. */
             uint64_t start = timer_sched_ticks();
-            kprintf("  [info] input window OPEN at tick %u\n", (unsigned)start);
-            while (timer_sched_ticks() < start + 500) {
+            kprintf("  [info] waiting for the session (deadline %u ticks)\n",
+                    (unsigned)DESKTOP_DEADLINE_TICKS);
+            while (timer_sched_ticks() < start + DESKTOP_DEADLINE_TICKS) {
                 /* virtio-input is POLLED, and this is its cadence: the same
                  * schedulable context the compositor ticks run in, never an
                  * IRQ handler. main.c's boot loop drives usb_poll() from the
@@ -773,16 +792,30 @@ void arch_early_main(uint64_t dtb_phys) {
                 virtio_input_poll();
                 compositor_pointer_tick();
                 compositor_anim_tick();
+
+                uint32_t k = 0, pt = 0;
+                virtio_input_stats(&k, &pt);
+                if (compositor_focused_pid() != 0 && k > 0 && pt > 0)
+                    break;          /* everything this phase asserts is true */
+
                 arch_cpu_idle();
             }
+            kprintf("  [info] waited %u tick(s)\n",
+                    (unsigned)(timer_sched_ticks() - start));
 
-            /* The assertion. A window that exists AND holds focus means the
-             * app got through the toolkit, asked the compositor for a surface,
-             * and the compositor accepted it -- which it only does once there
-             * is a framebuffer under it. */
+            /* The assertion. A window that exists AND holds focus means
+             * something got through the toolkit, asked the compositor for a
+             * surface, and was accepted -- which only happens once there is a
+             * framebuffer under it.
+             *
+             * The focused pid is NOT init's: init spawns the session and the
+             * session owns the window, so what this checks is "some process
+             * holds focus", not "the process I started does". Asserting
+             * equality here would be asserting that init never delegated,
+             * which is the opposite of what it is for. */
             uint32_t focused = compositor_focused_pid();
-            bool ok = (focused == (uint32_t)upid);
-            kprintf("  [%s] compositor: focused pid %u (app is %d)\n",
+            bool ok = (focused != 0);
+            kprintf("  [%s] compositor: focused pid %u (init is %d)\n",
                     ok ? " ok " : "FAIL", (unsigned)focused, upid);
             if (!ok)
                 selftest_fails++;
@@ -794,8 +827,6 @@ void arch_early_main(uint64_t dtb_phys) {
              * decoded, and reached the shared keyboard/mouse state. Run by
              * hand with no monitor driving it, they are legitimately zero;
              * that is why this reports rather than fails. */
-            kprintf("  [info] input window CLOSED at tick %u\n",
-                    (unsigned)timer_sched_ticks());
             uint32_t keys = 0, ptr = 0;
             virtio_input_stats(&keys, &ptr);
             int32_t mx = 0, my = 0; uint32_t mb = 0;

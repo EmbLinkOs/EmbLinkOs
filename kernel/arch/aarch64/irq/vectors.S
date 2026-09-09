@@ -99,9 +99,14 @@ exc_common:
      * exit. x86 never has this bug because the user RSP rides in the iretq
      * frame the hardware itself builds.
      *
-     * SPSR.M[3:0] == 0 is EL0t; EL1t/EL1h are 0b0100/0b0101. x3 still holds the
-     * SPSR read just above. */
-    and     x2, x3, #0xF
+     * SPSR.M[3:0] == 0 is EL0t; EL1t/EL1h are 0b0100/0b0101. The SPSR is RE-READ
+     * rather than reused from x3: the ESR/FAR snapshot above overwrites x2 and
+     * x3, and an earlier version of this code tested x3 believing it still held
+     * the SPSR. It held FAR_EL1, so which stack this saved was decided by the
+     * low nibble of a fault address -- and for an SVC, where FAR_EL1 is
+     * architecturally UNKNOWN, by stale bits. */
+    mrs     x2, spsr_el1
+    and     x2, x2, #0xF
     cbnz    x2, 1f
     mrs     x2, sp_el0
     b       2f

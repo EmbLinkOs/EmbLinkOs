@@ -221,15 +221,33 @@ ARM_SYSCALLS  := $(ARM_USER)/syscalls.o
 # witness; init.elf is the freestanding pid-1. The GUI apps are absent because
 # libembk.so and the compositor are A7 work -- see docs/TODO.md. Add a name here
 # and it builds; nothing else needs editing.
-ARM_NEWLIB_PROGS ?= hello
-ARM_PLAIN_PROGS  ?= init
+# Static newlib console programs (-T newlib.ld, no libembk.so).
+ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capreload capspawn \
+                    crasher ioracer sockdemo udptest nbsock httpget
 
-# The dynamically-linked EmUI apps -- A6's "done when". Declared HERE with the
-# other two lists, not beside the rules that build them further down, for the
-# same reason ARM_ROOTFS is declared at the top: ARM_USER_ELVES below is a `:=`
-# assignment, so a name that is not defined yet expands to nothing and the app
-# silently never builds.
-ARM_UI_PROGS     ?= uidemo
+# Freestanding: own _start, no libc at all (-T user.ld).
+ARM_PLAIN_PROGS  ?= init primtest
+
+# The dynamically-linked EmUI apps. DERIVED FROM THE x86 LIST rather than
+# retyped: $(EMUI_APP_SRCS) is the top-level Makefile's auto-discovery of
+# user/bin/*.c minus the programs that are not EmUI apps, and it is defined
+# before this fragment is included. Deriving it means a new app appears on BOTH
+# architectures the moment it is dropped in user/bin -- which is the whole point
+# of that auto-discovery, and it would have been lost by keeping a second list
+# here that someone has to remember to update.
+#
+# TWO SUBTRACTIONS. $(EMUI_APP_SRCS) is "everything that is not on the
+# exclusion list", and on x86 two of the survivors are still not dynamic EmUI
+# apps -- they are rescued by EXPLICIT rules that shadow the generic pattern,
+# which is knowledge the variable itself does not carry:
+#   beep      is a STATIC newlib console program (-T newlib.ld), below.
+#   primtest  is FREESTANDING, with its own _start and no main (-T user.ld).
+# Left in, primtest fails at link with "undefined reference to `main'" from
+# crt0 -- which is a true statement about a program that has none.
+#
+# Override on the command line to build a subset:  make ARCH=aarch64 ARM_UI_PROGS=uidemo
+ARM_UI_PROGS     ?= $(filter-out beep primtest,\
+                      $(patsubst user/bin/%.c,%,$(EMUI_APP_SRCS)))
 
 ARM_USER_ELVES := $(patsubst %,$(ARM_USER)/%.elf,$(ARM_NEWLIB_PROGS)) \
                   $(patsubst %,$(ARM_USER)/%.elf,$(ARM_PLAIN_PROGS)) \
@@ -317,11 +335,30 @@ $(ARM_LIBEMBK): $(ARM_LIBEMBK_OBJ)
 # .rela.plt/.got the in-kernel loader reads). libembk.so comes before -lc -lm so
 # ld pulls the libc the toolkit needs INTO the app, and --export-dynamic exports
 # it back to the .so. --no-dynamic-linker because the kernel is the loader.
+# A few apps are more than one translation unit, exactly as they are on x86
+# (where each has an explicit rule with extra objects). Naming the extra
+# SOURCES per app keeps that fact in one place instead of a second explicit
+# rule per app down here.
+ARM_XSRC_home   := user/lib/appauth.c
+ARM_XSRC_notepp := user/note/syntax.c user/note/doc.c user/note/edit.c
+
+# Every extra source any app needs, deduplicated -- two apps may share one.
+ARM_XSRC_ALL := $(sort $(foreach p,$(ARM_UI_PROGS),$(ARM_XSRC_$(p))))
+ARM_XOBJ      = $(patsubst %,$(ARM_USER)/x_%.o,$(subst /,_,$(basename $(1))))
+
+define ARM_XOBJ_RULE
+$(ARM_USER)/x_$(subst /,_,$(basename $(1))).o: $(1) | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note -c $$< -o $$@
+endef
+$(foreach src,$(ARM_XSRC_ALL),$(eval $(call ARM_XOBJ_RULE,$(src))))
+
 define ARM_UI_PROG
 $(ARM_USER)/$(1).o: user/bin/$(1).c user/lib/embk.h | $(ARM_USER)
-	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -c $$< -o $$@
-$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(ARM_CRT0) $(ARM_SYSCALLS) $(ARM_LIBEMBK)
-	$$(USER_CC) $$(NEWLIB_DYN_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) $$< \
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
+                      $(ARM_CRT0) $(ARM_SYSCALLS) $(ARM_LIBEMBK)
+	$$(USER_CC) $$(NEWLIB_DYN_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) \
+	    $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
 	    $(ARM_LIBEMBK) -lc -lm -lgcc $$(NEWLIB_DYN_WL) -o $$@
 endef
 $(foreach p,$(ARM_UI_PROGS),$(eval $(call ARM_UI_PROG,$(p))))
@@ -448,8 +485,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	@overall=0; \
 	for acc in $(ARM_TEST_ACCELS); do \
 	  case $$acc in \
-	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=15;;  \
-	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=40;; \
+	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=40;;  \
+	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=90;; \
 	  esac; \
 	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \
 	  echo "=== $$acc ==="; \
@@ -502,7 +539,10 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'hello: 5/5 checks passed'       A6 'the userland witness did not pass every check'; \
 	  chk 'exited with 5 (checks passed)'  A6 'the process did not exit cleanly with its status'; \
 	  chk 'libembk.so linked'              A6 'the dynamic link failed -- no EmUI app can load'; \
-	  chk 'uidemo.elf launched as pid'     A6 'the dynamically-linked app did not start'; \
+	  chk 'init.elf launched as pid'       A6 'pid 1 did not start'; \
+	  chk 'ns: /system is read-only'       A6 'init could not confine itself -- the namespace is not enforced'; \
+	  chk 'desktop session started'        A6 'init never spawned the session'; \
+	  chk 'home: desktop ready'            A7 'the desktop came up but never finished'; \
 	  chk 'first frame presented'          A7 'the compositor never presented a frame'; \
 	  chk 'framebuffer 1280x800'           A7 'virtio-gpu did not come up'; \
 	  chk 'is a keyboard'                  A7 'virtio-input found no keyboard'; \
@@ -535,7 +575,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "  A7 PCIe ECAM, virtio-blk, and the REAL filesystem mounted + read"; \
 	  echo "  A6 a newlib program from that filesystem, at EL0: argv, printf,"; \
 	  echo "     malloc, snprintf, time, a second thread, and a clean exit(5)"; \
-	  echo "  A6 a DYNAMICALLY-LINKED EmUI app: libembk.so loaded and relocated"; \
+	  echo "  A6 the REAL session: init -> auth -> a namespace-confined desktop,"; \
+	  echo "     dynamically linked against libembk.so"; \
 	  echo "  A7 virtio-gpu 1280x800, the compositor presenting a frame"; \
 	  echo "  A7 virtio-input: keyboard + tablet, events injected and RECEIVED"; \
 	else exit 1; fi

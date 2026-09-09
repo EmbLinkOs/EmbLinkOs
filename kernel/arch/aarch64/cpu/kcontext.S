@@ -220,6 +220,27 @@ aarch64_eret_to_el0:
     mov     x29, xzr
     mov     x30, xzr
 
+    /* FPCR and FPSR to a KNOWN state, and this is not tidiness either.
+     *
+     * Both are UNKNOWN out of reset. FPCR carries the IEEE trap-enable bits, so
+     * an unknown FPCR can mean "trap on inexact" -- and then the first ordinary
+     * floating-point instruction in user code raises EC 0x2C, "trapped
+     * floating-point exception", and the process is killed for doing
+     * arithmetic. That is exactly what happened the first time the real desktop
+     * ran here: libembk.so's rasterizer took an FP trap the moment it scaled a
+     * glyph. Zero is the AAPCS64 startup state -- every IEEE trap disabled,
+     * round-to-nearest -- and is what a fresh process must be handed.
+     *
+     * FPSR is zeroed for the same reason the GPRs are: it is accumulated
+     * status from whoever ran last, and none of it is this process's business.
+     *
+     * KNOWN GAP, recorded in docs/TODO.md: kernel_ctx_switch does not save or
+     * restore FP/SIMD state, so FPCR is effectively shared between threads.
+     * Zeroing here is correct because every thread wants the same value; it
+     * stops being sufficient the moment anything sets a rounding mode. */
+    msr     fpcr, xzr
+    msr     fpsr, xzr
+
     /* Now place the arguments, after everything else is zero. */
     mov     x0, x9
     mov     x1, x10

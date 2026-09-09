@@ -5,7 +5,7 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A7 COMPLETE. The desktop runs on ARM.**
+**Status: A0–A7 COMPLETE. The REAL desktop session runs on ARM.**
 
 **The whole shared kernel links and runs on aarch64** — the real scheduler, the
 real 95-handler syscall table, EMBKFS, the VFS, IPC, the compositor and the
@@ -816,12 +816,33 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
   as its own dynamic loader:
 
   ```
+    [ ok ] /system/bin/init.elf launched as pid 3
+  init: up -- root of EmbLink userspace authority
+  init: ns: /system is read-only for userspace (write refused) -- OK
+  init: DEV auto-login as 'yves'
+  init: authenticated session 'yves' -> ns[ro /system, ro /data/apps, rw /home/yves, rw /run]
   ELF dynlink: /system/lib/libembk.so linked
-    [ ok ] /data/apps/uidemo/uidemo.elf launched as pid 3
-  uidemo: font loaded (+43ms)
-  compositor: shared window 1 created (560x760, 416 pages) for pid 3
-  uidemo: first frame presented (+467ms)
+  init: desktop session started
+  compositor: desktop window 1 created (1280x800, 1000 pages) for pid 4
+  home: desktop ready
+  TopBar: first frame presented (+133ms)
   ```
+
+  **This is the same pid 1 x86 runs, not a demo.** init authenticates, builds a
+  confined namespace and spawns the session, so the desktop is init's CHILD --
+  and the kernel's one `process_create()` therefore exercises the freestanding
+  loader (init), the dynamic loader (home, TopBar) and the namespace machinery
+  in a single boot.
+
+  **THIRTY user programs build for aarch64**, not three: `ARM_UI_PROGS` is
+  DERIVED from the x86 `$(EMUI_APP_SRCS)` auto-discovery rather than retyped, so
+  a new app appears on both architectures the moment it is dropped in
+  `user/bin`. Two subtractions are needed and are named in `arch.mk` -- `beep`
+  is a static newlib console program and `primtest` is freestanding, facts the
+  x86 side encodes in explicit rules that shadow its generic pattern and that
+  the variable itself does not carry. Left in, `primtest` fails to link with
+  "undefined reference to `main`", which is a true statement about a program
+  that has none.
 
   Not one line of `elf.c` was written for it. The two-way link -- the app's
   imports resolving to the toolkit's exports, and the toolkit's libc imports
@@ -944,6 +965,32 @@ Each phase is a thing that *works*, not a thing that is written. ❌ = not built
     existing drivers still carry their own and should migrate; folding a
     refactor of three working drivers into a bring-up would have made any
     regression ambiguous.
+
+  **Three more bugs, and the first one was mine:**
+
+  0. **The SP_EL0 fix above tested the WRONG REGISTER.** Its comment said "x3
+     still holds the SPSR read just above" -- and the ESR/FAR snapshot in
+     between had overwritten x3 with FAR_EL1. So which stack got saved was
+     decided by the low nibble of a fault address, and for an `svc`, where
+     FAR_EL1 is architecturally UNKNOWN, by stale bits. It survived `hello.elf`
+     (whose faults happened to have the right nibble) and killed `init.elf` on
+     its first syscall-heavy stretch, as a near-NULL data abort whose reported
+     ELR pointed at an `add` instruction -- which cannot fault, and was the
+     clue. The SPSR is re-read now rather than reused.
+  1. **`FPCR` was never initialised, and it is UNKNOWN out of reset.** It
+     carries the IEEE trap-enable bits, so user code could take EC 0x2C
+     ("trapped floating-point exception") for doing ordinary arithmetic --
+     libembk.so's rasterizer did, the moment it scaled a glyph.
+     `aarch64_eret_to_el0` now zeroes FPCR and FPSR, which is the AAPCS64
+     startup state. x86 has the same requirement and meets it in `fpu.c`.
+  2. **The image was missing everything the session needs.** A directory that
+     does not exist cannot be GRANTED -- the kernel resolves an ns-bind prefix
+     in the parent's namespace at spawn time -- so `/home/<user>` and `/run`
+     have to be on the image before init runs, and with `/home` absent init's
+     mkdir loop failed forever while the log filled with `"home" not found`.
+     `mkfs_arm64.py` now IMPORTS `_SYSTEM_BIN` and `_tree_objects` from the x86
+     packer rather than duplicating them, because the paths are a contract with
+     init.c (which hardcodes `/system/bin/home.elf`), not a preference.
 
   **Two bugs found by looking at the SCREEN rather than the log:**
 

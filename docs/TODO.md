@@ -1685,13 +1685,26 @@ substantially complete.
     - [x] ~~**No `libembk.so` and no dynamically-linked app on aarch64.**~~ —
       `uidemo.elf` loads, relocates and presents a frame. The loader needed no
       aarch64-specific line, exactly as this entry predicted.
-    - [ ] **The aarch64 userland is FOUR programs** (`hello.elf`, `init.elf`,
-      `uidemo.elf`, plus `libembk.so`), named in `ARM_NEWLIB_PROGS` /
-      `ARM_PLAIN_PROGS` / `ARM_UI_PROGS` in `arch.mk`. Adding a name is the
-      whole of adding a program now — the rules are generated. The console
-      programs (`posixdemo`, `ioracer`, `capchild`, `sockdemo`) are the
-      cheapest way to widen the ABI's test surface; the remaining EmUI apps
-      (`files`, `term`, `settings`, `notepp`) should now build unchanged.
+    - [x] ~~**The aarch64 userland is FOUR programs**~~ — it is THIRTY, and
+      `ARM_UI_PROGS` is now DERIVED from the x86 `$(EMUI_APP_SRCS)`
+      auto-discovery rather than retyped, so a new app appears on both
+      architectures the moment it is dropped in `user/bin`. Two subtractions
+      are named in `arch.mk` (`beep` is static-newlib, `primtest` is
+      freestanding) because x86 encodes those facts in explicit rules that
+      shadow its generic pattern.
+    - [ ] **Twelve programs still do not build for aarch64**, and they split
+      into two honest groups. OPTIONAL PORTS whose libraries are x86-only:
+      `js` (QuickJS), `mp3play`, `photos`, `vellum`, `gitclone`/`gitpush`,
+      `pkg`/`pkgbuild`/`pkgfetch` — each needs its third-party dependency
+      cross-built for aarch64 first, exactly as x86 needed. And the `emlibc_*`
+      family, which links an ALTERNATIVE libc (`user/emlibc`) whose headers
+      deliberately shadow newlib's; it needs its own include set per app, not
+      a wider one (adding `-Iuser/emlibc/include` globally breaks every newlib
+      app instead).
+    - [ ] **`posixdemo` needs real work, not a build fix.** It contains x86
+      inline asm (`mov %fs:0x0`) for a direct TLS read and uses
+      `sig_atomic_t`. It is the POSIX conformance witness, so porting it is
+      worth doing properly rather than by deleting the assertions.
     - [ ] **`getentropy()` returns ENOSYS on aarch64.** The architectural
       equivalent of RDRAND is FEAT_RNG's `RNDR`, which EL0 may execute but only
       when it exists — and the feature bit is in `ID_AA64ISAR0_EL1`, which EL0
@@ -1812,6 +1825,12 @@ substantially complete.
       deliberate, recorded choice: folding a refactor of three working drivers
       into an ARM bring-up would have made any regression ambiguous. Migrate
       them one at a time, each with a boot to vouch for it.
+    - [ ] **No FP/SIMD state is saved across a context switch on aarch64,**
+      so `FPCR` is effectively shared between threads. Zeroing it on entry to
+      EL0 (`aarch64_eret_to_el0`) is correct only because every thread wants
+      the same value; it stops being sufficient the moment anything sets a
+      rounding mode or uses SIMD across a preemption point. The x86 side
+      saves/restores FXSAVE state and this does not.
     - [ ] **virtio-input's status queue is unused, so the lock LEDs do
       nothing.** Caps Lock still LATCHES correctly on aarch64 — `g_mods` flips
       and every consumer sees it — but there is no light, because
@@ -1821,11 +1840,10 @@ substantially complete.
       and the evdev path carries its own small shift table instead of going
       through them. Wiring evdev into the layout tables is the right fix, and a
       separate change from the bring-up.
-    - [ ] **aarch64 has no `init.elf` session, so the desktop is one app.**
-      `early.c` spawns `uidemo.elf` directly. On x86 init spawns login, the
-      session and `home.elf`, and those need an account database, the setup
-      flow and the launcher — all of which are EmUI apps that would now BUILD
-      for aarch64 (add them to `ARM_UI_PROGS`). Nothing blocks it but the work.
+    - [x] ~~**aarch64 has no `init.elf` session**~~ — it runs the same pid 1
+      x86 does: init authenticates, builds a confined namespace
+      (`ro /system, ro /data/apps, rw /home/yves, rw /run`) and spawns
+      `home.elf`, which spawns TopBar. The desktop is init's child.
     - [ ] **virtio-blk is polled and sets `VRING_AVAIL_F_NO_INTERRUPT`.** Fine
       at one outstanding request; an interrupt-driven version needs a wait
       queue and buys nothing until requests overlap.
