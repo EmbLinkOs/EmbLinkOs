@@ -1113,4 +1113,22 @@ static inline unsigned embk_intr_take(void) {
     return n > 0 ? (unsigned)n : 0u;
 }
 
+/* --- symbolic links --------------------------------------------------------
+ * A link holds TEXT, not a reference to an object. It may name something that
+ * does not exist (creating one before its target is normal), it is re-resolved
+ * on every path walk, and a cycle is reported as -EMBK_ELOOP rather than
+ * hung on. `target` is stored verbatim, so a relative target stays relative --
+ * which is what lets a tree of links survive being moved.
+ *
+ * embk_readlink reports the FULL length even when the buffer was too small, so
+ * a caller can tell a truncated answer from a complete one. */
+static inline int embk_symlink(const char *target, const char *linkpath) {
+    return (int)embk_syscall2(EMBK_SYS_symlink, (int64_t)(intptr_t)target,
+                              (int64_t)(intptr_t)linkpath);
+}
+static inline int64_t embk_readlink(const char *path, char *buf, size_t cap) {
+    return embk_syscall3(EMBK_SYS_readlink, (int64_t)(intptr_t)path,
+                         (int64_t)(intptr_t)buf, (int64_t)cap);
+}
+
 #endif /* __EMBK_H__ */

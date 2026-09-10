@@ -141,6 +141,12 @@
 /* The counted, clearable interrupt channel -- ^C that a process SURVIVES.
  * cmd 0 = take-and-clear the pending count; cmd 1 = opt in/out of catching. */
 #define EMBK_SYS_intr          101   /* (cmd, arg)         -> count   | -err */
+/* Symbolic links. A link holds TEXT, re-resolved on every walk -- so it may
+ * name something that does not exist. readlink reports the FULL length even
+ * when the buffer was short; lstat is stat that does not follow one. */
+#define EMBK_SYS_symlink       102   /* (target, linkpath) -> 0       | -err */
+#define EMBK_SYS_readlink      103   /* (path, buf, cap)   -> len     | -err */
+#define EMBK_SYS_lstat         104   /* (path, stat*)      -> 0       | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

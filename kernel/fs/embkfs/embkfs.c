@@ -4670,6 +4670,64 @@ int embkfs_mkdir_name(struct embkfs_volume *vol, uint64_t dir_oid,
     return embkfs_mkdir(vol, dir_oid, name, out_oid);
 }
 
+/* A symlink is an object holding TEXT. Two steps and no new machinery: create
+ * it with the link mode (make_object already turns that into a DT_LNK
+ * directory entry), then write the target as its content.
+ *
+ * NOT ATOMIC, and worth saying so: the create and the write are two commits,
+ * so a crash between them leaves an EMPTY link -- an object of the right type
+ * with no target. The walker refuses one (an empty target is not a path), so
+ * the failure mode is a link that reports EINVAL rather than one that points
+ * somewhere wrong. Making it one transaction means teaching make_object to
+ * carry initial content, which is worth doing when something else needs it
+ * too. Recorded in docs/TODO.md. */
+int embkfs_symlink(struct embkfs_volume *vol, uint64_t dir_oid,
+                   const char *name, const char *target)
+{
+    if (!vol || !name || !target) return -EMBK_EINVAL;
+    size_t tlen = strlen(target);
+    if (tlen == 0) return -EMBK_EINVAL;          /* a link to nowhere is not a link */
+    if (tlen > 1024) return -EMBK_ENAMETOOLONG;
+
+    uint64_t oid = 0;
+    int rc = embkfs_make_object(vol, dir_oid, name,
+                                EMBKFS_S_IFLNK | EMBKFS_PERM_LNK, &oid);
+    if (rc != EMBK_OK) return rc;
+
+    rc = embkfs_write_object(vol, oid, (const uint8_t *)target, (uint64_t)tlen);
+    if (rc != EMBK_OK) {
+        /* Undo the name rather than leave a link with no target. Best effort:
+         * if this fails too, the walker still refuses the empty link. */
+        (void)embkfs_unlink(vol, dir_oid, name);
+        return rc;
+    }
+    return EMBK_OK;
+}
+
+int embkfs_readlink(struct embkfs_volume *vol, uint64_t oid,
+                    char *buf, uint64_t cap, uint64_t *out_len)
+{
+    if (!vol || !buf || !out_len) return -EMBK_EINVAL;
+
+    struct embk_inode_item ino;
+    int rc = embkfs_stat_object(vol, oid, &ino);
+    if (rc != EMBK_OK) return rc;
+    if ((ino.mode & EMBKFS_S_IFMT) != EMBKFS_S_IFLNK) return -EMBK_EINVAL;
+
+    /* The FULL length is reported even when the buffer is short, so a caller
+     * can tell a truncated answer from a complete one instead of silently
+     * acting on half a path. */
+    *out_len = ino.size;
+    uint64_t want = ino.size < cap ? ino.size : cap;
+    if (want == 0) return EMBK_OK;
+
+    uint64_t got = 0;
+    rc = embkfs_read_object_at(vol, oid, 0, (uint8_t *)buf, want, &got);
+    if (rc != EMBK_OK) return rc;
+    if (got < want) *out_len = got;
+    return EMBK_OK;
+}
+
 int embkfs_mkdir_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
                       const char *path, uint64_t *out_oid)
 {

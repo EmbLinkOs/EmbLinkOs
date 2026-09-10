@@ -169,10 +169,16 @@ of this commit — is a programming language.
    that matches nothing is an empty table rather than the pattern passed
    through as a filename.
    - Still missing: recursive `**`, and brace expansion.
-3. **No symlinks.** Almost every ported build system assumes them, so this is
-   the quiet blocker behind "why won't this project build here". Now the
-   largest item on this list — and the only one that needs an on-disk format
-   change (EMBKFS has the `VFS_DT_LNK` type and nothing that creates one).
+3. ~~**No symlinks.**~~ **Done**, and the on-disk format needed no change
+   after all: EMBKFS already had `S_IFLNK`, `DT_LNK`, and a `make_object` that
+   mapped one to the other. A link is an ordinary object whose *content* is the
+   target text. What was missing was everything above it — `symlink`/`readlink`
+   ops, following in the path walker with `ELOOP`, `lstat` as a genuinely
+   separate call, and `ln`/`readlink` in the shell.
+   - Symlink creation is **two commits**, not one: the object then its target.
+     A crash between them leaves an empty link, which the walker refuses. One
+     transaction needs `make_object` to carry initial content.
+   - No hard links, and no `O_NOFOLLOW` on open.
 4. **Commands cannot be passed as values.** `def` makes a name, not a value, so
    the shell has no `each`-over-a-command and no way to write a higher-order
    pipeline stage. Less urgent than it was: `for f in $(glob "*.tmp") { ... }`

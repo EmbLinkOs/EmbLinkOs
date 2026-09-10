@@ -145,6 +145,25 @@ struct vfs_ops {
      * changes permissions, never what an object IS. */
     int (*chmod)(struct vnode *vn, uint32_t mode);
 
+    /* --- symbolic links -----------------------------------------------------
+     *
+     * Create `name` in `dir` as a link holding the TEXT `target`, and read that
+     * text back. A symlink is not a reference to an object: it is a STRING the
+     * path walker splices in and re-resolves, which is why it may name
+     * something that does not exist, may cross mounts, and may be created
+     * before its target is. Everything that makes symlinks useful and
+     * everything that makes them dangerous comes from that one fact.
+     *
+     * `readlink` fills at most `cap` bytes and reports the FULL length in
+     * *out_len, so a caller can tell a truncated answer from a complete one
+     * rather than silently acting on half a path.
+     *
+     * NULL = this filesystem has no symlinks; the VFS answers -ENOSYS rather
+     * than pretending. */
+    int (*symlink)(struct vnode *dir, const char *name, size_t name_len,
+                   const char *target);
+    int (*readlink)(struct vnode *vn, char *buf, size_t cap, size_t *out_len);
+
     /* fill *out with metadata for object `vn` */
     int (*stat)(struct vnode *vn, struct vfs_stat *out);
     int (*vget)(struct vfs_mount *mnt, uint64_t ino, uint8_t type,
@@ -202,6 +221,12 @@ int  vfs_resolve(const char *path, struct vnode *out);
  * to refuse a read-only binding. NS_MODE_RW in the global-fallback (kernel)
  * case. */
 int  vfs_resolve_ex(const char *path, struct vnode *out, uint8_t *mode_out);
+
+/* As vfs_resolve, but a symlink in the FINAL position is returned as itself
+ * rather than followed. lstat, readlink and unlink-the-link are built on it.
+ * Links in the MIDDLE of a path are still followed: `/a/link/b` has only one
+ * reading. */
+int  vfs_resolve_nofollow(const char *path, struct vnode *out);
 
 /* Convenience wrappers: resolve `path`, then call the matching op. */
 int  vfs_read(const char *path, uint64_t off, void *buf, size_t len, size_t *out_read);

@@ -190,6 +190,13 @@ int vfs_rename_path(const char *old_path, const char *new_path); /* strict: dest
 int vfs_chmod_path(const char *path, uint32_t mode);  /* permission bits; fs preserves the type bits */
 int vfs_fd_truncate(int fd, uint64_t size);  /* ftruncate over the existing per-fs truncate op */
 int vfs_fd_fsync(int fd);    /* push this file's dirty pages to the device NOW */
+
+/* Symbolic links, by path. `target` is stored verbatim and never validated --
+ * a link may name something that does not exist, which is the normal case in
+ * every build system that uses them. readlink/lstat act on the LINK itself. */
+int vfs_symlink_path(const char *target, const char *linkpath);
+int vfs_readlink_path(const char *path, char *buf, size_t cap, size_t *out_len);
+int vfs_lstat_path(const char *path, struct vfs_stat *out);
 int vfs_rmdir_path(const char *path);    /* rmdir: EMPTY dirs only (fs enforces) */
 int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode);
 

@@ -224,6 +224,76 @@ int vfs_mkdir_path(const char *path)
     return parent.mnt->ops->mkdir(&parent, leaf, leaf_len, &made);
 }
 
+/* symlink(target, linkpath) -- create `linkpath` as a link holding the TEXT
+ * `target`.
+ *
+ * The target is NEVER resolved or validated here. A symlink may name something
+ * that does not exist, and creating one before its target is the normal case
+ * in every build system that uses them -- checking would break the thing they
+ * are for. Only the LINK's own parent has to exist and be writable. */
+int vfs_symlink_path(const char *target, const char *linkpath)
+{
+    if (!target || !linkpath || !*target)
+        return -EMBK_EINVAL;
+
+    int wok = ns_check_writable(linkpath);   /* refuse in a read-only binding (UP2) */
+    if (wok != EMBK_OK)
+        return wok;
+
+    struct vnode parent;
+    const char *leaf = NULL;
+    size_t leaf_len = 0;
+
+    int rc = fd_split_parent(linkpath, &parent, &leaf, &leaf_len);
+    if (rc != EMBK_OK)
+        return rc;
+
+    if (!parent.mnt || !parent.mnt->ops || !parent.mnt->ops->symlink)
+        return -EMBK_ENOSYS;
+
+    return parent.mnt->ops->symlink(&parent, leaf, leaf_len, target);
+}
+
+/* readlink(path) -- the TEXT a link holds, without following it.
+ *
+ * Resolved with follow_final FALSE, which is the whole point: resolving it the
+ * ordinary way would land on the link's TARGET and there would be nothing left
+ * to read. Reports the full length even when the buffer is short, so a caller
+ * can tell truncation from completion. */
+int vfs_readlink_path(const char *path, char *buf, size_t cap, size_t *out_len)
+{
+    if (!path || !buf || !out_len)
+        return -EMBK_EINVAL;
+
+    struct vnode vn;
+    int rc = vfs_resolve_nofollow(path, &vn);
+    if (rc != EMBK_OK)
+        return rc;
+
+    if (vn.type != VFS_DT_LNK)
+        return -EMBK_EINVAL;          /* POSIX: EINVAL, not ENOENT -- it exists */
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->readlink)
+        return -EMBK_ENOSYS;
+
+    return vn.mnt->ops->readlink(&vn, buf, cap, out_len);
+}
+
+/* lstat -- metadata of the LINK, not of what it points at. The one place a
+ * caller can see that a symlink is a symlink. */
+int vfs_lstat_path(const char *path, struct vfs_stat *out)
+{
+    if (!path || !out)
+        return -EMBK_EINVAL;
+
+    struct vnode vn;
+    int rc = vfs_resolve_nofollow(path, &vn);
+    if (rc != EMBK_OK)
+        return rc;
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->stat)
+        return -EMBK_ENOSYS;
+    return vn.mnt->ops->stat(&vn, out);
+}
+
 int vfs_rename_path(const char *old_path, const char *new_path)
 {
     struct vnode old_parent, new_parent;

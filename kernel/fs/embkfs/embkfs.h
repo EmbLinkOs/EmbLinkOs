@@ -695,6 +695,20 @@ int embkfs_mkdir_name(struct embkfs_volume *vol, uint64_t dir_oid,
                       const char *name, uint64_t *out_oid);
 int embkfs_mkdir_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
                       const char *path, uint64_t *out_oid);
+
+/* Symbolic links. The on-disk format already had everything needed --
+ * EMBKFS_S_IFLNK, EMBKFS_DT_LNK, and embkfs_make_object() already maps the
+ * mode to the right directory-entry type -- so a link is an ordinary object
+ * whose CONTENT is the target path text. Nothing about the B-tree, the extent
+ * map or the commit protocol changes.
+ *
+ * The target is stored verbatim and is never validated: a symlink may name
+ * something that does not exist, and creating one before its target is the
+ * normal case in every build system that uses them. */
+int embkfs_symlink(struct embkfs_volume *vol, uint64_t dir_oid,
+                   const char *name, const char *target);
+int embkfs_readlink(struct embkfs_volume *vol, uint64_t oid,
+                    char *buf, uint64_t cap, uint64_t *out_len);
 int embkfs_write_object(struct embkfs_volume *vol, uint64_t oid,
                         const uint8_t *data, uint64_t len);
 /* `stat`-style metadata lookup: copies oid's raw inode item (size, mode,

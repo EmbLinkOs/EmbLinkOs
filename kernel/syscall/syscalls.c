@@ -1867,6 +1867,65 @@ static int64_t sys_intr(const struct sysargs *a) {
     }
 }
 
+/* --- symbolic links --------------------------------------------------------
+ *
+ * symlink(target, linkpath). The TARGET IS NEVER RESOLVED. A link may name
+ * something that does not exist, and creating one before its target is the
+ * normal case in every build system that uses them -- validating here would
+ * break the thing links are for. Only the link's own parent must exist and be
+ * writable. */
+static int64_t sys_symlink(const struct sysargs *a) {
+    char target[SYSCALL_PATH_MAX], linkpath[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(target, (const char *)a->arg[0], sizeof target);
+    if (len < 0) return len;
+    len = copy_string_from_user(linkpath, (const char *)a->arg[1], sizeof linkpath);
+    if (len < 0) return len;
+    return vfs_symlink_path(target, linkpath);
+}
+
+/* readlink(path, buf, cap) -> the number of bytes the LINK holds.
+ *
+ * Returns the FULL length even when it did not fit, which is what lets a
+ * caller tell a truncated answer from a complete one. POSIX returns the
+ * truncated count and gives you no way to know; this is the more useful
+ * contract and the libc wrapper clamps for callers who want POSIX's. */
+static int64_t sys_readlink(const struct sysargs *a) {
+    char path[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(path, (const char *)a->arg[0], sizeof path);
+    if (len < 0) return len;
+
+    void  *user_buf = (void *)a->arg[1];
+    uint64_t cap    = a->arg[2];
+    if (cap > SYSCALL_PATH_MAX) cap = SYSCALL_PATH_MAX;
+
+    char buf[SYSCALL_PATH_MAX];
+    size_t got = 0;
+    int rc = vfs_readlink_path(path, buf, (size_t)cap, &got);
+    if (rc != EMBK_OK) return rc;
+
+    size_t copy = got < cap ? got : (size_t)cap;
+    if (copy && copy_to_user(user_buf, buf, copy) != EMBK_OK)
+        return -EMBK_EFAULT;
+    return (int64_t)got;
+}
+
+/* lstat(path, out) -- stat that does NOT follow a link in the final position.
+ * The only way for a caller to see that something IS a link rather than
+ * silently measuring whatever it points at. */
+static int64_t sys_lstat(const struct sysargs *a) {
+    char path[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(path, (const char *)a->arg[0], sizeof path);
+    if (len < 0) return len;
+
+    struct vfs_stat st;
+    memset(&st, 0, sizeof st);
+    int rc = vfs_lstat_path(path, &st);
+    if (rc != EMBK_OK) return rc;
+    if (copy_to_user((void *)a->arg[1], &st, sizeof st) != EMBK_OK)
+        return -EMBK_EFAULT;
+    return 0;
+}
+
 static syscall_handler_t syscall_table[] = {
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -1960,6 +2019,9 @@ static syscall_handler_t syscall_table[] = {
     [SYS_dup]            = sys_dup,
     [SYS_fsync]          = sys_fsync,
     [SYS_intr]           = sys_intr,
+    [SYS_symlink]        = sys_symlink,
+    [SYS_readlink]       = sys_readlink,
+    [SYS_lstat]          = sys_lstat,
     [SYS_munmap]         = sys_munmap,
     [SYS_win_desktop_front] = sys_win_desktop_front,
     [SYS_debug_attach]   = sys_debug_attach,

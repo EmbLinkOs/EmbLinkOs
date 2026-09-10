@@ -473,17 +473,27 @@ int stat(const char *path, struct stat *st) {
     return 0;
 }
 
-/* lstat() == stat(), and here that is exact rather than a convenient fudge:
- * NOTHING in this kernel dereferences a symlink. embkfs can store a link
- * (EMBKFS_DT_LNK -> VFS_DT_LNK, and stat reports S_IFLNK for it), but there is
- * no readlink() and no follow step anywhere in path resolution -- so stat()
- * already reports the link itself, which is precisely lstat()'s contract. With
- * no dereferencing to skip, the two cannot disagree.
+/* lstat() -- metadata of the LINK, not of what it points at.
  *
- * If link-following is ever implemented, this alias becomes a LIE and must be
- * split into a real no-follow call at the same time. */
+ * This used to be a plain alias for stat(), and the comment on it said exactly
+ * why that was honest at the time -- nothing in the kernel dereferenced a
+ * symlink, so stat() already reported the link itself -- and exactly what
+ * would make it dishonest:
+ *
+ *     If link-following is ever implemented, this alias becomes a LIE and
+ *     must be split into a real no-follow call at the same time.
+ *
+ * Link-following is implemented. This is that call, and it is a different
+ * syscall from stat() rather than the same one wearing two names. */
 int lstat(const char *path, struct stat *st) {
-    return stat(path, st);
+    char abs[EMBK_PATH_MAX];
+    if (path_abs(path, abs, sizeof abs) != 0) return -1;
+    struct embk_vfs_stat vs;
+    int64_t ret = embk_syscall2(EMBK_SYS_lstat, (int64_t)(intptr_t)abs,
+                                (int64_t)(intptr_t)&vs);
+    if (embk_is_err(ret)) return embk_fail(ret);
+    embk_fill_stat(st, &vs);
+    return 0;
 }
 
 /* EmbLink tracks mtime but exposes no syscall to SET it, so utime() cannot do
@@ -937,13 +947,23 @@ int execv(const char *path, char *const argv[]) {
     return -1;
 }
 
+/* symlink(target, linkpath) -- real.
+ *
+ * The TARGET IS NOT RESOLVED and not checked to exist. That is not laxity: a
+ * link created before its target is the normal case in every build system that
+ * uses them, and a symlink() that validated would break the thing links are
+ * for. `linkpath`'s own parent must exist, because that is where the name
+ * goes. */
 int symlink(const char *target, const char *linkpath) {
-    /* EMBKFS can STORE a link type (VFS_DT_LNK) but nothing creates or follows
-     * one -- see lstat() above. Creating a link nothing can traverse would be
-     * worse than refusing. */
-    (void)target; (void)linkpath;
-    errno = ENOSYS;
-    return -1;
+    if (!target || !linkpath) { errno = EINVAL; return -1; }
+    char abs[EMBK_PATH_MAX];
+    if (path_abs(linkpath, abs, sizeof abs) != 0) return -1;
+    /* The target is stored VERBATIM -- relative targets stay relative, which is
+     * what makes a tree of links survive being moved. */
+    int64_t ret = embk_syscall2(EMBK_SYS_symlink, (int64_t)(intptr_t)target,
+                                (int64_t)(intptr_t)abs);
+    if (embk_is_err(ret)) return embk_fail(ret);
+    return 0;
 }
 
 int chroot(const char *path) {
@@ -1403,14 +1423,21 @@ int chmod(const char *path, mode_t mode) {
     return 0;
 }
 
+/* readlink(path, buf, bufsiz) -- the text a link holds, without following it.
+ *
+ * POSIX says the return is the number of bytes PLACED IN THE BUFFER, and gives
+ * a caller no way to distinguish "it fit exactly" from "it was truncated". The
+ * kernel call reports the FULL length, which is the more useful contract; this
+ * wrapper clamps it to POSIX's for callers that expect POSIX's, and the extra
+ * information is available to anyone who wants it via the syscall directly. */
 ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
-    /* The kernel HAS embkfs_readlink_object; no syscall exposes it yet. git
-     * only readlinks entries lstat reported as symlinks, which EmbLink repos
-     * will not contain (symlink() below is ENOSYS, so git init sets
-     * core.symlinks=false and never creates one). */
-    (void)path; (void)buf; (void)bufsiz;
-    errno = ENOSYS;
-    return -1;
+    if (!path || !buf) { errno = EINVAL; return -1; }
+    char abs[EMBK_PATH_MAX];
+    if (path_abs(path, abs, sizeof abs) != 0) return -1;
+    int64_t ret = embk_syscall3(EMBK_SYS_readlink, (int64_t)(intptr_t)abs,
+                                (int64_t)(intptr_t)buf, (int64_t)bufsiz);
+    if (embk_is_err(ret)) return embk_fail(ret);
+    return (ssize_t)((size_t)ret < bufsiz ? (size_t)ret : bufsiz);
 }
 
 int pipe(int fds[2]) {

@@ -635,6 +635,72 @@ static bool has_glob_chars(const char *s) {
     return false;
 }
 
+/* ln TARGET LINK -- make a symbolic link.
+ *
+ * NO `-s` FLAG, for two reasons that agree.
+ *
+ * There is nothing for it to distinguish: this OS has symbolic links and does
+ * not have hard links, so `ln` means one thing. A flag whose only job is to
+ * select the only option is ceremony.
+ *
+ * And it could not be written anyway. This shell's word rules make a LEADING
+ * '-' an operator -- `-` joins a word only when flanked by word characters on
+ * both sides -- so `-s` lexes as a minus applied to `s`, not as a flag. That is
+ * the documented grammar, and bending it here to accept one command's dash
+ * would be a special case in the LEXER, paid for by every line anyone ever
+ * writes. The house convention is subcommand words (`env set`, `pkg install`),
+ * and this fits it.
+ *
+ * The target is not resolved -- a link to something that does not exist yet is
+ * the normal case, not a mistake to catch. */
+static struct value bi_ln(const struct command *cmd, struct value input,
+                          struct scope *env) {
+    (void)env;
+    value_free(&input);
+
+    if (cmd->nargs != 2)
+        return value_error("ln: usage: ln <target> <linkname>  "
+                           "(no -s: symbolic is the only kind here)");
+
+    const char *target = expr_as_word(cmd->args[0]);
+    const char *linkw  = expr_as_word(cmd->args[1]);
+    if (!target || !linkw)
+        return value_error("ln: target and link must be plain words or strings");
+
+    /* The LINK's path is resolved against the cwd, because that is where the
+     * name is being created. The TARGET is passed through untouched -- turning
+     * a relative target absolute here would silently change what the link
+     * means if the tree is ever moved. */
+    char linkpath[PATH_MAX_LEN];
+    path_resolve(linkw, linkpath, sizeof linkpath);
+
+    int rc = embk_symlink(target, linkpath);
+    if (rc < 0) return err_os("ln: can't create", linkpath, rc);
+
+    struct value out = value_record();
+    value_record_set(&out, "link",   value_path(linkpath));
+    value_record_set(&out, "target", value_string(target));
+    return out;
+}
+
+/* readlink PATH -- the text a link holds, without following it. */
+static struct value bi_readlink(const struct command *cmd, struct value input,
+                                struct scope *env) {
+    (void)env;
+    value_free(&input);
+
+    char path[PATH_MAX_LEN];
+    if (cmd->nargs != 1 || arg_path(cmd, 0, NULL, path, sizeof path) != 0)
+        return value_error("readlink: usage: readlink <path>");
+
+    char buf[PATH_MAX_LEN];
+    int64_t n = embk_readlink(path, buf, sizeof buf - 1);
+    if (n < 0) return err_os("readlink", path, (int)n);
+    if ((size_t)n >= sizeof buf) return value_error("readlink: target is too long");
+    buf[n] = '\0';
+    return value_string(buf);
+}
+
 static struct value err_glob(const char *what) {
     char msg[128];
     snprintf(msg, sizeof msg, "glob: %s", what);
@@ -851,6 +917,7 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "clear",  bi_clear  },
         { "jobs",   bi_jobs   }, { "fg",     bi_fg     },
         { "glob",   bi_glob   },
+        { "ln",     bi_ln     }, { "readlink", bi_readlink },
     };
     for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
         if (strcmp(tab[i].name, name) == 0) return tab[i].fn;

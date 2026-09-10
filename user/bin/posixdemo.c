@@ -989,6 +989,92 @@ static void test_writeback(void) {
     unlink(path);
 }
 
+/* SYMBOLIC LINKS.
+ *
+ * A link holds TEXT, not a reference. Everything useful about symlinks and
+ * everything dangerous about them comes from that one fact: it can name
+ * something that does not exist, it is re-resolved on every walk, and two of
+ * them can point at each other.
+ *
+ * The assertions that matter are the ones separating a link from what it
+ * points at -- lstat vs stat, readlink vs read, unlink-the-link vs
+ * unlink-the-target. A system that conflated them would pass a happy-path test
+ * and destroy data on the first real use. */
+static void test_symlinks(void) {
+    printf("symbolic links:\n");
+
+    const char *target = "/symtarget.txt";
+    const char *link   = "/symlink.txt";
+    const char *dangle = "/symdangling";
+
+    unlink(link); unlink(dangle); unlink(target);
+
+    int fd = open(target, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ck("create a target file", fd >= 0);
+    if (fd < 0) return;
+    write(fd, "hello", 5);
+    close(fd);
+
+    ck("symlink() creates a link", symlink(target, link) == 0);
+
+    /* Reading THROUGH the link must reach the target's bytes. */
+    char buf[32];
+    memset(buf, 0, sizeof buf);
+    fd = open(link, O_RDONLY);
+    ck("open() follows the link", fd >= 0);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof buf - 1);
+        ck("reading through the link reaches the target's bytes",
+           n == 5 && memcmp(buf, "hello", 5) == 0);
+        close(fd);
+    }
+
+    /* stat FOLLOWS; lstat does NOT. This is the pair that used to be the same
+     * function, and the comment on the old alias said it would become a lie
+     * the day link-following landed. */
+    struct stat sst, lst;
+    ck("stat() through the link reports the TARGET (5 bytes, a regular file)",
+       stat(link, &sst) == 0 && S_ISREG(sst.st_mode) && sst.st_size == 5);
+    ck("lstat() reports the LINK ITSELF (S_ISLNK)",
+       lstat(link, &lst) == 0 && S_ISLNK(lst.st_mode));
+    ck("...and they are genuinely different answers",
+       (sst.st_mode & S_IFMT) != (lst.st_mode & S_IFMT));
+
+    /* readlink gives back exactly the text stored, not a resolved path. */
+    memset(buf, 0, sizeof buf);
+    ssize_t rl = readlink(link, buf, sizeof buf);
+    ck("readlink returns the stored text verbatim",
+       rl == (ssize_t)strlen(target) && strcmp(buf, target) == 0);
+
+    CK_FAILS("readlink of a NON-link -> EINVAL (it exists, so not ENOENT)",
+             (int)readlink(target, buf, sizeof buf), EINVAL);
+
+    /* A DANGLING link is legal. Creating one before its target is the normal
+     * case in every build system that uses links, so symlink() must not
+     * validate -- but resolving through it must fail honestly. */
+    ck("a link to something that does not exist can be created",
+       symlink("/no/such/file", dangle) == 0);
+    ck("lstat sees the dangling link", lstat(dangle, &lst) == 0 && S_ISLNK(lst.st_mode));
+    CK_FAILS("stat THROUGH a dangling link -> ENOENT", stat(dangle, &sst), ENOENT);
+    CK_FAILS("opening a dangling link -> ENOENT", open(dangle, O_RDONLY), ENOENT);
+
+    /* A LOOP must be reported, not hung on. */
+    unlink("/loopa"); unlink("/loopb");
+    if (symlink("/loopb", "/loopa") == 0 && symlink("/loopa", "/loopb") == 0) {
+        CK_FAILS("a symlink cycle -> ELOOP, not a hang", open("/loopa", O_RDONLY), ELOOP);
+        unlink("/loopa"); unlink("/loopb");
+    }
+
+    /* unlink removes the LINK, never what it points at. Getting this backwards
+     * deletes the user's data. */
+    ck("unlink removes the link", unlink(link) == 0);
+    ck("...and the target is still there",
+       stat(target, &sst) == 0 && sst.st_size == 5);
+
+    unlink(dangle);
+    unlink(target);
+}
+
 static void test_honest_refusals(void) {
     printf("honest refusals (must NOT pretend):\n");
     struct utimbuf ub = { 0, 0 };
@@ -1002,7 +1088,6 @@ static void test_honest_refusals(void) {
      * exactly what its standing obligation said would happen.) */
     ck("fsync on the console succeeds (nothing is buffered)", fsync(1) == 0);
     ck("fdatasync on the console succeeds", fdatasync(1) == 0);
-    CK_FAILS("symlink -> ENOSYS", symlink("/init.elf", "/l"), ENOSYS);
     CK_FAILS("chroot -> ENOSYS", chroot("/"), ENOSYS);
     CK_FAILS("pause -> ENOSYS (no signals; would be a hang)", pause(), ENOSYS);
 
@@ -1293,6 +1378,7 @@ int main(void) {
     test_mprotect();
     test_dup();
     test_writeback();
+    test_symlinks();
     test_honest_refusals();
 
     printf("\nposixdemo: %s (%d failure%s)\n",

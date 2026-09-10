@@ -3442,6 +3442,18 @@ int selftests_handle_command(const char *cmd)
             { "aggregates work on a real table column",
               "let t = $(ls /system/bin | where size > 0 | sum size)\n"
               "if $t > 0 { echo summed } else { echo zero }", 0 },
+            { "ln makes a link the shell can read back",
+              "ln /system/bin/shell.elf /shln.tmp\n"
+              "let t = $(readlink /shln.tmp)\n"
+              "rm /shln.tmp\n"
+              "if $t == \"/system/bin/shell.elf\" { echo ok } else { echo bad }", 0 },
+            { "a link the shell made resolves like the real thing",
+              "ln /system/bin /shlndir.tmp\n"
+              "let n = $(ls /shlndir.tmp | count)\n"
+              "rm /shlndir.tmp\n"
+              "if $n > 0 { echo through } else { echo empty }", 0 },
+            { "readlink of a non-link is an error",
+              "readlink /system/bin/shell.elf", 1 },
             { "range/join/split round-trip",
               "let s = $(range 3 | join \",\")\n"
               "let n = $(echo $s | split \",\" | count)\n"

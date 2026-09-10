@@ -1083,6 +1083,34 @@ interrupt-driven.
 - [ ] `vfs_mount` duplicate-mount check is a raw strcmp on `at` (not a
   normalized path). Fine for the single "/" mount.
 
+### Symbolic links
+
+Real as of the symlink commit: `symlink`/`readlink`/`lstat` syscalls, following
+in `vfs_walk_from_ex` with an eight-link `ELOOP` limit, and `ln`/`readlink` in
+the shell. EMBKFS needed no format change — it already had `S_IFLNK` and
+`DT_LNK`, and `embkfs_make_object()` already mapped the mode to the right
+directory-entry type. A link is an ordinary object whose content is the target
+text.
+
+- [ ] **Creating a link is TWO commits**, not one: `make_object` then
+  `write_object`. A crash between them leaves an object of the right type with
+  no target. The walker refuses an empty target, so the failure mode is a link
+  that reports `EINVAL` rather than one that points somewhere wrong — but it is
+  still a torn write. One transaction means teaching `make_object` to carry
+  initial content, which is worth doing when something else needs it too.
+- [ ] **No hard links.** `ln` therefore takes no `-s`, and says so.
+- [ ] **No `O_NOFOLLOW`.** `open()` always follows a link in the final
+  position. Nothing needs the other behaviour yet; `lstat` covers the "is this
+  a link" question.
+- [ ] **An absolute link target restarts at the walk's own root**, which is the
+  namespace binding the resolution began at — not a global root. That is what
+  stops a writable directory plus one link from being an escape from every
+  confined namespace. Worth a dedicated test that a link inside a namespace
+  cannot name the machine's real `/`.
+- [ ] **`readlink` reports the FULL length** even when the buffer was short,
+  which is more useful than POSIX's truncated count. The libc wrapper clamps to
+  POSIX's contract; nothing yet uses the extra information.
+
 ### File descriptors
 - [x] ~~fd table is fixed (64), global, per-boot. No per-process fd tables~~ —
   done: `struct fd_entry` moved to `kernel/fs/fd.h` (public) and `struct

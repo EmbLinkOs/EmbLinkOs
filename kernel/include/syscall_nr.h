@@ -143,4 +143,13 @@
  * one contract. See the intr_catch comment in process/process.h. */
 #define SYS_intr          101
 
+/* Symbolic links. A link holds TEXT, not a reference: it may name something
+ * that does not exist, and is re-resolved on every walk. `readlink` reports
+ * the FULL length even when the buffer is short, so a caller can tell a
+ * truncated answer from a complete one. `lstat` is stat that does not follow
+ * a link in the final position -- the only way to see that one IS a link. */
+#define SYS_symlink       102   /* (target, linkpath)       -> 0 | -err     */
+#define SYS_readlink      103   /* (path, buf, cap)         -> len | -err   */
+#define SYS_lstat         104   /* (path, struct embk_stat*)-> 0 | -err     */
+
 #endif /* _SYSCALL_NR_H_ */

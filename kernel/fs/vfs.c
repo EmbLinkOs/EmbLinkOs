@@ -155,11 +155,31 @@ static struct vfs_mount *vfs_find_mount(const char *path) {
  * filesystem gets them free, and '..' can never climb above `start` (depth is
  * clamped at 1) -- that is what makes a namespace binding a real containment
  * boundary. `rel` may lead with '/' or be empty (empty => `out` == `start`). */
-static int vfs_walk_from(struct vnode start, const char *rel, struct vnode *out) {
+/* How many links one resolution may follow before giving up.
+ *
+ * A symlink is TEXT the walker splices in and re-resolves, so `a -> b` and
+ * `b -> a` is a resolution that never ends. Eight is the number every Unix
+ * settled on: deep enough that no honest arrangement of links reaches it, and
+ * shallow enough that a cycle is reported in microseconds instead of walking a
+ * kernel stack into the ground. ELOOP names it, which is what a caller needs
+ * -- "too many levels of symbolic links" is actionable, and a hang is not. */
+#define VFS_MAX_SYMLINKS 8
+
+/* Where a rewritten path is built when a link is spliced in. Two, alternating,
+ * because the new path is (link target) + (the rest of the OLD one) and the
+ * rest is a pointer INTO the buffer being replaced. */
+#define VFS_PATH_BUF 256
+
+static int vfs_walk_from_ex(struct vnode start, const char *rel, struct vnode *out,
+                            bool follow_final) {
     /* Breadcrumb trail. stack[depth-1] is the directory we're currently inside,
      * starting at `start`, so '..' at the top is a safe no-op. */
     struct vnode stack[VFS_MAX_DEPTH];
     size_t depth = 0;
+
+    char  bufs[2][VFS_PATH_BUF];
+    int   which = 0;                    /* which scratch buffer `s` may live in */
+    int   nlinks = 0;
 
     stack[depth++] = start;                                // a value copy - vnode owns nothing
 
@@ -204,6 +224,62 @@ static int vfs_walk_from(struct vnode start, const char *rel, struct vnode *out)
             if (err)
                 return err;                                   // ENOENT, ENOTDIR, EINVAL, or whatever the filesystem returned
 
+            /* --- a SYMLINK is text, so splice it in and keep walking --------
+             *
+             * The rest of the path after this component is what the link's
+             * target has to be prefixed to. A link in the MIDDLE of a path is
+             * always followed -- `/a/link/b` means "b inside whatever link
+             * names", and there is no reading of it that does not. Only the
+             * FINAL component is optional, which is the distinction between
+             * stat and lstat. */
+            const char *rest = comp + len;
+            while (*rest == '/') rest++;
+            bool is_final = (*rest == '\0');
+
+            if (child.type == VFS_DT_LNK && (follow_final || !is_final)) {
+                if (++nlinks > VFS_MAX_SYMLINKS)
+                    return -EMBK_ELOOP;
+                if (!child.mnt || !child.mnt->ops || !child.mnt->ops->readlink)
+                    return -EMBK_ENOSYS;
+
+                char target[VFS_PATH_BUF];
+                size_t tlen = 0;
+                err = child.mnt->ops->readlink(&child, target, sizeof target - 1, &tlen);
+                if (err)
+                    return err;
+                if (tlen == 0 || tlen >= sizeof target)
+                    return -EMBK_EINVAL;      /* empty or truncated: not a path */
+                target[tlen] = '\0';
+
+                /* Build "target/rest" in the buffer `s` is NOT currently in. */
+                which ^= 1;
+                char *nb = bufs[which];
+                size_t n = 0;
+                for (size_t i = 0; i < tlen && n < VFS_PATH_BUF - 1; i++) nb[n++] = target[i];
+                if (*rest) {
+                    if (n < VFS_PATH_BUF - 1 && nb[n - 1] != '/') nb[n++] = '/';
+                    for (const char *r = rest; *r && n < VFS_PATH_BUF - 1; r++) nb[n++] = *r;
+                }
+                if (n >= VFS_PATH_BUF - 1)
+                    return -EMBK_ENAMETOOLONG;
+                nb[n] = '\0';
+
+                /* An ABSOLUTE target restarts from the walk's own root -- which
+                 * is `start`, the namespace binding this resolution began at,
+                 * NOT a global root. A link inside a confined namespace that
+                 * said "/etc/passwd" must mean that namespace's /etc/passwd; if
+                 * it escaped to the machine's, a writable directory plus one
+                 * link would be a way out of every container this OS has. */
+                if (nb[0] == '/') {
+                    depth = 1;                 /* back to `start` */
+                    s = nb;
+                    while (*s == '/') s++;
+                } else {
+                    s = nb;                    /* relative: from the SAME directory */
+                }
+                continue;                      /* re-parse from the new path */
+            }
+
             stack[depth++] = child;                           // push the child onto the stack
         }
 
@@ -214,6 +290,12 @@ static int vfs_walk_from(struct vnode start, const char *rel, struct vnode *out)
     // The last vnode on the stack is the resolved target. Copy it to *out.
     *out = stack[depth - 1];
     return EMBK_OK;
+}
+
+/* The historical shape: follow a link in the final position too, which is what
+ * open/stat/read all want. */
+static int vfs_walk_from(struct vnode start, const char *rel, struct vnode *out) {
+    return vfs_walk_from_ex(start, rel, out, true);
 }
 
 /* Resolve an absolute path to a vnode, honoring the CURRENT process's namespace
@@ -255,6 +337,29 @@ int vfs_resolve_ex(const char *path, struct vnode *out, uint8_t *mode_out) {
 
 int vfs_resolve(const char *path, struct vnode *out) {
     return vfs_resolve_ex(path, out, NULL);
+}
+
+/* As vfs_resolve, but a link in the FINAL position is returned as itself
+ * rather than followed. What lstat, readlink and "remove the link, not its
+ * target" are built on. Links in the middle of the path are still followed --
+ * `/a/link/b` has only one reading. */
+int vfs_resolve_nofollow(const char *path, struct vnode *out) {
+    if (!path || !out) return -EMBK_EINVAL;
+    if (path[0] != '/') return -EMBK_EINVAL;
+
+    struct namespace *ns = process_current_ns();
+    if (ns && ns->active) {
+        struct vnode root;
+        size_t plen;
+        uint8_t mode;
+        int rc = ns_lookup(ns, path, &root, &plen, &mode);
+        if (rc) return rc;
+        return vfs_walk_from_ex(root, path + plen, out, false);
+    }
+
+    struct vfs_mount *m = vfs_find_mount(path);
+    if (!m) return -EMBK_ENOENT;
+    return vfs_walk_from_ex(m->root, path + strlen(m->at), out, false);
 }
 
 

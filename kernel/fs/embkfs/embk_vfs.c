@@ -143,6 +143,36 @@ static int write_impl(struct vnode *vn, uint64_t off, const void *buf, size_t le
     return EMBK_OK;
 }
 
+static int symlink_impl(struct vnode *dir, const char *name, size_t name_len,
+                        const char *target)
+{
+    if (!dir || !name || !target || !dir->mnt || !dir->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (dir->type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+    if (name_len == 0 || name_len > 255)
+        return -EMBK_EINVAL;
+
+    char nm[256];
+    for (size_t i = 0; i < name_len; i++) nm[i] = name[i];
+    nm[name_len] = '\0';
+    return embkfs_symlink(vol_of(dir), dir->ino, nm, target);
+}
+
+static int readlink_impl(struct vnode *vn, char *buf, size_t cap, size_t *out_len)
+{
+    if (!vn || !buf || !out_len || !vn->mnt || !vn->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (vn->type != VFS_DT_LNK)
+        return -EMBK_EINVAL;
+
+    uint64_t n = 0;
+    int rc = embkfs_readlink(vol_of(vn), vn->ino, buf, (uint64_t)cap, &n);
+    if (rc != EMBK_OK) return rc;
+    *out_len = (size_t)n;
+    return EMBK_OK;
+}
+
 static int create_impl(struct vnode *dir, const char *name, size_t name_len,
                        uint32_t mode, struct vnode *out)
 {
@@ -327,6 +357,23 @@ static int embkfs_vfs_write(struct vnode *vn, uint64_t off, const void *buf,
     return rc;
 }
 
+static int embkfs_vfs_symlink(struct vnode *dir, const char *name, size_t name_len,
+                              const char *target)
+{
+    fs_lock();
+    int rc = symlink_impl(dir, name, name_len, target);
+    fs_unlock();
+    return rc;
+}
+
+static int embkfs_vfs_readlink(struct vnode *vn, char *buf, size_t cap, size_t *out_len)
+{
+    fs_lock();
+    int rc = readlink_impl(vn, buf, cap, out_len);
+    fs_unlock();
+    return rc;
+}
+
 static int embkfs_vfs_create(struct vnode *dir, const char *name, size_t name_len,
                              uint32_t mode, struct vnode *out)
 {
@@ -449,6 +496,8 @@ static const struct vfs_ops embkfs_vfs_ops = {
     .readdir = embkfs_vfs_readdir,
     .read = embkfs_vfs_read,
     .write = embkfs_vfs_write,
+    .symlink = embkfs_vfs_symlink,
+    .readlink = embkfs_vfs_readlink,
     .create = embkfs_vfs_create,
     .mkdir = embkfs_vfs_mkdir,
     .unlink = embkfs_vfs_unlink,
