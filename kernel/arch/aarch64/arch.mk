@@ -46,6 +46,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/drivers/absent.c \
                kernel/arch/aarch64/cpu/spinlock.c \
                kernel/arch/aarch64/cpu/arch_thread.c \
+               kernel/arch/aarch64/cpu/cpu_features.c \
                kernel/arch/aarch64/cpu/percpu.c \
                kernel/arch/aarch64/mm/pagetable.c \
                kernel/arch/aarch64/mm/pmm_arch.c \
@@ -874,6 +875,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'exited with 5 (checks passed)'  A6 'the process did not exit cleanly with its status'; \
 	  chk 'zeroed, written and read back'  MM 'mmap did not produce usable memory'; \
 	  chk 'munmap returned the memory'     MM 'munmap leaked pages -- page tables, most likely'; \
+	  chk 'PAN: EL1 reading a USER page'   MM 'PAN is not enforcing -- EL1 can read user memory'; \
 	  chk 'writable+executable mapping was refused' MM 'W^X is not enforced on mmap'; \
 	  chk 'the generated code RUNS and returns 42' MM 'mprotect W->X did not make the page executable'; \
 	  chk 'mprotect across the hole -> ENOMEM'   MM 'mprotect half-applied across an unmapped hole'; \

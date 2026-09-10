@@ -1,0 +1,91 @@
+#include "arch/aarch64/cpu/cpu_features.h"
+#include "include/kprintf.h"
+
+/* ==========================================================================
+ * WHAT THIS PROCESSOR CAN ENFORCE -- the aarch64 half.
+ *
+ * Same purpose as the x86 file of this name, different questions. There is no
+ * CPUID here: an AArch64 core describes itself through the ID_AA64* registers,
+ * which are readable at EL1 and are architecturally required to exist. Each
+ * field is a small integer where 0 means "not implemented" and larger numbers
+ * mean successive revisions -- so every check below is "!= 0", never "== 1",
+ * because a core with a newer version of a feature still has the feature.
+ * ========================================================================== */
+
+static struct arm_cpu_features g_cf;
+
+#define SCTLR_SPAN (1ULL << 23)   /* 0 = set PSTATE.PAN on exception entry */
+
+static inline uint64_t read_sctlr(void) {
+    uint64_t v; __asm__ volatile("mrs %0, sctlr_el1" : "=r"(v)); return v;
+}
+static inline void write_sctlr(uint64_t v) {
+    __asm__ volatile("msr sctlr_el1, %0" :: "r"(v));
+    __asm__ volatile("isb" ::: "memory");
+}
+
+uint64_t arm_read_sctlr(void) { return read_sctlr(); }
+
+uint64_t arm_read_pan(void) {
+    /* PSTATE is not a register you can read whole; PAN comes back through
+     * the "current PSTATE" accessor, where it sits at bit 22. */
+    uint64_t v;
+    __asm__ volatile("mrs %0, pan" : "=r"(v));
+    return (v >> 22) & 1;
+}
+
+void arm_cpu_features_detect(void) {
+    if (g_cf.detected) return;
+
+    uint64_t mmfr1;
+    __asm__ volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
+    g_cf.pan = ((mmfr1 >> 20) & 0xF) != 0;      /* FEAT_PAN, ARMv8.1 */
+
+    uint64_t pfr0;
+    __asm__ volatile("mrs %0, id_aa64pfr0_el1" : "=r"(pfr0));
+    g_cf.el0_aarch32 = ((pfr0 >> 0) & 0xF) == 2;
+
+    uint64_t isar0;
+    __asm__ volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar0));
+    g_cf.aes    = ((isar0 >> 4)  & 0xF) != 0;
+    g_cf.sha256 = ((isar0 >> 12) & 0xF) != 0;
+    g_cf.crc32  = ((isar0 >> 16) & 0xF) != 0;
+    g_cf.atomics= ((isar0 >> 20) & 0xF) != 0;
+
+    __asm__ volatile("mrs %0, midr_el1" : "=r"(g_cf.midr));
+
+    g_cf.detected = true;
+
+    kprintf("cpu: MIDR 0x%llx  protection available:%s  crypto:%s%s%s\n",
+            (unsigned long long)g_cf.midr,
+            g_cf.pan ? " PAN" : " (no PAN)",
+            g_cf.aes ? " AES" : "", g_cf.sha256 ? " SHA256" : "",
+            g_cf.crc32 ? " CRC32" : "");
+    if (!g_cf.pan)
+        kprintf("cpu: NOTE -- no FEAT_PAN; the kernel runs without it rather "
+                "than refusing to boot. PXN still holds (EL1 cannot EXECUTE "
+                "user memory); what is missing is the READ/WRITE half.\n");
+}
+
+const struct arm_cpu_features *arm_cpu_features(void) { return &g_cf; }
+
+void arm_protection_init_this_cpu(void) {
+    if (!g_cf.detected || !g_cf.pan) return;
+
+    /* SPAN = 0: the processor SETS PSTATE.PAN on every exception entry to EL1.
+     *
+     * This is the bit that makes PAN a default rather than a discipline.
+     * Without it, a syscall would inherit whatever PAN state happened to be
+     * live -- including PAN=0 left behind by an earlier deliberate access --
+     * and the protection would hold only as long as nobody made a mistake,
+     * which is the situation it exists to replace. With it, every entry to the
+     * kernel starts forbidden, and permission is something the kernel has to
+     * ask for, once, around the access that needs it. */
+    uint64_t sctlr = read_sctlr();
+    sctlr &= ~SCTLR_SPAN;
+    write_sctlr(sctlr);
+
+    /* And forbid it RIGHT NOW, for the boot path, which is already at EL1 and
+     * did not arrive by an exception. */
+    ARM_SET_PAN(1);
+}

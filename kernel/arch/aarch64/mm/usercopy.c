@@ -1,5 +1,6 @@
 #include "include/usercopy.h"
 #include "include/uaccess_guard.h"
+#include "arch/aarch64/cpu/cpu_features.h"
 #include "arch/aarch64/mm/pagetable.h"
 #include "mm/pmm.h"
 #include "mm/vma.h"   /* vm_fault: a page not yet touched is not a bad pointer */
@@ -96,6 +97,7 @@ int copy_from_user(void *kernel_dst, const void *user_src, size_t len) {
 
     if (!uaccess_arm())
         return -EMBK_EFAULT;          /* raced: the page went away mid-copy */
+    uaccess_hw_begin();               /* and PAN, which uaccess_disarm() puts back */
     memcpy(kernel_dst, user_src, len);
     uaccess_disarm();
     return EMBK_OK;
@@ -107,6 +109,7 @@ int copy_to_user(void *user_dst, const void *kernel_src, size_t len) {
 
     if (!uaccess_arm())
         return -EMBK_EFAULT;
+    uaccess_hw_begin();
     memcpy(user_dst, kernel_src, len);
     uaccess_disarm();
     return EMBK_OK;
@@ -123,7 +126,14 @@ int copy_string_from_user(char *kernel_dst, const char *user_src, size_t max_len
         const char *p = user_src + i;
         if (!access_ok(p, 1))
             return -EMBK_EFAULT;
+        /* Permission is taken around the ONE byte, not the loop, so the
+         * access_ok() page-table walk above runs forbidden: a bug in the walk
+         * should not get to touch user memory just because a string copy is in
+         * progress. Costs a PSTATE write per byte, and a path length is tens
+         * of bytes on a call that then does filesystem work. */
+        uaccess_hw_begin();
         kernel_dst[i] = *p;
+        uaccess_hw_end();
         if (kernel_dst[i] == '\0')
             return (int)i;
     }
@@ -138,4 +148,31 @@ void usercopy_stat_get(struct usercopy_stat_pub *out) {
 void usercopy_stat_reset(void) {
     struct usercopy_stat_pub zero = {0, 0, 0, 0};
     stats = zero;
+}
+
+/* ==========================================================================
+ * PAN: the processor's own check that user memory is only touched on purpose.
+ *
+ * The aarch64 counterpart of x86's SMAP, and the same bargain. With
+ * PSTATE.PAN set, any EL1 access to memory that EL0 can also reach is a
+ * permission fault -- so clearing it for the length of a copy is the kernel
+ * saying "this one is deliberate", and everything that does not say it is
+ * refused by hardware rather than by our confidence in our own discipline.
+ *
+ * SCTLR_EL1.SPAN = 0 (see arm_protection_init_this_cpu) makes the processor
+ * SET PAN on every exception entry, so a syscall always begins forbidden. That
+ * is what makes this a default instead of a convention: the kernel cannot
+ * forget to forbid, only to permit -- and forgetting to permit is a fault at
+ * the exact instruction, not a silent hole.
+ *
+ * GATED ON THE FEATURE BIT. FEAT_PAN is ARMv8.1; on a v8.0 core these are
+ * no-ops and PXN still holds, so EL1 cannot EXECUTE user memory even where it
+ * can still read it.
+ * ========================================================================== */
+void uaccess_hw_begin(void) {
+    if (arm_cpu_features()->pan) ARM_SET_PAN(0);
+}
+
+void uaccess_hw_end(void) {
+    if (arm_cpu_features()->pan) ARM_SET_PAN(1);
 }

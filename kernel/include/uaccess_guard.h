@@ -47,6 +47,40 @@
  * error".
  */
 
+/* ---------------------------------------------------------------------------
+ * THE HARDWARE HALF: tell this core it is allowed to touch user memory.
+ *
+ * The guard above survives a page going away mid-copy. This is the other
+ * question -- whether the processor will permit the access at all.
+ *
+ * x86 SMAP and aarch64 PAN both make a kernel-mode access to a user page a
+ * FAULT by default, and both provide a way to say "this one is deliberate"
+ * (stac/clac, and PSTATE.PAN). That default is the valuable part: it turns
+ * "we believe every user access goes through copy_from_user" from a claim
+ * about our own discipline into something the hardware checks on every single
+ * instruction. Anything that reaches user memory another way was already a
+ * bug -- the kernel dereferencing a pointer a user program chose -- and now
+ * says so at the moment it happens instead of working until someone arranges
+ * for the pointer to be interesting.
+ *
+ * PAIRED, ALWAYS, INCLUDING ON THE FAULT PATH. A core left permitted is a core
+ * with the protection silently off, which is worse than never having enabled
+ * it: it looks hardened and is not. uaccess_fault_recover() ends it too.
+ *
+ * Both are no-ops on a processor without the feature -- and they must be,
+ * because the instructions themselves fault where the feature is absent.
+ *
+ * SEPARATE FROM uaccess_arm(), and the first version of this was not. Folding
+ * the permission into the arm was tidier by one line and wrong by one concept:
+ * arming is "if this faults, recover", permission is "the processor may do
+ * this at all". Conflated, every armed region got user access whether it
+ * wanted it or not -- and the self-test that proves SMAP is live could not
+ * commit the violation it exists to commit, because arming the guard to catch
+ * the fault also granted the access that would have caused it. Two names for
+ * two things. */
+void uaccess_hw_begin(void);
+void uaccess_hw_end(void);
+
 /* Arm the recovery point. Evaluates to true on the direct pass (go ahead and
  * touch user memory) and false when a fault resumed us. Must be paired with
  * uaccess_disarm() on the success path -- an armed guard left behind would

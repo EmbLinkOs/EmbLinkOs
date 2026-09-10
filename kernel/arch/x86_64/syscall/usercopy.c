@@ -1,6 +1,7 @@
 #include "include/kprintf.h"
 #include "include/usercopy.h"
 #include "include/uaccess_guard.h"
+#include "arch/x86_64/cpu/cpu_features.h"
 #include "process/process.h"
 #include "mm/vmm.h"
 #include "mm/vma.h"   /* vm_fault: a page not yet touched is not a bad pointer */
@@ -192,6 +193,8 @@ int copy_from_user(void *kernel_dst, const void *user_src, size_t len) {
 
     if (!uaccess_arm())
         return -EMBK_EFAULT;          /* raced: the page went away mid-copy */
+    uaccess_hw_begin();               /* and the processor's permission, which
+                                       * uaccess_disarm() takes back */
     memcpy(kernel_dst, user_src, len);
     uaccess_disarm();
     return EMBK_OK;
@@ -202,6 +205,7 @@ int copy_to_user(void *user_dst, const void *kernel_src, size_t len) {
 
     if (!uaccess_arm())
         return -EMBK_EFAULT;
+    uaccess_hw_begin();
     memcpy(user_dst, kernel_src, len);
     uaccess_disarm();
     return EMBK_OK;
@@ -210,17 +214,62 @@ int copy_to_user(void *user_dst, const void *kernel_src, size_t len) {
 int copy_string_from_user(char *kernel_dst, const char *user_src, size_t max_len) {
     /* Validate one PAGE at a time, not one byte: access_ok now takes vmm_lock,
      * so a per-byte check was a lock cycle per character. Re-validate only when
-     * the next byte crosses into a new page. */
+     * the next byte crosses into a new page.
+     *
+     * THIS READS USER MEMORY DIRECTLY, which under SMAP means it needs the same
+     * permission the memcpy siblings take -- and it was the one place that
+     * touched a user pointer without going through them. It is bracketed per
+     * PAGE RUN rather than around the whole loop, so the page-table walk inside
+     * access_ok_counted() runs with permission OFF: a bug in the walk should
+     * not get to touch user memory just because a string copy is in progress.
+     * The cost is one stac/clac per page crossed, not per byte. */
     uint64_t validated_page = ~0ULL;
+    bool permitted = false;
     for (size_t i = 0; i < max_len; i++) {
         uint64_t byte_page = ((uint64_t)(uintptr_t)(user_src + i)) & ~(uint64_t)(PAGE_SIZE - 1);
         if (byte_page != validated_page) {
+            if (permitted) { uaccess_hw_end(); permitted = false; }
             if (!access_ok_counted(user_src + i, 1)) return -EMBK_EFAULT;
             validated_page = byte_page;
+            uaccess_hw_begin();
+            permitted = true;
         }
         char c = user_src[i];
         kernel_dst[i] = c;
-        if (c == '\0') return (int)i;
+        if (c == '\0') {
+            if (permitted) uaccess_hw_end();
+            return (int)i;
+        }
     }
+    if (permitted) uaccess_hw_end();
     return -EMBK_ENAMETOOLONG;
+}
+
+/* ==========================================================================
+ * SMAP: the processor's own check that user memory is only touched on purpose.
+ *
+ * With CR4.SMAP set, any kernel-mode read or write of a page marked
+ * user-accessible faults -- unless EFLAGS.AC is set, which is what stac does
+ * and clac undoes. So these two brackets are the kernel saying "this one is
+ * deliberate", and everything that does not say it is refused by hardware.
+ *
+ * GATED ON THE FEATURE BIT, and it has to be: stac and clac are themselves
+ * #UD on a processor without SMAP, so an ungated stac would turn "your
+ * processor is a little older" into "your kernel does not boot".
+ *
+ * NOT NESTED, deliberately. Every user access in this kernel goes through one
+ * of the three copy functions below and none of them calls another, so a depth
+ * counter would be state maintained for a case that cannot arise -- and a
+ * counter that got out of step would leave AC set, which is the silent failure
+ * this is guarding against. If a nested case ever appears, the honest fix is a
+ * saved-and-restored flag word, not a counter.
+ * ========================================================================== */
+void uaccess_hw_begin(void) {
+    if (cpu_features()->smap)
+        __asm__ volatile("stac" ::: "cc", "memory");
+}
+
+void uaccess_hw_end(void) {
+    if (cpu_features()->smap)
+        __asm__ volatile("clac" ::: "cc", "memory");
 }

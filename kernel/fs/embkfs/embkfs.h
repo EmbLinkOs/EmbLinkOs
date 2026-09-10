@@ -527,13 +527,34 @@ struct embkfs_volume {
      *
      * Keyed on `generation` as well as oid: any commit bumps it, so a stale
      * inode can never be served -- blunt, but correct, and far cheaper now
-     * that the page cache batches writes instead of committing per write. */
+     * that the page cache batches writes instead of committing per write.
+     *
+     * AND THEN SET-ASSOCIATIVE, because the mixed index above was a fix for a
+     * symptom. Mixing moves WHICH ids collide; it cannot make a direct-mapped
+     * cache stop having collisions. A stat consults about seven inodes, and
+     * the odds that two of seven land in the same one of 128 slots are
+     * 1 - e^(-21/128), about 15% -- so roughly one volume layout in seven
+     * produced the exact failure described above, and which layouts did
+     * depended on the order objects were allocated in, i.e. on the size of
+     * everything else on the image. It came back after the mixing fix the
+     * moment an unrelated change shifted the object ids, and was diagnosed
+     * the second time by instrumenting it: zero commits during the window,
+     * two inodes missing on every single stat, evicting each other.
+     *
+     * 32 sets of 4 ways, LRU within a set. Seven inodes would have to put five
+     * into one set of four to conflict, which is not a thing that happens by
+     * luck. Same 128 entries, same 18 KiB -- the cost is a four-way compare on
+     * lookup, against a B-tree descent on every conflict. */
+#define EMBKFS_ICACHE_WAYS 4
+#define EMBKFS_ICACHE_SETS 32
     struct {
         uint64_t oid;
         uint64_t gen;
+        uint32_t lru;           /* icache_clock at last use; smaller = older */
         bool     valid;
         struct embk_inode_item ino;
-    } icache[128];
+    } icache[EMBKFS_ICACHE_WAYS * EMBKFS_ICACHE_SETS];
+    uint32_t  icache_clock;
     uint64_t  icache_hits, icache_misses;
 
     /* THE NAME CACHE: (directory, name) -> object id.
@@ -613,6 +634,11 @@ struct embkfs_stat {
     uint64_t icache_hit, icache_miss;
     /* The name cache: (dir, name) -> oid, the other half of a path walk. */
     uint64_t ncache_hit, ncache_miss;
+    /* COMMITS: superblock generation bumps. Every one of them invalidates
+     * every generation-keyed cache above in a single stroke, so this is the
+     * number that says whether a cache that "stopped working" was actually
+     * being flushed underneath a measurement. */
+    uint64_t commits;
 };
 void embkfs_stat_reset(void);
 void embkfs_stat_get(struct embkfs_stat *out);

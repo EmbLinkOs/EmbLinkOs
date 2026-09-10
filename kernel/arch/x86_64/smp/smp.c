@@ -9,7 +9,8 @@
 #include "mm/pmm.h"
 #include "acpi/acpi.h"
 #include "process/process.h"
-#include "power/power.h"   /* idle residency accounting */
+#include "power/power.h"
+#include "arch/x86_64/cpu/cpu_features.h"   /* idle residency accounting */
 #include "drivers/timer/timer.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
@@ -63,6 +64,11 @@ void ap_main(void) {
      * bug, not a defensive measure -- reserved-bit double faults the first
      * time an AP ran a fresh kthread off its NX-mapped stack. */
     vmm_enable_nx_this_cpu();
+    /* SMEP/SMAP/UMIP are CR4, and CR4 is per core. An AP that skipped this
+     * would be the one soft spot in an otherwise hardened machine, with
+     * nothing to show for it -- the whole job of these bits is to be invisible
+     * while they are working. Same reasoning as EFER.NXE above. */
+    cpu_protection_init_this_cpu();
     vmm_pat_init_this_cpu();   // per-core, same reasoning as vmm_enable_nx_this_cpu()
                                // -- so a WC (vmm_map_mmio_wc) mapping resolves to
                                // Write-Combining on this AP too, not the reset WB.

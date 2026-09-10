@@ -1,4 +1,5 @@
 #include "mm/vmm.h"
+#include "arch/x86_64/cpu/cpu_features.h"
 #include "include/arch_ipi.h"
 #include "mm/pmm.h"
 #include "boot/boot_protocol.h"   /* memory map now arrives via the boot protocol */
@@ -673,6 +674,14 @@ void vmm_init(void) {
 
     vmm_enable_nx_this_cpu();
     vmm_pat_init_this_cpu();   /* WC PAT slot -- before any vmm_map_mmio_wc() */
+
+    /* Ask the processor what it can enforce, then turn all of it on. Here
+     * because it is the same "per core, before anything depends on it" rule as
+     * the two calls above -- and because SMEP and SMAP are nothing but the
+     * hardware honouring page-table permission bits, which is this file's
+     * whole subject. */
+    cpu_features_detect();
+    cpu_protection_init_this_cpu();
 
     // step 1:Allocate a new page for the kernel PML4
     // alloc_table() runs in the early phase (vmm_direct_map_active == 0), so it

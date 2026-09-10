@@ -12,6 +12,8 @@
 #include "block/block.h"
 #include "fs/embkfs/embkfs.h"
 #include "fs/vfs.h"
+#include "arch/aarch64/cpu/cpu_features.h"
+#include "include/uaccess_guard.h"
 #include "mm/vm_object.h"
 #include "power/power.h"
 #include "kworker/kworker.h"
@@ -487,6 +489,12 @@ void arch_early_main(uint64_t dtb_phys) {
 
     /* --- A3: interrupts and preemption ------------------------------------ */
     kprintf("\n");
+    /* What this core can enforce, and turning it on -- before any user process
+     * exists, which is the only moment at which "the kernel has never been
+     * able to touch user memory" is trivially true. */
+    arm_cpu_features_detect();
+    arm_protection_init_this_cpu();
+
     if (gic_init() != 0) {
         kprintf("gic: FATAL no interrupt controller\n");
         for (;;) __asm__ volatile("wfi");
@@ -1043,7 +1051,17 @@ void arch_early_main(uint64_t dtb_phys) {
             /* Zeroed on arrival, then writable, then readable -- in that
              * order, because a mapping that reads back what you wrote but
              * arrived full of someone else's data is a disclosure that a
-             * write-then-read test cannot see. */
+             * write-then-read test cannot see.
+             *
+             * BRACKETED, because this is EL1 touching a USER mapping and PAN
+             * forbids exactly that. It is a deliberate access -- the whole
+             * point of the case is to look at the page a user would see -- so
+             * it asks, the way every other deliberate user access in this
+             * kernel asks. This was the first thing PAN caught when it was
+             * turned on, which is a good advertisement for it: the code was
+             * always reaching into user memory from privileged context, and
+             * nothing had ever said so. */
+            uaccess_hw_begin();
             volatile uint64_t *m = (volatile uint64_t *)(uintptr_t)a;
             for (uint64_t i = 0; i < LEN / 8; i += 512)
                 if (m[i] != 0) ok = false;
@@ -1051,6 +1069,7 @@ void arch_early_main(uint64_t dtb_phys) {
                 m[i] = 0xC0FFEE00ULL + i;
             for (uint64_t i = 0; i < LEN / 8; i += 512)
                 if (m[i] != 0xC0FFEE00ULL + i) ok = false;
+            uaccess_hw_end();
         }
 
         uint64_t free_mapped = pmm_free_pages();
@@ -1071,6 +1090,42 @@ void arch_early_main(uint64_t dtb_phys) {
                                   MAP_ANONYMOUS | MAP_PRIVATE) : 0;
         kprintf("  [%s] a writable+executable mapping was refused\n",
                 wx < 0 ? " ok " : "FAIL");
+
+        /* --- AND THAT PAN IS ACTUALLY ENFORCING -----------------------------
+         *
+         * "SCTLR_EL1.SPAN is clear" and "EL1 cannot read a user page" are two
+         * different claims and only the second is worth anything. There is a
+         * live user mapping right here, so the violation is committed on
+         * purpose: read it WITHOUT asking, under the recovery guard, and
+         * require a fault. On a core without FEAT_PAN the read succeeds and
+         * this says so -- that is the honest outcome for hardware that cannot
+         * refuse it, not a failure. */
+        if (p && a > 0) {
+            const struct arm_cpu_features *cf = arm_cpu_features();
+            uint64_t before = uaccess_recoveries();
+            volatile uint64_t seen = 0;
+            int faulted = 0;
+
+            if (uaccess_arm()) {
+                seen = *(volatile uint64_t *)(uintptr_t)a;   /* no hw_begin */
+                uaccess_disarm();
+            } else {
+                faulted = 1;
+            }
+            uint64_t caught = uaccess_recoveries() - before;
+
+            if (cf->pan) {
+                kprintf("  [%s] PAN: EL1 reading a USER page without asking "
+                        "FAULTS (PSTATE.PAN=%d, caught %d)\n",
+                        (faulted && caught == 1) ? " ok " : "FAIL",
+                        (int)arm_read_pan(), (int)caught);
+                if (!faulted || caught != 1) selftest_fails++;
+            } else {
+                kprintf("  [info] no FEAT_PAN on this core; the unguarded read "
+                        "returned 0x%llx. PXN still holds.\n",
+                        (unsigned long long)seen);
+            }
+        }
 
         if (!ok || !took || !gave_back || wx >= 0)
             selftest_fails++;

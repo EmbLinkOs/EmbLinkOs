@@ -142,6 +142,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/cpu/kcontext.c \
              kernel/arch/x86_64/drivers/pci_arch.c \
              kernel/arch/x86_64/cpu/fpu.c \
+             kernel/arch/x86_64/cpu/cpu_features.c \
              kernel/arch/x86_64/cpu/spinlock.c \
              kernel/arch/x86_64/cpu/rwlock.c \
              kernel/arch/x86_64/smp/smp.c \

@@ -28,6 +28,8 @@
 #include "mm/kheap.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
+#include "arch/x86_64/cpu/cpu_features.h"  /* test hardening */
+#include "include/uaccess_guard.h"           /* test hardening */
 #include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
 #include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
 #include "power/power.h"  /* power / poweroff / reboot */
@@ -418,6 +420,7 @@ static void selftests_print_commands(void)
     kprintf("  test audiostress\n");
     kprintf("  test policycost\n");
     kprintf("  test jobctl\n");
+    kprintf("  test hardening\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1056,6 +1059,120 @@ int selftests_handle_command(const char *cmd)
         }
 
         kprintf("[cmd] test jobctl: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test hardening -- is the processor actually ENFORCING it?
+     *
+     * "We set CR4.SMAP" and "a kernel read of a user page faults" are two
+     * different claims, and only the second one is worth anything. A bit that
+     * was set on the boot core and missed on an AP, or set before something
+     * else rewrote CR4 wholesale, looks exactly like a hardened machine right
+     * up until it matters.
+     *
+     * So this reads CR4 back, and then DELIBERATELY COMMITS THE VIOLATION: it
+     * maps a page user-accessible, arms the recovery guard, and reads it
+     * WITHOUT taking the hardware permission. Under SMAP that is a fault the
+     * guard catches. Without SMAP the read succeeds and this test says so,
+     * which is the honest outcome on a processor that cannot do it rather than
+     * a failure.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test hardening") == 0) {
+        const struct cpu_features *cf = cpu_features();
+        uint64_t cr4 = cpu_read_cr4();
+        int ok = 1;
+
+        kprintf("\n[hardening] %s\n", cf->brand[0] ? cf->brand : cf->vendor);
+        kprintf("  available: SMEP %s  SMAP %s  UMIP %s  NX %s\n",
+                cf->smep ? "yes" : "NO", cf->smap ? "yes" : "NO",
+                cf->umip ? "yes" : "NO", cf->nx   ? "yes" : "NO");
+        kprintf("  CR4 = 0x%llx  -> SMEP %s  SMAP %s  UMIP %s\n",
+                (unsigned long long)cr4,
+                (cr4 & (1ULL << 20)) ? "ON" : "off",
+                (cr4 & (1ULL << 21)) ? "ON" : "off",
+                (cr4 & (1ULL << 11)) ? "ON" : "off");
+
+        /* Available but not enabled is a BUG -- it means the enable path did
+         * not run on this core. Unavailable and not enabled is a fact about
+         * the processor and not a failure. */
+        if (cf->smep) {
+            kprintf("  [%s] SMEP is enabled where the processor has it\n",
+                    (cr4 & (1ULL << 20)) ? "ok" : "FAIL");
+            if (!(cr4 & (1ULL << 20))) ok = 0;
+        }
+        if (cf->smap) {
+            kprintf("  [%s] SMAP is enabled where the processor has it\n",
+                    (cr4 & (1ULL << 21)) ? "ok" : "FAIL");
+            if (!(cr4 & (1ULL << 21))) ok = 0;
+        }
+
+        /* --- and now the part that is evidence rather than bookkeeping --- */
+        uint64_t page = pmm_alloc_page();
+        if (!page) {
+            kprintf("  [FAIL] no page to test with\n");
+            ok = 0;
+        } else {
+            /* A low, canonical, otherwise-unused address, mapped USER so the
+             * processor treats a kernel touch of it as the thing SMAP exists
+             * to refuse. Writable through the direct map first, so the value
+             * read back is known and a "success" cannot be a coincidence. */
+            const uint64_t probe_va = 0x0000600000000000ULL;
+            *(volatile uint64_t *)P2V(page) = 0x5EC0DEULL;
+
+            if (vmm_map(probe_va, page, VMM_PRESENT | VMM_WRITABLE | VMM_USER) != 0) {
+                kprintf("  [FAIL] could not map the probe page\n");
+                ok = 0;
+            } else {
+                uint64_t before = uaccess_recoveries();
+                volatile uint64_t got = 0;
+                int faulted = 0;
+
+                /* Armed, but NOT permitted -- no uaccess_hw_begin(). This is
+                 * the violation, on purpose. */
+                if (uaccess_arm()) {
+                    got = *(volatile uint64_t *)probe_va;
+                    uaccess_disarm();
+                } else {
+                    faulted = 1;      /* the fault handler resumed us here */
+                }
+
+                uint64_t caught = uaccess_recoveries() - before;
+
+                if (cf->smap) {
+                    kprintf("  [%s] a kernel read of a USER page without "
+                            "permission FAULTS (faulted %d, guard caught %llu)\n",
+                            (faulted && caught == 1) ? "ok" : "FAIL",
+                            faulted, (unsigned long long)caught);
+                    if (!faulted || caught != 1) ok = 0;
+
+                    /* And the same read WITH permission must still work, or
+                     * the kernel could not do its job. */
+                    volatile uint64_t got2 = 0;
+                    if (uaccess_arm()) {
+                        uaccess_hw_begin();
+                        got2 = *(volatile uint64_t *)probe_va;
+                        uaccess_hw_end();
+                        uaccess_disarm();
+                    }
+                    kprintf("  [%s] the same read WITH permission succeeds "
+                            "(0x%llx)\n",
+                            got2 == 0x5EC0DEULL ? "ok" : "FAIL",
+                            (unsigned long long)got2);
+                    if (got2 != 0x5EC0DEULL) ok = 0;
+                } else {
+                    kprintf("  (no SMAP on this processor: the unguarded read "
+                            "returned 0x%llx and did not fault, which is "
+                            "correct for hardware that cannot refuse it)\n",
+                            (unsigned long long)got);
+                }
+
+                vmm_unmap(probe_va);
+            }
+            pmm_free_page(page);
+        }
+
+        kprintf("[cmd] test hardening: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
@@ -6536,7 +6653,15 @@ int selftests_handle_command(const char *cmd)
             /* Zeroed FIRST, then written, then read back -- in that order. A
              * mapping that returns what you wrote but arrived carrying the
              * last owner's data is a disclosure a write-then-read test cannot
-             * see. */
+             * see.
+             *
+             * BRACKETED: this is ring 0 touching a USER mapping, which SMAP
+             * refuses unless asked. It hung here the first time SMAP was on --
+             * the first touch of each page is a not-present fault that
+             * vm_fault() resolves, the access retries, and the retry is then a
+             * perfectly present user page read with AC clear. The aarch64
+             * mmap test failed the same way under PAN for the same reason. */
+            uaccess_hw_begin();
             volatile uint64_t *m = (volatile uint64_t *)(uintptr_t)a;
             for (uint64_t i = 0; i < LEN / 8; i += 512)
                 if (m[i] != 0) ok = false;
@@ -6544,6 +6669,7 @@ int selftests_handle_command(const char *cmd)
                 m[i] = 0xC0FFEE00ULL + i;
             for (uint64_t i = 0; i < LEN / 8; i += 512)
                 if (m[i] != 0xC0FFEE00ULL + i) ok = false;
+            uaccess_hw_end();
         }
 
         uint64_t free_mapped = pmm_free_pages();
@@ -6581,11 +6707,13 @@ int selftests_handle_command(const char *cmd)
             } else {
                 uint64_t f1 = pmm_free_pages();
                 volatile char *m = (volatile char *)(uintptr_t)big;
+                uaccess_hw_begin();           /* ring 0 into a user mapping */
                 m[0] = 1;
                 m[BIG / 2] = 2;
                 m[BIG - 1] = 3;
-                uint64_t f2 = pmm_free_pages();
                 bool good = (m[0] == 1 && m[BIG / 2] == 2 && m[BIG - 1] == 3);
+                uaccess_hw_end();
+                uint64_t f2 = pmm_free_pages();
                 kprintf("      [%s] 1 GiB reserved for %llu pages, then 3 touched "
                         "for %llu more (eager would be %llu)\n",
                         good ? " ok " : "FAIL",
@@ -6755,12 +6883,34 @@ int selftests_handle_command(const char *cmd)
         /* (1) THE SAME file, over and over. The answer cannot change, so a
          *     second call should cost nothing. */
         (void)vfs_stat(paths[0], &st);              /* warm it */
+        struct embkfs_stat es0, es1;
+        embkfs_stat_get(&es0);
         embk_blkstat_reset(); embk_blkstat_get(&b0);
         for (int i = 0; i < 50; i++) (void)vfs_stat(paths[0], &st);
         embk_blkstat_get(&b1);
+        embkfs_stat_get(&es1);
         uint64_t same = b1.reads - b0.reads;
-        kprintf("  50 stats of ONE warm file:        %llu device reads\n",
-                (unsigned long long)same);
+        uint64_t commits_during = es1.commits - es0.commits;
+        kprintf("  50 stats of ONE warm file:        %llu device reads"
+                "  (%llu commit(s) landed during it)\n",
+                (unsigned long long)same, (unsigned long long)commits_during);
+        /* WHERE THE READS COME FROM, when there are any. A device read that
+         * no cache accounts for is a read none of them covers, and the
+         * breakdown is what says which. */
+        if (same) {
+            kprintf("    breakdown over the window: node_reads %llu  "
+                    "icache %llu/%llu  ncache %llu/%llu  ecache %llu/%llu  "
+                    "rcache %llu/%llu\n",
+                    (unsigned long long)(es1.node_reads   - es0.node_reads),
+                    (unsigned long long)(es1.icache_hit   - es0.icache_hit),
+                    (unsigned long long)(es1.icache_miss  - es0.icache_miss),
+                    (unsigned long long)(es1.ncache_hit   - es0.ncache_hit),
+                    (unsigned long long)(es1.ncache_miss  - es0.ncache_miss),
+                    (unsigned long long)(es1.ecache_hit   - es0.ecache_hit),
+                    (unsigned long long)(es1.ecache_miss  - es0.ecache_miss),
+                    (unsigned long long)(es1.rcache_hit   - es0.rcache_hit),
+                    (unsigned long long)(es1.rcache_miss  - es0.rcache_miss));
+        }
         /* A SMALL BOUND rather than exactly zero. It reads 0 in practice, and
          * did so immediately after a run of posixdemo that created and deleted
          * nine hundred objects -- but both caches are keyed on the volume

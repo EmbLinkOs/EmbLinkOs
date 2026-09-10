@@ -1,5 +1,6 @@
 #include "arch/aarch64/boot/fdt.h"
 #include "arch/aarch64/cpu/percpu.h"
+#include "arch/aarch64/cpu/cpu_features.h"
 #include "arch/aarch64/irq/gicv3.h"
 #include "arch/aarch64/irq/exception.h"
 #include "arch/aarch64/mm/pagetable.h"
@@ -221,6 +222,12 @@ void smp_secondary_main(uint64_t index) {
      * exactly how this presented: "4 of 4 cores online" and three cores that
      * had taken 0 interrupts between them. */
     exception_init();
+
+    /* PAN before anything can touch user memory on this core. Per core because
+     * SCTLR_EL1 and PSTATE are per core -- a secondary that skipped it would
+     * be the one core where the kernel can still read any user page, with
+     * nothing to show for it. Same reasoning as the x86 side's CR4. */
+    arm_protection_init_this_cpu();
 
     /* TPIDR_EL1 next: this_cpu() is a read of it, and everything below --
      * including anything that takes a lock or reports a failure -- wants a

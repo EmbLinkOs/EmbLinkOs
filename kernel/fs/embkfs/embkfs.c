@@ -1740,10 +1740,12 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     vol->ecache_verified = NULL;
     /* Inode cache: icache_valid is the gate, so it MUST be seeded -- a garbage
      * true here would serve a stale/garbage inode on the very first read. */
+    vol->icache_clock = 0;
     for (unsigned i = 0; i < sizeof vol->icache / sizeof vol->icache[0]; i++) {
         vol->icache[i].valid = false;
         vol->icache[i].oid = 0;
         vol->icache[i].gen = 0;
+        vol->icache[i].lru = 0;
     }
     vol->icache_hits = 0; vol->icache_misses = 0;
     for (unsigned i = 0; i < sizeof vol->ncache / sizeof vol->ncache[0]; i++)
@@ -2401,6 +2403,7 @@ static int embkfs_commit(struct embkfs_volume *vol,
     vol->root        = *new_root;
     vol->generation  = new_gen;
     vol->free_blocks = new_free;
+    g_efs_stat.commits++;
     return EMBK_OK;
 }
 
@@ -4839,19 +4842,42 @@ static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
 
     if (!vol || !out) return -EMBK_EINVAL;
 
-    /* Mix before indexing -- see the icache comment in embkfs.h. The constant
-     * is the 64-bit Fibonacci ratio, which is the standard choice for exactly
-     * this: it spreads the high bits of a sequential id into the low ones. */
-    unsigned slot = (unsigned)(((oid * 0x9E3779B97F4A7C15ULL) >> 40) %
-                               (sizeof vol->icache / sizeof vol->icache[0]));
+    /* Mix before choosing a SET -- see the icache comment in embkfs.h. The
+     * constant is the 64-bit Fibonacci ratio: it spreads the high bits of a
+     * sequential id into the low ones. It chooses a set now, not a slot, and
+     * the four ways of the set are what absorb the collisions mixing cannot
+     * prevent. */
+    unsigned set  = (unsigned)(((oid * 0x9E3779B97F4A7C15ULL) >> 40) %
+                               EMBKFS_ICACHE_SETS);
+    unsigned base = set * EMBKFS_ICACHE_WAYS;
 
-    if (vol->icache[slot].valid && vol->icache[slot].oid == oid &&
-        vol->icache[slot].gen == vol->generation) {
-        vol->icache_hits++;
-        *out = vol->icache[slot].ino;
-        return EMBK_OK;
+    for (unsigned w = 0; w < EMBKFS_ICACHE_WAYS; w++) {
+        unsigned i = base + w;
+        if (vol->icache[i].valid && vol->icache[i].oid == oid &&
+            vol->icache[i].gen == vol->generation) {
+            vol->icache_hits++;
+            vol->icache[i].lru = ++vol->icache_clock;
+            *out = vol->icache[i].ino;
+            return EMBK_OK;
+        }
     }
     vol->icache_misses++;
+
+    /* The victim: a dead way first (never used, or from an earlier
+     * generation, which cannot be served anyway and is costing nothing to
+     * evict), and only then the least recently used live one. Choosing an LRU
+     * victim while a stale way sits in the same set would throw away a live
+     * answer to keep a dead one. */
+    unsigned slot = base;
+    uint32_t oldest = UINT32_MAX;
+    for (unsigned w = 0; w < EMBKFS_ICACHE_WAYS; w++) {
+        unsigned i = base + w;
+        if (!vol->icache[i].valid || vol->icache[i].gen != vol->generation) {
+            slot = i;
+            break;
+        }
+        if (vol->icache[i].lru < oldest) { oldest = vol->icache[i].lru; slot = i; }
+    }
 
     const struct embk_item_header *ii =
         embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe_i, sizeof probe_i);
@@ -4863,6 +4889,7 @@ static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
     vol->icache[slot].ino   = *ino;    /* copy: probe_i is reused by the next call */
     vol->icache[slot].oid   = oid;
     vol->icache[slot].gen   = vol->generation;
+    vol->icache[slot].lru   = ++vol->icache_clock;
     vol->icache[slot].valid = true;
     *out = *ino;
     return EMBK_OK;
@@ -7334,6 +7361,13 @@ static int embkfs_run_namespace_selftests_impl(void)
     int rc = EMBK_OK;
     bool ok = true;
     uint64_t oid = 0;
+    /* WHICH CHECK FAILED. This used to report "FAIL (rc=0)" and nothing else,
+     * which is close to the least useful thing a test can say: rc=0 means the
+     * step that failed SUCCEEDED at something, so the one number printed was
+     * the one number guaranteed not to explain it. Each check now names what
+     * it was checking, and the first failure is the one reported. */
+    const char *failed = NULL;
+#define NS_FAIL(why) do { if (!failed) failed = (why); ok = false; } while (0)
 
     static const uint8_t payload[] = { 'N', 'S', 'D', 'A', 'T', 'A' };
     char linkbuf[64];
@@ -7363,82 +7397,126 @@ static int embkfs_run_namespace_selftests_impl(void)
 
     /* Must reject moving a directory into its own subtree. */
     rc = embkfs_rename_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/a", "/tstns/a/sub/a");
-    if (rc != -EMBK_EINVAL) ok = false;
+    if (rc != -EMBK_EINVAL) NS_FAIL("moving a directory into its own subtree was not refused");
 
     /* Hard-linking a directory must be denied. */
     if (ok) {
         rc = embkfs_link_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/a", "/tstns/a_link");
-        if (rc != -EMBK_EPERM) ok = false;
+        if (rc != -EMBK_EPERM) NS_FAIL("hard-linking a directory was not refused");
     }
 
     rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f", &oid);
     if (rc == -EMBK_EEXIST) {
         rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f", &oid);
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not find a file that said it already existed");
     } else if (rc != EMBK_OK) {
-        ok = false;
+        NS_FAIL("could not create /tstns/f");
     }
 
     if (ok) {
         rc = embkfs_write_object(vol, oid, payload, sizeof payload);
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not write the payload");
     }
 
     /* Hardlink should preserve object and readability after original unlink. */
     if (ok) {
         rc = embkfs_link_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f", "/tstns/f2");
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not hard-link a file");
     }
     if (ok) {
         rc = embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f");
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not unlink the original name");
     }
     if (ok) {
         uint64_t f2 = 0;
         rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f2", &f2);
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("the second link vanished with the first");
         if (ok) {
             memset(rbuf, 0, sizeof rbuf);
             nread = 0;
             rc = embkfs_read_object(vol, f2, rbuf, sizeof rbuf, &nread);
-            if (rc != EMBK_OK || nread != sizeof payload || memcmp(rbuf, payload, sizeof payload) != 0) ok = false;
+            if (rc != EMBK_OK || nread != sizeof payload || memcmp(rbuf, payload, sizeof payload) != 0) {
+                kprintf("EMBKFS: ns: read through the surviving link: rc %d, %llu bytes (want %u)\n",
+                        rc, (unsigned long long)nread, (unsigned)sizeof payload);
+                NS_FAIL("the data did not survive unlinking the original name");
+            }
         }
     }
 
     /* Symlink create/readlink/rename roundtrip. */
     if (ok) {
         rc = embkfs_symlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/l", "/tstns/f2", &oid);
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not create a symlink");
     }
     if (ok) {
         memset(linkbuf, 0, sizeof linkbuf);
         l = 0;
         rc = embkfs_readlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/l", linkbuf, sizeof linkbuf, &l);
-        if (rc != EMBK_OK || l != 9 || memcmp(linkbuf, "/tstns/f2", 9) != 0) ok = false;
+        if (rc != EMBK_OK || l != 9 || memcmp(linkbuf, "/tstns/f2", 9) != 0) NS_FAIL("readlink did not return the target it was given");
     }
     if (ok) {
         rc = embkfs_rename_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/l", "/tstns/l2");
-        if (rc != EMBK_OK) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("could not rename a symlink");
     }
     if (ok) {
         memset(linkbuf, 0, sizeof linkbuf);
         l = 0;
         rc = embkfs_readlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/l2", linkbuf, sizeof linkbuf, &l);
-        if (rc != EMBK_OK || l != 9 || memcmp(linkbuf, "/tstns/f2", 9) != 0) ok = false;
+        if (rc != EMBK_OK || l != 9 || memcmp(linkbuf, "/tstns/f2", 9) != 0) NS_FAIL("a renamed symlink lost its target");
     }
 
-    /* Rename into an existing destination must fail. */
+    /* RENAME OVER AN EXISTING NAME REPLACES IT, ATOMICALLY.
+     *
+     * This check used to assert the opposite -- that the rename was REFUSED
+     * with EEXIST -- and it was written before EMBKFS v2.3 made atomic replace
+     * "the one real semantic addition" (docs/EMBKFS_spec_v2.3.md §1). git's
+     * lockfile protocol is built on renaming a temporary onto the real name,
+     * and `mv` means the same thing to every person who has ever typed it. The
+     * filesystem was right; this test had drifted, and reported only
+     * "FAIL (rc=0)" for it -- which is how it stayed wrong for so long.
+     *
+     * The replacement claim is stronger than the old refusal, and it is
+     * asserted in full: the old name is gone, the new name resolves to the
+     * SOURCE's object, and reading it gives the source's bytes -- not the
+     * destination's old ones. */
+    uint64_t x_oid = 0, y_old_oid = 0;
+    static const uint8_t xdata[] = { 'X', 'X' };
+    static const uint8_t ydata[] = { 'Y', 'Y', 'Y' };
     if (ok) {
-        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &oid);
-        if (rc != EMBK_OK && rc != -EMBK_EEXIST) ok = false;
+        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &x_oid);
+        if (rc == -EMBK_EEXIST) rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &x_oid);
+        if (rc != EMBK_OK) NS_FAIL("could not create /tstns/x");
+        if (ok && embkfs_write_object(vol, x_oid, xdata, sizeof xdata) != EMBK_OK)
+            NS_FAIL("could not write /tstns/x");
     }
     if (ok) {
-        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &oid);
-        if (rc != EMBK_OK && rc != -EMBK_EEXIST) ok = false;
+        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &y_old_oid);
+        if (rc == -EMBK_EEXIST) rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &y_old_oid);
+        if (rc != EMBK_OK) NS_FAIL("could not create /tstns/y");
+        if (ok && embkfs_write_object(vol, y_old_oid, ydata, sizeof ydata) != EMBK_OK)
+            NS_FAIL("could not write /tstns/y");
     }
     if (ok) {
         rc = embkfs_rename_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", "/tstns/y");
-        if (rc != -EMBK_EEXIST) ok = false;
+        if (rc != EMBK_OK) NS_FAIL("rename onto an existing name did not replace it (v2.3 §1)");
+    }
+    if (ok) {
+        uint64_t gone = 0;
+        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &gone);
+        if (rc != -EMBK_ENOENT) NS_FAIL("the old name still resolves after a rename");
+    }
+    if (ok) {
+        uint64_t now_y = 0;
+        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &now_y);
+        if (rc != EMBK_OK) NS_FAIL("the new name does not resolve after a rename");
+        else if (now_y != x_oid) NS_FAIL("the new name resolves to something other than the source object");
+        else {
+            memset(rbuf, 0, sizeof rbuf);
+            nread = 0;
+            rc = embkfs_read_object(vol, now_y, rbuf, sizeof rbuf, &nread);
+            if (rc != EMBK_OK || nread != sizeof xdata || memcmp(rbuf, xdata, sizeof xdata) != 0)
+                NS_FAIL("the replaced name reads the destination's OLD bytes, not the source's");
+        }
     }
 
     embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f");
@@ -7452,8 +7530,10 @@ static int embkfs_run_namespace_selftests_impl(void)
     embkfs_rmdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/b");
     embkfs_rmdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns");
 
+#undef NS_FAIL
     if (!ok) {
-        kprintf("EMBKFS: %s: namespace stress: FAIL (rc=%d)\n", vol->dev->name, rc);
+        kprintf("EMBKFS: %s: namespace stress: FAIL -- %s (rc=%d)\n",
+                vol->dev->name, failed ? failed : "(unnamed check)", rc);
         return (rc == EMBK_OK) ? -EMBK_EINVAL : rc;
     }
 
