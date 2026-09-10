@@ -583,6 +583,151 @@ static struct value bi_clip(const struct command *cmd, struct value input,
     return value_null();
 }
 
+/* ==========================================================================
+ * glob PATTERN -- file selection by wildcard.
+ *
+ * `ls *.txt` is what a person types. This shell's structured answer --
+ * `ls | where name =~ ".txt"` -- works and composes and is not what anyone
+ * reaches for first, so the pattern gets a name of its own:
+ *
+ *     glob "*.c"                  -> a table, the same shape ls produces
+ *     for f in $(glob "src/*.c") { ... }
+ *     glob "*.tmp" | count
+ *
+ * A TABLE with ls's columns rather than a bare list of names, deliberately:
+ * it means every transform already written works on the result
+ * (`glob "*.log" | where size > 1mb | sort-by modified`), where a list of
+ * strings would have dead-ended.
+ *
+ * WHAT IS AND IS NOT MATCHED. `*` matches any run of characters WITHIN one
+ * path component and `?` matches exactly one. `*` deliberately does not cross
+ * '/': `*.c` must not reach into subdirectories, because a pattern that
+ * silently recursed would make `rm *.tmp` a very different command from the
+ * one it looks like. Recursive matching wants its own spelling (`**`) and is
+ * not here yet.
+ *
+ * A pattern that matches NOTHING yields an empty table -- not an error, and
+ * not the pattern itself passed through as a literal filename, which is the
+ * single worst thing the Bourne shell does. `for f in $(glob "*.none") { }`
+ * running zero times is what every caller means.
+ * ========================================================================== */
+
+/* One path component against one pattern component. Iterative with a
+ * backtrack point rather than recursive: a pattern is user input, and a
+ * recursive matcher on `a*a*a*a*b` is a stack the caller chooses the depth
+ * of. */
+static bool glob_match_1(const char *pat, size_t plen, const char *str, size_t slen) {
+    size_t p = 0, s = 0, star = (size_t)-1, mark = 0;
+
+    while (s < slen) {
+        if (p < plen && (pat[p] == '?' || pat[p] == str[s])) { p++; s++; continue; }
+        if (p < plen && pat[p] == '*') { star = p++; mark = s; continue; }
+        if (star != (size_t)-1) { p = star + 1; s = ++mark; continue; }
+        return false;
+    }
+    while (p < plen && pat[p] == '*') p++;
+    return p == plen;
+}
+
+static bool has_glob_chars(const char *s) {
+    for (; *s; s++)
+        if (*s == '*' || *s == '?') return true;
+    return false;
+}
+
+static struct value err_glob(const char *what) {
+    char msg[128];
+    snprintf(msg, sizeof msg, "glob: %s", what);
+    return value_error(msg);
+}
+
+static struct value bi_glob(const struct command *cmd, struct value input,
+                            struct scope *env) {
+    (void)env;
+    value_free(&input);
+
+    if (cmd->nargs != 1)
+        return err_glob("takes one pattern");
+
+    const char *pat = expr_as_word(cmd->args[0]);
+    if (!pat)
+        return err_glob("pattern must be a plain word or string");
+
+    /* Split the pattern into "the directory to read" and "the name pattern".
+     * Only the LAST component may contain wildcards -- a wildcard in a
+     * directory component would need to walk a tree, which is the recursive
+     * case this deliberately does not do yet. */
+    const char *slash = strrchr(pat, '/');
+    char dir[PATH_MAX_LEN];
+    const char *namepat;
+
+    if (slash) {
+        size_t dlen = (size_t)(slash - pat);
+        if (dlen == 0) { dir[0] = '/'; dir[1] = '\0'; }       /* "/foo" -> "/" */
+        else {
+            if (dlen >= sizeof dir) return err_glob("pattern is too long");
+            memcpy(dir, pat, dlen);
+            dir[dlen] = '\0';
+        }
+        namepat = slash + 1;
+        if (has_glob_chars(dir))
+            return err_glob("wildcards are only allowed in the last path component");
+    } else {
+        dir[0] = '.'; dir[1] = '\0';
+        namepat = pat;
+    }
+
+    char resolved[PATH_MAX_LEN];
+    path_resolve(dir, resolved, sizeof resolved);
+
+    struct embk_dirent *ents =
+        (struct embk_dirent *)malloc(LS_MAX_ENTRIES * sizeof(*ents));
+    if (!ents) return value_error("out of memory");
+
+    int64_t n = embk_readdir(resolved, ents, LS_MAX_ENTRIES);
+    if (n < 0) { free(ents); return err_os("glob: can't read", resolved, (int)n); }
+
+    size_t patlen = strlen(namepat);
+    struct value out = value_table();
+
+    for (int64_t i = 0; i < n; i++) {
+        if (!glob_match_1(namepat, patlen, ents[i].name, strlen(ents[i].name)))
+            continue;
+
+        /* "." and ".." are never matched by a wildcard, only by naming them.
+         * `rm *` reaching ".." is not a hypothetical class of accident. */
+        if (has_glob_chars(namepat) &&
+            (strcmp(ents[i].name, ".") == 0 || strcmp(ents[i].name, "..") == 0))
+            continue;
+
+        struct value row = value_record();
+        value_record_set(&row, "name", value_string(ents[i].name));
+        value_record_set(&row, "type", value_string(dt_name(ents[i].type)));
+
+        /* The full path as a PATH value, because that is what the caller
+         * feeds back to `rm`/`cat`. Without it every loop over a glob has to
+         * re-join the directory by hand and half of them get it wrong. */
+        char full[PATH_MAX_LEN + 64];
+        size_t rlen = strlen(resolved);
+        bool slash_end = rlen > 0 && resolved[rlen - 1] == '/';
+        snprintf(full, sizeof full, "%s%s%s", resolved, slash_end ? "" : "/", ents[i].name);
+        value_record_set(&row, "path", value_path(full));
+
+        struct embk_stat st;
+        bool have_st = (ents[i].type == EMBK_DT_REG || ents[i].type == EMBK_DT_DIR) &&
+                       embk_stat(full, &st) == 0;
+        value_record_set(&row, "size",
+                         (have_st && ents[i].type == EMBK_DT_REG)
+                             ? value_filesize((int64_t)st.size) : value_null());
+        value_record_set(&row, "modified",
+                         (have_st && st.mtime > 0) ? value_date((int64_t)st.mtime) : value_null());
+
+        value_table_push_row(&out, row);
+    }
+    free(ents);
+    return out;
+}
+
 /* --- background jobs -------------------------------------------------------
  *
  * `jobs` is a TABLE like everything else here, so it composes:
@@ -705,6 +850,7 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "clip",    bi_clip    },
         { "clear",  bi_clear  },
         { "jobs",   bi_jobs   }, { "fg",     bi_fg     },
+        { "glob",   bi_glob   },
     };
     for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
         if (strcmp(tab[i].name, name) == 0) return tab[i].fn;

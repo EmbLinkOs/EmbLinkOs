@@ -3425,6 +3425,27 @@ int selftests_handle_command(const char *cmd)
               "echo hi &\nlet r = $(fg 1)\nif $r.exit == 0 { echo done } else { echo bad }", 0 },
             { "fg on a job that does not exist is an error",
               "fg 99", 1 },
+            /* glob + the vocabulary. These are what turn "the shell can loop"
+             * into "the shell can do something in the loop". */
+            { "glob finds files and composes with the transforms",
+              "let n = $(glob \"/system/bin/*.elf\" | count)\n"
+              "if $n > 0 { echo found } else { echo none }", 0 },
+            { "a glob that matches nothing is EMPTY, not an error",
+              "let n = $(glob \"/system/bin/*.nonesuch\" | count)\n"
+              "if $n == 0 { echo empty } else { echo wrong }", 0 },
+            { "a wildcard in a directory component is refused",
+              "glob \"/sys*/bin/x\"", 1 },
+            { "glob rows carry a usable path, and a for loop can walk them",
+              "let c = 0\n"
+              "for f in $(glob \"/system/bin/*.elf\") { let c = $c + 1 }\n"
+              "if $c > 0 { echo walked } else { echo none }", 0 },
+            { "aggregates work on a real table column",
+              "let t = $(ls /system/bin | where size > 0 | sum size)\n"
+              "if $t > 0 { echo summed } else { echo zero }", 0 },
+            { "range/join/split round-trip",
+              "let s = $(range 3 | join \",\")\n"
+              "let n = $(echo $s | split \",\" | count)\n"
+              "if $n == 3 { echo ok } else { echo bad }", 0 },
         };
 
         int ok = 1;

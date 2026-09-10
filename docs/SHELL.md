@@ -168,6 +168,61 @@ A script is read and parsed **whole**, not line by line: a block spans lines
 and a line-at-a-time reader cannot see the end of one. A leading `#!` is
 skipped (and `#` already starts a comment, so it costs nothing).
 
+### File selection: `glob`
+
+```
+glob "*.c"                              -> a table, ls's shape
+glob "src/*.c" | where size > 1kb
+for f in $(glob "*.tmp") { rm $f.path }
+```
+
+A **table**, not a list of names, so every transform already written works on
+the result. Rows carry `path` as well as `name` — without it, every loop over a
+glob has to re-join the directory by hand and half of them get it wrong.
+
+`*` matches within one path component and `?` matches exactly one character.
+`*` deliberately does **not** cross `/`: a pattern that silently recursed would
+make `rm *.tmp` a very different command from the one it looks like. Recursive
+matching wants its own spelling and is not here yet. A wildcard is only allowed
+in the last component.
+
+A pattern that matches nothing yields an **empty table** — not an error, and
+not the pattern passed through as a literal filename, which is the single worst
+thing the Bourne shell does. `.` and `..` are never matched by a wildcard, only
+by naming them.
+
+### The vocabulary
+
+Control flow with nothing to compute is still not much. These are all *pure* —
+value in, value out, no OS — which is why they are covered by the host tests
+rather than only by a boot.
+
+| | |
+|---|---|
+| `sum` `avg` `min` `max` `[col]` | over a list, or a table column: `ls \| sum size` |
+| `range N` / `range A B` | half-open, so `range $n` has exactly n items |
+| `skip N` | `first`'s complement |
+| `uniq` | distinct list items, first occurrence wins |
+| `split SEP` / `join SEP` | text ↔ list |
+| `lines` | text → a list of lines |
+| `trim` `upper` `lower` | text maps |
+| `replace OLD NEW` | every occurrence, literal |
+
+The edge cases are the point, and each is pinned by a test:
+
+- **An empty aggregate is `null`, not zero.** `sum` of nothing being 0 is
+  defensible; `min` of nothing being 0 is a lie, and having the four agree is
+  worth more than the one convenient case.
+- **A null cell is skipped, not counted as zero** — a missing measurement is
+  not a measurement of zero, and averaging it as one drags the answer down.
+- **`split` keeps empty fields.** `"a,,b"` is three fields. A shell that
+  collapsed the middle one would corrupt every CSV it touched.
+- **`lines` produces no phantom last line** for the trailing newline every text
+  file ends with.
+- **A descending `range` is empty**, not reversed — a loop that should not run.
+- **`replace` scans forward** and does not re-scan what it wrote, so
+  `replace "aa" "b"` on `"aaa"` is `"ba"`.
+
 ### Background jobs, and Ctrl-C
 
 ```
@@ -487,8 +542,6 @@ Three gaps closed in one pass, all `test fd`-asserted live:
   process rather than only interrupt or cancel it.
 - **Interrupting a background job.** ^C reaches the foreground only, and
   `kill` takes a pid rather than a job id.
-- **Globbing** (`*.txt`). `ls | where name =~ ".txt"` is the structured
-  equivalent and works today, but it is not what anyone types.
 - **Closures / commands as values.** `def` creates a name, not a value; a
   command cannot yet be passed to another command.
 - **Early `return` from a script**, as distinct from from a command body —

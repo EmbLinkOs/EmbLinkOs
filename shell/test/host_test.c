@@ -500,6 +500,141 @@ static void test_program(void) {
     CHECK(prog_fails("def (a) { }"), "def needs a name");
 }
 
+/* ---------------------------------------------------------------------------
+ * The vocabulary: aggregation, sequences, text.
+ *
+ * All PURE -- value in, value out, no OS -- which is why they can be pinned
+ * here with dozens of small cases instead of only by booting a machine. The
+ * cases that matter most are the EDGE ones: what an empty input does, what a
+ * null cell does, what a trailing separator does. Those are where a shell
+ * quietly corrupts data.
+ * ------------------------------------------------------------------------- */
+static void test_vocabulary(void) {
+    printf("vocabulary (aggregates, sequences, text):\n");
+    struct scope top;
+    scope_init(&top, NULL);
+
+    struct value v;
+
+    /* --- range --- */
+    v = run("range 4 | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 4, "range N produces exactly N items");
+    value_free(&v);
+
+    v = run("range 2 5 | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 3, "range A B is half-open");
+    value_free(&v);
+
+    v = run("range 5 2 | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 0, "a descending range is EMPTY, not reversed");
+    value_free(&v);
+
+    /* --- aggregates --- */
+    v = run("range 5 | sum", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 10, "sum adds a list of ints (0+1+2+3+4)");
+    value_free(&v);
+
+    v = run("range 5 | max", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 4, "max");
+    value_free(&v);
+
+    v = run("range 5 | min", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 0, "min");
+    value_free(&v);
+
+    v = run("range 4 | avg", value_null(), &top);
+    CHECK(v.type == VAL_FLOAT && v.u.f > 1.49 && v.u.f < 1.51, "avg of 0..3 is 1.5");
+    value_free(&v);
+
+    /* Empty is NULL, not zero -- min of nothing being 0 would be a lie, and
+     * the four agreeing is worth more than the one convenient case. */
+    v = run("range 0 | sum", value_null(), &top);
+    CHECK(v.type == VAL_NULL, "an empty aggregate is null, not zero");
+    value_free(&v);
+
+    v = run("echo hello | sum", value_null(), &top);
+    CHECK(v.type == VAL_ERROR, "a non-numeric value is refused, not coerced");
+    value_free(&v);
+
+    /* --- skip / uniq --- */
+    v = run("range 5 | skip 2 | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 3, "skip drops the first N");
+    value_free(&v);
+
+    v = run("range 3 | skip 99 | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 0, "skipping past the end is empty, not an error");
+    value_free(&v);
+
+    v = run("echo \"a,b,a,c,b\" | split \",\" | uniq | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 3, "uniq keeps first occurrences");
+    value_free(&v);
+
+    /* --- split / join --- */
+    v = run("echo \"a,b,c\" | split \",\" | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 3, "split on a separator");
+    value_free(&v);
+
+    /* The case that quietly corrupts every CSV a shell touches. */
+    v = run("echo \"a,,b\" | split \",\" | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 3, "adjacent separators produce an EMPTY field");
+    value_free(&v);
+
+    v = run("echo \"abc\" | split \"\" | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 3, "an empty separator splits into characters");
+    value_free(&v);
+
+    v = run("range 3 | join \",\"", value_null(), &top);
+    CHECK(v.type == VAL_STRING && v.u.s.len == 5 &&
+          memcmp(v.u.s.bytes, "0,1,2", 5) == 0, "join renders non-text items plainly");
+    value_free(&v);
+
+    v = run("echo \"a,b,c\" | split \",\" | join \"-\"", value_null(), &top);
+    CHECK(v.type == VAL_STRING && memcmp(v.u.s.bytes, "a-b-c", 5) == 0,
+          "split then join round-trips through a different separator");
+    value_free(&v);
+
+    /* --- lines --- */
+    v = run("echo \"a\\nb\\nc\\n\" | lines | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 3,
+          "a trailing newline does NOT produce a phantom last line");
+    value_free(&v);
+
+    v = run("echo \"a\\r\\nb\" | lines | count", value_null(), &top);
+    CHECK(v.type == VAL_INT && v.u.i == 2, "CRLF counts as one line ending");
+    value_free(&v);
+
+    /* --- text maps --- */
+    v = run("echo \"  hi  \" | trim", value_null(), &top);
+    CHECK(v.type == VAL_STRING && v.u.s.len == 2 &&
+          memcmp(v.u.s.bytes, "hi", 2) == 0, "trim strips both ends");
+    value_free(&v);
+
+    v = run("echo \"aBc\" | upper", value_null(), &top);
+    CHECK(v.type == VAL_STRING && memcmp(v.u.s.bytes, "ABC", 3) == 0, "upper");
+    value_free(&v);
+
+    v = run("echo \"aBc\" | lower", value_null(), &top);
+    CHECK(v.type == VAL_STRING && memcmp(v.u.s.bytes, "abc", 3) == 0, "lower");
+    value_free(&v);
+
+    v = run("echo \"a-b-a\" | replace \"a\" \"X\"", value_null(), &top);
+    CHECK(v.type == VAL_STRING && v.u.s.len == 5 &&
+          memcmp(v.u.s.bytes, "X-b-X", 5) == 0, "replace hits every occurrence");
+    value_free(&v);
+
+    v = run("echo \"aaa\" | replace \"aa\" \"b\"", value_null(), &top);
+    CHECK(v.type == VAL_STRING && v.u.s.len == 2 &&
+          memcmp(v.u.s.bytes, "ba", 2) == 0,
+          "replace scans forward, it does not re-scan what it wrote");
+    value_free(&v);
+
+    v = run("echo \"abc\" | replace \"\" \"X\"", value_null(), &top);
+    CHECK(v.type == VAL_ERROR, "an empty `old` is refused (it would never terminate)");
+    value_free(&v);
+
+    scope_free(&top);
+}
+
 int main(void) {
     printf("=== shell host tests ===\n");
     test_lexer();
@@ -507,6 +642,7 @@ int main(void) {
     test_parser();
     test_program();
     test_eval();
+    test_vocabulary();
     test_hist();
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall green\n", g_fail);
     return g_fail;
