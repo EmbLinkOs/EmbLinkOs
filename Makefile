@@ -199,6 +199,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/mm/uaccess_guard.c \
              kernel/mm/vma.c \
              kernel/mm/vm_object.c \
+             kernel/power/power.c \
+             kernel/arch/x86_64/power/power_x86.c \
              kernel/mm/ipi.c \
              kernel/arch/x86_64/irq/ipi.c \
              kernel/arch/x86_64/mm/vmm.c \

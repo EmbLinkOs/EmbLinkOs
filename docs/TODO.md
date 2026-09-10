@@ -527,10 +527,68 @@ approximated, which is why none of them is a silent bug waiting to be found:
     file read takes.
   - [ ] **Read-ahead.** A sequential reader still faults one page at a time.
     The access pattern is trivially detectable from the object's own history.
-  - [ ] **The writeback thread polls** (yield loop against a deadline, the same
-    shape `sys_sleep_ms` uses) because the scheduler has no timer wakeup list.
-    A real sleeping timer would let it wake only when there is dirty data.
+  - [x] ~~**The writeback thread polls** because the scheduler has no timer
+    wakeup list.~~ **DONE** — `sched_sleep_ms()` blocks on a timer queue that
+    the scheduler tick drains (`sched_timer_tick()`, called before `schedule()`
+    on both architectures). See the power section below for what that
+    measurement then exposed.
 - [ ] **`msync`.** Meaningless until MAP_SHARED file mappings exist. `ENOSYS`.
+
+### Power
+
+`kernel/power/power.h`. Shutdown and reboot are real on both architectures
+(PSCI `SYSTEM_OFF`/`SYSTEM_RESET` on aarch64; the PM1a control register at the
+address every mainstream emulator uses on x86, then the 8042 reset line, then a
+deliberate triple fault). A transition flushes the page cache first — a
+shutdown that lost recently written files would make the write-back cache a bug
+rather than a feature. Per-core idle residency is measured continuously and
+`power` reports it: **97% system idle** on an otherwise idle desktop, four
+cores.
+
+The measurement immediately earned itself twice:
+
+1. It first reported **0% idle on a machine that was in fact halted on three of
+   four cores** — because it was instrumenting the per-core idle *kthread*,
+   which never runs. The adopted boot thread in `ap_main` is NORMAL priority
+   and always runnable, so the `PRIORITY_BACKGROUND` idle kthread behind it is
+   a liveness backstop that is never reached in practice. All three places a
+   core can halt are now instrumented.
+2. It showed every periodic thing in the kernel was a yield loop, which is why
+   `sched_sleep_ms` exists at all.
+
+- [ ] **A user thread cannot block on the timer queue.** `sched_sleep_ms`
+  falls back to the yield loop for user threads, so a sleeping *app* still
+  keeps a core out of idle. Blocking one and waking it from the tick corrupts
+  its resume on aarch64: it comes back with `ELR_EL1 = 0x2a` (the value of an
+  unrelated register) and takes a PC-alignment fault at EL1. **Bisected
+  precisely**: with the gate in place the whole aarch64 acceptance suite
+  passes; with user threads allowed through it dies in posixdemo's clock tests,
+  every time, under both TCG and HVF. Kernel threads take the identical path
+  and are fine — so it is something about resuming a thread that must return
+  through the EL0 exception path, not about the sleep queue. **Repro:** remove
+  the `pml4_phys != vmm_get_kernel_pml4()` gate in `sched_sleep_ms`
+  (`kernel/process/process.c`) and run `make ARCH=aarch64 test-arm64-boot`.
+- [ ] **No battery driver**, because the hardware this runs on has none.
+  `power_supply_get()` answers false, which is a fact about the machine and not
+  a stub; the driver interface is there for an ACPI `_BST`, an I2C fuel gauge,
+  or a hypervisor channel to fill. A real ACPI battery needs the AML
+  interpreter below.
+- [ ] **No AML interpreter**, which is what a *general* x86 power-off needs
+  (FADT → PM1a_CNT, and SLP_TYPa for S5 out of the DSDT). Without it, real
+  hardware falls through every mechanism and `power_transition` reports that it
+  could not power the machine off — the truth, and better than halting and
+  looking like a hang.
+- [ ] **No suspend-to-RAM.** Refused by name (`ENOSYS`), not silently ignored:
+  it needs every driver to save and restore its own state, and a driver that
+  silently does not is a machine that wakes up with a dead disk.
+- [ ] **No per-device power states, no thermal, no frequency scaling.** The
+  idle residency counter is the foundation any of those would be judged
+  against.
+- [ ] **The tick still fires at 100 Hz on every core, including halted ones.**
+  A halted core wakes 100 times a second to discover it has nothing to do.
+  Suppressing the tick on an idle core (a tickless idle) is the single largest
+  remaining power win, and it needs the timer queue above to decide the next
+  deadline.
 
 ---
 

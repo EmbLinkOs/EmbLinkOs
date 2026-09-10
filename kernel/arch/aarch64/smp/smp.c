@@ -10,6 +10,7 @@
 #include "include/kstring.h"
 #include "mm/pmm.h"
 #include "process/process.h"
+#include "power/power.h"   /* idle residency accounting */
 
 /* Secondary CPU bring-up over PSCI -- docs/ARM64.md phase A9.
  *
@@ -66,6 +67,8 @@ static uint8_t g_smp_stacks[MAX_CPUS][SMP_STACK_SIZE] __attribute__((aligned(16)
  * spun on by the primary. */
 static volatile uint32_t g_online;
 
+static bool psci_probe(void);
+
 static int64_t psci_call(uint32_t fn, uint64_t a1, uint64_t a2, uint64_t a3) {
     register uint64_t x0 __asm__("x0") = fn;
     register uint64_t x1 __asm__("x1") = a1;
@@ -77,6 +80,28 @@ static int64_t psci_call(uint32_t fn, uint64_t a1, uint64_t a2, uint64_t a3) {
     else
         __asm__ volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
     return (int64_t)x0;
+}
+
+/* PSCI is not only how secondary cores start -- it is also how this machine
+ * turns off and reboots (kernel/arch/aarch64/power/power_arm.c). The probe is
+ * therefore made available on its own, and made idempotent, rather than
+ * copied: a second implementation of "which conduit does this firmware use"
+ * is a second place to get it wrong. */
+static bool g_probed = false;
+static bool g_probe_ok = false;
+
+bool psci_available(void) {
+    if (!g_probed) {
+        g_probed = true;
+        g_probe_ok = fdt_ok() && psci_probe();
+    }
+    return g_probe_ok;
+}
+
+int64_t psci_invoke(uint32_t fn, uint64_t a1, uint64_t a2, uint64_t a3) {
+    if (!psci_available())
+        return -1;              /* PSCI NOT_SUPPORTED */
+    return psci_call(fn, a1, a2, a3);
 }
 
 static bool psci_probe(void) {
@@ -232,8 +257,16 @@ void smp_secondary_main(uint64_t index) {
         kprintf("smp: cpu%d scheduling, DAIF=%p\n", (int)index,
                 (void *)(uintptr_t)daif);
     }
-    for (;;)
+    for (;;) {
+        /* Bracketed for the idle accounting (kernel/power/power.h). This --
+         * NOT the per-core idle kthread -- is where a secondary actually
+         * spends its time: the adopted boot thread is NORMAL priority and
+         * always runnable, so the PRIORITY_BACKGROUND idle kthread behind it
+         * is a liveness backstop that is never reached in practice. */
+        power_idle_enter();
         arch_cpu_idle();
+        power_idle_exit();
+    }
 }
 
 extern void secondary_entry(void);      /* boot.S */

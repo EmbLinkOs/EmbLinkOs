@@ -568,15 +568,6 @@ void vmo_stats_get(struct vmo_stats *out) {
 /* How often the thread wakes to look at memory pressure. */
 #define VMO_SCAN_INTERVAL_MS     100
 
-/* Yield until `ms` have passed. There is no blocking kernel timer wait -- the
- * scheduler has no wakeup list -- so this is the same yield-against-a-deadline
- * shape sys_sleep_ms uses, and it costs a few microseconds per scheduler round
- * rather than a timeslice. */
-static void wait_ms(uint32_t ms) {
-    uint64_t end = timer_uptime_ms() + ms;
-    do { sys_yield(); } while (timer_uptime_ms() < end);
-}
-
 static void vmo_writeback_main(void) {
     uint64_t next_flush = 0;
     while (1) {
@@ -598,7 +589,11 @@ static void vmo_writeback_main(void) {
                 (void)vmo_reclaim(s.resident_pages - g_max_resident);
         }
 
-        wait_ms(VMO_SCAN_INTERVAL_MS);
+        /* A REAL sleep, not a yield loop. This thread wakes ten times a
+         * second and does nothing the vast majority of those times; as a
+         * yield loop it would have been permanently runnable and would have
+         * kept a core out of idle for the life of the machine. */
+        sched_sleep_ms(VMO_SCAN_INTERVAL_MS);
     }
 }
 

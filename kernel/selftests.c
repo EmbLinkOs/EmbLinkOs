@@ -30,6 +30,7 @@
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
 #include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
 #include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
+#include "power/power.h"  /* power / poweroff / reboot */
 #include "drivers/usb/usb.h"
 #include "drivers/video/framebuffer.h"
 #include "arch/x86_64/cpu/percpu.h"
@@ -6037,6 +6038,55 @@ int selftests_handle_command(const char *cmd)
                 (unsigned long long)v1.dirty_pages, (unsigned long long)v1.hits,
                 (unsigned long long)v1.misses, (unsigned long long)v1.evictions);
         kprintf("[cmd] test pagecache: %s\n", fails == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* What this machine is running on and what it is spending.
+     *
+     * The idle percentage is the number worth watching: it should be high on a
+     * machine with nothing to do, and if it falls without the workload
+     * changing, something started polling. That is a regression this command
+     * can catch and nothing else in the tree can. */
+    if (strcmp(cmd, "power") == 0) {
+        kprintf("\n[power]\n");
+        for (uint32_t c = 0; c < 64; c++) {
+            struct power_cpu_stats st;
+            if (!power_cpu_stats(c, &st))
+                continue;
+            kprintf("  cpu%u: idle %llu of %llu ms (%llu%%), %llu halts\n",
+                    (unsigned)c,
+                    (unsigned long long)st.idle_ms,
+                    (unsigned long long)st.uptime_ms,
+                    (unsigned long long)(st.uptime_ms ? st.idle_ms * 100 / st.uptime_ms : 0),
+                    (unsigned long long)st.idle_entries);
+        }
+        kprintf("  system idle: %u%%\n", (unsigned)power_idle_percent());
+
+        struct power_supply_state ps;
+        if (power_supply_get(&ps)) {
+            kprintf("  supply: %s, battery %s",
+                    ps.source == POWER_SOURCE_BATTERY ? "battery" : "AC",
+                    ps.battery_present ? "present" : "absent");
+            if (ps.battery_present)
+                kprintf(", %u%%%s", (unsigned)ps.percent, ps.charging ? " (charging)" : "");
+            kprintf("\n");
+        } else {
+            /* Not a stub and not a failure: this machine has no battery, and
+             * saying so is the accurate answer. */
+            kprintf("  supply: no power-supply driver -- this machine has no battery\n");
+        }
+        return 1;
+    }
+
+    if (strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "shutdown") == 0) {
+        int rc = power_transition(POWER_OFF);
+        kprintf("\n[cmd] poweroff: FAILED (%d) -- %s\n", rc, power_last_error());
+        return 1;
+    }
+
+    if (strcmp(cmd, "reboot") == 0) {
+        int rc = power_transition(POWER_REBOOT);
+        kprintf("\n[cmd] reboot: FAILED (%d) -- %s\n", rc, power_last_error());
         return 1;
     }
 

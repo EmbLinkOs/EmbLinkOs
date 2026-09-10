@@ -9,6 +9,7 @@
 #include "mm/pmm.h"
 #include "acpi/acpi.h"
 #include "process/process.h"
+#include "power/power.h"   /* idle residency accounting */
 #include "include/kprintf.h"
 #include "include/kstring.h"
 
@@ -126,7 +127,16 @@ void ap_main(void) {
      * and back again later -- the same mechanism that already drives
      * preemption on the BSP, now running independently on every core. */
     for (;;) {
+        /* Bracketed for the idle accounting (kernel/power/power.h). This --
+         * NOT the per-core idle kthread -- is where an AP actually spends its
+         * time: the adopted boot thread is NORMAL priority and always
+         * runnable, so the PRIORITY_BACKGROUND idle kthread behind it is a
+         * liveness backstop that is never reached in practice. Instrumenting
+         * only the kthread reported 0% idle on a machine that was in fact
+         * halted on three of its four cores. */
+        power_idle_enter();
         __asm__ volatile ("hlt");
+        power_idle_exit();
     }
 }
 

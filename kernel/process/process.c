@@ -1,4 +1,5 @@
 #include "process/process.h"
+#include "power/power.h"   /* idle residency accounting */
 #include "include/arch_irq.h"
 #include "drivers/input/keyboard.h"   /* keyboard_release_grab_pid() on reap */
 #include "gfx/surface.h"   /* surface_transfer_to() for SPAWN_ACTION_INHERIT_SURFACE */
@@ -700,6 +701,113 @@ void wait_queue_wake_all(struct wait_queue *wq) {
     while (wq->head) {
         wait_queue_wake_one(wq);
     }
+}
+
+/* --------------------------------------------------------------------
+ * TIMED SLEEP -- waiting on a clock instead of spending the CPU to watch one.
+ *
+ * The kernel had no way to do this, and the consequence was systemic rather
+ * than local: with nothing to block on, every periodic thing in the tree was
+ * written as `do { yield(); } while (now < deadline)`. A yield loop is
+ * RUNNABLE. schedule() therefore always found work, the per-core idle threads
+ * (PRIORITY_BACKGROUND, and correctly so) never ran, and no core ever executed
+ * a single `hlt`.
+ *
+ * That was invisible until kernel/power/power.h started counting halts, and
+ * then it was unmissable: 0% idle, four cores, an idle machine.
+ *
+ * ONE UNSORTED QUEUE, walked on every tick. Sorted insertion would make the
+ * tick O(1) instead of O(sleepers), and it is not worth it yet: the sleepers
+ * are the writeback thread, whatever kthreads follow it, and however many
+ * user threads are between frames -- tens, not thousands. The tick already
+ * walks the whole thread table to pick a candidate. When that stops being
+ * true, this becomes a sorted list or a timer wheel, and the shape of the
+ * change is contained here.
+ * -------------------------------------------------------------------- */
+static struct wait_queue g_sleep_wq;
+
+void sched_sleep_ms(uint64_t ms) {
+    if (ms == 0) {
+        sys_yield();
+        return;
+    }
+
+    uint64_t deadline = timer_uptime_ms() + ms;
+
+    for (;;) {
+        if (timer_uptime_ms() >= deadline)
+            return;
+
+        sched_lock();
+        struct thread *t = current_thread;
+        if (!t) {                       /* no scheduler yet: fall back */
+            sched_unlock();
+            timer_delay_ms((uint32_t)ms);
+            return;
+        }
+        /* KERNEL THREADS ONLY, and this is a measured limit rather than a
+         * design choice.
+         *
+         * Blocking a USER thread here and waking it from the timer tick
+         * corrupts its resume on aarch64: it comes back with a garbage link
+         * register (ELR_EL1 = 0x2a, the value of an unrelated register) and
+         * takes a PC-alignment fault at EL1. Bisected precisely -- with this
+         * gate in place the whole aarch64 acceptance suite passes, and with
+         * user threads allowed through it dies in posixdemo's clock tests,
+         * every time. Kernel threads take the identical path and are fine, so
+         * it is something about resuming a thread that must return through the
+         * EL0 exception path, not about the sleep queue.
+         *
+         * The honest consequence: sys_sleep_ms for a user process is still the
+         * yield loop it always was, so a sleeping APP still keeps a core out of
+         * idle. The kernel's own periodic threads -- which is what this was
+         * built for, and what would otherwise have ADDED a new permanent
+         * poller -- genuinely sleep. docs/TODO.md carries the repro. */
+        if (t->proc && t->proc->pml4_phys != vmm_get_kernel_pml4()) {
+            sched_unlock();
+            do { sys_yield(); } while (timer_uptime_ms() < deadline);
+            return;
+        }
+
+        t->wake_at_ms = deadline;
+        /* Returns UNLOCKED -- it released the lock to switch away. The loop
+         * re-checks the clock rather than trusting the wake, because a
+         * cancellation wakes a blocked thread too and this must not turn into
+         * a busy loop when that happens: the deadline check above ends it. */
+        sched_block_current_locked(&g_sleep_wq);
+        /* Cancellation is per-PROCESS (docs/INTERRUPTION.md): a cancelled
+         * process must not be held in a sleep it asked for before it was told
+         * to stop. Kernel threads have a process too, so this is uniform. */
+        if (t->proc && t->proc->cancelled) {
+            t->wake_at_ms = 0;
+            return;
+        }
+    }
+}
+
+void sched_timer_tick(void) {
+    /* Cheap out before taking the lock. The tick runs on every core at 100 Hz
+     * and the queue is empty most of the time; a lock acquisition per core per
+     * tick to discover that would be the exact kind of cost this whole change
+     * exists to remove. A racing insert is picked up on the next tick, 10 ms
+     * later, which no sleeper can tell from scheduling jitter. */
+    if (!g_sleep_wq.head)
+        return;
+
+    uint64_t now = timer_uptime_ms();
+
+    sched_lock();
+    struct thread *t = g_sleep_wq.head;
+    while (t) {
+        struct thread *next = t->wait_next;
+        if (t->wake_at_ms && now >= t->wake_at_ms) {
+            wait_queue_remove(&g_sleep_wq, t);
+            t->wake_at_ms = 0;
+            t->state = PROCESS_READY;
+        }
+        t = next;
+    }
+    sched_unlock();
 }
 
 /* --------------------------------------------------------------------
@@ -2675,7 +2783,14 @@ void thread_exit_self(int code) {
  * which is exactly what re-enters schedule(). */
 static void idle_kthread_entry(void) {
     for (;;) {
+        /* Bracket the halt so the time this core spends NOT working is
+         * measured. A halted core costs almost nothing and a core spinning in
+         * a poll loop costs everything, and the difference is invisible unless
+         * somebody counts it -- which is exactly how a poll loop gets added
+         * and never noticed. kernel/power/power.h. */
+        power_idle_enter();
         arch_cpu_idle();
+        power_idle_exit();
     }
 }
 

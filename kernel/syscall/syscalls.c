@@ -1352,16 +1352,18 @@ static int64_t sys_uptime_ms(const struct sysargs *a) {
     return (int64_t)uptime_ms_now();
 }
 
-/* Sleep >= arg 0 milliseconds. Implemented as a yield loop against an HPET
- * deadline -- every pass gives the CPU away, so a sleeping app costs a few
- * microseconds per scheduler round instead of burning its whole timeslice
- * (the ring-3 UI apps used to pace with volatile spin loops; with 2-3 apps
- * live, each stole a full slice per round and everything crawled). Not a
- * blocking timer wait (no scheduler-side wakeup list -- deliberately zero
- * scheduler surgery), but it removes ~all of the idle CPU theft. */
+/* Sleep >= arg 0 milliseconds.
+ *
+ * This WAS a yield loop against an HPET deadline, and the comment here said
+ * why: "not a blocking timer wait (no scheduler-side wakeup list --
+ * deliberately zero scheduler surgery), but it removes ~all of the idle CPU
+ * theft". It removed most of it and left the part that mattered most: a
+ * yield loop is RUNNABLE, so a sleeping app kept the scheduler permanently
+ * supplied with work and no core ever reached its idle thread. The kernel now
+ * has the wakeup list (sched_sleep_ms), so a sleeping process genuinely
+ * blocks and a machine with nothing to do genuinely halts. */
 static int64_t sys_sleep_ms(const struct sysargs *a) {
-    uint64_t end = uptime_ms_now() + a->arg[0];
-    do { sys_yield(); } while (uptime_ms_now() < end);
+    sched_sleep_ms(a->arg[0]);
     return 0;
 }
 

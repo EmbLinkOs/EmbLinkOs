@@ -193,6 +193,12 @@ struct thread {
     struct thread *wait_next;
     struct wait_queue *wait_queue;
 
+    /* Monotonic milliseconds at which a TIMED sleep should end. Only
+     * meaningful while blocked on the timer queue (sched_sleep_ms). 0 means
+     * this thread is not waiting on a deadline -- an ordinary blocked thread
+     * waits for an event, and no clock will ever wake it. */
+    uint64_t wake_at_ms;
+
     /* Which core (cpu_table[] index, kernel/cpu/percpu.h) this thread is
      * PROCESS_RUNNING on, set every time schedule()/process_start_first()
      * transitions it to RUNNING. -1 when not running anywhere (READY,
@@ -664,6 +670,30 @@ int process_is_cancelled(uint32_t pid);
 void sched_lock(void);
 void sched_unlock(void);
 void sched_block_current_locked(struct wait_queue *wq);
+
+/* SLEEP UNTIL A DEADLINE, without spending the CPU to wait.
+ *
+ * This is what the kernel was missing, and the cost was not subtle: with no
+ * way to wait on a clock, every periodic thing in the system was written as a
+ * yield loop -- `do { yield(); } while (now < deadline)`. A yield loop is
+ * RUNNABLE, so schedule() always had work, so the per-core idle threads never
+ * ran and no core ever halted. The idle accounting in kernel/power/power.h
+ * measured that directly the first time it was switched on: 0% idle, on four
+ * cores, with nothing to do.
+ *
+ * The thread blocks on the timer queue and the scheduler tick wakes it when
+ * its deadline passes. Callable only from a schedulable context.
+ *
+ * KERNEL THREADS ONLY for now: a user thread woken this way comes back with a
+ * corrupted link register on aarch64 and faults at EL1. It falls back to the
+ * yield loop, which is exactly what it did before, so nothing regresses -- but
+ * a sleeping APP still keeps a core out of idle. Bisected and recorded in
+ * docs/TODO.md; see the comment on the gate in process.c. */
+void sched_sleep_ms(uint64_t ms);
+
+/* Wake every thread whose deadline has passed. Called from the timer tick,
+ * before schedule(). Takes g_sched_lock itself. */
+void sched_timer_tick(void);
 
 /**
  * @brief Unconditionally terminate a process (every one of its threads),

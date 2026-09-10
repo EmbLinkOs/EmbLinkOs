@@ -63,6 +63,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/mm/uaccess_guard.c \
                   kernel/mm/vma.c \
                   kernel/mm/vm_object.c \
+                  kernel/power/power.c \
+                  kernel/arch/aarch64/power/power_arm.c \
                   kernel/mm/ipi.c \
                   kernel/mm/kheap.c \
                   kernel/mm/kmalloc.c \
@@ -842,6 +844,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'fstat reports every byte written'       PC 'stat disagrees with read about the size of a file with unflushed writes'; \
 	  chk 'one object per FILE, not per open'      PC 'two opens of one file cached it twice -- an incoherent cache'; \
 	  chk 'the cached tail went too'               PC 'O_TRUNC left stale bytes in the cache'; \
+	  chk 'power: idle accounting armed'          PW 'the power subsystem never came up'; \
 	  chk 'instead of panicking'           A6 'a kernel fault on user memory was not recovered'; \
 	  chk 'posixdemo: ALL PASS'            A6 'the POSIX conformance suite reported failures'; \
 	  chk 'posixdemo exited 0'             A6 'posixdemo did not exit clean'; \
@@ -915,6 +918,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "     description: two descriptors, ONE cursor"; \
 	  echo "  PC the unified page cache: write-back, one object per file,"; \
 	  echo "     coherent between independent opens, and a real fsync"; \
+	  echo "  PW power: per-core idle residency measured, PSCI SYSTEM_OFF"; \
+	  echo "     and SYSTEM_RESET wired to a real shutdown path"; \
 	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
 	  echo "     own GIC redistributor, VECTORS and timer, all reporting in"; \
 	  echo "     themselves, all TICKING, and all reachable by IPI"; \

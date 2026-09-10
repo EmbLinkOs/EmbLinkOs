@@ -58,6 +58,7 @@
 
 #include "kworker/kworker.h"
 #include "mm/vm_object.h"   /* the page cache writeback thread */
+#include "power/power.h"     /* idle residency, shutdown, reboot */
 
 #include "process/process.h"
 #include "tty/tty.h"
@@ -1968,6 +1969,12 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
      * long it stays there. See mm/vm_object.h. */
     vmo_writeback_init();
 
+    /* Power: idle residency starts being counted the moment the idle threads
+     * exist, and shutdown/reboot become available. After the page cache
+     * deliberately -- a power-off flushes it, so the thing it flushes has to
+     * be there first. */
+    power_init();
+
     // --- Networking (M1): virtio-net + Ethernet/ARP/IPv4/ICMP. After PCI is
     // enumerated and the scheduler is live (net_init spawns an RX poll kthread).
     // Static config for now; `test net` pings the gateway. No ring-3 surface yet.
@@ -2043,6 +2050,12 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
             }
         }
 
+        /* Bracketed for the idle accounting (kernel/power/power.h). The BSP
+         * halts here between ticks exactly as the APs do in ap_main; counting
+         * only one of the three places a core can halt would have reported an
+         * idle machine as busy. */
+        power_idle_enter();
         __asm__ volatile ("hlt");   // wake on any IRQ (timer, PS/2, or xHCI)
+        power_idle_exit();
     }
 }
