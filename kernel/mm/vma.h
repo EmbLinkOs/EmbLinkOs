@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include "include/types.h"
 
+struct vm_object;   /* mm/vm_object.h -- a file's pages */
+
 /* MEMORY MAPPINGS -- mmap()/munmap() and the per-process record of what is
  * mapped where.
  *
@@ -74,6 +76,19 @@ struct vm_area {
     uint64_t end;           /* exclusive, page aligned */
     uint32_t prot;
     uint32_t flags;
+
+    /* FILE BACKING. NULL for an anonymous mapping.
+     *
+     * The object is the SAME one read()/write() go through (mm/vm_object.h),
+     * not a copy of it -- which is the entire reason the cache was built as an
+     * object. A process that maps a file and one that reads it are looking at
+     * one set of pages, so they cannot disagree about what the file says.
+     *
+     * `file_off` is the byte offset in the file that `start` corresponds to,
+     * so page N of the mapping is page (file_off/PAGE + N) of the object. */
+    struct vm_object *obj;
+    uint64_t file_off;
+
     struct vm_area *next;   /* sorted ascending by start */
 };
 
@@ -81,6 +96,18 @@ struct vm_area {
  * `addr` is a hint and is honoured only with MAP_FIXED. */
 int64_t vma_mmap(struct process *proc, uint64_t addr, uint64_t len,
                  uint32_t prot, uint32_t flags);
+
+/* Map a FILE. `obj` is the file's page object -- the caller holds a reference
+ * for the life of the mapping and vma_munmap/vma_destroy_all release it.
+ * `file_off` must be page aligned: a mapping is made of pages, and an
+ * unaligned offset has no page to correspond to.
+ *
+ * MAP_SHARED means writes go to the FILE, through the same writeback the rest
+ * of the kernel uses. MAP_PRIVATE means writes are the caller's alone: the
+ * page is mapped read-only from the cache and COPIED on the first write, so
+ * two processes reading one file share its pages and only a writer pays. */
+int64_t vma_mmap_file(struct process *proc, uint64_t len, uint32_t prot,
+                      uint32_t flags, struct vm_object *obj, uint64_t file_off);
 
 /* Unmap a whole mapping, or a page-aligned prefix/suffix/middle of one.
  * Returns 0 or -EMBK_*. Unmapping a range that was never mapped is an error,
@@ -119,6 +146,9 @@ struct vm_fault_stats {
     uint64_t handled;      /* a page was mapped and the instruction retried */
     uint64_t declined;     /* not this process's address, or a permission
                             * violation -- the program dies */
+    uint64_t cow;          /* a private file page copied because it was
+                            * written -- the count that says sharing was
+                            * actually happening up to that point */
 };
 void vm_fault_stats(struct vm_fault_stats *out);
 

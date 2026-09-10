@@ -1536,14 +1536,23 @@ int ioctl(int fd, unsigned long request, ...) {
  * honest ENOSYS; it now gets real memory for the anonymous case it actually
  * uses, and the same honest refusal for the rest. */
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
-    if (fd >= 0)                       { errno = ENODEV;  return MAP_FAILED; }
-    if (off != 0)                      { errno = EINVAL;  return MAP_FAILED; }
-    if (flags & MAP_SHARED)            { errno = ENOTSUP; return MAP_FAILED; }
     if (flags & MAP_FIXED)             { errno = ENOTSUP; return MAP_FAILED; }
     if (addr != NULL)                  { errno = ENOTSUP; return MAP_FAILED; }
     if (len == 0)                      { errno = EINVAL;  return MAP_FAILED; }
+    if (off < 0 || (off & 0xFFF))      { errno = EINVAL;  return MAP_FAILED; }
 
-    int64_t ret = embk_mmap(len, prot);
+    /* Anonymous mappings are PRIVATE, always: MAP_SHARED anonymous memory
+     * would be shared with nobody, since there is no fork here to share it
+     * with. A file mapping honours whichever the caller asked for. */
+    if (fd < 0) {
+        if (off != 0)                  { errno = EINVAL;  return MAP_FAILED; }
+        if (flags & MAP_SHARED)        { errno = ENOTSUP; return MAP_FAILED; }
+    } else if (!(flags & (MAP_SHARED | MAP_PRIVATE))) {
+        errno = EINVAL;                /* a file mapping must say which */
+        return MAP_FAILED;
+    }
+
+    int64_t ret = embk_mmap_fd(len, prot, flags, fd, (uint64_t)off);
     if (ret < 0) { embk_fail((int)ret); return MAP_FAILED; }
     return (void *)(intptr_t)ret;
 }

@@ -50,10 +50,16 @@ TLB shootdown.
 
 **Next, in order:**
 
-1. **File-backed `mmap`, sharing the page object.** This is the payoff for
-   building the cache as an object rather than a cache: mapping a file is
-   handing the process the pages it already holds. No copy, no coherence
-   problem, no second implementation. It also makes `MAP_SHARED` meaningful.
+1. ~~**File-backed `mmap`, sharing the page object.**~~ **Done**, and it was
+   the payoff it promised: mapping a file hands the process the pages the cache
+   already holds. A `MAP_SHARED` write is visible to `read()` on another
+   descriptor *immediately* — no `fsync`, no `msync` — because there is only
+   one set of pages. `MAP_PRIVATE` maps them read-only and **copies on write**,
+   so N readers share one copy and only a writer pays.
+   - Still missing: `msync` (writeback already covers durability, but a caller
+     asking for it by name gets `ENOSYS`), and `MAP_SHARED` *anonymous* memory,
+   which would need a shared anonymous object and has no consumer without
+   `fork`.
 2. ~~**Demand paging.**~~ **Done.** `mmap` allocates nothing; a page appears on
    first touch, and the fault that puts it there is *resolved* instead of
    reported. `1 GiB reserved for 0 pages, then 3 touched for 8 more (eager
@@ -61,10 +67,17 @@ TLB shootdown.
    being one resource and being two.
    - Still to come: a **shared zero page** (a read of an untouched page could
      map one copy-on-write instead of allocating), and **copy-on-write** proper.
-3. **Copy-on-write.** Now one step away: the fault handler exists and the VMA
-   knows the permissions; what is missing is a per-page refcount and a
-   write-fault path that copies instead of allocating. It is what makes a cheap
-   `spawn` of a large process possible, and what a shared zero page needs.
+3. ~~**Copy-on-write.**~~ **Done for file mappings** — `MAP_PRIVATE` maps the
+   cache page read-only so the first write faults, and *that* fault is
+   unambiguous: a page this process had already copied would be mapped
+   writable and would not fault at all.
+   - Not done for **anonymous** memory, which is what a cheap `spawn` of a
+     large process would need — and needs a per-page refcount, since two
+     address spaces would then share a frame neither solely owns. Nothing asks
+     for it while there is no `fork`.
+   - A **shared zero page** (a read of untouched anonymous memory mapping one
+     global zero frame read-only) is the same machinery and would make a large
+     sparse read-mostly mapping nearly free.
 4. **A metadata cache.** Every `open`, `stat` and `SEEK_END` is a B-tree walk
    that reads the device. `test pagecache` deliberately keeps the seek outside
    its measured window rather than hide this. Largest single win left in I/O.

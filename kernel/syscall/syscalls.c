@@ -20,6 +20,7 @@
 #include "include/syscall_abi.h"
 #include "include/usercopy.h"
 #include "mm/vma.h"        /* sys_mmap / sys_munmap */
+#include "mm/vm_object.h"   /* the file's pages, for a file-backed mmap */
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"   /* sys_read's copy_to_user fault-path diagnostic */
 #include "ipc/pipe.h"          /* sys_pipe: pipe_create */
@@ -1821,9 +1822,34 @@ static int64_t sys_mmap(const struct sysargs *a) {
     struct process *p = current_thread ? current_thread->proc : 0;
     if (!p)
         return -EMBK_EPERM;
-    return vma_mmap(p, 0, (uint64_t)a->arg[0],
-                    (uint32_t)a->arg[1],
-                    (uint32_t)a->arg[2] | MAP_ANONYMOUS | MAP_PRIVATE);
+
+    uint64_t len   = (uint64_t)a->arg[0];
+    uint32_t prot  = (uint32_t)a->arg[1];
+    uint32_t flags = (uint32_t)a->arg[2];
+    int      fd    = (int)a->arg[3];
+    uint64_t off   = (uint64_t)a->arg[4];
+
+    /* fd < 0 is the anonymous form. The `addr` argument is still absent and
+     * still deliberate -- MAP_FIXED is refused, because an address the caller
+     * chooses is an address the caller can collide with. */
+    if (fd < 0) {
+        if (off != 0)
+            return -EMBK_EINVAL;      /* an offset into nothing */
+        return vma_mmap(p, 0, len, prot,
+                        flags | MAP_ANONYMOUS | MAP_PRIVATE);
+    }
+
+    /* A FILE. The object comes from the descriptor and the mapping holds a
+     * reference for its whole life -- so `mmap(fd); close(fd);` keeps working,
+     * which is the one behaviour every caller of mmap relies on. */
+    struct vm_object *obj = vfs_fd_object(fd);
+    if (!obj)
+        return -EMBK_ENODEV;          /* a pipe/socket/console has no pages */
+
+    int64_t rc = vma_mmap_file(p, len, prot, flags, obj, off);
+    if (rc < 0)
+        vmo_put(obj);                 /* the mapping never took the reference */
+    return rc;
 }
 
 /* munmap(addr, len) -> 0, or -errno. Unmapping a range that was never mapped

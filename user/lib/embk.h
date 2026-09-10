@@ -1021,8 +1021,18 @@ static inline int embk_tty_mode(int mode) {
 #define EMBK_PROT_WRITE  0x2
 #define EMBK_PROT_EXEC   0x4
 
+#define EMBK_MAP_SHARED   0x01
+#define EMBK_MAP_PRIVATE  0x02
+
+/* fd < 0 = anonymous. A file mapping shares the kernel's page cache object for
+ * that file, so a reader and a mapper see one set of pages -- and the mapping
+ * holds its own reference, so closing the fd afterwards is fine. */
+static inline int64_t embk_mmap_fd(size_t len, int prot, int flags,
+                                   int fd, uint64_t off) {
+    return embk_syscall5(EMBK_SYS_mmap, (int64_t)len, prot, flags, fd, (int64_t)off);
+}
 static inline int64_t embk_mmap(size_t len, int prot) {
-    return embk_syscall3(EMBK_SYS_mmap, (int64_t)len, prot, 0);
+    return embk_mmap_fd(len, prot, 0, -1, 0);
 }
 
 /* Unmaps a whole mapping, or a page-aligned prefix, suffix or middle of one --

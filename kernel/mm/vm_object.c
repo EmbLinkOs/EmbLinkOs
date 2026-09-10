@@ -484,6 +484,64 @@ void vmo_invalidate(struct vm_object *o) {
     mutex_unlock(&g_lock);
 }
 
+/* --- mapping a cached page ------------------------------------------------ */
+
+uint64_t vmo_wire_page(struct vm_object *o, uint64_t index) {
+    if (!o)
+        return 0;
+    mutex_lock(&g_lock);
+
+    /* A mapping may legitimately reach PAST the end of the file -- mmap
+     * rounds up to a page, and a file's last page is partly beyond it. Those
+     * bytes must read as ZERO, so an absent page inside the mapping is filled
+     * with zeroes rather than refused. */
+    bool past_eof = (index * PAGE_SIZE >= o->size);
+    struct vmo_page *p = page_get(o, index, past_eof);
+    if (!p) { mutex_unlock(&g_lock); return 0; }
+
+    p->wired++;
+    /* A wired page is not evictable, so its place in the LRU is meaningless
+     * until it is unwired -- but touching it keeps the ordering sane for when
+     * that happens. */
+    lru_touch(p);
+    uint64_t phys = p->phys;
+    mutex_unlock(&g_lock);
+    return phys;
+}
+
+void vmo_unwire_page(struct vm_object *o, uint64_t index) {
+    if (!o)
+        return;
+    mutex_lock(&g_lock);
+    struct vmo_page *p = page_find(o, index);
+    if (p && p->wired)
+        p->wired--;
+    mutex_unlock(&g_lock);
+}
+
+uint64_t vmo_page_phys(struct vm_object *o, uint64_t index) {
+    if (!o)
+        return 0;
+    mutex_lock(&g_lock);
+    struct vmo_page *p = page_find(o, index);
+    uint64_t phys = p ? p->phys : 0;
+    mutex_unlock(&g_lock);
+    return phys;
+}
+
+void vmo_mark_dirty(struct vm_object *o, uint64_t index) {
+    if (!o)
+        return;
+    mutex_lock(&g_lock);
+    struct vmo_page *p = page_find(o, index);
+    if (p && !p->dirty) {
+        p->dirty = true;
+        o->dirty_pages++;
+        g_stats.dirty_pages++;
+    }
+    mutex_unlock(&g_lock);
+}
+
 uint64_t vmo_writeback_all(void) {
     if (!g_ready)
         return 0;

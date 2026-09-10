@@ -356,6 +356,21 @@ int vfs_fd_truncate(int fd, uint64_t size)
  * do. user/lib/syscalls.c carried the standing obligation that came with that
  * -- "if a write-back cache is ever added, these must become a real device
  * flush the same day". This is that day. */
+/* mmap needs the file's pages, and the fd is what names them. A NEW reference
+ * is taken here rather than borrowing the descriptor's: a mapping outlives the
+ * close() that made it, which is the one behaviour every caller of mmap
+ * relies on and the reason the object is refcounted at all. */
+struct vm_object *vfs_fd_object(int fd)
+{
+    struct fd_entry *e = fd_lookup(fd);
+    if (!e || e->backing != FD_BACKING_VNODE)
+        return NULL;
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->obj)
+        return NULL;
+    return vmo_get(of->vn);          /* same object, one more holder */
+}
+
 int vfs_fd_fsync(int fd)
 {
     struct fd_entry *e = fd_lookup(fd);

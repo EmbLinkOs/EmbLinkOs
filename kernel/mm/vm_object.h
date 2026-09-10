@@ -130,6 +130,34 @@ uint64_t vmo_writeback_all(void);
  * aggressively in the first place. Returns the number actually freed. */
 uint64_t vmo_reclaim(uint64_t want);
 
+/* --- mapping a cached page into an address space --------------------------
+ *
+ * THIS IS THE PAYOFF for building the cache as an object rather than as a
+ * cache. Mapping a file is not "read it into some pages" -- it is handing the
+ * process the pages the object ALREADY HOLDS. No copy, no second
+ * implementation, and no way for a reader and a mapper to disagree about what
+ * the file says, because there is only one set of pages.
+ *
+ * `vmo_wire_page` faults the page in if absent and PINS it: a pinned page is
+ * skipped by the reclaimer, because evicting a frame that is live in some
+ * process's page table would hand that process someone else's memory. Returns
+ * the frame, or 0.
+ *
+ * `vmo_unwire_page` releases the pin. A page that was never wired is left
+ * alone rather than under-flowing the count.
+ *
+ * `vmo_page_phys` answers "which frame backs this index, if any" WITHOUT
+ * faulting or pinning -- what munmap uses to tell a pinned cache page from a
+ * private copy-on-write copy it has to free itself. */
+uint64_t vmo_wire_page(struct vm_object *o, uint64_t index);
+void     vmo_unwire_page(struct vm_object *o, uint64_t index);
+uint64_t vmo_page_phys(struct vm_object *o, uint64_t index);
+
+/* Mark a wired page dirty -- a MAP_SHARED write reaches the file through the
+ * ordinary writeback path, which is the whole point of MAP_SHARED. The kernel
+ * cannot see the store, so the mapper says so when it maps for writing. */
+void vmo_mark_dirty(struct vm_object *o, uint64_t index);
+
 /* Cache-wide counters, for `test pagecache` and the memory display. */
 struct vmo_stats {
     uint64_t objects;

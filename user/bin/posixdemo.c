@@ -1000,6 +1000,112 @@ static void test_writeback(void) {
  * points at -- lstat vs stat, readlink vs read, unlink-the-link vs
  * unlink-the-target. A system that conflated them would pass a happy-path test
  * and destroy data on the first real use. */
+/* FILE-BACKED mmap -- the payoff for a page cache built as an object.
+ *
+ * Mapping a file is not "read it into some pages": it is handing the process
+ * the pages the cache ALREADY HOLDS. The assertions that matter are the ones a
+ * copy-based implementation would fail:
+ *
+ *   - a write through a MAP_SHARED mapping is visible to read() on another
+ *     descriptor, with no fsync and no msync, because there is only one copy;
+ *   - a write through a MAP_PRIVATE mapping is visible to NOBODY, however
+ *     long you wait -- that is copy-on-write, and it is the difference
+ *     between "private" and "eventually shared".
+ */
+static void test_mmap_file(void) {
+    printf("file-backed mmap (one object, not a copy):\n");
+
+    const char *path = "/mmapfile.bin";
+    unlink(path);
+
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ck("create a file to map", fd >= 0);
+    if (fd < 0) return;
+
+    char page[4096];
+    memset(page, 'A', sizeof page);
+    ck("write one page of 'A'", write(fd, page, sizeof page) == (ssize_t)sizeof page);
+
+    /* --- MAP_SHARED: the mapping and the file are the same bytes ---------- */
+    char *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ck("mmap MAP_SHARED succeeds", m != MAP_FAILED);
+    if (m == MAP_FAILED) { close(fd); unlink(path); return; }
+
+    ck("the mapping shows the file's contents", m[0] == 'A' && m[4095] == 'A');
+
+    m[0] = 'Z';
+    m[100] = 'Z';
+
+    /* Read through a SEPARATE descriptor. No fsync, no msync: if the mapping
+     * and the read path share one object this is already true, and if they do
+     * not, no amount of flushing would make it true right now. */
+    int fd2 = open(path, O_RDONLY);
+    ck("a second, independent open", fd2 >= 0);
+    if (fd2 >= 0) {
+        char rb[8];
+        memset(rb, 0, sizeof rb);
+        ssize_t n = read(fd2, rb, 1);
+        ck("a MAP_SHARED write is visible to read() immediately (one set of pages)",
+           n == 1 && rb[0] == 'Z');
+        close(fd2);
+    }
+
+    /* And read() through the ORIGINAL descriptor agrees too. */
+    char rb2[8];
+    memset(rb2, 0, sizeof rb2);
+    ck("...and through the original descriptor",
+       lseek(fd, 100, SEEK_SET) == 100 && read(fd, rb2, 1) == 1 && rb2[0] == 'Z');
+
+    ck("munmap the shared mapping", munmap(m, 4096) == 0);
+
+    /* --- MAP_PRIVATE: copy on write --------------------------------------- */
+    char *pm = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    ck("mmap MAP_PRIVATE succeeds", pm != MAP_FAILED);
+    if (pm != MAP_FAILED) {
+        ck("the private mapping starts as the file's contents", pm[0] == 'Z');
+
+        pm[0] = 'Q';                       /* triggers the copy-on-write fault */
+        ck("the private write took locally", pm[0] == 'Q');
+
+        int fd3 = open(path, O_RDONLY);
+        if (fd3 >= 0) {
+            char rb3[8];
+            memset(rb3, 0, sizeof rb3);
+            ck("a MAP_PRIVATE write is visible to NOBODY else (copy-on-write)",
+               read(fd3, rb3, 1) == 1 && rb3[0] == 'Z');
+            close(fd3);
+        }
+        ck("munmap the private mapping", munmap(pm, 4096) == 0);
+    }
+
+    /* A mapping outlives the descriptor that made it -- the one behaviour
+     * every caller of mmap relies on, and the reason the object is
+     * refcounted. */
+    char *om = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    if (om != MAP_FAILED) {
+        close(fd);
+        fd = -1;
+        ck("a mapping outlives close() of its fd", om[0] == 'Z');
+        munmap(om, 4096);
+    }
+    if (fd >= 0) close(fd);
+
+    /* Refusals that stay refusals. */
+    int cfd = open(path, O_RDONLY);
+    if (cfd >= 0) {
+        errno = 0;
+        void *bad = mmap(NULL, 4096, PROT_READ, MAP_SHARED, cfd, 1);
+        ck("an unaligned file offset is refused", bad == MAP_FAILED && errno == EINVAL);
+        errno = 0;
+        void *neither = mmap(NULL, 4096, PROT_READ, 0, cfd, 0);
+        ck("a file mapping must say SHARED or PRIVATE",
+           neither == MAP_FAILED && errno == EINVAL);
+        close(cfd);
+    }
+
+    unlink(path);
+}
+
 static void test_symlinks(void) {
     printf("symbolic links:\n");
 
@@ -1378,6 +1484,7 @@ int main(void) {
     test_mprotect();
     test_dup();
     test_writeback();
+    test_mmap_file();
     test_symlinks();
     test_honest_refusals();
 

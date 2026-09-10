@@ -7,6 +7,7 @@
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "include/spinlock.h"
+#include "mm/vm_object.h"
 
 /* See mm/vma.h. */
 
@@ -156,13 +157,82 @@ bool vm_fault(struct process *proc, uint64_t addr, bool write, bool exec) {
     if (exec  && !(v->prot & PROT_EXEC))  VMF_DECLINE();
     if (v->prot == PROT_NONE)             VMF_DECLINE();
 
-    /* Already mapped? Then this fault was a permission violation on a page
-     * that exists, and the VMA checks above did not catch it -- which means
-     * the page tables and the VMA disagree. Decline rather than paper over it:
-     * mapping a second page on top would leak the first and hide a real bug. */
-    if (vmm_get_phys_in(proc->pml4_phys, page) != 0) {
-        /* Another core resolved this exact page while we were deciding. Not an
-         * error and not a bug: the instruction simply retries and succeeds. */
+    uint64_t already = vmm_get_phys_in(proc->pml4_phys, page);
+    uint64_t idx = (v->file_off + (page - v->start)) / PAGE_SIZE;
+
+    /* --- COPY ON WRITE ------------------------------------------------------
+     *
+     * A write fault on a page that IS mapped, inside a private file mapping,
+     * means exactly one thing: this is the shared read-only page from the
+     * cache, and the process is about to change its own copy of the file.
+     *
+     * It cannot be anything else. A private page this process already copied
+     * would be mapped WRITABLE, so a write to it would not fault at all --
+     * which is what makes "mapped, private, write fault" an unambiguous
+     * signal rather than a guess.
+     *
+     * This is what makes MAP_PRIVATE of a file worth having: N processes
+     * reading one file share its pages, and only a writer pays for a copy. */
+    if (already && write && v->obj && (v->flags & MAP_PRIVATE)) {
+        uint64_t shared = vmo_page_phys(v->obj, idx);
+        if (already == shared) {
+            uint64_t copy = pmm_alloc_page();
+            if (!copy) VMF_DECLINE();
+            memcpy((void *)(uintptr_t)P2V(copy),
+                   (const void *)(uintptr_t)P2V(already), PAGE_SIZE);
+            if (vmm_map_in(proc->pml4_phys, page, copy, prot_to_vmm(v->prot)) != 0) {
+                pmm_free_page(copy);
+                VMF_DECLINE();
+            }
+            /* The cache's page is no longer in this address space, so the pin
+             * this mapping held on it goes too -- otherwise a file mapped and
+             * written by many processes would pin pages nothing maps. */
+            vmo_unwire_page(v->obj, idx);
+            g_fault_stats.cow++;
+            g_fault_stats.handled++;
+            spin_unlock(&vma_lock);
+            return true;
+        }
+    }
+
+    /* Already mapped and not the COW case? Then another core resolved this
+     * exact page while we were deciding. Not an error and not a bug: the
+     * instruction simply retries and succeeds. */
+    if (already) {
+        spin_unlock(&vma_lock);
+        return true;
+    }
+
+    /* --- A FILE-BACKED PAGE COMES FROM THE CACHE, NOT THE ALLOCATOR --------
+     *
+     * This is the whole payoff of one object per file. Mapping a file is
+     * handing the process the pages the cache already holds -- so a reader and
+     * a mapper cannot disagree, and two processes mapping the same file share
+     * one set of frames.
+     *
+     * A SHARED mapping gets the page with the VMA's permissions, and a write
+     * through it reaches the file by the ordinary writeback path. A PRIVATE
+     * mapping gets it READ-ONLY however much the VMA permits, so that the
+     * first write faults and lands in the copy-on-write path above. */
+    if (v->obj) {
+        uint64_t phys = vmo_wire_page(v->obj, idx);
+        if (!phys) VMF_DECLINE();
+
+        uint32_t eff = v->prot;
+        if (v->flags & MAP_PRIVATE)
+            eff &= ~(uint32_t)PROT_WRITE;      /* force the COW fault */
+
+        if (vmm_map_in(proc->pml4_phys, page, phys, prot_to_vmm(eff)) != 0) {
+            vmo_unwire_page(v->obj, idx);
+            VMF_DECLINE();
+        }
+        /* A shared writable mapping may be written at any moment and the
+         * kernel will never see the store, so the page is dirty from the
+         * instant it is mapped. Anything less loses data. */
+        if ((v->flags & MAP_SHARED) && (v->prot & PROT_WRITE))
+            vmo_mark_dirty(v->obj, idx);
+
+        g_fault_stats.handled++;
         spin_unlock(&vma_lock);
         return true;
     }
@@ -192,8 +262,42 @@ bool vm_fault(struct process *proc, uint64_t addr, bool write, bool exec) {
     return true;
 }
 
+/* The shared core. `obj` NULL means anonymous; non-NULL means file-backed and
+ * the caller has already taken the reference this mapping will hold. */
+static int64_t vma_map_common(struct process *proc, uint64_t addr, uint64_t len,
+                              uint32_t prot, uint32_t flags,
+                              struct vm_object *obj, uint64_t file_off);
+
+int64_t vma_mmap_file(struct process *proc, uint64_t len, uint32_t prot,
+                      uint32_t flags, struct vm_object *obj, uint64_t file_off) {
+    if (!obj)
+        return -EMBK_EINVAL;
+    /* A mapping is made of PAGES; an unaligned file offset has no page to
+     * correspond to. Rounding it silently would map the wrong bytes. */
+    if (file_off & (PAGE_SIZE - 1))
+        return -EMBK_EINVAL;
+    /* MAP_ANONYMOUS and a file are contradictory. Refusing beats guessing
+     * which half the caller meant. */
+    if (flags & MAP_ANONYMOUS)
+        return -EMBK_EINVAL;
+    return vma_map_common(proc, 0, len, prot, flags, obj, file_off);
+}
+
 int64_t vma_mmap(struct process *proc, uint64_t addr, uint64_t len,
                  uint32_t prot, uint32_t flags) {
+    /* Only anonymous private mappings come through here. Refusing the rest is
+     * the whole point: a MAP_SHARED that silently behaved as MAP_PRIVATE would
+     * be two processes each believing they see the other's writes. */
+    if (!(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE))
+        return -EMBK_EINVAL;
+    if (flags & MAP_SHARED)
+        return -EMBK_EINVAL;
+    return vma_map_common(proc, addr, len, prot, flags, NULL, 0);
+}
+
+static int64_t vma_map_common(struct process *proc, uint64_t addr, uint64_t len,
+                              uint32_t prot, uint32_t flags,
+                              struct vm_object *obj, uint64_t file_off) {
     if (!proc || len == 0)
         return -EMBK_EINVAL;
 
@@ -201,12 +305,10 @@ int64_t vma_mmap(struct process *proc, uint64_t addr, uint64_t len,
     if (len == 0 || len > (USER_MMAP_MAX - USER_MMAP_BASE))
         return -EMBK_EINVAL;
 
-    /* Only anonymous private mappings exist. Refusing the rest is the whole
-     * point: a MAP_SHARED that silently behaved as MAP_PRIVATE would be two
-     * processes each believing they see the other's writes. */
-    if (!(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE))
-        return -EMBK_EINVAL;
-    if (flags & MAP_SHARED)
+    /* Exactly one of SHARED/PRIVATE, and one of them. "Neither" has no
+     * meaning and "both" is a caller that has not decided. */
+    bool shared = (flags & MAP_SHARED) != 0, private_ = (flags & MAP_PRIVATE) != 0;
+    if (shared == private_)
         return -EMBK_EINVAL;
 
     /* W^X, refused rather than granted-and-regretted. A page that is both
@@ -250,10 +352,12 @@ int64_t vma_mmap(struct process *proc, uint64_t addr, uint64_t len,
      * fails only for lack of ADDRESS SPACE, and the memory failure moves to
      * the first touch. Which is where every other kernel puts it, and is the
      * one genuinely awkward consequence -- a store can now fail. */
-    v->start = start;
-    v->end   = start + len;
-    v->prot  = prot;
-    v->flags = flags;
+    v->start    = start;
+    v->end      = start + len;
+    v->prot     = prot;
+    v->flags    = flags;
+    v->obj      = obj;
+    v->file_off = file_off;
     vma_insert(proc, v);
 
     spin_unlock(&vma_lock);
@@ -289,16 +393,43 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
 
         for (uint64_t va = lo; va < hi; va += PAGE_SIZE) {
             uint64_t pa = vmm_get_phys_in(proc->pml4_phys, va);
-            if (pa) {
-                vmm_unmap_in(proc->pml4_phys, va);
-                pmm_free_page(pa);
+            if (!pa)
+                continue;                      /* never faulted in */
+
+            vmm_unmap_in(proc->pml4_phys, va);
+
+            /* WHOSE FRAME IS THIS? For a file mapping it may be the CACHE's
+             * page, which this mapping only pinned -- freeing that would hand
+             * the allocator a frame the cache still believes it owns, and the
+             * next reader of the file would get whatever was written into it
+             * next. Or it may be a private copy-on-write copy, which is this
+             * process's alone and must be freed.
+             *
+             * The cache itself answers: ask it which frame backs that index
+             * and compare. Equal means it is the cache's and we only unpin;
+             * different means we copied it and it is ours to free. */
+            if (v->obj) {
+                uint64_t idx = (v->file_off + (va - v->start)) / PAGE_SIZE;
+                if (pa == vmo_page_phys(v->obj, idx)) {
+                    vmo_unwire_page(v->obj, idx);
+                    continue;
+                }
             }
+            pmm_free_page(pa);
         }
         touched = true;
 
         if (lo == v->start && hi == v->end) {
             *pp = v->next;                  /* whole mapping gone */
+            /* The reference this mapping held on the file's page object goes
+             * with it. Dropped OUTSIDE the lock would be cleaner (vmo_put can
+             * flush and therefore touch the disk) -- but it is dropped here
+             * because the alternative is a list of pending puts, and a
+             * mapping's last reference is not the common case. Recorded in
+             * docs/TODO.md. */
+            struct vm_object *o = v->obj;
             kfree(v);
+            if (o) vmo_put(o);
             continue;
         }
         if (lo == v->start) { v->start = hi; pp = &v->next; continue; }
@@ -316,11 +447,16 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
             spin_unlock(&vma_lock);
             return EMBK_OK;
         }
-        tail->start = hi;
-        tail->end   = v->end;
-        tail->prot  = v->prot;
-        tail->flags = v->flags;
-        v->end      = lo;
+        tail->start    = hi;
+        tail->end      = v->end;
+        tail->prot     = v->prot;
+        tail->flags    = v->flags;
+        tail->obj      = v->obj;
+        /* The tail starts further into the FILE than the head did. Copying
+         * file_off unchanged would map the same bytes twice. */
+        tail->file_off = v->file_off + (hi - v->start);
+        if (tail->obj) (void)vmo_get(tail->obj->vn);   /* a second holder */
+        v->end         = lo;
         tail->next  = v->next;
         v->next     = tail;
         pp = &tail->next;
@@ -341,12 +477,15 @@ static bool vma_split_at(struct process *proc, uint64_t at) {
         struct vm_area *tail = kmalloc(sizeof *tail);
         if (!tail)
             return false;
-        tail->start = at;
-        tail->end   = v->end;
-        tail->prot  = v->prot;
-        tail->flags = v->flags;
-        tail->next  = v->next;
-        v->end      = at;
+        tail->start    = at;
+        tail->end      = v->end;
+        tail->prot     = v->prot;
+        tail->flags    = v->flags;
+        tail->obj      = v->obj;
+        tail->file_off = v->file_off + (at - v->start);
+        if (tail->obj) (void)vmo_get(tail->obj->vn);   /* a second holder */
+        tail->next     = v->next;
+        v->end         = at;
         v->next     = tail;
         return true;
     }
@@ -424,7 +563,12 @@ void vma_destroy_all(struct process *proc) {
     struct vm_area *v = proc->vma_list;
     while (v) {
         struct vm_area *next = v->next;
+        struct vm_object *o = v->obj;
         kfree(v);
+        /* The frames themselves are reclaimed by the address-space teardown
+         * that follows; what has to happen HERE is the reference each file
+         * mapping holds on its page object, which nothing else knows about. */
+        if (o) vmo_put(o);
         v = next;
     }
     proc->vma_list = 0;
