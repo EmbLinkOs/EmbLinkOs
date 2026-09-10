@@ -454,11 +454,29 @@ surface from ring 3 on both.
 Each item below is REFUSED today with a distinct errno rather than
 approximated, which is why none of them is a silent bug waiting to be found:
 
-- [ ] **`mprotect`.** The reason W^X is a hard refusal instead of a policy: a
-  JIT needs to map writable, write, and then flip the pages to executable, and
-  without mprotect it cannot. This is the next piece of work, and the smallest:
-  the VMA list already records `prot` per range, so it is a split-and-rewalk of
-  the page tables plus a shootdown. Currently `ENOSYS`.
+- [x] **`mprotect`.** DONE (syscall 98). Map writable, emit, flip to
+  executable, run — asserted end to end on both machines by assembling a real
+  function at runtime and calling it, because "the call returned 0" is not the
+  claim. The range is split at both ends, a range with a hole in it is
+  `ENOMEM` for the whole call rather than half-applied, and `PROT_WRITE|
+  PROT_EXEC` is still refused. `PROT_NONE` is real (the frame stays yours and
+  every userspace access faults) rather than rounded to read-only.
+
+  It also uncovered a **latent x86 bug that predates mmap**: an x86 page walk
+  ANDs the permission bits down the levels, and `get_or_create_table()` was
+  installing intermediates with the *leaf's* flags — so a PDPT/PD/PT first
+  created for a data page carried NX, and every executable mapping made
+  underneath it afterwards was silently non-executable. `mprotect(W -> X)`
+  returned 0 and the first instruction fetch took `#PF` error 0x15 at an
+  address whose own PTE said execute was fine. Intermediates are now kept
+  permissive (`table_perms()`) and only ever widened; the leaf is
+  authoritative. aarch64 never had this — its table descriptors carry no
+  restriction bits unless you set them.
+  - [ ] `mprotect` does not stop the KERNEL touching a `PROT_NONE` page on the
+    process's behalf: `copy_to_user` walks the page tables looking for a frame
+    and finds one. Honouring it there means consulting the VMA list on the
+    copy path, which is a cost on every syscall — worth doing when there is a
+    caller that cares.
 - [ ] **File-backed mappings (`fd >= 0`).** Blocked on a page cache — see
   below. Currently `ENODEV`, never anonymous zeroes standing in for a file.
 - [ ] **`MAP_SHARED`.** Needs a shared anonymous object with a refcount, and

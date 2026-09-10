@@ -20,9 +20,13 @@
  *   PROT_WRITE|PROT_EXEC       EINVAL   -- refused in the kernel; that page
  *                                          is the primitive every code
  *                                          injection needs.
- *   mprotect, msync            ENOSYS   -- not built. mprotect is what a JIT
- *                                          needs to flip W to X and is the
- *                                          next piece of work (docs/TODO.md).
+ *   msync                      ENOSYS   -- meaningless until MAP_SHARED file
+ *                                          mappings exist.
+ *
+ * mprotect IS real, and is the other half of the W^X rule: mmap will not give
+ * you a page that is writable and executable, and with mprotect you do not
+ * need one -- map W, emit, flip to X. PROT_NONE is honoured as no access at
+ * all (a guard page), not rounded to read-only.
  *
  * Mapped pages arrive ZEROED, and the whole range is allocated up front: a
  * large mapping costs its full size immediately. There is no demand paging. */

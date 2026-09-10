@@ -1805,6 +1805,20 @@ static int64_t sys_munmap(const struct sysargs *a) {
     return vma_munmap(p, (uint64_t)a->arg[0], (uint64_t)a->arg[1]);
 }
 
+/* mprotect(addr, len, prot) -> 0, or -errno.
+ *
+ * The whole range must already be mapped (-ENOMEM otherwise, POSIX's answer),
+ * and PROT_WRITE|PROT_EXEC is refused here exactly as it is in mmap. The
+ * frames do not move: their contents are the entire reason anyone calls this.
+ */
+static int64_t sys_mprotect(const struct sysargs *a) {
+    struct process *p = current_thread ? current_thread->proc : 0;
+    if (!p)
+        return -EMBK_EPERM;
+    return vma_mprotect(p, (uint64_t)a->arg[0], (uint64_t)a->arg[1],
+                        (uint32_t)a->arg[2]);
+}
+
 static syscall_handler_t syscall_table[] = {
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -1894,6 +1908,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_audio_write]    = sys_audio_write,
     [SYS_audio_close]    = sys_audio_close,
     [SYS_mmap]           = sys_mmap,
+    [SYS_mprotect]       = sys_mprotect,
     [SYS_munmap]         = sys_munmap,
     [SYS_win_desktop_front] = sys_win_desktop_front,
     [SYS_debug_attach]   = sys_debug_attach,

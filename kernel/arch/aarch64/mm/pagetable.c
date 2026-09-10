@@ -644,6 +644,39 @@ int vmm_map_in(uint64_t root_phys, uint64_t virt, uint64_t phys, uint64_t flags)
     return vm_map_page_in(root_phys, virt, phys, f) == PT_OK ? 0 : -1;
 }
 
+/* Change the PERMISSIONS of an existing mapping, keeping the frame.
+ *
+ * mprotect could be written as unmap-then-map, and it would be wrong twice
+ * over: the frame would be freed and a different one handed back (the contents
+ * are the whole reason anyone calls mprotect), and the page tables underneath
+ * would be reclaimed and immediately rebuilt. The address translation is not
+ * changing here -- only what may be done through it -- so the descriptor is
+ * rewritten in place, frame bits untouched.
+ *
+ * BREAK-BEFORE-MAKE is deliberately NOT used. ARM requires it when changing a
+ * live entry's output address, memory type or shareability, because two TLB
+ * entries for one VA may otherwise coexist. Access permissions and the execute
+ * NEVER bits are explicitly exempt (D8, "Using break-before-make when updating
+ * translation table entries"), and they are all this touches: same frame, same
+ * MAIR index, same shareability. Doing BBM anyway would leave the page briefly
+ * unmapped, which another core could fault on. */
+int vmm_protect_in(uint64_t root_phys, uint64_t virt, uint64_t flags) {
+    uint32_t f = 0;
+    if (flags & VMM_WRITABLE) f |= PT_WRITE;
+    if (flags & VMM_USER)     f |= PT_USER;
+    if (flags & (VMM_NOCACHE | VMM_WRITETHROUGH)) f |= PT_DEVICE;
+    if (flags & VMM_EXEC)     f |= PT_EXEC;
+
+    int err = PT_OK;
+    uint64_t *slot = walk_in(root_phys, virt, false, &err);
+    if (!slot || !(*slot & PTE_VALID))
+        return -1;
+
+    *slot = (*slot & PTE_ADDR_MASK) | flags_to_pte(virt, f) | PTE_TABLE;
+    tlb_flush_page(virt);
+    return 0;
+}
+
 /* Is every entry in this table free? A table that describes nothing is 4 KiB
  * of physical memory held for no reason. */
 static bool table_is_empty(uint64_t table_phys) {

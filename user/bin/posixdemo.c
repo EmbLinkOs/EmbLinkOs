@@ -753,8 +753,81 @@ static void test_mmap(void) {
     ck("munmap of a range that was never mapped fails",
        munmap((void *)(uintptr_t)(0x500000000000ULL + 0x30000000ULL), 4096) == -1);
 
-    CK_FAILS("mprotect -> ENOSYS (not built yet)",
-             mprotect(q, 4096, PROT_READ), ENOSYS);
+}
+
+/* mprotect, and the sequence it exists for.
+ *
+ * The claim is not that the call returns 0 -- it is that MAP W, WRITE, FLIP TO
+ * X, EXECUTE works end to end, because that is the only reason mmap can refuse
+ * PROT_WRITE|PROT_EXEC without also making generated code impossible. So this
+ * assembles a real function at runtime and calls it. On both machines: two
+ * instruction encodings, one test.
+ *
+ * `long f(void)` returning 0x2A is the smallest thing that proves the CPU
+ * actually fetched from the page rather than the test believing it did. */
+static void test_mprotect(void) {
+    printf("mprotect (W^X, and the JIT sequence it exists for):\n");
+
+#if defined(__x86_64__)
+    /* mov eax, 42 ; ret */
+    static const unsigned char code[] = { 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3 };
+#elif defined(__aarch64__)
+    /* mov w0, #42 ; ret  -- little-endian, 4-byte aligned by construction */
+    static const unsigned char code[] = { 0x40, 0x05, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6 };
+#else
+#error "no encoding for this architecture"
+#endif
+
+    char *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ck("map a page writable (not executable -- mmap refuses W|X)", page != MAP_FAILED);
+    if (page == MAP_FAILED) return;
+
+    memcpy(page, code, sizeof code);
+    ck("mprotect W -> X succeeds", mprotect(page, 4096, PROT_READ | PROT_EXEC) == 0);
+
+    long (*fn)(void) = (long (*)(void))(void *)page;
+    long got = fn();
+    ck("the generated code RUNS and returns 42", got == 42);
+
+    /* And it is no longer writable. Not asserted by writing to it -- that is a
+     * fault, and a fault ends this process rather than failing this test. What
+     * can be asserted is that the kernel refuses to make it W and X at once. */
+    CK_FAILS("mprotect to WRITE|EXEC is refused (W^X holds)",
+             mprotect(page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC), EINVAL);
+
+    /* PROT_NONE, then back. The pages are still ours throughout -- this is a
+     * permission change, not an unmap -- so the contents must survive the
+     * round trip. A PROT_NONE that was really "read-only" would pass a weaker
+     * test than this one; what this catches is a PROT_NONE that silently
+     * UNMAPPED, which is the tempting implementation. */
+    ck("mprotect to PROT_NONE succeeds", mprotect(page, 4096, PROT_NONE) == 0);
+    ck("mprotect back to READ succeeds", mprotect(page, 4096, PROT_READ) == 0);
+    ck("the page's contents survived the round trip",
+       memcmp(page, code, sizeof code) == 0);
+
+    /* A range with a hole is refused WHOLE. Unmap the middle of three pages,
+     * then mprotect all three: half-applying would leave the caller believing
+     * a guarantee it does not have. */
+    char *three = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (three != MAP_FAILED) {
+        ck("punch a hole in a 3-page mapping", munmap(three + 4096, 4096) == 0);
+        CK_FAILS("mprotect across the hole -> ENOMEM (all or nothing)",
+                 mprotect(three, 3 * 4096, PROT_READ), ENOMEM);
+        /* The intact pages must be untouched by the refusal: still writable. */
+        three[0] = 'a'; three[2 * 4096] = 'b';
+        ck("the refusal changed nothing (both intact pages still writable)",
+           three[0] == 'a' && three[2 * 4096] == 'b');
+        munmap(three, 4096);
+        munmap(three + 2 * 4096, 4096);
+    }
+
+    CK_FAILS("mprotect of an unmapped range -> ENOMEM",
+             mprotect((void *)(uintptr_t)(0x500000000000ULL + 0x30000000ULL),
+                      4096, PROT_READ), ENOMEM);
+
+    munmap(page, 4096);
 }
 
 static void test_honest_refusals(void) {
@@ -1062,6 +1135,7 @@ int main(void) {
     test_rename();
     test_signals();
     test_mmap();
+    test_mprotect();
     test_honest_refusals();
 
     printf("\nposixdemo: %s (%d failure%s)\n",

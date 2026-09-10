@@ -20,7 +20,26 @@ static uint64_t page_align_up(uint64_t v) {
  * x86 the inverted VMM_NX), and silence means opposite things to them. That is
  * the rule vmm.h states, and it is why the kernel heap was W+X for years. */
 static uint64_t prot_to_vmm(uint32_t prot) {
-    uint64_t f = VMM_USER;
+    uint64_t f = 0;
+
+    /* PROT_NONE is the ABSENCE of VMM_USER, not a permission of its own. The
+     * page stays mapped -- the frame is still allocated and still the
+     * process's -- but neither ring 3 nor EL0 may touch it, so any access
+     * faults. That is what makes a guard page a guard page.
+     *
+     * It works on both machines for the same reason: an x86 walk ANDs the
+     * U/S bit down the levels, so a leaf without it is supervisor-only however
+     * the tables above are set; and on aarch64 the AP field without PT_USER
+     * encodes EL1-only. Note that on aarch64 this was NOT safe until nG stopped
+     * being tied to PT_USER -- a kernel-only mapping in the user half used to
+     * come out GLOBAL and match in every address space.
+     *
+     * What it does NOT stop is the kernel touching the page on the process's
+     * behalf: copy_to_user walks the page tables for a frame, and finds one.
+     * Recorded in docs/TODO.md rather than glossed. */
+    if (prot != PROT_NONE)
+        f |= VMM_USER;
+
     if (prot & PROT_WRITE) f |= VMM_WRITABLE;
     if (prot & PROT_EXEC)  f |= VMM_EXEC;
     else                   f |= VMM_NX;
@@ -214,6 +233,89 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
     }
 
     return touched ? EMBK_OK : -EMBK_EINVAL;
+}
+
+/* Split the VMA containing `at` so that a mapping boundary falls exactly
+ * there. Returns true if `at` is now a boundary (including the case where it
+ * already was, or falls in no mapping at all). The page tables are NOT touched
+ * -- this only changes how the range is described. */
+static bool vma_split_at(struct process *proc, uint64_t at) {
+    for (struct vm_area *v = proc->vma_list; v; v = v->next) {
+        if (at <= v->start || at >= v->end)
+            continue;
+        struct vm_area *tail = kmalloc(sizeof *tail);
+        if (!tail)
+            return false;
+        tail->start = at;
+        tail->end   = v->end;
+        tail->prot  = v->prot;
+        tail->flags = v->flags;
+        tail->next  = v->next;
+        v->end      = at;
+        v->next     = tail;
+        return true;
+    }
+    return true;
+}
+
+int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t prot) {
+    if (!proc || len == 0 || (addr & (PAGE_SIZE - 1)))
+        return -EMBK_EINVAL;
+
+    len = page_align_up(len);
+    uint64_t end = addr + len;
+    if (end < addr)
+        return -EMBK_EINVAL;
+
+    if (prot & ~(uint32_t)(PROT_READ | PROT_WRITE | PROT_EXEC))
+        return -EMBK_EINVAL;
+
+    /* W^X, and this is the function that makes it a rule rather than an
+     * inconvenience: a JIT maps writable, writes, then comes HERE to make the
+     * page executable. What it may never do is hold both at once. */
+    if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
+        return -EMBK_EINVAL;
+
+    /* EVERY page in the range must already be mapped -- POSIX says ENOMEM, and
+     * the reason to enforce it is that the alternative is worse: silently
+     * protecting the mapped part of a range would leave the caller believing a
+     * guarantee it does not have over the rest. Checked BEFORE anything is
+     * changed, so a refusal changes nothing. */
+    uint64_t covered = addr;
+    for (struct vm_area *v = proc->vma_list; v && covered < end; v = v->next) {
+        if (v->end <= covered)
+            continue;
+        if (v->start > covered)
+            break;                      /* a hole */
+        covered = v->end;
+    }
+    if (covered < end)
+        return -EMBK_ENOMEM;
+
+    /* Cut the list at both ends so the range is a whole number of VMAs. Done
+     * before the page tables are touched: a kmalloc failure here must leave
+     * the process exactly as it was. */
+    if (!vma_split_at(proc, addr) || !vma_split_at(proc, end))
+        return -EMBK_ENOMEM;
+
+    uint64_t vmm_flags = prot_to_vmm(prot);
+
+    for (struct vm_area *v = proc->vma_list; v; v = v->next) {
+        if (v->end <= addr || v->start >= end)
+            continue;
+
+        for (uint64_t va = v->start; va < v->end; va += PAGE_SIZE)
+            if (vmm_protect_in(proc->pml4_phys, va, vmm_flags) != 0)
+                /* The VMA says the page is there and the page tables disagree.
+                 * That is a kernel bug, not a caller error, and it is worth a
+                 * line rather than a silent skip. */
+                kprintf("vma: mprotect found no PTE for %p (VMA and page tables disagree)\n",
+                        (void *)(uintptr_t)va);
+
+        v->prot = prot;
+    }
+
+    return EMBK_OK;
 }
 
 void vma_destroy_all(struct process *proc) {

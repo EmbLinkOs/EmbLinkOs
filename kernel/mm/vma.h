@@ -78,6 +78,22 @@ int64_t vma_mmap(struct process *proc, uint64_t addr, uint64_t len,
  * not a no-op: it is far more often a bug than an idempotent cleanup. */
 int vma_munmap(struct process *proc, uint64_t addr, uint64_t len);
 
+/* Change the permissions of an already-mapped range, keeping its contents.
+ * Returns 0 or -EMBK_*; -EMBK_ENOMEM if any page in the range is not mapped
+ * (POSIX's answer), checked before anything changes so a refusal is inert.
+ * The range need not line up with a mapping: VMAs are split at both ends.
+ *
+ * THIS IS WHAT MAKES W^X A RULE INSTEAD OF AN OBSTACLE. mmap refuses
+ * PROT_WRITE|PROT_EXEC, and without mprotect that refusal would simply mean
+ * generated code is impossible. With it, the sequence a JIT actually wants
+ * works and the dangerous state never exists: map PROT_READ|PROT_WRITE, emit
+ * the code, mprotect to PROT_READ|PROT_EXEC, execute. Holding both at once is
+ * still refused here.
+ *
+ * PROT_NONE is real: the frame stays allocated and owned, and every access
+ * from userspace faults. That is a guard page. */
+int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t prot);
+
 /* Release every mapping a process owns. The page TABLES are torn down by
  * vmm_destroy_address_space(); this frees the bookkeeping and is what stops
  * the list itself leaking. */

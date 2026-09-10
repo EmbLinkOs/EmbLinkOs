@@ -82,6 +82,15 @@ void vmm_unmap(uint64_t virt);
 // down -- see vmm.c and kernel/gfx/surface.c).
 void vmm_unmap_in(uint64_t pml4_phys, uint64_t virt);
 
+/* Rewrite the PERMISSIONS of an existing mapping in `pml4_phys`, keeping the
+ * frame it already points at. Returns 0, or -1 if nothing is mapped there.
+ * This is what mprotect is built on: unmap-then-map would hand back a
+ * DIFFERENT frame, and the contents of the old one are the entire reason the
+ * caller asked. `flags` is the same VMM_* set vmm_map_in takes -- and, as ever
+ * on this seam, VMM_EXEC and VMM_NX must BOTH be stated: aarch64 reads the
+ * positive bit and x86 the inverted one, so silence means opposite things. */
+int vmm_protect_in(uint64_t pml4_phys, uint64_t virt, uint64_t flags);
+
 // Get the physical address of a virtual address (returns 0 if not mapped)
 uint64_t vmm_get_phys(uint64_t virt);
 

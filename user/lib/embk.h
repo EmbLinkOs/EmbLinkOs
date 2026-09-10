@@ -1033,4 +1033,28 @@ static inline int embk_munmap(void *addr, size_t len) {
     return (int)embk_syscall2(EMBK_SYS_munmap, (int64_t)(intptr_t)addr, (int64_t)len);
 }
 
+/* Change the permissions of memory you already have, keeping its contents.
+ *
+ * This is the other half of the W^X rule. mmap will not give you a page that
+ * is writable AND executable; with mprotect you do not need one:
+ *
+ *     void *code = (void *)embk_mmap(len, EMBK_PROT_READ | EMBK_PROT_WRITE);
+ *     ... emit instructions into it ...
+ *     embk_mprotect(code, len, EMBK_PROT_READ | EMBK_PROT_EXEC);
+ *
+ * The dangerous state never exists, and generated code still runs. Asking for
+ * WRITE|EXEC in one call is refused here too.
+ *
+ * EMBK_PROT_NONE is real, not a rounding: the pages stay yours and every
+ * access to them faults, which is how you place a guard page around something.
+ *
+ * The range must be page-aligned and ENTIRELY mapped -- a range with a hole in
+ * it is refused whole (-EMBK_ENOMEM) rather than half-applied, because a
+ * caller that believes it protected N pages and got M has a guarantee it does
+ * not have. */
+static inline int embk_mprotect(void *addr, size_t len, int prot) {
+    return (int)embk_syscall3(EMBK_SYS_mprotect, (int64_t)(intptr_t)addr,
+                              (int64_t)len, prot);
+}
+
 #endif /* __EMBK_H__ */

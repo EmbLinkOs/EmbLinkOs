@@ -1492,8 +1492,17 @@ int munmap(void *addr, size_t len) {
     int r = embk_munmap(addr, len);
     return r < 0 ? embk_fail(r) : 0;
 }
+/* mprotect -- real, and the reason mmap can refuse PROT_WRITE|PROT_EXEC
+ * outright. A JIT maps writable, emits, then flips to executable; the
+ * simultaneous W+X page that every code-injection technique needs never
+ * exists. Asking for both here is EINVAL, from the kernel.
+ *
+ * PROT_NONE is honoured as no access at all (a guard page), not approximated
+ * as read-only. The range must be page-aligned and fully mapped -- a hole in
+ * it is ENOMEM for the whole call rather than a partial application. */
 int mprotect(void *addr, size_t len, int prot) {
-    (void)addr; (void)len; (void)prot; errno = ENOSYS; return -1;
+    int r = embk_mprotect(addr, len, prot);
+    return r < 0 ? embk_fail(r) : 0;
 }
 int msync(void *addr, size_t len, int flags) {
     (void)addr; (void)len; (void)flags; errno = ENOSYS; return -1;

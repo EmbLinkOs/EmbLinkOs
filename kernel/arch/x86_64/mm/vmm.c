@@ -158,10 +158,40 @@ void vmm_switch_address_space(uint64_t pml4_phys) {
  * write, not through this path, so nothing legitimately propagates bit 7 up.) */
 #define VMM_PTE_PAT (1ULL << 7)
 
+/* The permissions an INTERMEDIATE entry may carry.
+ *
+ * An x86 page walk ANDs the permission bits down the levels: the effective
+ * right is the intersection of PML4E, PDPTE, PDE and PTE. So an intermediate
+ * that is missing a bit VETOES it for every page beneath -- including pages
+ * mapped later, by someone else, for another purpose entirely.
+ *
+ * That is why intermediates are kept PERMISSIVE and the leaf is made
+ * authoritative. Writable is already forced below for the same reason. NX is
+ * the one that bit: a table first created for a data page came out NX, and
+ * every executable mapping made under it afterwards was silently
+ * non-executable. mprotect(W -> X) then "succeeded" and the first instruction
+ * fetch took a #PF with error 0x15 -- present, user, instruction fetch,
+ * protection violation -- at an address whose own PTE said execute was fine.
+ *
+ * Nothing is lost by this: the LEAF still carries NX and U/S, and it is the
+ * leaf that decides. What is gained is that two mappings sharing a 2 MiB
+ * region can have different permissions, which is the entire point of having
+ * them per-page. */
+static inline uint64_t table_perms(uint64_t flags) {
+    return VMM_PRESENT | VMM_WRITABLE | (flags & VMM_USER);
+}
+
 // Get or Create the next-level table from entry
 static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t flags) {
 
     if (parent[index] & VMM_PRESENT) {
+        /* WIDEN an existing table's entry if this mapping needs more than the
+         * mapping that created it did. Only ever widen -- narrowing here would
+         * revoke a right from a neighbouring mapping that is still using it. */
+        uint64_t want = table_perms(flags);
+        if ((parent[index] & want) != want || (parent[index] & VMM_NX))
+            parent[index] = (parent[index] | want) & ~VMM_NX;
+
         // Table already exists, return its vitual address
         uint64_t phys_addr = parent[index] & VMM_ADDR_MASK;
         return (uint64_t *)vmm_table(phys_addr);
@@ -177,8 +207,8 @@ static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t 
         table[i] = 0;
     }
 
-    // install in parent table
-    parent[index] = phys_addr | VMM_PRESENT | VMM_WRITABLE | flags;
+    // install in parent table -- permissive; the leaf decides (see table_perms)
+    parent[index] = phys_addr | table_perms(flags);
     return table;
 }
 
@@ -194,10 +224,12 @@ static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t 
 
     uint64_t *pml4 = vmm_table(pml4_phys);
 
-    /* Intermediate tables must NOT carry the leaf's PAT bit (bit 7 = PS at
-     * their level -- see VMM_PTE_PAT). The leaf pt[] entry below gets the full
-     * flags. */
-    uint64_t table_flags = flags & ~VMM_PTE_PAT;
+    /* get_or_create_table() reduces this to table_perms() -- present, writable,
+     * and user only if the leaf is. That drops the leaf's PAT bit (bit 7 is PS
+     * at an intermediate level, where it would wrongly declare a huge page --
+     * see VMM_PTE_PAT) and, just as importantly, the leaf's NX. The full flags
+     * go on the leaf below. */
+    uint64_t table_flags = flags;
 
     uint64_t *pdpt = get_or_create_table(pml4, pml4_index(virt_addr),  table_flags);
     if (!pdpt) {
@@ -275,6 +307,55 @@ void vmm_unmap(uint64_t virt_addr){
  * so vmm_destroy_address_space() must NOT free it. Unmapping it here first
  * makes that frame invisible to the destroy walk (which frees every present
  * user-half frame it finds). No-op if the mapping isn't present. */
+/* Change the PERMISSIONS of an existing mapping, keeping the frame.
+ *
+ * mprotect could be written as unmap-then-map, and it would be wrong twice
+ * over: the frame would be freed and a different one handed back (its contents
+ * are the whole reason anyone calls mprotect), and the page tables underneath
+ * would be reclaimed and immediately rebuilt. The translation is not changing
+ * -- only what may be done through it -- so the PTE is rewritten in place with
+ * its frame bits untouched.
+ *
+ * The INTERMEDIATE entries are widened, never narrowed. An x86 page walk ANDs
+ * the permissions down the levels, so a PDE without VMM_WRITABLE makes every
+ * page under it read-only however the PTEs are set; get_or_create_table()
+ * already installs intermediates as user+writable for exactly this reason, and
+ * the leaf is where the real answer lives. Nothing here may clear a bit in a
+ * table a NEIGHBOURING mapping shares. */
+int vmm_protect_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t flags) {
+    spin_lock(&vmm_lock);
+
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return -1; }
+    uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return -1; }
+    uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return -1; }
+    if (pd[pd_index(virt_addr)] & VMM_HUGE) { spin_unlock(&vmm_lock); return -1; }
+    uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+
+    uint64_t *pte = &pt[pt_index(virt_addr)];
+    if (!(*pte & VMM_PRESENT)) { spin_unlock(&vmm_lock); return -1; }
+
+    /* Widen the intermediates first, for the reason table_perms() explains: a
+     * table created for a data page carries NX, and NX at any level vetoes
+     * execution for everything beneath it. Without this, mprotect(W -> X)
+     * returns 0 and the first instruction fetch still faults. */
+    uint64_t want = table_perms(flags);
+    uint64_t *chain[3] = { &pml4[pml4_index(virt_addr)],
+                           &pdpt[pdpt_index(virt_addr)],
+                           &pd[pd_index(virt_addr)] };
+    for (int i = 0; i < 3; i++)
+        if ((*chain[i] & want) != want || (*chain[i] & VMM_NX))
+            *chain[i] = (*chain[i] | want) & ~VMM_NX;
+
+    *pte = (*pte & VMM_ADDR_MASK) | VMM_PRESENT | flags;
+    vmm_flush_tlb(virt_addr);
+
+    spin_unlock(&vmm_lock);
+    return 0;
+}
+
 static bool vmm_table_is_empty(uint64_t table_phys) {
     const uint64_t *t = vmm_table(table_phys);
     for (int i = 0; i < 512; i++)

@@ -833,6 +833,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'zeroed, written and read back'  MM 'mmap did not produce usable memory'; \
 	  chk 'munmap returned the memory'     MM 'munmap leaked pages -- page tables, most likely'; \
 	  chk 'writable+executable mapping was refused' MM 'W^X is not enforced on mmap'; \
+	  chk 'the generated code RUNS and returns 42' MM 'mprotect W->X did not make the page executable'; \
+	  chk 'mprotect across the hole -> ENOMEM'   MM 'mprotect half-applied across an unmapped hole'; \
 	  chk 'instead of panicking'           A6 'a kernel fault on user memory was not recovered'; \
 	  chk 'posixdemo: ALL PASS'            A6 'the POSIX conformance suite reported failures'; \
 	  chk 'posixdemo exited 0'             A6 'posixdemo did not exit clean'; \
@@ -899,8 +901,9 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "     layer and retired by the device"; \
 	  echo "  A7 MSI: the GIC ITS translates and delivers (TCG; HVF has no ITS"; \
 	  echo "     and correctly falls back to INTx)"; \
-	  echo "  MM mmap/munmap: anonymous mappings, W^X enforced, and every"; \
-	  echo "     page given back -- page tables included"; \
+	  echo "  MM mmap/munmap/mprotect: anonymous mappings, W^X enforced,"; \
+	  echo "     every page given back (page tables included), and code"; \
+	  echo "     GENERATED at runtime, flipped W->X, and executed"; \
 	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
 	  echo "     own GIC redistributor, VECTORS and timer, all reporting in"; \
 	  echo "     themselves, all TICKING, and all reachable by IPI"; \

@@ -121,5 +121,8 @@
  * back, and no way to ask for it with chosen permissions. See mm/vma.h. */
 #define SYS_mmap           96
 #define SYS_munmap         97
+/* mprotect is what makes mmap's W^X refusal workable rather than merely
+ * restrictive: map writable, write, then flip to executable. See mm/vma.h. */
+#define SYS_mprotect       98
 
 #endif /* _SYSCALL_NR_H_ */

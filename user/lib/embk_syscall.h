@@ -130,6 +130,7 @@
  * one that is absent -- see kernel/mm/vma.h. */
 #define EMBK_SYS_mmap           96   /* (len, prot, flags) -> address | -err */
 #define EMBK_SYS_munmap         97   /* (addr, len)        -> 0       | -err */
+#define EMBK_SYS_mprotect       98   /* (addr, len, prot)  -> 0       | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *
