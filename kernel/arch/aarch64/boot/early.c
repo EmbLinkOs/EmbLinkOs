@@ -15,6 +15,7 @@
 #include "arch/aarch64/cpu/cpu_features.h"
 #include "include/uaccess_guard.h"
 #include "lib/random.h"
+#include "drivers/timer/rtc.h"   /* rtc_now_unix: the clock cross-check */
 #include "mm/vm_object.h"
 #include "power/power.h"
 #include "kworker/kworker.h"
@@ -88,6 +89,7 @@ extern char kernel_end[];
  * shape a memory prober needs -- but the test is what proves it. */
 
 static unsigned selftest_fails;
+static uint64_t selftest_rtc_t0;   /* PL031 seconds when the clocks were first trusted */
 
 /* A software breakpoint. ELR points AT the brk, so the handler's +4 lands on
  * the next instruction. EC decodes as 0x3C. */
@@ -660,6 +662,16 @@ void arch_early_main(uint64_t dtb_phys) {
      * x86 (after tsc_calibrate). Before any user process is spawned, because
      * each one's address-space layout is drawn from this. */
     random_init();
+
+    /* A SECOND OPINION ON THE CLOCK. Every millisecond this kernel reports on
+     * aarch64 -- scheduler lateness, audio runway, the self-test budget -- is
+     * CNTVCT divided by CNTFRQ, and a hypervisor that virtualises the counter
+     * at one rate while advertising another would make all of them wrong by
+     * the same factor, invisibly: uptime and the tick count are derived from
+     * the same registers and would agree with each other perfectly. The PL031
+     * is a different device tracking host wall time. Sampled here and again at
+     * the final tally, the two deltas either agree or they do not. */
+    selftest_rtc_t0 = rtc_now_unix();
 
     /* Two no-argument entry points, because kernel_ctx_prepare() takes none:
      * a thread's arguments belong in its own structure, which is what
@@ -1257,8 +1269,22 @@ void arch_early_main(uint64_t dtb_phys) {
      * later marker as missing, which reads as a dozen unrelated failures. This
      * line is what makes the budget a measurement -- set it from this number
      * plus headroom, not from how long it felt. */
-    kprintf("\n--- all self-tests done: %d failure(s), at %llu ms of uptime ---\n",
-            (int)selftest_fails, (unsigned long long)timer_uptime_ms());
+    {
+        uint64_t rtc_dt = rtc_now_unix() - selftest_rtc_t0;    /* whole seconds */
+        uint64_t up     = timer_uptime_ms();
+        kprintf("\n--- all self-tests done: %d failure(s), at %llu ms of uptime; "
+                "the RTC saw %llu s pass since the clocks came up ---\n",
+                (int)selftest_fails, (unsigned long long)up,
+                (unsigned long long)rtc_dt);
+        /* If the two disagree by more than the RTC's one-second granularity
+         * plus the boot time before the sample, CNTFRQ is lying and every
+         * millisecond above is wrong by the same ratio. Said here, once, in
+         * the log, rather than left for someone to notice. */
+        if (rtc_dt > 2 && (up / 1000) * 2 < rtc_dt)
+            kprintf("  [WARN] guest uptime (%llu s) is far below wall time (%llu s): "
+                    "the counter frequency is not what CNTFRQ claims\n",
+                    (unsigned long long)(up / 1000), (unsigned long long)rtc_dt);
+    }
 
     kprintf("\nA7 reached: the whole shared kernel is linked and running here.\n");
 

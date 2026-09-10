@@ -839,7 +839,9 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  qpid=$$!; \
 	  python3 tools/arm64_input_probe.py $$port $$secs >/dev/null 2>&1 & \
 	  ipid=$$!; \
-	  sleep $$secs; kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
+	  for i in $$(seq $$secs); do grep -q 'all self-tests done' $$log 2>/dev/null && break; sleep 1; done; \
+	  host_done=$$(( $$(date +%s) - host_t0 )); sleep 2; \
+	  kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
 	  kill $$ipid 2>/dev/null; wait $$ipid 2>/dev/null; \
 	  fail=0; \
 	  chk() { grep -q "$$1" $$log || { echo "FAIL($$2): $$3"; fail=1; }; }; \
@@ -931,7 +933,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	    echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
 	  if grep -q '\[FAIL\]' $$log; then echo "FAIL: a self-test case reported failure"; fail=1; fi; \
 	  echo "  guest clock at final tally: $$(grep -o 'at [0-9]* ms of uptime' $$log || echo 'NOT REACHED -- the budget ($$secs s) ended the run first')"; \
-	  echo "  host wall clock for the whole run: $$(( $$(date +%s) - host_t0 )) s (budget $$secs s) -- if the guest number is far below this, either the guest clock is slow or the HOST is (another VM running?)"; \
+	  echo "  host wall clock until the guest's tally: $$host_done s (timeout $$secs s) -- compare with the guest's own two clocks on that line"; \
 	  if grep -q 'DID NOT TAKE' $$log; then echo "FAIL(A7): a BAR write did not stick"; fail=1; fi; \
 	  if [ $$fail -ne 0 ]; then \
 	    echo "--- serial ($$acc) ---"; cat $$log; echo "--- end ---"; overall=1; \

@@ -1645,6 +1645,42 @@ checker, and by Python's own `wave` module. The OS was correct the whole time.
 A zero-length `data` chunk now means "to the end of the file", which is the only
 sensible reading of a truncated one, and the checker says when it does that.
 
+## Security hardening
+
+Scored 3/10 in the 2026-09-10 audit for the right reason: SMEP, SMAP, PAN, ASLR
+and KASLR were all absent. SMEP/SMAP/UMIP (x86) and PAN (aarch64, PXN was
+already there) landed in 24686e4, each proven by a self-test that commits the
+violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
+
+- [ ] **A known-answer test for the DRBG.** `test random` checks structure --
+      distinct draws, monobit 49-51%, no repeats in 8192, an unbiased
+      random_below() -- and says plainly that this is not a KAT. The NIST CAVP
+      HMAC_DRBG vectors (SHA-256, no prediction resistance, no additional
+      input) are what would turn "implements SP 800-90A" from a claim about
+      the code into a measurement. One vector, embedded, compared byte for
+      byte. Not done yet because the vector has to be transcribed exactly and
+      a wrong transcription would fail a correct implementation.
+- [ ] **ASLR** -- next. The app image is ET_EXEC at 0x400000 (PIE is a
+      toolchain change, below), but six addresses are KERNEL-chosen and can be
+      randomised per process today: the dylib base, the mmap base, the heap
+      base, the main stack, thread stacks, and the shared-surface window. A
+      survey for this found that the shared-surface window and the mmap window
+      START AT THE SAME ADDRESS (0x5000_0000_0000) and surface mappings are not
+      recorded in the VMA list -- a latent collision, ASLR or not.
+- [ ] **PIE userland** so the executable itself moves. Needs `-pie` in the
+      user link, relocations processed by the in-kernel loader (it already does
+      them for libembk.so), and the fixed `. = 0x400000` in newlib.ld replaced.
+- [ ] **KASLR.** The kernel is linked with -mcmodel=kernel at a fixed higher-
+      half address and stage2 loads it there. Randomising it needs a
+      relocatable kernel image (-fPIE + a relocation pass at boot, or a
+      linker-generated relocation table) AND a bootloader that can place it.
+      Both halves are real work; neither is started.
+- [ ] **Stack canaries in the kernel** (-fstack-protector is off on both
+      builds). Needs a per-CPU canary word and the TLS-slot plumbing the
+      compiler expects; cheap once the plumbing exists.
+- [ ] **Guard pages between kernel heap allocations, and a poisoned free.** Listed
+      under Memory Management already; it is a hardening item too.
+
 ## Process & Scheduling
 
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant
