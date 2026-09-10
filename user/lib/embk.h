@@ -1085,4 +1085,32 @@ static inline int embk_fsync(int fd) {
     return (int)embk_syscall1(EMBK_SYS_fsync, fd);
 }
 
+/* --- being interrupted, and surviving it ----------------------------------
+ *
+ * ^C routed at a process CANCELS it, and cancellation is sticky on purpose --
+ * a process must not be able to miss one by being between calls. That makes it
+ * exactly wrong for the other thing ^C means: "stop what you are doing and go
+ * back to your prompt". A shell that routed ^C at itself would take one
+ * keystroke and never read a line again.
+ *
+ * So a process can opt IN to catching interrupts instead. Then ^C increments a
+ * COUNTER it takes and clears whenever it is ready to act -- as many times as
+ * a human presses the key. Counted rather than a flag so a second press during
+ * a slow unwind is not lost, and so an impatient double-tap is visible as one.
+ *
+ *     embk_intr_catch(1);                    // ^C now interrupts, not kills
+ *     embk_console_interrupt_route(0);       // ...and it is aimed at me
+ *     while (working) {
+ *         if (embk_intr_take()) break;       // a human asked us to stop
+ *     }
+ *     embk_console_interrupt_route(-1);      // hand ^C back
+ */
+static inline int embk_intr_catch(int on) {
+    return (int)embk_syscall2(EMBK_SYS_intr, 1, on);
+}
+static inline unsigned embk_intr_take(void) {
+    int64_t n = embk_syscall2(EMBK_SYS_intr, 0, 0);
+    return n > 0 ? (unsigned)n : 0u;
+}
+
 #endif /* __EMBK_H__ */

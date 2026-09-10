@@ -139,6 +139,11 @@ static struct process *process_alloc(void) {
              * from the previous occupant would make this process born cancelled
              * -- every blocking syscall failing -ECANCELED before it ran a line. */
             process_table[i].cancelled = false;
+            /* Same reasoning, same hazard: a reused slot must not be born
+             * catching interrupts it never asked for, nor holding a backlog
+             * of the previous occupant's. */
+            process_table[i].intr_catch   = false;
+            process_table[i].intr_pending = 0;
             /* Default to kernel authority. Overwritten by process_create_caps
              * for user processes (attenuated from the parent); left as-is for
              * kernel threads, which ARE the kernel and hold the full set. */
@@ -857,6 +862,62 @@ int process_cancel(uint32_t pid) {
 
     spin_unlock(&g_sched_lock);
     return EMBK_OK;
+}
+
+/* See the comment on intr_catch in process.h for why this exists alongside
+ * process_cancel() rather than replacing it. */
+int process_raise_interrupt(uint32_t pid) {
+    spin_lock(&g_sched_lock);
+
+    struct process *proc = process_find(pid);
+    if (!proc) {
+        spin_unlock(&g_sched_lock);
+        return -EMBK_EINVAL;
+    }
+    if (!proc->intr_catch) {
+        spin_unlock(&g_sched_lock);
+        return 0;                 /* caller falls back to cancelling */
+    }
+    if (proc->live_thread_count == 0) {
+        spin_unlock(&g_sched_lock);
+        return 1;                 /* already stopped; nothing to interrupt */
+    }
+
+    proc->intr_pending++;
+
+    /* Wake every blocked thread so it re-checks, exactly as a cancellation
+     * does. An interrupt that only took effect the next time the process
+     * happened to run would not interrupt anything that was waiting -- which
+     * is most of what anyone wants to interrupt. */
+    for (struct thread *t = proc->thread_list; t; t = t->proc_thread_next) {
+        if (t->state == PROCESS_BLOCKED && t->wait_queue) {
+            wait_queue_remove(t->wait_queue, t);
+            t->state = PROCESS_READY;
+        }
+    }
+
+    spin_unlock(&g_sched_lock);
+    return 1;
+}
+
+void process_set_intr_catch(bool on) {
+    spin_lock(&g_sched_lock);
+    if (current_process) {
+        current_process->intr_catch = on;
+        if (!on) current_process->intr_pending = 0;   /* opting out drops the backlog */
+    }
+    spin_unlock(&g_sched_lock);
+}
+
+uint32_t process_take_interrupts(void) {
+    spin_lock(&g_sched_lock);
+    uint32_t n = 0;
+    if (current_process) {
+        n = current_process->intr_pending;
+        current_process->intr_pending = 0;
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
 }
 
 int process_is_cancelled(uint32_t pid) {

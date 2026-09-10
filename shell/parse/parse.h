@@ -95,6 +95,21 @@ enum stmt_kind {
 struct stmt {
     enum stmt_kind kind;
     size_t line, col;
+
+    /* `pipeline &` -- run it in the BACKGROUND and carry on.
+     *
+     * `bg_src` is a COPY of the statement's own source text, taken at parse
+     * time. Backgrounding is implemented by spawning another shell to run that
+     * text, which is the only way a BUILTIN pipeline can go to the background
+     * at all: builtins run in-process, and this process is busy being the
+     * shell. Re-parsing the source in the child costs a millisecond and means
+     * `ls | where size > 1mb &` works exactly like `wget ... &`, rather than
+     * backgrounding being a privilege only external programs have.
+     *
+     * A copy rather than a slice because the AST outlives the source buffer:
+     * the REPL's line is a stack array and a script's text is freed after the
+     * program runs. NULL unless this statement ended in '&'. */
+    char *bg_src;
     union {
         struct pipeline *pipe;                          /* STMT_PIPELINE */
         struct { char *name; struct expr *expr; } let;  /* STMT_LET (owned) */

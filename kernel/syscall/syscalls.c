@@ -1850,6 +1850,23 @@ static int64_t sys_mprotect(const struct sysargs *a) {
                         (uint32_t)a->arg[2]);
 }
 
+/* intr(cmd, arg) -> see syscall_nr.h.
+ *
+ * WHY THIS IS NOT sys_cancelled(). Cancellation is sticky and permanent, and
+ * that is the property that makes it trustworthy: a process cannot miss one by
+ * being between calls. It is therefore useless for "^C, go back to your
+ * prompt" -- a shell that routed ^C at itself would take one keystroke and
+ * never read a line again. This channel is counted and cleared by the taker,
+ * so a process can be interrupted as many times as a human presses the key and
+ * keep living. Both exist; neither is a weakened version of the other. */
+static int64_t sys_intr(const struct sysargs *a) {
+    switch ((int)a->arg[0]) {
+    case 0: return (int64_t)process_take_interrupts();
+    case 1: process_set_intr_catch(a->arg[1] != 0); return 0;
+    default: return -EMBK_EINVAL;
+    }
+}
+
 static syscall_handler_t syscall_table[] = {
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -1942,6 +1959,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_mprotect]       = sys_mprotect,
     [SYS_dup]            = sys_dup,
     [SYS_fsync]          = sys_fsync,
+    [SYS_intr]           = sys_intr,
     [SYS_munmap]         = sys_munmap,
     [SYS_win_desktop_front] = sys_win_desktop_front,
     [SYS_debug_attach]   = sys_debug_attach,

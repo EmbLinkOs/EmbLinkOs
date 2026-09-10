@@ -38,6 +38,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "embk.h"        /* embk_spawn_env / embk_wait / embk_proc_alive */
+#include <errno.h>
+
+extern char **environ;
 
 /* --- the user-command table ----------------------------------------------
  * A flat array, searched linearly. A shell session defines tens of commands,
@@ -188,6 +192,13 @@ static struct value userfn_call(const struct command *cmd, struct value input,
     return out.value;
 }
 
+/* --- interruption --------------------------------------------------------- */
+static bool (*g_interrupted)(void) = NULL;
+
+void exec_set_interrupt_check(bool (*fn)(void)) { g_interrupted = fn; }
+
+static bool interrupted(void) { return g_interrupted && g_interrupted(); }
+
 /* --- the sink and the top scope, set by the driver ------------------------ */
 static value_sink   g_sink     = NULL;
 static void        *g_sink_ctx = NULL;
@@ -245,6 +256,15 @@ int block_exec(const struct block *b, struct scope *env,
     out->value = value_null();
 
     for (size_t i = 0; i < b->n; i++) {
+        /* BETWEEN statements, not only in loops: a long straight-line script
+         * spawning one slow program after another is just as much a thing a
+         * person wants to stop. */
+        if (interrupted()) {
+            value_free(&out->value);
+            out->value = value_error("interrupted");
+            out->error = true;
+            return -1;
+        }
         int rc = stmt_exec(b->stmts[i], env, sink, ctx, out);
         if (rc != 0) { out->error = true; return rc; }
         if (out->flow != FLOW_NORMAL)
@@ -298,6 +318,22 @@ static int stmt_exec(const struct stmt *st, struct scope *env,
     }
 
     case STMT_PIPELINE: {
+        /* `pipeline &` -- hand the whole statement to another shell and carry
+         * on. The value of a backgrounded statement is its JOB ID, not the
+         * pipeline's result: the result does not exist yet, and reporting the
+         * id is what lets the next line say `fg 1`. */
+        if (st->bg_src) {
+            int id = jobs_start(st->bg_src);
+            value_free(&out->value);
+            if (id < 0) {
+                out->value = value_error("could not start a background job");
+                return -1;
+            }
+            out->value = value_int(id);
+            if (sink) sink(&out->value, ctx);
+            return 0;
+        }
+
         struct value v = pipeline_run(st->u.pipe, env);
         if (v.type == VAL_ERROR) {
             value_free(&out->value);
@@ -326,26 +362,24 @@ static int stmt_exec(const struct stmt *st, struct scope *env,
     }
 
     case STMT_WHILE: {
-        /* A hard iteration ceiling. An interactive shell with no job control
-         * and no way to interrupt a running script turns `while true { }`
-         * into a wedged machine that must be reset -- so the loop refuses
-         * rather than hangs, and says which line did it. The number is high
-         * enough that no honest script reaches it and low enough that a
-         * runaway is caught in seconds. Remove this the day the shell can be
-         * interrupted, and not before. */
-        const uint64_t LOOP_MAX = 10 * 1000 * 1000;
-        uint64_t n = 0;
+        /* THE ITERATION CEILING IS GONE. It existed because the shell could
+         * not be interrupted: `while true { }` could only be ended by
+         * resetting the machine, so the loop refused after ten million passes
+         * rather than hang. The comment on it said "remove this the day the
+         * shell can be interrupted, and not before" -- and that day is this
+         * commit. A loop now runs exactly as long as it is asked to, and stops
+         * when a human presses ^C, which is the correct behaviour and was
+         * never available before. */
         for (;;) {
+            if (interrupted()) {
+                value_free(&out->value);
+                out->value = value_error("interrupted");
+                return -1;
+            }
+
             bool c = false;
             if (cond_eval(st->u.wh.cond, env, out, &c) != 0) return -1;
             if (!c) break;
-
-            if (++n > LOOP_MAX) {
-                value_free(&out->value);
-                out->value = value_error("while loop exceeded 10,000,000 iterations "
-                                         "-- refusing to hang the shell");
-                return -1;
-            }
 
             int rc = block_exec(st->u.wh.body, env, sink, ctx, out);
             if (rc != 0) return rc;
@@ -370,6 +404,12 @@ static int stmt_exec(const struct stmt *st, struct scope *env,
         size_t n = seq_count(&seq);
         int rc = 0;
         for (size_t i = 0; i < n; i++) {
+            if (interrupted()) {
+                value_free(&out->value);
+                out->value = value_error("interrupted");
+                rc = -1;
+                break;
+            }
             struct value item = seq_at(&seq, i);
             if (scope_bind(env, st->u.fr.var, item) != 0) {
                 value_free(&item);
@@ -416,4 +456,121 @@ static int stmt_exec(const struct stmt *st, struct scope *env,
     }
     }
     return 0;
+}
+
+/* ==========================================================================
+ * BACKGROUND JOBS
+ *
+ * `pipeline &` spawns ANOTHER SHELL to run that pipeline's source text.
+ *
+ * WHY A SHELL AND NOT THE PROGRAM. Backgrounding by spawning the named
+ * program directly would only work for pipelines that are a single external
+ * command -- `ls | where size > 1mb &` could not be backgrounded at all,
+ * because builtins run IN THIS PROCESS and this process is busy being the
+ * shell. Re-parsing the source in a child costs a millisecond and makes
+ * backgrounding a property of any statement rather than a privilege that
+ * external programs happen to have.
+ *
+ * A job is remembered by its spawn HANDLE. That is the only name a parent has
+ * for a child in this OS -- never a pid, so a recycled pid cannot alias a job
+ * that has already finished.
+ * ========================================================================== */
+
+static struct job g_jobs[JOB_MAX];
+static int        g_next_job_id = 1;
+
+static struct job *job_free_slot(void) {
+    for (size_t i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i].id == 0)
+            return &g_jobs[i];
+    return NULL;
+}
+
+int jobs_start(const char *src) {
+    if (!src || !*src)
+        return -EINVAL;
+
+    struct job *j = job_free_slot();
+    if (!j)
+        return -EMFILE;
+
+    char *copy = strdup(src);
+    if (!copy)
+        return -ENOMEM;
+
+    /* The child gets THIS shell's environment, named explicitly -- nothing is
+     * inherited on EmbLink. It does NOT get the console interrupt route: ^C
+     * belongs to whatever is in the foreground, and a background job that
+     * stole it would make the next ^C stop the wrong thing. */
+    char *argv[] = { (char *)"/system/bin/shell.elf", (char *)"-c", copy, NULL };
+    int64_t h = embk_spawn_env("/system/bin/shell.elf", argv, environ, NULL, 0);
+    if (h < 0) {
+        free(copy);
+        return (int)h;
+    }
+
+    j->id     = g_next_job_id++;
+    j->handle = (int)h;
+    j->cmd    = copy;
+    j->reaped = false;
+    j->status = 0;
+    return j->id;
+}
+
+/* Notice finished children. Called before anything reads the table, so `jobs`
+ * never reports a corpse as running -- and so a job that ended is REAPED
+ * rather than left as a zombie holding a process slot. */
+void jobs_poll(void) {
+    for (size_t i = 0; i < JOB_MAX; i++) {
+        struct job *j = &g_jobs[i];
+        if (j->id == 0 || j->reaped)
+            continue;
+        if (!embk_proc_alive(j->handle)) {
+            j->status = (int)embk_wait(j->handle);
+            j->reaped = true;
+        }
+    }
+}
+
+size_t jobs_count(void) {
+    size_t n = 0;
+    for (size_t i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i].id != 0) n++;
+    return n;
+}
+
+struct job *jobs_at(size_t idx) {
+    size_t n = 0;
+    for (size_t i = 0; i < JOB_MAX; i++) {
+        if (g_jobs[i].id == 0) continue;
+        if (n++ == idx) return &g_jobs[i];
+    }
+    return NULL;
+}
+
+struct job *jobs_by_id(int id) {
+    for (size_t i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i].id == id) return &g_jobs[i];
+    return NULL;
+}
+
+int jobs_wait(struct job *j) {
+    if (!j || j->id == 0)
+        return -EINVAL;
+    if (!j->reaped) {
+        j->status = (int)embk_wait(j->handle);
+        j->reaped = true;
+    }
+    return j->status;
+}
+
+/* A finished job is forgotten once it has been REPORTED once -- the slot is
+ * freed after `jobs` shows its exit status. Keeping it forever would fill the
+ * table; dropping it silently would mean a job could finish between two
+ * prompts and leave no trace that it ever ran. */
+void jobs_forget(struct job *j) {
+    if (!j || j->id == 0) return;
+    free(j->cmd);
+    j->cmd = NULL;
+    j->id  = 0;
 }

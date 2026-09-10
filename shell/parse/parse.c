@@ -86,6 +86,7 @@ void block_free(struct block *b) {
 
 void stmt_free(struct stmt *s) {
     if (!s) return;
+    free(s->bg_src);
     switch (s->kind) {
     case STMT_PIPELINE: pipeline_free(s->u.pipe); break;
     case STMT_LET:      free(s->u.let.name); expr_free(s->u.let.expr); break;
@@ -234,7 +235,13 @@ static struct expr *parse_prefix(struct parser *P) {
         if (!pl) return NULL;
         while (pk(P)->type == TOK_NEWLINE) adv(P);
         if (pk(P)->type != TOK_RPAREN) {
-            perr(P, pk(P), "expected ')' to close '$('");
+            /* `$(cmd &)` asks for the VALUE of something that has not run yet.
+             * Saying that is worth four lines: the generic "expected ')'" sends
+             * the reader hunting for a typo that is not there. */
+            perr(P, pk(P), pk(P)->type == TOK_AMP
+                    ? "a background job has no value yet -- write `cmd &` as its own "
+                      "statement and use `jobs` or `fg`"
+                    : "expected ')' to close '$('");
             pipeline_free(pl);
             return NULL;
         }
@@ -355,7 +362,7 @@ static struct command *parse_command(struct parser *P) {
     while (pk(P)->type != TOK_PIPE   && pk(P)->type != TOK_EOF &&
            pk(P)->type != TOK_RPAREN && pk(P)->type != TOK_NEWLINE &&
            pk(P)->type != TOK_SEMI   && pk(P)->type != TOK_LBRACE &&
-           pk(P)->type != TOK_RBRACE) {
+           pk(P)->type != TOK_RBRACE && pk(P)->type != TOK_AMP) {
         struct expr *arg = parse_expr(P, BP_NONE);
         if (!arg) { command_free(cmd); return NULL; }
         if (cmd->nargs == cap) {
@@ -687,11 +694,30 @@ static struct stmt *parse_stmt(struct parser *P) {
         return s;
     }
     default: {
+        const struct token *first = pk(P);
         struct pipeline *pl = parse_pipeline(P);
         if (!pl) return NULL;
         struct stmt *s = stmt_new(P, STMT_PIPELINE, t);
         if (!s) { pipeline_free(pl); return NULL; }
         s->u.pipe = pl;
+
+        /* A trailing '&' backgrounds the statement. The source text is copied
+         * out HERE, while the tokens still point into it -- from the first
+         * token of the pipeline to the last one before the '&'. */
+        if (pk(P)->type == TOK_AMP) {
+            const struct token *last = &P->toks[P->pos - 1];
+            const char *b = first->lexeme;
+            const char *e = last->lexeme + last->lexeme_len;
+            if (b && e > b) {
+                s->bg_src = copy_slice(b, (size_t)(e - b));
+                if (!s->bg_src) { perr(P, first, "out of memory"); stmt_free(s); return NULL; }
+            } else {
+                perr(P, first, "cannot background this statement");
+                stmt_free(s);
+                return NULL;
+            }
+            adv(P);                        /* consume '&' */
+        }
         return s;
     }
     }

@@ -60,6 +60,7 @@ enum tok_type {
      * a token is what makes it checkable instead of ambient. */
     TOK_NEWLINE,
     TOK_SEMI,           /* ; -- the same separator, spelled inline */
+    TOK_AMP,            /* & -- run this statement in the BACKGROUND */
     TOK_LBRACE, TOK_RBRACE,
 
     TOK_IF, TOK_ELSE, TOK_WHILE, TOK_FOR, TOK_IN,

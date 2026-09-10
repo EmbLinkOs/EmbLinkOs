@@ -617,6 +617,14 @@ static void keyboard_deliver(char c) {
     if (c == 0x03) {
         uint32_t target = g_console_int_target;
         if (target) {
+            /* An interrupt FIRST, if the target asked to catch them. That is
+             * the difference between "stop what you are doing" and "stop
+             * permanently": a shell running a script wants the first and
+             * cannot survive the second, because cancellation is sticky by
+             * design. A target that has not opted in is cancelled exactly as
+             * before, so every routed child behaves as it always did. */
+            if (process_raise_interrupt(target) == 1)
+                return;
             process_cancel(target);
             return;         /* consumed: ^C is an interruption, not input */
         }

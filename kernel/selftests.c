@@ -3300,6 +3300,70 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* INTERRUPTION -- ^C that a process SURVIVES.
+     *
+     * The claim is specific and was untrue until now: a runaway script can be
+     * STOPPED. `while true { }` used to be unkillable -- the shell could not
+     * route ^C at itself, because ^C set the sticky cancellation flag and one
+     * keystroke would end the shell for good, so the loop carried an iteration
+     * ceiling instead and a genuinely infinite loop meant resetting the
+     * machine.
+     *
+     * This drives the interrupt from the kernel side (there is no keyboard in
+     * a scripted test) but through EXACTLY the path a ^C takes:
+     * process_raise_interrupt(), the same call keyboard_deliver() makes. */
+    if (strcmp(cmd, "test interrupt") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test interrupt: VFS not registered\n");
+            return 1;
+        }
+        int ok = 1;
+        kprintf("\n[interrupt]\n");
+
+        /* 1. A LOOP THAT NEVER ENDS ON ITS OWN. */
+        char *a[] = { "/system/bin/shell.elf", "-c", "while true { }", NULL };
+        int pid = process_create("/system/bin/shell.elf", a, 3, NULL, 0);
+        if (pid < 0) {
+            kprintf("  [FAIL] could not spawn the shell\n");
+            return 1;
+        }
+
+        /* Let it get past startup and into the loop. Busy-wait rather than
+         * sleep: this runs in the kernel's own REPL context, and the point is
+         * to give the CHILD cpu time, which any of the other three cores can
+         * provide. */
+        timer_delay_ms(400);
+
+        int alive_before = process_alive((uint32_t)pid);
+        int raised = process_raise_interrupt((uint32_t)pid);
+        int rc = process_wait((uint32_t)pid);
+
+        kprintf("  [%s] the loop was still running before the interrupt\n",
+                alive_before ? "ok" : "FAIL");
+        kprintf("  [%s] the shell had opted IN to catching interrupts (raise -> %d)\n",
+                raised == 1 ? "ok" : "FAIL", raised);
+        kprintf("  [%s] `while true { }` stopped and exited %d (want 1)\n",
+                rc == 1 ? "ok" : "FAIL", rc);
+        if (!alive_before || raised != 1 || rc != 1) ok = 0;
+
+        /* 2. THE OTHER HALF STILL WORKS. A process that has NOT opted in is
+         *    cancelled exactly as before -- the new channel must not have
+         *    quietly changed what ^C does to a routed child. */
+        char *b[] = { "/data/apps/posixdemo/posixdemo.elf", NULL };
+        int p2 = process_create("/data/apps/posixdemo/posixdemo.elf", b, 1, NULL, 0);
+        if (p2 >= 0) {
+            int r2 = process_raise_interrupt((uint32_t)p2);
+            kprintf("  [%s] a process that does NOT catch interrupts declines them "
+                    "(raise -> %d, want 0 so the caller cancels)\n",
+                    r2 == 0 ? "ok" : "FAIL", r2);
+            if (r2 != 0) ok = 0;
+            (void)process_wait((uint32_t)p2);
+        }
+
+        kprintf("[cmd] test interrupt: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* THE SHELL AS A LANGUAGE.
      *
      * `test shell` above covers pipelines -- one line, one statement. This
@@ -3349,6 +3413,18 @@ int selftests_handle_command(const char *cmd)
               "break", 1 },
             { "a pipeline continues after a trailing '|'",
               "ls / |\n  count", 0 },
+            /* Background jobs. The value of `cmd &` is its JOB ID, and `jobs`
+             * is a table like everything else -- so the whole thing composes
+             * rather than being a special-cased listing. */
+            { "'&' starts a background job that `jobs` can see",
+              "echo hi &\nlet n = $(jobs | count)\n"
+              "if $n > 0 { echo have } else { echo none }", 0 },
+            { "a background job inside $( ) is refused, and says why",
+              "let j = $(echo hi &)", 1 },
+            { "jobs is a table and fg waits for one",
+              "echo hi &\nlet r = $(fg 1)\nif $r.exit == 0 { echo done } else { echo bad }", 0 },
+            { "fg on a job that does not exist is an error",
+              "fg 99", 1 },
         };
 
         int ok = 1;

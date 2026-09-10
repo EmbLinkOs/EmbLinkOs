@@ -103,6 +103,26 @@ static bool block_defines_a_command(const struct block *b) {
     return false;
 }
 
+/* --- being interrupted ----------------------------------------------------
+ *
+ * While a program runs, ^C is AIMED AT THIS SHELL and caught rather than
+ * cancelling it (embk_intr_catch). At the prompt it is handed back to nobody,
+ * where the kernel delivers it as the byte 0x03 and read_line treats it as a
+ * line-edit key -- which is what a person expects an empty prompt's ^C to do.
+ *
+ * Routing it at SELF used to be impossible: ^C set the sticky cancellation
+ * flag, so one keystroke ended the shell for good. The kernel now has a
+ * counted, clearable interrupt channel alongside cancellation precisely
+ * because a shell needs to survive being interrupted.
+ *
+ * eval_extern hands the route to a CHILD for the child's lifetime and takes it
+ * back after -- there, ^C IS a real cancellation, which is right: interrupting
+ * `wget` should stop wget. This only covers the gap the child does not fill:
+ * the shell's own loops and the spaces between commands. */
+static bool shell_interrupted(void) {
+    return embk_intr_take() != 0;
+}
+
 static int run_program(const char *src, struct scope *top) {
     size_t ntoks = 0;
     struct token *toks = lex(src, &ntoks);
@@ -119,8 +139,22 @@ static int run_program(const char *src, struct scope *top) {
     }
     if (prog->n == 0) { block_free(prog); return 0; }   /* blank input */
 
+    /* Claim ^C for the duration. Only when we own the console session: under
+     * the Terminal app or `-c`, the route belongs to whoever spawned us and
+     * taking it would interrupt the wrong thing. */
+    if (g_console_session) {
+        (void)embk_intr_take();                 /* drop anything stale */
+        (void)embk_intr_catch(1);
+        (void)embk_console_interrupt_route(0);  /* 0 = self */
+    }
+
     struct exec_out out = { FLOW_NORMAL, value_null(), false };
     int rc = block_exec(prog, top, print_sink, NULL, &out);
+
+    if (g_console_session) {
+        (void)embk_console_interrupt_route(-1); /* ^C is a byte again */
+        (void)embk_intr_catch(0);
+    }
 
     if (rc != 0) {
         puts1("error: ");
@@ -334,6 +368,7 @@ int main(int argc, char **argv) {
      * against it) and the sink their bodies print through, before ANY program
      * runs -- including the one-shot forms below. */
     exec_init(&top, print_sink, NULL);
+    exec_set_interrupt_check(shell_interrupted);
 
     /* one-shot mode: shell.elf -c "ls | where size > 1mb"
      * The argument is a whole PROGRAM, so `-c 'if x { a } else { b }'` works

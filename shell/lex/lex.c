@@ -243,6 +243,7 @@ static void scan_symbol(struct lexer *L) {
         case ')': ty = TOK_RPAREN; break;
         case ',': ty = TOK_COMMA;  break;
         case ';': ty = TOK_SEMI;   break;
+        case '&': ty = TOK_AMP;    break;
         case '{': ty = TOK_LBRACE; break;
         case '}': ty = TOK_RBRACE; break;
         case '+': ty = TOK_PLUS;   break;
@@ -362,7 +363,7 @@ void lex_free_tokens(struct token *toks, size_t n) {
 
 const char *tok_type_name(enum tok_type t) {
     switch (t) {
-        case TOK_DOLLAR_LPAREN: return "'$('";
+        case TOK_DOLLAR_LPAREN: return "'$('"; case TOK_AMP: return "'&'";
         case TOK_NEWLINE: return "newline"; case TOK_SEMI: return "';'";
         case TOK_LBRACE: return "'{'"; case TOK_RBRACE: return "'}'";
         case TOK_IF: return "if"; case TOK_ELSE: return "else";

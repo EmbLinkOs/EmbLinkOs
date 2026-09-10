@@ -15,6 +15,7 @@
  * normalization) before reaching a RAW SDK call -- those bypass the libc.
  * ========================================================================== */
 #include "builtins/builtins.h"
+#include "eval/exec.h"     /* the background-job table */
 #include "sval/sval.h"
 #include "hist/hist.h"
 #include "embk.h"
@@ -582,6 +583,75 @@ static struct value bi_clip(const struct command *cmd, struct value input,
     return value_null();
 }
 
+/* --- background jobs -------------------------------------------------------
+ *
+ * `jobs` is a TABLE like everything else here, so it composes:
+ *   jobs | where state == "running" | count
+ * A structured shell that printed a special-cased job listing would be
+ * throwing away the one property that makes it worth using.
+ *
+ * A finished job is shown ONCE and then forgotten. Keeping it forever fills
+ * the table; dropping it the moment it exits would let a job finish between
+ * two prompts and leave no trace that it ever ran -- which is exactly the
+ * case a person needs to see. */
+static struct value bi_jobs(const struct command *cmd, struct value input,
+                            struct scope *env) {
+    (void)cmd; (void)env;
+    value_free(&input);
+
+    jobs_poll();
+
+    struct value out = value_table();
+    /* Walk by index and re-fetch, because reporting a finished job FREES its
+     * slot and shifts everything after it. */
+    for (size_t i = 0; i < JOB_MAX; ) {
+        struct job *j = jobs_at(i);
+        if (!j) break;
+
+        struct value row = value_record();
+        value_record_set(&row, "job",   value_int(j->id));
+        value_record_set(&row, "state", value_string(j->reaped ? "done" : "running"));
+        value_record_set(&row, "exit",  j->reaped ? value_int(j->status) : value_null());
+        value_record_set(&row, "cmd",   value_string(j->cmd ? j->cmd : ""));
+        value_table_push_row(&out, row);
+
+        if (j->reaped) jobs_forget(j);   /* shown once; the slot is free now */
+        else i++;
+    }
+    return out;
+}
+
+/* `fg N` -- wait for job N and hand back its exit status.
+ *
+ * Not "bring it to the foreground" in the terminal sense: there is no terminal
+ * ownership to transfer, because a background job here is a separate shell
+ * with its own stdio. What a person actually wants from `fg` is "block until
+ * that finishes", and that is what this does -- honestly named for what it
+ * gives rather than borrowed from a mechanism this OS does not have. */
+static struct value bi_fg(const struct command *cmd, struct value input,
+                          struct scope *env) {
+    value_free(&input);
+    if (cmd->nargs != 1)
+        return value_error("fg takes one job id");
+
+    struct value idv = expr_eval(cmd->args[0], env);
+    if (idv.type == VAL_ERROR) return idv;
+    if (idv.type != VAL_INT) { value_free(&idv); return value_error("fg takes a job id"); }
+    int id = (int)idv.u.i;
+    value_free(&idv);
+
+    struct job *j = jobs_by_id(id);
+    if (!j) return value_error("no such job");
+
+    int status = jobs_wait(j);
+    struct value out = value_record();
+    value_record_set(&out, "job",  value_int(id));
+    value_record_set(&out, "exit", value_int(status));
+    value_record_set(&out, "cmd",  value_string(j->cmd ? j->cmd : ""));
+    jobs_forget(j);
+    return out;
+}
+
 static struct value bi_uptime(const struct command *cmd, struct value input,
                               struct scope *env) {
     (void)cmd; (void)env;
@@ -634,6 +704,7 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "history", bi_history }, { "which", bi_which },
         { "clip",    bi_clip    },
         { "clear",  bi_clear  },
+        { "jobs",   bi_jobs   }, { "fg",     bi_fg     },
     };
     for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
         if (strcmp(tab[i].name, name) == 0) return tab[i].fn;

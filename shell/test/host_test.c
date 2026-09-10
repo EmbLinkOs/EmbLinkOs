@@ -481,6 +481,19 @@ static void test_program(void) {
      * between a typo and a surprise. */
     CHECK(prog_fails("echo a echo b\n" ) == false,
           "bare words are still arguments, not a missing separator");
+    b = prog_ok("sleep 5 &");
+    CHECK(b && b->n == 1 && b->stmts[0]->bg_src &&
+          strcmp(b->stmts[0]->bg_src, "sleep 5") == 0,
+          "'&' backgrounds a statement and copies its source");
+    block_free(b);
+
+    b = prog_ok("ls | where size > 1 &\necho after");
+    CHECK(b && b->n == 2 && b->stmts[0]->bg_src &&
+          strcmp(b->stmts[0]->bg_src, "ls | where size > 1") == 0 &&
+          b->stmts[1]->bg_src == NULL,
+          "a whole pipeline backgrounds, and the next statement does not");
+    block_free(b);
+
     CHECK(prog_fails("if true { echo hi"), "an unclosed block is an error");
     CHECK(prog_fails("if true echo hi"), "a block is required after if");
     CHECK(prog_fails("for in $xs { }"), "for needs a variable name");

@@ -136,4 +136,11 @@
  * now; see mm/vm_object.h. */
 #define SYS_fsync         100
 
+/* intr(cmd, arg) -- the COUNTED, CLEARABLE interrupt channel, as distinct from
+ * cancellation. cmd 0 = take-and-clear this process's pending count; cmd 1 =
+ * opt in/out of catching interrupts (arg != 0 to catch). One numbered syscall
+ * with a cmd, the same shape sys_fcntl uses, because these are two halves of
+ * one contract. See the intr_catch comment in process/process.h. */
+#define SYS_intr          101
+
 #endif /* _SYSCALL_NR_H_ */

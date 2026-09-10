@@ -346,6 +346,34 @@ struct process {
      * the uncatchable backstop, and escalating is the parent's policy. */
     volatile bool cancelled;
 
+    /* --- INTERRUPTION, as distinct from cancellation -----------------------
+     *
+     * Cancellation is "stop, permanently": sticky, never cleared, because a
+     * process must not be able to MISS one by being between calls. That is
+     * exactly right for "this child should die" and exactly wrong for the
+     * other thing ^C means, which is "stop what you are doing and go back to
+     * your prompt".
+     *
+     * The shell proved it. It cannot route ^C at itself while running a script
+     * -- one keystroke would set the sticky flag and the shell could never read
+     * a line again -- so a runaway `while true { }` could only be ended by
+     * resetting the machine, and the loop needed an iteration ceiling to
+     * bound the damage. A shell that cannot be interrupted is not usable, and
+     * weakening cancellation to fix it would break the guarantee that makes
+     * cancellation worth having.
+     *
+     * So: a SEPARATE, COUNTED, CLEARABLE channel. ^C routed at a process that
+     * has asked to catch interrupts increments `intr_pending` instead of
+     * cancelling it; the process takes-and-clears the count when it is ready
+     * to act on it. Counted rather than a flag so that a second ^C during a
+     * slow unwind is not lost -- and so an impatient double-tap is visible as
+     * one, which is what a caller wanting "really stop" would look for.
+     *
+     * `intr_catch` is opt-IN and per-process. Without it ^C still cancels,
+     * which keeps every existing routed child behaving exactly as it did. */
+    volatile bool     intr_catch;
+    volatile uint32_t intr_pending;
+
     /* Parent/child tracking for a real blocking sys_wait/process_wait(). */
     struct process *parent;    /* who called spawn() to create us. NULL means
                                 * "nobody will ever wait() on this pid" --
@@ -649,6 +677,19 @@ void wait_queue_wake_all(struct wait_queue *wq);
  * @return EMBK_OK, or -EMBK_EINVAL if no such process.
  */
 int process_cancel(uint32_t pid);
+
+/* Raise a counted interrupt on `pid` if it has opted in (intr_catch), waking
+ * its blocked threads exactly as a cancellation does so a sleeper notices.
+ * Returns 1 if the interrupt was raised, 0 if the process does not catch them
+ * (the caller should then cancel instead), or -EMBK_* if it does not exist.
+ * Callable from IRQ context -- takes g_sched_lock itself, like process_cancel,
+ * and for the same reason. */
+int process_raise_interrupt(uint32_t pid);
+
+/* Opt in/out of catching interrupts, and take-and-clear the pending count.
+ * Both act on the CALLING process. */
+void     process_set_intr_catch(bool on);
+uint32_t process_take_interrupts(void);
 
 /**
  * @brief Has `pid` been cancelled? 1 / 0, or -EMBK_EINVAL if no such process.

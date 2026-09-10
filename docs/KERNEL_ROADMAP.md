@@ -152,11 +152,17 @@ of this commit — is a programming language.
 
 **What actually blocks a user**, in the order it hurts:
 
-1. **You cannot run two things at once from a shell, or stop one.** No
-   background jobs (`&`), no job control, no Ctrl-C into a running script. This
-   is why `while` needs an iteration ceiling: a runaway loop can only be ended
-   by resetting the machine. Everything else on this list is smaller than this
-   one.
+1. ~~**You cannot run two things at once from a shell, or stop one.**~~
+   **Done.** `&` backgrounds any statement (including a builtin pipeline, by
+   spawning another shell to run its source), `jobs` is a composable table,
+   `fg N` waits, and **Ctrl-C interrupts a running script** — which needed a
+   new kernel channel: a *counted, clearable* interrupt alongside sticky
+   cancellation, because a shell that routed ^C at itself under the old model
+   took one keystroke and could never read a line again. `while` no longer
+   needs its iteration ceiling.
+   - Still missing: `^Z`/`bg` (suspend and resume, which needs the kernel to
+     be able to *stop* a process rather than only interrupt or cancel it), and
+     interrupting a background job rather than only the foreground.
 2. **No globbing.** `ls *.txt` is what a person types. `ls | where name =~
    ".txt"` is the structured equivalent and works, but nobody reaches for it
    first.
