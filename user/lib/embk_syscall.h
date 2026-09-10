@@ -147,6 +147,9 @@
 #define EMBK_SYS_symlink       102   /* (target, linkpath) -> 0       | -err */
 #define EMBK_SYS_readlink      103   /* (path, buf, cap)   -> len     | -err */
 #define EMBK_SYS_lstat         104   /* (path, stat*)      -> 0       | -err */
+/* The SLOW path of a userland lock. An uncontended lock never gets here.
+ * op 0 = WAIT (sleep if *addr == val), op 1 = WAKE (wake up to val). */
+#define EMBK_SYS_futex         105   /* (addr, op, val)    -> n       | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

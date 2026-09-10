@@ -33,6 +33,7 @@
 #include "include/uaccess_guard.h"
 #include "include/arch_ipi.h"
 #include "mm/vma.h"
+#include "process/futex.h"
 #include "arch/aarch64/smp/smp.h"
 #include "include/arch_irq.h"
 #include "include/kmalloc.h"
@@ -936,6 +937,29 @@ void arch_early_main(uint64_t dtb_phys) {
             if (code != 0)
                 selftest_fails++;
         }
+    }
+
+    /* --- the futex, and the userland mutex on it ---------------------------
+     * Threads existed here long before any way for two of them to agree about
+     * anything. The claim is not "a lock exists" -- it is that four threads
+     * hammering one counter produce the EXACT total, which is the only thing a
+     * broken mutex gets wrong (it loses updates; it does not crash). */
+    kprintf("\n--- futex ---\n");
+    {
+        const char *lp = "/system/bin/lockdemo.elf";
+        char *a[] = { (char *)lp, NULL };
+        uint64_t w0, k0, e0, w1, k1, e1;
+        futex_stats(&w0, &k0, &e0);
+        int pid = process_create(lp, a, 1, NULL, 0);
+        int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        futex_stats(&w1, &k1, &e1);
+        kprintf("  [%s] 4 threads x 2000 increments: the total is EXACT (exit %d)\n",
+                rc == 0 ? " ok " : "FAIL", rc);
+        kprintf("  [info] %llu futex waits, %llu wakes, %llu EAGAIN\n",
+                (unsigned long long)(w1 - w0), (unsigned long long)(k1 - k0),
+                (unsigned long long)(e1 - e0));
+        if (rc != 0)
+            selftest_fails++;
     }
 
     /* --- mmap / munmap ------------------------------------------------------

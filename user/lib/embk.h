@@ -460,7 +460,14 @@ static inline void embk_exit(int code) {
 
 /* Start `entry` as a new thread of this process; `arg` arrives as entry's
  * first parameter (RDI). Returns a tid (>= 0) or -EMBK_*. The tid names a
- * thread only within THIS process. */
+ * thread only within THIS process.
+ *
+ * `entry` MUST END BY CALLING embk_thread_exit(). It is not called like an
+ * ordinary function and there is NO RETURN ADDRESS on its stack -- returning
+ * jumps to 0 and the thread dies with a page fault at instruction address
+ * zero, which looks like a wild function pointer and is nothing of the kind.
+ * A trampoline in the libc could make a plain `return` work; until one does,
+ * this is the contract. */
 static inline int64_t embk_thread_create(void (*entry)(long arg), long arg) {
     return embk_syscall2(EMBK_SYS_thread_create, (int64_t)(intptr_t)entry, arg);
 }
@@ -1139,6 +1146,82 @@ static inline int embk_symlink(const char *target, const char *linkpath) {
 static inline int64_t embk_readlink(const char *path, char *buf, size_t cap) {
     return embk_syscall3(EMBK_SYS_readlink, (int64_t)(intptr_t)path,
                          (int64_t)(intptr_t)buf, (int64_t)cap);
+}
+
+/* ===========================================================================
+ * LOCKS -- the first correct way for two threads in one process to agree
+ * about anything.
+ *
+ * embk_thread_create has existed for a long time; a way to SHARE data between
+ * the threads it makes has not. A program had a choice between spinning on an
+ * atomic -- burning a whole timeslice per contention, on a machine where the
+ * holder may be on another core or may not be scheduled at all -- and being
+ * wrong. There was no third option.
+ *
+ * THE FAST PATH NEVER ENTERS THE KERNEL. An uncontended lock is one atomic
+ * compare-and-swap in ring 3 and nothing else; the syscall below is only what
+ * happens when a thread must actually wait. That is the whole point of the
+ * futex shape, and it is why the kernel call is the odd-looking "sleep if this
+ * word still says what I think it says" rather than "lock this".
+ *
+ * THREE STATES, not two, and the third is what stops a lost wakeup:
+ *
+ *     0  free
+ *     1  held, and NOBODY is waiting        -- unlock needs no syscall
+ *     2  held, and somebody MAY be waiting  -- unlock must wake
+ *
+ * With only free/held, a thread that released the lock could not know whether
+ * anyone was asleep on it, so it would have to make the wake syscall every
+ * time -- paying the kernel on the uncontended path, which is the one case
+ * that must stay free. */
+#define EMBK_FUTEX_WAIT 0
+#define EMBK_FUTEX_WAKE 1
+
+static inline int64_t embk_futex(volatile uint32_t *addr, int op, uint32_t val) {
+    return embk_syscall3(EMBK_SYS_futex, (int64_t)(intptr_t)addr, op, val);
+}
+
+typedef struct { volatile uint32_t state; } embk_mutex;
+
+#define EMBK_MUTEX_INIT { 0 }
+
+static inline void embk_mutex_init(embk_mutex *m) { m->state = 0; }
+
+static inline void embk_mutex_lock(embk_mutex *m) {
+    uint32_t expected = 0;
+    /* THE FAST PATH: one CAS, free -> held-uncontended. No syscall. */
+    if (__atomic_compare_exchange_n(&m->state, &expected, 1, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+
+    /* Contended. Announce it by moving the lock to state 2 and then sleeping
+     * on that value -- so the holder's unlock knows a wake is owed.
+     *
+     * The exchange is unconditional: whatever the lock was (1 or 2) it is 2
+     * now, which is the safe direction. Claiming "somebody may be waiting"
+     * when nobody is costs one wasted wake syscall; the opposite mistake
+     * loses a wakeup and hangs. */
+    while (__atomic_exchange_n(&m->state, 2, __ATOMIC_ACQUIRE) != 0) {
+        /* Sleep only while the lock still reads 2. If the holder released
+         * between the exchange and here, the kernel's compare fails, WAIT
+         * returns EAGAIN, and we loop round to try the exchange again --
+         * which is exactly the lost-wakeup window the in-kernel compare
+         * exists to close. */
+        (void)embk_futex(&m->state, EMBK_FUTEX_WAIT, 2);
+    }
+}
+
+static inline int embk_mutex_trylock(embk_mutex *m) {
+    uint32_t expected = 0;
+    return __atomic_compare_exchange_n(&m->state, &expected, 1, false,
+                                       __ATOMIC_ACQUIRE, __ATOMIC_RELAXED) ? 0 : -1;
+}
+
+static inline void embk_mutex_unlock(embk_mutex *m) {
+    /* If the lock was 1, nobody ever announced a wait and there is nothing to
+     * wake -- the uncontended unlock is one atomic store and no syscall. */
+    if (__atomic_exchange_n(&m->state, 0, __ATOMIC_RELEASE) == 2)
+        (void)embk_futex(&m->state, EMBK_FUTEX_WAKE, 1);
 }
 
 #endif /* __EMBK_H__ */

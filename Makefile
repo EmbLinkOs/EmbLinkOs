@@ -199,6 +199,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/mm/uaccess_guard.c \
              kernel/mm/vma.c \
              kernel/mm/vm_object.c \
+             kernel/process/futex.c \
              kernel/power/power.c \
              kernel/arch/x86_64/power/power_x86.c \
              kernel/mm/ipi.c \
@@ -1177,7 +1178,12 @@ build/capgpu.o: user/bin/capgpu.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capgpu.elf: build/crt0.o build/syscalls.o build/capgpu.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capgpu.o -lc -lgcc -o $@
-build/capnet.o: user/bin/capnet.c user/lib/embk.h | $(BUILD)
+build/lockdemo.o: user/bin/lockdemo.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/lockdemo.elf: build/crt0.o build/syscalls.o build/lockdemo.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/lockdemo.o -lc -lgcc -o $@
+
+build/capnet.o: user/bin/capnet.c user/bin/lockdemo.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capnet.elf: build/crt0.o build/syscalls.o build/capnet.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capnet.o -lc -lgcc -o $@
@@ -1707,7 +1713,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 endif
 
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
-               build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/capchild.embx \
+               build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf \

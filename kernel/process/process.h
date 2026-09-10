@@ -199,6 +199,12 @@ struct thread {
      * waits for an event, and no clock will ever wake it. */
     uint64_t wake_at_ms;
 
+    /* Which futex this thread is waiting on, or 0. A futex bucket holds every
+     * lock that hashes to it, so a wake has to be able to tell which sleepers
+     * it is actually for -- waking the wrong one is not merely wasteful, it
+     * lets the right one sleep through its own signal. See process/futex.c. */
+    uint64_t futex_key;
+
     /* Which core (cpu_table[] index, kernel/cpu/percpu.h) this thread is
      * PROCESS_RUNNING on, set every time schedule()/process_start_first()
      * transitions it to RUNNING. -1 when not running anywhere (READY,
@@ -657,6 +663,10 @@ struct process *process_find(uint32_t pid);
 void wait_queue_block(struct wait_queue *wq, struct thread *t);
 
 /** @brief Wake the first thread waiting on `wq` (BLOCKED -> READY). No-op on an empty queue. */
+/* Unlink `t` from `wq` WITHOUT changing its state -- the caller then sets
+ * READY (a wake) or ZOMBIE (a kill). Public because a SELECTIVE waker needs
+ * it: the futex layer wakes only the sleepers whose key matches. */
+void wait_queue_remove(struct wait_queue *wq, struct thread *t);
 void wait_queue_wake_one(struct wait_queue *wq);
 
 /** @brief Wake every thread waiting on `wq` (BLOCKED -> READY). */

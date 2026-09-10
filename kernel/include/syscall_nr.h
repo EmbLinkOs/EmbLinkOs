@@ -152,4 +152,10 @@
 #define SYS_readlink      103   /* (path, buf, cap)         -> len | -err   */
 #define SYS_lstat         104   /* (path, struct embk_stat*)-> 0 | -err     */
 
+/* futex(uaddr, op, val) -- how a userland lock WAITS instead of spinning. The
+ * fast path never gets here; see process/futex.c.
+ *   op 0 WAIT: sleep if *uaddr == val, else EAGAIN
+ *   op 1 WAKE: wake up to `val` sleepers, return how many */
+#define SYS_futex         105
+
 #endif /* _SYSCALL_NR_H_ */

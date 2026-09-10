@@ -31,6 +31,7 @@
 #include "include/types.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "process/futex.h"
 #include "process/debug.h"   /* sys_debug_* handlers for the table below */
 #include "tty/tty.h"
 #include "gfx/surface.h"
@@ -1952,6 +1953,17 @@ static int64_t sys_lstat(const struct sysargs *a) {
     return 0;
 }
 
+/* futex(uaddr, op, val). See process/futex.c for what this is and why its
+ * shape is "sleep if this word still says what I think" rather than "lock". */
+static int64_t sys_futex(const struct sysargs *a) {
+    const void *uaddr = (const void *)a->arg[0];
+    switch ((int)a->arg[1]) {
+    case 0: return futex_wait(uaddr, (uint32_t)a->arg[2]);
+    case 1: return futex_wake(uaddr, (uint32_t)a->arg[2]);
+    default: return -EMBK_EINVAL;
+    }
+}
+
 static syscall_handler_t syscall_table[] = {
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -2048,6 +2060,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_symlink]        = sys_symlink,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,
+    [SYS_futex]          = sys_futex,
     [SYS_munmap]         = sys_munmap,
     [SYS_win_desktop_front] = sys_win_desktop_front,
     [SYS_debug_attach]   = sys_debug_attach,

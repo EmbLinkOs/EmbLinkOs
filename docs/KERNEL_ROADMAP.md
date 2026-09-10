@@ -100,7 +100,12 @@ that resolves paths one component at a time so mount points compose.
    queue with merging and a depth greater than one is most of the gap between
    this and a modern storage stack, and the block layer already counts what it
    would be judged on.
-2. **Read-ahead**, driven by the object's own access history.
+2. ~~**Read-ahead.**~~ **Measured, and not needed.** `test readahead` reads a
+   527 KiB file cold, 4 KiB at a time: **15 device reads, 552 KiB moved, 73
+   blocks per request**. EMBKFS already fetches whole extents and its
+   read cache serves 131 of the 132 pages, so a read-ahead window in the page
+   cache would add machinery and change nothing. The test stays as a regression
+   guard — if that read path ever changes, it will say so.
 3. **Write barriers and a flush op**, so `fsync` can be a device-level flush
    and not only a "the filesystem has it" flush. EMBKFS's transactions want
    the ordering guarantee, not just the write.
@@ -140,8 +145,14 @@ capabilities rather than fork/exec.
 
 1. **Fix the user-thread resume bug above.** It gates the timer queue, which
    gates tickless idle, which gates any real power policy.
-2. **A futex-shaped primitive.** Userland has no way to block on a lock; every
-   contended lock in ring 3 spins today.
+2. ~~**A futex-shaped primitive.**~~ **Done.** `SYS_futex` (WAIT/WAKE, keyed on
+   the *physical* address so a shared file mapping works for free) and an
+   `embk_mutex` whose uncontended path is one atomic compare-and-swap and never
+   enters the kernel. Four threads, 2000 increments each, exact total, with the
+   kernel's own counters proving the slow path was taken.
+   - No condition variables, no read/write locks, no `pthread_*` veneer yet.
+   - No **timed** wait: `sched_sleep_ms` is kernel-threads-only until the
+     aarch64 user-thread resume bug above is fixed.
 3. **Per-core run queues.** One global lock guards every scheduling decision.
    It is correct and it will not scale past a handful of cores.
 4. **Accounting**: per-process CPU time, so scheduling policy can be argued

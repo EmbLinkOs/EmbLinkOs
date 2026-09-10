@@ -680,7 +680,7 @@ void wait_queue_block(struct wait_queue *wq, struct thread *t) {
  * (which then sets ZOMBIE). Keeping removal separate from the state change
  * means a killed-while-blocked thread can't leave a dangling entry that a
  * later wait_queue_wake_*() call would walk into. */
-static void wait_queue_remove(struct wait_queue *wq, struct thread *t) {
+void wait_queue_remove(struct wait_queue *wq, struct thread *t) {
     struct thread **link = &wq->head;
     while (*link) {
         if (*link == t) {

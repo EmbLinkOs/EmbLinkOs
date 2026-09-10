@@ -511,17 +511,29 @@ struct embkfs_volume {
      * stats of one file cost 1100 device reads and the cache reported 0 hits
      * and 15 misses.
      *
-     * Object ids are handed out sequentially, so oid % 32 spreads them without
-     * needing a hash. Keyed on `generation` as well as oid: any commit bumps
-     * it, so a stale inode can never be served -- blunt, but correct, and far
-     * cheaper now that the page cache batches writes instead of committing a
-     * transaction per write. */
+     * DIRECT-MAPPED ON A MIXED INDEX, not on oid % N. Object ids are handed
+     * out sequentially, so `oid % 32` looked like it would spread them -- and
+     * it does, for ids that arrive in a run. It does not for the four inodes a
+     * path walk actually touches: root, "/system", "/system/bin" and the file
+     * itself are ids from wildly different eras of the volume's life, and if
+     * two of them land in one slot they evict each other on EVERY lookup. That
+     * showed up as a warm stat costing exactly 4 device reads -- one per path
+     * component -- while the cache reported plenty of hits overall.
+     *
+     * Multiplying by a large odd constant before taking the index spreads the
+     * high bits down, which is what makes ids that are far apart stop
+     * colliding. 128 slots rather than 32 for headroom: an inode is 128 bytes,
+     * so the whole cache is 18 KiB per volume.
+     *
+     * Keyed on `generation` as well as oid: any commit bumps it, so a stale
+     * inode can never be served -- blunt, but correct, and far cheaper now
+     * that the page cache batches writes instead of committing per write. */
     struct {
         uint64_t oid;
         uint64_t gen;
         bool     valid;
         struct embk_inode_item ino;
-    } icache[32];
+    } icache[128];
     uint64_t  icache_hits, icache_misses;
 
     /* THE NAME CACHE: (directory, name) -> object id.

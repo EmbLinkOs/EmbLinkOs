@@ -4839,7 +4839,11 @@ static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
 
     if (!vol || !out) return -EMBK_EINVAL;
 
-    unsigned slot = (unsigned)(oid % (sizeof vol->icache / sizeof vol->icache[0]));
+    /* Mix before indexing -- see the icache comment in embkfs.h. The constant
+     * is the 64-bit Fibonacci ratio, which is the standard choice for exactly
+     * this: it spreads the high bits of a sequential id into the low ones. */
+    unsigned slot = (unsigned)(((oid * 0x9E3779B97F4A7C15ULL) >> 40) %
+                               (sizeof vol->icache / sizeof vol->icache[0]));
 
     if (vol->icache[slot].valid && vol->icache[slot].oid == oid &&
         vol->icache[slot].gen == vol->generation) {
