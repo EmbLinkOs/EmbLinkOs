@@ -183,9 +183,26 @@ of this commit — is a programming language.
    the shell has no `each`-over-a-command and no way to write a higher-order
    pipeline stage. Less urgent than it was: `for f in $(glob "*.tmp") { ... }`
    covers most of what `each` would have been for.
-5. **No users, and no permissions that are enforced.** There is a login and a
-   namespace-confined session, and authority is real — but `chmod` bits are
-   recorded and not checked, and there is one human.
+5. **One human.** Authority is *not* the gap here, and an earlier version of
+   this list said it was, which was wrong. Permission in this OS is
+   object-based and it **is** enforced, in three layers:
+   - **Namespaces** — a process resolves paths only from roots it was *handed*.
+     An unbound prefix is `ENOENT` (absence, not "denied"), `..` can never climb
+     above a binding root, and a read-only binding refuses writes.
+   - **Handles** — unforgeable references to a specific object. An operation on
+     a handle is handle-scoped and needs no re-check.
+   - **Capability classes** — gated at the *install points* where a handle is
+     obtained: `open`, socket creation, surface/window creation, audio, the
+     debugger. `test capgate` proves each both ways.
+
+   `chmod` bits are recorded and never checked, and that is **deliberate**:
+   they are metadata so ported software (git's `core.filemode`) behaves, not
+   the authority mechanism. Nothing should consult them.
+
+   What is genuinely missing is the *multi-user* part — one login, one person,
+   no per-user ownership of anything. Which matters far less here than it would
+   in a Unix, because a namespace already does what file ownership is usually
+   reached for.
 6. **No clipboard-grade interop between apps** beyond the system clipboard, and
    no drag and drop.
 7. **No sound input, no camera, no printing, no Bluetooth, no Wi-Fi.** Each is

@@ -2365,9 +2365,41 @@ int selftests_handle_command(const char *cmd)
             kprintf("[capgate] (FS case skipped: capfs.elf not on image)\n");
         }
 
+        /* (5..8) NETWORK and AUDIO -- gated in the kernel since sockets and the
+         * mixer existed, and until now proven by nothing.
+         *
+         * capnet probes BOTH in one run and returns the answers as BITS
+         * (1 = network, 2 = audio), which is what lets four spawns cover every
+         * combination -- including the case a single-class witness cannot see:
+         * that holding ONE class does not accidentally grant the OTHER. A gate
+         * that read the wrong bit would pass every one-class test ever
+         * written. */
+        const char *np = "/data/apps/capnet/capnet.elf";
+        if (vfs_stat(np, &st) == 0) {
+            char *na[] = { (char *)np, NULL };
+            const uint64_t NET = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+            const uint64_t AUD = EMBK_CAP_BIT(EMBK_CAP_AUDIO);
+            struct { const char *what; uint64_t caps; int want; } ncases[] = {
+                { "neither",      0,         0 },
+                { "network only", NET,       1 },
+                { "audio only",   AUD,       2 },
+                { "both",         NET | AUD, 3 },
+            };
+            for (unsigned i = 0; i < 4; i++) {
+                int pid = process_create_caps(np, na, 1, env, NULL, 0, ncases[i].caps);
+                int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+                int good = (rc == ncases[i].want);
+                kprintf("[capgate] capnet %-13s exit=%d (want %d: bit0=net bit1=audio)%s\n",
+                        ncases[i].what, rc, ncases[i].want, good ? "" : "  <- FAIL");
+                if (!good) ok = 0;
+            }
+        } else {
+            kprintf("[capgate] (capnet.elf not on image: NETWORK/AUDIO gates untested)\n");
+        }
+
         kprintf("\n[cmd] test capgate: %s\n",
-                ok ? "OK -- GPU surface AND filesystem open gated on their caps, both ways "
-                     "(win_create/desktop share the proven GPU gate)"
+                ok ? "OK -- GPU, FILESYSTEM, NETWORK and AUDIO each gated on their own "
+                     "cap, both ways, and holding one grants no other"
                    : "FAIL");
         return 1;
     }
