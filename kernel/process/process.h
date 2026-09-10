@@ -1264,6 +1264,12 @@ int sched_timeline_snapshot(struct sched_event_view *out, int max);
  * process_* affect every thread of the pid; thread_* affect one thread_table
  * index. Return the number of threads changed, or -1 if the pid/tid is absent
  * or entirely protected. Self-locking. */
+/* Wake everything blocked in process_wait() on a child of `pid` -- "go and look
+ * again", which is all child_wait ever means. Used by ^Z: a suspended child
+ * never exits, so its parent's wait has to be told to re-check. Self-locking
+ * and IRQ-safe. */
+void process_wake_child_waiters(uint32_t pid);
+
 int process_suspend(uint32_t pid);
 int process_resume(uint32_t pid);
 int thread_suspend(uint32_t tid);

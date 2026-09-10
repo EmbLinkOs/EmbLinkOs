@@ -192,4 +192,13 @@
  * asking how much CPU it has itself used is asking about itself. */
 #define SYS_thread_cpu_ns  109  /* ()                       -> ns            */
 
+/* suspend(handle, resume) -- STOP a child, or start it again.
+ *
+ * The kernel could always freeze a process (the debugger needs it); there was
+ * no way for a shell to ask, which is why ^Z did not exist. Handle-scoped like
+ * kill and cancel: only a child you spawned. A stopped child keeps its memory,
+ * its fds and its handle, and its parent's wait() answers -EMBK_ESTOPPED
+ * instead of blocking on an exit that is not coming. */
+#define SYS_suspend       110   /* (handle, resume)         -> n | -err       */
+
 #endif /* _SYSCALL_NR_H_ */

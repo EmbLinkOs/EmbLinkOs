@@ -409,12 +409,33 @@ capabilities rather than fork/exec.
    full page and zero-padded, making 21 ms the smallest unit of audio the
    device could be given. `make test-audio-latency` runs the sweep.
 
-10. **Job control**, which is a scheduling and a signalling problem at once:
-   backgrounding a pipeline, listing what is running, bringing one to the
-   foreground, and interrupting it. Cancellation already exists as a polite
-   sticky flag — what is missing is the shell-side notion of a *job* and a way
-   to route the console's interrupt at one. See "What a user can actually do"
-   above; this is item 1 on that list.
+10. **Job control is finished.** `^Z`, `stop`, `bg` and `fg` all work, and the
+   piece that had to be built for them was in the kernel: a process could be
+   *interrupted* or *cancelled*, but a shell had no way to ask for one to be
+   **stopped**. `process_suspend()` had existed since the debugger needed it
+   and was reachable only from the kernel console.
+
+   The hard part was not freezing, it was waiting. A stopped process never
+   exits, so a parent blocked in `wait()` for its exit code waits for something
+   that is not coming — and a shell that suspends its own foreground job hangs
+   holding the console. `process_wait()` now answers `-EMBK_ESTOPPED`, a
+   distinct return rather than POSIX's `WIFSTOPPED` bitfield, because the
+   caller has to do something distinct: report the job as stopped and take its
+   prompt back, not decode a status for an exit code that does not exist yet.
+
+   `^Z` also has to wake a parent that is *already* blocked, which is why the
+   console remembers the **router** as well as the target — `^C` never needed
+   that, because its target dies or gives up and the wait ends on its own.
+
+   `test jobctl` covers all of it, including the case that would hang a shell:
+   a wait already in progress being released when the child stops. The
+   *keystroke decode* is not covered — `keyboard_deliver()` is reachable only
+   from a real keyboard, not the serial console the tests drive, the same
+   limitation `test interrupt` has and states.
+
+   Also added: a `sleep MS` builtin, in milliseconds, because a shell that can
+   pace a loop or hold a job open long enough to be worth stopping needs a unit
+   smaller than a second far more often than one larger.
 
 ## What a user can actually do
 
@@ -440,9 +461,12 @@ of this commit — is a programming language.
    cancellation, because a shell that routed ^C at itself under the old model
    took one keystroke and could never read a line again. `while` no longer
    needs its iteration ceiling.
-   - Still missing: `^Z`/`bg` (suspend and resume, which needs the kernel to
-     be able to *stop* a process rather than only interrupt or cancel it), and
-     interrupting a background job rather than only the foreground.
+   - ~~`^Z`/`bg`~~ **Done**, and it needed exactly what this said: the kernel
+     had to be able to *stop* a process, not only interrupt or cancel one. See
+     item 10 below for the part that was genuinely hard, which was not the
+     stopping but the waiting.
+   - Still missing: interrupting a *background* job rather than only the
+     foreground one.
 2. ~~**No globbing.**~~ **Done.** `glob "*.c"` returns a *table* with ls's
    columns, so it composes with every transform already written, and rows
    carry `path` so a loop can act on them. `*` does not cross `/`; a pattern

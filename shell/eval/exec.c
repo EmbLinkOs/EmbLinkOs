@@ -509,12 +509,54 @@ int jobs_start(const char *src) {
         return (int)h;
     }
 
-    j->id     = g_next_job_id++;
-    j->handle = (int)h;
-    j->cmd    = copy;
-    j->reaped = false;
-    j->status = 0;
+    j->id      = g_next_job_id++;
+    j->handle  = (int)h;
+    j->cmd     = copy;
+    j->reaped  = false;
+    j->status  = 0;
+    j->stopped = false;
     return j->id;
+}
+
+/* Take an already-running child into the table, stopped.
+ *
+ * ^Z on a foreground command is where this is needed: the child was never a
+ * job, it was an ordinary command, and it only became one when someone froze
+ * it. Everything else about it -- the handle, its fds, its memory -- is
+ * unchanged; all that happens here is that the shell starts remembering it by
+ * a number so `bg` and `fg` have something to name. */
+int jobs_adopt_stopped(int handle, const char *src) {
+    struct job *j = job_free_slot();
+    if (!j) return -EMFILE;
+
+    char *copy = strdup(src && *src ? src : "(command)");
+    if (!copy) return -ENOMEM;
+
+    j->id      = g_next_job_id++;
+    j->handle  = handle;
+    j->cmd     = copy;
+    j->reaped  = false;
+    j->status  = 0;
+    j->stopped = true;
+    return j->id;
+}
+
+int jobs_stop(struct job *j) {
+    if (!j || j->id == 0 || j->reaped) return -EINVAL;
+    if (j->stopped) return 0;                 /* already: not an error */
+    int64_t n = embk_suspend(j->handle);
+    if (n < 0) return (int)n;
+    j->stopped = true;
+    return 0;
+}
+
+int jobs_resume(struct job *j) {
+    if (!j || j->id == 0 || j->reaped) return -EINVAL;
+    if (!j->stopped) return 0;
+    int64_t n = embk_resume(j->handle);
+    if (n < 0) return (int)n;
+    j->stopped = false;
+    return 0;
 }
 
 /* Notice finished children. Called before anything reads the table, so `jobs`
@@ -524,6 +566,12 @@ void jobs_poll(void) {
     for (size_t i = 0; i < JOB_MAX; i++) {
         struct job *j = &g_jobs[i];
         if (j->id == 0 || j->reaped)
+            continue;
+        /* A STOPPED JOB IS ALIVE, and must not be waited for: embk_wait on it
+         * would answer -EMBK_ESTOPPED, which is not an exit code and must not
+         * be recorded as one. It is skipped entirely -- `bg` or `fg` is what
+         * changes its state, not a poll. */
+        if (j->stopped)
             continue;
         if (!embk_proc_alive(j->handle)) {
             j->status = (int)embk_wait(j->handle);
@@ -557,10 +605,27 @@ struct job *jobs_by_id(int id) {
 int jobs_wait(struct job *j) {
     if (!j || j->id == 0)
         return -EINVAL;
-    if (!j->reaped) {
-        j->status = (int)embk_wait(j->handle);
-        j->reaped = true;
+    if (j->reaped)
+        return j->status;
+
+    /* RESUME BEFORE WAITING. A stopped process is not going to exit, so a wait
+     * for its exit code would never return -- the kernel answers
+     * -EMBK_ESTOPPED rather than blocking, but the right thing to do about a
+     * job someone asked to wait for is to let it run. */
+    int rc = jobs_resume(j);
+    if (rc < 0) return rc;
+
+    int64_t code = embk_wait(j->handle);
+    if (code == -EMBK_ESTOPPED) {
+        /* Stopped again while we waited: someone pressed ^Z. Not reaped, not
+         * finished, still ours -- leave it in the table for `bg` or another
+         * `fg`, and tell the caller what happened rather than inventing an
+         * exit code it does not have. */
+        j->stopped = true;
+        return (int)code;
     }
+    j->status = (int)code;
+    j->reaped = true;
     return j->status;
 }
 

@@ -603,7 +603,20 @@ int keyboard_has_char(void) {
  * wins, the same class of concession as embk_proc_kill's ambient authority. */
 static volatile uint32_t g_console_int_target;   /* pid, or 0 for none */
 
+/* WHO DELEGATED, so ^Z has somewhere to report back to.
+ *
+ * ^C needs only a target: interrupt it, and the shell finds out because its
+ * wait returns when the child dies or gives up. ^Z is different -- the child
+ * does not die, it FREEZES, and a parent blocked waiting for it would wait
+ * forever for an exit that is never coming. So the router is remembered too,
+ * and suspending wakes it.
+ *
+ * Recorded at the same moment as the target and by the same call, so the two
+ * cannot disagree about who routed what. */
+static volatile uint32_t g_console_int_router;   /* pid that routed, or 0 */
+
 void keyboard_set_interrupt_target(uint32_t pid) { g_console_int_target = pid; }
+void keyboard_set_interrupt_router(uint32_t pid) { g_console_int_router = pid; }
 uint32_t keyboard_get_interrupt_target(void) { return g_console_int_target; }
 
 static void keyboard_deliver(char c) {
@@ -630,6 +643,40 @@ static void keyboard_deliver(char c) {
         }
         /* Nobody routed: fall through and hand ^C over as an ordinary byte
          * rather than silently swallowing a keystroke. */
+    }
+
+    /* ^Z: STOP the routed target rather than delivering a byte.
+     *
+     * The other half of "stop what you are doing". ^C says do not finish this;
+     * ^Z says finish it later. It needs the kernel to be able to freeze a
+     * process rather than only interrupt or cancel one -- which it has always
+     * been able to do (process_suspend, built for the debugger) and has never
+     * had a way to ask for from a keyboard.
+     *
+     * WAKING THE ROUTER IS NOT A COURTESY, IT IS THE WHOLE MECHANISM. The
+     * child does not exit, so the shell's process_wait() would block forever
+     * on an exit that is not coming. process_wake_child_waiters() makes it
+     * re-check, and process_wait() now answers -EMBK_ESTOPPED, which is how a
+     * shell gets its prompt back and can say "Stopped".
+     *
+     * Same lock reasoning as ^C above: both calls take g_sched_lock
+     * themselves and this runs in IRQ context, so neither may be made with it
+     * already held -- and by the standing invariant it never is. */
+    if (c == 0x1A) {
+        uint32_t target = g_console_int_target;
+        uint32_t router = g_console_int_router;
+        /* Suspending the SHELL ITSELF is not a job control operation, it is a
+         * way to wedge the console with one keystroke. A session owner that
+         * routed ^C at its own prompt (handle 0) is refused here and ^Z falls
+         * through as an ordinary byte. */
+        if (target && target != router) {
+            if (process_suspend(target) > 0) {
+                if (router) process_wake_child_waiters(router);
+                return;     /* consumed */
+            }
+        }
+        /* Nobody routed, or the target could not be frozen (every thread of it
+         * is pinned): hand ^Z over as a byte rather than pretending. */
     }
 
     sched_lock();

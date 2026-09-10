@@ -68,10 +68,30 @@ struct job {
     char *cmd;           /* the source text, for `jobs` to show */
     bool  reaped;        /* it has exited AND been waited for */
     int   status;        /* its exit code, once reaped */
+    /* STOPPED IS NOT FINISHED. A job frozen by ^Z or by `stop` still holds its
+     * memory, its fds and this handle; it simply is not being scheduled. It
+     * must never be waited for in that state -- a stopped process is not going
+     * to exit -- which is why `fg` resumes before it waits. */
+    bool  stopped;
 };
 
 /* Start one. Returns the job id, or a negative errno. */
 int  jobs_start(const char *src);
+
+/* Take an ALREADY-RUNNING child into the job table, marked stopped.
+ *
+ * This is what ^Z on a foreground command needs: the child was spawned as an
+ * ordinary foreground process, and only became a job when someone froze it.
+ * The handle transfers -- the caller must not wait on or close it afterwards.
+ * Returns the job id, or a negative errno (and the caller still owns the
+ * handle if it fails). */
+int  jobs_adopt_stopped(int handle, const char *src);
+
+/* Freeze a job, or let it go again. `bg` is resume-and-do-not-wait; `fg`
+ * resumes first and then waits, because waiting on a stopped process waits for
+ * an exit that is not coming. */
+int  jobs_stop(struct job *j);
+int  jobs_resume(struct job *j);
 
 /* How many slots are in use, and the i'th of them (NULL past the end).
  * `jobs_poll()` first: it notices finished children and marks them. */
@@ -80,7 +100,11 @@ size_t      jobs_count(void);
 struct job *jobs_at(size_t i);
 struct job *jobs_by_id(int id);
 
-/* Wait for a job to finish, returning its exit status. */
+/* Wait for a job to finish, returning its exit status.
+ *
+ * Resumes it first if it was stopped. Returns -EMBK_ESTOPPED if it stops again
+ * while being waited for (someone pressed ^Z), in which case the job is left
+ * in the table marked stopped rather than reaped. */
 int jobs_wait(struct job *j);
 
 /* Free a finished job's slot, after its exit status has been reported once. */

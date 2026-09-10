@@ -397,6 +397,35 @@ static inline int64_t embk_cancel(int handle) {
     return embk_syscall1(EMBK_SYS_cancel, handle);
 }
 
+/* The one errno a caller of embk_wait() has to recognise by name. Mirrors
+ * kernel/include/errno.h, which is the source of truth; guarded because other
+ * headers in this tree define the codes they need the same way. */
+#ifndef EMBK_ESTOPPED
+#define EMBK_ESTOPPED 129
+#endif
+
+/* ---------------------------------------------------------------------------
+ * STOP a child, and start it again. The ^Z half of job control.
+ *
+ * ^C says "do not finish this". ^Z says "finish it later": the child keeps its
+ * memory, its file descriptors and its place in your handle table, and simply
+ * stops being scheduled. Handle-scoped like embk_cancel and embk_proc_kill --
+ * a child you spawned, never an arbitrary pid.
+ *
+ * WHAT CHANGES FOR THE PARENT: embk_wait() on a stopped child returns
+ * -EMBK_ESTOPPED rather than blocking. It has to -- a stopped process is not
+ * going to exit, so a wait for its exit code would never return. Treat that
+ * return as "it is still there, frozen", not as a failure.
+ *
+ * Returns how many threads changed state; 0 means it was already in that state
+ * (or every thread of it is pinned and cannot be frozen). */
+static inline int64_t embk_suspend(int handle) {
+    return embk_syscall2(EMBK_SYS_suspend, handle, 0);
+}
+static inline int64_t embk_resume(int handle) {
+    return embk_syscall2(EMBK_SYS_suspend, handle, 1);
+}
+
 /* 1 if THIS process has been cancelled, 0 if not.
  *
  * For compute loops that make no syscalls -- with nothing injected, a process

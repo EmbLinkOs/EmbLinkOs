@@ -51,6 +51,27 @@
 #include "drivers/audio/ac97.h"
 #include "drivers/audio/audio.h" /* test audiostress: underrun accounting */
 
+/* The other half of the ^Z test below: something has to stop the child WHILE
+ * its parent is inside wait(). A kthread, because the parent is blocked and
+ * cannot do it itself -- which is the whole point of the case. */
+static volatile uint32_t g_jobctl_victim;
+static volatile uint32_t g_jobctl_parent;
+
+static void jobctl_stopper(void) {
+    /* Long enough for the parent to be genuinely blocked rather than merely
+     * on its way there. A stop that lands before the wait would be answered by
+     * the check at the top of process_wait() and would prove less. */
+    sched_sleep_ms(250);
+    uint32_t vic = g_jobctl_victim, par = g_jobctl_parent;
+    if (vic) {
+        process_suspend(vic);
+        if (par) process_wake_child_waiters(par);   /* what ^Z does */
+    }
+    process_exit_self(0);
+}
+
+
+
 static struct fat32_volume *g_fat32 = NULL;
 static bool g_has_fat32 = false;
 static bool g_vfs_ready = false;
@@ -396,6 +417,7 @@ static void selftests_print_commands(void)
     kprintf("  test audio\n");
     kprintf("  test audiostress\n");
     kprintf("  test policycost\n");
+    kprintf("  test jobctl\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -854,6 +876,186 @@ int selftests_handle_command(const char *cmd)
                     (unsigned long long)(k_ms / (k_ns ? k_ns : 1)));
 
         kprintf("[cmd] test policycost: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test jobctl -- can a job be STOPPED, and does everything still work
+     * while it is?
+     *
+     * ^C says "do not finish this". ^Z says "finish it later", and it needs
+     * something ^C never did: the kernel has to freeze a process rather than
+     * only interrupt or cancel one. It could always do that -- process_suspend
+     * was built for the debugger -- and there was simply no way for a shell to
+     * ask.
+     *
+     * THE PART THAT IS EASY TO GET WRONG is not the freezing, it is the
+     * waiting. A stopped process never exits, so a parent blocked in wait()
+     * for its exit code waits for something that is not coming, and the shell
+     * that suspended its own foreground job hangs holding the console. That is
+     * why process_wait() answers -EMBK_ESTOPPED, and it is what this asserts:
+     * not "suspend returns success" but "the parent gets its prompt back".
+     * ------------------------------------------------------------------- */
+    if (strcmp(cmd, "test jobctl") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test jobctl: VFS not registered\n");
+            return 1;
+        }
+        const char *sp = "/system/bin/shell.elf";
+        struct vfs_stat sst;
+        if (vfs_stat(sp, &sst) != EMBK_OK) {
+            kprintf("\n[cmd] test jobctl: %s not on image\n", sp);
+            return 1;
+        }
+
+        kprintf("\n[jobctl] a shell backgrounds a job, stops it, sees it stopped,\n");
+        kprintf("         resumes it and collects its exit code -- all of which\n");
+        kprintf("         happens INSIDE the child shell, so what is under test\n");
+        kprintf("         is the whole path and not a kernel call in isolation.\n");
+
+        /* TWO THINGS THE SHELL'S OWN GRAMMAR DECIDES, and both were got wrong
+         * before being read:
+         *
+         * `&` is a STATEMENT, not an expression -- `$(cmd &)` is refused,
+         * because a job that has just started has no value yet. And `first` /
+         * `last` return a TABLE of one row, not a record, so `.job` on one is
+         * an error. A `for` over the table is how a person gets at a row, and
+         * it is what these do.
+         *
+         * Every case cleans up after itself: a stopped job left behind when
+         * the child shell exits is a frozen process nothing will ever name. */
+        struct { const char *what; const char *src; int want; } cases[] = {
+            /* The shape of the thing: start, stop, look, resume, collect. The
+             * sleep is what makes the stop meaningful -- a job that has already
+             * finished cannot be frozen, and a test that stopped one would be
+             * asserting nothing. */
+            { "a job can be stopped and reports itself stopped",
+              "sleep 1200 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "stop $id\n"
+              "let st = \"\"\n"
+              "for row in $(jobs) { let st = $row.state }\n"
+              "bg $id\n"
+              "let r = $(fg $id)\n"
+              "if $st == \"stopped\" { return 0 } else { return 1 }", 0 },
+
+            /* THE ASSERTION THAT MATTERS. Without -EMBK_ESTOPPED the fg below
+             * never returns and the case times out rather than failing. */
+            { "bg lets it go again and fg collects its exit code",
+              "sleep 600 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "stop $id\n"
+              "bg $id\n"
+              "let r = $(fg $id)\n"
+              "if $r.exit == 0 { return 0 } else { return 1 }", 0 },
+
+            /* fg on a STOPPED job must resume it first. Waiting for a frozen
+             * process to exit is waiting for something that is not coming, and
+             * this is the case where a shell would hang forever. */
+            { "fg resumes a stopped job rather than waiting forever",
+              "sleep 600 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "stop $id\n"
+              "let r = $(fg $id)\n"
+              "if $r.exit == 0 { return 0 } else { return 1 }", 0 },
+
+            /* A stopped job is ALIVE, and the poll that `jobs` does first must
+             * not mistake it for a corpse and try to reap it -- a wait on a
+             * stopped process answers ESTOPPED, and that is not an exit code.
+             * If it did, the job would vanish from the table between the two
+             * counts. */
+            { "polling jobs does not reap a stopped one",
+              "sleep 1200 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "stop $id\n"
+              "let a = $(jobs | count)\n"
+              "let b = $(jobs | count)\n"
+              "bg $id\n"
+              "let r = $(fg $id)\n"
+              "if $a == $b { return 0 } else { return 1 }", 0 },
+
+            /* A job that has been collected is GONE -- `fg` frees the slot
+             * once it has reported an exit code. Stopping it afterwards names
+             * nothing, and saying so beats a silent no-op that reads as
+             * success. */
+            { "stopping an already-collected job is refused",
+              "sleep 50 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "let r = $(fg $id)\n"
+              "stop $id", 1 },
+
+            { "stop needs a job id",  "stop",   1 },
+            { "bg needs a job that exists", "bg 999", 1 },
+        };
+
+        int ok = 1;
+        for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char *a[] = { (char *)sp, "-c", (char *)cases[i].src, NULL };
+            int pid = process_create(sp, a, 3, NULL, 0);
+            int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+            int good = (rc == cases[i].want);
+            if (!good) ok = 0;
+            kprintf("  [%s] %s (exit %d, want %d)\n",
+                    good ? "ok" : "FAIL", cases[i].what, rc, cases[i].want);
+        }
+
+        /* ------------------------------------------------------------------
+         * AND THE PART THE SHELL CASES ABOVE CANNOT REACH: a parent that is
+         * ALREADY BLOCKED in wait() when its child is stopped.
+         *
+         * That is the ^Z path, and it is the one that hangs a shell if it is
+         * wrong. `stop N` above always runs while the shell is at its prompt;
+         * ^Z arrives while it is waiting for a foreground command, and unless
+         * the wait is released and answers ESTOPPED, the console is gone for
+         * good.
+         *
+         * The KEYSTROKE is not covered here -- keyboard_deliver() is reachable
+         * only from a real keyboard, not from the serial console these tests
+         * drive, which is the same limitation `test interrupt` has and says
+         * so. What is covered is everything that keystroke does: suspend the
+         * target, wake the router, and see what the router's wait() answers.
+         * ---------------------------------------------------------------- */
+        {
+            char *a[] = { (char *)sp, "-c", "sleep 5000", NULL };
+            int vic = process_create(sp, a, 3, NULL, 0);
+            if (vic < 0) {
+                kprintf("  [FAIL] could not spawn the victim shell\n");
+                ok = 0;
+            } else {
+                /* Let it get past startup, so the stop lands on a process that
+                 * is genuinely running rather than one still being linked. */
+                timer_delay_ms(500);
+
+                g_jobctl_victim = (uint32_t)vic;
+                g_jobctl_parent = current_process ? current_process->pid : 0;
+                struct thread *kt = process_create_kthread(jobctl_stopper, NULL);
+
+                /* Blocks. The kthread above suspends the child and wakes us --
+                 * without that, this line never returns and the test hangs,
+                 * which is exactly what a shell would do. */
+                int rc = kt ? process_wait((uint32_t)vic) : 0;
+
+                kprintf("  [%s] a wait already in progress is released when the\n"
+                        "       child stops, and says so (rc %d, want %d)\n",
+                        rc == -EMBK_ESTOPPED ? "ok" : "FAIL",
+                        rc, -EMBK_ESTOPPED);
+                if (rc != -EMBK_ESTOPPED) ok = 0;
+
+                /* Clean up: a frozen process that nothing will ever name again
+                 * is exactly the leak this feature must not create. */
+                process_resume((uint32_t)vic);
+                process_kill((uint32_t)vic);
+                (void)process_wait((uint32_t)vic);
+                g_jobctl_victim = 0;
+            }
+        }
+
+        kprintf("[cmd] test jobctl: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

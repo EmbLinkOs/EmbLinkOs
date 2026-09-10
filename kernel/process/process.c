@@ -1324,6 +1324,35 @@ retry:
             return -EMBK_ECHILD;
         }
 
+        /* STOPPED IS NOT FINISHED, and waiting for a stopped process to exit
+         * is waiting for something that is not going to happen. ^Z at the
+         * console suspends the routed child; a debugger freezes one. Either
+         * way the parent has to get its prompt back and say so, which it
+         * cannot do from inside a block that nothing will ever end.
+         *
+         * CHECKED AFTER THE ZOMBIE SCAN, deliberately, and for the same reason
+         * the cancellation check above is: if the child has already exited its
+         * status is a real result and the caller gets it. A process cannot be
+         * both, but the ordering is what guarantees that rather than a claim
+         * about it.
+         *
+         * Every thread suspended means the process is stopped. One of several
+         * suspended is a debugger freezing a single thread, which is not a
+         * stopped JOB and must not take the parent's wait away. */
+        if (target->live_thread_count > 0) {
+            int frozen = 0, live = 0;
+            for (struct thread *t = target->thread_list; t; t = t->proc_thread_next) {
+                if (t->state == PROCESS_ZOMBIE || t->state == PROCESS_UNUSED)
+                    continue;
+                live++;
+                if (t->suspended) frozen++;
+            }
+            if (live > 0 && frozen == live) {
+                spin_unlock(&g_sched_lock);
+                return -EMBK_ESTOPPED;
+            }
+        }
+
         /* It's our child and still running/ready/blocked -- block until
          * SOME child of ours exits (child_wait doesn't say which), then
          * loop back and re-check. Harmless if it wasn't this pid: we just
@@ -1741,6 +1770,21 @@ static int set_process_suspended(uint32_t pid, bool val) {
     spin_unlock(&g_sched_lock);
     return n;
 }
+/* Wake everything blocked in process_wait() on `pid`'s children.
+ *
+ * The wake itself says nothing -- child_wait never says WHICH child -- so this
+ * is only ever "go and look again". That is exactly what is needed when a child
+ * has been suspended rather than has exited: the waiter re-checks, finds it
+ * frozen, and gets -EMBK_ESTOPPED instead of blocking on an exit that is not
+ * coming. Called from the keyboard IRQ, so it takes the lock itself and does
+ * nothing that can sleep. */
+void process_wake_child_waiters(uint32_t pid) {
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    if (p) wait_queue_wake_all(&p->child_wait);
+    spin_unlock(&g_sched_lock);
+}
+
 int process_suspend(uint32_t pid) { return set_process_suspended(pid, true); }
 int process_resume(uint32_t pid)  { return set_process_suspended(pid, false); }
 

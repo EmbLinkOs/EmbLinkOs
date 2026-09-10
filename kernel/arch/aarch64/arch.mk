@@ -691,11 +691,27 @@ ARM_SMP     ?= 4
 # CPU actually did and HVF offers no equivalent, so `run-arm64-tcg` stays one
 # word away. More to the point, the two disagree in ways that find bugs: A3's
 # level-triggered-interrupt ordering error was invisible under TCG and obvious
-# under HVF. That is why test-arm64-boot runs BOTH where both exist.
+# under HVF.
+#
+# BUT IT IS NOT IN THE DEFAULT RUN ANY MORE, on a host that has HVF. TCG is
+# roughly ten times slower than the hardware it pretends to be, and as the boot
+# self-test grew -- the scheduler A/B alone runs `jitter` twice against six
+# threads that never sleep -- a TCG pass stopped being a statement about the
+# kernel and became a statement about how long the harness was willing to wait.
+# It reports a run that ended early as eleven unrelated marker failures, which
+# is worse than useless: it is misleading. Every one of those in this repo's
+# history has been the clock, not a bug.
+#
+# It is one word away when it is wanted, and that word is worth typing when
+# touching interrupts, the GIC, or anything where the two might disagree:
+#
+#     ARM_TEST_ACCELS="hvf tcg" make ARCH=aarch64 test-arm64-boot
+#
+# On a host with no HVF, TCG is still the only opinion available and is used.
 ARM_HOST_ARCH := $(shell uname -m)
 ifeq ($(UNAME_S)-$(ARM_HOST_ARCH),Darwin-arm64)
 ARM_ACCEL       ?= hvf
-ARM_TEST_ACCELS ?= hvf tcg
+ARM_TEST_ACCELS ?= hvf
 else
 ARM_ACCEL       ?= tcg
 ARM_TEST_ACCELS ?= tcg
@@ -773,6 +789,17 @@ debug-arm64: $(ARM_IMG) $(ARM_ROOTFS)
 # is absent unless someone installed gtimeout. Backgrounding qemu and killing it
 # is portable to both hosts -- the same rule the top-level Makefile applies to
 # stat and truncate.
+#
+# THE BUDGETS ARE MEASURED, and overridable (ARM_TCG_SECS / ARM_HVF_SECS)
+# because a slower host is a real thing and a hardcoded number is not
+# debuggable. TCG was 90 seconds for a long time and quietly became marginal as
+# the self-test grew -- the scheduler A/B alone runs `jitter` twice against six
+# threads that never sleep. Bisected: it stops in the same place at 90, 100,
+# 105 and 120 and completes at 115 and 170, i.e. it needs a little over 100 and
+# the old budget was sometimes enough and sometimes not. 150 is that with room
+# for a loaded host. A run that ends early does not report a timeout, it
+# reports every marker after that point as missing -- which reads as eleven
+# unrelated failures and is why this is worth writing down.
 # Each accelerator boots a COPY of the root filesystem, never the original.
 # posixdemo WRITES -- mkdir, create, rename, unlink -- so a run mutates the
 # image, and without a scratch copy the second accelerator inherits the first
@@ -784,7 +811,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	for acc in $(ARM_TEST_ACCELS); do \
 	  case $$acc in \
 	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=$${ARM_HVF_SECS:-40};;  \
-	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=$${ARM_TCG_SECS:-90};; \
+	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=$${ARM_TCG_SECS:-150};; \
 	  esac; \
 	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \
 	  echo "=== $$acc ==="; \

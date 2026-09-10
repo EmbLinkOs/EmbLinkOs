@@ -946,11 +946,13 @@ static int64_t sys_console_interrupt_route(const struct sysargs *a) {
     if (handle == 0) {                       /* route to SELF: the session owner
                                               * claiming ^C at its own prompt */
         keyboard_set_interrupt_target(current_process->pid);
+        keyboard_set_interrupt_router(current_process->pid);
         return 0;
     }
 
     if (handle < 0) {
         keyboard_set_interrupt_target(0);   /* reclaim: ^C is a byte again */
+        keyboard_set_interrupt_router(0);
         return 0;
     }
 
@@ -961,7 +963,36 @@ static int64_t sys_console_interrupt_route(const struct sysargs *a) {
     }
 
     keyboard_set_interrupt_target(pid);
+    /* And who handed it over, so ^Z has somewhere to report the stop back to. */
+    keyboard_set_interrupt_router(current_process->pid);
     return 0;
+}
+
+/* suspend(handle, resume) -> stop the child named by `handle`, or start it
+ * again. Returns how many of its threads changed state.
+ *
+ * HANDLE-SCOPED, exactly like sys_kill and sys_cancel and for the same reason:
+ * you may only stop a child YOU spawned. Freezing a process you were never
+ * handed is ambient authority over someone else's work, which is the property
+ * this OS refuses.
+ *
+ * The kernel has been able to do this since the debugger needed it; what did
+ * not exist was a way for a shell to ask. A stopped child keeps everything it
+ * had -- its memory, its fds, its place in its parent's handle table -- and its
+ * parent's process_wait() answers -EMBK_ESTOPPED rather than blocking on an
+ * exit that is not coming.
+ *
+ * A process whose every thread is pinned cannot be frozen (freezing a core's
+ * fallback context would take that core's guarantee away), and this returns 0
+ * changed rather than pretending. */
+static int64_t sys_suspend(const struct sysargs *a) {
+    int handle = (int)a->arg[0];
+
+    uint32_t pid;
+    int rc = process_handle_resolve(current_process, handle, &pid);
+    if (rc != 0) return rc;   /* -EMBK_EINVAL: not a child of yours */
+
+    return a->arg[1] ? process_resume(pid) : process_suspend(pid);
 }
 
 /* getpid() -> this process's pid. Trivial, but a real primitive a spawn()
@@ -2087,6 +2118,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_cancel]       = sys_cancel,
     [SYS_cancelled]    = sys_cancelled,
     [SYS_console_interrupt_route] = sys_console_interrupt_route,
+    [SYS_suspend]        = sys_suspend,
     [SYS_rename]       = sys_rename,
     [SYS_ftruncate]    = sys_ftruncate,
     [SYS_chmod]        = sys_chmod,

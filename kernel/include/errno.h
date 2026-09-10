@@ -60,6 +60,21 @@
 #define EMBK_EINPROGRESS  115   // non-blocking connect() started, not yet complete
 #define EMBK_EPROTO       71    // protocol error (EmbLink UI Piece 2: HELLO version mismatch)
 
+/* THE CHILD STOPPED RATHER THAN EXITED, and that is not a failure.
+ *
+ * process_wait() returns this when the process it is waiting for has been
+ * SUSPENDED -- by ^Z at the console, or by a debugger. It is the difference
+ * between "it finished" and "it is still there, frozen", and without it a shell
+ * that suspends its foreground job waits forever for something that is never
+ * going to exit.
+ *
+ * POSIX folds this into the status word (WIFSTOPPED) and makes every caller
+ * decode a bitfield to notice. It is a distinct return here because the caller
+ * has to do something distinct: report the job as stopped and take its prompt
+ * back, not collect an exit code that does not exist yet. 129 is unused by
+ * every other value in this file. */
+#define EMBK_ESTOPPED    129   // the awaited process is suspended, not finished
+
 // Helper: turn an error code into a short human-readable string.
 // Returns a static string; never NULL.
 const char *embk_strerror(int err);

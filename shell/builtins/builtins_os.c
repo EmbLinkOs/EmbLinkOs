@@ -828,7 +828,10 @@ static struct value bi_jobs(const struct command *cmd, struct value input,
 
         struct value row = value_record();
         value_record_set(&row, "job",   value_int(j->id));
-        value_record_set(&row, "state", value_string(j->reaped ? "done" : "running"));
+        value_record_set(&row, "state",
+                         value_string(j->reaped  ? "done"
+                                    : j->stopped ? "stopped"
+                                                 : "running"));
         value_record_set(&row, "exit",  j->reaped ? value_int(j->status) : value_null());
         value_record_set(&row, "cmd",   value_string(j->cmd ? j->cmd : ""));
         value_table_push_row(&out, row);
@@ -839,34 +842,151 @@ static struct value bi_jobs(const struct command *cmd, struct value input,
     return out;
 }
 
+/* Resolve the single job-id argument the three job commands share. Returns
+ * NULL and fills `err` when the argument is not a job id or names nothing. */
+static struct job *job_arg(const struct command *cmd, struct scope *env,
+                           const char *who, struct value *err) {
+    if (cmd->nargs != 1) {
+        char m[64]; snprintf(m, sizeof m, "%s takes one job id", who);
+        *err = value_error(m);
+        return NULL;
+    }
+    struct value idv = expr_eval(cmd->args[0], env);
+    if (idv.type == VAL_ERROR) { *err = idv; return NULL; }
+    if (idv.type != VAL_INT) {
+        value_free(&idv);
+        char m[64]; snprintf(m, sizeof m, "%s takes a job id", who);
+        *err = value_error(m);
+        return NULL;
+    }
+    int id = (int)idv.u.i;
+    value_free(&idv);
+
+    struct job *j = jobs_by_id(id);
+    if (!j) { *err = value_error("no such job"); return NULL; }
+    return j;
+}
+
+/* `stop N` -- freeze job N where it stands.
+ *
+ * The same thing ^Z does to a foreground command, addressed at a job by name.
+ * A stopped job keeps everything: its memory, its open files, its place in
+ * this shell's handle table. It is simply not scheduled until `bg` or `fg`. */
+static struct value bi_stop(const struct command *cmd, struct value input,
+                            struct scope *env) {
+    value_free(&input);
+    struct value err = value_null();
+    struct job *j = job_arg(cmd, env, "stop", &err);
+    if (!j) return err;
+
+    if (j->reaped) return value_error("that job has already finished");
+    int rc = jobs_stop(j);
+    if (rc < 0) return value_error("could not stop that job");
+
+    struct value out = value_record();
+    value_record_set(&out, "job",   value_int(j->id));
+    value_record_set(&out, "state", value_string("stopped"));
+    value_record_set(&out, "cmd",   value_string(j->cmd ? j->cmd : ""));
+    return out;
+}
+
+/* `bg N` -- let a stopped job carry on, without waiting for it.
+ *
+ * The difference from `fg` is the waiting, not the scheduling: both resume it,
+ * and only `fg` blocks. A job that was already running is left alone rather
+ * than reported as an error -- "carry on" is already true of it. */
+static struct value bi_bg(const struct command *cmd, struct value input,
+                          struct scope *env) {
+    value_free(&input);
+    struct value err = value_null();
+    struct job *j = job_arg(cmd, env, "bg", &err);
+    if (!j) return err;
+
+    if (j->reaped) return value_error("that job has already finished");
+    int rc = jobs_resume(j);
+    if (rc < 0) return value_error("could not resume that job");
+
+    struct value out = value_record();
+    value_record_set(&out, "job",   value_int(j->id));
+    value_record_set(&out, "state", value_string("running"));
+    value_record_set(&out, "cmd",   value_string(j->cmd ? j->cmd : ""));
+    return out;
+}
+
 /* `fg N` -- wait for job N and hand back its exit status.
  *
  * Not "bring it to the foreground" in the terminal sense: there is no terminal
  * ownership to transfer, because a background job here is a separate shell
  * with its own stdio. What a person actually wants from `fg` is "block until
  * that finishes", and that is what this does -- honestly named for what it
- * gives rather than borrowed from a mechanism this OS does not have. */
+ * gives rather than borrowed from a mechanism this OS does not have.
+ *
+ * A STOPPED JOB IS RESUMED FIRST. Waiting for a frozen process to exit is
+ * waiting for something that is not going to happen, and `fg` on a job you
+ * just suspended is the most ordinary thing anyone would type. */
 static struct value bi_fg(const struct command *cmd, struct value input,
                           struct scope *env) {
     value_free(&input);
-    if (cmd->nargs != 1)
-        return value_error("fg takes one job id");
+    struct value err = value_null();
+    struct job *j = job_arg(cmd, env, "fg", &err);
+    if (!j) return err;
 
-    struct value idv = expr_eval(cmd->args[0], env);
-    if (idv.type == VAL_ERROR) return idv;
-    if (idv.type != VAL_INT) { value_free(&idv); return value_error("fg takes a job id"); }
-    int id = (int)idv.u.i;
-    value_free(&idv);
-
-    struct job *j = jobs_by_id(id);
-    if (!j) return value_error("no such job");
-
+    int id = j->id;
     int status = jobs_wait(j);
+
+    /* Stopped AGAIN while we waited: someone pressed ^Z. It is not finished
+     * and has no exit code, so say what happened and leave it in the table. */
+    if (status == -EMBK_ESTOPPED) {
+        struct value out = value_record();
+        value_record_set(&out, "job",   value_int(id));
+        value_record_set(&out, "state", value_string("stopped"));
+        value_record_set(&out, "cmd",   value_string(j->cmd ? j->cmd : ""));
+        return out;
+    }
+
     struct value out = value_record();
     value_record_set(&out, "job",  value_int(id));
     value_record_set(&out, "exit", value_int(status));
     value_record_set(&out, "cmd",  value_string(j->cmd ? j->cmd : ""));
     jobs_forget(j);
+    return out;
+}
+
+/* `sleep MS` -- wait, and give back how long it actually took.
+ *
+ * Milliseconds, not seconds. A shell that can pace a loop, poll for something,
+ * or hold a job open long enough to be worth stopping needs a unit smaller
+ * than a second far more often than it needs one larger, and `sleep 1000` says
+ * what it means. Returning the measured elapsed time rather than nothing makes
+ * it composable and makes oversleeping visible instead of invisible.
+ *
+ * Interruptible: ^C during a sleep gives the shell back, because the sleep is
+ * a blocking syscall and cancellation is what those answer. */
+static struct value bi_sleep(const struct command *cmd, struct value input,
+                             struct scope *env) {
+    value_free(&input);
+    if (cmd->nargs != 1)
+        return value_error("sleep takes a number of milliseconds");
+
+    struct value msv = expr_eval(cmd->args[0], env);
+    if (msv.type == VAL_ERROR) return msv;
+    if (msv.type != VAL_INT) {
+        value_free(&msv);
+        return value_error("sleep takes a number of milliseconds");
+    }
+    int64_t ms = msv.u.i;
+    value_free(&msv);
+    if (ms < 0) return value_error("sleep cannot go backwards");
+
+    uint64_t t0 = embk_uptime_ms();
+    int rc = embk_sleep_ms((uint64_t)ms);
+    uint64_t took = embk_uptime_ms() - t0;
+
+    if (rc < 0) return value_error("sleep was interrupted");
+
+    struct value out = value_record();
+    value_record_set(&out, "ms",   value_int(ms));
+    value_record_set(&out, "took", value_int((int64_t)took));
     return out;
 }
 
@@ -918,11 +1038,13 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "ps",     bi_ps     }, { "kill",   bi_kill   },
         { "env",    bi_env    },
         { "uptime", bi_uptime }, { "date",   bi_date   },
+        { "sleep",  bi_sleep  },
         { "whoami", bi_whoami }, { "hostname", bi_hostname },
         { "history", bi_history }, { "which", bi_which },
         { "clip",    bi_clip    },
         { "clear",  bi_clear  },
         { "jobs",   bi_jobs   }, { "fg",     bi_fg     },
+        { "bg",     bi_bg     }, { "stop",   bi_stop   },
         { "glob",   bi_glob   },
         { "ln",     bi_ln     }, { "readlink", bi_readlink },
     };
