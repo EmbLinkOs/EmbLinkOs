@@ -374,15 +374,6 @@ static void worker(int id) {
 static void worker_a(void) { worker(1); }
 static void worker_b(void) { worker(2); }
 
-/* The post-EOI hook once userland is live. Timed sleeps are woken BEFORE the
- * next thread is chosen -- otherwise a thread whose deadline passed on this
- * very tick waits a whole extra quantum to be noticed. x86 does the same thing
- * in lapic_timer_handler(); this is the aarch64 half of the same seam. */
-static void sched_tick_then_schedule(void) {
-    sched_timer_tick();
-    schedule();
-}
-
 static void selftest_preemption(void) {
     uint64_t start = timer_get_ticks();
     uint64_t ms0   = timer_uptime_ms();
@@ -820,7 +811,7 @@ void arch_early_main(uint64_t dtb_phys) {
             kprintf("  [FAIL] could not adopt the boot context as a thread\n");
             selftest_fails++;
         } else {
-            gic_set_post_eoi(sched_tick_then_schedule);
+            gic_set_post_eoi(schedule);
 
     /* --- the user-copy recovery guard ---------------------------------------
      * Proven by CAUSING the fault it exists for. access_ok() cannot be made to

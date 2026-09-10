@@ -1224,4 +1224,72 @@ static inline void embk_mutex_unlock(embk_mutex *m) {
         (void)embk_futex(&m->state, EMBK_FUTEX_WAKE, 1);
 }
 
+/* ---------------------------------------------------------------------------
+ * CONDITION VARIABLES -- waiting for a STATE, not for a lock.
+ *
+ * A mutex answers "may I touch this yet". It cannot answer "has it become
+ * what I need", and that is what almost every piece of concurrent code
+ * actually wants: a consumer waiting for an item, a worker waiting for a job,
+ * a thread waiting for shutdown. Without one, the only way to express it is to
+ * take the lock, look, drop the lock, and try again -- a poll loop that burns
+ * a core to discover nothing changed.
+ *
+ * A SEQUENCE NUMBER IS THE WHOLE IMPLEMENTATION. The counter is not the state
+ * anyone cares about; it exists so a waiter can say "sleep unless something
+ * has been signalled since I looked". Read it BEFORE dropping the mutex, and
+ * the dangerous window closes: if a signal lands between the unlock and the
+ * futex call, the counter has already moved, the kernel's compare fails, and
+ * the wait returns immediately instead of sleeping through the event it was
+ * waiting for. That lost wakeup is the entire difficulty of condition
+ * variables, and this is where it is prevented.
+ *
+ * SPURIOUS WAKEUPS ARE PART OF THE CONTRACT, not a defect to be papered over.
+ * A wake means "the state MAY have changed"; it never means it did. Every
+ * caller must re-check its own condition in a loop:
+ *
+ *     embk_mutex_lock(&m);
+ *     while (!ready)                     // while, never if
+ *         embk_cond_wait(&c, &m);
+ *     ... consume ...
+ *     embk_mutex_unlock(&m);
+ *
+ * Writing `if` there is the classic bug, and it is silent: it works until the
+ * day two waiters are woken by one signal and the second finds nothing.
+ */
+typedef struct { volatile uint32_t seq; } embk_cond;
+
+#define EMBK_COND_INIT { 0 }
+
+static inline void embk_cond_init(embk_cond *c) { c->seq = 0; }
+
+/* Atomically release `m` and sleep until signalled; re-acquires `m` before
+ * returning. The mutex MUST be held on entry -- that is what makes the
+ * caller's check of its own condition and this wait a single indivisible
+ * step from any other thread's point of view. */
+static inline void embk_cond_wait(embk_cond *c, embk_mutex *m) {
+    /* Read the sequence WHILE STILL HOLDING THE MUTEX. Everything depends on
+     * this ordering: a signal cannot slip past between here and the sleep,
+     * because a signal moves the counter and the kernel refuses to sleep on a
+     * value that has changed. */
+    uint32_t seq = __atomic_load_n(&c->seq, __ATOMIC_RELAXED);
+
+    embk_mutex_unlock(m);
+    (void)embk_futex(&c->seq, EMBK_FUTEX_WAIT, seq);
+    embk_mutex_lock(m);
+}
+
+/* Wake ONE waiter. Correct only when any single waiter can make progress --
+ * which is not true of, say, a bounded queue with producers and consumers on
+ * one condition, where the one woken may be the wrong kind. Broadcast when in
+ * doubt: waking too many costs time, waking too few hangs. */
+static inline void embk_cond_signal(embk_cond *c) {
+    __atomic_fetch_add(&c->seq, 1, __ATOMIC_RELEASE);
+    (void)embk_futex(&c->seq, EMBK_FUTEX_WAKE, 1);
+}
+
+static inline void embk_cond_broadcast(embk_cond *c) {
+    __atomic_fetch_add(&c->seq, 1, __ATOMIC_RELEASE);
+    (void)embk_futex(&c->seq, EMBK_FUTEX_WAKE, 0x7FFFFFFF);
+}
+
 #endif /* __EMBK_H__ */

@@ -742,9 +742,11 @@ void sched_block_current_locked(struct wait_queue *wq);
  * docs/TODO.md; see the comment on the gate in process.c. */
 void sched_sleep_ms(uint64_t ms);
 
-/* Wake every thread whose deadline has passed. Called from the timer tick,
- * before schedule(). Takes g_sched_lock itself. */
-void sched_timer_tick(void);
+/* Expired sleepers are woken by schedule() itself, inside the critical section
+ * it picks the next thread in. There is deliberately no separate tick hook:
+ * taking g_sched_lock a second time on the tick path corrupted a resuming
+ * thread on four cores, because that lock is held across a context switch and
+ * released by whichever core resumes. See wake_expired_locked() in process.c. */
 
 /**
  * @brief Unconditionally terminate a process (every one of its threads),

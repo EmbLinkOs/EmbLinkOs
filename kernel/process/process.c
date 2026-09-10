@@ -753,15 +753,30 @@ void sched_sleep_ms(uint64_t ms) {
         /* KERNEL THREADS ONLY, and this is a measured limit rather than a
          * design choice.
          *
-         * Blocking a USER thread here and waking it from the timer tick
-         * corrupts its resume on aarch64: it comes back with a garbage link
-         * register (ELR_EL1 = 0x2a, the value of an unrelated register) and
-         * takes a PC-alignment fault at EL1. Bisected precisely -- with this
-         * gate in place the whole aarch64 acceptance suite passes, and with
-         * user threads allowed through it dies in posixdemo's clock tests,
-         * every time. Kernel threads take the identical path and are fine, so
-         * it is something about resuming a thread that must return through the
-         * EL0 exception path, not about the sleep queue.
+         * Letting USER threads block here corrupts a resume on aarch64: the
+         * thread comes back on a context that was not finished being saved and
+         * dies with a PC-alignment fault (garbage ELR) or an undefined
+         * instruction abort at EL1.
+         *
+         * THE FIRST DIAGNOSIS WAS WRONG and is worth recording as such. It
+         * read "kernel threads take the identical path and are fine, so it is
+         * something about the EL0 exception path". Re-tested since:
+         *
+         *   1 core  -- passes with this gate REMOVED
+         *   2 cores -- passes with this gate REMOVED
+         *   4 cores -- fails
+         *
+         * So it is not about user threads at all. It is a latent race in the
+         * block/resume path that four cores expose, and user threads merely
+         * make FREQUENT: the kernel's own sleepers block ten times a second,
+         * while every app calling sleep() blocks constantly. Kernel threads
+         * are not immune -- they are rare.
+         *
+         * That makes this gate a THROTTLE on a scheduler bug rather than a
+         * boundary around a broken path, and the real fix is in the switch
+         * itself. Not attempted blind: the next step is to find what two cores
+         * can do to one TCB between wait_queue_block() and the end of
+         * kernel_ctx_switch, which is a debugging job and not a patch.
          *
          * The honest consequence: sys_sleep_ms for a user process is still the
          * yield loop it always was, so a sleeping APP still keeps a core out of
@@ -790,18 +805,29 @@ void sched_sleep_ms(uint64_t ms) {
     }
 }
 
-void sched_timer_tick(void) {
-    /* Cheap out before taking the lock. The tick runs on every core at 100 Hz
-     * and the queue is empty most of the time; a lock acquisition per core per
-     * tick to discover that would be the exact kind of cost this whole change
-     * exists to remove. A racing insert is picked up on the next tick, 10 ms
-     * later, which no sleeper can tell from scheduling jitter. */
+/* Wake every sleeper whose deadline has passed. CALLER MUST HOLD g_sched_lock,
+ * and that requirement is the entire point of this function's shape.
+ *
+ * It used to take the lock itself, from the timer tick, immediately before
+ * schedule() took it again -- and that extra acquire/release on the tick path
+ * corrupted a resuming thread on four cores. g_sched_lock is HELD ACROSS a
+ * context switch and released by whichever core resumes next, so its saved
+ * interrupt flags are a single slot written by one core and consumed by
+ * another; process.c has a long comment on that hazard for exactly this
+ * reason. Adding a second lock/unlock cycle to the tick, between the switch
+ * and its release, was enough to break it: the symptom was a PC-alignment
+ * fault at EL1 with a garbage ELR -- a thread resumed onto a context that was
+ * not finished being saved.
+ *
+ * Folding the scan INTO schedule()'s existing critical section removes the
+ * cycle entirely. It is also simply better: one acquisition per tick instead
+ * of two, and the wake is now atomic with the scheduling decision that acts on
+ * it. */
+static void wake_expired_locked(void) {
     if (!g_sleep_wq.head)
-        return;
+        return;                        /* the common case, and now lock-free */
 
     uint64_t now = timer_uptime_ms();
-
-    sched_lock();
     struct thread *t = g_sleep_wq.head;
     while (t) {
         struct thread *next = t->wait_next;
@@ -812,7 +838,6 @@ void sched_timer_tick(void) {
         }
         t = next;
     }
-    sched_unlock();
 }
 
 /* --------------------------------------------------------------------
@@ -2271,6 +2296,11 @@ void schedule(void) {
      * theoretical one, on any kernel with more than one core actually
      * contending for this lock. */
     spin_lock(&g_sched_lock);
+    /* Inside the SAME critical section that is about to pick the next thread:
+     * a sleeper whose deadline just passed is a candidate for this very
+     * decision, and waking it in a separate one cost a corrupted resume (see
+     * wake_expired_locked). */
+    wake_expired_locked();
     schedule_locked();
 }
 

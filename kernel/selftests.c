@@ -6390,8 +6390,13 @@ int selftests_handle_command(const char *cmd)
         uint64_t waits = w1 - w0, wakes = k1 - k0, again = e1 - e0;
 
         int ok = 1;
-        kprintf("\n[futex] 4 threads x 2000 increments of one shared counter\n");
-        kprintf("  [%s] the total is EXACT (exit %d; 1 = lost updates)\n",
+        kprintf("\n[futex] phase 1: 4 threads x 2000 increments of one counter\n");
+        kprintf("        phase 2: a bounded queue, 2 producers + 2 consumers\n");
+        /* The exit code says WHICH phase failed, because "the concurrency test
+         * failed" is not a useful thing to be told:
+         *   1 = the mutex lost updates      3 = items were lost or duplicated
+         *   2 = a thread could not start    4 = the checksums disagree      */
+        kprintf("  [%s] both phases exact (exit %d; 1=mutex 3=count 4=checksum)\n",
                 rc == 0 ? "ok" : "FAIL", rc);
         if (rc != 0) ok = 0;
 

@@ -573,18 +573,41 @@ The measurement immediately earned itself twice:
 2. It showed every periodic thing in the kernel was a yield loop, which is why
    `sched_sleep_ms` exists at all.
 
-- [ ] **A user thread cannot block on the timer queue.** `sched_sleep_ms`
-  falls back to the yield loop for user threads, so a sleeping *app* still
-  keeps a core out of idle. Blocking one and waking it from the tick corrupts
-  its resume on aarch64: it comes back with `ELR_EL1 = 0x2a` (the value of an
-  unrelated register) and takes a PC-alignment fault at EL1. **Bisected
-  precisely**: with the gate in place the whole aarch64 acceptance suite
-  passes; with user threads allowed through it dies in posixdemo's clock tests,
-  every time, under both TCG and HVF. Kernel threads take the identical path
-  and are fine — so it is something about resuming a thread that must return
-  through the EL0 exception path, not about the sleep queue. **Repro:** remove
+- [ ] **A latent race in the block/resume path that four cores expose.**
+  `sched_sleep_ms` gates user threads back to a yield loop, so a sleeping *app*
+  still keeps a core out of idle. Removing the gate kills aarch64 with a
+  PC-alignment fault (garbage `ELR_EL1`) or an undefined-instruction abort at
+  EL1 — a thread resumed onto a context that was not finished being saved.
+
+  **The first diagnosis in this entry was wrong**, and the correction is the
+  useful part. It said "kernel threads take the identical path and are fine, so
+  it is something about the EL0 exception path". Re-tested since:
+
+  | cores | gate removed |
+  |---:|---|
+  | 1 | **passes** |
+  | 2 | **passes** |
+  | 4 | fails |
+
+  So it is not about user threads. It is a race in block/resume that four cores
+  expose, and user threads only make it FREQUENT — the kernel's own sleepers
+  block ten times a second, while every app calling `sleep()` blocks
+  constantly. Kernel threads are not immune, they are rare. The gate is a
+  throttle on a scheduler bug, not a boundary around a broken path.
+
+  One suspect has been ruled out: `sched_timer_tick` used to take
+  `g_sched_lock` on the tick path immediately before `schedule()` took it
+  again, which is genuinely dangerous (the lock is held across a context switch
+  and released by whichever core resumes, so its saved interrupt flags are one
+  slot written by one core and consumed by another). Folding the wake into
+  `schedule()`'s own critical section removed that cycle — a real improvement,
+  and not the cause.
+
+  **Next step:** find what two cores can do to one TCB between
+  `wait_queue_block()` and the end of `kernel_ctx_switch`. **Repro:** delete
   the `pml4_phys != vmm_get_kernel_pml4()` gate in `sched_sleep_ms`
-  (`kernel/process/process.c`) and run `make ARCH=aarch64 test-arm64-boot`.
+  (`kernel/process/process.c`) and run `make ARCH=aarch64 test-arm64-boot`;
+  `ARM_SMP=1` or `ARM_SMP=2` pass, which is the shape of the bug.
 - [ ] **No battery driver**, because the hardware this runs on has none.
   `power_supply_get()` answers false, which is a fact about the machine and not
   a stub; the driver interface is there for an ACPI `_BST`, an I2C fuel gauge,

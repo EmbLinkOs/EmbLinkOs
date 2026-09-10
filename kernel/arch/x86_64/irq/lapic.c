@@ -321,13 +321,8 @@ void lapic_timer_handler(void){
      * == NULL) or nothing else is runnable — same mechanism sys_exit already
      * uses to reach a different process's saved context via
      * kernel_ctx_switch, just triggered by the timer instead of a syscall. */
-    /* Wake anything whose sleep deadline has passed, BEFORE picking the next
-     * thread -- otherwise a thread that became runnable this very tick waits a
-     * full extra quantum for the next one to notice. Cheap when nothing is
-     * sleeping: it looks at one pointer and returns without taking a lock. */
-    extern void sched_timer_tick(void);
-    sched_timer_tick();
-
+    /* schedule() wakes expired sleepers itself, inside the same critical
+     * section it picks the next thread in -- see wake_expired_locked(). */
     extern void schedule(void);
     schedule();
 }
