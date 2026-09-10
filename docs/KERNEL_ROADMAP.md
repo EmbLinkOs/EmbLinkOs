@@ -129,6 +129,57 @@ capabilities rather than fork/exec.
    from numbers.
 5. **Deadline or reservation scheduling** for the compositor and audio, which
    are the two things whose lateness is immediately visible and audible.
+6. **Job control**, which is a scheduling and a signalling problem at once:
+   backgrounding a pipeline, listing what is running, bringing one to the
+   foreground, and interrupting it. Cancellation already exists as a polite
+   sticky flag — what is missing is the shell-side notion of a *job* and a way
+   to route the console's interrupt at one. See "What a user can actually do"
+   above; this is item 1 on that list.
+
+## What a user can actually do
+
+A kernel subsystem is not a capability. This section is the other axis, and it
+is the one to judge the project by: not "does it have a page cache" but "can a
+person sit down at this machine and get something done".
+
+**What is real today.** A graphical desktop with a compositor, windows, a dock
+and a top bar. A file manager, a text editor, a terminal, a settings app, a
+photo viewer, an MP3 player. A web engine with CSS, cookies and charset
+handling. A package manager that installs, verifies, updates and rolls back. A
+C compiler on the machine, a JavaScript engine, and `git clone`/`git push` over
+real TLS. Networking down to the Ethernet frame. A structured shell that — as
+of this commit — is a programming language.
+
+**What actually blocks a user**, in the order it hurts:
+
+1. **You cannot run two things at once from a shell, or stop one.** No
+   background jobs (`&`), no job control, no Ctrl-C into a running script. This
+   is why `while` needs an iteration ceiling: a runaway loop can only be ended
+   by resetting the machine. Everything else on this list is smaller than this
+   one.
+2. **No globbing.** `ls *.txt` is what a person types. `ls | where name =~
+   ".txt"` is the structured equivalent and works, but nobody reaches for it
+   first.
+3. **No symlinks.** Almost every ported build system assumes them, so this is
+   the quiet blocker behind "why won't this project build here".
+4. **Commands cannot be passed as values.** `def` makes a name, not a value, so
+   the shell has no `map`/`each`-over-a-command, and no way to write a
+   higher-order pipeline stage.
+5. **No users, and no permissions that are enforced.** There is a login and a
+   namespace-confined session, and authority is real — but `chmod` bits are
+   recorded and not checked, and there is one human.
+6. **No clipboard-grade interop between apps** beyond the system clipboard, and
+   no drag and drop.
+7. **No sound input, no camera, no printing, no Bluetooth, no Wi-Fi.** Each is
+   a driver and a service, and each is a day when the thing above it exists.
+
+The pattern is worth naming: items 1–4 are all *the system is not extensible or
+controllable by the person using it*. That is a different problem from "the
+kernel lacks a subsystem", and it is why the shell becoming a language came
+before the next kernel feature. A user who can write a command has a way to
+close gaps that nobody has to ship for them.
+
+---
 
 ## Where the design deliberately departs
 
