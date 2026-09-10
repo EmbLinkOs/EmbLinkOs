@@ -644,13 +644,59 @@ int vmm_map_in(uint64_t root_phys, uint64_t virt, uint64_t phys, uint64_t flags)
     return vm_map_page_in(root_phys, virt, phys, f) == PT_OK ? 0 : -1;
 }
 
+/* Is every entry in this table free? A table that describes nothing is 4 KiB
+ * of physical memory held for no reason. */
+static bool table_is_empty(uint64_t table_phys) {
+    const uint64_t *t = table_at(table_phys);
+    for (int i = 0; i < 512; i++)
+        if (t[i] & PTE_VALID)
+            return false;
+    return true;
+}
+
 void vmm_unmap_in(uint64_t root_phys, uint64_t virt) {
-    int err = PT_OK;
-    uint64_t *slot = walk_in(root_phys, virt, false, &err);
-    if (slot && (*slot & PTE_VALID)) {
-        *slot = 0;
-        tlb_flush_page(virt);
+    /* Remember each level's table on the way down, so the walk back up can
+     * free the ones this unmap just emptied. */
+    uint64_t *tbl = table_at(root_phys);
+    uint64_t *slots[3];
+    uint64_t  tables[3];
+
+    for (int level = 0; level < 3; level++) {
+        uint64_t *slot = &tbl[level_index(virt, level)];
+        if (!is_table(*slot, level))
+            return;                         /* nothing mapped here */
+        slots[level]  = slot;
+        tables[level] = *slot & PTE_ADDR_MASK;
+        tbl = table_at(tables[level]);
     }
+
+    uint64_t *leaf = &tbl[level_index(virt, 3)];
+    if (!(*leaf & PTE_VALID))
+        return;
+    *leaf = 0;
+    tlb_flush_page(virt);
+
+    /* RECLAIM THE TABLES THIS EMPTIED, deepest first.
+     *
+     * Without this, unmapping gives back the DATA pages and keeps every page
+     * table that described them -- three per region on a 4-level walk. A
+     * process that maps and unmaps repeatedly at fresh addresses leaks them
+     * forever, and the leak is invisible from userspace because the address
+     * space looks free. It showed up as munmap() returning 16 of the 19 pages
+     * an mmap() had taken.
+     *
+     * A table is freed only when EVERY entry in it is clear, so a mapping that
+     * shares a table with a live neighbour keeps it. Stop at the first level
+     * that is still in use: if the leaf's table survives, so does everything
+     * above it. */
+    for (int level = 2; level >= 0; level--) {
+        if (!table_is_empty(tables[level]))
+            break;
+        *slots[level] = 0;
+        __asm__ volatile("dsb ishst" ::: "memory");
+        pmm_free_page(tables[level]);
+    }
+    tlb_flush_page(virt);
 }
 
 uint64_t vmm_get_phys_in(uint64_t root_phys, uint64_t virt) {

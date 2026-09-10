@@ -19,6 +19,7 @@
 
 #include "include/syscall_abi.h"
 #include "include/usercopy.h"
+#include "mm/vma.h"        /* sys_mmap / sys_munmap */
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"   /* sys_read's copy_to_user fault-path diagnostic */
 #include "ipc/pipe.h"          /* sys_pipe: pipe_create */
@@ -1773,6 +1774,37 @@ static int64_t sys_audio_close(const struct sysargs *a) {
     return 0;
 }
 
+/* --- memory mappings ------------------------------------------------------
+ * mmap(len, prot, flags) -> address, or -errno.
+ *
+ * NO `addr` ARGUMENT AND NO fd. Both are deliberate omissions rather than
+ * unimplemented parameters: MAP_FIXED is refused (an address the caller
+ * chooses is an address the caller can collide with, and nothing here needs
+ * it), and file-backed mappings need a page cache that does not exist yet.
+ * Adding them as arguments that are ignored would be worse than not having
+ * them -- a caller passing a file descriptor and getting anonymous zeroes is
+ * a bug that surfaces a long way from the call.
+ *
+ * The one prot combination refused is WRITE|EXEC. See mm/vma.h. */
+static int64_t sys_mmap(const struct sysargs *a) {
+    struct process *p = current_thread ? current_thread->proc : 0;
+    if (!p)
+        return -EMBK_EPERM;
+    return vma_mmap(p, 0, (uint64_t)a->arg[0],
+                    (uint32_t)a->arg[1],
+                    (uint32_t)a->arg[2] | MAP_ANONYMOUS | MAP_PRIVATE);
+}
+
+/* munmap(addr, len) -> 0, or -errno. Unmapping a range that was never mapped
+ * is an ERROR, not a no-op: it is far more often a bug than idempotent
+ * cleanup, and a silent success there hides a double free of address space. */
+static int64_t sys_munmap(const struct sysargs *a) {
+    struct process *p = current_thread ? current_thread->proc : 0;
+    if (!p)
+        return -EMBK_EPERM;
+    return vma_munmap(p, (uint64_t)a->arg[0], (uint64_t)a->arg[1]);
+}
+
 static syscall_handler_t syscall_table[] = {
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -1861,6 +1893,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_audio_open]     = sys_audio_open,
     [SYS_audio_write]    = sys_audio_write,
     [SYS_audio_close]    = sys_audio_close,
+    [SYS_mmap]           = sys_mmap,
+    [SYS_munmap]         = sys_munmap,
     [SYS_win_desktop_front] = sys_win_desktop_front,
     [SYS_debug_attach]   = sys_debug_attach,
     [SYS_debug_wait]     = sys_debug_wait,

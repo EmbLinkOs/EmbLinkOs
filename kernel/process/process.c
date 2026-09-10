@@ -7,6 +7,7 @@
 #include "ipc/pipe.h"      /* struct pipe_end + fd_install_pipe target for SPAWN_ACTION_INSTALL_OBJ */
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "mm/vma.h"
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "include/kstring.h"
@@ -380,6 +381,12 @@ static void process_reap_slot(struct process *proc) {
      * OWNED by the compositor -- they must be unmapped here so the address-space
      * teardown below doesn't free them out from under the compositor. */
     compositor_reap_pid((int)proc->pid);
+
+    /* The mmap BOOKKEEPING. The pages themselves go with the address space
+     * below -- vmm_destroy_address_space() walks the tables and frees every
+     * frame under them -- but the vm_area records are kernel heap and would
+     * leak one allocation per mapping, forever, on every process exit. */
+    vma_destroy_all(proc);
 
     vmm_destroy_address_space(proc->pml4_phys);
 
@@ -1563,6 +1570,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     }
 
     proc->zombie_next = NULL;
+    proc->vma_list = 0;   /* no mappings until mmap() makes one */
     proc->zombie_head = NULL;
     proc->child_list = NULL;
     proc->child_next = NULL;

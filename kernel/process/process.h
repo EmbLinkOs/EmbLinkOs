@@ -26,6 +26,8 @@ struct debug_session;      /* process/debug.h — a pointer only, see cap_set */
  * purpose: every process needs at least one thread, and multithreaded
  * processes need more than one, so the thread table has to outgrow the
  * process table, not match it 1:1. */
+
+struct vm_area;   /* mm/vma.h -- this process's mmap()'d ranges */
 #define MAX_PROCESSES 64
 #define MAX_THREADS   256
 
@@ -486,6 +488,12 @@ struct process {
 
     /* current break pointer for this process's heap (user-mode threads only) 
      * grows/shrinks as the process allocates/frees heap memory. via sys_brk(). */
+    /* Every mmap()'d range this process owns, sorted by address. The page
+     * tables know a page is mapped; only this knows it was the third page of a
+     * twelve-page mapping, which is what munmap() needs and what makes "is
+     * this range free" answerable. See mm/vma.h. */
+    struct vm_area *vma_list;
+
     uint64_t heap_brk;  
 
     /* The highest virtual address mapped in the process's heap region (user-mode threads only) 

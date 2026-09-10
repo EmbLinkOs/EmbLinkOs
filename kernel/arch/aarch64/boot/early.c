@@ -29,6 +29,7 @@
 #include "drivers/audio/audio.h"
 #include "include/uaccess_guard.h"
 #include "include/arch_ipi.h"
+#include "mm/vma.h"
 #include "arch/aarch64/smp/smp.h"
 #include "include/arch_irq.h"
 #include "include/kmalloc.h"
@@ -911,6 +912,59 @@ void arch_early_main(uint64_t dtb_phys) {
             if (code != 0)
                 selftest_fails++;
         }
+    }
+
+    /* --- mmap / munmap ------------------------------------------------------
+     * The claim is not "the syscall returns an address" -- it is that the
+     * address WORKS and that unmapping GIVES THE MEMORY BACK. Both are checked
+     * against the physical allocator's own free count, which is the only
+     * number that cannot be faked by the thing under test. */
+    kprintf("\n--- mmap ---\n");
+    {
+        struct process *p = current_thread ? current_thread->proc : 0;
+        uint64_t free_before = pmm_free_pages();
+        const uint64_t LEN = 16 * 4096;
+
+        int64_t a = p ? vma_mmap(p, 0, LEN, PROT_READ | PROT_WRITE,
+                                 MAP_ANONYMOUS | MAP_PRIVATE)
+                      : -1;
+        bool ok = a > 0;
+
+        if (ok) {
+            /* Zeroed on arrival, then writable, then readable -- in that
+             * order, because a mapping that reads back what you wrote but
+             * arrived full of someone else's data is a disclosure that a
+             * write-then-read test cannot see. */
+            volatile uint64_t *m = (volatile uint64_t *)(uintptr_t)a;
+            for (uint64_t i = 0; i < LEN / 8; i += 512)
+                if (m[i] != 0) ok = false;
+            for (uint64_t i = 0; i < LEN / 8; i += 512)
+                m[i] = 0xC0FFEE00ULL + i;
+            for (uint64_t i = 0; i < LEN / 8; i += 512)
+                if (m[i] != 0xC0FFEE00ULL + i) ok = false;
+        }
+
+        uint64_t free_mapped = pmm_free_pages();
+        bool took = free_mapped <= free_before - LEN / 4096;
+
+        int rc = (p && a > 0) ? vma_munmap(p, (uint64_t)a, LEN) : -1;
+        uint64_t free_after = pmm_free_pages();
+        bool gave_back = (rc == EMBK_OK) && (free_after == free_before);
+
+        kprintf("  [%s] %d KiB mapped at %p, zeroed, written and read back\n",
+                ok ? " ok " : "FAIL", (int)(LEN / 1024), (void *)(uintptr_t)a);
+        kprintf("  [%s] free pages %d -> %d -> %d (munmap returned the memory)\n",
+                (took && gave_back) ? " ok " : "FAIL",
+                (int)free_before, (int)free_mapped, (int)free_after);
+
+        /* W^X is refused, not granted. */
+        int64_t wx = p ? vma_mmap(p, 0, 4096, PROT_WRITE | PROT_EXEC,
+                                  MAP_ANONYMOUS | MAP_PRIVATE) : 0;
+        kprintf("  [%s] a writable+executable mapping was refused\n",
+                wx < 0 ? " ok " : "FAIL");
+
+        if (!ok || !took || !gave_back || wx >= 0)
+            selftest_fails++;
     }
 
     kprintf("\n--- the desktop (A6 + A7) ---\n");

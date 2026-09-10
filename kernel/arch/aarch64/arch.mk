@@ -61,6 +61,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
 # arch_pmm_reserve_fixed() ended up being.
 ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/mm/uaccess_guard.c \
+                  kernel/mm/vma.c \
                   kernel/mm/ipi.c \
                   kernel/mm/kheap.c \
                   kernel/mm/kmalloc.c \
@@ -829,6 +830,9 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'embk thread create/join: OK'    A6 'a second EL0 thread could not be created or joined'; \
 	  chk 'hello: 5/5 checks passed'       A6 'the userland witness did not pass every check'; \
 	  chk 'exited with 5 (checks passed)'  A6 'the process did not exit cleanly with its status'; \
+	  chk 'zeroed, written and read back'  MM 'mmap did not produce usable memory'; \
+	  chk 'munmap returned the memory'     MM 'munmap leaked pages -- page tables, most likely'; \
+	  chk 'writable+executable mapping was refused' MM 'W^X is not enforced on mmap'; \
 	  chk 'instead of panicking'           A6 'a kernel fault on user memory was not recovered'; \
 	  chk 'posixdemo: ALL PASS'            A6 'the POSIX conformance suite reported failures'; \
 	  chk 'posixdemo exited 0'             A6 'posixdemo did not exit clean'; \
@@ -895,6 +899,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "     layer and retired by the device"; \
 	  echo "  A7 MSI: the GIC ITS translates and delivers (TCG; HVF has no ITS"; \
 	  echo "     and correctly falls back to INTx)"; \
+	  echo "  MM mmap/munmap: anonymous mappings, W^X enforced, and every"; \
+	  echo "     page given back -- page tables included"; \
 	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
 	  echo "     own GIC redistributor, VECTORS and timer, all reporting in"; \
 	  echo "     themselves, all TICKING, and all reachable by IPI"; \

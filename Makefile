@@ -197,6 +197,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/block/partition.c \
              kernel/mm/pmm.c \
              kernel/mm/uaccess_guard.c \
+             kernel/mm/vma.c \
              kernel/mm/ipi.c \
              kernel/arch/x86_64/irq/ipi.c \
              kernel/arch/x86_64/mm/vmm.c \

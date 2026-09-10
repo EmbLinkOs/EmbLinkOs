@@ -116,4 +116,10 @@
 #define SYS_audio_write    94
 #define SYS_audio_close    95
 
+/* Memory mappings. The kernel had only sbrk() -- one heap per process that
+ * grows and never shrinks -- so before these there was no way to hand memory
+ * back, and no way to ask for it with chosen permissions. See mm/vma.h. */
+#define SYS_mmap           96
+#define SYS_munmap         97
+
 #endif /* _SYSCALL_NR_H_ */
