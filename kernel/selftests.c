@@ -30,6 +30,7 @@
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
 #include "arch/x86_64/cpu/cpu_features.h"  /* test hardening */
 #include "include/uaccess_guard.h"           /* test hardening */
+#include "lib/random.h"                      /* test random */
 #include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
 #include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
 #include "power/power.h"  /* power / poweroff / reboot */
@@ -421,6 +422,7 @@ static void selftests_print_commands(void)
     kprintf("  test policycost\n");
     kprintf("  test jobctl\n");
     kprintf("  test hardening\n");
+    kprintf("  test random\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1173,6 +1175,120 @@ int selftests_handle_command(const char *cmd)
         }
 
         kprintf("[cmd] test hardening: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test random -- the kernel's CSPRNG.
+     *
+     * STRUCTURAL CHECKS, and honestly labelled as such. What would actually
+     * prove HMAC_DRBG is implemented correctly is a known-answer test against
+     * the NIST CAVP vectors, and there is not one here yet (docs/TODO.md). What
+     * this can say is: consecutive outputs differ, a reseed changes the
+     * stream, the bits are not grossly lopsided, and the uniform-range helper
+     * is unbiased on a bound that a modulus would get wrong. Plus the thing
+     * that matters most operationally: WHERE the seed came from, because a
+     * generator seeded only from clocks under an emulator is a different
+     * claim from one seeded from RDSEED on metal, and the difference should be
+     * printed rather than assumed.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test random") == 0) {
+        int ok = 1;
+        uint64_t b0, r0, h0;
+        random_stats(&b0, &r0, &h0);
+        enum random_quality q = random_quality();
+
+        kprintf("\n[random] seed quality: %s (%llu hardware words so far, "
+                "%llu reseeds, %llu bytes drawn)\n",
+                q == RANDOM_HARDWARE ? "HARDWARE + clocks"
+              : q == RANDOM_JITTER   ? "clocks and jitter ONLY (no hardware RNG)"
+                                     : "UNSEEDED",
+                (unsigned long long)h0, (unsigned long long)r0,
+                (unsigned long long)b0);
+        if (q == RANDOM_UNSEEDED) { kprintf("  [FAIL] never seeded\n"); ok = 0; }
+
+        /* 1. Two draws are not the same, and neither is zero. */
+        uint64_t a = random_u64(), b = random_u64();
+        kprintf("  [%s] consecutive draws differ (0x%llx, 0x%llx)\n",
+                (a != b && a && b) ? "ok" : "FAIL",
+                (unsigned long long)a, (unsigned long long)b);
+        if (a == b || !a || !b) ok = 0;
+
+        /* 2. Monobit: over 64 KiB, ones within 49-51% -- a generous bound that
+         *    a stuck or structurally broken generator still cannot meet. */
+        static uint8_t buf[65536];
+        random_bytes(buf, sizeof buf);
+        uint64_t ones = 0;
+        for (size_t i = 0; i < sizeof buf; i++)
+            /* A plain loop, not __builtin_popcount: the builtin lowers to a
+             * libgcc call (__popcountdi2) on this target and the freestanding
+             * kernel does not link libgcc. It cost a link failure that a
+             * targeted build masked, and a test run on a stale kernel. */
+            for (uint8_t v = buf[i]; v; v &= v - 1) ones++;
+        uint64_t bits = (uint64_t)sizeof buf * 8;
+        uint64_t pct100 = ones * 10000 / bits;   /* percent x100 */
+        kprintf("  [%s] monobit over 64 KiB: %llu.%02llu%% ones\n",
+                (pct100 >= 4900 && pct100 <= 5100) ? "ok" : "FAIL",
+                (unsigned long long)(pct100 / 100), (unsigned long long)(pct100 % 100));
+        if (pct100 < 4900 || pct100 > 5100) ok = 0;
+
+        /* 3. No 8-byte value repeats across 8192 draws. The birthday bound for
+         *    64-bit values at this count is ~2e-12, so a single repeat is a
+         *    broken generator, not bad luck. O(n^2) on 8192 is fine here. */
+        uint64_t *w = (uint64_t *)buf;
+        size_t nw = sizeof buf / sizeof(uint64_t);
+        int repeats = 0;
+        for (size_t i = 0; i < nw && repeats == 0; i++)
+            for (size_t j = i + 1; j < nw; j++)
+                if (w[i] == w[j]) { repeats++; break; }
+        kprintf("  [%s] no repeated 64-bit value among %u draws\n",
+                repeats == 0 ? "ok" : "FAIL", (unsigned)nw);
+        if (repeats) ok = 0;
+
+        /* 4. random_below is unbiased on a bound a modulus would skew. With
+         *    bound 3 and 30000 draws, each bucket should hold ~10000; a modulo
+         *    bias on a 64-bit draw is invisible at this size, so this checks
+         *    the rejection path runs, not that it matters -- the bound
+         *    3 * 2^62 + 1 below is where it would. */
+        uint64_t bucket[3] = {0,0,0};
+        for (int i = 0; i < 30000; i++) bucket[random_below(3)]++;
+        int fair = 1;
+        for (int i = 0; i < 3; i++)
+            if (bucket[i] < 9600 || bucket[i] > 10400) fair = 0;
+        kprintf("  [%s] random_below(3) over 30000 draws: %llu / %llu / %llu\n",
+                fair ? "ok" : "FAIL",
+                (unsigned long long)bucket[0], (unsigned long long)bucket[1],
+                (unsigned long long)bucket[2]);
+        if (!fair) ok = 0;
+        uint64_t big = random_below(3ull * (1ull << 62) + 1);
+        kprintf("  [%s] random_below on a bound with a large modulus remainder "
+                "returns inside it (0x%llx)\n",
+                big < 3ull * (1ull << 62) + 1 ? "ok" : "FAIL",
+                (unsigned long long)big);
+        if (big >= 3ull * (1ull << 62) + 1) ok = 0;
+
+        /* 5. Mixing entropy changes the stream: the same call after an
+         *    add_entropy cannot continue the sequence it would have. Checked
+         *    the only way it can be -- by drawing, mixing, drawing, and
+         *    requiring the second draw not to equal what a plain third draw
+         *    from the untouched state would produce... which is unobservable.
+         *    So the weaker, honest version: the state advances and does not
+         *    crash, and the draw after mixing is still a fresh value. */
+        uint64_t before = random_u64();
+        const char salt[] = "test random salt";
+        random_add_entropy(salt, sizeof salt);
+        uint64_t after = random_u64();
+        kprintf("  [%s] add_entropy then draw: 0x%llx -> 0x%llx\n",
+                (before != after) ? "ok" : "FAIL",
+                (unsigned long long)before, (unsigned long long)after);
+        if (before == after) ok = 0;
+
+        uint64_t b1, r1, h1;
+        random_stats(&b1, &r1, &h1);
+        kprintf("  drew %llu bytes in this test\n",
+                (unsigned long long)(b1 - b0));
+
+        kprintf("[cmd] test random: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

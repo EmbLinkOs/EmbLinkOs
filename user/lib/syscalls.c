@@ -1129,7 +1129,13 @@ int getentropy(void *buf, size_t len) {
     }
 #if defined(__x86_64__)
     if (!cpu_has_rdrand()) {
-        errno = ENOSYS;       /* honest: we have no entropy source */
+        /* No RDRAND: the kernel's generator, which is seeded from every clock
+         * the machine has and is the same source the kernel lays out address
+         * spaces with. Not a clock-derived fake -- the refusal below is for
+         * when even THAT is unreachable. */
+        long got = embk_getrandom(buf, len);
+        if (got == (long)len) return 0;
+        errno = ENOSYS;
         return -1;
     }
 
@@ -1148,10 +1154,14 @@ int getentropy(void *buf, size_t len) {
     }
     return 0;
 #else
-    /* No reachable entropy source on this architecture -- see the note above.
-     * The SAME refusal the x86 path makes when RDRAND is absent, for the same
-     * reason: a caller that gets -1 can decide what to do, a caller handed
-     * predictable bytes cannot. */
+    /* aarch64: no unprivileged instruction to ask -- RNDR's feature bit is in
+     * a register EL0 cannot read, so there was no safe way to even probe. The
+     * kernel can probe, and does; this is the syscall the note above asked
+     * for. It reads RNDR at EL1 where the processor has it and falls back to
+     * its clock-and-jitter-seeded DRBG where it does not -- random_quality()
+     * on the kernel side says which, and `test random` prints it. */
+    long got = embk_getrandom(buf, len);
+    if (got == (long)len) return 0;
     errno = ENOSYS;
     return -1;
 #endif

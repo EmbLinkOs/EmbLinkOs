@@ -31,6 +31,7 @@
 #include "include/types.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "lib/random.h"          /* sys_getrandom */
 #include "process/futex.h"
 #include "process/debug.h"   /* sys_debug_* handlers for the table below */
 #include "tty/tty.h"
@@ -985,6 +986,22 @@ static int64_t sys_console_interrupt_route(const struct sysargs *a) {
  * A process whose every thread is pinned cannot be frozen (freezing a core's
  * fallback context would take that core's guarantee away), and this returns 0
  * changed rather than pretending. */
+/* getrandom(buf, len) -> len. See syscall_nr.h. Bounced through a kernel
+ * buffer rather than generated in place, because the DRBG writes through a
+ * plain pointer and the destination is user memory -- copy_to_user is the one
+ * path that is allowed to touch it. */
+static int64_t sys_getrandom(const struct sysargs *a) {
+    void   *ubuf = (void *)a->arg[0];
+    size_t  len  = (size_t)a->arg[1];
+    if (len == 0) return 0;
+    if (len > 256) return -EMBK_EINVAL;
+    uint8_t tmp[256];
+    random_bytes(tmp, len);
+    int rc = copy_to_user(ubuf, tmp, len);
+    memset(tmp, 0, sizeof tmp);          /* do not leave entropy on the stack */
+    return rc == EMBK_OK ? (int64_t)len : rc;
+}
+
 static int64_t sys_suspend(const struct sysargs *a) {
     int handle = (int)a->arg[0];
 
@@ -2119,6 +2136,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_cancelled]    = sys_cancelled,
     [SYS_console_interrupt_route] = sys_console_interrupt_route,
     [SYS_suspend]        = sys_suspend,
+    [SYS_getrandom]      = sys_getrandom,
     [SYS_rename]       = sys_rename,
     [SYS_ftruncate]    = sys_ftruncate,
     [SYS_chmod]        = sys_chmod,

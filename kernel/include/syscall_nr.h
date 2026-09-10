@@ -201,4 +201,15 @@
  * instead of blocking on an exit that is not coming. */
 #define SYS_suspend       110   /* (handle, resume)         -> n | -err       */
 
+/* getrandom(buf, len) -- unpredictable bytes from the kernel's CSPRNG.
+ *
+ * The first entropy source aarch64 userland has ever had: RDRAND is an
+ * unprivileged instruction on x86, but RNDR's feature bit lives in a register
+ * EL0 may not read, so there was no way to ask before executing and no safe
+ * way to execute. The kernel can ask. On x86 it is the fallback for a
+ * processor without RDRAND. Capped at 256 bytes per call, like getentropy;
+ * never blocks, never returns fewer than asked. Ungated: randomness is not a
+ * capability, it is a utility. */
+#define SYS_getrandom     111   /* (buf, len)               -> len | -err     */
+
 #endif /* _SYSCALL_NR_H_ */

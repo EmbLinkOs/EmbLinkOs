@@ -76,6 +76,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/lib/kprintf.c \
                   kernel/lib/kstring.c \
                   kernel/lib/errno.c \
+                  kernel/lib/random.c \
                   kernel/lib/ksym.c \
                   kernel/drivers/bus/pci.c \
                   kernel/drivers/storage/virtio_blk.c \
@@ -800,8 +801,13 @@ debug-arm64: $(ARM_IMG) $(ARM_ROOTFS)
 # the old budget was sometimes enough and sometimes not. 150 is that with room
 # for a loaded host. HVF drifted the same way for the same reason: 40 seconds
 # was right when it was set and became marginal without anyone changing it --
-# it fails, then passes, then fails on the same build. It completes at 55 and
-# at 70, so 75.
+# it fails, then passes, then fails on the same build. It completed at 55 and
+# at 70, so it was set to 75 -- and 75 then failed twice on the next build,
+# with the log ending inside the 25-second session wait. Which is the lesson:
+# two passing samples are not a measurement of a budget, they are two samples.
+# 120 now, and the guest prints its OWN uptime on its final tally line (see
+# early.c, "all self-tests done"), echoed below -- so the next person sets
+# this from that number plus headroom, not from a feeling.
 #
 # A run that ends early does not report a timeout, it reports every marker
 # after that point as missing -- which reads as a dozen unrelated failures in
@@ -818,7 +824,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	@overall=0; \
 	for acc in $(ARM_TEST_ACCELS); do \
 	  case $$acc in \
-	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=$${ARM_HVF_SECS:-75};;  \
+	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=$${ARM_HVF_SECS:-120};;  \
 	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=$${ARM_TCG_SECS:-150};; \
 	  esac; \
 	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \
@@ -827,6 +833,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  cp $(ARM_ROOTFS) $$scratch; \
 	  disk="-drive file=$$scratch,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0"; \
 	  port=$$(awk 'BEGIN{srand();print 4500+int(rand()*400)}'); \
+	  host_t0=$$(date +%s); \
 	  $$qcmd $$disk $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -display none -serial file:$$log \
 	      -qmp tcp:127.0.0.1:$$port,server,nowait -kernel $(ARM_IMG) 2>/dev/null & \
 	  qpid=$$!; \
@@ -923,6 +930,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  if grep -q 'KV2P.*MISMATCH\|MISMATCH.*KV2P' $$log; then \
 	    echo "FAIL(A2): a translation does not match KV2P"; fail=1; fi; \
 	  if grep -q '\[FAIL\]' $$log; then echo "FAIL: a self-test case reported failure"; fail=1; fi; \
+	  echo "  guest clock at final tally: $$(grep -o 'at [0-9]* ms of uptime' $$log || echo 'NOT REACHED -- the budget ($$secs s) ended the run first')"; \
+	  echo "  host wall clock for the whole run: $$(( $$(date +%s) - host_t0 )) s (budget $$secs s) -- if the guest number is far below this, either the guest clock is slow or the HOST is (another VM running?)"; \
 	  if grep -q 'DID NOT TAKE' $$log; then echo "FAIL(A7): a BAR write did not stick"; fail=1; fi; \
 	  if [ $$fail -ne 0 ]; then \
 	    echo "--- serial ($$acc) ---"; cat $$log; echo "--- end ---"; overall=1; \

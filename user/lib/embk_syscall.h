@@ -155,6 +155,7 @@
 #define EMBK_SYS_audio_latency  108  /* (ms)               -> ms      | -err */
 #define EMBK_SYS_thread_cpu_ns  109  /* ()                 -> ns            */
 #define EMBK_SYS_suspend        110  /* (handle, resume)   -> n | -err */
+#define EMBK_SYS_getrandom      111  /* (buf, len)         -> len | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

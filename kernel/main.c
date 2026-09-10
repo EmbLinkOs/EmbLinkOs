@@ -59,6 +59,7 @@
 #include "kworker/kworker.h"
 #include "mm/vm_object.h"   /* the page cache writeback thread */
 #include "power/power.h"     /* idle residency, shutdown, reboot */
+#include "lib/random.h"      /* random_init: the kernel CSPRNG */
 
 #include "process/process.h"
 #include "tty/tty.h"
@@ -1814,6 +1815,15 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // timer arms an absolute TSC deadline and needs the calibrated frequency
     // here. Only depends on HPET/PIT (both up by now), not on the LAPIC timer.
     tsc_calibrate();
+
+    /* THE KERNEL'S ENTROPY, seeded here and not earlier for a reason that is
+     * easy to get wrong: the seed mixes the TSC across a jitter loop, and
+     * time_get_ns() returns 0 until the line above has calibrated it. Seeding
+     * before that point would mix in a clock that does not move -- which is
+     * exactly the kind of quietly-wrong seed this file's own comments warn
+     * about elsewhere. The HPET (above) and RTC are readable by now too.
+     * Before any process exists, because process layout is chosen from it. */
+    random_init();
 
     // --- Timer (LAPIC) + retire PIC ---
     /* The boot core's IPI vectors, before any AP exists to send it one. */

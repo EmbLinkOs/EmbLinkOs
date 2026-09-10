@@ -9,6 +9,7 @@ struct arm_cpu_features {
     bool     pan;          /* FEAT_PAN: EL1 cannot touch EL0-accessible memory */
     bool     el0_aarch32;
     bool     aes, sha256, crc32, atomics;
+    bool     rndr;         /* FEAT_RNG: an RNDR instruction exists           */
     uint64_t midr;
 };
 

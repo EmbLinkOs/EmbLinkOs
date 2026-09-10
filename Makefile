@@ -239,6 +239,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/gfx/compositor.c \
              kernel/lib/kstring.c \
              kernel/lib/errno.c \
+             kernel/lib/random.c \
              kernel/lib/ksym.c \
              kernel/lib/kprintf.c
 

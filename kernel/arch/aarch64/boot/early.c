@@ -14,6 +14,7 @@
 #include "fs/vfs.h"
 #include "arch/aarch64/cpu/cpu_features.h"
 #include "include/uaccess_guard.h"
+#include "lib/random.h"
 #include "mm/vm_object.h"
 #include "power/power.h"
 #include "kworker/kworker.h"
@@ -653,6 +654,13 @@ void arch_early_main(uint64_t dtb_phys) {
 
     timer_init();
 
+    /* Seed the kernel CSPRNG now that the counter frequency is known --
+     * time_get_ns() is 0 before timer_init(), and a seed that mixes a clock
+     * that does not move is the mistake this is placed to avoid. Same rule as
+     * x86 (after tsc_calibrate). Before any user process is spawned, because
+     * each one's address-space layout is drawn from this. */
+    random_init();
+
     /* Two no-argument entry points, because kernel_ctx_prepare() takes none:
      * a thread's arguments belong in its own structure, which is what
      * process.c already does and what this stands in for. */
@@ -1243,7 +1251,14 @@ void arch_early_main(uint64_t dtb_phys) {
             selftest_fails++;
     }
 
-    kprintf("\n--- all self-tests done: %d failure(s) ---\n", (int)selftest_fails);
+    /* WITH THE CLOCK, because the harness cannot see it. The per-accelerator
+     * budget in arch.mk is a fixed sleep-then-kill, and every time it has been
+     * wrong it was wrong in the same way: a run that ends early reports every
+     * later marker as missing, which reads as a dozen unrelated failures. This
+     * line is what makes the budget a measurement -- set it from this number
+     * plus headroom, not from how long it felt. */
+    kprintf("\n--- all self-tests done: %d failure(s), at %llu ms of uptime ---\n",
+            (int)selftest_fails, (unsigned long long)timer_uptime_ms());
 
     kprintf("\nA7 reached: the whole shared kernel is linked and running here.\n");
 

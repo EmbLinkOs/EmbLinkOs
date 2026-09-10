@@ -51,6 +51,7 @@ void arm_cpu_features_detect(void) {
     g_cf.sha256 = ((isar0 >> 12) & 0xF) != 0;
     g_cf.crc32  = ((isar0 >> 16) & 0xF) != 0;
     g_cf.atomics= ((isar0 >> 20) & 0xF) != 0;
+    g_cf.rndr   = ((isar0 >> 60) & 0xF) != 0;     /* FEAT_RNG, ARMv8.5 */
 
     __asm__ volatile("mrs %0, midr_el1" : "=r"(g_cf.midr));
 
@@ -61,6 +62,7 @@ void arm_cpu_features_detect(void) {
             g_cf.pan ? " PAN" : " (no PAN)",
             g_cf.aes ? " AES" : "", g_cf.sha256 ? " SHA256" : "",
             g_cf.crc32 ? " CRC32" : "");
+    kprintf("cpu: hardware RNG (RNDR): %s\n", g_cf.rndr ? "yes" : "no");
     if (!g_cf.pan)
         kprintf("cpu: NOTE -- no FEAT_PAN; the kernel runs without it rather "
                 "than refusing to boot. PXN still holds (EL1 cannot EXECUTE "
@@ -88,4 +90,41 @@ void arm_protection_init_this_cpu(void) {
     /* And forbid it RIGHT NOW, for the boot path, which is already at EL1 and
      * did not arrive by an exception. */
     ARM_SET_PAN(1);
+}
+
+/* ==========================================================================
+ * Hardware entropy for lib/random.c.
+ * ========================================================================== */
+#include "lib/random.h"
+#include "drivers/timer/timer.h"
+
+/* RNDR (FEAT_RNG, ARMv8.5). Read through its system-register encoding,
+ * S3_3_C2_C4_0, rather than the `rndr` mnemonic, for the same reason PAN is
+ * set by encoding: the mnemonic needs an -march the rest of the kernel does not
+ * want. Executing it on a core without the feature is UNDEFINED, so the
+ * ID_AA64ISAR0_EL1.RNDR field is checked first, and that check is the only
+ * thing that makes this safe to call at all.
+ *
+ * RNDR reports through the flags, not through a return value: on success it
+ * writes the value and sets NZCV to 0b0000; when it cannot produce one it sets
+ * NZCV to 0b0100 -- Z set. So "Z clear" is the success test. */
+bool arch_hw_random_u64(uint64_t *out) {
+    if (!g_cf.rndr) return false;
+    for (int i = 0; i < 16; i++) {
+        uint64_t v, nzcv;
+        __asm__ volatile("mrs %0, S3_3_C2_C4_0\n\tmrs %1, nzcv"
+                         : "=r"(v), "=r"(nzcv) :: "cc");
+        if (!(nzcv & (1ull << 30))) {   /* Z clear: a value was produced */
+            *out = v;
+            return true;
+        }
+    }
+    return false;
+}
+
+void arch_random_seed_extra(void (*sink)(const void *, size_t)) {
+    uint64_t v;
+    v = time_get_ns();                                     sink(&v, sizeof v);
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));      sink(&v, sizeof v);
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));      sink(&v, sizeof v);
 }

@@ -426,6 +426,15 @@ static inline int64_t embk_resume(int handle) {
     return embk_syscall2(EMBK_SYS_suspend, handle, 1);
 }
 
+/* Unpredictable bytes from the kernel's CSPRNG (HMAC_DRBG over SHA-256, seeded
+ * from a hardware generator where the processor has one and from clocks and
+ * timing jitter regardless). At most 256 per call; returns how many, which is
+ * always `len` unless the pointer is bad. The libc getentropy() is built on
+ * this where there is no unprivileged hardware instruction to build it on. */
+static inline int64_t embk_getrandom(void *buf, size_t len) {
+    return embk_syscall2(EMBK_SYS_getrandom, (int64_t)(intptr_t)buf, (int64_t)len);
+}
+
 /* 1 if THIS process has been cancelled, 0 if not.
  *
  * For compute loops that make no syscalls -- with nothing injected, a process

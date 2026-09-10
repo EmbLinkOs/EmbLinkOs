@@ -136,3 +136,45 @@ void cpu_protection_init_this_cpu(void) {
 
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
 }
+
+/* ==========================================================================
+ * Hardware entropy for lib/random.c.
+ * ========================================================================== */
+#include "lib/random.h"
+#include "drivers/timer/timer.h"
+#include "drivers/timer/hpet.h"
+#include "drivers/timer/rtc.h"
+
+/* RDSEED over RDRAND when both exist: RDSEED is the conditioned output of the
+ * entropy source itself, RDRAND is a DRBG seeded from it. For seeding another
+ * DRBG the former is the right thing to ask for. Both may legitimately refuse
+ * when the on-die pool is momentarily drained -- Intel's guidance is a bounded
+ * retry, never a spin -- and a refusal is reported as false, not as zero. */
+bool arch_hw_random_u64(uint64_t *out) {
+    if (g_cf.rdseed) {
+        for (int i = 0; i < 16; i++) {
+            unsigned char ok = 0;
+            __asm__ volatile("rdseed %0; setc %1" : "=r"(*out), "=qm"(ok) :: "cc");
+            if (ok) return true;
+        }
+    }
+    if (g_cf.rdrand) {
+        for (int i = 0; i < 16; i++) {
+            unsigned char ok = 0;
+            __asm__ volatile("rdrand %0; setc %1" : "=r"(*out), "=qm"(ok) :: "cc");
+            if (ok) return true;
+        }
+    }
+    return false;
+}
+
+void arch_random_seed_extra(void (*sink)(const void *, size_t)) {
+    uint64_t v;
+    v = time_get_ns();            sink(&v, sizeof v);   /* TSC             */
+    if (hpet_available()) {
+        v = hpet_read_counter();  sink(&v, sizeof v);   /* a second clock  */
+    }
+    v = rtc_now_ns();             sink(&v, sizeof v);   /* wall clock      */
+    __asm__ volatile("rdtsc" : "=a"(v) : : "rdx");      /* low TSC, raw    */
+    sink(&v, sizeof v);
+}

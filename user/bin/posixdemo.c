@@ -1421,6 +1421,30 @@ static void test_rename(void) {
     (void)unlink("/rn_c.txt");
 }
 
+/* getentropy(): on aarch64 this IS the kernel's SYS_getrandom -- there is no
+ * unprivileged instruction to build it on, and until that syscall existed this
+ * call returned ENOSYS on that architecture. On x86 the libc uses RDRAND in
+ * userland where the processor has it (no syscall, and the right design), so
+ * the kernel boundary is exercised by the aarch64 boot test's run of this
+ * program rather than by the x86 one. Either way the contract is the same:
+ * 32 bytes, not zero, not repeated, and a request past the cap refused. */
+static void test_getentropy(void) {
+    printf("getentropy (kernel CSPRNG on aarch64, RDRAND on x86):\n");
+    unsigned char a[32], b[32];
+    memset(a, 0, sizeof a); memset(b, 0, sizeof b);
+    int ra = getentropy(a, sizeof a);
+    int rb = getentropy(b, sizeof b);
+    ck("getentropy(32) succeeds twice", ra == 0 && rb == 0);
+    int nz = 0;
+    for (size_t i = 0; i < sizeof a; i++) nz |= a[i];
+    ck("the bytes are not all zero", nz != 0);
+    ck("two calls do not return the same 32 bytes", memcmp(a, b, sizeof a) != 0);
+    errno = 0;
+    int big = getentropy(a, 257);
+    ck_fails("getentropy(257) is refused with EIO (the documented cap is 256)",
+             big, EIO, errno);
+}
+
 static void test_signals(void) {
     printf("signals (self-delivery only -- nothing can interrupt from outside):\n");
 
@@ -1486,6 +1510,7 @@ int main(void) {
     test_writeback();
     test_mmap_file();
     test_symlinks();
+    test_getentropy();
     test_honest_refusals();
 
     printf("\nposixdemo: %s (%d failure%s)\n",
