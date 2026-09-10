@@ -6202,6 +6202,129 @@ int selftests_handle_command(const char *cmd)
      * wrong is worse than no cache: coherence between two independent opens,
      * fsync actually reaching the device, and the pages coming back under
      * pressure. */
+    /* METADATA. The page cache made a file's CONTENTS nearly free to re-read;
+     * its NAME and its SIZE were not, and `test pagecache` says so out loud by
+     * keeping the seek outside its measured window rather than hiding it.
+     *
+     * This measures the part that was left: how many device reads it costs to
+     * ask about a file you have already asked about. A stat is a B-tree
+     * descent for the inode; an open is TWO descents per path component (the
+     * directory's inode, then the entry). Nothing about that changes between
+     * two identical calls, so anything above zero is work being redone. */
+    if (strcmp(cmd, "test metacache") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test metacache: VFS not registered\n");
+            return 1;
+        }
+
+        const char *paths[4] = {
+            "/system/bin/shell.elf",
+            "/system/bin/init.elf",
+            "/system/bin/hello.elf",
+            "/system/bin/sysinfo.elf",
+        };
+        struct vfs_stat st;
+        int npaths = 0;
+        for (int i = 0; i < 4; i++)
+            if (vfs_stat(paths[i], &st) == EMBK_OK) paths[npaths++] = paths[i];
+        if (npaths == 0) {
+            kprintf("\n[cmd] test metacache: no fixture files on the image\n");
+            return 1;
+        }
+
+        struct embk_blkstat b0, b1;
+        int fails = 0;
+        kprintf("\n[metacache] (%d fixture file(s))\n", npaths);
+
+        /* (1) THE SAME file, over and over. The answer cannot change, so a
+         *     second call should cost nothing. */
+        (void)vfs_stat(paths[0], &st);              /* warm it */
+        embk_blkstat_reset(); embk_blkstat_get(&b0);
+        for (int i = 0; i < 50; i++) (void)vfs_stat(paths[0], &st);
+        embk_blkstat_get(&b1);
+        uint64_t same = b1.reads - b0.reads;
+        kprintf("  50 stats of ONE warm file:        %llu device reads\n",
+                (unsigned long long)same);
+        if (same != 0) fails++;
+
+        /* (2) ROUND-ROBIN over several files. This is what a one-entry cache
+         *     cannot do: each call evicts the answer the next one wants, so a
+         *     single slot scores exactly zero hits however warm it is. */
+        for (int i = 0; i < npaths; i++) (void)vfs_stat(paths[i], &st);
+        embk_blkstat_reset(); embk_blkstat_get(&b0);
+        for (int r = 0; r < 20; r++)
+            for (int i = 0; i < npaths; i++) (void)vfs_stat(paths[i], &st);
+        embk_blkstat_get(&b1);
+        uint64_t rr = b1.reads - b0.reads;
+        kprintf("  %d stats round-robin over %d files: %llu device reads\n",
+                20 * npaths, npaths, (unsigned long long)rr);
+        if (rr != 0) fails++;
+
+        /* (3) OPEN, which is the path walk: two descents per component. */
+        int fd = vfs_open(paths[0], O_RDONLY, 0);
+        if (fd >= 0) vfs_close(fd);
+        embk_blkstat_reset(); embk_blkstat_get(&b0);
+        for (int i = 0; i < 20; i++) {
+            fd = vfs_open(paths[0], O_RDONLY, 0);
+            if (fd >= 0) vfs_close(fd);
+        }
+        embk_blkstat_get(&b1);
+        uint64_t opens = b1.reads - b0.reads;
+        kprintf("  20 opens of ONE warm path:        %llu device reads\n",
+                (unsigned long long)opens);
+        if (opens != 0) fails++;
+
+        /* (4) THE PART THAT MATTERS MORE THAN THE SPEED: a cache that serves a
+         *     stale answer is worse than no cache. Every case below changes
+         *     something the caches hold and then asks again through the
+         *     ordinary path -- if any of them returns the old answer, the
+         *     numbers above are worthless. */
+        const char *tp = "/metacache.tmp";
+        vfs_unlink_path(tp);
+
+        /* a) a name that did not exist must not stay non-existent. Negative
+         *    answers are deliberately never cached, and create-then-open is
+         *    the most common sequence in the system. */
+        struct vfs_stat s0;
+        bool absent_first = (vfs_stat(tp, &s0) != EMBK_OK);
+        int nfd = vfs_open(tp, O_RDWR | O_CREAT, 0644);
+        bool found_after = (nfd >= 0) && (vfs_stat(tp, &s0) == EMBK_OK);
+        kprintf("  [%s] a file created after a failed lookup is found\n",
+                (absent_first && found_after) ? "ok" : "FAIL");
+        if (!absent_first || !found_after) fails++;
+
+        /* b) the SIZE now comes from the cached inode. A write must move it. */
+        if (nfd >= 0) {
+            size_t w = 0;
+            (void)vfs_fd_write(nfd, "0123456789", 10, &w);
+            (void)vfs_fd_fsync(nfd);
+            vfs_close(nfd);
+        }
+        struct vfs_stat s1;
+        bool grew = (vfs_stat(tp, &s1) == EMBK_OK) && (s1.size == 10);
+        kprintf("  [%s] stat reports the new size after a write (%llu, want 10)\n",
+                grew ? "ok" : "FAIL", (unsigned long long)s1.size);
+        if (!grew) fails++;
+
+        /* c) an unlinked name must stop resolving. This is the one a
+         *    generation-keyed cache gets right and a naive one does not. */
+        (void)vfs_unlink_path(tp);
+        bool gone = (vfs_stat(tp, &s1) != EMBK_OK);
+        kprintf("  [%s] an unlinked file stops resolving\n", gone ? "ok" : "FAIL");
+        if (!gone) fails++;
+
+        struct embkfs_stat es;
+        embkfs_stat_get(&es);
+        kprintf("  inode cache: %llu hits / %llu misses;  name cache: %llu / %llu\n",
+                (unsigned long long)es.icache_hit,
+                (unsigned long long)es.icache_miss,
+                (unsigned long long)es.ncache_hit,
+                (unsigned long long)es.ncache_miss);
+
+        kprintf("[cmd] test metacache: %s\n", fails == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test pagecache") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test pagecache: VFS not registered\n");

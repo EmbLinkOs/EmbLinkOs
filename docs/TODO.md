@@ -516,10 +516,27 @@ approximated, which is why none of them is a silent bug waiting to be found:
   `user/lib/syscalls.c` demanded: *"if a write-back cache is ever added, these
   must become a real device flush the same day, or it turns into the lie the
   old comment feared."*
-  - [ ] **Metadata is still uncached.** A `seek` to SEEK_END, a `stat`, an
-    `open` — each is a B-tree walk that reads the device. `test pagecache`
-    deliberately keeps the seek outside its measured window rather than hide
-    this. A vnode/inode cache is the next-largest single win after this one.
+  - [x] ~~**Metadata is still uncached.**~~ **DONE.** `test metacache`:
+
+    | | before | after |
+    |---|---:|---:|
+    | 50 stats of one warm file | 1100 device reads | **0** |
+    | 40 stats round-robin over 2 files | 880 | **0** |
+    | 20 opens of one warm path | 480 | **0** |
+
+    The inode cache existed and reported **0 hits against 15 misses**, because
+    it was one slot *and* three separate call sites did their own B-tree
+    descent instead of asking it: `stat_object`, `lookup`'s directory-inode
+    read, and `inode_dtype` (the type of every path component). Made 32-way,
+    and all three now go through it. A name cache — `(dir, name) -> oid` —
+    covers the other descent per component. And `stat` was calling
+    `seek_object(SEEK_END)`, which walks every extent to re-derive a size the
+    inode was already holding.
+
+    Both caches are keyed on the volume `generation`, so any commit retires
+    every entry: blunt, and correct. Negative lookups are deliberately never
+    cached — "this name does not exist" stops being true the moment somebody
+    creates it, and create-then-open is the most common sequence there is.
   - [ ] **One lock for the whole cache** — the registry, every object's pages,
     and the global LRU. Per-object locks plus a separate LRU lock is the right
     shape eventually; the moment to build it is when a profile shows

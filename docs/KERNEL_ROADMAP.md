@@ -78,9 +78,11 @@ TLB shootdown.
    - A **shared zero page** (a read of untouched anonymous memory mapping one
      global zero frame read-only) is the same machinery and would make a large
      sparse read-mostly mapping nearly free.
-4. **A metadata cache.** Every `open`, `stat` and `SEEK_END` is a B-tree walk
-   that reads the device. `test pagecache` deliberately keeps the seek outside
-   its measured window rather than hide this. Largest single win left in I/O.
+4. ~~**A metadata cache.**~~ **Done.** A warm `stat` and a warm `open` now cost
+   **zero** device reads, from 22 and 24 respectively. An inode cache that
+   existed but scored 0 hits (one slot, and three call sites bypassing it), a
+   name cache for the other descent per path component, and a `stat` that
+   stopped walking every extent to re-derive a size the inode already held.
 5. **Compression before eviction**, macOS-style, once there is a reason: a
    compressed page is faster to recover than a re-read and costs no device.
    Sequenced after 1–4 because it is only worth it when the cache is under real

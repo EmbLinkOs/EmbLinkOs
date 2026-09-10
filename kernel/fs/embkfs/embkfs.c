@@ -1020,6 +1020,9 @@ static int embkfs_snapshot_find_free_slot(struct embkfs_volume *vol, uint32_t *o
  *   (b) find the entry whose key offset == CRC32C(name)
  *   (c) confirm the STORED name — a 32-bit hash match is only a candidate
  */
+static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
+                               struct embk_inode_item *out);
+
 static int embkfs_lookup(struct embkfs_volume *vol, uint64_t dir_oid,
                          const char *name, uint64_t *out_oid)
 {
@@ -1027,19 +1030,40 @@ static int embkfs_lookup(struct embkfs_volume *vol, uint64_t dir_oid,
     size_t name_len = strlen(name);
     static uint8_t buf[4096];                  /* node buffer, reused across descents */
 
-    /* (a) directory inode — descend for {dir_oid, INODE, 0} */
-    const struct embk_item_header *di =
-        embkfs_find_item(vol, dir_oid, EMBK_TYPE_INODE, 0, buf, sizeof buf);
-    if (!di) { kprintf("EMBKFS: %s: dir object %lu has no inode\n", dev, dir_oid); return -EMBK_ENOENT; }
-    const struct embk_inode_item *dino = embk_item_data(buf, vol->block_size, di, sizeof *dino);
-    if (!dino) { kprintf("EMBKFS: %s: object %lu inode truncated\n", dev, dir_oid); return -EMBK_EINVAL; }
-    if ((dino->mode & EMBKFS_S_IFMT) != EMBKFS_S_IFDIR) {
+    /* (a) directory inode -- THROUGH THE CACHE. A path walk asks for the same
+     * directory inodes over and over ("/system" on the way to every file in
+     * it), and this descent was doing the full B-tree read every time. It is
+     * the same question embkfs_inode_cached exists to answer. */
+    struct embk_inode_item dino_c;
+    int drc = embkfs_inode_cached(vol, dir_oid, &dino_c);
+    if (drc != EMBK_OK) { kprintf("EMBKFS: %s: dir object %lu has no inode\n", dev, dir_oid); return drc; }
+    if ((dino_c.mode & EMBKFS_S_IFMT) != EMBKFS_S_IFDIR) {
         kprintf("EMBKFS: %s: object %lu is not a directory\n", dev, dir_oid); return -EMBK_ENOTDIR;
     }
-    /* dino consumed (mode checked) before the next descent reuses buf */
 
-    /* (b) dir entry — descend for {dir_oid, DIR_ENTRY, hash(name)} */
+    /* (b) dir entry -- the cache first.
+     *
+     * The NAME compare is authoritative, not the hash: two names can share a
+     * crc32c, and serving the wrong file because of a collision would be
+     * silent and catastrophic. The hash only picks the slot and rejects most
+     * mismatches cheaply. Names longer than the slot are simply not cached --
+     * they still resolve, they just pay the descent. */
     uint32_t hash = embk_crc32c(name, name_len, 0);
+    unsigned nslot = (unsigned)((dir_oid ^ hash) %
+                                (sizeof vol->ncache / sizeof vol->ncache[0]));
+    if (name_len < sizeof vol->ncache[0].name &&
+        vol->ncache[nslot].valid &&
+        vol->ncache[nslot].gen == vol->generation &&
+        vol->ncache[nslot].dir_oid == dir_oid &&
+        vol->ncache[nslot].hash == hash &&
+        vol->ncache[nslot].name_len == (uint8_t)name_len &&
+        memcmp(vol->ncache[nslot].name, name, name_len) == 0) {
+        vol->ncache_hits++;
+        *out_oid = vol->ncache[nslot].oid;
+        return EMBK_OK;
+    }
+    vol->ncache_misses++;
+
     const struct embk_item_header *de =
         embkfs_find_item(vol, dir_oid, EMBK_TYPE_DIR_ENTRY, hash, buf, sizeof buf);
     if (!de) { kprintf("EMBKFS: %s: \"%s\" (hash 0x%08X) not found\n", dev, name, hash); return -EMBK_ENOENT; }
@@ -1056,6 +1080,18 @@ static int embkfs_lookup(struct embkfs_volume *vol, uint64_t dir_oid,
         if (rec->name_len == name_len &&
             memcmp((const char *)rec + sizeof *rec, name, name_len) == 0) {
             *out_oid = rec->target_object_id;
+            /* Remember the ANSWER, never the absence -- see the ncache comment
+             * in embkfs.h. The full name is stored so the hit above can do an
+             * authoritative compare rather than trusting a hash. */
+            if (name_len < sizeof vol->ncache[0].name) {
+                vol->ncache[nslot].dir_oid  = dir_oid;
+                vol->ncache[nslot].hash     = hash;
+                vol->ncache[nslot].name_len = (uint8_t)name_len;
+                memcpy(vol->ncache[nslot].name, name, name_len);
+                vol->ncache[nslot].oid      = rec->target_object_id;
+                vol->ncache[nslot].gen      = vol->generation;
+                vol->ncache[nslot].valid    = true;
+            }
             return EMBK_OK;
         }
         p += rec_len; remaining -= rec_len;
@@ -1704,8 +1740,15 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     vol->ecache_verified = NULL;
     /* Inode cache: icache_valid is the gate, so it MUST be seeded -- a garbage
      * true here would serve a stale/garbage inode on the very first read. */
-    vol->icache_valid = false; vol->icache_oid = 0; vol->icache_gen = 0;
+    for (unsigned i = 0; i < sizeof vol->icache / sizeof vol->icache[0]; i++) {
+        vol->icache[i].valid = false;
+        vol->icache[i].oid = 0;
+        vol->icache[i].gen = 0;
+    }
     vol->icache_hits = 0; vol->icache_misses = 0;
+    for (unsigned i = 0; i < sizeof vol->ncache / sizeof vol->ncache[0]; i++)
+        vol->ncache[i].valid = false;
+    vol->ncache_hits = 0; vol->ncache_misses = 0;
     /* Read-ahead window: wcache_buf is the gate (NULL = unallocated), same shape
      * as rcache/ecache, so a garbage pointer here would be read as a live cache. */
     vol->wcache_buf = NULL; vol->wcache_oid = 0; vol->wcache_gen = 0;
@@ -1765,6 +1808,8 @@ void embkfs_stat_get(struct embkfs_stat *out)
         g_efs_stat.rcache_bypass = g_embkfs_live->rcache_bypass;
         g_efs_stat.icache_hit   = g_embkfs_live->icache_hits;
         g_efs_stat.icache_miss  = g_embkfs_live->icache_misses;
+        g_efs_stat.ncache_hit   = g_embkfs_live->ncache_hits;
+        g_efs_stat.ncache_miss  = g_embkfs_live->ncache_misses;
     }
     *out = g_efs_stat;
 }
@@ -3869,13 +3914,19 @@ int embkfs_object_put(struct embkfs_volume *vol, uint64_t oid)
             g_open_refs[i].vol = NULL;
             g_open_refs[i].oid = 0;
 
-            /* Last handle closed. Read the AUTHORITATIVE on-disk link count. */
-            const struct embk_item_header *ti =
-                embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
-            if (!ti) return EMBK_OK;                /* inode already gone */
-            const struct embk_inode_item *tino =
-                embk_item_data(probe, vol->block_size, ti, sizeof *tino);
-            if (!tino) return -EMBK_EINVAL;
+            /* Last handle closed. Read the AUTHORITATIVE on-disk link count --
+             * through the cache, which does not weaken that word. The cache is
+             * keyed on `generation`, and an unlink is a COMMIT: it bumps the
+             * generation and retires every entry. So a hit can only be served
+             * when nothing has been committed since the entry was made, which
+             * is exactly when the cached value and the on-disk value are the
+             * same number. A stale one is not reachable.
+             *
+             * It was the last device read an open/close pair cost. */
+            struct embk_inode_item tino_c;
+            int trc = embkfs_inode_cached(vol, oid, &tino_c);
+            if (trc != EMBK_OK) return EMBK_OK;     /* inode already gone */
+            const struct embk_inode_item *tino = &tino_c;
             if (tino->links == 0)
                 return embkfs_destroy_object(vol, oid);
             return EMBK_OK;                         /* still linked: keep it */
@@ -4347,14 +4398,17 @@ int embkfs_dir_is_empty(struct embkfs_volume *vol, uint64_t dir_oid,
     return EMBK_OK;
 }
 
+/* THE THIRD BYPASS. Every path component's type is asked for here, right after
+ * the lookup that just found it -- and this did its own B-tree descent, like
+ * stat and like the lookup's own directory-inode read did before them. Three
+ * places asking the same question three different ways, with a cache in front
+ * of none of them. */
 static int embkfs_inode_dtype(struct embkfs_volume *vol, uint64_t oid, uint8_t *out_type)
 {
-    static uint8_t probe[4096];
-    const struct embk_item_header *ii =
-        embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
-    if (!ii) return -EMBK_ENOENT;
-    const struct embk_inode_item *ino = embk_item_data(probe, vol->block_size, ii, sizeof *ino);
-    if (!ino) return -EMBK_EINVAL;
+    struct embk_inode_item ino_c;
+    int rc = embkfs_inode_cached(vol, oid, &ino_c);
+    if (rc != EMBK_OK) return rc;
+    const struct embk_inode_item *ino = &ino_c;
 
     uint32_t mode = ino->mode & EMBKFS_S_IFMT;
     if (mode == EMBKFS_S_IFDIR) *out_type = EMBKFS_DT_DIR;
@@ -4785,10 +4839,12 @@ static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
 
     if (!vol || !out) return -EMBK_EINVAL;
 
-    if (vol->icache_valid && vol->icache_oid == oid &&
-        vol->icache_gen == vol->generation) {
+    unsigned slot = (unsigned)(oid % (sizeof vol->icache / sizeof vol->icache[0]));
+
+    if (vol->icache[slot].valid && vol->icache[slot].oid == oid &&
+        vol->icache[slot].gen == vol->generation) {
         vol->icache_hits++;
-        *out = vol->icache_ino;
+        *out = vol->icache[slot].ino;
         return EMBK_OK;
     }
     vol->icache_misses++;
@@ -4800,10 +4856,10 @@ static int embkfs_inode_cached(struct embkfs_volume *vol, uint64_t oid,
         embk_item_data(probe_i, vol->block_size, ii, sizeof *ino);
     if (!ino) return -EMBK_EINVAL;
 
-    vol->icache_ino   = *ino;          /* copy: probe_i is reused by the next call */
-    vol->icache_oid   = oid;
-    vol->icache_gen   = vol->generation;
-    vol->icache_valid = true;
+    vol->icache[slot].ino   = *ino;    /* copy: probe_i is reused by the next call */
+    vol->icache[slot].oid   = oid;
+    vol->icache[slot].gen   = vol->generation;
+    vol->icache[slot].valid = true;
     *out = *ino;
     return EMBK_OK;
 }
@@ -4818,20 +4874,15 @@ int embkfs_write_object(struct embkfs_volume *vol, uint64_t oid,
  * copy, not a live pointer into the read buffer) -- size/mode/links/
  * timestamps/generation, everything a `stat`-style caller needs. Read-
  * only, takes no lock beyond whatever a single tree lookup needs. */
+/* stat used to do its OWN descent, bypassing the inode cache entirely -- which
+ * is why the cache reported 0 hits against 15 misses while `stat` was the most
+ * frequent metadata call in the system. It answers the same question the cache
+ * exists for, so it asks the cache. */
 int embkfs_stat_object(struct embkfs_volume *vol, uint64_t oid,
                        struct embk_inode_item *out)
 {
-    static uint8_t probe[4096];
     if (!vol || !out) return -EMBK_EINVAL;
-
-    const struct embk_item_header *ii =
-        embkfs_find_item(vol, oid, EMBK_TYPE_INODE, 0, probe, sizeof probe);
-    if (!ii) return -EMBK_ENOENT;
-    const struct embk_inode_item *ino = embk_item_data(probe, vol->block_size, ii, sizeof *ino);
-    if (!ino) return -EMBK_EINVAL;
-
-    *out = *ino;
-    return EMBK_OK;
+    return embkfs_inode_cached(vol, oid, out);
 }
 
 int embkfs_read_object(struct embkfs_volume *vol, uint64_t oid,

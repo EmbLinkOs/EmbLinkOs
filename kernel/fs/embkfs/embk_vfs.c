@@ -247,14 +247,6 @@ static int unlink_impl(struct vnode *dir, const char *name, size_t name_len)
  * neutral seconds. Best-effort: a failed inode read leaves 0 ("unknown")
  * rather than failing the whole stat -- size/type are the load-bearing
  * fields, mtime is advisory metadata. */
-static uint64_t stat_mtime_seconds(struct embkfs_volume *vol, uint64_t oid)
-{
-    struct embk_inode_item ino;
-    if (embkfs_stat_object(vol, oid, &ino) != EMBK_OK)
-        return 0;
-    return ino.mtime / 1000000000ULL;
-}
-
 static int stat_impl(struct vnode *vn, struct vfs_stat *out)
 {
     if (!vn || !out || !vn->mnt || !vn->mnt->fs_data)
@@ -262,7 +254,20 @@ static int stat_impl(struct vnode *vn, struct vfs_stat *out)
 
     struct embkfs_volume *vol = vol_of(vn);
     out->type = vn->type;
-    out->mtime = stat_mtime_seconds(vol, vn->ino);
+
+    /* ONE inode read for everything this function needs.
+     *
+     * It used to read the inode for the mtime, and then -- for a regular file
+     * -- call embkfs_seek_object(SEEK_END) for the size, which walks EVERY
+     * EXTENT of the object to re-derive a number the inode was already
+     * holding. Two answers to one question, the expensive one preferred, on
+     * the most frequent metadata call in the system. It was the last 8 of the
+     * 22 device reads a warm stat cost. */
+    struct embk_inode_item ino;
+    int irc = embkfs_stat_object(vol, vn->ino, &ino);
+    if (irc != EMBK_OK)
+        return irc;
+    out->mtime = ino.mtime / 1000000000ULL;
 
     if (vn->type == VFS_DT_DIR) {
         out->mode = EMBKFS_S_IFDIR | EMBKFS_PERM_DIR;
@@ -275,13 +280,11 @@ static int stat_impl(struct vnode *vn, struct vfs_stat *out)
         return EMBK_OK;
     }
 
-    uint64_t size = 0;
-    int rc = embkfs_seek_object(vol, vn->ino, 0, EMBKFS_SEEK_END, 0, &size);
-    if (rc != EMBK_OK)
-        return rc;
-
-    out->size = size;
-    out->nlink = 1;
+    /* The inode's own size. It is what the write path maintains and what the
+     * extent walk was reconstructing; asking the cheap authority instead of
+     * the expensive one is the whole change. */
+    out->size = ino.size;
+    out->nlink = ino.links ? ino.links : 1;
     if (vn->type == VFS_DT_LNK)
         out->mode = EMBKFS_S_IFLNK | EMBKFS_PERM_LNK;
     else

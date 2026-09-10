@@ -499,11 +499,59 @@ struct embkfs_volume {
      * read_object_at's size probe plus read_object_range's own lookup. Measured:
      * ~3 device reads per 8 KB chunk when only ONE is the actual data block.
      * A single 128-byte struct, so it costs nothing next to rcache's megabytes. */
-    uint64_t  icache_oid;
-    uint64_t  icache_gen;
-    bool      icache_valid;
+    /* THE INODE CACHE. Finding an inode is a B-tree descent that reads blocks,
+     * and the answer cannot change between two calls that see the same
+     * `generation` -- so every read after the first is work being redone.
+     *
+     * DIRECT-MAPPED, 32 ways, because ONE slot is not a cache. A single entry
+     * scores exactly zero hits the moment two files are used alternately --
+     * each call evicts the answer the next one wants -- and that is not a
+     * corner case, it is what a path walk does (a directory's inode, then the
+     * child's, then the next directory's). Measured before changing it: 50
+     * stats of one file cost 1100 device reads and the cache reported 0 hits
+     * and 15 misses.
+     *
+     * Object ids are handed out sequentially, so oid % 32 spreads them without
+     * needing a hash. Keyed on `generation` as well as oid: any commit bumps
+     * it, so a stale inode can never be served -- blunt, but correct, and far
+     * cheaper now that the page cache batches writes instead of committing a
+     * transaction per write. */
+    struct {
+        uint64_t oid;
+        uint64_t gen;
+        bool     valid;
+        struct embk_inode_item ino;
+    } icache[32];
     uint64_t  icache_hits, icache_misses;
-    struct embk_inode_item icache_ino;
+
+    /* THE NAME CACHE: (directory, name) -> object id.
+     *
+     * The other half of a path walk. With the inode cache in place, resolving
+     * "/system/bin/shell.elf" still cost one B-tree descent PER COMPONENT to
+     * turn a name into an object id -- and a path walk asks the same questions
+     * every time, because directories change far less often than they are
+     * read. Measured: after fixing the inode cache, 50 stats of one file were
+     * still 700 device reads.
+     *
+     * ONLY POSITIVE ANSWERS ARE CACHED. A miss is not remembered, because
+     * "this name does not exist" stops being true the moment somebody creates
+     * it -- and create-then-open is the single most common sequence in the
+     * system. Caching absence would need the create path to invalidate, which
+     * is a second thing to get wrong for no measured gain.
+     *
+     * Keyed on `generation` like the inode cache, so any commit -- including
+     * the unlink or rename that would change an answer -- retires every entry
+     * at once. Blunt and correct. */
+    struct {
+        uint64_t dir_oid;
+        uint32_t hash;          /* crc32c of the name */
+        uint8_t  name_len;
+        char     name[56];      /* the authoritative compare; a hash can collide */
+        uint64_t oid;
+        uint64_t gen;
+        bool     valid;
+    } ncache[64];
+    uint64_t  ncache_hits, ncache_misses;
 
     /* Windowed read-ahead cache. rcache is all-or-nothing: it caches the WHOLE
      * object, so `total <= EMBKFS_RCACHE_MAX` is a cliff -- a file one byte over
@@ -551,6 +599,8 @@ struct embkfs_stat {
      * when rcache MISSES, so it may well be cold in practice. (ecache already
      * had hit/miss counters above.) */
     uint64_t icache_hit, icache_miss;
+    /* The name cache: (dir, name) -> oid, the other half of a path walk. */
+    uint64_t ncache_hit, ncache_miss;
 };
 void embkfs_stat_reset(void);
 void embkfs_stat_get(struct embkfs_stat *out);
