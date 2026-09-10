@@ -1453,18 +1453,45 @@ int ioctl(int fd, unsigned long request, ...) {
     return -1;
 }
 
-/* NO mmap. Memory here is sbrk (a real growable heap) and typed objects
- * (shared surfaces, zero-copy windows); mapping a FILE into an address space is
- * a capability this OS has never had. Refused, not faked out of malloc: an
- * anonymous-looking block would silently not be MAP_SHARED and would not be
- * backed by the file the caller named. TCC's `-run` is the caller; `tcc -o`
- * never reaches here. */
+/* mmap -- ANONYMOUS PRIVATE ONLY, over the kernel's EMBK_SYS_mmap.
+ *
+ * Everything the kernel cannot honour is refused HERE, at the call, rather
+ * than approximated:
+ *
+ *   file-backed (fd >= 0)  ENODEV  -- needs a page cache that does not exist.
+ *                                     Returning anonymous zeroes for a file
+ *                                     the caller named is a bug that surfaces
+ *                                     a long way from the call.
+ *   MAP_SHARED             ENOTSUP -- two processes would each believe they
+ *                                     saw the other's writes.
+ *   MAP_FIXED              ENOTSUP -- the kernel picks the address. An address
+ *                                     the caller chooses is one it can collide
+ *                                     with, and nothing here needs it.
+ *   PROT_WRITE|PROT_EXEC   EINVAL  -- refused by the kernel. Map writable,
+ *                                     write, then mprotect to executable --
+ *                                     once mprotect exists.
+ *
+ * `off` must be zero: there is nothing for a non-zero offset to be an offset
+ * INTO. TCC's `-run` was the historical caller of this function and got an
+ * honest ENOSYS; it now gets real memory for the anonymous case it actually
+ * uses, and the same honest refusal for the rest. */
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
-    (void)addr; (void)len; (void)prot; (void)flags; (void)fd; (void)off;
-    errno = ENOSYS;
-    return MAP_FAILED;
+    if (fd >= 0)                       { errno = ENODEV;  return MAP_FAILED; }
+    if (off != 0)                      { errno = EINVAL;  return MAP_FAILED; }
+    if (flags & MAP_SHARED)            { errno = ENOTSUP; return MAP_FAILED; }
+    if (flags & MAP_FIXED)             { errno = ENOTSUP; return MAP_FAILED; }
+    if (addr != NULL)                  { errno = ENOTSUP; return MAP_FAILED; }
+    if (len == 0)                      { errno = EINVAL;  return MAP_FAILED; }
+
+    int64_t ret = embk_mmap(len, prot);
+    if (ret < 0) { embk_fail((int)ret); return MAP_FAILED; }
+    return (void *)(intptr_t)ret;
 }
-int munmap(void *addr, size_t len) { (void)addr; (void)len; errno = ENOSYS; return -1; }
+
+int munmap(void *addr, size_t len) {
+    int r = embk_munmap(addr, len);
+    return r < 0 ? embk_fail(r) : 0;
+}
 int mprotect(void *addr, size_t len, int prot) {
     (void)addr; (void)len; (void)prot; errno = ENOSYS; return -1;
 }

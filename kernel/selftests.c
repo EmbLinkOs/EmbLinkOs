@@ -28,6 +28,7 @@
 #include "mm/kheap.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
+#include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
 #include "drivers/usb/usb.h"
 #include "drivers/video/framebuffer.h"
 #include "arch/x86_64/cpu/percpu.h"
@@ -5817,6 +5818,70 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test sched roundrobin") == 0) {
         int rc = process_test_roundrobin();
         kprintf("\n[cmd] test sched roundrobin: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* mmap/munmap, measured against the PHYSICAL allocator.
+     *
+     * posixdemo already exercises the syscall from ring 3 and checks that the
+     * memory works and that the refusals refuse. What it cannot see from there
+     * is whether munmap actually GAVE THE PAGES BACK -- reading unmapped
+     * memory is a fault, so a userland test can only prove the mapping is
+     * gone, not that the frames returned to the allocator. pmm_free_pages() is
+     * the one number the thing under test cannot fake.
+     *
+     * The exact round trip is the point. It used to be inexact: munmap gave
+     * back the DATA pages and kept the three page tables that described them
+     * (docs/TODO.md carried that as "vm_unmap_page() does not free page tables
+     * that become empty"), so this would have read 19 out and 16 back. */
+    if (strcmp(cmd, "test mmap") == 0) {
+        struct process *p = current_thread ? current_thread->proc : 0;
+        if (!p) {
+            kprintf("\n[cmd] test mmap: no process context\n");
+            return 1;
+        }
+
+        const uint64_t LEN = 16 * 4096;
+        uint64_t free_before = pmm_free_pages();
+
+        int64_t a = vma_mmap(p, 0, LEN, PROT_READ | PROT_WRITE,
+                             MAP_ANONYMOUS | MAP_PRIVATE);
+        bool ok = a > 0;
+
+        if (ok) {
+            /* Zeroed FIRST, then written, then read back -- in that order. A
+             * mapping that returns what you wrote but arrived carrying the
+             * last owner's data is a disclosure a write-then-read test cannot
+             * see. */
+            volatile uint64_t *m = (volatile uint64_t *)(uintptr_t)a;
+            for (uint64_t i = 0; i < LEN / 8; i += 512)
+                if (m[i] != 0) ok = false;
+            for (uint64_t i = 0; i < LEN / 8; i += 512)
+                m[i] = 0xC0FFEE00ULL + i;
+            for (uint64_t i = 0; i < LEN / 8; i += 512)
+                if (m[i] != 0xC0FFEE00ULL + i) ok = false;
+        }
+
+        uint64_t free_mapped = pmm_free_pages();
+        bool took = ok && free_mapped <= free_before - LEN / 4096;
+
+        int rc = ok ? vma_munmap(p, (uint64_t)a, LEN) : -1;
+        uint64_t free_after = pmm_free_pages();
+        bool gave_back = (rc == EMBK_OK) && (free_after == free_before);
+
+        kprintf("\n[cmd] test mmap: %d KiB at %p, zeroed, written, read back: %s\n",
+                (int)(LEN / 1024), (void *)(uintptr_t)a, ok ? "OK" : "FAIL");
+        kprintf("      free pages %d -> %d -> %d (page tables included): %s\n",
+                (int)free_before, (int)free_mapped, (int)free_after,
+                (took && gave_back) ? "OK" : "FAIL");
+
+        int64_t wx = vma_mmap(p, 0, 4096, PROT_WRITE | PROT_EXEC,
+                              MAP_ANONYMOUS | MAP_PRIVATE);
+        kprintf("      writable+executable refused: %s\n", wx < 0 ? "OK" : "FAIL");
+        if (wx > 0) vma_munmap(p, (uint64_t)wx, 4096);
+
+        kprintf("[cmd] test mmap: %s\n",
+                (ok && took && gave_back && wx < 0) ? "OK" : "FAIL");
         return 1;
     }
 

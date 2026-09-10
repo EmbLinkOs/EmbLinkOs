@@ -1000,4 +1000,37 @@ static inline int embk_tty_mode(int mode) {
     return (int)embk_syscall1(EMBK_SYS_tty_mode, mode);
 }
 
+/* --- anonymous memory mappings -------------------------------------------
+ * Pages with the permissions you ask for, at an address the kernel picks, and
+ * -- unlike the sbrk heap, which only ever grows -- pages you can give back.
+ *
+ * PRIVATE AND ANONYMOUS ONLY. There is no `fd`: a file mapping needs a page
+ * cache the kernel does not have, and MAP_SHARED that quietly behaved as
+ * MAP_PRIVATE would be two processes each believing they saw the other's
+ * writes. There is no `addr`: an address the caller chooses is an address the
+ * caller can collide with.
+ *
+ * PROT_WRITE|PROT_EXEC is REFUSED (-EMBK_EINVAL). A page that is both is the
+ * primitive every code injection needs. A JIT maps it writable, writes, and
+ * then flips it to executable -- which is mprotect, and is not built yet.
+ *
+ * Every page arrives ZEROED, and the whole mapping is allocated up front, so
+ * a large mapping costs its full size immediately. */
+#define EMBK_PROT_NONE   0x0
+#define EMBK_PROT_READ   0x1
+#define EMBK_PROT_WRITE  0x2
+#define EMBK_PROT_EXEC   0x4
+
+static inline int64_t embk_mmap(size_t len, int prot) {
+    return embk_syscall3(EMBK_SYS_mmap, (int64_t)len, prot, 0);
+}
+
+/* Unmaps a whole mapping, or a page-aligned prefix, suffix or middle of one --
+ * a middle splits it in two. Unmapping a range that was never mapped is an
+ * ERROR, not a no-op: it is far more often a bug than idempotent cleanup, and
+ * succeeding silently would hide a double free of address space. */
+static inline int embk_munmap(void *addr, size_t len) {
+    return (int)embk_syscall2(EMBK_SYS_munmap, (int64_t)(intptr_t)addr, (int64_t)len);
+}
+
 #endif /* __EMBK_H__ */

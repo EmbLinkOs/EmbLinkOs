@@ -36,6 +36,8 @@
 #include <time.h>
 #include <sched.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <stdint.h>
 
 static int failures = 0;
 
@@ -678,6 +680,83 @@ static void test_fcntl(void) {
 
 /* Every one of these is supposed to fail. A stub that returned 0 would pass a
  * happy-path test and then mislead its caller at the worst moment. */
+/* mmap/munmap. Anonymous private only, and every refusal is checked as
+ * carefully as the success -- a wrapper that quietly turned a MAP_SHARED or a
+ * file mapping into anonymous zeroes would pass a test that only looked at the
+ * happy path, and would corrupt the caller somewhere else entirely.
+ *
+ * The MUNMAP-THEN-TOUCH check is deliberately absent: reading unmapped memory
+ * is a fault, and a fault is how this process dies. That the pages really came
+ * back is asserted where it can be: the kernel's own free-page count, in the
+ * boot self-test. */
+static void test_mmap(void) {
+    printf("mmap/munmap (anonymous, private):\n");
+
+    const size_t len = 64 * 1024;
+    char *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ck("mmap 64 KiB returns a mapping", p != MAP_FAILED);
+    if (p == MAP_FAILED) return;
+
+    int zeroed = 1;
+    for (size_t i = 0; i < len; i++) if (p[i]) { zeroed = 0; break; }
+    ck("every byte arrives zeroed", zeroed);
+
+    /* Touch the first, last and a middle byte of every page: a mapping whose
+     * page tables are only partly installed reads fine at the start. */
+    for (size_t off = 0; off < len; off += 4096) {
+        p[off] = (char)(off / 4096 + 1);
+        p[off + 2048] = (char)0xA5;
+        p[off + 4095] = (char)0x5A;
+    }
+    int stored = 1;
+    for (size_t off = 0; off < len; off += 4096)
+        if (p[off] != (char)(off / 4096 + 1) ||
+            p[off + 2048] != (char)0xA5 || p[off + 4095] != (char)0x5A) { stored = 0; break; }
+    ck("writes to every page read back", stored);
+
+    /* A second mapping must not overlap the first. */
+    char *q = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ck("a second mapping does not overlap the first",
+       q != MAP_FAILED && (q + len <= p || q >= p + len));
+
+    /* Unmap the MIDDLE of the first mapping: the kernel must split it in two
+     * and leave both halves usable. This is the case a munmap implemented by
+     * walking page tables gets wrong. */
+    ck("munmap of a middle page splits the mapping", munmap(p + 4096, 4096) == 0);
+    ck("the pages either side of the hole survive",
+       p[0] == (char)1 && p[2 * 4096] == (char)3);
+
+    ck("munmap of the prefix", munmap(p, 4096) == 0);
+    ck("munmap of the remainder", munmap(p + 2 * 4096, len - 2 * 4096) == 0);
+    if (q != MAP_FAILED) ck("munmap of the second mapping", munmap(q, len) == 0);
+
+    /* Refusals. Each of these is a thing the kernel cannot honour; each must
+     * say so rather than hand back something that is not what was asked for. */
+    errno = 0;
+    void *wx = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ck("PROT_WRITE|PROT_EXEC is refused (W^X)", wx == MAP_FAILED && errno == EINVAL);
+
+    errno = 0;
+    void *sh = mmap(NULL, 4096, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    ck("MAP_SHARED is refused, not silently made private",
+       sh == MAP_FAILED && errno == ENOTSUP);
+
+    /* ANY fd is refused -- fd 1 rather than a file we open, so this assertion
+     * cannot be skipped by a missing fixture the way a stat() guard would. */
+    errno = 0;
+    void *fm = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 1, 0);
+    ck("a file-backed mapping is refused, not faked with zeroes",
+       fm == MAP_FAILED && errno == ENODEV);
+
+    errno = 0;
+    ck("munmap of a range that was never mapped fails",
+       munmap((void *)(uintptr_t)(0x500000000000ULL + 0x30000000ULL), 4096) == -1);
+
+    CK_FAILS("mprotect -> ENOSYS (not built yet)",
+             mprotect(q, 4096, PROT_READ), ENOSYS);
+}
+
 static void test_honest_refusals(void) {
     printf("honest refusals (must NOT pretend):\n");
     struct utimbuf ub = { 0, 0 };
@@ -982,6 +1061,7 @@ int main(void) {
     test_errno_translation();
     test_rename();
     test_signals();
+    test_mmap();
     test_honest_refusals();
 
     printf("\nposixdemo: %s (%d failure%s)\n",

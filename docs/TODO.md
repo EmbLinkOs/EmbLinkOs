@@ -441,6 +441,46 @@ web asks for them and how much they change a page:
   (error 0x0C) the first time W^X set NX on the data segment. Consider moving
   the enable into vmm_init/CPU-feature init where it belongs logically.
 
+### mmap — what exists, and what it deliberately does not
+
+`mmap(len, prot, flags)` / `munmap(addr, len)` are real on both architectures
+(`kernel/mm/vma.c`, syscalls 96/97, libc wrappers in `user/lib/syscalls.c`).
+Anonymous private mappings, permissions chosen by the caller, W^X enforced, and
+every page — page tables included — returned on unmap. Measured, not asserted:
+`test mmap` on x86 reads `free pages 1026067 -> 1026048 -> 1026067`, the ARM
+boot self-test `128279 -> 128260 -> 128279`, and `posixdemo` exercises the whole
+surface from ring 3 on both.
+
+Each item below is REFUSED today with a distinct errno rather than
+approximated, which is why none of them is a silent bug waiting to be found:
+
+- [ ] **`mprotect`.** The reason W^X is a hard refusal instead of a policy: a
+  JIT needs to map writable, write, and then flip the pages to executable, and
+  without mprotect it cannot. This is the next piece of work, and the smallest:
+  the VMA list already records `prot` per range, so it is a split-and-rewalk of
+  the page tables plus a shootdown. Currently `ENOSYS`.
+- [ ] **File-backed mappings (`fd >= 0`).** Blocked on a page cache — see
+  below. Currently `ENODEV`, never anonymous zeroes standing in for a file.
+- [ ] **`MAP_SHARED`.** Needs a shared anonymous object with a refcount, and
+  for file mappings the page cache again. Currently `ENOTSUP`; a MAP_SHARED
+  quietly behaving as MAP_PRIVATE is two processes each believing they see the
+  other's writes.
+- [ ] **`MAP_FIXED` / a caller-chosen address.** The kernel picks. Refusing is
+  cheap and nothing needs it; the plumbing exists in `vma_mmap` behind the flag
+  should that change. Currently `ENOTSUP`.
+- [ ] **Demand paging.** Every mapping is allocated AND ZEROED up front, so a
+  large one costs its full size immediately. Real demand paging needs a fault
+  handler that can tell "not mapped yet, and legitimately yours" from "not
+  yours" — the VMA list is exactly the record that can answer it, which is
+  half the reason it exists — plus a zero page mapped read-only and copied on
+  write.
+- [ ] **A page cache.** The block layer issues every `write()` straight to the
+  device synchronously and keeps no dirty pages (which is why `fsync` is
+  vacuously true today — see `user/lib/syscalls.c`). A page cache is the
+  prerequisite for file-backed mmap, and the day it lands `fsync`/`fdatasync`
+  must become a real device flush *in the same commit*.
+- [ ] **`msync`.** Meaningless until MAP_SHARED file mappings exist. `ENOSYS`.
+
 ---
 
 ## Interrupts & Timers
@@ -1599,20 +1639,45 @@ substantially complete.
     - [ ] **`fdt_find_compatible()` searches two levels only** (root children
       and their children). Enough for `virt`'s flat tree; will quietly miss a
       device behind a deeper bus.
-    - [ ] **`vm_unmap_page()` does not free page tables that become empty.**
-      Leaks one to three pages per fully-unmapped 2 MiB region. Harmless while
-      nothing unmaps in a loop; A5's process teardown is where that stops.
-    - [ ] **No TLB shootdown between CPUs, and SMP now makes that REAL.**
-      This was theoretical while aarch64 ran one core; four cores share page
-      tables, so a mapping torn down on one core can live on in another's
-      TLB. `tlbi ... is` (inner-shareable) already broadcasts, which covers
-      the unmap paths in pagetable.c -- what is NOT covered is the ordering
-      around it and anything that assumes a local-only invalidate. Audit it
-      against the x86 side, which has the same problem and the same partial
-      answer.
-    - [ ] **No SGIs, so there is no way to interrupt another core** -- which
-      is what a real shootdown, a reschedule IPI or a panic-stop would need.
-      The GIC driver configures SGIs but nothing sends one.
+    - [x] **`vm_unmap_page()` does not free page tables that become empty.**
+      DONE, on BOTH architectures. `vmm_unmap_in()` records the table at each
+      level on the way down and, after clearing the leaf, walks back up freeing
+      every level it just emptied, stopping at the first one a neighbouring
+      mapping still uses. The order is clear, then flush, then free -- a table
+      page handed back to the PMM can be reallocated immediately, and a core
+      still holding a cached walk of it would be translating through somebody
+      else's data; the invalidation has to cover the whole 2 MiB/1 GiB span the
+      removed entry described, not just the one VA. On x86 the reclamation is
+      restricted to PML4 slots 0-255: slots 256-511 are copies of the kernel's
+      own entries, so the tables beneath them are shared by every address space
+      in the system. The leak was theoretical until mmap() existed; the boot
+      self-test then measured it exactly -- munmap gave back 16 of the 19 pages
+      an mmap had taken, the missing 3 being the L1/L2/L3 tables. It is now a
+      round trip: `free pages 128281 -> 128262 -> 128281`.
+    - [x] **No TLB shootdown between CPUs, and SMP now makes that REAL.**
+      DONE, and the two architectures needed opposite fixes. aarch64 never had
+      the hole: `tlbi ... is` broadcasts across the inner-shareable domain in
+      hardware, so the work here was the ORDERING around it (clear the entry,
+      `dsb`, invalidate, `dsb; isb`) and widening the invalidate to the whole
+      span when an intermediate table is removed. x86 DID have the hole, from
+      the day it gained a second core: `invlpg` invalidates the issuing core's
+      TLB and says nothing to the rest, so a page unmapped on one core stayed
+      live on the others until something evicted it -- a use-after-free the
+      hardware performs for you, on memory the allocator has already handed to
+      somebody else. `vmm_flush_tlb()` now broadcasts `IPI_TLB_SHOOTDOWN` and
+      every receiving core reloads CR3. Deliberately blunt: the IPI carries no
+      payload naming the page, so a mailbox and a handshake would narrow it --
+      the right change once a shootdown is frequent enough to measure, which
+      it is not.
+    - [x] **No SGIs, so there is no way to interrupt another core.**
+      DONE. `kernel/arch/aarch64/irq/ipi.c` sends SGIs through `ICC_SGI1R_EL1`
+      (IRM=1, all-but-self); x86's equivalent is `kernel/arch/x86_64/irq/ipi.c`
+      on vectors 0xF0-0xF2. Both meet the same seam, `kernel/include/arch_ipi.h`
+      + `kernel/mm/ipi.c`, with three reasons: `IPI_TLB_SHOOTDOWN`,
+      `IPI_RESCHEDULE` and `IPI_HALT`. The acceptance test asserts every core
+      is actually REACHABLE by one, which is what the old wording ("the GIC
+      driver configures SGIs but nothing sends one") was really about -- a
+      configured-but-unused path is indistinguishable from a broken one.
     - [ ] **aarch64 has its own `mm/pagetable.c` alongside x86's `mm/vmm.c`.**
       Intentional per ARM64.md §2.3 — the shared interface is factored from two
       WORKING implementations, and the aarch64 one is not finished until A5

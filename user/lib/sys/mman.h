@@ -1,16 +1,31 @@
 /* sys/mman.h -- EmbLink override header (newlib ships none).
  *
- * EmbLink has NO mmap. Memory comes from sbrk (a real, growable heap) and from
- * the typed object primitives (shared surfaces, zero-copy windows) -- mapping a
- * FILE into an address space is a capability this OS has never had, not one it
- * mislaid. The kernel VMM could grow it; nothing has needed it.
+ * mmap IS REAL NOW, for the anonymous private case: the kernel keeps a per
+ * process list of mapped ranges (kernel/mm/vma.h) and hands out pages with
+ * the permissions you ask for, at an address it picks -- and takes them back
+ * on munmap, page tables included. That is the one thing sbrk could never do:
+ * the heap only ever grows.
  *
- * These exist so portable code COMPILES (TCC's tccrun.c -- its `-run` mode --
- * includes this unconditionally even when you only ever compile to a file).
- * The functions are defined in syscalls.c as honest ENOSYS refusals, so
- * `tcc -run` fails loudly and `tcc -o` never comes near them. Nothing here
- * fakes an anonymous mapping out of malloc: a caller that asked for MAP_SHARED
- * or a file mapping would get something that silently is not one. */
+ * WHAT IS STILL REFUSED, and refused loudly rather than approximated:
+ *
+ *   mmap of a FILE (fd >= 0)   ENODEV   -- needs a page cache that does not
+ *                                          exist yet. Handing back anonymous
+ *                                          zeroes for a named file is a bug
+ *                                          that surfaces far from the call.
+ *   MAP_SHARED                 ENOTSUP  -- a MAP_SHARED that behaved as
+ *                                          MAP_PRIVATE is two processes each
+ *                                          believing they see the other's
+ *                                          writes.
+ *   MAP_FIXED / a non-NULL addr ENOTSUP -- the kernel chooses the address.
+ *   PROT_WRITE|PROT_EXEC       EINVAL   -- refused in the kernel; that page
+ *                                          is the primitive every code
+ *                                          injection needs.
+ *   mprotect, msync            ENOSYS   -- not built. mprotect is what a JIT
+ *                                          needs to flip W to X and is the
+ *                                          next piece of work (docs/TODO.md).
+ *
+ * Mapped pages arrive ZEROED, and the whole range is allocated up front: a
+ * large mapping costs its full size immediately. There is no demand paging. */
 #ifndef _EMBK_SYS_MMAN_H
 #define _EMBK_SYS_MMAN_H
 

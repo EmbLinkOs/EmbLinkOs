@@ -688,15 +688,28 @@ void vmm_unmap_in(uint64_t root_phys, uint64_t virt) {
      * A table is freed only when EVERY entry in it is clear, so a mapping that
      * shares a table with a live neighbour keeps it. Stop at the first level
      * that is still in use: if the leaf's table survives, so does everything
-     * above it. */
+     * above it.
+     *
+     * CLEAR, THEN FLUSH, THEN FREE -- in that order, and the order is the
+     * whole safety argument. A page-table page handed back to the PMM can be
+     * reallocated and rewritten immediately; any core still holding a cached
+     * WALK of it would be translating through somebody else's data. And a
+     * per-VA `tlbi` is not enough here: the entry being removed describes a
+     * 2 MiB or 1 GiB span, and the walk caches hold it for the whole span, so
+     * the invalidation has to be the whole regime. tlb_flush_all() broadcasts
+     * inner-shareable, which covers every core. */
+    int freed = 0;
     for (int level = 2; level >= 0; level--) {
         if (!table_is_empty(tables[level]))
             break;
         *slots[level] = 0;
-        __asm__ volatile("dsb ishst" ::: "memory");
-        pmm_free_page(tables[level]);
+        freed++;
     }
-    tlb_flush_page(virt);
+    if (freed) {
+        tlb_flush_all();
+        for (int level = 2; level > 2 - freed; level--)
+            pmm_free_page(tables[level]);
+    }
 }
 
 uint64_t vmm_get_phys_in(uint64_t root_phys, uint64_t virt) {

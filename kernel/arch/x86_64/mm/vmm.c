@@ -5,6 +5,7 @@
 #include "drivers/char/serial.h"
 #include "include/spinlock.h"
 #include <stdint.h>
+#include <stdbool.h>
 
 
 static uint64_t kernel_pml4_phys = 0;     // physical address of the kernel PML4
@@ -274,19 +275,89 @@ void vmm_unmap(uint64_t virt_addr){
  * so vmm_destroy_address_space() must NOT free it. Unmapping it here first
  * makes that frame invisible to the destroy walk (which frees every present
  * user-half frame it finds). No-op if the mapping isn't present. */
+static bool vmm_table_is_empty(uint64_t table_phys) {
+    const uint64_t *t = vmm_table(table_phys);
+    for (int i = 0; i < 512; i++)
+        if (t[i] & VMM_PRESENT)
+            return false;
+    return true;
+}
+
 void vmm_unmap_in(uint64_t pml4_phys, uint64_t virt_addr) {
     spin_lock(&vmm_lock);
 
+    /* Remember each level's table on the way down, so the walk back up can
+     * free the ones this unmap just emptied. tables[0]=PDPT, [1]=PD, [2]=PT;
+     * slots[n] is the entry in the level ABOVE that points at tables[n]. */
+    uint64_t *slots[3];
+    uint64_t  tables[3];
+
     uint64_t *pml4 = vmm_table(pml4_phys);
-    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
-    uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
-    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
-    uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
-    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
-    uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+    slots[0] = &pml4[pml4_index(virt_addr)];
+    if (!(*slots[0] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    tables[0] = *slots[0] & VMM_ADDR_MASK;
+
+    uint64_t *pdpt = vmm_table(tables[0]);
+    slots[1] = &pdpt[pdpt_index(virt_addr)];
+    if (!(*slots[1] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    if (*slots[1] & VMM_HUGE)      { spin_unlock(&vmm_lock); return; }  /* 1G leaf */
+    tables[1] = *slots[1] & VMM_ADDR_MASK;
+
+    uint64_t *pd = vmm_table(tables[1]);
+    slots[2] = &pd[pd_index(virt_addr)];
+    if (!(*slots[2] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    if (*slots[2] & VMM_HUGE)      { spin_unlock(&vmm_lock); return; }  /* 2M leaf */
+    tables[2] = *slots[2] & VMM_ADDR_MASK;
+
+    uint64_t *pt = vmm_table(tables[2]);
+    if (!(pt[pt_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
 
     pt[pt_index(virt_addr)] = 0;
     vmm_flush_tlb(virt_addr);   /* harmless if this address space isn't active */
+
+    /* RECLAIM THE TABLES THIS EMPTIED, deepest first.
+     *
+     * Without this, unmapping gives back the DATA pages and keeps every page
+     * table that described them -- three per region on a 4-level walk. A
+     * process that maps and unmaps repeatedly at fresh addresses leaks them
+     * forever, and the leak is invisible from userspace because the address
+     * space looks free. It showed up on ARM first, as munmap() returning 16 of
+     * the 19 pages an mmap() had taken; x86 walks the same four levels and had
+     * exactly the same hole.
+     *
+     * ONLY IN THE USER HALF. Slots 256-511 of every PML4 are COPIES of the
+     * kernel's own entries (vmm_create_address_space), so the tables under
+     * them are shared by every address space in the system. Freeing one
+     * because this process stopped using it would pull the kernel mapping out
+     * from under all the others. Every caller today passes a user address;
+     * this makes that a rule rather than a coincidence.
+     *
+     * A table is freed only when EVERY entry in it is clear, so a mapping that
+     * shares a table with a live neighbour keeps it. Stop at the first level
+     * still in use: if the leaf's table survives, so does everything above.
+     *
+     * CLEAR, THEN FLUSH, THEN FREE -- in that order, and the order is the
+     * whole safety argument. A page-table page handed back to the PMM can be
+     * reallocated and rewritten immediately; any core still holding a cached
+     * WALK of it would be translating through somebody else's data. `invlpg`
+     * on the one VA is not enough either: the entry being removed describes a
+     * 2 MiB or 1 GiB span and the paging-structure caches hold it for that
+     * whole span. vmm_flush_tlb's shootdown IPI makes every core reload CR3,
+     * which is exactly the blunt instrument this case needs. */
+    if (pml4_index(virt_addr) < 256) {
+        int freed = 0;
+        for (int level = 2; level >= 0; level--) {
+            if (!vmm_table_is_empty(tables[level]))
+                break;
+            *slots[level] = 0;
+            freed++;
+        }
+        if (freed) {
+            vmm_flush_tlb(virt_addr);
+            for (int level = 2; level > 2 - freed; level--)
+                pmm_free_page(tables[level]);
+        }
+    }
 
     spin_unlock(&vmm_lock);
 }
