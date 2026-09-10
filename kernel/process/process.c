@@ -750,44 +750,11 @@ void sched_sleep_ms(uint64_t ms) {
             timer_delay_ms((uint32_t)ms);
             return;
         }
-        /* KERNEL THREADS ONLY, and this is a measured limit rather than a
-         * design choice.
-         *
-         * Letting USER threads block here corrupts a resume on aarch64: the
-         * thread comes back on a context that was not finished being saved and
-         * dies with a PC-alignment fault (garbage ELR) or an undefined
-         * instruction abort at EL1.
-         *
-         * THE FIRST DIAGNOSIS WAS WRONG and is worth recording as such. It
-         * read "kernel threads take the identical path and are fine, so it is
-         * something about the EL0 exception path". Re-tested since:
-         *
-         *   1 core  -- passes with this gate REMOVED
-         *   2 cores -- passes with this gate REMOVED
-         *   4 cores -- fails
-         *
-         * So it is not about user threads at all. It is a latent race in the
-         * block/resume path that four cores expose, and user threads merely
-         * make FREQUENT: the kernel's own sleepers block ten times a second,
-         * while every app calling sleep() blocks constantly. Kernel threads
-         * are not immune -- they are rare.
-         *
-         * That makes this gate a THROTTLE on a scheduler bug rather than a
-         * boundary around a broken path, and the real fix is in the switch
-         * itself. Not attempted blind: the next step is to find what two cores
-         * can do to one TCB between wait_queue_block() and the end of
-         * kernel_ctx_switch, which is a debugging job and not a patch.
-         *
-         * The honest consequence: sys_sleep_ms for a user process is still the
-         * yield loop it always was, so a sleeping APP still keeps a core out of
-         * idle. The kernel's own periodic threads -- which is what this was
-         * built for, and what would otherwise have ADDED a new permanent
-         * poller -- genuinely sleep. docs/TODO.md carries the repro. */
-        if (t->proc && t->proc->pml4_phys != vmm_get_kernel_pml4()) {
-            sched_unlock();
-            do { sys_yield(); } while (timer_uptime_ms() < deadline);
-            return;
-        }
+        /* USER THREADS TOO, now. This was gated to kernel threads for two
+         * commits because letting user threads block killed aarch64 on four
+         * cores -- and the gate was a throttle on a scheduler bug, not a
+         * boundary around a broken path. The bug is fixed at its source: see
+         * "UNDO A BLOCK THAT DID NOT HAPPEN" in schedule_locked(). */
 
         t->wake_at_ms = deadline;
         /* Returns UNLOCKED -- it released the lock to switch away. The loop
@@ -2460,6 +2427,16 @@ static void schedule_locked(void) {
              * fault seen bringing up AP 3 under -smp 4. Both failure modes
              * are real; this condition is the intersection that avoids
              * both. */
+            /* STILL RUNNING SOMEWHERE IS NOT DISPATCHABLE. A READY thread
+             * should always have running_cpu == -1 by construction, so this
+             * costs one comparison and catches the case where it does not --
+             * which is precisely the two-cores-one-stack corruption the
+             * early-return path above now prevents at its source. Belt and
+             * braces on the single most damaging thing this scan can get
+             * wrong. */
+            if (candidate != current_thread && candidate->running_cpu >= 0) {
+                continue;
+            }
             if ((candidate->state == PROCESS_READY ||
                  (candidate == current_thread && candidate->state == PROCESS_RUNNING))
                 && candidate->priority == band) {
@@ -2493,6 +2470,40 @@ static void schedule_locked(void) {
          * (harmless to repeat, see thread_zombie_locked()'s own comment)
          * -- the reap only actually happens once a real switch below has
          * moved this core off of it. */
+        /* --- UNDO A BLOCK THAT DID NOT HAPPEN -------------------------------
+         *
+         * If the caller had already marked this thread BLOCKED and put it on a
+         * wait queue (sched_block_current_locked does both BEFORE calling
+         * here), that state is now a LIE: we never switched away, so the
+         * thread is still physically executing on this core.
+         *
+         * Leaving the lie in place is a two-core disaster. Another core's
+         * waker finds the thread on the queue, marks it READY, and the
+         * candidate scan -- which matches on READY -- dispatches it. But this
+         * thread never reached kernel_ctx_switch, so it has no saved context:
+         * the other core resumes it onto a stale one while this core is still
+         * running it. Two cores, one kernel stack. The symptom is a thread
+         * coming back with a garbage ELR and dying of a PC-alignment fault at
+         * EL1, which is exactly the aarch64 crash docs/TODO.md has been
+         * carrying, and why sched_sleep_ms had to gate user threads out.
+         *
+         * So: unqueue it and put it back to RUNNING. The block simply did not
+         * take. Every caller of sched_block_current_locked already loops on
+         * its own predicate -- process_wait's retry loop is documented as
+         * relying on exactly this "returned without switching" case -- so a
+         * caller that wakes without its condition met just tries again.
+         *
+         * ZOMBIE is deliberately NOT touched: the long comment above owns that
+         * case, and a zombie must stay a zombie. */
+        if (current_thread->state == PROCESS_BLOCKED) {
+            if (current_thread->wait_queue)
+                wait_queue_remove(current_thread->wait_queue, current_thread);
+            current_thread->state       = PROCESS_RUNNING;
+            current_thread->running_cpu = (int)this_cpu()->cpu_index;
+            current_thread->wake_at_ms  = 0;
+            current_thread->futex_key   = 0;
+        }
+
         spin_unlock(&g_sched_lock);
         return;
     }

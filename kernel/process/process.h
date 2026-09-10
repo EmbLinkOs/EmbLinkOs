@@ -735,11 +735,11 @@ void sched_block_current_locked(struct wait_queue *wq);
  * The thread blocks on the timer queue and the scheduler tick wakes it when
  * its deadline passes. Callable only from a schedulable context.
  *
- * KERNEL THREADS ONLY for now: a user thread woken this way comes back with a
- * corrupted link register on aarch64 and faults at EL1. It falls back to the
- * yield loop, which is exactly what it did before, so nothing regresses -- but
- * a sleeping APP still keeps a core out of idle. Bisected and recorded in
- * docs/TODO.md; see the comment on the gate in process.c. */
+ * ANY thread, kernel or user. It was gated to kernel threads for a while
+ * because letting user threads block killed aarch64 on four cores -- which was
+ * never about user threads: it was a window in schedule_locked where a thread
+ * could be marked BLOCKED while still executing, and user threads only made it
+ * frequent. See "UNDO A BLOCK THAT DID NOT HAPPEN" in process.c. */
 void sched_sleep_ms(uint64_t ms);
 
 /* Expired sleepers are woken by schedule() itself, inside the critical section

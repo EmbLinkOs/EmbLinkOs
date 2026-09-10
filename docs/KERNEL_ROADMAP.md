@@ -123,9 +123,11 @@ kernel's own periodic threads sleep instead of spinning.
 
 **Next:**
 
-1. **Let user threads block on the timer queue.** They cannot today: one woken
-   that way corrupts its resume on aarch64. Bisected, with a repro in
-   `docs/TODO.md`. Until it is fixed, a sleeping *app* keeps a core out of idle.
+1. ~~**Let user threads block on the timer queue.**~~ **Done** — and it was a
+   scheduler bug, not a user-thread one. `schedule_locked()` could return
+   without switching while the thread was already marked `BLOCKED` and queued,
+   so another core could dispatch a thread that had never saved a context. A
+   sleeping app now blocks instead of spinning.
 2. **Tickless idle.** A halted core still wakes 100 times a second to find it
    has nothing to do. The timer queue is what makes "when is the next thing
    due?" answerable, which is the prerequisite.
@@ -151,8 +153,8 @@ capabilities rather than fork/exec.
    enters the kernel. Four threads, 2000 increments each, exact total, with the
    kernel's own counters proving the slow path was taken.
    - No condition variables, no read/write locks, no `pthread_*` veneer yet.
-   - No **timed** wait: `sched_sleep_ms` is kernel-threads-only until the
-     aarch64 user-thread resume bug above is fixed.
+   - No **timed** wait on a futex yet — `sched_sleep_ms` now works for user
+     threads, so this is a small addition rather than a blocked one.
 3. **Per-core run queues.** One global lock guards every scheduling decision.
    It is correct and it will not scale past a handful of cores.
 4. **Accounting**: per-process CPU time, so scheduling policy can be argued

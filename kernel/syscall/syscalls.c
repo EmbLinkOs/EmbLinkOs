@@ -1361,9 +1361,13 @@ static int64_t sys_uptime_ms(const struct sysargs *a) {
  * deliberately zero scheduler surgery), but it removes ~all of the idle CPU
  * theft". It removed most of it and left the part that mattered most: a
  * yield loop is RUNNABLE, so a sleeping app kept the scheduler permanently
- * supplied with work and no core ever reached its idle thread. The kernel now
- * has the wakeup list (sched_sleep_ms), so a sleeping process genuinely
- * blocks and a machine with nothing to do genuinely halts. */
+ * supplied with work and no core ever reached its idle thread.
+ *
+ * It genuinely blocks now, for USER threads too. That took two goes: the first
+ * attempt had to gate user threads back to the yield loop because letting them
+ * block killed aarch64 on four cores -- which turned out not to be about user
+ * threads at all, but a scheduler window they made frequent. See the
+ * "UNDO A BLOCK THAT DID NOT HAPPEN" comment in schedule_locked(). */
 static int64_t sys_sleep_ms(const struct sysargs *a) {
     sched_sleep_ms(a->arg[0]);
     return 0;

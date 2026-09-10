@@ -611,6 +611,21 @@ void arch_early_main(uint64_t dtb_phys) {
      * with no thread to receive it, nothing released it. The page cache makes
      * that path load-bearing rather than merely leaky: it is also how a dying
      * process's dirty pages reach the device. */
+    /* ONE PINNED IDLE THREAD PER CORE -- the liveness backstop process.h calls
+     * an invariant, and which aarch64 simply never had. x86 creates these in
+     * main.c; nothing here did, so a core with nothing else runnable found NO
+     * candidate in schedule_locked's scan and took its early return.
+     *
+     * That is the path that could leave a thread marked BLOCKED while it was
+     * still executing (schedule_locked now unwinds it, which is the real fix)
+     * -- but a core that has somewhere to switch TO never reaches it in the
+     * first place. Both halves are worth having: one makes the state
+     * impossible, the other makes it unreachable. */
+    for (uint32_t ci = 0; ci < cpu_count; ci++) {
+        if (!process_create_idle_for_cpu(ci))
+            kprintf("warning: no idle kthread for cpu %u\n", (unsigned)ci);
+    }
+
     kworker_init();
     vmo_writeback_init();
     power_init();

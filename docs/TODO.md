@@ -573,7 +573,42 @@ The measurement immediately earned itself twice:
 2. It showed every periodic thing in the kernel was a yield loop, which is why
    `sched_sleep_ms` exists at all.
 
-- [ ] **A latent race in the block/resume path that four cores expose.**
+- [x] ~~**A latent race in the block/resume path that four cores expose.**~~
+  **FIXED**, and the fix is four lines in `schedule_locked()`.
+
+  `schedule_locked()` can return WITHOUT switching — when the candidate scan
+  finds nothing runnable on this core. But `sched_block_current_locked()` marks
+  the thread `BLOCKED` and puts it on a wait queue *before* calling it. So on
+  that path the thread was left marked blocked, `running_cpu = -1`, sitting on
+  a queue — **while still physically executing**.
+
+  Another core's waker then finds it on the queue, marks it `READY`, and the
+  candidate scan (which matches on `READY`) dispatches it. It never reached
+  `kernel_ctx_switch`, so it has no saved context: the other core resumes it
+  onto a stale one while the first core is still running it. Two cores, one
+  kernel stack — the garbage `ELR` and the PC-alignment fault at EL1.
+
+  The fix: if we are returning without switching, **undo the block**. Unqueue
+  the thread and put it back to `RUNNING`. Every caller of
+  `sched_block_current_locked` already loops on its own predicate — the code
+  documented `process_wait`'s retry loop as relying on exactly this
+  "returned without switching" case — so a caller that wakes without its
+  condition met simply tries again. What was missing was unwinding the *state*.
+
+  Two supporting changes, each independently right:
+  - The candidate scan now skips any thread with `running_cpu >= 0`. A `READY`
+    thread should always have `-1` by construction; this costs one comparison
+    and catches the case where it does not.
+  - **aarch64 had no per-core idle kthreads.** `process_create_idle_for_cpu`
+    was only ever called from x86's `main.c`, so the "this core always has a
+    legal switch target" invariant `process.h` calls load-bearing was simply
+    absent on ARM — which is *why* the early-return path was reachable there
+    and not on x86. Now created on both.
+
+  `sched_sleep_ms` no longer gates user threads, so a sleeping **app** blocks
+  instead of spinning.
+
+- [x] ~~(superseded entry kept for its history)~~
   `sched_sleep_ms` gates user threads back to a yield loop, so a sleeping *app*
   still keeps a core out of idle. Removing the gate kills aarch64 with a
   PC-alignment fault (garbage `ELR_EL1`) or an undefined-instruction abort at
