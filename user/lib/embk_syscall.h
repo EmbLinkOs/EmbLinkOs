@@ -151,6 +151,9 @@
  * op 0 = WAIT (sleep if *addr == val), op 1 = WAKE (wake up to val). */
 #define EMBK_SYS_futex         105   /* (addr, op, val)    -> n       | -err */
 #define EMBK_SYS_sched_period  106   /* (period_ms, budget) -> 0     | -err */
+#define EMBK_SYS_audio_position 107  /* ()                 -> frames        */
+#define EMBK_SYS_audio_latency  108  /* (ms)               -> ms      | -err */
+#define EMBK_SYS_thread_cpu_ns  109  /* ()                 -> ns            */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

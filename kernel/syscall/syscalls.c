@@ -1371,6 +1371,13 @@ static uint64_t uptime_ms_now(void) {
  * only spend 8 ms of every 16 anyway. Gating it would mostly mean ordinary
  * applications cannot ask to be smooth, which is the outcome the whole policy
  * exists to avoid. */
+/* CPU this thread has consumed, in nanoseconds. See syscall_nr.h for why the
+ * clock is not a substitute. */
+static int64_t sys_thread_cpu_ns(const struct sysargs *a) {
+    (void)a;
+    return (int64_t)sched_self_cpu_ns();
+}
+
 static int64_t sys_sched_period(const struct sysargs *a) {
     return sched_declare_period((uint32_t)a->arg[0], (uint32_t)a->arg[1]);
 }
@@ -1824,6 +1831,28 @@ static int64_t sys_audio_write(const struct sysargs *a) {
     return (int64_t)accepted;
 }
 
+/* Where the speaker actually is, in frames. Gated by the same capability as
+ * every other audio call: the position of a stream is information about a
+ * stream, and a process that may not make a noise has no business reading
+ * how far someone else's noise has got. */
+static int64_t sys_audio_position(const struct sysargs *a) {
+    (void)a;
+    if (!audio_permitted()) return -EMBK_EPERM;
+    struct process *proc = current_process_atomic();
+    if (!proc) return -EMBK_ENOMEM;
+    return (int64_t)audio_position(proc->pid);
+}
+
+/* Ask for a shallower start-up buffer -- see audio.h. The trade is stated
+ * there and it is real: this is the caller choosing latency over safety
+ * margin, and a caller that cannot keep up has chosen holes. */
+static int64_t sys_audio_latency(const struct sysargs *a) {
+    if (!audio_permitted()) return -EMBK_EPERM;
+    struct process *proc = current_process_atomic();
+    if (!proc) return -EMBK_ENOMEM;
+    return audio_set_latency(proc->pid, (uint32_t)a->arg[0]);
+}
+
 /* audio_close() -> 0. arg 0 non-zero asks "has it all been played yet?" instead,
  * which is what a program needs before it exits: closing while the hardware
  * still has buffers cuts the end off every sound. */
@@ -2033,6 +2062,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_key_poll]     = sys_key_poll,
     [SYS_uptime_ms]    = sys_uptime_ms,
     [SYS_sched_period] = sys_sched_period,
+    [SYS_thread_cpu_ns] = sys_thread_cpu_ns,
     [SYS_key_grab]     = sys_key_grab,
     [SYS_win_create]   = sys_win_create,
     [SYS_win_present]  = sys_win_present,
@@ -2083,6 +2113,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_audio_open]     = sys_audio_open,
     [SYS_audio_write]    = sys_audio_write,
     [SYS_audio_close]    = sys_audio_close,
+    [SYS_audio_position] = sys_audio_position,
+    [SYS_audio_latency]  = sys_audio_latency,
     [SYS_mmap]           = sys_mmap,
     [SYS_mprotect]       = sys_mprotect,
     [SYS_dup]            = sys_dup,

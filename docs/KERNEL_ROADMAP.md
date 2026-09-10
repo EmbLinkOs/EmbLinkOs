@@ -267,7 +267,81 @@ capabilities rather than fork/exec.
    was built for this and **removed** — it moved the mean by less than the
    run-to-run noise, which is the same answer read-ahead and per-core run
    queues got.
-6. **Job control**, which is a scheduling and a signalling problem at once:
+6. **Something actually declares a cadence now**, which is what makes item 5
+   more than a switch nobody flips.
+
+   **The UI toolkit declares for the app.** `em_app_run` holds a reservation
+   while an app is animating and gives it back when it stops — apps do not have
+   to know this exists. Two details were got wrong first and are worth keeping
+   written down:
+
+   - *"N frames in a row" is the wrong test for animating.* A loop polling
+     every 10 ms that renders 30 fps video builds one frame in three and never
+     two consecutively, so a consecutive-frames rule sees video as idle. With
+     that rule nothing on the desktop ever declared anything. It is a heat
+     counter now: a frame adds three, an idle iteration subtracts one, held
+     while ≥ 9.
+   - *The budget must cover the whole active part of an iteration.* Timing only
+     build-render-present measured 3–4 ms and omitted input polling and the
+     present's copy, so the app declared a budget it exhausted inside its own
+     frame and spent the rest of every period unprivileged — the opposite of
+     the intent.
+
+   The budget is *measured*, not guessed: the minimum of the recent
+   frame costs, because wall time includes preemption and the minimum is the
+   sample that suffered least. Declaring half the period "to be safe" would
+   claim half a core for a 4 ms frame, and admission control would then refuse
+   the third app on the desktop.
+
+   `framepace.elf` is a real EmApp — real window, real render, real compositor
+   surface — and exists because a quiet desktop never animates, so without it
+   the declaration is code that is never reached.
+
+   **What it actually reports on this host, and it is not a win.** Under TCG
+   with six busy threads, one frame of a 240×120 window costs **10–14 ms of
+   CPU** — more than half a 16 ms period — so the toolkit declines to declare,
+   says so with the number, and backs off. That is the correct answer: an app
+   that needs more than half a core continuously is not periodic at that rate,
+   admission control would rightly refuse it, and granting it would deny the
+   claim to an app that could keep it. No scheduler makes this machine able to
+   render 60 Hz in software under that load.
+
+   Both branches are verified: the declaring path fired (`pacing 16 ms,
+   budget 4 ms`) while the cost estimate was lower, and the refusal path fires
+   now with its reason printed. The frame-interval spread is *printed and not
+   asserted* — with neither run declaring, any difference between them is
+   run-to-run noise, and reading it as a result would be exactly the mistake
+   this project keeps refusing to make.
+
+   The obvious next step, **not taken**: an app that cannot hold its pace
+   should slow to one it can and hit that evenly — 30 fps smooth beats 60 fps
+   ragged. It is not done because the benefit cannot be measured on this host,
+   where the spread is noise-dominated. See `docs/TODO.md`.
+
+7. **Audio: the latency floor moved 40 ms → 15 ms.** The buffer a writer keeps
+   queued *is* the delay between deciding to make a sound and the sound
+   existing, and how shallow it can be is a scheduler question.
+
+   | policy | shallowest clean runway | at 20 ms | at 15 ms |
+   |---|---|---|---|
+   | round-robin | 40 ms | 12–19 underruns | 22–28 underruns |
+   | deadline, declaring 10/3 ms | **15 ms** | 0 | 0 |
+
+   An underrun is the hardware's own report — the AC'97 latches "reached the
+   end of the list and halted", which `ac97_set_last()` has always had to
+   detect to restart the stream and simply never counted.
+
+   Three real gaps had to be closed first, none of them test scaffolding:
+   `audio_position()` (the device's actual playback position — the first
+   version of the test paced off the wall clock and measured nothing, because
+   the device starts when the prefill is met, not when you start writing);
+   `audio_latency(ms)` (the ~170 ms prefill was a floor no scheduler could get
+   under; it is the writer's choice now, floored at one timer tick); and
+   per-descriptor lengths in `ac97_fill()`, which declared every descriptor a
+   full page and zero-padded, making 21 ms the smallest unit of audio the
+   device could be given. `make test-audio-latency` runs the sweep.
+
+8. **Job control**, which is a scheduling and a signalling problem at once:
    backgrounding a pipeline, listing what is running, bringing one to the
    foreground, and interrupting it. Cancellation already exists as a polite
    sticky flag — what is missing is the shell-side notion of a *job* and a way

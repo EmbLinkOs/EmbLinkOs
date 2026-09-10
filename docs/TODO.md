@@ -1560,6 +1560,79 @@ how it came down" and BUILD.md §6.
 
 ---
 
+## Audio
+
+### The latency floor moved 40 ms -> 15 ms, and what it took
+
+`test audiostress` (`make test-audio-latency`) sweeps how little audio a writer
+can keep queued ahead of the speaker before the sound gets holes in it. That
+number IS the latency: everything queued is delay between deciding to make a
+sound and the sound existing.
+
+| policy | shallowest clean runway | at 20 ms | at 15 ms |
+|---|---|---|---|
+| round-robin, no declaration | 40 ms | 12-19 underruns | 22-28 underruns |
+| deadline, declaring 10/3 ms | **15 ms** | 0 | 0 |
+
+An underrun is the hardware's own report, not an inference: the AC'97 latches
+"reached the end of the list and halted", and `ac97_set_last()` has always had
+to detect that to restart the stream -- it just never counted it.
+
+**Three things had to be built before this could be measured at all**, and each
+was a real gap rather than test scaffolding:
+
+- `audio_position()` -- where the speaker actually is, in frames. The device
+  reports only which descriptor it is on, which wraps and answers nothing. The
+  first version of this test paced off the WALL CLOCK and measured nothing,
+  because the device does not start when you start writing, it starts when the
+  prefill is met -- so a clock estimate runs ahead of the truth by exactly the
+  prefill. This is also the number A/V sync is made of.
+- `audio_latency(ms)` -- the prefill was a fixed ~170 ms, which is a latency
+  floor no scheduler can get under. It is a writer's choice now, floored at
+  10 ms (one tick; below that no scheduler can promise a refill).
+- Per-descriptor lengths in `ac97_fill()`. The driver declared every descriptor
+  a full page and zero-padded a short fill, so the smallest unit of audio the
+  device could be given was 21 ms. The BDL entry has carried a length field the
+  whole time. This also retired the zero-padding and the click it was hiding.
+  (`virtio_snd.c` already did this correctly.)
+
+- [ ] **An app that cannot hold its pace should slow down to one it can.**
+      `em_app_run` measures its frame cost and declines to declare a cadence
+      when a frame costs more than half the pace -- correct, but it stops
+      there. The better behaviour is to raise its own pace to something
+      sustainable (roughly three times the measured cost) and declare THAT: an
+      even 30 fps looks better than a ragged 60, and the toolkit already knows
+      both numbers. Not done because the benefit cannot be measured on this
+      host -- under TCG the frame-interval spread is noise-dominated (75 ms vs
+      40 ms between two runs that both declared nothing), and shipping it on
+      the strength of a plausible story is the thing this project does not do.
+      Measure it on hardware, or under HVF with a cheaper renderer, first.
+
+- [ ] **Only x86 has the underrun count as a hardware fact.** `virtio_snd.c`
+      infers it -- nothing in flight while running, at the moment new audio
+      arrives -- which answers the same question but is an inference. Stated in
+      the code; worth revisiting if virtio-snd grows something better.
+- [ ] The ARM boot self-test does not run `test audiostress`: it needs an
+      `-audiodev` that records, and the ARM target boots with `audiodev none`.
+      The policy half is covered there by the `jitter` A/B; the audio half is
+      x86-only for now.
+- [ ] Nothing in the shipped audio programs calls `embk_audio_latency()` yet.
+      `beep` and `mp3play` are fine deep-buffered -- a song does not care about
+      170 ms -- so lowering it for them would trade safety for nothing. The
+      call exists for what comes next (a synth, a game, video sync), and the
+      right time to wire it is when one of those exists.
+
+### A killed writer's WAV reads as silence -- `make test-audio` was failing for that alone
+
+`audio_check.py` believed the RIFF and data lengths. QEMU's wav sink writes them
+as placeholders and patches them on close, and the harness ends the guest with
+SIGTERM, so on this host they stayed zero: an 88 KB file containing a clean
+440 Hz square wave was read as 0.00 s, peak 0, "mostly SILENCE" -- by the
+checker, and by Python's own `wave` module. The OS was correct the whole time.
+
+A zero-length `data` chunk now means "to the end of the file", which is the only
+sensible reading of a truncated one, and the checker says when it does that.
+
 ## Process & Scheduling
 
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant

@@ -29,4 +29,9 @@ void ac97_play(int last);     /* walk descriptors 0..last, inclusive */
 bool ac97_done(int last);     /* has it walked past `last` yet?      */
 void ac97_stop(void);
 
+/* How many times the device ran dry since the current sound started -- the
+ * hardware's own count, latched when it reached the end of what it had been
+ * given and halted. See the definition. */
+uint64_t ac97_underruns(void);
+
 #endif

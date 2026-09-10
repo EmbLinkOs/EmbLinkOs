@@ -49,6 +49,7 @@
 #include "ipc/endpoint.h"
 #include "ipc/pipe.h"
 #include "drivers/audio/ac97.h"
+#include "drivers/audio/audio.h" /* test audiostress: underrun accounting */
 
 static struct fat32_volume *g_fat32 = NULL;
 static bool g_has_fat32 = false;
@@ -393,6 +394,7 @@ static void selftests_print_commands(void)
     kprintf("  test usercopy\n");
     kprintf("  test pmm\n");
     kprintf("  test audio\n");
+    kprintf("  test audiostress\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -637,6 +639,127 @@ int selftests_handle_command(const char *cmd)
                 "tools/audio_check.py)\n",
                 spins < 2000 ? "PLAYED" : "TIMED OUT waiting for the device",
                 done, tone);
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test audiostress -- HOW SHALLOW CAN THE AUDIO BUFFER BE?
+     *
+     * The first version of this asked whether a busy machine makes the speaker
+     * run dry, and the answer was no: zero underruns under round-robin against
+     * six threads that never sleep. The driver keeps roughly 320 ms of audio
+     * queued ahead of the device, and nothing a scheduler does on a 10 ms tick
+     * reaches through 320 ms of runway. That test measured the ring size.
+     *
+     * The cost of a deep buffer is LATENCY -- every millisecond queued ahead
+     * is a millisecond between deciding to make a sound and the sound
+     * existing, which is what a synth, a game, or anything syncing to picture
+     * actually pays. So the question is how LITTLE runway can be held without
+     * a hole appearing, because that number is the achievable latency, and it
+     * is a number a scheduler can move.
+     *
+     * tonestress paces itself by the clock rather than filling the ring, so
+     * the depth is an argument. This sweeps it downward under both policies
+     * and reports the shallowest each survived.
+     *
+     * THE UNDERRUN COUNT IS THE HARDWARE'S. When the device reaches the end of
+     * what it was given and halts, it latches the fact; ac97_set_last() has
+     * always had to detect that to restart the stream, and now counts it.
+     * Nothing here is inferred from timings.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test audiostress") == 0) {
+        if (!ac97_present()) {
+            kprintf("\n[cmd] test audiostress: NO DEVICE (add -device AC97 to "
+                    "the QEMU line)\n");
+            return 1;
+        }
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test audiostress: VFS not registered\n");
+            return 1;
+        }
+        const char *tp = "/data/apps/tonestress/tonestress.elf";
+        struct vfs_stat tst;
+        if (vfs_stat(tp, &tst) != EMBK_OK) {
+            kprintf("\n[cmd] test audiostress: %s not on image\n", tp);
+            return 1;
+        }
+
+        const struct sched_policy *saved = sched_policy_get();
+        const struct sched_policy *rr    = sched_policy_by_name("round-robin");
+        const struct sched_policy *dl    = sched_policy_by_name("deadline");
+        if (!rr || !dl) {
+            kprintf("\n[cmd] test audiostress: a policy is missing\n");
+            return 1;
+        }
+
+        /* Down to 15 ms. Nothing in the hardware stops it going lower -- a
+         * descriptor holds whatever is put in it -- but a buffer shallower
+         * than a timer tick has to be refilled inside one scheduling round on
+         * a busy machine, and no scheduler can promise that. audio.c refuses
+         * below 10 ms for the same reason. */
+        static const char *DEPTH[] = { "160", "80", "40", "20", "15" };
+        const int NDEPTH = (int)(sizeof(DEPTH) / sizeof(DEPTH[0]));
+
+        kprintf("\n[audiostress] 400 ms of 440 Hz against 8 threads that never\n");
+        kprintf("              sleep, holding progressively less audio queued\n");
+        kprintf("              ahead of the speaker. An underrun is a hole you\n");
+        kprintf("              hear; the runway that avoids one IS the latency.\n");
+
+        int best_rr = -1, best_dl = -1;   /* shallowest clean depth, ms */
+        int ok = 1;
+
+        for (int pass = 0; pass < 2; pass++) {
+            const int  deadline = (pass == 1);
+            const char *decl    = deadline ? "1" : "0";
+            sched_policy_set(deadline ? dl : rr);
+            kprintf("\n--- %s ---\n",
+                    deadline ? "deadline, declaring 10 ms / 3 ms"
+                             : "round-robin, no declaration");
+
+            for (int d = 0; d < NDEPTH; d++) {
+                char *a[] = { (char *)tp, "8", "400", (char *)decl,
+                              (char *)DEPTH[d], NULL };
+                int pid = process_create(tp, a, 5, NULL, 0);
+                int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+
+                uint64_t un = 0, fr = 0;
+                audio_stats(&un, &fr, 0);
+
+                kprintf("  %4s ms runway: %llu underrun(s), %llu frames%s\n",
+                        DEPTH[d], (unsigned long long)un,
+                        (unsigned long long)fr,
+                        rc == 0 ? "" : " (writer did not finish)");
+
+                if (rc != 0) { ok = 0; continue; }
+                if (un == 0) {
+                    int ms = 0;
+                    for (const char *c = DEPTH[d]; *c; c++) ms = ms * 10 + (*c - '0');
+                    if (deadline) { if (best_dl < 0 || ms < best_dl) best_dl = ms; }
+                    else          { if (best_rr < 0 || ms < best_rr) best_rr = ms; }
+                }
+            }
+        }
+
+        sched_policy_set(saved);
+
+        kprintf("\n[audiostress] shallowest clean runway: round-robin %d ms, "
+                "deadline %d ms\n", best_rr, best_dl);
+
+        /* The assertion is the comparison, and only the comparison. An
+         * absolute latency figure would be a claim about QEMU's audio timing. */
+        kprintf("  [%s] declaring a period does not need MORE runway "
+                "(%d <= %d)\n",
+                (best_dl >= 0 && best_rr >= 0 && best_dl <= best_rr)
+                    ? "ok" : "FAIL", best_dl, best_rr);
+        if (best_dl < 0 || best_rr < 0 || best_dl > best_rr) ok = 0;
+
+        if (best_rr >= 0 && best_rr <= 15)
+            kprintf("  (round-robin was clean at the SHALLOWEST depth tested, so\n"
+                    "   the hardware's two-descriptor floor is the limit here and\n"
+                    "   not the scheduler -- this run says the policy is not\n"
+                    "   needed for audio on this host, which is a result.)\n");
+
+        kprintf("[cmd] test audiostress: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
@@ -6530,6 +6653,45 @@ int selftests_handle_command(const char *cmd)
         sched_policy_set(dl);
         int pid_dl   = process_create(jp, a, 5, NULL, 0);
         int worst_dl = pid_dl >= 0 ? process_wait((uint32_t)pid_dl) : -1;
+
+        /* AND THE SAME QUESTION THROUGH THE REAL TOOLKIT. jitter is a bare
+         * thread with a hand-written sleep loop; framepace is an actual EmApp
+         * with a real window rendering into a real compositor surface, and it
+         * declares nothing itself -- em_app_run declares for it, because it is
+         * animating. So this run is what verifies that the declaration
+         * actually happens on the path every app on this desktop uses, which a
+         * quiet desktop never reaches.
+         *
+         * Not asserted, printed. It renders real frames through a real
+         * compositor, so its absolute numbers depend on the host's graphics
+         * speed in a way jitter's do not, and turning that into a pass/fail
+         * would be asserting something about QEMU. */
+        const char *fp = "/data/apps/framepace/framepace.elf";
+        struct vfs_stat fst;
+        if (vfs_stat(fp, &fst) == EMBK_OK) {
+            char *fa[] = { (char *)fp, "60", "6", NULL };
+
+            kprintf("\n--- the same question through the real UI toolkit ---\n");
+            sched_policy_set(rr);
+            int p1 = process_create(fp, fa, 3, NULL, 0);
+            int w1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+
+            sched_policy_set(dl);
+            int p2 = process_create(fp, fa, 3, NULL, 0);
+            int w2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+
+            /* SPREAD, not lateness: this app renders in software and cannot
+             * hit 16 ms on an emulated machine, so drift from an ideal clock
+             * would be a renderer benchmark. How much worse the worst frame
+             * was than the best is stutter, and stutter survives a slow
+             * renderer -- 15 fps evenly looks fine, 15 fps unevenly does
+             * not. */
+            kprintf("  a real EmApp at 60 Hz, frame-interval spread: "
+                    "round-robin %d ms, deadline %d ms\n", w1, w2);
+        } else {
+            kprintf("\n  (framepace.elf is not on this image -- the toolkit "
+                    "half of this test did not run)\n");
+        }
 
         sched_policy_set(saved);
 

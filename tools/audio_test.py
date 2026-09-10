@@ -32,6 +32,19 @@ MIN_SECONDS = os.environ.get("AUDIO_MIN_SECONDS", "0.4")
 # proves the whole stack -- a program asking for the speaker, the capability
 # check, the syscalls, and the same hardware underneath.
 CMD = os.environ.get("AUDIO_CMD", "test audio")
+# WHETHER THE WAV IS THE VERDICT. It is, for every test of "did the sound come
+# out". It is NOT for the latency sweep, which deliberately makes holes in the
+# sound in order to find where they start -- there the guest's own comparison
+# is the result and a WAV checker would fail a run that worked perfectly.
+CHECK = os.environ.get("AUDIO_CHECK", "1") != "0"
+PLAY_WAIT = int(os.environ.get("AUDIO_PLAY_WAIT", "140"))
+# HOW MANY CORES. One by default, deliberately: the tone tests want the driver
+# under the least favourable conditions and a single core is where a streaming
+# bug shows. The latency sweep wants the opposite -- it is measuring the
+# SCHEDULER, so it needs a machine with enough cores for the scheduler to have
+# a decision to make, and on one emulated core its ten runs take twelve
+# minutes.
+SMP = os.environ.get("AUDIO_SMP", "1")
 
 
 def boot():
@@ -48,7 +61,7 @@ def boot():
         "-audiodev", "wav,id=snd0,path=%s" % OUT,
         "-vga", "none", "-device", "virtio-vga,xres=800,yres=600", "-display", "none",
         "-serial", "unix:%s,server,nowait" % SOCK,
-        "-no-reboot", "-no-shutdown", "-m", "521m", "-smp", "1",
+        "-no-reboot", "-no-shutdown", "-m", "521m", "-smp", SMP,
         "-accel", "tcg,thread=multi",
     ]
     log = open(os.path.join(ROOT, "build", "audio-qemu.log"), "wb")
@@ -92,7 +105,7 @@ def main():
     print("=== test-audio: booting with an AC'97 and a WAV sink")
     q = boot()
     try:
-        out = drive(CMD, 75, 140)
+        out = drive(CMD, 75, PLAY_WAIT)
     finally:
         q.terminate()
         try:
@@ -103,6 +116,14 @@ def main():
     for line in out.splitlines():
         if "audio" in line.lower() or "ac97" in line.lower() or "[cmd]" in line:
             print("  guest: %s" % line.strip())
+
+    if not CHECK:
+        # The guest measured it. Echo its verdict and adopt it.
+        for line in out.splitlines():
+            if "audiostress" in line or "runway" in line or "[ok]" in line \
+               or "[FAIL]" in line:
+                print("  %s" % line.strip())
+        return 0 if "test audiostress: OK" in out else 1
 
     if "PLAYED" not in out and "played" not in out:
         print("=== test-audio: FAIL -- the guest did not report playing")

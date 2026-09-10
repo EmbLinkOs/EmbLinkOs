@@ -31,7 +31,40 @@ int  audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
 /* Has the hardware played everything handed to it? */
 bool audio_drained(uint32_t pid);
 
+/* WHERE THE SPEAKER ACTUALLY IS, in frames since this stream started;
+ * monotonic, 0 before the device begins. The device itself reports only which
+ * descriptor it is on -- a number that wraps and answers nothing alone -- so
+ * the laps are counted for you.
+ *
+ * This is what a writer needs to hold a KNOWN distance ahead, and what A/V
+ * sync needs to line sound up with picture. Do not substitute the wall clock:
+ * the device does not start at t=0, it starts when the prefill is met, so a
+ * clock-based estimate is ahead of the truth by exactly the prefill.
+ *
+ * Resolution is one descriptor (~21 ms at 48 kHz) -- it is the position of the
+ * buffer being played, not of the sample. */
+uint64_t audio_position(uint32_t pid);
+
+/* Ask for a shallower start-up buffer: the device will begin once `ms` of
+ * audio is queued instead of the default ~170 ms. THAT NUMBER IS THE LATENCY
+ * of everything the stream does afterwards, so a writer that can be relied on
+ * to come back in time should lower it, and one that cannot should not --
+ * running dry is worse than being late, and a caller who lowers this without
+ * being able to keep up has chosen holes over delay.
+ *
+ * Only before the first sound comes out; -EBUSY afterwards. Returns the
+ * latency actually granted in ms, which is rounded UP to whole descriptors and
+ * floored at two of them. */
+int audio_set_latency(uint32_t pid, uint32_t ms);
+
 void audio_close(uint32_t pid);
 void audio_reap_pid(uint32_t pid);   /* a process died holding the device */
+
+/* WHAT THE STREAM ACTUALLY DID. `underruns` is how many times the speaker ran
+ * dry mid-sound -- the hardware's own count, not an inference -- and it is the
+ * only audio failure a person hears directly. `frames` is how much was handed
+ * over, `writes` how many calls it took. All three are since the current sound
+ * started. Any may be NULL. */
+void audio_stats(uint64_t *underruns, uint64_t *frames, uint64_t *writes);
 
 #endif

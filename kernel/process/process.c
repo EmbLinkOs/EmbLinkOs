@@ -2728,6 +2728,34 @@ void sched_account_resume(void) {
     if (t) t->dispatched_ns = time_get_ns();
 }
 
+/* CPU consumed by the CALLING thread, including the fragment it is running
+ * right now.
+ *
+ * NO LOCK, and it is safe for exactly one reason: this reads the thread that
+ * is asking, and cpu_ns is written only by whichever core is switching AWAY
+ * from a thread. That cannot be happening while the thread itself is executing
+ * this. `dispatched_ns` was written when this core dispatched us. Both are
+ * therefore stable for the duration of the read, which is not true of any
+ * OTHER thread and is why this takes no argument.
+ *
+ * It exists because WALL TIME IS NOT COST on a busy machine. A UI toolkit
+ * measuring how long a frame took in order to declare an honest budget
+ * measures mostly preemption if it uses the clock -- on a contended emulated
+ * machine that read 40 ms for a frame whose actual work was a few
+ * milliseconds, and the app then refused to declare a cadence it could
+ * comfortably have kept. */
+uint64_t sched_self_cpu_ns(void) {
+    struct thread *t = current_thread;
+    if (!t) return 0;
+    uint64_t v = t->cpu_ns;
+    uint64_t d = t->dispatched_ns;
+    if (d) {
+        uint64_t now = time_get_ns();
+        if (now > d) v += now - d;
+    }
+    return v;
+}
+
 uint64_t process_cpu_ns(uint32_t pid) {
     uint64_t total = 0;
     uint64_t now_ns = time_get_ns();

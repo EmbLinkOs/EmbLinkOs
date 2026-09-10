@@ -961,6 +961,12 @@ void sched_lock_stats(uint64_t *acquires, uint64_t *contended, uint64_t *spins);
  * threads are running right now. 0 if the pid is unknown. Self-locking. */
 uint64_t process_cpu_ns(uint32_t pid);
 
+/* CPU consumed by the CALLING thread, in nanoseconds, including the fragment
+ * it is running right now. Lock-free and safe only because it reads the asking
+ * thread -- see the definition. This is what a caller wanting to know the COST
+ * of something must use: on a busy machine the clock measures preemption. */
+uint64_t sched_self_cpu_ns(void);
+
 /* Declare (or clear, with period_ms == 0) the calling thread's rate.
  *
  * ADMISSION CONTROL is the whole of the safety argument. Summed over every

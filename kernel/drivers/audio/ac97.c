@@ -80,6 +80,22 @@ static struct {
     uint32_t buf_samples;          /* samples per buffer (both channels)    */
 } g_ac97;
 
+/* HOW MANY TIMES THE SPEAKER RAN DRY.
+ *
+ * The device latches "last valid buffer completed" when it reaches LVI and
+ * halts -- which happens for exactly one reason once a stream is running: the
+ * writer did not get back in time. ac97_set_last() has always DETECTED that
+ * (it has to, or a new LVI would not restart anything); it just never said so.
+ *
+ * This is the only failure in the whole audio path that a person hears
+ * directly, and it is the hardware's own account of it rather than an
+ * inference from timing -- which makes it the right number to judge a
+ * scheduler by. Zeroed on every ac97_play(), because a count that spans two
+ * unrelated sounds answers no question anyone asked. */
+static uint64_t g_underruns;
+
+uint64_t ac97_underruns(void) { return g_underruns; }
+
 /* AC'97 codec registers are reached through BAR0's ports directly on this
  * controller -- there is no index/data pair to sequence. */
 static void mixer_write(uint8_t reg, uint16_t value)
@@ -102,25 +118,35 @@ uint32_t ac97_frames_per_buffer(void)
 }
 
 /* Fill descriptor `i` from `frames` stereo frames of interleaved S16. Returns
- * how many frames were taken -- the caller keeps the rest for the next one. */
+ * how many frames were taken -- the caller keeps the rest for the next one.
+ *
+ * A DESCRIPTOR IS AS LONG AS WHAT WAS PUT IN IT, which is the point. This used
+ * to declare every descriptor a full page (1024 frames, ~21 ms at 48 kHz) and
+ * zero-pad a short fill, so the smallest unit of audio the device could be
+ * given was 21 ms and the shallowest buffer anyone could ask for was two of
+ * them. That is a 43 ms latency floor written into the driver, and it is not a
+ * hardware limit -- the BDL entry has carried a length field the whole time.
+ *
+ * Writing the true length also retires the zero-padding and the click it was
+ * there to hide: the device now stops at the end of the audio instead of
+ * playing whatever the rest of the page still held. The buffer's tail is
+ * stale, and unread.
+ *
+ * A page is still the CAP, so a writer that hands over big chunks gets big
+ * descriptors and the same behaviour as before. Granularity is the writer's
+ * choice now, and it is the same choice as its latency. */
 uint32_t ac97_fill(int i, const int16_t *frames, uint32_t nframes)
 {
     if (!g_ac97.present || i < 0 || i >= AC97_BDL_ENTRIES) return 0;
 
     uint32_t cap = ac97_frames_per_buffer();
     uint32_t take = nframes < cap ? nframes : cap;
+    if (take == 0) return 0;
 
     memcpy(g_ac97.buf[i], frames, (size_t)take * 2 * sizeof(int16_t));
-    /* Silence the tail rather than leaving the previous buffer's audio in it:
-     * a short final block otherwise repeats whatever was there, which is the
-     * click at the end of every sound a half-finished driver plays. */
-    if (take < cap) {
-        memset(g_ac97.buf[i] + take * 2, 0,
-               (size_t)(cap - take) * 2 * sizeof(int16_t));
-    }
 
     g_ac97.bdl[i].addr    = (uint32_t)g_ac97.buf_phys[i];
-    g_ac97.bdl[i].samples = (uint16_t)(cap * 2);   /* SAMPLES, both channels */
+    g_ac97.bdl[i].samples = (uint16_t)(take * 2);  /* SAMPLES, both channels */
     g_ac97.bdl[i].flags   = AC97_BD_IOC;
     return take;
 }
@@ -162,7 +188,12 @@ void ac97_set_last(int last)
     if (halted) {
         /* It DID reach the old end and stop. Clear the latch -- while it is
          * set, a new LVI does not restart anything -- and run again. An
-         * underrun costs a gap, not the rest of the sound. */
+         * underrun costs a gap, not the rest of the sound.
+         *
+         * And it IS an underrun: the writer had more to give and the device
+         * had already finished. Counted here rather than guessed at from
+         * timings above, because this branch is the hardware saying it. */
+        g_underruns++;
         outw((uint16_t)(g_ac97.bus + AC97_PO_SR), (uint16_t)(sr & (AC97_SR_BCIS | AC97_SR_LVBCI)));
         outb((uint16_t)(g_ac97.bus + AC97_PO_CR), AC97_CR_IOCE | AC97_CR_RPBM);
     } else if (sr & AC97_SR_BCIS) {
@@ -185,6 +216,7 @@ void ac97_play(int last)
      * closed the device, and the sound was cut to whatever had been prefilled.
      * Exactly 0.18s of a 0.5s beep, which is the prefill and nothing else. */
     outw((uint16_t)(g_ac97.bus + AC97_PO_SR), AC97_SR_BCIS | AC97_SR_LVBCI);
+    g_underruns = 0;              /* this sound's count, not the last one's */
     /* LVI LAST: this is the write that tells the device how far the list is
      * valid, and therefore the one that starts it moving. */
     outb((uint16_t)(g_ac97.bus + AC97_PO_LVI), (uint8_t)last);

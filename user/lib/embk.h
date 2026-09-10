@@ -828,6 +828,20 @@ static inline int embk_sched_period(uint32_t period_ms, uint32_t budget_ms) {
     return (int)embk_syscall2(EMBK_SYS_sched_period, period_ms, budget_ms);
 }
 
+/* CPU THIS THREAD HAS ACTUALLY USED, in nanoseconds. Monotonic, includes the
+ * slice it is running right now.
+ *
+ * Use this, not the clock, whenever you want the COST of something. On a busy
+ * machine wall time is mostly how long you were not running: the UI toolkit
+ * timing a frame in order to declare an honest scheduling budget measured
+ * ~40 ms for a frame whose real work was a few milliseconds, and then declined
+ * to ask for a cadence it could easily have kept. Subtract two readings around
+ * the work and you have what the work cost. */
+static inline uint64_t embk_thread_cpu_ns(void) {
+    int64_t r = embk_syscall0(EMBK_SYS_thread_cpu_ns);
+    return r > 0 ? (uint64_t)r : 0;
+}
+
 /* 1 if the child named by spawn HANDLE `handle` (what embk_spawn returned) is
  * still alive, else 0 (unknown/freed handles are "not alive"). Handle-based on
  * purpose: spawn never exposes raw pids, and a handle stays pinned to the
@@ -1001,6 +1015,41 @@ static inline int embk_audio_drained(void) {
 }
 static inline int embk_audio_close(void) {
     return (int)embk_syscall1(EMBK_SYS_audio_close, 0);
+}
+
+/* ---------------------------------------------------------------------------
+ * WHERE THE SPEAKER ACTUALLY IS, in frames since this stream started.
+ * Monotonic; 0 until the device begins.
+ *
+ * A streaming writer needs this and cannot substitute the clock. The device
+ * does not start when you start writing -- it starts once enough is queued to
+ * keep it fed -- so "frames the clock says should have played" runs ahead of
+ * the truth by exactly the start-up buffer, and a writer pacing off it silently
+ * holds far more audio queued than it meant to. (That mistake is what made the
+ * first version of this OS's own latency test measure nothing.)
+ *
+ * It is also the number A/V sync is made of: picture time is sound time here.
+ * Resolution is one buffer, about 21 ms -- the position of the buffer being
+ * played, not of the sample inside it. */
+static inline uint64_t embk_audio_position(void) {
+    int64_t r = embk_syscall0(EMBK_SYS_audio_position);
+    return r > 0 ? (uint64_t)r : 0;
+}
+
+/* Ask to start playing sooner: the device begins once `ms` of audio is queued
+ * instead of the default ~170 ms.
+ *
+ * THAT NUMBER IS THE LATENCY of everything the stream does afterwards -- the
+ * delay between deciding to make a sound and the sound existing. Lower it if
+ * your refill loop can be relied on to come back in time (declaring a period
+ * with embk_sched_period() is how you make that true), and leave it alone if
+ * it cannot: running dry is a hole in the sound, and that is worse than delay.
+ *
+ * Call it after embk_audio_open() and before the first write. Returns the
+ * latency actually granted in ms -- rounded UP to whole buffers, floored at
+ * two -- or -EBUSY if the sound has already started. */
+static inline int embk_audio_latency(uint32_t ms) {
+    return (int)embk_syscall1(EMBK_SYS_audio_latency, ms);
 }
 
 static inline int embk_win_minimize(int win) {

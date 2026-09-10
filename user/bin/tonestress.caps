@@ -1,0 +1,11 @@
+# What tonestress may DO. The speaker, and nothing else -- the same narrow set
+# as beep, for the same reason: it exists to prove one thing and a program that
+# can only do that one thing cannot be wrong about anything else.
+#
+# Note what is NOT here and does not need to be: declaring a scheduling period
+# is not a capability. Its safety comes from the budget and from admission
+# control (kernel/process/process.c, sched_declare_period), not from a gate --
+# see the note on sys_sched_period. If it were gated, ordinary programs could
+# not ask to be smooth, which is the whole point.
+
+audio

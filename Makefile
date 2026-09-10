@@ -1186,6 +1186,11 @@ build/lockdemo.o: user/bin/lockdemo.c user/lib/embk.h | $(BUILD)
 build/lockdemo.elf: build/crt0.o build/syscalls.o build/lockdemo.o user/lib/newlib.ld
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/lockdemo.o -lc -lgcc -o $@
 
+build/tonestress.o: user/bin/tonestress.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+build/tonestress.elf: build/crt0.o build/syscalls.o build/tonestress.o user/lib/newlib.ld
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/tonestress.o -lc -lgcc -o $@
+
 build/jitter.o: user/bin/jitter.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/jitter.elf: build/crt0.o build/syscalls.o build/jitter.o user/lib/newlib.ld
@@ -1361,7 +1366,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/capnet.c user/bin/jitter.c user/bin/vellum.c user/bin/js.c user/bin/photos.c user/bin/mp3play.c, $(wildcard user/bin/*.c))
+EMUI_APP_SRCS := $(filter-out user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/capnet.c user/bin/jitter.c user/bin/tonestress.c user/bin/vellum.c user/bin/js.c user/bin/photos.c user/bin/mp3play.c, $(wildcard user/bin/*.c))
 EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
@@ -1721,7 +1726,7 @@ build/tcc.elf: $(TCC_BIN) build/crt0.o build/syscalls.o | $(BUILD)
 endif
 
 EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo.elf build/ioracer.elf \
-               build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/capchild.embx \
+               build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/tonestress.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf \
@@ -2467,6 +2472,16 @@ test-audio: $(IMG) $(EMBKFS_MASTER)
 	@# self-test fills every descriptor before starting, so it never exercised
 	@# extending the range under a running device -- where the real bug was.
 	@AUDIO_CMD="run /data/apps/beep/beep.elf" python3 tools/audio_test.py
+
+# HOW SHALLOW THE AUDIO BUFFER CAN BE, which is the same question as how much
+# latency the sound has. Separate from test-audio on purpose: this run
+# DELIBERATELY produces holes (that is the measurement), so the WAV checker
+# would rightly fail it. The pass/fail is the guest's own comparison of the two
+# scheduler policies -- see `test audiostress` in kernel/selftests.c.
+.PHONY: test-audio-latency
+test-audio-latency: $(IMG) $(EMBKFS_MASTER)
+	@AUDIO_CMD="test audiostress" AUDIO_CHECK=0 AUDIO_PLAY_WAIT=300 \
+	    AUDIO_SMP=4 python3 tools/audio_test.py
 
 .PHONY: test-audio
 

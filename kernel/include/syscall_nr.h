@@ -176,4 +176,20 @@
  * a frame and several that do not. */
 #define SYS_sched_period  106   /* (ms)                     -> 0 | -err     */
 
+/* THE OTHER HALF OF LOW-LATENCY AUDIO. A scheduler that wakes a writer on time
+ * is worth nothing if the driver insists on 170 ms of queued sound before it
+ * will make a noise, and a shallow buffer is worth nothing if the writer
+ * cannot be woken in time to refill it. Both, or neither.
+ *   audio_position()  -> frames the device has actually played (monotonic)
+ *   audio_latency(ms) -> start once `ms` is queued; returns what was granted */
+#define SYS_audio_position 107  /* ()                       -> frames        */
+#define SYS_audio_latency  108  /* (ms)                     -> ms | -err     */
+
+/* CPU consumed by the CALLING THREAD, in nanoseconds. Not the clock: on a busy
+ * machine the clock measures how much you were preempted, and anything sizing
+ * itself against its own cost -- a UI toolkit declaring a scheduling budget, a
+ * profiler, an adaptive quality setting -- needs the cost. Ungated: a thread
+ * asking how much CPU it has itself used is asking about itself. */
+#define SYS_thread_cpu_ns  109  /* ()                       -> ns            */
+
 #endif /* _SYSCALL_NR_H_ */

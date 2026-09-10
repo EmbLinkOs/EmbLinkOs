@@ -29,6 +29,9 @@
 #define MAX_HOGS 16
 
 static volatile int g_stop;
+/* Where the hogs' arithmetic goes. `volatile` on the accumulator is not enough
+ * to keep the compiler from noticing nothing reads it; this is the read. */
+static volatile unsigned g_sink;
 static volatile int g_hogs_running;
 
 /* A thread that is always runnable and never blocks. Not a strawman: a build,
@@ -39,6 +42,7 @@ static void hog(long arg) {
     while (!__atomic_load_n(&g_stop, __ATOMIC_SEQ_CST)) {
         volatile unsigned x = 0;
         for (int i = 0; i < 20000; i++) x += (unsigned)i;
+        g_sink = x;
     }
     embk_thread_exit(0);
 }

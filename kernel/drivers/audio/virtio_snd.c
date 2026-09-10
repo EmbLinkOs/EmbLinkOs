@@ -215,9 +215,33 @@ uint8_t ac97_civ(void) {
  * told where to stop. virtio-snd has no such distinction -- a buffer that has
  * been submitted will be played and one that has not will not -- so both map
  * to the same operation and the START is issued once, lazily. */
+/* HOW MANY TIMES THE SPEAKER RAN DRY -- the same count the AC'97 driver keeps,
+ * arrived at differently because the two devices report differently.
+ *
+ * AC'97 latches "reached the end of the list and halted", which is the
+ * hardware saying it. virtio-snd has no such bit, so the equivalent is
+ * inferred from the one fact that means the same thing: at the moment new
+ * audio arrives, was there anything still in flight? Nothing in flight while
+ * running means the device finished everything it had and waited -- a hole,
+ * and the writer is only now coming back.
+ *
+ * It is an inference, and the AC'97 one is not; that difference is real and is
+ * why this comment says so rather than presenting the two as the same
+ * measurement. Both answer the same question, and neither is a guess about
+ * timing. Zeroed when a stream starts. */
+static uint64_t g_underruns;
+
+uint64_t ac97_underruns(void) { return g_underruns; }
+
 static void submit_through(int last) {
     if (!g_up || last < 0 || last >= NBUFS)
         return;
+
+    if (g_running) {
+        reap();
+        if (g_completed >= g_submitted)
+            g_underruns++;      /* nothing was left playing; this is the hole */
+    }
 
     if (!g_running) {
         if (!pcm_simple(VIRTIO_SND_R_PCM_START)) {
@@ -282,6 +306,7 @@ void ac97_stop(void) {
     g_next_submit = 0;
     g_submitted = g_completed = 0;
     g_tlast_used = tused.idx;
+    g_underruns = 0;              /* this sound's count, not the last one's */
     memset(g_frames, 0, sizeof g_frames);
 }
 

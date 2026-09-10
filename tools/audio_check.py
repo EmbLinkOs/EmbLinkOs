@@ -39,10 +39,28 @@ def read_wav(path):
     if len(data) < 44 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise ValueError("not a RIFF/WAVE file")
 
+    # A WAV WRITTEN BY A PROCESS THAT WAS KILLED HAS A HEADER OF ZEROES, and
+    # believing it means reading a perfectly good recording as silence.
+    #
+    # QEMU's wav sink writes the RIFF and data lengths as placeholders and
+    # patches them when the file is CLOSED -- which never happens, because the
+    # harness ends the guest with SIGTERM. On this machine that produced a
+    # 88 KB file full of a clean 440 Hz square wave which every reader,
+    # including Python's own `wave`, reported as zero frames: the OS was
+    # emitting the tone correctly and the test said "mostly SILENCE".
+    #
+    # So a zero-length chunk means "to the end of the file" rather than
+    # "empty". Nothing legitimate is lost -- a genuinely empty data chunk at
+    # the end of a file is indistinguishable from a truncated one anyway, and
+    # the silence checks below are what catch a real failure.
+    truncated = False
     pos, fmt, frames = 12, None, None
     while pos + 8 <= len(data):
         cid = data[pos:pos + 4]
         size = struct.unpack_from("<I", data, pos + 4)[0]
+        if size == 0 and cid == b"data":
+            size = len(data) - (pos + 8)
+            truncated = True
         body = data[pos + 8: pos + 8 + size]
         if cid == b"fmt ":
             tag, ch, rate, _brate, _align, bits = struct.unpack_from("<HHIIHH", body, 0)
@@ -50,6 +68,10 @@ def read_wav(path):
         elif cid == b"data":
             frames = body
         pos += 8 + size + (size & 1)          # chunks are word-aligned
+
+    if truncated:
+        print("  (the writer was killed before it finalised the header -- "
+              "reading the data chunk to end of file)")
 
     if fmt is None or frames is None:
         raise ValueError("missing fmt or data chunk")
