@@ -797,9 +797,16 @@ debug-arm64: $(ARM_IMG) $(ARM_ROOTFS)
 # threads that never sleep. Bisected: it stops in the same place at 90, 100,
 # 105 and 120 and completes at 115 and 170, i.e. it needs a little over 100 and
 # the old budget was sometimes enough and sometimes not. 150 is that with room
-# for a loaded host. A run that ends early does not report a timeout, it
-# reports every marker after that point as missing -- which reads as eleven
-# unrelated failures and is why this is worth writing down.
+# for a loaded host. HVF drifted the same way for the same reason: 40 seconds
+# was right when it was set and became marginal without anyone changing it --
+# it fails, then passes, then fails on the same build. It completes at 55 and
+# at 70, so 75.
+#
+# A run that ends early does not report a timeout, it reports every marker
+# after that point as missing -- which reads as a dozen unrelated failures in
+# subsystems that are fine, and is why this is worth writing down. If this test
+# ever reports a broad spread of failures across unrelated phases, suspect the
+# clock before the kernel.
 # Each accelerator boots a COPY of the root filesystem, never the original.
 # posixdemo WRITES -- mkdir, create, rename, unlink -- so a run mutates the
 # image, and without a scratch copy the second accelerator inherits the first
@@ -810,7 +817,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	@overall=0; \
 	for acc in $(ARM_TEST_ACCELS); do \
 	  case $$acc in \
-	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=$${ARM_HVF_SECS:-40};;  \
+	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=$${ARM_HVF_SECS:-75};;  \
 	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=$${ARM_TCG_SECS:-150};; \
 	  esac; \
 	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \

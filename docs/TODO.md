@@ -477,16 +477,27 @@ approximated, which is why none of them is a silent bug waiting to be found:
     and finds one. Honouring it there means consulting the VMA list on the
     copy path, which is a cost on every syscall — worth doing when there is a
     caller that cares.
-- [ ] **File-backed mappings (`fd >= 0`).** Blocked on a page cache — see
-  below. Currently `ENODEV`, never anonymous zeroes standing in for a file.
-- [ ] **`MAP_SHARED`.** Needs a shared anonymous object with a refcount, and
-  for file mappings the page cache again. Currently `ENOTSUP`; a MAP_SHARED
+- [x] **File-backed mappings (`fd >= 0`).** **Done** -- `vma_mmap_file()` over
+  the unified VM object (`kernel/mm/vm_object.c`), which is the page cache this
+  said it was blocked on. `test mmap` covers it.
+- [x] **`MAP_SHARED` for FILE mappings.** **Done**, over the same VM object:
+  two mappers share the object's resident pages, so a write through one is
+  visible through the other and through `read()`. Shared ANONYMOUS memory is
+  still open (it needs the refcounted anonymous object below). The original
+  note, kept because the reasoning still applies to the anonymous case:
+  Needs a shared anonymous object with a refcount, and
+  for file mappings the page cache again. A MAP_SHARED
   quietly behaving as MAP_PRIVATE is two processes each believing they see the
   other's writes.
 - [ ] **`MAP_FIXED` / a caller-chosen address.** The kernel picks. Refusing is
   cheap and nothing needs it; the plumbing exists in `vma_mmap` behind the flag
   should that change. Currently `ENOTSUP`.
-- [ ] **Demand paging.** Every mapping is allocated AND ZEROED up front, so a
+- [x] **Demand paging.** **Done** -- `vm_fault()` in `kernel/mm/vma.c` resolves
+  a fault against the VMA list, which is exactly the record this said could
+  answer "not mapped yet, and legitimately yours" from "not yours". Copy-on-
+  write included: a MAP_PRIVATE file page is mapped read-only so the first
+  write faults unambiguously. The original note, for the record:
+  Every mapping is allocated AND ZEROED up front, so a
   large one costs its full size immediately. Real demand paging needs a fault
   handler that can tell "not mapped yet, and legitimately yours" from "not
   yours" — the VMA list is exactly the record that can answer it, which is
@@ -659,11 +670,12 @@ The measurement immediately earned itself twice:
 - [ ] **No per-device power states, no thermal, no frequency scaling.** The
   idle residency counter is the foundation any of those would be judged
   against.
-- [ ] **The tick still fires at 100 Hz on every core, including halted ones.**
-  A halted core wakes 100 times a second to discover it has nothing to do.
-  Suppressing the tick on an idle core (a tickless idle) is the single largest
-  remaining power win, and it needs the timer queue above to decide the next
-  deadline.
+- [x] **Tickless idle.** **Done.** An idle core arms its one-shot for the next
+  real deadline instead of 10 ms hence (`sched_idle_next_ms`, capped at 1 s),
+  and a targeted IPI wakes exactly one core rather than broadcasting. Measured
+  by `power`: an idle core takes 5-8 timer interrupts a second, not 100.
+  A busy core now also arms for the next PERIODIC sleeper -- see Process &
+  Scheduling.
 
 ---
 
@@ -1658,12 +1670,12 @@ is not late because the wrong thread was picked; it is late because it was not
 yet a candidate when the decision was made. **No scheduler policy can fix
 this** -- by the time `pick()` is asked, its answer is already right.
 
-- [ ] Arm the per-core one-shot timer for the next sleeper's deadline on BUSY
-      cores, not only on the idle path (`sched_idle_next_ms`) that does it
-      today. The machinery exists; what is missing is arming it from the
-      switch path as well. Expect the residual mean to collapse toward the
-      wake-and-dispatch cost, and re-measure with `test deadline` -- the
-      before-numbers are recorded above so the after-numbers mean something.
+- [x] Arm the per-core one-shot timer for the next sleeper's deadline on BUSY
+      cores. **Done.** Mean lateness 4.33/5.24 ms -> 1.09/1.47 ms, worst
+      13 ms -> 3/4 ms, still zero periods missed; aarch64 4-5 ms -> 0-6 ms.
+      Only for threads that DECLARED a period -- the first version woke a core
+      for any sleeper and tripled idle scheduler-lock spins for nothing, since
+      a poll loop asking for 100 ms does not care about five of them.
 
       Note the residual is 4.6-6.0 ms on x86 and 1.7-2.2 ms on aarch64 while
       BOTH tick at 100 Hz, so "half a tick" is the x86 arithmetic working out
@@ -1672,20 +1684,22 @@ this** -- by the time `pick()` is asked, its answer is already right.
       evidently depends on how much else is competing. Fixing the mechanism is
       what would settle it, on both.
 - [ ] Preempt-on-wake was written for this and **removed** because it did not
-      measure: IPI-ing the core running the least urgent thread when a
+      measure. (Still open, and now testable: the timer arming above landed,
+      which is the condition this said to reconsider it after.)
+      Original note: IPI-ing the core running the least urgent thread when a
       deadline thread wakes moved the mean by less than run-to-run noise
       (5.79 ms with it; 4.62 and 5.96 ms without it on the boots either
       side). It could not have helped --
       the thread is not READY at the instant the IPI would fire. Reconsider it
       only AFTER the timer arming above, where it could finally be visible,
       and only if it measures then.
-- [ ] The deadline policy is not the default. `sched deadline` installs it at
-      the kernel console and `test deadline` swaps it for the A/B, but nothing
-      boots with it. Making it the default is safe on its own terms (a thread
-      with no declared period is scheduled exactly as before, by the same
-      round-robin code) -- what is missing is the compositor and the audio
-      thread actually CALLING `embk_sched_period()`, without which the change
-      would be a no-op that could only cost.
+- [x] The deadline policy is the default. **Done.** It had to be made free
+      first: the empty scan cost 13.2 us of a 97 us scheduling decision, and a
+      `sched_declared_count()` short-circuit took that to 3.9 us -- inside the
+      run-to-run spread of the round-robin measurement itself. With nothing
+      declared the decision is byte-for-byte the old one. `test policycost`
+      guards it. The UI toolkit declares while an app animates and an audio
+      writer declares to hold a shallow buffer, so it is not a no-op.
 - [ ] Admission control refuses past 700 permille, and the bound ignores
       BLOCKING time: a deadline thread waiting on a lock held by a
       budget-spent thread can still miss, and there is no priority
