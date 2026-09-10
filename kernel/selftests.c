@@ -29,6 +29,7 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
 #include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
+#include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
 #include "drivers/usb/usb.h"
 #include "drivers/video/framebuffer.h"
 #include "arch/x86_64/cpu/percpu.h"
@@ -5882,6 +5883,160 @@ int selftests_handle_command(const char *cmd)
 
         kprintf("[cmd] test mmap: %s\n",
                 (ok && took && gave_back && wx < 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* THE PAGE CACHE -- and the number that says whether it is real.
+     *
+     * The claim is not "reads got faster". It is that a write() no longer
+     * commits a filesystem transaction. EMBKFS is copy-on-write: every write
+     * that reaches it rebuilds the object and commits a new generation, so a
+     * program appending a line at a time used to cost one transaction PER
+     * LINE. That is the thing being measured here -- 512 small appends, and
+     * how many times the device was written during them.
+     *
+     * Everything else in this test exists because a cache that is fast and
+     * wrong is worse than no cache: coherence between two independent opens,
+     * fsync actually reaching the device, and the pages coming back under
+     * pressure. */
+    if (strcmp(cmd, "test pagecache") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test pagecache: VFS not registered\n");
+            return 1;
+        }
+
+        const char *path = "/pcachetest.bin";
+        const int N = 512, CHUNK = 64;
+        char buf[64];
+        for (int i = 0; i < CHUNK; i++) buf[i] = (char)('A' + (i % 26));
+
+        int fails = 0;
+        struct embk_blkstat b0, b1;
+        struct vmo_stats v0, v1;
+
+        vfs_unlink_path(path);   /* a stale file from a previous run is not a fixture */
+
+        int fd = vfs_open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            kprintf("\n[cmd] test pagecache: cannot create %s (%d)\n", path, fd);
+            return 1;
+        }
+
+        /* --- 1. the append storm ------------------------------------- */
+        embk_blkstat_reset();
+        embk_blkstat_get(&b0);
+        vmo_stats_get(&v0);
+
+        for (int i = 0; i < N; i++) {
+            size_t w = 0;
+            if (vfs_fd_write(fd, buf, CHUNK, &w) != EMBK_OK || w != (size_t)CHUNK) {
+                fails++; break;
+            }
+        }
+        vmo_stats_get(&v1);
+        uint64_t wb_during = v1.writebacks - v0.writebacks;
+
+        kprintf("\n[cmd] test pagecache:\n");
+        kprintf("      %d writes of %d bytes -> %llu page writebacks during the loop\n",
+                N, CHUNK, (unsigned long long)wb_during);
+        /* 512 * 64 = 32 KiB = 8 pages. Write-through would have been 512
+         * transactions; anything near N means the cache is not absorbing. */
+        if (wb_during > 16) { kprintf("      FAIL: writes reached the device one at a time\n"); fails++; }
+
+        /* --- 2. fsync is a real flush --------------------------------- */
+        vmo_stats_get(&v0);
+        int rc = vfs_fd_fsync(fd);
+        vmo_stats_get(&v1);
+        kprintf("      fsync: rc=%d, %llu pages pushed, %llu still dirty\n",
+                rc, (unsigned long long)(v1.writebacks - v0.writebacks),
+                (unsigned long long)v1.dirty_pages);
+        if (rc != EMBK_OK) { kprintf("      FAIL: fsync failed\n"); fails++; }
+        if (v1.writebacks == v0.writebacks) { kprintf("      FAIL: fsync wrote nothing\n"); fails++; }
+
+        /* --- 3. coherence between two independent opens ---------------- */
+        /* Not two descriptors from dup -- a SEPARATE open(), which is the case
+         * that fails if each open caches its own copy of the file. */
+        int fd2 = vfs_open(path, O_RDONLY, 0);
+        if (fd2 < 0) { kprintf("      FAIL: second open\n"); fails++; }
+        else {
+            size_t w = 0;
+            (void)vfs_fd_seek(fd, 0, 2, &(uint64_t){0});
+            const char *tag = "COHERENT";
+            if (vfs_fd_write(fd, tag, 8, &w) != EMBK_OK) fails++;
+
+            char rb[8] = {0};
+            uint64_t at = (uint64_t)N * CHUNK;
+            (void)vfs_fd_seek(fd2, (int64_t)at, 0, &(uint64_t){0});
+            size_t got = 0;
+            int r2 = vfs_fd_read(fd2, rb, 8, &got);
+            bool same = (r2 == EMBK_OK && got == 8 && rb[0] == 'C' && rb[7] == 'T');
+            kprintf("      a write through one open is visible to another, unflushed: %s\n",
+                    same ? "OK" : "FAIL");
+            if (!same) fails++;
+            vfs_close(fd2);
+        }
+
+        /* --- 4. the second read of a file costs the device nothing ----- */
+        /* The SEEK stays outside the measured window on purpose. A seek asks
+         * the filesystem for the file's size, and that is a B-tree walk that
+         * legitimately reads the device -- metadata caching is a separate
+         * problem from page caching, and folding them together here would
+         * measure the wrong thing and hide both. */
+        char big[512];
+        size_t got = 0;
+        (void)vfs_fd_seek(fd, 0, 0, &(uint64_t){0});
+        for (int i = 0; i < 8; i++) (void)vfs_fd_read(fd, big, sizeof big, &got);
+        (void)vfs_fd_seek(fd, 0, 0, &(uint64_t){0});
+
+        embk_blkstat_get(&b0);
+        vmo_stats_get(&v0);
+        for (int i = 0; i < 8; i++) (void)vfs_fd_read(fd, big, sizeof big, &got);
+        embk_blkstat_get(&b1);
+        vmo_stats_get(&v1);
+        kprintf("      re-reading 4 KiB already cached: %llu device reads, %llu cache hits\n",
+                (unsigned long long)(b1.reads - b0.reads),
+                (unsigned long long)(v1.hits - v0.hits));
+        if (b1.reads != b0.reads) { kprintf("      FAIL: a cached read still touched the device\n"); fails++; }
+
+        /* --- 5. the pages come back under pressure --------------------- */
+        /* While the file is still OPEN -- closing it releases the object and
+         * its pages anyway, which would make this measure nothing. The point
+         * is that a LIVE cache yields memory the moment something else wants
+         * it. */
+        vmo_stats_get(&v0);
+        uint64_t free_before = pmm_free_pages();
+        uint64_t got_back = vmo_reclaim(4);
+        uint64_t free_after = pmm_free_pages();
+        kprintf("      %llu pages resident; reclaim asked for 4, freed %llu, "
+                "pmm %llu -> %llu\n",
+                (unsigned long long)v0.resident_pages, (unsigned long long)got_back,
+                (unsigned long long)free_before, (unsigned long long)free_after);
+        if (v0.resident_pages >= 4 && got_back != 4) {
+            kprintf("      FAIL: reclaim did not free what it could\n"); fails++;
+        }
+        if (free_after != free_before + got_back) {
+            kprintf("      FAIL: reclaim reported pages it did not return\n"); fails++;
+        }
+
+        /* And the file still reads correctly through the hole it just made:
+         * eviction is not data loss, it is a re-read. */
+        (void)vfs_fd_seek(fd, 0, 0, &(uint64_t){0});
+        got = 0;
+        int rr = vfs_fd_read(fd, big, sizeof big, &got);
+        bool intact = (rr == EMBK_OK && got == sizeof big && big[0] == 'A' && big[25] == 'Z');
+        kprintf("      the file reads correctly after eviction: %s\n", intact ? "OK" : "FAIL");
+        if (!intact) fails++;
+
+        vfs_close(fd);
+        vfs_unlink_path(path);
+
+        vmo_stats_get(&v1);
+        kprintf("      cache now: %llu objects, %llu resident, %llu dirty, "
+                "%llu hits / %llu misses, %llu evictions\n",
+                (unsigned long long)v1.objects, (unsigned long long)v1.resident_pages,
+                (unsigned long long)v1.dirty_pages, (unsigned long long)v1.hits,
+                (unsigned long long)v1.misses, (unsigned long long)v1.evictions);
+        kprintf("[cmd] test pagecache: %s\n", fails == 0 ? "OK" : "FAIL");
         return 1;
     }
 

@@ -135,6 +135,9 @@
  * are one syscall: (oldfd, newfd, min_fd), newfd < 0 meaning "lowest free at
  * or above min_fd". */
 #define EMBK_SYS_dup            99   /* (oldfd, newfd, min) -> newfd  | -err */
+/* A REAL device flush. write() now returns once the bytes are in the page
+ * cache; this is how a caller says it needs them on the disk. */
+#define EMBK_SYS_fsync         100   /* (fd)               -> 0       | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

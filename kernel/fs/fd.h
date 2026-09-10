@@ -5,6 +5,8 @@
 #include "fs/vfs.h"
 #include <stdint.h>
 
+struct vm_object;   /* mm/vm_object.h -- the file's resident pages */
+
 /* Opaque forward declaration -- fd.h can't include process.h (process.h
  * itself includes fd.h, to embed struct fd_entry fds[] in struct process;
  * including it back here would be circular). Without this, every TU that
@@ -143,6 +145,14 @@ struct open_file {
     struct vnode vn;
     uint64_t pos;
     int refs;                   /**< descriptors pointing here; atomic */
+
+    /* The file's PAGES. Not "a cache this fd keeps" -- the one object every
+     * descriptor onto this file shares, so a write through one is visible to a
+     * read through another without either touching the device. NULL for a
+     * backing the cache does not serve (before the scheduler exists, or a
+     * filesystem with no read op), in which case I/O falls through to the
+     * filesystem directly. See mm/vm_object.h. */
+    struct vm_object *obj;
 };
 
 struct fd_entry {
@@ -179,6 +189,7 @@ int vfs_mkdir_path(const char *path);    /* mkdir: split parent + per-fs mkdir o
 int vfs_rename_path(const char *old_path, const char *new_path); /* strict: dest must not exist (POSIX replace = libc veneer) */
 int vfs_chmod_path(const char *path, uint32_t mode);  /* permission bits; fs preserves the type bits */
 int vfs_fd_truncate(int fd, uint64_t size);  /* ftruncate over the existing per-fs truncate op */
+int vfs_fd_fsync(int fd);    /* push this file's dirty pages to the device NOW */
 int vfs_rmdir_path(const char *path);    /* rmdir: EMPTY dirs only (fs enforces) */
 int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode);
 

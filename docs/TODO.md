@@ -492,11 +492,44 @@ approximated, which is why none of them is a silent bug waiting to be found:
   yours" — the VMA list is exactly the record that can answer it, which is
   half the reason it exists — plus a zero page mapped read-only and copied on
   write.
-- [ ] **A page cache.** The block layer issues every `write()` straight to the
-  device synchronously and keeps no dirty pages (which is why `fsync` is
-  vacuously true today — see `user/lib/syscalls.c`). A page cache is the
-  prerequisite for file-backed mmap, and the day it lands `fsync`/`fdatasync`
-  must become a real device flush *in the same commit*.
+- [x] **A page cache.** **DONE**, and built as a *unified* one:
+  `kernel/mm/vm_object.h` defines ONE object per file that owns its resident
+  pages, rather than a block cache under the filesystem and a page cache over
+  it. Two caches of the same bytes can disagree — a program that `mmap`s a file
+  and one that `read`s it would see different data and neither would be wrong
+  on its own terms. Object identity is the FILE, so two independent opens share
+  one set of pages and one authoritative size.
+
+  Measured, `test pagecache`:
+
+  | | before | after |
+  |---|---:|---:|
+  | 512 × 64-byte appends → device writes | 512 transactions | **0** during the loop, one 32 KiB transaction at `fsync` |
+  | re-reading 4 KiB already read | 4 device reads | **0** (8 cache hits) |
+
+  EMBKFS is copy-on-write, so every write that reached it rebuilt the object
+  and committed a new generation — a program appending a line at a time cost
+  one transaction *per line*.
+
+  And `fsync`/`fdatasync` are now **real device flushes** (syscall 100), in the
+  same commit, which is exactly what the standing obligation in
+  `user/lib/syscalls.c` demanded: *"if a write-back cache is ever added, these
+  must become a real device flush the same day, or it turns into the lie the
+  old comment feared."*
+  - [ ] **Metadata is still uncached.** A `seek` to SEEK_END, a `stat`, an
+    `open` — each is a B-tree walk that reads the device. `test pagecache`
+    deliberately keeps the seek outside its measured window rather than hide
+    this. A vnode/inode cache is the next-largest single win after this one.
+  - [ ] **One lock for the whole cache** — the registry, every object's pages,
+    and the global LRU. Per-object locks plus a separate LRU lock is the right
+    shape eventually; the moment to build it is when a profile shows
+    contention, because a two-lock ordering bug here deadlocks the path every
+    file read takes.
+  - [ ] **Read-ahead.** A sequential reader still faults one page at a time.
+    The access pattern is trivially detectable from the object's own history.
+  - [ ] **The writeback thread polls** (yield loop against a deadline, the same
+    shape `sys_sleep_ms` uses) because the scheduler has no timer wakeup list.
+    A real sleeping timer would let it wake only when there is dirty data.
 - [ ] **`msync`.** Meaningless until MAP_SHARED file mappings exist. `ENOSYS`.
 
 ---

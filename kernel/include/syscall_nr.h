@@ -131,4 +131,9 @@
  * reference. See fs/fd.h. */
 #define SYS_dup            99
 
+/* fsync(fd) -- a REAL device flush now that write() lands in the page cache
+ * instead of on the disk. It was vacuously true before and is load-bearing
+ * now; see mm/vm_object.h. */
+#define SYS_fsync         100
+
 #endif /* _SYSCALL_NR_H_ */

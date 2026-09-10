@@ -899,22 +899,109 @@ static void test_dup(void) {
     unlink(path);
 }
 
+/* THE PAGE CACHE, from ring 3.
+ *
+ * A user program cannot see whether a write reached the disk -- and should not
+ * have to. What it CAN see, and what a broken cache breaks, is coherence: a
+ * write must be visible immediately to anyone who reads the file, and stat()
+ * must agree with read() about how long the file is. Those two properties are
+ * exactly what a per-descriptor cache gets wrong, which is why the kernel has
+ * one object per FILE rather than one per open.
+ *
+ * The stat() assertion is the sharp one. Writes now land in memory, so a stat
+ * that asked the device would report the length as of the last writeback --
+ * and every program that stats a file and then reads that many bytes (which is
+ * most of them) would silently get a truncated copy. */
+static void test_writeback(void) {
+    printf("page cache (coherence, size, fsync):\n");
+
+    const char *path = "/wbtest.bin";
+    unlink(path);
+
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ck("create a file", fd >= 0);
+    if (fd < 0) return;
+
+    /* Many small writes: the shape the old write-through path turned into one
+     * filesystem transaction each. */
+    const int N = 200, CHUNK = 16;
+    char chunk[16];
+    for (int i = 0; i < CHUNK; i++) chunk[i] = (char)('a' + (i % 26));
+
+    int wrote_all = 1;
+    for (int i = 0; i < N; i++)
+        if (write(fd, chunk, CHUNK) != CHUNK) { wrote_all = 0; break; }
+    ck("200 small writes all succeed", wrote_all);
+
+    /* stat() must count bytes that are only in the cache. */
+    struct stat st;
+    ck("fstat reports every byte written, flushed or not",
+       fstat(fd, &st) == 0 && st.st_size == (off_t)(N * CHUNK));
+
+    /* SEEK_END must land past them too -- an append loop that seeks to the end
+     * would otherwise seek back over its own unflushed data. */
+    ck("SEEK_END lands past the unflushed bytes",
+       lseek(fd, 0, SEEK_END) == (off_t)(N * CHUNK));
+
+    /* A SEPARATE open of the same file must see the data with no fsync in
+     * between. Two descriptors from dup share an object by construction; two
+     * independent opens only do if the cache is keyed on the FILE. */
+    int fd2 = open(path, O_RDONLY);
+    ck("a second, independent open succeeds", fd2 >= 0);
+    if (fd2 >= 0) {
+        char rb[16];
+        memset(rb, 0, sizeof rb);
+        ssize_t n = read(fd2, rb, CHUNK);
+        ck("it sees the unflushed writes (one object per FILE, not per open)",
+           n == CHUNK && memcmp(rb, chunk, CHUNK) == 0);
+
+        struct stat st2;
+        ck("and agrees about the size",
+           fstat(fd2, &st2) == 0 && st2.st_size == (off_t)(N * CHUNK));
+        close(fd2);
+    }
+
+    /* fsync is a real flush now. It cannot be observed from here as anything
+     * but success -- but it must not fail, and the file must survive it. */
+    ck("fsync succeeds", fsync(fd) == 0);
+    ck("fdatasync succeeds", fdatasync(fd) == 0);
+
+    ck("the file still reads back correctly after the flush",
+       lseek(fd, 0, SEEK_SET) == 0 &&
+       read(fd, chunk, CHUNK) == CHUNK && chunk[0] == 'a');
+
+    /* O_TRUNC must drop the cached tail, not just the on-disk one. Reopening
+     * truncated and reading must return EOF, even though the old bytes were
+     * in memory a moment ago. */
+    close(fd);
+    fd = open(path, O_WRONLY | O_TRUNC);
+    ck("reopen with O_TRUNC", fd >= 0);
+    if (fd >= 0) close(fd);
+
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        char rb[8];
+        ck("the truncated file is empty (the cached tail went too)",
+           read(fd, rb, sizeof rb) == 0);
+        close(fd);
+    }
+
+    unlink(path);
+}
+
 static void test_honest_refusals(void) {
     printf("honest refusals (must NOT pretend):\n");
     struct utimbuf ub = { 0, 0 };
     CK_FAILS("utime -> ENOSYS", utime("/init.elf", &ub), ENOSYS);
-    /* fsync/fdatasync SUCCEED, and that is not faked durability -- it is
-     * durability that is vacuously satisfied. There is no write-back path in
-     * this OS to flush: the block layer keeps no dirty-page cache and issues
-     * every write() straight to the device synchronously, so by the time
-     * write() returned the data was already handed down. "Your writes are
-     * committed" is a TRUE statement here. The old ENOSYS broke callers with
-     * every right to expect success (pip does flush()+os.fsync() before an
-     * atomic replace). user/lib/syscalls.c carries the full argument, and the
-     * standing obligation: if a write-back cache is ever added, these must
-     * become a real device flush the same day. */
-    ck("fsync succeeds (no write-back path to flush)", fsync(1) == 0);
-    ck("fdatasync succeeds", fdatasync(1) == 0);
+    /* fsync/fdatasync on a NON-FILE fd. There is no device behind the console
+     * and nothing buffered on the caller's behalf, so success is the true
+     * answer rather than a convenient one. (fsync on a real file is a real
+     * device flush now -- see test_writeback. The old comment here said these
+     * were "vacuously satisfied" because every write went straight to the
+     * disk; that stopped being true the day the page cache landed, which is
+     * exactly what its standing obligation said would happen.) */
+    ck("fsync on the console succeeds (nothing is buffered)", fsync(1) == 0);
+    ck("fdatasync on the console succeeds", fdatasync(1) == 0);
     CK_FAILS("symlink -> ENOSYS", symlink("/init.elf", "/l"), ENOSYS);
     CK_FAILS("chroot -> ENOSYS", chroot("/"), ENOSYS);
     CK_FAILS("pause -> ENOSYS (no signals; would be a hang)", pause(), ENOSYS);
@@ -1205,6 +1292,7 @@ int main(void) {
     test_mmap();
     test_mprotect();
     test_dup();
+    test_writeback();
     test_honest_refusals();
 
     printf("\nposixdemo: %s (%d failure%s)\n",

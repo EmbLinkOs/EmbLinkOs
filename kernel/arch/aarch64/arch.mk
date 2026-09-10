@@ -62,6 +62,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
 ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/mm/uaccess_guard.c \
                   kernel/mm/vma.c \
+                  kernel/mm/vm_object.c \
                   kernel/mm/ipi.c \
                   kernel/mm/kheap.c \
                   kernel/mm/kmalloc.c \
@@ -837,6 +838,10 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'mprotect across the hole -> ENOMEM'   MM 'mprotect half-applied across an unmapped hole'; \
 	  chk 'two writes APPENDED (one shared cursor'  FD 'dup gave the copy its OWN cursor -- not a shared open file description'; \
 	  chk 'dup2 lands on exactly the descriptor'    FD 'dup2 did not honour the requested fd number'; \
+	  chk 'pagecache: writeback thread started'    PC 'the page cache never came up'; \
+	  chk 'fstat reports every byte written'       PC 'stat disagrees with read about the size of a file with unflushed writes'; \
+	  chk 'one object per FILE, not per open'      PC 'two opens of one file cached it twice -- an incoherent cache'; \
+	  chk 'the cached tail went too'               PC 'O_TRUNC left stale bytes in the cache'; \
 	  chk 'instead of panicking'           A6 'a kernel fault on user memory was not recovered'; \
 	  chk 'posixdemo: ALL PASS'            A6 'the POSIX conformance suite reported failures'; \
 	  chk 'posixdemo exited 0'             A6 'posixdemo did not exit clean'; \
@@ -908,6 +913,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "     GENERATED at runtime, flipped W->X, and executed"; \
 	  echo "  FD dup/dup2/F_DUPFD over a real shared open file"; \
 	  echo "     description: two descriptors, ONE cursor"; \
+	  echo "  PC the unified page cache: write-back, one object per file,"; \
+	  echo "     coherent between independent opens, and a real fsync"; \
 	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
 	  echo "     own GIC redistributor, VECTORS and timer, all reporting in"; \
 	  echo "     themselves, all TICKING, and all reachable by IPI"; \

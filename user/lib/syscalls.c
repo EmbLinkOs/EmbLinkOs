@@ -792,27 +792,34 @@ mode_t umask(mode_t mask) {
 /* Genuinely absent -- fail rather than pretend                        */
 /* ------------------------------------------------------------------ */
 
-/* fsync/fdatasync succeed as a NO-OP -- and that is honest here, not a lie.
- * fsync's contract is "flush this fd's buffered writes to the device". EmbLinkOS
- * has NO write-back path to flush: the block layer keeps no dirty-page cache and
- * issues every write() straight to the device synchronously (grep block.c/ata.c
- * -- there is no cache/writeback/flush machinery). So by the time write()
- * returned, the data was already handed down; there is nothing left for fsync to
- * do, and "your writes are committed" is a TRUE statement about this OS. This is
- * the [[FD_CLOEXEC]] case from the port notes: a capability that is vacuously
- * SATISFIED, not missing -- refusing it (the old ENOSYS) broke callers with every
- * right to expect success (pip's adjacent_tmp_file does flush()+os.fsync() before
- * an atomic replace). If a write-back cache is ever added, THIS must become a
- * real device flush the same day, or it turns into the lie the old comment
- * feared. */
+/* fsync/fdatasync -- A REAL DEVICE FLUSH.
+ *
+ * This function used to succeed as a documented no-op, and the reasoning was
+ * sound at the time: there was no write-back path, every write() went straight
+ * to the device synchronously, so "your writes are committed" was already a
+ * true statement and fsync had nothing left to do. The comment ended with a
+ * standing obligation:
+ *
+ *     If a write-back cache is ever added, THIS must become a real device
+ *     flush the same day, or it turns into the lie the old comment feared.
+ *
+ * The write-back cache is here (kernel/mm/vm_object.h). write() now returns
+ * once the bytes are in memory, so this is no longer vacuous -- it is the
+ * only thing standing between a caller and losing its data to a power cut,
+ * and it does not return until the file's dirty pages are on the device.
+ *
+ * fdatasync is the same call. The distinction POSIX draws -- data without
+ * metadata -- has nothing to attach to here: EMBKFS commits an object's data
+ * and its inode in ONE copy-on-write transaction, so there is no cheaper
+ * flush to offer. Reporting that as a separate, weaker guarantee would be
+ * inventing a difference this filesystem does not have. */
 int fsync(int fd) {
-    (void)fd;
-    return 0;
+    int r = embk_fsync(fd);
+    return r < 0 ? embk_fail(r) : 0;
 }
 
 int fdatasync(int fd) {
-    (void)fd;
-    return 0;
+    return fsync(fd);
 }
 
 /* dup -- the lowest free descriptor, referring to the SAME open file.

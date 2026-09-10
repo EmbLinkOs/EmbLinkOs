@@ -18,6 +18,14 @@ void kworker_init(void);
 
 void kworker_defer_obj_put_locked(struct vnode vn);
 
+/* The same, plus the file's page object (mm/vm_object.h). The fd close path
+ * that runs under g_sched_lock cannot call vmo_put itself: it takes a sleeping
+ * lock and may write dirty pages to the disk. The worker releases the page
+ * object FIRST and the vnode second -- flushing needs the file to still exist,
+ * and obj_put is what may destroy it. `obj` may be NULL. */
+struct vm_object;
+void kworker_defer_vmo_put_locked(struct vnode vn, struct vm_object *obj);
+
 /* EmbDBG v2 Kernel Object Explorer: how many deferred-teardown items are queued
  * right now (g_head - g_tail). A racy debug sample; no lock. */
 uint32_t kworker_pending(void);

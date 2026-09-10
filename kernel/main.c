@@ -57,6 +57,7 @@
 #include "selftests.h"
 
 #include "kworker/kworker.h"
+#include "mm/vm_object.h"   /* the page cache writeback thread */
 
 #include "process/process.h"
 #include "tty/tty.h"
@@ -1960,6 +1961,12 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     }
 
     kworker_init();
+
+    /* The page cache's writeback thread. AFTER the scheduler (it is a kthread
+     * and takes a sleeping lock) and after the filesystem is mounted -- from
+     * this point a write() lands in memory and this thread is what bounds how
+     * long it stays there. See mm/vm_object.h. */
+    vmo_writeback_init();
 
     // --- Networking (M1): virtio-net + Ethernet/ARP/IPv4/ICMP. After PCI is
     // enumerated and the scheduler is live (net_init spawns an RX poll kthread).

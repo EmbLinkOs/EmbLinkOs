@@ -372,6 +372,18 @@ static int64_t sys_dup(const struct sysargs *a) {
     return vfs_fd_dup((int)a->arg[0], (int)a->arg[1], (int)a->arg[2]);
 }
 
+/* fsync(fd) -> 0 or -errno.
+ *
+ * Before the page cache this could not exist as anything but a lie or a no-op:
+ * every write() went straight to the device, so there was nothing to flush and
+ * "your writes are committed" was already true. Now a write() returns as soon
+ * as the bytes are in the cache, and this is how a caller says the difference
+ * matters -- a database's journal, a shell's history, git writing a ref. It
+ * does not return until the file's dirty pages are on the device. */
+static int64_t sys_fsync(const struct sysargs *a) {
+    return vfs_fd_fsync((int)a->arg[0]);
+}
+
 /* fd_poll(fd, events) -> ready POLL* bits (or POLLNVAL for a bad fd). One fd at
  * a time; the libc select() loops over the fd_set calling this. What lets a
  * non-blocking socket report connect-completion (POLLOUT) and readability. */
@@ -1927,6 +1939,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_mmap]           = sys_mmap,
     [SYS_mprotect]       = sys_mprotect,
     [SYS_dup]            = sys_dup,
+    [SYS_fsync]          = sys_fsync,
     [SYS_munmap]         = sys_munmap,
     [SYS_win_desktop_front] = sys_win_desktop_front,
     [SYS_debug_attach]   = sys_debug_attach,

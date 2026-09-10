@@ -12,6 +12,8 @@
 #include "block/block.h"
 #include "fs/embkfs/embkfs.h"
 #include "fs/vfs.h"
+#include "mm/vm_object.h"
+#include "kworker/kworker.h"
 #include "process/process.h"
 #include "include/errno.h"
 #include "boot/boot_protocol.h"
@@ -598,6 +600,17 @@ void arch_early_main(uint64_t dtb_phys) {
         if (!ok)
             selftest_fails++;
     }
+
+    /* The deferred-teardown worker and the page cache's writeback thread.
+     *
+     * x86 has started the worker since it existed; aarch64 never did, and the
+     * consequence was a real (if quiet) leak -- an exit-time fd close hands its
+     * vnode to this thread precisely because obj_put can block on the disk, and
+     * with no thread to receive it, nothing released it. The page cache makes
+     * that path load-bearing rather than merely leaky: it is also how a dying
+     * process's dirty pages reach the device. */
+    kworker_init();
+    vmo_writeback_init();
 
     bringup_sched_init();
 

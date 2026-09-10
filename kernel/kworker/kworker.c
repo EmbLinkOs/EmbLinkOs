@@ -1,26 +1,40 @@
 #include "kworker.h"
 #include "process/process.h"
 #include "include/kprintf.h"
+#include "mm/vm_object.h"   /* the page object rides along with the vnode */
 #include <stdint.h>
 
 #define DEFERRED_VN_MAX 64   /* max number of vnode obj_puts we can queue at once */
 
-static struct vnode g_ring[DEFERRED_VN_MAX];
+/* One deferred teardown: release the file's page object, THEN the vnode.
+ * That order is the contract -- flushing dirty pages needs the object still to
+ * exist on the filesystem, and obj_put is what may destroy it. */
+struct deferred_close {
+    struct vnode vn;
+    struct vm_object *obj;       /* may be NULL: not every fd is cached */
+};
+
+static struct deferred_close g_ring[DEFERRED_VN_MAX];
 static uint32_t     g_head, g_tail;              /* guarded by g_sched_lock */
 static struct wait_queue    g_kworker_wq;        /* gzero_init: NULL head is empty */
 
 
-void kworker_defer_obj_put_locked(struct vnode vn) {
+void kworker_defer_vmo_put_locked(struct vnode vn, struct vm_object *obj) {
     uint32_t next = (g_head + 1) % DEFERRED_VN_MAX;
     if (next == g_tail) {
         /* Ring full: log + leak this one. See header contract */
         kprintf("kworker: deferred ring full, leaking one obj_put (ino=%lu)\n", vn.ino);
         return;
     }
-    g_ring[g_head] = vn;           /* struct copy -- vnode is small + copyable */
+    g_ring[g_head].vn  = vn;       /* struct copy -- vnode is small + copyable */
+    g_ring[g_head].obj = obj;
     g_head = next;
     wait_queue_wake_one(&g_kworker_wq);   /* safe: caller holds g_sched_lock,
                                            * same shape as keyboard_deliver */
+}
+
+void kworker_defer_obj_put_locked(struct vnode vn) {
+    kworker_defer_vmo_put_locked(vn, NULL);
 }
 
 uint32_t kworker_pending(void) {
@@ -30,7 +44,7 @@ uint32_t kworker_pending(void) {
 
 static void kworker_main(void) {
     while (1) {
-        struct vnode vn;
+        struct deferred_close job;
 
         sched_lock();
         while (g_head == g_tail) {
@@ -42,7 +56,7 @@ static void kworker_main(void) {
             sched_block_current_locked(&g_kworker_wq);
             sched_lock();
         }
-        vn = g_ring[g_tail];
+        job = g_ring[g_tail];
         g_tail = (g_tail + 1) % DEFERRED_VN_MAX;
         sched_unlock();
 
@@ -57,8 +71,13 @@ static void kworker_main(void) {
          * kworker adds one more racer to an already-ledgered SMP hazard, it
          * does not create it. Tracked with the other embkfs statics. */       
 
-        if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_put) {
-            (void)vn.mnt->ops->obj_put(vn.mnt, vn.ino);
+        /* The page object first: its flush needs the file to still exist, and
+         * the obj_put below is what may destroy it. Both may block on disk,
+         * which is the entire reason this thread exists. */
+        vmo_put(job.obj);
+
+        if (job.vn.mnt && job.vn.mnt->ops && job.vn.mnt->ops->obj_put) {
+            (void)job.vn.mnt->ops->obj_put(job.vn.mnt, job.vn.ino);
         }
     }
 }

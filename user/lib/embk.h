@@ -1074,4 +1074,15 @@ static inline int embk_dup(int oldfd, int newfd, int min_fd) {
     return (int)embk_syscall3(EMBK_SYS_dup, oldfd, newfd, min_fd);
 }
 
+/* Do not return until this file's outstanding writes are ON THE DEVICE.
+ *
+ * write() returns as soon as the bytes reach the page cache, which is what
+ * makes writing fast and what makes a crash able to lose them. This is the
+ * control: a journal, a lock file, a git ref -- anything whose ordering
+ * against a later write must survive a power cut -- calls this and waits.
+ * Everything else does not, and gets the speed. */
+static inline int embk_fsync(int fd) {
+    return (int)embk_syscall1(EMBK_SYS_fsync, fd);
+}
+
 #endif /* __EMBK_H__ */

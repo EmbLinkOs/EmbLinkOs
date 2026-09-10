@@ -3,6 +3,7 @@
 #include "fs/namespace.h"   /* ns_check_writable -- read-only binding gate (UP2) */
 #include "include/errno.h"
 #include "include/kmalloc.h"   /* open file descriptions are heap objects */
+#include "mm/vm_object.h"        /* the page cache: one object per file */
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"
@@ -76,6 +77,10 @@ static struct open_file *of_alloc(struct vnode vn) {
     of->vn = vn;
     of->pos = 0;
     of->refs = 1;
+    /* Join the file's page object, creating it if this is the first open. NULL
+     * is not a failure -- it means the cache cannot serve this backing, and
+     * every path below falls through to the filesystem. */
+    of->obj = vmo_get(vn);
     return of;
 }
 
@@ -267,7 +272,34 @@ int vfs_fd_truncate(int fd, uint64_t size)
     if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->truncate)
         return -EMBK_ENOSYS;
 
-    return of->vn.mnt->ops->truncate(&of->vn, size);
+    int rc = of->vn.mnt->ops->truncate(&of->vn, size);
+    if (rc == EMBK_OK)
+        vmo_truncated(of->obj, size);   /* or the cache serves the old tail */
+    return rc;
+}
+
+/* fsync(fd) -- push this file's dirty pages to the device and do not return
+ * until they are there.
+ *
+ * This used to be vacuously true: every write() went straight to the device,
+ * so "your writes are committed" was already a fact and fsync had nothing to
+ * do. user/lib/syscalls.c carried the standing obligation that came with that
+ * -- "if a write-back cache is ever added, these must become a real device
+ * flush the same day". This is that day. */
+int vfs_fd_fsync(int fd)
+{
+    struct fd_entry *e = fd_lookup(fd);
+    if (!e)
+        return -EMBK_EBADF;
+    /* A pipe, a socket or the console has no device behind it and nothing
+     * buffered on the caller's behalf. Succeeding is the true answer, not a
+     * convenient one: there is genuinely nothing outstanding. */
+    if (e->backing != FD_BACKING_VNODE)
+        return EMBK_OK;
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->obj)
+        return EMBK_OK;
+    return vmo_flush(of->obj);
 }
 
 int vfs_chmod_path(const char *path, uint32_t mode)
@@ -452,6 +484,10 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         err = vn.mnt->ops->truncate(&vn, 0);
         if (err != EMBK_OK)
             return err;
+        /* Somebody ELSE may have this file open and cached. The truncate went
+         * to the device; the pages have to follow, or that other descriptor
+         * keeps reading a file that no longer has those bytes. */
+        vmo_file_truncated(vn, 0);
     }
 
     /* Find a free slot and claim it ATOMICALLY. Before the lock, the find and
@@ -773,6 +809,10 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
         err = vn.mnt->ops->truncate(&vn, 0);
         if (err != EMBK_OK)
             return err;
+        /* Somebody ELSE may have this file open and cached. The truncate went
+         * to the device; the pages have to follow, or that other descriptor
+         * keeps reading a file that no longer has those bytes. */
+        vmo_file_truncated(vn, 0);
     }
 
     /* Lock the TARGET's table, not current's. At spawn time target is the child,
@@ -812,6 +852,27 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
     return target_fd;
  }
 
+/* Metadata from the filesystem, with the SIZE corrected to what a reader can
+ * actually see.
+ *
+ * A write that has only reached the cache has already changed the file: any
+ * descriptor onto it reads the new bytes back immediately. Reporting the
+ * device's idea of the length would make stat() disagree with read(), and the
+ * failure is not subtle -- every program that stats a file and then reads that
+ * many bytes (which is most of them) would get a truncated copy of anything
+ * recently written. */
+static int vnode_stat_cached(struct open_file *of, struct vfs_stat *out) {
+    int err = of->vn.mnt->ops->stat(&of->vn, out);
+    if (err)
+        return err;
+    if (of->obj) {
+        uint64_t cached = vmo_size(of->obj);
+        if (cached > out->size)
+            out->size = cached;
+    }
+    return EMBK_OK;
+}
+
 static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
     if (!fd_readable(e->flags))
         return -EMBK_EBADF;
@@ -820,7 +881,14 @@ static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_
         return -EMBK_ENOSYS;
 
     size_t bytes_read = 0;
-    int err = of->vn.mnt->ops->read(&of->vn, of->pos, buf, len, &bytes_read);
+    int err;
+    if (of->obj) {
+        uint64_t done = 0;
+        err = vmo_read(of->obj, of->pos, buf, len, &done);
+        bytes_read = (size_t)done;
+    } else {
+        err = of->vn.mnt->ops->read(&of->vn, of->pos, buf, len, &bytes_read);
+    }
     if (err)
         return err;
 
@@ -837,7 +905,17 @@ static int vnode_fd_write(struct fd_entry *e, const void *buf, size_t len, size_
         return -EMBK_ENOSYS;
 
     size_t bytes_written = 0;
-    int err = of->vn.mnt->ops->write(&of->vn, of->pos, buf, len, &bytes_written);
+    int err;
+    if (of->obj) {
+        /* Into the cache, and the call returns. The bytes are on their way to
+         * the device, not on it -- fsync() is how a caller says it needs the
+         * difference, and the writeback thread bounds how long it lasts. */
+        uint64_t done = 0;
+        err = vmo_write(of->obj, of->pos, buf, len, &done);
+        bytes_written = (size_t)done;
+    } else {
+        err = of->vn.mnt->ops->write(&of->vn, of->pos, buf, len, &bytes_written);
+    }
     if (err)
         return err;
 
@@ -851,8 +929,12 @@ static int vnode_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t
     if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->stat)
         return -EMBK_ENOSYS;
 
+    /* SEEK_END means the END OF THE FILE, which now includes bytes that are
+     * only in the cache. Asking the device would report the length before the
+     * last writeback -- so an append loop (seek to end, write, repeat) would
+     * seek back over its own unflushed data and overwrite it. */
     struct vfs_stat st;
-    int err = of->vn.mnt->ops->stat(&of->vn, &st);
+    int err = vnode_stat_cached(of, &st);
     if (err)
         return err;
 
@@ -880,7 +962,7 @@ static int vnode_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
     if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->stat)
         return -EMBK_ENOSYS;
 
-    return of->vn.mnt->ops->stat(&of->vn, out);
+    return vnode_stat_cached(of, out);
 }
 
 
@@ -908,6 +990,10 @@ static void vnode_fd_close(struct fd_entry *e) {
     struct open_file *of = e->u.file.of;
     if (!of_put(of))
         return;                 /* another descriptor still holds it */
+    /* Before the vnode reference goes: the last descriptor onto a file is the
+     * last chance to write its dirty pages while the object is still nameable.
+     * vmo_put flushes if this was the final reference. */
+    vmo_put(of->obj);
     if (of->vn.mnt && of->vn.mnt->ops && of->vn.mnt->ops->obj_put)
         (void)of->vn.mnt->ops->obj_put(of->vn.mnt, of->vn.ino);
     kfree(of);
@@ -922,7 +1008,11 @@ static void vnode_fd_close_locked(struct fd_entry *e) {
     struct open_file *of = e->u.file.of;
     if (!of_put(of))
         return;
-    kworker_defer_obj_put_locked(of->vn);
+    /* NOT vmo_put() here: it takes a sleeping lock and may write to the disk,
+     * and this runs under g_sched_lock -- the same reason the obj_put below is
+     * deferred. The object is handed to the kworker with the vnode, which
+     * flushes and releases it from a context that is allowed to block. */
+    kworker_defer_vmo_put_locked(of->vn, of->obj);
     kfree(of);
 }
 
