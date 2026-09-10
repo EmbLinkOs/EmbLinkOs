@@ -22,6 +22,7 @@ struct cpu_idle {
     uint64_t idle_ms;
     uint64_t entries;
     uint64_t first_ms;      /* when this core started counting */
+    uint64_t timer_irqs;
     bool     in_idle;
 };
 static struct cpu_idle g_idle[POWER_MAX_CPUS];
@@ -82,6 +83,12 @@ void power_idle_exit(void) {
     s->in_idle = false;
 }
 
+void power_timer_tick(void) {
+    uint32_t c = this_cpu()->cpu_index;
+    if (c < POWER_MAX_CPUS)
+        g_idle[c].timer_irqs++;
+}
+
 bool power_cpu_stats(uint32_t cpu, struct power_cpu_stats *out) {
     if (!out || cpu >= POWER_MAX_CPUS)
         return false;
@@ -98,6 +105,7 @@ bool power_cpu_stats(uint32_t cpu, struct power_cpu_stats *out) {
         out->idle_ms += now - s->enter_ms;
     out->uptime_ms = now > s->first_ms ? now - s->first_ms : 0;
     out->idle_entries = s->entries;
+    out->timer_irqs = s->timer_irqs;
     return true;
 }
 

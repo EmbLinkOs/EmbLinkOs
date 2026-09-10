@@ -128,9 +128,23 @@ kernel's own periodic threads sleep instead of spinning.
    without switching while the thread was already marked `BLOCKED` and queued,
    so another core could dispatch a thread that had never saved a context. A
    sleeping app now blocks instead of spinning.
-2. **Tickless idle.** A halted core still wakes 100 times a second to find it
-   has nothing to do. The timer queue is what makes "when is the next thing
-   due?" answerable, which is the prerequisite.
+2. ~~**Tickless idle.**~~ **Done, and honestly a modest win.** A core about to
+   halt now arms its timer for the next thing actually *due* rather than for
+   the next 10 ms quantum. Timer interrupts on the secondaries fell from
+   **~98/s to ~70/s**; system idle is unchanged at 97-98%.
+
+   It is not lower because the floor is real work, not the tick: the page
+   cache's writeback thread wakes ten times a second, apps sleep on timers, and
+   a core cannot idle past the next thing genuinely due. Getting further means
+   having fewer periodic wakers, not a cleverer timer.
+
+   The interesting part was a **failed** first attempt. Waking idle cores with
+   `arch_ipi_broadcast` — one thread becoming runnable interrupting every other
+   core — cost *more* than the tick it replaced: idle fell from 98% to **87%**.
+   A targeted `arch_ipi_send` to exactly one idle core recovered it. That
+   measurement is why the targeted IPI exists on both architectures.
+   - The BSP still ticks at ~100/s: its REPL polls the serial console, so it
+     keeps a short arm deliberately. A UART RX interrupt would fix that.
 3. **Per-device power states.** Idle a disk, blank a display, quiesce a NIC.
 4. **An AML interpreter** — the honest blocker for ACPI battery reporting and
    for a general x86 power-off on real hardware.

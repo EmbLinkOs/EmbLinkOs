@@ -80,7 +80,15 @@ struct power_cpu_stats {
     uint64_t idle_ms;           /* time this core spent halted              */
     uint64_t uptime_ms;         /* time since this core started counting    */
     uint64_t idle_entries;      /* how many times it went to sleep          */
+    uint64_t timer_irqs;        /* timer interrupts taken on this core      */
 };
+
+/* Called from each architecture's timer interrupt. The number this makes
+ * visible is the one tickless idle exists to reduce: a HALTED core still wakes
+ * 100 times a second to discover it has nothing to do, and until it is counted
+ * that cost is invisible -- "the machine is 99% idle" says nothing about how
+ * often it was woken to find out. */
+void power_timer_tick(void);
 
 /* Per-core residency. `cpu` is the core index; false if it has none. */
 bool power_cpu_stats(uint32_t cpu, struct power_cpu_stats *out);

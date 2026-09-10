@@ -33,6 +33,24 @@ void lapic_ipi_handler(uint64_t reason) {
      * that is otherwise fine. */
     lapic_send_eoi();
     ipi_dispatch((enum ipi_reason)reason);
+
+    /* A RESCHEDULE has to actually reschedule THIS core, and on x86 nothing
+     * else will: there is no generic post-interrupt scheduler hook here (the
+     * LAPIC timer handler calls schedule() itself, which is why the tick used
+     * to be the only thing that ever moved work between cores). aarch64 gets
+     * this from gic_dispatch's post-EOI hook and needs nothing added.
+     *
+     * AFTER the EOI, for the same reason the timer does it after: schedule()
+     * context-switches and may not return here for a long time, and an
+     * un-EOI'd interrupt would block every later one on this core meanwhile.
+     *
+     * This is what makes an idle core wake PROMPTLY once its timer has been
+     * armed far into the future -- without it, tickless idle would trade a
+     * hundred pointless wakeups a second for a second of latency. */
+    if ((enum ipi_reason)reason == IPI_RESCHEDULE) {
+        extern void schedule(void);
+        schedule();
+    }
 }
 
 void arch_ipi_init_this_cpu(void) {
@@ -51,6 +69,15 @@ bool arch_ipi_broadcast(enum ipi_reason reason) {
         return false;
 
     lapic_send_ipi_all_but_self((uint8_t)(IPI_VECTOR_BASE + reason));
+    return true;
+}
+
+bool arch_ipi_send(uint32_t cpu, enum ipi_reason reason) {
+    if (reason >= IPI_REASON_COUNT || cpu >= cpu_count)
+        return false;
+    if (cpu == this_cpu()->cpu_index)
+        return false;                    /* interrupting ourselves is a no-op */
+    lapic_send_ipi_one(cpu_table[cpu].apic_id, (uint8_t)(IPI_VECTOR_BASE + reason));
     return true;
 }
 

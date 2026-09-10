@@ -742,6 +742,18 @@ void sched_block_current_locked(struct wait_queue *wq);
  * frequent. See "UNDO A BLOCK THAT DID NOT HAPPEN" in process.c. */
 void sched_sleep_ms(uint64_t ms);
 
+/* --- tickless idle --------------------------------------------------------
+ * A core about to halt asks how long it may sleep, arms its own timer for
+ * that, and announces that it is idle so a waker knows to kick it. On the way
+ * out it withdraws the announcement.
+ *
+ * sched_idle_next_ms() is the earliest sleeper's deadline, capped. Everything
+ * that makes a thread runnable kicks the idle cores, so the cap is a backstop
+ * rather than the mechanism -- see its comment in process.c. */
+uint32_t sched_idle_next_ms(void);
+void     sched_idle_enter(void);
+void     sched_idle_exit(void);
+
 /* Expired sleepers are woken by schedule() itself, inside the critical section
  * it picks the next thread in. There is deliberately no separate tick hook:
  * taking g_sched_lock a second time on the tick path corrupted a resuming

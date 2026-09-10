@@ -10,6 +10,7 @@
 #include "acpi/acpi.h"
 #include "process/process.h"
 #include "power/power.h"   /* idle residency accounting */
+#include "drivers/timer/timer.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
 
@@ -134,9 +135,16 @@ void ap_main(void) {
          * liveness backstop that is never reached in practice. Instrumenting
          * only the kthread reported 0% idle on a machine that was in fact
          * halted on three of its four cores. */
+        /* Tickless, same as the idle kthread: nothing to preempt here, so
+         * arm for the next real deadline rather than the next quantum. */
+        sched_idle_enter();
+        timer_arm_this_cpu_ms(sched_idle_next_ms());
+
         power_idle_enter();
         __asm__ volatile ("hlt");
         power_idle_exit();
+
+        sched_idle_exit();
     }
 }
 

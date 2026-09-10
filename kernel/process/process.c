@@ -1,5 +1,6 @@
 #include "process/process.h"
 #include "power/power.h"   /* idle residency accounting */
+#include "include/arch_ipi.h"  /* IPI_RESCHEDULE: waking a halted core */
 #include "include/arch_irq.h"
 #include "drivers/input/keyboard.h"   /* keyboard_release_grab_pid() on reap */
 #include "gfx/surface.h"   /* surface_transfer_to() for SPAWN_ACTION_INHERIT_SURFACE */
@@ -117,6 +118,7 @@ static void kthread_trampoline(void);
  * schedule()'s own comment for why releasing the lock in between, even
  * briefly, is a real cross-core race, not a theoretical one. */
 static void schedule_locked(void);
+static void sched_kick_idle(void);
 
 /* First free PROCESS slot (pid == 0 marks free -- see the struct's own
  * comment in process.h). Self-locking (not "assumes caller holds the
@@ -700,6 +702,7 @@ void wait_queue_wake_one(struct wait_queue *wq) {
     struct thread *t = wq->head;
     wait_queue_remove(wq, t);
     t->state = PROCESS_READY;
+    sched_kick_idle();      /* a halted core may be the one to run it */
 }
 
 void wait_queue_wake_all(struct wait_queue *wq) {
@@ -772,6 +775,78 @@ void sched_sleep_ms(uint64_t ms) {
     }
 }
 
+/* --- TICKLESS IDLE ---------------------------------------------------------
+ *
+ * Which cores are halted right now. A core sets its bit on the way into the
+ * idle halt and clears it on the way out, so a thread becoming runnable knows
+ * whether anybody needs telling.
+ *
+ * Read and written without the scheduler lock, atomically. It is a HINT: a
+ * stale bit costs one unnecessary IPI, and a missed bit is impossible in the
+ * direction that matters -- a core sets its bit BEFORE arming its timer and
+ * halting, so a waker that races it either sees the bit (and IPIs) or the core
+ * has not halted yet (and will re-run the scheduler on its way in). */
+static volatile uint32_t g_idle_cpus;
+
+void sched_idle_enter(void) {
+    __atomic_or_fetch(&g_idle_cpus, 1u << (this_cpu()->cpu_index & 31), __ATOMIC_SEQ_CST);
+}
+void sched_idle_exit(void) {
+    __atomic_and_fetch(&g_idle_cpus, ~(1u << (this_cpu()->cpu_index & 31)), __ATOMIC_SEQ_CST);
+}
+
+/* Somebody became runnable. Drag the halted cores out so one of them picks it
+ * up, instead of leaving it until a timer that may be a second away.
+ *
+ * Only when a core is ACTUALLY halted: on a busy machine this is a load of one
+ * word and a branch, and sends nothing. That matters, because this sits on
+ * every wake path in the kernel. */
+static void sched_kick_idle(void) {
+    uint32_t mask = __atomic_load_n(&g_idle_cpus, __ATOMIC_RELAXED);
+    if (!mask)
+        return;                          /* nobody halted: nothing to tell */
+
+    /* EXACTLY ONE CORE. One thread became runnable, so one core needs to run
+     * it, and interrupting the rest to hand it to one of them is a thundering
+     * herd -- measured on four cores, broadcasting here cost MORE than the
+     * 100 Hz tick tickless idle was removing: system idle fell from 98% to
+     * 87%. That measurement is the reason arch_ipi_send exists.
+     *
+     * The lowest set bit, deliberately arbitrary: which idle core takes it
+     * does not matter, and any policy worth having (cache affinity, the core
+     * the thread last ran on) needs per-core run queues to act on. */
+    uint32_t cpu = (uint32_t)__builtin_ctz(mask);
+    if (cpu != this_cpu()->cpu_index)
+        (void)arch_ipi_send(cpu, IPI_RESCHEDULE);
+}
+
+/* How long THIS core may sleep: until the earliest sleeper's deadline, capped.
+ *
+ * THE CAP IS NOT A SAFETY NET, it is an admission. Everything that can make a
+ * thread runnable is supposed to kick the idle cores, and if that were
+ * complete the cap could be minutes. It is one second because "supposed to" is
+ * a claim about code I have not enumerated exhaustively -- a wake path added
+ * later that forgets to kick would hang the machine, and instead costs one
+ * wasted wakeup per second. Lower it when the kick paths are provably total;
+ * do not raise it because nothing has hung yet. */
+#define SCHED_IDLE_CAP_MS 1000
+
+uint32_t sched_idle_next_ms(void) {
+    uint64_t now = timer_uptime_ms();
+    uint64_t best = now + SCHED_IDLE_CAP_MS;
+
+    sched_lock();
+    for (struct thread *t = g_sleep_wq.head; t; t = t->wait_next)
+        if (t->wake_at_ms && t->wake_at_ms < best)
+            best = t->wake_at_ms;
+    sched_unlock();
+
+    if (best <= now)
+        return 1;                       /* already due: wake immediately */
+    uint64_t ms = best - now;
+    return ms > SCHED_IDLE_CAP_MS ? SCHED_IDLE_CAP_MS : (uint32_t)ms;
+}
+
 /* Wake every sleeper whose deadline has passed. CALLER MUST HOLD g_sched_lock,
  * and that requirement is the entire point of this function's shape.
  *
@@ -795,6 +870,7 @@ static void wake_expired_locked(void) {
         return;                        /* the common case, and now lock-free */
 
     uint64_t now = timer_uptime_ms();
+    bool woke = false;
     struct thread *t = g_sleep_wq.head;
     while (t) {
         struct thread *next = t->wait_next;
@@ -802,9 +878,12 @@ static void wake_expired_locked(void) {
             wait_queue_remove(&g_sleep_wq, t);
             t->wake_at_ms = 0;
             t->state = PROCESS_READY;
+            woke = true;
         }
         t = next;
     }
+    if (woke)
+        sched_kick_idle();
 }
 
 /* --------------------------------------------------------------------
@@ -2885,6 +2964,19 @@ void thread_exit_self(int code) {
  * which is exactly what re-enters schedule(). */
 static void idle_kthread_entry(void) {
     for (;;) {
+        /* TICKLESS. Arm this core's timer for the next thing actually due
+         * instead of for the next 10 ms quantum -- there is nothing to preempt
+         * on a core that is about to halt, so the only reason to wake is a
+         * deadline, and waking anyway is a hundred interrupts a second spent
+         * confirming there is nothing to do.
+         *
+         * The order matters: announce idle BEFORE arming and halting, so a
+         * waker that races us either sees the announcement and sends an IPI,
+         * or has not published its thread yet and this core runs the scheduler
+         * on its way in. */
+        sched_idle_enter();
+        timer_arm_this_cpu_ms(sched_idle_next_ms());
+
         /* Bracket the halt so the time this core spends NOT working is
          * measured. A halted core costs almost nothing and a core spinning in
          * a poll loop costs everything, and the difference is invisible unless
@@ -2893,6 +2985,8 @@ static void idle_kthread_entry(void) {
         power_idle_enter();
         arch_cpu_idle();
         power_idle_exit();
+
+        sched_idle_exit();
     }
 }
 

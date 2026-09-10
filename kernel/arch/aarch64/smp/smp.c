@@ -40,6 +40,14 @@ static uint32_t          g_cpu_on_id = PSCI_CPU_ON_64;
 /* Every core's MPIDR affinity value, indexed BY CPU INDEX. The device tree
  * lists them; nothing else does. */
 static uint64_t g_cpu_mpidr[MAX_CPUS];
+
+/* A core's MPIDR affinity, by dense cpu index -- what a TARGETED SGI needs to
+ * build its affinity fields. Exposed rather than duplicated: the device-tree
+ * walk that filled this array is the only thing that knows the mapping, and a
+ * second reading of /cpus would be a second chance to disagree with it. */
+uint64_t smp_cpu_mpidr(uint32_t cpu) {
+    return cpu < MAX_CPUS ? g_cpu_mpidr[cpu] : 0;
+}
 static uint32_t g_cpu_listed;
 
 /* Each secondary's stack top, as a KERNEL-WINDOW VIRTUAL address. boot.S reads
@@ -263,9 +271,14 @@ void smp_secondary_main(uint64_t index) {
          * spends its time: the adopted boot thread is NORMAL priority and
          * always runnable, so the PRIORITY_BACKGROUND idle kthread behind it
          * is a liveness backstop that is never reached in practice. */
+        sched_idle_enter();
+        timer_arm_this_cpu_ms(sched_idle_next_ms());
+
         power_idle_enter();
         arch_cpu_idle();
         power_idle_exit();
+
+        sched_idle_exit();
     }
 }
 

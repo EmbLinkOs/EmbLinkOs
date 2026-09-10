@@ -31,6 +31,23 @@ uint64_t timer_get_ticks(void);
  * rather than an assumption that they always are. */
 uint64_t timer_sched_ticks(void);
 
+/* Arm THIS core's preemption timer to fire in `ms` milliseconds, one shot.
+ *
+ * The seam tickless idle is built on. A core with work to do arms the ordinary
+ * 10 ms quantum; a core about to halt arms for the next thing actually due --
+ * which is usually far away, and is why a machine doing nothing should not be
+ * woken a hundred times a second to confirm it.
+ *
+ * `ms` is clamped by the implementation to something the hardware counter can
+ * express. Both architectures already had a per-core one-shot underneath: the
+ * aarch64 generic timer is CNTV_CVAL, and the LAPIC is one-shot the moment the
+ * PERIODIC bit is cleared. */
+void timer_arm_this_cpu_ms(uint32_t ms);
+
+/* The scheduler quantum, in milliseconds -- what a core arms when it has work
+ * to run. One name for the number both the timer and the scheduler mean. */
+#define TIMER_QUANTUM_MS 10
+
 /* Busy-wait for `ms` milliseconds. For device bring-up sequences that have to
  * observe a spec'd settle time before the scheduler exists (or while holding a
  * lock that forbids sleeping). Was `pit_delay_ms` at every call site, which

@@ -3,6 +3,7 @@
 #include "arch/aarch64/irq/gicv3.h"
 #include "arch/aarch64/boot/fdt.h"
 #include "include/kprintf.h"
+#include "power/power.h"   /* power_timer_tick */
 
 /* The ARM generic timer -- docs/ARM64.md phase A3.
  *
@@ -52,6 +53,8 @@ static inline uint64_t cntvct(void) {
 }
 
 static void timer_tick(uint32_t intid) {
+    power_timer_tick();   /* count it: see power.h */
+
     (void)intid;
 
     /* Re-arm FIRST, before anything else: the timer interrupt is LEVEL
@@ -140,8 +143,19 @@ void timer_init(void) {
  * CNTFRQ, finding the interrupt in the device tree, and registering the
  * handler. Those are the machine's properties, not the core's. */
 void timer_arm_this_cpu(void) {
+    timer_arm_this_cpu_ms(TIMER_QUANTUM_MS);
+}
+
+/* Arm this core's comparator `ms` milliseconds out. The generic timer is
+ * absolute-deadline hardware (CNTV_CVAL against CNTVCT), so an arbitrary
+ * interval costs exactly what the fixed quantum did -- which is why tickless
+ * needed no new mechanism here, only a caller willing to ask for longer. */
+void timer_arm_this_cpu_ms(uint32_t ms) {
     uint32_t cpu = this_cpu()->cpu_index & (MAX_CPUS - 1);
-    next_deadline[cpu] = cntvct() + reload;
+    if (ms == 0) ms = 1;
+    uint64_t delta = ((uint64_t)timer_freq * ms) / 1000u;
+    if (delta == 0) delta = 1;
+    next_deadline[cpu] = cntvct() + delta;
     __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(next_deadline[cpu]));
     __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)1));  /* ENABLE, unmasked */
     __asm__ volatile("isb" ::: "memory");

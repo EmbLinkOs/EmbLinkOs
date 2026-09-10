@@ -53,6 +53,7 @@ void lapic_start_ap(uint32_t dest_apic_id, uint64_t trampoline_phys);
 /* Send one vector to every core except this one -- the delivery half of an
  * IPI. See include/arch_ipi.h for what the vectors MEAN. */
 void lapic_send_ipi_all_but_self(uint8_t vector);
+void lapic_send_ipi_one(uint32_t dest_apic_id, uint8_t vector);
 
 // Send an EOI to the local APIC to signal end of interrupt handling
 void lapic_send_eoi(void);
@@ -68,6 +69,7 @@ uint32_t lapic_get_id(void);
 void lapic_timer_init(uint8_t vector);
 
 // Ticks elapsed since lapic_timer_init (100 Hz -> 10 ms per tick)
+void lapic_timer_arm_ms(uint32_t ms);
 uint64_t lapic_timer_get_ticks(void);
 
 #endif /* __LAPIC_H__ */

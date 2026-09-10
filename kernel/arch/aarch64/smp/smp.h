@@ -7,6 +7,9 @@
  * says which and returns. */
 void smp_bringup(void);
 
+/* A core's MPIDR affinity by dense cpu index -- what a targeted SGI needs. */
+uint64_t smp_cpu_mpidr(uint32_t cpu);
+
 /* PSCI, exposed because it is not only about CPUs: SYSTEM_OFF and
  * SYSTEM_RESET go the same way. `psci_available()` probes the device tree on
  * first use and is safe to call any time after the DTB is parsed; a machine

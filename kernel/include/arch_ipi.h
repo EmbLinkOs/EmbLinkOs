@@ -48,6 +48,13 @@ void arch_ipi_init_this_cpu(void);
  * yourself", never as "it was delivered". */
 bool arch_ipi_broadcast(enum ipi_reason reason);
 
+/* ONE core, by dense cpu index. Waking a single idle core is not a broadcast
+ * job: interrupting every other core to hand one thread to one of them is a
+ * thundering herd, and measured on four cores it cost more than the 100 Hz
+ * tick tickless idle was removing -- system idle fell from 98% to 87%. Returns
+ * false for an out-of-range index or for this core itself. */
+bool arch_ipi_send(uint32_t cpu, enum ipi_reason reason);
+
 /* Called by the arch's interrupt path when an IPI arrives. Shared, so the
  * MEANING of each reason lives in one place and only the delivery differs. */
 void ipi_dispatch(enum ipi_reason reason);

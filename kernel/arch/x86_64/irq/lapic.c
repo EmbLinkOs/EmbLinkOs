@@ -8,6 +8,7 @@
 #include "drivers/timer/pit.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/cpu/percpu.h"
+#include "power/power.h"
 
 void net_tick(void);   /* kernel/net/net.c -- 10 ms net clock, wired from the tick */
 #include <stdint.h>
@@ -171,6 +172,17 @@ void lapic_send_ipi_all_but_self(uint8_t vector) {
     lapic_wait_icr_idle();
 }
 
+/* One core, by APIC id. The broadcast above is the wrong tool for waking a
+ * single idle core: it interrupts every other core to hand ONE thread to one
+ * of them, and measured on a four-core desktop that thundering herd cost more
+ * than the 100 Hz tick it was meant to replace -- system idle fell from 98% to
+ * 87%. Fixed destination, no shorthand. */
+void lapic_send_ipi_one(uint32_t dest_apic_id, uint8_t vector) {
+    lapic_write(LAPIC_REG_ICR_HIGH, dest_apic_id << LAPIC_ICR_DEST_SHIFT);
+    lapic_write(LAPIC_REG_ICR_LOW, (uint32_t)vector);   /* fixed, physical, no shorthand */
+    lapic_wait_icr_idle();
+}
+
 void lapic_start_ap(uint32_t dest_apic_id, uint64_t trampoline_phys) {
     uint32_t dest = dest_apic_id << LAPIC_ICR_DEST_SHIFT;
     uint8_t sipi_vector = (uint8_t)(trampoline_phys >> 12);
@@ -280,14 +292,29 @@ void lapic_timer_init(uint8_t vector) {
     // now configure periodic mode at 100hz
     uint32_t initial_count = lapic_timer_ticks_per_ms * 10; // 10 ms per tick for 100 Hz
     lapic_write(LAPIC_REG_TIMER_DIVIDE, LAPIC_REG_TIMER_DIVIDE); // Divide by 16
-    lapic_write(LAPIC_REG_LVT_TIMER, LAPIC_TIMER_PERIODIC | vector ); // Set the interrupt vector and periodic mode
-    lapic_write(LAPIC_REG_TIMER_INIT, initial_count); // Set the initial count for 100 Hz
+    /* ONE-SHOT, not periodic. A periodic timer fires whatever the kernel
+     * wants; a one-shot is re-armed by the handler, which is what lets an idle
+     * core arm for the next thing actually due instead of for 10 ms hence.
+     * The cost is that the handler MUST re-arm -- a missed re-arm stops this
+     * core's clock dead -- so it re-arms at the very top, before anything that
+     * could take a branch. */
+    lapic_write(LAPIC_REG_LVT_TIMER, vector);         /* bit 17 clear = one-shot */
+    lapic_write(LAPIC_REG_TIMER_INIT, initial_count);
     kprintf("LAPIC timer: configured for 100 Hz with initial (count= %u), vector=%u \n", (unsigned int)initial_count, (unsigned int)vector);
 
     idt_set_entry(vector, (uint64_t)lapic_timer_stub, 0x8E); // Set the LAPIC timer handler in the IDT
 }
 
 void lapic_timer_handler(void){
+    /* RE-ARM FIRST, unconditionally. In one-shot mode this core has no clock
+     * at all until this write happens, so it comes before the counting, the
+     * scheduling, and anything else that could return early. The idle path
+     * re-arms for longer on its way to halting; this is the default quantum
+     * for a core that has work. */
+    lapic_timer_arm_ms(TIMER_QUANTUM_MS);
+
+    power_timer_tick();   /* count it: see power.h */
+
     /* Once every core has its own LAPIC timer firing independently (SMP),
      * incrementing this SHARED counter from every core's handler would
      * silently change its meaning from "wall-clock ticks" to "sum of every
@@ -326,6 +353,29 @@ void lapic_timer_handler(void){
     extern void schedule(void);
     schedule();
 }
+
+/* Arm this core's LAPIC timer for `ms` milliseconds, one shot.
+ *
+ * TSC-deadline mode has its own absolute-deadline path (lapic_timer_arm_tsc_
+ * deadline) and is untested here -- QEMU's TCG APIC does not advertise it, as
+ * lapic_timer_init explains at length -- so this handles the LVT count path
+ * and defers to that one where it is live. */
+void lapic_timer_arm_ms(uint32_t ms) {
+    if (lapic_timer_tsc_deadline) {
+        lapic_timer_arm_tsc_deadline();
+        return;
+    }
+    if (ms == 0) ms = 1;
+    uint64_t count = (uint64_t)lapic_timer_ticks_per_ms * ms;
+    /* The initial-count register is 32 bits. A longer sleep than it can
+     * express simply becomes the longest it can: waking early is a wasted
+     * interrupt, waking late is a missed deadline. */
+    if (count > 0xFFFFFFFFULL) count = 0xFFFFFFFFULL;
+    if (count == 0) count = 1;
+    lapic_write(LAPIC_REG_TIMER_INIT, (uint32_t)count);
+}
+
+void timer_arm_this_cpu_ms(uint32_t ms) { lapic_timer_arm_ms(ms); }
 
 uint64_t lapic_timer_get_ticks(void) {
     return lapic_ticks;

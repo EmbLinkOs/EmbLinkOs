@@ -1,4 +1,5 @@
 #include "include/arch_ipi.h"
+#include "arch/aarch64/smp/smp.h"
 #include "arch/aarch64/irq/gicv3.h"
 #include "arch/aarch64/cpu/percpu.h"
 #include "include/kprintf.h"
@@ -52,6 +53,44 @@ bool arch_ipi_broadcast(enum ipi_reason reason) {
      * are ignored with IRM set, which is why none are filled in. */
     uint64_t val = SGI_IRM_ALL_BUT_SELF |
                    ((uint64_t)SGI_INTID(reason) << 24);
+
+    __asm__ volatile("dsb ishst" ::: "memory");
+    __asm__ volatile("msr S3_0_C12_C11_5, %0" :: "r"(val));   /* ICC_SGI1R_EL1 */
+    __asm__ volatile("isb" ::: "memory");
+    return true;
+}
+
+/* ONE core, by dense cpu index. IRM=0 means "use the affinity fields", and the
+ * target is a 16-bit MASK of cores within one Aff1 cluster -- so this builds
+ * the mask from that core's own MPIDR rather than from its index.
+ *
+ * Refusing a target outside this cluster rather than silently sending to the
+ * wrong core: on `virt` every core shares Aff1..Aff3, so the case does not
+ * arise here, and a machine where it does would otherwise wake a stranger. */
+bool arch_ipi_send(uint32_t cpu, enum ipi_reason reason) {
+    if (reason >= IPI_REASON_COUNT || cpu >= cpu_count)
+        return false;
+    if (cpu == this_cpu()->cpu_index)
+        return false;
+
+    uint64_t self = 0;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(self));
+    uint64_t tgt = smp_cpu_mpidr(cpu);
+
+    uint64_t aff1 = (tgt >> 8)  & 0xFF;
+    uint64_t aff2 = (tgt >> 16) & 0xFF;
+    uint64_t aff3 = (tgt >> 32) & 0xFF;
+    if (aff1 != ((self >> 8) & 0xFF) || aff2 != ((self >> 16) & 0xFF) ||
+        aff3 != ((self >> 32) & 0xFF))
+        return false;                     /* another cluster: not ours to target */
+
+    uint64_t aff0 = tgt & 0xFF;
+    if (aff0 > 15)
+        return false;                     /* outside this target list's 16 bits */
+
+    uint64_t val = ((uint64_t)SGI_INTID(reason) << 24) |
+                   (aff3 << 48) | (aff2 << 32) | (aff1 << 16) |
+                   (1ULL << aff0);        /* IRM = 0: use the affinity fields */
 
     __asm__ volatile("dsb ishst" ::: "memory");
     __asm__ volatile("msr S3_0_C12_C11_5, %0" :: "r"(val));   /* ICC_SGI1R_EL1 */

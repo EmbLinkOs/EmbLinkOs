@@ -6650,12 +6650,15 @@ int selftests_handle_command(const char *cmd)
             struct power_cpu_stats st;
             if (!power_cpu_stats(c, &st))
                 continue;
-            kprintf("  cpu%u: idle %llu of %llu ms (%llu%%), %llu halts\n",
+            kprintf("  cpu%u: idle %llu of %llu ms (%llu%%), %llu halts, "
+                    "%llu timer irqs (%llu/s)\n",
                     (unsigned)c,
                     (unsigned long long)st.idle_ms,
                     (unsigned long long)st.uptime_ms,
                     (unsigned long long)(st.uptime_ms ? st.idle_ms * 100 / st.uptime_ms : 0),
-                    (unsigned long long)st.idle_entries);
+                    (unsigned long long)st.idle_entries,
+                    (unsigned long long)st.timer_irqs,
+                    (unsigned long long)(st.uptime_ms ? st.timer_irqs * 1000 / st.uptime_ms : 0));
         }
         kprintf("  system idle: %u%%\n", (unsigned)power_idle_percent());
 
