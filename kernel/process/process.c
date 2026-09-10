@@ -764,6 +764,25 @@ static struct wait_queue g_sleep_wq;
  * all", which is the common case on a quiet machine. */
 static volatile uint64_t g_earliest_wake_ms;
 
+/* THE SAME CACHE, NARROWED TO THREADS THAT DECLARED A PERIOD.
+ *
+ * Waking a busy core early for a sleeper is what removes the half-tick of
+ * lateness (see sched_next_wake_in_ms), and it is not free: every early wake is
+ * an extra timer interrupt and an extra trip through schedule(), on every core.
+ * Under TCG that cost is large enough to push the aarch64 boot self-test past
+ * its budget, which is how it got noticed.
+ *
+ * But almost nothing that sleeps NEEDS to be punctual. A poll loop asking for
+ * 100 ms does not care about five of them; a compositor owing a frame every
+ * 16 ms does, and an audio thread with a 15 ms buffer does. Those are exactly
+ * the threads that declared a period -- they said so, in the one place the
+ * kernel asks. So the early wake is spent on them and on nothing else, and a
+ * machine where nothing has declared pays nothing at all.
+ *
+ * That is the same rule the deadline policy's scan follows: do not charge every
+ * machine for a feature it is not using. */
+static volatile uint64_t g_earliest_periodic_wake_ms;
+
 void sched_sleep_ms(uint64_t ms) {
     if (ms == 0) {
         sys_yield();
@@ -793,6 +812,9 @@ void sched_sleep_ms(uint64_t ms) {
         /* Under the lock, so this cannot race the drain below. */
         if (!g_earliest_wake_ms || deadline < g_earliest_wake_ms)
             __atomic_store_n(&g_earliest_wake_ms, deadline, __ATOMIC_RELAXED);
+        if (t->period_ms &&
+            (!g_earliest_periodic_wake_ms || deadline < g_earliest_periodic_wake_ms))
+            __atomic_store_n(&g_earliest_periodic_wake_ms, deadline, __ATOMIC_RELAXED);
         /* Returns UNLOCKED -- it released the lock to switch away. The loop
          * re-checks the clock rather than trusting the wake, because a
          * cancellation wakes a blocked thread too and this must not turn into
@@ -864,6 +886,61 @@ static void sched_kick_idle(void) {
  * do not raise it because nothing has hung yet. */
 #define SCHED_IDLE_CAP_MS 1000
 
+/* How long a BUSY core may run before its next timer interrupt.
+ *
+ * THE QUANTUM IS NOT THE ONLY DEADLINE A RUNNING CORE HAS. A sleeping thread
+ * becomes runnable only inside wake_expired_locked(), which runs inside
+ * schedule() -- so on a machine with more runnable work than cores, where no
+ * core is idle, nothing notices a sleeper coming due until the next tick. It
+ * is not late because the wrong thread was picked; it was not yet a CANDIDATE
+ * when the decision was made.
+ *
+ * That is worth roughly half a tick on average, and it is exactly the residual
+ * the deadline policy could not explain away: worst-case lateness fell from
+ * 78 ms to 13 ms with the policy, but the MEAN stayed near 5 ms against a
+ * period of 16, and no policy can fix a thread that is not a candidate.
+ *
+ * So a busy core arms for whichever comes first: its quantum, or the next
+ * sleeper. This returns the SLEEPER half -- 0 when nothing is sleeping, which
+ * is the common case and the cheapest answer -- and the caller combines it
+ * with its own quantum deadline. It is split that way because the two arches
+ * track their quantum differently and because an early fire must not be
+ * COUNTED as a tick: `ticks` is a clock and net_tick() is a 10 ms clock, and
+ * both would run fast if an extra interrupt looked like an extra tick.
+ *
+ * Never returns 0 when something IS due: on the LAPIC an initial count of zero
+ * stops the timer rather than firing it, which would stop the core's clock
+ * dead, and 1 ms is the smallest honest "now".
+ *
+ * CAPPED AT THE QUANTUM because a core that has work is going to be
+ * interrupted then anyway; asking for longer would be asking to be preempted
+ * later, which is a different change and not this one.
+ *
+ * READS THE LOCK-FREE CACHE, deliberately. This is called at the very top of
+ * the timer interrupt, before the re-arm, where taking the scheduler lock
+ * would be both a deadlock risk and an absurd cost. g_earliest_wake_ms is racy
+ * by design (see its comment); stale-late here means arming for the quantum
+ * and catching the sleeper one tick later, which is exactly the behaviour this
+ * replaces and therefore not a regression. Stale-EARLY cannot storm: every
+ * fire leads to schedule(), and schedule_locked() calls wake_expired_locked()
+ * unconditionally, which recomputes the cache. */
+uint32_t sched_next_wake_in_ms(void) {
+    /* THE PERIODIC CACHE, NOT THE GENERAL ONE. See its definition: a thread
+     * that never said it needs a cadence is not worth an extra interrupt on
+     * every core, and almost nothing that sleeps has said so. */
+    uint64_t earliest = __atomic_load_n(&g_earliest_periodic_wake_ms,
+                                        __ATOMIC_RELAXED);
+    if (!earliest)
+        return 0;                       /* nothing periodic is sleeping */
+
+    uint64_t now = timer_uptime_ms();
+    if (earliest <= now)
+        return 1;                       /* already due */
+
+    uint64_t ms = earliest - now;
+    return ms >= TIMER_QUANTUM_MS ? TIMER_QUANTUM_MS : (uint32_t)ms;
+}
+
 uint32_t sched_idle_next_ms(void) {
     uint64_t now = timer_uptime_ms();
     uint64_t best = now + SCHED_IDLE_CAP_MS;
@@ -922,7 +999,7 @@ static void wake_expired_locked(void) {
 
     uint64_t now = timer_uptime_ms();
     bool woke = false;
-    uint64_t earliest = 0;
+    uint64_t earliest = 0, earliest_p = 0;
     struct thread *t = g_sleep_wq.head;
     while (t) {
         struct thread *next = t->wait_next;
@@ -931,14 +1008,18 @@ static void wake_expired_locked(void) {
             t->wake_at_ms = 0;
             sched_set_ready(t);
             woke = true;
-        } else if (t->wake_at_ms && (!earliest || t->wake_at_ms < earliest)) {
-            earliest = t->wake_at_ms;
+        } else if (t->wake_at_ms) {
+            if (!earliest || t->wake_at_ms < earliest)
+                earliest = t->wake_at_ms;
+            if (t->period_ms && (!earliest_p || t->wake_at_ms < earliest_p))
+                earliest_p = t->wake_at_ms;
         }
         t = next;
     }
-    /* Recomputed from the walk we were doing anyway -- the cache is exact
-     * again here, whatever it drifted to between drains. */
+    /* Recomputed from the walk we were doing anyway -- the caches are exact
+     * again here, whatever they drifted to between drains. */
     __atomic_store_n(&g_earliest_wake_ms, earliest, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_earliest_periodic_wake_ms, earliest_p, __ATOMIC_RELAXED);
     if (woke)
         sched_kick_idle();
 }

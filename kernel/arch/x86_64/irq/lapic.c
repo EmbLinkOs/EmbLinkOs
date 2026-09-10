@@ -9,6 +9,7 @@
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/cpu/percpu.h"
 #include "power/power.h"
+#include "process/process.h"   /* sched_next_wake_in_ms */
 
 void net_tick(void);   /* kernel/net/net.c -- 10 ms net clock, wired from the tick */
 #include <stdint.h>
@@ -305,15 +306,63 @@ void lapic_timer_init(uint8_t vector) {
     idt_set_entry(vector, (uint64_t)lapic_timer_stub, 0x8E); // Set the LAPIC timer handler in the IDT
 }
 
+/* When each core's next full QUANTUM is due, in uptime milliseconds. 0 = not
+ * yet established (the first interrupt on this core sets it).
+ *
+ * Exists because this handler now fires for two reasons -- the quantum, and a
+ * sleeper coming due sooner -- and the tick counters must only advance for the
+ * first. An absolute deadline rather than a countdown so an early fire does
+ * not push the quantum out: a core interrupted at 3 ms is still preempted at
+ * 10, not at 13. aarch64's timer has always worked this way, for the drift
+ * reason its own comment gives; this is the same shape for the same kind of
+ * reason. */
+static volatile uint64_t lapic_next_quantum_ms[MAX_CPUS];
+
 void lapic_timer_handler(void){
     /* RE-ARM FIRST, unconditionally. In one-shot mode this core has no clock
      * at all until this write happens, so it comes before the counting, the
      * scheduling, and anything else that could return early. The idle path
-     * re-arms for longer on its way to halting; this is the default quantum
-     * for a core that has work. */
-    lapic_timer_arm_ms(TIMER_QUANTUM_MS);
+     * re-arms for longer on its way to halting; this is a core that has work.
+     *
+     * NOT ALWAYS A FULL QUANTUM, AND NOT ALWAYS A TICK. A sleeping thread only
+     * becomes runnable inside schedule(), so a busy core that always armed for
+     * 10 ms could not notice a sleeper due in 3 -- worth half a tick of
+     * lateness on average to everything periodic on the machine.
+     *
+     * That means this handler now runs for two different reasons, and only one
+     * of them is a TICK. `lapic_ticks` is a clock and net_tick() is a 10 ms
+     * clock; counting an early wake as a tick would make both run fast. So the
+     * quantum is tracked as an absolute deadline per core -- the same shape
+     * aarch64 has always used -- and the counting below is gated on having
+     * actually reached it. */
+    uint32_t cpu = this_cpu()->cpu_index & (MAX_CPUS - 1);
+    uint64_t now = timer_uptime_ms();
 
-    power_timer_tick();   /* count it: see power.h */
+    bool real_tick = (lapic_next_quantum_ms[cpu] == 0) ||
+                     (now >= lapic_next_quantum_ms[cpu]);
+    if (real_tick)
+        lapic_next_quantum_ms[cpu] = now + TIMER_QUANTUM_MS;
+
+    uint64_t left = lapic_next_quantum_ms[cpu] - now;
+    uint32_t arm  = (left == 0 || left > TIMER_QUANTUM_MS)
+                        ? TIMER_QUANTUM_MS : (uint32_t)left;
+
+    /* EVERY CORE, not just the boot core. Restricting this to the BSP was
+     * tried, on the theory that one core noticing a sleeper is enough and that
+     * four arming for the same instant would pile into the scheduler lock the
+     * way the idle path does. Neither half held up: the lock was no quieter
+     * (148k spins against 140k) and the worst-case lateness got worse (10 ms
+     * against 3-4), because the one core allowed to notice was not always the
+     * one free to run the thread. The extra lock traffic is not lockstep, it
+     * is simply the extra schedule() calls that noticing sleepers on time
+     * consists of. */
+    uint32_t wake = sched_next_wake_in_ms();
+    if (wake && wake < arm) arm = wake;
+
+    lapic_timer_arm_ms(arm);
+
+    if (real_tick)
+        power_timer_tick();   /* count it: see power.h */
 
     /* Once every core has its own LAPIC timer firing independently (SMP),
      * incrementing this SHARED counter from every core's handler would
@@ -323,7 +372,7 @@ void lapic_timer_handler(void){
      * online. Keep it a true wall clock: only the BSP's own timer
      * advances it. Every core (BSP and every AP) still unconditionally
      * calls schedule() below on its OWN tick -- that part doesn't change. */
-    if (this_cpu_is_bsp()) {
+    if (real_tick && this_cpu_is_bsp()) {
         lapic_ticks++; // Increment the LAPIC timer tick count
         net_tick();    // 10 ms net clock: drive event-driven RX + client timeouts
                        // (a no-op with empty queues before the net stack is up)

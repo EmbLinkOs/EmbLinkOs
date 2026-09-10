@@ -293,7 +293,49 @@ capabilities rather than fork/exec.
    the tempting story that the scheduler is mostly clock reads. It really is
    the scans, at ~45 ns per slot under TCG.
 
-7. **Something actually declares a cadence**, which is what makes the default
+7. **The other half of being on time is being a CANDIDATE on time.** A sleeping
+   thread only becomes runnable inside `wake_expired_locked()`, which runs
+   inside `schedule()` — so on a machine with more runnable work than cores,
+   where nothing is idle, a sleeper due in 3 ms of a 10 ms tick is not late
+   because the wrong thread was picked. It was not yet a candidate when the
+   decision was made.
+
+   That was the residual the deadline policy could not explain away, and it is
+   fixed in the timer rather than the policy: a busy core now arms for its
+   quantum *or* the next sleeper, whichever is sooner.
+
+   | | before | after |
+   |---|---|---|
+   | mean lateness (x86) | 4.33, 5.24 ms | 1.09, 1.47 ms |
+   | worst lateness (x86) | 13, 13 ms | 3, 4 ms |
+   | periods missed | 0 | 0 |
+   | aarch64 worst | 4–5 ms | 2, 6 ms |
+
+   **Only for threads that declared a period**, and that narrowing is the whole
+   difference between shipping this and not. The first version woke a core for
+   *any* sleeper, which tripled idle scheduler-lock spins (≈40 k → ≈130 k per
+   2 s) and slowed TCG enough to push the aarch64 boot self-test past its
+   90-second budget. Almost nothing that sleeps needs punctuality — a poll loop
+   asking for 100 ms does not care about five of them. A compositor owing a
+   frame does, and it said so. Narrowed, the lock traffic is back to baseline
+   (1039 acquires / 23 % contended / 45 k spins, against 975–1008 / 18–23 % /
+   35–43 k before the change) and the lateness win is intact.
+
+   Two other things were tried and rejected with numbers. Waking only the boot
+   core, on the theory that four cores arming for one instant would pile into
+   the lock: it was no quieter (148 k spins vs 140 k) and the worst case got
+   *worse* (10 ms vs 3–4), because the one core allowed to notice was not
+   always the one free to run the thread. And blaming the clock for the cost of
+   a scheduling decision: `timer_uptime_ms()` is 231 ns and `time_get_ns()` is
+   85 ns against an 86 µs decision, so it was never the clock.
+
+   The timer handler now fires for two different reasons, and only one is a
+   *tick*. `lapic_ticks` is a clock and `net_tick()` is a 10 ms clock; both
+   would run fast if an early wake were counted as a tick. So x86 tracks its
+   quantum as an absolute per-core deadline — the shape aarch64 has always
+   used — and the counting is gated on having actually reached it.
+
+8. **Something actually declares a cadence**, which is what makes the default
    worth having.
 
    **The UI toolkit declares for the app.** `em_app_run` holds a reservation
@@ -344,7 +386,7 @@ capabilities rather than fork/exec.
    ragged. It is not done because the benefit cannot be measured on this host,
    where the spread is noise-dominated. See `docs/TODO.md`.
 
-8. **Audio: the latency floor moved 40 ms → 15 ms.** The buffer a writer keeps
+9. **Audio: the latency floor moved 40 ms → 15 ms.** The buffer a writer keeps
    queued *is* the delay between deciding to make a sound and the sound
    existing, and how shallow it can be is a scheduler question.
 
@@ -367,7 +409,7 @@ capabilities rather than fork/exec.
    full page and zero-padded, making 21 ms the smallest unit of audio the
    device could be given. `make test-audio-latency` runs the sweep.
 
-9. **Job control**, which is a scheduling and a signalling problem at once:
+10. **Job control**, which is a scheduling and a signalling problem at once:
    backgrounding a pipeline, listing what is running, bringing one to the
    foreground, and interrupting it. Cancellation already exists as a polite
    sticky flag — what is missing is the shell-side notion of a *job* and a way

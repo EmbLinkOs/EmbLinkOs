@@ -806,6 +806,13 @@ void sched_sleep_ms(uint64_t ms);
  * sched_idle_next_ms() is the earliest sleeper's deadline, capped. Everything
  * that makes a thread runnable kicks the idle cores, so the cap is a backstop
  * rather than the mechanism -- see its comment in process.c. */
+/* Milliseconds until the next sleeping thread is due, capped at one quantum;
+ * 0 when nothing is sleeping. Called from the timer interrupt before the
+ * re-arm, so a BUSY core can wake for a sleeper instead of only on its tick --
+ * see the definition for the lateness that removes, and for why the caller and
+ * not this function decides what to do with the answer. */
+uint32_t sched_next_wake_in_ms(void);
+
 uint32_t sched_idle_next_ms(void);
 void     sched_idle_enter(void);
 void     sched_idle_exit(void);

@@ -4,6 +4,7 @@
 #include "arch/aarch64/boot/fdt.h"
 #include "include/kprintf.h"
 #include "power/power.h"   /* power_timer_tick */
+#include "process/process.h" /* sched_next_wake_in_ms */
 
 /* The ARM generic timer -- docs/ARM64.md phase A3.
  *
@@ -53,8 +54,6 @@ static inline uint64_t cntvct(void) {
 }
 
 static void timer_tick(uint32_t intid) {
-    power_timer_tick();   /* count it: see power.h */
-
     (void)intid;
 
     /* Re-arm FIRST, before anything else: the timer interrupt is LEVEL
@@ -70,22 +69,49 @@ static void timer_tick(uint32_t intid) {
      * Advancing a deadline instead makes the tick exact regardless of handler
      * latency -- late once, not late forever. */
     uint32_t cpu = this_cpu()->cpu_index & (MAX_CPUS - 1);
-    next_deadline[cpu] += reload;
-
-    /* If we fell so far behind that the next deadline is already past --
-     * possible under TCG, or after a long period with interrupts masked --
-     * resynchronise rather than spending the next N interrupts catching up in
-     * a burst that starves everything else. */
     uint64_t now = cntvct();
-    if (next_deadline[cpu] <= now)
-        next_deadline[cpu] = now + reload;
 
-    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(next_deadline[cpu]));
+    /* TWO REASONS TO BE HERE, AND ONLY ONE OF THEM IS A TICK. This core is
+     * also armed for the next SLEEPING thread when one is due before the
+     * quantum (see below), so an interrupt can arrive early -- and `ticks` is
+     * a clock. Counting an early wake would make time run fast, which is the
+     * same mistake as letting four cores each count the same tick. */
+    bool real_tick = (now >= next_deadline[cpu]);
+
+    if (real_tick) {
+        next_deadline[cpu] += reload;
+        /* If we fell so far behind that the next deadline is already past --
+         * possible under TCG, or after a long period with interrupts masked --
+         * resynchronise rather than spending the next N interrupts catching up
+         * in a burst that starves everything else. */
+        if (next_deadline[cpu] <= now)
+            next_deadline[cpu] = now + reload;
+        power_timer_tick();   /* count it: see power.h */
+    }
+
+    /* ARM FOR WHICHEVER COMES FIRST: this core's quantum, or the moment the
+     * next sleeper is due.
+     *
+     * A sleeping thread only becomes runnable inside schedule(), so a core
+     * that always ran to its quantum could not notice a sleeper due in 3 ms of
+     * a 10 ms tick -- worth half a tick of lateness on average to everything
+     * periodic on the machine. The quantum deadline itself is NOT moved by an
+     * early fire: a core interrupted at 3 ms is still preempted at 10. */
+    uint64_t target = next_deadline[cpu];
+    /* Every core, not just core 0 -- see the note in the x86 handler for the
+     * measurement that settled it. */
+    uint32_t wake = sched_next_wake_in_ms();
+    if (wake) {
+        uint64_t early = now + ((uint64_t)timer_freq * wake) / 1000u;
+        if (early < target) target = early;
+    }
+
+    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(target));
 
     /* UPTIME IS COUNTED ONCE, by the boot core. Every core gets a tick -- that
      * is what preempts it -- but `ticks` is a clock, and four cores
      * incrementing it would make time run four times too fast. */
-    if (cpu == 0)
+    if (real_tick && cpu == 0)
         ticks++;
 
     /* No scheduler call here. Preemption happens from the GIC's post-EOI hook

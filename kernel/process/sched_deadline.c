@@ -115,10 +115,11 @@ static void dl_enqueue(struct thread *t) {
  * (that run is inside the boot self-test, before the desktop exists). Fixing
  * the mechanism is what would settle it, and would settle both.
  *
- * The fix is in the timer, not here: arm the per-core one-shot for the next
- * sleeper's deadline on BUSY cores too, not only on the idle path that does it
- * today. That is a change to the tickless machinery and is recorded in
- * docs/TODO.md rather than guessed at from here.
+ * The fix was in the timer, not here, and it has been made: a busy core arms
+ * for its quantum or the next PERIODIC sleeper, whichever is sooner
+ * (sched_next_wake_in_ms). The mean above fell to 1.09-1.47 ms and the worst to
+ * 3-4 ms; aarch64 to 2-6 ms. The numbers in the paragraphs above are the
+ * BEFORE, kept because they are what the reasoning was derived from.
  *
  * A preempt-on-wake IPI was written for this and REMOVED, because it did not
  * work: sending the nearest-deadline thread's wake to the core running the

@@ -783,8 +783,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	@overall=0; \
 	for acc in $(ARM_TEST_ACCELS); do \
 	  case $$acc in \
-	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=40;;  \
-	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=90;; \
+	    hvf) qcmd="$(ARM_QEMU_hvf)"; secs=$${ARM_HVF_SECS:-40};;  \
+	    *)   qcmd="$(ARM_QEMU_tcg)"; secs=$${ARM_TCG_SECS:-90};; \
 	  esac; \
 	  log=$(ARM_BUILD)/boot-$$acc.log; rm -f $$log; \
 	  echo "=== $$acc ==="; \
