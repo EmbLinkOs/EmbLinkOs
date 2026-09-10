@@ -626,6 +626,12 @@ void arch_early_main(uint64_t dtb_phys) {
             kprintf("warning: no idle kthread for cpu %u\n", (unsigned)ci);
     }
 
+    /* COM-equivalent receive, interrupt-driven. After the GIC is up (it needs
+     * to register an INTID) and after the device tree is parsed (it needs to
+     * find which one). The polled path dropped anything longer than the FIFO
+     * pasted between two ticks. */
+    pl011_irq_enable();
+
     kworker_init();
     vmo_writeback_init();
     power_init();

@@ -34,6 +34,11 @@ void pl011_putdec(uint64_t v);
 
 /* Polled input, same contract as serial_has_char()/serial_read_char(). */
 int  pl011_has_char(void);
+
+/* Interrupt-driven receive -- see the ring comment in pl011.c. */
+void     pl011_irq_drain(void);
+void     pl011_irq_enable(void);
+uint32_t pl011_rx_dropped(void);
 char pl011_getc(void);
 
 #endif /* _AARCH64_PL011_H */

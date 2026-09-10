@@ -1,4 +1,6 @@
 #include "arch/aarch64/drivers/pl011.h"
+#include "arch/aarch64/boot/fdt.h"
+#include "arch/aarch64/irq/gicv3.h"
 #include "drivers/char/serial.h"
 
 /* PL011 on QEMU `-M virt`. Hardcoded, and honestly so: `virt`'s memory map is
@@ -29,6 +31,17 @@ static volatile unsigned long pl011_base = PL011_PHYS;
 #define UARTCR          0x30    /* control */
 #define UARTIMSC        0x38    /* interrupt mask set/clear */
 #define UARTICR         0x44    /* interrupt clear */
+
+/* PL011 interrupt bits (ARM DDI 0183, table 3-14). RX is "the FIFO reached its
+ * trigger level"; RT is "there is something in the FIFO and nothing has
+ * arrived for a while". BOTH are needed: with RX alone, a short burst that
+ * never reaches the trigger level sits in the FIFO until the next byte turns
+ * up -- which for a human typing is the difference between a responsive
+ * console and one that echoes a character late, forever. */
+#define IMSC_RX         (1u << 4)
+#define IMSC_RT         (1u << 6)
+#define ICR_RX          (1u << 4)
+#define ICR_RT          (1u << 6)
 
 #define FR_RXFE         (1u << 4)   /* receive FIFO empty */
 #define FR_TXFF         (1u << 5)   /* transmit FIFO full */
@@ -121,11 +134,75 @@ void pl011_putdec(uint64_t v) {
         pl011_putc(buf[i]);
 }
 
+/* --- the receive ring ------------------------------------------------------
+ * Same story as the 16550's, and for the same reason: the debug console polled
+ * once per timer tick, and a PL011's FIFO is 32 bytes. Anything longer than
+ * that pasted or scripted between two polls lost its middle, silently. The
+ * interrupt drains the FIFO into this ring instead, so the reader's timing
+ * stops mattering. */
+#define PL011_RING 512
+static volatile unsigned char s_ring[PL011_RING];
+static volatile uint32_t s_head, s_tail, s_dropped;
+static volatile int s_irq_driven;
+
+void pl011_irq_drain(void) {
+    while ((mmio_r32(UARTFR) & FR_RXFE) == 0) {
+        unsigned char c = (unsigned char)(mmio_r32(UARTDR) & 0xff);
+        uint32_t next = (s_head + 1) % PL011_RING;
+        if (next == s_tail) { s_dropped++; continue; }
+        s_ring[s_head] = c;
+        s_head = next;
+    }
+    mmio_w32(UARTICR, ICR_RX | ICR_RT);      /* ack receive + receive-timeout */
+}
+
+uint32_t pl011_rx_dropped(void) { return s_dropped; }
+
+static void pl011_irq_handler(uint32_t intid) {
+    (void)intid;
+    pl011_irq_drain();
+}
+
+/* Find the UART's interrupt in the device tree and wire it up. The same shape
+ * timer_generic.c uses for the generic timer: the tree is the only thing that
+ * knows which INTID this board's UART is on, and hardcoding `virt`'s number
+ * would work on exactly one machine. */
+void pl011_irq_enable(void) {
+    fdt_node_t node = fdt_find_compatible("arm,pl011");
+    uint32_t type, num, flags;
+    if (node == FDT_NONE || !fdt_interrupt(node, 0, &type, &num, &flags)) {
+        /* No interrupt in the tree: stay POLLED. Silently switching the
+         * readers to a ring nothing fills would be a console that never
+         * receives another byte. */
+        pl011_puts("pl011: no interrupt in the device tree -- input stays polled\n");
+        return;
+    }
+
+    uint32_t intid = gic_intid(type, num);
+    if (gic_register(intid, pl011_irq_handler, "pl011 rx") != 0) {
+        pl011_puts("pl011: could not register the receive interrupt -- staying polled\n");
+        return;
+    }
+
+    pl011_irq_drain();                       /* whatever is already queued */
+    mmio_w32(UARTIMSC, IMSC_RX | IMSC_RT);   /* RX and RX-timeout */
+    s_irq_driven = 1;
+}
+
 int pl011_has_char(void) {
+    if (s_irq_driven)
+        return s_head != s_tail;
     return (mmio_r32(UARTFR) & FR_RXFE) == 0;
 }
 
 char pl011_getc(void) {
+    if (s_irq_driven) {
+        while (s_head == s_tail)
+            ;                                /* the polled contract, kept */
+        unsigned char c = s_ring[s_tail];
+        s_tail = (s_tail + 1) % PL011_RING;
+        return (char)c;
+    }
     while (!pl011_has_char())
         ;
     return (char)(mmio_r32(UARTDR) & 0xff);
@@ -145,4 +222,7 @@ void serial_write_char(char c)       { pl011_putc(c); }
 void serial_write_string(const char *s) { pl011_puts(s); }
 void serial_write_hex(uint64_t v)    { pl011_puthex64(v); }
 int  serial_has_char(void)           { return pl011_has_char(); }
+void     serial_irq_drain(void)      { pl011_irq_drain(); }
+void     serial_irq_enable(void)     { pl011_irq_enable(); }
+uint32_t serial_rx_dropped(void)     { return pl011_rx_dropped(); }
 char serial_read_char(void)          { return pl011_getc(); }

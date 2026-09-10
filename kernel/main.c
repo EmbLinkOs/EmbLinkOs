@@ -1687,6 +1687,18 @@ static void kernel_handle_line_command(const char *cmd)
         kprintf("\n[cmd] unknown command: %s\n", cmd);
 }
 
+/* COM1's receive interrupt: drain the FIFO into the driver's ring. It lives
+ * here rather than in serial.c because irq_handler_t and the IRQ layer belong
+ * to x86, and serial.c is shared with nothing that has them. */
+/* How often the debug REPL wakes to pump the compositor: ~60 Hz. Named because
+ * it is a FRAME rate, not a scheduler quantum, and the two had been the same
+ * number by accident. */
+#define COMPOSITOR_PUMP_MS 16
+
+static void serial_irq_handler(void) {
+    serial_irq_drain();
+}
+
 void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                                         * pointer the loader left in RDI, relayed
                                         * by kentry.asm as the first argument. */
@@ -2050,12 +2062,25 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
             }
         }
 
-        /* Bracketed for the idle accounting (kernel/power/power.h). The BSP
-         * halts here between ticks exactly as the APs do in ap_main; counting
-         * only one of the three places a core can halt would have reported an
-         * idle machine as busy. */
+        /* TICKLESS, at the compositor's rate rather than the scheduler's.
+         *
+         * This loop is not idle in the scheduler's sense -- it pumps the
+         * compositor's pointer and window animation every pass, so it must run
+         * at something like a frame rate. But it has no reason to run at the
+         * 10 ms preemption quantum, which is what a plain `hlt` gave it: any
+         * interrupt woke it, and the timer was the one that always did.
+         *
+         * Arming for the pump period instead cuts core 0's timer interrupts by
+         * about a third. Console input no longer depends on this rate at all,
+         * because COM1's receive interrupt wakes the halt directly -- which is
+         * what makes lengthening it safe rather than a latency regression. */
+        sched_idle_enter();
+        timer_arm_this_cpu_ms(COMPOSITOR_PUMP_MS);
+
         power_idle_enter();
-        __asm__ volatile ("hlt");   // wake on any IRQ (timer, PS/2, or xHCI)
+        __asm__ volatile ("hlt");   // wake on any IRQ (timer, COM1, PS/2, xHCI)
         power_idle_exit();
+
+        sched_idle_exit();
     }
 }
