@@ -200,8 +200,25 @@ capabilities rather than fork/exec.
    - **`sched_idle_next_ms` took the lock on every halt, purely to read.** A
      core halts thousands of times a second. The earliest deadline is cached
      now and read lock-free; acquisitions at idle fell about a third.
-4. **Accounting**: per-process CPU time, so scheduling policy can be argued
-   from numbers.
+4. ~~**Accounting**: per-process CPU time.~~ **Done** — `ps` carries a `cpu`
+   column (milliseconds), and in the shell it is an ordinary column that sorts
+   and filters: `ps | sort-by cpu | last 5`. Charged at the one place a switch
+   happens, so it is exact rather than sampled — a thread that blocks between
+   two ticks is still billed for what it ran, which is precisely what a
+   tick-sampled counter loses.
+
+   **It immediately caught a bug in the idle accounting, and the idle numbers
+   in this document were wrong.** `power` reported 99% idle on a machine whose
+   CPU accounting said one process was using half a core. The CPU one was
+   right: a core halts inside `power_idle_enter`'s bracket, an interrupt wakes
+   it, and the handler *switches to another thread* — so the idle interval
+   stayed open for the entire time that other thread ran. Every core reported
+   itself idle while working. The switch path closes the interval now.
+
+   Real figures: **~87% idle, ~12% busy**, and the two independent measurements
+   agree within a couple of percent (the remainder is interrupt-handler time,
+   which neither charges). The timer-interrupt *rates* quoted elsewhere were
+   measured directly and are unaffected.
 5. **Deadline or reservation scheduling** for the compositor and audio, which
    are the two things whose lateness is immediately visible and audible.
 6. **Job control**, which is a scheduling and a signalling problem at once:

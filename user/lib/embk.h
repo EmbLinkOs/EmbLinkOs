@@ -181,6 +181,10 @@ struct embk_proc_info {
     uint8_t       priority;
     int           exit_code;    /* meaningful only for ZOMBIE */
     unsigned char is_kthread;
+    uint64_t      cpu_ns;       /* CPU actually consumed, all threads. Time
+                                 * EXECUTING -- a thread halted or blocked is
+                                 * charged nothing, which is the difference
+                                 * between this and wall time. */
 };
 /* Snapshot every live process (the shell's ps). Returns the count written
  * (<= max), or -EMBK_*. */

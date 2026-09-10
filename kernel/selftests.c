@@ -3485,6 +3485,13 @@ int selftests_handle_command(const char *cmd)
               "let n = $(ls /shlndir.tmp | count)\n"
               "rm /shlndir.tmp\n"
               "if $n > 0 { echo through } else { echo empty }", 0 },
+            /* The point is that CPU time is an ORDINARY COLUMN: it sorts and
+             * filters like every other field, rather than being a special
+             * pretty-printed listing. `last 1` yields a one-row TABLE, not a
+             * record, so this counts rather than reaching for a field. */
+            { "ps carries CPU time and it sorts and filters like any column",
+              "let n = $(ps | sort-by cpu | where cpu >= 0 | count)\n"
+              "if $n > 0 { echo ok } else { echo bad }", 0 },
             { "readlink of a non-link is an error",
               "readlink /system/bin/shell.elf", 1 },
             { "range/join/split round-trip",

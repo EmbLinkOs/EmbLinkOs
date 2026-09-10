@@ -510,6 +510,17 @@ static int64_t sys_proc_list(const struct sysargs *a) {
     if (max > MAX_PROCESSES) {
         max = MAX_PROCESSES;
     }
+    /* struct process_info is copied RAW into userland, where struct
+     * embk_proc_info (user/lib/embk.h) mirrors it field for field. The two
+     * MUST be grown together -- a kernel struct that gained a field alone
+     * would hand every reader garbage from the row after the one it wanted.
+     * This assertion is the only thing that would notice. */
+    _Static_assert(sizeof(struct process_info) ==
+                   sizeof(uint32_t) * 2 + sizeof(int) + sizeof(uint8_t) +
+                   sizeof(int) + sizeof(unsigned char) + sizeof(uint64_t) +
+                   /* padding to the uint64_t's alignment */ 6,
+                   "process_info and embk_proc_info have drifted apart");
+
     struct process_info snap[MAX_PROCESSES];
     int n = process_list(snap, max);
     if (n > 0 && copy_to_user(user_out, snap, (size_t)n * sizeof(snap[0])) != EMBK_OK) {

@@ -743,15 +743,31 @@ static bool shell_handle_process_command(const char *cmd)
     if (strcmp(cmd, "ps") == 0) {
         struct process_info procs[MAX_PROCESSES];
         int n = process_list(procs, MAX_PROCESSES);
-        kprintf("\nPID  PPID STATE   PRI KIND    EXIT\n");
+        /* CPU in MILLISECONDS, from nanoseconds. A process that has used less
+         * than a millisecond shows 0 rather than a spuriously precise figure:
+         * this is a "what is the machine busy with" column, and to answer that
+         * the interesting rows are the ones with big numbers. */
+        kprintf("\nPID  PPID STATE   PRI KIND     CPU(ms) EXIT\n");
+        uint64_t total_ns = 0;
         for (int i = 0; i < n; i++) {
-            kprintf("%-4u %-4u %-7s %-3u %-7s %d\n",
+            total_ns += procs[i].cpu_ns;
+            kprintf("%-4u %-4u %-7s %-3u %-7s %-8llu %d\n",
                     (unsigned int)procs[i].pid, (unsigned int)procs[i].parent_pid,
                     process_state_name(procs[i].state),
                     (unsigned int)procs[i].priority,
                     procs[i].is_kthread ? "kthread" : "process",
+                    (unsigned long long)(procs[i].cpu_ns / 1000000ULL),
                     procs[i].exit_code);
         }
+        /* The total against uptime is the sanity check that makes the column
+         * trustworthy: on a 4-core machine idling at 97%, the sum of every
+         * process's CPU should be a small fraction of 4 x uptime. A total that
+         * exceeded it would mean the accounting is double-charging. */
+        kprintf("total %llu ms of CPU used; uptime %llu ms x %u cores"
+                "  [ns-clock says %llu ms]\n",
+                (unsigned long long)(total_ns / 1000000ULL),
+                (unsigned long long)timer_uptime_ms(), (unsigned)cpu_count,
+                (unsigned long long)(time_get_ns() / 1000000ULL));
         return true;
     }
 

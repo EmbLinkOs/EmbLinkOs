@@ -68,6 +68,10 @@ void power_idle_enter(void) {
     s->enter_ms = timer_uptime_ms();
     s->in_idle = true;
     s->entries++;
+
+    /* The dispatched thread stops being charged for CPU here -- it is about to
+     * do nothing. See sched_account_pause(). */
+    sched_account_pause();
 }
 
 void power_idle_exit(void) {
@@ -81,6 +85,8 @@ void power_idle_exit(void) {
     if (now > s->enter_ms)
         s->idle_ms += now - s->enter_ms;
     s->in_idle = false;
+
+    sched_account_resume();
 }
 
 void power_timer_tick(void) {

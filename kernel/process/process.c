@@ -1276,6 +1276,11 @@ int process_set_priority(uint32_t pid, uint8_t priority) {
 }
 
 int process_list(struct process_info *out, int max) {
+    /* ONE clock read for the whole listing. Sampling it per row would make the
+     * rows disagree about "now", so a long list would show later processes
+     * with slightly more running fragment than earlier ones for no reason. */
+    const uint64_t list_now_ns = time_get_ns();
+
     spin_lock(&g_sched_lock);
     int n = 0;
     for (int i = 0; i < MAX_PROCESSES && n < max; i++) {
@@ -1294,6 +1299,13 @@ int process_list(struct process_info *out, int max) {
         out[n].priority = p->thread_list ? p->thread_list->priority : 0;
         out[n].exit_code = p->exit_code;
         out[n].is_kthread = (p->pml4_phys == vmm_get_kernel_pml4());
+        out[n].cpu_ns = 0;
+        for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
+            out[n].cpu_ns += t->cpu_ns;
+            if (t->state == PROCESS_RUNNING && t->dispatched_ns &&
+                list_now_ns > t->dispatched_ns)
+                out[n].cpu_ns += list_now_ns - t->dispatched_ns;
+        }
         n++;
     }
     spin_unlock(&g_sched_lock);
@@ -1352,6 +1364,20 @@ int process_inspect(uint32_t pid, struct process_detail *out,
         n++;
     }
     out->thread_count = n;
+
+    /* CPU consumed, summed here while the lock is already held and the thread
+     * list is already walked -- including the fragment the running threads
+     * have earned since their last dispatch. */
+    {
+        uint64_t now_ns = time_get_ns();
+        out->cpu_ns = 0;
+        for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
+            out->cpu_ns += t->cpu_ns;
+            if (t->state == PROCESS_RUNNING && t->dispatched_ns &&
+                now_ns > t->dispatched_ns)
+                out->cpu_ns += now_ns - t->dispatched_ns;
+        }
+    }
     spin_unlock(&g_sched_lock);
     return 0;
 }
@@ -2587,6 +2613,33 @@ static void schedule_locked(void) {
             prev->proc->running_cpu = -1;
         }
     }
+    /* THIS CORE IS NO LONGER IDLE. It halted inside power_idle_enter's
+     * bracket, an interrupt woke it, and the handler is now switching to a
+     * different thread -- so the halt is over, and the core will not return to
+     * power_idle_exit until the halting thread is scheduled again, which may
+     * be seconds away.
+     *
+     * Without this, the idle interval stayed open for the entire time some
+     * OTHER thread ran, and every core reported itself idle while working. It
+     * is why `power` said 99% idle on a machine whose own CPU accounting said
+     * a process was using half a core -- the two numbers disagreed by more
+     * than ten times, and the idle one was wrong. Idempotent: the halting
+     * thread's own power_idle_exit later finds the interval already closed. */
+    power_idle_exit();
+
+    /* --- CPU ACCOUNTING, at the one place a switch happens -----------------
+     * Bill the outgoing thread for the turn it just finished and stamp the
+     * incoming one. Exact rather than sampled: a thread that blocks between
+     * two timer ticks is still charged for the time it ran, which is
+     * precisely the case a tick-sampled counter loses -- and precisely the
+     * threads (short, frequent, latency-sensitive) whose cost matters most. */
+    {
+        uint64_t now_ns = time_get_ns();
+        if (prev && prev->dispatched_ns && now_ns > prev->dispatched_ns)
+            prev->cpu_ns += now_ns - prev->dispatched_ns;
+        next->dispatched_ns = now_ns;
+    }
+
     next->state = PROCESS_RUNNING;  // Mark the next thread as RUNNING
     next->running_cpu = (int)this_cpu()->cpu_index;
     next->ticks_since_scheduled = 0;  // it's getting CPU time now; aging clock resets
@@ -2643,6 +2696,56 @@ void sys_yield(void) {
  * lock RELEASED once woken); restore IF; loop. Waking is via the existing
  * wait_queue_wake_one/all (process.h), which must be called under sched_lock.
  * -------------------------------------------------------------------- */
+/* Every thread's consumed time, plus whatever the running ones have earned
+ * since their last dispatch. Without that fragment a compute-bound thread that
+ * has not yet been switched away reads as having used nothing -- which is the
+ * one process anybody looking at this number is trying to find. */
+/* --- pausing the charge across a HALT --------------------------------------
+ *
+ * A thread that halts is still the one dispatched on this core, so charging it
+ * for wall time would bill it for doing nothing -- and the first `ps` said
+ * exactly that: 97 SECONDS of CPU used on a machine reporting 97% idle, with
+ * the four adopted idle contexts at the top of the list. Dispatched time and
+ * CPU time are not the same quantity on a machine that sleeps.
+ *
+ * So the halt is bracketed. The idle paths already call power_idle_enter/exit
+ * around every one of the three places a core can halt; those now also stop
+ * and restart the clock on whatever thread is dispatched. The result is time
+ * spent EXECUTING, which is the number anybody reading `ps` is asking for.
+ *
+ * No lock: both only ever touch the CURRENT thread on THIS core, which no
+ * other core may be writing -- the same argument the spinlock counters make. */
+void sched_account_pause(void) {
+    struct thread *t = current_thread;
+    if (!t || !t->dispatched_ns) return;
+    uint64_t now = time_get_ns();
+    if (now > t->dispatched_ns) t->cpu_ns += now - t->dispatched_ns;
+    t->dispatched_ns = 0;               /* the halt is charged to nobody */
+}
+
+void sched_account_resume(void) {
+    struct thread *t = current_thread;
+    if (t) t->dispatched_ns = time_get_ns();
+}
+
+uint64_t process_cpu_ns(uint32_t pid) {
+    uint64_t total = 0;
+    uint64_t now_ns = time_get_ns();
+
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    if (p) {
+        for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
+            total += t->cpu_ns;
+            if (t->state == PROCESS_RUNNING && t->dispatched_ns &&
+                now_ns > t->dispatched_ns)
+                total += now_ns - t->dispatched_ns;
+        }
+    }
+    spin_unlock(&g_sched_lock);
+    return total;
+}
+
 void sched_lock_stats(uint64_t *acquires, uint64_t *contended, uint64_t *spins) {
     spin_stats(&g_sched_lock, acquires, contended, spins);
 }

@@ -205,6 +205,24 @@ struct thread {
      * lets the right one sleep through its own signal. See process/futex.c. */
     uint64_t futex_key;
 
+    /* --- CPU ACCOUNTING -----------------------------------------------------
+     *
+     * How long this thread has actually RUN, in nanoseconds, and when its
+     * current turn on a core began.
+     *
+     * Charged at the ONE place a switch happens, which is what makes it exact
+     * rather than sampled: the outgoing thread is billed for now - dispatched
+     * at the moment it is switched away, so nothing is lost to a thread that
+     * blocks between two timer ticks. A sampling profiler would miss exactly
+     * the threads that matter -- the short, frequent ones.
+     *
+     * `cpu_ns` is written only by whichever core is switching AWAY from this
+     * thread, under g_sched_lock, so it needs no atomic. A reader that catches
+     * it mid-turn sees the time up to the last switch; process_cpu_ns() adds
+     * the running fragment so a long-running thread does not read as idle. */
+    uint64_t cpu_ns;
+    uint64_t dispatched_ns;
+
     /* Which core (cpu_table[] index, kernel/cpu/percpu.h) this thread is
      * PROCESS_RUNNING on, set every time schedule()/process_start_first()
      * transitions it to RUNNING. -1 when not running anywhere (READY,
@@ -901,6 +919,18 @@ extern struct thread thread_table[MAX_THREADS];
  * dangerous code in this kernel -- so the number comes first. */
 void sched_lock_stats(uint64_t *acquires, uint64_t *contended, uint64_t *spins);
 
+/* CPU actually consumed by `pid`, in nanoseconds, INCLUDING the fragment its
+ * threads are running right now. 0 if the pid is unknown. Self-locking. */
+uint64_t process_cpu_ns(uint32_t pid);
+
+/* Stop and restart the CPU charge on the current thread across a halt. A
+ * halted thread is still the dispatched one, and billing it for wall time
+ * makes the idle contexts the busiest things on the machine -- which is what
+ * the first version of this accounting reported. Called by the idle paths,
+ * which already bracket every halt for the power counters. */
+void sched_account_pause(void);
+void sched_account_resume(void);
+
 /**
  * @name Scheduler selftests
  * docs/architecture/process-and-scheduling.md §12. Each returns 0 on
@@ -970,6 +1000,9 @@ struct process_info {
     uint8_t priority;
     int exit_code;         /* meaningful only when state == PROCESS_ZOMBIE */
     bool is_kthread;        /* shares the kernel's own PML4 rather than owning one */
+    uint64_t cpu_ns;        /* CPU actually consumed, all threads, live fragment
+                             * included -- what `ps` needs to answer "what is
+                             * this machine busy with", which it could not. */
 };
 
 /**
@@ -1022,6 +1055,7 @@ struct process_detail {
     uint64_t heap_mapped_top;  /* top of heap-backed mapping */
     uint64_t pml4_phys;        /* address-space root (for vmmap/pagewalk) */
     int thread_count;          /* entries written to the caller's threads[] */
+    uint64_t cpu_ns;           /* CPU actually consumed, summed over threads */
 };
 /** Fill `out` + up to `max_threads` of pid's threads into `threads`. Returns 0
  * if the pid exists (out->found true), -1 otherwise. Self-locking. */

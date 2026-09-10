@@ -410,6 +410,13 @@ static struct value bi_ps(const struct command *cmd, struct value input,
             (info[i].state >= 0 && info[i].state <= 4) ? state_names[info[i].state] : "?"));
         value_record_set(&r, "pri",   value_int((int64_t)info[i].priority));
         value_record_set(&r, "kind",  value_string(info[i].is_kthread ? "kthread" : "process"));
+        /* CPU actually consumed, in MILLISECONDS. A column rather than a
+         * pretty string, so it sorts and filters like everything else here:
+         *   ps | sort-by cpu | last 5      -- what is this machine busy with
+         *   ps | where cpu > 1000          -- who has burned a second
+         * Milliseconds because nanoseconds is precision nobody reading a
+         * process list is asking for, and it would push the column wide. */
+        value_record_set(&r, "cpu",   value_int((int64_t)(info[i].cpu_ns / 1000000ULL)));
         value_table_push_row(&out, r);
     }
     return out;
