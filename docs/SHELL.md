@@ -168,11 +168,51 @@ A script is read and parsed **whole**, not line by line: a block spans lines
 and a line-at-a-time reader cannot see the end of one. A leading `#!` is
 skipped (and `#` already starts a comment, so it costs nothing).
 
-`while` refuses after ten million iterations. There is no job control and no
-way to interrupt a running script, so `while true { }` would otherwise wedge
-the machine until it is reset — the loop says which line did it instead of
-hanging. **Remove that ceiling the day the shell can be interrupted, and not
-before.**
+### Background jobs, and Ctrl-C
+
+```
+wget http://host/big.iso &      -> 1        (the job id)
+ls | where size > 1mb &         -> 2        (a BUILTIN pipeline, backgrounded)
+jobs                            -> a table: job, state, exit, cmd
+fg 1                            -> waits, and hands back { job, exit, cmd }
+```
+
+`&` backgrounds a statement by spawning **another shell** to run that
+statement's source text. Spawning the named program directly would only work
+for pipelines that are a single external command — builtins run *in this
+process*, and this process is busy being the shell. Re-parsing the source in a
+child costs a millisecond and makes backgrounding a property of any statement
+rather than a privilege external programs happen to have.
+
+`jobs` is a **table**, so it composes: `jobs | where state == "running" |
+count`. A finished job is shown once and then forgotten — keeping it forever
+fills the table, and dropping it the instant it exits would let a job finish
+between two prompts and leave no trace it ever ran.
+
+`fg N` waits for a job and returns its exit status. It is *not* "bring it to
+the foreground" in the terminal sense: there is no terminal ownership to
+transfer, because a background job here is a separate shell with its own
+stdio. It is named for what it gives.
+
+`$(cmd &)` is refused, and says why: a background job has no value yet.
+
+**Ctrl-C interrupts a running script.** While a program runs, ^C is aimed at
+the shell and *caught* rather than cancelling it; at the prompt it is handed
+back and arrives as the byte the line editor treats as "kill this line".
+
+This was impossible until the kernel grew a second channel. Cancellation is
+sticky and permanent — that is the property that makes it trustworthy, since a
+process cannot miss one by being between calls — so a shell that routed ^C at
+itself would take one keystroke and never read a line again. The kernel now
+has a **counted, clearable interrupt** alongside it (`embk_intr_catch`,
+`embk_intr_take`): opt in, and ^C increments a counter you take and clear, as
+many times as a human presses the key.
+
+Which is why `while` no longer has an iteration ceiling. It used to refuse
+after ten million passes, because `while true { }` could otherwise only be
+ended by resetting the machine, and the comment on it said *"remove this the
+day the shell can be interrupted, and not before"*. That day has come: a loop
+now runs exactly as long as it is asked to, and stops when someone asks it to.
 
 **Every command argument is an expression** — no command has a bespoke arg
 parser. `where`'s arg is the expr `size > 1mb`; `ls`'s arg is the bare word
@@ -441,9 +481,12 @@ Three gaps closed in one pass, all `test fd`-asserted live:
 
 - **Streaming stages** (`tail -f` shapes) — v1 materializes.
 - **Regex `=~`** — substring today.
-- **Background jobs (`&`) and job control.** The single largest remaining gap:
-  a user cannot run two things at once from one shell, and cannot interrupt a
-  running one. The `while` iteration ceiling exists *because* of this.
+- **Stopping and resuming a job** (`^Z`, `bg`). `&`, `jobs`, `fg` and ^C into a
+  running script all work; what is missing is suspending something already
+  running and putting it back. That needs the kernel to be able to *stop* a
+  process rather than only interrupt or cancel it.
+- **Interrupting a background job.** ^C reaches the foreground only, and
+  `kill` takes a pid rather than a job id.
 - **Globbing** (`*.txt`). `ls | where name =~ ".txt"` is the structured
   equivalent and works today, but it is not what anyone types.
 - **Closures / commands as values.** `def` creates a name, not a value; a
