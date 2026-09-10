@@ -219,8 +219,54 @@ capabilities rather than fork/exec.
    agree within a couple of percent (the remainder is interrupt-handler time,
    which neither charges). The timer-interrupt *rates* quoted elsewhere were
    measured directly and are unaffected.
-5. **Deadline or reservation scheduling** for the compositor and audio, which
-   are the two things whose lateness is immediately visible and audible.
+5. **Deadline / reservation scheduling — DONE**, and it is the first thing the
+   policy seam was built for: `kernel/process/sched_deadline.c` is a new file
+   and `schedule_locked()` was not touched.
+
+   A thread declares a rate — `embk_sched_period(period_ms, budget_ms)`, "I
+   must run once every 16 ms and I need about 4 ms of it". A thread holding a
+   live deadline with unspent budget beats every thread without one, and among
+   those the nearest deadline wins. **Past its budget it is an ordinary thread
+   again** for the rest of the period — not throttled, not stopped, not
+   penalised next period, just no longer urgent. That, plus admission control
+   that refuses a declaration once 700 permille of the machine is promised
+   away, is the whole reason this is safe to hand to ring 3 without a
+   capability gate: the worst a caller can do is claim `budget/period` of a
+   core ahead of its neighbours, and the sum of those claims is bounded.
+
+   Why not priority: priority says "before everyone else, always", so two
+   threads that both need a cadence starve each other, and a thread needing
+   2 ms out of every 16 takes all 16. A deadline says *when*.
+
+   **The measurement** (`test deadline`, the same binary run twice against the
+   same load, once under each policy — 16 ms period, 150 periods, six threads
+   that never sleep on four cores):
+
+   | policy | worst lateness | mean | periods missed |
+   |---|---|---|---|
+   | round-robin | 75 / 75 / 114 ms | 19.4 / 20.8 / 30.0 ms | 70 / 78 / 94 of 150 |
+   | deadline | 13 / 13 / 13 ms | 4.6 / 5.8 / 6.0 ms | **0** |
+
+   Round-robin drops roughly half the frames of a 60 Hz loop under load. This
+   drops none. **aarch64 runs the same A/B in its boot self-test** and agrees
+   under both HVF and TCG: 51–55 ms worst down to 6 ms, 0 missed.
+
+   **What it is not.** Not a real-time scheduler, and it must not be described
+   as one: there is no bounded-latency interrupt path, no priority inheritance
+   on the futex, and the admission test ignores blocking time. The claim is
+   narrower and is the one that was measured: *under CPU contention, a thread
+   that declares a rate keeps it.*
+
+   **What the measurement then exposed.** The residual mean is not a policy
+   problem at all — a sleeping thread only becomes runnable inside
+   `wake_expired_locked()`, which runs inside `schedule()`, and on a machine
+   with no idle core nothing re-enters `schedule()` until the next tick. The thread is late because it was not yet
+   a *candidate*, not because the wrong one was picked. Fixing that means
+   arming the one-shot timer for the next sleeper on busy cores too; it is
+   written up in `docs/TODO.md` rather than guessed at. A preempt-on-wake IPI
+   was built for this and **removed** — it moved the mean by less than the
+   run-to-run noise, which is the same answer read-ahead and per-core run
+   queues got.
 6. **Job control**, which is a scheduling and a signalling problem at once:
    backgrounding a pipeline, listing what is running, bringing one to the
    foreground, and interrupting it. Cancellation already exists as a polite

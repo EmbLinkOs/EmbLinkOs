@@ -34,6 +34,7 @@
 #include "include/arch_ipi.h"
 #include "mm/vma.h"
 #include "process/futex.h"
+#include "process/sched.h"   /* the deadline policy A/B */
 #include "arch/aarch64/smp/smp.h"
 #include "include/arch_irq.h"
 #include "include/kmalloc.h"
@@ -972,6 +973,54 @@ void arch_early_main(uint64_t dtb_phys) {
                 (unsigned long long)(e1 - e0));
         if (rc != 0)
             selftest_fails++;
+    }
+
+    /* --- the deadline scheduler policy -------------------------------------
+     * The same A/B the x86 console runs as `test deadline`: one binary, one
+     * load, two policies. The assertion is the comparison, because "13 ms of
+     * jitter" is neither good nor bad on its own -- and it is run here rather
+     * than assumed to port, since the whole policy rests on the timer and the
+     * timers are the part of the two architectures with nothing in common.
+     *
+     * Fewer periods than x86 (60, not 150): this runs under TCG as well as
+     * HVF, and the boot test has to finish. */
+    kprintf("\n--- deadline scheduler ---\n");
+    {
+        const char *jp = "/system/bin/jitter.elf";
+        char *a[] = { (char *)jp, "6", "16", "60", "2", NULL };
+
+        const struct sched_policy *saved = sched_policy_get();
+        const struct sched_policy *rr = sched_policy_by_name("round-robin");
+        const struct sched_policy *dl = sched_policy_by_name("deadline");
+
+        if (!rr || !dl) {
+            kprintf("  [FAIL] a policy is missing from the table\n");
+            selftest_fails++;
+        } else {
+            sched_policy_set(rr);
+            int prr = process_create(jp, a, 5, NULL, 0);
+            int wrr = prr >= 0 ? process_wait((uint32_t)prr) : -1;
+
+            sched_policy_set(dl);
+            int pdl = process_create(jp, a, 5, NULL, 0);
+            int wdl = pdl >= 0 ? process_wait((uint32_t)pdl) : -1;
+
+            sched_policy_set(saved);
+
+            kprintf("  [%s] worst lateness: round-robin %d ms, deadline %d ms\n",
+                    (wrr >= 0 && wdl >= 0 && wdl <= wrr) ? " ok " : "FAIL",
+                    wrr, wdl);
+            if (wrr < 0 || wdl < 0 || wdl > wrr)
+                selftest_fails++;
+            if (wrr >= 0 && wrr < 10)
+                kprintf("  [info] round-robin's worst was only %d ms -- the load\n"
+                        "         did not contend, so this is not evidence\n", wrr);
+            kprintf("  [%s] no reservation outlived its thread (%u permille)\n",
+                    sched_reserved_permille() == 0 ? " ok " : "FAIL",
+                    sched_reserved_permille());
+            if (sched_reserved_permille() != 0)
+                selftest_fails++;
+        }
     }
 
     /* --- mmap / munmap ------------------------------------------------------

@@ -1562,6 +1562,64 @@ how it came down" and BUILD.md §6.
 
 ## Process & Scheduling
 
+### The sleep wake is quantised to the timer tick -- and it is now the dominant
+### source of lateness
+
+Measured while building the deadline policy (`test deadline`), three boots, a
+16 ms periodic thread against six threads that never sleep:
+
+| policy | worst lateness | mean | periods missed (of 150) |
+|---|---|---|---|
+| round-robin | 75 / 75 / 114 ms | 19.4 / 20.8 / 30.0 ms | 70 / 78 / 94 |
+| deadline | 13 / 13 / 13 ms | 4.6 / 5.8 / 6.0 ms | **0 / 0 / 0** |
+
+aarch64 agrees (60 periods, inside the boot self-test, both HVF and TCG):
+round-robin 51-55 ms worst, deadline **6 ms** worst, 0 missed, mean 1.7-2.2 ms.
+
+The deadline policy misses nothing. What is left is the MEAN.
+
+A sleeping thread only becomes runnable inside `wake_expired_locked()`, which
+runs inside `schedule()`. On a machine with more runnable work than cores no
+core is idle, so nothing re-enters `schedule()` until the next tick. The thread
+is not late because the wrong thread was picked; it is late because it was not
+yet a candidate when the decision was made. **No scheduler policy can fix
+this** -- by the time `pick()` is asked, its answer is already right.
+
+- [ ] Arm the per-core one-shot timer for the next sleeper's deadline on BUSY
+      cores, not only on the idle path (`sched_idle_next_ms`) that does it
+      today. The machinery exists; what is missing is arming it from the
+      switch path as well. Expect the residual mean to collapse toward the
+      wake-and-dispatch cost, and re-measure with `test deadline` -- the
+      before-numbers are recorded above so the after-numbers mean something.
+
+      Note the residual is 4.6-6.0 ms on x86 and 1.7-2.2 ms on aarch64 while
+      BOTH tick at 100 Hz, so "half a tick" is the x86 arithmetic working out
+      and not a derivation. The mechanism (a sleeper only becomes runnable
+      inside `schedule()`) is read off the code and is certain; the constant
+      evidently depends on how much else is competing. Fixing the mechanism is
+      what would settle it, on both.
+- [ ] Preempt-on-wake was written for this and **removed** because it did not
+      measure: IPI-ing the core running the least urgent thread when a
+      deadline thread wakes moved the mean by less than run-to-run noise
+      (5.79 ms with it; 4.62 and 5.96 ms without it on the boots either
+      side). It could not have helped --
+      the thread is not READY at the instant the IPI would fire. Reconsider it
+      only AFTER the timer arming above, where it could finally be visible,
+      and only if it measures then.
+- [ ] The deadline policy is not the default. `sched deadline` installs it at
+      the kernel console and `test deadline` swaps it for the A/B, but nothing
+      boots with it. Making it the default is safe on its own terms (a thread
+      with no declared period is scheduled exactly as before, by the same
+      round-robin code) -- what is missing is the compositor and the audio
+      thread actually CALLING `embk_sched_period()`, without which the change
+      would be a no-op that could only cost.
+- [ ] Admission control refuses past 700 permille, and the bound ignores
+      BLOCKING time: a deadline thread waiting on a lock held by a
+      budget-spent thread can still miss, and there is no priority
+      inheritance on the futex to stop it. This is why the policy is
+      documented as "punctual under CPU contention" and not as real-time.
+
+
 Full phased spec, comparative analysis (Linux/Windows/BSD/XNU), and every bug
 below in detail: `docs/architecture/process-and-scheduling.md`. Current
 mechanism: `thread_table[MAX_THREADS=256]` (schedulable unit) split from

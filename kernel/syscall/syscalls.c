@@ -1360,6 +1360,21 @@ static uint64_t uptime_ms_now(void) {
     return timer_uptime_ms();
 }
 
+/* sched_period(period_ms, budget_ms) -- declare this thread's rate.
+ *
+ * NOT capability-gated, and that is a decision rather than an omission. The
+ * thing a capability would protect against is a thread claiming more of the
+ * machine than it should, and that is already bounded structurally: the budget
+ * caps what one declaration buys, and admission control caps the sum. A hostile
+ * caller declaring 4/4 gets refused by the same rule that refuses an honest
+ * one, and a caller declaring 16/8 has taken 500 permille of a promise it can
+ * only spend 8 ms of every 16 anyway. Gating it would mostly mean ordinary
+ * applications cannot ask to be smooth, which is the outcome the whole policy
+ * exists to avoid. */
+static int64_t sys_sched_period(const struct sysargs *a) {
+    return sched_declare_period((uint32_t)a->arg[0], (uint32_t)a->arg[1]);
+}
+
 static int64_t sys_uptime_ms(const struct sysargs *a) {
     (void)a;
     return (int64_t)uptime_ms_now();
@@ -2017,6 +2032,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_ui_present_rect] = sys_ui_present_rect,
     [SYS_key_poll]     = sys_key_poll,
     [SYS_uptime_ms]    = sys_uptime_ms,
+    [SYS_sched_period] = sys_sched_period,
     [SYS_key_grab]     = sys_key_grab,
     [SYS_win_create]   = sys_win_create,
     [SYS_win_present]  = sys_win_present,

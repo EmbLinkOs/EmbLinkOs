@@ -32,6 +32,7 @@
 #include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
 #include "power/power.h"  /* power / poweroff / reboot */
 #include "process/futex.h" /* test futex */
+#include "process/sched.h" /* test deadline: swapping the policy */
 #include "drivers/usb/usb.h"
 #include "drivers/video/framebuffer.h"
 #include "arch/x86_64/cpu/percpu.h"
@@ -6450,6 +6451,128 @@ int selftests_handle_command(const char *cmd)
      *   first check by luck, and blocking is the entire point of a futex. The
      *   kernel's own wait/wake counters say whether any thread actually slept.
      *   A run reporting zero waits proves nothing, however green it looks. */
+    /* ----------------------------------------------------------------------
+     * test deadline -- does declaring a rate actually make a thread punctual?
+     *
+     * THE A/B IS THE TEST. A single run of jitter.elf reports a number with
+     * nothing to compare it to, and "12 ms of jitter" is neither good nor bad
+     * on its own. So the SAME binary is run twice against the SAME load, once
+     * under each policy, and the assertion is that the deadline policy is
+     * better -- which is the only claim being made for it.
+     *
+     * Swapping the policy between runs is safe HERE and is not safe in
+     * general. sched.h says there is deliberately no supported way to change
+     * policy under load, because a policy holding queue state would strand it.
+     * Both of these hold none -- each is a scan of thread_table with all its
+     * state in struct thread -- and the swap happens between two runs with no
+     * deadline thread alive in between. That is a property of these two
+     * policies, not a general permission, and a third one with a run queue
+     * would have to reinstate the restriction.
+     * -------------------------------------------------------------------- */
+    /* `sched` alone reports the installed policy and how much of the machine
+     * is promised away; `sched <name>` installs another one. See the note in
+     * `test deadline` about when swapping is safe -- it is a property of the
+     * two policies that exist today, not a general guarantee. */
+    if (strcmp(cmd, "sched") == 0) {
+        kprintf("\npolicy: %s   reserved: %u permille (ceiling %u)\n",
+                sched_policy_get()->name, sched_reserved_permille(),
+                (unsigned)SCHED_MAX_RESERVED_PERMILLE);
+        kprintf("available: round-robin, deadline\n");
+        kprintf("[cmd] sched\n");
+        return 1;
+    }
+    if (strncmp(cmd, "sched ", 6) == 0) {
+        const struct sched_policy *p = sched_policy_by_name(cmd + 6);
+        if (!p) {
+            kprintf("\nsched: no policy named \"%s\"\n", cmd + 6);
+        } else {
+            sched_policy_set(p);
+            kprintf("\npolicy: %s\n", sched_policy_get()->name);
+        }
+        kprintf("[cmd] %s\n", cmd);
+        return 1;
+    }
+
+    if (strcmp(cmd, "test deadline") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test deadline: VFS not registered\n");
+            return 1;
+        }
+        const char *jp = "/data/apps/jitter/jitter.elf";
+        struct vfs_stat jst;
+        if (vfs_stat(jp, &jst) != EMBK_OK) {
+            kprintf("\n[cmd] test deadline: %s not on image\n", jp);
+            return 1;
+        }
+
+        const struct sched_policy *saved = sched_policy_get();
+        const struct sched_policy *rr    = sched_policy_by_name("round-robin");
+        const struct sched_policy *dl    = sched_policy_by_name("deadline");
+        if (!rr || !dl) {
+            kprintf("\n[cmd] test deadline: a policy is missing from the table\n");
+            return 1;
+        }
+
+        /* 6 hogs on a 4-core machine: more runnable work than cores, which is
+         * the only condition under which the question means anything. */
+        char *a[] = { (char *)jp, "6", "16", "150", "2", NULL };
+
+        kprintf("\n[deadline] one 16 ms periodic thread, 150 periods, 6 threads\n");
+        kprintf("           that never sleep. Exit code is the WORST lateness\n");
+        kprintf("           in ms (capped at 250).\n");
+
+        kprintf("\n--- policy: round-robin ---\n");
+        sched_policy_set(rr);
+        int pid_rr   = process_create(jp, a, 5, NULL, 0);
+        int worst_rr = pid_rr >= 0 ? process_wait((uint32_t)pid_rr) : -1;
+
+        kprintf("\n--- policy: deadline ---\n");
+        sched_policy_set(dl);
+        int pid_dl   = process_create(jp, a, 5, NULL, 0);
+        int worst_dl = pid_dl >= 0 ? process_wait((uint32_t)pid_dl) : -1;
+
+        sched_policy_set(saved);
+
+        int ok = 1;
+        if (worst_rr < 0 || worst_dl < 0) {
+            kprintf("  [FAIL] a run did not complete (rr=%d dl=%d)\n",
+                    worst_rr, worst_dl);
+            kprintf("[cmd] test deadline: FAIL\n");
+            return 1;
+        }
+
+        kprintf("\n[deadline] worst lateness: round-robin %d ms, deadline %d ms\n",
+                worst_rr, worst_dl);
+
+        /* The comparison, and it is the ONLY assertion worth making. An
+         * absolute bound would be a claim about QEMU's timing rather than
+         * about this kernel; "better than the policy it replaces, on the same
+         * load, in the same boot" is a claim about the change. */
+        kprintf("  [%s] the deadline policy is not worse (%d <= %d ms)\n",
+                worst_dl <= worst_rr ? "ok" : "FAIL", worst_dl, worst_rr);
+        if (worst_dl > worst_rr) ok = 0;
+
+        /* Sanity on the load itself. If round-robin already delivered every
+         * period inside one tick, the machine was not actually contended and
+         * the run above proves nothing either way -- so say so rather than
+         * quietly banking a green tick. */
+        if (worst_rr < 10) {
+            kprintf("  (round-robin's worst was only %d ms -- the load did not\n"
+                    "   contend, so this comparison is not evidence)\n", worst_rr);
+        }
+
+        kprintf("  reserved after both runs: %u permille (0 expected: the\n"
+                "  declaration dies with the thread)\n",
+                sched_reserved_permille());
+        if (sched_reserved_permille() != 0) {
+            kprintf("  [FAIL] a reservation outlived its thread\n");
+            ok = 0;
+        }
+
+        kprintf("[cmd] test deadline: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test futex") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test futex: VFS not registered\n");

@@ -66,6 +66,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/process/futex.c \
                   kernel/process/sched.c \
                   kernel/process/sched_rr.c \
+                  kernel/process/sched_deadline.c \
                   kernel/power/power.c \
                   kernel/arch/aarch64/power/power_arm.c \
                   kernel/mm/ipi.c \
@@ -235,7 +236,7 @@ ARM_SYSCALLS  := $(ARM_USER)/syscalls.o
 # libembk.so and the compositor are A7 work -- see docs/TODO.md. Add a name here
 # and it builds; nothing else needs editing.
 # Static newlib console programs (-T newlib.ld, no libembk.so).
-ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capnet capreload capspawn lockdemo \
+ARM_NEWLIB_PROGS ?= hello beep capchild capfs capgpu capnet capreload capspawn lockdemo jitter \
                     crasher ioracer sockdemo udptest nbsock httpget \
                     tlstest wget pkgfetch pkg pkgbuild httpd \
                     posixdemo pkgprobe shell sysinfo tally embbuild \

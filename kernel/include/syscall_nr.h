@@ -158,4 +158,22 @@
  *   op 1 WAKE: wake up to `val` sleepers, return how many */
 #define SYS_futex         105
 
+/* sched_period(ms) -- "I must run once every `ms` milliseconds."
+ *
+ * A DECLARATION OF RATE, not of importance. A compositor between frames and an
+ * audio thread between buffer refills both need to be scheduled at a regular
+ * cadence, and both are hurt by lateness in a way a person can actually
+ * perceive: a dropped frame, an underrun. Priority cannot say this. Priority
+ * says "before everyone else, always", so two threads that both need a
+ * cadence fight instead of interleaving, and a thread that only needs 2 ms
+ * every 16 gets to monopolise all 16.
+ *
+ * ms == 0 clears the declaration. The value is advisory: a policy that does
+ * not implement deadlines (round-robin, the default) stores it and ignores it,
+ * which is why declaring one can never make a thread WORSE off.
+ *
+ * Per-THREAD, not per-process: a UI process typically has one thread that owes
+ * a frame and several that do not. */
+#define SYS_sched_period  106   /* (ms)                     -> 0 | -err     */
+
 #endif /* _SYSCALL_NR_H_ */

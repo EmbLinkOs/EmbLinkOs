@@ -2746,6 +2746,89 @@ uint64_t process_cpu_ns(uint32_t pid) {
     return total;
 }
 
+/* ==========================================================================
+ * RATE DECLARATIONS AND ADMISSION CONTROL.
+ *
+ * This lives here rather than in a policy file because period/budget are
+ * attributes of a THREAD, not of whoever is scheduling it: round-robin stores
+ * them and ignores them, the deadline policy acts on them, and a third policy
+ * could weigh them differently again. The declaration must mean the same thing
+ * whichever one is installed, or a `sched policy` command would silently
+ * change what an application already asked for.
+ *
+ * The sum is recomputed by scanning rather than kept incrementally, on
+ * purpose. An incremental total has to be decremented on every path a thread
+ * can leave by -- exit, kill, the parent reaping a whole process, a thread
+ * that faults -- and a single missed one leaks reservation permanently until
+ * reboot, at which point the machine refuses work it could do. A scan of
+ * MAX_THREADS on a syscall nobody calls in a loop cannot drift. */
+static uint32_t reserved_permille_locked(const struct thread *except) {
+    uint32_t sum = 0;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        const struct thread *t = &thread_table[i];
+        if (t == except) continue;
+        if (t->state == PROCESS_UNUSED || t->state == PROCESS_ZOMBIE) continue;
+        if (!t->period_ms) continue;
+        sum += (uint32_t)((uint64_t)t->budget_ms * 1000u / t->period_ms);
+    }
+    return sum;
+}
+
+uint32_t sched_reserved_permille(void) {
+    spin_lock(&g_sched_lock);
+    uint32_t v = reserved_permille_locked(NULL);
+    spin_unlock(&g_sched_lock);
+    return v;
+}
+
+int sched_declare_period(uint32_t period_ms, uint32_t budget_ms) {
+    struct thread *t = current_thread;
+    if (!t) return -EMBK_EINVAL;
+
+    /* Clearing is always allowed and can never fail -- giving a reservation
+     * back must not be able to be refused. */
+    if (period_ms == 0) {
+        spin_lock(&g_sched_lock);
+        t->period_ms     = 0;
+        t->budget_ms     = 0;
+        t->deadline_ms   = 0;
+        t->period_cpu_ns = 0;
+        spin_unlock(&g_sched_lock);
+        return EMBK_OK;
+    }
+
+    if (period_ms < SCHED_MIN_PERIOD_MS || period_ms > SCHED_MAX_PERIOD_MS)
+        return -EMBK_EINVAL;
+
+    /* Half the period by default. A caller that knows its own work -- a
+     * compositor that spends 2 ms drawing a 16 ms frame -- should say so and
+     * leave the rest of the machine admissible; half is the value that is
+     * generous enough to be right when nobody thought about it. */
+    if (budget_ms == 0)
+        budget_ms = period_ms / 2 ? period_ms / 2 : 1;
+    if (budget_ms > period_ms)
+        return -EMBK_EINVAL;
+
+    uint32_t want = (uint32_t)((uint64_t)budget_ms * 1000u / period_ms);
+
+    spin_lock(&g_sched_lock);
+    /* `t` is excluded from the sum so RE-declaring is not refused by the
+     * caller's own existing reservation -- changing 16/8 to 16/4 must be
+     * possible on a machine that is exactly full. */
+    if (reserved_permille_locked(t) + want > SCHED_MAX_RESERVED_PERMILLE) {
+        spin_unlock(&g_sched_lock);
+        return -EMBK_EBUSY;
+    }
+    t->period_ms     = period_ms;
+    t->budget_ms     = budget_ms;
+    /* The first period opens NOW, spending nothing. Leaving deadline_ms at 0
+     * would make this thread infinitely urgent until its next wakeup. */
+    t->deadline_ms   = timer_uptime_ms() + period_ms;
+    t->period_cpu_ns = t->cpu_ns;
+    spin_unlock(&g_sched_lock);
+    return EMBK_OK;
+}
+
 void sched_lock_stats(uint64_t *acquires, uint64_t *contended, uint64_t *spins) {
     spin_stats(&g_sched_lock, acquires, contended, spins);
 }

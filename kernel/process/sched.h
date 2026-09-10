@@ -79,6 +79,10 @@ const struct sched_policy *sched_policy_get(void);
 /* The policies that exist. Adding one means adding a file and a name here --
  * and nothing in process.c. */
 extern const struct sched_policy sched_policy_roundrobin;
+extern const struct sched_policy sched_policy_deadline;
+
+/* By name, for the debug console. Returns NULL if there is no such policy. */
+const struct sched_policy *sched_policy_by_name(const char *name);
 
 /* Mechanism-side helpers: change a thread's runnability AND tell the policy,
  * in one place, so the two can never drift apart. Both require g_sched_lock. */

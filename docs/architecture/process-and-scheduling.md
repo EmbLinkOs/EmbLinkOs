@@ -364,6 +364,57 @@ Phase C (✅ built, but NOT via the intrusive per-band linked list this section 
 
 Per-CPU run queues (⏳, explicitly deferred — see §8, §13's "explicitly not scheduled" line): one run queue **per CPU**, not one global one. The single global `g_sched_lock` (Phase SMP, §13) is the shipped design; per-CPU queues remain the *next* step only if that lock is *measured* to bottleneck, not a speculative build now. Exact shape (intrusive per-band lists vs. per-CPU flat tables) should be decided against real profiling data if that day comes, not designed ahead of it.
 
+### 6.4 The policy seam and the deadline policy (✅ built)
+
+The scan above is a **policy**, and since Phase 6 it lives behind a vtable
+(`kernel/process/sched.h`) rather than inlined in `schedule_locked()`. Adding a
+scheduler is adding a file: `sched_rr.c` holds the priority-band round-robin
+verbatim, `sched_deadline.c` holds earliest-deadline-first, and
+`schedule_locked()` was not edited to add the second one. Every entry point
+runs with `g_sched_lock` **held** and may not sleep, block, or take the lock —
+the contract is stated at length in `sched.h` and is not negotiable.
+
+`enqueue`/`dequeue` exist even though round-robin ignores them, deliberately: a
+run-queue policy needs exactly those notifications, and if the call sites did
+not exist the seam would be a lie.
+
+**Earliest deadline first, with a budget** (`sched_deadline.c`). A thread
+declares a rate with `sched_period(period_ms, budget_ms)`; a thread holding a
+live deadline and unspent budget outranks every thread without one, and among
+those the nearest deadline wins. **Past its budget it becomes an ordinary
+candidate again** for the rest of the period — the `continue` in `dl_pick`
+removes its *privilege*, not its turn. Together with admission control
+(`sched_declare_period`, ceiling `SCHED_MAX_RESERVED_PERMILLE = 700`, summed by
+scanning rather than kept incrementally so it cannot leak) that is the entire
+safety argument for exposing this to ring 3 ungated: one declaration buys at
+most `budget/period` of a core ahead of its neighbours, and the sum of every
+such claim is bounded below 1.
+
+Measured (`test deadline`, same binary, same load, once under each policy —
+16 ms period, 150 periods, six never-sleeping threads on four cores, three
+boots):
+
+| policy | worst lateness | mean | periods missed |
+|---|---|---|---|
+| round-robin | 75 / 75 / 114 ms | 19.4 / 20.8 / 30.0 ms | 70 / 78 / 94 of 150 |
+| deadline | 13 / 13 / 13 ms | 4.6 / 5.8 / 6.0 ms | **0** |
+
+**Not a real-time scheduler.** No bounded-latency interrupt path, no priority
+inheritance on the futex, and the admission test ignores blocking time — so a
+deadline thread waiting on a lock held by a budget-spent thread can still miss.
+The claim is the measured one: under CPU contention, a thread that declares a
+rate keeps it.
+
+**Swapping policies at runtime** (`sched <name>` at the kernel console) is safe
+for these two specifically, because both are stateless scans of `thread_table`
+with all their state in `struct thread`. `sched.h` still says there is no
+general way to swap under load, and that stays true: a policy holding a run
+queue would strand it. `test deadline` swaps between runs with no deadline
+thread alive in between.
+
+The residual ~5 ms mean is not a policy problem — see `docs/TODO.md`, "The
+sleep wake is quantised to the timer tick".
+
 ---
 
 ## 7. State Machine

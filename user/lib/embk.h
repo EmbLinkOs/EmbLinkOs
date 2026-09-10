@@ -802,6 +802,32 @@ static inline int embk_sleep_ms(uint64_t ms) {
     return (int)embk_syscall1(EMBK_SYS_sleep_ms, (int64_t)ms);
 }
 
+/* ---------------------------------------------------------------------------
+ * DECLARE THIS THREAD'S RATE: "I must run once every `period_ms`, and I need
+ * about `budget_ms` of CPU each time."
+ *
+ * This is what a compositor and an audio thread have that ordinary code does
+ * not: a cadence, and a small, known amount of work per beat. Saying so lets
+ * the scheduler run you close to your beat under load, where a plain sleep
+ * loop waits its ordinary turn behind whatever else is busy -- which for a
+ * 16 ms frame and three busy neighbours is a dropped frame every time.
+ *
+ * It is a request about TIMING, not importance, and it cannot make you run
+ * more than budget_ms per period ahead of anyone. Past that you are simply an
+ * ordinary thread again until the next period, so declaring one honestly costs
+ * you nothing and declaring one dishonestly gains you nothing.
+ *
+ * budget_ms == 0 means "half the period" -- generous, and the right answer when
+ * you have not measured. period_ms == 0 gives the reservation back.
+ *
+ * Returns 0, or -EBUSY if the machine has already promised out as much of
+ * itself as it is willing to. THAT IS NOT A FAILURE YOU SHOULD DIE ON: it
+ * means run the ordinary way, exactly as every program did before this
+ * existed. Check it, and carry on either way. */
+static inline int embk_sched_period(uint32_t period_ms, uint32_t budget_ms) {
+    return (int)embk_syscall2(EMBK_SYS_sched_period, period_ms, budget_ms);
+}
+
 /* 1 if the child named by spawn HANDLE `handle` (what embk_spawn returned) is
  * still alive, else 0 (unknown/freed handles are "not alive"). Handle-based on
  * purpose: spawn never exposes raw pids, and a handle stays pinned to the

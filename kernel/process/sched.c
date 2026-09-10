@@ -1,5 +1,6 @@
 #include "process/sched.h"
 #include "process/process.h"
+#include "include/kstring.h"
 
 /* The live policy. See sched.h for the contract every entry point here obeys:
  * g_sched_lock is HELD, nothing may sleep, nothing may block. */
@@ -14,6 +15,22 @@ void sched_policy_set(const struct sched_policy *p) {
 }
 
 const struct sched_policy *sched_policy_get(void) { return g_policy; }
+
+/* Every policy that exists, by name. A table rather than a chain of strcmp so
+ * that adding a policy is one line in one place -- the same reason the vtable
+ * exists at all. */
+static const struct sched_policy *const g_policies[] = {
+    &sched_policy_roundrobin,
+    &sched_policy_deadline,
+};
+
+const struct sched_policy *sched_policy_by_name(const char *name) {
+    if (!name) return 0;
+    for (unsigned i = 0; i < sizeof(g_policies) / sizeof(g_policies[0]); i++)
+        if (strcmp(g_policies[i]->name, name) == 0)
+            return g_policies[i];
+    return 0;
+}
 
 /* Change runnability AND tell the policy, in one place.
  *

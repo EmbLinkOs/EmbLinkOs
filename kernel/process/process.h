@@ -223,6 +223,44 @@ struct thread {
     uint64_t cpu_ns;
     uint64_t dispatched_ns;
 
+    /* --- DEADLINES ----------------------------------------------------------
+     *
+     * A thread that must run at a REGULAR RATE rather than merely often: the
+     * compositor between frames, an audio thread between buffer refills. Both
+     * have the property that being late is perceptible -- a dropped frame, an
+     * underrun -- and that running EARLY buys nothing.
+     *
+     * `period_ms` is what the thread asked for; zero means "no deadline", which
+     * is almost every thread. `deadline_ms` is when the current period must be
+     * satisfied by, set when the thread becomes runnable -- which is exactly
+     * what the policy's enqueue hook is for, and why that hook was built
+     * before anything used it.
+     *
+     * Priority does NOT express this. A high-priority thread beats everything
+     * always, including the next high-priority thread, so two of them starve
+     * each other by construction; a deadline says WHEN, so two of them
+     * interleave correctly. */
+    uint32_t period_ms;
+    uint64_t deadline_ms;
+
+    /* THE RESERVATION, and the reason a deadline is safe to hand to ring 3.
+     *
+     * `budget_ms` is how much CPU this thread may spend AT DEADLINE PRIORITY
+     * within one period. Past it the thread keeps running -- it is not
+     * throttled, nothing is killed -- it simply stops outranking everything
+     * else and competes as an ordinary thread for the rest of the period. So
+     * the worst a thread can do by declaring a deadline is claim budget/period
+     * of a core ahead of its neighbours, and admission control (see
+     * sched_declare_period) bounds the SUM of those fractions across the
+     * machine. Without this, "I need to run every 1 ms" would be a syscall
+     * that stops the computer.
+     *
+     * `period_cpu_ns` is the cpu_ns reading when the current period opened;
+     * spend-so-far is the difference, which is why this rides on the
+     * accounting that already exists rather than a second timer. */
+    uint32_t budget_ms;
+    uint64_t period_cpu_ns;
+
     /* Which core (cpu_table[] index, kernel/cpu/percpu.h) this thread is
      * PROCESS_RUNNING on, set every time schedule()/process_start_first()
      * transitions it to RUNNING. -1 when not running anywhere (READY,
@@ -922,6 +960,35 @@ void sched_lock_stats(uint64_t *acquires, uint64_t *contended, uint64_t *spins);
 /* CPU actually consumed by `pid`, in nanoseconds, INCLUDING the fragment its
  * threads are running right now. 0 if the pid is unknown. Self-locking. */
 uint64_t process_cpu_ns(uint32_t pid);
+
+/* Declare (or clear, with period_ms == 0) the calling thread's rate.
+ *
+ * ADMISSION CONTROL is the whole of the safety argument. Summed over every
+ * thread that holds one, budget/period is the fraction of a core promised
+ * away; this refuses a declaration that would push that sum past
+ * SCHED_MAX_RESERVED_PERMILLE, so the promises stay collectively keepable.
+ * A refusal is EBUSY -- the machine is full, not the caller is wrong.
+ *
+ * Returns EMBK_OK, or a negative errno for a bad period, a budget larger than
+ * its period, or a full machine. Self-locking (g_sched_lock). */
+int sched_declare_period(uint32_t period_ms, uint32_t budget_ms);
+
+/* How much of the machine is promised away right now, in permille. */
+uint32_t sched_reserved_permille(void);
+
+/* The ceiling. Not 1000: EDF only guarantees the set is feasible at 100%
+ * utilisation if the deadline threads are the ONLY threads, and they are not
+ * -- the shell, the filesystem writeback thread and the network stack all
+ * still have to run. The remainder is what is left for everything that never
+ * declared anything, which is almost everything. */
+#define SCHED_MAX_RESERVED_PERMILLE 700
+
+/* Bounds on a declaration. The floor exists because a period below the timer
+ * tick cannot be honoured and would only produce a thread that is permanently
+ * late; the ceiling because past it "periodic" is indistinguishable from
+ * "occasionally". */
+#define SCHED_MIN_PERIOD_MS 4u
+#define SCHED_MAX_PERIOD_MS 10000u
 
 /* Stop and restart the CPU charge on the current thread across a halt. A
  * halted thread is still the dispatched one, and billing it for wall time

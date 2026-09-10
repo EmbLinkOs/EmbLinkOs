@@ -47,7 +47,8 @@ from mkfs_embkfs import (make_image, _read_font, _tree_objects,
 # lockdemo.elf joins the two the ARM boot self-test already spawns by absolute
 # path: the futex case in early.c runs "/system/bin/lockdemo.elf", and a
 # program the kernel names has to be where the kernel looks.
-_SYSTEM_BIN = _X86_SYSTEM_BIN | {"hello.elf", "posixdemo.elf", "lockdemo.elf"}
+_SYSTEM_BIN = _X86_SYSTEM_BIN | {"hello.elf", "posixdemo.elf", "lockdemo.elf",
+                                "jitter.elf"}
 
 # Must match DEV_USER in user/bin/init.c -- init auto-logs in as this name and
 # binds /home/<name> into the desktop's namespace.

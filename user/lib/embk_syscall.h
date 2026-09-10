@@ -150,6 +150,7 @@
 /* The SLOW path of a userland lock. An uncontended lock never gets here.
  * op 0 = WAIT (sleep if *addr == val), op 1 = WAKE (wake up to val). */
 #define EMBK_SYS_futex         105   /* (addr, op, val)    -> n       | -err */
+#define EMBK_SYS_sched_period  106   /* (period_ms, budget) -> 0     | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *
