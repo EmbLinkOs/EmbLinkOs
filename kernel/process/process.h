@@ -896,6 +896,11 @@ struct thread *process_create_idle_for_cpu(uint32_t cpu_index);
  * thread_* by handle. */
 extern struct thread thread_table[MAX_THREADS];
 
+/* How contended the ONE scheduler lock actually is. Per-core run queues are
+ * the standard answer to a hot one, and they are a large change to the most
+ * dangerous code in this kernel -- so the number comes first. */
+void sched_lock_stats(uint64_t *acquires, uint64_t *contended, uint64_t *spins);
+
 /**
  * @name Scheduler selftests
  * docs/architecture/process-and-scheduling.md §12. Each returns 0 on

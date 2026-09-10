@@ -169,17 +169,37 @@ capabilities rather than fork/exec.
    - No condition variables, no read/write locks, no `pthread_*` veneer yet.
    - No **timed** wait on a futex yet — `sched_sleep_ms` now works for user
      threads, so this is a small addition rather than a blocked one.
-3. **Per-core run queues.** One global lock guards every scheduling decision.
-   It is correct and it will not scale past a handful of cores.
-   - The **policy seam now exists** (`process/sched.h`): which thread runs next
-     is a vtable, and `enqueue`/`dequeue` are called at every runnability
-     transition even though the default round-robin policy ignores them —
-     precisely so that writing a queue-based policy is a *new file* rather than
-     an edit to `schedule_locked()`, the function where two separate real bugs
-     have already been found.
-   - What is still missing before a run-queue policy is worth writing: a
-     **measurement of the contention**. Nothing yet shows `g_sched_lock` is
-     hot, and by this project's own rule that argues for measuring first.
+3. **Per-core run queues — measured, and NOT worth building yet.**
+
+   The policy seam exists (`process/sched.h`), so a queue-based policy would be
+   a new file rather than an edit to `schedule_locked()`. What was missing was
+   a reason. `test schedlock` supplies it:
+
+   | | acquires | contended | spin cycles |
+   |---|---:|---:|---:|
+   | 2 s idle | 1270 | 247 (19%) | 53166 |
+   | under a 4-thread load | 2554 | 43 (1%) | 12101 |
+
+   **~0.04% of one core.** Nineteen percent *contended* sounds alarming and is
+   the wrong number to read: a lock taken a few hundred times a second can be
+   contended half the time and still cost nothing. What matters is the time
+   spent spinning, and it is noise.
+
+   So: not built. It would be the riskiest refactor in this kernel — the
+   function where two separate real bugs have already been found — to buy four
+   hundredths of one percent. Revisit when either number moves: many more
+   cores, or a workload with far more scheduling events than four threads on
+   one mutex.
+
+   Two real things came out of measuring it, though:
+   - **Tickless made the cores wake in lockstep.** Every idle core computes the
+     same "earliest deadline" — it is a property of the system, not of the core
+     asking — so all four armed for one instant and piled into the lock
+     together. An *idle* machine contending harder than a busy one is the
+     signature. They are skewed by core now.
+   - **`sched_idle_next_ms` took the lock on every halt, purely to read.** A
+     core halts thousands of times a second. The earliest deadline is cached
+     now and read lock-free; acquisitions at idle fell about a third.
 4. **Accounting**: per-process CPU time, so scheduling policy can be argued
    from numbers.
 5. **Deadline or reservation scheduling** for the compositor and audio, which

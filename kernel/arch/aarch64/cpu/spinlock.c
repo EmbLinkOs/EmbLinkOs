@@ -33,6 +33,7 @@ void spin_lock(spinlock_t *lock) {
     __asm__ volatile("mrs %0, daif" : "=r"(flags) :: "memory");
     __asm__ volatile("msr daifset, #2" ::: "memory");   /* mask IRQ only */
 
+    uint64_t spun = 0;
     while (__atomic_exchange_n(&lock->locked, 1, __ATOMIC_ACQUIRE) != 0) {
         /* WFE parks the core until an event arrives, which spin_unlock sends
          * with SEV. This is the ARM equivalent of x86's `pause` but stronger:
@@ -41,11 +42,19 @@ void spin_lock(spinlock_t *lock) {
          * WFE -- is handled by the architecture: SEV sets a per-core event
          * register, and WFE returns immediately when it is already set. */
         __asm__ volatile("wfe" ::: "memory");
+        spun++;
     }
 
     /* Safe to write only now: until the exchange succeeded, another core could
      * have been the owner and this field is the owner's. */
     lock->saved_flags = flags;
+
+    /* Accounting, written only by the holder -- see spinlock.h. A WFE spin
+     * counts iterations rather than cycles, which on this architecture means
+     * "how many times we were woken and still lost"; it is a contention
+     * signal, not a duration. */
+    lock->acquires++;
+    if (spun) { lock->contended++; lock->spins += spun; }
 }
 
 void spin_unlock(spinlock_t *lock) {

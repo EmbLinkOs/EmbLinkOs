@@ -738,6 +738,21 @@ void wait_queue_wake_all(struct wait_queue *wq) {
  * -------------------------------------------------------------------- */
 static struct wait_queue g_sleep_wq;
 
+/* The earliest deadline on that queue, cached so an idling core can ask
+ * "when must somebody wake?" WITHOUT TAKING THE SCHEDULER LOCK.
+ *
+ * It was a locked walk of the queue, on every halt -- and a core halts
+ * thousands of times a second, so that was thousands of acquisitions of the
+ * one global scheduler lock purely to READ. Measured at idle: 23% of all
+ * acquisitions were contended.
+ *
+ * Racy on purpose. A stale value can only be too EARLY (a sleeper was added
+ * with a nearer deadline and we have not seen it yet) or too LATE by at most
+ * one queue change -- and both are bounded by the idle cap, and both are
+ * corrected by the very next scheduling decision. 0 means "no deadline at
+ * all", which is the common case on a quiet machine. */
+static volatile uint64_t g_earliest_wake_ms;
+
 void sched_sleep_ms(uint64_t ms) {
     if (ms == 0) {
         sys_yield();
@@ -764,6 +779,9 @@ void sched_sleep_ms(uint64_t ms) {
          * "UNDO A BLOCK THAT DID NOT HAPPEN" in schedule_locked(). */
 
         t->wake_at_ms = deadline;
+        /* Under the lock, so this cannot race the drain below. */
+        if (!g_earliest_wake_ms || deadline < g_earliest_wake_ms)
+            __atomic_store_n(&g_earliest_wake_ms, deadline, __ATOMIC_RELAXED);
         /* Returns UNLOCKED -- it released the lock to switch away. The loop
          * re-checks the clock rather than trusting the wake, because a
          * cancellation wakes a blocked thread too and this must not turn into
@@ -839,16 +857,34 @@ uint32_t sched_idle_next_ms(void) {
     uint64_t now = timer_uptime_ms();
     uint64_t best = now + SCHED_IDLE_CAP_MS;
 
-    sched_lock();
-    for (struct thread *t = g_sleep_wq.head; t; t = t->wait_next)
-        if (t->wake_at_ms && t->wake_at_ms < best)
-            best = t->wake_at_ms;
-    sched_unlock();
+    uint64_t earliest = __atomic_load_n(&g_earliest_wake_ms, __ATOMIC_RELAXED);
+    if (earliest && earliest < best)
+        best = earliest;
 
     if (best <= now)
         return 1;                       /* already due: wake immediately */
     uint64_t ms = best - now;
-    return ms > SCHED_IDLE_CAP_MS ? SCHED_IDLE_CAP_MS : (uint32_t)ms;
+    if (ms > SCHED_IDLE_CAP_MS) ms = SCHED_IDLE_CAP_MS;
+
+    /* SKEW BY CORE, or they all wake at the same instant.
+     *
+     * Every idle core computes the SAME answer -- the earliest sleeper's
+     * deadline is a property of the system, not of the core asking -- so
+     * without this they arm for one moment, wake together, and pile into the
+     * scheduler lock at once. Measured, and it is not small: at idle the lock
+     * was 23% CONTENDED with 156 spin iterations per collision, while the same
+     * lock under a four-thread load was 2%. An idle machine contending harder
+     * than a busy one is the signature of lockstep, and this is the change
+     * that introduced it -- before tickless the cores ticked at whatever
+     * phases they happened to boot with.
+     *
+     * A few milliseconds apart is enough to de-phase them. It costs the later
+     * cores a slightly longer sleep, which is the wrong direction only if they
+     * were the one that had to service the deadline -- and they are not: any
+     * core that wakes drains the timer queue, and a thread made runnable kicks
+     * an idle core directly. */
+    ms += (uint64_t)(this_cpu()->cpu_index & 3) * 2;
+    return (uint32_t)ms;
 }
 
 /* Wake every sleeper whose deadline has passed. CALLER MUST HOLD g_sched_lock,
@@ -875,6 +911,7 @@ static void wake_expired_locked(void) {
 
     uint64_t now = timer_uptime_ms();
     bool woke = false;
+    uint64_t earliest = 0;
     struct thread *t = g_sleep_wq.head;
     while (t) {
         struct thread *next = t->wait_next;
@@ -883,9 +920,14 @@ static void wake_expired_locked(void) {
             t->wake_at_ms = 0;
             sched_set_ready(t);
             woke = true;
+        } else if (t->wake_at_ms && (!earliest || t->wake_at_ms < earliest)) {
+            earliest = t->wake_at_ms;
         }
         t = next;
     }
+    /* Recomputed from the walk we were doing anyway -- the cache is exact
+     * again here, whatever it drifted to between drains. */
+    __atomic_store_n(&g_earliest_wake_ms, earliest, __ATOMIC_RELAXED);
     if (woke)
         sched_kick_idle();
 }
@@ -2601,6 +2643,10 @@ void sys_yield(void) {
  * lock RELEASED once woken); restore IF; loop. Waking is via the existing
  * wait_queue_wake_one/all (process.h), which must be called under sched_lock.
  * -------------------------------------------------------------------- */
+void sched_lock_stats(uint64_t *acquires, uint64_t *contended, uint64_t *spins) {
+    spin_stats(&g_sched_lock, acquires, contended, spins);
+}
+
 void sched_lock(void)   { spin_lock(&g_sched_lock); }
 void sched_unlock(void) { spin_unlock(&g_sched_lock); }
 

@@ -18,14 +18,22 @@ void spin_lock(spinlock_t *lock) {
     // __atomic_exchange_n sets *locked to 1 and returns the OLD value
     // If the old value was 0, we acquired the lock. If it was 1, we keep spinning.
 
+    uint64_t spun = 0;
     while (__atomic_exchange_n(&lock->locked, 1, __ATOMIC_ACQUIRE) != 0) {
         // Spin. Use 'pause' instruction to reduce power consumption and improve performance on hyperthreaded CPUs
         __asm__ volatile ("pause" ::: "memory");
+        spun++;
     }
 
     // We have the lock, save the previous interrupt state inside it so unlock can restore it
     // can restore them. (safe because only the thread that holds the lock can writes this)
     lock->saved_flags = flags;
+
+    /* Accounting, written only by the holder -- see spinlock.h. The waiting
+     * loop above counted into a LOCAL, so a spinning core touches nothing
+     * shared but the lock word it is already polling. */
+    lock->acquires++;
+    if (spun) { lock->contended++; lock->spins += spun; }
 }
 
 

@@ -6212,6 +6212,82 @@ int selftests_handle_command(const char *cmd)
      * descent for the inode; an open is TWO descents per path component (the
      * directory's inode, then the entry). Nothing about that changes between
      * two identical calls, so anything above zero is work being redone. */
+    /* HOW CONTENDED IS THE SCHEDULER LOCK, really?
+     *
+     * One global lock guards every scheduling decision, and the standard
+     * answer to that is per-core run queues -- a large change to the most
+     * dangerous code in this kernel, in a function where two separate real
+     * bugs have already been found. Worth making against a number, not a
+     * hunch, which is what this produces.
+     *
+     * MEASURED UNDER LOAD, not at idle: an idle machine barely touches the
+     * lock, so an idle measurement would say "not contended" about a system
+     * that was not doing anything. The work below is deliberately the most
+     * scheduler-intensive thing available -- four ring-3 threads hammering one
+     * mutex, which drives block, wake and switch on every core at once. */
+    if (strcmp(cmd, "test schedlock") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test schedlock: VFS not registered\n");
+            return 1;
+        }
+        const char *lp = "/data/apps/lockdemo/lockdemo.elf";
+        struct vfs_stat st;
+        if (vfs_stat(lp, &st) != EMBK_OK) {
+            kprintf("\n[cmd] test schedlock: %s not on image\n", lp);
+            return 1;
+        }
+
+        uint64_t a0, c0, s0, a1, c1, s1;
+
+        /* (1) IDLE baseline: whatever the desktop does on its own. */
+        sched_lock_stats(&a0, &c0, &s0);
+        timer_delay_ms(2000);
+        sched_lock_stats(&a1, &c1, &s1);
+        kprintf("\n[schedlock] 2s idle:   %llu acquires, %llu contended (%llu%%), "
+                "%llu spins\n",
+                (unsigned long long)(a1 - a0), (unsigned long long)(c1 - c0),
+                (unsigned long long)((a1 - a0) ? (c1 - c0) * 100 / (a1 - a0) : 0),
+                (unsigned long long)(s1 - s0));
+
+        /* (2) UNDER LOAD: four threads, one mutex, a bounded queue. */
+        sched_lock_stats(&a0, &c0, &s0);
+        char *a[] = { (char *)lp, NULL };
+        int pid = process_create(lp, a, 1, NULL, 0);
+        int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        sched_lock_stats(&a1, &c1, &s1);
+
+        uint64_t acq = a1 - a0, con = c1 - c0, spn = s1 - s0;
+        kprintf("[schedlock] under load: %llu acquires, %llu contended (%llu%%), "
+                "%llu spins (exit %d)\n",
+                (unsigned long long)acq, (unsigned long long)con,
+                (unsigned long long)(acq ? con * 100 / acq : 0),
+                (unsigned long long)spn, rc);
+        kprintf("            %llu spin iterations per contended acquire\n",
+                (unsigned long long)(con ? spn / con : 0));
+
+        /* THE PERCENTAGE IS THE WRONG NUMBER ON ITS OWN, and that is the whole
+         * lesson of this test. A lock can be 20% contended and cost nothing,
+         * if it is only taken a few hundred times a second. What matters is
+         * the TIME spent spinning, so that is what this converts to.
+         *
+         * A spin iteration is one `pause` (x86) or one `wfe` wake (aarch64) --
+         * call it ~35 cycles. The absolute figure is what decides whether
+         * per-core run queues are worth the riskiest refactor in this kernel,
+         * and it is printed rather than asserted because there is no correct
+         * answer to fail against. */
+        {
+            uint64_t spins_per_sec = spn;      /* the load window is ~1s */
+            uint64_t cycles = spins_per_sec * 35;
+            kprintf("            ~%llu spin-cycles/s across all cores; on a 1 GHz\n"
+                    "            core that is ~%llu.%02llu%% of ONE core\n",
+                    (unsigned long long)cycles,
+                    (unsigned long long)(cycles / 10000000),
+                    (unsigned long long)((cycles / 100000) % 100));
+        }
+        kprintf("[cmd] test schedlock: measured (see docs/KERNEL_ROADMAP.md)\n");
+        return 1;
+    }
+
     if (strcmp(cmd, "test metacache") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test metacache: VFS not registered\n");
