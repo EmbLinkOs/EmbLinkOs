@@ -141,6 +141,15 @@ static int dispatchable(struct thread *c, struct thread *current, uint32_t cpu) 
 }
 
 static struct thread *dl_pick(uint32_t cpu, struct thread *current) {
+    /* NOTHING HAS DECLARED, which is the state of this machine almost all of
+     * the time. Skip straight to the policy that decides everything else --
+     * without this the scan below runs on every scheduling decision looking
+     * for a thread that does not exist, which measured 11.6 us of a 97 us
+     * decision and is the whole difference between the two policies when idle.
+     * A default policy must not charge for a feature nobody is using. */
+    if (!sched_declared_count())
+        return sched_policy_roundrobin.pick(cpu, current);
+
     uint64_t now_ms = timer_uptime_ms();
     uint64_t now_ns = time_get_ns();
 

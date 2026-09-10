@@ -967,6 +967,16 @@ uint64_t process_cpu_ns(uint32_t pid);
  * of something must use: on a busy machine the clock measures preemption. */
 uint64_t sched_self_cpu_ns(void);
 
+/* Nanoseconds per scheduling decision, measured by re-entering the scheduler
+ * `iters` times on the CALLING thread with nothing else runnable. Used to
+ * compare POLICIES: the absolute number is a statement about the host. See the
+ * definition for the two ways of getting this wrong that it avoids. */
+uint64_t sched_pick_cost_ns(uint32_t iters);
+
+/* Nanoseconds per call to timer_uptime_ms() and to time_get_ns(). One reads a
+ * device and one reads a register; both are on the scheduler's hot path. */
+void sched_clock_cost_ns(uint32_t iters, uint64_t *ms_cost, uint64_t *ns_cost);
+
 /* Declare (or clear, with period_ms == 0) the calling thread's rate.
  *
  * ADMISSION CONTROL is the whole of the safety argument. Summed over every
@@ -978,6 +988,11 @@ uint64_t sched_self_cpu_ns(void);
  * Returns EMBK_OK, or a negative errno for a bad period, a budget larger than
  * its period, or a full machine. Self-locking (g_sched_lock). */
 int sched_declare_period(uint32_t period_ms, uint32_t budget_ms);
+
+/* How many live threads have declared a period. A HINT for the deadline policy
+ * to skip its scan when nothing has -- see the definition for why a count is
+ * safe here when the reservation total deliberately refuses to be one. */
+uint32_t sched_declared_count(void);
 
 /* How much of the machine is promised away right now, in permille. */
 uint32_t sched_reserved_permille(void);

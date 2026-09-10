@@ -395,6 +395,7 @@ static void selftests_print_commands(void)
     kprintf("  test pmm\n");
     kprintf("  test audio\n");
     kprintf("  test audiostress\n");
+    kprintf("  test policycost\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -760,6 +761,99 @@ int selftests_handle_command(const char *cmd)
                     "   needed for audio on this host, which is a result.)\n");
 
         kprintf("[cmd] test audiostress: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test policycost -- what the deadline policy costs when nobody uses it.
+     *
+     * The deadline policy is only worth making the DEFAULT if it is free on a
+     * machine where nothing has declared a period, which is every machine most
+     * of the time. It scans all MAX_THREADS slots looking for a live deadline
+     * and then falls through to round-robin, which does the scan again -- so
+     * the question is not rhetorical and "it is only a loop" is not an answer
+     * this kernel accepts from itself.
+     *
+     * One kthread re-entering the scheduler as fast as it can, timed, under
+     * each policy. Every iteration is exactly one pick(). The absolute figure
+     * is a statement about the host; the RATIO is the result.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test policycost") == 0) {
+        const struct sched_policy *saved = sched_policy_get();
+        const struct sched_policy *rr    = sched_policy_by_name("round-robin");
+        const struct sched_policy *dl    = sched_policy_by_name("deadline");
+        if (!rr || !dl) {
+            kprintf("\n[cmd] test policycost: a policy is missing\n");
+            return 1;
+        }
+
+        kprintf("\n[policycost] 200000 scheduling decisions, taken on this\n");
+        kprintf("             thread with nothing else runnable, so each one is\n");
+        kprintf("             a pick() and nothing else. Nothing has declared a\n");
+        kprintf("             period, so this is what the deadline policy costs\n");
+        kprintf("             when it has no work of its own to do.\n");
+        kprintf("             (%u permille reserved right now)\n",
+                sched_reserved_permille());
+
+        /* A warm-up under each, discarded: the first run of either pays for
+         * cold caches and would flatter whichever went second. */
+        sched_policy_set(rr); (void)sched_pick_cost_ns(20000);
+        sched_policy_set(dl); (void)sched_pick_cost_ns(20000);
+
+        sched_policy_set(rr);
+        uint64_t c_rr = sched_pick_cost_ns(200000);
+        sched_policy_set(dl);
+        uint64_t c_dl = sched_pick_cost_ns(200000);
+        sched_policy_set(saved);
+
+        uint64_t k_ms = 0, k_ns = 0;
+        sched_clock_cost_ns(20000, &k_ms, &k_ns);
+
+        kprintf("\n  round-robin: %llu ns per decision\n", (unsigned long long)c_rr);
+        kprintf("  deadline:    %llu ns per decision\n", (unsigned long long)c_dl);
+
+        int ok = 1;
+        if (!c_rr || !c_dl) {
+            kprintf("  [FAIL] a benchmark thread could not run\n");
+            ok = 0;
+        } else {
+            /* A FIFTH is the bar. It was a third when the empty scan really
+             * ran; with sched_declared_count() short-circuiting it the
+             * difference is inside the noise of the round-robin measurement
+             * itself (82.8 to 91.8 ns across runs of identical code on this
+             * host), so the bar is set at roughly twice that spread. What is
+             * being ruled out is a policy that costs enough when idle that it
+             * cannot be the default -- if this fails it means the
+             * short-circuit stopped working, which is the thing worth
+             * catching. */
+            uint64_t bar = c_rr + c_rr / 5;
+            kprintf("  [%s] the unused policy costs under a fifth more "
+                    "(%llu vs %llu ns, bar %llu)\n",
+                    c_dl <= bar ? "ok" : "FAIL",
+                    (unsigned long long)c_dl, (unsigned long long)c_rr,
+                    (unsigned long long)bar);
+            if (c_dl > bar) ok = 0;
+
+            if (c_dl > c_rr)
+                kprintf("  (%llu ns of that is the empty deadline scan, which is\n"
+                        "   the price of the policy being available at all)\n",
+                        (unsigned long long)(c_dl - c_rr));
+        }
+
+        /* WHERE THE TIME ACTUALLY GOES. A scheduling decision costing tens of
+         * microseconds is not a table scan, and printing the two clocks says
+         * what it is instead: timer_uptime_ms() reads the HPET over MMIO,
+         * which is a device trap under emulation, while time_get_ns() is
+         * rdtsc. Both are on the hot path. */
+        kprintf("\n  the clocks, per call: timer_uptime_ms (HPET, MMIO) %llu ns,\n"
+                "                        time_get_ns (rdtsc) %llu ns\n",
+                (unsigned long long)k_ms, (unsigned long long)k_ns);
+        if (k_ns && k_ms > k_ns * 4)
+            kprintf("  (the ms clock is %llux the ns clock -- a scheduling\n"
+                    "   decision is mostly clock reads, not scheduling)\n",
+                    (unsigned long long)(k_ms / (k_ns ? k_ns : 1)));
+
+        kprintf("[cmd] test policycost: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

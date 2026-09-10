@@ -5,7 +5,27 @@
 /* The live policy. See sched.h for the contract every entry point here obeys:
  * g_sched_lock is HELD, nothing may sleep, nothing may block. */
 
-static const struct sched_policy *g_policy = &sched_policy_roundrobin;
+/* THE DEFAULT IS THE DEADLINE POLICY, and it is the default because it is free
+ * when nobody uses it.
+ *
+ * It has to be. A policy that only runs when a test switches it on is a switch
+ * nobody flips: the UI toolkit declares a cadence while an app animates, an
+ * audio writer declares one to keep a shallow buffer fed, and neither would
+ * ever have been given what it asked for.
+ *
+ * WHAT IT COSTS WHEN NOTHING HAS DECLARED, measured by `test policycost`: the
+ * empty scan was 13.2 us of a 97 us scheduling decision, which was too much to
+ * charge every machine for a feature most of them are not using. With
+ * sched_declared_count() short-circuiting it, that is 3.9 us -- inside the
+ * run-to-run spread of the round-robin measurement itself (82.8 to 91.8 us
+ * across runs of identical code), so the honest statement is that it is no
+ * longer distinguishable rather than that it is exactly zero.
+ *
+ * And when nothing has declared, the DECISION is identical: dl_pick returns
+ * sched_policy_roundrobin.pick() unchanged, which is the same function the old
+ * default called. This is not a new scheduler for everyone; it is the old one
+ * with a door in it. */
+static const struct sched_policy *g_policy = &sched_policy_deadline;
 
 void sched_policy_set(const struct sched_policy *p) {
     if (!p || !p->pick)

@@ -267,8 +267,34 @@ capabilities rather than fork/exec.
    was built for this and **removed** — it moved the mean by less than the
    run-to-run noise, which is the same answer read-ahead and per-core run
    queues got.
-6. **Something actually declares a cadence now**, which is what makes item 5
-   more than a switch nobody flips.
+6. **The deadline policy is the DEFAULT**, which is what makes item 5 more than
+   a switch nobody flips — and it is the default because it was made free when
+   nobody uses it.
+
+   `test policycost` times 200 000 scheduling decisions under each policy, taken
+   on the calling thread with nothing else runnable so each iteration is one
+   `pick()` and nothing else. The empty deadline scan cost **13.2 µs of a 97 µs
+   decision** — too much to charge every machine for a feature most of them are
+   not using. A `sched_declared_count()` short-circuit takes that to **3.9 µs**,
+   which is inside the run-to-run spread of the round-robin measurement itself
+   (82.8–91.8 µs across runs of identical code), so the honest claim is that it
+   is no longer distinguishable, not that it is zero.
+
+   When nothing has declared, the *decision* is byte-for-byte the old one:
+   `dl_pick` returns `sched_policy_roundrobin.pick()` unchanged. This is not a
+   new scheduler for everyone, it is the old one with a door in it.
+
+   Two wrong measurements were thrown away getting there, both worth recording.
+   The first ran a helper kthread and divided wall time by *its* iteration
+   count, so the answer was inflated by whatever share of the machine that
+   thread got — 186 µs for a decision that cannot cost a fraction of one. The
+   second read the clock every iteration; that turned out not to be the problem
+   either (`timer_uptime_ms` is 231 ns, `time_get_ns` 85 ns), which ruled out
+   the tempting story that the scheduler is mostly clock reads. It really is
+   the scans, at ~45 ns per slot under TCG.
+
+7. **Something actually declares a cadence**, which is what makes the default
+   worth having.
 
    **The UI toolkit declares for the app.** `em_app_run` holds a reservation
    while an app is animating and gives it back when it stops — apps do not have
@@ -318,7 +344,7 @@ capabilities rather than fork/exec.
    ragged. It is not done because the benefit cannot be measured on this host,
    where the spread is noise-dominated. See `docs/TODO.md`.
 
-7. **Audio: the latency floor moved 40 ms → 15 ms.** The buffer a writer keeps
+8. **Audio: the latency floor moved 40 ms → 15 ms.** The buffer a writer keeps
    queued *is* the delay between deciding to make a sound and the sound
    existing, and how shallow it can be is a scheduler question.
 
@@ -341,7 +367,7 @@ capabilities rather than fork/exec.
    full page and zero-padded, making 21 ms the smallest unit of audio the
    device could be given. `make test-audio-latency` runs the sweep.
 
-8. **Job control**, which is a scheduling and a signalling problem at once:
+9. **Job control**, which is a scheduling and a signalling problem at once:
    backgrounding a pipeline, listing what is running, bringing one to the
    foreground, and interrupting it. Cancellation already exists as a polite
    sticky flag — what is missing is the shell-side notion of a *job* and a way
