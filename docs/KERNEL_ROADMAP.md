@@ -163,14 +163,20 @@ of this commit — is a programming language.
    - Still missing: `^Z`/`bg` (suspend and resume, which needs the kernel to
      be able to *stop* a process rather than only interrupt or cancel it), and
      interrupting a background job rather than only the foreground.
-2. **No globbing.** `ls *.txt` is what a person types. `ls | where name =~
-   ".txt"` is the structured equivalent and works, but nobody reaches for it
-   first.
+2. ~~**No globbing.**~~ **Done.** `glob "*.c"` returns a *table* with ls's
+   columns, so it composes with every transform already written, and rows
+   carry `path` so a loop can act on them. `*` does not cross `/`; a pattern
+   that matches nothing is an empty table rather than the pattern passed
+   through as a filename.
+   - Still missing: recursive `**`, and brace expansion.
 3. **No symlinks.** Almost every ported build system assumes them, so this is
-   the quiet blocker behind "why won't this project build here".
+   the quiet blocker behind "why won't this project build here". Now the
+   largest item on this list — and the only one that needs an on-disk format
+   change (EMBKFS has the `VFS_DT_LNK` type and nothing that creates one).
 4. **Commands cannot be passed as values.** `def` makes a name, not a value, so
-   the shell has no `map`/`each`-over-a-command, and no way to write a
-   higher-order pipeline stage.
+   the shell has no `each`-over-a-command and no way to write a higher-order
+   pipeline stage. Less urgent than it was: `for f in $(glob "*.tmp") { ... }`
+   covers most of what `each` would have been for.
 5. **No users, and no permissions that are enforced.** There is a login and a
    namespace-confined session, and authority is real — but `chmod` bits are
    recorded and not checked, and there is one human.
