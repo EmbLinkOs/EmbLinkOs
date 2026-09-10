@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include "drivers/char/serial.h"
 #include "include/uaccess_guard.h"
+#include "mm/vma.h"          /* vm_fault: demand paging */
+#include "process/process.h"
 #include "include/spinlock.h"
 #include "process/process.h"   /* current_thread, struct process/thread */
 #include "process/debug.h"     /* debug_on_exception (§6.6 exception routing) */
@@ -107,21 +109,6 @@ static void dump_fault(struct registers *regs) {
     serial_write_string("RBP: ");
     serial_write_hex(regs->rbp);
     serial_write_string("\n");
-    /* A GUARDED user copy that faulted -- the kernel touched user memory that
-     * access_ok() had just proved was mapped, and another core unmapped it in
-     * between (include/uaccess_guard.h). This does not return: it longjmps
-     * back into copy_from_user()/copy_to_user(), which reports -EFAULT.
-     *
-     * Vector 14 (#PF) and KERNEL mode only -- error_code bit 2 clear. A user
-     * -mode fault is the program's own and belongs to the handling below.
-     * Checked before the panic printing, because it is the only fault here
-     * that can legitimately happen. */
-    if (regs->vector == 14 && !(regs->error_code & 0x4) &&
-        uaccess_fault_recover()) {
-        /* not reached */
-    }
-
-
     // Page Fault (vector 14): CR2 holds the faulting address, and the
     // error code's low bits explain the cause.
     if (regs->vector == 14) {
@@ -211,6 +198,54 @@ static void dump_fault(struct registers *regs) {
 
 
 void isr_handler(struct registers *regs) {
+    /* --- RESOLVE the fault, if it is resolvable -----------------------------
+     *
+     * Before any of the reporting below, ask the VM whether this address is
+     * legitimately the process's and simply has no page yet. That is what
+     * demand paging IS: mmap reserves address space, and the page appears
+     * here, on first touch.
+     *
+     * A fault that vm_fault() handles is NOT an error and must produce no
+     * output -- it is the ordinary way memory comes into existence, and a
+     * kernel that logged one per page would spend its life printing. Returning
+     * retries the faulting instruction, which now succeeds.
+     *
+     * ANY RING, but only for a USER address. A kernel-mode fault on a user
+     * address is not a bug -- it is the kernel touching a process's memory on
+     * its behalf, which is what copy_to_user does, and a page it has not
+     * faulted in yet is exactly as legitimate there as it is at EL0. What
+     * stays fatal is a kernel-mode fault on a KERNEL address, which has no VMA
+     * and is always a real bug.
+     *
+     * Ordered BEFORE the guarded-copy recovery on purpose: an unfaulted page
+     * inside a valid mapping should be MADE to work, not reported as EFAULT.
+     * The guard still catches the case vm_fault declines. */
+    if (regs->vector == 14 && current_thread) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        if (cr2 < USER_VA_LIMIT) {
+            bool w = (regs->error_code & 0x2) != 0;
+            bool x = (regs->error_code & 0x10) != 0;
+            if (vm_fault(current_thread->proc, cr2, w, x))
+                return;                  /* retry the instruction */
+        }
+    }
+
+    /* A GUARDED user copy that faulted -- the kernel touched user memory that
+     * access_ok() had just proved was mapped, and another core unmapped it in
+     * between (include/uaccess_guard.h). This does not return: it longjmps
+     * back into copy_from_user()/copy_to_user(), which reports -EFAULT.
+     *
+     * Vector 14 (#PF) and KERNEL mode only -- error_code bit 2 clear. A user
+     * -mode fault is the program's own and belongs to the handling below.
+     * Checked before the panic printing, because it is the only fault here
+     * that can legitimately happen. */
+    if (regs->vector == 14 && !(regs->error_code & 0x4) &&
+        uaccess_fault_recover()) {
+        /* not reached */
+    }
+
+
     /* EMBDBG_Specification.md §6.6 — the debug pre-dispatch, BEFORE either final
      * path below. For the debug-relevant vectors, a fault from a thread whose
      * process has a debug session is delivered to the debugger as a STOP EVENT:

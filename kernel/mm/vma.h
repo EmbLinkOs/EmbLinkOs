@@ -22,12 +22,21 @@
  * sorted list of the ranges it asked for, and the page tables remain what they
  * are: the hardware's opinion, derived from this.
  *
- * EAGER, NOT DEMAND-PAGED. mmap() allocates and zeroes every page up front.
- * Demand paging needs a fault handler that can distinguish "not mapped yet"
- * from "not yours", plus a page cache to make file-backed mappings worth
- * having; that is the next piece of work and is recorded in docs/TODO.md, not
- * half-built here. The consequence is honest and worth stating: a large
- * mapping costs its full size immediately.
+ * DEMAND-PAGED. mmap() reserves ADDRESS SPACE and allocates nothing; a page
+ * appears the first time it is touched, and the fault that puts it there is
+ * resolved rather than reported.
+ *
+ * This used to be eager, and the comment here said why: "demand paging needs a
+ * fault handler that can distinguish 'not mapped yet' from 'not yours'". That
+ * distinction is exactly what this list is -- a VMA is the record that says an
+ * address is legitimately the caller's before any page exists there -- so the
+ * fault handler was one lookup away the whole time. See vm_fault() below.
+ *
+ * The difference is not a micro-optimisation. Eager allocation means the size
+ * of a mapping is the cost of a mapping, so a program that maps a gigabyte to
+ * use three pages of it pays for a gigabyte, and a machine with 512 MiB simply
+ * cannot run it. Demand paging is what makes address space and memory two
+ * different resources.
  */
 
 /* prot -- the same bit values POSIX uses, so a userland wrapper is a pass. */
@@ -77,6 +86,41 @@ int64_t vma_mmap(struct process *proc, uint64_t addr, uint64_t len,
  * Returns 0 or -EMBK_*. Unmapping a range that was never mapped is an error,
  * not a no-op: it is far more often a bug than an idempotent cleanup. */
 int vma_munmap(struct process *proc, uint64_t addr, uint64_t len);
+
+/* RESOLVE A FAULT, or decline it.
+ *
+ * Called from each architecture's fault handler before it decides the program
+ * is broken. Returns true if the fault was HANDLED -- a page has been mapped
+ * and the faulting instruction should be retried -- and false if this address
+ * is genuinely not the process's, which is when the program dies.
+ *
+ * `write` is whether the access was a store, and `exec` whether it was an
+ * instruction fetch. Both matter because a VMA carries permissions: touching a
+ * PROT_READ page for writing is not a missing page, it is a protection
+ * violation, and resolving it by mapping a writable page would silently grant
+ * what the caller was refused.
+ *
+ * This is the function that separates "a kernel that reports faults" from "a
+ * kernel that uses them". Everything a modern VM does -- demand paging, copy
+ * on write, growing a stack, mapping a file, swapping -- is a different answer
+ * from this one place. */
+bool vm_fault(struct process *proc, uint64_t addr, bool write, bool exec);
+
+/* The top of the user half. An address at or above this belongs to the kernel
+ * and can never have a VMA, so a fault there is always a real bug. Defined
+ * here because the fault handlers need it and both architectures agree: 47
+ * bits of user VA, the same split the page tables already use. */
+#define USER_VA_LIMIT 0x0000800000000000ULL
+
+/* How many faults this kernel has resolved, and how many it declined. The
+ * numbers `test mmap` asserts against: a demand-paged mapping that reported
+ * zero faults never faulted, which means it was not demand-paged. */
+struct vm_fault_stats {
+    uint64_t handled;      /* a page was mapped and the instruction retried */
+    uint64_t declined;     /* not this process's address, or a permission
+                            * violation -- the program dies */
+};
+void vm_fault_stats(struct vm_fault_stats *out);
 
 /* Change the permissions of an already-mapped range, keeping its contents.
  * Returns 0 or -EMBK_*; -EMBK_ENOMEM if any page in the range is not mapped

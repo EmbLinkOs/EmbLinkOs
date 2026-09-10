@@ -3,6 +3,7 @@
 #include "include/uaccess_guard.h"
 #include "process/process.h"
 #include "mm/vmm.h"
+#include "mm/vma.h"   /* vm_fault: a page not yet touched is not a bad pointer */
 #include "mm/pmm.h"
 #include "include/errno.h"
 #include "include/kstring.h"
@@ -73,7 +74,20 @@ bool access_ok(const void *user_ptr, size_t len) {
     uint64_t last_page = (end - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     for (; page <= last_page; page += PAGE_SIZE) {
         if (!vmm_get_phys_in(pml4, page)) {
-            return false;   // a page in range isn't mapped in this process
+            /* NOT MAPPED YET IS NOT THE SAME AS NOT ALLOWED. With demand
+             * paging a process's mmap'd buffer has no pages until it touches
+             * them -- and handing that buffer straight to read() is the most
+             * ordinary thing a program does. Rejecting it here would make
+             * every such call EFAULT, so the page is FAULTED IN instead, which
+             * is what the process's own first touch would have done.
+             *
+             * write=false: this only asks the page to exist with whatever
+             * permissions its VMA grants. A copy_to_user into a read-only
+             * mapping still fails -- at the store, caught by the uaccess
+             * guard -- which is the correct place for that refusal, because
+             * only the copy knows which direction it is going. */
+            if (!vm_fault(current_process_atomic(), page, false, false))
+                return false;   // genuinely not this process's memory
         }
     }
     return true;

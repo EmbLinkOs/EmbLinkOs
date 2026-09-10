@@ -6,8 +6,34 @@
 #include "include/kmalloc.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
+#include "include/spinlock.h"
 
 /* See mm/vma.h. */
+
+/* THE VMA LIST NEEDS A LOCK NOW, and did not before.
+ *
+ * While mmap was eager, the list was only touched by mmap/munmap/mprotect --
+ * syscalls, on the calling thread, rare. Demand paging made a THIRD reader:
+ * the page-fault handler, which now runs on every core, on every first touch
+ * of every page. A walk of the list racing a munmap that is freeing its nodes
+ * is a use-after-free, and with faults this frequent it stops being a
+ * theoretical race and becomes a boot that dies on four cores while passing on
+ * one -- which is exactly how it was found.
+ *
+ * A SPINLOCK, not the sleeping mutex the fd layer uses: this is taken inside a
+ * fault handler, and a handler that can sleep is a handler that can be
+ * preempted mid-fault by something that faults again.
+ *
+ * ONE GLOBAL LOCK rather than one per process, which is the wrong long-term
+ * answer and the right first one -- every fault on every core serialises here.
+ * Per-process is the shape this wants, and the moment to build it is when a
+ * profile shows the contention rather than when it sounds better. Recorded in
+ * docs/TODO.md.
+ *
+ * LOCK ORDER: vma_lock -> pmm_lock / vmm_lock. Never the reverse. vm_fault and
+ * vma_munmap both take this and then call into the page-table and frame
+ * allocators, which take their own; nothing in those calls back into here. */
+static spinlock_t vma_lock = SPINLOCK_INIT;
 
 static uint64_t page_align_up(uint64_t v) {
     return (v + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
@@ -81,37 +107,89 @@ static void vma_insert(struct process *proc, struct vm_area *nv) {
     *pp = nv;
 }
 
-/* Populate [start,end) with fresh zeroed frames. Returns false having undone
- * whatever it managed -- a half-mapped region is worse than a failed mmap,
- * because the caller has no way to describe it to munmap. */
-static bool populate(struct process *proc, uint64_t start, uint64_t end,
-                     uint64_t vmm_flags) {
-    for (uint64_t va = start; va < end; va += PAGE_SIZE) {
-        uint64_t pa = pmm_alloc_page();
-        if (!pa)
-            goto unwind;
-
-        /* ZEROED, and that is a security property rather than a courtesy: a
-         * fresh page carries whatever the last owner left in it, and handing
-         * that to a different process is a disclosure. */
-        memset((void *)(uintptr_t)P2V(pa), 0, PAGE_SIZE);
-
-        if (vmm_map_in(proc->pml4_phys, va, pa, vmm_flags) != 0) {
-            pmm_free_page(pa);
-            goto unwind;
-        }
+/* Which VMA contains `addr`, or NULL. The list is sorted, so this stops early
+ * on a miss rather than walking every mapping. */
+static struct vm_area *vma_find(struct process *proc, uint64_t addr) {
+    for (struct vm_area *v = proc->vma_list; v; v = v->next) {
+        if (addr < v->start) return NULL;      /* sorted: no later one can match */
+        if (addr < v->end)   return v;
     }
-    return true;
+    return NULL;
+}
 
-unwind:
-    for (uint64_t va = start; va < end; va += PAGE_SIZE) {
-        uint64_t pa = vmm_get_phys_in(proc->pml4_phys, va);
-        if (!pa)
-            break;
-        vmm_unmap_in(proc->pml4_phys, va);
+static struct vm_fault_stats g_fault_stats;
+
+void vm_fault_stats(struct vm_fault_stats *out) {
+    if (out) *out = g_fault_stats;
+}
+
+bool vm_fault(struct process *proc, uint64_t addr, bool write, bool exec) {
+    if (!proc)
+        return false;
+
+    uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
+
+    /* Held across the whole decision AND the mapping. Not just the lookup:
+     * two cores faulting on the same page would otherwise both find it absent,
+     * both allocate a frame, and both map it -- the second silently leaking
+     * the first. Check-and-map has to be one step. */
+    spin_lock(&vma_lock);
+
+    struct vm_area *v = vma_find(proc, page);
+    if (!v) {
+        /* Not inside any mapping this process asked for. This is the wild
+         * pointer, the null dereference, the stack that ran off its guard
+         * page -- and it is the case that MUST stay fatal. A kernel that
+         * quietly mapped a page here would turn every use of an uninitialised
+         * pointer into silent corruption instead of a crash. */
+        g_fault_stats.declined++;
+        spin_unlock(&vma_lock);
+        return false;
+    }
+
+    /* PERMISSIONS ARE CHECKED AGAINST THE VMA, NOT INFERRED FROM THE FAULT.
+     * A store to a PROT_READ page is not a missing page; it is the program
+     * being told no. Resolving it by mapping something writable would hand
+     * over exactly the access mmap refused, and would do it silently. */
+#define VMF_DECLINE() do { g_fault_stats.declined++; spin_unlock(&vma_lock); return false; } while (0)
+    if (write && !(v->prot & PROT_WRITE)) VMF_DECLINE();
+    if (exec  && !(v->prot & PROT_EXEC))  VMF_DECLINE();
+    if (v->prot == PROT_NONE)             VMF_DECLINE();
+
+    /* Already mapped? Then this fault was a permission violation on a page
+     * that exists, and the VMA checks above did not catch it -- which means
+     * the page tables and the VMA disagree. Decline rather than paper over it:
+     * mapping a second page on top would leak the first and hide a real bug. */
+    if (vmm_get_phys_in(proc->pml4_phys, page) != 0) {
+        /* Another core resolved this exact page while we were deciding. Not an
+         * error and not a bug: the instruction simply retries and succeeds. */
+        spin_unlock(&vma_lock);
+        return true;
+    }
+
+    uint64_t pa = pmm_alloc_page();
+    if (!pa) {
+        /* Out of memory at first touch -- the awkward consequence of demand
+         * paging, and the honest one. The alternative is refusing the mmap
+         * that might never have touched these pages at all. */
+        VMF_DECLINE();
+    }
+
+    /* ZEROED, and that is a security property rather than a courtesy: a fresh
+     * frame carries whatever the last owner left in it, and handing that to a
+     * different process is a disclosure. It is also the whole semantics of an
+     * anonymous mapping -- the caller was promised zeroes. */
+    memset((void *)(uintptr_t)P2V(pa), 0, PAGE_SIZE);
+
+    if (vmm_map_in(proc->pml4_phys, page, pa, prot_to_vmm(v->prot)) != 0) {
         pmm_free_page(pa);
+        VMF_DECLINE();
     }
-    return false;
+#undef VMF_DECLINE
+
+    g_fault_stats.handled++;
+    spin_unlock(&vma_lock);
+    return true;
 }
 
 int64_t vma_mmap(struct process *proc, uint64_t addr, uint64_t len,
@@ -139,36 +217,46 @@ int64_t vma_mmap(struct process *proc, uint64_t addr, uint64_t len,
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
         return -EMBK_EINVAL;
 
+    /* From here the LIST is read and then written, and a fault on another core
+     * may be walking it. One critical section for both halves. */
+    spin_lock(&vma_lock);
+
     uint64_t start;
     if (flags & MAP_FIXED) {
         if (addr & (PAGE_SIZE - 1))
-            return -EMBK_EINVAL;
+            { spin_unlock(&vma_lock); return -EMBK_EINVAL; }
         if (addr < USER_MMAP_BASE || addr + len > USER_MMAP_MAX)
-            return -EMBK_EINVAL;
+            { spin_unlock(&vma_lock); return -EMBK_EINVAL; }
         if (!range_is_free(proc, addr, addr + len))
-            return -EMBK_EEXIST;   /* MAP_FIXED does NOT silently replace here */
+            { spin_unlock(&vma_lock); return -EMBK_EEXIST; }  /* MAP_FIXED does NOT silently replace */
         start = addr;
     } else {
         start = find_gap(proc, len);
         if (!start)
-            return -EMBK_ENOMEM;
+            { spin_unlock(&vma_lock); return -EMBK_ENOMEM; }
     }
 
     struct vm_area *v = kmalloc(sizeof *v);
     if (!v)
-        return -EMBK_ENOMEM;
+        { spin_unlock(&vma_lock); return -EMBK_ENOMEM; }
 
-    if (!populate(proc, start, start + len, prot_to_vmm(prot))) {
-        kfree(v);
-        return -EMBK_ENOMEM;
-    }
-
+    /* NOTHING IS ALLOCATED HERE. The VMA is the promise; vm_fault() keeps it,
+     * one page at a time, as the pages are actually touched.
+     *
+     * That makes mmap O(1) in the size of the mapping instead of O(n), and it
+     * makes address space and memory two different resources -- a program can
+     * reserve a gigabyte to use three pages of it and pay for three pages. It
+     * also means mmap can no longer fail with ENOMEM for lack of memory: it
+     * fails only for lack of ADDRESS SPACE, and the memory failure moves to
+     * the first touch. Which is where every other kernel puts it, and is the
+     * one genuinely awkward consequence -- a store can now fail. */
     v->start = start;
     v->end   = start + len;
     v->prot  = prot;
     v->flags = flags;
     vma_insert(proc, v);
 
+    spin_unlock(&vma_lock);
     return (int64_t)start;
 }
 
@@ -180,6 +268,11 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
     uint64_t end = addr + len;
     if (end < addr)
         return -EMBK_EINVAL;
+
+    /* The list is REWRITTEN here -- nodes freed, split, retargeted -- and a
+     * fault on another core walks it. This is the use-after-free the lock
+     * exists for. */
+    spin_lock(&vma_lock);
 
     struct vm_area **pp = &proc->vma_list;
     bool touched = false;
@@ -220,6 +313,7 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
             v->end = lo;
             kprintf("vma: out of memory splitting a mapping; %d KiB of VA leaked\n",
                     (int)((v->end - hi) / 1024));
+            spin_unlock(&vma_lock);
             return EMBK_OK;
         }
         tail->start = hi;
@@ -232,6 +326,7 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
         pp = &tail->next;
     }
 
+    spin_unlock(&vma_lock);
     return touched ? EMBK_OK : -EMBK_EINVAL;
 }
 
@@ -295,8 +390,11 @@ int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t pro
     /* Cut the list at both ends so the range is a whole number of VMAs. Done
      * before the page tables are touched: a kmalloc failure here must leave
      * the process exactly as it was. */
-    if (!vma_split_at(proc, addr) || !vma_split_at(proc, end))
+    spin_lock(&vma_lock);
+    if (!vma_split_at(proc, addr) || !vma_split_at(proc, end)) {
+        spin_unlock(&vma_lock);
         return -EMBK_ENOMEM;
+    }
 
     uint64_t vmm_flags = prot_to_vmm(prot);
 
@@ -315,12 +413,14 @@ int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t pro
         v->prot = prot;
     }
 
+    spin_unlock(&vma_lock);
     return EMBK_OK;
 }
 
 void vma_destroy_all(struct process *proc) {
     if (!proc)
         return;
+    spin_lock(&vma_lock);
     struct vm_area *v = proc->vma_list;
     while (v) {
         struct vm_area *next = v->next;
@@ -328,6 +428,7 @@ void vma_destroy_all(struct process *proc) {
         v = next;
     }
     proc->vma_list = 0;
+    spin_unlock(&vma_lock);
 }
 
 uint64_t vma_total_bytes(struct process *proc) {

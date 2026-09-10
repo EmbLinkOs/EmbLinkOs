@@ -6085,12 +6085,24 @@ int selftests_handle_command(const char *cmd)
             return 1;
         }
 
+        int fails = 0;
         const uint64_t LEN = 16 * 4096;
         uint64_t free_before = pmm_free_pages();
 
         int64_t a = vma_mmap(p, 0, LEN, PROT_READ | PROT_WRITE,
                              MAP_ANONYMOUS | MAP_PRIVATE);
         bool ok = a > 0;
+
+        /* DEMAND PAGING: the mapping exists and costs NOTHING yet. Asserted
+         * before a single byte is touched, because "mmap is cheap" is a claim
+         * about this exact moment. */
+        uint64_t free_mapped_only = pmm_free_pages();
+        bool lazy = (free_mapped_only >= free_before - 4);   /* page tables only */
+        kprintf("      %d KiB mapped: %llu pages consumed before first touch "
+                "(demand paging: want ~0)\n",
+                (int)(LEN / 1024),
+                (unsigned long long)(free_before - free_mapped_only));
+        if (!lazy) { kprintf("      FAIL: mmap allocated eagerly\n"); fails++; }
 
         if (ok) {
             /* Zeroed FIRST, then written, then read back -- in that order. A
@@ -6109,6 +6121,13 @@ int selftests_handle_command(const char *cmd)
         uint64_t free_mapped = pmm_free_pages();
         bool took = ok && free_mapped <= free_before - LEN / 4096;
 
+        /* And having touched it, the pages ARE there -- so laziness is not a
+         * synonym for "never allocated". */
+        struct vm_fault_stats fs;
+        vm_fault_stats(&fs);
+        kprintf("      after touching every page: %llu resolved faults total\n",
+                (unsigned long long)fs.handled);
+
         int rc = ok ? vma_munmap(p, (uint64_t)a, LEN) : -1;
         uint64_t free_after = pmm_free_pages();
         bool gave_back = (rc == EMBK_OK) && (free_after == free_before);
@@ -6119,13 +6138,54 @@ int selftests_handle_command(const char *cmd)
                 (int)free_before, (int)free_mapped, (int)free_after,
                 (took && gave_back) ? "OK" : "FAIL");
 
+        /* THE HEADLINE. A gigabyte of address space, three pages touched.
+         * Eagerly allocated this would need 262144 pages and would simply fail
+         * on a smaller machine -- which is the difference between address
+         * space and memory being one resource and being two. */
+        {
+            const uint64_t BIG = 1024ull * 1024 * 1024;
+            uint64_t f0 = pmm_free_pages();
+            int64_t big = vma_mmap(p, 0, BIG, PROT_READ | PROT_WRITE,
+                                   MAP_ANONYMOUS | MAP_PRIVATE);
+            if (big <= 0) {
+                kprintf("      FAIL: could not reserve 1 GiB of address space\n");
+                fails++;
+            } else {
+                uint64_t f1 = pmm_free_pages();
+                volatile char *m = (volatile char *)(uintptr_t)big;
+                m[0] = 1;
+                m[BIG / 2] = 2;
+                m[BIG - 1] = 3;
+                uint64_t f2 = pmm_free_pages();
+                bool good = (m[0] == 1 && m[BIG / 2] == 2 && m[BIG - 1] == 3);
+                kprintf("      [%s] 1 GiB reserved for %llu pages, then 3 touched "
+                        "for %llu more (eager would be %llu)\n",
+                        good ? " ok " : "FAIL",
+                        (unsigned long long)(f0 - f1),
+                        (unsigned long long)(f1 - f2),
+                        (unsigned long long)(BIG / 4096));
+                if (!good || (f0 - f1) > 8) fails++;
+                (void)vma_munmap(p, (uint64_t)big, BIG);
+            }
+        }
+
+        /* A fault OUTSIDE any mapping must still be fatal. Not tested by
+         * touching one -- that would kill this context -- but by asking
+         * vm_fault directly, which is the same call the fault handler makes. */
+        {
+            bool declined = !vm_fault(p, USER_MMAP_BASE + 0x3000000000ull, true, false);
+            kprintf("      [%s] a fault outside every mapping is DECLINED "
+                    "(a wild pointer must still crash)\n", declined ? " ok " : "FAIL");
+            if (!declined) fails++;
+        }
+
         int64_t wx = vma_mmap(p, 0, 4096, PROT_WRITE | PROT_EXEC,
                               MAP_ANONYMOUS | MAP_PRIVATE);
         kprintf("      writable+executable refused: %s\n", wx < 0 ? "OK" : "FAIL");
         if (wx > 0) vma_munmap(p, (uint64_t)wx, 4096);
 
         kprintf("[cmd] test mmap: %s\n",
-                (ok && took && gave_back && wx < 0) ? "OK" : "FAIL");
+                (ok && took && gave_back && wx < 0 && fails == 0) ? "OK" : "FAIL");
         return 1;
     }
 

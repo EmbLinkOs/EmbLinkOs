@@ -1,5 +1,6 @@
 #include "arch/aarch64/irq/exception.h"
 #include "include/uaccess_guard.h"
+#include "mm/vma.h"            /* vm_fault: demand paging */
 #include "arch/aarch64/drivers/pl011.h"
 #include "arch/aarch64/irq/gicv3.h"
 #include "process/process.h"
@@ -196,6 +197,33 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
     if (which == EXC_EL0_64_SYNC && ec == 0x15) {
         aarch64_syscall(f);
         return;
+    }
+
+    /* --- RESOLVE the fault, if it is resolvable -----------------------------
+     *
+     * Before the probe and long before the panic: ask the VM whether this
+     * address is legitimately the process's and simply has no page yet. That
+     * is what demand paging IS -- mmap reserves address space, and the page
+     * appears here, on first touch. A handled fault produces NO output; it is
+     * the ordinary way memory comes into existence.
+     *
+     * EITHER EL, but only for a USER address. A fault at EL1 on a user address
+     * is not a bug -- it is the kernel touching a process's memory on its
+     * behalf, which is what copy_to_user does, and a page not yet faulted in
+     * is as legitimate there as it is at EL0. A fault at EL1 on a KERNEL
+     * address has no VMA and stays fatal.
+     *
+     * EC 0x24/0x25 are data aborts (lower EL / same EL) and 0x20/0x21
+     * instruction aborts. WnR (bit 6 of ISS) says whether a DATA access was a
+     * write; for an instruction abort the access is by definition a fetch,
+     * which is what `exec` carries. */
+    if ((ec == 0x24 || ec == 0x25 || ec == 0x20 || ec == 0x21) &&
+        current_thread && f->far < USER_VA_LIMIT) {
+        bool is_data = (ec == 0x24 || ec == 0x25);
+        bool w = is_data && ((f->esr >> 6) & 1);
+        bool x = !is_data;
+        if (vm_fault(current_thread->proc, f->far, w, x))
+            return;                      /* retry the instruction */
     }
 
     /* A GUARDED user copy that faulted. The kernel touched user memory that

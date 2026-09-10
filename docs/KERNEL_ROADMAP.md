@@ -54,13 +54,17 @@ TLB shootdown.
    building the cache as an object rather than a cache: mapping a file is
    handing the process the pages it already holds. No copy, no coherence
    problem, no second implementation. It also makes `MAP_SHARED` meaningful.
-2. **Demand paging and a shared zero page.** Mappings are eagerly allocated and
-   zeroed today, so a large one costs its full size immediately. The VMA list
-   is already the record that can answer "not mapped yet, and legitimately
-   yours" — which is half of what a fault handler needs and the reason the list
-   exists.
-3. **Copy-on-write.** Falls out of 2 plus a per-page refcount, and is what
-   makes a cheap `spawn` of a large process possible.
+2. ~~**Demand paging.**~~ **Done.** `mmap` allocates nothing; a page appears on
+   first touch, and the fault that puts it there is *resolved* instead of
+   reported. `1 GiB reserved for 0 pages, then 3 touched for 8 more (eager
+   would be 262144)`. That is the difference between address space and memory
+   being one resource and being two.
+   - Still to come: a **shared zero page** (a read of an untouched page could
+     map one copy-on-write instead of allocating), and **copy-on-write** proper.
+3. **Copy-on-write.** Now one step away: the fault handler exists and the VMA
+   knows the permissions; what is missing is a per-page refcount and a
+   write-fault path that copies instead of allocating. It is what makes a cheap
+   `spawn` of a large process possible, and what a shared zero page needs.
 4. **A metadata cache.** Every `open`, `stat` and `SEEK_END` is a B-tree walk
    that reads the device. `test pagecache` deliberately keeps the seek outside
    its measured window rather than hide this. Largest single win left in I/O.
