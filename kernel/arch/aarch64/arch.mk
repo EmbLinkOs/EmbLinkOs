@@ -835,6 +835,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'writable+executable mapping was refused' MM 'W^X is not enforced on mmap'; \
 	  chk 'the generated code RUNS and returns 42' MM 'mprotect W->X did not make the page executable'; \
 	  chk 'mprotect across the hole -> ENOMEM'   MM 'mprotect half-applied across an unmapped hole'; \
+	  chk 'two writes APPENDED (one shared cursor'  FD 'dup gave the copy its OWN cursor -- not a shared open file description'; \
+	  chk 'dup2 lands on exactly the descriptor'    FD 'dup2 did not honour the requested fd number'; \
 	  chk 'instead of panicking'           A6 'a kernel fault on user memory was not recovered'; \
 	  chk 'posixdemo: ALL PASS'            A6 'the POSIX conformance suite reported failures'; \
 	  chk 'posixdemo exited 0'             A6 'posixdemo did not exit clean'; \
@@ -904,6 +906,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "  MM mmap/munmap/mprotect: anonymous mappings, W^X enforced,"; \
 	  echo "     every page given back (page tables included), and code"; \
 	  echo "     GENERATED at runtime, flipped W->X, and executed"; \
+	  echo "  FD dup/dup2/F_DUPFD over a real shared open file"; \
+	  echo "     description: two descriptors, ONE cursor"; \
 	  echo "  A9 SMP: $(ARM_SMP) cores started over PSCI, each bringing up its"; \
 	  echo "     own GIC redistributor, VECTORS and timer, all reporting in"; \
 	  echo "     themselves, all TICKING, and all reachable by IPI"; \

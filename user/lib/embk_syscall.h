@@ -131,6 +131,10 @@
 #define EMBK_SYS_mmap           96   /* (len, prot, flags) -> address | -err */
 #define EMBK_SYS_munmap         97   /* (addr, len)        -> 0       | -err */
 #define EMBK_SYS_mprotect       98   /* (addr, len, prot)  -> 0       | -err */
+/* dup, dup2 and fcntl(F_DUPFD) are three spellings of one operation, so they
+ * are one syscall: (oldfd, newfd, min_fd), newfd < 0 meaning "lowest free at
+ * or above min_fd". */
+#define EMBK_SYS_dup            99   /* (oldfd, newfd, min) -> newfd  | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

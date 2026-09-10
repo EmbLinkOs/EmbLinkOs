@@ -2,6 +2,7 @@
 #include "fs/vfs.h"
 #include "fs/namespace.h"   /* ns_check_writable -- read-only binding gate (UP2) */
 #include "include/errno.h"
+#include "include/kmalloc.h"   /* open file descriptions are heap objects */
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"
@@ -61,6 +62,37 @@ static struct fd_entry *fd_table(void)
 static inline void fdlock(struct process *p)   { if (p) mutex_lock(&p->fd_lock); }
 static inline void fdunlock(struct process *p) { if (p) mutex_unlock(&p->fd_lock); }
 
+/* --- open file descriptions (see struct open_file in fd.h) -----------------
+ *
+ * The refcount is atomic rather than fd-table-locked because the descriptors
+ * sharing one description can live in DIFFERENT processes -- a spawn-inherited
+ * fd is exactly that -- so no single table lock covers them all. Anything else
+ * here (vn, pos) is touched only through a descriptor, and a descriptor is
+ * reached only under its own process's fd lock. */
+static struct open_file *of_alloc(struct vnode vn) {
+    struct open_file *of = kmalloc(sizeof *of);
+    if (!of)
+        return NULL;
+    of->vn = vn;
+    of->pos = 0;
+    of->refs = 1;
+    return of;
+}
+
+static void of_get(struct open_file *of) {
+    if (of) __atomic_fetch_add(&of->refs, 1, __ATOMIC_ACQ_REL);
+}
+
+/* Drop one descriptor's reference. True when that was the LAST one, meaning
+ * the caller must release the vnode -- which it does differently depending on
+ * whether it may block, hence the two close ops. The struct itself is freed
+ * here either way. */
+static bool of_put(struct open_file *of) {
+    if (!of)
+        return false;
+    return __atomic_sub_fetch(&of->refs, 1, __ATOMIC_ACQ_REL) == 0;
+}
+
 void vfs_fd_init(void)
 {
     struct fd_entry *fds = fd_table();
@@ -69,7 +101,7 @@ void vfs_fd_init(void)
         fds[i].backing = FD_BACKING_NONE;
         fds[i].ops = NULL;
         fds[i].flags = 0;
-        fds[i].u.file.pos = 0;
+        fds[i].u.file.of = NULL;
     }
 }
 
@@ -231,10 +263,11 @@ int vfs_fd_truncate(int fd, uint64_t size)
         return -EMBK_EBADF;
     if (e->backing != FD_BACKING_VNODE)
         return -EMBK_EINVAL;
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->truncate)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->truncate)
         return -EMBK_ENOSYS;
 
-    return e->u.file.vn.mnt->ops->truncate(&e->u.file.vn, size);
+    return of->vn.mnt->ops->truncate(&of->vn, size);
 }
 
 int vfs_chmod_path(const char *path, uint32_t mode)
@@ -455,10 +488,18 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         }
     }
 
+    struct open_file *of = of_alloc(vn);
+    if (!of) {
+        fds[fd - FD_BASE].used = false;
+        fdunlock(p);
+        if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_put)
+            (void)vn.mnt->ops->obj_put(vn.mnt, vn.ino);
+        return -EMBK_ENOMEM;
+    }
+
     fds[fd - FD_BASE].backing = FD_BACKING_VNODE;
     fds[fd - FD_BASE].ops = &vnode_fd_ops;
-    fds[fd - FD_BASE].u.file.vn = vn;
-    fds[fd - FD_BASE].u.file.pos = 0;
+    fds[fd - FD_BASE].u.file.of = of;
     fds[fd - FD_BASE].flags = flags;
     fdunlock(p);
 
@@ -466,7 +507,7 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         struct vfs_stat st;
         err = vn.mnt->ops->stat(&vn, &st);
         if (err == EMBK_OK)
-            fds[fd - FD_BASE].u.file.pos = st.size;
+            of->pos = st.size;
     }
 
     return fd;
@@ -562,6 +603,71 @@ int vfs_close(int fd)
 
     snap.ops->close(&snap);
     return EMBK_OK;
+}
+
+/* dup / dup2 / fcntl(F_DUPFD) -- see fd.h.
+ *
+ * ONE open file description, TWO descriptors. Not a copy: the cursor is
+ * shared, so a write through either advances both, and the vnode reference is
+ * released once when the last descriptor closes. Anything else would be the
+ * "accidental third thing" vnode_fd_inherit() spent a paragraph refusing to
+ * be, and the whole reason this needed a real object rather than a struct
+ * assignment.
+ *
+ * dup2(fd, fd) is a NO-OP that returns fd, which is not an arbitrary special
+ * case: closing the target first and then duplicating would destroy the very
+ * description being duplicated. POSIX calls it out for the same reason. */
+int vfs_fd_dup(int oldfd, int newfd, int min_fd) {
+    if (oldfd < FD_BASE || oldfd >= FD_BASE + FD_MAX_OPEN)
+        return -EMBK_EBADF;
+    if (newfd >= FD_BASE + FD_MAX_OPEN || min_fd < 0 || min_fd >= FD_MAX_OPEN)
+        return -EMBK_EBADF;
+
+    struct process *p = current_process;
+
+    fdlock(p);
+    struct fd_entry *fds = fd_table();
+    struct fd_entry *src = &fds[oldfd - FD_BASE];
+    if (!src->used || !src->ops) { fdunlock(p); return -EMBK_EBADF; }
+
+    if (newfd >= 0 && newfd == oldfd) { fdunlock(p); return oldfd; }
+
+    /* A backing that cannot say what inheriting means must not be guessed at:
+     * "inherit" is a struct copy for a stateless singleton and a refcount bump
+     * for anything owned, and picking wrong is a silent use-after-free. */
+    if (!src->ops->inherit) { fdunlock(p); return -EMBK_ENOSYS; }
+
+    int target = newfd;
+    if (target < 0) {
+        target = -1;
+        for (int i = min_fd; i < FD_MAX_OPEN; i++)
+            if (!fds[i].used) { target = i + FD_BASE; break; }
+        if (target < 0) { fdunlock(p); return -EMBK_EMFILE; }
+    }
+
+    struct fd_entry *dst = &fds[target - FD_BASE];
+
+    /* Whatever the target held is closed -- that IS dup2, and it is how every
+     * shell redirect works. Snapshot then clear under the lock, tear down
+     * after: the same ordering rule vfs_close() states, for the same reason
+     * (a close op may take g_sched_lock, which this mutex is built on). */
+    struct fd_entry snap;
+    bool had = dst->used && dst->ops && dst->ops->close;
+    if (had) snap = *dst;
+    memset(dst, 0, sizeof(*dst));
+
+    int rc = src->ops->inherit(dst, src);
+    if (rc != EMBK_OK) {
+        memset(dst, 0, sizeof(*dst));
+        fdunlock(p);
+        if (had) snap.ops->close(&snap);   /* it is gone either way */
+        return rc;
+    }
+    dst->used = true;
+    fdunlock(p);
+
+    if (had) snap.ops->close(&snap);
+    return target;
 }
 
 int64_t vfs_fd_avail(int fd) {
@@ -681,18 +787,25 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
 
     memset(e, 0, sizeof(*e));
 
+    struct open_file *of = of_alloc(vn);
+    if (!of) {
+        fdunlock(target);
+        if (vn.mnt && vn.mnt->ops && vn.mnt->ops->obj_put)
+            (void)vn.mnt->ops->obj_put(vn.mnt, vn.ino);
+        return -EMBK_ENOMEM;
+    }
+
     e->used = true;
     e->backing = FD_BACKING_VNODE;
     e->ops = &vnode_fd_ops;
-    e->u.file.vn = vn;
-    e->u.file.pos = 0;
+    e->u.file.of = of;
     e->flags = flags;
 
     if ((flags & O_APPEND) && vn.mnt && vn.mnt->ops && vn.mnt->ops->stat) {
         struct vfs_stat st;
         err = vn.mnt->ops->stat(&vn, &st);
         if (err == EMBK_OK)
-            e->u.file.pos = st.size;
+            of->pos = st.size;
     }
     fdunlock(target);
 
@@ -702,15 +815,16 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
 static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_read) {
     if (!fd_readable(e->flags))
         return -EMBK_EBADF;
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->read)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->read)
         return -EMBK_ENOSYS;
 
     size_t bytes_read = 0;
-    int err = e->u.file.vn.mnt->ops->read(&e->u.file.vn, e->u.file.pos, buf, len, &bytes_read);
+    int err = of->vn.mnt->ops->read(&of->vn, of->pos, buf, len, &bytes_read);
     if (err)
         return err;
 
-    e->u.file.pos += bytes_read;
+    of->pos += bytes_read;
     *out_read = bytes_read;
     return EMBK_OK;
 }
@@ -718,32 +832,34 @@ static int vnode_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *out_
 static int vnode_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
     if (!fd_writable(e->flags))
         return -EMBK_EBADF;
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->write)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->write)
         return -EMBK_ENOSYS;
 
     size_t bytes_written = 0;
-    int err = e->u.file.vn.mnt->ops->write(&e->u.file.vn, e->u.file.pos, buf, len, &bytes_written);
+    int err = of->vn.mnt->ops->write(&of->vn, of->pos, buf, len, &bytes_written);
     if (err)
         return err;
 
-    e->u.file.pos += bytes_written;
+    of->pos += bytes_written;
     *out_written = bytes_written;
     return EMBK_OK;
 }
 
 static int vnode_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t *out_offset) {
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->stat)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->stat)
         return -EMBK_ENOSYS;
 
     struct vfs_stat st;
-    int err = e->u.file.vn.mnt->ops->stat(&e->u.file.vn, &st);
+    int err = of->vn.mnt->ops->stat(&of->vn, &st);
     if (err)
         return err;
 
     uint64_t base;
     switch (whence) {
         case 0: base = 0; break; // SEEK_SET
-        case 1: base = e->u.file.pos; break; // SEEK_CUR
+        case 1: base = of->pos; break; // SEEK_CUR
         case 2: base = st.size; break; // SEEK_END
         default: return -EMBK_EINVAL;
     }
@@ -753,40 +869,48 @@ static int vnode_fd_seek(struct fd_entry *e, int64_t delta, int whence, uint64_t
     if (err)
         return err;
 
-    e->u.file.pos = new_pos;
+    of->pos = new_pos;
     *out_offset = new_pos;
     return EMBK_OK;
 }
 
 
 static int vnode_fd_fstat(struct fd_entry *e, struct vfs_stat *out) {
-    if (!e->u.file.vn.mnt || !e->u.file.vn.mnt->ops || !e->u.file.vn.mnt->ops->stat)
+    struct open_file *of = e->u.file.of;
+    if (!of || !of->vn.mnt || !of->vn.mnt->ops || !of->vn.mnt->ops->stat)
         return -EMBK_ENOSYS;
 
-    return e->u.file.vn.mnt->ops->stat(&e->u.file.vn, out);
+    return of->vn.mnt->ops->stat(&of->vn, out);
 }
 
 
 static int vnode_fd_inherit(struct fd_entry *dst, const struct fd_entry *src) {
-    (void)dst; (void)src;
-    /* Deliberately NOT "obj_get + struct copy". That would fix the LIFETIME
-     * bug (refcount) while leaving the CURSOR bug: the child would get an
-     * independent u.file.pos onto the same object -- neither POSIX (which
-     * shares the offset through a shared open-file-description) nor a fresh
-     * open. It's an accidental third thing, and it corrupts silently.
+    /* This used to be an outright -ENOSYS, and the comment it carried said
+     * why: "obj_get + struct copy" would have fixed the LIFETIME bug while
+     * leaving the CURSOR bug -- the child getting an INDEPENDENT offset onto
+     * the same object, which is neither POSIX nor a fresh open but an
+     * accidental third thing that corrupts silently. It also said when to fix
+     * it properly: "when something eventually redirects a child's stdout to a
+     * FILE". dup2() is that, so the shared open file description now exists
+     * and this is a reference bump onto it -- one cursor, two descriptors,
+     * exactly as POSIX describes.
      *
-     * Nothing can put a vnode in fds 0/1/2 today, so this cannot fire. When
-     * something eventually redirects a child's stdout to a FILE, it will
-     * fail LOUDLY here rather than quietly sharing a cursor -- and that's
-     * the moment to build the real shared open-file-description (the gap
-     * already tracked in TODO.md), not before. */
-    return -EMBK_ENOSYS;
+     * The vnode's own reference is NOT bumped here: it belongs to the
+     * description, which is what is being shared, and is released once when
+     * the last descriptor onto it closes. */
+    *dst = *src;
+    of_get(dst->u.file.of);
+    return EMBK_OK;
 }
 
 
 static void vnode_fd_close(struct fd_entry *e) {
-    if (e->u.file.vn.mnt && e->u.file.vn.mnt->ops && e->u.file.vn.mnt->ops->obj_put)
-        (void)e->u.file.vn.mnt->ops->obj_put(e->u.file.vn.mnt, e->u.file.vn.ino);
+    struct open_file *of = e->u.file.of;
+    if (!of_put(of))
+        return;                 /* another descriptor still holds it */
+    if (of->vn.mnt && of->vn.mnt->ops && of->vn.mnt->ops->obj_put)
+        (void)of->vn.mnt->ops->obj_put(of->vn.mnt, of->vn.ino);
+    kfree(of);
 }
 
 static void vnode_fd_close_locked(struct fd_entry *e) {
@@ -795,7 +919,11 @@ static void vnode_fd_close_locked(struct fd_entry *e) {
      * I/O, disqualifying under g_sched_lock. Defer to the kworker, which
      * obj_puts from a normal schedulable thread holding nothing. This CLOSES
      * the pre-existing exit-time vnode refcount leak. */
-    kworker_defer_obj_put_locked(e->u.file.vn);
+    struct open_file *of = e->u.file.of;
+    if (!of_put(of))
+        return;
+    kworker_defer_obj_put_locked(of->vn);
+    kfree(of);
 }
 
 static const struct fd_ops vnode_fd_ops = {

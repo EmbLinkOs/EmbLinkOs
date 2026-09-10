@@ -1057,4 +1057,21 @@ static inline int embk_mprotect(void *addr, size_t len, int prot) {
                               (int64_t)len, prot);
 }
 
+/* --- a second name for an open file ---------------------------------------
+ * `newfd` < 0 asks for the lowest free descriptor at or above `min_fd`;
+ * otherwise `newfd` is the exact slot and whatever it held is closed first.
+ *
+ * The two descriptors share ONE open file description -- one cursor, one
+ * reference to the underlying object. A write through either advances both,
+ * and closing either leaves the other fully working. That shared cursor is the
+ * entire promise of dup: re-opening the file instead would give a separate
+ * one, which is the opposite of what the caller asked for.
+ *
+ * embk_dup(fd, fd) returns fd unchanged rather than closing and reopening it,
+ * because closing the target first would destroy the description being
+ * duplicated. */
+static inline int embk_dup(int oldfd, int newfd, int min_fd) {
+    return (int)embk_syscall3(EMBK_SYS_dup, oldfd, newfd, min_fd);
+}
+
 #endif /* __EMBK_H__ */

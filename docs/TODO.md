@@ -1001,10 +1001,23 @@ interrupt-driven.
   existing pre-process `test ring3`/selftest behavior that runs before any
   process exists). Verified via QEMU: two spawned processes opening
   different files see independent fd numbering/state, no cross-talk.
-  Open-file-description sharing (fork / dup / dup2, shared cursor across
-  dup'd fds) is still NOT modeled — each fd entry still owns its own
-  cursor; only isolation between processes was added, not fd aliasing
-  within one.
+  - [x] ~~Open-file-description sharing (dup / dup2, shared cursor across
+    dup'd fds) is still NOT modeled — each fd entry owns its own cursor.~~
+    **DONE.** `struct open_file` (fs/fd.h) is now a real refcounted object
+    holding the vnode and the cursor, and `struct fd_entry` points at one. A
+    descriptor is a NUMBER; what it refers to is the description. dup, dup2,
+    `fcntl(F_DUPFD)` and a spawn-inherited fd all produce a second descriptor
+    onto the SAME one, so a write through either advances one cursor and the
+    vnode reference is released once, when the last descriptor closes.
+
+    This is what `vnode_fd_inherit()` was waiting for. It used to return
+    `ENOSYS` outright, with a comment saying a struct copy would fix the
+    lifetime bug while leaving the CURSOR bug — "an accidental third thing
+    that corrupts silently" — and that the moment to build the real thing was
+    "when something eventually redirects a child's stdout to a FILE". dup2 is
+    that. Asserted the only way that distinguishes a real implementation from
+    a plausible one: write `a` through one descriptor and `b` through the
+    other, and the file must read `ab`, not `b`.
 - [x] ~~g_boot_fds / per-process fds arrays are unlocked mutable state — needs
   a lock once syscalls from the same process can race.~~ **DONE**, and the race
   was already REACHABLE, not hypothetical: the note's "a single process only

@@ -123,13 +123,35 @@ struct fd_ops {
 #define POLLHUP  0x0010
 #define POLLNVAL 0x0020
 
+/* AN OPEN FILE DESCRIPTION -- POSIX's name for it, and a separate object from
+ * the descriptor on purpose.
+ *
+ * A file descriptor is a NUMBER in one process's table. What it refers to is
+ * this: the vnode, and the CURSOR. dup(), dup2() and a spawn-inherited fd all
+ * produce a second descriptor onto the SAME description, which is what makes
+ *
+ *     write(1, "a", 1); write(dup(1), "b", 1);
+ *
+ * append rather than overwrite, and what makes a shell's `>>` behave. Two
+ * descriptors with independent cursors onto one file is neither dup nor a
+ * fresh open -- it is an accidental third thing that corrupts silently, which
+ * is precisely why vnode_fd_inherit() used to refuse rather than approximate.
+ *
+ * `refs` counts descriptors, across every process. The vnode's own reference
+ * is released once, when the last of them goes. */
+struct open_file {
+    struct vnode vn;
+    uint64_t pos;
+    int refs;                   /**< descriptors pointing here; atomic */
+};
+
 struct fd_entry {
     bool used;
     enum fd_backing backing;    /**< selects which fd_ops table applies */
     const struct fd_ops *ops;   /**< per-backing dispatch (NULL when unused) */
     int flags;
     union {
-        struct { struct vnode vn; uint64_t pos; } file;  /**< FD_BACKING_VNODE */
+        struct { struct open_file *of; } file;           /**< FD_BACKING_VNODE */
         struct { struct pipe *p; int side; } pipe;       /**< FD_BACKING_PIPE (side: 0=read, 1=write) */
         struct { int conn; uint16_t bind_port; } sock;   /**< FD_BACKING_SOCKET (conn: TCP index, -1 until connect/listen; bind_port for a server) */
         struct { int us; } udp;                          /**< FD_BACKING_UDP (UDP socket index) */
@@ -159,6 +181,17 @@ int vfs_chmod_path(const char *path, uint32_t mode);  /* permission bits; fs pre
 int vfs_fd_truncate(int fd, uint64_t size);  /* ftruncate over the existing per-fs truncate op */
 int vfs_rmdir_path(const char *path);    /* rmdir: EMPTY dirs only (fs enforces) */
 int fd_open_into(struct process *target, int target_fd, const char *path, int flags, uint32_t mode);
+
+/* dup / dup2 / fcntl(F_DUPFD).
+ *
+ * `newfd < 0` means "the lowest free descriptor at or above `min_fd`" (dup is
+ * min_fd 0, F_DUPFD is min_fd = the caller's argument). Otherwise `newfd` is
+ * the exact slot, and whatever it held is closed first -- that is dup2, and it
+ * is the mechanism behind every shell redirect.
+ *
+ * Both descriptors share ONE open file description: the same cursor, the same
+ * vnode reference. Closing either leaves the other fully working. */
+int vfs_fd_dup(int oldfd, int newfd, int min_fd);
 
 /* Install one end of a pipe onto target_fd in `target` -- the fd-layer half
  * of the INSTALL_OBJ spawn action (pipe_fd_ops is private to fd.c, so the

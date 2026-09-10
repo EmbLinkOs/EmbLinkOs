@@ -125,4 +125,10 @@
  * restrictive: map writable, write, then flip to executable. See mm/vma.h. */
 #define SYS_mprotect       98
 
+/* dup(oldfd, newfd, min_fd) -- one entry point for dup, dup2 and
+ * fcntl(F_DUPFD). newfd < 0 means "lowest free at or above min_fd". Both
+ * descriptors share ONE open file description: one cursor, one vnode
+ * reference. See fs/fd.h. */
+#define SYS_dup            99
+
 #endif /* _SYSCALL_NR_H_ */

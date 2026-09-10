@@ -336,8 +336,9 @@ static int64_t sys_fd_avail(const struct sysargs *a) {
 
 /* fcntl(fd, cmd, arg) -- the sliver of POSIX fcntl the kernel actually owns:
  * the O_NONBLOCK fd flag. cmd 1 = get (returns 1 if non-blocking, else 0);
- * cmd 2 = set non-blocking to `arg`. Everything else about fcntl (F_GETFD,
- * F_DUPFD, ...) stays a libc concern. */
+ * cmd 2 = set non-blocking to `arg`. F_DUPFD is served by SYS_dup, which the
+ * libc's fcntl() routes to; everything else about fcntl (F_GETFD, ...) stays a
+ * libc concern. */
 static int64_t sys_fcntl(const struct sysargs *a) {
     int fd  = (int)a->arg[0];
     int cmd = (int)a->arg[1];
@@ -353,6 +354,22 @@ static int64_t sys_fcntl(const struct sysargs *a) {
     default:
         return -EMBK_EINVAL;
     }
+}
+
+/* dup(oldfd, newfd, min_fd) -> the new fd, or -errno.
+ *
+ * One syscall for three POSIX calls, because they are three spellings of one
+ * operation: dup(fd) is (fd, -1, 0), dup2(fd, n) is (fd, n, 0), and
+ * fcntl(fd, F_DUPFD, n) is (fd, -1, n). Splitting them into three entry points
+ * would be three copies of the same fd-table walk.
+ *
+ * What comes back is a SECOND NAME for the same open file description, not a
+ * copy of it: the cursor is shared, and the underlying object is released once
+ * when the last descriptor closes. That is what makes shell redirection work
+ * -- `cmd > file` is dup2 onto fd 1 -- and it is why this needed a real
+ * refcounted object underneath rather than a struct assignment. */
+static int64_t sys_dup(const struct sysargs *a) {
+    return vfs_fd_dup((int)a->arg[0], (int)a->arg[1], (int)a->arg[2]);
 }
 
 /* fd_poll(fd, events) -> ready POLL* bits (or POLLNVAL for a bad fd). One fd at
@@ -1909,6 +1926,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_audio_close]    = sys_audio_close,
     [SYS_mmap]           = sys_mmap,
     [SYS_mprotect]       = sys_mprotect,
+    [SYS_dup]            = sys_dup,
     [SYS_munmap]         = sys_munmap,
     [SYS_win_desktop_front] = sys_win_desktop_front,
     [SYS_debug_attach]   = sys_debug_attach,

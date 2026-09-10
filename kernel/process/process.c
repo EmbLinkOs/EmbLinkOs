@@ -1131,10 +1131,10 @@ int process_fds_snapshot(uint32_t pid, struct fd_snap_info *out, int max) {
         out[n].pos = 0;
         out[n].vtype = 0;
         out[n].pipe_side = -1;
-        if (f->backing == FD_BACKING_VNODE) {
-            out[n].ino = f->u.file.vn.ino;
-            out[n].vtype = f->u.file.vn.type;
-            out[n].pos = f->u.file.pos;
+        if (f->backing == FD_BACKING_VNODE && f->u.file.of) {
+            out[n].ino = f->u.file.of->vn.ino;
+            out[n].vtype = f->u.file.of->vn.type;
+            out[n].pos = f->u.file.of->pos;
         } else if (f->backing == FD_BACKING_PIPE) {
             out[n].pipe_side = f->u.pipe.side;
         }

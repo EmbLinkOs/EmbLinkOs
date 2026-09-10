@@ -62,6 +62,10 @@
 #include <sys/select.h>   /* fd_set, FD_*, FD_SETSIZE -- for select() */
 
 #include "embk_syscall.h"
+#include "embk.h"          /* embk_net_*, embk_mmap/mprotect/dup -- the kernel API.
+                            * Included HERE and not further down: dup() and the
+                            * memory wrappers appear well before the socket code
+                            * that used to be its only caller. */
 
 /* --- kernel types replicated on the user side (no kernel headers here) ---
  * struct vfs_stat (kernel/fs/vfs.h) and the VFS_DT_* type tags, byte-for-
@@ -811,13 +815,16 @@ int fdatasync(int fd) {
     return 0;
 }
 
-/* No dup: the fd table has no duplicate-into-lowest-free operation, and faking
- * one by re-opening would give a SEPARATE file position, which is the opposite
- * of what dup() promises (a shared cursor). */
+/* dup -- the lowest free descriptor, referring to the SAME open file.
+ *
+ * This used to be ENOSYS, and the reason it could not simply be faked is worth
+ * keeping: re-opening the file would give the copy a SEPARATE cursor, which is
+ * the opposite of what dup promises. The kernel now has a real shared open
+ * file description (fs/fd.h), so both descriptors advance one cursor and the
+ * underlying object is released once, when the last of them closes. */
 int dup(int fd) {
-    (void)fd;
-    errno = ENOSYS;
-    return -1;
+    int r = embk_dup(fd, -1, 0);
+    return r < 0 ? embk_fail(r) : r;
 }
 
 /* There is no fcntl SYSCALL, but the descriptor-flag commands are answerable
@@ -846,7 +853,9 @@ int dup(int fd) {
  * a false "non-blocking is set" is the real trap -- the caller would then hang
  * forever in a blocking read. This lets blocking-socket code (CPython's _socket,
  * which reads/sets the flags) work while never lying about non-blocking.
- * F_DUPFD likewise refused, since dup() itself is ENOSYS (see above).
+ * F_DUPFD is real, and routes to the same kernel operation dup() uses -- with
+ * the "lowest free descriptor AT OR ABOVE this number" behaviour that is the
+ * only thing distinguishing it from dup().
  */
 #include <fcntl.h>
 /* uname(): real facts about this OS -- nothing here is faked or guessed.
@@ -886,6 +895,13 @@ int fcntl(int fd, int cmd, ...) {
          * cmd 1 = get non-blocking. */
         int nb = (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
         return O_RDWR | ((nb > 0) ? O_NONBLOCK : 0);
+    }
+    case F_DUPFD: {
+        va_list ap; va_start(ap, cmd);
+        int min_fd = va_arg(ap, int);
+        va_end(ap);
+        int r = embk_dup(fd, -1, min_fd);
+        return r < 0 ? embk_fail(r) : r;
     }
     case F_SETFL: {
         va_list ap; va_start(ap, cmd);
@@ -1262,7 +1278,6 @@ int unlink(const char *path) {
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include "embk.h"          /* embk_net_* -- the kernel CAP_NETWORK socket layer */
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/statvfs.h>
@@ -1407,15 +1422,26 @@ pid_t waitpid(pid_t pid, int *status, int options) {
     (void)pid; (void)status; (void)options;
     errno = ENOSYS; return (pid_t)-1;
 }
-/* WEAK: a libc stub must YIELD to an application that ships its own. CPython
- * carries a dup2 compat implementation (for platforms lacking the call) and a
- * strong definition here collides with it -- "multiple definition of `dup2'",
- * found the moment python.elf was relinked against this libc. Weak means their
- * definition simply wins, which is what a portable program expects from a libc
- * it is overriding. (Theirs fails too -- it goes through fcntl(F_DUPFD), which
- * we also refuse -- but it fails as THEIR code, on their terms.) */
+/* dup2 -- redirection. `cmd > file` is this call and nothing else: open the
+ * file, dup2 it onto fd 1, and every write the program makes to stdout lands
+ * in the file without the program knowing.
+ *
+ * dup2(fd, fd) returns fd UNCHANGED and closes nothing. POSIX calls that out
+ * explicitly and it is not a special case for its own sake: the general path
+ * closes the target before duplicating, which here would destroy the very
+ * description being duplicated.
+ *
+ * Still WEAK, for the reason it always was: a libc stub must yield to an
+ * application shipping its own. CPython carries a dup2 compat implementation
+ * for platforms lacking the call, and a strong definition here collided with
+ * it ("multiple definition of `dup2'") the moment python.elf was relinked.
+ * Theirs now works too -- it goes through fcntl(F_DUPFD), which is also real
+ * now. */
 __attribute__((weak))
-int dup2(int oldfd, int newfd) { (void)oldfd; (void)newfd; errno = ENOSYS; return -1; }
+int dup2(int oldfd, int newfd) {
+    int r = embk_dup(oldfd, newfd, 0);
+    return r < 0 ? embk_fail(r) : r;
+}
 pid_t setsid(void)             { errno = ENOSYS; return (pid_t)-1; }
 pid_t getpgid(pid_t pid)       { (void)pid; errno = ENOSYS; return (pid_t)-1; }
 pid_t tcgetpgrp(int fd)        { (void)fd; errno = ENOSYS; return (pid_t)-1; }

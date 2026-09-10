@@ -830,6 +830,75 @@ static void test_mprotect(void) {
     munmap(page, 4096);
 }
 
+/* dup / dup2 / fcntl(F_DUPFD).
+ *
+ * The interesting assertion is not "a second number came back" -- it is the
+ * SHARED CURSOR. Two descriptors onto one open file description advance one
+ * offset between them; two independent opens do not. That difference is the
+ * whole reason dup could not be faked by re-opening the file, and it is the
+ * only way to tell a real implementation from a plausible one.
+ *
+ * It is also what makes redirection work: `cmd > file` is dup2 onto fd 1, and
+ * the program writing to stdout never learns anything changed. */
+static void test_dup(void) {
+    printf("dup / dup2 (one open file, two descriptors):\n");
+
+    const char *path = "/duptest.txt";   /* root, not TESTDIR: this test must
+                                          * not depend on another one's fixture */
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ck("create a file to duplicate", fd >= 0);
+    if (fd < 0) return;
+
+    int fd2 = dup(fd);
+    ck("dup returns a new descriptor", fd2 >= 0 && fd2 != fd);
+    if (fd2 < 0) { close(fd); return; }
+
+    /* THE point. Write through one, write through the other: if the cursor is
+     * shared the file reads "ab"; if each has its own it reads "b", because
+     * the second write started from offset 0 and overwrote the first. */
+    ck("write 'a' through the original", write(fd, "a", 1) == 1);
+    ck("write 'b' through the duplicate", write(fd2, "b", 1) == 1);
+
+    char buf[8];
+    memset(buf, 0, sizeof buf);
+    ck("seek to the start", lseek(fd, 0, SEEK_SET) == 0);
+    ssize_t n = read(fd2, buf, sizeof buf - 1);
+    ck("the two writes APPENDED (one shared cursor, not two)",
+       n == 2 && buf[0] == 'a' && buf[1] == 'b');
+
+    /* And the seek was through fd but the read through fd2 -- which only
+     * lands at offset 0 if they really are the same description. */
+
+    ck("closing one leaves the other usable",
+       close(fd2) == 0 && lseek(fd, 0, SEEK_SET) == 0);
+
+    /* fcntl(F_DUPFD, n): the lowest free descriptor AT OR ABOVE n. */
+    int hi = fcntl(fd, F_DUPFD, 20);
+    ck("fcntl(F_DUPFD, 20) returns a descriptor >= 20", hi >= 20);
+    if (hi >= 0) close(hi);
+
+    /* dup2 onto a specific number, which is what a shell redirect does. */
+    int want = 30;
+    int got = dup2(fd, want);
+    ck("dup2 lands on exactly the descriptor asked for", got == want);
+    if (got == want) {
+        ck("the duplicate reads the file's contents",
+           lseek(want, 0, SEEK_SET) == 0 &&
+           read(want, buf, 2) == 2 && buf[0] == 'a');
+        close(want);
+    }
+
+    /* dup2(fd, fd) is a no-op returning fd -- NOT a close-then-duplicate,
+     * which would destroy the very thing being duplicated. */
+    ck("dup2(fd, fd) returns fd and closes nothing",
+       dup2(fd, fd) == fd && lseek(fd, 0, SEEK_SET) == 0);
+
+    CK_FAILS("dup of a closed descriptor -> EBADF", dup(fd2), EBADF);
+
+    close(fd);
+    unlink(path);
+}
+
 static void test_honest_refusals(void) {
     printf("honest refusals (must NOT pretend):\n");
     struct utimbuf ub = { 0, 0 };
@@ -846,7 +915,6 @@ static void test_honest_refusals(void) {
      * become a real device flush the same day. */
     ck("fsync succeeds (no write-back path to flush)", fsync(1) == 0);
     ck("fdatasync succeeds", fdatasync(1) == 0);
-    CK_FAILS("dup -> ENOSYS", dup(1), ENOSYS);
     CK_FAILS("symlink -> ENOSYS", symlink("/init.elf", "/l"), ENOSYS);
     CK_FAILS("chroot -> ENOSYS", chroot("/"), ENOSYS);
     CK_FAILS("pause -> ENOSYS (no signals; would be a hang)", pause(), ENOSYS);
@@ -1136,6 +1204,7 @@ int main(void) {
     test_signals();
     test_mmap();
     test_mprotect();
+    test_dup();
     test_honest_refusals();
 
     printf("\nposixdemo: %s (%d failure%s)\n",
