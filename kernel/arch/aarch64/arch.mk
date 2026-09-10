@@ -64,6 +64,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/mm/vma.c \
                   kernel/mm/vm_object.c \
                   kernel/process/futex.c \
+                  kernel/process/sched.c \
+                  kernel/process/sched_rr.c \
                   kernel/power/power.c \
                   kernel/arch/aarch64/power/power_arm.c \
                   kernel/mm/ipi.c \

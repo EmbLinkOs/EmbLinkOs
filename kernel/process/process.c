@@ -1,5 +1,6 @@
 #include "process/process.h"
 #include "power/power.h"   /* idle residency accounting */
+#include "process/sched.h"    /* the policy seam: WHICH thread runs next */
 #include "include/arch_ipi.h"  /* IPI_RESCHEDULE: waking a halted core */
 #include "include/arch_irq.h"
 #include "drivers/input/keyboard.h"   /* keyboard_release_grab_pid() on reap */
@@ -75,7 +76,10 @@
  * thread; thread_create() is the new primitive that lets a process have
  * more than one. */
 static struct process process_table[MAX_PROCESSES];
-static struct thread   thread_table[MAX_THREADS];
+/* NOT static any more: a scheduler POLICY (process/sched.h) that decides by
+ * scanning needs to see the threads. Declared in process.h so the seam is
+ * explicit rather than an extern smuggled into one file. */
+struct thread   thread_table[MAX_THREADS];
 // current_thread is now a macro (process.h) reading through
 // this_cpu()->current_thread (kernel/cpu/percpu.h) -- no plain global
 // definition lives here anymore. Storage lives in cpu_table[], populated by
@@ -190,7 +194,7 @@ static struct thread *thread_alloc(void) {
     spin_lock(&g_sched_lock);
     for (int i = 0; i < MAX_THREADS; i++) {
         if (thread_table[i].state == PROCESS_UNUSED) {
-            thread_table[i].state = PROCESS_BLOCKED;
+            thread_table[i].state = PROCESS_BLOCKED;   /* slot init, not a transition */
             thread_table[i].running_cpu = -1;
             thread_table[i].pinned_cpu = -1;
             spin_unlock(&g_sched_lock);
@@ -655,7 +659,7 @@ static struct process *thread_zombie_locked(struct thread *t) {
  * -------------------------------------------------------------------- */
 
 void wait_queue_block(struct wait_queue *wq, struct thread *t) {
-    t->state = PROCESS_BLOCKED;
+    sched_set_blocked(t);
     t->running_cpu = -1;   // no longer running anywhere -- same invariant
                            // schedule_locked()'s own RUNNING->READY demotion
                            // maintains; `t` is always the CALLER's own
@@ -701,7 +705,7 @@ void wait_queue_wake_one(struct wait_queue *wq) {
     }
     struct thread *t = wq->head;
     wait_queue_remove(wq, t);
-    t->state = PROCESS_READY;
+    sched_set_ready(t);
     sched_kick_idle();      /* a halted core may be the one to run it */
 }
 
@@ -877,7 +881,7 @@ static void wake_expired_locked(void) {
         if (t->wake_at_ms && now >= t->wake_at_ms) {
             wait_queue_remove(&g_sleep_wq, t);
             t->wake_at_ms = 0;
-            t->state = PROCESS_READY;
+            sched_set_ready(t);
             woke = true;
         }
         t = next;
@@ -927,7 +931,7 @@ int process_cancel(uint32_t pid) {
     for (struct thread *t = proc->thread_list; t; t = t->proc_thread_next) {
         if (t->state == PROCESS_BLOCKED && t->wait_queue) {
             wait_queue_remove(t->wait_queue, t);
-            t->state = PROCESS_READY;
+            sched_set_ready(t);
         }
     }
 
@@ -963,7 +967,7 @@ int process_raise_interrupt(uint32_t pid) {
     for (struct thread *t = proc->thread_list; t; t = t->proc_thread_next) {
         if (t->state == PROCESS_BLOCKED && t->wait_queue) {
             wait_queue_remove(t->wait_queue, t);
-            t->state = PROCESS_READY;
+            sched_set_ready(t);
         }
     }
 
@@ -2127,7 +2131,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         proc->debug_session = s;
         /* t->state was left BLOCKED by debug_session_spawn's wait_queue_block. */
     } else {
-        t->state = PROCESS_READY;
+        sched_set_ready(t);
     }
     return (int)proc->pid;
 }
@@ -2380,36 +2384,11 @@ static void schedule_locked(void) {
      * gets bumped up one band (floor PRIORITY_REALTIME) and its counter
      * resets -- the standard fix for strict priority scheduling's one real
      * flaw (a full high band starving everything below it forever). */
-    for (int i = 0; i < MAX_THREADS; i++) {
-        struct thread *t = &thread_table[i];
-        if (t == current_thread || t->state != PROCESS_READY) {
-            continue;
-        }
-        /* Pinned infrastructure (each core's idle kthread and adopted
-         * bootstrap context, process.h) is exempt from aging: an idle
-         * sits READY almost permanently by design, so aging would walk it
-         * up to PRIORITY_REALTIME within a few hundred ticks -- and under
-         * strict band priority, an idle in band 0 doesn't just waste a
-         * slice, it STARVES every real thread in the lower bands
-         * outright. Aging exists to protect real, transiently-starved
-         * work; "waiting" is the idles' entire job. */
-        if (t->pinned_cpu >= 0) {
-            continue;
-        }
-        /* A suspended thread (EmbDBG v2 control) is frozen by intent, not
-         * starved — the same reasoning that exempts the idles above. Aging it
-         * would walk its priority up to REALTIME while frozen and, on resume,
-         * let it starve everything below it (the shell that issued `resume`
-         * included). Freeze means freeze: no run, no aging. */
-        if (t->suspended) {
-            continue;
-        }
-        if (++t->ticks_since_scheduled >= PRIORITY_AGE_TICKS) {
-            if (t->priority > PRIORITY_REALTIME) {
-                t->priority--;
-            }
-            t->ticks_since_scheduled = 0;
-        }
+    /* Priority aging, timeslice accounting -- whatever the POLICY does with a
+     * tick. It used to be an inlined loop here; see process/sched.h. */
+    {
+        const struct sched_policy *pol = sched_policy_get();
+        if (pol->tick) pol->tick(current_thread);
     }
 
     /* If the OUTGOING thread is a zombie, its hand-off (or deferred
@@ -2453,77 +2432,12 @@ static void schedule_locked(void) {
      * current_thread (just handled above) can never match this scan's
      * READY/RUNNING check, so it can't come back as `next == current_thread`
      * the way a still-alive thread legitimately can. */
-    int start = 0;
-    for (int i = 0; i < MAX_THREADS; i++) {
-        if (&thread_table[i] == current_thread) {
-            start = i;
-            break;
-        }
-    }
-    struct thread *next = NULL;
-    for (int band = 0; band < SCHED_PRIORITY_BANDS && !next; band++) {
-        for (int off = 1; off <= MAX_THREADS; off++) {
-            struct thread *candidate = &thread_table[(start + off) % MAX_THREADS];
-            /* pinned_cpu: an adopted per-core idle/shell context may only
-             * ever be dispatched by its own core -- see process.h for why
-             * this is a liveness invariant, not a preference. */
-            if (candidate->pinned_cpu >= 0 &&
-                candidate->pinned_cpu != (int)this_cpu()->cpu_index) {
-                continue;
-            }
-            /* A suspended thread (process/thread suspend, EmbDBG v2 control) is
-             * frozen: never a scheduling candidate, whatever its state. This
-             * includes the current thread if it was suspended while RUNNING —
-             * the scan then skips it and this core switches to its pinned idle
-             * (never suspendable), so a fully-frozen core still has something to
-             * run. Resume just clears the flag and it is a candidate again. */
-            if (candidate->suspended) {
-                continue;
-            }
-            /* candidate == current_thread ADDS the self-fallback that lets
-             * the wrap-around land back on ourselves when nothing else is
-             * runnable in any band -- see the loop's own comment above. It
-             * must be combined with state == PROCESS_RUNNING, not used
-             * instead of a state check entirely: current_thread can be
-             * ZOMBIE here (process_exit_self() sets that before calling
-             * schedule()), and a zombie must never be re-selected as `next`
-             * regardless of what else is runnable -- the block above this
-             * loop already gave it its one, final disposition (hand off or
-             * defer-reap). Matching on identity alone let a zombie select
-             * itself via this fallback, hit the "next == current_thread"
-             * early return below, and simply resume executing as itself
-             * past process_exit_self() -- __builtin_unreachable() territory,
-             * seen hanging under -smp 4 once the two other kthreads in
-             * "test sched roundrobin" had already exited and self was the
-             * only "candidate" left. On single-core this whole distinction
-             * was invisible: current_thread was the only RUNNING thread
-             * that could ever exist, so state == PROCESS_RUNNING and
-             * candidate == current_thread were equivalent checks. Under
-             * SMP they're not: every other core has its own RUNNING thread
-             * at the same time, and matching on state alone (the ORIGINAL
-             * bug this comment used to describe) let this scan pick SOME
-             * OTHER CORE's live thread as `next` instead -- a real double
-             * fault seen bringing up AP 3 under -smp 4. Both failure modes
-             * are real; this condition is the intersection that avoids
-             * both. */
-            /* STILL RUNNING SOMEWHERE IS NOT DISPATCHABLE. A READY thread
-             * should always have running_cpu == -1 by construction, so this
-             * costs one comparison and catches the case where it does not --
-             * which is precisely the two-cores-one-stack corruption the
-             * early-return path above now prevents at its source. Belt and
-             * braces on the single most damaging thing this scan can get
-             * wrong. */
-            if (candidate != current_thread && candidate->running_cpu >= 0) {
-                continue;
-            }
-            if ((candidate->state == PROCESS_READY ||
-                 (candidate == current_thread && candidate->state == PROCESS_RUNNING))
-                && candidate->priority == band) {
-                next = candidate;
-                break;
-            }
-        }
-    }
+    /* WHICH thread runs next is the POLICY's decision, and the only thing
+     * asked of it. Everything around this call -- the lock held across the
+     * switch, the zombie hand-off above, the address-space swap below -- is
+     * mechanism that does not care what it answers. process/sched.h. */
+    struct thread *next = sched_policy_get()->pick(this_cpu()->cpu_index,
+                                                   current_thread);
 
     if (!next || next == current_thread) {
         /* No other thread to switch to, or only the current one is
@@ -2612,7 +2526,7 @@ static void schedule_locked(void) {
 
     struct thread *prev = current_thread;
     if (prev->state == PROCESS_RUNNING) {
-        prev->state = PROCESS_READY;  // Mark the previous thread as READY
+        sched_set_ready(prev);        // now runnable again; tell the policy
         prev->running_cpu = -1;       // no longer running anywhere
     } else if (prev->state == PROCESS_ZOMBIE) {
         /* The zombie's hand-off/defer-reap was decided above; the switch
@@ -2773,7 +2687,7 @@ struct thread *process_create_kthread(void (*entry)(void), struct process *paren
         return NULL;
     }
 
-    t->state = PROCESS_READY;
+    sched_set_ready(t);
     return t;
 }
 
@@ -2783,7 +2697,7 @@ struct thread *thread_create(struct process *proc, void (*entry)(void)) {
     if (!t) {
         return NULL;
     }
-    t->state = PROCESS_READY;
+    sched_set_ready(t);
     return t;
 }
 
@@ -2859,7 +2773,7 @@ int thread_create_user(struct process *proc, uint64_t entry_point, uint64_t arg)
         return -EMBK_ENOMEM;
     }
 
-    t->state = PROCESS_READY;
+    sched_set_ready(t);
     return tid;
 }
 

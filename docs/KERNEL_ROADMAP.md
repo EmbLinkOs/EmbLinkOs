@@ -171,6 +171,15 @@ capabilities rather than fork/exec.
      threads, so this is a small addition rather than a blocked one.
 3. **Per-core run queues.** One global lock guards every scheduling decision.
    It is correct and it will not scale past a handful of cores.
+   - The **policy seam now exists** (`process/sched.h`): which thread runs next
+     is a vtable, and `enqueue`/`dequeue` are called at every runnability
+     transition even though the default round-robin policy ignores them —
+     precisely so that writing a queue-based policy is a *new file* rather than
+     an edit to `schedule_locked()`, the function where two separate real bugs
+     have already been found.
+   - What is still missing before a run-queue policy is worth writing: a
+     **measurement of the contention**. Nothing yet shows `g_sched_lock` is
+     hot, and by this project's own rule that argues for measuring first.
 4. **Accounting**: per-process CPU time, so scheduling policy can be argued
    from numbers.
 5. **Deadline or reservation scheduling** for the compositor and audio, which

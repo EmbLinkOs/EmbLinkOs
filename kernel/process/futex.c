@@ -1,5 +1,6 @@
 #include "process/futex.h"
 #include "process/process.h"
+#include "process/sched.h"
 #include "include/errno.h"
 #include "include/usercopy.h"
 #include "mm/vmm.h"
@@ -160,7 +161,7 @@ int64_t futex_wake(const void *uaddr, uint32_t n) {
         struct thread *next = t->wait_next;
         if (t->futex_key == key) {
             wait_queue_remove(wq, t);
-            t->state = PROCESS_READY;
+            sched_set_ready(t);
             woken++;
         }
         t = next;

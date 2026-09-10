@@ -889,6 +889,13 @@ __attribute__((noreturn)) void thread_exit_self(int code);
  * a liveness requirement under SMP, not an optimization. */
 struct thread *process_create_idle_for_cpu(uint32_t cpu_index);
 
+/* Every thread slot, for a scheduler POLICY that decides by scanning
+ * (process/sched.h). Readable only with g_sched_lock held -- which every
+ * policy entry point already is, by contract. Nothing outside the scheduler
+ * should touch this: the rest of the kernel goes through process_* and
+ * thread_* by handle. */
+extern struct thread thread_table[MAX_THREADS];
+
 /**
  * @name Scheduler selftests
  * docs/architecture/process-and-scheduling.md §12. Each returns 0 on

@@ -200,6 +200,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/mm/vma.c \
              kernel/mm/vm_object.c \
              kernel/process/futex.c \
+             kernel/process/sched.c \
+             kernel/process/sched_rr.c \
              kernel/power/power.c \
              kernel/arch/x86_64/power/power_x86.c \
              kernel/mm/ipi.c \
