@@ -301,6 +301,7 @@ HAVE_ZLIB_ARM  := $(if $(wildcard $(ZLIB_ARM_A)),1,)
 
 ARM_SHELL_SRC := shell/value/value.c shell/wire/wire.c shell/sval/sval.c \
                  shell/lex/lex.c shell/parse/parse.c shell/eval/eval.c \
+                 shell/eval/exec.c \
                  shell/builtins/builtins.c shell/hist/hist.c \
                  shell/eval/eval_extern.c shell/builtins/builtins_os.c
 ARM_SHELL_SDK := shell/value/value.c shell/wire/wire.c shell/sval/sval.c

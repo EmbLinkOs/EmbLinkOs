@@ -56,6 +56,7 @@ void expr_free(struct expr *e) {
     case EXPR_COLUMN:  free(e->u.var.name); break;
     case EXPR_FIELD:   expr_free(e->u.field.obj); free(e->u.field.field); break;
     case EXPR_UNARY:   expr_free(e->u.unary.operand); break;
+    case EXPR_CAPTURE: pipeline_free(e->u.capture); break;
     case EXPR_BINARY:  expr_free(e->u.binary.lhs); expr_free(e->u.binary.rhs); break;
     }
     free(e);
@@ -76,10 +77,42 @@ void pipeline_free(struct pipeline *p) {
     free(p);
 }
 
+void block_free(struct block *b) {
+    if (!b) return;
+    for (size_t i = 0; i < b->n; i++) stmt_free(b->stmts[i]);
+    free(b->stmts);
+    free(b);
+}
+
 void stmt_free(struct stmt *s) {
     if (!s) return;
-    if (s->kind == STMT_PIPELINE) pipeline_free(s->u.pipe);
-    else { free(s->u.let.name); expr_free(s->u.let.expr); }
+    switch (s->kind) {
+    case STMT_PIPELINE: pipeline_free(s->u.pipe); break;
+    case STMT_LET:      free(s->u.let.name); expr_free(s->u.let.expr); break;
+    case STMT_IF:
+        expr_free(s->u.iff.cond);
+        block_free(s->u.iff.then_b);
+        block_free(s->u.iff.else_b);
+        break;
+    case STMT_WHILE:
+        expr_free(s->u.wh.cond);
+        block_free(s->u.wh.body);
+        break;
+    case STMT_FOR:
+        free(s->u.fr.var);
+        expr_free(s->u.fr.seq);
+        block_free(s->u.fr.body);
+        break;
+    case STMT_DEF:
+        free(s->u.def.name);
+        for (size_t i = 0; i < s->u.def.nparams; i++) free(s->u.def.params[i]);
+        free(s->u.def.params);
+        block_free(s->u.def.body);
+        break;
+    case STMT_RETURN:   expr_free(s->u.ret); break;
+    case STMT_BREAK:
+    case STMT_CONTINUE: break;
+    }
     free(s);
 }
 
@@ -123,6 +156,7 @@ static bool is_comparison(enum tok_type t) {
 }
 
 static struct expr *parse_expr(struct parser *P, int min_bp);
+static struct pipeline *parse_pipeline(struct parser *P);
 
 /* --- prefix position: literals, names, unary ops, parens --- */
 static struct expr *parse_prefix(struct parser *P) {
@@ -189,6 +223,25 @@ static struct expr *parse_prefix(struct parser *P) {
         if (!e) { expr_free(operand); return NULL; }
         e->u.unary.op = (int)t->type;
         e->u.unary.operand = operand;
+        return e;
+    }
+    case TOK_DOLLAR_LPAREN: {
+        /* $( pipeline ) -- newlines inside are insignificant: the thing is
+         * bracketed, so "where does it end" is already answered. */
+        adv(P);
+        while (pk(P)->type == TOK_NEWLINE) adv(P);
+        struct pipeline *pl = parse_pipeline(P);
+        if (!pl) return NULL;
+        while (pk(P)->type == TOK_NEWLINE) adv(P);
+        if (pk(P)->type != TOK_RPAREN) {
+            perr(P, pk(P), "expected ')' to close '$('");
+            pipeline_free(pl);
+            return NULL;
+        }
+        adv(P);
+        struct expr *e = expr_new(P, EXPR_CAPTURE, t);
+        if (!e) { pipeline_free(pl); return NULL; }
+        e->u.capture = pl;
         return e;
     }
     case TOK_LPAREN: {
@@ -295,8 +348,14 @@ static struct command *parse_command(struct parser *P) {
     if (!cmd->name) { perr(P, name, "out of memory"); free(cmd); return NULL; }
 
     size_t cap = 0;
-    while (pk(P)->type != TOK_PIPE && pk(P)->type != TOK_EOF &&
-           pk(P)->type != TOK_RPAREN) {
+    /* Arguments stop at anything that ENDS a command. The three new ones are
+     * the statement separators and '{': without them, `if ok { echo hi }`
+     * would swallow the brace as another argument to `ok` and the block would
+     * never be seen. '}' is here for the same reason, one level out. */
+    while (pk(P)->type != TOK_PIPE   && pk(P)->type != TOK_EOF &&
+           pk(P)->type != TOK_RPAREN && pk(P)->type != TOK_NEWLINE &&
+           pk(P)->type != TOK_SEMI   && pk(P)->type != TOK_LBRACE &&
+           pk(P)->type != TOK_RBRACE) {
         struct expr *arg = parse_expr(P, BP_NONE);
         if (!arg) { command_free(cmd); return NULL; }
         if (cmd->nargs == cap) {
@@ -333,6 +392,10 @@ static struct pipeline *parse_pipeline(struct parser *P) {
 
         if (pk(P)->type != TOK_PIPE) break;
         adv(P);                                   /* consume '|' */
+        /* A line that ends in '|' obviously continues. This is the one place
+         * a newline is NOT a separator, and it is why long pipelines can be
+         * written down the page instead of off the right of the screen. */
+        while (pk(P)->type == TOK_NEWLINE) adv(P);
         if (pk(P)->type == TOK_EOF) {
             perr(P, pk(P), "expected a command after '|'");
             pipeline_free(pl);
@@ -340,6 +403,320 @@ static struct pipeline *parse_pipeline(struct parser *P) {
         }
     }
     return pl;
+}
+
+/* -------------------------------------------------------------------------
+ * STATEMENTS AND BLOCKS -- the grammar that turned this from a launcher into
+ * a language.
+ *
+ *   program := sep* ( stmt ( sep+ stmt )* )? sep*
+ *   sep     := NEWLINE | ';'
+ *   stmt    := "let" IDENT "=" expr
+ *            | "if" expr block ( "else" ( block | if-stmt ) )?
+ *            | "while" expr block
+ *            | "for" IDENT "in" expr block
+ *            | "def" IDENT ( "(" IDENT ("," IDENT)* ")" )? block
+ *            | "break" | "continue" | "return" expr?
+ *            | pipeline
+ *   block   := "{" program "}"
+ *
+ * `else if` is parsed as an else-block containing one if-statement rather
+ * than as its own keyword. One rule, arbitrary depth, and nothing in the
+ * evaluator has to know the difference.
+ * ------------------------------------------------------------------------- */
+static struct block *parse_block_braced(struct parser *P);
+static struct stmt  *parse_stmt(struct parser *P);
+
+static bool is_sep(enum tok_type t) { return t == TOK_NEWLINE || t == TOK_SEMI; }
+
+static void skip_seps(struct parser *P) {
+    while (is_sep(pk(P)->type)) adv(P);
+}
+
+static struct stmt *stmt_new(struct parser *P, enum stmt_kind k, const struct token *at) {
+    struct stmt *s = (struct stmt *)calloc(1, sizeof(*s));
+    if (!s) { perr(P, at, "out of memory"); return NULL; }
+    s->kind = k;
+    s->line = at->line;
+    s->col  = at->col;
+    return s;
+}
+
+static int block_push(struct parser *P, struct block *b, struct stmt *st, size_t *cap) {
+    if (b->n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 8;
+        struct stmt **ns = (struct stmt **)realloc(b->stmts, nc * sizeof(*ns));
+        if (!ns) { perr(P, pk(P), "out of memory"); return -1; }
+        b->stmts = ns;
+        *cap = nc;
+    }
+    b->stmts[b->n++] = st;
+    return 0;
+}
+
+/* Statements until `end` (TOK_RBRACE inside a block, TOK_EOF at top level). */
+static struct block *parse_stmts_until(struct parser *P, enum tok_type end) {
+    struct block *b = (struct block *)calloc(1, sizeof(*b));
+    if (!b) { perr(P, pk(P), "out of memory"); return NULL; }
+
+    size_t cap = 0;
+    for (;;) {
+        skip_seps(P);
+        if (pk(P)->type == end || pk(P)->type == TOK_EOF) break;
+
+        struct stmt *st = parse_stmt(P);
+        if (!st) { block_free(b); return NULL; }
+        if (block_push(P, b, st, &cap) != 0) { stmt_free(st); block_free(b); return NULL; }
+
+        /* After a statement the only legal things are a separator or the
+         * end of the block. Saying so here is what turns `echo a echo b`
+         * into an error instead of one command with three arguments. */
+        if (is_sep(pk(P)->type)) continue;
+        if (pk(P)->type == end || pk(P)->type == TOK_EOF) break;
+        perr(P, pk(P), "expected a newline or ';' between statements");
+        block_free(b);
+        return NULL;
+    }
+    return b;
+}
+
+static struct block *parse_block_braced(struct parser *P) {
+    if (pk(P)->type != TOK_LBRACE) {
+        perr(P, pk(P), "expected '{'");
+        return NULL;
+    }
+    adv(P);
+    struct block *b = parse_stmts_until(P, TOK_RBRACE);
+    if (!b) return NULL;
+    if (pk(P)->type != TOK_RBRACE) {
+        perr(P, pk(P), "expected '}' to close the block");
+        block_free(b);
+        return NULL;
+    }
+    adv(P);
+    return b;
+}
+
+static struct stmt *parse_if(struct parser *P) {
+    const struct token *kw = pk(P);
+    adv(P);                                   /* 'if' */
+
+    struct stmt *s = stmt_new(P, STMT_IF, kw);
+    if (!s) return NULL;
+
+    s->u.iff.cond = parse_expr(P, BP_NONE);
+    if (!s->u.iff.cond) { stmt_free(s); return NULL; }
+
+    s->u.iff.then_b = parse_block_braced(P);
+    if (!s->u.iff.then_b) { stmt_free(s); return NULL; }
+
+    /* `else` may sit on the line after '}' -- which reads naturally and would
+     * otherwise be a separator ending the statement. Look past newlines for
+     * it, but ONLY for it: anything else and the if is complete. */
+    size_t save = P->pos;
+    while (pk(P)->type == TOK_NEWLINE) adv(P);
+    if (pk(P)->type != TOK_ELSE) { P->pos = save; return s; }
+    adv(P);                                   /* 'else' */
+
+    if (pk(P)->type == TOK_IF) {
+        /* else-if: an else block holding exactly one if. */
+        struct stmt *inner = parse_if(P);
+        if (!inner) { stmt_free(s); return NULL; }
+        struct block *b = (struct block *)calloc(1, sizeof(*b));
+        if (!b) { perr(P, kw, "out of memory"); stmt_free(inner); stmt_free(s); return NULL; }
+        size_t cap = 0;
+        if (block_push(P, b, inner, &cap) != 0) { stmt_free(inner); free(b); stmt_free(s); return NULL; }
+        s->u.iff.else_b = b;
+        return s;
+    }
+
+    s->u.iff.else_b = parse_block_braced(P);
+    if (!s->u.iff.else_b) { stmt_free(s); return NULL; }
+    return s;
+}
+
+static struct stmt *parse_while(struct parser *P) {
+    const struct token *kw = pk(P);
+    adv(P);
+    struct stmt *s = stmt_new(P, STMT_WHILE, kw);
+    if (!s) return NULL;
+    s->u.wh.cond = parse_expr(P, BP_NONE);
+    if (!s->u.wh.cond) { stmt_free(s); return NULL; }
+    s->u.wh.body = parse_block_braced(P);
+    if (!s->u.wh.body) { stmt_free(s); return NULL; }
+    return s;
+}
+
+static struct stmt *parse_for(struct parser *P) {
+    const struct token *kw = pk(P);
+    adv(P);
+    struct stmt *s = stmt_new(P, STMT_FOR, kw);
+    if (!s) return NULL;
+
+    const struct token *var = pk(P);
+    if (var->type != TOK_IDENT) {
+        perr(P, var, "expected a loop variable name after 'for'");
+        stmt_free(s);
+        return NULL;
+    }
+    adv(P);
+    s->u.fr.var = copy_slice(var->lexeme, var->lexeme_len);
+    if (!s->u.fr.var) { perr(P, var, "out of memory"); stmt_free(s); return NULL; }
+
+    if (pk(P)->type != TOK_IN) {
+        perr(P, pk(P), "expected 'in' after the loop variable");
+        stmt_free(s);
+        return NULL;
+    }
+    adv(P);
+
+    s->u.fr.seq = parse_expr(P, BP_NONE);
+    if (!s->u.fr.seq) { stmt_free(s); return NULL; }
+    s->u.fr.body = parse_block_braced(P);
+    if (!s->u.fr.body) { stmt_free(s); return NULL; }
+    return s;
+}
+
+static struct stmt *parse_def(struct parser *P) {
+    const struct token *kw = pk(P);
+    adv(P);
+    struct stmt *s = stmt_new(P, STMT_DEF, kw);
+    if (!s) return NULL;
+
+    const struct token *name = pk(P);
+    if (name->type != TOK_IDENT) {
+        perr(P, name, "expected a command name after 'def'");
+        stmt_free(s);
+        return NULL;
+    }
+    adv(P);
+    s->u.def.name = copy_slice(name->lexeme, name->lexeme_len);
+    if (!s->u.def.name) { perr(P, name, "out of memory"); stmt_free(s); return NULL; }
+
+    /* The parameter list is optional: `def hello { ... }` is a command that
+     * takes nothing, and having to write `()` for it would be ceremony. */
+    if (pk(P)->type == TOK_LPAREN) {
+        adv(P);
+        size_t cap = 0;
+        while (pk(P)->type != TOK_RPAREN) {
+            const struct token *pt = pk(P);
+            if (pt->type != TOK_IDENT) {
+                perr(P, pt, "expected a parameter name");
+                stmt_free(s);
+                return NULL;
+            }
+            adv(P);
+            if (s->u.def.nparams == cap) {
+                size_t nc = cap ? cap * 2 : 4;
+                char **np = (char **)realloc(s->u.def.params, nc * sizeof(*np));
+                if (!np) { perr(P, pt, "out of memory"); stmt_free(s); return NULL; }
+                s->u.def.params = np;
+                cap = nc;
+            }
+            s->u.def.params[s->u.def.nparams] = copy_slice(pt->lexeme, pt->lexeme_len);
+            if (!s->u.def.params[s->u.def.nparams]) {
+                perr(P, pt, "out of memory"); stmt_free(s); return NULL;
+            }
+            s->u.def.nparams++;
+
+            if (pk(P)->type == TOK_COMMA) { adv(P); continue; }
+            if (pk(P)->type != TOK_RPAREN) {
+                perr(P, pk(P), "expected ',' or ')' in the parameter list");
+                stmt_free(s);
+                return NULL;
+            }
+        }
+        adv(P);                               /* ')' */
+    }
+
+    s->u.def.body = parse_block_braced(P);
+    if (!s->u.def.body) { stmt_free(s); return NULL; }
+    return s;
+}
+
+static struct stmt *parse_let(struct parser *P) {
+    const struct token *kw = pk(P);
+    adv(P);
+    const struct token *name = pk(P);
+    if (name->type != TOK_IDENT) {
+        perr(P, name, "expected a variable name after 'let'");
+        return NULL;
+    }
+    adv(P);
+    if (pk(P)->type != TOK_ASSIGN) {
+        perr(P, pk(P), "expected '=' in let binding");
+        return NULL;
+    }
+    adv(P);
+    struct expr *e = parse_expr(P, BP_NONE);
+    if (!e) return NULL;
+
+    struct stmt *s = stmt_new(P, STMT_LET, kw);
+    if (!s) { expr_free(e); return NULL; }
+    s->u.let.name = copy_slice(name->lexeme, name->lexeme_len);
+    s->u.let.expr = e;
+    if (!s->u.let.name) { perr(P, name, "out of memory"); stmt_free(s); return NULL; }
+    return s;
+}
+
+static struct stmt *parse_stmt(struct parser *P) {
+    const struct token *t = pk(P);
+    switch (t->type) {
+    case TOK_LET:   return parse_let(P);
+    case TOK_IF:    return parse_if(P);
+    case TOK_WHILE: return parse_while(P);
+    case TOK_FOR:   return parse_for(P);
+    case TOK_DEF:   return parse_def(P);
+    case TOK_BREAK:
+    case TOK_CONTINUE: {
+        struct stmt *s = stmt_new(P, t->type == TOK_BREAK ? STMT_BREAK : STMT_CONTINUE, t);
+        if (s) adv(P);
+        return s;
+    }
+    case TOK_RETURN: {
+        struct stmt *s = stmt_new(P, STMT_RETURN, t);
+        if (!s) return NULL;
+        adv(P);
+        /* `return` alone is legal; a value is optional. Anything that ends a
+         * statement means there is no expression to read. */
+        if (!is_sep(pk(P)->type) && pk(P)->type != TOK_EOF &&
+            pk(P)->type != TOK_RBRACE) {
+            s->u.ret = parse_expr(P, BP_NONE);
+            if (!s->u.ret) { stmt_free(s); return NULL; }
+        }
+        return s;
+    }
+    default: {
+        struct pipeline *pl = parse_pipeline(P);
+        if (!pl) return NULL;
+        struct stmt *s = stmt_new(P, STMT_PIPELINE, t);
+        if (!s) { pipeline_free(pl); return NULL; }
+        s->u.pipe = pl;
+        return s;
+    }
+    }
+}
+
+struct block *parse_program(const struct token *toks, size_t ntoks,
+                            char *err, size_t errcap) {
+    struct parser P = { toks, ntoks, 0, err, errcap, false };
+    if (errcap) err[0] = '\0';
+
+    for (size_t i = 0; i < ntoks; i++) {
+        if (toks[i].type == TOK_ERROR) {
+            perr(&P, &toks[i], toks[i].lexeme ? toks[i].lexeme : "lex error");
+            return NULL;
+        }
+    }
+
+    struct block *b = parse_stmts_until(&P, TOK_EOF);
+    if (!b) return NULL;
+    if (pk(&P)->type != TOK_EOF) {
+        perr(&P, pk(&P), "unexpected trailing input");
+        block_free(b);
+        return NULL;
+    }
+    return b;
 }
 
 /* -------------------------------------------------------------------------
@@ -357,6 +734,11 @@ struct stmt *parse(const struct token *toks, size_t ntoks, char *err, size_t err
             return NULL;
         }
     }
+
+    /* Newlines are TOKENS now (lex.h). A single-statement caller means "this
+     * one statement", so blank lines around it are not input -- skip them
+     * rather than making every existing caller strip its own whitespace. */
+    while (pk(&P)->type == TOK_NEWLINE) adv(&P);
 
     struct stmt *s = (struct stmt *)calloc(1, sizeof(*s));
     if (!s) { perr(&P, pk(&P), "out of memory"); return NULL; }
@@ -389,6 +771,7 @@ struct stmt *parse(const struct token *toks, size_t ntoks, char *err, size_t err
         s->u.pipe = pl;
     }
 
+    while (pk(&P)->type == TOK_NEWLINE || pk(&P)->type == TOK_SEMI) adv(&P);
     if (pk(&P)->type != TOK_EOF) {
         perr(&P, pk(&P), "unexpected trailing input");
         stmt_free(s);

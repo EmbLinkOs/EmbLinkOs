@@ -18,12 +18,14 @@
 #include "lex/lex.h"
 #include "parse/parse.h"
 #include "eval/eval.h"
+#include "eval/exec.h"
 #include "sval/sval.h"
 #include "hist/hist.h"
 #include "embk.h"        /* EMBK_KEY_UP/DOWN -- the kernel's private arrow codes */
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <sys/stat.h>
 
 
@@ -59,59 +61,131 @@ void shell_tty_resume(void) {
 static void puts1(const char *s) { write(1, s, strlen(s)); }
 
 /* -------------------------------------------------------------------------
- * Run one line through the stages. Returns 0 on success, 1 on any error
- * (which has already been printed).
+ * THE SINK -- what happens to each statement's value.
+ *
+ * The executor must not know whether a human is watching: a `for` loop's body
+ * inside a script and a line typed at the prompt take the identical path, and
+ * the only difference is where the result goes. If this shell was composed
+ * into a bigger pipeline (fd 3 is a structured pipe) it EMITS a frame;
+ * otherwise it pretty-prints.
  * ------------------------------------------------------------------------- */
-static int run_line(const char *line, struct scope *top) {
+static void print_sink(struct value *v, void *ctx) {
+    (void)ctx;
+    if (sval_structured_out())
+        (void)sval_emit(v);
+    else
+        (void)sval_print(v, 1);
+}
+
+/* -------------------------------------------------------------------------
+ * Run a PROGRAM -- one typed line, or a whole script file. Returns 0 on
+ * success, 1 on any error (already printed).
+ *
+ * A parsed program whose statements include a `def` is HANDED to the executor
+ * rather than freed: a definition stores a borrowed pointer into this AST, so
+ * freeing it here would leave the command table pointing at freed memory the
+ * moment the line that defined it returned. exec_retain_program() says so out
+ * loud instead of leaving it to a comment.
+ * ------------------------------------------------------------------------- */
+static bool block_defines_a_command(const struct block *b) {
+    for (size_t i = 0; i < b->n; i++) {
+        if (b->stmts[i]->kind == STMT_DEF) return true;
+        /* A `def` nested inside `if`/`while`/`for` is legal and reaches the
+         * table the same way, so the whole AST has to be retained for it too.
+         * Rather than walk every arm, treat any control-flow statement as
+         * possibly containing one: the cost of being wrong in this direction
+         * is one retained AST, and in the other it is a use-after-free. */
+        switch (b->stmts[i]->kind) {
+        case STMT_IF: case STMT_WHILE: case STMT_FOR: return true;
+        default: break;
+        }
+    }
+    return false;
+}
+
+static int run_program(const char *src, struct scope *top) {
     size_t ntoks = 0;
-    struct token *toks = lex(line, &ntoks);
+    struct token *toks = lex(src, &ntoks);
     if (!toks) { puts1("error: out of memory\n"); return 1; }
 
-    /* an empty line lexes to just EOF -- nothing to do */
-    if (ntoks == 1 && toks[0].type == TOK_EOF) {
-        lex_free_tokens(toks, ntoks);
-        return 0;
-    }
-
     char err[160];
-    struct stmt *st = parse(toks, ntoks, err, sizeof err);
+    struct block *prog = parse_program(toks, ntoks, err, sizeof err);
     lex_free_tokens(toks, ntoks);
-    if (!st) {
+    if (!prog) {
         puts1("error: ");
         puts1(err);
         puts1("\n");
         return 1;
     }
+    if (prog->n == 0) { block_free(prog); return 0; }   /* blank input */
 
-    int rc = 0;
-    if (st->kind == STMT_LET) {
-        struct value v = expr_eval(st->u.let.expr, top);
-        if (v.type == VAL_ERROR) {
-            puts1("error: ");
-            puts1(value_error_msg(&v));
-            puts1("\n");
-            value_free(&v);
-            rc = 1;
-        } else if (scope_bind(top, st->u.let.name, v) != 0) {
-            puts1("error: out of memory\n");
-            rc = 1;
-        }
-    } else {
-        struct value out = pipeline_run(st->u.pipe, top);
-        if (out.type == VAL_ERROR) {
-            puts1("error: ");
-            puts1(value_error_msg(&out));
-            puts1("\n");
-            rc = 1;
-        } else if (out.type != VAL_NULL) {
-            if (sval_structured_out())
-                (void)sval_emit(&out);       /* composed into a larger pipeline */
-            else
-                (void)sval_print(&out, 1);   /* a human is watching */
-        }
-        value_free(&out);
+    struct exec_out out = { FLOW_NORMAL, value_null(), false };
+    int rc = block_exec(prog, top, print_sink, NULL, &out);
+
+    if (rc != 0) {
+        puts1("error: ");
+        puts1(out.value.type == VAL_ERROR ? value_error_msg(&out.value)
+                                          : "command failed");
+        puts1("\n");
+    } else if (out.flow == FLOW_BREAK || out.flow == FLOW_CONTINUE) {
+        /* Reaching the top still unwinding means there was no loop to unwind
+         * to. Silence here would make a misplaced `break` look like it worked. */
+        puts1("error: ");
+        puts1(out.flow == FLOW_BREAK ? "'break' outside a loop\n"
+                                     : "'continue' outside a loop\n");
+        rc = -1;
     }
-    stmt_free(st);
+    value_free(&out.value);
+
+    if (block_defines_a_command(prog)) {
+        if (!exec_retain_program(prog)) {
+            puts1("error: too many definitions in this session\n");
+            rc = -1;
+        }
+        /* NOT freed -- the command table points into it. */
+    } else {
+        block_free(prog);
+    }
+    return rc != 0 ? 1 : 0;
+}
+
+/* One typed line. Kept as its own name because that is what the REPL, `-c`
+ * and the completion probe all mean; a line is simply the shortest program. */
+static int run_line(const char *line, struct scope *top) {
+    return run_program(line, top);
+}
+
+/* -------------------------------------------------------------------------
+ * Run a SCRIPT FILE. The whole file is read and parsed as ONE program, not
+ * line by line: a block spans lines, and a line-at-a-time reader cannot see
+ * the end of one.
+ *
+ * A leading `#!` line is skipped rather than parsed. It is a comment to the
+ * lexer anyway (`#` already starts one), so this is belt and braces -- but it
+ * means a script that names an interpreter reads correctly whether or not the
+ * kernel ever learns to honour it.
+ * ------------------------------------------------------------------------- */
+static int run_script(const char *path, struct scope *top) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        puts1("shell: cannot open ");
+        puts1(path);
+        puts1("\n");
+        return 1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); puts1("shell: cannot size the script\n"); return 1; }
+    long n = ftell(f);
+    if (n < 0) { fclose(f); puts1("shell: cannot size the script\n"); return 1; }
+    rewind(f);
+
+    char *src = (char *)malloc((size_t)n + 1);
+    if (!src) { fclose(f); puts1("shell: out of memory\n"); return 1; }
+    size_t got = fread(src, 1, (size_t)n, f);
+    fclose(f);
+    src[got] = '\0';
+
+    int rc = run_program(src, top);
+    free(src);
     return rc;
 }
 
@@ -256,9 +330,26 @@ int main(int argc, char **argv) {
             sval_set_colour(1);
     }
 
-    /* one-shot mode: shell.elf -c "ls | where size > 1mb" */
+    /* The executor needs the session's top scope (user commands resolve
+     * against it) and the sink their bodies print through, before ANY program
+     * runs -- including the one-shot forms below. */
+    exec_init(&top, print_sink, NULL);
+
+    /* one-shot mode: shell.elf -c "ls | where size > 1mb"
+     * The argument is a whole PROGRAM, so `-c 'if x { a } else { b }'` works
+     * and semicolons separate statements. */
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
-        int rc = run_line(argv[2], &top);
+        int rc = run_program(argv[2], &top);
+        scope_free(&top);
+        return rc;
+    }
+
+    /* script mode: shell.elf path.esh
+     * The first non-flag argument is a script to run. This is what makes the
+     * system automatable at all -- until now every capability the shell had
+     * required a human to type it. */
+    if (argc >= 2 && argv[1][0] != '-') {
+        int rc = run_script(argv[1], &top);
         scope_free(&top);
         return rc;
     }

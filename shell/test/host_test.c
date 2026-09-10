@@ -372,11 +372,127 @@ static void test_hist(void) {
     CHECK(hist_get(hist_count()) == NULL, "out-of-range index is NULL");
 }
 
+/* ---------------------------------------------------------------------------
+ * The PROGRAM grammar: statements, blocks, control flow, definitions.
+ *
+ * These test the PARSER, not the executor -- the executor needs a sink and a
+ * top-level scope that only the driver has. What is being pinned here is that
+ * the shape of a program is understood: that a newline separates statements
+ * but does not end a pipeline mid-'|', that a block spans lines, and that the
+ * forms nest.
+ * ------------------------------------------------------------------------- */
+static struct block *prog_ok(const char *src) {
+    size_t n = 0;
+    struct token *t = lex(src, &n);
+    char err[160];
+    struct block *b = parse_program(t, n, err, sizeof err);
+    if (!b) printf("       parse failed: %s\n", err);
+    lex_free_tokens(t, n);
+    return b;
+}
+
+static bool prog_fails(const char *src) {
+    size_t n = 0;
+    struct token *t = lex(src, &n);
+    char err[160];
+    struct block *b = parse_program(t, n, err, sizeof err);
+    lex_free_tokens(t, n);
+    if (b) { block_free(b); return false; }
+    return true;
+}
+
+static void test_program(void) {
+    printf("program grammar:\n");
+
+    struct block *b = prog_ok("echo one\necho two\necho three");
+    CHECK(b && b->n == 3, "newlines separate statements");
+    block_free(b);
+
+    b = prog_ok("echo one; echo two");
+    CHECK(b && b->n == 2, "';' separates statements on one line");
+    block_free(b);
+
+    b = prog_ok("\n\n  \n echo hi \n\n");
+    CHECK(b && b->n == 1, "blank lines are not statements");
+    block_free(b);
+
+    /* The one place a newline must NOT end the statement. */
+    b = prog_ok("ls |\n  where size > 1 |\n  count");
+    CHECK(b && b->n == 1 && b->stmts[0]->kind == STMT_PIPELINE &&
+          b->stmts[0]->u.pipe->nstages == 3,
+          "a pipeline continues across a newline after '|'");
+    block_free(b);
+
+    b = prog_ok("if true { echo yes }");
+    CHECK(b && b->n == 1 && b->stmts[0]->kind == STMT_IF &&
+          b->stmts[0]->u.iff.else_b == NULL, "if with no else");
+    block_free(b);
+
+    b = prog_ok("if true {\n  echo yes\n} else {\n  echo no\n}");
+    CHECK(b && b->n == 1 && b->stmts[0]->kind == STMT_IF &&
+          b->stmts[0]->u.iff.then_b->n == 1 &&
+          b->stmts[0]->u.iff.else_b->n == 1, "if/else spanning lines");
+    block_free(b);
+
+    /* `else` on the line after '}' -- which reads naturally and would
+     * otherwise be a separator ending the statement. */
+    b = prog_ok("if true { echo a }\nelse { echo b }");
+    CHECK(b && b->n == 1 && b->stmts[0]->u.iff.else_b != NULL,
+          "'else' may start the next line");
+    block_free(b);
+
+    /* A statement is a pipeline, a let, or a control form -- a bare literal
+     * is not one, so the arms here are commands. */
+    b = prog_ok("if a { echo 1 } else if b { echo 2 } else { echo 3 }");
+    CHECK(b && b->n == 1 && b->stmts[0]->u.iff.else_b &&
+          b->stmts[0]->u.iff.else_b->n == 1 &&
+          b->stmts[0]->u.iff.else_b->stmts[0]->kind == STMT_IF,
+          "else-if is an else block holding one if");
+    block_free(b);
+
+    b = prog_ok("while true { break }");
+    CHECK(b && b->n == 1 && b->stmts[0]->kind == STMT_WHILE &&
+          b->stmts[0]->u.wh.body->stmts[0]->kind == STMT_BREAK, "while + break");
+    block_free(b);
+
+    b = prog_ok("for f in $files { echo $f }");
+    CHECK(b && b->n == 1 && b->stmts[0]->kind == STMT_FOR &&
+          strcmp(b->stmts[0]->u.fr.var, "f") == 0, "for/in binds a loop variable");
+    block_free(b);
+
+    b = prog_ok("def hello { echo hi }");
+    CHECK(b && b->n == 1 && b->stmts[0]->kind == STMT_DEF &&
+          b->stmts[0]->u.def.nparams == 0, "def with no parameter list");
+    block_free(b);
+
+    b = prog_ok("def greet(name, punct) {\n  echo $name\n  return 1\n}");
+    CHECK(b && b->n == 1 && b->stmts[0]->kind == STMT_DEF &&
+          b->stmts[0]->u.def.nparams == 2 &&
+          strcmp(b->stmts[0]->u.def.params[1], "punct") == 0 &&
+          b->stmts[0]->u.def.body->n == 2, "def with parameters and a return");
+    block_free(b);
+
+    b = prog_ok("for x in $xs {\n  if $x > 3 {\n    while true { break }\n  }\n}");
+    CHECK(b && b->n == 1 && b->stmts[0]->kind == STMT_FOR, "the forms nest");
+    block_free(b);
+
+    /* Two commands on one line with nothing between them was previously read
+     * as one command with extra arguments. Saying so is the difference
+     * between a typo and a surprise. */
+    CHECK(prog_fails("echo a echo b\n" ) == false,
+          "bare words are still arguments, not a missing separator");
+    CHECK(prog_fails("if true { echo hi"), "an unclosed block is an error");
+    CHECK(prog_fails("if true echo hi"), "a block is required after if");
+    CHECK(prog_fails("for in $xs { }"), "for needs a variable name");
+    CHECK(prog_fails("def (a) { }"), "def needs a name");
+}
+
 int main(void) {
     printf("=== shell host tests ===\n");
     test_lexer();
     test_wire();
     test_parser();
+    test_program();
     test_eval();
     test_hist();
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall green\n", g_fail);

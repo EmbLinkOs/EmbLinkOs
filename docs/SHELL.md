@@ -79,10 +79,100 @@ shell/
 ## 3. The grammar
 
 ```
-line     := "let" IDENT "=" expr | pipeline
+program  := sep* ( stmt ( sep+ stmt )* )? sep*
+sep      := NEWLINE | ";"
+stmt     := "let" IDENT "=" expr
+          | "if" expr block ( "else" ( block | if-stmt ) )?
+          | "while" expr block
+          | "for" IDENT "in" expr block
+          | "def" IDENT ( "(" IDENT ("," IDENT)* ")" )? block
+          | "break" | "continue" | "return" expr?
+          | pipeline
+block    := "{" program "}"
 pipeline := command ("|" command)*
-command  := IDENT expr*            (args end at '|', ')' or end of line)
+command  := IDENT expr*      (args end at '|', ')', '{', '}', ';', newline, EOF)
+expr     := ... | "$(" pipeline ")"      -- command substitution
 ```
+
+**A NEWLINE IS A TOKEN, not whitespace.** It separates statements everywhere
+except the three places a statement obviously continues: after a `|`, inside
+`$( )` and `( )`, and around a block's braces. `else` may also start the line
+after a closing `}`, because that is how people write it.
+
+**Why this exists at all.** The shell could always compose commands with `|`.
+It could not decide, repeat, or be extended — and with thirty builtins and
+fifty-odd programs and no way to branch, a user has eighty capabilities. With
+`if`, `while`, `for` and `def` they have as many as they are willing to write
+down, and can add one *without rebuilding the OS*. That is the difference
+between a launcher and a language.
+
+### Command substitution is `$(...)`, never `(...)`
+
+Plain parentheses group expressions. `(total)` would otherwise have to be a
+guess between "the bare word `total`" and "run the command `total`" — and a
+guess like that is wrong *silently*, in whichever direction it is made. `$` is
+already how this language says "a value from somewhere", so `$(ls /)` reads as
+what it is.
+
+```
+for row in $(ls /) { echo $row.name }
+let n = $(ls / | count)
+```
+
+### Defined commands are functions
+
+```
+def bigger-than(n) {
+    ls | where size > $n
+}
+
+bigger-than 1mb | count
+```
+
+- Arguments are **expressions, evaluated in the caller's scope**, bound to the
+  parameter names in a fresh child scope whose parent is the *top-level*
+  scope — not the caller's. A callee that forgot to declare something must not
+  be silently satisfied by a local of whoever called it.
+- Arity is checked. `one 1 2` where `one` takes one parameter is an error, not
+  a silently dropped argument.
+- The pipeline's input arrives as **`$in`**. A command that ignores it is a
+  source; one that uses it is a filter.
+- The result is the last statement's value, or whatever `return` carried — so
+  a definition composes into a pipeline like any other stage.
+- **A body's statements do not print.** A command is a function: its output is
+  its return value and the caller decides what happens to it. The cost is that
+  `def f { echo a; echo b }` yields only `b`; the benefit is that `f | count`
+  counts rows instead of printing them, which is the whole point of being able
+  to define one.
+
+### Name resolution
+
+```
+builtin  >  user command  >  external program
+```
+
+Builtins win because they are the language's own verbs — `where`, `select` and
+`sort-by` are as much a part of the grammar as `if` is, and a script that
+shadowed one would change the meaning of every pipeline that followed it,
+including ones its author never read. User commands beat programs on disk so
+that `def` genuinely extends the system.
+
+### Scripts
+
+```
+shell.elf path.esh        run a script file
+shell.elf -c "program"    run one program from the command line
+```
+
+A script is read and parsed **whole**, not line by line: a block spans lines
+and a line-at-a-time reader cannot see the end of one. A leading `#!` is
+skipped (and `#` already starts a comment, so it costs nothing).
+
+`while` refuses after ten million iterations. There is no job control and no
+way to interrupt a running script, so `while true { }` would otherwise wedge
+the machine until it is reset — the loop says which line did it instead of
+hanging. **Remove that ceiling the day the shell can be interrupted, and not
+before.**
 
 **Every command argument is an expression** — no command has a bespoke arg
 parser. `where`'s arg is the expr `size > 1mb`; `ls`'s arg is the bare word
@@ -351,6 +441,18 @@ Three gaps closed in one pass, all `test fd`-asserted live:
 
 - **Streaming stages** (`tail -f` shapes) — v1 materializes.
 - **Regex `=~`** — substring today.
+- **Background jobs (`&`) and job control.** The single largest remaining gap:
+  a user cannot run two things at once from one shell, and cannot interrupt a
+  running one. The `while` iteration ceiling exists *because* of this.
+- **Globbing** (`*.txt`). `ls | where name =~ ".txt"` is the structured
+  equivalent and works today, but it is not what anyone types.
+- **Closures / commands as values.** `def` creates a name, not a value; a
+  command cannot yet be passed to another command.
+- **Early `return` from a script**, as distinct from from a command body —
+  today a top-level `return` sets the exit status and stops that block only.
 - **cwd / relative paths, env vars, Ctrl-C** — tracked in the libc/OS
-  roadmap (see the C++/Python/git plan), not shell-local.
-- **dup2-style fd aliasing** — named gap from Piece 0; nothing needs it yet.
+  roadmap, not shell-local.
+- ~~**dup2-style fd aliasing**~~ — the kernel has it now (`dup`, `dup2`,
+  `fcntl(F_DUPFD)` over a real shared open file description); the shell has
+  not yet grown the `<`/`>` syntax that would use it, because `save` and `cat`
+  already cover the cases and `>` is a comparison operator here.

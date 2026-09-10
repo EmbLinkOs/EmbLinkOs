@@ -89,4 +89,22 @@ struct value pipeline_run(const struct pipeline *pl, struct scope *top);
 struct value extern_stage_run(const struct command *cmd, struct value input,
                               struct scope *env);
 
+/* -------------------------------------------------------------------------
+ * USER-DEFINED COMMANDS, reached through a hook rather than a direct call.
+ *
+ * `def name { ... }` lives in the statement layer (eval/exec.c), which sits
+ * ABOVE this one: exec.c calls pipeline_run, so pipeline_run calling exec.c
+ * back by name would be a cycle -- and the host test build links eval.c
+ * WITHOUT exec.c at all. Two function pointers, NULL until exec_init() fills
+ * them, keep the layering honest and keep a build with no program layer
+ * behaving exactly as it did before.
+ *
+ * Resolution order is builtin, then user command, then external program; the
+ * reasoning is in exec.c's header.
+ * ------------------------------------------------------------------------- */
+extern bool (*eval_user_command_exists)(const char *name);
+extern struct value (*eval_user_command_call)(const struct command *cmd,
+                                              struct value input,
+                                              struct scope *env);
+
 #endif /* __EMBK_EVAL_H__ */

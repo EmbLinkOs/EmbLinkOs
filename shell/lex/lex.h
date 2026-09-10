@@ -29,6 +29,14 @@ enum tok_type {
     TOK_TRUE, TOK_FALSE,
     TOK_IDENT,          /* bare word: command name OR column ref (parser decides) */
     TOK_DOLLAR_IDENT,   /* $name */
+    TOK_DOLLAR_LPAREN,  /* $( -- run a pipeline and use its VALUE.
+                         * Its own token rather than '$' followed by '(' so
+                         * that command substitution is UNAMBIGUOUS. Plain
+                         * parentheses group expressions, and `(total)` would
+                         * otherwise have to be a guess between "the bare word
+                         * total" and "run the command total" -- a guess that
+                         * would be wrong silently, in whichever direction it
+                         * was made. */
     TOK_LET,            /* let */
     TOK_PIPE,           /* | */
     TOK_LPAREN, TOK_RPAREN,
@@ -39,6 +47,25 @@ enum tok_type {
     TOK_MATCH,          /* =~ */
     TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH,
     TOK_ASSIGN,         /* = */
+
+    /* --- statement structure (the shell became a language) ----------------
+     * A NEWLINE is a TOKEN, not whitespace. It was whitespace while the shell
+     * read exactly one line and handed it to a parser that demanded EOF at the
+     * end; the moment a block can span lines, "where does this statement stop"
+     * has to be answerable, and the only honest answer in a shell is "at the
+     * end of the line, unless the line clearly continues". The parser skips
+     * newlines exactly where a statement obviously continues -- after '|',
+     * inside (), and around {} -- and treats them as separators everywhere
+     * else. That is the rule every shell converges on, and writing it down as
+     * a token is what makes it checkable instead of ambient. */
+    TOK_NEWLINE,
+    TOK_SEMI,           /* ; -- the same separator, spelled inline */
+    TOK_LBRACE, TOK_RBRACE,
+
+    TOK_IF, TOK_ELSE, TOK_WHILE, TOK_FOR, TOK_IN,
+    TOK_DEF,            /* def name(a, b) { ... } -- a user-defined command */
+    TOK_BREAK, TOK_CONTINUE, TOK_RETURN,
+
     TOK_ERROR,          /* malformed input; lexeme = the message */
 };
 

@@ -192,6 +192,9 @@ static enum tok_type keyword_of(const char *s, size_t n) {
     #define KW(str, ty) if (n == sizeof(str)-1 && memcmp(s, str, n) == 0) return ty;
     KW("and", TOK_AND) KW("or", TOK_OR) KW("not", TOK_NOT)
     KW("true", TOK_TRUE) KW("false", TOK_FALSE) KW("let", TOK_LET)
+    KW("if", TOK_IF) KW("else", TOK_ELSE) KW("while", TOK_WHILE)
+    KW("for", TOK_FOR) KW("in", TOK_IN) KW("def", TOK_DEF)
+    KW("break", TOK_BREAK) KW("continue", TOK_CONTINUE) KW("return", TOK_RETURN)
     #undef KW
     return TOK_IDENT;
 }
@@ -239,6 +242,9 @@ static void scan_symbol(struct lexer *L) {
         case '(': ty = TOK_LPAREN; break;
         case ')': ty = TOK_RPAREN; break;
         case ',': ty = TOK_COMMA;  break;
+        case ';': ty = TOK_SEMI;   break;
+        case '{': ty = TOK_LBRACE; break;
+        case '}': ty = TOK_RBRACE; break;
         case '+': ty = TOK_PLUS;   break;
         case '*': ty = TOK_STAR;   break;
         case '-': ty = TOK_MINUS;  break;   /* standalone -- (a word-joining '-'
@@ -301,11 +307,26 @@ struct token *lex(const char *src, size_t *out_n) {
         char c = peek(&L);
         if (c == '\0') break;
 
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { advance(&L); continue; }
+        if (c == '\n') {
+            /* A separator, not whitespace -- see lex.h. Emitted BEFORE
+             * advance() so the token carries the line it ends, not the one it
+             * begins, which is what an error message wants to name. */
+            struct token *t = emit(&L, TOK_NEWLINE);
+            if (t) { t->lexeme = L.src + L.pos; t->lexeme_len = 1; }
+            advance(&L);
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\r') { advance(&L); continue; }
         if (c == '#') { while (peek(&L) && peek(&L) != '\n') advance(&L); continue; }
 
         if (is_digit(c))            { scan_number(&L); }
         else if (c == '"' || c == '\'') { advance(&L); scan_string(&L, c); }
+        else if (c == '$' && peek2(&L) == '(') {
+            size_t col = L.col;
+            advance(&L); advance(&L);                 /* '$' '(' */
+            struct token *t = emit(&L, TOK_DOLLAR_LPAREN);
+            if (t) { t->lexeme = L.src + L.pos - 2; t->lexeme_len = 2; t->col = col; }
+        }
         else if (c == '$')          { scan_word(&L, true); }
         /* '/' is a word char (paths: /foo/bar) -- but a '/' NOT followed by
          * a word char stands alone: DIVISION. Without this check scan_word
@@ -341,6 +362,14 @@ void lex_free_tokens(struct token *toks, size_t n) {
 
 const char *tok_type_name(enum tok_type t) {
     switch (t) {
+        case TOK_DOLLAR_LPAREN: return "'$('";
+        case TOK_NEWLINE: return "newline"; case TOK_SEMI: return "';'";
+        case TOK_LBRACE: return "'{'"; case TOK_RBRACE: return "'}'";
+        case TOK_IF: return "if"; case TOK_ELSE: return "else";
+        case TOK_WHILE: return "while"; case TOK_FOR: return "for";
+        case TOK_IN: return "in"; case TOK_DEF: return "def";
+        case TOK_BREAK: return "break"; case TOK_CONTINUE: return "continue";
+        case TOK_RETURN: return "return";
         case TOK_EOF: return "EOF"; case TOK_INT: return "INT"; case TOK_FLOAT: return "FLOAT";
         case TOK_STRING: return "STRING"; case TOK_FILESIZE: return "FILESIZE";
         case TOK_TRUE: return "true"; case TOK_FALSE: return "false";

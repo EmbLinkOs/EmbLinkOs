@@ -3255,8 +3255,10 @@ int selftests_handle_command(const char *cmd)
          * must reach the same `environ` it passes to the commands it spawns.
          * Spawned WITH an environment here, so the rendered table proves the
          * whole chain: process_create_env -> RDX -> crt0 -> environ -> builtin. */
-        /* `|`, not `;` -- the lexer has no statement separator. Builtins run
-         * IN-PROCESS, so the set and the listing share one `environ`. */
+        /* `|` rather than `;` here on purpose, even though the shell now HAS a
+         * statement separator: piping keeps both halves in ONE process, and
+         * builtins run in-process, so the set and the listing share one
+         * `environ` -- which is the thing being tested. */
         char *aenv[] = { "/system/bin/shell.elf", "-c", "env set EMBK_SET fromshell | env", NULL };
         char *senv[] = { "EMBK_ENV_TEST=shell-ok", "HOME=/", NULL };
         int pe = process_create_env("/system/bin/shell.elf", aenv, 3, senv, NULL, 0);
@@ -3295,6 +3297,105 @@ int selftests_handle_command(const char *cmd)
         kprintf("\n[cmd] test shell: expr rc=%d; ls-pipeline rc=%d; error-path rc=%d; "
                 "cmd-batch rc=%d -> %s\n",
                 c1, c2, c3, c4, ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* THE SHELL AS A LANGUAGE.
+     *
+     * `test shell` above covers pipelines -- one line, one statement. This
+     * covers the part that turns a launcher into something a user can extend:
+     * statements, branching, loops, definitions, and a SCRIPT FILE.
+     *
+     * Every case asserts an EXIT CODE, because that is the only thing a
+     * spawned shell can tell this process without a pipe. `return 0` / `return
+     * 1` from a script is the shell's own exit status, so each script below
+     * ends by deciding whether it passed -- the test cannot be fooled by a
+     * script that runs and does nothing. */
+    if (strcmp(cmd, "test shellscript") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test shellscript: VFS not registered\n");
+            return 1;
+        }
+
+        struct { const char *what; const char *src; int want; } cases[] = {
+            { "';' separates statements",
+              "echo one; echo two", 0 },
+            { "if takes the true branch",
+              "if 2 > 1 { echo yes } else { rm /definitely-not-here }", 0 },
+            { "if takes the false branch",
+              "if 1 > 2 { rm /definitely-not-here } else { echo no }", 0 },
+            { "else-if chains",
+              "if 1 > 2 { echo a } else if 2 > 1 { echo b } else { echo c }", 0 },
+            { "a condition that is not a boolean is refused",
+              "if 5 { echo nope }", 1 },
+            { "while counts and break leaves",
+              "let i = 0\n"
+              "while true {\n"
+              "  let i = $i + 1\n"
+              "  if $i > 4 { break }\n"
+              "}\n"
+              "echo $i", 0 },
+            { "for walks a table's rows",
+              "for row in $(ls /) { echo $row.name }", 0 },
+            { "def defines a command and it runs",
+              "def twice(x) { echo $x + $x }\ntwice 21", 0 },
+            { "a defined command's arity is checked",
+              "def one(x) { echo $x }\none 1 2", 1 },
+            { "a defined command composes into a pipeline",
+              "def rows { ls / }\nrows | count", 0 },
+            { "command substitution feeds an expression",
+              "let n = $(ls / | count)\nif $n > 0 { echo many } else { echo none }", 0 },
+            { "break outside a loop is an error",
+              "break", 1 },
+            { "a pipeline continues after a trailing '|'",
+              "ls / |\n  count", 0 },
+        };
+
+        int ok = 1;
+        for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char *a[] = { "/system/bin/shell.elf", "-c", (char *)cases[i].src, NULL };
+            int pid = process_create("/system/bin/shell.elf", a, 3, NULL, 0);
+            int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+            int good = (rc == cases[i].want);
+            if (!good) ok = 0;
+            kprintf("  [%s] %s (exit %d, want %d)\n",
+                    good ? "ok" : "FAIL", cases[i].what, rc, cases[i].want);
+        }
+
+        /* A REAL SCRIPT FILE, written here and run by path. This is the case
+         * that could not exist before: every capability the shell had needed a
+         * human to type it. */
+        const char *path = "/scripttest.esh";
+        const char *script =
+            "#!/system/bin/shell.elf\n"
+            "# count the entries in / two ways and agree\n"
+            "let n = 0\n"
+            "for row in $(ls /) {\n"
+            "  let n = $n + 1\n"
+            "}\n"
+            "def total { ls / | count }\n"
+            "let m = $(total)\n"
+            "if $n == $m { return 0 } else { return 1 }\n";
+
+        vfs_unlink_path(path);
+        int fd = vfs_open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int script_rc = -1;
+        if (fd >= 0) {
+            size_t w = 0;
+            (void)vfs_fd_write(fd, script, strlen(script), &w);
+            (void)vfs_fd_fsync(fd);       /* the child reads it through its own open */
+            vfs_close(fd);
+
+            char *a[] = { "/system/bin/shell.elf", (char *)path, NULL };
+            int pid = process_create("/system/bin/shell.elf", a, 2, NULL, 0);
+            script_rc = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        }
+        vfs_unlink_path(path);
+        if (script_rc != 0) ok = 0;
+        kprintf("  [%s] a script FILE runs by path (exit %d, want 0)\n",
+                script_rc == 0 ? "ok" : "FAIL", script_rc);
+
+        kprintf("[cmd] test shellscript: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
