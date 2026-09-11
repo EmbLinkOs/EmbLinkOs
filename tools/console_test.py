@@ -25,8 +25,9 @@ rarely needs to:
     SMP, MEM     cores (4) and memory (2G).
     TIMEOUT      seconds to wait for each command's verdict (400).
 
-Exit status is the number of commands whose verdict line did not say OK, so
-`make` can fail on it. A command that never produced a verdict counts as
+Exit status is the number of commands whose verdict line said neither OK nor
+SKIP, so `make` can fail on it. A SKIP is a test that could not run (no scratch
+disk attached, say): it is reported as a skip and counted as neither. A command that never produced a verdict counts as
 failed and the run stops there -- a hung kernel is a failure, not a timeout
 to shrug at.
 
@@ -175,8 +176,15 @@ def main(cmds):
             with lock: text = bytes(buf).decode("utf-8", "replace")
             line = [l for l in text.splitlines() if l.startswith("[cmd] " + c)][-1]
             ok = (": OK" in line) or line.rstrip().endswith("OK") or "-> OK" in line
-            print("\nconsole_test: %s -> %s" % (c, "OK" if ok else "FAIL"), file=sys.stderr)
-            if not ok: failures += 1
+            # A test that says SKIP did not run and did not fail -- `test nvme`
+            # with no scratch namespace attached, for one. Counting that as a
+            # failure teaches the reader to ignore red, and printing OK for a
+            # test that never ran would be worse. It gets its own word and is
+            # not counted either way; the kernel prints the reason above it.
+            skipped = ": SKIP" in line or line.rstrip().endswith("SKIP")
+            verdict = "OK" if ok else ("SKIP" if skipped else "FAIL")
+            print("\nconsole_test: %s -> %s" % (c, verdict), file=sys.stderr)
+            if not ok and not skipped: failures += 1
             time.sleep(0.3)
     finally:
         p.send_signal(signal.SIGTERM)
