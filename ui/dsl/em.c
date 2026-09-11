@@ -393,7 +393,12 @@ void em_flush(void) {
          * ui_text_field_submitted. */
         case PK_FIELD:    clicked = em_field_impl(P.buf, P.cap, P.str, pr, &hovered);
                           g_field_submit = ui_text_field_submitted(); break;
-        case PK_PASSWORD: clicked = em_password_impl(P.buf, P.cap, P.str, pr, &hovered); break;
+        /* The same edge for a password field. It was never read here, so
+         * .submitted() on a PasswordField was always false -- a sign-in form
+         * could not be finished with Return -- and the unread edge sat in the
+         * kit until the NEXT text field to be emitted reported it as its own. */
+        case PK_PASSWORD: clicked = em_password_impl(P.buf, P.cap, P.str, pr, &hovered);
+                          g_field_submit = ui_text_field_submitted(); break;
         case PK_SEGMENTED:em_segmented_impl(P.labels, P.count, (int *)P.bind, pr); break;
         case PK_LISTROW:  clicked = em_listrow_impl(P.cp, P.str, P.str2, pr, &hovered); break;
         case PK_CLOSEBTN: clicked = em_closebtn_impl(&hovered); break;
@@ -616,6 +621,7 @@ EmV em_checkbox(const char *l, bool *b){ EmV v = stage(PK_CHECK); P.str = l; P.b
 EmV em_slider(float *b){ EmV v = stage(PK_SLIDER); P.bind = b; return v; }
 EmV em_stepper(const char *l, int *b, int lo, int hi){ EmV v = stage(PK_STEPPER); P.str = l; P.bind = b; P.lo = lo; P.hi = hi; return v; }
 void em_field_emphasis(unsigned start, unsigned len){ em_flush(); ui_text_field_emphasis(start, len); }
+void em_field_autofocus(void){ em_flush(); ui_text_field_autofocus(); }
 EmV em_text_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_FIELD); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_password_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_PASSWORD); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_segmented(const char *const *labels, int count, int *b){ EmV v = stage(PK_SEGMENTED); P.labels = labels; P.count = count; P.bind = b; return v; }

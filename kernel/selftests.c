@@ -438,6 +438,7 @@ static void selftests_print_commands(void)
     kprintf("  test swap           (anonymous memory > RAM survives: make test-swap)\n");
     kprintf("  test kill io        (a process killed inside the filesystem leaves it usable)\n");
     kprintf("  test session        (sessions: identity, inheritance, the gates, logout)\n");
+    kprintf("  test accounts       (the account store and the session-profile policy)\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1637,6 +1638,43 @@ int selftests_handle_command(const char *cmd)
         #undef SP_CHECK
         #undef SP_LIVE
         kprintf("[cmd] test session: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test plant profile <user> -- a TEST FIXTURE, not a feature: write a
+     * HOSTILE session profile for <user> into /etc/sessions -- one that asks
+     * for the account store and every home on the machine -- so that
+     * tools/login_test.py can sign in and watch init refuse those lines. What
+     * a profile may grant is decided by user/lib/session_policy.h, never by
+     * the profile. */
+    if (strncmp(cmd, "test plant profile ", 19) == 0) {
+        const char *u = cmd + 19;
+        char path[96], text[256];
+        snprintf(path, sizeof path, "/etc/sessions/%s.ns", u);
+        snprintf(text, sizeof text,
+                 "# planted by the test: asks for far more than any session may have\n"
+                 "rw /etc\nrw /home\nro /system\nro /data/apps\nrw /home/%s\nrw /run\n", u);
+        (void)vfs_mkdir_path("/etc/sessions");
+        int fd = vfs_open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        size_t w = 0;
+        int rc = fd >= 0 ? vfs_fd_write(fd, text, strlen(text), &w) : fd;
+        if (fd >= 0) { (void)vfs_fd_fsync(fd); vfs_close(fd); }
+        kprintf("\n[cmd] test plant profile: %s (%s, %d)\n", rc == EMBK_OK ? "OK" : "FAIL", path, rc);
+        return 1;
+    }
+
+    /* test accounts -- the account store and the session policy
+     * (user/bin/authtest.c against a scratch store: create, verify, change,
+     * reset, remove, the last-administrator rule, the upgrade of a standard
+     * PBKDF2 record made elsewhere, atomic rewrites, the throttle, and the
+     * clamp on session profiles). Exit code = claims that did not hold. */
+    if (strcmp(cmd, "test accounts") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test accounts: VFS not registered\n"); return 1; }
+        const char *tp = "/data/apps/authtest/authtest.elf";
+        char *a[] = { (char *)tp, NULL };
+        int pid = process_create(tp, a, 1, NULL, 0);
+        int rc = pid >= 0 ? process_wait((uint32_t)pid) : pid;
+        kprintf("[cmd] test accounts: %s (exit %d)\n", rc == 0 ? "OK" : "FAIL", rc);
         return 1;
     }
 

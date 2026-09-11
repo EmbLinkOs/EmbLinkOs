@@ -106,6 +106,10 @@ bool ui_text_field_submitted(void);
  * recede -- the host being the part that says who you are talking to. */
 void ui_text_field_emphasis(unsigned start, unsigned len);
 
+/* The next field takes keyboard focus if nothing has it -- a form that opens
+ * ready to type into (the login screen). One-shot, set before the field. */
+void ui_text_field_autofocus(void);
+
 /* --- scroll view --- */
 /* A fixed-height viewport that clips + vertically scrolls its children. `scroll_y`
  * is the app-owned scroll position (px from top); the wheel over the view and a

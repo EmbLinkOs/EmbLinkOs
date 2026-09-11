@@ -378,26 +378,98 @@ void ui_text_field_emphasis(unsigned start, unsigned len) {
     g_emph_start = start; g_emph_len = len; g_emph_on = (len > 0);
 }
 
+/* KEYBOARD FOCUS TRAVERSAL -- Tab moves to the next field.
+ *
+ * A form you can only fill by clicking each field is not usable from the
+ * keyboard, and the login screen is exactly such a form. Immediate mode has no
+ * list of focusable widgets to walk, so traversal is built from what it does
+ * have: the order fields are emitted in, which IS the reading order.
+ *
+ *   Tab in the focused field  -> the NEXT field emitted this frame takes focus,
+ *                                and whatever was typed after the Tab goes to it
+ *   Tab in the LAST field     -> next frame, the FIRST field takes focus (wrap)
+ *
+ * Per-frame state, reset when ui_frame_serial() moves. */
+static uint64_t g_trav_frame;
+static bool     g_tab_pending;            /* hand focus to the next field emitted */
+static bool     g_focus_first;            /* wrapped: the first field of this frame takes it */
+static bool     g_seen_field;             /* a field has been emitted this frame */
+static char     g_carry[32];              /* keys typed after the Tab, for the next field */
+static int      g_carry_n;
+static bool     g_autofocus_next;         /* see ui_text_field_autofocus */
+
+void ui_text_field_autofocus(void) { g_autofocus_next = true; }
+
+static void trav_new_frame(void) {
+    uint64_t f = ui_frame_serial();
+    if (f == g_trav_frame) return;
+    g_trav_frame = f;
+    if (g_tab_pending) {                  /* Tab in the last field last frame: wrap */
+        g_tab_pending = false;
+        g_focus_first = true;
+    }
+    g_seen_field = false;
+}
+
 static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool masked) {
     const struct ui_theme *t = TH;
     bool     emph  = g_emph_on;
     unsigned emph_s = g_emph_start, emph_n = g_emph_len;
     g_emph_on = false;                    /* consumed, whether or not it is used */
+    bool autofocus = g_autofocus_next;
+    g_autofocus_next = false;             /* one-shot, like the emphasis */
+    trav_new_frame();
+    bool first = !g_seen_field;
+    g_seen_field = true;
+
     ui_box_begin(0);
     struct instance_handle self = ui_open();
     if (ui_consume_click(self)) ui_request_focus(self);
+    /* How this field came by focus decides where its keys come from. The typed
+     * queue is the FRAME's, not consumed per field: a field Tabbed into in the
+     * same frame must take only what followed the Tab (the carry) -- taking the
+     * queue again would replay everything, the Tab included, and bounce focus
+     * down the whole form. A field wrapped into on the NEXT frame takes the
+     * carry and then that frame's queue, which is new. */
+    enum { OWN_QUEUE, CARRY_ONLY, CARRY_THEN_QUEUE } keys = OWN_QUEUE;
+    if (g_tab_pending) {                  /* the previous field was Tabbed out of */
+        g_tab_pending = false;
+        ui_request_focus(self);
+        keys = CARRY_ONLY;
+    } else if (first && g_focus_first) {  /* wrapped around from the last field */
+        g_focus_first = false;
+        ui_request_focus(self);
+        keys = CARRY_THEN_QUEUE;
+    } else if (autofocus && !ui_any_focus()) {
+        ui_request_focus(self);           /* a form that opens ready to type */
+    }
     bool focused = ui_has_focus(self);
 
-    /* while focused, apply this frame's typed characters in place */
+    /* while focused, apply this frame's typed characters in place -- first
+     * whatever the field before this one saw typed after a Tab */
     if (focused) {
-        char in[32];
-        int n = ui_input_take(in, (int)sizeof in);
+        char in[64];
+        int n = 0;
+        if (keys != OWN_QUEUE) {
+            memcpy(in, g_carry, (size_t)g_carry_n);
+            n = g_carry_n;
+            g_carry_n = 0;
+        }
+        if (keys != CARRY_ONLY)
+            n += ui_input_take(in + n, (int)sizeof in - n);
         unsigned long len = strlen(buf);
         for (int i = 0; i < n; i++) {
             char c = in[i];
             if (c == '\b') { if (len > 0) buf[--len] = 0; }
             else if (c == '\n') { g_field_submit = true; }   /* submit; see above */
-            else if (c == '\t') { /* single-line: no tab traversal yet */ }
+            else if (c == '\t') {
+                /* The rest of this frame's keys belong to the next field. */
+                g_carry_n = 0;
+                for (int k = i + 1; k < n && g_carry_n < (int)sizeof g_carry; k++)
+                    g_carry[g_carry_n++] = in[k];
+                g_tab_pending = true;
+                break;
+            }
             else if ((unsigned char)c >= 32 && (unsigned char)c < 127 && len + 1 < cap) {
                 buf[len++] = c; buf[len] = 0;
             }

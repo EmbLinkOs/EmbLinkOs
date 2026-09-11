@@ -283,6 +283,9 @@ struct EmV {
 /* Emphasise a span of the next TextField's value while it is not being edited.
  * See ui_text_field_emphasis. */
 void em_field_emphasis(unsigned start, unsigned len);
+/* The next TextField/PasswordField takes keyboard focus if nothing has it: a
+ * form that opens ready to type into. Tab moves to the next field, always. */
+void em_field_autofocus(void);
 #define PasswordField(...) em_password_field(__VA_ARGS__)
 #define Segmented(...)   em_segmented(__VA_ARGS__)
 #define Spacer()         em_spacer_()

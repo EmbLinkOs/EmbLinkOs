@@ -29,19 +29,44 @@
  */
 
 #include "embk.h"
+#include "session_policy.h"   /* the clamp on every session profile */
 
 #define DESKTOP      "/system/bin/home.elf"
 #define SETUP        "/system/bin/setup.elf"
 #define LOGIN        "/system/bin/login.elf"
 #define SHADOW       "/etc/shadow"
-#define NS_ACTS_MAX  8
+#define PASSWD       "/etc/passwd"
+#define NS_ACTS_MAX  9           /* up to 8 bindings + the NEW_SESSION action */
 #define SESSION_FD   9
 
 /* Development shortcut: authentication is already validated, so UI work can
  * boot straight into this disposable session. Set to 0 to restore the normal
- * first-boot setup + password login flow. */
+ * first-boot setup + password login flow.
+ *
+ * It opens the session at BOOT and after a CRASH -- a desktop that dies while
+ * UI work is under way comes straight back. It does not survive a LOGOUT: a
+ * user who logs out has asked for the login screen, and logging them straight
+ * back in would make logging out meaningless. So even a development image
+ * reaches the real setup and greeter, which is how they are tested.
+ *
+ * A PRODUCTION image is built with `make AUTOLOGIN=0`: no session opens
+ * without a password, from the first boot on. */
+#ifndef DEV_AUTOLOGIN
 #define DEV_AUTOLOGIN 1
+#endif
 #define DEV_USER      "yves"
+
+/* init links no libc, and the compiler emits calls to these two for struct
+ * copies and zero-initialisers (a spawn action is 280 bytes). The attribute
+ * stops GCC recognising each loop as the very function it implements and
+ * compiling it into a call to itself. */
+#define NO_LOOP_IDIOMS __attribute__((optimize("no-tree-loop-distribute-patterns")))
+NO_LOOP_IDIOMS void *memset(void *d, int c, unsigned long n) {
+    unsigned char *p = d; while (n--) *p++ = (unsigned char)c; return d;
+}
+NO_LOOP_IDIOMS void *memcpy(void *d, const void *src, unsigned long n) {
+    unsigned char *p = d; const unsigned char *q = src; while (n--) *p++ = *q++; return d;
+}
 
 static void log_line(const char *s) { embk_puts(1, s); }
 
@@ -72,25 +97,71 @@ static int read_small(const char *path, char *buf, int cap) {
     return n;
 }
 
-/* Load user <user>'s SESSION PROFILE -- /home/<user>/user.ns -- into
- * NS_BIND spawn actions (docs/USERSPACE_v2.md UP3). Same "<ro|rw> <prefix>"
- * manifest format as the app manifests (UP4); '#' comments and blanks ignored.
- * Returns the binding count (0 => no profile, so the caller launches the desktop
- * with a plain full-inherit view and it always comes up). `desc` gets a short
- * summary for the log. This is the whole of "instantiate a user's session": a
- * session IS a namespace, and it is read from the user's own home. */
-static int load_user_profile(const char *user,
+/* Is <user> an administrator? The gid field of its /etc/passwd line == 10
+ * (user/lib/auth.h). Read here, not taken from the profile: whether a clamp
+ * applies cannot be decided by the file being clamped. */
+static int user_is_admin(const char *user) {
+    char buf[2048];
+    int n = read_small(PASSWD, buf, sizeof buf);
+    int ul = 0; while (user[ul]) ul++;
+    for (int i = 0; i < n; ) {
+        int ls = i;
+        while (i < n && buf[i] != '\n') i++;
+        int le = i++;
+        int match = (le - ls > ul && buf[ls + ul] == ':');
+        for (int k = 0; match && k < ul; k++) match = (buf[ls + k] == user[k]);
+        if (!match) continue;
+        int field = 0, p = ls;
+        while (p < le && field < 3) { if (buf[p] == ':') field++; p++; }
+        long gid = 0;
+        while (p < le && buf[p] >= '0' && buf[p] <= '9') gid = gid * 10 + (buf[p++] - '0');
+        return gid == 10;
+    }
+    return 0;
+}
+
+/* The default session: what every account gets without a profile. */
+static int default_profile(const char *user, struct embk_spawn_file_action *acts, char *desc, int desc_cap) {
+    static char home[48];
+    char *p = home;
+    p = put_str(p, "/home/"); p = put_str(p, user); *p = 0;
+    embk_action_ns_bind(&acts[0], "/system", EMBK_NS_RO);
+    embk_action_ns_bind(&acts[1], "/data/apps", EMBK_NS_RO);
+    embk_action_ns_bind(&acts[2], home, EMBK_NS_RW);
+    embk_action_ns_bind(&acts[3], "/run", EMBK_NS_RW);
+    char *d = desc;
+    if (desc_cap > 96) {
+        d = put_str(d, "ro /system, ro /data/apps, rw "); d = put_str(d, home);
+        d = put_str(d, ", rw /run"); *d = 0;
+    }
+    return 4;
+}
+
+/* Load <user>'s SESSION PROFILE -- /etc/sessions/<user>.ns -- into NS_BIND
+ * spawn actions (docs/USERSPACE_v2.md UP3). "<ro|rw> <prefix>" per line, '#'
+ * comments. Every binding passes through embk_session_grant_ok first (see
+ * user/lib/session_policy.h): one that asks for more than the policy allows
+ * is dropped and logged, never granted.
+ *
+ * FROM /etc, AND CLAMPED ANYWAY. It used to be /home/<user>/user.ns -- a file
+ * in the user's own writable home, granted unclamped by the process that holds
+ * every authority on the machine. One line added to it (`rw /etc`) and the next
+ * session could rewrite the account store. /etc is out of every session's
+ * reach, and the clamp holds even if that ever stops being true.
+ *
+ * No profile, or nothing left after the clamp: the default session. */
+static int load_user_profile(const char *user, int is_admin,
                              struct embk_spawn_file_action *acts, int max,
                              char *desc, int desc_cap) {
     char path[128], *p = path;
-    p = put_str(p, "/home/");
+    p = put_str(p, "/etc/sessions/");
     p = put_str(p, user);
-    p = put_str(p, "/user.ns");
+    p = put_str(p, ".ns");
     *p = 0;
 
     char buf[512];
     int n = read_small(path, buf, sizeof buf);
-    if (n <= 0) return 0;
+    if (n <= 0) return default_profile(user, acts, desc, desc_cap);
 
     int na = 0, dn = 0;
     if (desc_cap) desc[0] = 0;
@@ -115,6 +186,14 @@ static int load_user_profile(const char *user,
         char prefix[208];
         for (int k = 0; k < plen; k++) prefix[k] = buf[ps + k];
         prefix[plen] = 0;
+        if (!embk_session_grant_ok(user, is_admin, prefix, mode == EMBK_NS_RO)) {
+            char b[300], *q = b;
+            q = put_str(q, "init: session profile for '"); q = put_str(q, user);
+            q = put_str(q, "' asks for "); q = put_str(q, mode == EMBK_NS_RO ? "ro " : "rw ");
+            q = put_str(q, prefix); q = put_str(q, " -- not granted (session policy)\n"); *q = 0;
+            log_line(b);
+            continue;
+        }
         embk_action_ns_bind(&acts[na], prefix, mode);
         if (desc_cap && dn + plen + 6 < desc_cap) {
             if (dn) { desc[dn++]=','; desc[dn++]=' '; }
@@ -124,7 +203,7 @@ static int load_user_profile(const char *user,
         }
         na++;
     }
-    return na;
+    return na > 0 ? na : default_profile(user, acts, desc, desc_cap);
 }
 
 /* Live proof of the UP2 namespace: init runs in ring 3 holding the inherited
@@ -145,93 +224,95 @@ static void ns_selfcheck(void) {
     else          log_line("init: ns: WARNING -- /system unreadable (over-restricted)\n");
 }
 
+/* Spawn a system-session helper (setup, the greeter) with only what it needs:
+ * the filesystem (it manages /etc) and the display. Not the network, not
+ * audio, not the debugger -- and above all not EMBK_CAP_SESSION, which is
+ * init's alone: a greeter bug must not be a way to open sessions. */
+static int64_t spawn_narrow(const char *path, struct embk_spawn_file_action *extra, int nextra) {
+    struct embk_spawn_file_action acts[3];
+    int n = 0;
+    for (int i = 0; i < nextra && n < 2; i++) acts[n++] = extra[i];
+    embk_action_set_caps(&acts[n++], EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM) | EMBK_CAP_BIT(EMBK_CAP_GPU));
+    char *argv_[] = { (char *)path, NULL };
+    return embk_spawn(path, argv_, acts, n);
+}
+
 void _start(long argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     log_line("init: up -- root of EmbLink userspace authority\n");
     ns_selfcheck();
 
+    int autologin = DEV_AUTOLOGIN;     /* cleared by a logout; see DEV_AUTOLOGIN */
+
     for (;;) {
-#if DEV_AUTOLOGIN
-        char user[32] = DEV_USER;
-        log_line("init: DEV auto-login as '" DEV_USER "'\n");
-#else
-        struct embk_stat shadow;
-        if (embk_stat(SHADOW, &shadow) < 0 || shadow.size == 0) {
-            char *argv_setup[] = { (char *)SETUP, NULL };
-            int setup = (int)embk_spawn(SETUP, argv_setup, NULL, 0);
-            if (setup < 0) {
-                log_line("init: could not launch first-boot setup; retrying\n");
+        char user[32];
+        if (autologin) {
+            char *d = user; d = put_str(d, DEV_USER); *d = 0;
+            log_line("init: DEV auto-login as '" DEV_USER "'\n");
+            /* A fresh COW image has no account directories. */
+            (void)embk_mkdir("/home/" DEV_USER);
+            (void)embk_mkdir("/home/" DEV_USER "/Desktop");
+            (void)embk_mkdir("/home/" DEV_USER "/Documents");
+            (void)embk_mkdir("/home/" DEV_USER "/Downloads");
+            (void)embk_mkdir("/home/" DEV_USER "/Music");
+            (void)embk_mkdir("/home/" DEV_USER "/Pictures");
+            (void)embk_mkdir("/home/" DEV_USER "/Videos");
+            (void)embk_mkdir("/home/" DEV_USER "/Trash");
+        } else {
+            struct embk_stat shadow;
+            if (embk_stat(SHADOW, &shadow) < 0 || shadow.size == 0) {
+                int setup = (int)spawn_narrow(SETUP, NULL, 0);
+                if (setup < 0) {
+                    log_line("init: could not launch first-boot setup; retrying\n");
+                    embk_sleep_ms(1000);
+                    continue;
+                }
+                log_line("init: no account found; first-boot setup started\n");
+                if (embk_wait(setup) != 0) {
+                    log_line("init: setup closed without creating an account\n");
+                    continue;
+                }
+            }
+
+            int pipe_handles[2];
+            if (embk_pipe(pipe_handles) != 0) {
+                log_line("init: could not create login channel\n");
                 embk_sleep_ms(1000);
                 continue;
             }
-            log_line("init: no account found; first-boot setup started\n");
-            if (embk_wait(setup) != 0) {
-                log_line("init: setup closed without creating an account\n");
+            struct embk_spawn_file_action login_action = {0};
+            login_action.kind = EMBK_SPAWN_ACTION_INSTALL_OBJ;
+            login_action.target_fd = 3;
+            login_action.src_obj_handle = pipe_handles[1];
+            int login = (int)spawn_narrow(LOGIN, &login_action, 1);
+            embk_close_handle(pipe_handles[1]);
+            if (login < 0) {
+                embk_close_handle(pipe_handles[0]);
+                log_line("init: could not launch login\n");
+                embk_sleep_ms(1000);
                 continue;
             }
-        }
-
-        int pipe_handles[2];
-        if (embk_pipe(pipe_handles) != 0) {
-            log_line("init: could not create login channel\n");
-            embk_sleep_ms(1000);
-            continue;
-        }
-        struct embk_spawn_file_action login_action = {0};
-        login_action.kind = EMBK_SPAWN_ACTION_INSTALL_OBJ;
-        login_action.target_fd = 3;
-        login_action.src_obj_handle = pipe_handles[1];
-        char *login_argv[] = { (char *)LOGIN, NULL };
-        int login = (int)embk_spawn(LOGIN, login_argv, &login_action, 1);
-        embk_close_handle(pipe_handles[1]);
-        if (login < 0) {
+            log_line("init: login screen started\n");
+            embk_fd_install_obj(pipe_handles[0], SESSION_FD);
             embk_close_handle(pipe_handles[0]);
-            log_line("init: could not launch login\n");
-            embk_sleep_ms(1000);
-            continue;
+            int login_code = embk_wait(login);
+            int64_t user_len = embk_read(SESSION_FD, user, sizeof user - 1);
+            embk_close(SESSION_FD);
+            if (login_code != 0 || user_len <= 0 || user_len >= (int64_t)sizeof user) {
+                log_line("init: login ended without an authenticated user\n");
+                continue;
+            }
+            user[user_len] = 0;
         }
-        embk_fd_install_obj(pipe_handles[0], SESSION_FD);
-        embk_close_handle(pipe_handles[0]);
-        int login_code = embk_wait(login);
-        char user[32];
-        int64_t user_len = embk_read(SESSION_FD, user, sizeof user - 1);
-        embk_close(SESSION_FD);
-        if (login_code != 0 || user_len <= 0 || user_len >= (int64_t)sizeof user) {
-            log_line("init: login ended without an authenticated user\n");
-            continue;
-        }
-        user[user_len] = 0;
-#endif
 
+        /* THE SESSION: its namespace (the profile, clamped) and its identity
+         * (NEW_SESSION -- the kernel records whose every process in it is,
+         * and ends them all when the desktop goes). */
         struct embk_spawn_file_action sacts[NS_ACTS_MAX];
         char nsdesc[192];
-#if DEV_AUTOLOGIN
-        /* A fresh COW image has no account directories. Create only the home
-         * required by the development desktop and give it the same namespace
-         * policy as a real session profile. */
-        (void)embk_mkdir("/home/" DEV_USER);
-        (void)embk_mkdir("/home/" DEV_USER "/Desktop");
-        (void)embk_mkdir("/home/" DEV_USER "/Documents");
-        (void)embk_mkdir("/home/" DEV_USER "/Downloads");
-        (void)embk_mkdir("/home/" DEV_USER "/Music");
-        (void)embk_mkdir("/home/" DEV_USER "/Pictures");
-        (void)embk_mkdir("/home/" DEV_USER "/Videos");
-        (void)embk_mkdir("/home/" DEV_USER "/Trash");
-        embk_action_ns_bind(&sacts[0], "/system", EMBK_NS_RO);
-        embk_action_ns_bind(&sacts[1], "/data/apps", EMBK_NS_RO);
-        embk_action_ns_bind(&sacts[2], "/home/" DEV_USER, EMBK_NS_RW);
-        embk_action_ns_bind(&sacts[3], "/run", EMBK_NS_RW);
-        int snacts = 4;
-        char *nd = nsdesc;
-        nd = put_str(nd, "ro /system, ro /data/apps, rw /home/" DEV_USER ", rw /run");
-        *nd = 0;
-#else
-        int snacts = load_user_profile(user, sacts, NS_ACTS_MAX, nsdesc, sizeof nsdesc);
-        if (snacts <= 0) {
-            log_line("init: authenticated user has no valid session profile\n");
-            continue;
-        }
-#endif
+        int is_admin = user_is_admin(user);
+        int snacts = load_user_profile(user, is_admin, sacts, NS_ACTS_MAX - 1, nsdesc, sizeof nsdesc);
+        embk_action_new_session(&sacts[snacts++], user);
 
         char home[80], env_user[48], env_home[96], env_pwd[96];
         char *p = home;
@@ -244,7 +325,8 @@ void _start(long argc, char **argv, char **envp) {
         {
             char b[256], *q = b;
             q = put_str(q, "init: authenticated session '"); q = put_str(q, user);
-            q = put_str(q, "' -> ns["); q = put_str(q, nsdesc); q = put_str(q, "]\n"); *q = 0;
+            q = put_str(q, is_admin ? "' (administrator)" : "'");
+            q = put_str(q, " -> ns["); q = put_str(q, nsdesc); q = put_str(q, "]\n"); *q = 0;
             log_line(b);
         }
 
@@ -259,17 +341,26 @@ void _start(long argc, char **argv, char **envp) {
 
         /* Block until the desktop exits, then reap it. The wait frees BOTH the
          * zombie process slot and this spawn handle -- without it, every restart
-         * would leak one of init's 16 handles. */
+         * would leak one of init's 16 handles. The kernel has already stopped
+         * whatever the session left running: its leader is gone. */
         int code = embk_wait(h);
 
-        char b[96], *q = b;
-        const char *pre = "init: desktop exited (code ";
-        while (*pre) *q++ = *pre++;
-        q = put_dec(q, code);
-        const char *post = ") -- returning to login\n";
-        while (*post) *q++ = *post++;
-        *q = 0;
-        log_line(b);
+        if (code == EMBK_EXIT_LOGOUT) {
+            char b[96], *q = b;
+            q = put_str(q, "init: '"); q = put_str(q, user);
+            q = put_str(q, "' logged out -- returning to the login screen\n"); *q = 0;
+            log_line(b);
+            autologin = 0;
+        } else {
+            char b[96], *q = b;
+            const char *pre = "init: desktop exited (code ";
+            while (*pre) *q++ = *pre++;
+            q = put_dec(q, code);
+            const char *post = autologin ? ") -- restarting the session\n" : ") -- returning to login\n";
+            while (*post) *q++ = *post++;
+            *q = 0;
+            log_line(b);
+        }
 
         embk_sleep_ms(200);   /* never a hot crash-loop */
     }

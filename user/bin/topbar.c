@@ -154,6 +154,19 @@ static void bar(void) {
                 Menu("EmbLink", .font = BodyBold, .color = g_ink) {
                     MenuItem("About EmbLink");
                     MenuSeparator();
+                    /* LOG OUT ends the session -- every process in it, this
+                     * bar included -- and init shows the login screen. The
+                     * name is the kernel's record of whose session this is,
+                     * not $USER. */
+                    static char logout_label[48];
+                    if (!logout_label[0]) {
+                        struct embk_session_info si;
+                        if (embk_session_info(&si) == 0 && si.user[0])
+                            snprintf(logout_label, sizeof logout_label, "Log Out %s", si.user);
+                        else
+                            snprintf(logout_label, sizeof logout_label, "Log Out");
+                    }
+                    if (MenuItem(logout_label)) embk_session_end(0);
                     if (MenuItem("Quit")) exit(0);
                 }
                 Menu("File", .color = g_ink) { MenuItem("New"); MenuItem("Open"); }

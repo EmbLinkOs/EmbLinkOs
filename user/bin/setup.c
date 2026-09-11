@@ -1,3 +1,6 @@
+/* setup.c -- first boot: create the machine's first account, which administers
+ * it. init runs this when the account store is empty; it exits 0 once an
+ * account exists, and init then shows the greeter. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,71 +12,35 @@
 static char username[EMBK_AUTH_USERNAME_MAX + 1];
 static char password[EMBK_AUTH_PASSWORD_MAX + 1];
 static char confirm[EMBK_AUTH_PASSWORD_MAX + 1];
-static char status[128] = "Choose the account used to open your desktop.";
-
-static int write_all(const char *path, const char *data) {
-    int fd = (int)embk_open(path, EMBK_O_CREAT | EMBK_O_TRUNC | EMBK_O_WRONLY, 0600);
-    if (fd < 0) return -1;
-    size_t len = strlen(data), off = 0;
-    while (off < len) {
-        int64_t n = embk_write(fd, data + off, len - off);
-        if (n <= 0) { embk_close(fd); return -1; }
-        off += (size_t)n;
-    }
-    embk_close(fd);
-    return 0;
-}
-
-static void create_home_folders(const char *home) {
-    static const char *names[] = {
-        "Desktop", "Documents", "Downloads", "Music",
-        "Pictures", "Videos", "Trash"
-    };
-    char path[128];
-    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
-        snprintf(path, sizeof path, "%s/%s", home, names[i]);
-        (void)embk_mkdir(path);
-    }
-}
+static char status[128] = "Choose the account that will administer this machine.";
 
 static void create_account(void) {
     if (!embk_auth_valid_username(username)) {
         snprintf(status, sizeof status, "Use lowercase letters, numbers, - or _.");
         return;
     }
-    if (strlen(password) < 8) {
-        snprintf(status, sizeof status, "The password needs at least 8 characters.");
+    if (strlen(password) < EMBK_AUTH_PASSWORD_MIN) {
+        snprintf(status, sizeof status, "The password needs at least %d characters.", EMBK_AUTH_PASSWORD_MIN);
         return;
     }
     if (strcmp(password, confirm) != 0) {
         snprintf(status, sizeof status, "The two passwords do not match.");
+        memset(confirm, 0, sizeof confirm);
         return;
     }
-
-    char home[96], profile[112], manifest[320];
-    snprintf(home, sizeof home, "/home/%s", username);
-    snprintf(profile, sizeof profile, "%s/user.ns", home);
-    struct embk_stat st;
-    if (embk_mkdir(home) < 0 &&
-        (embk_stat(home, &st) < 0 || st.type != EMBK_DT_DIR)) {
-        snprintf(status, sizeof status, "Could not create the user directory.");
-        return;
-    }
-    create_home_folders(home);
-    snprintf(manifest, sizeof manifest,
-             "# Session profile for %s\nro /system\nro /data/apps\nrw %s\nrw /run\n",
-             username, home);
-    if (write_all(profile, manifest) < 0) {
-        snprintf(status, sizeof status, "Could not create the session profile.");
-        return;
-    }
-    int rc = embk_auth_create(username, password);
+    snprintf(status, sizeof status, "Creating the account...");
+    int rc = embk_auth_create_as(username, password, 1);
     memset(password, 0, sizeof password);
     memset(confirm, 0, sizeof confirm);
     if (rc != 0) {
         snprintf(status, sizeof status, "Account creation failed (%d).", rc);
         return;
     }
+    if (embk_auth_provision(username) != 0) {
+        snprintf(status, sizeof status, "The account exists but its home could not be made.");
+        return;
+    }
+    printf("setup: account '%s' created (administrator)\n", username);
     em_app_request_exit(0);
 }
 
@@ -92,12 +59,15 @@ static void view(void) {
                   .background = { .r = 0.045f, .g = 0.055f, .b = 0.09f, .a = 0.92f },
                   .corner = 20, .border = 1, .shadow = 1) {
                 Text("Welcome to EmbLink OS").title();
-                Text("Create your first account").heading();
+                Text("Create the first account").heading();
                 Text(status).body().secondary();
+                /* Opens ready to type; Tab walks the fields; Return in the
+                 * last one creates the account. */
+                em_field_autofocus();
                 TextField(username, sizeof username, "username");
                 PasswordField(password, sizeof password, "password");
-                PasswordField(confirm, sizeof confirm, "confirm password");
-                if (Button("Create account").primary().clicked()) create_account();
+                bool go = PasswordField(confirm, sizeof confirm, "confirm password").submitted();
+                if (Button("Create account").primary().clicked() || go) create_account();
             }
             Spacer();
         }

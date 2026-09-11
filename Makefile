@@ -323,8 +323,12 @@ USER_INC     = -Iuser/lib
 
 # The real pid-1 init: kernel spawns it first; it brings up the desktop session
 # and supervises. Freestanding (no libc) -- init stays minimal (USERSPACE_v2 UP1).
-build/init.o: user/bin/init.c | $(BUILD)
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+# AUTOLOGIN=0 builds a production init: no session without a password. The
+# default (unset) keeps the development auto-login -- see DEV_AUTOLOGIN in
+# init.c for exactly what it does and does not do. make does not track a
+# variable's value: after changing it, `touch user/bin/init.c`.
+build/init.o: user/bin/init.c user/lib/session_policy.h | $(BUILD)
+	$(USER_CC) $(USER_CFLAGS) $(if $(AUTOLOGIN),-DDEV_AUTOLOGIN=$(AUTOLOGIN)) -c $< -o $@
 
 build/init.elf: build/init.o user/lib/user.ld
 	$(USER_LD) -T user/lib/user.ld build/init.o -o $@
@@ -2393,6 +2397,12 @@ declare-test:
 	    -lm -o $(BUILD)/declare_test
 	$(BUILD)/declare_test
 
+# The text field and the keyboard: autofocus, Tab traversal (and the keys
+# typed after a Tab), wrap, Return, focus let go when its field is gone.
+kit-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 $(UI_INC) $(UI_SRC) ui/kit/kit_test.c -lm -o $(BUILD)/kit_test
+	$(BUILD)/kit_test
+
 # Themed showcase: renders a real UI with the widget kit to a PNG, so the
 # toolkit's actual look can be seen (not just unit-tested).
 UI_SRC = ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c ui/backend/scene_render.c \
@@ -2482,7 +2492,7 @@ test-audio: $(IMG) $(EMBKFS_MASTER)
 # --- x86 console tests, scripted -----------------------------------------------
 # tools/console_test.py boots the kernel headless and types at its console. Any
 # self-test the kernel has can be run this way:  make test-x86 T="test mmap"
-.PHONY: test-x86 test-embkfs-crash test-swap-store test-swap
+.PHONY: test-x86 test-embkfs-crash test-swap-store test-swap test-login kit-test
 test-x86: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/console_test.py $(T)
 
@@ -2505,6 +2515,13 @@ build/crash-seed.img: tools/embkfs_mkfs/mkfs_embkfs.py | $(BUILD)
 # attached as the fourth IDE disk. mkswap writes only block 0.
 build/swap.img: tools/mkswap.py | $(BUILD)
 	python3 tools/mkswap.py $@ 128
+
+# THE LOGIN PATH, typed on the real keyboard (QMP sendkey into the PS/2
+# controller): logout of the auto-login session, first-boot setup, a refused
+# password, a real sign-in, a planted hostile session profile refused, and
+# logout back to the greeter. Runs on a scratch copy of the image.
+test-login: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/login_test.py
 
 test-swap-store: $(IMG) $(EMBKFS_MASTER) build/swap.img
 	@SWAP_DISK=build/swap.img python3 tools/console_test.py "test swap store"

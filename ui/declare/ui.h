@@ -128,6 +128,7 @@ int  ui_input_take(char *dst, int max);           /* focused field drains queued
 void ui_request_focus(struct instance_handle h);
 bool ui_has_focus(struct instance_handle h);
 bool ui_any_focus(void);       /* is ANY text field focused? (app key hooks) */
+uint64_t ui_frame_serial(void); /* changes every frame; for per-frame widget state */
 
 /* --- scroll --- */
 void  ui_set_scroll_offset(float dy);             /* shift open box's children up by dy */

@@ -2058,6 +2058,77 @@ what it was handed can ask "is that one of yours".
   isolation, wipe on end; logout from outside and from inside
   (`EMBK_EXIT_LOGOUT`, nothing left); a leader that just exits takes its
   session with it.
+- [x] **init opens sessions.** The desktop is spawned with `NEW_SESSION`;
+  a logout (`EMBK_EXIT_LOGOUT`) returns to the greeter, a crash restarts the
+  session under the development auto-login and returns to the greeter
+  otherwise. The auto-login no longer survives a logout -- logging out has to
+  mean something, and it is how even a development image reaches the real
+  setup and greeter. `make AUTOLOGIN=0` builds a production init. The greeter
+  and setup run in the system session with FILESYSTEM|GPU only -- not the
+  network, audio, the debugger, or `CAP_SESSION`.
+- [x] **A privilege escalation, closed.** init granted the session namespace
+  from `/home/<user>/user.ns` -- a file in the user's own writable home --
+  unclamped. One line (`rw /etc`) and the next session could rewrite the
+  account store; `rw /home` and it read everyone's files. Profiles live in
+  `/etc/sessions/<user>.ns` now (out of every session's reach), and init
+  clamps every line anyway (`user/lib/session_policy.h`): /system and
+  /data/apps read-only, the user's own home, /run; /data for administrators;
+  never /etc, never another home, compared component by component. A refused
+  line is logged and dropped. `make test-login` plants a hostile profile and
+  watches init refuse it at a real sign-in.
+- [x] **The account store** (`user/lib/auth.c`): PBKDF2-HMAC-SHA256 at
+  210,000 iterations (was 4,096), with the HMAC pads precomputed -- the old
+  code recomputed them every iteration, four compressions where two do, half
+  the work factor paid by the owner and not the attacker. A weaker stored
+  hash is rehashed on the next successful login. The store is read at its
+  real size (the old fixed 8 KiB buffer silently dropped the ~40th account),
+  and every change is written to `.new`, synced and renamed into place (one
+  filesystem commit). New: change password (old one required), an
+  administrator's reset, remove (never the last administrator), an
+  administrator role (the first account; gid 10), uids above every one used
+  (not a line count, which reissued a removed account's uid). **163 ms per
+  verify at native speed (aarch64/HVF), 1.7 s under x86 emulation.**
+- [x] **The greeter manages accounts**: sign in; change password; an
+  administrator's name and password unlock create (optionally as an
+  administrator), reset and remove. Wrong passwords are throttled across all
+  of it -- free for two, then 1 s doubling to 30 s -- without blocking the
+  screen, and refusals are logged to the console by name.
+- [x] **The toolkit became keyboard-usable for forms**: Tab moves to the next
+  text field (with whatever was typed after it in the same frame) and wraps;
+  `em_field_autofocus()` opens a form ready to type; Return in a PASSWORD
+  field is reported at all -- the DSL never read that edge, so a sign-in form
+  could not be finished with Return and the unread edge leaked into the next
+  text field. Focus is let go when its field leaves the screen, which had
+  kept a new page's autofocus from ever firing. `make kit-test` (host).
+- [x] **Tests**: `test accounts` (`user/bin/authtest.c`, on both
+  architectures): 22 claims -- every store operation, the last-administrator
+  rule, the upgrade of a standard PBKDF2 record made by Python's hashlib,
+  atomic rewrites, the throttle, 20 policy judgements. `make test-login`
+  (x86, real keystrokes, 13 steps): logout is not auto-login; setup typed with
+  Tab and Return; a wrong password refused and logged; the right one opens an
+  administrator's session; a planted hostile profile clamped; the kernel lists
+  the session under the right name; logout returns to the greeter.
+- [x] A "Log Out <user>" item in the top bar's system menu.
+
+Open:
+
+- [ ] **One session at a time.** Sessions are sequential: one display, one
+  console, and the desktop's `/run` endpoint names are machine singletons.
+  Fast user switching needs per-session endpoint namespaces and a compositor
+  that knows whose windows are whose.
+- [ ] **Files a session leaves in /run are not scrubbed.** Endpoints die with
+  their owners, but a plain file written to /run by session A is readable by
+  session B.
+- [ ] **The account-management page is proven at the library level only.**
+  `test accounts` covers every operation the page calls; `make test-login`
+  cannot reach the page's buttons -- buttons take no keyboard focus, and the
+  test VM's PS/2 mouse is relative. A USB tablet in the test VM, or keyboard
+  focus for buttons, closes it.
+- [ ] **Buttons are not keyboard-reachable** (Tab traverses text fields only).
+- [ ] **The throttle lives in the greeter process**; a greeter crash resets
+  the count. Persisting it (per account, in the store) would survive that.
+- [ ] **`make` does not track `AUTOLOGIN`**: after changing it,
+  `touch user/bin/init.c`.
 
 ## Process & Scheduling
 

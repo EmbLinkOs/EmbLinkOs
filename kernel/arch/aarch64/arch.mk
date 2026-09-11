@@ -503,7 +503,7 @@ $(foreach p,$(ARM_NEWLIB_PROGS),$(eval $(call ARM_NEWLIB_PROG,$(p))))
 # against user.ld exactly as x86 does -- $(USER_LD) is aarch64-elf-ld here.
 define ARM_PLAIN_PROG
 $(ARM_USER)/$(1).plain.o: user/bin/$(1).c | $(ARM_USER)
-	$$(USER_CC) $$(USER_CFLAGS) -c $$< -o $$@
+	$$(USER_CC) $$(USER_CFLAGS) $$(if $$(AUTOLOGIN),-DDEV_AUTOLOGIN=$$(AUTOLOGIN)) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).plain.o user/lib/user.ld
 	$$(USER_LD) -T user/lib/user.ld -z max-page-size=0x1000 $$< -o $$@
 endef
@@ -876,6 +876,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
 	  chk 'virtio-blk: sda'              A7 'the virtio-blk device did not come up'; \
 	  chk 'power cut at every write: OK' A7 'the crash-consistency test did not pass here (seed disk sdb)'; \
 	  chk 'anonymous memory larger than RAM: OK' A7 'the swap witness did not pass here (store sdc)'; \
+	  chk 'the account store and the session policy: OK' A7 'the account store test did not pass here'; \
 	  chk 'written and read back'        A7 'the disk failed a write/read round trip'; \
 	  chk 'EMBKFS: sda: mounted'         A7 'the real filesystem did not mount'; \
 	  chk 'ELF magic intact'             A7 'could not read a file out of the mounted image'; \

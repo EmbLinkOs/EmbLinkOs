@@ -996,6 +996,22 @@ void arch_early_main(uint64_t dtb_phys) {
      * virtio-blk, "sdc") and came back. The pager, the objects and the store
      * are shared code; the disk under them is not. Quick mode: the hot-set
      * A/B is a policy claim, made once, on x86. */
+    /* --- the account store, on this architecture too -----------------------
+     * user/bin/authtest.c against a scratch store: every operation the greeter
+     * offers, the upgrade of a standard PBKDF2 record made elsewhere, and the
+     * clamp on session profiles. At native speed here, which is where the
+     * work factor's real cost can be read off. */
+    kprintf("\n--- accounts ---\n");
+    {
+        const char *tp = "/data/apps/authtest/authtest.elf";
+        char *a[] = { (char *)tp, NULL };
+        int pid = process_create(tp, a, 1, NULL, 0);
+        int rc = pid >= 0 ? process_wait((uint32_t)pid) : pid;
+        kprintf("  [%s] the account store and the session policy: %s (exit %d)\n",
+                rc == 0 ? " ok " : "FAIL", rc == 0 ? "OK" : "FAIL", rc);
+        if (rc != 0) selftest_fails++;
+    }
+
     kprintf("\n--- swap ---\n");
     {
         int rc = swap_selftest_run("/data/apps/swapper/swapper.elf", true);

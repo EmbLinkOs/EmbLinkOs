@@ -76,6 +76,7 @@ static struct instance_handle g_clicked;   /* deepest instance a press landed on
 static int g_press_edges;
 static struct instance_handle g_active;    /* instance that owns the current drag (pointer capture) */
 static struct instance_handle g_focused;   /* instance with keyboard focus (text field) */
+static bool g_focus_seen;                   /* the focused widget asked this frame */
 static float g_ptr_x, g_ptr_y;
 static bool  g_ptr_down;
 static bool  g_press_edge;                  /* a press landed this frame (for defocus-on-outside-click) */
@@ -881,7 +882,14 @@ bool ui_is_pressed(void) { return g_ptr_down && is_ancestor_or_self(ui_open(), g
  * pressed", which a drag spanning many widgets cannot ask. */
 bool ui_pointer_down(void) { return g_ptr_down; }
 
+/* A number that changes every frame -- for widget code that keeps a little
+ * per-frame state of its own (keyboard focus traversal, in kit.c) and has to
+ * know when a frame boundary passed. */
+static uint64_t g_frame_serial;
+uint64_t ui_frame_serial(void) { return g_frame_serial; }
+
 void ui_frame_begin(void) {
+    g_frame_serial++;
     g_depth_overflowed = 0; g_cursor_over = 0;
     g_cursor_top = -1;
     reset_children_unvisited(g_root);
@@ -892,6 +900,12 @@ void ui_frame_end(void) {
     g_cursor_top = -1;
     /* a press that landed on no focusable widget clears keyboard focus */
     if (g_press_edge && !g_focus_claimed) g_focused = INSTANCE_HANDLE_NULL;
+    /* ...and so does the focused widget NOT BEING THERE: a page changed and
+     * its field was never emitted. Left set, focus would point at nothing and
+     * ui_any_focus() would say yes -- which kept the next page's autofocus
+     * from ever firing. */
+    if (!g_focus_seen && !g_focus_claimed) g_focused = INSTANCE_HANDLE_NULL;
+    g_focus_seen = false;
     g_press_edge = false;
     g_focus_claimed = false;
     g_input_n = 0;                 /* typed queue is consumed within the frame */
@@ -1051,7 +1065,9 @@ int ui_input_take(char *dst, int max) {
 void ui_request_focus(struct instance_handle h) { g_focused = h; g_focus_claimed = true; }
 bool ui_any_focus(void) { return !instance_handle_is_null(g_focused); }
 bool ui_has_focus(struct instance_handle h) {
-    return h.index == g_focused.index && h.generation == g_focused.generation && h.index != 0;
+    bool yes = h.index == g_focused.index && h.generation == g_focused.generation && h.index != 0;
+    if (yes) g_focus_seen = true;
+    return yes;
 }
 
 /* Scroll wheel: the loop feeds this frame's delta; the open box consumes it only
