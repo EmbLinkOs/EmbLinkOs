@@ -764,8 +764,19 @@ _PROG_DIRS = ("user/apps", "user/system", "user/tools", "user/tests", "user/exam
 
 def _prog_meta(base: str, ext: str) -> str:
     """Path to <base>.<ext> beside the program's source, or a path that does not
-    exist (so the caller's _read_file returns None, as it always has)."""
-    for d in _PROG_DIRS:
+    exist (so the caller's _read_file returns None, as it always has).
+
+    A LAUNCHER ENTRY (.app) is only ever taken from user/apps/. The desktop
+    lists exactly the programs that ship one, and before the directories said
+    what a program is, the five toolkit reference demos shipped one too: a
+    third of the launcher of an OS meant to be used every day was "V4 Demo",
+    "Editor Demo", "Windows", "Menus" and "UI Demo". They are still built,
+    installed and runnable -- `run /data/apps/v4demo/v4demo.elf` -- and their
+    namespace and capability manifests are still packed so they run correctly
+    when started that way. They are just not presented as applications, because
+    they are not. Move one into user/apps/ and it is back on the desktop."""
+    dirs = ("user/apps",) if ext == "app" else _PROG_DIRS
+    for d in dirs:
         p = f"{d}/{base}/{base}.{ext}"
         if os.path.exists(p):
             return p

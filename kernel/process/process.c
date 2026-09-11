@@ -120,6 +120,7 @@ static spinlock_t g_sched_lock = SPINLOCK_INIT;
  * one back and runs long before that point in this file. The reasoning for why
  * a count is safe at all is with recount_declared_locked(). */
 static uint32_t g_declared_count;
+static void recount_declared_locked(void);   /* defined with sched_declare_period() */
 
 
 /* Forward declarations: the trampoline is the fabricated ctx.rip - where
@@ -431,13 +432,33 @@ static void thread_reap_slot(struct thread *t) {
     }
 
     vmm_free_kernel_stack(t->kstack_top, KSTACK_SIZE);
-    /* A thread that died still holding a declaration gives it back here. The
-     * count would self-heal on the next declaration anyway -- see
-     * g_declared_count -- but leaving it high means the deadline policy scans
-     * for a thread that no longer exists until someone else declares. */
-    if (t->period_ms && g_declared_count) g_declared_count--;
+    /* A thread that died still holding a declaration gives it back here -- by
+     * RECOUNTING, never by decrementing.
+     *
+     * This used to be `g_declared_count--`, and that made the deadline policy
+     * switch itself off, intermittently, for entire runs. The count is
+     * recomputed from scratch on every declaration, and that recount SKIPS
+     * zombies. So: thread A declares (count 1), A exits and becomes a zombie,
+     * thread B declares (recount skips A: count 1, correct) -- and THEN A's
+     * slot is reaped, the decrement fires because A still carries period_ms,
+     * and the count reads 0 with B alive and declared. dl_pick() treats 0 as
+     * "nobody declared" and hands every decision to round-robin, so B runs its
+     * whole life unscheduled by the policy it asked for. Whether it happened
+     * depended only on whether A's reap landed before or after B's
+     * declaration: the aarch64 boot test's deadline check failed on about one
+     * run in five, with the deadline run's histogram indistinguishable from
+     * round-robin's (mean 16.8 ms, 27 of 60 periods missed).
+     *
+     * A decrement can only be right if it knows whether the last recount
+     * counted this thread, and it cannot know. A recount is right by
+     * construction. We hold g_sched_lock here (both callers take it), and it
+     * only runs for a thread that had declared, so the scan costs nothing
+     * anywhere else. */
+    bool had_period = t->period_ms != 0;
     memset(t, 0, sizeof(*t));
     t->state = PROCESS_UNUSED;
+    if (had_period)
+        recount_declared_locked();
 }
 
 /* Reclaim a PROCESS's address space and return its slot to free (pid = 0).
@@ -3182,10 +3203,13 @@ uint64_t process_cpu_ns(uint32_t pid) {
  * A COUNT RATHER THAN A SCAN IS SAFE HERE, and the reasoning is worth stating
  * because the sum next door deliberately refuses the same trick. Two things
  * make it different. The count is only ever a HINT to skip work: too high and
- * the policy does a scan it did not need (correct, slower); it can only be too
- * LOW if some path sets period_ms without going through the one function that
- * writes it, and there is no such path -- thread_reap_slot() memsets the whole
- * slot, so a recycled thread cannot inherit a declaration either. And it is
+ * the policy does a scan it did not need (correct, slower). Too LOW is the
+ * dangerous direction -- dl_pick() reads 0 as "nobody declared" and stops
+ * applying the policy at all -- and it WAS reachable: thread_reap_slot() used to
+ * decrement for a zombie this very recount had already left out, taking the
+ * count to 0 under a live declared thread. It recounts now instead (see there).
+ * No path sets period_ms except the one function below, and thread_reap_slot()
+ * memsets the whole slot, so a recycled thread cannot inherit a declaration. And it is
  * recomputed from scratch on every declaration, so any drift lasts until the
  * next one rather than until reboot, which was the objection to an incremental
  * reservation total. */

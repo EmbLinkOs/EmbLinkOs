@@ -238,8 +238,8 @@ ContextMenu(&ctx, cx, cy) {
 ```
 
 The `EM_APPLICATION` runtime feeds the right mouse button in for you, so
-`RightClicked()` fires anywhere in the content. `v6demo.c` (the "Menus" home
-tile) is the reference app.
+`RightClicked()` fires anywhere in the content. `user/examples/v6demo/v6demo.c`
+is the reference app — run it with `run /data/apps/v6demo/v6demo.elf`.
 
 ## Text editor (V7)
 
@@ -261,8 +261,9 @@ VStack(.spacing = 10, .padding = 16, .align = Fill) {
 
 The arrow/Home/End keys arrive as `EMBK_KEY_*` codes the kernel keyboard driver
 emits for the extended scancodes; under `EM_APPLICATION` the runtime grabs the
-keyboard and forwards everything, so no extra wiring is needed. `v7demo.c` (the
-"Editor" home tile) is the reference app.
+keyboard and forwards everything, so no extra wiring is needed.
+`user/examples/v7demo/v7demo.c` is the reference app
+(`run /data/apps/v7demo/v7demo.elf`).
 
 ## Materials: glass
 
@@ -311,7 +312,7 @@ That's the whole change — your view still renders normally (opaque); the
 compositor does the frosting (`EMBK_WINF_GLASS`, a kernel-side blur + uniform
 alpha). The blur runs when the window paints, so a still window is cheap; a
 *drag* re-blurs each step (fine under a GPU, a little heavier under plain QEMU).
-`v7demo.c` (the "Editor" tile) is an Acrylic window.
+`v7demo.c` is an Acrylic window.
 
 ## App-owned chrome: chromeless windows
 
@@ -489,6 +490,11 @@ straight to the home launcher and click your tile.
 
 - [EMUI_INTERNALS.md](EMUI_INTERNALS.md) — how the layers underneath this
   guide actually work, for anyone extending the toolkit itself.
+The reference apps live in `user/examples/` and are **not** on the desktop's
+launcher — they are installed and run from the terminal
+(`run /data/apps/<name>/<name>.elf`). Only programs under `user/apps/` get a
+launcher entry; move one there and it appears.
+
 - [`user/examples/v4demo/v4demo.c`](../user/examples/v4demo/v4demo.c) — the fullest reference app:
   chromeless chrome, tabs, split view, every V4/V5 component in one place.
 - [`user/apps/clockw/clockw.c`](../user/apps/clockw/clockw.c) — the minimal widget reference.

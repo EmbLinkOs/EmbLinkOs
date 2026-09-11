@@ -55,16 +55,38 @@ class _CairoRect(ctypes.Structure):
                 ("width", ctypes.c_double), ("height", ctypes.c_double)]
 
 
+def _dlopen(candidates):
+    """The first of `candidates` that loads. The names are per platform and
+    there is no portable one: Linux ships librsvg-2.so.2, Homebrew ships
+    librsvg-2.2.dylib under a prefix that is not on the default dlopen path
+    (/opt/homebrew on Apple Silicon, /usr/local on Intel). This tool was
+    Linux-only by accident -- on the Mac every SVG master was silently skipped
+    even with librsvg installed, and six apps shipped the same generic icon."""
+    last = None
+    for name in candidates:
+        try:
+            return ctypes.CDLL(name)
+        except OSError as e:
+            last = e
+    raise OSError(last)
+
+
+def _lib(linux_name, mac_stem):
+    brew = [p + "/lib/" + mac_stem for p in ("/opt/homebrew", "/usr/local")]
+    return [linux_name, mac_stem] + brew
+
+
 class SvgRenderer:
     def __init__(self):
         try:
-            self.cairo = ctypes.CDLL("libcairo.so.2")
-            self.rsvg = ctypes.CDLL("librsvg-2.so.2")
-            self.gobj = ctypes.CDLL("libgobject-2.0.so.0")
+            self.cairo = _dlopen(_lib("libcairo.so.2", "libcairo.2.dylib"))
+            self.rsvg = _dlopen(_lib("librsvg-2.so.2", "librsvg-2.2.dylib"))
+            self.gobj = _dlopen(_lib("libgobject-2.0.so.0", "libgobject-2.0.0.dylib"))
         except OSError as e:
             raise RuntimeError(
                 "SVG masters need librsvg and cairo.\n"
                 "  Debian/Ubuntu:  sudo apt install librsvg2-2 libcairo2\n"
+                "  macOS:          brew install librsvg\n"
                 f"  (dlopen failed: {e})")
 
         c, r, g = self.cairo, self.rsvg, self.gobj
@@ -408,7 +430,7 @@ def main():
                   ".eic (install librsvg for SVG, Pillow for PNG masters)")
             return 0
         sys.exit(f"mkicons: cannot build {', '.join(missing)} -- "
-                 "install librsvg2-2 (SVG masters) or Pillow (PNG/.pam)")
+                 "install librsvg2-2 / `brew install librsvg` (SVG masters) or Pillow (PNG/.pam)")
 
     os.makedirs(OUTDIR, exist_ok=True)
     print(f"mkicons: {len(names)} icon(s), ladder {ladder}")

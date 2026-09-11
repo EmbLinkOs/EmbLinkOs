@@ -7923,10 +7923,19 @@ int selftests_handle_command(const char *cmd)
         /* The comparison, and it is the ONLY assertion worth making. An
          * absolute bound would be a claim about QEMU's timing rather than
          * about this kernel; "better than the policy it replaces, on the same
-         * load, in the same boot" is a claim about the change. */
-        kprintf("  [%s] the deadline policy is not worse (%d <= %d ms)\n",
-                worst_dl <= worst_rr ? "ok" : "FAIL", worst_dl, worst_rr);
-        if (worst_dl > worst_rr) ok = 0;
+         * load, in the same boot" is a claim about the change.
+         *
+         * FOUR TIMES BETTER, not merely "no worse". `worst_dl <= worst_rr` was
+         * the assertion and it let the real failure through: when the policy
+         * silently stopped applying (the declared-count reap race, fixed in
+         * process/process.c), a deadline run measured 44 ms against
+         * round-robin's 44 ms and PASSED. Working, this policy is 4 ms against
+         * 115 here and 0-1 against 42-52 on aarch64 -- so a quarter is a wide
+         * margin that still fails the instant the policy is not in effect. */
+        bool dl_better = worst_dl * 4 <= worst_rr;
+        kprintf("  [%s] the deadline policy is 4x better, not merely no worse "
+                "(%d <= %d/4 ms)\n", dl_better ? "ok" : "FAIL", worst_dl, worst_rr);
+        if (!dl_better) ok = 0;
 
         /* Sanity on the load itself. If round-robin already delivered every
          * period inside one tick, the machine was not actually contended and

@@ -1537,6 +1537,19 @@ text.
 
 ## User Interface (EmUI), Compositor & Userland Runtime
 
+- [ ] **Six applications share one generic icon.** Files, Editor, Note++,
+      Photos, Music and Vellum all declare `/system/images/file.eic` -- a
+      document glyph -- because nobody drew theirs; only Settings and Terminal
+      have art. The pipeline is ready (`icons/masters/<name>.svg` ->
+      `system/images/<name>.eic` at build time) and `tools/mkicons.py` now finds
+      librsvg on macOS (it only knew the Linux library names, so every SVG
+      master was silently skipped on the Mac). What it needs is librsvg on the
+      build machine -- `brew install librsvg` -- and six SVGs.
+- [x] **The toolkit reference demos are no longer on the launcher.** A third of
+      the launcher was "V4 Demo", "Editor Demo", "Windows", "Menus", "UI Demo".
+      Launcher entries are now packed only for programs under `user/apps/`; the
+      examples are still built, installed and runnable from the terminal.
+
 Design/usage docs: `docs/EMUI_GUIDE.md` (how to build an app),
 `docs/EMUI_INTERNALS.md` (how the toolkit is built), `docs/BUILD_SETUP.md`
 (newlib + dynamic linking). Open items only — the toolkit itself, the
@@ -2327,16 +2340,38 @@ Open:
 
 ## Process & Scheduling
 
-- [ ] **The deadline scheduler's lateness check is intermittent, and it does
-      not look like host noise.** On the aarch64 boot test (HVF), `worst
-      lateness: round-robin 44 ms, deadline 0 ms` on most runs and
-      `round-robin 44 ms, deadline 46 ms` on some -- 2 of roughly 12 runs on
-      2026-09-11. The round-robin figure is 44 ms EVERY time; host scheduling
-      noise would move both. The deadline thread's lateness jumping to exactly
-      one round-robin period instead suggests it occasionally runs WITHOUT its
-      deadline policy for one period -- a missed admission, or a wakeup that
-      lands on the round-robin path. It fails the boot test when it happens,
-      which is the worst kind of test: one that teaches you to rerun it.
+- [x] **The deadline policy switched itself off, intermittently, for whole
+      runs.** `dl_pick()` treats a declared-thread count of 0 as "nobody asked
+      for deadlines" and hands every decision to round-robin. The count is
+      recomputed on each declaration and that recount SKIPS zombies -- but
+      `thread_reap_slot()` DECREMENTED it for any thread that still carried a
+      period. So: thread A declares, A exits (zombie), thread B declares
+      (recount = 1, correct), A's slot is reaped, count = 0, and B runs its
+      entire life without the policy it asked for. Purely a question of whether
+      the reap landed before or after the next declaration.
+      MEASURED, with a detector on the old code that logged the moment a reap
+      drove the count to 0 under a live declaration:
+
+      | 12 boot tests, old code | result |
+      |---|---|
+      | detector silent | 11 runs, deadline lateness 0 ms |
+      | detector fired | 1 run, deadline lateness 44 ms (round-robin's own 44) |
+
+      Twelve runs of the fixed code: 0 ms every time. The reap RECOUNTS now --
+      a decrement cannot know whether the last recount counted that thread, and
+      a recount is right by construction.
+- [x] **The assertion that missed it, tightened.** `deadline <= round-robin`
+      passed that 44-vs-44 run. Working, the policy is 0-1 ms against 42-52 on
+      aarch64 and 4 ms against 115 on x86, so both tests now require the
+      deadline run to be at least FOUR TIMES better. A tie is a failure.
+- [ ] **One boot hung inside the deadline test and is not explained.** A boot
+      stopped after `jitter: 6 hog thread(s) ... sched_period -> 0` (the second,
+      deadline run) and made no progress for over two minutes; the whole boot
+      normally takes ~25 s. Once, in a batch of four, on 2026-09-11, before the
+      count fix -- and not seen in the ~40 boots since. It may have been the
+      same bug wearing a worse face, or starvation under a deadline thread plus
+      six hogs. Not closed on the strength of "it stopped happening": capture
+      the next one with `info registers -a` over QMP before killing it.
 
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant
 ### source of lateness

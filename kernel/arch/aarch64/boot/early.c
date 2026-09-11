@@ -1125,14 +1125,24 @@ void arch_early_main(uint64_t dtb_phys) {
 
             sched_policy_set(dl);
             int pdl = process_create(jp, a, 5, NULL, 0);
+
             int wdl = pdl >= 0 ? process_wait((uint32_t)pdl) : -1;
 
             sched_policy_set(saved);
 
-            kprintf("  [%s] worst lateness: round-robin %d ms, deadline %d ms\n",
-                    (wrr >= 0 && wdl >= 0 && wdl <= wrr) ? " ok " : "FAIL",
-                    wrr, wdl);
-            if (wrr < 0 || wdl < 0 || wdl > wrr)
+            /* AT MOST A QUARTER, not merely "no worse". The old assertion was
+             * wdl <= wrr, and it let the real failure through: when the policy
+             * silently did not apply (the declared-count reap race, fixed in
+             * process.c), the deadline run measured 44 ms against round-robin's
+             * 44 ms and PASSED. The policy working is not a tie -- it is 0-1 ms
+             * against 42-52 here and 4 ms against 115 on x86, so a quarter is a
+             * wide margin that still fails the moment the policy is not in
+             * effect. */
+            bool dl_ok = (wrr >= 0 && wdl >= 0 && wdl * 4 <= wrr);
+            kprintf("  [%s] worst lateness: round-robin %d ms, deadline %d ms "
+                    "(the policy must be 4x better, not merely no worse)\n",
+                    dl_ok ? " ok " : "FAIL", wrr, wdl);
+            if (!dl_ok)
                 selftest_fails++;
             if (wrr >= 0 && wrr < 10)
                 kprintf("  [info] round-robin's worst was only %d ms -- the load\n"

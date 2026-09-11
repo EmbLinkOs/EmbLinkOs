@@ -712,7 +712,17 @@ $(foreach p,$(ARM_EMLIBC_PROGS),$(eval $(call ARM_EMLIBC_PROG,$(p))))
 # arm64 packer reuses the SAME make_image()/build_root_items() formatter (so the
 # on-disk format cannot drift between the two) and simply gives it a shorter
 # object list.
-$(ARM_ROOTFS): tools/embkfs_mkfs/mkfs_arm64.py $(ARM_USER_ELVES) $(ARM_LIBEMBK) | $(ARM_BUILD)
+# The image depends on EVERYTHING that decides its contents, not just the
+# script named on the recipe line. mkfs_arm64.py imports its layout and its
+# manifest lookup from mkfs_embkfs.py and layout.py, and packs each program's
+# .ns/.caps/.app from its program directory -- so a change to any of those
+# changed what the image SHOULD hold while make considered it up to date. The
+# symptom was an x86 image and an aarch64 image built from the same tree
+# disagreeing about which apps the launcher shows.
+ARM_ROOTFS_INPUTS := tools/embkfs_mkfs/mkfs_arm64.py tools/embkfs_mkfs/mkfs_embkfs.py \
+                     tools/embkfs_mkfs/layout.py \
+                     $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app)
+$(ARM_ROOTFS): $(ARM_ROOTFS_INPUTS) $(ARM_USER_ELVES) $(ARM_LIBEMBK) | $(ARM_BUILD)
 	python3 tools/embkfs_mkfs/mkfs_arm64.py $@ $(ARM_USER)
 
 .PHONY: arm64-rootfs
