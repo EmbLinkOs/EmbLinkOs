@@ -409,7 +409,44 @@ capabilities rather than fork/exec.
    full page and zero-padded, making 21 ms the smallest unit of audio the
    device could be given. `make test-audio-latency` runs the sweep.
 
-10. **Job control is finished.** `^Z`, `stop`, `bg` and `fg` all work, and the
+10. **ASLR, our way — and a collision it found on the way in.** Every process
+   used to live at the same six addresses. Now the six the *kernel* chooses
+   are drawn per process from the CSPRNG (`struct user_layout`, rolled in
+   `process_alloc()` so no creation path can forget):
+
+   | window | base | randomised over | entropy |
+   |---|---|---|---|
+   | dylib (`libembk.so`) | `0x2000_0000_0000` | 16 GiB | 22 bits |
+   | shared surfaces | `0x4000_0000_0000` | 64 GiB | 24 bits |
+   | mmap | `0x5000_0000_0000` | 64 GiB | 24 bits |
+   | heap | `0x6000_0000_0000` | 16 GiB | 22 bits |
+   | main stack | `0x7000_0000_0000` (downward) | 16 GiB | 22 bits |
+   | thread stacks | `0x7000_1000_0000` | 16 GiB | 22 bits |
+
+   `test aslr` spawns six processes and reads their layouts straight from the
+   process table: every window page-aligned, inside its range, distinct across
+   all six, disjoint within each, and all six children alive on their
+   randomised stacks. `aslrprobe.elf` is the human version — run it twice.
+
+   **What it found:** the shared-surface window and the mmap window started at
+   the *same* address, and surface mappings are not in the VMA list, so
+   `mmap()` could hand out a page the compositor had already mapped. Shared
+   surfaces have their own window now.
+
+   **Two things it got wrong first, both recorded in the code:** the first
+   pass missed one of the seven `USER_STACK_VA` sites — the `argv` string
+   pointers — which would have left every process with a stack at the new
+   address and `argv[]` pointing at the old one; and the layout was rolled in
+   `process_create_caps()`, leaving *adopted* contexts (the kernel console's
+   own process) with an empty mmap window that refused everything with
+   `EINVAL`. `test mmap` caught the second on both architectures.
+
+   **What still does not move:** the executable itself. Apps are `ET_EXEC` at
+   `0x400000`; moving them is PIE userland, a toolchain-and-loader change
+   (`docs/TODO.md`). The probe prints that address next to the ones that move,
+   so the gap is visible rather than implied.
+
+11. **Job control is finished.** `^Z`, `stop`, `bg` and `fg` all work, and the
    piece that had to be built for them was in the kernel: a process could be
    *interrupted* or *cancelled*, but a shell had no way to ask for one to be
    **stopped**. `process_suspend()` had existed since the debugger needed it

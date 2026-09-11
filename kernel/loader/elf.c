@@ -342,6 +342,7 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
 /* The app is already segment-loaded (bias 0). Load /libembk.so at DYLIB_VA_BASE
  * and perform the two-way link. */
 static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
+                        uint64_t dylib_base,
                         const struct elf64_phdr *app_ph, uint16_t app_phnum)
 {
     /* libembk.so is the sealed ABI (docs/USERSPACE.md D2 §3.1); it lives under
@@ -360,13 +361,13 @@ static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
     }
     const struct elf64_phdr *so_ph = (const struct elf64_phdr *)(so_buf + soeh->e_phoff);
 
-    rc = load_segments(so_buf, so_len, pml4, DYLIB_VA_BASE, so_ph, soeh->e_phnum);
+    rc = load_segments(so_buf, so_len, pml4, dylib_base, so_ph, soeh->e_phnum);
     if (rc != EMBK_OK) { kfree(so_buf); return rc; }
 
     struct dynmod app, so;
     uint64_t ar_v, ar_sz, aj_v, aj_sz, sr_v, sr_sz, sj_v, sj_sz;
     if (parse_dynamic(app_image, app_ph, app_phnum, 0, &app, &ar_v, &ar_sz, &aj_v, &aj_sz) != EMBK_OK ||
-        parse_dynamic(so_buf, so_ph, soeh->e_phnum, DYLIB_VA_BASE, &so, &sr_v, &sr_sz, &sj_v, &sj_sz) != EMBK_OK) {
+        parse_dynamic(so_buf, so_ph, soeh->e_phnum, dylib_base, &so, &sr_v, &sr_sz, &sj_v, &sj_sz) != EMBK_OK) {
         kfree(so_buf); return -EMBK_ENOEXEC;
     }
     struct dynmod mods[2] = { app, so };
@@ -399,7 +400,12 @@ static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
         return -EMBK_EINVAL; \
     } while (0)
 
-int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint64_t *entry_out)
+/* The dylib goes where the PROCESS says, which is now a random place per
+ * process (struct user_layout). The old entry points keep the fixed base for
+ * any caller that has no process to ask -- there are none in the tree today,
+ * and one that appears will get the unrandomised layout rather than a crash. */
+int elf_load_at(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys,
+                uint64_t dylib_base, uint64_t *entry_out)
 {
     if (!image || !entry_out || !pml4_phys)
         ELF_REFUSE("null image/entry/pml4");
@@ -427,7 +433,7 @@ int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint6
     for (uint16_t i = 0; i < eh->e_phnum; i++)
         if (ph[i].p_type == PT_DYNAMIC) { has_dynamic = 1; break; }
     if (has_dynamic) {
-        rc = dynamic_link(image, pml4_phys, ph, eh->e_phnum);
+        rc = dynamic_link(image, pml4_phys, dylib_base, ph, eh->e_phnum);
         if (rc != EMBK_OK) return rc;
     }
 
@@ -436,7 +442,7 @@ int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint6
 }
 
 /* Read a user ELF off the filesystem and load it into pml4_phys. */
-int elf_load_from_file(const char *path, uint64_t pml4_phys, uint64_t *entry_out)
+int elf_load_from_file_at(const char *path, uint64_t pml4_phys, uint64_t dylib_base, uint64_t *entry_out)
 {
     uint8_t *buf = 0; uint64_t total = 0;
     int rc = read_file_kbuf(path, &buf, &total);
@@ -444,7 +450,18 @@ int elf_load_from_file(const char *path, uint64_t pml4_phys, uint64_t *entry_out
         serial_write_string("elf_load_from_file: read failed\n");
         return rc;
     }
-    rc = elf_load(buf, total, pml4_phys, entry_out);
+    rc = elf_load_at(buf, total, pml4_phys, dylib_base, entry_out);
     kfree(buf);
     return rc;
+}
+
+
+int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint64_t *entry_out)
+{
+    return elf_load_at(image, image_len, pml4_phys, DYLIB_VA_BASE, entry_out);
+}
+
+int elf_load_from_file(const char *path, uint64_t pml4_phys, uint64_t *entry_out)
+{
+    return elf_load_from_file_at(path, pml4_phys, DYLIB_VA_BASE, entry_out);
 }

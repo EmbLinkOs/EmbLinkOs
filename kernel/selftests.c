@@ -31,6 +31,7 @@
 #include "arch/x86_64/cpu/cpu_features.h"  /* test hardening */
 #include "include/uaccess_guard.h"           /* test hardening */
 #include "lib/random.h"                      /* test random */
+#include <stddef.h>                            /* offsetof: test aslr */
 #include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
 #include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
 #include "power/power.h"  /* power / poweroff / reboot */
@@ -423,6 +424,7 @@ static void selftests_print_commands(void)
     kprintf("  test jobctl\n");
     kprintf("  test hardening\n");
     kprintf("  test random\n");
+    kprintf("  test aslr\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1289,6 +1291,103 @@ int selftests_handle_command(const char *cmd)
                 (unsigned long long)(b1 - b0));
 
         kprintf("[cmd] test random: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test aslr -- does every process get its own addresses?
+     *
+     * Six processes, six layouts read straight out of the process table. Each
+     * of the six windows must be page-aligned, inside its window, and DISTINCT
+     * across all six: at 22 bits of entropy per window the chance of any
+     * collision among six is about 1 in 300,000, so a repeat is a broken
+     * generator, not bad luck. The children sleep so they exist long enough to
+     * be read, and are killed and collected afterwards -- a frozen or leaked
+     * child is exactly what a test of process creation must not leave behind.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test aslr") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test aslr: VFS not registered\n"); return 1; }
+        const char *sp = "/system/bin/shell.elf";
+        struct vfs_stat sst;
+        if (vfs_stat(sp, &sst) != EMBK_OK) { kprintf("\n[cmd] test aslr: %s not on image\n", sp); return 1; }
+
+        enum { N = 6 };
+        struct user_layout L[N];
+        int pids[N];
+        int ok = 1, got = 0;
+
+        kprintf("\n[aslr] %d processes, six kernel-chosen windows each\n", N);
+        for (int i = 0; i < N; i++) {
+            char *a[] = { (char *)sp, "-c", "sleep 3000", NULL };
+            pids[i] = process_create(sp, a, 3, NULL, 0);
+            if (pids[i] < 0 || process_layout_of((uint32_t)pids[i], &L[i]) != 0) {
+                kprintf("  [FAIL] could not spawn/read process %d\n", i);
+                ok = 0; pids[i] = -1; continue;
+            }
+            got++;
+            kprintf("  pid %3d: dylib %llx  shared %llx  mmap %llx  heap %llx  stack %llx  tstack %llx\n",
+                    pids[i],
+                    (unsigned long long)L[i].dylib_base, (unsigned long long)L[i].shared_base,
+                    (unsigned long long)L[i].mmap_base,  (unsigned long long)L[i].heap_base,
+                    (unsigned long long)L[i].stack_top_page, (unsigned long long)L[i].thread_stack_base);
+        }
+
+        /* Each field: aligned, in-window, and unique across the set. */
+        struct { const char *name; size_t off; uint64_t lo, hi; } F[] = {
+            { "dylib",  offsetof(struct user_layout, dylib_base),        0x0000200000000000ULL, 0x0000200000000000ULL + (16ull<<30) },
+            { "shared", offsetof(struct user_layout, shared_base),       0x0000400000000000ULL, 0x0000400000000000ULL + (64ull<<30) },
+            { "mmap",   offsetof(struct user_layout, mmap_base),         0x0000500000000000ULL, 0x0000500000000000ULL + (64ull<<30) },
+            { "heap",   offsetof(struct user_layout, heap_base),         0x0000600000000000ULL, 0x0000600000000000ULL + (16ull<<30) },
+            { "stack",  offsetof(struct user_layout, stack_top_page),    0x0000700000000000ULL - (16ull<<30), 0x0000700000000000ULL + 1 },
+            { "tstack", offsetof(struct user_layout, thread_stack_base), 0x0000700010000000ULL, 0x0000700010000000ULL + (16ull<<30) },
+        };
+        for (unsigned f = 0; f < sizeof F / sizeof F[0]; f++) {
+            int aligned = 1, inwin = 1, distinct = 1;
+            for (int i = 0; i < N; i++) {
+                if (pids[i] < 0) continue;
+                uint64_t v = *(uint64_t *)((char *)&L[i] + F[f].off);
+                if (v & 0xFFF) aligned = 0;
+                if (v < F[f].lo || v >= F[f].hi) inwin = 0;
+                for (int j = i + 1; j < N; j++) {
+                    if (pids[j] < 0) continue;
+                    if (v == *(uint64_t *)((char *)&L[j] + F[f].off)) distinct = 0;
+                }
+            }
+            kprintf("  [%s] %-6s: page-aligned %s, inside its window %s, all %d distinct %s\n",
+                    (aligned && inwin && distinct) ? "ok" : "FAIL", F[f].name,
+                    aligned ? "yes" : "NO", inwin ? "yes" : "NO", got, distinct ? "yes" : "NO");
+            if (!(aligned && inwin && distinct)) ok = 0;
+        }
+
+        /* The windows must not overlap WITHIN one process either: the largest
+         * (mmap, 256 GiB from a base up to 64 GiB in) tops out at
+         * 0x5050_0000_0000, below the heap base. Checked, not assumed. */
+        int disjoint = 1;
+        for (int i = 0; i < N; i++) {
+            if (pids[i] < 0) continue;
+            if (L[i].mmap_max > L[i].heap_base) disjoint = 0;
+            if (L[i].heap_max > L[i].stack_top_page - (128ull << 12)) disjoint = 0;   /* main stack pages */
+            if (L[i].shared_base + (64ull << 30) > L[i].mmap_base) disjoint = 0;
+        }
+        kprintf("  [%s] the six windows do not overlap inside any process\n", disjoint ? "ok" : "FAIL");
+        if (!disjoint) ok = 0;
+
+        /* And the processes actually RAN with those layouts: they are alive,
+         * which means main() was reached on a randomised stack with argv
+         * pointers that resolved -- the one site that was missed in the first
+         * pass would have faulted every one of them before this line. */
+        int alive = 0;
+        for (int i = 0; i < N; i++) if (pids[i] >= 0 && process_alive((uint32_t)pids[i])) alive++;
+        kprintf("  [%s] %d of %d children are alive on their randomised stacks\n",
+                alive == got ? "ok" : "FAIL", alive, got);
+        if (alive != got) ok = 0;
+
+        for (int i = 0; i < N; i++) {
+            if (pids[i] < 0) continue;
+            process_kill((uint32_t)pids[i]);
+            (void)process_wait((uint32_t)pids[i]);
+        }
+        kprintf("[cmd] test aslr: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
@@ -6845,7 +6944,7 @@ int selftests_handle_command(const char *cmd)
          * touching one -- that would kill this context -- but by asking
          * vm_fault directly, which is the same call the fault handler makes. */
         {
-            bool declined = !vm_fault(p, USER_MMAP_BASE + 0x3000000000ull, true, false);
+            bool declined = !vm_fault(p, p->layout.mmap_base + 0x3000000000ull, true, false);
             kprintf("      [%s] a fault outside every mapping is DECLINED "
                     "(a wild pointer must still crash)\n", declined ? " ok " : "FAIL");
             if (!declined) fails++;

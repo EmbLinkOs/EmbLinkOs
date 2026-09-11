@@ -385,6 +385,56 @@ struct thread {
  * deferred until multiple threads were actually needed. A process with
  * `live_thread_count == 0` is a free slot (pid == 0 marks this, mirroring
  * how a fresh/reaped thread slot is marked PROCESS_UNUSED). */
+/* ==========================================================================
+ * ADDRESS-SPACE LAYOUT RANDOMISATION -- our way.
+ *
+ * Every process used to be laid out at the same six addresses: the dynamic
+ * library at 0x2000_0000_0000, mmap at 0x5000_..., the heap at 0x6000_..., the
+ * stack at 0x7000_..., thread stacks just above it, and shared surfaces --
+ * which, it turned out, started at exactly the mmap base and were not recorded
+ * in the VMA list, so the two could hand out the same page. Predictable
+ * addresses are what an exploit is made of: a write-what-where is only useful
+ * if you know where.
+ *
+ * THE EXECUTABLE ITSELF DOES NOT MOVE YET. Apps are linked ET_EXEC at 0x400000
+ * (user/lib/newlib.ld), and moving them needs PIE userland, which is a
+ * toolchain change (docs/TODO.md). Everything the KERNEL chooses moves now,
+ * per process, from the kernel's CSPRNG:
+ *
+ *   window          base                 randomised over   entropy
+ *   dylib           0x2000_0000_0000     16 GiB            22 bits
+ *   shared surfaces 0x4000_0000_0000     64 GiB            24 bits   (moved off mmap)
+ *   mmap            0x5000_0000_0000     64 GiB            24 bits   (+256 GiB window)
+ *   heap            0x6000_0000_0000     16 GiB            22 bits   (+1 GiB window)
+ *   main stack      0x7000_0000_0000     16 GiB below      22 bits
+ *   thread stacks   0x7000_1000_0000     16 GiB            22 bits
+ *
+ * All page-granular, all inside the canonical low half, and the windows are
+ * disjoint by construction -- the largest, mmap, reaches at most
+ * 0x5050_0000_0000. Entropy is per window; an attacker who learns one base
+ * learns nothing about the others.
+ *
+ * WHY A STRUCT AND NOT SIX FIELDS: so a kthread can be told from a user
+ * process by one zero-test, and so `test aslr` can read a process's whole
+ * layout in one copy. Filled by process_layout_roll(), read everywhere the
+ * old constants were, which is exactly the list above.
+ * ========================================================================== */
+struct user_layout {
+    uint64_t dylib_base;          /* where libembk.so is linked in            */
+    uint64_t shared_base;         /* first shared-surface mapping             */
+    uint64_t mmap_base, mmap_max; /* the mmap() window                        */
+    uint64_t heap_base, heap_max; /* the sbrk() window                        */
+    uint64_t stack_top_page;      /* VA of the TOP page of the main stack     */
+    uint64_t thread_stack_base;   /* thread stacks: base + (tid+1) * slot     */
+};
+
+/* Choose a layout for a user process about to be created. Idempotent per
+ * process; a second call re-rolls. */
+void process_layout_roll(struct process *proc);
+
+/* Copy `pid`'s layout out. Self-locking. -1 if there is no such process. */
+int  process_layout_of(uint32_t pid, struct user_layout *out);
+
 struct process {
     uint32_t pid;              /**< Process ID. 0 means this slot is free. */
     uint64_t pml4_phys;        /**< Physical address of this process's PML4 (page table) */
@@ -596,6 +646,11 @@ struct process {
      * used to track the top of the heap and ensure that the process does not exceed its allocated heap space. */
     uint64_t heap_mapped_top;
 
+    /* WHERE THIS PROCESS'S ADDRESS SPACE IS, chosen at random when it is born.
+     * See struct user_layout. UNUSED by a kthread or an adopted context, which
+     * have no user half and never consult it -- not necessarily zero, since a
+     * process slot is reused and process_alloc() does not clear it. */
+    struct user_layout layout;
 };
 
 

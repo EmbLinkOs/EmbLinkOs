@@ -80,7 +80,7 @@ static uint64_t prot_to_vmm(uint32_t prot) {
  * for a process with thousands -- a tree is the answer then, and this is not
  * that yet. */
 static uint64_t find_gap(struct process *proc, uint64_t len) {
-    uint64_t cand = USER_MMAP_BASE;
+    uint64_t cand = proc->layout.mmap_base;      /* this process's window */
 
     for (struct vm_area *v = proc->vma_list; v; v = v->next) {
         if (v->start >= cand + len)
@@ -88,7 +88,7 @@ static uint64_t find_gap(struct process *proc, uint64_t len) {
         if (v->end > cand)
             cand = v->end;
     }
-    if (cand + len > USER_MMAP_MAX || cand + len < cand)
+    if (cand + len > proc->layout.mmap_max || cand + len < cand)
         return 0;
     return cand;
 }
@@ -302,7 +302,7 @@ static int64_t vma_map_common(struct process *proc, uint64_t addr, uint64_t len,
         return -EMBK_EINVAL;
 
     len = page_align_up(len);
-    if (len == 0 || len > (USER_MMAP_MAX - USER_MMAP_BASE))
+    if (len == 0 || len > (proc->layout.mmap_max - proc->layout.mmap_base))
         return -EMBK_EINVAL;
 
     /* Exactly one of SHARED/PRIVATE, and one of them. "Neither" has no
@@ -327,7 +327,7 @@ static int64_t vma_map_common(struct process *proc, uint64_t addr, uint64_t len,
     if (flags & MAP_FIXED) {
         if (addr & (PAGE_SIZE - 1))
             { spin_unlock(&vma_lock); return -EMBK_EINVAL; }
-        if (addr < USER_MMAP_BASE || addr + len > USER_MMAP_MAX)
+        if (addr < proc->layout.mmap_base || addr + len > proc->layout.mmap_max)
             { spin_unlock(&vma_lock); return -EMBK_EINVAL; }
         if (!range_is_free(proc, addr, addr + len))
             { spin_unlock(&vma_lock); return -EMBK_EEXIST; }  /* MAP_FIXED does NOT silently replace */

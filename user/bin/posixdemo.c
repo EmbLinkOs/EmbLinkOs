@@ -749,9 +749,16 @@ static void test_mmap(void) {
     ck("a file-backed mapping is refused, not faked with zeroes",
        fm == MAP_FAILED && errno == ENODEV);
 
+    /* A range that is KNOWN to be unmapped, found by asking rather than by
+     * assuming an address: map a page, unmap it, and use that. The old fixed
+     * 0x5000_3000_0000 stopped being knowably free when mmap's window became
+     * random per process. */
+    void *probe = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ck("a probe page can be mapped to find a free address", probe != MAP_FAILED);
+    if (probe != MAP_FAILED) munmap(probe, 4096);
     errno = 0;
     ck("munmap of a range that was never mapped fails",
-       munmap((void *)(uintptr_t)(0x500000000000ULL + 0x30000000ULL), 4096) == -1);
+       probe == MAP_FAILED || munmap(probe, 4096) == -1);
 
 }
 
@@ -823,9 +830,12 @@ static void test_mprotect(void) {
         munmap(three + 2 * 4096, 4096);
     }
 
+    /* Same trick as the munmap case: find a free address by mapping and
+     * unmapping one, rather than assuming where the mmap window is. */
+    void *gone = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (gone != MAP_FAILED) munmap(gone, 4096);
     CK_FAILS("mprotect of an unmapped range -> ENOMEM",
-             mprotect((void *)(uintptr_t)(0x500000000000ULL + 0x30000000ULL),
-                      4096, PROT_READ), ENOMEM);
+             mprotect(gone == MAP_FAILED ? (void *)0x1000 : gone, 4096, PROT_READ), ENOMEM);
 
     munmap(page, 4096);
 }

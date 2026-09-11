@@ -21,6 +21,9 @@
                                     * switch, the thread pointer, the kernel
                                     * stack, and this core's id */
 #include "drivers/timer/timer.h"    /* timer_sched_ticks() -- the preempting clock */
+#include "lib/random.h"             /* process_layout_roll: ASLR offsets */
+#include "mm/vma.h"                 /* USER_MMAP_BASE */
+#include "loader/elf.h"             /* DYLIB_VA_BASE */
 #include "include/spinlock.h"
 #include "process/ksync.h"       /* mutex_init for each process's fd_lock */
 #include "process/debug.h"       /* debug_session_spawn, debug_notify_exit */
@@ -34,6 +37,7 @@
  * scene traversal / glyph rasterisation with multi-KB frames). Map this many
  * pages ending at USER_STACK_TOP so the stack has room to grow. */
 #define USER_STACK_PAGES 128                   /* 512 KiB main stack */
+
 
 /* Phase 5 (ring-3 threads): per-thread user stacks for every thread BEYOND
  * a process's own main one (which keeps using USER_STACK_VA/TOP above,
@@ -137,6 +141,48 @@ static void sched_kick_idle(void);
  * own first step, none of them already hold g_sched_lock at that point,
  * and without a lock here two cores calling process_create() concurrently
  * could both claim the SAME free slot. */
+/* --- ASLR: the windows above, made per-process ---------------------------
+ * See struct user_layout in process.h for the table and the reasoning. The
+ * constants stay: they are the window BASES, and the roll adds a random,
+ * page-aligned offset inside each window. */
+#define ASLR_DYLIB_SPAN     (16ull << 30)
+#define ASLR_SHARED_BASE    0x0000400000000000ULL      /* off the mmap base */
+#define ASLR_SHARED_SPAN    (64ull << 30)
+#define ASLR_MMAP_SPAN      (64ull << 30)
+#define ASLR_MMAP_WINDOW    (256ull << 30)
+#define ASLR_HEAP_SPAN      (16ull << 30)
+#define ASLR_HEAP_WINDOW    (1ull << 30)
+#define ASLR_STACK_SPAN     (16ull << 30)
+#define ASLR_TSTACK_SPAN    (16ull << 30)
+
+static uint64_t aslr_offset(uint64_t span) {
+    /* Page-granular: the low 12 bits of an address are not entropy, they are
+     * alignment, and an offset that breaks alignment breaks the mapping. */
+    return random_below(span >> 12) << 12;
+}
+
+void process_layout_roll(struct process *proc) {
+    struct user_layout *l = &proc->layout;
+    l->dylib_base        = DYLIB_VA_BASE        + aslr_offset(ASLR_DYLIB_SPAN);
+    l->shared_base       = ASLR_SHARED_BASE     + aslr_offset(ASLR_SHARED_SPAN);
+    l->mmap_base         = USER_MMAP_BASE       + aslr_offset(ASLR_MMAP_SPAN);
+    l->mmap_max          = l->mmap_base + ASLR_MMAP_WINDOW;
+    l->heap_base         = USER_HEAP_VA_BASE    + aslr_offset(ASLR_HEAP_SPAN);
+    l->heap_max          = l->heap_base + ASLR_HEAP_WINDOW;
+    l->stack_top_page    = USER_STACK_VA        - aslr_offset(ASLR_STACK_SPAN);
+    l->thread_stack_base = USER_THREAD_STACK_BASE + aslr_offset(ASLR_TSTACK_SPAN);
+}
+
+int process_layout_of(uint32_t pid, struct user_layout *out) {
+    if (!out) return -1;
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    if (!p) { spin_unlock(&g_sched_lock); return -1; }
+    *out = p->layout;
+    spin_unlock(&g_sched_lock);
+    return 0;
+}
+
 static struct process *process_alloc(void) {
     spin_lock(&g_sched_lock);
     for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -178,6 +224,15 @@ static struct process *process_alloc(void) {
              * every thread of the previous process is gone.) */
             mutex_init(&process_table[i].fd_lock);
             spin_unlock(&g_sched_lock);
+            /* EVERY process gets a layout here -- the one place all of them pass
+             * through. The first version rolled it in process_create_caps() and left
+             * adopted contexts (the kernel console's own process among them) with an
+             * all-zero layout, so their mmap window was empty and vma_mmap() refused
+             * everything with EINVAL. A kthread does not need one and gets one anyway:
+             * 48 bytes of RNG output is cheaper than a second path that can be
+             * forgotten. For the earliest kthreads this runs before random_init();
+             * random_bytes() self-seeds and nothing consults those layouts. */
+            process_layout_roll(&process_table[i]);
             return &process_table[i];
         }
     }
@@ -2023,12 +2078,12 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     proc->child_list = NULL;
     proc->child_next = NULL;
     proc->exit_code = 0;
-    proc->heap_brk = USER_HEAP_VA_BASE;   // sbrk_(0) queries this before any real
+    proc->heap_brk = proc->layout.heap_base;   // sbrk_(0) queries this before any real
                                            // growth; must start at the heap's base,
                                            // not 0 (which also fails process_sbrk()'s
                                            // own USER_HEAP_VA_BASE bound check on the
                                            // very first growth request)
-    proc->heap_mapped_top = USER_HEAP_VA_BASE;   // nothing mapped yet, but tracked
+    proc->heap_mapped_top = proc->layout.heap_base;   // nothing mapped yet, but tracked
                                                   // from the same base heap_brk starts
                                                   // at (process_sbrk() only maps pages
                                                   // between heap_mapped_top and the new
@@ -2037,7 +2092,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
                                                   // below the real heap)
     memset(proc->handles, 0, sizeof(proc->handles));
     memset(proc->obj_handles, 0, sizeof(proc->obj_handles));
-    proc->shared_next_va = USER_SHARED_VA_BASE;   /* surface-mapping VA window */
+    proc->shared_next_va = proc->layout.shared_base;   /* surface-mapping VA window, its OWN now */
 
     /* Register ourselves on our parent's live-children list (ps tree view
      * only -- see child_list's comment in process.h). */
@@ -2074,7 +2129,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         rc = embx_load_from_file(path, pml4, parent_caps, &entry_point, &granted);
         if (rc == EMBK_OK) proc->cap_set = granted;   /* declared + granted */
     } else {
-        rc = elf_load_from_file(path, pml4, &entry_point);
+        rc = elf_load_from_file_at(path, pml4, proc->layout.dylib_base, &entry_point);
     }
     if (rc != EMBK_OK) {
         vmm_destroy_address_space(pml4);
@@ -2207,14 +2262,14 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         return -EMBK_ENOMEM;  // Failed to allocate user stack
     }
 
-    vmm_map_in(pml4, USER_STACK_VA, stack_phys, VMM_NX | VMM_WRITABLE | VMM_USER);
+    vmm_map_in(pml4, proc->layout.stack_top_page, stack_phys, VMM_NX | VMM_WRITABLE | VMM_USER);
 
     // 3.1 Give the main stack room to grow down: map (USER_STACK_PAGES-1) more
     // pages BELOW the top page. argv still lives in the top page (below).
     for (int i = 1; i < USER_STACK_PAGES; i++) {
         uint64_t ph = pmm_alloc_page();
         if (!ph) { vmm_destroy_address_space(pml4); proc->pid = 0; return -EMBK_ENOMEM; }
-        vmm_map_in(pml4, USER_STACK_VA - (uint64_t)i * 0x1000, ph,
+        vmm_map_in(pml4, proc->layout.stack_top_page - (uint64_t)i * 0x1000, ph,
                    VMM_NX | VMM_WRITABLE | VMM_USER);
     }
 
@@ -2249,7 +2304,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         size_t slen = strlen(argv[i]) + 1;  // include null terminator
         off -= slen;
         memcpy((void *)(child_kva + off), argv[i], slen);
-        argv_child_uva[i] = USER_STACK_VA + off;                 // the child's stack VA
+        argv_child_uva[i] = proc->layout.stack_top_page + off;   // the child's stack VA -- the ROLLED one
                                                                  // not the kernel alias,
                                                                  // we just wrote through
     }
@@ -2260,12 +2315,12 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         size_t slen = strlen(envp[i]) + 1;
         off -= slen;
         memcpy((void *)(child_kva + off), envp[i], slen);
-        envp_child_uva[i] = USER_STACK_VA + off;
+        envp_child_uva[i] = proc->layout.stack_top_page + off;
     }
 
     off &= ~0x7ULL;           // 8-align before the pointer array
     off -= (argc + 1) * sizeof(uint64_t);  // space for the argv array + null terminator
-    uint64_t argv_array_child_uva = USER_STACK_VA + off;
+    uint64_t argv_array_child_uva = proc->layout.stack_top_page + off;
     uint64_t *argv_array_child_kva = (uint64_t *)(child_kva + off);
     for (int i = 0; i < argc; i++) {
         argv_array_child_kva[i] = argv_child_uva[i];
@@ -2280,7 +2335,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     if (envp) {
         off &= ~0x7ULL;
         off -= (envc + 1) * sizeof(uint64_t);
-        envp_array_child_uva = USER_STACK_VA + off;
+        envp_array_child_uva = proc->layout.stack_top_page + off;
         uint64_t *envp_array_child_kva = (uint64_t *)(child_kva + off);
         for (int i = 0; i < envc; i++) {
             envp_array_child_kva[i] = envp_child_uva[i];
@@ -2290,7 +2345,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
 
     off &= ~0xFULL;            // 16-align before the initial RSP push
 
-    uint64_t child_user_rsp = USER_STACK_VA + off;
+    uint64_t child_user_rsp = proc->layout.stack_top_page + off;
 
 
     // 4. Allocate the first (and, for this phase, only) thread: kernel
@@ -2407,7 +2462,7 @@ int64_t process_sbrk(struct process *proc, int64_t increment){
         return -EMBK_EOVERFLOW;  // increment overflowed new_brk
     }
 
-    if (new_brk < USER_HEAP_VA_BASE || new_brk > USER_HEAP_VA_MAX) {
+    if (new_brk < proc->layout.heap_base || new_brk > proc->layout.heap_max) {
         return -EMBK_ENOMEM;  // out of bounds -- no more heap to give (matches
                                // newlib's own _sbrk()/POSIX brk() convention:
                                // failure means ENOMEM, not EINVAL)
@@ -3152,7 +3207,7 @@ int thread_create_user(struct process *proc, uint64_t entry_point, uint64_t arg)
      * fresh address space of its own; that sharing is the entire point of
      * a "thread" versus a "process". VMM_NX: a stack should never be
      * executable. */
-    uint64_t slot_top = USER_THREAD_STACK_BASE + (uint64_t)(tid + 1) * USER_THREAD_STACK_SLOT;
+    uint64_t slot_top = proc->layout.thread_stack_base + (uint64_t)(tid + 1) * USER_THREAD_STACK_SLOT;
     for (int i = 0; i < USER_THREAD_STACK_PAGES; i++) {
         uint64_t phys = pmm_alloc_page();
         if (!phys) {

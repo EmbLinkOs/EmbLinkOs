@@ -1,3 +1,6 @@
+#ifndef _EMBK_LOADER_ELF_H_
+#define _EMBK_LOADER_ELF_H_
+
 /* the minimum ELF64 needed to load a static executable */
 #include <stdint.h>
 
@@ -134,3 +137,13 @@ struct elf64_rela { uint64_t r_offset; uint64_t r_info; int64_t r_addend; } __at
 int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint64_t *entry_out);
 
 int elf_load_from_file(const char *path, uint64_t pml4_phys, uint64_t *entry_out);
+
+/* The same, with the dynamic library placed at `dylib_base` instead of
+ * DYLIB_VA_BASE -- which is what a process with a randomised layout wants.
+ * The two-argument forms above keep the fixed base. */
+int elf_load_at(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys,
+                uint64_t dylib_base, uint64_t *entry_out);
+int elf_load_from_file_at(const char *path, uint64_t pml4_phys,
+                          uint64_t dylib_base, uint64_t *entry_out);
+
+#endif /* _EMBK_LOADER_ELF_H_ */

@@ -407,15 +407,24 @@ static void ctrlc_parent(void)
     embk_exit(42);
 }
 
-#define EXPECTED_HEAP_BASE 0x0000600000000000L
 
 /* Grow/shrink the heap via embk_sbrk and verify the mapping, persistence,
  * shrink-doesn't-unmap, and oversized-request-rejection behavior. Returns 1
  * on pass, 0 on fail. */
 static int sbrk_test(void)
 {
+    /* The break used to be asserted equal to a fixed 0x6000_0000_0000. It is
+     * randomised per process now (ASLR), so what CAN be asserted is what is
+     * still true: it is page-aligned, it lies in the heap's window, and asking
+     * twice gives the same answer. The window is 16 GiB starting at the old
+     * constant. */
     long base = embk_sbrk(0);
-    if (base != EXPECTED_HEAP_BASE) { embk_puts(1, "sbrk_test: FAIL initial break\n"); return 0; }
+    if (base & 0xFFF) { embk_puts(1, "sbrk_test: FAIL initial break not page-aligned\n"); return 0; }
+    if ((unsigned long)base < 0x0000600000000000UL ||
+        (unsigned long)base >= 0x0000600000000000UL + (16UL << 30)) {
+        embk_puts(1, "sbrk_test: FAIL initial break outside the heap window\n"); return 0;
+    }
+    if (embk_sbrk(0) != base) { embk_puts(1, "sbrk_test: FAIL break moved between two queries\n"); return 0; }
 
     long grow = 3 * 4096;   /* span three pages: exercises the mapping LOOP */
     long old_brk = embk_sbrk(grow);

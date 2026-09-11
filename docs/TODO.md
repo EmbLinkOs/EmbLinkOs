@@ -1660,13 +1660,12 @@ violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
       the code into a measurement. One vector, embedded, compared byte for
       byte. Not done yet because the vector has to be transcribed exactly and
       a wrong transcription would fail a correct implementation.
-- [ ] **ASLR** -- next. The app image is ET_EXEC at 0x400000 (PIE is a
-      toolchain change, below), but six addresses are KERNEL-chosen and can be
-      randomised per process today: the dylib base, the mmap base, the heap
-      base, the main stack, thread stacks, and the shared-surface window. A
-      survey for this found that the shared-surface window and the mmap window
-      START AT THE SAME ADDRESS (0x5000_0000_0000) and surface mappings are not
-      recorded in the VMA list -- a latent collision, ASLR or not.
+- [x] **ASLR** for everything the kernel chooses. **Done** -- six windows per
+      process, 22-24 bits each, from the CSPRNG; `test aslr` on both arches.
+      The mmap/shared-surface collision the survey found is fixed by giving
+      surfaces their own window. Surface mappings are STILL not in the VMA
+      list, which is now harmless (disjoint windows) but remains untidy:
+      `vmmap`-style tooling cannot see them.
 - [ ] **PIE userland** so the executable itself moves. Needs `-pie` in the
       user link, relocations processed by the in-kernel loader (it already does
       them for libembk.so), and the fixed `. = 0x400000` in newlib.ld replaced.
