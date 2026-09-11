@@ -30,7 +30,7 @@ ONE QEMU AT A TIME. Two guests on one host starve each other and produce
 scheduler-timing failures that are not in the kernel; this file refuses to
 start if another qemu-system is running rather than manufacture one.
 """
-import os, sys, time, signal, subprocess, threading
+import os, sys, time, signal, subprocess, threading, socket, json, random, bisect, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -53,7 +53,59 @@ def main(cmds):
     argv += ["-serial", "stdio", "-no-reboot", "-no-shutdown",
              "-m", os.environ.get("MEM", "2G"), "-smp", os.environ.get("SMP", "4"),
              "-display", "none"]
+    # A QMP socket, so a HANG leaves evidence: on any timeout below, every
+    # vCPU's RIP and RFLAGS are read through the monitor and symbolized against
+    # the kernel. "It never came back" says nothing; "cpu 2 is in
+    # spin_lock+0x1c called from vma_munmap, IF=0" says almost everything.
+    qmp_port = 4900 + random.randint(0, 400)
+    argv += ["-qmp", "tcp:127.0.0.1:%d,server,nowait" % qmp_port]
     timeout = float(os.environ.get("TIMEOUT", "400"))
+
+    def hmp(cmd):
+        try:
+            sk = socket.create_connection(("127.0.0.1", qmp_port), timeout=3.0)
+            f = sk.makefile("rw")
+            f.readline()                                   # the greeting
+            f.write(json.dumps({"execute": "qmp_capabilities"}) + "\n"); f.flush(); f.readline()
+            f.write(json.dumps({"execute": "human-monitor-command",
+                                "arguments": {"command-line": cmd}}) + "\n"); f.flush()
+            resp = json.loads(f.readline()); sk.close()
+            return resp.get("return", "")
+        except Exception as e:
+            return "(qmp failed: %s)" % e
+
+    _syms = []
+    def symbolize(addr):
+        if not _syms:
+            try:
+                out = subprocess.run(["x86_64-elf-nm", "-n", os.path.join(ROOT, "kernel", "kernel.elf")],
+                                     capture_output=True, text=True).stdout
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) == 3 and parts[1] in "tTwW":
+                        _syms.append((int(parts[0], 16), parts[2]))
+            except Exception:
+                pass
+            if not _syms: _syms.append((0, "?"))
+        i = bisect.bisect_right([a for a, _ in _syms], addr) - 1
+        if i < 0: return "?"
+        return "%s+0x%x" % (_syms[i][1], addr - _syms[i][0])
+
+    def hang_report(why):
+        print("\nconsole_test: %s -- where each core is (5 samples, 200 ms apart):" % why, file=sys.stderr)
+        for sample in range(5):
+          if sample: time.sleep(0.2)
+          regs = hmp("info registers -a")
+          for block in regs.split("CPU#")[1:]:
+            cpu = block.split()[0]
+            rip = re.search(r"RIP=([0-9a-f]+)", block); rfl = re.search(r"RFL=([0-9a-f]+)", block)
+            rsp = re.search(r"RSP=([0-9a-f]+)", block); cs = re.search(r"CS =([0-9a-f]+)", block)
+            if not rip: continue
+            a = int(rip.group(1), 16); flags = int(rfl.group(1), 16) if rfl else 0
+            print("  [%d] cpu %s: rip %016x  %s  rsp %s  cs %s  IF=%d" % (
+                sample, cpu, a, symbolize(a) if a >= 0xffffffff80000000 else "(user)",
+                rsp.group(1) if rsp else "?", cs.group(1) if cs else "?", 1 if flags & 0x200 else 0),
+                file=sys.stderr)
 
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, bufsize=0, cwd=ROOT)
@@ -77,13 +129,13 @@ def main(cmds):
     failures = 0
     try:
         if not wait_for("first frame presented", 240):
-            print("\nconsole_test: the desktop never came up", file=sys.stderr); return 1
+            hang_report("the desktop never came up"); return 1
         time.sleep(1.5)
         for c in cmds:
             with lock: buf.clear()
             p.stdin.write((c + "\n").encode()); p.stdin.flush()
             if not wait_for("[cmd] " + c, timeout):
-                print("\nconsole_test: NO VERDICT for %r within %ds -- stopping" % (c, timeout), file=sys.stderr)
+                hang_report("NO VERDICT for %r within %ds -- stopping" % (c, timeout))
                 failures += 1 + (len(cmds) - cmds.index(c) - 1)
                 break
             with lock: text = bytes(buf).decode("utf-8", "replace")

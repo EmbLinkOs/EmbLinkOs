@@ -26,11 +26,14 @@ static void rr_tick(struct thread *current) {
         if (t == current || t->state != PROCESS_READY) {
             continue;
         }
-        /* The per-core idle threads are pinned and are NOT starved by
-         * definition -- they exist to have nothing to do. Aging one would walk
-         * it up to REALTIME and let it outrank real work; "waiting" is the
-         * idles' entire job. */
-        if (t->pinned_cpu >= 0) {
+        /* The per-core idle threads are NOT starved by definition -- they
+         * exist to have nothing to do. Aging one would walk it up to REALTIME
+         * and let it outrank real work; "waiting" is the idles' entire job.
+         * By the FLAG, not by being pinned: the first version exempted every
+         * pinned thread, and the kernel shell is pinned too -- so under eight
+         * spinning kthreads it sat READY in its band, never aged, never
+         * picked, for as long as they ran (measured at 19 s and counting). */
+        if (t->is_idle) {
             continue;
         }
         /* A suspended thread (EmbDBG v2 control) is frozen by intent, not

@@ -1953,6 +1953,24 @@ Open, in the order they matter:
   actually up (0 self-test failures, first frame presented). A rerun passed.
   Either the harness should tolerate a torn marker (search the joined
   stream) or the desktop's marker should be one write that cannot interleave.
+- [x] **PRIORITY AGING WAS A ONE-WAY RATCHET, and the pinned shell could not
+  age at all** (audit finding, closed). Aging lowered a waiting thread's band
+  toward REALTIME, but dispatch never restored the base: under sustained load
+  every runnable thread ended in band 0 for good, and the bands meant
+  nothing. And `rr_tick` exempted every PINNED thread from aging -- meant for
+  the per-core idles, but the kernel shell is pinned too. `test thread smp`
+  (eight spinning kthreads) starved the shell: READY, band 2, dispatchable,
+  age 0, unpicked for 19 s (measured by a hog printing the shell's state).
+  Now `base_priority` is recorded wherever a priority is set and restored on
+  dispatch, and only threads flagged `is_idle` are exempt. Five runs in a
+  row where the first attempt hung before.
+- [x] **The x86 console harness reports where every core is on a hang**:
+  `tools/console_test.py` opens a QMP socket and, on any timeout, samples
+  each vCPU's RIP/RFLAGS five times and symbolizes them against
+  `kernel/kernel.elf`. It is how the above was found in one run.
+- [x] **A joined thread's stack is reclaimed at the join**, in the joiner's
+  process context; a thread nobody joins keeps its slot's stack until reuse
+  or exit, as documented at `thread_create_user`.
 - [ ] **Observed twice, not reproduced since:** an x86 boot (256 MiB, swap
   disk) stalled after `init: authenticated session` -- `ELF dynlink` never
   printed; later, twice, the swap witness hung right after its dynlink line

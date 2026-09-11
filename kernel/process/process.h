@@ -184,6 +184,20 @@ struct thread {
      * another. */
     volatile bool   killed;
     volatile int    in_kernel;
+
+    /* THE PRIORITY A THREAD RETURNS TO. `priority` is the band the scheduler
+     * scans; aging lowers it (toward REALTIME) while the thread waits, and
+     * dispatch puts it back to `base_priority`. The first version had no base
+     * to return to: an aged band was permanent, so under sustained load every
+     * runnable thread ratcheted up to REALTIME and the bands meant nothing --
+     * and a thread that could not age (the pinned kernel shell, exempted along
+     * with the idles) starved for as long as the load lasted. Measured: eight
+     * spinning kthreads kept the shell READY, unpicked, for 19 seconds. */
+    uint8_t         base_priority;
+    /* The per-core idle thread: pinned, and NEVER aged -- waiting is its job.
+     * Told apart by this flag, not by being pinned; the kernel shell is pinned
+     * too and must age like anything else. */
+    bool            is_idle;
     uint64_t kstack_top;       /**< Virtual address of the top of this thread's kernel stack */
     uint64_t entry_point;      /**< Ring-3 user entry (process_trampoline) OR the real
                                  *   kthread function (kthread_trampoline stashes it here) */

@@ -307,6 +307,8 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
     t->fs_base = 0;
     t->proc = proc;
     t->priority = PRIORITY_NORMAL;
+    t->base_priority = PRIORITY_NORMAL;
+    t->is_idle = false;
     t->ticks_since_scheduled = 0;
     t->suspended = false;         /* slots are reused -- a stale true would freeze a fresh thread */
     t->killed    = false;         /* ... and a stale kill would end it at its first syscall */
@@ -1447,6 +1449,7 @@ int process_set_priority(uint32_t pid, uint8_t priority) {
      * assignment the pre-split code made directly. */
     for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
         t->priority = priority;
+        t->base_priority = (uint8_t)priority;
         t->ticks_since_scheduled = 0;   // don't let a stale aging counter from
                                         // the old band immediately re-bump it
     }
@@ -2842,6 +2845,10 @@ static void schedule_locked(void) {
     next->state = PROCESS_RUNNING;  // Mark the next thread as RUNNING
     next->running_cpu = (int)this_cpu()->cpu_index;
     next->ticks_since_scheduled = 0;  // it's getting CPU time now; aging clock resets
+    /* And the band it was aged into is given back: the boost bought it this
+     * turn, which is all it was for. Without this line every busy thread ended
+     * at REALTIME for good (see base_priority in process.h). */
+    next->priority = next->base_priority;
     /* EmbDBG v2: log this switch (counter + ring + per-thread dispatch/migration).
      * prev is the outgoing thread; reads next->last_ran_cpu before updating it. */
     sched_record_switch(prev, next, next->running_cpu);
@@ -3328,6 +3335,20 @@ retry:
             int code = t->exit_code;
             thread_reap_slot(t);
             spin_unlock(&g_sched_lock);
+
+            /* THE STACK GOES BACK HERE, not at the reap: the reap runs under
+             * the scheduler lock, where an object cannot let go of its pages,
+             * and a thread that dies with siblings alive is otherwise a slot
+             * whose stack lingers until the slot is next used. The joiner is
+             * a sibling, so the process is alive by construction, and this is
+             * ordinary process context. A thread nobody joins keeps its stack
+             * until reuse or exit -- the bounded case thread_create_user
+             * describes. Nothing mapped there (a thread that never ran, or a
+             * slot already reclaimed) is not an error. */
+            (void)vma_munmap(proc,
+                             proc->layout.thread_stack_base + (uint64_t)(tid + 1) * USER_THREAD_STACK_SLOT
+                                 - (uint64_t)USER_THREAD_STACK_PAGES * PAGE_SIZE,
+                             (uint64_t)USER_THREAD_STACK_PAGES * PAGE_SIZE);
             return code;
         }
 
@@ -3438,6 +3459,8 @@ struct thread *process_create_idle_for_cpu(uint32_t cpu_index) {
     spin_lock(&g_sched_lock);
     idle->pinned_cpu = (int)cpu_index;
     idle->priority = PRIORITY_BACKGROUND;
+    idle->base_priority = PRIORITY_BACKGROUND;
+    idle->is_idle = true;
     spin_unlock(&g_sched_lock);
     return idle;
 }
@@ -3473,6 +3496,7 @@ struct thread *process_adopt_current(void) {
     self->user_rsp = 0;
     self->proc = proc;
     self->priority = PRIORITY_NORMAL;
+    self->base_priority = PRIORITY_NORMAL;
     self->ticks_since_scheduled = 0;
     self->wait_next = NULL;
     self->wait_queue = NULL;
@@ -3554,8 +3578,28 @@ static void selftest_release_self(struct thread *self, bool did_adopt) {
 
 static void selftest_wait_ticks(uint64_t ticks) {
     uint64_t start = timer_sched_ticks();
+    /* A wait that overruns its budget five times over says so, on WALL time
+     * (the HPET, independent of the scheduler tick it is waiting on), with
+     * enough state to tell "this thread never runs" from "the tick counter
+     * stopped": the two look identical from outside and are nothing alike. */
+    uint64_t t0 = timer_uptime_ms();
+    int warned = 0;
     while (timer_sched_ticks() < start + ticks) {
         arch_cpu_idle();
+        uint64_t wall = timer_uptime_ms() - t0;
+        if (warned < 3 && wall > (ticks * 10) * 5 + 2000 * (uint64_t)(warned + 1)) {
+            warned++;
+            kprintf("selftest_wait_ticks: %llu ticks asked; %llu ms of wall time, sched ticks %llu -> %llu; "
+                    "this thread %p: state %d prio %d pinned %d cpu %d killed %d suspended %d\n",
+                    (unsigned long long)ticks, (unsigned long long)wall,
+                    (unsigned long long)start, (unsigned long long)timer_sched_ticks(),
+                    (void *)current_thread, current_thread ? (int)current_thread->state : -1,
+                    current_thread ? (int)current_thread->priority : -1,
+                    current_thread ? (int)current_thread->pinned_cpu : -1,
+                    current_thread ? (int)current_thread->running_cpu : -1,
+                    current_thread ? (int)current_thread->killed : -1,
+                    current_thread ? (int)current_thread->suspended : -1);
+        }
     }
 }
 
@@ -4029,8 +4073,8 @@ int process_test_priority(void) {
     bool ok = (trt != NULL && tbg != NULL);
 
     if (ok) {
-        trt->priority = PRIORITY_REALTIME;
-        tbg->priority = PRIORITY_BACKGROUND;
+        trt->priority = PRIORITY_REALTIME; trt->base_priority = PRIORITY_REALTIME;
+        tbg->priority = PRIORITY_BACKGROUND; tbg->base_priority = PRIORITY_BACKGROUND;
 
         /* Long enough for: rt to dominate early, self's own aging to let
          * it resume at all, and bg's (slower, starting one band further
