@@ -1159,13 +1159,25 @@ static int console_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *ou
     return tty_read(buf, len, out_read);  // line discipline
 }
 
+/* ONE write() TO THE CONSOLE IS ONE WRITE. Without this a process preempted
+ * mid-loop -- typically while the UART's 16-byte FIFO drains -- lets another
+ * process's bytes land in the middle of its line. The aarch64 boot test saw
+ * `home: desktop ready` arrive as `home: desktop re` + TopBar's lines +
+ * `ady`, and reported a working desktop as failed. A sleeping lock, because
+ * the loop is long and this is syscall context; kprintf takes its own path
+ * to the serial port and is not serialised against user writes -- a kernel
+ * line inside a user line remains possible and is a kernel choosing to speak. */
+static struct mutex g_console_write_lock = MUTEX_INIT;
+
 static int console_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
     (void)e; 
 
     const char *cbuf = (const char *)buf;
+    mutex_lock(&g_console_write_lock);
     for (size_t i = 0; i < len; i++) {
         console_putchar(cbuf[i]);
     }
+    mutex_unlock(&g_console_write_lock);
     *out_written = len;
     return EMBK_OK;
 }

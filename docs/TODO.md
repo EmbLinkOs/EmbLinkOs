@@ -1947,12 +1947,13 @@ Open, in the order they matter:
   `pmm_alloc_page` directly under the VMA lock, so a COW fault under real
   pressure declines instead of reclaiming. Route it through the object's
   reserve once COW pages are objects too.
-- [ ] **The ARM boot harness reads markers from a console two processes
-  write at once.** Seen once: `home: desktop ready` arrived as `home: desktop
-  re` + TopBar's lines + `ady`, and A7 was reported failed with everything
-  actually up (0 self-test failures, first frame presented). A rerun passed.
-  Either the harness should tolerate a torn marker (search the joined
-  stream) or the desktop's marker should be one write that cannot interleave.
+- [x] ~~**The ARM boot harness reads markers from a console two processes
+  write at once.**~~ **Closed at the cause:** `console_fd_write` looped
+  `console_putchar` per byte with no lock across the write, so a process
+  preempted while the UART FIFO drained let another's bytes into its line
+  (`home: desktop re` + TopBar + `ady`). A mutex now makes one `write()` to
+  the console one write. kprintf keeps its own path and can still land
+  inside a user line -- a kernel choosing to speak, not a tear.
 - [x] **PRIORITY AGING WAS A ONE-WAY RATCHET, and the pinned shell could not
   age at all** (audit finding, closed). Aging lowered a waiting thread's band
   toward REALTIME, but dispatch never restored the base: under sustained load
