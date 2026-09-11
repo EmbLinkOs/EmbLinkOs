@@ -5473,11 +5473,37 @@ TOOLING gaps rather than anything wrong with the OS.
       docs/PORTS.md and the GPT+EBR work), so writing them is not research.
       Doing that would remove the dependency on BOTH hosts, which is the
       better outcome than special-casing one.
-- [ ] UEFI (`make run-uefi`) needs a GNU `objcopy` that supports
-      `efi-app-x86_64`. Homebrew's binutils does not provide that target.
-      Our own EFI app is ELF until that step, so emitting the PE/COFF wrapper
-      ourselves is the durable fix -- and we already write an ELF loader, a
-      packfile writer and an EMBX emitter, so a PE header is in scope.
+- [x] ~~UEFI (`make run-uefi`) needs a GNU `objcopy` that supports
+      `efi-app-x86_64`.~~ It does: `x86_64-elf-objcopy --info` lists
+      `pei-x86-64`, and the build now uses the CROSS objcopy rather than the
+      host's (macOS ships none at all). The image itself is built by
+      `tools/mkuefidisk.py` -- protective MBR, both GPTs with their three
+      CRC32s, and a hand-written FAT32 ESP -- replacing a shell script that
+      needed mkfs.vfat, mmd, mcopy, sfdisk and GNU `stat`, none of which exist
+      here. OVMF's path is per host now too. VERIFIED: the firmware finds the
+      GPT, reads the FAT32, and launches /EFI/BOOT/BOOTX64.EFI.
+- [ ] **The UEFI loader crashes before it reaches the kernel, and the last step
+      is not understood.** Under OVMF it gets: firmware handoff, a valid system
+      table (signature `IBI SYST`), a working ConOut (a direct
+      `OutputString` call prints), into `boot_emblinkos` -- and then its FIRST
+      console call dies with #UD at a low legacy address, because the global
+      `ST` reads back as `ffffffffffffffff` instead of what `con_init` stored
+      one call earlier.
+      FOUND AND FIXED ON THE WAY: the link used `-shared`, and with this
+      binutils that plus an external `-T` script makes cross-file global
+      accesses ABSOLUTE -- the linker relaxes the compiler's GOT reference into
+      `mov $0xef030,%rax`, the link-time address, and emits NO relocation to
+      correct it, so crt0's relocation loop has nothing to apply and every
+      global is read from low memory that is not the image. `-pie` makes the
+      same linker, script and objects emit `lea 0x...(%rip)` instead. Verified
+      instruction by instruction. It is NOT the whole story: `ST` still reads
+      all-ones afterwards, so something else moves or protects that page.
+      Next: dump the loaded image's base and compare .data byte-for-byte with
+      the file (QMP `xp`), and check whether OVMF's image-protection policy is
+      write-protecting .data. The loader now marks its own progress on COM1
+      ('1' entry, '2' relocated, '3' C entry, '4' console, 'B' booting), which
+      is how all of the above was found and is what a real machine with no
+      display will need anyway.
 - [ ] Re-baseline the TIMING-dependent tests on the Mac: `make test-audio`
       durations, `tools/app_shot.py --settle`, the MP3 player's queue depth
       (QUEUE_AHEAD). Cross-architecture TCG is slower than x86-on-x86 TCG and

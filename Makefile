@@ -272,6 +272,8 @@ KERNEL_ELF  = kernel/kernel.elf
 # sections; PT_LOAD offsets and e_entry are untouched, so load_elf parses it
 # identically. Keep kernel.elf (with symbols) for gdb + the .embdbg producer.
 STRIP       = x86_64-elf-strip
+# The UEFI loader is an x86_64 PE whatever ARCH the rest of the build targets.
+UEFI_OBJCOPY = x86_64-elf-objcopy
 KERNEL_BIN  = kernel/kernel.strip.elf
 
 # The kernel's own .embdbg panic-symbol sidecar (EMBDBG_Specification.md §7),
@@ -2326,8 +2328,19 @@ run-usb-ide: usb.img
 UEFI_CFLAGS = -ffreestanding -fpic -fno-stack-protector -mno-red-zone \
               -fno-asynchronous-unwind-tables -Wall -c
 BOOTX64 = build/BOOTX64.EFI
-OVMF_CODE = /usr/share/OVMF/OVMF_CODE_4M.fd
-OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
+# OVMF: the UEFI firmware QEMU boots. Its path is per distribution, and the
+# defaults here were Linux-only -- which made `make run-uefi` impossible on the
+# macOS host this OS is developed on, so the UEFI path could not be tested at
+# all there. Homebrew's qemu ships edk2 beside itself; the x86_64 code pairs
+# with the i386 vars file, which is the naming edk2 uses, not a mistake.
+ifeq ($(UNAME_S),Darwin)
+QEMU_FW_DIR ?= $(shell dirname $(shell which qemu-system-x86_64))/../share/qemu
+OVMF_CODE   ?= $(QEMU_FW_DIR)/edk2-x86_64-code.fd
+OVMF_VARS   ?= $(QEMU_FW_DIR)/edk2-i386-vars.fd
+else
+OVMF_CODE   ?= /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS   ?= /usr/share/OVMF/OVMF_VARS_4M.fd
+endif
 
 build/uefi_crt0.o: boot/uefi/crt0.S | $(BUILD)
 	$(CC) -c $< -o $@
@@ -2348,17 +2361,40 @@ build/uefi_kernel_blob.o: boot/uefi/kernel_blob.S $(KERNEL_BIN) | $(BUILD)
 UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
             build/uefi_menu.o build/uefi_kernel_blob.o
 
+# -pie, NOT -shared, and that one word is the difference between an EFI
+# application that runs and one that cannot.
+#
+# With this binutils, `-shared` plus an external `-T` script produces an image
+# whose cross-file global accesses are ABSOLUTE -- the linker relaxes the
+# compiler's GOT reference into `mov $0xef030,%rax`, the symbol's LINK-TIME
+# address -- and emits no relocation to correct it. UEFI loads an application
+# wherever it likes, so every such global then reads from low memory that is
+# not the image: the system table pointer came back as ffffffffffffffff and the
+# first console write jumped into nowhere (#UD at 0xB0000). crt0's relocation
+# loop could not save it, because there were no relocations to apply.
+#
+# `-pie` makes the same linker, the same script and the same objects produce
+# RIP-relative accesses (`lea 0xed03d(%rip),%rax`) -- position-independent by
+# construction, nothing to relocate. Checked instruction by instruction, not
+# assumed.
 build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds
-	$(CC) -nostdlib -shared -Bsymbolic -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
+	$(CC) -nostdlib -pie -Bsymbolic -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
 
 # ELF -> PE32+ EFI application. The efi-app-x86_64 pseudo-target sets the EFI
-# subsystem and PE layout correctly. Host objcopy: the cross one lacks pei.
+# subsystem and PE layout correctly.
+#
+# THE CROSS objcopy, not the host's. The note here used to say the cross one
+# lacked PE support, and the host's was used instead -- which is a build that
+# cannot work on a host whose objcopy is not GNU's (macOS ships none at all).
+# `x86_64-elf-objcopy --info` lists pei-x86-64, so the toolchain this tree
+# already requires can do it, and the build stops depending on what else the
+# machine happens to have.
 $(BOOTX64): build/uefi_loader.so
-	objcopy -O efi-app-x86_64 -j .text -j .data -j .reloc $< $@
+	$(UEFI_OBJCOPY) -O efi-app-x86_64 -j .text -j .data -j .reloc $< $@
 
 # GPT + ESP disk carrying /EFI/BOOT/BOOTX64.EFI.
-uefi.img: $(BOOTX64) tools/mkuefidisk.sh
-	tools/mkuefidisk.sh $(BOOTX64) $@
+uefi.img: $(BOOTX64) tools/mkuefidisk.py
+	python3 tools/mkuefidisk.py $(BOOTX64) $@
 
 # Boot under OVMF. VARS must be a writable per-run copy. The kernel's EMBKFS root
 # rides a second drive for the MVP (kernel probes every block device for it).
@@ -2375,8 +2411,8 @@ run-uefi: uefi.img embkfs.img
 # [EMBKFS: root]. This is what you dd onto a real USB stick -- the firmware
 # launches BOOTX64.EFI and the kernel finds its root on the SAME device (no
 # second drive). `make run-uefi-usb` proves single-device boot under OVMF.
-uefi-usb.img: $(BOOTX64) embkfs.img tools/mkuefidisk.sh
-	tools/mkuefidisk.sh $(BOOTX64) $@ embkfs.img
+uefi-usb.img: $(BOOTX64) embkfs.img tools/mkuefidisk.py
+	python3 tools/mkuefidisk.py $(BOOTX64) $@ embkfs.img
 
 run-uefi-usb: uefi-usb.img
 	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd

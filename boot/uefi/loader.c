@@ -16,6 +16,23 @@
 #include "console.h"
 #include "menu.h"
 
+/* A BYTE ON COM1. See crt0.S: the firmware's console may not be ours yet, and
+ * on real hardware may not exist, so the loader marks its own progress on the
+ * serial port where a failure between two ConOut calls would otherwise leave
+ * nothing at all. */
+static inline void mark(char c) {
+    __asm__ volatile("outb %0, %1" :: "a"(c), "Nd"((unsigned short)0x3F8));
+}
+
+static void mark_hex(const char *tag, uint64_t v) {
+    while (*tag) mark(*tag++);
+    mark('=');
+    for (int i = 60; i >= 0; i -= 4)
+        mark("0123456789abcdef"[(v >> i) & 0xF]);
+    mark('\r'); mark('\n');
+}
+
+
 /* ---- boot_protocol ABI (mirrors kernel/arch/x86_64/boot/boot_protocol.h;
  *      that header's _Static_asserts are the master copy -- keep in sync). --- */
 #define BOOT_PROTOCOL_MAGIC   0x4F52504B4E494C45ULL   /* "ELINKPRO" */
@@ -295,6 +312,7 @@ static void finalize_and_handoff(struct boot_protocol *bp,
  * returns. This is the machinery the "Boot EmbLinkOS" and (later) "Recovery"
  * menu entries invoke; the menu itself lives in menu.c. */
 void boot_emblinkos(EFI_HANDLE image) {
+    mark('B');                 /* B: booting -- the last marker before the kernel */
     con_print("\nBooting EmbLinkOS...\n");
 
     /* Structures the kernel reads via KP2V must live below 1GB (the extent of
@@ -338,7 +356,12 @@ void boot_emblinkos(EFI_HANDLE image) {
 
 /* ---- EmbBoot entry point: run the menu, dispatch the choice ---------------- */
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
+    mark('3');
     con_init(st);
+    mark('4');
+    mark_hex("st", (uint64_t)(uintptr_t)st);
+    mark_hex("sig", ((const uint64_t *)(uintptr_t)st)[0]);
+    mark_hex("conout", (uint64_t)(uintptr_t)st->ConOut);
 
     for (;;) {
         int choice = menu_run();          /* draws the menu, returns an entry id */

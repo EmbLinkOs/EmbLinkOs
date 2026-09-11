@@ -34,7 +34,7 @@ emulates the common real part, so none has to wait for the machine.
 | **A real network card** | absent — virtio-net only | A physical machine has no network at all. Intel e1000e and Realtek r8169 cover most wired machines |
 | **Intel HD Audio** | absent — AC97 and virtio-snd only | AC97 left real hardware around 2008; no sound |
 | **USB hot-plug + mass storage mount** | ports scanned once at boot; no hot-plug | A USB stick plugged in after boot does nothing |
-| **Native-resolution UEFI framebuffer** | GOP handoff exists (`boot/uefi/loader.c`), untested on hardware | The first thing seen on the machine |
+| **UEFI boot** | the bootable image can now be BUILT on macOS (`tools/mkuefidisk.py`, no external tools) and the firmware launches the loader; the loader itself still crashes before the kernel — see docs/TODO.md | A machine from the last several years boots this way and no other |
 
 ## Phase 2 — it installs itself
 
