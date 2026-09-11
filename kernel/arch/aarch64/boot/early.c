@@ -11,6 +11,8 @@
 #include "drivers/storage/virtio_blk.h"
 #include "block/block.h"
 #include "fs/embkfs/embkfs.h"
+#include "mm/swap.h"          /* swap_init: the store, if a disk carries the header */
+#include "mm/swaptest.h"      /* the swap witness, driven */
 #include "fs/vfs.h"
 #include "arch/aarch64/cpu/cpu_features.h"
 #include "include/uaccess_guard.h"
@@ -581,6 +583,7 @@ void arch_early_main(uint64_t dtb_phys) {
     process_init();
     vfs_init();
     embkfs_init();
+    swap_init();                 /* a raw device with the EMBKSWAP header, if any -- see mm/swap.h */
 
     /* embkfs_init() mounts the volume; registering it with the VFS at "/" is a
      * separate step, exactly as kernel/main.c does it -- a mounted volume and a
@@ -986,6 +989,21 @@ void arch_early_main(uint64_t dtb_phys) {
      * anything. The claim is not "a lock exists" -- it is that four threads
      * hammering one counter produce the EXACT total, which is the only thing a
      * broken mutex gets wrong (it loses updates; it does not crash). */
+    /* --- swap, on THIS architecture too --------------------------------------
+     * The same witness x86 runs as `make test-swap`: more anonymous memory
+     * than the machine has free, written and read back, mmap then malloc, and
+     * the kernel's counters saying the pages went out to the store (a third
+     * virtio-blk, "sdc") and came back. The pager, the objects and the store
+     * are shared code; the disk under them is not. Quick mode: the hot-set
+     * A/B is a policy claim, made once, on x86. */
+    kprintf("\n--- swap ---\n");
+    {
+        int rc = swap_selftest_run("/data/apps/swapper/swapper.elf", true);
+        kprintf("  [%s] anonymous memory larger than RAM: %s\n",
+                rc == 0 ? " ok " : "FAIL", rc == 0 ? "OK" : "FAIL");
+        if (rc != 0) selftest_fails++;
+    }
+
     kprintf("\n--- futex ---\n");
     {
         const char *lp = "/system/bin/lockdemo.elf";

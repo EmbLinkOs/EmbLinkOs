@@ -1728,10 +1728,14 @@ violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
   at the first match, so a second disk on aarch64 could not exist. It is
   per-instance now (up to 4), which is also what a swap store on aarch64
   needs.
-  - [ ] `make test-swap` has no aarch64 counterpart yet: the harness would
-    attach `build/swap.img` as a third virtio-blk and the boot would run the
-    witness. The driver side is done; the harness and the early-boot hook are
-    not.
+  - [x] ~~`make test-swap` has no aarch64 counterpart yet~~ -- it does: the
+    boot test attaches `build/swap.img` as a third virtio-blk (`sdc`), the
+    early boot calls `swap_init()` and runs the witness (mmap and heap; the
+    hot-set A/B is a policy claim made once, on x86) through the same
+    `swap_selftest_run()` the x86 console uses -- the test body moved to
+    `kernel/mm/swaptest.c` for that. **562 MiB over 499 MiB free, 190 MiB
+    out in 3,040 cluster writes, 20,680 of 24,064 pages read ahead, 0 wrong,
+    1.2 s and 0.8 s** under HVF.
 
 ## Filesystem: mounting is two calls, and that is a sharp edge
 

@@ -243,6 +243,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/lib/random.c \
              kernel/lib/canary.c \
              kernel/mm/swap.c \
+             kernel/mm/swaptest.c \
              kernel/lib/ksym.c \
              kernel/lib/kprintf.c
 
