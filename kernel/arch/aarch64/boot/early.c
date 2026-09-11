@@ -1235,6 +1235,25 @@ void arch_early_main(uint64_t dtb_phys) {
                 if (compositor_focused_pid() != 0 && k > 0 && pt > 0)
                     break;          /* everything this phase asserts is true */
 
+                /* DIAGNOSTIC: a session that has not appeared after 800 ticks
+                 * is stuck somewhere; say where. Each of init's threads: its
+                 * state, the PC and SP its kernel context was saved with, what
+                 * it waits on, and how deep in the kernel it is. */
+                static bool dumped = false;
+                if (!dumped && timer_sched_ticks() > start + 800) {
+                    dumped = true;
+                    sched_lock();
+                    struct process *ip = process_find((uint32_t)upid);
+                    kprintf("  [diag] init pid %d: %s\n", upid, ip ? "found" : "GONE");
+                    for (struct thread *t = ip ? ip->thread_list : NULL; t; t = t->proc_thread_next) {
+                        kprintf("  [diag]   thread %p: state %d cpu %d in_kernel %d killed %d wq %p ctx.pc %llx ctx.sp %llx\n",
+                                (void *)t, (int)t->state, (int)t->running_cpu,
+                                (int)t->in_kernel, (int)t->killed, (void *)t->wait_queue,
+                                (unsigned long long)t->ctx.pc, (unsigned long long)t->ctx.sp);
+                    }
+                    sched_unlock();
+                }
+
                 arch_cpu_idle();
             }
             kprintf("  [info] waited %u tick(s)\n",

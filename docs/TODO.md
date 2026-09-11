@@ -1863,14 +1863,17 @@ Open, in the order they matter:
     the path -- correct -- but a thread mid-`munmap` (phase 2, no lock held)
     that is killed simply finishes phase 2 and 3 first, so the `VMA_DYING`
     double-put concern above is closed by construction.
-- [ ] **aarch64 keeps IRQs masked around `vm_fault`** (x86 unmasks when the
-  faulting context had them on). Unmasking hangs init before its first print,
-  every boot; masked, it boots (bisected 2026-09-11). The root is wider: on
-  aarch64 nothing unmasks IRQs inside ANY exception -- syscalls included --
-  so kernel code at EL1 has never been preempted by the tick. Two
-  consequences: a disk-bound syscall delays the tick on its core, and the
-  first EL1 preemption is untested. Find what on the tick/switch path is not
-  safe nested in a sync handler, then unmask in the syscall path too.
+- [x] ~~**aarch64 keeps IRQs masked around `vm_fault`**~~ -- **closed, and
+  the cause was elsewhere.** Unmasking hung init every boot (bisected
+  2026-09-11); what the unmask had exposed was the VMA spinlock, under which
+  objects were created and pages discarded -- both sleep on the page cache's
+  mutex -- so the first EL1 preemption of a thread holding it left the other
+  cores spinning on it with interrupts off. With nothing sleeping under that
+  lock, the unmask went back in: seven consecutive ARM boots. The syscall
+  path is unmasked now too, as x86's always was, so a disk-bound syscall no
+  longer holds its core's tick off, and a thread inside a syscall is
+  preemptible like every other. User threads are now preempted at EL1 on
+  aarch64 for the first time; kernel threads always were.
 - [x] ~~**The kernel heap's slab pools cap at 1 MiB**~~ -- **closed.** They
   capped at `SLAB_MAX_RANGES` 128 x `SLAB_REGION_BYTES` 8 KiB, and past that
   every small allocation walked the general first-fit heap: **224 us per

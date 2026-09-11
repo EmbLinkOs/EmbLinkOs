@@ -1,4 +1,5 @@
 #include "arch/aarch64/irq/exception.h"
+#include "include/arch_irq.h"   /* arch_irq_enable: syscalls run unmasked */
 #include "process/process.h"   /* current_thread: the kill flag is checked at the exit */
 #include "include/syscall_abi.h"
 #include "include/kprintf.h"
@@ -35,6 +36,16 @@ void aarch64_syscall(struct aarch64_frame *f) {
      * way out, so whatever happens to DAIF in between is discarded. */
     arch_irq_enable();
 
+    /* WITH INTERRUPTS ON, as x86's syscall_dispatch has always run (its
+     * `sti`). Taking the SVC masked IRQs, and until now nothing unmasked them
+     * for the length of the call -- so a syscall that waited on a disk held
+     * this core's tick off for the whole wait, and a thread inside a syscall
+     * was the one kind of thread the scheduler could never preempt. User
+     * code always runs unmasked, so unmasking here is legitimate; the vector
+     * epilogue restores the caller's PSTATE from the frame regardless. Masked
+     * again before returning so the epilogue runs as it always did. */
+    arch_irq_enable();
+
     /* IN A KERNEL PATH for the length of the call: a kill that arrives now
      * waits for the return below, where the thread holds nothing. */
     if (current_thread) current_thread->in_kernel++;
@@ -44,6 +55,7 @@ void aarch64_syscall(struct aarch64_frame *f) {
         if (current_thread->killed)
             thread_die_killed();         /* never returns */
     }
+    arch_irq_disable();
 
     arch_irq_disable();
 }

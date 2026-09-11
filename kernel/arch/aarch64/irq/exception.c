@@ -224,22 +224,30 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
         bool w = is_data && ((f->esr >> 6) & 1);
         bool x = !is_data;
 
-        /* WITH INTERRUPTS MASKED -- unlike x86, and not by choice. The x86
-         * handler unmasks around vm_fault when the faulting context had them
-         * on, because resolving a fault can mean waiting for a disk. The same
-         * three lines here hang init before its first print, every boot, and
-         * boot cleanly with them removed (bisected, 2026-09-11). The reason is
-         * larger than this function: on aarch64 NOTHING unmasks IRQs inside an
-         * exception -- syscalls included; `daifclr` appears only in the
-         * spinlock and the context switch -- so kernel code at EL1 has never
-         * been preempted by a timer interrupt, and this would have been the
-         * first path to try it. Whatever on the tick path is not safe to run
-         * nested inside a sync handler has to be found first. docs/TODO.md
-         * carries it. Until then a fault that reads a disk waits masked, which
-         * is what it always did here. */
+        /* WITH INTERRUPTS ON, if the interrupted context had them on -- as
+         * on x86. Taking an exception masks IRQs, and resolving a fault can
+         * mean waiting for a disk: the file the page comes from, or the swap
+         * store it went to. The saved PSTATE (SPSR_EL1.I clear = unmasked)
+         * says whether unmasking is legitimate: EL0 always was; an EL1
+         * copy_to_user that faulted was too. Re-masked afterwards so the
+         * rest of this handler runs as it always did.
+         *
+         * THIS HUNG INIT ONCE, every boot, and the cause was not here. The
+         * three lines were bisected out and the boot passed; what they had
+         * exposed was the VMA lock: a spinlock under which objects were
+         * created and pages discarded -- both of which sleep on the page
+         * cache's mutex -- so the first EL1 preemption of a thread holding
+         * it, made possible by this unmask, left every other core spinning
+         * on it with interrupts off. With nothing sleeping under that lock
+         * (mm/vma.c), the unmask went back in and seven boots in a row
+         * passed. This was also the first path on aarch64 to be preempted at
+         * EL1 as a USER thread; kernel threads always were. */
         bool from_user = (which >> 2) == 2;
         if (from_user) current_thread->in_kernel++;   /* a kill waits for this to finish */
+        bool irqs_on = (f->spsr & (1ULL << 7)) == 0;
+        if (irqs_on) arch_irq_enable();
         bool handled = vm_fault(current_thread->proc, f->far, w, x);
+        if (irqs_on) arch_irq_disable();
         if (from_user) {
             current_thread->in_kernel--;
             if (handled && current_thread->killed)
