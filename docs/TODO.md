@@ -560,10 +560,30 @@ approximated, which is why none of them is a silent bug waiting to be found:
     the fault path waits for this lock -- **~1.2 s of the 3.4-6 s a paging
     run spends inside the object (20-35%)**, all of it queued behind the
     writeback thread's reclaim batches, which hold the lock through their
-    cluster writes. The targeted fix is narrower than a lock split: let
-    reclaim drop the lock across the I/O, with the batch's pages marked
-    in-flight so a fault on one waits for the write instead of mapping a
-    frame that is about to be freed (Linux's PG_writeback). Not built yet.
+    cluster writes. **Built, measured, reverted (2026-09-11).** Two shapes
+    were tried: reclaim dropping the lock across its cluster writes with the
+    batch's pages marked in-flight (faults and teardown wait for them), and
+    then the writeback thread as the ONLY reclaimer with faults waiting on
+    its landing queue. Both were slower than holding the lock -- 7.6/6.8/
+    13.9/14.5 s against 6.2/6.0/8.7/9.0 for the four witness runs, worst
+    single fault up to 2.2 s -- because the wait only moved: the disk is
+    one ATA channel taking one command at a time, so a fault that needs a
+    swap-in queues behind the writer at the DEVICE whether or not it holds
+    the lock, and taking reclaim away from the faulting core removed a
+    second pump that was actually helping. The lock is not the bottleneck;
+    the single command queue is. What would help: concurrent I/O at the
+    device (AHCI/NCQ, or virtio-blk's queue used asynchronously), and
+    priority for reads over the writer's stream. Two things from the
+    attempt stayed: the ATA driver's own lock (below) and the worst-fault
+    metric `test swap` prints.
+  - [x] **The ATA driver had no lock.** Its command path is file-scope state
+    (one PRDT, one bounce, one completion flag per channel) and every caller
+    happened to arrive under some other lock -- the filesystem's, or the
+    page cache's, which swap I/O ran under. A swap-in under the cache lock
+    and a metadata read under the filesystem lock could already meet on the
+    channel; the experiment above made them meet constantly, and a lost
+    completion hung `ata_wait_irq` (its timeout is a million halts). One
+    sleeping lock across each request, in the driver, where the state is.
   - [ ] **Read-ahead.** A sequential reader still faults one page at a time.
     The access pattern is trivially detectable from the object's own history.
   - [x] ~~**The writeback thread polls** because the scheduler has no timer

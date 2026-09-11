@@ -162,11 +162,14 @@ struct vm_fault_stats {
     uint64_t ns;           /* wall time inside vm_fault, all outcomes -- the
                             * number that says whether a slow paging run is
                             * the disk, the fault path, or the machine */
+    uint64_t max_ns;       /* the single WORST fault -- the latency a program
+                            * actually feels under paging, which the totals hide */
     uint64_t wire_ns;      /* ... of which, getting the page from its object
                             * (cache lock, fill or swap-in, disk waits) */
     uint64_t map_ns;       /* ... of which, installing the PTE */
 };
 void vm_fault_stats(struct vm_fault_stats *out);
+void vm_fault_reset_max(void);       /* start a fresh worst-case window (tests) */
 
 /* Change the permissions of an already-mapped range, keeping its contents.
  * Returns 0 or -EMBK_*; -EMBK_ENOMEM if any page in the range is not mapped

@@ -57,6 +57,7 @@ int swap_selftest_run(const char *wp, bool quick) {
         vmo_stats_get(&v0);
         vm_fault_stats(&f0);
         pmm_scan_stats(&pb0, &pa0);
+        vm_fault_reset_max();
 
         char arg[24];
         snprintf(arg, sizeof arg, "%llu", (unsigned long long)want);
@@ -87,6 +88,7 @@ int swap_selftest_run(const char *wp, bool quick) {
                 (unsigned long long)(f1.handled - f0.handled),
                 (unsigned long long)((f1.ns - f0.ns) / 1000000),
                 (unsigned long long)((f1.handled - f0.handled) ? (f1.ns - f0.ns) / 1000 / (f1.handled - f0.handled) : 0));
+        kprintf("  [info]   the worst single fault took %llu ms\n", (unsigned long long)(f1.max_ns / 1000000));
         kprintf("  [info]   of which: in the object (wire, fill, swap-in) %llu ms -- %llu ms of it waiting for the cache lock -- installing PTEs %llu ms\n",
                 (unsigned long long)((f1.wire_ns - f0.wire_ns) / 1000000),
                 (unsigned long long)((v1.wire_lock_wait_ns - v0.wire_lock_wait_ns) / 1000000),

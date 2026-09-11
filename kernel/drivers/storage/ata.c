@@ -10,6 +10,7 @@
 #include "include/errno.h"
 #include "include/kstring.h"
 #include "mm/vmm.h"
+#include "process/ksync.h"     /* one command at a time: a SLEEPING lock across each request */
 
 
 #include <stdint.h>
@@ -605,51 +606,77 @@ int ata_flush(uint32_t drive_index) {
     return 0;
 }
 
+/* ONE COMMAND AT A TIME, ENFORCED. This driver's command path is file-scope
+ * state -- one PRDT, one DMA bounce, one completion flag per channel -- and it
+ * was never locked. It worked because every caller happened to arrive under
+ * some other lock: the filesystem's, or the page cache's, which the swap
+ * store's I/O ran under. The moment reclaim released the cache lock across
+ * its cluster write, a swap-in from a faulting thread and the writeback
+ * thread's write met on the channel, a completion was lost, and
+ * ata_wait_irq waited for it forever (its timeout is a million halts -- hours).
+ * Two requesters could already meet here before that: a swap-in under the
+ * cache lock and a metadata read under the filesystem lock. The lock belongs
+ * in the driver, where the shared state is.
+ *
+ * SLEEPING, not a spinlock: the wait is a disk round trip, and a requester
+ * holding a spinlock across one would stop the scheduler for its duration.
+ * Uncontended before the scheduler exists (current_thread is NULL), so the
+ * identify and partition reads at init neither block nor complain. One lock
+ * for the controller rather than one per channel, because the PRDT and the
+ * bounce buffer are shared across both channels. */
+static struct mutex g_ata_lock = MUTEX_INIT;
+
 // Block-layer adapter: flush. Maps the device back to its ATA drive index.
 static int ata_block_flush(struct embk_block_device *dev) {
     if (!dev) return -EMBK_EINVAL;
     uint32_t drive_index = (uint32_t)(uintptr_t)dev->driver_data;
-    return (ata_flush(drive_index) == 0) ? EMBK_OK : -EMBK_EIO;
+    mutex_lock(&g_ata_lock);
+    int rc = ata_flush(drive_index);
+    mutex_unlock(&g_ata_lock);
+    return (rc == 0) ? EMBK_OK : -EMBK_EIO;
 }
 
 // Block-layer adapter: read. Pulls the ATA drive index from driver_data,
-// dispatches to the DMA READ PATH.
+// dispatches to the DMA READ PATH. ata_read_dma takes a uint8_t count, so a
+// long request is chunked -- under ONE hold of the lock, so the chunks of one
+// request are not interleaved with another requester's.
 static int ata_block_read(struct embk_block_device *dev, uint64_t lba, uint32_t count, void *buffer) {
     if (!dev || !buffer) return -EMBK_EINVAL;
-    uint32_t drive_index = (uint32_t)(uintptr_t)dev->driver_data; // driver_data holds the ATA drive index
-    
-    // ata_read_dma takes uint8_t count; chunk if needed.
+    uint32_t drive_index = (uint32_t)(uintptr_t)dev->driver_data;
     uint8_t *ptr = (uint8_t *)buffer;
+    mutex_lock(&g_ata_lock);
     while (count > 0) {
         uint8_t chunk = (count > 255) ? 255 : (uint8_t)count;
         if (ata_read_dma(drive_index, lba, chunk, ptr) != 0) {
-            return -EMBK_EIO; // I/O error
+            mutex_unlock(&g_ata_lock);
+            return -EMBK_EIO;
         }
         lba += chunk;
         ptr += (uint32_t)chunk * ATA_SECTOR_SIZE;
         count -= chunk;
     }
+    mutex_unlock(&g_ata_lock);
     return EMBK_OK;
 }
-
 
 static int ata_block_write(struct embk_block_device *dev, uint64_t lba, uint32_t count, const void *buffer) {
     if (!dev || !buffer) return -EMBK_EINVAL;
-    uint32_t drive_index = (uint32_t)(uintptr_t)dev->driver_data; // driver_data holds the ATA drive index
-
+    uint32_t drive_index = (uint32_t)(uintptr_t)dev->driver_data;
     const uint8_t *ptr = (const uint8_t *)buffer;
+    mutex_lock(&g_ata_lock);
     while (count > 0) {
         uint8_t chunk = (count > 255) ? 255 : (uint8_t)count;
         if (ata_write_dma(drive_index, lba, chunk, ptr) != 0) {
-            return -EMBK_EIO; // I/O error
+            mutex_unlock(&g_ata_lock);
+            return -EMBK_EIO;
         }
         lba += chunk;
         ptr += (uint32_t)chunk * ATA_SECTOR_SIZE;
         count -= chunk;
     }
+    mutex_unlock(&g_ata_lock);
     return EMBK_OK;
 }
-
 
 void ata_register_block_devices(void) {
     for (uint32_t i = 0; i < drive_count; i++) {

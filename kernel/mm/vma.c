@@ -146,13 +146,16 @@ static struct vm_fault_stats g_fault_stats;
 void vm_fault_stats(struct vm_fault_stats *out) {
     if (out) *out = g_fault_stats;
 }
+void vm_fault_reset_max(void) { g_fault_stats.max_ns = 0; }
 
 static bool vm_fault_resolve(struct process *proc, uint64_t addr, bool write, bool exec);
 
 bool vm_fault(struct process *proc, uint64_t addr, bool write, bool exec) {
     uint64_t t0 = time_get_ns();
     bool r = vm_fault_resolve(proc, addr, write, exec);
-    g_fault_stats.ns += time_get_ns() - t0;
+    uint64_t dt = time_get_ns() - t0;
+    g_fault_stats.ns += dt;
+    if (dt > g_fault_stats.max_ns) g_fault_stats.max_ns = dt;
     return r;
 }
 
