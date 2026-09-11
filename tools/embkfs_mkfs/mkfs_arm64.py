@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import layout as L
 from mkfs_embkfs import (make_image, _read_font, _tree_objects,
-                          FIXTURE_OBJECTS,
+                          FIXTURE_OBJECTS, _prog_meta,
                           _SYSTEM_BIN as _X86_SYSTEM_BIN)
 
 # /system/bin is the sealed system tree (docs/USERSPACE.md): the kernel spawns
@@ -118,7 +118,14 @@ def main(argv):
         dest = _dest(name)
         if dest.startswith(b"data/apps/"):
             for suffix in ("ns", "caps", "app"):
-                side = os.path.join("user", "bin", f"{base}.{suffix}")
+                # _prog_meta, SHARED with the x86 image builder, because a
+                # program's manifests live in the program's own directory now
+                # (user/apps/<name>/, user/tests/<name>/, ...) and only the NAME
+                # is known here. Composing the path from parts locally is how
+                # this broke: a tree-wide rewrite of "user/bin/..." literals
+                # could not see it, so the aarch64 launcher came up empty and
+                # the x86 one did not. One function, one place to be wrong.
+                side = _prog_meta(base, suffix)
                 if os.path.exists(side):
                     with open(side, "rb") as sf:
                         objects.append((f"data/apps/{base}/{base}.{suffix}".encode(),

@@ -886,7 +886,11 @@ ARM_SND_REAL = -device virtio-sound-pci,audiodev=a0 -audiodev $(ARM_AUDIODEV),id
 
 .PHONY: run-arm64-desktop
 run-arm64-desktop: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
-	@echo "==> EmbLinkOS aarch64: log in as yves.  Kernel console is THIS terminal."
+	@echo "==> EmbLinkOS aarch64.  The kernel console is THIS terminal."
+	@echo "    Auto-login is ON: this build boots straight into a session as 'yves'."
+	@echo "    For the REAL first-boot setup and password login screen, build with"
+	@echo "    authentication required:"
+	@echo "        make ARCH=aarch64 AUTOLOGIN=0 run-arm64-desktop"
 	$(ARM_QEMU_$(ARM_ACCEL)) $(ARM_DESKTOP_DISKS) $(ARM_GPU_WINDOW) $(ARM_INPUT) \
 	    $(ARM_SND_REAL) -display $(ARM_DISPLAY) \
 	    -serial stdio -no-reboot -no-shutdown -kernel $(ARM_IMG)
