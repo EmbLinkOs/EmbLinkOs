@@ -2370,8 +2370,14 @@ Open:
       normally takes ~25 s. Once, in a batch of four, on 2026-09-11, before the
       count fix -- and not seen in the ~40 boots since. It may have been the
       same bug wearing a worse face, or starvation under a deadline thread plus
-      six hogs. Not closed on the strength of "it stopped happening": capture
-      the next one with `info registers -a` over QMP before killing it.
+      six hogs. SEEN AGAIN AFTER THE COUNT FIX (2026-09-12), at exactly the
+      same point -- so it is a second, separate bug, not that one wearing a
+      worse face. Roughly 2 in 45 boots. x86 does not show it: 8 consecutive
+      `test deadline` runs in one boot were clean, so it is aarch64-specific.
+      `python3 tools/arm64_hang_capture.py 25` boots until it happens and
+      photographs every vCPU's PC twice, 200 ms apart, symbolized -- identical
+      PCs mean a stuck core, moving ones a livelock. 10 runs so far have not
+      caught one; it needs a longer loop.
 
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant
 ### source of lateness
