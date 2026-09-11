@@ -1668,7 +1668,11 @@ int selftests_handle_command(const char *cmd)
                     (unsigned long long)(s1.cluster_pages - s0.cluster_pages),
                     (unsigned long long)(s1.clusters - s0.clusters));
             if (!outs) ok = 0;
-            kprintf("  [%s] pages came back from it: %llu\n", ins ? "ok" : "FAIL", (unsigned long long)ins);
+            kprintf("  [%s] pages came back from it: %llu, of which %llu read ahead in %llu cluster reads (%llu faults swapped in)\n",
+                    ins ? "ok" : "FAIL", (unsigned long long)ins,
+                    (unsigned long long)(v1.readahead_pages - v0.readahead_pages),
+                    (unsigned long long)(v1.readahead_reads - v0.readahead_reads),
+                    (unsigned long long)((v1.swapins - v0.swapins) - (v1.readahead_pages - v0.readahead_pages)));
             if (!ins) ok = 0;
 
             /* The witness has exited and is reaped, but its address space is

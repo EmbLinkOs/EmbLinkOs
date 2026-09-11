@@ -246,6 +246,8 @@ struct vmo_stats {
     uint64_t swapped_pages;      /* anonymous pages out on the swap store    */
     uint64_t swapouts;           /* anonymous pages written to the store     */
     uint64_t swapins;            /* ... and read back                        */
+    uint64_t readahead_pages;    /* pages brought back BEFORE they faulted   */
+    uint64_t readahead_reads;    /* device commands that did it              */
 
     /* Where reclaim spends its time. Kept, not just for one measurement,
      * because these are the numbers that decide the next change here. */

@@ -220,8 +220,13 @@ static uint64_t reclaim_locked(uint64_t want, bool swap_ok);
  * by vmm_map_in from the same pool, and so is every kmalloc, and neither can
  * reclaim. Keeping a margin means the fault that paged this page in does not
  * then fail on the table that maps it. */
-#define VMO_FAULT_RESERVE_PAGES  128     /* 512 KiB */
-#define VMO_FAULT_RECLAIM_BATCH   64
+/* 256 pages of reserve and a batch of 512 -- 32 clusters -- rather than the
+ * 128/64 this started with. With the small numbers the fault path kept free
+ * memory hovering just above its own reserve under sustained pressure, and
+ * the read-ahead below, which needs room for a cluster and never reclaims to
+ * get it, found none: 349 pages read ahead of 18,750 swapped in. */
+#define VMO_FAULT_RESERVE_PAGES  256     /* 1 MiB */
+#define VMO_FAULT_RECLAIM_BATCH  512
 static uint64_t frame_or_reclaim(void) {
     if (pmm_free_pages() < VMO_FAULT_RESERVE_PAGES)
         (void)reclaim_locked(VMO_FAULT_RECLAIM_BATCH, true);
@@ -286,6 +291,83 @@ static struct vmo_page *page_fill(struct vm_object *o, uint64_t index, bool zero
     return p;
 }
 
+/* READ-AHEAD AROUND A SWAP-IN. The pages that left RAM in one cluster sit in
+ * consecutive slots, and a program that touched them together will very
+ * likely touch them together again -- the witness's reverse pass faulted on
+ * every one of them, one 380 us read at a time. So after a page comes back,
+ * its neighbours in the object that are also out on the store are fetched
+ * too, one command per run of contiguous slots, and are simply RESIDENT when
+ * the fault for them arrives: a hit, no I/O.
+ *
+ * Bounded on purpose: a window of VMO_RA_EACH_SIDE pages each way (one
+ * cluster in all), and only when the allocator is comfortably above the
+ * fault path's reserve -- read-ahead never reclaims, since evicting a page
+ * somebody is using to prefetch one somebody might use is a bad trade. A
+ * frame that cannot be had ends the read-ahead, not the fault. Caller holds
+ * g_lock. */
+#define VMO_RA_EACH_SIDE 8
+static void swap_readahead_locked(struct vm_object *o, uint64_t index) {
+    if (pmm_free_pages() < VMO_FAULT_RESERVE_PAGES + 2 * VMO_RA_EACH_SIDE)
+        return;
+
+    /* Candidates: swapped-out neighbours, sorted by slot. */
+    struct vmo_page *cand[2 * VMO_RA_EACH_SIDE];
+    int n = 0;
+    for (uint64_t d = 1; d <= VMO_RA_EACH_SIDE; d++) {
+        uint64_t idx[2] = { index + d, index - d };
+        for (int k = 0; k < 2; k++) {
+            if (k == 1 && index < d) continue;
+            struct vmo_page *p = page_find(o, idx[k]);
+            if (p && !p->phys && p->swap_slot)
+                cand[n++] = p;
+        }
+    }
+    for (int i = 1; i < n; i++) {                  /* insertion sort: n <= 16 */
+        struct vmo_page *p = cand[i]; int j = i - 1;
+        while (j >= 0 && cand[j]->swap_slot > p->swap_slot) { cand[j + 1] = cand[j]; j--; }
+        cand[j + 1] = p;
+    }
+
+    /* Each run of contiguous slots is one read. */
+    for (int i = 0; i < n; ) {
+        int run = 1;
+        while (i + run < n && cand[i + run]->swap_slot == cand[i]->swap_slot + (uint64_t)run) run++;
+
+        uint64_t phys[2 * VMO_RA_EACH_SIDE];
+        int got = 0;
+        for (; got < run; got++) {
+            phys[got] = pmm_alloc_page();
+            if (!phys[got]) break;
+        }
+        if (got < run) {                            /* out of frames: stop reading ahead */
+            for (int k = 0; k < got; k++) pmm_free_page(phys[k]);
+            return;
+        }
+
+        uint64_t ts = time_get_ns();
+        int rc = (run == 1) ? swap_in(cand[i]->swap_slot, phys[0])
+                            : swap_in_cluster(cand[i]->swap_slot, run, phys);
+        g_stats.swap_ns += time_get_ns() - ts;
+        if (rc != EMBK_OK) {
+            for (int k = 0; k < run; k++) pmm_free_page(phys[k]);
+            return;
+        }
+        for (int k = 0; k < run; k++) {
+            struct vmo_page *p = cand[i + k];
+            swap_free(p->swap_slot);
+            p->swap_slot = 0;
+            p->phys = phys[k];
+            o->resident++;
+            if (o->swapped) o->swapped--;
+            g_stats.swapins++;
+            g_stats.readahead_pages++;
+            lru_touch(p);
+        }
+        g_stats.readahead_reads++;
+        i += run;
+    }
+}
+
 /* The page for `index`, faulting it in if absent. */
 static struct vmo_page *page_get(struct vm_object *o, uint64_t index, bool zero_only) {
     struct vmo_page *p = page_find(o, index);
@@ -315,6 +397,8 @@ static struct vmo_page *page_get(struct vm_object *o, uint64_t index, bool zero_
         g_stats.swapins++;
         g_stats.misses++;
         lru_touch(p);
+        if (o->anon)
+            swap_readahead_locked(o, index);
         return p;
     }
     if (p) {

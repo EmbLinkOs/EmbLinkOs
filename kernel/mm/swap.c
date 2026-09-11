@@ -189,6 +189,33 @@ bool swap_slot_held(uint64_t slot) {
     return held;
 }
 
+int swap_in_cluster(uint64_t first, int n, const uint64_t *phys) {
+    if (!g_dev || !phys || n <= 0 || n > SWAP_CLUSTER_PAGES) return -EMBK_EINVAL;
+    if (first == 0 || first + (uint64_t)n > g_nslots) return -EMBK_EINVAL;
+
+    spin_lock(&g_lock);
+    bool held = true;
+    for (int i = 0; i < n; i++) if (!bm_test(first + (uint64_t)i)) { held = false; break; }
+    if (held && !g_cluster_busy) g_cluster_busy = true; else held = false;
+    spin_unlock(&g_lock);
+    if (!held) return -EMBK_EINVAL;     /* a slot nobody owns is garbage; or the buffer is in use */
+
+    int rc = embk_block_read(g_dev, first * g_spp, (uint32_t)n * g_spp, g_cluster_buf);
+    if (rc == EMBK_OK)
+        for (int i = 0; i < n; i++)
+            memcpy((void *)P2V(phys[i]), g_cluster_buf + (size_t)i * 4096, 4096);
+
+    spin_lock(&g_lock);
+    g_cluster_busy = false;
+    if (rc == EMBK_OK) {
+        g_st.ins += (uint64_t)n;
+        g_st.bytes_read += (uint64_t)n * 4096;
+        g_st.cluster_reads++;
+    }
+    spin_unlock(&g_lock);
+    return rc;
+}
+
 void swap_free(uint64_t slot) {
     if (!g_dev || slot == 0 || slot >= g_nslots) return;
     spin_lock(&g_lock);

@@ -54,6 +54,13 @@ int      swap_in(uint64_t slot, uint64_t phys);
 
 void     swap_free(uint64_t slot);
 
+/* CLUSTERED PAGE-IN: n CONTIGUOUS slots starting at `first` into the n frames
+ * of `phys`, in ONE device command. The read-ahead path uses it: the pages
+ * that were written together in one cluster sit in consecutive slots, and
+ * a fault on one of them is the moment to fetch the rest. Slots stay
+ * allocated; the caller frees them as it adopts the pages. */
+int      swap_in_cluster(uint64_t first, int n, const uint64_t *phys);
+
 /* Is `slot` currently allocated? For audits: a page record naming a slot the
  * store does not consider held is a page whose contents will be overwritten
  * by the next page-out. */
@@ -80,6 +87,7 @@ struct swap_stats {
     uint64_t nslots, used;
     uint64_t outs, ins, frees;
     uint64_t clusters;        /* multi-page writes issued                       */
+    uint64_t cluster_reads;   /* multi-page reads issued (read-ahead)           */
     uint64_t cluster_pages;   /* pages that went out inside them (also in outs) */
     uint64_t bytes_written, bytes_read;
     char     dev[16];

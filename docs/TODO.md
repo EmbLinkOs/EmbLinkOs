@@ -1889,11 +1889,16 @@ Open, in the order they matter:
   recently USED one. Correct, and the wrong page under a real working set.
   Access-bit scanning (with a TLB flush per scan, or an active/inactive pair
   of lists) is the next step; needs a workload to measure against.
-- [ ] **Swap-in is one page per command.** Page-out clusters sixteen; a read
-  brings back exactly the page that faulted. In the witness, swap-ins are
-  ~380 us each under load and the largest remaining I/O cost. Read-ahead of
-  the neighbouring slots (the pages evicted together were written together)
-  is the usual answer.
+- [x] ~~**Swap-in is one page per command.**~~ -- **closed: read-ahead.**
+  After a page comes back, its neighbours in the object (8 each way, one
+  cluster in all) that are also out on the store are fetched too, one
+  command per run of contiguous slots -- the pages that left together sit in
+  consecutive slots -- and are simply resident when their faults arrive.
+  Never reclaims to do it: only when free memory is above the fault path's
+  reserve plus a window, which the reserve was retuned (128/64 -> 256/512)
+  to leave. `test swap`: **16,635 of 19,303 pages read ahead in 2,093
+  cluster reads; faults that waited on the disk 18,445 -> 2,668; swap I/O
+  6.7 s -> 2.1 s** (mmap run), heap run 48 us per fault.
 - [ ] **One shootdown per evicted page** (x86: an IPI broadcast and a CR3
   reload on every core). Measured at 8.7 us each, 0.4 s of the run -- not
   worth batching yet; would be once a batch API exists (clear N PTEs, one
