@@ -72,10 +72,17 @@ typedef struct slab_pool {
  * to route a pointer: a hit means "this is a slab object of pool N", a miss means
  * "general block". Fixed and bounded; if it fills, grow just declines and the
  * size falls back to the general allocator (honest degradation, never unsafe). */
-#define SLAB_MAX_RANGES 128
-#define SLAB_REGION_BYTES (8u * 1024u)   // per grow; keeps range count low
+/* 1024 regions of 64 KiB: 64 MiB of slab before anything falls back. The
+ * first version stopped at 128 x 8 KiB = 1 MiB, and MEASURED past that cap
+ * every small allocation took 224 us -- a walk of the general first-fit list,
+ * fifty thousand blocks long by then -- 13 of a 36-second paging run spent in
+ * kmalloc(80). The registry is kept SORTED by address and searched by
+ * bisection, so growing it to a thousand entries costs a free ten compares
+ * rather than a thousand. */
+#define SLAB_MAX_RANGES 1024
+#define SLAB_REGION_BYTES (64u * 1024u)
 typedef struct slab_range { uintptr_t start, end; uint8_t pool_idx; } slab_range_t;
-static slab_range_t g_slab_ranges[SLAB_MAX_RANGES];
+static slab_range_t g_slab_ranges[SLAB_MAX_RANGES];   /* sorted by start */
 static int g_slab_range_count;
 
 // Size classes and their pools. Declared here (not lower down) so the lookup
@@ -86,13 +93,34 @@ static const uint64_t slab_sizes[KHEAP_SLAB_SIZES] = {
 static slab_pool_t slab_pools[KHEAP_SLAB_SIZES];
 
 // pool_idx if ptr lies in a slab region, else -1. The whole discrimination.
+// Bisection over the sorted registry: regions never overlap, so the last
+// region starting at or below `a` is the only candidate.
 static int slab_range_lookup(void *ptr) {
     uintptr_t a = (uintptr_t)ptr;
-    for (int i = 0; i < g_slab_range_count; i++) {
-        if (a >= g_slab_ranges[i].start && a < g_slab_ranges[i].end)
-            return g_slab_ranges[i].pool_idx;
+    int lo = 0, hi = g_slab_range_count;          /* [lo, hi) */
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (g_slab_ranges[mid].start <= a) lo = mid + 1;
+        else                                hi = mid;
     }
-    return -1;
+    if (lo == 0)
+        return -1;
+    const slab_range_t *r = &g_slab_ranges[lo - 1];
+    return (a < r->end) ? r->pool_idx : -1;
+}
+
+// Register a region, keeping the registry sorted. Grows are rare (once per
+// 64 KiB of a size class); the shift is nothing next to the carve.
+static void slab_range_insert(uintptr_t start, uintptr_t end, uint8_t pool_idx) {
+    int i = g_slab_range_count;
+    while (i > 0 && g_slab_ranges[i - 1].start > start) {
+        g_slab_ranges[i] = g_slab_ranges[i - 1];
+        i--;
+    }
+    g_slab_ranges[i].start    = start;
+    g_slab_ranges[i].end      = end;
+    g_slab_ranges[i].pool_idx = pool_idx;
+    g_slab_range_count++;
 }
 
 // Smallest size class that fits `size`, or -1 if too big for any pool. Rounds
@@ -202,10 +230,8 @@ static void kheap_slab_grow_locked(slab_pool_t *pool) {
     if (!region)
         return;   /* OOM: pool stays empty, caller falls back to general */
 
-    g_slab_ranges[g_slab_range_count].start    = (uintptr_t)region;
-    g_slab_ranges[g_slab_range_count].end      = (uintptr_t)region + objs * pool->obj_size;
-    g_slab_ranges[g_slab_range_count].pool_idx = (uint8_t)(pool - slab_pools);
-    g_slab_range_count++;
+    slab_range_insert((uintptr_t)region, (uintptr_t)region + objs * pool->obj_size,
+                      (uint8_t)(pool - slab_pools));
 
     for (uint64_t i = 0; i < objs; i++) {
         void *obj = region + i * pool->obj_size;
@@ -617,6 +643,20 @@ void kheap_check(void) {
      * via the aarch64 build) flagged it. A check that says nothing on success
      * cannot be told apart from a check that did not run. */
     kprintf("kheap_check: %lu blocks, canaries intact\n", (unsigned long)i);
+}
+
+void kheap_slab_stats_get(uint64_t *total_objs, uint64_t *used_objs, int *ranges) {
+    uint64_t t = 0, u = 0;
+    spin_lock(&heap_lock);
+    for (int i = 0; i < KHEAP_SLAB_SIZES; i++) {
+        t += slab_pools[i].total_objs;
+        u += slab_pools[i].used_objs;
+    }
+    int r = g_slab_range_count;
+    spin_unlock(&heap_lock);
+    if (total_objs) *total_objs = t;
+    if (used_objs)  *used_objs  = u;
+    if (ranges)     *ranges     = r;
 }
 
 void kheap_slab_stats(void) {

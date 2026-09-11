@@ -1871,13 +1871,15 @@ Open, in the order they matter:
   consequences: a disk-bound syscall delays the tick on its core, and the
   first EL1 preemption is untested. Find what on the tick/switch path is not
   safe nested in a sync handler, then unmask in the syscall path too.
-- [ ] **The kernel heap's slab pools cap at 1 MiB** (`SLAB_MAX_RANGES` 128 x
-  `SLAB_REGION_BYTES` 8 KiB, `kernel/mm/kheap.c`); past that, every small
-  allocation walks the general first-fit heap. Measured at **224 us per
-  `kmalloc(80)`** with ~58,000 blocks live. The page cache now carries its
-  own records, but the next thing that wants tens of thousands of small
-  objects will hit this. Larger regions and a faster range lookup, or a real
-  slab allocator.
+- [x] ~~**The kernel heap's slab pools cap at 1 MiB**~~ -- **closed.** They
+  capped at `SLAB_MAX_RANGES` 128 x `SLAB_REGION_BYTES` 8 KiB, and past that
+  every small allocation walked the general first-fit heap: **224 us per
+  `kmalloc(80)`** with ~58,000 blocks live. Now 1024 regions of 64 KiB
+  (64 MiB of slab), with the range registry kept sorted and searched by
+  bisection so a `kfree` costs ten compares, not a thousand. `test kheap`
+  allocates 20,000 objects of 96 bytes -- 2.5 MiB, past the old cap --
+  and requires every one to come from the slab: **388 ns each, 445 ns to
+  free** (TCG), 46 regions.
 - [ ] **The LRU is fault-order, not access-order.** A page is touched in the
   LRU when it is faulted in and never again -- the hardware access bits are
   not scanned -- so reclaim evicts the oldest FAULTED page, not the least
@@ -1902,6 +1904,12 @@ Open, in the order they matter:
   `pmm_alloc_page` directly under the VMA lock, so a COW fault under real
   pressure declines instead of reclaiming. Route it through the object's
   reserve once COW pages are objects too.
+- [ ] **The ARM boot harness reads markers from a console two processes
+  write at once.** Seen once: `home: desktop ready` arrived as `home: desktop
+  re` + TopBar's lines + `ady`, and A7 was reported failed with everything
+  actually up (0 self-test failures, first frame presented). A rerun passed.
+  Either the harness should tolerate a torn marker (search the joined
+  stream) or the desktop's marker should be one write that cannot interleave.
 - [ ] **Observed twice, not reproduced since:** an x86 boot (256 MiB, swap
   disk) stalled after `init: authenticated session` -- `ELF dynlink` never
   printed; later, twice, the swap witness hung right after its dynlink line

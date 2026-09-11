@@ -4916,6 +4916,39 @@ int selftests_handle_command(const char *cmd)
         HCHK("krealloc slab->general keeps data", rok);
         if (r) kfree(r);
         kheap_check();
+        /* 5. PAST THE OLD CAP, AND STILL O(1). 20,000 objects of 96 bytes is
+         *    2.5 MiB in the 128-byte class -- beyond the 1 MiB the slab used
+         *    to stop at, after which every one of these walked the general
+         *    first-fit list (measured: 224 us each, with the list fifty
+         *    thousand blocks long). Every object must come from the slab,
+         *    and the time per allocation is printed so the claim is a
+         *    number. */
+        {
+            enum { NBIG = 20000 };
+            static void *big_set[NBIG];
+            uint64_t t0 = 0, u0 = 0, t1 = 0, u1 = 0; int r0 = 0, r1 = 0;
+            kheap_slab_stats_get(&t0, &u0, &r0);
+            uint64_t ns0 = time_get_ns();
+            int bgot = 0;
+            for (int i = 0; i < NBIG; i++) { big_set[i] = kmalloc(96); if (big_set[i]) bgot++; }
+            uint64_t ns1 = time_get_ns();
+            kheap_slab_stats_get(&t1, &u1, &r1);
+            for (int i = 0; i < bgot; i++) *(int *)big_set[i] = i;
+            int balias = 0;
+            for (int i = 0; i < bgot; i++) if (*(int *)big_set[i] != i) balias++;
+            for (int i = 0; i < bgot; i++) kfree(big_set[i]);
+            uint64_t ns2 = time_get_ns();
+            kprintf("  %d x kmalloc(96): %llu us total (%llu ns each), free %llu ns each; "
+                    "slab objects out %llu -> %llu, regions %d -> %d\n",
+                    bgot, (unsigned long long)((ns1 - ns0) / 1000),
+                    (unsigned long long)(bgot ? (ns1 - ns0) / bgot : 0),
+                    (unsigned long long)(bgot ? (ns2 - ns1) / bgot : 0),
+                    (unsigned long long)u0, (unsigned long long)u1, r0, r1);
+            HCHK("20000 objects past the old 1 MiB cap all came from the slab",
+                 bgot == NBIG && u1 - u0 == (uint64_t)NBIG);
+            HCHK("no two of them alias", balias == 0);
+        }
+        kheap_check();
 
         kheap_slab_stats();
         kprintf("\n[cmd] test kheap: %s (%d/%d)\n",
