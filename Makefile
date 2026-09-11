@@ -1,4 +1,9 @@
+# -w+orphan-labels: NASM treats an unrecognised bare word as a LABEL, so a
+# mistyped mnemonic assembles to nothing and the code falls through to
+# whatever follows. `sysretq` (not a NASM mnemonic; the spelling is
+# `o64 sysret`) did exactly that, and the fall-through double-faulted.
 ASM       = nasm
+ASMFLAGS  = -w+orphan-labels
 ASM_FLAGS = -f bin
 # --- host portability -------------------------------------------------------
 # This repo is developed on Linux and on macOS (Apple Silicon), and the two
@@ -149,6 +154,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/smp/smp.c \
              kernel/arch/x86_64/boot/boot_protocol.c \
              kernel/arch/x86_64/syscall/syscall.c \
+             kernel/arch/x86_64/syscall/syscall_fast.c \
              kernel/syscall/syscalls.c \
              kernel/arch/x86_64/syscall/usercopy.c \
              kernel/arch/x86_64/syscall/usermode.c \
@@ -1630,19 +1636,19 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 $(ISR_OBJ): $(ISR_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 $(SYSCALL_OBJ): $(SYSCALL_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 $(KCONTEXT_OBJ): $(KCONTEXT_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 $(KENTRY_OBJ): $(KENTRY_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 $(AP_ENTRY_OBJ): $(AP_ENTRY_ASM) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 # Flat binary, NOT linked into the kernel -- an AP starts in 16-bit real
 # mode and must execute below 1MB, which the kernel's higher-half ELF is
@@ -1651,7 +1657,7 @@ $(AP_TRAMPOLINE_BIN): $(AP_TRAMPOLINE_ASM) | $(BUILD)
 	$(ASM) -f bin $< -o $@
 
 $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BUILD)
-	$(ASM) -f elf64 $< -o $@
+	$(ASM) $(ASMFLAGS) -f elf64 $< -o $@
 
 # Every kernel header is a prerequisite. The kernel is one monolithic $(CC)
 # over $(KERNEL_SRC) with no per-TU depfiles, so without this a header-only

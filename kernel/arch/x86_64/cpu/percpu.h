@@ -19,7 +19,17 @@ struct process;   // (process.h includes this header, to get current_thread's
  * assigned in MADT enumeration order by percpu_init_topology(), and the
  * BSP is always first in that order because it's the one that read the
  * MADT in the first place. */
+/* THE SYSCALL SCRATCH, reached through GS.base by syscall_entry.asm's fast
+ * stub -- the only thing in this kernel that uses GS at all. Two words at
+ * FIXED offsets 0 and 8, asserted in syscall_fast.c: the stub is assembly and
+ * cannot ask C for an offsetof. */
+struct syscall_scratch {
+    uint64_t user_rsp;      /* gs:0 -- where the entry parks the user stack */
+    uint64_t kstack_top;    /* gs:8 -- the stack it switches to (== tss.rsp0) */
+};
+
 struct cpu_data {
+    struct syscall_scratch sc;
     uint32_t apic_id;
     uint32_t cpu_index;
 
@@ -80,6 +90,12 @@ extern uint32_t cpu_count;
  * entry) -- see kernel_main's call site. Marks cpu_table[0] (the BSP)
  * online immediately; every AP marks itself online later, in ap_main(). */
 void percpu_init_topology(void);
+
+/* Arm `syscall`/`sysret` on THIS core and point its GS.base at its own
+ * syscall scratch. After the GDT is loaded (a GS selector reload would undo
+ * the base) and after the TSS has its RSP0. Idempotent. */
+void syscall_fast_init_this_cpu(void);
+bool syscall_fast_enabled(void);
 
 /* Returns this core's own struct cpu_data, found via its LAPIC ID. Safe to
  * call as soon as percpu_init_topology() has run; before that (i.e. only

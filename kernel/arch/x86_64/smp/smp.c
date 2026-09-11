@@ -78,6 +78,7 @@ void ap_main(void) {
                             // idle kthread's adoption below counts).
 
     gdt_init_this_cpu();
+    syscall_fast_init_this_cpu();   /* per core: the MSRs and this core's GS scratch */
     idt_load_this_cpu();
     lapic_init_this_cpu();
 

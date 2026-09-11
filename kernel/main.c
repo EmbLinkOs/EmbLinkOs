@@ -1753,6 +1753,9 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                       // (the BSP) directly, see gdt_init_bsp()'s comment.
     idt_init();
     syscall_init();   // install int 0x80 (DPL3) + #DF on IST1; needs idt_init first
+    syscall_fast_init_this_cpu();   // and `syscall`/`sysret`: MSRs + this core's
+                                    // GS scratch. After gdt_init_bsp (a GS selector
+                                    // reload would clear GS.base) -- see syscall_fast.c
     pic_init();
     irq_install();
     fpu_init_this_cpu();   // CR0/CR4 are per-core -- every AP repeats this in

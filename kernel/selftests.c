@@ -14,6 +14,7 @@
 #include "fs/vfs.h"
 #include "fs/fd.h"
 #include "arch/x86_64/cpu/rwlock.h"
+#include "arch/x86_64/cpu/percpu.h"      /* syscall_fast_enabled: test syscall */
 #include "drivers/timer/rtc.h"
 #include "arch/x86_64/syscall/usermode.h"
 #include "process/process.h"
@@ -439,6 +440,7 @@ static void selftests_print_commands(void)
     kprintf("  test kill io        (a process killed inside the filesystem leaves it usable)\n");
     kprintf("  test session        (sessions: identity, inheritance, the gates, logout)\n");
     kprintf("  test accounts       (the account store and the session-profile policy)\n");
+    kprintf("  test syscall        (int 0x80 vs syscall/sysret, timed)\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1660,6 +1662,22 @@ int selftests_handle_command(const char *cmd)
         int rc = fd >= 0 ? vfs_fd_write(fd, text, strlen(text), &w) : fd;
         if (fd >= 0) { (void)vfs_fd_fsync(fd); vfs_close(fd); }
         kprintf("\n[cmd] test plant profile: %s (%s, %d)\n", rc == EMBK_OK ? "OK" : "FAIL", path, rc);
+        return 1;
+    }
+
+    /* test syscall -- the two ways into the kernel, timed against each other
+     * by user/bin/syscallbench.c: `int 0x80` (an interrupt: IDT walk, TSS
+     * stack switch, pushed frame) and `syscall` (selectors from an MSR, RIP
+     * in RCX, jump). Both must return the same pid before either is timed. */
+    if (strcmp(cmd, "test syscall") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test syscall: VFS not registered\n"); return 1; }
+        const char *bp = "/data/apps/syscallbench/syscallbench.elf";
+        char *a[] = { (char *)bp, NULL };
+        kprintf("\n[syscall] fast path armed: %s\n", syscall_fast_enabled() ? "yes" : "NO");
+        int pid = process_create(bp, a, 1, NULL, 0);
+        int rc = pid >= 0 ? process_wait((uint32_t)pid) : pid;
+        kprintf("[cmd] test syscall: %s (exit %d)\n",
+                (rc == 0 && syscall_fast_enabled()) ? "OK" : "FAIL", rc);
         return 1;
     }
 

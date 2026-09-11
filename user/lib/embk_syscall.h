@@ -186,27 +186,27 @@
 
 static inline int64_t embk_syscall0(int64_t n) {
     int64_t ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n) : "rcx", "r11", "memory");
+    __asm__ volatile ("syscall" : "=a"(ret) : "a"(n) : "rcx", "r11", "memory");
     return ret;
 }
 
 static inline int64_t embk_syscall1(int64_t n, int64_t a1) {
     int64_t ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret)
+    __asm__ volatile ("syscall" : "=a"(ret)
         : "a"(n), "D"(a1) : "rcx", "r11", "memory");
     return ret;
 }
 
 static inline int64_t embk_syscall2(int64_t n, int64_t a1, int64_t a2) {
     int64_t ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret)
+    __asm__ volatile ("syscall" : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
     return ret;
 }
 
 static inline int64_t embk_syscall3(int64_t n, int64_t a1, int64_t a2, int64_t a3) {
     int64_t ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret)
+    __asm__ volatile ("syscall" : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
     return ret;
 }
@@ -217,7 +217,7 @@ static inline int64_t embk_syscall4(int64_t n, int64_t a1, int64_t a2, int64_t a
                                      int64_t a4) {
     int64_t ret;
     register int64_t r10 __asm__("r10") = a4;
-    __asm__ volatile ("int $0x80" : "=a"(ret)
+    __asm__ volatile ("syscall" : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
         : "rcx", "r11", "memory");
     return ret;
@@ -228,7 +228,7 @@ static inline int64_t embk_syscall5(int64_t n, int64_t a1, int64_t a2, int64_t a
     int64_t ret;
     register int64_t r10 __asm__("r10") = a4;
     register int64_t r8  __asm__("r8")  = a5;
-    __asm__ volatile ("int $0x80" : "=a"(ret)
+    __asm__ volatile ("syscall" : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8)
         : "rcx", "r11", "memory");
     return ret;
@@ -240,7 +240,7 @@ static inline int64_t embk_syscall6(int64_t n, int64_t a1, int64_t a2, int64_t a
     register int64_t r10 __asm__("r10") = a4;
     register int64_t r8  __asm__("r8")  = a5;
     register int64_t r9  __asm__("r9")  = a6;
-    __asm__ volatile ("int $0x80" : "=a"(ret)
+    __asm__ volatile ("syscall" : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
         : "rcx", "r11", "memory");
     return ret;
@@ -268,7 +268,7 @@ static inline int64_t embk_syscall6(int64_t n, int64_t a1, int64_t a2, int64_t a
         "mov 0(%5), %%r10\n\t"
         "mov 8(%5), %%r8\n\t"
         "mov 16(%5), %%r9\n\t"
-        "int $0x80"
+        "syscall"
         : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2), "d"(a3), "c"(ex)
         : "r8", "r9", "r10", "r11", "memory");

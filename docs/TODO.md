@@ -1358,10 +1358,41 @@ text.
   — write=1, exit=2, yield=3, open=4, close=5, read=6, lseek=7, stat=8,
   readdir=9, spawn=10, wait=11, getpid=12, kill=13. `spawn` returns a
   capability handle (not the raw pid); `wait`/`kill` take one.
-- [ ] Fast path `syscall`/`sysret` deferred: needs STAR/LSTAR/SFMASK MSRs + EFER.SCE,
-  AND swapgs + a per-CPU GS base for the kernel-stack switch (syscall does NOT
-  switch stacks via the TSS). Wants per-CPU/SMP infra. GDT already laid out user
-  data-before-code for it.
+- [x] ~~Fast path `syscall`/`sysret` deferred~~ -- **built.** EFER.SCE +
+  STAR/LSTAR/FMASK per core (`kernel/arch/x86_64/syscall/syscall_fast.c`), the
+  stub in `syscall_entry.asm`. The GDT was already in SYSRET's order.
+  - **No swapgs, and that is the point.** `syscall` does not switch stacks, so
+    the usual answer is a per-CPU pointer behind a swapped GS -- and swapgs
+    across a blocking syscall is the hardest thing in a kernel to get right,
+    because the syscall and interrupt return paths must agree on the swap
+    state. EmbLink finds its per-CPU data by LAPIC ID and reads GS nowhere, so
+    GS.base can hold this core's syscall scratch AT ALL TIMES and the stub
+    needs no swapgs. Ring 3 cannot read it (kernel address, supervisor page)
+    or change it (no arch_prctl, CR4.FSGSBASE off).
+  - FMASK clears IF (a syscall begins with interrupts off, as the interrupt
+    gate did), and TF/DF/NT/IOPL/**AC** -- AC because with SMAP that bit is
+    what says "the kernel may touch user memory", and entering with a caller's
+    AC set would disable the protection for the whole syscall.
+  - `int 0x80` stays installed: prebuilt binaries in the image still use it.
+  - Userland changed by one token per wrapper: the ABI was already written for
+    `syscall` (rcx/r11 declared clobbered, arg 4 in r10, never rcx).
+  - **Two bugs worth recording.** NASM has no `sysretq` mnemonic -- and an
+    unrecognised bare word is a LABEL, so it assembled to *nothing* and the
+    stub fell through into the next function on a user stack (double fault).
+    The spelling is `o64 sysret`; the build now passes `-w+orphan-labels` so
+    this cannot be silent again. And the user RSP was parked in the per-CPU
+    scratch and read back at exit -- correct until a thread is preempted
+    mid-syscall and another on the same core overwrites it, after which the
+    first returns to ring 3 on the wrong stack (it killed the desktop on a
+    push to an unmapped address). It lives on the kernel stack now, which is
+    per thread by construction.
+  - **Measured** (`test syscall`, user/bin/syscallbench.c: 200,000 getpid each
+    way in one process, both agreeing on the pid first): **2735 ns/call via
+    int 0x80, 2500 ns via syscall -- 91%.** Under x86 TCG, where the
+    emulator's dispatch dominates and the IDT walk and TSS stack switch that
+    `syscall` skips are microcode this host never charges for. The hardware
+    gap is larger and is NOT measured here: this machine cannot run x86
+    natively.
 - [x] ~~Syscall table: wire the fd/VFS syscalls~~ — done: `sys_open`,
   `sys_close`, `sys_read`, `sys_lseek`, `sys_stat`, `sys_readdir` (via a
   callback-based `sys_readdir_cb` walking `vfs_readdir`, filling a
