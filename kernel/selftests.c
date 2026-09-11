@@ -1563,7 +1563,7 @@ int selftests_handle_command(const char *cmd)
 
     /* test session -- whose a process is, and what that decides.
      *
-     * The witness (user/bin/sessprobe.c) is spawned into sessions this test
+     * The witness (user/tests/sessprobe/sessprobe.c) is spawned into sessions this test
      * names -- the console holds EMBK_CAP_SESSION, as init does -- and each
      * mode is one claim: identity and inheritance, no minting, the kill-by-pid
      * gate, clipboard isolation, logout from inside and from outside, a
@@ -1700,7 +1700,7 @@ int selftests_handle_command(const char *cmd)
     }
 
     /* test syscall -- the two ways into the kernel, timed against each other
-     * by user/bin/syscallbench.c: `int 0x80` (an interrupt: IDT walk, TSS
+     * by user/tests/syscallbench/syscallbench.c: `int 0x80` (an interrupt: IDT walk, TSS
      * stack switch, pushed frame) and `syscall` (selectors from an MSR, RIP
      * in RCX, jump). Both must return the same pid before either is timed. */
     if (strcmp(cmd, "test syscall") == 0) {
@@ -1716,7 +1716,7 @@ int selftests_handle_command(const char *cmd)
     }
 
     /* test accounts -- the account store and the session policy
-     * (user/bin/authtest.c against a scratch store: create, verify, change,
+     * (user/tests/authtest/authtest.c against a scratch store: create, verify, change,
      * reset, remove, the last-administrator rule, the upgrade of a standard
      * PBKDF2 record made elsewhere, atomic rewrites, the throttle, and the
      * clamp on session profiles). Exit code = claims that did not hold. */
@@ -1733,7 +1733,7 @@ int selftests_handle_command(const char *cmd)
     /* test kill io -- kill a process while it is inside the filesystem, eight
      * times at eight different moments, and the filesystem is still usable.
      *
-     * The witness (user/bin/fsloop.c) creates, writes, fsyncs and unlinks a
+     * The witness (user/tests/fsloop/fsloop.c) creates, writes, fsyncs and unlinks a
      * file in a loop; fsync commits a transaction under the filesystem's lock
      * in the PROCESS's own context, so a kill that lands there lands on a
      * thread holding that lock -- asleep on the disk, or preempted. What a
@@ -1783,7 +1783,7 @@ int selftests_handle_command(const char *cmd)
 
     /* test swap -- anonymous memory larger than RAM, and the program survives.
      *
-     * The witness (user/bin/swapper.c) maps N MiB anonymous, writes a pattern
+     * The witness (user/tests/swapper/swapper.c) maps N MiB anonymous, writes a pattern
      * through every page and reads every page back; its exit code is the
      * number of pages that came back wrong. N is chosen HERE from what the
      * machine actually has free, so the run forces paging at any -m: more
@@ -4283,7 +4283,7 @@ int selftests_handle_command(const char *cmd)
         // /system/bin/primtest.elf runs the full EmbLink native-primitive suite -- a second
         // thread (create/join + shared-memory proof), a spawn() with argv +
         // file-actions, and an sbrk() heap exercise -- and exits 16 iff ALL
-        // of them passed (see user/bin/primtest.c, built on the EmbLink SDK
+        // of them passed (see user/tests/primtest/primtest.c, built on the EmbLink SDK
         // user/embk.h). 16 is a fixed success sentinel, not a computed value.
         // Needs a real filesystem with /system/bin/primtest.elf on it (e.g. `make
         // run-embkfs`) -- unlike "test ring3", there's no embedded fallback

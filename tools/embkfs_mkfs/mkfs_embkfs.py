@@ -753,11 +753,29 @@ def _elf_dest(name: str) -> bytes:
     return f"data/apps/{name[:-4]}/{name}".encode()          # every other app: /data/apps/<name>/
 
 
+
+# A program's metadata lives in the program's OWN directory now -- user/apps/,
+# user/system/, user/tools/, user/tests/ or user/examples/, one folder per
+# program -- rather than in one flat user/bin/. Only the NAME is known here (it
+# comes from the .elf), so the directory is searched rather than passed in. The
+# categories are deliberately not hardcoded anywhere else: moving a program
+# between them is moving its folder.
+_PROG_DIRS = ("user/apps", "user/system", "user/tools", "user/tests", "user/examples")
+
+def _prog_meta(base: str, ext: str) -> str:
+    """Path to <base>.<ext> beside the program's source, or a path that does not
+    exist (so the caller's _read_file returns None, as it always has)."""
+    for d in _PROG_DIRS:
+        p = f"{d}/{base}/{base}.{ext}"
+        if os.path.exists(p):
+            return p
+    return f"user/apps/{base}/{base}.{ext}"
+
 def discover_userland_objects(build_dir="build"):
     """Assemble the boot image's objects by DISCOVERING what's been built, placed
     into the docs/USERSPACE.md tree (see _elf_dest / the sealed-vs-mutable map
     above). Adding a new EmUI app still needs no mkfs edit -- drop
-    user/bin/foo.c in and foo.elf appears at the root; name it in _SYSTEM_BIN or
+    user/apps/foo/foo.c in and foo.elf appears at the root; name it in _SYSTEM_BIN or
     _APPS only if it belongs elsewhere. Returns a list of (name, dtype, mode,
     data); `name` may contain '/', and build_root_items creates the dirs.
       - system programs      -> /system/bin/
@@ -780,11 +798,11 @@ def discover_userland_objects(build_dir="build"):
             continue                                          # already added / staged elsewhere
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
         # Per-app NAMESPACE MANIFEST (docs/USERSPACE_v2.md UP4): an app ships its
-        # declared namespace as user/bin/<name>.ns, packed beside its .elf as
+        # declared namespace as <progdir>/<name>.ns, packed beside its .elf as
         # /data/apps/<name>/<name>.ns. The session (home) reads it and grants
         # EXACTLY those bindings (absent => the app inherits the parent's view).
         base = name[:-4]                                      # strip ".elf"
-        nsm = _read_file(f"user/bin/{base}.ns")
+        nsm = _read_file(_prog_meta(base, "ns"))
         if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
             dest = f"data/apps/{base}/{base}.ns".encode()
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
@@ -793,14 +811,14 @@ def discover_userland_objects(build_dir="build"):
         # needs -- what it may DO, where the .ns says what it may NAME. The
         # session grants exactly that; the kernel refuses any mask that is not a
         # subset of the grantor's, so the file can only ever narrow.
-        capm = _read_file(f"user/bin/{base}.caps")
+        capm = _read_file(_prog_meta(base, "caps"))
         if capm is not None and _elf_dest(name).startswith(b"data/apps/"):
             dest = f"data/apps/{base}/{base}.caps".encode()
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, capm))
         # Per-app PRESENTATION MANIFEST: an app describes itself (display name +
-        # icon) in user/bin/<name>.app, packed as /data/apps/<name>/<name>.app.
+        # icon) in <progdir>/<name>.app, packed as /data/apps/<name>/<name>.app.
         # The desktop reads it instead of hard-coding each app's name and icon.
-        appm = _read_file(f"user/bin/{base}.app")
+        appm = _read_file(_prog_meta(base, "app"))
         if appm is not None and _elf_dest(name).startswith(b"data/apps/"):
             dest = f"data/apps/{base}/{base}.app".encode()
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, appm))
@@ -1028,14 +1046,14 @@ def discover_userland_objects(build_dir="build"):
     # wall" coming down. The ui/ tree ships to /data/src/ui/ preserving its subdir
     # shape (the app's -I set mirrors it); clockw.c beside it.
     objects.extend(_tree_objects("ui", b"data/src/ui/", ".h"))
-    ck = _read_file("user/bin/clockw.c")
+    ck = _read_file("user/apps/clockw/clockw.c")
     if ck is not None:
         objects.append((b"data/src/ui/clockw.c", L.DT_REG, L.S_IFREG | L.PERM_FILE, ck))
     # ...and the MANIFEST that builds it: EmbBuild's first GUI target. Until
     # this shipped, "the OS rebuilds its userland" excluded the GUI -- first
     # because tcc could not link a libembk.so app at all, then, once it could,
     # because no manifest named one. `test embbuild gui` is the proof.
-    ckm = _read_file("user/bin/clockw.build.ebm")
+    ckm = _read_file("user/apps/clockw/clockw.build.ebm")
     if ckm is not None:
         objects.append((b"data/src/ui/build.ebm", L.DT_REG, L.S_IFREG | L.PERM_FILE, ckm))
 
@@ -1093,7 +1111,7 @@ def discover_userland_objects(build_dir="build"):
     # with embcc (against emlibc's headers + embcc's own freestanding stddef/
     # stdarg, NOT newlib), then link+emit with embld -- the whole artifact
     # produced by the owned toolchain on the metal. `test embcc embx` proves it.
-    app_c = _read_file("user/bin/emlibc_embxapp.c")
+    app_c = _read_file("user/tests/emlibc_embxapp/emlibc_embxapp.c")
     if app_c is not None:
         objects.append((b"data/src/emlibc/embxapp.c",
                         L.DT_REG, L.S_IFREG | L.PERM_FILE, app_c))
@@ -1113,7 +1131,7 @@ def discover_userland_objects(build_dir="build"):
                      ("user/emlibc/process/process.c",b"data/src/emlibc/process.c"),
                      ("user/lib/embk_syscall.h",      b"data/src/emlibc/include/embk_syscall.h"),
                      ("user/emlibc/math/math.c",      b"data/src/emlibc/math.c"),
-                     ("user/bin/mathself.c",          b"data/src/emlibc/mathself.c")):
+                     ("user/tests/mathself/mathself.c",          b"data/src/emlibc/mathself.c")):
         blob = _read_file(src)
         if blob is not None:
             objects.append((dst, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
@@ -1218,7 +1236,7 @@ def discover_userland_objects(build_dir="build"):
     objects.append((b"etc/passwd", L.DT_REG, L.S_IFREG | 0o644, b""))
     objects.append((b"etc/shadow", L.DT_REG, L.S_IFREG | 0o600, b""))
     # /etc/sessions: where a session's clamped namespace profile lives
-    # (user/bin/init.c reads /etc/sessions/<user>.ns). The DIRECTORY has to be
+    # (user/system/init/init.c reads /etc/sessions/<user>.ns). The DIRECTORY has to be
     # on the image even when it is empty, for the same reason .vellum above
     # does: a namespace bind resolves its prefix in the parent at spawn time, so
     # a directory that does not exist yet can never be granted and therefore can
@@ -1232,7 +1250,7 @@ def discover_userland_objects(build_dir="build"):
     #
     # They must exist before anyone logs in, and for the bind reason above they
     # cannot be created on demand by the session that wants one. Two of them,
-    # because one proves nothing: user/bin/primtest.c's mu_isolation_test runs
+    # because one proves nothing: user/tests/primtest/primtest.c's mu_isolation_test runs
     # as a confined `guest` and checks that it can write its own home AND that
     # /data/users/teo does not resolve at all. With only one user on the image
     # that second half is vacuous, and with neither it cannot spawn.

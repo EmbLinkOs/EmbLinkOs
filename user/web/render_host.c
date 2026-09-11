@@ -60,7 +60,7 @@ static struct css_sheet g_sheet;
 static int HDEFER;   /* host cache: pretend no picture has arrived yet */
 static const char      *g_doc_base;
 
-/* The app's shape, verbatim from user/bin/vellum.c -- if this diverges the
+/* The app's shape, verbatim from user/apps/vellum/vellum.c -- if this diverges the
  * harness stops being evidence. `g_busy` stands in for a fetch in flight, so
  * the loading strip can be laid out here instead of in a five-minute boot. */
 static int  g_busy;

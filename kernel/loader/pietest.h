@@ -4,7 +4,7 @@
 /* THE POSITION-INDEPENDENT-EXECUTABLE WITNESS, DRIVEN.
  *
  * Spawns the ET_DYN program at `witness` twice and judges the two runs on
- * where they actually landed. The program (user/bin/pieprobe.c) verifies its
+ * where they actually landed. The program (user/tests/pieprobe/pieprobe.c) verifies its
  * own relocated pointers, its constructor and its __thread variable, then exits
  * with the page index of its own text inside the kernel's executable window --
  * so one integer says "I am position-independent, I was relocated correctly,

@@ -101,7 +101,7 @@ Shared header = contract; one file per concern; subdirs for `crypto`/`x509`.
   ECDHE + key schedule + transcript + record layer are all byte-correct), then an
   encrypted HTTPS GET returned `HTTP/1.1 301` and 1166 bytes of decrypted app
   data. **The OS speaks TLS.**
-    - `user/lib/tls/{handshake,tls}.{c,h}`, on-OS driver `user/bin/tlstest.c`
+    - `user/lib/tls/{handshake,tls}.{c,h}`, on-OS driver `user/tests/tlstest/tlstest.c`
       (packed at `/data/apps/tlstest/`, CAP_NETWORK + RDRAND); host message tests
       `tools/tls/test_handshake.c`. libtls links the kernel crypto compiled for
       userspace (the kshim), same one-codebase trick as T1.

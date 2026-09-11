@@ -288,9 +288,36 @@ build/kernel.embdbg: $(KERNEL_ELF) | $(BUILD)
 # ---- Userland ---------------------------------------------------------------
 # Layout: user/lib/ is the shared userland library -- the EmbLink SDK (embk.h,
 # embk_syscall.h), the newlib retargeting layer (crt0.c, syscalls.c), and the
-# linker scripts. user/bin/ holds the actual programs. Built artifacts (.o,
-# .elf) go to $(BUILD), out of the source tree. -Iuser/lib lets a program in
-# user/bin include the SDK as "embk.h". See user/README.md.
+# linker scripts. Other user/<topic>/ directories are shared component
+# libraries several programs draw on (user/web's decoders are used by both the
+# browser and the photo viewer, for instance).
+#
+# THE PROGRAMS live one per directory under four category folders, and the
+# CATEGORY IS THE CLASSIFICATION -- there is no second list anywhere saying
+# what a thing is:
+#
+#   user/apps/<name>/      applications with a user interface
+#   user/system/<name>/    what makes the machine boot and log in
+#   user/tools/<name>/     command-line programs
+#   user/tests/<name>/     witnesses the kernel's self-tests spawn
+#   user/examples/<name>/  reference programs the toolkit guide points at
+#
+# A program's directory holds everything that belongs to it: the source, its
+# declared namespace (.ns), its capability manifest (.caps), its launcher entry
+# (.app), its build manifest (.build.ebm). They were all in one flat user/bin/
+# before -- 107 files, five kinds, no way to tell an application from a test
+# fixture without grepping the Makefile.
+#
+# Built artifacts (.o, .elf) go to $(BUILD), out of the source tree.
+# -Iuser/lib lets any program include the SDK as "embk.h". See user/README.md.
+
+# The ONE place that turns a program's NAME into its source path. Everything
+# that builds a program by name -- this file's generated rules and the aarch64
+# fragment's -- goes through it, so a program can be moved between categories
+# by moving its directory and nothing else.
+USER_PROG_DIRS := user/apps user/system user/tools user/tests user/examples
+USER_PROG_SRCS := $(wildcard $(addsuffix /*/*.c,$(USER_PROG_DIRS)))
+USER_SRC        = $(firstword $(foreach d,$(USER_PROG_DIRS),$(wildcard $(d)/$(1)/$(1).c)))
 #
 # THE USERLAND IS BUILT FOR $(ARCH), like the kernel. Everything below derives
 # from $(USER_TRIPLE) rather than naming x86_64-elf, because user/lib is ONE
@@ -333,15 +360,15 @@ USER_INC     = -Iuser/lib
 # AUTOLOGIN=0 builds a production init: no session without a password. The
 # default (unset) keeps the development auto-login -- see DEV_AUTOLOGIN in
 # init.c for exactly what it does and does not do. make does not track a
-# variable's value: after changing it, `touch user/bin/init.c`.
-build/init.o: user/bin/init.c user/lib/session_policy.h | $(BUILD)
+# variable's value: after changing it, `touch user/system/init/init.c`.
+build/init.o: user/system/init/init.c user/lib/session_policy.h | $(BUILD)
 	$(USER_CC) $(USER_CFLAGS) $(if $(AUTOLOGIN),-DDEV_AUTOLOGIN=$(AUTOLOGIN)) -c $< -o $@
 
 build/init.elf: build/init.o user/lib/user.ld
 	$(USER_LD) -T user/lib/user.ld build/init.o -o $@
 
 # The native-primitive self-test (formerly init.elf); `test ring3 threads`.
-build/primtest.o: user/bin/primtest.c | $(BUILD)
+build/primtest.o: user/tests/primtest/primtest.c | $(BUILD)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 build/primtest.elf: build/primtest.o user/lib/user.ld
@@ -524,12 +551,12 @@ NEWLIB_PIE_WL = -Wl,--no-dynamic-linker -Wl,--hash-style=sysv
 # with nothing to say it stopped moving.
 define NEWLIB_SIMPLE_PROG
 ifeq ($$(PIE_OK),)
-build/$(1).o: user/bin/$(1).c | $$(BUILD)
+build/$(1).o: $$(call USER_SRC,$(1)) | $$(BUILD)
 	$$(USER_CC) $$(NEWLIB_CFLAGS) -c $$< -o $$@
 build/$(1).elf: build/$(1).o build/crt0.o build/syscalls.o $$(NEWLIB_LDSCRIPT)
 	$$(USER_CC) $$(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/$(1).o -lc -lgcc -o $$@
 else
-build/$(1).o: user/bin/$(1).c | $$(BUILD)
+build/$(1).o: $$(call USER_SRC,$(1)) | $$(BUILD)
 	$$(USER_CC) $$(NEWLIB_PIE_CFLAGS) -c $$< -o $$@
 build/$(1).elf: build/$(1).o build/crt0_pic.o build/syscalls_pic.o $$(NEWLIB_PIE_LDSCRIPT)
 	$$(USER_CC) $$(NEWLIB_PIE_LDFLAGS) $$(NEWLIB_PIE_WL) \
@@ -581,15 +608,15 @@ cxx-check:
 	fi
 .PHONY: cxx-check
 
-# cxxdemo.elf -- the first C++ program (user/bin/cxxdemo.cc). A .cc extension,
-# so the user/bin/*.c EmUI auto-discovery leaves it alone. Statically linked
+# cxxdemo.elf -- the first C++ program (user/tests/cxxdemo/cxxdemo.cc). A .cc extension,
+# so the user/apps/*/*.c EmUI auto-discovery leaves it alone. Statically linked
 # like shell.elf; the g++ driver pulls in libstdc++/libsupc++ (which
 # function-local statics need for __cxa_guard_acquire). CXX_APPS is EMPTY when
 # no C++ toolchain is installed, so the whole tree still builds without one.
 ifeq ($(HAVE_CXX),yes)
 CXX_APPS = build/cxxdemo.elf
 
-build/cxxdemo.o: user/bin/cxxdemo.cc | $(BUILD)
+build/cxxdemo.o: user/tests/cxxdemo/cxxdemo.cc | $(BUILD)
 	$(USER_CXX) $(CXXFLAGS_EMBK) -c $< -o $@
 
 build/cxxdemo.elf: build/cxxdemo.o build/crt0.o build/syscalls.o $(NEWLIB_LDSCRIPT)
@@ -742,7 +769,7 @@ build/crt0_pic.o: user/lib/crt0.c | $(BUILD)
 build/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 
-build/pieprobe.o: user/bin/pieprobe.c | $(BUILD)
+build/pieprobe.o: user/tests/pieprobe/pieprobe.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 
 # The ONE genuinely position-independent executable in the tree, and the thing
@@ -771,7 +798,7 @@ endif
 # capchild / capspawn -- the ring-1 capability-attenuation test pair. Static
 # newlib console programs (no UI). capspawn is spawned by `test spawncaps` with
 # a limited cap set and drives the rest across the spawn syscall.
-build/capchild.o: user/bin/capchild.c user/lib/embk.h | $(BUILD)
+build/capchild.o: user/tests/capchild/capchild.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capchild.elf: build/crt0.o build/syscalls.o build/capchild.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capchild.o -lc -lgcc -o $@
@@ -792,21 +819,21 @@ build/capchild.embx: build/capchild.elf tools/embx/mkembx.py | $(BUILD)
 # httpget -- the M4 ring-3 networking witness. Static newlib; resolves + connects
 # + GETs over the BSD-sockets shim (embk_socket.h -> native socket syscalls).
 # `test netuser` spawns it with/without CAP_NETWORK. Auto-discovered by mkfs.
-build/httpget.o: user/bin/httpget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+build/httpget.o: user/tests/httpget/httpget.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/httpget.elf: build/crt0.o build/syscalls.o build/httpget.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/httpget.o -lc -lgcc -o $@
 
 # sockdemo -- proves the POSIX BSD-sockets shim (uses real <sys/socket.h>/<netdb.h>,
 # not the native embk_socket.h). The path Python's _socket / git take. Auto-packed.
-build/sockdemo.o: user/bin/sockdemo.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
+build/sockdemo.o: user/tests/sockdemo/sockdemo.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/sockdemo.elf: build/crt0.o build/syscalls.o build/sockdemo.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/sockdemo.o -lc -lgcc -o $@
 
 # nbsock -- the non-blocking socket witness (fcntl O_NONBLOCK + EINPROGRESS
-# connect + select + EAGAIN recv). See user/bin/nbsock.c.
-build/nbsock.o: user/bin/nbsock.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
+# connect + select + EAGAIN recv). See user/tests/nbsock/nbsock.c.
+build/nbsock.o: user/tests/nbsock/nbsock.c user/lib/sys/socket.h user/lib/netdb.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/nbsock.elf: build/crt0.o build/syscalls.o build/nbsock.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/nbsock.o -lc -lgcc -o $@
@@ -843,7 +870,7 @@ build/qjs:
 build/qjs/%.o: $(QJS_SRC)/%.c | build/qjs
 	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 -Wno-array-bounds $(QJS_CFLAGS) -c $< -o $@
 
-build/qjs/js.o: user/bin/js.c $(QJS_SRC)/quickjs.h | build/qjs
+build/qjs/js.o: user/apps/js/js.c $(QJS_SRC)/quickjs.h | build/qjs
 	$(USER_CC) $(NEWLIB_CFLAGS) -std=gnu11 $(QJS_CFLAGS) -c $< -o $@
 
 build/js.elf: build/crt0.o build/syscalls.o build/qjs/js.o $(QJS_OBJS) $(NEWLIB_LDSCRIPT)
@@ -858,7 +885,7 @@ build/web_style.o: user/web/style.c user/web/style.h user/web/css/css.h | $(BUIL
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/web -Iuser/web/css -c $< -o $@
 build/web_render.o: user/web/render.c user/web/render.h user/web/style.h user/web/html.h user/web/css/css.h user/web/imgcache.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css -c $< -o $@
-build/vellum.o: user/bin/vellum.c user/web/html.h user/web/style.h user/web/render.h \
+build/vellum.o: user/apps/vellum/vellum.c user/web/html.h user/web/style.h user/web/render.h \
                 user/web/url.h user/web/net.h user/web/fetchjob.h user/web/css/css.h \
                 user/web/jsdom.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/web -Iuser/web/css $(if $(HAVE_QJS),-DHAVE_JSDOM,) -c $< -o $@
@@ -959,7 +986,7 @@ build/httpd_mime.o: user/httpd/mime.c user/httpd/mime.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
 build/httpd_serve.o: user/httpd/serve.c user/httpd/serve.h user/httpd/http.h user/httpd/mime.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
-build/httpd.o: user/bin/httpd.c user/httpd/http.h user/httpd/serve.h user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+build/httpd.o: user/tools/httpd/httpd.c user/httpd/http.h user/httpd/serve.h user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/httpd -c $< -o $@
 HTTPD_OBJS := build/httpd.o build/httpd_http.o build/httpd_mime.o build/httpd_serve.o
 build/httpd.elf: build/crt0.o build/syscalls.o $(HTTPD_OBJS) $(NEWLIB_LDSCRIPT)
@@ -967,7 +994,7 @@ build/httpd.elf: build/crt0.o build/syscalls.o $(HTTPD_OBJS) $(NEWLIB_LDSCRIPT)
 
 # udptest -- the M5 ring-3 UDP witness: a userspace DNS resolver over a
 # SOCK_DGRAM socket (sendto/recvfrom). Auto-discovered by mkfs.
-build/udptest.o: user/bin/udptest.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
+build/udptest.o: user/tests/udptest/udptest.c user/lib/embk.h user/lib/embk_socket.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/udptest.elf: build/crt0.o build/syscalls.o build/udptest.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/udptest.o -lc -lgcc -o $@
@@ -1029,12 +1056,12 @@ iconv-test:
 
 # beep: the first program to use the audio syscalls, and the first user of
 # EMBK_CAP_AUDIO. Plain newlib link -- sound needs no toolkit.
-build/beep.o: user/bin/beep.c user/lib/embk.h | $(BUILD)
+build/beep.o: user/tools/beep/beep.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/beep.elf: build/crt0.o build/syscalls.o build/beep.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/beep.o -lc -lgcc -o $@
 
-build/wget.o: user/bin/wget.c user/lib/embk.h user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
+build/wget.o: user/tools/wget/wget.c user/lib/embk.h user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/wget.elf: build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/wget.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
@@ -1055,14 +1082,14 @@ build/git_repo.o: user/git/repo.c user/git/repo.h user/git/pack.h user/git/sha1.
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
 build/git_push.o: user/git/push.c user/git/push.h user/git/pack.h user/git/sha1.h user/git/pktline.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -I$(ZLIB_BUILD)/include -c $< -o $@
-build/gitclone.o: user/bin/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h user/git/repo.h | $(BUILD)
+build/gitclone.o: user/tools/gitclone/gitclone.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/sha1.h user/git/repo.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
 GITCLONE_OBJS := build/gitclone.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_repo.o
 build/gitclone.elf: build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o $(GITCLONE_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) -lc -lgcc -o $@
 
 # gitpush -- push a first commit over HTTPS (git-receive-pack + pack_write + auth).
-build/gitpush.o: user/bin/gitpush.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/push.h | $(BUILD)
+build/gitpush.o: user/tools/gitpush/gitpush.c user/git/githttp.h user/git/pktline.h user/git/pack.h user/git/push.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/git -c $< -o $@
 GITPUSH_OBJS := build/gitpush.o build/githttp.o build/pktline.o build/git_pack.o build/git_sha1.o build/git_push.o
 build/gitpush.elf: build/crt0.o build/syscalls.o $(GITPUSH_OBJS) $(TLS_LIB_OBJS) $(ZLIB_A) $(NEWLIB_LDSCRIPT)
@@ -1076,7 +1103,7 @@ build/pkg_manifest.o: user/pkg/manifest.c user/pkg/manifest.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -c $< -o $@
 build/pkg_embxinfo.o: user/pkg/embxinfo.c user/pkg/embxinfo.h user/pkg/manifest.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
-build/pkg.o: user/bin/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/pkg/pkgkey.h user/lib/embk.h | $(BUILD)
+build/pkg.o: user/tools/pkg/pkg.c user/pkg/manifest.h user/pkg/embxinfo.h user/pkg/pkgkey.h user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -Iuser/lib/tls/crypto -Ikernel -c $< -o $@
 # pkg verifies the manifest signature with ECDSA P-256 (tls_ecdsa + tls_bignum).
 PKG_OBJS := build/pkg.o build/pkg_manifest.o build/pkg_embxinfo.o \
@@ -1088,7 +1115,7 @@ build/pkg.elf: build/crt0.o build/syscalls.o $(PKG_OBJS) $(NEWLIB_LDSCRIPT)
 # EMBX writer (byte-identical to mkembx.py); sha256 via tls_sha256.o (-Ikernel).
 build/pkg_embxgen.o: user/pkg/embxgen.c user/pkg/embxgen.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Ikernel -c $< -o $@
-build/pkgbuild.o: user/bin/pkgbuild.c user/pkg/embxgen.h user/pkg/manifest.h | $(BUILD)
+build/pkgbuild.o: user/tools/pkgbuild/pkgbuild.c user/pkg/embxgen.h user/pkg/manifest.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/pkg -Iuser/lib -c $< -o $@
 PKGBUILD_OBJS := build/pkgbuild.o build/pkg_embxgen.o build/pkg_manifest.o build/tls_sha256.o
 build/pkgbuild.elf: build/crt0.o build/syscalls.o $(PKGBUILD_OBJS) $(NEWLIB_LDSCRIPT)
@@ -1098,7 +1125,7 @@ build/pkgbuild.elf: build/crt0.o build/syscalls.o $(PKGBUILD_OBJS) $(NEWLIB_LDSC
 # grants {filesystem} + ro /system + rw /data/apps/pkgprobe. mkembx repackages
 # the ELF into an EMBX; mkpkg derives the manifest from that EMBX (build_id/caps
 # consistent by construction). The bundle is STAGED (mkfs), pkg adopts it live.
-build/pkgprobe.o: user/bin/pkgprobe.c user/lib/embk.h | $(BUILD)
+build/pkgprobe.o: user/tests/pkgprobe/pkgprobe.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/pkgprobe.elf: build/crt0.o build/syscalls.o build/pkgprobe.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/pkgprobe.o -lc -lgcc -o $@
@@ -1124,7 +1151,7 @@ build/pkg_inflate.o: user/lib/inflate.c user/lib/inflate.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/pkg_unzip.o: user/lib/unzip.c user/lib/unzip.h user/lib/inflate.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
-build/pkgfetch.o: user/bin/pkgfetch.c user/lib/embk_socket.h user/lib/tls/tls.h user/lib/unzip.h | $(BUILD)
+build/pkgfetch.o: user/tools/pkgfetch/pkgfetch.c user/lib/embk_socket.h user/lib/tls/tls.h user/lib/unzip.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -Iuser/lib -c $< -o $@
 build/pkgfetch.elf: build/crt0.o build/syscalls.o build/pkgfetch.o build/pkg_inflate.o build/pkg_unzip.o $(TLS_LIB_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/pkgfetch.o build/pkg_inflate.o build/pkg_unzip.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
@@ -1172,7 +1199,7 @@ build/tls_tls.o: user/lib/tls/tls.c | $(BUILD)
 build/tls_handle.o: user/lib/tls/tls_handle.c user/lib/tls/tls_handle.h user/lib/tls/tls.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 
-build/tlstest.o: user/bin/tlstest.c user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
+build/tlstest.o: user/tests/tlstest/tlstest.c user/lib/embk_socket.h user/lib/tls/tls.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(TLS_LIB_INC) -c $< -o $@
 build/tlstest.elf: build/crt0.o build/syscalls.o build/tlstest.o $(TLS_LIB_OBJS) $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/tlstest.o $(TLS_LIB_OBJS) -lc -lgcc -o $@
@@ -1238,7 +1265,7 @@ build/emlibc_crt0.o: user/lib/crt0.c | $(BUILD)
 
 # The proof (house rule): a program that links emlibc INSTEAD of newlib -- no
 # -lc, no build/crt0.o, no build/syscalls.o -- and runs on the OS.
-build/emlibc_demo.o: user/bin/emlibc_net.c user/bin/emlibc_demo.c | $(BUILD)
+build/emlibc_demo.o: user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_demo.elf: build/emlibc_crt0.o build/emlibc_demo.o build/libemlibc.a $(NEWLIB_LDSCRIPT)
 	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
@@ -1246,7 +1273,7 @@ build/emlibc_demo.elf: build/emlibc_crt0.o build/emlibc_demo.o build/libemlibc.a
 
 # emlibc_net -- native networking demo (em_tcp_connect over emlibc, 0 newlib).
 # (Distinct object name from the rim's build/emlibc_net.o.)
-build/emlibcnet_demo.o: user/bin/emlibc_net.c user/emlibc/include/net.h | $(BUILD)
+build/emlibcnet_demo.o: user/tests/emlibc_net/emlibc_net.c user/emlibc/include/net.h | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_net.elf: build/emlibc_crt0.o build/emlibcnet_demo.o build/libemlibc.a $(NEWLIB_LDSCRIPT)
 	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
@@ -1254,14 +1281,14 @@ build/emlibc_net.elf: build/emlibc_crt0.o build/emlibcnet_demo.o build/libemlibc
 
 # emlibc_caps -- the part newlib cannot express: capability inspection +
 # handle-based spawn with attenuation. Also emlibc-linked, not newlib.
-build/emlibc_caps.o: user/bin/emlibc_caps.c | $(BUILD)
+build/emlibc_caps.o: user/tests/emlibc_caps/emlibc_caps.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_caps.elf: build/emlibc_crt0.o build/emlibc_caps.o build/libemlibc.a $(NEWLIB_LDSCRIPT)
 	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
 	    build/emlibc_crt0.o build/emlibc_caps.o -Lbuild -lemlibc -lgcc -o $@
 
 # emlibc_math -- exercises emlibc's <math.h> + %f/%e formatting. emlibc-linked.
-build/emlibc_math.elf.o: user/bin/emlibc_math.c | $(BUILD)
+build/emlibc_math.elf.o: user/tests/emlibc_math/emlibc_math.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_math.elf: build/emlibc_crt0.o build/emlibc_math.elf.o build/libemlibc.a $(NEWLIB_LDSCRIPT)
 	$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
@@ -1275,7 +1302,7 @@ build/emlibc_math.elf: build/emlibc_crt0.o build/emlibc_math.elf.o build/libemli
 EMBCC_ROOT ?= $(HOME)/EmbCC
 HOST_EMBLD := $(EMBCC_ROOT)/embld
 LIBGCC_A   := $(shell $(USER_CC) -print-libgcc-file-name)
-build/emlibc_embxapp.o: user/bin/emlibc_embxapp.c | $(BUILD)
+build/emlibc_embxapp.o: user/tests/emlibc_embxapp/emlibc_embxapp.c | $(BUILD)
 	$(USER_CC) $(EMLIBC_CFLAGS) -c $< -o $@
 build/emlibc_embxapp.embx: build/emlibc_crt0.o build/emlibc_embxapp.o build/libemlibc.a $(HOST_EMBLD)
 	$(HOST_EMBLD) --embx --cap filesystem -o $@ \
@@ -1287,49 +1314,49 @@ build/emlibc_embxapp.embx: build/emlibc_crt0.o build/emlibc_embxapp.o build/libe
 # EmbCC + EmbLD are present; absent otherwise (honest, never faked).
 HOST_EMBCC    := $(EMBCC_ROOT)/embcc
 EMLIBC_EC_INC := -I$(EMLIBC_DIR)/include -I$(EMBCC_ROOT)/include -Iuser/lib -I$(EMLIBC_FD_DIR)
-build/mathself.embx: user/bin/mathself.c $(EMLIBC_DIR)/math/math.c $(EMLIBC_FD_SRCS) \
+build/mathself.embx: user/tests/mathself/mathself.c $(EMLIBC_DIR)/math/math.c $(EMLIBC_FD_SRCS) \
                      build/emlibc_crt0.o build/libemlibc.a $(HOST_EMBCC) $(HOST_EMBLD)
 	@rm -rf build/mathself.d && mkdir -p build/mathself.d
-	$(HOST_EMBCC) -c user/bin/mathself.c $(EMLIBC_EC_INC) -o build/mathself.d/mathself.o
+	$(HOST_EMBCC) -c user/tests/mathself/mathself.c $(EMLIBC_EC_INC) -o build/mathself.d/mathself.o
 	$(HOST_EMBCC) -c $(EMLIBC_DIR)/math/math.c $(EMLIBC_EC_INC) -o build/mathself.d/math.o
 	@for f in $(EMLIBC_FD_SRCS); do $(HOST_EMBCC) -c $$f $(EMLIBC_EC_INC) \
 	    -o build/mathself.d/$$(basename $$f .c).o || exit 1; done
 	$(HOST_EMBLD) --embx --cap filesystem -o $@ \
 	    build/emlibc_crt0.o build/mathself.d/*.o build/libemlibc.a
 
-build/capspawn.o: user/bin/capspawn.c user/lib/embk.h | $(BUILD)
+build/capspawn.o: user/tests/capspawn/capspawn.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capspawn.elf: build/crt0.o build/syscalls.o build/capspawn.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capspawn.o -lc -lgcc -o $@
-build/capreload.o: user/bin/capreload.c user/lib/embk.h | $(BUILD)
+build/capreload.o: user/tests/capreload/capreload.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capreload.elf: build/crt0.o build/syscalls.o build/capreload.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capreload.o -lc -lgcc -o $@
-build/capgpu.o: user/bin/capgpu.c user/lib/embk.h | $(BUILD)
+build/capgpu.o: user/tests/capgpu/capgpu.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capgpu.elf: build/crt0.o build/syscalls.o build/capgpu.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capgpu.o -lc -lgcc -o $@
-build/lockdemo.o: user/bin/lockdemo.c user/lib/embk.h | $(BUILD)
+build/lockdemo.o: user/tests/lockdemo/lockdemo.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/lockdemo.elf: build/crt0.o build/syscalls.o build/lockdemo.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/lockdemo.o -lc -lgcc -o $@
 
-build/tonestress.o: user/bin/tonestress.c user/lib/embk.h | $(BUILD)
+build/tonestress.o: user/tests/tonestress/tonestress.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/tonestress.elf: build/crt0.o build/syscalls.o build/tonestress.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/tonestress.o -lc -lgcc -o $@
 
-build/jitter.o: user/bin/jitter.c user/lib/embk.h | $(BUILD)
+build/jitter.o: user/tests/jitter/jitter.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/jitter.elf: build/crt0.o build/syscalls.o build/jitter.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/jitter.o -lc -lgcc -o $@
 
-build/capnet.o: user/bin/capnet.c user/bin/lockdemo.c user/lib/embk.h | $(BUILD)
+build/capnet.o: user/tests/capnet/capnet.c user/tests/lockdemo/lockdemo.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capnet.elf: build/crt0.o build/syscalls.o build/capnet.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capnet.o -lc -lgcc -o $@
 
-build/capfs.o: user/bin/capfs.c user/lib/embk.h | $(BUILD)
+build/capfs.o: user/tests/capfs/capfs.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/capfs.elf: build/crt0.o build/syscalls.o build/capfs.o $(NEWLIB_LDSCRIPT)
 	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/capfs.o -lc -lgcc -o $@
@@ -1483,24 +1510,36 @@ build/libembk.so: $(LIBEMBK_OBJS)
 libembk: build/libembk.so
 	@echo "libembk.so OK"
 
-# --- EmUI apps: AUTO-DISCOVERED from user/bin/*.c -----------------------------
-# Every user/bin/*.c EXCEPT the two special-linked programs (init.c is
+# --- EmUI apps: AUTO-DISCOVERED from user/apps/*/*.c -----------------------------
+# Every user/apps/*/*.c EXCEPT the two special-linked programs (init.c is
 # freestanding; hello.c is static-newlib) is a dynamically-linked EmUI app,
 # built by the identical pattern below and packed onto the boot image
-# automatically. So adding a new app is just: drop user/bin/foo.c in and
+# automatically. So adding a new app is just: drop user/apps/foo/foo.c in and
 # `make embkfs.img` -- no per-app Makefile rule, no mkfs edit. (uidemo,
 # wmdemo, home, v4demo, clockw all previously had five copies of the same
 # two rules here; this replaces them.)
+#
+# The wildcard covers EVERY program directory, not just user/apps: the set it
+# discovers is exactly the set the old flat user/bin/*.c produced, so the
+# restructure moved files and changed no build behaviour. A program with its own
+# explicit rule is filtered out below, as it always was.
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/bin/pieprobe.c user/bin/init.c user/bin/hello.c user/bin/posixdemo.c user/bin/ioracer.c user/bin/crasher.c user/bin/httpget.c user/bin/httpd.c user/bin/udptest.c user/bin/wget.c user/bin/tlstest.c user/bin/pkgfetch.c user/bin/sockdemo.c user/bin/nbsock.c user/bin/gitclone.c user/bin/gitpush.c user/bin/pkg.c user/bin/pkgbuild.c user/bin/pkgprobe.c user/bin/emlibc_net.c user/bin/emlibc_demo.c user/bin/emlibc_caps.c user/bin/emlibc_embxapp.c user/bin/emlibc_math.c user/bin/mathself.c user/bin/capchild.c user/bin/capspawn.c user/bin/capreload.c user/bin/capgpu.c user/bin/capfs.c user/bin/capnet.c user/bin/jitter.c user/bin/tonestress.c user/bin/vellum.c user/bin/js.c user/bin/photos.c user/bin/mp3play.c, $(wildcard user/bin/*.c))
-EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
+EMUI_APP_SRCS := $(filter-out user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
+EMUI_APPS     := $(patsubst %.c,build/%.elf,$(notdir $(EMUI_APP_SRCS)))
+EMUI_APP_NAMES := $(basename $(notdir $(EMUI_APP_SRCS)))
 
-# One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
-# include paths).
-build/%.o: user/bin/%.c user/lib/embk.h | $(BUILD)
-	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
+# One compile rule per EmUI app object (newlib CFLAGS + the toolkit include
+# paths). GENERATED rather than a `build/%.o: user/bin/%.c` pattern, because a
+# pattern rule can only name ONE source directory and the programs now live in
+# five. The generator is the only thing that changed; the recipe is the same
+# one line it always was.
+define EMUI_APP_OBJ
+build/$(1).o: $$(call USER_SRC,$(1)) user/lib/embk.h | $$(BUILD)
+	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -c $$< -o $$@
+endef
+$(foreach a,$(EMUI_APP_NAMES),$(eval $(call EMUI_APP_OBJ,$(a))))
 
 # One DYNAMIC link rule for any EmUI app: it imports the toolkit from
 # libembk.so instead of statically bundling it. NO -static (would forbid the
@@ -1518,7 +1557,7 @@ build/%.elf: build/%.o build/crt0.o build/syscalls.o build/libembk.so
 # It shares the browser's decoders rather than carrying its own: png.c and
 # jpeg.c already decode to exactly the premultiplied BGRA the toolkit blits,
 # and a second copy of a JPEG decoder is a second place for a bug to live.
-build/photos.o: user/bin/photos.c user/photos/photo.h user/lib/embk.h | $(BUILD)
+build/photos.o: user/apps/photos/photos.c user/photos/photo.h user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/photos -c $< -o $@
 build/photo_decode.o: user/photos/decode.c user/photos/photo.h user/web/png.h user/web/jpeg.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/photos -Iuser/web -c $< -o $@
@@ -1645,7 +1684,7 @@ build/mp3_%.o: user/audio/mp3/%.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/audio/mp3 -c $< -o $@
 build/au_resample.o: user/audio/resample.c user/audio/resample.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/audio -c $< -o $@
-build/mp3play.o: user/bin/mp3play.c user/audio/mp3/mp3.h user/audio/resample.h | $(BUILD)
+build/mp3play.o: user/apps/mp3play/mp3play.c user/audio/mp3/mp3.h user/audio/resample.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/audio/mp3 -Iuser/audio -c $< -o $@
 
 build/mp3play.elf: build/crt0.o build/syscalls.o build/mp3play.o $(MP3_APP_OBJS) build/libembk.so
@@ -1668,7 +1707,7 @@ build/note_doc.o: user/note/doc.c user/note/doc.h user/note/syntax.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/note -c $< -o $@
 build/note_edit.o: user/note/edit.c user/note/edit.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -Iuser/note -c $< -o $@
-build/notepp.o: user/bin/notepp.c user/note/doc.h user/note/syntax.h user/note/edit.h | $(BUILD)
+build/notepp.o: user/apps/notepp/notepp.c user/note/doc.h user/note/syntax.h user/note/edit.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -Iuser/note -c $< -o $@
 build/notepp.elf: build/notepp.o build/note_syntax.o build/note_doc.o build/note_edit.o \
                   build/crt0.o build/syscalls.o build/libembk.so
@@ -1814,7 +1853,7 @@ $(DISK):
 # make WHEN the image is stale -- and it has to stay complete, because an app
 # missing from it is not a build error: the image just silently keeps the old
 # copy, or never gains the new app at all. EMUI_APPS is a wildcard over
-# user/bin/*.c, so EmUI apps are automatic; static console programs have bespoke
+# user/apps/*/*.c, so EmUI apps are automatic; static console programs have bespoke
 # rules and must be named here (the check in the recipe below catches omissions).
 ifeq ($(HAVE_GIT),yes)
 GIT_APPS = build/git.elf
@@ -1857,7 +1896,7 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/hello.elf build/posixdemo
                build/capchild.elf build/capspawn.elf build/capreload.elf build/capgpu.elf build/capfs.elf build/capnet.elf build/lockdemo.elf build/jitter.elf build/tonestress.elf build/capchild.embx \
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
-               build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf \
+               build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf build/notepp.elf \
                build/embbuild.elf build/pkg.elf build/pkgbuild.elf \
                build/pkgprobe.elf build/pkgprobe.embx build/pkgprobe.pkg \
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
@@ -1925,7 +1964,7 @@ icons: $(ICONS_STAMP)
 EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
                   $(shell find system data -type d 2>/dev/null)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/bin/*.ns) $(wildcard user/bin/*.caps) $(wildcard user/bin/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT)
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT)
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -2644,7 +2683,7 @@ test-login: $(IMG) $(EMBKFS_MASTER)
 test-swap-store: $(IMG) $(EMBKFS_MASTER) build/swap.img
 	@SWAP_DISK=build/swap.img python3 tools/console_test.py "test swap store"
 
-# ANONYMOUS MEMORY LARGER THAN RAM. `test swap` runs user/bin/swapper.elf,
+# ANONYMOUS MEMORY LARGER THAN RAM. `test swap` runs user/tests/swapper/swapper.elf,
 # which maps more than the machine has free, writes every page and reads every
 # page back; the kernel's own counters then say whether pages went out to the
 # store and came back. 256 MiB of RAM so the store is exercised in seconds

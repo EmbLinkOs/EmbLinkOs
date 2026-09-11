@@ -48,7 +48,7 @@ A window app is a `view` function plus one declaration that **replaces
 `main()` entirely**:
 
 ```c
-/* user/bin/hello_ui.c */
+/* user/apps/hello_ui/hello_ui.c */
 #include "embk.h"
 #include "ui.h"
 #include "em.h"
@@ -344,7 +344,7 @@ runtime wires this up automatically. `CloseButton()` is one round control
 that tints red on hover; put whatever you want next to it (a menu, more
 icons) — the bar is yours. `em_window_closed()` is what the runtime checks to
 know your own close control fired; you don't call it yourself unless you're
-hand-rolling the loop (see [`user/bin/home.c`](../user/bin/home.c) for that
+hand-rolling the loop (see [`user/apps/home/home.c`](../user/apps/home/home.c) for that
 lower-level pattern).
 
 Add `.resize = Resizable` and `Window()` draws a small corner grip; dragging
@@ -359,7 +359,7 @@ wallpaper, always below every app window, so apps naturally float over it.
 Use `EM_WIDGET` instead of `EM_APPLICATION`:
 
 ```c
-/* user/bin/clockw.c (shipped as the reference widget) */
+/* user/apps/clockw/clockw.c (shipped as the reference widget) */
 #include "embk.h"
 #include "ui.h"
 #include "em.h"
@@ -419,21 +419,21 @@ else runs.
 
 ## Wiring your app into the boot image
 
-**Just drop the `.c` file in `user/bin/` and rebuild — that's it.** The build
-system auto-discovers apps: any `user/bin/*.c` (except the two special-linked
+**Just drop the `.c` file in `user/apps/<name>/` and rebuild — that's it.** The build
+system auto-discovers apps: any `user/apps/*/*.c` (except the two special-linked
 programs `init.c` and `hello.c`) is treated as a dynamically-linked EmUI app,
 built by a Makefile pattern rule and packed onto the boot image by
 `mkfs_embkfs.py`'s `discover_userland_objects()` (which globs `build/*.elf`).
 No per-app Makefile rule, no mkfs edit.
 
 ```
-# create user/bin/hello_ui.c with a view + EM_APPLICATION, then:
+# create user/apps/hello_ui/hello_ui.c with a view + EM_APPLICATION, then:
 make embkfs.img            # discovers, builds, and packs hello_ui.elf automatically
 make run-embkfs-cow        # boots to the desktop; see CONTRIBUTING.md for run targets
 ```
 
 The **only** optional manual step is a home-screen tile: in
-[`user/bin/home.c`](../user/bin/home.c)'s tile grid, add
+[`user/apps/home/home.c`](../user/apps/home/home.c)'s tile grid, add
 `tile("Hello UI", "/hello_ui.elf");` if you want to launch it by click rather
 than by `run /hello_ui.elf` at the shell.
 
@@ -489,8 +489,8 @@ straight to the home launcher and click your tile.
 
 - [EMUI_INTERNALS.md](EMUI_INTERNALS.md) — how the layers underneath this
   guide actually work, for anyone extending the toolkit itself.
-- [`user/bin/v4demo.c`](../user/bin/v4demo.c) — the fullest reference app:
+- [`user/examples/v4demo/v4demo.c`](../user/examples/v4demo/v4demo.c) — the fullest reference app:
   chromeless chrome, tabs, split view, every V4/V5 component in one place.
-- [`user/bin/clockw.c`](../user/bin/clockw.c) — the minimal widget reference.
+- [`user/apps/clockw/clockw.c`](../user/apps/clockw/clockw.c) — the minimal widget reference.
 - [`ui/dsl/showcase_v2.c`](../ui/dsl/showcase_v2.c) — every component
   exercised for the host-render test loop.

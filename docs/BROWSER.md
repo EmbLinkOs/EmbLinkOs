@@ -79,7 +79,7 @@ user/web/
   render.h/.c    document tree + styles -> EmUI nodes
   html_test.c    host test                              [DONE, 33 assertions]
   style_test.c   host test
-user/bin/vellum.c  the application: chrome, history, input
+user/apps/vellum/vellum.c  the application: chrome, history, input
 ```
 
 One concern per file, shared header as the contract — the same rule the network
@@ -262,7 +262,7 @@ networked app needs it.
 ## 9. On JavaScript
 
 **The engine now runs on the OS (2026-08-07).** `js.elf` is QuickJS
-2024-01-13, cross-compiled against newlib and hosted by `user/bin/js.c` -- a
+2024-01-13, cross-compiled against newlib and hosted by `user/apps/js/js.c` -- a
 hundred lines that create a runtime, bind `console.log`, evaluate, and report
 an exception with its stack. QuickJS's own `qjs` CLI is deliberately NOT used:
 it brings threads, dlopen, a poll loop and a module loader, none of which a

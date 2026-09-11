@@ -2,7 +2,7 @@
 #define _EMBK_SWAPTEST_H_
 #include "include/types.h"
 
-/* THE SWAP WITNESS, DRIVEN. Runs user/bin/swapper.elf at `witness` against
+/* THE SWAP WITNESS, DRIVEN. Runs user/tests/swapper/swapper.elf at `witness` against
  * the machine's actual free memory -- more than is free, less than free plus
  * half the store -- and judges each run on the kernel's own counters: pages
  * went out and came back, every slot has an owner, the anonymous pages in

@@ -174,6 +174,7 @@ ARM_CFLAGS  = -ffreestanding -nostdlib -nostartfiles \
               -fstack-protector-strong \
               -Wall -Wextra \
               -Ikernel \
+              -DEMBK_VGPU_CAP_W=$(FB_W) -DEMBK_VGPU_CAP_H=$(FB_H) \
               -Wl,--no-warn-rwx-segments \
               -g -O0
 
@@ -189,7 +190,11 @@ $(ARM_BUILD):
 
 # One compile, like the x86 kernel: every header is a prerequisite because
 # there are no per-TU depfiles to consult. Same reasoning as $(KERNEL_HDRS).
-$(ARM_ELF): $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_BUILD)
+# $(FB_STAMP) for the same reason the x86 kernel has it: FB_W/FB_H reach the
+# kernel as compile-time defines, and a prerequisite list of source files alone
+# would rebuild nothing when they change -- so `make FB_W=1280` would silently
+# boot the OLD cap. The stamp's mtime moves only when the pair actually changes.
+$(ARM_ELF): $(FB_STAMP) $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_BUILD)
 	$(AARCH64_CC) $(ARM_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC)
 
 # The flat Image. QEMU boots the ELF directly, so this is not on the run path
@@ -262,9 +267,9 @@ ARM_PLAIN_PROGS  ?= init primtest
 
 # The dynamically-linked EmUI apps. DERIVED FROM THE x86 LIST rather than
 # retyped: $(EMUI_APP_SRCS) is the top-level Makefile's auto-discovery of
-# user/bin/*.c minus the programs that are not EmUI apps, and it is defined
+# user/apps/*/*.c minus the programs that are not EmUI apps, and it is defined
 # before this fragment is included. Deriving it means a new app appears on BOTH
-# architectures the moment it is dropped in user/bin -- which is the whole point
+# architectures the moment it is dropped in user/apps -- which is the whole point
 # of that auto-discovery, and it would have been lost by keeping a second list
 # here that someone has to remember to update.
 #
@@ -293,7 +298,7 @@ ARM_EMLIBC_PROGS ?= emlibc_demo emlibc_net emlibc_caps emlibc_math \
                     emlibc_embxapp mathself
 
 ARM_UI_PROGS     ?= $(filter-out beep primtest,\
-                      $(patsubst user/bin/%.c,%,$(EMUI_APP_SRCS))) \
+                      $(basename $(notdir $(EMUI_APP_SRCS)))) \
                     photos mp3play vellum
 
 # QuickJS's five translation units. DECLARED HERE, built by the rule in the
@@ -306,7 +311,7 @@ ARM_UI_PROGS     ?= $(filter-out beep primtest,\
 # RULE FOR THIS FILE: every `:=` list lives above every `$(eval $(call ...))`
 # that reads it. Rules can go anywhere; DECLARATIONS cannot.
 # The SHELL and its external pipeline tools. They live in shell/, not
-# user/bin, so they are not in $(EMUI_APP_SRCS) and need naming here. The tools
+# a program directory, so they are not in $(EMUI_APP_SRCS) and need naming here. The tools
 # are separate .elf files on purpose -- the shell SPAWNS them as pipeline
 # stages rather than running them as builtins -- and each links the same three
 # SDK objects (value/wire/sval) that carry the shell's typed-record protocol.
@@ -385,7 +390,7 @@ ARM_INC_vellum    := -Iuser/web -Iuser/web/css $(TLS_LIB_INC) \
                      $(if $(HAVE_QJS),-DHAVE_JSDOM $(QJS_CFLAGS),)
 ARM_INC_js        := $(QJS_CFLAGS)
 
-# shell/ programs: their sources are outside user/bin, so each names its own
+# shell/ programs: their sources are outside the program directories, so each names its own
 # main and its own extra objects.
 ARM_XSRC_shell    := $(ARM_SHELL_SRC)
 ARM_XSRC_sysinfo  := $(ARM_SHELL_SDK)
@@ -396,7 +401,7 @@ ARM_INC_sysinfo   := -Ishell
 ARM_INC_tally     := -Ishell
 ARM_INC_embbuild  := -Ishell
 
-# Where each one's main() lives, when it is not user/bin/<name>.c.
+# Where each one's main() lives, when $(call USER_SRC,<name>) does not find it.
 # gitclone / gitpush: the in-tree git client. Both need the TLS stack (HTTPS),
 # the pack/pktline/sha1/repo layer, and libz -- the same cross-built zlib the
 # x86 side links, built for this target with
@@ -497,7 +502,7 @@ $(ARM_USER)/syscalls.o: user/lib/syscalls.c | $(ARM_USER)
 # makes the outcome depend on nothing but this file.
 define ARM_NEWLIB_PROG
 ifeq ($$(and $$(PIE_OK),$$(filter $(1),$$(NEWLIB_SIMPLE_PROGS))),)
-$(ARM_USER)/$(1).o: $(if $(ARM_MAIN_$(1)),$(ARM_MAIN_$(1)),user/bin/$(1).c) | $(ARM_USER)
+$(ARM_USER)/$(1).o: $(if $(ARM_MAIN_$(1)),$(ARM_MAIN_$(1)),$(call USER_SRC,$(1))) | $(ARM_USER)
 	$$(USER_CC) $$(NEWLIB_CFLAGS) $(ARM_INC_$(1)) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
                       $(ARM_EXTRAOBJ_$(1)) \
@@ -511,7 +516,7 @@ else
 # ET_DYN here exactly as it is on x86. The list is SHARED rather than repeated,
 # because a program that is position-independent on one architecture and not on
 # the other is a difference nobody would go looking for.
-$(ARM_USER)/$(1).o: $(if $(ARM_MAIN_$(1)),$(ARM_MAIN_$(1)),user/bin/$(1).c) | $(ARM_USER)
+$(ARM_USER)/$(1).o: $(if $(ARM_MAIN_$(1)),$(ARM_MAIN_$(1)),$(call USER_SRC,$(1))) | $(ARM_USER)
 	$$(USER_CC) $$(NEWLIB_PIE_CFLAGS) $(ARM_INC_$(1)) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(ARM_PIE_CRT0) $(ARM_PIE_SYSCALLS) \
                       $(NEWLIB_PIE_LDSCRIPT)
@@ -535,7 +540,7 @@ $(ARM_USER)/crt0_pic.o: user/lib/crt0.c | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 $(ARM_USER)/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
-$(ARM_USER)/pieprobe.o: user/bin/pieprobe.c | $(ARM_USER)
+$(ARM_USER)/pieprobe.o: user/tests/pieprobe/pieprobe.c | $(ARM_USER)
 	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
 $(ARM_USER)/pieprobe.elf: $(ARM_USER)/crt0_pic.o $(ARM_USER)/syscalls_pic.o \
                            $(ARM_USER)/pieprobe.o $(NEWLIB_PIE_LDSCRIPT)
@@ -550,7 +555,7 @@ endif
 # Freestanding programs (init.elf): own _start, no libc, linked with the raw ld
 # against user.ld exactly as x86 does -- $(USER_LD) is aarch64-elf-ld here.
 define ARM_PLAIN_PROG
-$(ARM_USER)/$(1).plain.o: user/bin/$(1).c | $(ARM_USER)
+$(ARM_USER)/$(1).plain.o: $(call USER_SRC,$(1)) | $(ARM_USER)
 	$$(USER_CC) $$(USER_CFLAGS) $$(if $$(AUTOLOGIN),-DDEV_AUTOLOGIN=$$(AUTOLOGIN)) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).plain.o user/lib/user.ld
 	$$(USER_LD) -T user/lib/user.ld -z max-page-size=0x1000 $$< -o $$@
@@ -598,7 +603,7 @@ $(ARM_LIBEMBK): $(ARM_LIBEMBK_OBJ)
 
 
 define ARM_UI_PROG
-$(ARM_USER)/$(1).o: user/bin/$(1).c user/lib/embk.h | $(ARM_USER)
+$(ARM_USER)/$(1).o: $(call USER_SRC,$(1)) user/lib/embk.h | $(ARM_USER)
 	$$(USER_CC) $$(NEWLIB_CFLAGS) $$(UIDEMO_INC) -Iuser/note $(ARM_INC_$(1)) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
                       $(ARM_EXTRAOBJ_$(1)) \
@@ -683,10 +688,10 @@ $(ARM_USER)/emlibc_crt0.o: user/lib/crt0.c | $(ARM_USER)
 # both inherited from x86: emlibc_demo builds from emlibc_demo.c but the rim's
 # net.c already owns the name emlibc_net.o, and emlibc_math's object is
 # .elf.o. Naming them here keeps that quirk in one place.
-ARM_EMSRC_emlibc_net := user/bin/emlibc_net.c
+ARM_EMSRC_emlibc_net := user/tests/emlibc_net/emlibc_net.c
 
 define ARM_EMLIBC_PROG
-$(ARM_USER)/app_$(1).o: $(if $(ARM_EMSRC_$(1)),$(ARM_EMSRC_$(1)),user/bin/$(1).c) | $(ARM_USER)
+$(ARM_USER)/app_$(1).o: $(if $(ARM_EMSRC_$(1)),$(ARM_EMSRC_$(1)),$(call USER_SRC,$(1))) | $(ARM_USER)
 	$$(USER_CC) $$(ARM_EMLIBC_CFLAGS) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/emlibc_crt0.o $(ARM_USER)/app_$(1).o \
                       $(ARM_LIBEMLIBC) $(NEWLIB_LDSCRIPT)
@@ -842,11 +847,19 @@ ARM_DESKTOP_DISKS = \
     -drive file=build/crash-seed.img,format=raw,if=none,id=d1 -device virtio-blk-pci,drive=d1 \
     -drive file=build/swap.img,format=raw,if=none,id=d2 -device virtio-blk-pci,drive=d2
 
-# The scanout size. The whole stack -- framebuffer, compositor, mouse clamp,
-# the launcher -- takes whatever the device reports, so this is a free choice:
-#   make ARCH=aarch64 run-arm64-desktop ARM_XRES=1920 ARM_YRES=1080
-ARM_XRES ?= 1280
-ARM_YRES ?= 800
+# The scanout size -- the SAME per-host default the x86 targets use, and for
+# the reason spelled out where FB_W/FB_H are defined: -display cocoa with
+# zoom-to-fit=off draws one guest pixel per PHYSICAL pixel, and Mac panels are
+# Retina, so a 1280x800 guest fills about 640x400 points and looks half-size.
+# The guest resolution has to roughly double to LOOK normal. Hardcoding 1280x800
+# here is exactly the mistake that note exists to prevent.
+#
+# The whole stack -- framebuffer, compositor, mouse clamp, the launcher -- takes
+# whatever the device reports, so this is a free choice:
+#   make ARCH=aarch64 run-arm64-desktop ARM_XRES=2560 ARM_YRES=1600
+# and smaller is the cheapest speedup available if it ever feels sluggish.
+ARM_XRES ?= $(FB_W)
+ARM_YRES ?= $(FB_H)
 ARM_GPU_WINDOW = -device virtio-gpu-pci,xres=$(ARM_XRES),yres=$(ARM_YRES)
 
 # zoom-to-fit=off shows guest pixels 1:1 rather than stretching them to the

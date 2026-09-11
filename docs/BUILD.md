@@ -141,7 +141,7 @@ not a rebuild claim, so the exclusion stood on a missing manifest rather
 than a missing compiler — a weaker reason, and worth saying out loud
 rather than quietly deleting the line.
 
-`/data/src/ui/build.ebm` (authored as `user/bin/clockw.build.ebm`) is
+`/data/src/ui/build.ebm` (authored as `user/apps/clockw/clockw.build.ebm`) is
 that manifest, and **`test embbuild gui`** is the proof: EmbBuild
 compiles and dynamically links the clock widget on-OS, the staged ELF is
 `ET_EXEC phnum=5` (the direct readout that the dynamic path was taken —

@@ -24,7 +24,7 @@
 
 /* Protocol status codes carried in reply payloads (msg_hello_ack.status,
  * msg_role_created.status, msg_error.code). These MIRROR the negative-errno
- * values in kernel/include/errno.h -- userland roles (user/bin/init.c) are
+ * values in kernel/include/errno.h -- userland roles (user/system/init/init.c) are
  * freestanding and don't include that kernel header, so the few the protocol
  * needs are restated here. Guarded so a translation unit that DID pull in the
  * kernel definitions (or a future userland errno.h) doesn't collide. */

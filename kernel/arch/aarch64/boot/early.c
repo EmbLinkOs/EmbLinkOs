@@ -998,7 +998,7 @@ void arch_early_main(uint64_t dtb_phys) {
      * are shared code; the disk under them is not. Quick mode: the hot-set
      * A/B is a policy claim, made once, on x86. */
     /* --- the account store, on this architecture too -----------------------
-     * user/bin/authtest.c against a scratch store: every operation the greeter
+     * user/tests/authtest/authtest.c against a scratch store: every operation the greeter
      * offers, the upgrade of a standard PBKDF2 record made elsewhere, and the
      * clamp on session profiles. At native speed here, which is where the
      * work factor's real cost can be read off. */

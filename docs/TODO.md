@@ -1308,7 +1308,7 @@ text.
     effectively single-threaded per fd table, so the lock is never contended.
     A concurrent open/close hammer (N processes, assert no two fds alias one
     slot) is the missing harness.
-    - **The template now exists**: `test blockrace` + `user/bin/ioracer.c` do
+    - **The template now exists**: `test blockrace` + `user/tests/ioracer/ioracer.c` do
       exactly this shape for the block layer — spawn N processes *before*
       waiting on any, then assert on content rather than on return codes, and
       report whether the lock was actually contended so a vacuous pass is
@@ -1410,7 +1410,7 @@ text.
     first returns to ring 3 on the wrong stack (it killed the desktop on a
     push to an unmapped address). It lives on the kernel stack now, which is
     per thread by construction.
-  - **Measured** (`test syscall`, user/bin/syscallbench.c: 200,000 getpid each
+  - **Measured** (`test syscall`, user/tests/syscallbench/syscallbench.c: 200,000 getpid each
     way in one process, both agreeing on the pid first): **2735 ns/call via
     int 0x80, 2500 ns via syscall -- 91%.** Under x86 TCG, where the
     emulator's dispatch dominates and the IDT walk and TSS stack switch that
@@ -1469,7 +1469,7 @@ renders — and since the same day EmbBuild **builds** one from a manifest
 covers the GUI, not just static C. See `docs/PORTS.md` § "The GUI wall, and
 how it came down" and BUILD.md §6.
 
-- [ ] **The menu bar's drag-and-drop is one-directional** (`user/bin/topbar.c`
+- [ ] **The menu bar's drag-and-drop is one-directional** (`user/apps/topbar/topbar.c`
   + `em_dock`). You can drag a status chip to reorder it or pull it out of the
   bar to remove it, but you cannot yet drag a *new* item **into** the bar from
   an external tray — that needs either a same-window chip palette the dock
@@ -1478,7 +1478,7 @@ how it came down" and BUILD.md §6.
   reorder/drag-out half is built and live; the drag-in half is the open piece
   of the user's "drag stuff into it or out of it" request.
 - [ ] **Only ONE EmUI app has a build manifest** (clockw). home/uidemo/wmdemo
-  and the rest of `user/bin/*.c` are still host-built only. This is now
+  and the rest of `user/apps/*/*.c` are still host-built only. This is now
   breadth, not capability — each needs the same three-stanza shape plus its
   own header closure.
 - [ ] **Header inputs in manifests are hand-written and can go silently
@@ -1630,11 +1630,11 @@ how it came down" and BUILD.md §6.
   advance, and for any modal animation).
 - [x] ~~**Adding a new app requires three manual registration points.**~~ —
   done: the build system now auto-discovers apps. A Makefile pattern rule
-  (`build/%.elf` over `$(EMUI_APPS) := $(wildcard user/bin/*.c)` minus the
-  special-linked `init.c`/`hello.c`) builds any `user/bin/*.c` as a
+  (`build/%.elf` over `$(EMUI_APPS) := $(wildcard user/apps/*/*.c)` minus the
+  special-linked `init.c`/`hello.c`) builds any `user/apps/*/*.c` as a
   dynamically-linked EmUI app, and `mkfs_embkfs.py`'s
   `discover_userland_objects()` globs `build/*.elf` and packs them all.
-  Adding an app is now just "drop `user/bin/foo.c` in, `make embkfs.img`" —
+  Adding an app is now just "drop `user/apps/foo/foo.c` in, `make embkfs.img`" —
   verified by dropping a throwaway `probeapp.c` and watching it compile,
   link, and land on the image with zero build-file edits. *(Minor residual:
   deleting an app's `.c` leaves a stale `build/*.elf` that keeps getting
@@ -1943,7 +1943,7 @@ what it left open:
   object is private by design) because evicting means unmapping first; the
   page record survives eviction holding the slot, and the fault that next
   wants the page swaps it back in.
-- [x] **The witness, `make test-swap`** (`user/bin/swapper.c`, 256 MiB of
+- [x] **The witness, `make test-swap`** (`user/tests/swapper/swapper.c`, 256 MiB of
   RAM): maps more than is free, writes a pattern through every page, reads
   every page back. **229 MiB touched with 170 MiB free: 41,344 pages out
   (161 MiB) as 2,584 cluster writes, 20,928 back, 0 pages wrong, every slot
@@ -2167,7 +2167,7 @@ what it was handed can ask "is that one of yours".
 - [x] `whoami` asks the kernel (`SYS_session_info`, 113) instead of reading
   `$USER`, which is whatever the parent put in the environment. `ps` has a
   `sess` column; `session` returns `{id, user, leader}`.
-- [x] `test session` (`user/bin/sessprobe.c`): identity and inheritance; no
+- [x] `test session` (`user/tests/sessprobe/sessprobe.c`): identity and inheritance; no
   minting (NEW_SESSION and asking for the cap back, both refused); a
   non-username refused; kill-by-pid gated three ways; the ^C slot; clipboard
   isolation, wipe on end; logout from outside and from inside
@@ -2215,7 +2215,7 @@ what it was handed can ask "is that one of yours".
   could not be finished with Return and the unread edge leaked into the next
   text field. Focus is let go when its field leaves the screen, which had
   kept a new page's autofocus from ever firing. `make kit-test` (host).
-- [x] **Tests**: `test accounts` (`user/bin/authtest.c`, on both
+- [x] **Tests**: `test accounts` (`user/tests/authtest/authtest.c`, on both
   architectures): 22 claims -- every store operation, the last-administrator
   rule, the upgrade of a standard PBKDF2 record made by Python's hashlib,
   atomic rewrites, the throttle, 20 policy judgements. `make test-login`
@@ -2243,7 +2243,7 @@ Open:
 - [ ] **The throttle lives in the greeter process**; a greeter crash resets
   the count. Persisting it (per account, in the store) would survive that.
 - [ ] **`make` does not track `AUTOLOGIN`**: after changing it,
-  `touch user/bin/init.c`.
+  `touch user/system/init/init.c`.
 
 ## Process & Scheduling
 
@@ -2966,7 +2966,7 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
 
 - [x] ~~**PK1** — the package manifest format + local `pkg install`.~~ **DONE,
   metal-proven (`test pkg`).** Manifest (§3) parser + EMBX reader/`build_id`
-  verifier in `user/pkg/`; `pkg verify|install|run|list` (`user/bin/pkg.c`).
+  verifier in `user/pkg/`; `pkg verify|install|run|list` (`user/tools/pkg/pkg.c`).
   `install` recomputes the EMBX `build_id` (SHA-256 with `build_id`+`header_checksum`
   zeroed) and matches it to the header *and* the manifest, cross-checks the
   manifest `caps:` against the EMBX cap table + `abi`, presents the declared
@@ -2993,7 +2993,7 @@ the design and the live proofs (`test namespace`, `ns_spawn_test`,
 - [x] ~~**PK2b** — on-device package generation.~~ **DONE, metal-proven
   (`test pkgbuild`).** `user/pkg/embxgen.c` is a C EMBX writer (repackage a linked
   ELF → EMBX with a cap table) — a faithful port of `mkembx.py`, host-verified
-  BYTE-IDENTICAL, so the build_id matches. `user/bin/pkgbuild.c` reads ONE
+  BYTE-IDENTICAL, so the build_id matches. `user/tools/pkgbuild/pkgbuild.c` reads ONE
   `.pkgspec` + an ELF and emits all three views (EMBX/`.ns`/manifest) ON THE OS.
   On-device builds are unsigned, so `pkg install --local` adopts a dev build (a
   present signature is still verified; caps/build_id/re-negotiation still apply).
@@ -3078,7 +3078,7 @@ Encrypt/RSA), `test wget https`, `test pypi`.
 
 ### T5 — the consumers
 - [x] ~~**Install a real PyPI package over HTTPS.**~~ **DONE via `pkgfetch`**
-  (commit `f476790`): a native installer (`user/bin/pkgfetch.c` + our own
+  (commit `f476790`): a native installer (`user/tools/pkgfetch/pkgfetch.c` + our own
   `user/lib/inflate.c` DEFLATE + `user/lib/unzip.c`) fetches a package's PEP-503
   index + wheel over authenticated libtls and unpacks it into
   `/data/py/site-packages`. `test pkgfetch` installs `six` from pypi.org /

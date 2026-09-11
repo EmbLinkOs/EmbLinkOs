@@ -50,7 +50,7 @@ from mkfs_embkfs import (make_image, _read_font, _tree_objects,
 _SYSTEM_BIN = _X86_SYSTEM_BIN | {"hello.elf", "posixdemo.elf", "lockdemo.elf",
                                 "jitter.elf"}
 
-# Must match DEV_USER in user/bin/init.c -- init auto-logs in as this name and
+# Must match DEV_USER in user/system/init/init.c -- init auto-logs in as this name and
 # binds /home/<name> into the desktop's namespace.
 DEV_USER = b"yves"
 

@@ -694,7 +694,7 @@ newlib-based libc port.*
   icons, and borders; and the toolkit got its first **drag-and-drop** — a
   `Dock` container whose chips you drag to reorder or pull out to remove
   (`em_dock`) — which powers a **dynamic Apple-modern menu bar**
-  (`user/bin/topbar.c`, auto-spawned by home): a chromeless glass strip with a
+  (`user/apps/topbar/topbar.c`, auto-spawned by home): a chromeless glass strip with a
   leading logo, a `File`/`Edit`/`View` menu bar, a `DragHandle` middle that
   moves the whole bar, and a right-side dock of status chips + clock + a pin
   control that snaps the bar to a screen anchor (`em_window_move_to`). The
@@ -776,7 +776,7 @@ newlib-based libc port.*
   broadly, not just a message-passing feature on its own.
 - **`epfs`** (`kernel/fs/epfs.c`): an additional lightweight filesystem
   backend alongside EMBKFS/FAT32 in the VFS mount registry.
-- **The home launcher** (`user/bin/home.c`) replaces the interactive kernel
+- **The home launcher** (`user/apps/home/home.c`) replaces the interactive kernel
   shell as the default boot target: a full-screen chromeless desktop window
   hosting an app-tile grid (click to `spawn()`), spawning the clock desktop
   widget (`clockw.elf`) automatically. It hand-rolls its own event loop
@@ -792,7 +792,7 @@ newlib-based libc port.*
   split view, every V4/V5 component), `v6demo.elf` (the V6 menu system — the
   "Menus" home tile), `v7demo.elf` (the V7 text editor — the "Editor" home
   tile), `clockw.elf` (the minimal `EM_WIDGET` reference, an uptime clock
-  ticking on the desktop). New EmUI apps under `user/bin/*.c` are
+  ticking on the desktop). New EmUI apps under `user/apps/*/*.c` are
   auto-discovered by the Makefile and packed into the EMBKFS image — no
   per-app build rule or mkfs entry to add by hand.
 
@@ -802,7 +802,7 @@ newlib-based libc port.*
 
 A whole network stack, hand-written in `kernel/net/` (split per-protocol, one
 
-And something now STANDS on it: `httpd` (`user/httpd/` + `user/bin/httpd.c`) is a real HTTP/1.1 server that serves the OS's own filesystem -- request parsing, percent-decoded paths, directory listings, content types by extension, 403/404/405, and files streamed in 32KB bites. Point a browser on the host at a SLIRP-forwarded port and you are reading EMBKFS through our own virtio-net, IPv4, TCP and socket layer (`test httpserve`).
+And something now STANDS on it: `httpd` (`user/httpd/` + `user/tools/httpd/httpd.c`) is a real HTTP/1.1 server that serves the OS's own filesystem -- request parsing, percent-decoded paths, directory listings, content types by extension, 403/404/405, and files streamed in 32KB bites. Point a browser on the host at a SLIRP-forwarded port and you are reading EMBKFS through our own virtio-net, IPv4, TCP and socket layer (`test httpserve`).
 concern per file). virtio-net driver (mirrors the virtio-gpu transport, split
 virtqueues, KV2P DMA, MSI-X RX interrupt) under Ethernet/ARP/IPv4/ICMP, then
 UDP + a DHCP client (real DORA lease at boot) + a minimal DNS resolver, then
@@ -969,7 +969,7 @@ verified on the metal.
   `test nbsock`). With those, **stock `pip install` works**: `urllib3` → our
   `ssl.py` → `_embtls` → an authenticated PyPI fetch, `pip install six` succeeds.
 - **T7 — `git clone` over our TLS.** git can't fork/exec its HTTPS transport here,
-  so `gitclone` (`user/git/` + `user/bin/gitclone.c`) drives git's **smart-HTTP
+  so `gitclone` (`user/git/` + `user/tools/gitclone/gitclone.c`) drives git's **smart-HTTP
   protocol** directly over libtls: ref discovery, `git-upload-pack` fetch, an own
   **packfile unpacker** (own zlib-streaming inflate + delta resolution) named by an
   **own SHA-1**, then writes a real `.git` + checks out the working tree.
@@ -1029,7 +1029,7 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
   build_id/caps/namespace/provides`) that *mirrors* an app's declared authority
   (its EMBX cap table + its UP4 `.ns`). It is a **view, not a second source of
   truth**: `pkg` cross-checks it against the real binary so it cannot drift.
-- **`pkg`** (`user/bin/pkg.c` + `user/pkg/`): `verify` recomputes the EMBX
+- **`pkg`** (`user/tools/pkg/pkg.c` + `user/pkg/`): `verify` recomputes the EMBX
   `build_id` (SHA-256 with `build_id`+`header_checksum` zeroed, EMBX §3.4 — the
   kernel loader checks CRCs but not this) and matches it to the header *and* the
   manifest, cross-checks the manifest `caps:` against the cap table + `abi`.
@@ -1061,7 +1061,7 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
   or namespace** unless `--allow-widen` (a new version cannot silently widen its
   reach); `pkg rollback/remove/info` complete the set. `test pkg` runs 8 checks
   green on the metal.
-- **PK2b — on-device package generation.** `pkgbuild` (`user/bin/pkgbuild.c` +
+- **PK2b — on-device package generation.** `pkgbuild` (`user/tools/pkgbuild/pkgbuild.c` +
   `user/pkg/embxgen.c`, a C EMBX writer byte-identical to mkembx) turns one
   `.pkgspec` + a linked ELF into the three views ON THE OS ITSELF; `pkg install
   --local` adopts the unsigned dev build. `test pkgbuild` proves generate →
@@ -1088,7 +1088,7 @@ hostile page needs a bounded appetite), `style.c` computes a `struct vstyle`
 from a user-agent stylesheet, `render.c` maps the CSS box model onto EmUI --
 blocks become columns, an inline run becomes a wrapping row holding ONE TEXT
 NODE PER WORD, list items become [marker][column] so wrapped text hangs under
-itself, `<pre>` neither collapses nor wraps. `user/bin/vellum.c` is the app:
+itself, `<pre>` neither collapses nor wraps. `user/apps/vellum/vellum.c` is the app:
 URL bar, back/forward, clickable links, a status line. The renderer reads only
 `struct vstyle` and never a tag name, so real CSS changes how that struct is
 FILLED and nothing else.
@@ -1103,7 +1103,7 @@ window. Clicks and timers reach the page too: `addEventListener('click')`,
 clickable so a page's links keep working.
 
 **The engine half.** QuickJS 2024-01-13 cross-compiled
-against newlib and hosted by ~100 lines of our own (`user/bin/js.c`) -- one
+against newlib and hosted by ~100 lines of our own (`user/apps/js/js.c`) -- one
 patch of two hunks for the whole 58k-line engine, both hunks merely widening
 existing `#ifdef`s. `js hello.js` runs closures, regexps, Array.sort and
 JSON from the OS's shell. The DOM bindings, which are the point, are next.
@@ -1958,7 +1958,7 @@ order check over a space the copier does not emit.
 
 ### Phase 38 — Note++: the OS's own code editor ✅
 
-`user/bin/edit.c` is the one-file editor: a buffer, a Save button, the path
+`user/apps/edit/edit.c` is the one-file editor: a buffer, a Save button, the path
 Files handed it. Note++ is the other thing — eight documents at once, a caret
 you drive from the keyboard, selection, undo/redo, find and replace, and code
 coloured by the same keyword tables the OS's own compiler reads.
@@ -1972,7 +1972,7 @@ tests: `make edit-test` and `make syntax-test` run on the build machine in
 under a second. An editor is mostly edge cases (a selection dragged backwards,
 an undo that restores the cursor as well as the characters, a replace-all whose
 replacement contains the search term) and none of them are worth discovering on
-a screen. `user/bin/notepp.c` is the part that cannot be tested that way:
+a screen. `user/apps/notepp/notepp.c` is the part that cannot be tested that way:
 pixels, keys and files.
 
 It draws its own text rather than using the toolkit's TextEditor, which cannot
@@ -2101,7 +2101,7 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
   On the metal: 27.3 s of continuous audio, zero dropouts in 55 half-second
   windows. MPEG-2/2.5 not done (says so rather than guessing).
   `make test-mp3`, `make test-mp3-pcm`, `make test-resample`.
-- Photos: the picture viewer (`user/bin/photos.c` + `user/photos/`) reads
+- Photos: the picture viewer (`user/apps/photos/photos.c` + `user/photos/`) reads
   PNG and JPEG through the browser's own decoders and resamples by AREA
   AVERAGE rather than leaving it to the compositor's bilinear blitter —
   which is right for magnifying and aliases badly when shrinking. On the

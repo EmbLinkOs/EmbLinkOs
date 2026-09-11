@@ -463,7 +463,7 @@ The "Terminal" tile on home (or `run /term.elf`) opens an EmUI window
 hosting the shell. Live-verified: typing `ls` renders the table in the
 window.
 
-It is a deliberately **dumb byte terminal** (user/bin/term.c): it spawns
+It is a deliberately **dumb byte terminal** (user/apps/term/term.c): it spawns
 `/shell.elf` with fds 0/1/2 piped (INSTALL_OBJ both ways + fd_install_obj
 for its own ends), forwards keystrokes into the shell's stdin, and renders
 whatever comes back — the shell already does echo, backspace erase and the

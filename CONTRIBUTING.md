@@ -192,7 +192,7 @@ hardware changes, docs synced, and gaps left behind. Fill it honestly — the
   is slower and none of the timing figures quoted in the docs transfer.
 - **Build the kernel + bootloader:** `make`
 - **Build userland + the UI toolkit + pack a disk image:** `make embkfs.img`
-  (every app in `user/bin/`, the shared `libembk.so` toolkit, and `font.ttf`,
+  (every app in `user/apps/`, `user/tools/` and `user/tests/`, the shared `libembk.so` toolkit, and `font.ttf`,
   packed into an EMBKFS image via `tools/embkfs_mkfs/mkfs_embkfs.py`).
 - **Run — kernel-only variants** (no userland disk image needed):
   `make run` (base), `make run-smp` (`-smp 4`), `make run-bigmem`,
