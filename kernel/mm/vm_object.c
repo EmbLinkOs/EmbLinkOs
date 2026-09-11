@@ -758,7 +758,11 @@ void vmo_invalidate(struct vm_object *o) {
 uint64_t vmo_wire_page(struct vm_object *o, uint64_t index) {
     if (!o)
         return 0;
+    /* How long the fault waits for the lock -- as opposed to for the disk --
+     * is the number that decides whether this cache needs finer locking. */
+    uint64_t tl = time_get_ns();
     mutex_lock(&g_lock);
+    g_stats.wire_lock_wait_ns += time_get_ns() - tl;
 
     /* A mapping may legitimately reach PAST the end of the file -- mmap
      * rounds up to a page, and a file's last page is partly beyond it. Those

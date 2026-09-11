@@ -258,6 +258,8 @@ struct vmo_stats {
     uint64_t swap_ns;            /* ... of which, in the swap store (out+in) */
     uint64_t unmap_ns;           /* ... of which, unmapping (TLB shootdowns) */
 
+    uint64_t wire_lock_wait_ns;  /* time the fault path spent WAITING for the cache lock */
+
     /* Where a page FILL spends its time: the frame, zeroing it, its record. */
     uint64_t fill_frame_ns;
     uint64_t fill_zero_ns;

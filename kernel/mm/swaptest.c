@@ -87,8 +87,9 @@ int swap_selftest_run(const char *wp, bool quick) {
                 (unsigned long long)(f1.handled - f0.handled),
                 (unsigned long long)((f1.ns - f0.ns) / 1000000),
                 (unsigned long long)((f1.handled - f0.handled) ? (f1.ns - f0.ns) / 1000 / (f1.handled - f0.handled) : 0));
-        kprintf("  [info]   of which: in the object (wire, fill, swap-in) %llu ms, installing PTEs %llu ms\n",
+        kprintf("  [info]   of which: in the object (wire, fill, swap-in) %llu ms -- %llu ms of it waiting for the cache lock -- installing PTEs %llu ms\n",
                 (unsigned long long)((f1.wire_ns - f0.wire_ns) / 1000000),
+                (unsigned long long)((v1.wire_lock_wait_ns - v0.wire_lock_wait_ns) / 1000000),
                 (unsigned long long)((f1.map_ns - f0.map_ns) / 1000000));
         kprintf("  [info]   a fill: frame %llu ms, zeroing %llu ms, record %llu ms; pmm scanned %llu bits over %llu allocations\n",
                 (unsigned long long)((v1.fill_frame_ns - v0.fill_frame_ns) / 1000000),

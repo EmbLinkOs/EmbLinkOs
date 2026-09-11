@@ -556,7 +556,14 @@ approximated, which is why none of them is a silent bug waiting to be found:
     and the global LRU. Per-object locks plus a separate LRU lock is the right
     shape eventually; the moment to build it is when a profile shows
     contention, because a two-lock ordering bug here deadlocks the path every
-    file read takes.
+    file read takes. **The profile now exists:** `test swap` prints how long
+    the fault path waits for this lock -- **~1.2 s of the 3.4-6 s a paging
+    run spends inside the object (20-35%)**, all of it queued behind the
+    writeback thread's reclaim batches, which hold the lock through their
+    cluster writes. The targeted fix is narrower than a lock split: let
+    reclaim drop the lock across the I/O, with the batch's pages marked
+    in-flight so a fault on one waits for the write instead of mapping a
+    frame that is about to be freed (Linux's PG_writeback). Not built yet.
   - [ ] **Read-ahead.** A sequential reader still faults one page at a time.
     The access pattern is trivially detectable from the object's own history.
   - [x] ~~**The writeback thread polls** because the scheduler has no timer
