@@ -54,6 +54,11 @@ int      swap_in(uint64_t slot, uint64_t phys);
 
 void     swap_free(uint64_t slot);
 
+/* Is `slot` currently allocated? For audits: a page record naming a slot the
+ * store does not consider held is a page whose contents will be overwritten
+ * by the next page-out. */
+bool     swap_slot_held(uint64_t slot);
+
 /* CLUSTERED PAGE-OUT: up to SWAP_CLUSTER_PAGES pages to CONTIGUOUS slots in
  * ONE device command. Measured before it was built: with one command per page
  * the store cost 158 us/page idle and ~350 us/page under load, and a run that

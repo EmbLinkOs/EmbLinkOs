@@ -37,6 +37,19 @@
  * allocators, which take their own; nothing in those calls back into here. */
 static spinlock_t vma_lock = SPINLOCK_INIT;
 
+/* NOTHING SLEEPS UNDER vma_lock. It is a spinlock taken in the fault path
+ * with interrupts off, and the page cache's lock is a mutex. The first
+ * version created objects, dropped references and discarded pages under it,
+ * and every one of those can block behind a reclaim batch that is writing to
+ * the disk: the holder sleeps with the spinlock held, every other core that
+ * faults spins on it with interrupts off, and the reclaimer's next TLB
+ * shootdown waits for cores that cannot answer. Intermittent, and it hung a
+ * process at its first sbrk. So: objects are made BEFORE the lock and the
+ * range re-checked after; a mapping being unmapped is flagged VMA_DYING and
+ * left on the list while its pages are handled outside; the fault path drops
+ * the lock across the cache and re-validates. The lock now covers list
+ * structure and page-table edits, which never block. */
+
 static uint64_t page_align_up(uint64_t v) {
     return (v + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
 }
@@ -114,9 +127,18 @@ static void vma_insert(struct process *proc, struct vm_area *nv) {
 static struct vm_area *vma_find(struct process *proc, uint64_t addr) {
     for (struct vm_area *v = proc->vma_list; v; v = v->next) {
         if (addr < v->start) return NULL;      /* sorted: no later one can match */
-        if (addr < v->end)   return v;
+        if (addr < v->end)   return (v->flags & VMA_DYING) ? NULL : v;
     }
     return NULL;
+}
+
+/* Take a node off the list. Caller holds vma_lock. */
+static void vma_unlink(struct process *proc, struct vm_area *v) {
+    struct vm_area **pp = &proc->vma_list;
+    while (*pp && *pp != v)
+        pp = &(*pp)->next;
+    if (*pp)
+        *pp = v->next;
 }
 
 static struct vm_fault_stats g_fault_stats;
@@ -182,27 +204,53 @@ static bool vm_fault_resolve(struct process *proc, uint64_t addr, bool write, bo
      * signal rather than a guess.
      *
      * This is what makes MAP_PRIVATE of a file worth having: N processes
-     * reading one file share its pages, and only a writer pays for a copy. */
+     * reading one file share its pages, and only a writer pays for a copy.
+     *
+     * The cache is asked which frame it holds WITHOUT the lock (its lock
+     * sleeps), and the mapping and the page table are checked again after:
+     * the same shape as the wire below. */
     if (already && write && v->obj && !v->obj->anon && (v->flags & MAP_PRIVATE)) {
-        uint64_t shared = vmo_page_phys(v->obj, idx);
-        if (already == shared) {
+        struct vm_object *obj = v->obj;
+        vmo_ref(obj);
+        spin_unlock(&vma_lock);
+        uint64_t shared = vmo_page_phys(obj, idx);
+        spin_lock(&vma_lock);
+        v = vma_find(proc, page);
+        bool same = v && v->obj == obj &&
+                    (v->file_off + (page - v->start)) / PAGE_SIZE == idx &&
+                    vmm_get_phys_in(proc->pml4_phys, page) == already;
+        bool copied = false;
+        if (same && already == shared) {
             uint64_t copy = pmm_alloc_page();
-            if (!copy) VMF_DECLINE();
+            if (!copy) {
+                g_fault_stats.declined++;
+                spin_unlock(&vma_lock);
+                vmo_put(obj);
+                return false;
+            }
             memcpy((void *)(uintptr_t)P2V(copy),
                    (const void *)(uintptr_t)P2V(already), PAGE_SIZE);
             if (vmm_map_in(proc->pml4_phys, page, copy, prot_to_vmm(v->prot)) != 0) {
                 pmm_free_page(copy);
-                VMF_DECLINE();
+                g_fault_stats.declined++;
+                spin_unlock(&vma_lock);
+                vmo_put(obj);
+                return false;
             }
-            /* The cache's page is no longer in this address space, so the pin
-             * this mapping held on it goes too -- otherwise a file mapped and
-             * written by many processes would pin pages nothing maps. */
-            vmo_unwire_page(v->obj, idx);
             g_fault_stats.cow++;
             g_fault_stats.handled++;
-            spin_unlock(&vma_lock);
-            return true;
+            copied = true;
         }
+        spin_unlock(&vma_lock);
+        /* The cache's page is no longer in this address space, so the pin
+         * this mapping held on it goes too -- otherwise a file mapped and
+         * written by many processes would pin pages nothing maps. */
+        if (copied) vmo_unwire_page(obj, idx);
+        vmo_put(obj);
+        /* Copied, or not the cache's page after all (already a private copy,
+         * or the mapping changed under us): either way the retry succeeds or
+         * comes back here with the truth. */
+        return true;
     }
 
     /* Already mapped and not the COW case? Then another core resolved this
@@ -299,12 +347,57 @@ static bool vm_fault_resolve(struct process *proc, uint64_t addr, bool write, bo
     return mapped || retry;
 }
 
-/* The shared core. `obj` NULL means anonymous, and an object is made for it
- * here; non-NULL means file-backed and the caller has already taken the
- * reference this mapping will hold. */
+/* The shared core. `obj` NULL means anonymous, and an object is made for it;
+ * non-NULL means file-backed and the caller has already taken the reference
+ * this mapping will hold. */
 static int64_t vma_map_common(struct process *proc, uint64_t addr, uint64_t len,
                               uint32_t prot, uint32_t flags,
                               struct vm_object *obj, uint64_t file_off);
+
+/* Make the record for a mapping the caller has already placed and whose
+ * object the caller already holds. Caller holds vma_lock and has checked the
+ * range is free. Fails only for the record's own allocation.
+ *
+ * NO PAGES ARE ALLOCATED HERE. The VMA is the promise; vm_fault() keeps it,
+ * one page at a time, as the pages are actually touched. That makes mmap O(1)
+ * in the size of the mapping instead of O(n), and it makes address space and
+ * memory two different resources -- a program can reserve a gigabyte to use
+ * three pages of it and pay for three pages. It also means mmap can no longer
+ * fail with ENOMEM for lack of memory: it fails only for lack of ADDRESS
+ * SPACE, and the memory failure moves to the first touch. Which is where every
+ * other kernel puts it, and is the one genuinely awkward consequence -- a
+ * store can now fail. */
+static int install_locked(struct process *proc, uint64_t start, uint64_t len,
+                          uint32_t prot, uint32_t flags,
+                          struct vm_object *obj, uint64_t file_off) {
+    struct vm_area *v = kmalloc(sizeof *v);
+    if (!v)
+        return -EMBK_ENOMEM;
+    v->start      = start;
+    v->end        = start + len;
+    v->prot       = prot;
+    v->flags      = flags;
+    v->obj        = obj;
+    v->file_off   = file_off;
+    v->dying_next = NULL;
+    vma_insert(proc, v);
+    return 0;
+}
+
+/* ANONYMOUS MEMORY GETS AN OBJECT, so that it can be paged. Before this the
+ * fault handler handed out bare frames that nothing tracked: they could not
+ * be found again, so they could not be evicted, so an anonymous mapping was
+ * memory that had to fit or fail. The object is the record -- its pages,
+ * their frames, and where each went when it was swapped -- and it is told the
+ * one address space that maps it, because evicting means unmapping first.
+ * Made OUTSIDE vma_lock (see the lock's comment); the caller re-checks the
+ * range once it holds the lock again and puts the object if it lost. */
+static struct vm_object *anon_object_for(struct process *proc, uint64_t start, uint64_t len) {
+    struct vm_object *obj = vmo_create_anon(len);
+    if (obj)
+        vmo_set_mapper(obj, proc->pml4_phys, start);
+    return obj;
+}
 
 int64_t vma_mmap_file(struct process *proc, uint64_t len, uint32_t prot,
                       uint32_t flags, struct vm_object *obj, uint64_t file_off) {
@@ -352,73 +445,63 @@ static int64_t vma_map_common(struct process *proc, uint64_t addr, uint64_t len,
     /* W^X, refused rather than granted-and-regretted. A page that is both
      * writable and executable is the primitive every code-injection attack
      * needs, and nothing in this OS requires one -- the JIT-shaped caller that
-     * eventually does should map W, write, then mprotect to X. (mprotect is
-     * not implemented yet; docs/TODO.md.) */
+     * eventually does maps W, writes, then mprotects to X. */
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
         return -EMBK_EINVAL;
+    if (flags & VMA_DYING)
+        return -EMBK_EINVAL;
 
-    /* From here the LIST is read and then written, and a fault on another core
-     * may be walking it. One critical section for both halves. */
-    spin_lock(&vma_lock);
+    /* Choose the address under the lock; if the mapping needs an object made,
+     * make it outside and come back to check the range is still free -- a
+     * second thread may have taken it meanwhile. A few rounds cover any
+     * realistic race; a caller that keeps losing is told ENOMEM. */
+    for (int attempt = 0; attempt < 8; attempt++) {
+        spin_lock(&vma_lock);
+        uint64_t start;
+        if (flags & MAP_FIXED) {
+            if (addr & (PAGE_SIZE - 1))
+                { spin_unlock(&vma_lock); return -EMBK_EINVAL; }
+            if (addr < proc->layout.mmap_base || addr + len > proc->layout.mmap_max)
+                { spin_unlock(&vma_lock); return -EMBK_EINVAL; }
+            if (!range_is_free(proc, addr, addr + len))
+                { spin_unlock(&vma_lock); return -EMBK_EEXIST; }  /* MAP_FIXED does NOT silently replace */
+            start = addr;
+        } else {
+            start = find_gap(proc, len);
+            if (!start)
+                { spin_unlock(&vma_lock); return -EMBK_ENOMEM; }
+        }
+        if (obj) {                                    /* file: the object is in hand */
+            int rc = install_locked(proc, start, len, prot, flags, obj, file_off);
+            spin_unlock(&vma_lock);
+            return rc ? rc : (int64_t)start;
+        }
+        spin_unlock(&vma_lock);
 
-    uint64_t start;
-    if (flags & MAP_FIXED) {
-        if (addr & (PAGE_SIZE - 1))
-            { spin_unlock(&vma_lock); return -EMBK_EINVAL; }
-        if (addr < proc->layout.mmap_base || addr + len > proc->layout.mmap_max)
-            { spin_unlock(&vma_lock); return -EMBK_EINVAL; }
-        if (!range_is_free(proc, addr, addr + len))
-            { spin_unlock(&vma_lock); return -EMBK_EEXIST; }  /* MAP_FIXED does NOT silently replace */
-        start = addr;
-    } else {
-        start = find_gap(proc, len);
-        if (!start)
-            { spin_unlock(&vma_lock); return -EMBK_ENOMEM; }
+        struct vm_object *anon = anon_object_for(proc, start, len);
+        if (!anon)
+            return -EMBK_ENOMEM;
+
+        spin_lock(&vma_lock);
+        if (range_is_free(proc, start, start + len)) {
+            int rc = install_locked(proc, start, len, prot, flags, anon, 0);
+            spin_unlock(&vma_lock);
+            if (rc) { vmo_put(anon); return rc; }
+            return (int64_t)start;
+        }
+        spin_unlock(&vma_lock);
+        vmo_put(anon);                                /* lost the range; choose again */
+        if (flags & MAP_FIXED)
+            return -EMBK_EEXIST;
     }
-
-    struct vm_area *v = kmalloc(sizeof *v);
-    if (!v)
-        { spin_unlock(&vma_lock); return -EMBK_ENOMEM; }
-
-    /* ANONYMOUS MEMORY GETS AN OBJECT, so that it can be paged. Before this
-     * the fault handler handed out bare frames that nothing tracked: they
-     * could not be found again, so they could not be evicted, so an anonymous
-     * mapping was memory that had to fit or fail. The object is the record --
-     * its pages, their frames, and where each went when it was swapped -- and
-     * it is told the one address space that maps it, because evicting means
-     * unmapping first. */
-    if (!obj) {
-        obj = vmo_create_anon(len);
-        if (!obj)
-            { kfree(v); spin_unlock(&vma_lock); return -EMBK_ENOMEM; }
-        vmo_set_mapper(obj, proc->pml4_phys, start);
-        file_off = 0;
-    }
-
-    /* NO PAGES ARE ALLOCATED HERE. The VMA is the promise; vm_fault() keeps it,
-     * one page at a time, as the pages are actually touched.
-     *
-     * That makes mmap O(1) in the size of the mapping instead of O(n), and it
-     * makes address space and memory two different resources -- a program can
-     * reserve a gigabyte to use three pages of it and pay for three pages. It
-     * also means mmap can no longer fail with ENOMEM for lack of memory: it
-     * fails only for lack of ADDRESS SPACE, and the memory failure moves to
-     * the first touch. Which is where every other kernel puts it, and is the
-     * one genuinely awkward consequence -- a store can now fail. */
-    v->start    = start;
-    v->end      = start + len;
-    v->prot     = prot;
-    v->flags    = flags;
-    v->obj      = obj;
-    v->file_off = file_off;
-    vma_insert(proc, v);
-
-    spin_unlock(&vma_lock);
-    return (int64_t)start;
+    return -EMBK_ENOMEM;
 }
 
-/* Unmap the pages of a FILE-backed (or, historically, bare) range and settle
- * who owns each frame. Caller holds vma_lock. */
+static bool vma_split_at(struct process *proc, uint64_t at);
+
+/* Unmap the pages of a FILE-backed range and settle who owns each frame.
+ * Runs WITHOUT vma_lock: the mapping is VMA_DYING, so nothing else will map
+ * or fault the range meanwhile, and the cache's lock may be taken. */
 static void unmap_range_pages(struct process *proc, struct vm_area *v,
                               uint64_t lo, uint64_t hi) {
     for (uint64_t va = lo; va < hi; va += PAGE_SIZE) {
@@ -458,89 +541,56 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
     if (end < addr)
         return -EMBK_EINVAL;
 
-    /* The list is REWRITTEN here -- nodes freed, split, retargeted -- and a
-     * fault on another core walks it. This is the use-after-free the lock
-     * exists for. */
+    /* 1. UNDER THE LOCK: cut the list so the range is a whole number of
+     *    mappings (both cuts before anything changes, so a failed allocation
+     *    leaves the process as it was), then flag each mapping inside the
+     *    range DYING. It stays on the list: the range cannot be handed out
+     *    again, a fault there is declined, a second munmap of it finds
+     *    nothing to do -- and nothing that can sleep has happened yet. */
     spin_lock(&vma_lock);
-
-    struct vm_area **pp = &proc->vma_list;
-    bool touched = false;
-    struct vm_area *gone = NULL;        /* unlinked nodes, each carrying a pending vmo_put */
-
-    while (*pp) {
-        struct vm_area *v = *pp;
-        if (v->end <= addr || v->start >= end) {   /* no overlap */
-            pp = &v->next;
-            continue;
-        }
-
-        uint64_t lo = v->start > addr ? v->start : addr;
-        uint64_t hi = v->end   < end  ? v->end   : end;
-
-        /* ANONYMOUS: the object does it. It knows which of its pages exist,
-         * which are in frames and which are out on the swap store, and the
-         * page tables it is mapped in -- so it unmaps and frees in O(pages
-         * that exist) rather than walking every address in the range, and a
-         * page that is on disk gives back its slot, which a page-table walk
-         * would never have found. */
-        if (v->obj && v->obj->anon)
-            vmo_discard_range(v->obj, (v->file_off + (lo - v->start)) / PAGE_SIZE,
-                              (hi - lo) / PAGE_SIZE);
-        else
-            unmap_range_pages(proc, v, lo, hi);
-        touched = true;
-
-        if (lo == v->start && hi == v->end) {
-            *pp = v->next;                  /* whole mapping gone */
-            /* The reference this mapping held on its object goes with it --
-             * AFTER the lock. A last-reference vmo_put flushes, and a flush is
-             * disk I/O; under this spinlock that is a disk wait with
-             * interrupts off, which the ATA driver's canary reported the first
-             * time posixdemo unmapped a file whose descriptor was already
-             * closed. The dead node itself carries the pending put: it is off
-             * the list, nothing else can reach it, and its `next` is free. */
-            v->next = gone;
-            gone = v;
-            continue;
-        }
-        if (lo == v->start) { v->start = hi; pp = &v->next; continue; }
-        if (hi == v->end)   { v->end   = lo; pp = &v->next; continue; }
-
-        /* A hole in the middle: the mapping becomes two. */
-        struct vm_area *tail = kmalloc(sizeof *tail);
-        if (!tail) {
-            /* The pages ARE gone; the bookkeeping cannot describe it. Truncate
-             * rather than lie -- the tail leaks address space, not memory, and
-             * saying so beats a VMA that claims to cover unmapped pages. */
-            v->end = lo;
-            kprintf("vma: out of memory splitting a mapping; %d KiB of VA leaked\n",
-                    (int)((v->end - hi) / 1024));
-            break;                          /* touched: reports OK below */
-        }
-        tail->start    = hi;
-        tail->end      = v->end;
-        tail->prot     = v->prot;
-        tail->flags    = v->flags;
-        tail->obj      = v->obj;
-        /* The tail starts further into the FILE than the head did. Copying
-         * file_off unchanged would map the same bytes twice. */
-        tail->file_off = v->file_off + (hi - v->start);
-        if (tail->obj) vmo_ref(tail->obj);              /* a second holder */
-        v->end         = lo;
-        tail->next  = v->next;
-        v->next     = tail;
-        pp = &tail->next;
+    if (!vma_split_at(proc, addr) || !vma_split_at(proc, end)) {
+        spin_unlock(&vma_lock);
+        return -EMBK_ENOMEM;
     }
-
+    struct vm_area *dying = NULL;
+    for (struct vm_area *v = proc->vma_list; v; v = v->next) {
+        if (v->end <= addr || v->start >= end || (v->flags & VMA_DYING))
+            continue;
+        v->flags |= VMA_DYING;
+        v->dying_next = dying;
+        dying = v;
+    }
     spin_unlock(&vma_lock);
+    if (!dying)
+        return -EMBK_EINVAL;
 
-    while (gone) {
-        struct vm_area *n = gone->next;
-        if (gone->obj) vmo_put(gone->obj);
-        kfree(gone);
-        gone = n;
+    /* 2. THE PAGES, without the lock. An anonymous mapping's object does it:
+     *    it knows which of its pages exist, which are in frames and which are
+     *    out on the swap store, and the page tables it is mapped in -- so it
+     *    unmaps and frees in O(pages that exist), and a page that is on disk
+     *    gives back its slot, which a page-table walk would never have found.
+     *    A file mapping is walked, because its object is shared and only the
+     *    wires are this mapping's. */
+    for (struct vm_area *d = dying; d; d = d->dying_next) {
+        if (d->obj && d->obj->anon)
+            vmo_discard_range(d->obj, d->file_off / PAGE_SIZE, (d->end - d->start) / PAGE_SIZE);
+        else
+            unmap_range_pages(proc, d, d->start, d->end);
     }
-    return touched ? EMBK_OK : -EMBK_EINVAL;
+
+    /* 3. Off the list, then the references -- a last one may flush to disk,
+     *    which is exactly why it is not dropped under the lock. */
+    spin_lock(&vma_lock);
+    for (struct vm_area *d = dying; d; d = d->dying_next)
+        vma_unlink(proc, d);
+    spin_unlock(&vma_lock);
+    while (dying) {
+        struct vm_area *n = dying->dying_next;
+        if (dying->obj) vmo_put(dying->obj);
+        kfree(dying);
+        dying = n;
+    }
+    return EMBK_OK;
 }
 
 /* Split the VMA containing `at` so that a mapping boundary falls exactly
@@ -551,19 +601,22 @@ static bool vma_split_at(struct process *proc, uint64_t at) {
     for (struct vm_area *v = proc->vma_list; v; v = v->next) {
         if (at <= v->start || at >= v->end)
             continue;
+        if (v->flags & VMA_DYING)
+            return true;                /* being unmapped: to everyone else, a hole already */
         struct vm_area *tail = kmalloc(sizeof *tail);
         if (!tail)
             return false;
-        tail->start    = at;
-        tail->end      = v->end;
-        tail->prot     = v->prot;
-        tail->flags    = v->flags;
-        tail->obj      = v->obj;
-        tail->file_off = v->file_off + (at - v->start);
+        tail->start      = at;
+        tail->end        = v->end;
+        tail->prot       = v->prot;
+        tail->flags      = v->flags;
+        tail->obj        = v->obj;
+        tail->file_off   = v->file_off + (at - v->start);
+        tail->dying_next = NULL;
         if (tail->obj) vmo_ref(tail->obj);              /* a second holder */
-        tail->next     = v->next;
-        v->end         = at;
-        v->next     = tail;
+        tail->next       = v->next;
+        v->end           = at;
+        v->next          = tail;
         return true;
     }
     return true;
@@ -596,8 +649,8 @@ int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t pro
     for (struct vm_area *v = proc->vma_list; v && covered < end; v = v->next) {
         if (v->end <= covered)
             continue;
-        if (v->start > covered)
-            break;                      /* a hole */
+        if (v->start > covered || (v->flags & VMA_DYING))
+            break;                      /* a hole (a mapping being unmapped is one) */
         covered = v->end;
     }
     if (covered < end)
@@ -615,7 +668,7 @@ int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t pro
     uint64_t vmm_flags = prot_to_vmm(prot);
 
     for (struct vm_area *v = proc->vma_list; v; v = v->next) {
-        if (v->end <= addr || v->start >= end)
+        if (v->end <= addr || v->start >= end || (v->flags & VMA_DYING))
             continue;
 
         for (uint64_t va = v->start; va < v->end; va += PAGE_SIZE)
@@ -633,11 +686,27 @@ int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t pro
     return EMBK_OK;
 }
 
+struct vm_area *vma_detach_all(struct process *proc) {
+    if (!proc)
+        return NULL;
+    /* NO LOCK, deliberately: the reap path calls this with the scheduler lock
+     * held, and the mmap path takes vma_lock and then (through the cache) the
+     * scheduler lock -- taking vma_lock here would be the reverse order. It is
+     * safe because a process with no threads has nobody left to walk its
+     * list; vm_fault runs only on the faulting process's own threads. */
+    struct vm_area *list = proc->vma_list;
+    proc->vma_list = NULL;
+    return list;
+}
+
 void vma_destroy_all(struct process *proc) {
     if (!proc)
         return;
-    spin_lock(&vma_lock);
-    struct vm_area *v = proc->vma_list;
+    vma_destroy_list(vma_detach_all(proc), proc->pml4_phys);
+}
+
+void vma_destroy_list(struct vm_area *list, uint64_t pml4_phys) {
+    struct vm_area *v = list;
     struct vm_area *gone = NULL;
     while (v) {
         struct vm_area *next = v->next;
@@ -661,22 +730,20 @@ void vma_destroy_all(struct process *proc) {
                 vmo_detach_mapper(o);
             } else {
                 for (uint64_t va = v->start; va < v->end; va += PAGE_SIZE) {
-                    uint64_t pa = vmm_get_phys_in(proc->pml4_phys, va);
+                    uint64_t pa = vmm_get_phys_in(pml4_phys, va);
                     if (!pa) continue;
                     uint64_t idx = (v->file_off + (va - v->start)) / PAGE_SIZE;
                     if (pa == vmo_page_phys(o, idx)) {
-                        vmm_unmap_in(proc->pml4_phys, va);
+                        vmm_unmap_in(pml4_phys, va);
                         vmo_unwire_page(o, idx);
                     }
                 }
             }
         }
-        v->next = gone;                 /* the put waits for the unlock; see vma_munmap */
+        v->next = gone;                 /* the puts come last, all at once */
         gone = v;
         v = next;
     }
-    proc->vma_list = 0;
-    spin_unlock(&vma_lock);
 
     while (gone) {
         struct vm_area *n = gone->next;
@@ -691,4 +758,77 @@ uint64_t vma_total_bytes(struct process *proc) {
     for (struct vm_area *v = proc ? proc->vma_list : 0; v; v = v->next)
         total += v->end - v->start;
     return total;
+}
+
+/* --- kernel-placed anonymous mappings: the heap and the stacks ------------ */
+
+int vma_map_anon_at(struct process *proc, uint64_t start, uint64_t len, uint32_t prot) {
+    if (!proc || len == 0 || (start & (PAGE_SIZE - 1)) || (len & (PAGE_SIZE - 1)) ||
+        start + len < start)
+        return -EMBK_EINVAL;
+    struct vm_object *obj = anon_object_for(proc, start, len);
+    if (!obj)
+        return -EMBK_ENOMEM;
+    spin_lock(&vma_lock);
+    if (!range_is_free(proc, start, start + len))
+        { spin_unlock(&vma_lock); vmo_put(obj); return -EMBK_EEXIST; }
+    int rc = install_locked(proc, start, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, obj, 0);
+    spin_unlock(&vma_lock);
+    if (rc) vmo_put(obj);
+    return rc;
+}
+
+int vma_heap_set_end(struct process *proc, uint64_t old_end, uint64_t new_end) {
+    if (!proc || (old_end & (PAGE_SIZE - 1)) || (new_end & (PAGE_SIZE - 1)))
+        return -EMBK_EINVAL;
+    if (new_end < proc->layout.heap_base || new_end > proc->layout.heap_max)
+        return -EMBK_ENOMEM;
+    if (new_end == old_end)
+        return 0;
+
+    /* SHRINK: the range goes away entirely -- pages, swap slots, records --
+     * through the same path a munmap of it would take. (Nothing mapped there
+     * is not an error: a heap that grew and shrank inside one page.) */
+    if (new_end < old_end) {
+        int rc = vma_munmap(proc, new_end, old_end - new_end);
+        return (rc == EMBK_OK || rc == -EMBK_EINVAL) ? 0 : rc;
+    }
+
+    /* GROW, the usual way: extend the mapping that ends exactly at old_end.
+     * Under the lock and without an allocation, which is what makes a heap
+     * that grows a page at a time cheap. */
+    spin_lock(&vma_lock);
+    if (!range_is_free(proc, old_end, new_end))
+        { spin_unlock(&vma_lock); return -EMBK_ENOMEM; }
+    for (struct vm_area *v = proc->vma_list; v; v = v->next) {
+        if (v->end == old_end && v->obj && v->obj->anon &&
+            v->prot == (PROT_READ | PROT_WRITE) && !(v->flags & VMA_DYING)) {
+            v->end = new_end;
+            spin_unlock(&vma_lock);
+            return 0;
+        }
+    }
+    spin_unlock(&vma_lock);
+
+    /* GROW, the other way: nothing ends at old_end (the first growth, or a
+     * heap split by mprotect or with a hole munmap'd out of it -- it simply
+     * becomes more than one mapping). A fresh one, its object made outside
+     * the lock and the range checked again after. */
+    struct vm_object *obj = anon_object_for(proc, old_end, new_end - old_end);
+    if (!obj)
+        return -EMBK_ENOMEM;
+    spin_lock(&vma_lock);
+    if (!range_is_free(proc, old_end, new_end))
+        { spin_unlock(&vma_lock); vmo_put(obj); return -EMBK_ENOMEM; }
+    int rc = install_locked(proc, old_end, new_end - old_end, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, obj, 0);
+    spin_unlock(&vma_lock);
+    if (rc) vmo_put(obj);
+    return rc;
+}
+
+uint64_t vma_prefault(struct process *proc, uint64_t va) {
+    if (!proc || !vm_fault(proc, va, true, false))
+        return 0;
+    return vmm_get_phys_in(proc->pml4_phys, va & ~(uint64_t)(PAGE_SIZE - 1));
 }

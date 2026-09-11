@@ -6,6 +6,13 @@
 
 struct vm_object;   /* mm/vm_object.h -- a file's pages */
 
+/* A mapping being UNMAPPED. It stays on the list -- so the range is not handed
+ * out again, and a fault there is declined -- while its pages are dealt with
+ * OUTSIDE vma_lock: that work talks to the page cache, whose lock sleeps, and
+ * vma_lock is a spinlock taken in the fault path with interrupts off. Set in
+ * `flags`, above every MAP_* bit; never visible to userland. */
+#define VMA_DYING 0x80000000u
+
 /* MEMORY MAPPINGS -- mmap()/munmap() and the per-process record of what is
  * mapped where.
  *
@@ -92,6 +99,7 @@ struct vm_area {
     uint64_t file_off;
 
     struct vm_area *next;   /* sorted ascending by start */
+    struct vm_area *dying_next;  /* munmap's private chain of VMA_DYING nodes */
 };
 
 /* Map `len` bytes. Returns the base address, or a negative -EMBK_* code.
@@ -180,6 +188,42 @@ int vma_mprotect(struct process *proc, uint64_t addr, uint64_t len, uint32_t pro
  * vmm_destroy_address_space(); this frees the bookkeeping and is what stops
  * the list itself leaking. */
 void vma_destroy_all(struct process *proc);
+
+/* TEARDOWN IN TWO HALVES, because the reap path holds the scheduler lock and
+ * an object letting go of its pages takes the page cache's sleeping lock.
+ * `vma_detach_all` takes the list off the process -- no lock: a process being
+ * reaped has no threads, so nothing can be walking it -- and `vma_destroy_list`
+ * finishes the job from the kworker, where blocking is fine. `pml4_phys` is
+ * passed explicitly because the process slot is gone by then. vma_destroy_all
+ * is the two in one, for callers in process context (a process_create that
+ * fails halfway). */
+struct vm_area *vma_detach_all(struct process *proc);
+void vma_destroy_list(struct vm_area *list, uint64_t pml4_phys);
+
+/* --- KERNEL-PLACED ANONYMOUS MAPPINGS: the sbrk heap and the stacks ------
+ *
+ * Until these existed, the heap and every stack were bare frames mapped
+ * eagerly at creation -- 512 KiB per process for the main stack whether or
+ * not it was used, and heap pages the fault handler never saw, so none of it
+ * could be paged out, and the stack pages were handed over UNZEROED (a frame
+ * recycled from another process arrived with that process's data). Now they
+ * are mappings like any other: an anonymous object each, demand-paged, zero
+ * on first touch, swappable, and returned exactly on teardown. */
+
+/* Place an anonymous private mapping at exactly [start, start+len) -- outside
+ * the mmap window, which is why it is not vma_mmap with MAP_FIXED. EEXIST if
+ * anything is there. */
+int vma_map_anon_at(struct process *proc, uint64_t start, uint64_t len, uint32_t prot);
+
+/* Move the heap's mapped end from `old_end` to `new_end` (both page-aligned,
+ * inside the heap window). Growth extends the mapping that ends at old_end or
+ * places a new one; shrinking unmaps [new_end, old_end) and frees its pages
+ * and swap slots -- the old sbrk never gave memory back. */
+int vma_heap_set_end(struct process *proc, uint64_t old_end, uint64_t new_end);
+
+/* Fault a page in NOW and return its frame: for the kernel writing a process's
+ * initial stack (argv, envp) before the process has ever run. 0 on failure. */
+uint64_t vma_prefault(struct process *proc, uint64_t va);
 
 /* Bytes currently mapped, for diagnostics and the boot self-test. */
 uint64_t vma_total_bytes(struct process *proc);

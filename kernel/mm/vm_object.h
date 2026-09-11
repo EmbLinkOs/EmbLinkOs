@@ -262,6 +262,13 @@ struct vmo_stats {
 };
 void vmo_stats_get(struct vmo_stats *out);
 
+/* AUDIT the swap bookkeeping: every anonymous page that is out on the store
+ * must name a slot the store holds, and no two pages may name the same slot.
+ * Returns the number of pages out; *dangling counts slots the store does not
+ * hold, *duplicates the pages sharing a slot with an earlier one. Walks every
+ * object under the cache lock: a test's tool, not a fast path. */
+uint64_t vmo_audit_swap(uint64_t *store_used, uint64_t *dangling, uint64_t *duplicates);
+
 /* Start the writeback thread. After the scheduler and the VFS. */
 void vmo_writeback_init(void);
 

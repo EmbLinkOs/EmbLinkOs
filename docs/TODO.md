@@ -1802,17 +1802,56 @@ what it left open:
   from a file mapping. A process exiting with a file mapped was freeing cache
   pages under the cache (or twice). Mappings now let go of their pages before
   the tables are walked; the object's frames are the object's.
-- [x] **Object puts happen outside the VMA lock** (`vma_munmap`,
-  `vma_destroy_all`): a last-reference `vmo_put` flushes, a flush is disk
-  I/O, and under the spinlock that was a disk wait with interrupts off. The
-  dead node carries the pending put past the unlock.
+- [x] **The sbrk heap and every stack are mappings too** (second commit).
+  `malloc`'s memory -- where an ordinary program lives -- is an anonymous
+  object like the rest: demand-paged, zero on first touch, swappable, and a
+  shrink frees pages (the old sbrk never gave memory back). The main stack is
+  one 512 KiB mapping instead of 128 eagerly allocated frames handed over
+  UNZEROED (a frame recycled from another process arrived with that process's
+  data on it -- a leak, closed as a side effect); thread stacks are mappings
+  reclaimed when their thread-table slot is next used. `test swap` runs its
+  witness twice, `mmap` then `heap`: **241 MiB over 179 MiB free, 0 pages
+  wrong, both** -- 6.6 s and 4.9 s. Free memory at idle went UP (lazy stacks).
+- [x] **NOTHING SLEEPS UNDER `vma_lock`**, and this was the bug behind an
+  intermittent hang. The lock is a spinlock taken in the fault path with
+  interrupts off; the page cache's lock is a mutex. The first version created
+  objects, discarded pages and dropped references under it, each of which can
+  block behind a reclaim batch writing to disk -- the holder sleeps with the
+  spinlock held, every other core that faults spins on it with interrupts off.
+  Once every process had heap and stack mappings this stopped being rare: a
+  process hung at its first `sbrk` in two of four runs. Now objects are made
+  BEFORE the lock and the range re-checked after; a mapping being unmapped is
+  flagged `VMA_DYING` and stays on the list (the range cannot be handed out
+  again, a fault there is declined) while its pages are handled outside; the
+  copy-on-write branch drops the lock across the cache like the wire path
+  does. Five consecutive runs since; the earlier observed-once boot stall
+  (below) has the same shape and is kept on the books until a longer soak.
+- [x] **A dead process's address space is torn down by the kworker.** The
+  reap holds the scheduler lock, and letting go of an object's pages takes
+  the cache mutex -- the file-mapping `vmo_put` in `vma_destroy_all` had that
+  latent sleep-under-spinlock all along, unseen because every test process
+  unmapped before exiting. The VMA list is detached under the lock (no
+  `vma_lock`: a process with no threads has nobody walking its list, and the
+  mmap path's order is `vma_lock` -> cache -> scheduler, so the reverse would
+  invert) and the worker unmaps, puts and frees the page tables. The ring
+  grew 64 -> 256 and reports its in-flight job, because `test swap` counts
+  what came back only after the teardown is done.
+- [x] **`vmo_audit_swap`**: every page out on the store names a slot the
+  store holds, no two share one, and the store's count equals the pages out
+  -- all read under one lock, because read separately a reclaim batch moved
+  the numbers by a hundred between two adjacent reads and looked like a leak.
 
 Open, in the order they matter:
 
-- [ ] **Only `mmap` memory pages.** The sbrk heap -- where `malloc` lives --
-  and the stacks are still eagerly mapped bare frames the fault handler never
-  sees. Moving them onto anonymous objects is the same mechanism (a VMA per
-  heap, one per stack) and is what makes swap matter to an ordinary program.
+- [ ] **A thread killed while blocked inside a kernel path is reaped with its
+  locks and its work in flight.** `thread_reap_slot` frees the kernel stack
+  of a BLOCKED thread synchronously. A thread asleep on the cache mutex inside
+  `munmap` holds no spinlock any more (above), but its `VMA_DYING` nodes are
+  half-processed: the exit-path teardown will put their objects again. The
+  general fix is the usual one -- a kill is a request the thread acts on at
+  its next return to user mode or wake, never a teardown of a thread mid-path.
+  Not new; the pre-existing shape of kill. Recorded here because the dying
+  chain makes the consequence concrete.
 - [ ] **aarch64 keeps IRQs masked around `vm_fault`** (x86 unmasks when the
   faulting context had them on). Unmasking hangs init before its first print,
   every boot; masked, it boots (bisected 2026-09-11). The root is wider: on
@@ -1852,11 +1891,17 @@ Open, in the order they matter:
   `pmm_alloc_page` directly under the VMA lock, so a COW fault under real
   pressure declines instead of reclaiming. Route it through the object's
   reserve once COW pages are objects too.
-- [ ] **Observed once, not reproduced:** an x86 boot (256 MiB, swap disk)
-  stalled after `init: authenticated session` -- `ELF dynlink: libembk.so
-  linked` never printed, no panic, no fault -- with the growable page index
-  freshly added. Two rebuilds and every run since booted. Recorded with the
-  exact point so a second sighting has something to match.
+- [ ] **Observed twice, not reproduced since:** an x86 boot (256 MiB, swap
+  disk) stalled after `init: authenticated session` -- `ELF dynlink` never
+  printed; later, twice, the swap witness hung right after its dynlink line
+  without a first `sbrk` completing. The second pair was the sleep-under-
+  `vma_lock` hazard above, and it has not recurred since that was removed
+  (five runs). The first has the same shape -- a process starting under
+  memory pressure -- and is presumed the same. Kept until a longer soak.
+- [ ] **The heap's first growth makes an object of the growth's size and
+  every later growth extends the mapping**, so the object's `size` stays at
+  the first `sbrk`. Nothing reads it for an anonymous object today (fills are
+  zero, wires ignore it); if anything ever does, set it on extension.
 
 ## Process & Scheduling
 

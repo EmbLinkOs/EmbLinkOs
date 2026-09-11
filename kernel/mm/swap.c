@@ -181,6 +181,14 @@ int swap_in(uint64_t slot, uint64_t phys) {
     return EMBK_OK;
 }
 
+bool swap_slot_held(uint64_t slot) {
+    if (!g_dev || slot == 0 || slot >= g_nslots) return false;
+    spin_lock(&g_lock);
+    bool held = bm_test(slot);
+    spin_unlock(&g_lock);
+    return held;
+}
+
 void swap_free(uint64_t slot) {
     if (!g_dev || slot == 0 || slot >= g_nslots) return;
     spin_lock(&g_lock);

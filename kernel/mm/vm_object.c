@@ -401,18 +401,21 @@ static int flush_object_locked(struct vm_object *o) {
 /* ---- objects ------------------------------------------------------------ */
 
 static void obj_free_pages_locked(struct vm_object *o) {
+    uint64_t frames = 0, slots = 0, neither = 0;
     for (uint32_t b = 0; b < o->nbuckets; b++) {
         struct vmo_page *p = o->buckets[b];
         while (p) {
             struct vmo_page *next = p->hnext;
             lru_unlink(p);
-            if (p->phys)           pmm_free_page(p->phys);
-            else if (p->swap_slot) swap_free(p->swap_slot);
+            if (p->phys)           { pmm_free_page(p->phys); frames++; }
+            else if (p->swap_slot) { swap_free(p->swap_slot); slots++; }
+            else neither++;
             record_free(p);
             p = next;
         }
         o->buckets[b] = NULL;
     }
+    (void)frames; (void)slots; (void)neither;
     o->resident = 0;
     o->dirty_pages = 0;
     o->swapped = 0;
@@ -962,6 +965,43 @@ uint64_t vmo_reclaim(uint64_t want) {
     uint64_t freed = reclaim_locked(want, true);
     mutex_unlock(&g_lock);
     return freed;
+}
+
+uint64_t vmo_audit_swap(uint64_t *store_used, uint64_t *dangling, uint64_t *duplicates) {
+    uint64_t out = 0, dang = 0, dup = 0;
+    if (store_used) *store_used = 0;
+    if (!g_ready) { if (dangling) *dangling = 0; if (duplicates) *duplicates = 0; return 0; }
+    mutex_lock(&g_lock);
+    /* A bit per slot seen so far, to catch two pages naming one slot. 32768
+     * slots is 4 KiB; a store larger than 64 Mi slots is not audited for
+     * duplicates (the bitmap is skipped), which is stated rather than hidden. */
+    /* The store's own count, read HERE under the cache lock: no page-out or
+     * page-in can happen between it and the walk, so the two are comparable.
+     * (Read outside, they were not: a reclaim batch in progress moved the
+     * page count by a hundred between two adjacent reads.) */
+    struct swap_stats st; swap_stats_get(&st);
+    if (store_used) *store_used = st.used;
+    uint64_t nbits = st.nslots + 1;
+    uint8_t *seen = (nbits <= (64ull << 20)) ? kmalloc((nbits + 7) / 8) : NULL;
+    if (seen) memset(seen, 0, (nbits + 7) / 8);
+    for (struct vm_object *o = g_registry; o; o = o->reg_next) {
+        if (!o->anon) continue;
+        for (uint32_t b = 0; b < o->nbuckets; b++)
+            for (struct vmo_page *p = o->buckets[b]; p; p = p->hnext) {
+                if (p->phys || !p->swap_slot) continue;
+                out++;
+                if (!swap_slot_held(p->swap_slot)) dang++;
+                if (seen && p->swap_slot < nbits) {
+                    if (seen[p->swap_slot >> 3] & (1u << (p->swap_slot & 7))) dup++;
+                    else seen[p->swap_slot >> 3] |= (uint8_t)(1u << (p->swap_slot & 7));
+                }
+            }
+    }
+    mutex_unlock(&g_lock);
+    if (seen) kfree(seen);
+    if (dangling)   *dangling = dang;
+    if (duplicates) *duplicates = dup;
+    return out;
 }
 
 void vmo_stats_get(struct vmo_stats *out) {

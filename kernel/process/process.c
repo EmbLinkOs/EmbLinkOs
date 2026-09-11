@@ -11,6 +11,7 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/vma.h"
+#include "kworker/kworker.h"   /* the address space of a dead process is torn down there */
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "include/kstring.h"
@@ -460,13 +461,16 @@ static void process_reap_slot(struct process *proc) {
      * teardown below doesn't free them out from under the compositor. */
     compositor_reap_pid((int)proc->pid);
 
-    /* The mmap BOOKKEEPING. The pages themselves go with the address space
-     * below -- vmm_destroy_address_space() walks the tables and frees every
-     * frame under them -- but the vm_area records are kernel heap and would
-     * leak one allocation per mapping, forever, on every process exit. */
-    vma_destroy_all(proc);
-
-    vmm_destroy_address_space(proc->pml4_phys);
+    /* THE ADDRESS SPACE GOES TO THE KWORKER. Every mapping has an object now
+     * -- the heap and the stacks included -- and an object letting go of its
+     * pages takes the page cache's sleeping lock, which this path, holding
+     * g_sched_lock, cannot take. (It could not before either: a process that
+     * exited with a file still mapped would have slept here. None of the
+     * tests did, so it was never seen.) The list is detached now, under the
+     * lock, so the slot can be reused; the worker unmaps, drops the objects'
+     * references and frees the page tables the moment it runs. Nothing is
+     * waiting on that memory: no thread of this process exists. */
+    kworker_defer_address_space_locked(proc->pml4_phys, vma_detach_all(proc));
 
     uint32_t reaped_pid = proc->pid;
     keyboard_release_grab_pid(reaped_pid);   /* free the kbd grab if this proc held it */
@@ -2254,23 +2258,32 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         }
     }
 
-    // 3. Allocate a user stack page and map it into the process's address space
-    uint64_t stack_phys = pmm_alloc_page();
+    // 3. The main stack: USER_STACK_PAGES ending with the top page, as ONE
+    // anonymous mapping. Demand-paged and zero on first touch -- the eager
+    // version mapped all 128 frames up front and, below the top page, handed
+    // them over UNZEROED, so a frame recycled from another process arrived on
+    // this one's stack with that process's data in it. And it can be paged
+    // out now, like everything else that is a mapping. The guard below it is
+    // the absence of a mapping: a fault there is declined and fatal.
+    uint64_t stack_lo = proc->layout.stack_top_page + PAGE_SIZE
+                      - (uint64_t)USER_STACK_PAGES * PAGE_SIZE;
+    if (vma_map_anon_at(proc, stack_lo, (uint64_t)USER_STACK_PAGES * PAGE_SIZE,
+                        PROT_READ | PROT_WRITE) != 0) {
+        vma_destroy_all(proc);
+        vmm_destroy_address_space(pml4);
+        proc->pid = 0;
+        return -EMBK_ENOMEM;
+    }
+
+    // 3.1 argv/envp are written into the TOP page below, through the direct
+    // map, before the process has ever run -- so that one page is faulted in
+    // now, by the same path its first touch would have taken.
+    uint64_t stack_phys = vma_prefault(proc, proc->layout.stack_top_page);
     if (!stack_phys) {
+        vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
         proc->pid = 0;
         return -EMBK_ENOMEM;  // Failed to allocate user stack
-    }
-
-    vmm_map_in(pml4, proc->layout.stack_top_page, stack_phys, VMM_NX | VMM_WRITABLE | VMM_USER);
-
-    // 3.1 Give the main stack room to grow down: map (USER_STACK_PAGES-1) more
-    // pages BELOW the top page. argv still lives in the top page (below).
-    for (int i = 1; i < USER_STACK_PAGES; i++) {
-        uint64_t ph = pmm_alloc_page();
-        if (!ph) { vmm_destroy_address_space(pml4); proc->pid = 0; return -EMBK_ENOMEM; }
-        vmm_map_in(pml4, proc->layout.stack_top_page - (uint64_t)i * 0x1000, ph,
-                   VMM_NX | VMM_WRITABLE | VMM_USER);
     }
 
     // 3.5 Lay out argv on the child's stack, via the SAME direct-map trick
@@ -2292,7 +2305,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     for (int i = 0; i < argc; i++) argv_bytes += strlen(argv[i]) + 1;
     if (STACK_ROOM_NEEDED(argv_bytes, argc) + STACK_ROOM_NEEDED(env_bytes, envc)
             > PAGE_SIZE) {
-        pmm_free_page(stack_phys);
+        vma_destroy_all(proc);          /* the stack's frame is its object's, not ours to free */
         vmm_destroy_address_space(pml4);
         proc->pid = 0;
         return -EMBK_E2BIG;
@@ -2354,6 +2367,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
                                          entry_point, child_user_rsp);
     if (!t) {
         pmm_free_page(stack_phys);
+        vma_destroy_all(proc);
         vmm_destroy_address_space(pml4);
         proc->pid = 0;
         return -EMBK_EIO;  // Failed to allocate kernel stack
@@ -2383,7 +2397,8 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         if (!s) {
             /* No session slot -- fail the spawn cleanly rather than run a
              * child the debugger asked to hold. */
-            vmm_destroy_address_space(pml4);
+            vma_destroy_all(proc);
+        vmm_destroy_address_space(pml4);
             proc->pid = 0;
             return -EMBK_ENOMEM;
         }
@@ -2443,19 +2458,24 @@ static void process_trampoline(void) {
     __builtin_unreachable();  // Should never return
 }
 
-/* sys_sbrk's kernel side. Cortex-M-style, Matching newlib's _sbrk(ptrdiff_t
- * increment) directly: ONE call, a relative increment, returns the OLD break (the
- * newly available region starts there) or -1 -- not Linux's two-call brk(addr)
- * No shrink-side unmappaing: heap_mapped_top only ever grows, same reasoning
- * USER_THREAD_STACK_BASE already uses for its own never-unmapped
- * per-thread stacks. */
+/* sys_sbrk's kernel side. Cortex-M-style, matching newlib's _sbrk(ptrdiff_t
+ * increment) directly: ONE call, a relative increment, returns the OLD break
+ * (the newly available region starts there) or -errno -- not Linux's two-call
+ * brk(addr).
+ *
+ * THE HEAP IS A MAPPING NOW. It used to be frames allocated and zeroed here,
+ * eagerly, one per page of growth, that the fault handler never saw -- so
+ * malloc's memory could not be paged out, and a shrink never gave anything
+ * back. Growth now moves the end of an anonymous mapping (vma_heap_set_end);
+ * the pages appear on first touch, zero, through the same object path every
+ * other mapping uses, and a shrink frees them -- frames, swap slots and all.
+ * heap_mapped_top is the page-aligned end of that mapping. */
 int64_t process_sbrk(struct process *proc, int64_t increment){
     uint64_t old_brk = proc->heap_brk;
     uint64_t new_brk = old_brk + (uint64_t)increment;
 
     if (increment == 0) {
         return (int64_t)old_brk;  // pure query -- malloc() does this first
-    
     }
 
     if (increment > 0 && new_brk < old_brk) {
@@ -2468,38 +2488,15 @@ int64_t process_sbrk(struct process *proc, int64_t increment){
                                // failure means ENOMEM, not EINVAL)
     }
 
-    if (new_brk > proc->heap_mapped_top) {
-        uint64_t map_to = (new_brk + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);  // round up to page boundary
-        // Map new pages from heap_mapped_top to map_to
-        for (uint64_t addr = proc->heap_mapped_top; addr < map_to; addr += PAGE_SIZE) {
-            uint64_t phys_page = pmm_alloc_page();
-            if (!phys_page) {
-                proc->heap_mapped_top = addr;  // update to the last successfully mapped page
-                return -EMBK_ENOMEM;  // physical memory exhausted
-            }
-            // ZERO IT BEFORE IT IS USER-VISIBLE. pmm_alloc_page() hands back
-            // whatever the last owner left, so a page recycled from another
-            // process arrived in this one's heap with that process's data
-            // still in it -- readable by anyone who called malloc() and did
-            // not initialise. That is an information leak between processes
-            // first and a correctness problem second: brk(2) specifies the
-            // new space as zero-filled, and code that trusts it is entitled
-            // to. Zeroed through the direct map, which is how the kernel
-            // reaches a physical page it has not mapped anywhere else.
-            memset((void *)P2V(phys_page), 0, PAGE_SIZE);
-            if (vmm_map_in(proc->pml4_phys, addr, phys_page, VMM_WRITABLE | VMM_USER) < 0) {
-                pmm_free_page(phys_page);
-                proc->heap_mapped_top = addr;   // don't claim a page we failed to map
-                return -EMBK_ENOMEM;
-            }
-        }
-        proc->heap_mapped_top = map_to;
+    uint64_t new_top = (new_brk + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (new_top != proc->heap_mapped_top) {
+        int rc = vma_heap_set_end(proc, proc->heap_mapped_top, new_top);
+        if (rc != 0)
+            return -EMBK_ENOMEM;
+        proc->heap_mapped_top = new_top;
     }
-    
-    // Shrinking: just move heap_brk down; heap_mapped_top remains as is (pages are not unmapped)
     proc->heap_brk = new_brk;
     return (int64_t)old_brk;
-
 }
 
 /* The kthread equivalent of process_trampoline() above -- same reason it
@@ -3208,23 +3205,22 @@ int thread_create_user(struct process *proc, uint64_t entry_point, uint64_t arg)
      * a "thread" versus a "process". VMM_NX: a stack should never be
      * executable. */
     uint64_t slot_top = proc->layout.thread_stack_base + (uint64_t)(tid + 1) * USER_THREAD_STACK_SLOT;
-    for (int i = 0; i < USER_THREAD_STACK_PAGES; i++) {
-        uint64_t phys = pmm_alloc_page();
-        if (!phys) {
-            /* Rare, bounded (<= USER_THREAD_STACK_PAGES-1) OOM mid-mapping.
-             * Deliberately not unwound page-by-page here: whatever got
-             * mapped so far is still only reachable through proc's own
-             * page tables, and is reclaimed for free the moment `proc`
-             * itself is eventually torn down (vmm_destroy_address_space()
-             * frees every user-half frame unconditionally) -- the same
-             * "don't build a rollback path for a rare edge case when the
-             * eventual owner-teardown already covers it" call this
-             * function's whole stack-lifetime design makes, see below. */
-            t->state = PROCESS_UNUSED;
-            return -EMBK_ENOMEM;
-        }
-        uint64_t va = slot_top - (uint64_t)(i + 1) * PAGE_SIZE;
-        vmm_map_in(proc->pml4_phys, va, phys, VMM_WRITABLE | VMM_USER | VMM_NX);
+    uint64_t slot_len = (uint64_t)USER_THREAD_STACK_PAGES * PAGE_SIZE;
+    uint64_t slot_lo  = slot_top - slot_len;
+
+    /* The slot is per THREAD-TABLE INDEX, and a dead thread's stack is not
+     * unmapped when it dies (the reap runs under the scheduler lock, where an
+     * object cannot let go of its pages). So it is reclaimed HERE, when the
+     * index is next used: whatever the previous occupant left -- frames,
+     * swap slots -- goes back before the new stack is placed. Bounded by
+     * MAX_THREADS stacks per process, and every one of them pageable; the
+     * eager version leaked the frames until process exit and could not page
+     * them. Nothing mapped there is the common case and not an error. */
+    (void)vma_munmap(proc, slot_lo, slot_len);
+
+    if (vma_map_anon_at(proc, slot_lo, slot_len, PROT_READ | PROT_WRITE) != 0) {
+        t->state = PROCESS_UNUSED;
+        return -EMBK_ENOMEM;
     }
 
     /* THE ABI, and it is not optional. SysV x86-64 says a function sees

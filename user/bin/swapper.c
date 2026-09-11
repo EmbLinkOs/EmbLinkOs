@@ -17,10 +17,16 @@
  * pages into N swap-ins. Either order proves the same thing; this one takes
  * a third of the I/O.
  *
- *   run /data/apps/swapper/swapper.elf 256      (MiB; default 64)
+ * TWO KINDS OF MEMORY, one witness. `mmap` maps the buffer anonymously;
+ * `heap` takes it from malloc, which is sbrk underneath -- the memory every
+ * ordinary program lives in. The heap became a pageable mapping after mmap
+ * did, and this is the run that says so.
+ *
+ *   run /data/apps/swapper/swapper.elf 256 [mmap|heap]     (MiB; default 64, mmap)
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
 #include <sys/mman.h>
 
@@ -39,10 +45,15 @@ int main(int argc, char **argv) {
     size_t len = (size_t)mib << 20;
     size_t npages = len / PAGE;
 
-    uint64_t *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (m == MAP_FAILED) {
-        printf("swapper: mmap of %lu MiB failed\n", mib);
-        return 250;
+    int heap = (argc > 2 && strcmp(argv[2], "heap") == 0);
+    uint64_t *m;
+    if (heap) {
+        m = malloc(len + PAGE);
+        if (!m) { printf("swapper: malloc of %lu MiB failed\n", mib); return 250; }
+        m = (uint64_t *)(((uintptr_t)m + PAGE - 1) & ~(uintptr_t)(PAGE - 1));   /* page-align the pattern */
+    } else {
+        m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) { printf("swapper: mmap of %lu MiB failed\n", mib); return 250; }
     }
 
     for (size_t p = 0; p < npages; p++) {
@@ -58,8 +69,8 @@ int main(int argc, char **argv) {
             if (w[i] != pattern(p, i)) { bad++; break; }
     }
 
-    printf("swapper: %lu MiB (%lu pages) written and read back, %lu pages wrong\n",
-           mib, (unsigned long)npages, bad);
-    munmap(m, len);
+    printf("swapper: %s: %lu MiB (%lu pages) written and read back, %lu pages wrong\n",
+           heap ? "heap" : "mmap", mib, (unsigned long)npages, bad);
+    if (!heap) munmap(m, len);      /* the heap block is left to exit: that path must return it too */
     return bad > 200 ? 200 : (int)bad;
 }

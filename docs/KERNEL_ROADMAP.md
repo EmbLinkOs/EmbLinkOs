@@ -88,13 +88,16 @@ one measured against the run before it (docs/TODO.md has the table).
    existed but scored 0 hits (one slot, and three call sites bypassing it), a
    name cache for the other descent per path component, and a `stat` that
    stopped walking every extent to re-derive a size the inode already held.
-5. ~~**Swap.**~~ **Done** -- see above. Still open inside it: the sbrk heap
-   and the stacks are not objects yet (only `mmap` memory pages), swap-in is
-   one page per command where page-out is sixteen, and the LRU is fault-order
+5. ~~**Swap.**~~ **Done** -- see above. Still open inside it: swap-in is one
+   page per command where page-out is sixteen, and the LRU is fault-order
    rather than access-order. All in docs/TODO.md with numbers.
-6. **The sbrk heap and the stacks as anonymous objects.** `malloc` lives in
-   sbrk; until it is an object, swap helps `mmap` users and nobody else. Same
-   mechanism, one VMA per heap and per stack.
+6. ~~**The sbrk heap and the stacks as anonymous objects.**~~ **Done.**
+   `malloc`'s memory pages (`test swap` runs its witness over the heap as
+   well as over `mmap`: 241 MiB over 179 MiB free, 0 pages wrong), the main
+   stack is one lazy mapping instead of 128 frames handed over unzeroed, and
+   thread stacks are reclaimed. It took a rule to get there -- nothing sleeps
+   under the VMA spinlock -- and moved a dead process's address-space
+   teardown to the kworker, where the cache's lock may be taken.
 7. **Compression before eviction**, macOS-style, once there is a reason: a
    compressed page is faster to recover than a re-read and costs no device.
    Only worth it when the cache is under real pressure, which needs real

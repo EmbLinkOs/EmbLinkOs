@@ -29,6 +29,7 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
 #include "mm/swap.h"                         /* test swap store */
+#include "kworker/kworker.h"                 /* test swap: wait for the deferred teardown */
 #include "arch/x86_64/cpu/cpu_features.h"  /* test hardening */
 #include "include/uaccess_guard.h"           /* test hardening */
 #include "lib/random.h"                      /* test random */
@@ -1539,88 +1540,116 @@ int selftests_handle_command(const char *cmd)
         struct vfs_stat wst;
         if (vfs_stat(wp, &wst) != EMBK_OK) { kprintf("\n[cmd] test swap: %s not on image\n", wp); return 1; }
 
-        struct swap_stats s0, s1;
-        struct vmo_stats  v0, v1;
-        struct vm_fault_stats f0, f1;
-        uint64_t pb0, pa0, pb1, pa1;                 /* pmm scan bits / allocations */
-        swap_stats_get(&s0);
-        vmo_stats_get(&v0);
-        vm_fault_stats(&f0);
-        pmm_scan_stats(&pb0, &pa0);
-
+        struct swap_stats st;
+        swap_stats_get(&st);
         uint64_t free_mib = pmm_free_pages() / 256;
-        uint64_t swap_mib = (s0.nslots - s0.used) / 256;
+        uint64_t swap_mib = (st.nslots - st.used) / 256;
         uint64_t want = free_mib * 135 / 100;            /* more than fits ... */
         uint64_t cap  = free_mib + swap_mib / 2;         /* ... but not more than fits in RAM + half the store */
         if (want > cap) want = cap;
         if (want < 8)   want = 8;
 
-        kprintf("\n[swap] %llu MiB free, %llu MiB of store: the witness will touch %llu MiB\n",
+        kprintf("\n[swap] %llu MiB free, %llu MiB of store: the witness will touch %llu MiB, twice\n",
                 (unsigned long long)free_mib, (unsigned long long)swap_mib, (unsigned long long)want);
 
-        char arg[24];
-        snprintf(arg, sizeof arg, "%llu", (unsigned long long)want);
-        char *a[] = { (char *)wp, arg, NULL };
-        uint64_t t0 = timer_uptime_ms();
-        int pid = process_create(wp, a, 2, NULL, 0);
-        if (pid < 0) { kprintf("[cmd] test swap: FAIL (spawn %d)\n", pid); return 1; }
-        int rc = process_wait((uint32_t)pid);
-        uint64_t dt = timer_uptime_ms() - t0;
-
-        swap_stats_get(&s1);
-        vmo_stats_get(&v1);
-        vm_fault_stats(&f1);
-        pmm_scan_stats(&pb1, &pa1);
+        /* TWICE: once with mmap memory and once with malloc's -- sbrk, the
+         * heap every ordinary program lives in, which became a pageable
+         * mapping after mmap did. Each run is judged on its own counters. */
+        static const char *const modes[] = { "mmap", "heap" };
         int ok = 1;
+        for (int m = 0; m < 2; m++) {
+            struct swap_stats s0, s1;
+            struct vmo_stats  v0, v1;
+            struct vm_fault_stats f0, f1;
+            uint64_t pb0, pa0, pb1, pa1;                 /* pmm scan bits / allocations */
+            swap_stats_get(&s0);
+            vmo_stats_get(&v0);
+            vm_fault_stats(&f0);
+            pmm_scan_stats(&pb0, &pa0);
 
-        kprintf("  [%s] the witness exited %d after %llu ms (0 = every page came back intact)\n",
-                rc == 0 ? "ok" : "FAIL", rc, (unsigned long long)dt);
-        if (rc != 0) ok = 0;
+            char arg[24];
+            snprintf(arg, sizeof arg, "%llu", (unsigned long long)want);
+            char *a[] = { (char *)wp, arg, (char *)modes[m], NULL };
+            uint64_t t0 = timer_uptime_ms();
+            int pid = process_create(wp, a, 3, NULL, 0);
+            if (pid < 0) { kprintf("[cmd] test swap: FAIL (spawn %d)\n", pid); return 1; }
+            int rc = process_wait((uint32_t)pid);
+            uint64_t dt = timer_uptime_ms() - t0;
 
-        /* WHERE THE TIME WENT. Not asserted; this is the breakdown that decides
-         * what to build next, and it is printed so that a claim about it can
-         * be checked against the run that made it. */
-        uint64_t calls = v1.reclaim_calls - v0.reclaim_calls;
-        kprintf("  [info] %llu faults resolved in %llu ms inside vm_fault (%llu us each, disk waits included)\n",
-                (unsigned long long)(f1.handled - f0.handled),
-                (unsigned long long)((f1.ns - f0.ns) / 1000000),
-                (unsigned long long)((f1.handled - f0.handled) ? (f1.ns - f0.ns) / 1000 / (f1.handled - f0.handled) : 0));
-        kprintf("  [info]   of which: in the object (wire, fill, swap-in) %llu ms, installing PTEs %llu ms\n",
-                (unsigned long long)((f1.wire_ns - f0.wire_ns) / 1000000),
-                (unsigned long long)((f1.map_ns - f0.map_ns) / 1000000));
-        kprintf("  [info]   a fill: frame %llu ms, zeroing %llu ms, record %llu ms; pmm scanned %llu bits over %llu allocations\n",
-                (unsigned long long)((v1.fill_frame_ns - v0.fill_frame_ns) / 1000000),
-                (unsigned long long)((v1.fill_zero_ns - v0.fill_zero_ns) / 1000000),
-                (unsigned long long)((v1.fill_record_ns - v0.fill_record_ns) / 1000000),
-                (unsigned long long)(pb1 - pb0), (unsigned long long)(pa1 - pa0));
-        kprintf("  [info] reclaim ran %llu times, examined %llu LRU nodes (%llu per call)\n",
-                (unsigned long long)calls,
-                (unsigned long long)(v1.lru_visited - v0.lru_visited),
-                (unsigned long long)(calls ? (v1.lru_visited - v0.lru_visited) / calls : 0));
-        kprintf("  [info] time: reclaim %llu ms total, of which swap I/O %llu ms and unmapping %llu ms\n",
-                (unsigned long long)((v1.reclaim_ns - v0.reclaim_ns) / 1000000),
-                (unsigned long long)((v1.swap_ns - v0.swap_ns) / 1000000),
-                (unsigned long long)((v1.unmap_ns - v0.unmap_ns) / 1000000));
+            swap_stats_get(&s1);
+            vmo_stats_get(&v1);
+            vm_fault_stats(&f1);
+            pmm_scan_stats(&pb1, &pa1);
 
-        uint64_t outs = s1.outs - s0.outs, ins = s1.ins - s0.ins;
-        kprintf("  [%s] pages went out to the store: %llu (%llu MiB), %llu of them as %llu cluster writes\n",
-                outs ? "ok" : "FAIL", (unsigned long long)outs, (unsigned long long)(outs / 256),
-                (unsigned long long)(s1.cluster_pages - s0.cluster_pages),
-                (unsigned long long)(s1.clusters - s0.clusters));
-        if (!outs) ok = 0;
-        kprintf("  [%s] pages came back from it: %llu\n", ins ? "ok" : "FAIL", (unsigned long long)ins);
-        if (!ins) ok = 0;
+            kprintf("  [%s] %s: the witness exited %d after %llu ms (0 = every page came back intact)\n",
+                    rc == 0 ? "ok" : "FAIL", modes[m], rc, (unsigned long long)dt);
+            if (rc != 0) ok = 0;
 
-        kprintf("  [%s] every slot returned after exit: %llu in use before, %llu after\n",
-                s1.used == s0.used ? "ok" : "FAIL",
-                (unsigned long long)s0.used, (unsigned long long)s1.used);
-        if (s1.used != s0.used) ok = 0;
+            /* WHERE THE TIME WENT. Not asserted; this is the breakdown that
+             * decides what to build next, and it is printed so that a claim
+             * about it can be checked against the run that made it. */
+            uint64_t calls = v1.reclaim_calls - v0.reclaim_calls;
+            kprintf("  [info] %llu faults resolved in %llu ms inside vm_fault (%llu us each, disk waits included)\n",
+                    (unsigned long long)(f1.handled - f0.handled),
+                    (unsigned long long)((f1.ns - f0.ns) / 1000000),
+                    (unsigned long long)((f1.handled - f0.handled) ? (f1.ns - f0.ns) / 1000 / (f1.handled - f0.handled) : 0));
+            kprintf("  [info]   of which: in the object (wire, fill, swap-in) %llu ms, installing PTEs %llu ms\n",
+                    (unsigned long long)((f1.wire_ns - f0.wire_ns) / 1000000),
+                    (unsigned long long)((f1.map_ns - f0.map_ns) / 1000000));
+            kprintf("  [info]   a fill: frame %llu ms, zeroing %llu ms, record %llu ms; pmm scanned %llu bits over %llu allocations\n",
+                    (unsigned long long)((v1.fill_frame_ns - v0.fill_frame_ns) / 1000000),
+                    (unsigned long long)((v1.fill_zero_ns - v0.fill_zero_ns) / 1000000),
+                    (unsigned long long)((v1.fill_record_ns - v0.fill_record_ns) / 1000000),
+                    (unsigned long long)(pb1 - pb0), (unsigned long long)(pa1 - pa0));
+            kprintf("  [info] reclaim ran %llu times, examined %llu LRU nodes (%llu per call)\n",
+                    (unsigned long long)calls,
+                    (unsigned long long)(v1.lru_visited - v0.lru_visited),
+                    (unsigned long long)(calls ? (v1.lru_visited - v0.lru_visited) / calls : 0));
+            kprintf("  [info] time: reclaim %llu ms total, of which swap I/O %llu ms and unmapping %llu ms\n",
+                    (unsigned long long)((v1.reclaim_ns - v0.reclaim_ns) / 1000000),
+                    (unsigned long long)((v1.swap_ns - v0.swap_ns) / 1000000),
+                    (unsigned long long)((v1.unmap_ns - v0.unmap_ns) / 1000000));
 
-        kprintf("  [%s] every anonymous page freed after exit: %llu resident / %llu swapped before, %llu / %llu after\n",
-                (v1.anon_pages == v0.anon_pages && v1.swapped_pages == v0.swapped_pages) ? "ok" : "FAIL",
-                (unsigned long long)v0.anon_pages, (unsigned long long)v0.swapped_pages,
-                (unsigned long long)v1.anon_pages, (unsigned long long)v1.swapped_pages);
-        if (!(v1.anon_pages == v0.anon_pages && v1.swapped_pages == v0.swapped_pages)) ok = 0;
+            uint64_t outs = s1.outs - s0.outs, ins = s1.ins - s0.ins;
+            kprintf("  [%s] pages went out to the store: %llu (%llu MiB), %llu of them as %llu cluster writes\n",
+                    outs ? "ok" : "FAIL", (unsigned long long)outs, (unsigned long long)(outs / 256),
+                    (unsigned long long)(s1.cluster_pages - s0.cluster_pages),
+                    (unsigned long long)(s1.clusters - s0.clusters));
+            if (!outs) ok = 0;
+            kprintf("  [%s] pages came back from it: %llu\n", ins ? "ok" : "FAIL", (unsigned long long)ins);
+            if (!ins) ok = 0;
+
+            /* The witness has exited and is reaped, but its address space is
+             * torn down by the kworker: wait for that before counting. */
+            for (int spin = 0; spin < 600 && kworker_pending(); spin++) sched_sleep_ms(5);
+            swap_stats_get(&s1);
+            vmo_stats_get(&v1);
+
+            /* WHAT MUST HOLD AFTERWARDS -- and what must not be asserted. The
+             * other processes' heaps and stacks are anonymous objects too, and
+             * the witness pushed them out to the store: those slots are in use
+             * afterwards and rightly so. So: every slot in use is a swapped
+             * page somebody owns (nothing leaked), and the anonymous pages in
+             * the system -- resident plus swapped -- are what they were before
+             * the witness, within what the desktop allocates in the meantime
+             * (a bound of 4 MiB against a witness of 200+ MiB is not a hedge). */
+            uint64_t before = v0.anon_pages + v0.swapped_pages;
+            uint64_t after  = v1.anon_pages + v1.swapped_pages;
+            {
+                uint64_t used = 0, dang = 0, dup = 0;
+                uint64_t outp = vmo_audit_swap(&used, &dang, &dup);
+                bool sound = (used == outp && dang == 0 && dup == 0);
+                kprintf("  [%s] every slot has an owner: %llu slots in use, %llu pages out on the store; %llu name a slot not held, %llu share a slot\n",
+                        sound ? "ok" : "FAIL", (unsigned long long)used, (unsigned long long)outp,
+                        (unsigned long long)dang, (unsigned long long)dup);
+                if (!sound) ok = 0;
+            }
+            kprintf("  [%s] the witness's pages are gone: %llu anonymous pages before (%llu resident, %llu swapped), %llu after (%llu, %llu)\n",
+                    after <= before + 1024 ? "ok" : "FAIL",
+                    (unsigned long long)before, (unsigned long long)v0.anon_pages, (unsigned long long)v0.swapped_pages,
+                    (unsigned long long)after, (unsigned long long)v1.anon_pages, (unsigned long long)v1.swapped_pages);
+            if (after > before + 1024) ok = 0;
+        }
 
         kprintf("[cmd] test swap: %s\n", ok ? "OK" : "FAIL");
         return 1;
