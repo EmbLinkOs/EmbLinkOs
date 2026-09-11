@@ -1719,7 +1719,12 @@ violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
 
 ## Filesystem: mounting is two calls, and that is a sharp edge
 
-- [ ] **`embkfs_mount()` does not produce a write-capable volume.** It reads the
+- [x] ~~**`embkfs_mount()` does not produce a write-capable volume.**~~ **Closed:**
+      `embkfs_mount()` is one call now (superblock, root, allocator, sweep; EIO
+      past a good superblock), and the superblock-only half is named for what
+      it is, `embkfs_probe_superblock()`, used by the self-heal and verify-boot
+      probes that must not sweep a live device through a scratch descriptor.
+      The original note: It reads the
       superblock and finds the root; `embkfs_finish_mount()` (static, embkfs.c)
       verifies the root node, BUILDS THE ALLOCATOR and sweeps orphans. A volume
       that has only been through the first has an empty free index and refuses

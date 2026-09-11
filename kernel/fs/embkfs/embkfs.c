@@ -1541,7 +1541,16 @@ static bool embkfs_unlock_volume(struct embk_block_device *dev, struct embkfs_vo
  * pointer into the metadata tree.
  */
 
-int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
+/* THE SUPERBLOCK HALF of a mount, and no more: read and verify the
+ * superblock -- the format's root of trust -- and fill `vol` from it. On its
+ * own this does NOT produce a usable volume: no root node read, no allocator
+ * built, no orphans swept, and a volume left here refuses every allocation
+ * with ENOSPC. That is why it is no longer the function called `mount`. It
+ * exists by name for the tests that probe superblock acceptance on a live
+ * device through a scratch descriptor (self-heal, verify-boot), which must
+ * not sweep or allocate on that device's behalf. Everything else calls
+ * embkfs_mount(). */
+int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume *vol)
 {
     if (!dev || !vol) {
         return -EMBK_EINVAL;
@@ -6916,7 +6925,7 @@ static int embkfs_run_selfheal_selftests_impl(void)
      * volume from an automated (non-interactive) test run. */
     struct embkfs_volume *scratch = kmalloc(sizeof *scratch);
     if (!scratch) { kfree(primary_snapshot); kfree(corrupted); return -EMBK_ENOMEM; }
-    rc = embkfs_mount(dev, scratch);
+    rc = embkfs_probe_superblock(dev, scratch);
     if (rc != EMBK_OK) {
         kprintf("EMBKFS: selfheal: FAIL remount after corrupting backup: %s\n", embk_strerror(rc));
         ok = false;
@@ -6940,7 +6949,7 @@ static int embkfs_run_selfheal_selftests_impl(void)
         struct embkfs_volume *scratch2 = kmalloc(sizeof *scratch2);
         if (!scratch2) { ok = false; }
         else {
-            rc = embkfs_mount(dev, scratch2);
+            rc = embkfs_probe_superblock(dev, scratch2);
             if (rc != EMBK_OK) {
                 kprintf("EMBKFS: selfheal: FAIL remount after repair: %s\n", embk_strerror(rc));
                 ok = false;
@@ -7307,7 +7316,7 @@ static int embkfs_run_verifyboot_selftests_impl(void)
         struct embkfs_volume *scratch = kmalloc(sizeof *scratch);
         if (!scratch) { ok = false; }
         else {
-            rc = embkfs_mount(dev, scratch);
+            rc = embkfs_probe_superblock(dev, scratch);
             if (rc != EMBK_OK) {
                 kprintf("EMBKFS: verifyboot: FAIL mount with a CORRECT hmac was refused: %s\n", embk_strerror(rc));
                 ok = false;
@@ -7330,7 +7339,7 @@ static int embkfs_run_verifyboot_selftests_impl(void)
         struct embkfs_volume *scratch = kmalloc(sizeof *scratch);
         if (!scratch) { ok = false; }
         else {
-            rc = embkfs_mount(dev, scratch);
+            rc = embkfs_probe_superblock(dev, scratch);
             if (rc == EMBK_OK) {
                 kprintf("EMBKFS: verifyboot: FAIL mount with a TAMPERED root was accepted\n");
                 ok = false;
@@ -7679,6 +7688,25 @@ static bool embkfs_finish_mount(struct embkfs_volume *vol)
     return true;
 }
 
+/*
+ * Mount: the superblock, then the root node, the allocator and the orphan
+ * sweep -- ONE call, and the volume it returns is usable. It used to be two
+ * (embkfs_mount then a static embkfs_finish_mount), and a caller that made
+ * only the first got a volume that reported free blocks and refused every
+ * allocation with ENOSPC; the crash-consistency test lost a round to exactly
+ * that. A mount that gets past the superblock and fails after it is EIO: the
+ * device is readable, the volume on it is not usable.
+ */
+int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
+{
+    int rc = embkfs_probe_superblock(dev, vol);
+    if (rc != EMBK_OK)
+        return rc;
+    if (!embkfs_finish_mount(vol))
+        return -EMBK_EIO;
+    return EMBK_OK;
+}
+
 void embkfs_init(void)
 {
     kprintf("\n=== EMBKFS init ===\n");
@@ -7710,8 +7738,6 @@ void embkfs_init(void)
             continue;
         struct embkfs_volume *slot = &g_embkfs_volumes[g_embkfs_volume_count];
         if (embkfs_mount(d, slot) != EMBK_OK)
-            continue;
-        if (!embkfs_finish_mount(slot))
             continue;
         g_embkfs_volume_count++;
     }
@@ -8380,7 +8406,7 @@ static int embkfs_run_crash_selftests_impl(struct embk_block_device *seed)
      * -- which is what the first version of this test found on a fresh 4 MiB
      * format with 1018 free blocks, and mistook for a size bug. The boot path
      * has always done both; so does every mount here. */
-    if (embkfs_mount(&dev, vol) != EMBK_OK || !embkfs_finish_mount(vol)) { kprintf("  [FAIL] the seed image does not mount\n"); goto fail; }
+    if (embkfs_mount(&dev, vol) != EMBK_OK) { kprintf("  [FAIL] the seed image does not mount\n"); goto fail; }
     kprintf("  mounted: read_only=%d generation=%llu free_blocks=%llu block_size=%u\n",
             (int)vol->read_only, (unsigned long long)vol->generation,
             (unsigned long long)vol->free_blocks, (unsigned)vol->block_size);
@@ -8391,7 +8417,7 @@ static int embkfs_run_crash_selftests_impl(struct embk_block_device *seed)
     uint64_t total_writes = r->writes;
     memset(vol, 0, sizeof *vol);
     int mok = 1, k0 = -2;
-    if (embkfs_mount(&dev, vol) == EMBK_OK && embkfs_finish_mount(vol)) k0 = crash_match(vol, &mok);
+    if (embkfs_mount(&dev, vol) == EMBK_OK) k0 = crash_match(vol, &mok);
     kprintf("  [%s] uncut: %llu device writes, remount sees the state after all %d commits (k=%d)\n",
             k0 == CRASH_NOPS ? "ok" : "FAIL", (unsigned long long)total_writes, CRASH_NOPS, k0);
     if (k0 != CRASH_NOPS) goto fail;
@@ -8404,7 +8430,7 @@ static int embkfs_run_crash_selftests_impl(struct embk_block_device *seed)
             memcpy(data, pristine, bytes);
             memset(vol, 0, sizeof *vol);
             r->writes = 0; r->cut = cut; r->tear = tear; r->dropped = 0; r->torn = 0;
-            if (embkfs_mount(&dev, vol) != EMBK_OK || !embkfs_finish_mount(vol)) { unmountable++; continue; }
+            if (embkfs_mount(&dev, vol) != EMBK_OK) { unmountable++; continue; }
             r->writes = 0;                           /* the cut counts WORKLOAD writes, not mount's */
             crash_workload(vol);
 
@@ -8416,7 +8442,7 @@ static int embkfs_run_crash_selftests_impl(struct embk_block_device *seed)
             /* The remount after the crash: superblock, root, allocator, and the
              * orphan sweep -- whose writes are RECOVERY and are counted below
              * as self-heal, not hidden. */
-            if (embkfs_mount(&dev, vol) != EMBK_OK || !embkfs_finish_mount(vol)) {
+            if (embkfs_mount(&dev, vol) != EMBK_OK) {
                 unmountable++;
                 if (first_bad < 0) first_bad = (int)cut;
                 continue;

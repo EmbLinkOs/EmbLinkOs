@@ -736,7 +736,14 @@ void embkfs_lockstat_reset(void);
 /* Probe one block device: read + verify the superblock at byte 65536, and on
  * success fill *vol. Returns EMBK_OK, or -EMBK_EINVAL if the device isn't an
  * EMBKFS volume (or its superblock is corrupt). */
+/* Mount `dev` into `vol`: superblock, root node, allocator, orphan sweep --
+ * ONE call, and the volume is usable. EIO if the superblock is fine and the
+ * volume behind it is not. */
 int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol);
+/* The superblock half only: verify it and fill `vol` from it. NOT a usable
+ * volume -- for tests that probe superblock acceptance on a live device
+ * through a scratch descriptor and must not allocate or sweep on its behalf. */
+int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume *vol);
 
 /* Read the block `ptr` targets and verify it as a tree node, against `ptr`
  * itself. On success `buf` holds the whole block_size-byte block. Used for
