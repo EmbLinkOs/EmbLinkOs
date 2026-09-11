@@ -118,11 +118,22 @@ def main(cmds):
             with lock: buf.extend(b)
     threading.Thread(target=reader, daemon=True).start()
 
+    # KEYSTROKES A TEST ASKS FOR. A few tests prove the real keyboard IRQ path
+    # and so cannot fake the key from software: they print a marker and wait.
+    # Seen while waiting for a verdict, the key is sent through the monitor --
+    # once per marker occurrence.
+    KEY_ON_MARKER = {b"(send ^C now)": "sendkey ctrl-c"}
+    sent = {}
     def wait_for(needle, secs):
         dl = time.time() + secs; nb = needle.encode()
         while time.time() < dl:
             with lock:
                 if nb in buf: return True
+                pending = [(m, k) for m, k in KEY_ON_MARKER.items() if buf.count(m) > sent.get(m, 0)]
+            for m, k in pending:
+                time.sleep(0.3)
+                hmp(k)
+                sent[m] = sent.get(m, 0) + 1
             time.sleep(0.05)
         return False
 
@@ -133,6 +144,7 @@ def main(cmds):
         time.sleep(1.5)
         for c in cmds:
             with lock: buf.clear()
+            sent.clear()
             p.stdin.write((c + "\n").encode()); p.stdin.flush()
             if not wait_for("[cmd] " + c, timeout):
                 hang_report("NO VERDICT for %r within %ds -- stopping" % (c, timeout))

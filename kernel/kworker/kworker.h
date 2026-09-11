@@ -37,6 +37,11 @@ void kworker_defer_vmo_put_locked(struct vnode vn, struct vm_object *obj);
 struct vm_area;
 void kworker_defer_address_space_locked(uint64_t pml4_phys, struct vm_area *vmas);
 
+/* Defer the end of session `sid` (its leader just died): kill whatever is
+ * still running in it. Must be called with g_sched_lock held -- the leader's
+ * death is noticed there, and ending a session takes that lock per kill. */
+void kworker_defer_session_end_locked(uint32_t sid);
+
 /* EmbDBG v2 Kernel Object Explorer: how many deferred-teardown items are queued
  * right now (g_head - g_tail). A racy debug sample; no lock. */
 uint32_t kworker_pending(void);

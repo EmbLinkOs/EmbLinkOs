@@ -24,6 +24,7 @@
 #include "lib/ksym.h"         /* test debugsym: the panic symbolizer */
 #include "tty/tty.h"
 #include "drivers/input/keyboard.h"
+#include "ipc/clipboard.h"                   /* test session: whose the clipboard is */
 #include "process/ksync.h"
 #include "mm/kheap.h"
 #include "mm/vmm.h"
@@ -436,6 +437,7 @@ static void selftests_print_commands(void)
     kprintf("  test swap store     (needs a swap disk: make test-swap-store)\n");
     kprintf("  test swap           (anonymous memory > RAM survives: make test-swap)\n");
     kprintf("  test kill io        (a process killed inside the filesystem leaves it usable)\n");
+    kprintf("  test session        (sessions: identity, inheritance, the gates, logout)\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1519,6 +1521,122 @@ int selftests_handle_command(const char *cmd)
         }
         int rc = embkfs_run_crash_selftests(seed);
         kprintf("[cmd] test embkfs crash: %s\n", rc == EMBK_OK ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test session -- whose a process is, and what that decides.
+     *
+     * The witness (user/bin/sessprobe.c) is spawned into sessions this test
+     * names -- the console holds EMBK_CAP_SESSION, as init does -- and each
+     * mode is one claim: identity and inheritance, no minting, the kill-by-pid
+     * gate, clipboard isolation, logout from inside and from outside, a
+     * session that ends with its leader, the console's ^C slot. */
+    if (strcmp(cmd, "test session") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test session: VFS not registered\n"); return 1; }
+        const char *wp = "/data/apps/sessprobe/sessprobe.elf";
+        struct vfs_stat wst;
+        if (vfs_stat(wp, &wst) != EMBK_OK) { kprintf("\n[cmd] test session: %s not on image\n", wp); return 1; }
+        kprintf("\n[session] the witness runs in sessions this test opens\n");
+        int ok = 1;
+
+        /* Spawn the witness in a NEW session for `user` (or in ours if NULL). */
+        #define SP_SPAWN(user, ...) ({                                              \
+            char *a_[] = { (char *)wp, __VA_ARGS__, NULL };                          \
+            int n_ = 0; while (a_[n_]) n_++;                                         \
+            struct spawn_file_action act_; memset(&act_, 0, sizeof act_);            \
+            int na_ = 0;                                                              \
+            if (user) { act_.kind = SPAWN_ACTION_NEW_SESSION;                        \
+                        strncpy(act_.path, (user), sizeof act_.path - 1); na_ = 1; } \
+            process_create(wp, a_, n_, na_ ? &act_ : NULL, na_); })
+        #define SP_RUN(user, ...) ({ int p_ = SP_SPAWN(user, __VA_ARGS__);          \
+            p_ < 0 ? p_ : process_wait((uint32_t)p_); })
+        #define SP_CHECK(cond, ...) do { kprintf("  [%s] ", (cond) ? "ok" : "FAIL"); \
+            kprintf(__VA_ARGS__); kprintf("\n"); if (!(cond)) ok = 0; } while (0)
+
+        /* How many processes a session still has, waiting for the stragglers
+         * of an ended session to reach their exits (a kill is deferred to the
+         * victim's next safe point). */
+        #define SP_LIVE(sid) ({ uint32_t c_ = 0;                                     \
+            for (int w_ = 0; w_ < 400; w_++) {                                        \
+                struct session_row r_[16]; int n_ = session_list(r_, 16); c_ = 0;     \
+                for (int i_ = 0; i_ < n_; i_++) if (r_[i_].id == (sid)) c_ = r_[i_].procs; \
+                if (!c_ && !kworker_pending()) break;                                 \
+                sched_sleep_ms(5);                                                    \
+            } c_; })
+
+        int rc = SP_RUN("alice", "info", "alice");
+        SP_CHECK(rc == 0, "identity: a session for alice, not the system's, no power to open sessions, and the child is in it (exit %d)", rc);
+
+        rc = SP_RUN("alice", "mint");
+        SP_CHECK(rc == 0, "a session cannot open another: NEW_SESSION and CAP_SESSION both refused (exit %d)", rc);
+
+        struct spawn_file_action bad; memset(&bad, 0, sizeof bad);
+        bad.kind = SPAWN_ACTION_NEW_SESSION; strcpy(bad.path, "Bad/Name");
+        { char *a[] = { (char *)wp, "sleep", NULL };
+          rc = process_create(wp, a, 2, &bad, 1); }
+        if (rc > 0) { process_kill((uint32_t)rc); process_wait((uint32_t)rc); }
+        SP_CHECK(rc == -EMBK_EINVAL, "a session name that is not a username is refused (rc %d)", rc);
+
+        /* A system-session process and a kernel thread for the kill gate. */
+        int sys0 = SP_SPAWN(NULL, "sleep");
+        uint32_t kth = 0;
+        { struct process_info rows[MAX_PROCESSES]; int n = process_list(rows, MAX_PROCESSES);
+          for (int i = 0; i < n && !kth; i++) if (rows[i].is_kthread) kth = rows[i].pid; }
+        char s0[16], sk[16];
+        snprintf(s0, sizeof s0, "%d", sys0); snprintf(sk, sizeof sk, "%u", kth);
+        rc = SP_RUN("bob", "kill", s0, sk);
+        SP_CHECK(rc == 0 && process_alive((uint32_t)sys0),
+                 "kill by pid: another session's and a kernel thread's refused, one's own child killed (exit %d, pid %d still alive %d)",
+                 rc, sys0, (int)process_alive((uint32_t)sys0));
+
+        /* The console's ^C slot, taken by the system session. */
+        keyboard_set_interrupt_target((uint32_t)sys0);
+        rc = SP_RUN("erin", "route");
+        keyboard_set_interrupt_target(0);
+        SP_CHECK(rc == 0, "the console's ^C cannot be taken from another session (exit %d)", rc);
+        process_kill((uint32_t)sys0); (void)process_wait((uint32_t)sys0);
+
+        /* Clipboard: alice copies and stays; bob looks. */
+        int a = SP_SPAWN("alice", "clipset", "s3cret-password");
+        uint32_t sid_a = 0;
+        (void)process_session_of((uint32_t)a, &sid_a);
+        for (int w = 0; w < 400 && clipboard_owner_session() != sid_a; w++) sched_sleep_ms(5);
+        SP_CHECK(sid_a && clipboard_owner_session() == sid_a, "alice's clipboard holds her copy (session %u)", sid_a);
+        { struct process_info rows[MAX_PROCESSES]; int n = process_list(rows, MAX_PROCESSES), seen = 0;
+          for (int i = 0; i < n; i++) if (rows[i].pid == (uint32_t)a && rows[i].session_id == sid_a) seen = 1;
+          SP_CHECK(seen, "ps shows alice's process in her session"); }
+        rc = SP_RUN("bob", "clipget");
+        SP_CHECK(rc == 0, "bob, in another session, sees an empty clipboard (%d bytes)", rc);
+
+        /* Logout from outside -- what init does -- ends her session. */
+        int nk = session_end(sid_a, true);
+        rc = process_wait((uint32_t)a);
+        uint32_t left = SP_LIVE(sid_a);
+        SP_CHECK(rc == EMBK_EXIT_LOGOUT && left == 0 && clipboard_owner_session() == 0,
+                 "ending alice's session: %d stopped, leader exit 0x%x (want 0x%x), %u left, clipboard wiped %d",
+                 nk, (unsigned)rc, (unsigned)EMBK_EXIT_LOGOUT, left, (int)(clipboard_owner_session() == 0));
+
+        /* A leader that exits without logging out: the session ends anyway. */
+        int c = SP_SPAWN("carol", "linger");
+        uint32_t sid_c = 0; (void)process_session_of((uint32_t)c, &sid_c);
+        rc = process_wait((uint32_t)c);
+        left = SP_LIVE(sid_c);
+        SP_CHECK(rc == 0 && sid_c && left == 0,
+                 "a leader that exits takes its session with it: the child it left running is stopped (%u left)", left);
+
+        /* Logout from inside: the session, the caller included. */
+        int d = SP_SPAWN("dave", "logout");
+        uint32_t sid_d = 0; (void)process_session_of((uint32_t)d, &sid_d);
+        rc = process_wait((uint32_t)d);
+        left = SP_LIVE(sid_d);
+        SP_CHECK(rc == EMBK_EXIT_LOGOUT && left == 0,
+                 "logging out from inside: leader exit 0x%x (want 0x%x), %u left", (unsigned)rc, (unsigned)EMBK_EXIT_LOGOUT, left);
+
+        #undef SP_SPAWN
+        #undef SP_RUN
+        #undef SP_CHECK
+        #undef SP_LIVE
+        kprintf("[cmd] test session: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

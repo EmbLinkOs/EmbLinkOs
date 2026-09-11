@@ -11,7 +11,8 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/vma.h"
-#include "kworker/kworker.h"   /* the address space of a dead process is torn down there */
+#include "kworker/kworker.h"
+#include "ipc/clipboard.h"     /* clipboard_session_ended */   /* the address space of a dead process is torn down there */
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "include/kstring.h"
@@ -207,6 +208,12 @@ static struct process *process_alloc(void) {
              * for user processes (attenuated from the parent); left as-is for
              * kernel threads, which ARE the kernel and hold the full set. */
             process_table[i].cap_set = EMBK_CAP_ALL;
+            /* The system session until process_create_caps says otherwise:
+             * kernel threads and the adopted console context belong to no
+             * user. A reused slot must not inherit its last occupant's. */
+            process_table[i].session_id = 0;
+            process_table[i].session_user[0] = 0;
+            process_table[i].session_leader = false;
             /* Namespace: default INACTIVE (global-mount fallback) -- the safe
              * reset for a REUSED slot and the resting state for kernel threads.
              * process_create_caps installs the real per-process view for user
@@ -643,6 +650,13 @@ static struct process *thread_zombie_locked(struct thread *t) {
 
     if (was_linked) {
         proc->live_thread_count--;
+        /* THE LEADER IS GONE, so the session is over: whatever it started and
+         * left running dies too. Deferred to the kworker because this runs
+         * under the scheduler lock and ending a session takes it (once per
+         * process killed). The session id is captured now; the slot may be
+         * reused before the worker runs. */
+        if (proc->live_thread_count == 0 && proc->session_leader && proc->session_id)
+            kworker_defer_session_end_locked(proc->session_id);
         if (proc->live_thread_count == 0) {
             /* Snapshot NOW, before the switch-away (schedule_locked()'s
              * own prev-demotion section) clears the thread's own
@@ -1206,6 +1220,10 @@ int process_is_cancelled(uint32_t pid) {
  * -------------------------------------------------------------------- */
 
 void process_kill(uint32_t pid) {
+    process_kill_code(pid, -1);
+}
+
+void process_kill_code(uint32_t pid, int code) {
     spin_lock(&g_sched_lock);
 
     struct process *proc = process_find(pid);
@@ -1220,8 +1238,9 @@ void process_kill(uint32_t pid) {
         return;   // already fully exited; nothing left to force
     }
 
-    proc->exit_code = -1;   // killed, not a normal exit -- set once, for
-                             // whenever the process (every thread) actually finishes
+    proc->exit_code = code; // killed, not a normal exit (-1 unless the killer says
+                             // otherwise -- a logout) -- set once, for whenever the
+                             // process (every thread) actually finishes
     proc->cancelled = true;  // a killed process is certainly cancelled: every
                              // interruptible sleep in the kernel returns, and the
                              // thread reaches its exit
@@ -1298,6 +1317,112 @@ void process_kill(uint32_t pid) {
     }
 
     spin_unlock(&g_sched_lock);
+}
+
+/* --------------------------------------------------------------------
+ * Sessions -- see struct process::session_id.
+ * -------------------------------------------------------------------- */
+
+int process_session_of(uint32_t pid, uint32_t *out_session) {
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    int rc = -EMBK_ENOENT;
+    if (p && p->live_thread_count > 0) {
+        if (out_session) *out_session = p->session_id;
+        rc = EMBK_OK;
+    }
+    spin_unlock(&g_sched_lock);
+    return rc;
+}
+
+int session_end(uint32_t sid, bool logout) {
+    if (sid == 0)
+        return -EMBK_EPERM;              /* the system session is not a user's to end */
+
+    int killed = 0;
+    bool self_in = current_thread && current_process->session_id == sid;
+    bool self_leader = self_in && current_process->session_leader;
+
+    /* ROUNDS, because a kill is a flag the victim acts on at its next safe
+     * point: a member in the middle of a spawn finishes it before it dies, and
+     * the child it made is in the session too. So every round kills what is
+     * NEW -- each process exactly once -- and the loop runs until a round
+     * finds nothing new and every process already killed is gone (or ~1 s
+     * has passed: a victim blocked on a lock completes its path and dies, it
+     * is not waited for forever). Members before the leader within a round:
+     * the leader's death is what its waiter sees. The caller, if it is in the
+     * session, is left for the very end. */
+    uint32_t done[MAX_PROCESSES];
+    int nd = 0;
+    for (int round = 0; round < 100; round++) {
+        uint32_t fresh[MAX_PROCESSES];
+        uint32_t leader = 0;
+        int nf = 0, alive = 0;
+        spin_lock(&g_sched_lock);
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            struct process *p = &process_table[i];
+            if (p->pid == 0 || p->live_thread_count == 0 || p->session_id != sid)
+                continue;
+            if (current_thread && p == current_process)
+                continue;
+            bool seen = false;
+            for (int k = 0; k < nd && !seen; k++) seen = (done[k] == p->pid);
+            if (seen) { alive++; continue; }
+            if (p->session_leader) leader = p->pid;
+            else fresh[nf++] = p->pid;
+        }
+        spin_unlock(&g_sched_lock);
+        if (nf == 0 && leader == 0) {
+            if (alive == 0)
+                break;
+            if (current_thread) sched_sleep_ms(10);   /* the killed are on their way out */
+            continue;
+        }
+        for (int i = 0; i < nf; i++) {
+            process_kill_code(fresh[i], -1);
+            done[nd++] = fresh[i];
+            killed++;
+        }
+        if (leader) {
+            process_kill_code(leader, logout ? EMBK_EXIT_LOGOUT : -1);
+            done[nd++] = leader;
+            killed++;
+        }
+    }
+
+    /* What the session left in shared kernel state. */
+    clipboard_session_ended(sid);
+
+    if (self_in) {
+        /* Last, and never returns: process_kill of the current process hands
+         * this core to the scheduler. */
+        process_kill_code(current_process->pid, (self_leader && logout) ? EMBK_EXIT_LOGOUT : -1);
+    }
+    return killed;
+}
+
+int session_list(struct session_row *out, int max) {
+    int n = 0;
+    spin_lock(&g_sched_lock);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        struct process *p = &process_table[i];
+        if (p->pid == 0 || p->live_thread_count == 0 || p->session_id == 0)
+            continue;
+        int k = 0;
+        while (k < n && out[k].id != p->session_id) k++;
+        if (k == n) {
+            if (n == max) continue;
+            out[n].id = p->session_id;
+            out[n].leader_pid = 0;
+            out[n].procs = 0;
+            memcpy(out[n].user, p->session_user, sizeof out[n].user);
+            n++;
+        }
+        out[k].procs++;
+        if (p->session_leader) out[k].leader_pid = p->pid;
+    }
+    spin_unlock(&g_sched_lock);
+    return n;
 }
 
 /* --------------------------------------------------------------------
@@ -1481,6 +1606,7 @@ int process_list(struct process_info *out, int max) {
         out[n].priority = p->thread_list ? p->thread_list->priority : 0;
         out[n].exit_code = p->exit_code;
         out[n].is_kthread = (p->pml4_phys == vmm_get_kernel_pml4());
+        out[n].session_id = p->session_id;
         out[n].cpu_ns = 0;
         for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
             out[n].cpu_ns += t->cpu_ns;
@@ -2078,6 +2204,49 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         }
     }
 
+    /* The session -- whose this process is. Inherited from the spawner, like
+     * everything else a process is born with; replaced only by a NEW_SESSION
+     * action, which only a holder of EMBK_CAP_SESSION may make and which
+     * STRIPS that capability from the child: a session can never open another
+     * one. Checked here, before the address space exists, so a refusal is
+     * just "release the slot" like the capability and namespace refusals
+     * above. See struct process::session_id. */
+    {
+        if (current_thread) {
+            proc->session_id = current_process->session_id;
+            memcpy(proc->session_user, current_process->session_user, sizeof proc->session_user);
+        }
+        for (int i = 0; i < n_count; i++) {
+            if (actions[i].kind != SPAWN_ACTION_NEW_SESSION)
+                continue;
+            if (current_thread && !(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_SESSION))) {
+                proc->pid = 0;
+                return -EMBK_EPERM;
+            }
+            /* A username, and only a username: [a-z0-9_-], 1..31. The same
+             * rule the account store enforces, repeated here because this is
+             * the identity every gate compares, and "the caller checked" is
+             * not a property of the kernel. */
+            const char *u = actions[i].path;
+            size_t ul = 0;
+            while (ul < sizeof proc->session_user && u[ul]) ul++;   /* bounded: the kernel has no strnlen */
+            bool valid = ul > 0 && ul < sizeof proc->session_user;
+            for (size_t k = 0; valid && k < ul; k++)
+                valid = (u[k] >= 'a' && u[k] <= 'z') || (u[k] >= '0' && u[k] <= '9') ||
+                        u[k] == '_' || u[k] == '-';
+            if (!valid) {
+                proc->pid = 0;
+                return -EMBK_EINVAL;
+            }
+            static uint32_t g_next_session_id = 1;
+            proc->session_id = __atomic_fetch_add(&g_next_session_id, 1, __ATOMIC_RELAXED);
+            memset(proc->session_user, 0, sizeof proc->session_user);
+            memcpy(proc->session_user, u, ul);
+            proc->session_leader = true;
+            proc->cap_set &= ~EMBK_CAP_BIT(EMBK_CAP_SESSION);
+            break;
+        }
+    }
     proc->zombie_next = NULL;
     proc->vma_list = 0;   /* no mappings until mmap() makes one */
     proc->zombie_head = NULL;
@@ -2242,6 +2411,8 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         } else if (act->kind == SPAWN_ACTION_NS_BIND) {
             /* Not a file action -- the namespace grant was already built and
              * installed into proc->ns at creation (below the cap grant). Skip. */
+        } else if (act->kind == SPAWN_ACTION_NEW_SESSION) {
+            /* Not a file action -- the session was granted at creation. Skip. */
         } else if (act->kind == SPAWN_ACTION_DEBUG) {
             /* Born under debug (§6.2). Only note it here; the session is
              * created and the child parked at the very end, once its thread and

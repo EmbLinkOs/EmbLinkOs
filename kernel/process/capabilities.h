@@ -63,7 +63,16 @@
  * debug syscalls (69-75) refuse without it — which is the "coarse gate governs
  * which handles a parent installs" step the header note below anticipated. */
 #define EMBK_CAP_DEBUG      10
-#define EMBK_CAP_MAX_ID      10
+/* cap_id 11 -- the authority to OPEN A SESSION: to spawn a process that
+ * belongs to a user (SPAWN_ACTION_NEW_SESSION). Held by init, which
+ * authenticates people, and by the kernel. A process that enters a session
+ * loses it -- the kernel strips it from every session leader -- so nothing a
+ * user runs can ever mint a session for someone else, however it attenuates
+ * or does not. It also carries the authority to act ACROSS sessions (kill by
+ * pid, end another session), which is the same authority seen from the
+ * other side. */
+#define EMBK_CAP_SESSION    11
+#define EMBK_CAP_MAX_ID      11
 
 #define EMBK_CAP_BIT(id)  (1ULL << (id))
 

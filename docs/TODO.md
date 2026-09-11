@@ -2011,6 +2011,54 @@ Open, in the order they matter:
   the first `sbrk`. Nothing reads it for an anonymous object today (fills are
   zero, wires ignore it); if anything ever does, set it on extension.
 
+## Sessions: more than one user (audit gap)
+
+EmbLink has no uid, and is not getting one: authority is the namespace and the
+capability set. What a multi-user machine needed on top was IDENTITY -- which
+person a process runs for -- so the few places a process can reach beyond
+what it was handed can ask "is that one of yours".
+
+- [x] **Kernel sessions.** `struct process` carries `session_id`,
+  `session_user` and `session_leader`, inherited by every child and never
+  changeable from inside. A session is opened only by a spawn with
+  `SPAWN_ACTION_NEW_SESSION`, which needs the new `EMBK_CAP_SESSION` (init and
+  the kernel hold it) and which the kernel strips from the child: a session
+  can never open another. Usernames only (`[a-z0-9_-]`, 1-31) -- the kernel
+  checks it, it does not trust the caller to have. Session 0 is the system.
+- [x] **A session ends with its leader.** When the leader's last thread dies,
+  the kworker stops everything still in the session. Before this, logging
+  out (the desktop exiting) left every app it had started running, orphaned,
+  into the next user's session. `SYS_session_end` (114) is logout: the
+  caller's own session, or any with `CAP_SESSION`; the leader dies last with
+  `EMBK_EXIT_LOGOUT` so its waiter can tell a logout from a crash.
+- [x] **The single-user concessions are gated by session** -- each was
+  documented in the code as exactly that:
+  - `SYS_proc_kill` (kill by pid, the shell's `kill`): your own session's
+    processes only, never a kernel thread (the writeback thread or the
+    kworker killed is a machine that hangs later).
+  - The clipboard: per session. A copy is invisible to other sessions and
+    wiped -- zeroed -- when its session ends. (User A's copied password was
+    pasteable by user B.)
+  - The console's ^C slot: cannot be taken or cleared while it points into
+    another session.
+- [x] **Found on the way: `console_interrupt_route(0)` meant "myself" -- and
+  0 is also a process's FIRST spawn handle.** A shell routing ^C to its first
+  child routed it to itself, so the ^C meant for the child cancelled the
+  shell. SELF is -2 now (`EMBK_INTR_ROUTE_SELF`). `test ctrlc` (primtest's
+  delegation to its first child) could not pass that way, by inspection; it
+  had never been run by the console harness, which could not send a key --
+  `tools/console_test.py` now sends `sendkey ctrl-c` when a test prints
+  `(send ^C now)`, and it passes.
+- [x] `whoami` asks the kernel (`SYS_session_info`, 113) instead of reading
+  `$USER`, which is whatever the parent put in the environment. `ps` has a
+  `sess` column; `session` returns `{id, user, leader}`.
+- [x] `test session` (`user/bin/sessprobe.c`): identity and inheritance; no
+  minting (NEW_SESSION and asking for the cap back, both refused); a
+  non-username refused; kill-by-pid gated three ways; the ^C slot; clipboard
+  isolation, wipe on end; logout from outside and from inside
+  (`EMBK_EXIT_LOGOUT`, nothing left); a leader that just exits takes its
+  session with it.
+
 ## Process & Scheduling
 
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant

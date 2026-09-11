@@ -72,6 +72,7 @@
 #define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
 #define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */
 #define EMBK_SPAWN_ACTION_NS_BIND     7   /* narrow child namespace; `path`=prefix, `flags`=mode */
+#define EMBK_SPAWN_ACTION_NEW_SESSION 8   /* child leads a new session for user `path` */
 
 /* Coarse resource-class capabilities (kernel capabilities.h, EMBX spec §5.6).
  * A child's set is a subset of its parent's; declare a subset via a
@@ -85,6 +86,8 @@
 #define EMBK_CAP_SERIAL      7
 #define EMBK_CAP_RAWDISK     8
 #define EMBK_CAP_KERNEL_EXT  9
+#define EMBK_CAP_DEBUG      10
+#define EMBK_CAP_SESSION    11   /* open a session for a user; init only -- see embk_action_new_session */
 #define EMBK_CAP_BIT(id)     (1u << (id))
 struct embk_spawn_file_action {
     unsigned char kind;         /* EMBK_SPAWN_ACTION_* */
@@ -185,6 +188,7 @@ struct embk_proc_info {
                                  * EXECUTING -- a thread halted or blocked is
                                  * charged nothing, which is the difference
                                  * between this and wall time. */
+    uint32_t      session_id;   /* whose it is: 0 = the system session */
 };
 /* Snapshot every live process (the shell's ps). Returns the count written
  * (<= max), or -EMBK_*. */
@@ -192,8 +196,9 @@ static inline int embk_proc_list(struct embk_proc_info *out, int max) {
     return (int)embk_syscall2(EMBK_SYS_proc_list, (int64_t)(intptr_t)out, max);
 }
 /* Kill by PID (the shell's kill). Unlike embk_kill (handle-scoped to your
- * own children), this is the single-user OS's ambient process-manager
- * authority. 0, or -EMBK_ENOENT if no such live pid. */
+ * own children), this names any pid -- but only one in YOUR session may be
+ * killed this way (-EMBK_EPERM otherwise, and always for a kernel thread).
+ * 0, or -EMBK_ENOENT if no such live pid. */
 static inline int embk_proc_kill(uint32_t pid) {
     return (int)embk_syscall1(EMBK_SYS_proc_kill, (int64_t)pid);
 }
@@ -334,6 +339,65 @@ static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
     a->kind = EMBK_SPAWN_ACTION_SET_CAPS;
     a->target_fd = 0; a->path[0] = 0; a->flags = (int)cap_mask;
     a->mode = 0; a->src_obj_handle = 0;
+}
+
+/* The kernel's error codes -- a syscall that fails returns one NEGATED. The
+ * values are the kernel's own (kernel/include/errno.h); only the ones a
+ * program is likely to branch on are mirrored here. Guarded: other EmbLink
+ * headers define a few of them too. */
+#ifndef EMBK_EPERM
+#define EMBK_EPERM    1
+#endif
+#ifndef EMBK_ENOENT
+#define EMBK_ENOENT   2
+#endif
+#ifndef EMBK_EACCES
+#define EMBK_EACCES  13
+#endif
+#ifndef EMBK_EEXIST
+#define EMBK_EEXIST  17
+#endif
+#ifndef EMBK_EINVAL
+#define EMBK_EINVAL  22
+#endif
+
+/* --- sessions: whose a process is -------------------------------------------
+ *
+ * A session is opened when init authenticates someone: the desktop is spawned
+ * with a NEW_SESSION action naming the user, and every process started from it
+ * inherits the session and can never change it. When the leader exits the
+ * session ends and whatever it left running is stopped. Session 0 is the
+ * system (kernel, init, the login screen). */
+#define EMBK_EXIT_LOGOUT 0x4C4F47          /* a session leader's exit code after a logout */
+
+struct embk_session_info {
+    uint32_t id;                  /* 0 = the system session */
+    uint32_t leader_pid;          /* the process whose exit ends it */
+    char     user[32];            /* "" in the system session */
+};
+
+/* Who am I -- the kernel's answer, not $USER (which any parent can set). */
+static inline int embk_session_info(struct embk_session_info *out) {
+    return (int)embk_syscall1(EMBK_SYS_session_info, (int64_t)(intptr_t)out);
+}
+
+/* Log out: end session `sid` (0 = your own). Every process in it is stopped,
+ * the leader last with EMBK_EXIT_LOGOUT -- and you with them, so for your own
+ * session this does not return. Another session needs EMBK_CAP_SESSION. */
+static inline int embk_session_end(uint32_t sid) {
+    return (int)embk_syscall1(EMBK_SYS_session_end, (int64_t)sid);
+}
+
+/* Fill `a` as a NEW_SESSION action: the child leads a new session for `user`
+ * ([a-z0-9_-], 1..31). Needs EMBK_CAP_SESSION, which only init holds; the
+ * child is born without it. */
+static inline void embk_action_new_session(struct embk_spawn_file_action *a, const char *user) {
+    a->kind = EMBK_SPAWN_ACTION_NEW_SESSION;
+    a->target_fd = 0;
+    int i = 0;
+    if (user) { while (user[i] && i < 31) { a->path[i] = user[i]; i++; } }
+    a->path[i] = 0;
+    a->flags = 0; a->mode = 0; a->src_obj_handle = 0;
 }
 
 /* Namespace grant modes (mirror kernel enum ns_mode). */
@@ -480,6 +544,10 @@ static inline int64_t embk_child_cancelled(int handle) {
  * single-user concession, same class as embk_proc_kill.
  *
  * Cancellation may be declined -- pair it with embk_kill() as the backstop. */
+#define EMBK_INTR_ROUTE_SELF  (-2)   /* ^C means ME (a shell at its own prompt) */
+#define EMBK_INTR_ROUTE_NONE  (-1)   /* reclaim: ^C is a byte again */
+/* handle >= 0 names a child. SELF used to be 0, which is also a process's first
+ * spawn handle -- a shell's first child's ^C went to the shell. */
 static inline int64_t embk_console_interrupt_route(int handle) {
     return embk_syscall1(EMBK_SYS_console_interrupt_route, handle);
 }
@@ -1110,9 +1178,11 @@ static inline int embk_win_desktop_front(int on) {
     return (int)embk_syscall1(EMBK_SYS_win_desktop_front, on);
 }
 
-/* --- the system clipboard: one machine-global text buffer ----------------
+/* --- the clipboard: one text buffer PER SESSION ---------------------------
  * Set replaces it whole; get copies up to cap bytes OUT and returns how many
- * bytes the clipboard HOLDS -- more than cap means the caller saw a prefix. */
+ * bytes the clipboard HOLDS -- more than cap means the caller saw a prefix.
+ * What one session copied, another sees as an empty clipboard, and a session's
+ * clipboard is wiped when it ends. */
 static inline int embk_clip_set(const void *buf, size_t len) {
     return (int)embk_syscall2(EMBK_SYS_clip_set, (int64_t)(intptr_t)buf, (int64_t)len);
 }

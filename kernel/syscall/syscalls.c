@@ -519,7 +519,8 @@ static int64_t sys_proc_list(const struct sysargs *a) {
     _Static_assert(sizeof(struct process_info) ==
                    sizeof(uint32_t) * 2 + sizeof(int) + sizeof(uint8_t) +
                    sizeof(int) + sizeof(unsigned char) + sizeof(uint64_t) +
-                   /* padding to the uint64_t's alignment */ 6,
+                   /* padding to the uint64_t's alignment */ 6 +
+                   sizeof(uint32_t) /* session_id */ + 4 /* tail padding */,
                    "process_info and embk_proc_info have drifted apart");
 
     struct process_info snap[MAX_PROCESSES];
@@ -540,8 +541,54 @@ static int64_t sys_proc_kill(const struct sysargs *a) {
     if (!process_alive(pid)) {
         return -EMBK_ENOENT;
     }
+    /* GATED, now that there is more than one user. By pid you may kill what
+     * belongs to your own session -- the shell's `kill` of what `ps` shows
+     * it -- and nothing else, unless you hold the authority that spans
+     * sessions (init). Kernel threads are never a user's to kill: the
+     * writeback thread or the kworker gone is a machine that hangs later. */
+    uint32_t target_session;
+    if (process_session_of(pid, &target_session) != EMBK_OK)
+        return -EMBK_ENOENT;
+    struct process_info info;
+    bool is_kthread = false;
+    {
+        struct process_info rows[MAX_PROCESSES];
+        int n = process_list(rows, MAX_PROCESSES);
+        for (int i = 0; i < n; i++)
+            if (rows[i].pid == pid) { info = rows[i]; is_kthread = info.is_kthread; break; }
+    }
+    if (is_kthread)
+        return -EMBK_EPERM;
+    if (target_session != current_process->session_id &&
+        !(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_SESSION)))
+        return -EMBK_EPERM;
     process_kill(pid);
     return 0;
+}
+
+static int64_t sys_session_info(const struct sysargs *a) {
+    struct { uint32_t id; uint32_t leader_pid; char user[32]; } out;
+    memset(&out, 0, sizeof out);
+    out.id = current_process->session_id;
+    memcpy(out.user, current_process->session_user, sizeof out.user);
+    if (out.id) {
+        struct session_row rows[16];
+        int n = session_list(rows, 16);
+        for (int i = 0; i < n; i++)
+            if (rows[i].id == out.id) out.leader_pid = rows[i].leader_pid;
+    }
+    return copy_to_user((void *)a->arg[0], &out, sizeof out) == EMBK_OK ? 0 : -EMBK_EFAULT;
+}
+
+static int64_t sys_session_end(const struct sysargs *a) {
+    uint32_t sid = (uint32_t)a->arg[0];
+    uint32_t own = current_process->session_id;
+    if (sid == 0) sid = own;
+    if (sid == 0)
+        return -EMBK_EPERM;                 /* the system session has no one to log out */
+    if (sid != own && !(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_SESSION)))
+        return -EMBK_EPERM;
+    return session_end(sid, true);          /* does not return if it is our own */
 }
 
 /* lseek(fd, offset, whence) -> new absolute offset, or -errno.
@@ -944,8 +991,23 @@ static int64_t sys_cancelled(const struct sysargs *a) {
 static int64_t sys_console_interrupt_route(const struct sysargs *a) {
     int handle = (int)a->arg[0];
 
-    if (handle == 0) {                       /* route to SELF: the session owner
-                                              * claiming ^C at its own prompt */
+    /* THE SLOT IS GLOBAL (one console), so no session may take it -- or clear
+     * it -- while it points into ANOTHER session: only while it is free,
+     * pointing at a process that is gone, or pointing into your own session.
+     * Holders of EMBK_CAP_SESSION (init) may always. */
+    {
+        uint32_t cur = keyboard_get_interrupt_target(), cur_sid;
+        if (cur && process_session_of(cur, &cur_sid) == EMBK_OK &&
+            cur_sid != current_process->session_id &&
+            !(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_SESSION)))
+            return -EMBK_EPERM;
+    }
+
+    /* SELF is its own value, -2. It used to be 0 -- which is also the FIRST
+     * spawn handle a process gets, so a shell routing ^C to its first child
+     * routed it to itself instead, and the ^C meant for the child cancelled
+     * the shell. -1 reclaims; every other value is a handle. */
+    if (handle == EMBK_INTR_ROUTE_SELF) {    /* the session owner claiming ^C at its own prompt */
         keyboard_set_interrupt_target(current_process->pid);
         keyboard_set_interrupt_router(current_process->pid);
         return 0;
@@ -2185,6 +2247,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_intr]           = sys_intr,
     [SYS_symlink]        = sys_symlink,
     [SYS_link]           = sys_link,
+    [SYS_session_info]   = sys_session_info,
+    [SYS_session_end]    = sys_session_end,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,
     [SYS_futex]          = sys_futex,

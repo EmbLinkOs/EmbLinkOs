@@ -1544,6 +1544,27 @@ static bool shell_handle_process_command(const char *cmd)
         return true;
     }
 
+    /* sessions: every live session -- id, user, leader, processes. And
+     * `session end <id>`, which is init's logout: every process in it is
+     * stopped, the leader last. The console holds EMBK_CAP_SESSION. */
+    if (strcmp(cmd, "sessions") == 0) {
+        struct session_row rows[16];
+        int n = session_list(rows, 16);
+        kprintf("\n[sessions] %d live\n", n);
+        for (int i = 0; i < n; i++)
+            kprintf("  session %u  user %-12s  leader pid %u  %u process(es)\n",
+                    (unsigned)rows[i].id, rows[i].user, (unsigned)rows[i].leader_pid,
+                    (unsigned)rows[i].procs);
+        return true;
+    }
+    if ((arg = shell_match_prefix(cmd, "session end")) != NULL) {
+        uint32_t sid = shell_parse_uint(arg);
+        int n = session_end(sid, true);
+        kprintf("\n[session] end %u: %d process(es) stopped%s\n", (unsigned)sid, n,
+                n < 0 ? " (refused)" : "");
+        return true;
+    }
+
     if ((arg = shell_match_prefix(cmd, "kill")) != NULL) {
         if (!arg[0]) {
             kprintf("\n[kill] usage: kill <pid>\n");

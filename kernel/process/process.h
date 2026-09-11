@@ -540,6 +540,26 @@ struct process {
      * gates a syscall on it yet (except the debug syscalls — cap_id 10). */
     uint64_t cap_set;
 
+    /* THE SESSION this process belongs to -- whose it is.
+     *
+     * EmbLink has no uid. Authority is the namespace and the capability set,
+     * and both already narrow down the tree. What was missing is IDENTITY: the
+     * fact that this process was started on behalf of a particular person, so
+     * that the few places where a process may reach beyond what it was handed
+     * -- kill by pid, the clipboard, the console's interrupt slot -- can ask
+     * "is that one of yours". A session is created when init authenticates
+     * someone and spawns their desktop with SPAWN_ACTION_NEW_SESSION; every
+     * process that desktop starts, and everything they start, inherits it and
+     * can never change it. When the leader dies the session is over and
+     * everything still in it dies too -- logging out is not "the desktop
+     * exited and its apps kept running".
+     *
+     * 0 is the SYSTEM session: the kernel, init, the login screen, kernel
+     * threads. session_user is "" there. */
+    uint32_t session_id;
+    char     session_user[32];
+    bool     session_leader;     /* spawned with NEW_SESSION: its death ends the session */
+
     /* Per-process NAMESPACE -- the OTHER grant a process is born with (the
      * "authority IS the namespace" model, docs/USERSPACE_v2.md UP2). Maps path
      * prefixes -> root object handles (+ ro/rw); path resolution starts HERE,
@@ -923,6 +943,30 @@ void     sched_idle_exit(void);
  */
 void process_kill(uint32_t pid);
 
+/* The same, with the exit code the process's waiter will see. process_kill is
+ * this with -1. A session ended by logout gives its leader EMBK_EXIT_LOGOUT,
+ * so init can tell "the user logged out" from "the desktop crashed". */
+void process_kill_code(uint32_t pid, int code);
+
+/* --- sessions -------------------------------------------------------------
+ * See struct process::session_id. */
+#define EMBK_EXIT_LOGOUT 0x4C4F47          /* "LOG": the leader of a session ended by logout */
+
+/* The session `pid` belongs to, or -EMBK_ENOENT. */
+int process_session_of(uint32_t pid, uint32_t *out_session);
+
+/* End session `sid`: every live process in it is killed, members first and
+ * the leader last (with EMBK_EXIT_LOGOUT when `logout`, -1 otherwise), and
+ * whatever the session left in shared kernel state -- the clipboard -- is
+ * wiped. Returns the number of processes killed. If the CALLER is in the
+ * session it dies last and this does not return. sid 0 is refused. */
+int session_end(uint32_t sid, bool logout);
+
+/* Every live session: id, user, leader pid, live processes. For the kernel
+ * console and tests. Returns the count written. */
+struct session_row { uint32_t id; uint32_t leader_pid; uint32_t procs; char user[32]; };
+int session_list(struct session_row *out, int max);
+
 /**
  * @brief Mark the current thread a zombie and hand off to the scheduler.
  * Shared by sys_exit (cpu/syscall.c) and the in-kernel selftests below,
@@ -1187,6 +1231,7 @@ struct process_info {
     uint64_t cpu_ns;        /* CPU actually consumed, all threads, live fragment
                              * included -- what `ps` needs to answer "what is
                              * this machine busy with", which it could not. */
+    uint32_t session_id;    /* whose it is: 0 = the system session */
 };
 
 /**

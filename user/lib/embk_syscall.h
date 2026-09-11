@@ -157,6 +157,8 @@
 #define EMBK_SYS_suspend        110  /* (handle, resume)   -> n | -err */
 #define EMBK_SYS_getrandom      111  /* (buf, len)         -> len | -err */
 #define EMBK_SYS_link           112  /* (oldpath, newpath) -> 0 | -err */
+#define EMBK_SYS_session_info   113  /* (out)              -> 0 | -err */
+#define EMBK_SYS_session_end    114  /* (sid)              -> n | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

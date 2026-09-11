@@ -410,6 +410,9 @@ static struct value bi_ps(const struct command *cmd, struct value input,
             (info[i].state >= 0 && info[i].state <= 4) ? state_names[info[i].state] : "?"));
         value_record_set(&r, "pri",   value_int((int64_t)info[i].priority));
         value_record_set(&r, "kind",  value_string(info[i].is_kthread ? "kthread" : "process"));
+        /* WHOSE it is: the session id. 0 is the system (kernel, init, the
+         * login screen); `ps | where sess == (whoami --id)` is "mine". */
+        value_record_set(&r, "sess",  value_int((int64_t)info[i].session_id));
         /* CPU actually consumed, in MILLISECONDS. A column rather than a
          * pretty string, so it sorts and filters like everything else here:
          *   ps | sort-by cpu | last 5      -- what is this machine busy with
@@ -501,8 +504,11 @@ static struct value bi_kill(const struct command *cmd, struct value input,
     uint32_t pid = (uint32_t)pv.u.i;
     int rc = embk_proc_kill(pid);
     if (rc != 0) {
-        char msg[64];
-        snprintf(msg, sizeof msg, "kill: no live process with pid %u", pid);
+        char msg[80];
+        if (rc == -EMBK_EPERM)
+            snprintf(msg, sizeof msg, "kill: pid %u is not yours (another session, or the kernel's)", pid);
+        else
+            snprintf(msg, sizeof msg, "kill: no live process with pid %u", pid);
         return value_error(msg);
     }
     return value_null();
@@ -514,11 +520,32 @@ static struct value bi_kill(const struct command *cmd, struct value input,
 /* -------------------------------------------------------------------------
  * The identity-and-orientation set every Unix hand types on reflex.
  * ------------------------------------------------------------------------- */
+/* whoami: the KERNEL's answer. It used to read $USER, which is whatever the
+ * parent put in the environment -- a claim, not an identity. The session a
+ * process belongs to is set by init when it authenticates someone and can
+ * never be changed from inside, so that is what this reports. */
 static struct value bi_whoami(const struct command *cmd, struct value input,
                               struct scope *env) {
     (void)cmd; (void)env; value_free(&input);
-    const char *u = getenv("USER");
-    return value_string(u && *u ? u : "user");
+    struct embk_session_info si;
+    if (embk_session_info(&si) != 0)
+        return value_error("whoami: the kernel would not say");
+    return value_string(si.user[0] ? si.user : "system");
+}
+
+/* session -> {id, user, leader}: the session this shell runs in, as the
+ * kernel records it. `ps | where sess == (session).id` is "my processes". */
+static struct value bi_session(const struct command *cmd, struct value input,
+                               struct scope *env) {
+    (void)cmd; (void)env; value_free(&input);
+    struct embk_session_info si;
+    if (embk_session_info(&si) != 0)
+        return value_error("session: the kernel would not say");
+    struct value r = value_record();
+    value_record_set(&r, "id",     value_int((int64_t)si.id));
+    value_record_set(&r, "user",   value_string(si.user[0] ? si.user : "system"));
+    value_record_set(&r, "leader", value_int((int64_t)si.leader_pid));
+    return r;
 }
 
 static struct value bi_hostname(const struct command *cmd, struct value input,
@@ -1075,6 +1102,7 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "uptime", bi_uptime }, { "date",   bi_date   },
         { "sleep",  bi_sleep  },
         { "whoami", bi_whoami }, { "hostname", bi_hostname },
+        { "session", bi_session },
         { "history", bi_history }, { "which", bi_which },
         { "clip",    bi_clip    },
         { "clear",  bi_clear  },

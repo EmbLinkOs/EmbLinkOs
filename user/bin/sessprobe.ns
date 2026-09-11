@@ -1,0 +1,3 @@
+# sessprobe: the session witness -- reads nothing, writes nothing.
+ro /system
+ro /data/apps

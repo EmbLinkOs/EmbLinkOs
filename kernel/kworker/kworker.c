@@ -13,7 +13,7 @@
  * that holds the scheduler lock. */
 #define DEFERRED_MAX 256
 
-enum job_kind { JOB_VMO_PUT, JOB_ADDRESS_SPACE };
+enum job_kind { JOB_VMO_PUT, JOB_ADDRESS_SPACE, JOB_SESSION_END };
 
 /* One deferred teardown. JOB_VMO_PUT: release the file's page object, THEN
  * the vnode -- that order is the contract, because flushing dirty pages needs
@@ -26,6 +26,7 @@ struct deferred_job {
     struct vm_object *obj;       /* may be NULL: not every fd is cached */
     uint64_t pml4;
     struct vm_area *vmas;
+    uint32_t session;
 };
 
 static struct deferred_job g_ring[DEFERRED_MAX];
@@ -71,6 +72,18 @@ void kworker_defer_address_space_locked(uint64_t pml4_phys, struct vm_area *vmas
     j->kind = JOB_ADDRESS_SPACE;
     j->pml4 = pml4_phys;
     j->vmas = vmas;
+    wait_queue_wake_one(&g_kworker_wq);
+}
+
+void kworker_defer_session_end_locked(uint32_t sid) {
+    struct deferred_job *j = ring_push_locked();
+    if (!j) {
+        kprintf("kworker: deferred ring full -- session %u's stragglers are left running\n",
+                (unsigned)sid);
+        return;
+    }
+    j->kind = JOB_SESSION_END;
+    j->session = sid;
     wait_queue_wake_one(&g_kworker_wq);
 }
 
@@ -130,6 +143,18 @@ static void kworker_main(void) {
             vma_destroy_list(job.vmas, job.pml4);
             vmm_destroy_address_space(job.pml4);
             break;
+
+        case JOB_SESSION_END: {
+            /* The leader died on its own (a crash, or exit without logout):
+             * the session is over, and anything it left running goes with
+             * it. The kworker is in the system session, so it is never one of
+             * the victims and session_end returns. */
+            int n = session_end(job.session, false);
+            if (n > 0)
+                kprintf("session %u ended with its leader: %d process(es) it left running were stopped\n",
+                        (unsigned)job.session, n);
+            break;
+        }
         }
         sched_lock();
         g_busy = false;

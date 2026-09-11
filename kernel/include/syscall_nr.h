@@ -218,4 +218,15 @@
  * through the caller's namespace like every other path syscall. */
 #define SYS_link          112   /* (oldpath, newpath)       -> 0 | -err       */
 
+/* session_info(out) -- who am I: this process's session id and the user it
+ * belongs to (struct { u32 id; u32 leader_pid; char user[32]; }). Session 0
+ * is the system session, user "". */
+#define SYS_session_info  113   /* (out)                    -> 0 | -err       */
+
+/* session_end(sid) -- log out. sid 0 means "my own session": every process in
+ * it is stopped, the leader last with EMBK_EXIT_LOGOUT, and the caller with
+ * them -- this does not return. Ending ANOTHER session needs
+ * EMBK_CAP_SESSION (init). */
+#define SYS_session_end   114   /* (sid)                    -> n | -err       */
+
 #endif /* _SYSCALL_NR_H_ */

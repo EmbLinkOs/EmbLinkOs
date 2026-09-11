@@ -138,6 +138,12 @@ int keyboard_has_char(void);
  * sys_console_interrupt_route(), which only accepts a HANDLE the caller holds,
  * so nobody can route interrupts at a process they were never given. */
 void keyboard_set_interrupt_target(uint32_t pid);
+
+/* sys_console_interrupt_route's two non-handle values. SELF is -2, not 0: 0 is
+ * a valid spawn handle (a process's first child), and meaning "self" by it
+ * routed a shell's first child's ^C to the shell. */
+#define EMBK_INTR_ROUTE_SELF  (-2)
+#define EMBK_INTR_ROUTE_NONE  (-1)
 /* Who did the routing. ^C needs only the target; ^Z also has to wake the
  * parent, because a frozen child never exits and a parent waiting for one
  * would wait forever. Set by the same call that sets the target. */

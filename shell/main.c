@@ -145,7 +145,7 @@ static int run_program(const char *src, struct scope *top) {
     if (g_console_session) {
         (void)embk_intr_take();                 /* drop anything stale */
         (void)embk_intr_catch(1);
-        (void)embk_console_interrupt_route(0);  /* 0 = self */
+        (void)embk_console_interrupt_route(EMBK_INTR_ROUTE_SELF);
     }
 
     struct exec_out out = { FLOW_NORMAL, value_null(), false };
