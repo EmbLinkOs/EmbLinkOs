@@ -2327,6 +2327,17 @@ Open:
 
 ## Process & Scheduling
 
+- [ ] **The deadline scheduler's lateness check is intermittent, and it does
+      not look like host noise.** On the aarch64 boot test (HVF), `worst
+      lateness: round-robin 44 ms, deadline 0 ms` on most runs and
+      `round-robin 44 ms, deadline 46 ms` on some -- 2 of roughly 12 runs on
+      2026-09-11. The round-robin figure is 44 ms EVERY time; host scheduling
+      noise would move both. The deadline thread's lateness jumping to exactly
+      one round-robin period instead suggests it occasionally runs WITHOUT its
+      deadline policy for one period -- a missed admission, or a wakeup that
+      lands on the round-robin path. It fails the boot test when it happens,
+      which is the worst kind of test: one that teaches you to rerun it.
+
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant
 ### source of lateness
 

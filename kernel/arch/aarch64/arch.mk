@@ -971,7 +971,10 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img bu
 	  python3 tools/arm64_input_probe.py $$port $$secs >/dev/null 2>&1 & \
 	  ipid=$$!; \
 	  for i in $$(seq $$secs); do grep -q 'all self-tests done' $$log 2>/dev/null && break; sleep 1; done; \
-	  host_done=$$(( $$(date +%s) - host_t0 )); sleep 2; \
+	  host_done=$$(( $$(date +%s) - host_t0 )); \
+	  kill $$ipid 2>/dev/null; wait $$ipid 2>/dev/null; \
+	  python3 tools/arm64_click_launcher.py $$port $$log >/dev/null 2>&1; \
+	  sleep 2; \
 	  kill $$qpid 2>/dev/null; wait $$qpid 2>/dev/null; \
 	  kill $$ipid 2>/dev/null; wait $$ipid 2>/dev/null; \
 	  fail=0; \
@@ -1042,6 +1045,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img bu
 	  chk 'desktop session started'        A6 'init never spawned the session'; \
 	  chk 'home: desktop ready'            A7 'the desktop came up but never finished'; \
 	  chk 'first frame presented'          A7 'the compositor never presented a frame'; \
+	  chk 'home: launcher OPEN'            A7 'the launcher button did nothing -- the top bar could not reach the desktop through /run'; \
 	  chk 'framebuffer 1280x800'           A7 'virtio-gpu did not come up'; \
 	  chk 'is a keyboard'                  A7 'virtio-input found no keyboard'; \
 	  chk 'is a tablet'                    A7 'virtio-input found no pointer'; \
@@ -1095,7 +1099,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img bu
 	  echo "     variant-I TLS (TPIDR_EL0, block above the pointer)"; \
 	  echo "  A6 the REAL session: init -> auth -> a namespace-confined desktop,"; \
 	  echo "     dynamically linked against libembk.so"; \
-	  echo "  A7 virtio-gpu 1280x800, the compositor presenting a frame"; \
+	  echo "  A7 virtio-gpu 1280x800, the compositor presenting a frame, and the"; \
+	  echo "     launcher button PRESSED over QMP and the launcher opening"; \
 	  echo "  A7 virtio-input: keyboard + tablet, events injected and RECEIVED"; \
 	  echo "  A7 virtio-snd: a real buffer submitted through the shared audio"; \
 	  echo "     layer and retired by the device"; \
