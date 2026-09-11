@@ -429,6 +429,7 @@ static void selftests_print_commands(void)
     kprintf("  test aslr\n");
     kprintf("  test canary\n");
     kprintf("  test hardlink\n");
+    kprintf("  test embkfs crash   (needs sdc: make test-embkfs-crash)\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1499,6 +1500,19 @@ int selftests_handle_command(const char *cmd)
 
         vfs_rmdir_path(d); vfs_unlink_path(b);
         kprintf("[cmd] test hardlink: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test embkfs crash -- power loss at every write. Needs the small tree
+     * image attached as a THIRD disk (sdc): `make test-embkfs-crash`. */
+    if (strcmp(cmd, "test embkfs crash") == 0) {
+        struct embk_block_device *seed = embk_block_get_by_name("sdc");
+        if (!seed) {
+            kprintf("\n[cmd] test embkfs crash: no third disk (sdc) -- run `make test-embkfs-crash`\n");
+            return 1;
+        }
+        int rc = embkfs_run_crash_selftests(seed);
+        kprintf("[cmd] test embkfs crash: %s\n", rc == EMBK_OK ? "OK" : "FAIL");
         return 1;
     }
 

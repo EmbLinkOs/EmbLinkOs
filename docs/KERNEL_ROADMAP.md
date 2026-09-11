@@ -464,7 +464,37 @@ capabilities rather than fork/exec.
    claim: two NIST CAVP vectors match byte for byte through the live
    primitives.
 
-13. **Job control is finished.** `^Z`, `stop`, `bg` and `fg` all work, and the
+13. **Power cut at every write: EMBKFS's copy-on-write claim, measured.** The
+   audit's last filesystem gap: a CoW, checksummed filesystem that had never
+   had power cut on it mid-transaction. `make test-embkfs-crash` copies a
+   fresh 4 MiB format into a RAM-backed block device, runs 19 commits (mkdir,
+   eight creates, eight writes, a rename, an unlink — 65 device writes), and
+   for **every** N from 1 to 65 drops all writes after the N-th, remounts from
+   the surviving bytes, lists the directory and reads every file. The result
+   must equal the state after some whole number of commits, byte for byte.
+   Then the same sweep with the cut write *torn* (first 256 bytes land).
+
+       recovered to k = 0:1 1:3 2:3 3:3 … 18:3 19:2       (both sweeps)
+       0 inconsistent, 0 unmountable, 130 simulated power losses
+       19 of 65 remounts repaired a backup superblock left behind by the cut
+
+   Two things it found on the way in, neither in the CoW logic. The
+   hand-laid `embkfs_tree.img` fixture has no root inode a writer can update —
+   it was never a write target, so the seed is now a real small format
+   (`mkfs --size-mib 4`). And `embkfs_mount()` does not produce a
+   write-capable volume: the allocator is built by a separate
+   `embkfs_finish_mount()` that the boot path has always called, and a volume
+   that skips it refuses everything with `ENOSPC` while reporting a thousand
+   free blocks. Recorded as a sharp edge in `docs/TODO.md`.
+
+   x86 only for now: the test needs a third disk and the aarch64 boot harness
+   attaches one. The filesystem code is shared; the harness is not.
+
+   `tools/console_test.py` came out of this: the x86 kernel console, scripted,
+   judging each command by the kernel's own verdict line — the driver the x86
+   side had lacked while aarch64 had `test-arm64-boot` all along.
+
+14. **Job control is finished.** `^Z`, `stop`, `bg` and `fg` all work, and the
    piece that had to be built for them was in the kernel: a process could be
    *interrupted* or *cancelled*, but a shell had no way to ask for one to be
    **stopped**. `process_suspend()` had existed since the debugger needed it

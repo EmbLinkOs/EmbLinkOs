@@ -2477,6 +2477,31 @@ test-audio: $(IMG) $(EMBKFS_MASTER)
 	@# extending the range under a running device -- where the real bug was.
 	@AUDIO_CMD="run /data/apps/beep/beep.elf" python3 tools/audio_test.py
 
+# --- x86 console tests, scripted -----------------------------------------------
+# tools/console_test.py boots the kernel headless and types at its console. Any
+# self-test the kernel has can be run this way:  make test-x86 T="test mmap"
+.PHONY: test-x86 test-embkfs-crash
+test-x86: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/console_test.py $(T)
+
+# POWER LOSS, SIMULATED, AT EVERY WRITE. `test embkfs crash` copies the small
+# tree image into a RAM-backed block device inside the kernel, runs a workload
+# of commits against it while dropping every write after the N-th, remounts,
+# and requires the result to be exactly the state after some whole number of
+# commits -- for every N. The image is attached as a third disk only to be
+# READ once as the pristine seed; nothing is ever written to it, so the copy
+# is for hygiene, not correctness.
+# THE SEED IS A REAL FORMAT, NOT A FIXTURE. embkfs_tree.img is a hand-laid
+# two-level tree built for the path-walk tests; it has no root inode a writer
+# can update, and the first version of this test seeded from it and made zero
+# device writes. A 4 MiB image from the real formatter is what a fresh volume
+# actually looks like.
+build/crash-seed.img: tools/embkfs_mkfs/mkfs_embkfs.py | $(BUILD)
+	python3 tools/embkfs_mkfs/mkfs_embkfs.py --size-mib 4 $@
+
+test-embkfs-crash: $(IMG) $(EMBKFS_MASTER) build/crash-seed.img
+	@EXTRA_DISK=build/crash-seed.img python3 tools/console_test.py "test embkfs crash"
+
 # HOW SHALLOW THE AUDIO BUFFER CAN BE, which is the same question as how much
 # latency the sound has. Separate from test-audio on purpose: this run
 # DELIBERATELY produces holes (that is the measurement), so the WAV checker

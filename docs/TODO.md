@@ -336,14 +336,18 @@ web asks for them and how much they change a page:
 ### VMM — page-table location limit (measured)
 - [x] Boots fine at 4 GB. Page tables (~28 KB) + bitmap (160 KB) fit under
   physical 2 MB, so KP2V works.
-- [ ] HARD LIMIT ~32 GB RAM: the PMM bitmap alone (~1 MB at 32 GB) plus page
-  tables pushes allocations past physical 2 MB, where KP2V (kernel mapping is
-  0–2 MB only) faults. 128 GB → ~4 MB bitmap → guaranteed crash.
-  - FIX (when needed): two-phase paging bootstrap.
-    * Phase 1: pre-map the first ~16 MB into the kernel range (bootloader),
-      or build a minimal direct map covering where page tables will live.
-    * Phase 2: build the full direct map using P2V (direct-map access).
-    * Then switch VMM table access from KP2V to P2V.
+- [x] ~~HARD LIMIT ~32 GB RAM~~ **Stale -- retired by measurement (2026-09-11).**
+  The entry predicted a guaranteed crash at 128 GB. Booted with `-m 64G`:
+  2 MB bitmap, 16.7 M pages, `power` at 90 % idle. Booted with `-m 128G`:
+  4 MB bitmap, 33.8 M pages, `test mmap` OK at a random address. The fix the
+  entry asked for -- a two-phase bootstrap, page tables reached through the
+  direct map once it exists -- had already been built: `vmm_table()` in
+  arch/x86_64/mm/vmm.c switches from KP2V to P2V at the CR3 switch, and its
+  comment records the very bug this entry describes. Nobody closed the entry.
+  The REAL constraint is that the kernel image, the bitmap and the early page
+  tables must fit inside stage2's 1 GB identity map, which holds to roughly
+  16 TB of RAM (a 512 MB bitmap). Not measured on aarch64, whose bootstrap is
+  different; say so rather than assume.
 
 ### vmm_map_mmio
 
@@ -1689,6 +1693,36 @@ violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
       read.
 - [ ] **Guard pages between kernel heap allocations, and a poisoned free.** Listed
       under Memory Management already; it is a hardening item too.
+
+## Filesystem: crash consistency (audit gap, closed)
+
+- [x] **A crash-consistency test.** **Done** -- `test embkfs crash` /
+      `make test-embkfs-crash`: 19 commits, 65 device writes, power cut after
+      each one (dropped, then torn), remount, verify the state is exactly the
+      state after some whole number of commits. 130 cuts, 0 inconsistent.
+- [ ] Run it on aarch64. The filesystem code is shared; what is missing is a
+      third virtio-blk in `test-arm64-boot` and a `chk` for the verdict.
+- [ ] Widen the workload: larger files (multi-extent, multi-block), a
+      directory with enough entries to split a leaf, a snapshot taken
+      mid-run, compression on. Each is a different shape of transaction and
+      the sweep is cheap enough (milliseconds per cut) to run them all.
+- [ ] Torn writes are modelled as "first 256 bytes land". A second model --
+      random bytes in the tail, and a cut spanning TWO sectors of one
+      4 KiB block -- would exercise the per-node checksum differently.
+
+## Filesystem: mounting is two calls, and that is a sharp edge
+
+- [ ] **`embkfs_mount()` does not produce a write-capable volume.** It reads the
+      superblock and finds the root; `embkfs_finish_mount()` (static, embkfs.c)
+      verifies the root node, BUILDS THE ALLOCATOR and sweeps orphans. A volume
+      that has only been through the first has an empty free index and refuses
+      every allocation with `ENOSPC` -- found by the crash-consistency test on
+      a fresh 4 MiB format reporting 1018 free blocks, and mistaken for a size
+      bug for one round. The boot path has always done both. Either
+      `embkfs_mount()` should call `finish_mount` itself for read-write mounts
+      (and `embkfs_init`'s loop drop its own call), or the header should say
+      loudly that a mount is two calls. The first is better; it touches the
+      boot path, so it is a change to make with the boot test running.
 
 ## Filesystem: hard links (audit gap, closed)
 

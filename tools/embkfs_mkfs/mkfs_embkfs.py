@@ -1469,6 +1469,16 @@ if __name__ == "__main__":
         out_path = sys.argv[2] if len(sys.argv) > 2 else "embkfs_encrypted.img"
         passphrase = (sys.argv[3] if len(sys.argv) > 3 else "correcthorsebattery").encode()
         make_encrypted_image(out_path, passphrase)
+    elif len(sys.argv) > 3 and sys.argv[1] == "--size-mib":
+        # A SMALL, REAL volume: mkfs_embkfs.py --size-mib <N> <path>. The
+        # standard image packs the whole userland (128 MB); the kernel's
+        # crash-consistency test wants a genuine fresh format it can copy into
+        # RAM a few hundred times, not a fixture and not 128 MB. One tiny file
+        # so the tree is not empty.
+        make_image(sys.argv[3], int(sys.argv[2]) << 20, objects=[
+            (b"readme.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+             b"a small real EMBKFS volume, made for the crash test\n"),
+        ])
     elif len(sys.argv) > 1:
         # Single-image mode: write one flat oracle image at the given path
         # (used by the Makefile to produce a second, independent EMBKFS

@@ -757,6 +757,9 @@ int embkfs_run_object_selftests(void);
 int embkfs_run_shrink_selftests(void);
 int embkfs_run_timestamp_selftests(void);
 int embkfs_run_multivol_selftests(void);
+/* Power loss simulated at every write against a RAM copy of `seed` (a small
+ * EMBKFS image; the third disk). See the definition. */
+int embkfs_run_crash_selftests(struct embk_block_device *seed);
 int embkfs_run_compress_selftests(void);
 int embkfs_run_selfheal_selftests(void);
 int embkfs_run_snapshot_selftests(void);

@@ -8161,6 +8161,300 @@ int embkfs_run_timestamp_selftests(void)
     return rc;
 }
 
+/* ==========================================================================
+ * POWER LOSS, SIMULATED AT EVERY WRITE -- the crash-consistency test.
+ *
+ * EMBKFS is copy-on-write with a checksummed tree and a commit that is one
+ * superblock write: the claim is that the volume on disk is ALWAYS the state
+ * after some whole number of commits, never a state between two. That claim
+ * had never had power cut on it. This cuts it at every write.
+ *
+ * THE TARGET IS RAM. A block device backed by a kmalloc'd copy of the small
+ * tree image (embkfs_tree.img, attached as the third disk and read exactly
+ * once as the pristine seed). Every iteration restores the copy from the
+ * seed, so the disk is never written and no per-run image copy is needed.
+ * It also makes a sweep of ~150 remounts take milliseconds each.
+ *
+ * THE CUT. The device counts writes and, after the N-th, silently drops
+ * them -- it returns success and changes nothing, which is what the medium
+ * does when the power goes: the OS believes the write landed. Reads see the
+ * bytes that actually landed. A second sweep TEARS the cut write instead:
+ * its first 256 bytes land and the rest do not, the shape of a sector
+ * interrupted mid-transfer, which is what the checksums exist to catch.
+ *
+ * THE INVARIANT. The workload is 19 commits whose expected on-disk state
+ * after each prefix is known: mkdir, eight creates, eight writes with
+ * distinct content, a rename, an unlink. After a cut and a fresh mount from
+ * the surviving bytes, the directory is listed and every file read; that
+ * observation must EQUAL the expected state after some k in 0..19, byte for
+ * byte. A file that is present with the wrong length, a name that should
+ * not coexist with another, a node that fails its checksum on the walk --
+ * any of those is a state no sequence of commits produces, and a FAIL.
+ * Errors DURING the workload after the cut are expected and ignored: that is
+ * the system failing, and what matters is what a fresh mount sees.
+ * ========================================================================== */
+
+struct crash_ram {
+    uint8_t *data, *pristine;
+    uint64_t bytes;
+    uint64_t writes, cut, dropped, torn;
+    int      tear;               /* 0 = drop the cut write, 1 = tear it */
+};
+
+static int crash_ram_read(struct embk_block_device *dev, uint64_t lba, uint32_t count, void *buf) {
+    struct crash_ram *r = dev->driver_data;
+    uint64_t off = lba * dev->block_size, len = (uint64_t)count * dev->block_size;
+    if (off + len > r->bytes) return -EMBK_EINVAL;
+    memcpy(buf, r->data + off, len);
+    return EMBK_OK;
+}
+static int crash_ram_write(struct embk_block_device *dev, uint64_t lba, uint32_t count, const void *buf) {
+    struct crash_ram *r = dev->driver_data;
+    uint64_t off = lba * dev->block_size, len = (uint64_t)count * dev->block_size;
+    if (off + len > r->bytes) return -EMBK_EINVAL;
+    r->writes++;
+    if (r->cut && r->writes > r->cut) { r->dropped++; return EMBK_OK; }   /* power is gone */
+    if (r->cut && r->writes == r->cut && r->tear) {
+        memcpy(r->data + off, buf, len < 256 ? len : 256);                 /* torn sector */
+        r->torn++;
+        return EMBK_OK;
+    }
+    memcpy(r->data + off, buf, len);
+    return EMBK_OK;
+}
+static int crash_ram_flush(struct embk_block_device *dev) { (void)dev; return EMBK_OK; }
+
+/* The workload: 19 commits. Errors after the cut are expected. */
+#define CRASH_NFILES 8
+#define CRASH_NOPS   19
+static uint8_t crash_content_byte(int i) { return (uint8_t)(0x30 + i); }
+static uint32_t crash_content_len(int i)  { return (uint32_t)(64 * (i + 1)); }
+
+/* The first failure, if any, so a silent workload is not a mystery: the
+ * first version of this ignored every return code and reported "0 device
+ * writes" with nothing to say about why. Cleared per run. */
+static int         crash_first_rc;
+static const char *crash_first_op;
+#define CRASH_OP(what, call) do { int _rc = (call); \
+        if (_rc != EMBK_OK && !crash_first_op) { crash_first_op = (what); crash_first_rc = _rc; } } while (0)
+
+static void crash_workload(struct embkfs_volume *vol) {
+    uint64_t oid;
+    char path[32];
+    static uint8_t buf[64 * CRASH_NFILES];
+    crash_first_op = 0; crash_first_rc = 0;
+    CRASH_OP("mkdir /crash", embkfs_mkdir_path(vol, EMBKFS_ROOT_OBJECT_ID, "/crash", &oid));
+    for (int i = 0; i < CRASH_NFILES; i++) {
+        snprintf(path, sizeof path, "/crash/f%d", i);
+        CRASH_OP("create", embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, path, &oid));
+    }
+    for (int i = 0; i < CRASH_NFILES; i++) {
+        snprintf(path, sizeof path, "/crash/f%d", i);
+        if (embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, path, &oid) != EMBK_OK) continue;
+        memset(buf, crash_content_byte(i), crash_content_len(i));
+        CRASH_OP("write", embkfs_write_object(vol, oid, buf, crash_content_len(i)));
+    }
+    CRASH_OP("rename", embkfs_rename_path(vol, EMBKFS_ROOT_OBJECT_ID, "/crash/f3", "/crash/g3"));
+    CRASH_OP("unlink", embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/crash/f5"));
+}
+
+/* What the directory must contain after exactly k commits. Returns the
+ * number of entries; fills names and lengths. -1 = no directory at all. */
+struct crash_expect { char name[8]; uint32_t len; };
+static int crash_expected(int k, struct crash_expect *e) {
+    if (k < 1) return -1;
+    int n = 0;
+    for (int i = 0; i < CRASH_NFILES; i++) {
+        if (k < 2 + i) continue;                        /* not created yet */
+        if (i == 5 && k >= 19) continue;                /* unlinked          */
+        snprintf(e[n].name, sizeof e[n].name, (i == 3 && k >= 18) ? "g%d" : "f%d", i);
+        e[n].len = (k >= 10 + i) ? crash_content_len(i) : 0;
+        n++;
+    }
+    return n;
+}
+
+/* Observe: list /crash and read every entry. Any read/checksum failure is an
+ * inconsistency in itself. */
+struct crash_seen { char name[8]; uint32_t len; uint8_t byte; int bad; };
+struct crash_obs  { struct crash_seen s[CRASH_NFILES + 2]; int n; int overflow; struct embkfs_volume *vol; };
+static int crash_list_cb(uint64_t oid, uint8_t type, const char *name, uint8_t name_len, void *ctx) {
+    struct crash_obs *o = ctx;
+    (void)type;
+    if (o->n >= (int)(sizeof o->s / sizeof o->s[0])) { o->overflow = 1; return EMBK_OK; }
+    struct crash_seen *x = &o->s[o->n++];
+    memset(x, 0, sizeof *x);
+    size_t l = name_len < 7 ? name_len : 7;
+    memcpy(x->name, name, l); x->name[l] = 0;
+    static uint8_t rb[64 * CRASH_NFILES + 64];
+    uint64_t got = 0;
+    int rc = embkfs_read_object(o->vol, oid, rb, sizeof rb, &got);
+    if (rc != EMBK_OK) { x->bad = 1; return EMBK_OK; }
+    x->len = (uint32_t)got;
+    if (got) {
+        x->byte = rb[0];
+        for (uint64_t i = 1; i < got; i++) if (rb[i] != rb[0]) { x->bad = 1; break; }
+    }
+    return EMBK_OK;
+}
+
+/* Which k, if any, the observation equals. -2 = none (INCONSISTENT). */
+static int crash_match(struct embkfs_volume *vol, int *mount_ok) {
+    struct crash_obs o; memset(&o, 0, sizeof o); o.vol = vol;
+    uint64_t dir;
+    int rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/crash", &dir);
+    if (rc == -EMBK_ENOENT) return 0;                    /* state k=0: no dir */
+    if (rc != EMBK_OK) { *mount_ok = 0; return -2; }
+    if (embkfs_list_dir(vol, dir, crash_list_cb, &o) != EMBK_OK || o.overflow) return -2;
+    for (int i = 0; i < o.n; i++) if (o.s[i].bad) return -2;
+
+    for (int k = 1; k <= CRASH_NOPS; k++) {
+        struct crash_expect e[CRASH_NFILES];
+        int n = crash_expected(k, e);
+        if (n != o.n) continue;
+        int all = 1;
+        for (int i = 0; i < n && all; i++) {
+            int found = 0;
+            for (int j = 0; j < o.n; j++) {
+                if (strcmp(e[i].name, o.s[j].name) != 0) continue;
+                found = 1;
+                if (o.s[j].len != e[i].len) all = 0;
+                else if (e[i].len && o.s[j].byte != crash_content_byte(e[i].name[1] - '0')) all = 0;
+                break;
+            }
+            if (!found) all = 0;
+        }
+        if (all) return k;
+    }
+    return -2;
+}
+
+static int embkfs_run_crash_selftests_impl(struct embk_block_device *seed)
+{
+    if (!seed) return -EMBK_ENODEV;
+    uint64_t bytes = seed->block_count * seed->block_size;
+    if (bytes == 0 || bytes > (32u << 20)) {
+        kprintf("EMBKFS: crash: seed device is %llu bytes; want a small image (<= 32 MiB)\n",
+                (unsigned long long)bytes);
+        return -EMBK_EINVAL;
+    }
+
+    struct crash_ram *r = kmalloc(sizeof *r);
+    struct embkfs_volume *vol = kmalloc(sizeof *vol);
+    uint8_t *data = kmalloc(bytes), *pristine = kmalloc(bytes);
+    if (!r || !vol || !data || !pristine) { kfree(r); kfree(vol); kfree(data); kfree(pristine); return -EMBK_ENOMEM; }
+    memset(r, 0, sizeof *r);
+    r->data = data; r->pristine = pristine; r->bytes = bytes;
+
+    /* The pristine seed, read once, in chunks the driver can DMA. */
+    for (uint64_t lba = 0; lba < seed->block_count; lba += 64) {
+        uint32_t n = (uint32_t)((seed->block_count - lba) < 64 ? (seed->block_count - lba) : 64);
+        if (seed->read(seed, lba, n, pristine + lba * seed->block_size) != EMBK_OK) {
+            kprintf("EMBKFS: crash: could not read the seed image at lba %llu\n", (unsigned long long)lba);
+            kfree(r); kfree(vol); kfree(data); kfree(pristine); return -EMBK_EIO;
+        }
+    }
+
+    struct embk_block_device dev;
+    memset(&dev, 0, sizeof dev);
+    snprintf(dev.name, sizeof dev.name, "crashram");
+    dev.block_count = seed->block_count; dev.block_size = seed->block_size;
+    dev.read = crash_ram_read; dev.write = crash_ram_write; dev.flush = crash_ram_flush;
+    dev.driver_data = r; dev.dma_max_phys = UINT64_MAX; dev.needs_kernel_range = false;
+
+    kprintf("\n[embkfs crash] %llu KiB image in RAM; %d commits per run\n",
+            (unsigned long long)(bytes >> 10), CRASH_NOPS);
+
+    /* 0. No cut: count the writes, and prove the verifier sees the full state. */
+    memcpy(data, pristine, bytes);
+    memset(vol, 0, sizeof *vol);
+    r->writes = 0; r->cut = 0;
+    /* MOUNT IS TWO CALLS. embkfs_mount() reads the superblock and finds the
+     * root; embkfs_finish_mount() verifies the root node, BUILDS THE
+     * ALLOCATOR, and sweeps orphans. A volume that has only been through the
+     * first has an empty free index and refuses every allocation with ENOSPC
+     * -- which is what the first version of this test found on a fresh 4 MiB
+     * format with 1018 free blocks, and mistook for a size bug. The boot path
+     * has always done both; so does every mount here. */
+    if (embkfs_mount(&dev, vol) != EMBK_OK || !embkfs_finish_mount(vol)) { kprintf("  [FAIL] the seed image does not mount\n"); goto fail; }
+    kprintf("  mounted: read_only=%d generation=%llu free_blocks=%llu block_size=%u\n",
+            (int)vol->read_only, (unsigned long long)vol->generation,
+            (unsigned long long)vol->free_blocks, (unsigned)vol->block_size);
+    crash_workload(vol);
+    if (crash_first_op)
+        kprintf("  first failing op in the UNCUT run: %s -> %d (%s)\n",
+                crash_first_op, crash_first_rc, embk_strerror(crash_first_rc));
+    uint64_t total_writes = r->writes;
+    memset(vol, 0, sizeof *vol);
+    int mok = 1, k0 = -2;
+    if (embkfs_mount(&dev, vol) == EMBK_OK && embkfs_finish_mount(vol)) k0 = crash_match(vol, &mok);
+    kprintf("  [%s] uncut: %llu device writes, remount sees the state after all %d commits (k=%d)\n",
+            k0 == CRASH_NOPS ? "ok" : "FAIL", (unsigned long long)total_writes, CRASH_NOPS, k0);
+    if (k0 != CRASH_NOPS) goto fail;
+
+    int fails = 0;
+    for (int tear = 0; tear <= 1; tear++) {
+        int hist[CRASH_NOPS + 1]; memset(hist, 0, sizeof hist);
+        int inconsistent = 0, unmountable = 0, backup = 0, first_bad = -1;
+        for (uint64_t cut = 1; cut <= total_writes; cut++) {
+            memcpy(data, pristine, bytes);
+            memset(vol, 0, sizeof *vol);
+            r->writes = 0; r->cut = cut; r->tear = tear; r->dropped = 0; r->torn = 0;
+            if (embkfs_mount(&dev, vol) != EMBK_OK || !embkfs_finish_mount(vol)) { unmountable++; continue; }
+            r->writes = 0;                           /* the cut counts WORKLOAD writes, not mount's */
+            crash_workload(vol);
+
+            /* The power is off. Everything the FS believed is gone with it;
+             * only the bytes in `data` survive. */
+            memset(vol, 0, sizeof *vol);
+            r->cut = 0;                              /* the remount's own writes (none expected) land */
+            uint64_t w_before = r->writes;
+            /* The remount after the crash: superblock, root, allocator, and the
+             * orphan sweep -- whose writes are RECOVERY and are counted below
+             * as self-heal, not hidden. */
+            if (embkfs_mount(&dev, vol) != EMBK_OK || !embkfs_finish_mount(vol)) {
+                unmountable++;
+                if (first_bad < 0) first_bad = (int)cut;
+                continue;
+            }
+            if (vol->generation) { /* the mount log says "using newer backup superblock" when it happened */ }
+            int m_ok = 1;
+            int k = crash_match(vol, &m_ok);
+            if (k < 0) { inconsistent++; if (first_bad < 0) first_bad = (int)cut; }
+            else hist[k]++;
+            if (r->writes != w_before) backup++;     /* the mount repaired something */
+        }
+        kprintf("  --- %s the cut write, cut at each of %llu writes ---\n",
+                tear ? "TEARING" : "DROPPING", (unsigned long long)total_writes);
+        kprintf("      recovered to k = ");
+        for (int k = 0; k <= CRASH_NOPS; k++) if (hist[k]) kprintf("%d:%d ", k, hist[k]);
+        kprintf("\n");
+        kprintf("  [%s] every surviving state is the state after some whole number of commits "
+                "(%d inconsistent, %d unmountable%s%s)\n",
+                (inconsistent == 0 && unmountable == 0) ? "ok" : "FAIL",
+                inconsistent, unmountable,
+                first_bad >= 0 ? " -- first bad cut at write " : "",
+                first_bad >= 0 ? "" : "");
+        if (first_bad >= 0) kprintf("      first bad cut: write #%d\n", first_bad);
+        if (backup) kprintf("      (%d mount(s) wrote to the device while recovering -- self-heal)\n", backup);
+        if (inconsistent || unmountable) fails++;
+    }
+
+    kfree(r); kfree(vol); kfree(data); kfree(pristine);
+    return fails ? -EMBK_EINVAL : EMBK_OK;
+fail:
+    kfree(r); kfree(vol); kfree(data); kfree(pristine);
+    return -EMBK_EINVAL;
+}
+
+int embkfs_run_crash_selftests(struct embk_block_device *seed)
+{
+    embkfs_lock();
+    int rc = embkfs_run_crash_selftests_impl(seed);
+    embkfs_unlock();
+    return rc;
+}
+
 int embkfs_run_multivol_selftests(void)
 {
     embkfs_lock();
