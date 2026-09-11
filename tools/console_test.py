@@ -16,6 +16,8 @@ Options via the environment, because a Makefile target sets them and a person
 rarely needs to:
     EXTRA_DISK   a third raw image, attached as IDE index 2 (the kernel names
                  it sdc). Used by tests that want a disk they may destroy.
+    SWAP_DISK    a raw image with an EMBKSWAP header (tools/mkswap.py),
+                 attached as IDE index 3; the kernel finds it by the header.
     SMP, MEM     cores (4) and memory (2G).
     TIMEOUT      seconds to wait for each command's verdict (400).
 
@@ -45,6 +47,9 @@ def main(cmds):
             "-drive", "format=raw,file=%s/embkfs.img,if=ide,index=1" % ROOT]
     if extra:
         argv += ["-drive", "format=raw,file=%s,if=ide,index=2" % os.path.abspath(extra)]
+    swap = os.environ.get("SWAP_DISK")
+    if swap:
+        argv += ["-drive", "format=raw,file=%s,if=ide,index=3" % os.path.abspath(swap)]
     argv += ["-serial", "stdio", "-no-reboot", "-no-shutdown",
              "-m", os.environ.get("MEM", "2G"), "-smp", os.environ.get("SMP", "4"),
              "-display", "none"]

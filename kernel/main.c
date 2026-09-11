@@ -60,6 +60,7 @@
 #include "mm/vm_object.h"   /* the page cache writeback thread */
 #include "power/power.h"     /* idle residency, shutdown, reboot */
 #include "lib/random.h"      /* random_init: the kernel CSPRNG */
+#include "mm/swap.h"         /* swap_init: the swap store */
 
 #include "process/process.h"
 #include "tty/tty.h"
@@ -1862,6 +1863,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     //  Mount FAT32 (probe every disk, mount the first valid one)
     // ============================================================
     embkfs_init();
+
+    /* The swap store, if a block device carries the header. After the block
+     * layer and beside the filesystem, because it is found the same way the
+     * filesystem is: by reading block 0 of every device and recognising it. */
+    swap_init();
     static struct fat32_volume vol;
     bool found = false;
     for (uint32_t i = 0; i < embk_block_count(); i++) {

@@ -242,6 +242,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/lib/errno.c \
              kernel/lib/random.c \
              kernel/lib/canary.c \
+             kernel/mm/swap.c \
              kernel/lib/ksym.c \
              kernel/lib/kprintf.c
 
@@ -2480,7 +2481,7 @@ test-audio: $(IMG) $(EMBKFS_MASTER)
 # --- x86 console tests, scripted -----------------------------------------------
 # tools/console_test.py boots the kernel headless and types at its console. Any
 # self-test the kernel has can be run this way:  make test-x86 T="test mmap"
-.PHONY: test-x86 test-embkfs-crash
+.PHONY: test-x86 test-embkfs-crash test-swap-store
 test-x86: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/console_test.py $(T)
 
@@ -2498,6 +2499,14 @@ test-x86: $(IMG) $(EMBKFS_MASTER)
 # actually looks like.
 build/crash-seed.img: tools/embkfs_mkfs/mkfs_embkfs.py | $(BUILD)
 	python3 tools/embkfs_mkfs/mkfs_embkfs.py --size-mib 4 $@
+
+# A SWAP STORE for the tests: a 128 MiB raw image with the EMBKSWAP header,
+# attached as the fourth IDE disk. mkswap writes only block 0.
+build/swap.img: tools/mkswap.py | $(BUILD)
+	python3 tools/mkswap.py $@ 128
+
+test-swap-store: $(IMG) $(EMBKFS_MASTER) build/swap.img
+	@SWAP_DISK=build/swap.img python3 tools/console_test.py "test swap store"
 
 test-embkfs-crash: $(IMG) $(EMBKFS_MASTER) build/crash-seed.img
 	@EXTRA_DISK=build/crash-seed.img python3 tools/console_test.py "test embkfs crash"

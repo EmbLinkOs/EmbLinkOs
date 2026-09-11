@@ -78,6 +78,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/lib/errno.c \
                   kernel/lib/random.c \
                   kernel/lib/canary.c \
+                  kernel/mm/swap.c \
                   kernel/lib/ksym.c \
                   kernel/drivers/bus/pci.c \
                   kernel/drivers/storage/virtio_blk.c \

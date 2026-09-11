@@ -28,6 +28,7 @@
 #include "mm/kheap.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
+#include "mm/swap.h"                         /* test swap store */
 #include "arch/x86_64/cpu/cpu_features.h"  /* test hardening */
 #include "include/uaccess_guard.h"           /* test hardening */
 #include "lib/random.h"                      /* test random */
@@ -430,6 +431,7 @@ static void selftests_print_commands(void)
     kprintf("  test canary\n");
     kprintf("  test hardlink\n");
     kprintf("  test embkfs crash   (needs sdc: make test-embkfs-crash)\n");
+    kprintf("  test swap store     (needs a swap disk: make test-swap-store)\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1513,6 +1515,59 @@ int selftests_handle_command(const char *cmd)
         }
         int rc = embkfs_run_crash_selftests(seed);
         kprintf("[cmd] test embkfs crash: %s\n", rc == EMBK_OK ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test swap store -- the page store, before anything is swapped.
+     * Slots are handed out and taken back; a page written out comes back
+     * byte for byte; two pages out do not come back as each other; a slot
+     * nobody holds is refused. Needs the swap image: make test-swap-store. */
+    if (strcmp(cmd, "test swap store") == 0) {
+        if (!swap_available()) {
+            kprintf("\n[cmd] test swap store: no swap store (attach build/swap.img: make test-swap-store)\n");
+            return 1;
+        }
+        int ok = 1;
+        struct swap_stats st0, st1;
+        swap_stats_get(&st0);
+        kprintf("\n[swap store] %s: %llu slots, %llu in use\n", st0.dev,
+                (unsigned long long)st0.nslots, (unsigned long long)st0.used);
+
+        uint64_t pa = pmm_alloc_page(), pb = pmm_alloc_page(), pc = pmm_alloc_page();
+        if (!pa || !pb || !pc) { kprintf("  [FAIL] no pages\n"); return 1; }
+        uint8_t *a = (uint8_t *)P2V(pa), *b = (uint8_t *)P2V(pb), *c = (uint8_t *)P2V(pc);
+        for (int i = 0; i < 4096; i++) { a[i] = (uint8_t)(i * 7 + 1); b[i] = (uint8_t)(0xA5 ^ i); }
+
+        uint64_t sa = swap_out(pa), sb = swap_out(pb);
+        kprintf("  [%s] two pages went out to distinct slots (%llu, %llu)\n",
+                (sa && sb && sa != sb) ? "ok" : "FAIL", (unsigned long long)sa, (unsigned long long)sb);
+        if (!(sa && sb && sa != sb)) ok = 0;
+
+        memset(a, 0, 4096); memset(b, 0, 4096);
+        int ra = swap_in(sa, pc);
+        int match_a = 1; for (int i = 0; i < 4096; i++) if (c[i] != (uint8_t)(i * 7 + 1)) { match_a = 0; break; }
+        kprintf("  [%s] page A came back byte for byte (rc %d)\n", (ra == EMBK_OK && match_a) ? "ok" : "FAIL", ra);
+        if (ra != EMBK_OK || !match_a) ok = 0;
+
+        int rb = swap_in(sb, pc);
+        int match_b = 1; for (int i = 0; i < 4096; i++) if (c[i] != (uint8_t)(0xA5 ^ i)) { match_b = 0; break; }
+        kprintf("  [%s] page B came back byte for byte, not as A (rc %d)\n", (rb == EMBK_OK && match_b) ? "ok" : "FAIL", rb);
+        if (rb != EMBK_OK || !match_b) ok = 0;
+
+        int rz = swap_in(sa + 1000 < st0.nslots ? sa + 1000 : 1, pc);
+        kprintf("  [%s] reading a slot nobody holds is refused (rc %d)\n", rz == -EMBK_EINVAL ? "ok" : "FAIL", rz);
+        if (rz != -EMBK_EINVAL) ok = 0;
+
+        swap_free(sa); swap_free(sb);
+        swap_stats_get(&st1);
+        kprintf("  [%s] slots returned: %llu in use before, %llu after; %llu outs, %llu ins\n",
+                st1.used == st0.used ? "ok" : "FAIL",
+                (unsigned long long)st0.used, (unsigned long long)st1.used,
+                (unsigned long long)(st1.outs - st0.outs), (unsigned long long)(st1.ins - st0.ins));
+        if (st1.used != st0.used) ok = 0;
+
+        pmm_free_page(pa); pmm_free_page(pb); pmm_free_page(pc);
+        kprintf("[cmd] test swap store: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
