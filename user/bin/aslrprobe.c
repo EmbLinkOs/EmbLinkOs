@@ -8,9 +8,14 @@
  *   mmap    a fresh mapping       the mmap window
  *   stack   the address of a local
  *   dylib   a libembk.so symbol   the dynamic library's load base
- *   text    a function in THIS binary -- fixed at 0x400000, because the app
- *           is ET_EXEC; moving it is the PIE work in docs/TODO.md. Printed so
- *           the thing that does NOT move is visible next to the things that do.
+ *   text    a function in THIS binary -- fixed at 0x400000, because this app
+ *           is ET_EXEC. Printed so the thing that does NOT move is visible
+ *           next to the things that do. The executable CAN move now: an app
+ *           linked -pie (user/lib/newlib-pie.ld) is loaded at a random bias
+ *           like everything else, and user/bin/pieprobe.c is the witness for
+ *           that. This one stays ET_EXEC on purpose -- it is dynamically
+ *           linked against libembk.so, which is the case PIE has not been
+ *           taken through yet (docs/TODO.md).
  *
  *   run /data/apps/aslrprobe/aslrprobe.elf     (twice)
  */
@@ -37,7 +42,7 @@ int main(void) {
      * pointer to a static inside the .so, which is where the library actually
      * is. */
     printf("aslrprobe: dylib %p   (libembk.so: its theme tokens)\n", (const void *)em_tokens_());
-    printf("aslrprobe: text  %p   (this binary -- fixed until PIE)\n", (void *)here);
+    printf("aslrprobe: text  %p   (this binary -- ET_EXEC; see pieprobe)\n", (void *)here);
     if (m != MAP_FAILED) munmap(m, 4096);
     return 0;
 }

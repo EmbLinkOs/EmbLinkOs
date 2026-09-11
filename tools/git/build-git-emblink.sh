@@ -66,7 +66,7 @@ CFLAGS = -O2 $ARCH_CFLAGS -fno-stack-protector \
          -D_POSIX_TIMERS=200809L -D_POSIX_MONOTONIC_CLOCK=200809L \
          -D__LINUX_ERRNO_EXTENSIONS__ \
          -DSA_RESTART=0
-LDFLAGS = -static -nostartfiles -T $M/user/lib/newlib.ld -L$NL/lib \
+LDFLAGS = -static -nostartfiles -T $M/user/lib/newlib.ld -L$M/user/lib -L$NL/lib \
           $OBJDIR/crt0.o $OBJDIR/syscalls.o
 
 ZLIB_PATH = $Z

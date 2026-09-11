@@ -90,7 +90,7 @@ CFLAGS  += -I$(EMBLINK_ROOT)/user/lib \
 # other userland binary: crt0.c provides _start (there is no crtX here) and
 # syscalls.c is the whole libc-to-kernel boundary. Without them the link has no
 # entry symbol and every read(), open() and stat() in the core is undefined.
-LDFLAGS += -nostartfiles -static -T $(EMBLINK_ROOT)/user/lib/newlib.ld \
+LDFLAGS += -nostartfiles -static -T $(EMBLINK_ROOT)/user/lib/newlib.ld -L $(EMBLINK_ROOT)/user/lib \
            -L$(EMBLINK_NEWLIB)/x86_64-elf/lib -L$(EMBLINK_ZLIB)/lib \
            $(EMBLINK_ROOT)/build/crt0.o $(EMBLINK_ROOT)/build/syscalls.o \
            -lz -lm -lemfont -lemnet $(EMBLINK_TLS_OBJS)

@@ -1,7 +1,8 @@
 /* kernel/loader/elf.c -- the user ELF loader.
  *
- * Loads a static ET_EXEC, and (Phase 2) DYNAMICALLY-linked executables: an
- * ET_EXEC app with a PT_DYNAMIC + DT_NEEDED libembk.so. The kernel IS the
+ * Loads a static ET_EXEC; a POSITION-INDEPENDENT executable (ET_DYN, loaded at
+ * a per-process random bias -- see elf_load_at); and DYNAMICALLY-linked
+ * executables: an app with a PT_DYNAMIC + DT_NEEDED libembk.so. The kernel IS the
  * dynamic linker (there is no userspace ld.so, and no PT_INTERP). It loads the
  * one shared object (the PIC UI toolkit) at a fixed bias, then does two-way
  * symbol resolution + relocation:
@@ -171,7 +172,8 @@ struct dynmod {
 static int parse_dynamic(const uint8_t *image, const struct elf64_phdr *ph, uint16_t phnum,
                          uint64_t bias, struct dynmod *m,
                          uint64_t *rela_v, uint64_t *rela_sz,
-                         uint64_t *jmprel_v, uint64_t *jmprel_sz)
+                         uint64_t *jmprel_v, uint64_t *jmprel_sz,
+                         int *needed_out)
 {
     const struct elf64_dyn *dyn = 0;
     for (uint16_t i = 0; i < phnum; i++)
@@ -179,9 +181,11 @@ static int parse_dynamic(const uint8_t *image, const struct elf64_phdr *ph, uint
     if (!dyn) return -EMBK_EINVAL;
 
     uint64_t symtab_v = 0, strtab_v = 0, hash_v = 0;
+    int needed = 0;
     *rela_v = *rela_sz = *jmprel_v = *jmprel_sz = 0;
     for (const struct elf64_dyn *d = dyn; d->d_tag != DT_NULL; d++) {
         switch (d->d_tag) {
+        case DT_NEEDED:   needed++;            break;
         case DT_SYMTAB:   symtab_v   = d->d_val; break;
         case DT_STRTAB:   strtab_v   = d->d_val; break;
         case DT_HASH:     hash_v     = d->d_val; break;
@@ -197,6 +201,7 @@ static int parse_dynamic(const uint8_t *image, const struct elf64_phdr *ph, uint
     m->strtab = (const char *)img_at(image, ph, phnum, strtab_v);
     const uint32_t *hash = (const uint32_t *)img_at(image, ph, phnum, hash_v);
     m->symcount = hash ? hash[1] : 0;   /* DT_HASH: [nbucket][nchain][...]    */
+    if (needed_out) *needed_out = needed;
     if (!m->symtab || !m->strtab || !m->symcount) return -EMBK_EINVAL;
     return EMBK_OK;
 }
@@ -288,7 +293,9 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
         uint64_t where = m->bias + r->r_offset;
         uint64_t val;
 
-        if (type == ELF_RELOC_RELATIVE) {
+        if (type == ELF_RELOC_NONE) {
+            continue;                       /* padding; see ELF_RELOC_NONE */
+        } else if (type == ELF_RELOC_RELATIVE) {
             val = m->bias + (uint64_t)r->r_addend;
         } else if (type == ELF_RELOC_COPY) {
             /* ET_EXEC app referencing a DATA object that lives in the .so: the
@@ -331,7 +338,8 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
             }
             val = (type == ELF_RELOC_ABS64) ? symval + (uint64_t)r->r_addend : symval;
         } else {
-            serial_write_string("ELF dynlink: unhandled reloc type\n");
+            kprintf("ELF dynlink: unhandled reloc type %u at index %llu\n",
+                    (unsigned)type, (unsigned long long)i);
             return -EMBK_ENOEXEC;
         }
         if (poke_user(pml4, where, val) != EMBK_OK) return -EMBK_EFAULT;
@@ -339,10 +347,11 @@ static int apply_relocs(uint64_t pml4, struct dynmod *m, struct dynmod *mods, in
     return EMBK_OK;
 }
 
-/* The app is already segment-loaded (bias 0). Load /libembk.so at DYLIB_VA_BASE
- * and perform the two-way link. */
+/* The app is already segment-loaded at `app_bias` (0 for an ET_EXEC app, its
+ * randomised exec_base for a PIE). Load /libembk.so at `dylib_base` and perform
+ * the two-way link. */
 static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
-                        uint64_t dylib_base,
+                        uint64_t app_bias, uint64_t dylib_base,
                         const struct elf64_phdr *app_ph, uint16_t app_phnum)
 {
     /* libembk.so is the sealed ABI (docs/USERSPACE.md D2 §3.1); it lives under
@@ -366,8 +375,8 @@ static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
 
     struct dynmod app, so;
     uint64_t ar_v, ar_sz, aj_v, aj_sz, sr_v, sr_sz, sj_v, sj_sz;
-    if (parse_dynamic(app_image, app_ph, app_phnum, 0, &app, &ar_v, &ar_sz, &aj_v, &aj_sz) != EMBK_OK ||
-        parse_dynamic(so_buf, so_ph, soeh->e_phnum, dylib_base, &so, &sr_v, &sr_sz, &sj_v, &sj_sz) != EMBK_OK) {
+    if (parse_dynamic(app_image, app_ph, app_phnum, app_bias, &app, &ar_v, &ar_sz, &aj_v, &aj_sz, 0) != EMBK_OK ||
+        parse_dynamic(so_buf, so_ph, soeh->e_phnum, dylib_base, &so, &sr_v, &sr_sz, &sj_v, &sj_sz, 0) != EMBK_OK) {
         kfree(so_buf); return -EMBK_ENOEXEC;
     }
     struct dynmod mods[2] = { app, so };
@@ -382,6 +391,30 @@ static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
     if (rc == EMBK_OK)
         serial_write_string("ELF dynlink: /system/lib/libembk.so linked\n");
     kfree(so_buf);
+    return rc;
+}
+
+/* A PIE with no DT_NEEDED: nothing to link AGAINST, but its own RELATIVE
+ * relocations still have to be applied, because every absolute address the
+ * linker could not fold into a PC-relative instruction -- an initialised
+ * pointer, a jump table, a .init_array entry -- was written assuming a load
+ * address of zero and is wrong by exactly the bias until we fix it.
+ *
+ * This is the whole of "self-relocation", and it is why a PIE needs no ld.so
+ * here: the relocations are RELATIVE, so resolving them needs no symbol table
+ * and no second module. The mods array is the app alone, which also means a
+ * stray symbol-based relocation in a supposedly self-contained binary fails
+ * loudly (UNRESOLVED) instead of silently binding to nothing. */
+static int self_relocate(const uint8_t *image, uint64_t pml4, uint64_t bias,
+                         const struct elf64_phdr *ph, uint16_t phnum)
+{
+    struct dynmod app;
+    uint64_t r_v, r_sz, j_v, j_sz;
+    if (parse_dynamic(image, ph, phnum, bias, &app, &r_v, &r_sz, &j_v, &j_sz, 0) != EMBK_OK)
+        return -EMBK_ENOEXEC;
+    struct dynmod mods[1] = { app };
+    int rc = apply_relocs(pml4, &app, mods, 1, r_v, r_sz);
+    if (rc == EMBK_OK) rc = apply_relocs(pml4, &app, mods, 1, j_v, j_sz);
     return rc;
 }
 
@@ -405,7 +438,7 @@ static int dynamic_link(const uint8_t *app_image, uint64_t pml4,
  * any caller that has no process to ask -- there are none in the tree today,
  * and one that appears will get the unrandomised layout rather than a crash. */
 int elf_load_at(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys,
-                uint64_t dylib_base, uint64_t *entry_out)
+                uint64_t exec_base, uint64_t dylib_base, uint64_t *entry_out)
 {
     if (!image || !entry_out || !pml4_phys)
         ELF_REFUSE("null image/entry/pml4");
@@ -418,31 +451,75 @@ int elf_load_at(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys,
         ELF_REFUSE("not an ELF (bad magic)");
     if (eh->e_ident[4] != 2)                              /* ELFCLASS64 */
         ELF_REFUSE("not ELFCLASS64");
-    if (eh->e_type != ET_EXEC || eh->e_machine != ELF_ARCH_MACHINE)
-        ELF_REFUSE("not an x86-64 ET_EXEC");
+    if (eh->e_machine != ELF_ARCH_MACHINE)
+        ELF_REFUSE("wrong machine for this architecture");
+    if (eh->e_type != ET_EXEC && eh->e_type != ET_DYN)
+        ELF_REFUSE("not ET_EXEC or ET_DYN");
     if (eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > image_len)
         ELF_REFUSE("program headers past the end of the image");
 
+    /* THE LOAD BIAS, and why e_type is enough to choose it.
+     *
+     * An ET_EXEC binary names its own addresses: the linker script put .text at
+     * 0x400000 and every absolute reference in the file says 0x400000-something.
+     * There is exactly one place it can go, and the bias is 0.
+     *
+     * An ET_DYN executable -- a PIE -- was linked at zero and carries the
+     * relocations needed to move it. We move it, per process, to a base the
+     * kernel drew from its CSPRNG. That is the last fixed address in a user
+     * address space: the heap, the stacks, mmap, the shared surfaces and the
+     * toolkit were already randomised per process, and the executable's own
+     * text was the one thing an attacker could still count on -- which is
+     * exactly what a ROP chain is built out of.
+     *
+     * A refusal rather than a silent bias-of-0: an unaligned base would map the
+     * image's pages at an offset the relocations do not agree with, and the
+     * program would run with every pointer wrong by less than a page. That is a
+     * far worse failure than not starting. */
+    uint64_t bias = 0;
+    if (eh->e_type == ET_DYN) {
+        if (exec_base & (PAGE_SIZE_4K - 1))
+            ELF_REFUSE("PIE load base is not page-aligned");
+        bias = exec_base;
+    }
+
     const struct elf64_phdr *ph = (const struct elf64_phdr *)(image + eh->e_phoff);
 
-    int rc = load_segments(image, image_len, pml4_phys, 0, ph, eh->e_phnum);
+    int rc = load_segments(image, image_len, pml4_phys, bias, ph, eh->e_phnum);
     if (rc != EMBK_OK) return rc;
 
-    /* dynamically-linked app? -> load + link the shared toolkit */
+    /* PT_DYNAMIC means SOMETHING has to be relocated -- but what depends on
+     * whether the binary imports anything. DT_NEEDED present: it wants the
+     * toolkit, so load /system/lib/libembk.so and do the two-way link (which
+     * also applies the app's own RELATIVE relocations, so a dynamic PIE needs
+     * nothing extra). DT_NEEDED absent: a self-contained PIE, which still has
+     * its own relocations to apply against the bias. */
     int has_dynamic = 0;
     for (uint16_t i = 0; i < eh->e_phnum; i++)
         if (ph[i].p_type == PT_DYNAMIC) { has_dynamic = 1; break; }
     if (has_dynamic) {
-        rc = dynamic_link(image, pml4_phys, dylib_base, ph, eh->e_phnum);
+        struct dynmod probe;
+        uint64_t a, b, c, d;
+        int needed = 0;
+        if (parse_dynamic(image, ph, eh->e_phnum, bias, &probe, &a, &b, &c, &d, &needed) != EMBK_OK)
+            ELF_REFUSE("PT_DYNAMIC without a usable symbol table");
+        rc = needed ? dynamic_link(image, pml4_phys, bias, dylib_base, ph, eh->e_phnum)
+                    : self_relocate(image, pml4_phys, bias, ph, eh->e_phnum);
         if (rc != EMBK_OK) return rc;
+    } else if (eh->e_type == ET_DYN) {
+        /* ET_DYN with no PT_DYNAMIC is not a thing a linker produces; refusing
+         * it is cheaper than loading something whose relocations we cannot even
+         * find and letting it fault at a random address. */
+        ELF_REFUSE("ET_DYN with no PT_DYNAMIC");
     }
 
-    *entry_out = eh->e_entry;
+    *entry_out = bias + eh->e_entry;
     return EMBK_OK;
 }
 
 /* Read a user ELF off the filesystem and load it into pml4_phys. */
-int elf_load_from_file_at(const char *path, uint64_t pml4_phys, uint64_t dylib_base, uint64_t *entry_out)
+int elf_load_from_file_at(const char *path, uint64_t pml4_phys,
+                          uint64_t exec_base, uint64_t dylib_base, uint64_t *entry_out)
 {
     uint8_t *buf = 0; uint64_t total = 0;
     int rc = read_file_kbuf(path, &buf, &total);
@@ -450,7 +527,7 @@ int elf_load_from_file_at(const char *path, uint64_t pml4_phys, uint64_t dylib_b
         serial_write_string("elf_load_from_file: read failed\n");
         return rc;
     }
-    rc = elf_load_at(buf, total, pml4_phys, dylib_base, entry_out);
+    rc = elf_load_at(buf, total, pml4_phys, exec_base, dylib_base, entry_out);
     kfree(buf);
     return rc;
 }
@@ -458,10 +535,10 @@ int elf_load_from_file_at(const char *path, uint64_t pml4_phys, uint64_t dylib_b
 
 int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint64_t *entry_out)
 {
-    return elf_load_at(image, image_len, pml4_phys, DYLIB_VA_BASE, entry_out);
+    return elf_load_at(image, image_len, pml4_phys, EXEC_VA_BASE, DYLIB_VA_BASE, entry_out);
 }
 
 int elf_load_from_file(const char *path, uint64_t pml4_phys, uint64_t *entry_out)
 {
-    return elf_load_from_file_at(path, pml4_phys, DYLIB_VA_BASE, entry_out);
+    return elf_load_from_file_at(path, pml4_phys, EXEC_VA_BASE, DYLIB_VA_BASE, entry_out);
 }

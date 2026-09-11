@@ -62,6 +62,13 @@ struct elf64_phdr {
  * family where the two architectures genuinely diverge -- x86 counts down from
  * the thread pointer, aarch64 counts up from it -- and nothing in this kernel
  * emits them yet. See docs/TODO.md.) */
+/* Type 0 is R_*_NONE on EVERY architecture: "do nothing". The link editor emits
+ * it as padding -- ld leaves exactly one in the .rela.plt of a PIE that has no
+ * PLT entries -- and a loader that treats it as unknown refuses a perfectly
+ * good binary. Outside the #if because the value is the same on both machines;
+ * that is the point of it. */
+#define ELF_RELOC_NONE       0
+
 #if defined(__x86_64__)
 #define ELF_ARCH_MACHINE     0x3E    /* EM_X86_64                */
 #define ELF_RELOC_ABS64      1       /* R_X86_64_64              */
@@ -134,16 +141,31 @@ struct elf64_rela { uint64_t r_offset; uint64_t r_info; int64_t r_addend; } __at
  * shared-window VA (0x5000...), the heap (0x6000...) and the stack (0x7000...). */
 #define DYLIB_VA_BASE 0x0000200000000000ULL
 
+/* Where a POSITION-INDEPENDENT executable (ET_DYN with no PT_INTERP) goes when
+ * the caller has no process to ask. Clear of every other window: the app's own
+ * old fixed base (0x400000), the dylib (0x2000...), shared surfaces (0x4000...),
+ * mmap (0x5000...), heap (0x6000...) and the stacks (0x7000...). A real process
+ * passes its own randomised layout.exec_base instead, which is the whole point
+ * -- see struct user_layout. */
+#define EXEC_VA_BASE 0x0000100000000000ULL
+
 int elf_load(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys, uint64_t *entry_out);
 
 int elf_load_from_file(const char *path, uint64_t pml4_phys, uint64_t *entry_out);
 
-/* The same, with the dynamic library placed at `dylib_base` instead of
- * DYLIB_VA_BASE -- which is what a process with a randomised layout wants.
- * The two-argument forms above keep the fixed base. */
+/* The same, with the two load biases the PROCESS chose rather than the fixed
+ * defaults -- which is what a process with a randomised layout wants. The
+ * short forms above keep the fixed bases.
+ *
+ * exec_base is used ONLY for an ET_DYN executable; an ET_EXEC app is linked at
+ * an absolute address and is loaded there, bias 0, exactly as before. So a
+ * mixed image -- some apps PIE, some not -- needs no flag day and no second
+ * code path: the file's own e_type selects.
+ *
+ * Both biases must be page-aligned. */
 int elf_load_at(const uint8_t *image, uint64_t image_len, uint64_t pml4_phys,
-                uint64_t dylib_base, uint64_t *entry_out);
+                uint64_t exec_base, uint64_t dylib_base, uint64_t *entry_out);
 int elf_load_from_file_at(const char *path, uint64_t pml4_phys,
-                          uint64_t dylib_base, uint64_t *entry_out);
+                          uint64_t exec_base, uint64_t dylib_base, uint64_t *entry_out);
 
 #endif /* _EMBK_LOADER_ELF_H_ */

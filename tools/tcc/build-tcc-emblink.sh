@@ -105,7 +105,7 @@ cd "$TCC_SRC"
     --sysincludepaths="/system/abi/include:/data/apps/tcc/include" \
     --libpaths=/system/abi \
     --extra-cflags="-O2 -mno-red-zone -fno-stack-protector -DCONFIG_TCC_STATIC -DCONFIG_TCCBOOT -I$MYOS/user/lib -isystem $NEWLIB_PREFIX/x86_64-elf/include -DSSIZE_MAX=0x7fffffffffffffffL" \
-    --extra-ldflags="-static -nostartfiles -T $MYOS/user/lib/newlib.ld -L$NEWLIB_PREFIX/x86_64-elf/lib $MYOS/build/crt0.o $MYOS/build/syscalls.o"
+    --extra-ldflags="-static -nostartfiles -T $MYOS/user/lib/newlib.ld -L$MYOS/user/lib -L$NEWLIB_PREFIX/x86_64-elf/lib $MYOS/build/crt0.o $MYOS/build/syscalls.o"
 
 # `make clean` is NOT paranoia: a stale libtcc.a and a fresh tcc.o disagree about
 # their config and give IDENTICAL errors with and without a flag -- that cost a

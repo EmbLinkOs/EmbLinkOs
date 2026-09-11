@@ -1,11 +1,29 @@
 #!/bin/sh
 # Build newlib for EmbLinkOS, for EITHER target architecture.
 #
-#   usage: tools/newlib/build-newlib-emblink.sh /path/to/newlib-4.4.0.20231231 [target] [prefix]
+#   usage: tools/newlib/build-newlib-emblink.sh [--pic] /path/to/newlib-4.4.0.20231231 [target] [prefix]
 #
+#          --pic   build a SECOND, position-independent libc (see below)
 #          target  x86_64-elf (default) | aarch64-elf
 #          prefix  default $HOME/cross/newlib-c99          for x86_64-elf
 #                          $HOME/cross/newlib-aarch64-c99  for aarch64-elf
+#                  with --pic:  $HOME/cross/newlib-pic
+#                               $HOME/cross/newlib-aarch64-pic
+#
+# --pic, AND WHY IT IS A SECOND PREFIX RATHER THAN A FLAG ON THE OLD ONE.
+# A position-independent executable may not contain an absolute relocation into
+# text -- R_X86_64_32 and friends -- and a stock newlib is full of them: 73,166
+# in the x86 libc.a this tree used to link, which is 73,166 reasons ld refuses
+# to produce a PIE. Rebuilding with -fPIC removes all of them (measured: 0 left,
+# 2,892 GOTPCREL/PLT32 in their place).
+#
+# It is a separate prefix because -fPIC is not free -- a GOT indirection on
+# every global -- and because the two libcs must otherwise be IDENTICAL. That
+# is the whole reason --pic lives in this script instead of a hand-typed
+# configure line: the C99 formats, the long-long support, the syscall contract
+# and the aarch64 configure.host patch are the parts that silently differ when
+# somebody builds the second libc by hand, and every one of them changes what a
+# program does rather than whether it links.
 #
 # WHY THIS EXISTS AT ALL, on either architecture: the newlib baked into a stock
 # cross toolchain is configured WITHOUT C99 printf formats, so "%zu" prints the
@@ -24,16 +42,20 @@
 #       from building the ILP32 variant, which we will never load.
 set -eu
 
-NLSRC="${1:?usage: $0 /path/to/newlib-x.y.z [target] [prefix]}"
+PIC=""
+if [ "${1:-}" = "--pic" ]; then PIC=yes; shift; fi
+
+NLSRC="${1:?usage: $0 [--pic] /path/to/newlib-x.y.z [target] [prefix]}"
 [ -d "$NLSRC/newlib" ] || { echo "$0: $NLSRC is not a newlib source tree" >&2; exit 2; }
 NLSRC=$(cd "$NLSRC" && pwd)
 
 TARGET="${2:-x86_64-elf}"
 case "$TARGET" in
-  x86_64-elf)  DEFPREFIX="$HOME/cross/newlib-c99" ;;
-  aarch64-elf) DEFPREFIX="$HOME/cross/newlib-aarch64-c99" ;;
+  x86_64-elf)  DEFPREFIX="$HOME/cross/newlib-c99";         PICPREFIX="$HOME/cross/newlib-pic" ;;
+  aarch64-elf) DEFPREFIX="$HOME/cross/newlib-aarch64-c99"; PICPREFIX="$HOME/cross/newlib-aarch64-pic" ;;
   *) echo "$0: unknown target '$TARGET' (expected x86_64-elf or aarch64-elf)" >&2; exit 2 ;;
 esac
+[ -n "$PIC" ] && DEFPREFIX="$PICPREFIX"
 PREFIX="${3:-$DEFPREFIX}"
 
 command -v "$TARGET-gcc" >/dev/null 2>&1 || {
@@ -86,7 +108,7 @@ if [ "$TARGET" = "aarch64-elf" ]; then
   fi
 fi
 
-BUILD="${BUILD_DIR:-${TMPDIR:-/tmp}/build-newlib-$TARGET}"
+BUILD="${BUILD_DIR:-${TMPDIR:-/tmp}/build-newlib-$TARGET${PIC:+-pic}}"
 rm -rf "$BUILD"; mkdir -p "$BUILD"
 
 echo "==> newlib $NLSRC"
@@ -94,9 +116,14 @@ echo "    target $TARGET  ->  $PREFIX"
 echo "    build  $BUILD"
 
 cd "$BUILD"
+# CFLAGS_FOR_TARGET is the one knob that differs between the two libcs, and it
+# is passed to configure rather than to make so that the flags are recorded in
+# every sub-makefile newlib generates -- setting it on the make line alone
+# leaves whole subdirectories compiled without it.
 "$NLSRC/configure" --target="$TARGET" --prefix="$PREFIX" \
     --disable-newlib-supplied-syscalls --disable-multilib --disable-nls \
-    --enable-newlib-io-c99-formats --enable-newlib-io-long-long
+    --enable-newlib-io-c99-formats --enable-newlib-io-long-long \
+    ${PIC:+CFLAGS_FOR_TARGET="-O2 -fPIC"}
 
 make ${MAKEFLAGS:--j8}
 make install
@@ -119,10 +146,43 @@ if "$TARGET-nm" "$LIB" 2>/dev/null | grep -qw "T write"; then
   echo "     It would collide with user/lib/syscalls.c." >&2
   exit 1
 fi
+# --pic makes one more claim than the stock build, and it is the claim the whole
+# second prefix rests on: no relocation survives that a PIE cannot carry.
+#
+# WHICH relocations those are is narrower than "absolute", and getting it wrong
+# in the strict direction is just as bad as missing one. A 64-bit absolute
+# reference in DATA is fine in a position-independent image: the link editor
+# rewrites it as R_X86_64_RELATIVE / R_AARCH64_RELATIVE and the loader adds the
+# bias. What a PIE cannot carry is a TRUNCATED absolute -- R_X86_64_32/32S,
+# R_AARCH64_ABS32 -- because there is no relative form of it to rewrite into:
+# the address simply may not fit once the image moves. Those are what a non-PIC
+# libc is full of (73,166 in the stock x86 libc.a) and what ld names when it
+# refuses to produce a PIE.
+if [ -n "$PIC" ]; then
+  case "$TARGET" in
+    x86_64-elf)  BAD='R_X86_64_32' ;;      # matches _32 and _32S
+    aarch64-elf) BAD='R_AARCH64_ABS32\|R_AARCH64_ABS16' ;;
+  esac
+  n=$("$TARGET-readelf" -rW "$LIB" 2>/dev/null | grep -c "$BAD" || true)
+  if [ "$n" -ne 0 ]; then
+    echo "$0: $LIB still has $n truncated absolute relocation(s) ($BAD)," >&2
+    echo "     so it is not PIC and ld will refuse to link a PIE against it." >&2
+    exit 1
+  fi
+  echo "==> ok: no truncated absolute relocations -- this libc can go into a PIE"
+fi
+
 echo
 echo "==> ok: $LIB  (asks for write(), does not define it)"
 echo "    point the build at it with:"
-case "$TARGET" in
-  x86_64-elf)  echo "      make NEWLIB_PREFIX=$PREFIX" ;;
-  aarch64-elf) echo "      make ARCH=aarch64 NEWLIB_AARCH64_PREFIX=$PREFIX" ;;
-esac
+if [ -n "$PIC" ]; then
+  case "$TARGET" in
+    x86_64-elf)  echo "      make NEWLIB_PIC_PREFIX=$PREFIX" ;;
+    aarch64-elf) echo "      make ARCH=aarch64 NEWLIB_PIC_PREFIX=$PREFIX" ;;
+  esac
+else
+  case "$TARGET" in
+    x86_64-elf)  echo "      make NEWLIB_PREFIX=$PREFIX" ;;
+    aarch64-elf) echo "      make ARCH=aarch64 NEWLIB_AARCH64_PREFIX=$PREFIX" ;;
+  esac
+fi

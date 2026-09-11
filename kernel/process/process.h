@@ -431,6 +431,7 @@ struct thread {
  * per process, from the kernel's CSPRNG:
  *
  *   window          base                 randomised over   entropy
+ *   executable      0x1000_0000_0000     64 GiB            24 bits   (PIE only)
  *   dylib           0x2000_0000_0000     16 GiB            22 bits
  *   shared surfaces 0x4000_0000_0000     64 GiB            24 bits   (moved off mmap)
  *   mmap            0x5000_0000_0000     64 GiB            24 bits   (+256 GiB window)
@@ -449,6 +450,7 @@ struct thread {
  * old constants were, which is exactly the list above.
  * ========================================================================== */
 struct user_layout {
+    uint64_t exec_base;           /* load bias for an ET_DYN (PIE) executable */
     uint64_t dylib_base;          /* where libembk.so is linked in            */
     uint64_t shared_base;         /* first shared-surface mapping             */
     uint64_t mmap_base, mmap_max; /* the mmap() window                        */

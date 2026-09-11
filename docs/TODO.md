@@ -1758,21 +1758,81 @@ violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
       surfaces their own window. Surface mappings are STILL not in the VMA
       list, which is now harmless (disjoint windows) but remains untidy:
       `vmmap`-style tooling cannot see them.
-- [ ] **PIE userland** so the executable itself moves. Needs `-pie` in the
-      user link, relocations processed by the in-kernel loader (it already does
-      them for libembk.so), and the fixed `. = 0x400000` in newlib.ld replaced.
-      **Scoped, and gated on a toolchain rebuild:** the prebuilt x86 `libc.a`
-      (`~/cross/newlib-c99`) has 73,166 `R_X86_64_32` and 11,768 `R_X86_64_64`
-      absolute relocations -- it is not PIC. Linking it into a PIE would need
-      text relocations, which means the loader writing into executable pages,
-      which is exactly what W^X refuses. So step one is rebuilding newlib with
-      `-fPIC` for both targets; nothing kernel-side is worth starting before
-      that exists.
-- [ ] **KASLR.** The kernel is linked with -mcmodel=kernel at a fixed higher-
-      half address and stage2 loads it there. Randomising it needs a
-      relocatable kernel image (-fPIE + a relocation pass at boot, or a
-      linker-generated relocation table) AND a bootloader that can place it.
-      Both halves are real work; neither is started.
+- [x] **PIE userland** so the executable itself moves. **The mechanism is done
+      and proven on both architectures; the conversion of the existing apps is
+      not, and is the open half.** What landed:
+      - A seventh ASLR window, `exec_base`: 0x1000_0000_0000, 64 GiB, 24 bits,
+        per process, from the same CSPRNG as the other six. `test aslr` checks
+        it with the rest.
+      - `kernel/loader/elf.c` accepts `ET_DYN` as an executable and loads it at
+        that bias, biasing the entry point and the module's own relocations. A
+        PIE with `DT_NEEDED` gets the existing two-way link against
+        libembk.so with a non-zero app bias; one without gets self-relocation
+        only (RELATIVE against its own bias). `R_*_NONE` is now skipped, which
+        it was not -- ld leaves exactly one in a PIE's .rela.plt, and it was
+        refusing perfectly good binaries.
+      - A PIC libc: `tools/newlib/build-newlib-emblink.sh --pic` builds a
+        second newlib prefix from the SAME script and the same options plus
+        `-fPIC`, and checks the claim (0 truncated absolute relocations, down
+        from 73,166 `R_X86_64_32` on x86). `make pie-check` says which you have;
+        with no PIC libc the PIE targets simply do not exist and the tree still
+        builds and boots.
+      - `user/lib/newlib-pie.ld`: linked at 0, with a PT_DYNAMIC. It shares its
+        whole section list with the fixed-address script through
+        `newlib-body.ld`, so the two cannot drift.
+      - `test pie` (x86 console) and the aarch64 boot test run `pieprobe.elf`
+        twice and require different addresses. The probe checks its own
+        relocated pointers, its constructor, its `__thread` variable and the
+        PIC libc's C99 formats before it answers.
+      Two real bugs fell out of this and are fixed: the TLS geometry was
+      published as SHN_ABS linker numbers, which a load bias corrupts silently
+      (a size comes back biased); and the alignment was floored at 8, so any
+      program whose maximum TLS alignment was smaller -- a single
+      `__thread int` -- built its block at the wrong offset and read zeroes.
+      Both were latent at a fixed address; only the second was reachable there.
+      A third, unrelated to PIE and found by running the crash path for real:
+      the x86 ring-3 backtrace in `dump_fault()` read the user stack with
+      access_ok() alone and no `uaccess_hw_begin()`, so SMAP faulted the read --
+      in the fault handler, in kernel mode, with no recovery point -- and the
+      machine went into a fault loop. It was reachable by ANY ring-3 fault and
+      had never printed a single frame. Fixed with the hardware permission and
+      an armed guard; `test faultkill` now prints the backtrace it was written
+      to print.
+- [ ] **Convert the remaining apps to PIE.** Five are converted and tested on
+      both architectures: `pieprobe`, plus `hello`, `posixdemo`, `ioracer` and
+      `crasher` through `$(NEWLIB_SIMPLE_PROGS)` -- one make define, one shared
+      list, so a program cannot be a PIE on one architecture and not the other.
+      `posixdemo` is the load-bearing one: the whole POSIX suite, including
+      variant-I TLS on aarch64, passes position-independent.
+      What is left is everything with a NON-PIC DEPENDENCY, and that is the
+      blocker rather than the link mode: zlib (`build-zlib`), the TLS library
+      objects, QuickJS, the shell SDK and its tools, and the out-of-tree ports
+      (CPython, git, tcc, NetSurf) which link with their own scripts. Each needs
+      its dependencies rebuilt `-fPIC` first. The EmUI apps are a separate case
+      again: they are ET_EXEC importing from libembk.so and EXPORTING their
+      static newlib back to it, so making them PIE means the app's newlib
+      becomes PIC while the .so still binds to it -- the loader already handles
+      a PIE with DT_NEEDED, but nothing has exercised it.
+- [ ] **KASLR.** NOT STARTED, and deliberately so -- it is the one item of this
+      round left undone, said plainly rather than half-built. The kernel is
+      linked with -mcmodel=kernel at a fixed higher-half address and stage2
+      loads it there. Randomising it needs BOTH halves and neither exists:
+      1. A relocatable kernel image. -mcmodel=kernel assumes the top 2 GiB and
+         folds absolute addresses into instructions; moving the image means
+         either -fPIE plus a relocation pass over a linker-emitted `.rela.dyn`
+         before the first C frame, or keeping the model and emitting a
+         relocation table to apply by hand. The pass itself has to run from
+         position-independent assembly, because it runs before the addresses it
+         is fixing are correct.
+      2. A bootloader that can place it. stage2 loads to a hardcoded physical
+         address and jumps to a hardcoded virtual one; it would have to draw an
+         offset (from RDRAND/RDSEED -- there is no CSPRNG that early), map the
+         higher half at base+offset, and pass the offset on so the kernel can
+         relocate itself and so `ksym` symbolisation still works.
+      Everything that reports a kernel address would follow: the panic
+      backtrace, `EMBDBG`, `info registers` symbolisation against kernel.elf.
+      The userland half of the same idea (PIE) is done above and is worth more
+      per unit of risk, which is why it went first.
 - [x] **Stack canaries in the kernel.** **Done** -- `-fstack-protector-strong`
       on both builds with a global guard (`lib/canary.c`), seeded by the entry
       stub before the first C frame exists, low byte zero. `test canary` and

@@ -80,6 +80,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/lib/canary.c \
                   kernel/mm/swap.c \
                   kernel/mm/swaptest.c \
+                  kernel/loader/pietest.c \
                   kernel/lib/ksym.c \
                   kernel/drivers/bus/pci.c \
                   kernel/drivers/storage/virtio_blk.c \
@@ -234,6 +235,13 @@ arm64: $(ARM_ELF) $(ARM_IMG) $(ARM_ROOTFS)
 ARM_USER      := $(ARM_BUILD)/user
 ARM_CRT0      := $(ARM_USER)/crt0.o
 ARM_SYSCALLS  := $(ARM_USER)/syscalls.o
+# Their -fPIC twins, for the programs linked as PIEs. Named HERE, beside the
+# originals, and not beside the rules that build them: ARM_NEWLIB_PROG expands
+# these when it is called, so a name defined further down expands to nothing and
+# the link silently drops crt0 -- the failure this fragment's own comments warn
+# about four times over.
+ARM_PIE_CRT0     := $(ARM_USER)/crt0_pic.o
+ARM_PIE_SYSCALLS := $(ARM_USER)/syscalls_pic.o
 
 # The programs built for aarch64. This is SHORT ON PURPOSE and is the honest
 # statement of how much userland the second architecture has: hello.elf is a
@@ -462,6 +470,7 @@ endef
 $(foreach src,$(ARM_XSRC_ALL),$(eval $(call ARM_XOBJ_RULE,$(src))))
 
 ARM_USER_ELVES := $(patsubst %,$(ARM_USER)/%.elf,$(ARM_NEWLIB_PROGS)) \
+                  $(if $(PIE_OK),$(ARM_USER)/pieprobe.elf,) \
                   $(patsubst %,$(ARM_USER)/%.elf,$(ARM_PLAIN_PROGS)) \
                   $(patsubst %,$(ARM_USER)/%.elf,$(ARM_UI_PROGS)) \
                   $(patsubst %,$(ARM_USER)/%.elf,$(ARM_EMLIBC_PROGS))
@@ -487,16 +496,55 @@ $(ARM_USER)/syscalls.o: user/lib/syscalls.c | $(ARM_USER)
 # takes precedence over a pattern rule, so generating one per program is what
 # makes the outcome depend on nothing but this file.
 define ARM_NEWLIB_PROG
+ifeq ($$(and $$(PIE_OK),$$(filter $(1),$$(NEWLIB_SIMPLE_PROGS))),)
 $(ARM_USER)/$(1).o: $(if $(ARM_MAIN_$(1)),$(ARM_MAIN_$(1)),user/bin/$(1).c) | $(ARM_USER)
 	$$(USER_CC) $$(NEWLIB_CFLAGS) $(ARM_INC_$(1)) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
                       $(ARM_EXTRAOBJ_$(1)) \
-                      $(ARM_CRT0) $(ARM_SYSCALLS) user/lib/newlib.ld
+                      $(ARM_CRT0) $(ARM_SYSCALLS) $(NEWLIB_LDSCRIPT)
 	$$(USER_CC) $$(NEWLIB_LDFLAGS) $(ARM_CRT0) $(ARM_SYSCALLS) \
 	    $(ARM_USER)/$(1).o $(call ARM_XOBJ,$(ARM_XSRC_$(1))) \
 	    $(ARM_EXTRAOBJ_$(1)) -lc -lm -lgcc -o $$@
+else
+# On the PIE list (the top-level Makefile's $(NEWLIB_SIMPLE_PROGS): one source
+# file, no non-PIC dependency) and a PIC libc is installed -- so this program is
+# ET_DYN here exactly as it is on x86. The list is SHARED rather than repeated,
+# because a program that is position-independent on one architecture and not on
+# the other is a difference nobody would go looking for.
+$(ARM_USER)/$(1).o: $(if $(ARM_MAIN_$(1)),$(ARM_MAIN_$(1)),user/bin/$(1).c) | $(ARM_USER)
+	$$(USER_CC) $$(NEWLIB_PIE_CFLAGS) $(ARM_INC_$(1)) -c $$< -o $$@
+$(ARM_USER)/$(1).elf: $(ARM_USER)/$(1).o $(ARM_PIE_CRT0) $(ARM_PIE_SYSCALLS) \
+                      $(NEWLIB_PIE_LDSCRIPT)
+	$$(USER_CC) $$(NEWLIB_PIE_LDFLAGS) $$(NEWLIB_PIE_WL) \
+	    $(ARM_PIE_CRT0) $(ARM_PIE_SYSCALLS) $(ARM_USER)/$(1).o -lc -lm -lgcc -o $$@
+	@t=$$$$($$(USER_TRIPLE)-readelf -h $$@ | awk '/Type:/{print $$$$2}'); \
+	 if [ "$$$$t" != "DYN" ]; then echo "$(1).elf is $$$$t, not DYN -- PIE_OK is set but it did not link PIE"; exit 1; fi
+endif
 endef
 $(foreach p,$(ARM_NEWLIB_PROGS),$(eval $(call ARM_NEWLIB_PROG,$(p))))
+
+# --- the PIE witness, aarch64 -------------------------------------------------
+# Same program, same two link ingredients, as the x86 side: everything compiled
+# -fPIC against the -fPIC newlib, linked -pie with newlib-pie.ld. Its own rule
+# rather than a member of ARM_NEWLIB_PROGS because every object on the line --
+# crt0 and the syscall stubs included -- has to be the PIC one, and sharing the
+# list would have linked the non-PIC crt0 into it. Gated on the PIC newlib
+# existing, exactly as x86 is.
+ifneq ($(PIE_OK),)
+$(ARM_USER)/crt0_pic.o: user/lib/crt0.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
+$(ARM_USER)/syscalls_pic.o: user/lib/syscalls.c user/lib/embk_syscall.h | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
+$(ARM_USER)/pieprobe.o: user/bin/pieprobe.c | $(ARM_USER)
+	$(USER_CC) $(NEWLIB_PIE_CFLAGS) -c $< -o $@
+$(ARM_USER)/pieprobe.elf: $(ARM_USER)/crt0_pic.o $(ARM_USER)/syscalls_pic.o \
+                           $(ARM_USER)/pieprobe.o $(NEWLIB_PIE_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_PIE_LDFLAGS) $(NEWLIB_PIE_WL) \
+	    $(ARM_USER)/crt0_pic.o $(ARM_USER)/syscalls_pic.o $(ARM_USER)/pieprobe.o \
+	    -lc -lm -lgcc -o $@
+	@t=$$($(USER_TRIPLE)-readelf -h $@ | awk '/Type:/{print $$2}'); \
+	 if [ "$$t" != "DYN" ]; then echo "pieprobe.elf is $$t, not DYN -- not a PIE"; exit 1; fi
+endif
 
 
 # Freestanding programs (init.elf): own _start, no libc, linked with the raw ld
@@ -641,8 +689,8 @@ define ARM_EMLIBC_PROG
 $(ARM_USER)/app_$(1).o: $(if $(ARM_EMSRC_$(1)),$(ARM_EMSRC_$(1)),user/bin/$(1).c) | $(ARM_USER)
 	$$(USER_CC) $$(ARM_EMLIBC_CFLAGS) -c $$< -o $$@
 $(ARM_USER)/$(1).elf: $(ARM_USER)/emlibc_crt0.o $(ARM_USER)/app_$(1).o \
-                      $(ARM_LIBEMLIBC) user/lib/newlib.ld
-	$$(USER_CC) -nostdlib -static -T user/lib/newlib.ld \
+                      $(ARM_LIBEMLIBC) $(NEWLIB_LDSCRIPT)
+	$$(USER_CC) -nostdlib -static -T user/lib/newlib.ld -L user/lib \
 	    -Wl,-z,max-page-size=0x1000 \
 	    $(ARM_USER)/emlibc_crt0.o $(ARM_USER)/app_$(1).o \
 	    -L$(ARM_USER) -lemlibc -lgcc -o $$@
@@ -898,6 +946,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
 	  chk 'writable+executable mapping was refused' MM 'W^X is not enforced on mmap'; \
 	  chk 'the generated code RUNS and returns 42' MM 'mprotect W->X did not make the page executable'; \
 	  chk 'mprotect across the hole -> ENOMEM'   MM 'mprotect half-applied across an unmapped hole'; \
+	  if [ -n "$(PIE_OK)" ]; then chk 'a PIE moves between runs: OK' PIE 'a position-independent executable did not run, or landed at the same address twice'; fi; \
 	  chk 'two writes APPENDED (one shared cursor'  FD 'dup gave the copy its OWN cursor -- not a shared open file description'; \
 	  chk 'dup2 lands on exactly the descriptor'    FD 'dup2 did not honour the requested fd number'; \
 	  chk 'pagecache: writeback thread started'    PC 'the page cache never came up'; \
@@ -977,6 +1026,11 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
 	  echo "  MM mmap/munmap/mprotect: anonymous mappings, W^X enforced,"; \
 	  echo "     every page given back (page tables included), and code"; \
 	  echo "     GENERATED at runtime, flipped W->X, and executed"; \
+	  if [ -n "$(PIE_OK)" ]; then \
+	    echo "  PIE a position-independent executable: loaded at a random bias,"; \
+	    echo "      its RELATIVE relocations applied, its constructor run, its"; \
+	    echo "      __thread variable intact, and a DIFFERENT address each run"; \
+	  fi; \
 	  echo "  FD dup/dup2/F_DUPFD over a real shared open file"; \
 	  echo "     description: two descriptors, ONE cursor"; \
 	  echo "  PC the unified page cache: write-back, one object per file,"; \

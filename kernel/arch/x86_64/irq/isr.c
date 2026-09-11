@@ -165,34 +165,63 @@ static void dump_fault(struct registers *regs) {
      * The kernel walk above stops at the kernel's own .text, which is exactly
      * no help when the faulting code is an application -- and "RIP=0" says a
      * call or return went through a null pointer without saying whose. The
-     * user stack is mapped right now (same CR3), so the rbp chain is readable;
-     * every read goes through access_ok so a corrupt frame ends the walk
-     * instead of faulting the fault handler.
+     * user stack is mapped right now (same CR3), so the rbp chain is readable.
+     *
+     * TWO THINGS ARE NEEDED TO READ IT, and this had only one of them.
+     *
+     * access_ok() proves a page is mapped. It does NOT make the processor
+     * willing to touch it: SMAP turns any kernel-mode read of a user page into
+     * a fault unless the access is declared deliberate, which is what
+     * uaccess_hw_begin() does. Without it the first dereference here faulted --
+     * inside the fault handler, in kernel mode, with no recovery point armed --
+     * and the machine went into a fault loop printing nothing. The line
+     * "ret@rsp" with no value after it was the whole of the evidence.
+     *
+     * That was reachable by ANY ring-3 fault, which is to say by any program
+     * that crashes, which is the one situation this code exists for. It
+     * survived because the crash path's own witness reads the kernel's verdict
+     * line rather than this block, so a handler that hung before printing it
+     * looked like a slow test.
+     *
+     * So: permission from the hardware, and a recovery point, because
+     * access_ok is a check and a check is not a guarantee -- the page can go
+     * away between the proof and the read. A fault inside the walk now ends the
+     * walk instead of the machine.
      *
      * Addresses, not symbols: the kernel has its own .embdbg and knows nothing
-     * about an application's. `nm build/<app>.elf` turns these into names, and
-     * an ET_EXEC app is loaded at bias 0 so they match directly. */
+     * about an application's. `nm build/<app>.elf` turns these into names --
+     * directly for an ET_EXEC app, which is loaded at bias 0, and offset by the
+     * load bias for a PIE (whose text is in the executable window, 0x1000_...;
+     * subtract the window-relative page from `rip` to recover the link-time
+     * address). */
     if ((regs->cs & 0x3) == 0x3) {
         serial_write_string("\n--- ring-3 backtrace (addresses; nm the app) ---\n");
         serial_write_string("  rip  "); serial_write_hex(regs->rip); serial_write_string("\n");
-        /* The return address the faulting frame would use, if rsp still points
-         * at it -- the usual shape when a CALL through a null pointer faults
-         * on the very first instruction fetch. */
-        if (access_ok((const void *)(uintptr_t)regs->rsp, 8)) {
-            serial_write_string("  ret@rsp  ");
-            serial_write_hex(*(volatile uint64_t *)(uintptr_t)regs->rsp);
-            serial_write_string("\n");
+        uaccess_hw_begin();
+        if (uaccess_arm()) {
+            /* The return address the faulting frame would use, if rsp still
+             * points at it -- the usual shape when a CALL through a null
+             * pointer faults on the very first instruction fetch. */
+            if (access_ok((const void *)(uintptr_t)regs->rsp, 8)) {
+                serial_write_string("  ret@rsp  ");
+                serial_write_hex(*(volatile uint64_t *)(uintptr_t)regs->rsp);
+                serial_write_string("\n");
+            }
+            uint64_t rbp = regs->rbp;
+            for (int i = 0; i < 24; i++) {
+                if ((rbp & 0x7) || !access_ok((const void *)(uintptr_t)rbp, 16)) break;
+                uint64_t next = *(volatile uint64_t *)(uintptr_t)(rbp);
+                uint64_t ret  = *(volatile uint64_t *)(uintptr_t)(rbp + 8);
+                if (!ret) break;
+                serial_write_string("  frame "); serial_write_hex(ret); serial_write_string("\n");
+                if (next <= rbp) break;                /* chain must climb */
+                rbp = next;
+            }
+            uaccess_disarm();
+        } else {
+            serial_write_string("  (stack unreadable -- walk abandoned)\n");
         }
-        uint64_t rbp = regs->rbp;
-        for (int i = 0; i < 24; i++) {
-            if ((rbp & 0x7) || !access_ok((const void *)(uintptr_t)rbp, 16)) break;
-            uint64_t next = *(volatile uint64_t *)(uintptr_t)(rbp);
-            uint64_t ret  = *(volatile uint64_t *)(uintptr_t)(rbp + 8);
-            if (!ret) break;
-            serial_write_string("  frame "); serial_write_hex(ret); serial_write_string("\n");
-            if (next <= rbp) break;                    /* chain must climb */
-            rbp = next;
-        }
+        uaccess_hw_end();
         serial_write_string("--- end ring-3 backtrace ---\n");
     }
 }

@@ -147,6 +147,8 @@ static void sched_kick_idle(void);
  * See struct user_layout in process.h for the table and the reasoning. The
  * constants stay: they are the window BASES, and the roll adds a random,
  * page-aligned offset inside each window. */
+#define ASLR_EXEC_BASE      0x0000100000000000ULL      /* PIE text, below the dylib */
+#define ASLR_EXEC_SPAN      (64ull << 30)
 #define ASLR_DYLIB_SPAN     (16ull << 30)
 #define ASLR_SHARED_BASE    0x0000400000000000ULL      /* off the mmap base */
 #define ASLR_SHARED_SPAN    (64ull << 30)
@@ -165,6 +167,7 @@ static uint64_t aslr_offset(uint64_t span) {
 
 void process_layout_roll(struct process *proc) {
     struct user_layout *l = &proc->layout;
+    l->exec_base         = ASLR_EXEC_BASE       + aslr_offset(ASLR_EXEC_SPAN);
     l->dylib_base        = DYLIB_VA_BASE        + aslr_offset(ASLR_DYLIB_SPAN);
     l->shared_base       = ASLR_SHARED_BASE     + aslr_offset(ASLR_SHARED_SPAN);
     l->mmap_base         = USER_MMAP_BASE       + aslr_offset(ASLR_MMAP_SPAN);
@@ -2304,7 +2307,8 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         rc = embx_load_from_file(path, pml4, parent_caps, &entry_point, &granted);
         if (rc == EMBK_OK) proc->cap_set = granted;   /* declared + granted */
     } else {
-        rc = elf_load_from_file_at(path, pml4, proc->layout.dylib_base, &entry_point);
+        rc = elf_load_from_file_at(path, pml4, proc->layout.exec_base,
+                                   proc->layout.dylib_base, &entry_point);
     }
     if (rc != EMBK_OK) {
         vmm_destroy_address_space(pml4);

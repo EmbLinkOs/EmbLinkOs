@@ -161,15 +161,20 @@ extern void (*__ctors_end[])(void) __attribute__((weak));
  * hypothetical: crt0.o is linked TWO ways. Static programs use -T newlib.ld,
  * which defines these; the dynamic EmUI apps use NEWLIB_DYN_LDFLAGS (no -T,
  * ld's DEFAULT script), which does NOT. A strong reference would break every
- * EmUI app's link instantly. Weak ⇒ absent ⇒ 0 ⇒ __tls_memsz == 0 ⇒ the setup
+ * EmUI app's link instantly. Weak ⇒ absent ⇒ 0 ⇒ memsz == 0 ⇒ the setup
  * below does nothing, which is exactly right for a program with no TLS.
  * KNOWN GAP: that also means dynamically-linked EmUI apps get no TLS at all --
  * fine while nothing there uses __thread, but a `__thread` variable in one
  * would fault on %fs. Fix by teaching the dynamic link the same symbols. */
-extern char __tls_image[]  __attribute__((weak));
-extern char __tls_filesz[] __attribute__((weak));
-extern char __tls_memsz[]  __attribute__((weak));
-extern char __tls_align[]  __attribute__((weak));
+/* Both are ADDRESSES -- __tls_geom points at three quadwords (filesz, memsz,
+ * align) the linker script emitted as DATA. The geometry used to be three
+ * linker symbols holding the numbers themselves, and that does not survive a
+ * position-independent link: PIC code reaches a symbol PC-relatively, so the
+ * program computes load_bias + value, which is right for an address and
+ * nonsense for a size. Reading them out of memory means there is nothing to
+ * bias. newlib-body.ld's comment carries the full reasoning. */
+extern char __tls_image[] __attribute__((weak));
+extern char __tls_geom[]  __attribute__((weak));   /* 3 quadwords: filesz, memsz, align */
 
 extern void *malloc(unsigned long size);
 extern void *memcpy(void *dst, const void *src, unsigned long n);
@@ -208,7 +213,8 @@ extern void *memset(void *dst, int c, unsigned long n);
  *
  * Get the arithmetic wrong and there is no fault to debug: every TLS variable
  * quietly resolves to the wrong address. Both formulas are the LINKER's, so
- * both must use the linker's own alignment (__tls_align) rather than a guess.
+ * both must use the linker's own alignment (__tls_geom[2]) rather than a
+ * guess.
  *
  * On aarch64 the 16 is not a constant we picked -- it is TCB_SIZE in binutils'
  * elfNN_aarch64_tpoff_base(), which computes every TPREL offset as
@@ -220,9 +226,18 @@ extern void *memset(void *dst, int c, unsigned long n);
  * allocator uses _impure_ptr, not TLS; it would be circular otherwise. */
 static void setup_tls(void)
 {
-    unsigned long memsz  = (unsigned long)(unsigned long *)__tls_memsz;
-    unsigned long filesz = (unsigned long)(unsigned long *)__tls_filesz;
-    unsigned long align  = (unsigned long)(unsigned long *)__tls_align;
+    /* Absent (a dynamically-linked EmUI app, or the stubs in
+     * emlink_dynstubs.s) => __tls_geom is a null pointer => the program has no
+     * TLS and we do nothing, which is the same answer the old absolute symbols
+     * gave for memsz == 0. Checked BEFORE the load, not after: dereferencing it
+     * is the one thing we must not do. */
+    if (!__tls_geom) {
+        return;
+    }
+    const unsigned long *geom = (const unsigned long *)__tls_geom;
+    unsigned long filesz = geom[0];
+    unsigned long memsz  = geom[1];
+    unsigned long align  = geom[2];
 
     if (memsz == 0) {
         return;             /* no PT_TLS: nothing to set up, the thread pointer

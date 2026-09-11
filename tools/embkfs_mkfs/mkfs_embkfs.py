@@ -1217,6 +1217,32 @@ def discover_userland_objects(build_dir="build"):
     objects.append((b"etc",      L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"etc/passwd", L.DT_REG, L.S_IFREG | 0o644, b""))
     objects.append((b"etc/shadow", L.DT_REG, L.S_IFREG | 0o600, b""))
+    # /etc/sessions: where a session's clamped namespace profile lives
+    # (user/bin/init.c reads /etc/sessions/<user>.ns). The DIRECTORY has to be
+    # on the image even when it is empty, for the same reason .vellum above
+    # does: a namespace bind resolves its prefix in the parent at spawn time, so
+    # a directory that does not exist yet can never be granted and therefore can
+    # never be created by the process that needs it.
+    objects.append((b"etc/sessions", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+
+    # Per-user homes under /data/users. This is the multi-user boundary made
+    # real: a session is granted ITS OWN directory here and nothing else, so
+    # another user's home is not merely unreadable, it is UNNAMEABLE -- absence
+    # rather than a permission check.
+    #
+    # They must exist before anyone logs in, and for the bind reason above they
+    # cannot be created on demand by the session that wants one. Two of them,
+    # because one proves nothing: user/bin/primtest.c's mu_isolation_test runs
+    # as a confined `guest` and checks that it can write its own home AND that
+    # /data/users/teo does not resolve at all. With only one user on the image
+    # that second half is vacuous, and with neither it cannot spawn.
+    objects.append((b"data/users",       L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/guest", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/teo",   L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/teo/user.ns", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"# teo's session profile -- the file a guest must not be able to name.\n"
+                    b"ro /system\n"
+                    b"rw /data/users/teo\n"))
     return objects
 
 

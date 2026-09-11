@@ -1,4 +1,4 @@
-build/emlibc_embxapp.o: user/bin/emlibc_embxapp.c \
- user/emlibc/include/stdio.h user/emlibc/include/process.h
-user/emlibc/include/stdio.h:
-user/emlibc/include/process.h:
+build/emlibc_crt0.o: user/lib/crt0.c user/lib/embk_syscall.h \
+ user/emlibc/include/stdint.h
+user/lib/embk_syscall.h:
+user/emlibc/include/stdint.h:

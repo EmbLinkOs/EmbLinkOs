@@ -12,7 +12,8 @@
 #include "block/block.h"
 #include "fs/embkfs/embkfs.h"
 #include "mm/swap.h"          /* swap_init: the store, if a disk carries the header */
-#include "mm/swaptest.h"      /* the swap witness, driven */
+#include "mm/swaptest.h"
+#include "loader/pietest.h"      /* the swap witness, driven */
 #include "fs/vfs.h"
 #include "arch/aarch64/cpu/cpu_features.h"
 #include "include/uaccess_guard.h"
@@ -1010,6 +1011,23 @@ void arch_early_main(uint64_t dtb_phys) {
         kprintf("  [%s] the account store and the session policy: %s (exit %d)\n",
                 rc == 0 ? " ok " : "FAIL", rc == 0 ? "OK" : "FAIL", rc);
         if (rc != 0) selftest_fails++;
+    }
+
+    /* --- a position-independent executable, on this architecture too -------
+     * The aarch64 relocation types and the aarch64 linker are the only parts
+     * of PIE that differ from x86, and they are exactly the parts a shared
+     * loader cannot prove on one machine. Same witness, same claim: a real
+     * ET_DYN binary loads twice and lands somewhere different each time. */
+    kprintf("\n--- pie ---\n");
+    {
+        int rc = pie_selftest_run("/data/apps/pieprobe/pieprobe.elf");
+        if (rc == -EMBK_ENOENT) {
+            kprintf("  [ -- ] position-independent executables: NOT BUILT (no -fPIC libc)\n");
+        } else {
+            kprintf("  [%s] a PIE moves between runs: %s\n",
+                    rc == 0 ? " ok " : "FAIL", rc == 0 ? "OK" : "FAIL");
+            if (rc != 0) selftest_fails++;
+        }
     }
 
     kprintf("\n--- swap ---\n");

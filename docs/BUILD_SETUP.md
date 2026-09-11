@@ -234,6 +234,19 @@ Check it worked: the OS boots to the EmUI desktop. At the serial prompt,
 `test posix` should print `ALL PASS`.
 
 ```sh
+# 4b. OPTIONAL -- a SECOND, position-independent newlib, so apps can be linked
+#     as PIEs (ET_DYN) and loaded at a random address in every process. Same
+#     script, same source tree, same options, plus -fPIC; a separate prefix
+#     because the two libcs must otherwise be identical and -fPIC is not free.
+tools/newlib/build-newlib-emblink.sh --pic ~/cross/src/newlib-4.4.0.20231231
+tools/newlib/build-newlib-emblink.sh --pic ~/cross/src/newlib-4.4.0.20231231 aarch64-elf
+#   Nothing else to configure -- the Makefile finds $HOME/cross/newlib-pic and
+#   $HOME/cross/newlib-aarch64-pic on its own. Check with:
+make pie-check
+#   Without it the tree still builds and boots; apps just stay at 0x400000.
+#   With it, `test pie` (x86) and the aarch64 boot test load a real PIE twice
+#   and require it to land at a different address each time.
+
 # 5. OPTIONAL ports -- each is independent; build only what you want.
 #    Every script takes the SOURCE TREE as an argument and derives the rest.
 

@@ -37,6 +37,7 @@
 #include "include/uaccess_guard.h"           /* test hardening */
 #include "lib/random.h"                      /* test random */
 #include "lib/canary.h"                      /* test canary */
+#include "loader/pietest.h"
 #include <stddef.h>                            /* offsetof: test aslr */
 #include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
 #include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
@@ -432,6 +433,7 @@ static void selftests_print_commands(void)
     kprintf("  test hardening\n");
     kprintf("  test random\n");
     kprintf("  test aslr\n");
+    kprintf("  test pie\n");
     kprintf("  test canary\n");
     kprintf("  test hardlink\n");
     kprintf("  test embkfs crash   (needs sdc: make test-embkfs-crash)\n");
@@ -1327,8 +1329,8 @@ int selftests_handle_command(const char *cmd)
     /* ----------------------------------------------------------------------
      * test aslr -- does every process get its own addresses?
      *
-     * Six processes, six layouts read straight out of the process table. Each
-     * of the six windows must be page-aligned, inside its window, and DISTINCT
+     * Six processes, seven layouts read straight out of the process table. Each
+     * of the seven windows must be page-aligned, inside its window, and DISTINCT
      * across all six: at 22 bits of entropy per window the chance of any
      * collision among six is about 1 in 300,000, so a repeat is a broken
      * generator, not bad luck. The children sleep so they exist long enough to
@@ -1346,7 +1348,7 @@ int selftests_handle_command(const char *cmd)
         int pids[N];
         int ok = 1, got = 0;
 
-        kprintf("\n[aslr] %d processes, six kernel-chosen windows each\n", N);
+        kprintf("\n[aslr] %d processes, seven kernel-chosen windows each\n", N);
         for (int i = 0; i < N; i++) {
             char *a[] = { (char *)sp, "-c", "sleep 3000", NULL };
             pids[i] = process_create(sp, a, 3, NULL, 0);
@@ -1355,8 +1357,8 @@ int selftests_handle_command(const char *cmd)
                 ok = 0; pids[i] = -1; continue;
             }
             got++;
-            kprintf("  pid %3d: dylib %llx  shared %llx  mmap %llx  heap %llx  stack %llx  tstack %llx\n",
-                    pids[i],
+            kprintf("  pid %3d: exec %llx  dylib %llx  shared %llx  mmap %llx  heap %llx  stack %llx  tstack %llx\n",
+                    pids[i], (unsigned long long)L[i].exec_base,
                     (unsigned long long)L[i].dylib_base, (unsigned long long)L[i].shared_base,
                     (unsigned long long)L[i].mmap_base,  (unsigned long long)L[i].heap_base,
                     (unsigned long long)L[i].stack_top_page, (unsigned long long)L[i].thread_stack_base);
@@ -1364,6 +1366,7 @@ int selftests_handle_command(const char *cmd)
 
         /* Each field: aligned, in-window, and unique across the set. */
         struct { const char *name; size_t off; uint64_t lo, hi; } F[] = {
+            { "exec",   offsetof(struct user_layout, exec_base),          0x0000100000000000ULL, 0x0000100000000000ULL + (64ull<<30) },
             { "dylib",  offsetof(struct user_layout, dylib_base),        0x0000200000000000ULL, 0x0000200000000000ULL + (16ull<<30) },
             { "shared", offsetof(struct user_layout, shared_base),       0x0000400000000000ULL, 0x0000400000000000ULL + (64ull<<30) },
             { "mmap",   offsetof(struct user_layout, mmap_base),         0x0000500000000000ULL, 0x0000500000000000ULL + (64ull<<30) },
@@ -1398,8 +1401,9 @@ int selftests_handle_command(const char *cmd)
             if (L[i].mmap_max > L[i].heap_base) disjoint = 0;
             if (L[i].heap_max > L[i].stack_top_page - (128ull << 12)) disjoint = 0;   /* main stack pages */
             if (L[i].shared_base + (64ull << 30) > L[i].mmap_base) disjoint = 0;
+            if (L[i].exec_base + (64ull << 30) > L[i].dylib_base) disjoint = 0;
         }
-        kprintf("  [%s] the six windows do not overlap inside any process\n", disjoint ? "ok" : "FAIL");
+        kprintf("  [%s] the seven windows do not overlap inside any process\n", disjoint ? "ok" : "FAIL");
         if (!disjoint) ok = 0;
 
         /* And the processes actually RAN with those layouts: they are alive,
@@ -1418,6 +1422,36 @@ int selftests_handle_command(const char *cmd)
             (void)process_wait((uint32_t)pids[i]);
         }
         kprintf("[cmd] test aslr: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test pie -- does a position-independent executable actually MOVE?
+     *
+     * `test aslr` above proves the kernel CHOOSES a different executable base
+     * for every process. That is only half the claim, and the cheaper half: a
+     * base nothing is loaded at randomises nothing. This spawns a real ET_DYN
+     * binary twice and asks it where it ended up.
+     *
+     * pieprobe.c checks its own relocated pointers, its constructor and its
+     * __thread variable before answering, and exits with the PAGE INDEX of its
+     * own text inside the kernel's executable window -- so one small integer
+     * carries "I am position-independent, I was relocated correctly, and here
+     * is where". Two runs, two different answers, both inside the window.
+     *
+     * Sequential, not concurrent. Two processes alive at once would also prove
+     * it, but a serial spawn-and-wait proves the addresses differ ACROSS TIME
+     * rather than merely across two live layouts, which is the property an
+     * attacker cares about: knowing where yesterday's process put its text must
+     * tell you nothing about today's.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test pie") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test pie: VFS not registered\n"); return 1; }
+        const char *pp = "/data/apps/pieprobe/pieprobe.elf";
+        kprintf("\n[pie] %s, twice\n", pp);
+        int rc = pie_selftest_run(pp);
+        if (rc == -EMBK_ENOENT) { kprintf("[cmd] test pie: SKIP\n"); return 1; }
+        kprintf("[cmd] test pie: %s\n", rc == 0 ? "OK" : "FAIL");
         return 1;
     }
 
