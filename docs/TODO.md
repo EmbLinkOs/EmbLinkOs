@@ -1652,14 +1652,13 @@ and KASLR were all absent. SMEP/SMAP/UMIP (x86) and PAN (aarch64, PXN was
 already there) landed in 24686e4, each proven by a self-test that commits the
 violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
 
-- [ ] **A known-answer test for the DRBG.** `test random` checks structure --
-      distinct draws, monobit 49-51%, no repeats in 8192, an unbiased
-      random_below() -- and says plainly that this is not a KAT. The NIST CAVP
-      HMAC_DRBG vectors (SHA-256, no prediction resistance, no additional
-      input) are what would turn "implements SP 800-90A" from a claim about
-      the code into a measurement. One vector, embedded, compared byte for
-      byte. Not done yet because the vector has to be transcribed exactly and
-      a wrong transcription would fail a correct implementation.
+- [x] **A known-answer test for the DRBG.** **Done** -- two NIST CAVP
+      HMAC_DRBG/SHA-256 vectors (no PR, with reseed), emitted into C by a
+      script from Botan's vector file rather than typed, run through the same
+      update/generate primitives the live generator uses on a private state.
+      Both match the second generate's 1024-bit ReturnedBits, which settles
+      the DRBG and the procedure question at once. `test random` runs them
+      first; the structural checks now say less than that line does.
 - [x] **ASLR** for everything the kernel chooses. **Done** -- six windows per
       process, 22-24 bits each, from the CSPRNG; `test aslr` on both arches.
       The mmap/shared-surface collision the survey found is fixed by giving
@@ -1690,6 +1689,32 @@ violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
       read.
 - [ ] **Guard pages between kernel heap allocations, and a poisoned free.** Listed
       under Memory Management already; it is a hardening item too.
+
+## Filesystem: hard links (audit gap, closed)
+
+- [x] **Hard links.** **Done.** The filesystem had them all along
+      (`embkfs_link_name`, exercised by the namespace stress test); what was
+      missing was every layer above: a `link` op in `struct vfs_ops`,
+      `vfs_link_path()` (target resolved WITH symlink following -- a hard link
+      is to the thing, not the pointer; `EXDEV` across mounts; directories
+      refused uniformly with `EPERM` before any fs sees them), `SYS_link`,
+      the libc `link()` stub that had said "no link op yet" for as long as
+      the fs had had one, and a shell `link` verb -- its own word, because the
+      lexer reads a leading `-` as an operator and because it is a different
+      thing from `ln`. `test hardlink` (kernel) and `posixdemo` (both arches)
+      assert the link count 1 -> 2 -> 1 and the bytes surviving the original
+      name's removal.
+- [ ] The shell `link` verb is not covered by a test: the kernel console's
+      `run` does not parse quotes, so a one-line script cannot be driven over
+      serial. It is a 12-line wrapper over a tested syscall. A `test
+      shellscript` case would cover it once `link` can be expressed there.
+- [ ] **Observed once, not reproduced:** the aarch64 boot self-test hung after
+      loading `lockdemo` (the futex test) on one run of the hard-link build,
+      with no exception dump; the identical build passed solo at 9 s
+      immediately after, and has passed ~10 times today. No stray QEMU was
+      found afterwards, but the run followed an x86 TCG run by about a minute.
+      Recorded so that a second occurrence is recognised as a pattern rather
+      than a surprise.
 
 ## Process & Scheduling
 

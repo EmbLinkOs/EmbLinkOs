@@ -660,6 +660,41 @@ static bool has_glob_chars(const char *s) {
  *
  * The target is not resolved -- a link to something that does not exist yet is
  * the normal case, not a mistake to catch. */
+/* `link <existing> <newname>` -- a HARD link: a second name for the same
+ * object. Its own verb rather than a flag on `ln`, for two reasons. The lexer
+ * reads a leading `-` as an operator, so `ln -s` cannot be typed; and the two
+ * are different things that Unix happened to spell alike -- `ln` here makes
+ * a NAME THAT POINTS (a string, re-resolved on every walk), `link` makes a
+ * NAME THAT IS (the object itself, alive until its last name is gone).
+ * Both paths are resolved against the cwd, unlike `ln`'s target, because a
+ * hard link's target must exist NOW and be the actual object. */
+static struct value bi_link(const struct command *cmd, struct value input,
+                            struct scope *env) {
+    (void)env;
+    value_free(&input);
+
+    if (cmd->nargs != 2)
+        return value_error("link: usage: link <existing> <newname>  "
+                           "(a hard link; `ln` makes symbolic ones)");
+
+    const char *oldw = expr_as_word(cmd->args[0]);
+    const char *neww = expr_as_word(cmd->args[1]);
+    if (!oldw || !neww)
+        return value_error("link: both names must be plain words or strings");
+
+    char oldpath[PATH_MAX_LEN], newpath[PATH_MAX_LEN];
+    path_resolve(oldw, oldpath, sizeof oldpath);
+    path_resolve(neww, newpath, sizeof newpath);
+
+    int rc = embk_link(oldpath, newpath);
+    if (rc < 0) return err_os("link: can't create", newpath, rc);
+
+    struct value out = value_record();
+    value_record_set(&out, "name",     value_path(newpath));
+    value_record_set(&out, "same_as",  value_path(oldpath));
+    return out;
+}
+
 static struct value bi_ln(const struct command *cmd, struct value input,
                           struct scope *env) {
     (void)env;
@@ -1047,6 +1082,7 @@ builtin_fn builtin_lookup_os(const char *name) {
         { "bg",     bi_bg     }, { "stop",   bi_stop   },
         { "glob",   bi_glob   },
         { "ln",     bi_ln     }, { "readlink", bi_readlink },
+        { "link",   bi_link   },
     };
     for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
         if (strcmp(tab[i].name, name) == 0) return tab[i].fn;

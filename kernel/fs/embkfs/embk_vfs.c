@@ -360,6 +360,31 @@ static int embkfs_vfs_write(struct vnode *vn, uint64_t off, const void *buf,
     return rc;
 }
 
+/* The hard-link op: the same shape as symlink_impl, but the second argument
+ * is an OBJECT (the resolved target vnode's oid), not a string. The
+ * filesystem does the real work -- embkfs_link_name bumps the inode's link
+ * count and adds the directory entry in one transaction, and refuses a
+ * directory target with EPERM on its own account. */
+static int embkfs_vfs_link(struct vnode *dir, const char *name, size_t name_len,
+                           struct vnode *target)
+{
+    if (!dir || !name || !target || !dir->mnt || !dir->mnt->fs_data)
+        return -EMBK_EINVAL;
+    if (dir->type != VFS_DT_DIR)
+        return -EMBK_ENOTDIR;
+    if (name_len == 0 || name_len > 255)
+        return -EMBK_EINVAL;
+
+    char nm[256];
+    for (size_t i = 0; i < name_len; i++) nm[i] = name[i];
+    nm[name_len] = '\0';
+
+    fs_lock();
+    int rc = embkfs_link_name(vol_of(dir), target->ino, dir->ino, nm);
+    fs_unlock();
+    return rc;
+}
+
 static int embkfs_vfs_symlink(struct vnode *dir, const char *name, size_t name_len,
                               const char *target)
 {
@@ -501,6 +526,7 @@ static const struct vfs_ops embkfs_vfs_ops = {
     .write = embkfs_vfs_write,
     .symlink = embkfs_vfs_symlink,
     .readlink = embkfs_vfs_readlink,
+    .link = embkfs_vfs_link,
     .create = embkfs_vfs_create,
     .mkdir = embkfs_vfs_mkdir,
     .unlink = embkfs_vfs_unlink,

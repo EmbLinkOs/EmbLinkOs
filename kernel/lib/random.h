@@ -35,11 +35,9 @@
  * assume -- and `test random` prints it, because "seeded" from a clock under
  * QEMU is not the same claim as "seeded" from RDSEED on metal.
  *
- * WHAT THIS IS NOT. There is no known-answer test against the NIST CAVP
- * vectors yet (docs/TODO.md); the self-test checks structure -- distinct
- * outputs, reseed changes the stream, a monobit sanity bound -- and says so.
- * Until a KAT lands, "implements HMAC_DRBG" is a claim about the code, not a
- * measurement.
+ * AND IT IS MEASURED, not claimed: random_kat() runs NIST CAVP vectors through
+ * the same update/generate primitives the live generator uses, on a private
+ * state. `test random` requires every vector to match.
  * ========================================================================== */
 
 enum random_quality {
@@ -68,6 +66,12 @@ uint64_t random_below(uint64_t bound);
 void random_add_entropy(const void *data, size_t len);
 
 enum random_quality random_quality(void);
+
+/* The known-answer test against NIST CAVP vectors, on a private state. Returns
+ * 0 on a match; *which says which generate matched (2 = correct, 1 = the
+ * procedure assumption is off, 0 = the DRBG is). See random.c. */
+int      random_kat(unsigned idx, int *which);
+unsigned random_kat_count(void);
 
 /* How much has been drawn, for the self-test and for `power`-style reporting. */
 void random_stats(uint64_t *bytes_out, uint64_t *reseeds,

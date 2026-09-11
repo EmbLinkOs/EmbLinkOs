@@ -428,6 +428,7 @@ static void selftests_print_commands(void)
     kprintf("  test random\n");
     kprintf("  test aslr\n");
     kprintf("  test canary\n");
+    kprintf("  test hardlink\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1186,10 +1187,9 @@ int selftests_handle_command(const char *cmd)
     /* ----------------------------------------------------------------------
      * test random -- the kernel's CSPRNG.
      *
-     * STRUCTURAL CHECKS, and honestly labelled as such. What would actually
-     * prove HMAC_DRBG is implemented correctly is a known-answer test against
-     * the NIST CAVP vectors, and there is not one here yet (docs/TODO.md). What
-     * this can say is: consecutive outputs differ, a reseed changes the
+     * The KNOWN-ANSWER TEST comes first: NIST CAVP vectors through the same
+     * primitives the live generator uses. Everything after it is structural
+     * and says less: consecutive outputs differ, a reseed changes the
      * stream, the bits are not grossly lopsided, and the uniform-range helper
      * is unbiased on a bound that a modulus would get wrong. Plus the thing
      * that matters most operationally: WHERE the seed came from, because a
@@ -1211,6 +1211,21 @@ int selftests_handle_command(const char *cmd)
                 (unsigned long long)h0, (unsigned long long)r0,
                 (unsigned long long)b0);
         if (q == RANDOM_UNSEEDED) { kprintf("  [FAIL] never seeded\n"); ok = 0; }
+
+        /* 0. THE KNOWN-ANSWER TEST, which is the only line here that says the
+         *    DRBG is HMAC_DRBG rather than something that merely looks random.
+         *    NIST CAVP vectors, run on a private state through the same
+         *    primitives the live generator uses. */
+        for (unsigned v = 0; v < random_kat_count(); v++) {
+            int which = -1;
+            int rc = random_kat(v, &which);
+            kprintf("  [%s] CAVP HMAC_DRBG/SHA-256 vector %u: %s\n",
+                    rc == 0 ? "ok" : "FAIL", v,
+                    which == 2 ? "second generate matches ReturnedBits"
+                  : which == 1 ? "only the FIRST generate matches -- the procedure is off by one generate"
+                               : "NEITHER generate matches -- the DRBG is wrong");
+            if (rc != 0) ok = 0;
+        }
 
         /* 1. Two draws are not the same, and neither is zero. */
         uint64_t a = random_u64(), b = random_u64();
@@ -1438,6 +1453,52 @@ int selftests_handle_command(const char *cmd)
         if (!landed || fired != 1) ok = 0;
 
         kprintf("[cmd] test canary: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test hardlink -- the VFS half of hard links, in the kernel. The
+     * filesystem's own namespace test already proves embkfs_link_name; this
+     * proves the path from a NAME to it, which is what a syscall uses. */
+    if (strcmp(cmd, "test hardlink") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test hardlink: VFS not registered\n"); return 1; }
+        int ok = 1;
+        struct vfs_stat st;
+        const char *a = "/khl_a", *b = "/khl_b", *d = "/khl_dir";
+        vfs_unlink_path(b); vfs_unlink_path(a); vfs_rmdir_path(d);
+
+        int fd = vfs_open(a, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) { kprintf("\n[cmd] test hardlink: cannot create %s\n", a); return 1; }
+        size_t wr = 0; (void)vfs_fd_write(fd, "kernel", 6, &wr); vfs_close(fd);
+
+        kprintf("\n[hardlink]\n");
+        int rc = vfs_link_path(a, b);
+        kprintf("  [%s] vfs_link_path creates a second name (rc %d)\n", rc == EMBK_OK ? "ok" : "FAIL", rc);
+        if (rc != EMBK_OK) ok = 0;
+
+        rc = vfs_stat(a, &st);
+        kprintf("  [%s] nlink is 2 through the original (%llu)\n",
+                (rc == EMBK_OK && st.nlink == 2) ? "ok" : "FAIL", (unsigned long long)st.nlink);
+        if (rc != EMBK_OK || st.nlink != 2) ok = 0;
+
+        rc = vfs_unlink_path(a);
+        rc = vfs_stat(b, &st);
+        kprintf("  [%s] after unlinking the original: the other name resolves, nlink %llu, size %llu\n",
+                (rc == EMBK_OK && st.nlink == 1 && st.size == 6) ? "ok" : "FAIL",
+                (unsigned long long)st.nlink, (unsigned long long)st.size);
+        if (rc != EMBK_OK || st.nlink != 1 || st.size != 6) ok = 0;
+
+        rc = vfs_mkdir_path(d);
+        rc = vfs_link_path(d, "/khl_dir2");
+        kprintf("  [%s] a directory target is refused (rc %d, want %d)\n",
+                rc == -EMBK_EPERM ? "ok" : "FAIL", rc, -EMBK_EPERM);
+        if (rc != -EMBK_EPERM) ok = 0;
+
+        rc = vfs_link_path("/khl_does_not_exist", "/khl_c");
+        kprintf("  [%s] a missing target is ENOENT (rc %d)\n", rc == -EMBK_ENOENT ? "ok" : "FAIL", rc);
+        if (rc != -EMBK_ENOENT) ok = 0;
+
+        vfs_rmdir_path(d); vfs_unlink_path(b);
+        kprintf("[cmd] test hardlink: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

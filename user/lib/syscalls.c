@@ -1281,9 +1281,13 @@ pid_t wait(int *status) {
 }
 
 int link(const char *oldpath, const char *newpath) {
-    (void)oldpath; (void)newpath;
-    errno = ENOSYS;   /* VFS public surface exposes no link op yet */
-    return -1;
+    /* REAL since SYS_link (112). This stub said "no link op yet" for as long
+     * as the filesystem had had one -- embkfs_link_name predates it by a long
+     * way, and the namespace self-test exercised it -- because nothing in
+     * userland had asked. git's object store and ln both do. */
+    int rc = embk_link(oldpath, newpath);
+    if (rc < 0) { errno = -rc; return -1; }
+    return 0;
 }
 
 int unlink(const char *path) {

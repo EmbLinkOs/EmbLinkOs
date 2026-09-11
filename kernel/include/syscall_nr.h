@@ -212,4 +212,10 @@
  * capability, it is a utility. */
 #define SYS_getrandom     111   /* (buf, len)               -> len | -err     */
 
+/* link(oldpath, newpath) -- a second NAME for an existing file. The object's
+ * link count rises; the bytes are freed only when the last name is gone.
+ * Directories are refused (EPERM): two parents is a cycle. Both paths resolve
+ * through the caller's namespace like every other path syscall. */
+#define SYS_link          112   /* (oldpath, newpath)       -> 0 | -err       */
+
 #endif /* _SYSCALL_NR_H_ */

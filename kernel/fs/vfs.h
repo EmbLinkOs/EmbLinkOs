@@ -164,6 +164,21 @@ struct vfs_ops {
                    const char *target);
     int (*readlink)(struct vnode *vn, char *buf, size_t cap, size_t *out_len);
 
+    /* HARD LINK: a second NAME for an existing object. `target` is the object
+     * (resolved by the VFS, so a symlink in the target path has already been
+     * followed -- a hard link is to the thing, never to the pointer); `dir`
+     * and `name` are where the new name goes. The object's link count goes
+     * up by one and the data is freed only when it reaches zero, which is the
+     * whole point: two names, one object, and neither name is the "real" one.
+     *
+     * A filesystem may refuse a DIRECTORY target (EMBKFS does, with EPERM):
+     * a directory with two parents is a cycle waiting to happen, and every
+     * Unix has refused it for fifty years for that reason.
+     *
+     * NULL = no hard links here (FAT32); the VFS answers -ENOSYS. */
+    int (*link)(struct vnode *dir, const char *name, size_t name_len,
+                struct vnode *target);
+
     /* fill *out with metadata for object `vn` */
     int (*stat)(struct vnode *vn, struct vfs_stat *out);
     int (*vget)(struct vfs_mount *mnt, uint64_t ino, uint8_t type,

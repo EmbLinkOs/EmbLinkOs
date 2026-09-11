@@ -200,6 +200,7 @@ struct vm_object *vfs_fd_object(int fd);
  * a link may name something that does not exist, which is the normal case in
  * every build system that uses them. readlink/lstat act on the LINK itself. */
 int vfs_symlink_path(const char *target, const char *linkpath);
+int vfs_link_path(const char *oldpath, const char *newpath);   /* hard link */
 int vfs_readlink_path(const char *path, char *buf, size_t cap, size_t *out_len);
 int vfs_lstat_path(const char *path, struct vfs_stat *out);
 int vfs_rmdir_path(const char *path);    /* rmdir: EMPTY dirs only (fs enforces) */

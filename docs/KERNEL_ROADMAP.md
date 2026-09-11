@@ -458,7 +458,13 @@ capabilities rather than fork/exec.
    (gated on a newlib rebuild: the prebuilt `libc.a` is not PIC), KASLR, a
    CAVP known-answer test for the DRBG, and per-CPU canaries.
 
-12. **Job control is finished.** `^Z`, `stop`, `bg` and `fg` all work, and the
+12. **Hard links, and the DRBG measured.** The audit listed hard links as
+   absent; the filesystem had them, and everything above it did not
+   (`docs/TODO.md`, "Filesystem: hard links"). And the CSPRNG is no longer a
+   claim: two NIST CAVP vectors match byte for byte through the live
+   primitives.
+
+13. **Job control is finished.** `^Z`, `stop`, `bg` and `fg` all work, and the
    piece that had to be built for them was in the kernel: a process could be
    *interrupted* or *cancelled*, but a shell had no way to ask for one to be
    **stopped**. `process_suspend()` had existed since the debugger needed it

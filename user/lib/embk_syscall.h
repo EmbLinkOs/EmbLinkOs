@@ -156,6 +156,7 @@
 #define EMBK_SYS_thread_cpu_ns  109  /* ()                 -> ns            */
 #define EMBK_SYS_suspend        110  /* (handle, resume)   -> n | -err */
 #define EMBK_SYS_getrandom      111  /* (buf, len)         -> len | -err */
+#define EMBK_SYS_link           112  /* (oldpath, newpath) -> 0 | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

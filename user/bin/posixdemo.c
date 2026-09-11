@@ -1438,6 +1438,53 @@ static void test_rename(void) {
  * the kernel boundary is exercised by the aarch64 boot test's run of this
  * program rather than by the x86 one. Either way the contract is the same:
  * 32 bytes, not zero, not repeated, and a request past the cap refused. */
+/* Hard links: two names, one object. The filesystem has had these for a long
+ * time (embkfs_link_name); the libc stub said "no link op yet" the whole
+ * while because nothing had asked. What is asserted is what makes them
+ * different from symlinks: the link count is REAL, the bytes survive
+ * unlinking the ORIGINAL name, and a directory is refused. */
+static void test_link(void) {
+    printf("hard links:\n");
+    const char *a = "/hl_a.txt", *b = "/hl_b.txt", *d = "/hl_dir";
+    unlink(b); unlink(a); rmdir(d);
+
+    int fd = open(a, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ck("create the original", fd >= 0);
+    if (fd < 0) return;
+    write(fd, "linked", 6);
+    close(fd);
+
+    struct stat st;
+    ck("a fresh file has ONE name", stat(a, &st) == 0 && st.st_nlink == 1);
+    ck("link() creates a second name", link(a, b) == 0);
+    ck("...and the count is now TWO", stat(a, &st) == 0 && st.st_nlink == 2);
+    ck("...seen from either name", stat(b, &st) == 0 && st.st_nlink == 2);
+
+    ck("unlinking the ORIGINAL name succeeds", unlink(a) == 0);
+    char buf[16]; memset(buf, 0, sizeof buf);
+    fd = open(b, O_RDONLY);
+    ck("the object is still there under the other name", fd >= 0);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof buf - 1);
+        ck("and its bytes are intact", n == 6 && memcmp(buf, "linked", 6) == 0);
+        close(fd);
+    }
+    ck("the count is back to ONE", stat(b, &st) == 0 && st.st_nlink == 1);
+    ck("the original name no longer resolves", stat(a, &st) == -1 && errno == ENOENT);
+
+    ck("mkdir a directory", mkdir(d, 0755) == 0);
+    /* The call goes in its OWN statement. C does not order the evaluation of
+     * function arguments, and `ck_fails(..., link(...), EPERM, errno)` let
+     * x86's compiler read errno BEFORE link() ran -- reporting errno=0 for a
+     * refusal the kernel had correctly made with EPERM. aarch64 evaluated the
+     * other way round and passed. The test was wrong, on one architecture. */
+    errno = 0;
+    int dl = link(d, "/hl_dir2");
+    ck_fails("link() on a DIRECTORY is refused with EPERM", dl, EPERM, errno);
+    rmdir(d);
+    unlink(b);
+}
+
 static void test_getentropy(void) {
     printf("getentropy (kernel CSPRNG on aarch64, RDRAND on x86):\n");
     unsigned char a[32], b[32];
@@ -1520,6 +1567,7 @@ int main(void) {
     test_writeback();
     test_mmap_file();
     test_symlinks();
+    test_link();
     test_getentropy();
     test_honest_refusals();
 

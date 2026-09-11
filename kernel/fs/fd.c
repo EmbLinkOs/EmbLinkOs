@@ -260,6 +260,45 @@ int vfs_symlink_path(const char *target, const char *linkpath)
  * ordinary way would land on the link's TARGET and there would be nothing left
  * to read. Reports the full length even when the buffer is short, so a caller
  * can tell truncation from completion. */
+/* A hard link: `newpath` becomes a second name for the object `oldpath`
+ * names. The target is resolved WITH symlink following -- a hard link is to
+ * the thing, never to the pointer -- and must be on the same filesystem as
+ * the new name, because a link is a directory entry naming an object id and
+ * an id means nothing on another volume (EXDEV, the same answer rename gives
+ * across mounts). Directories are refused here, uniformly, before any
+ * filesystem gets to decide: two parents is a cycle, and every filesystem
+ * that allowed it has regretted it. */
+int vfs_link_path(const char *oldpath, const char *newpath)
+{
+    if (!oldpath || !newpath || !*oldpath || !*newpath)
+        return -EMBK_EINVAL;
+
+    int wok = ns_check_writable(newpath);
+    if (wok != EMBK_OK)
+        return wok;
+
+    struct vnode target;
+    int rc = vfs_resolve(oldpath, &target);
+    if (rc != EMBK_OK)
+        return rc;                        /* ENOENT: nothing to link to */
+    if (target.type == VFS_DT_DIR)
+        return -EMBK_EPERM;
+
+    struct vnode parent;
+    const char *leaf = NULL;
+    size_t leaf_len = 0;
+    rc = fd_split_parent(newpath, &parent, &leaf, &leaf_len);
+    if (rc != EMBK_OK)
+        return rc;
+
+    if (parent.mnt != target.mnt)
+        return -EMBK_EXDEV;
+    if (!parent.mnt || !parent.mnt->ops || !parent.mnt->ops->link)
+        return -EMBK_ENOSYS;
+
+    return parent.mnt->ops->link(&parent, leaf, leaf_len, &target);
+}
+
 int vfs_readlink_path(const char *path, char *buf, size_t cap, size_t *out_len)
 {
     if (!path || !buf || !out_len)

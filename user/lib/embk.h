@@ -1256,6 +1256,15 @@ static inline unsigned embk_intr_take(void) {
  *
  * embk_readlink reports the FULL length even when the buffer was too small, so
  * a caller can tell a truncated answer from a complete one. */
+/* A HARD link: `newpath` becomes a second name for the object `oldpath`
+ * names. Unlike embk_symlink this is a reference to the thing, not a string
+ * that names it -- both names are equal, neither is the original, and the
+ * data lives until the last name is unlinked. Directories are refused. */
+static inline int embk_link(const char *oldpath, const char *newpath) {
+    return (int)embk_syscall2(EMBK_SYS_link, (int64_t)(intptr_t)oldpath,
+                              (int64_t)(intptr_t)newpath);
+}
+
 static inline int embk_symlink(const char *target, const char *linkpath) {
     return (int)embk_syscall2(EMBK_SYS_symlink, (int64_t)(intptr_t)target,
                               (int64_t)(intptr_t)linkpath);

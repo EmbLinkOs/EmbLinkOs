@@ -2008,6 +2008,19 @@ static int64_t sys_intr(const struct sysargs *a) {
  * normal case in every build system that uses them -- validating here would
  * break the thing links are for. Only the link's own parent must exist and be
  * writable. */
+/* link(oldpath, newpath) -> 0. A second NAME for the object oldpath names.
+ * The target is resolved (a symlink in it is followed -- a hard link is to
+ * the thing, never to the pointer); the new name's parent must exist and be
+ * writable in the caller's namespace. Directories are refused. */
+static int64_t sys_link(const struct sysargs *a) {
+    char oldpath[SYSCALL_PATH_MAX], newpath[SYSCALL_PATH_MAX];
+    int len = copy_string_from_user(oldpath, (const char *)a->arg[0], sizeof oldpath);
+    if (len < 0) return len;
+    len = copy_string_from_user(newpath, (const char *)a->arg[1], sizeof newpath);
+    if (len < 0) return len;
+    return vfs_link_path(oldpath, newpath);
+}
+
 static int64_t sys_symlink(const struct sysargs *a) {
     char target[SYSCALL_PATH_MAX], linkpath[SYSCALL_PATH_MAX];
     int len = copy_string_from_user(target, (const char *)a->arg[0], sizeof target);
@@ -2171,6 +2184,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_fsync]          = sys_fsync,
     [SYS_intr]           = sys_intr,
     [SYS_symlink]        = sys_symlink,
+    [SYS_link]           = sys_link,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,
     [SYS_futex]          = sys_futex,
