@@ -677,6 +677,34 @@ int vmm_protect_in(uint64_t root_phys, uint64_t virt, uint64_t flags) {
     return 0;
 }
 
+bool vmm_test_and_clear_accessed_in(uint64_t root_phys, uint64_t virt) {
+    int err = 0;
+    uint64_t *slot = walk_in(root_phys, virt, false, &err);
+    if (!slot || !(*slot & PTE_VALID))
+        return false;
+    bool was = (*slot & PTE_AF) != 0;
+    if (was) {
+        /* Software-managed access flag: clear it AND drop the TLB entry, so
+         * the next access re-walks, finds AF clear, and takes the access-flag
+         * fault that vmm_set_accessed_in resolves. Without the flush a cached
+         * translation would keep serving the page and the bit would never
+         * come back. */
+        *slot &= ~PTE_AF;
+        tlb_flush_page(virt);
+    }
+    return was;
+}
+
+bool vmm_set_accessed_in(uint64_t root_phys, uint64_t virt) {
+    int err = 0;
+    uint64_t *slot = walk_in(root_phys, virt, false, &err);
+    if (!slot || !(*slot & PTE_VALID))
+        return false;
+    *slot |= PTE_AF;
+    __asm__ volatile("dsb ishst" ::: "memory");   /* the walker sees the store */
+    return true;
+}
+
 /* Is every entry in this table free? A table that describes nothing is 4 KiB
  * of physical memory held for no reason. */
 static bool table_is_empty(uint64_t table_phys) {

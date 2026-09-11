@@ -357,6 +357,37 @@ int vmm_protect_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t flags) {
     return 0;
 }
 
+/* The leaf PTE for `virt` in `pml4_phys`, or NULL. Caller holds vmm_lock. */
+static uint64_t *pte_slot_locked(uint64_t pml4_phys, uint64_t virt_addr) {
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) return NULL;
+    uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) return NULL;
+    uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT) || (pd[pd_index(virt_addr)] & VMM_HUGE)) return NULL;
+    uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pte = &pt[pt_index(virt_addr)];
+    return (*pte & VMM_PRESENT) ? pte : NULL;
+}
+
+bool vmm_test_and_clear_accessed_in(uint64_t pml4_phys, uint64_t virt_addr) {
+    spin_lock(&vmm_lock);
+    uint64_t *pte = pte_slot_locked(pml4_phys, virt_addr);
+    bool was = pte && (*pte & VMM_ACCESSED);
+    if (was)
+        *pte &= ~VMM_ACCESSED;      /* no flush: see mm/vmm.h */
+    spin_unlock(&vmm_lock);
+    return was;
+}
+
+bool vmm_set_accessed_in(uint64_t pml4_phys, uint64_t virt_addr) {
+    spin_lock(&vmm_lock);
+    uint64_t *pte = pte_slot_locked(pml4_phys, virt_addr);
+    if (pte) *pte |= VMM_ACCESSED;
+    spin_unlock(&vmm_lock);
+    return pte != NULL;
+}
+
 static bool vmm_table_is_empty(uint64_t table_phys) {
     const uint64_t *t = vmm_table(table_phys);
     for (int i = 0; i < 512; i++)

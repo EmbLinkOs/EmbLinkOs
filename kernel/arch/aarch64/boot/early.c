@@ -1093,6 +1093,23 @@ void arch_early_main(uint64_t dtb_phys) {
             uaccess_hw_end();
         }
 
+        /* THE ACCESS FLAG, software-managed here: clearing it drops the TLB
+         * entry, and the next touch takes an access-flag fault that the
+         * handler resolves by setting it -- the round trip the reclaimer's
+         * second chance depends on, and the one path a translation fault
+         * never exercises. */
+        bool acc1 = false, acc2 = false;
+        if (ok && p) {
+            acc1 = vmm_test_and_clear_accessed_in(p->pml4_phys, (uint64_t)a);
+            uaccess_hw_begin();
+            (void)*(volatile uint64_t *)(uintptr_t)a;         /* access-flag fault, resolved */
+            uaccess_hw_end();
+            acc2 = vmm_test_and_clear_accessed_in(p->pml4_phys, (uint64_t)a);
+            kprintf("  [%s] the access flag: set by the touches, clear once read, set again through the fault\n",
+                    (acc1 && acc2) ? " ok " : "FAIL");
+            if (!(acc1 && acc2)) selftest_fails++;
+        }
+
         uint64_t free_mapped = pmm_free_pages();
         bool took = free_mapped <= free_before - LEN / 4096;
 

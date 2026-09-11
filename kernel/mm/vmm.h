@@ -1,6 +1,7 @@
 #ifndef _VMM_H_
 #define _VMM_H_
 #include <stdint.h>
+#include "include/types.h"   /* bool */
 
 
 /* Page-table entry flags.
@@ -90,6 +91,24 @@ void vmm_unmap_in(uint64_t pml4_phys, uint64_t virt);
  * on this seam, VMM_EXEC and VMM_NX must BOTH be stated: aarch64 reads the
  * positive bit and x86 the inverted one, so silence means opposite things. */
 int vmm_protect_in(uint64_t pml4_phys, uint64_t virt, uint64_t flags);
+
+/* THE ACCESSED BIT -- what the reclaimer reads to tell a page that is still
+ * being used from one that merely happens to be mapped.
+ *
+ * `test_and_clear`: was the page referenced since the bit was last cleared?
+ * Clears it. On x86 the CPU sets the bit on a TLB fill and the clear is not
+ * followed by a flush -- an entry still in a TLB will not set it again until
+ * it is refilled, which is the imprecision every kernel accepts here (the
+ * alternative is a shootdown per page examined). On aarch64 the flag is
+ * software-managed (TCR_EL1.HA is not enabled): the clear invalidates the
+ * TLB entry, and the NEXT access takes an access-flag fault that
+ * `set_accessed` resolves. Both return false for an address with no page.
+ *
+ * `set_accessed`: mark the page referenced -- the aarch64 fault handler's
+ * half of the above; on x86 the hardware does it and this only reports
+ * whether the page is mapped. */
+bool vmm_test_and_clear_accessed_in(uint64_t pml4_phys, uint64_t virt);
+bool vmm_set_accessed_in(uint64_t pml4_phys, uint64_t virt);
 
 // Get the physical address of a virtual address (returns 0 if not mapped)
 uint64_t vmm_get_phys(uint64_t virt);

@@ -22,7 +22,14 @@
  * ordinary program lives in. The heap became a pageable mapping after mmap
  * did, and this is the run that says so.
  *
- *   run /data/apps/swapper/swapper.elf 256 [mmap|heap]     (MiB; default 64, mmap)
+ * A THIRD MODE, `hot`, is the one that tells a fault-order LRU from a real
+ * one: a quarter of the pages are re-read every round while a fresh quarter
+ * of cold pages streams past. A reclaimer that evicts the OLDEST ARRIVAL
+ * evicts the hot set every round -- it arrived first -- and every round pays
+ * for it again. One that asks the hardware whether a page was referenced
+ * keeps the hot set and pays once. The kernel counts the swap-ins.
+ *
+ *   run /data/apps/swapper/swapper.elf 256 [mmap|heap|hot]  (MiB; default 64, mmap)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +70,20 @@ int main(int argc, char **argv) {
     }
 
     unsigned long bad = 0;
+    int hot = (argc > 2 && strcmp(argv[2], "hot") == 0);
+    if (hot) {
+        size_t H = npages / 4, S = (npages - H) / 4;
+        for (int round = 0; round < 4; round++) {
+            for (size_t p = 0; p < H; p++) {                       /* the hot quarter */
+                const uint64_t *w = m + p * WORDS;
+                if (w[0] != pattern(p, 0) || w[WORDS - 1] != pattern(p, WORDS - 1)) bad++;
+            }
+            for (size_t p = H + (size_t)round * S; p < H + (size_t)(round + 1) * S && p < npages; p++) {
+                const uint64_t *w = m + p * WORDS;                  /* a cold quarter, once */
+                if (w[0] != pattern(p, 0) || w[WORDS - 1] != pattern(p, WORDS - 1)) bad++;
+            }
+        }
+    } else
     for (size_t p = npages; p-- > 0; ) {
         const uint64_t *w = m + p * WORDS;
         for (size_t i = 0; i < WORDS; i++)
@@ -70,7 +91,7 @@ int main(int argc, char **argv) {
     }
 
     printf("swapper: %s: %lu MiB (%lu pages) written and read back, %lu pages wrong\n",
-           heap ? "heap" : "mmap", mib, (unsigned long)npages, bad);
+           hot ? "hot" : heap ? "heap" : "mmap", mib, (unsigned long)npages, bad);
     if (!heap) munmap(m, len);      /* the heap block is left to exit: that path must return it too */
     return bad > 200 ? 200 : (int)bad;
 }

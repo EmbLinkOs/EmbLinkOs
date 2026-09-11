@@ -953,13 +953,28 @@ static uint64_t anon_batch_out_locked(struct vmo_page **batch, int n) {
     return out;
 }
 
+static bool g_second_chance = true;
+void vmo_set_second_chance(bool on) { g_second_chance = on; }
+
 /* Anonymous pages, from the tail of the anonymous LRU, a cluster at a time.
- * Caller holds g_lock and has already checked that the store can take them. */
+ * Caller holds g_lock and has already checked that the store can take them.
+ *
+ * SECOND CHANCE. The LRU only sees faults: a page is touched in it when it
+ * comes in and never again, so its order is the order pages ARRIVED, and the
+ * tail is the oldest arrival -- which under a stream of new pages is exactly
+ * the hot set a program keeps coming back to. The hardware knows better: it
+ * sets the accessed bit on every reference. So a candidate whose bit is set
+ * is spared -- bit cleared, page moved to the head -- and the walk goes on;
+ * it is evicted only if it is still unreferenced when the walk comes round
+ * again. Two passes at most: the second takes pages regardless, so a call
+ * always makes progress even when every page was referenced. This is CLOCK,
+ * folded into the LRU walk the reclaimer already does. */
 static uint64_t reclaim_anon_locked(uint64_t want) {
     uint64_t freed = 0;
     struct vmo_page *batch[SWAP_CLUSTER_PAGES];
     int n = 0;
 
+  for (int pass = 0; pass < 2 && freed + (uint64_t)n < want; pass++) {
     struct vmo_page *p = g_lru_anon.tail;
     while (p && freed + (uint64_t)n < want) {
         struct vmo_page *prev = p->lru_prev;
@@ -972,6 +987,13 @@ static uint64_t reclaim_anon_locked(uint64_t want) {
                 take = false;
             } else {
                 uint64_t va = o->mapper_base + p->index * PAGE_SIZE;
+                if (pass == 0 && g_second_chance &&
+                    vmm_test_and_clear_accessed_in(o->mapper_pml4, va)) {
+                    g_stats.second_chances++;
+                    lru_touch(p);              /* referenced: to the head, and on */
+                    p = prev;
+                    continue;
+                }
                 /* WIRED AND MAPPED, OR WIRED AND IN FLIGHT? The fault path
                  * wires a page BEFORE it maps it, and holds no lock of ours in
                  * between (it may have just waited on a disk to get here). A
@@ -1007,13 +1029,20 @@ static uint64_t reclaim_anon_locked(uint64_t want) {
                 freed += out;
                 n = 0;
                 if (out == 0)
-                    break;              /* the store refused a whole cluster: full, or failing */
+                    return freed;       /* the store refused a whole cluster: full, or failing */
             }
         }
         p = prev;                       /* still valid: only g_lock holders touch the list */
     }
-    if (n)
+    /* Flush the partial batch BEFORE the next pass walks the list again: a
+     * page still in the batch is still on the LRU, and the second pass would
+     * collect it twice -- two slots written, the first one leaked. The audit
+     * in `test swap` caught exactly that: 4 to 7 slots per run with no owner. */
+    if (n) {
         freed += anon_batch_out_locked(batch, n);
+        n = 0;
+    }
+  }
     return freed;
 }
 

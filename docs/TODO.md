@@ -1888,12 +1888,22 @@ Open, in the order they matter:
   allocates 20,000 objects of 96 bytes -- 2.5 MiB, past the old cap --
   and requires every one to come from the slab: **388 ns each, 445 ns to
   free** (TCG), 46 regions.
-- [ ] **The LRU is fault-order, not access-order.** A page is touched in the
-  LRU when it is faulted in and never again -- the hardware access bits are
-  not scanned -- so reclaim evicts the oldest FAULTED page, not the least
-  recently USED one. Correct, and the wrong page under a real working set.
-  Access-bit scanning (with a TLB flush per scan, or an active/inactive pair
-  of lists) is the next step; needs a workload to measure against.
+- [x] ~~**The LRU is fault-order, not access-order.**~~ -- **closed: second
+  chance.** An anonymous page the reclaimer reaches whose accessed bit is set
+  is spared (bit cleared, moved to the head) and evicted only if still
+  unreferenced when the walk comes round again -- CLOCK, folded into the LRU
+  walk. x86 reads and clears the hardware bit without a flush (the usual
+  imprecision); aarch64's access flag is software-managed, so the clear
+  drops the TLB entry and the next touch takes an access-flag fault the
+  handler resolves by setting it (a new fault class, exercised by the ARM
+  boot test's mmap block). `test swap` runs a hot-set witness both ways: a
+  quarter of 61,440 pages re-read every round while cold pages stream past
+  -- **swapped in 77,183 times in fault order, 61,846 with second chance:
+  once per page**, at equal wall time. The switch (`vmo_set_second_chance`)
+  exists for that A/B.
+  - [ ] File pages that are mapped are wired and never candidates; unmapped
+    file pages are ordered by `vmo_read`/`vmo_write` touches, which is a
+    real LRU already. A mapped file page's accessed bit is not consulted.
 - [x] ~~**Swap-in is one page per command.**~~ -- **closed: read-ahead.**
   After a page comes back, its neighbours in the object (8 each way, one
   cluster in all) that are also out on the store are fetched too, one

@@ -1,6 +1,7 @@
 #include "arch/aarch64/irq/exception.h"
 #include "include/uaccess_guard.h"
 #include "mm/vma.h"            /* vm_fault: demand paging */
+#include "mm/vmm.h"            /* vmm_set_accessed_in: the access-flag fault */
 #include "include/arch_irq.h"   /* arch_irq_enable/disable around vm_fault */
 #include "arch/aarch64/drivers/pl011.h"
 #include "arch/aarch64/irq/gicv3.h"
@@ -218,6 +219,17 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
      * instruction aborts. WnR (bit 6 of ISS) says whether a DATA access was a
      * write; for an instruction abort the access is by definition a fetch,
      * which is what `exec` carries. */
+    /* AN ACCESS-FLAG FAULT is not a missing page: the page is mapped and the
+     * reclaimer cleared its access flag to learn whether it is still used
+     * (mm/vm_object.c, second chance). Set the flag and retry. Any EL, user
+     * address -- a copy_to_user into such a page takes this too. DFSC
+     * 0x08..0x0B is the class; the low two bits name the level. */
+    if ((ec == 0x24 || ec == 0x25 || ec == 0x20 || ec == 0x21) &&
+        ((f->esr & 0x3F) >> 2) == 2 && current_thread && f->far < USER_VA_LIMIT) {
+        if (vmm_set_accessed_in(current_thread->proc->pml4_phys, f->far))
+            return;                      /* retry: the flag is set now */
+    }
+
     if ((ec == 0x24 || ec == 0x25 || ec == 0x20 || ec == 0x21) &&
         current_thread && f->far < USER_VA_LIMIT) {
         bool is_data = (ec == 0x24 || ec == 0x25);

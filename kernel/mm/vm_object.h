@@ -248,6 +248,7 @@ struct vmo_stats {
     uint64_t swapins;            /* ... and read back                        */
     uint64_t readahead_pages;    /* pages brought back BEFORE they faulted   */
     uint64_t readahead_reads;    /* device commands that did it              */
+    uint64_t second_chances;     /* anonymous pages found referenced and spared */
 
     /* Where reclaim spends its time. Kept, not just for one measurement,
      * because these are the numbers that decide the next change here. */
@@ -270,6 +271,14 @@ void vmo_stats_get(struct vmo_stats *out);
  * hold, *duplicates the pages sharing a slot with an earlier one. Walks every
  * object under the cache lock: a test's tool, not a fast path. */
 uint64_t vmo_audit_swap(uint64_t *store_used, uint64_t *dangling, uint64_t *duplicates);
+
+/* SECOND CHANCE on or off. On (the default): an anonymous page the reclaimer
+ * reaches whose accessed bit is set is not evicted but cleared and moved to
+ * the head of the LRU -- it is being USED, and the LRU, which only sees
+ * faults, cannot tell. Off: pure fault order, what this was before. Exposed
+ * so `test swap` can run its hot-set witness both ways and print the two
+ * numbers side by side; a switch a test can flip is a claim it can check. */
+void vmo_set_second_chance(bool on);
 
 /* Start the writeback thread. After the scheduler and the VFS. */
 void vmo_writeback_init(void);

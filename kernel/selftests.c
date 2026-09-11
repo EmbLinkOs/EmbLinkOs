@@ -1607,9 +1607,18 @@ int selftests_handle_command(const char *cmd)
         /* TWICE: once with mmap memory and once with malloc's -- sbrk, the
          * heap every ordinary program lives in, which became a pageable
          * mapping after mmap did. Each run is judged on its own counters. */
-        static const char *const modes[] = { "mmap", "heap" };
+        /* And a THIRD witness, twice: a hot quarter re-read every round while
+         * cold pages stream past -- first with the reclaimer in pure fault
+         * order, then with second chance (the accessed bit). The two swap-in
+         * counts side by side are the claim; the bound on the second is the
+         * assertion: with the hot set kept, every page is swapped in about
+         * once, not once per round. */
+        static const char *const modes[] = { "mmap", "heap", "hot", "hot" };
         int ok = 1;
-        for (int m = 0; m < 2; m++) {
+        uint64_t hot_ins[2] = { 0, 0 };
+        for (int m = 0; m < 4; m++) {
+            if (m == 2) vmo_set_second_chance(false);
+            if (m == 3) vmo_set_second_chance(true);
             struct swap_stats s0, s1;
             struct vmo_stats  v0, v1;
             struct vm_fault_stats f0, f1;
@@ -1633,9 +1642,12 @@ int selftests_handle_command(const char *cmd)
             vm_fault_stats(&f1);
             pmm_scan_stats(&pb1, &pa1);
 
-            kprintf("  [%s] %s: the witness exited %d after %llu ms (0 = every page came back intact)\n",
-                    rc == 0 ? "ok" : "FAIL", modes[m], rc, (unsigned long long)dt);
+            kprintf("  [%s] %s%s: the witness exited %d after %llu ms (0 = every page came back intact)\n",
+                    rc == 0 ? "ok" : "FAIL", modes[m],
+                    m == 2 ? " (fault-order LRU)" : m == 3 ? " (second chance)" : "",
+                    rc, (unsigned long long)dt);
             if (rc != 0) ok = 0;
+            if (m >= 2) hot_ins[m - 2] = s1.ins - s0.ins;
 
             /* WHERE THE TIME WENT. Not asserted; this is the breakdown that
              * decides what to build next, and it is printed so that a claim
@@ -1707,6 +1719,14 @@ int selftests_handle_command(const char *cmd)
             if (after > before + 1024) ok = 0;
         }
 
+        {
+            uint64_t wpages = want * 256;
+            kprintf("  [%s] the hot set stays: %llu pages, swapped in %llu times in fault order, %llu with second chance (bound %llu)\n",
+                    hot_ins[1] <= wpages * 13 / 10 ? "ok" : "FAIL",
+                    (unsigned long long)wpages, (unsigned long long)hot_ins[0],
+                    (unsigned long long)hot_ins[1], (unsigned long long)(wpages * 13 / 10));
+            if (hot_ins[1] > wpages * 13 / 10) ok = 0;
+        }
         kprintf("[cmd] test swap: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
@@ -7311,6 +7331,24 @@ int selftests_handle_command(const char *cmd)
             for (uint64_t i = 0; i < LEN / 8; i += 512)
                 if (m[i] != 0xC0FFEE00ULL + i) ok = false;
             uaccess_hw_end();
+        }
+
+        /* THE ACCESSED BIT, which reclaim reads to spare a page that is in
+         * use: set by the touches above, clear once read, set again by one
+         * more touch. The TLB entry is flushed between, because the CPU sets
+         * the bit on a TLB fill and not on a hit -- the imprecision the
+         * reclaimer accepts, made exact here so the claim is exact. */
+        bool acc1 = false, acc2 = false;
+        if (ok) {
+            acc1 = vmm_test_and_clear_accessed_in(p->pml4_phys, (uint64_t)a);
+            vmm_flush_tlb((uint64_t)a);
+            uaccess_hw_begin();
+            (void)*(volatile uint64_t *)(uintptr_t)a;
+            uaccess_hw_end();
+            acc2 = vmm_test_and_clear_accessed_in(p->pml4_phys, (uint64_t)a);
+            kprintf("      [%s] the accessed bit: set after the touches, clear once read, set again by one touch\n",
+                    (acc1 && acc2) ? " ok " : "FAIL");
+            if (!(acc1 && acc2)) fails++;
         }
 
         uint64_t free_mapped = pmm_free_pages();
