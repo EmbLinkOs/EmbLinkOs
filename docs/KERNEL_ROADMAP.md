@@ -17,9 +17,8 @@ needs it is a subsystem that will be wrong in ways nobody can see yet.
 ## The two rules everything here is held to
 
 **A capability is real or it is refused by name.** Not approximated, not
-stubbed to return success. `mmap` of a file returns `ENODEV` because there is
-no page cache to back it — not anonymous zeroes that look like the file until
-the moment they matter. `MAP_SHARED` is `ENOTSUP` rather than quietly private.
+stubbed to return success. `MAP_SHARED` *anonymous* memory is `ENOTSUP` rather
+than quietly private; `msync` is `ENOSYS` rather than a yes that means nothing.
 Suspend-to-RAM is `ENOSYS` rather than a halt that looks like sleep. Every one
 of those is a bug the caller finds at the call instead of a long way from it.
 
@@ -46,7 +45,13 @@ and one authoritative size. Write-back with a bounded interval, real `fsync`,
 a global LRU reclaimer that yields memory before an allocation has to fail.
 `mmap`/`munmap`/`mprotect` over a per-process VMA list, W^X enforced, page
 tables reclaimed exactly. Per-process address spaces, ASIDs on ARM, cross-core
-TLB shootdown.
+TLB shootdown. **Swap:** anonymous memory is a `vm_object` too, and pages out
+to a raw-device store under pressure -- `make test-swap` maps more than the
+machine has free, writes and reads every page back, and the kernel's own
+counters confirm the pages left and returned (229 MiB over 170 MiB free,
+0 pages wrong, 9.2 s under TCG). Clustered page-out, a per-object page index
+that doubles, page records from a pool, word-wide `memset`/`memcpy` -- each
+one measured against the run before it (docs/TODO.md has the table).
 
 **Next, in order:**
 
@@ -83,10 +88,17 @@ TLB shootdown.
    existed but scored 0 hits (one slot, and three call sites bypassing it), a
    name cache for the other descent per path component, and a `stat` that
    stopped walking every extent to re-derive a size the inode already held.
-5. **Compression before eviction**, macOS-style, once there is a reason: a
+5. ~~**Swap.**~~ **Done** -- see above. Still open inside it: the sbrk heap
+   and the stacks are not objects yet (only `mmap` memory pages), swap-in is
+   one page per command where page-out is sixteen, and the LRU is fault-order
+   rather than access-order. All in docs/TODO.md with numbers.
+6. **The sbrk heap and the stacks as anonymous objects.** `malloc` lives in
+   sbrk; until it is an object, swap helps `mmap` users and nobody else. Same
+   mechanism, one VMA per heap and per stack.
+7. **Compression before eviction**, macOS-style, once there is a reason: a
    compressed page is faster to recover than a re-read and costs no device.
-   Sequenced after 1–4 because it is only worth it when the cache is under real
-   pressure, which needs real workloads.
+   Only worth it when the cache is under real pressure, which needs real
+   workloads.
 
 ## Storage
 

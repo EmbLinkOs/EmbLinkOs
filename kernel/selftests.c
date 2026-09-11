@@ -432,6 +432,7 @@ static void selftests_print_commands(void)
     kprintf("  test hardlink\n");
     kprintf("  test embkfs crash   (needs sdc: make test-embkfs-crash)\n");
     kprintf("  test swap store     (needs a swap disk: make test-swap-store)\n");
+    kprintf("  test swap           (anonymous memory > RAM survives: make test-swap)\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1518,6 +1519,113 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* test swap -- anonymous memory larger than RAM, and the program survives.
+     *
+     * The witness (user/bin/swapper.c) maps N MiB anonymous, writes a pattern
+     * through every page and reads every page back; its exit code is the
+     * number of pages that came back wrong. N is chosen HERE from what the
+     * machine actually has free, so the run forces paging at any -m: more
+     * than is free, less than free plus half the store. Then the kernel's
+     * counters have to agree that pages went out and came back, and that
+     * everything the process held -- frames and slots -- was returned when
+     * it exited. Needs the swap image: make test-swap. */
+    if (strcmp(cmd, "test swap") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test swap: VFS not registered\n"); return 1; }
+        if (!swap_available()) {
+            kprintf("\n[cmd] test swap: no swap store (attach build/swap.img: make test-swap)\n");
+            return 1;
+        }
+        const char *wp = "/data/apps/swapper/swapper.elf";
+        struct vfs_stat wst;
+        if (vfs_stat(wp, &wst) != EMBK_OK) { kprintf("\n[cmd] test swap: %s not on image\n", wp); return 1; }
+
+        struct swap_stats s0, s1;
+        struct vmo_stats  v0, v1;
+        struct vm_fault_stats f0, f1;
+        uint64_t pb0, pa0, pb1, pa1;                 /* pmm scan bits / allocations */
+        swap_stats_get(&s0);
+        vmo_stats_get(&v0);
+        vm_fault_stats(&f0);
+        pmm_scan_stats(&pb0, &pa0);
+
+        uint64_t free_mib = pmm_free_pages() / 256;
+        uint64_t swap_mib = (s0.nslots - s0.used) / 256;
+        uint64_t want = free_mib * 135 / 100;            /* more than fits ... */
+        uint64_t cap  = free_mib + swap_mib / 2;         /* ... but not more than fits in RAM + half the store */
+        if (want > cap) want = cap;
+        if (want < 8)   want = 8;
+
+        kprintf("\n[swap] %llu MiB free, %llu MiB of store: the witness will touch %llu MiB\n",
+                (unsigned long long)free_mib, (unsigned long long)swap_mib, (unsigned long long)want);
+
+        char arg[24];
+        snprintf(arg, sizeof arg, "%llu", (unsigned long long)want);
+        char *a[] = { (char *)wp, arg, NULL };
+        uint64_t t0 = timer_uptime_ms();
+        int pid = process_create(wp, a, 2, NULL, 0);
+        if (pid < 0) { kprintf("[cmd] test swap: FAIL (spawn %d)\n", pid); return 1; }
+        int rc = process_wait((uint32_t)pid);
+        uint64_t dt = timer_uptime_ms() - t0;
+
+        swap_stats_get(&s1);
+        vmo_stats_get(&v1);
+        vm_fault_stats(&f1);
+        pmm_scan_stats(&pb1, &pa1);
+        int ok = 1;
+
+        kprintf("  [%s] the witness exited %d after %llu ms (0 = every page came back intact)\n",
+                rc == 0 ? "ok" : "FAIL", rc, (unsigned long long)dt);
+        if (rc != 0) ok = 0;
+
+        /* WHERE THE TIME WENT. Not asserted; this is the breakdown that decides
+         * what to build next, and it is printed so that a claim about it can
+         * be checked against the run that made it. */
+        uint64_t calls = v1.reclaim_calls - v0.reclaim_calls;
+        kprintf("  [info] %llu faults resolved in %llu ms inside vm_fault (%llu us each, disk waits included)\n",
+                (unsigned long long)(f1.handled - f0.handled),
+                (unsigned long long)((f1.ns - f0.ns) / 1000000),
+                (unsigned long long)((f1.handled - f0.handled) ? (f1.ns - f0.ns) / 1000 / (f1.handled - f0.handled) : 0));
+        kprintf("  [info]   of which: in the object (wire, fill, swap-in) %llu ms, installing PTEs %llu ms\n",
+                (unsigned long long)((f1.wire_ns - f0.wire_ns) / 1000000),
+                (unsigned long long)((f1.map_ns - f0.map_ns) / 1000000));
+        kprintf("  [info]   a fill: frame %llu ms, zeroing %llu ms, record %llu ms; pmm scanned %llu bits over %llu allocations\n",
+                (unsigned long long)((v1.fill_frame_ns - v0.fill_frame_ns) / 1000000),
+                (unsigned long long)((v1.fill_zero_ns - v0.fill_zero_ns) / 1000000),
+                (unsigned long long)((v1.fill_record_ns - v0.fill_record_ns) / 1000000),
+                (unsigned long long)(pb1 - pb0), (unsigned long long)(pa1 - pa0));
+        kprintf("  [info] reclaim ran %llu times, examined %llu LRU nodes (%llu per call)\n",
+                (unsigned long long)calls,
+                (unsigned long long)(v1.lru_visited - v0.lru_visited),
+                (unsigned long long)(calls ? (v1.lru_visited - v0.lru_visited) / calls : 0));
+        kprintf("  [info] time: reclaim %llu ms total, of which swap I/O %llu ms and unmapping %llu ms\n",
+                (unsigned long long)((v1.reclaim_ns - v0.reclaim_ns) / 1000000),
+                (unsigned long long)((v1.swap_ns - v0.swap_ns) / 1000000),
+                (unsigned long long)((v1.unmap_ns - v0.unmap_ns) / 1000000));
+
+        uint64_t outs = s1.outs - s0.outs, ins = s1.ins - s0.ins;
+        kprintf("  [%s] pages went out to the store: %llu (%llu MiB), %llu of them as %llu cluster writes\n",
+                outs ? "ok" : "FAIL", (unsigned long long)outs, (unsigned long long)(outs / 256),
+                (unsigned long long)(s1.cluster_pages - s0.cluster_pages),
+                (unsigned long long)(s1.clusters - s0.clusters));
+        if (!outs) ok = 0;
+        kprintf("  [%s] pages came back from it: %llu\n", ins ? "ok" : "FAIL", (unsigned long long)ins);
+        if (!ins) ok = 0;
+
+        kprintf("  [%s] every slot returned after exit: %llu in use before, %llu after\n",
+                s1.used == s0.used ? "ok" : "FAIL",
+                (unsigned long long)s0.used, (unsigned long long)s1.used);
+        if (s1.used != s0.used) ok = 0;
+
+        kprintf("  [%s] every anonymous page freed after exit: %llu resident / %llu swapped before, %llu / %llu after\n",
+                (v1.anon_pages == v0.anon_pages && v1.swapped_pages == v0.swapped_pages) ? "ok" : "FAIL",
+                (unsigned long long)v0.anon_pages, (unsigned long long)v0.swapped_pages,
+                (unsigned long long)v1.anon_pages, (unsigned long long)v1.swapped_pages);
+        if (!(v1.anon_pages == v0.anon_pages && v1.swapped_pages == v0.swapped_pages)) ok = 0;
+
+        kprintf("[cmd] test swap: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* test swap store -- the page store, before anything is swapped.
      * Slots are handed out and taken back; a page written out comes back
      * byte for byte; two pages out do not come back as each other; a slot
@@ -1557,6 +1665,26 @@ int selftests_handle_command(const char *cmd)
         int rz = swap_in(sa + 1000 < st0.nslots ? sa + 1000 : 1, pc);
         kprintf("  [%s] reading a slot nobody holds is refused (rc %d)\n", rz == -EMBK_EINVAL ? "ok" : "FAIL", rz);
         if (rz != -EMBK_EINVAL) ok = 0;
+
+        /* HOW FAST IS THE STORE, per page? Printed, not asserted -- it is a
+         * fact about the device and the host, not about the code -- but every
+         * paging decision above this layer is a bet on this number, so the
+         * test that proves the store works also says what it costs. 512 pages
+         * out to fresh slots, then the same 512 back. */
+        {
+            enum { NT = 512 };
+            static uint64_t slots[NT];
+            int n = 0;
+            uint64_t t0 = timer_uptime_ms();
+            for (; n < NT; n++) { slots[n] = swap_out(pa); if (!slots[n]) break; }
+            uint64_t t1 = timer_uptime_ms();
+            for (int i = 0; i < n; i++) (void)swap_in(slots[i], pc);
+            uint64_t t2 = timer_uptime_ms();
+            for (int i = 0; i < n; i++) swap_free(slots[i]);
+            kprintf("  [info] %d pages out in %llu ms (%llu us/page), the same %d back in %llu ms (%llu us/page)\n",
+                    n, (unsigned long long)(t1 - t0), (unsigned long long)(n ? (t1 - t0) * 1000 / n : 0),
+                    n, (unsigned long long)(t2 - t1), (unsigned long long)(n ? (t2 - t1) * 1000 / n : 0));
+        }
 
         swap_free(sa); swap_free(sb);
         swap_stats_get(&st1);
@@ -7743,7 +7871,7 @@ int selftests_handle_command(const char *cmd)
         vmo_stats_get(&v1);
         uint64_t wb_during = v1.writebacks - v0.writebacks;
 
-        kprintf("\n[cmd] test pagecache:\n");
+        kprintf("\n[pagecache] the write-back cache, measured:\n");
         kprintf("      %d writes of %d bytes -> %llu page writebacks during the loop\n",
                 N, CHUNK, (unsigned long long)wb_during);
         /* 512 * 64 = 32 KiB = 8 pages. Write-through would have been 512

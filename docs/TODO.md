@@ -564,7 +564,14 @@ approximated, which is why none of them is a silent bug waiting to be found:
     the scheduler tick drains (`sched_timer_tick()`, called before `schedule()`
     on both architectures). See the power section below for what that
     measurement then exposed.
-- [ ] **`msync`.** Meaningless until MAP_SHARED file mappings exist. `ENOSYS`.
+- [ ] **`msync`.** MAP_SHARED file mappings exist now and writeback covers
+  their durability; a caller asking by name still gets `ENOSYS` rather than a
+  yes that means nothing. Make it `vmo_flush` of the range.
+- [x] **Swap.** See "Memory: swap, and anonymous memory as an object" below.
+  Anonymous mappings live in `vm_object`s and page out to a raw-device store;
+  `make test-swap` is the proof. The page cache also gained a per-object index
+  that doubles with the object and a private pool for its page records --
+  both found by that test, both measured there.
 
 ### Power
 
@@ -1749,6 +1756,107 @@ violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
       found afterwards, but the run followed an x86 TCG run by about a minute.
       Recorded so that a second occurrence is recognised as a pattern rather
       than a surprise.
+
+## Memory: swap, and anonymous memory as an object (audit gap, closed)
+
+The audit said: no swap, so running out of RAM was failure rather than
+degradation. Closed in two commits (`feat(mm): a swap store`, `feat(mm):
+anonymous memory is an object, and it pages`). What is built, measured, and
+what it left open:
+
+- [x] **A swap store** (`kernel/mm/swap.{c,h}`, `tools/mkswap.py`): a raw
+  block device found by an `EMBKSWAP` header in block 0, one slot per page,
+  bitmap allocated, written in place. Not a file on EMBKFS: every write there
+  is a copy-on-write transaction, the wrong cost for memory nobody is using.
+  `make test-swap-store`: **158 us/page out, 107 us/page in** (TCG, idle).
+- [x] **Anonymous memory is a `vm_object`** (`vmo_create_anon`), so every
+  mapping has one and reclaim treats file and anonymous pages by one rule: a
+  page whose contents exist elsewhere is dropped, one whose contents exist
+  only here is written first. The object records its ONE mapper (an anonymous
+  object is private by design) because evicting means unmapping first; the
+  page record survives eviction holding the slot, and the fault that next
+  wants the page swaps it back in.
+- [x] **The witness, `make test-swap`** (`user/bin/swapper.c`, 256 MiB of
+  RAM): maps more than is free, writes a pattern through every page, reads
+  every page back. **229 MiB touched with 170 MiB free: 41,344 pages out
+  (161 MiB) as 2,584 cluster writes, 20,928 back, 0 pages wrong, every slot
+  and frame returned at exit -- 9.2 s, 91 us per fault.** The same run took
+  61.6 s when it first passed. What each step was worth, measured:
+
+  | change | run | what was wrong |
+  |---|---:|---|
+  | first passing run | 61.6 s | I/O under the VMA spinlock: 24,985 `ATA WARN ... IF=0` lines |
+  | IRQs on around `vm_fault`; lock dropped across the wire | 53.9 s | the fault path slept with interrupts off |
+  | clustered page-out (16 pages, one command); file/anon LRUs split | 42.9 s | 49,152 commands -> 3,072; 3.4 M LRU nodes walked -> 49,152 |
+  | per-object page index that doubles | 36.9 s | 16 buckets for a 58,624-page object: 3,600-entry chains |
+  | page records from a pool, not kmalloc | 22.7 s | **224 us per kmalloc** past the heap's 1 MiB slab cap (below) |
+  | word-wide `memset`/`memcpy`/`memmove` | **9.2 s** | byte loops: 69 us to zero a page, and every bounce/cluster copy |
+
+  Every line of that table is printed by `test swap` itself (`[info]` lines:
+  time inside `vm_fault`, wire vs. PTE install, frame/zero/record per fill,
+  reclaim calls and LRU nodes, swap I/O and unmap time), so the next change
+  here starts from a breakdown, not a guess.
+- [x] **A bug this found in the exit path, predating swap:** `vma_destroy_all`
+  freed only the `vm_area` records and let `vmm_destroy_address_space` free
+  every frame it found -- including the page cache's own frames still mapped
+  from a file mapping. A process exiting with a file mapped was freeing cache
+  pages under the cache (or twice). Mappings now let go of their pages before
+  the tables are walked; the object's frames are the object's.
+- [x] **Object puts happen outside the VMA lock** (`vma_munmap`,
+  `vma_destroy_all`): a last-reference `vmo_put` flushes, a flush is disk
+  I/O, and under the spinlock that was a disk wait with interrupts off. The
+  dead node carries the pending put past the unlock.
+
+Open, in the order they matter:
+
+- [ ] **Only `mmap` memory pages.** The sbrk heap -- where `malloc` lives --
+  and the stacks are still eagerly mapped bare frames the fault handler never
+  sees. Moving them onto anonymous objects is the same mechanism (a VMA per
+  heap, one per stack) and is what makes swap matter to an ordinary program.
+- [ ] **aarch64 keeps IRQs masked around `vm_fault`** (x86 unmasks when the
+  faulting context had them on). Unmasking hangs init before its first print,
+  every boot; masked, it boots (bisected 2026-09-11). The root is wider: on
+  aarch64 nothing unmasks IRQs inside ANY exception -- syscalls included --
+  so kernel code at EL1 has never been preempted by the tick. Two
+  consequences: a disk-bound syscall delays the tick on its core, and the
+  first EL1 preemption is untested. Find what on the tick/switch path is not
+  safe nested in a sync handler, then unmask in the syscall path too.
+- [ ] **The kernel heap's slab pools cap at 1 MiB** (`SLAB_MAX_RANGES` 128 x
+  `SLAB_REGION_BYTES` 8 KiB, `kernel/mm/kheap.c`); past that, every small
+  allocation walks the general first-fit heap. Measured at **224 us per
+  `kmalloc(80)`** with ~58,000 blocks live. The page cache now carries its
+  own records, but the next thing that wants tens of thousands of small
+  objects will hit this. Larger regions and a faster range lookup, or a real
+  slab allocator.
+- [ ] **The LRU is fault-order, not access-order.** A page is touched in the
+  LRU when it is faulted in and never again -- the hardware access bits are
+  not scanned -- so reclaim evicts the oldest FAULTED page, not the least
+  recently USED one. Correct, and the wrong page under a real working set.
+  Access-bit scanning (with a TLB flush per scan, or an active/inactive pair
+  of lists) is the next step; needs a workload to measure against.
+- [ ] **Swap-in is one page per command.** Page-out clusters sixteen; a read
+  brings back exactly the page that faulted. In the witness, swap-ins are
+  ~380 us each under load and the largest remaining I/O cost. Read-ahead of
+  the neighbouring slots (the pages evicted together were written together)
+  is the usual answer.
+- [ ] **One shootdown per evicted page** (x86: an IPI broadcast and a CR3
+  reload on every core). Measured at 8.7 us each, 0.4 s of the run -- not
+  worth batching yet; would be once a batch API exists (clear N PTEs, one
+  shootdown).
+- [ ] **The swap slot is freed on swap-in.** A page read back and never
+  written again could keep its slot and be dropped for free the next time.
+- [ ] **Shared anonymous memory** (`MAP_SHARED|MAP_ANONYMOUS`) is refused:
+  the anonymous object has one mapper by design, and sharing needs a reverse
+  map to unmap every mapper before eviction. No consumer without `fork`.
+- [ ] **The copy-on-write allocation** in `vm_fault` still calls
+  `pmm_alloc_page` directly under the VMA lock, so a COW fault under real
+  pressure declines instead of reclaiming. Route it through the object's
+  reserve once COW pages are objects too.
+- [ ] **Observed once, not reproduced:** an x86 boot (256 MiB, swap disk)
+  stalled after `init: authenticated session` -- `ELF dynlink: libembk.so
+  linked` never printed, no panic, no fault -- with the growable page index
+  freshly added. Two rebuilds and every run since booted. Recorded with the
+  exact point so a second sighting has something to match.
 
 ## Process & Scheduling
 

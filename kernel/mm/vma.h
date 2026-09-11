@@ -77,9 +77,11 @@ struct vm_area {
     uint32_t prot;
     uint32_t flags;
 
-    /* FILE BACKING. NULL for an anonymous mapping.
+    /* THE OBJECT BEHIND THE MAPPING. A file's page object, or -- for an
+     * anonymous mapping -- an object with no file that exists so the memory
+     * can be paged out (vmo_create_anon). Never NULL once the mapping is made.
      *
-     * The object is the SAME one read()/write() go through (mm/vm_object.h),
+     * For a file, the object is the SAME one read()/write() go through (mm/vm_object.h),
      * not a copy of it -- which is the entire reason the cache was built as an
      * object. A process that maps a file and one that reads it are looking at
      * one set of pages, so they cannot disagree about what the file says.
@@ -149,6 +151,12 @@ struct vm_fault_stats {
     uint64_t cow;          /* a private file page copied because it was
                             * written -- the count that says sharing was
                             * actually happening up to that point */
+    uint64_t ns;           /* wall time inside vm_fault, all outcomes -- the
+                            * number that says whether a slow paging run is
+                            * the disk, the fault path, or the machine */
+    uint64_t wire_ns;      /* ... of which, getting the page from its object
+                            * (cache lock, fill or swap-in, disk waits) */
+    uint64_t map_ns;       /* ... of which, installing the PTE */
 };
 void vm_fault_stats(struct vm_fault_stats *out);
 

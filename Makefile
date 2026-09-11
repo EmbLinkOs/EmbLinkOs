@@ -2481,7 +2481,7 @@ test-audio: $(IMG) $(EMBKFS_MASTER)
 # --- x86 console tests, scripted -----------------------------------------------
 # tools/console_test.py boots the kernel headless and types at its console. Any
 # self-test the kernel has can be run this way:  make test-x86 T="test mmap"
-.PHONY: test-x86 test-embkfs-crash test-swap-store
+.PHONY: test-x86 test-embkfs-crash test-swap-store test-swap
 test-x86: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/console_test.py $(T)
 
@@ -2507,6 +2507,15 @@ build/swap.img: tools/mkswap.py | $(BUILD)
 
 test-swap-store: $(IMG) $(EMBKFS_MASTER) build/swap.img
 	@SWAP_DISK=build/swap.img python3 tools/console_test.py "test swap store"
+
+# ANONYMOUS MEMORY LARGER THAN RAM. `test swap` runs user/bin/swapper.elf,
+# which maps more than the machine has free, writes every page and reads every
+# page back; the kernel's own counters then say whether pages went out to the
+# store and came back. 256 MiB of RAM so the store is exercised in seconds
+# rather than minutes -- the witness sizes itself from what is actually free,
+# so any -m forces paging; a small one just makes it quick.
+test-swap: $(IMG) $(EMBKFS_MASTER) build/swap.img
+	@MEM=256M SWAP_DISK=build/swap.img python3 tools/console_test.py "test swap"
 
 test-embkfs-crash: $(IMG) $(EMBKFS_MASTER) build/crash-seed.img
 	@EXTRA_DISK=build/crash-seed.img python3 tools/console_test.py "test embkfs crash"

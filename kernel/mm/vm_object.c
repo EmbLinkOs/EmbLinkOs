@@ -1,5 +1,7 @@
 #include "mm/vm_object.h"
 #include "mm/pmm.h"
+#include "mm/vmm.h"          /* vmm_unmap_in: taking an anonymous page out of its mapper */
+#include "mm/swap.h"
 #include "include/errno.h"
 #include "include/kmalloc.h"
 #include "include/kprintf.h"
@@ -25,12 +27,18 @@ static bool g_ready = false;
 
 static struct vm_object *g_registry = NULL;
 
-/* Global LRU across every object: newest at the head. Reclaim walks from the
- * TAIL, which is the least recently used page in the system regardless of
- * which file it belongs to. Per-object LRUs would let a file that is read once
- * and never again hold pages a hot file needs. */
-static struct vmo_page *g_lru_head = NULL;
-static struct vmo_page *g_lru_tail = NULL;
+/* TWO LRUs, one for file pages and one for anonymous pages, each newest at the
+ * head. Reclaim walks a list from its TAIL -- the least recently used page of
+ * that kind in the system, regardless of which object it belongs to; per-object
+ * LRUs would let a file read once and never again hold pages a hot file needs.
+ *
+ * Two lists rather than one because reclaim's passes are BY KIND: clean file
+ * pages first, then dirty ones, then anonymous pages to the swap store. With
+ * one list the first pass walked every anonymous node to find none of them
+ * evictable -- measured at 35,000 nodes per call, 3.4 million in one paging
+ * run -- before the pass that wanted them started over from the tail. */
+struct lru { struct vmo_page *head, *tail; };
+static struct lru g_lru_file, g_lru_anon;
 
 static struct vmo_stats g_stats;
 
@@ -55,39 +63,123 @@ static inline void *page_va(uint64_t phys) {
 
 /* ---- LRU ---------------------------------------------------------------- */
 
+static inline struct lru *lru_of(struct vmo_page *p) {
+    return p->owner->anon ? &g_lru_anon : &g_lru_file;
+}
+
 static void lru_unlink(struct vmo_page *p) {
+    struct lru *l = lru_of(p);
     if (p->lru_prev) p->lru_prev->lru_next = p->lru_next;
-    else if (g_lru_head == p) g_lru_head = p->lru_next;
+    else if (l->head == p) l->head = p->lru_next;
     if (p->lru_next) p->lru_next->lru_prev = p->lru_prev;
-    else if (g_lru_tail == p) g_lru_tail = p->lru_prev;
+    else if (l->tail == p) l->tail = p->lru_prev;
     p->lru_prev = p->lru_next = NULL;
 }
 
 static void lru_touch(struct vmo_page *p) {
-    if (g_lru_head == p)
+    struct lru *l = lru_of(p);
+    if (l->head == p)
         return;
     lru_unlink(p);
-    p->lru_next = g_lru_head;
-    if (g_lru_head) g_lru_head->lru_prev = p;
-    g_lru_head = p;
-    if (!g_lru_tail) g_lru_tail = p;
+    p->lru_next = l->head;
+    if (l->head) l->head->lru_prev = p;
+    l->head = p;
+    if (!l->tail) l->tail = p;
+}
+
+/* ---- page records ------------------------------------------------------- */
+
+/* PAGE RECORDS COME FROM A POOL, NOT FROM kmalloc. Measured: the kernel heap's
+ * slab pools are capped at 128 regions of 8 KiB -- one megabyte in all -- and
+ * past that every small allocation falls to the general first-fit heap, which
+ * walks every block before it. A paging run that filled 58,624 pages spent
+ * 13.2 s of its 36 s allocating their records: 224 us per kmalloc. The page
+ * cache is the one thing in the kernel that wants tens of thousands of small
+ * objects, so it carries them itself, the way every kernel carries its page
+ * structures: chunks of records threaded on a free list, O(1) either way.
+ *
+ * Chunks come from the heap ARENA (kmalloc), not from the frame allocator --
+ * so caching a file or paging a mapping never changes the free-frame count
+ * by anything but the pages themselves, which is what `test mmap`'s exact
+ * round trip asserts. Chunks are kept, not returned: the pool's high-water
+ * mark is a few dozen bytes per page ever cached at once, the ratio every
+ * kernel pays for its page array. */
+#define VMO_RECORD_CHUNK_BYTES (32u * 1024u)
+static struct vmo_page *g_rec_free;          /* free list, threaded through hnext */
+static uint64_t g_rec_chunks, g_rec_free_count;
+
+static struct vmo_page *record_alloc(void) {
+    if (!g_rec_free) {
+        struct vmo_page *chunk = kmalloc(VMO_RECORD_CHUNK_BYTES);
+        if (!chunk)
+            return NULL;
+        uint64_t n = VMO_RECORD_CHUNK_BYTES / sizeof *chunk;
+        for (uint64_t i = 0; i < n; i++) {
+            chunk[i].hnext = g_rec_free;
+            g_rec_free = &chunk[i];
+        }
+        g_rec_chunks++;
+        g_rec_free_count += n;
+    }
+    struct vmo_page *p = g_rec_free;
+    g_rec_free = p->hnext;
+    g_rec_free_count--;
+    return p;
+}
+
+static void record_free(struct vmo_page *p) {
+    p->hnext = g_rec_free;
+    g_rec_free = p;
+    g_rec_free_count++;
 }
 
 /* ---- pages within an object --------------------------------------------- */
 
+static inline uint32_t bucket_of(const struct vm_object *o, uint64_t index) {
+    return (uint32_t)(index & (o->nbuckets - 1));
+}
+
 static struct vmo_page *page_find(struct vm_object *o, uint64_t index) {
-    for (struct vmo_page *p = o->buckets[index % VMO_HASH_BUCKETS]; p; p = p->hnext)
+    for (struct vmo_page *p = o->buckets[bucket_of(o, index)]; p; p = p->hnext)
         if (p->index == index)
             return p;
     return NULL;
 }
 
 static void page_unlink(struct vm_object *o, struct vmo_page *p) {
-    struct vmo_page **pp = &o->buckets[p->index % VMO_HASH_BUCKETS];
+    struct vmo_page **pp = &o->buckets[bucket_of(o, p->index)];
     while (*pp && *pp != p)
         pp = &(*pp)->hnext;
     if (*pp)
         *pp = p->hnext;
+}
+
+/* Double the index when it holds more pages than buckets. Amortised O(1) per
+ * insert. A failed allocation keeps the old table -- slower, not wrong. Caller
+ * holds g_lock. */
+static void index_grow_if_needed(struct vm_object *o) {
+    uint64_t pages = (uint64_t)o->resident + o->swapped;
+    if (pages <= o->nbuckets || o->nbuckets >= VMO_HASH_MAX_BUCKETS)
+        return;
+    uint32_t nb = o->nbuckets * 2;
+    struct vmo_page **nt = kmalloc((uint64_t)nb * sizeof *nt);
+    if (!nt)
+        return;
+    memset(nt, 0, (size_t)nb * sizeof *nt);
+    for (uint32_t b = 0; b < o->nbuckets; b++) {
+        struct vmo_page *p = o->buckets[b];
+        while (p) {
+            struct vmo_page *next = p->hnext;
+            uint32_t h = (uint32_t)(p->index & (nb - 1));
+            p->hnext = nt[h];
+            nt[h] = p;
+            p = next;
+        }
+    }
+    if (o->buckets != o->inline_buckets)
+        kfree(o->buckets);
+    o->buckets  = nt;
+    o->nbuckets = nb;
 }
 
 /* Release one page: its frame goes back to the allocator and the record with
@@ -96,9 +188,15 @@ static void page_destroy(struct vm_object *o, struct vmo_page *p) {
     lru_unlink(p);
     page_unlink(o, p);
     if (p->dirty && o->dirty_pages) o->dirty_pages--;
-    o->resident--;
-    pmm_free_page(p->phys);
-    kfree(p);
+    /* A page is in a frame OR in a swap slot -- never both, never neither. */
+    if (p->phys) {
+        o->resident--;
+        pmm_free_page(p->phys);
+    } else if (p->swap_slot) {
+        if (o->swapped) o->swapped--;
+        swap_free(p->swap_slot);
+    }
+    record_free(p);
 }
 
 /* Fetch page `index` from the filesystem into a fresh frame.
@@ -108,13 +206,47 @@ static void page_destroy(struct vm_object *o, struct vmo_page *p) {
  * previous owner's bytes in its tail is a disclosure, and it is one that only
  * shows up on files whose length is not a multiple of the page size -- which
  * is almost all of them. */
-static struct vmo_page *page_fill(struct vm_object *o, uint64_t index, bool zero_only) {
+static uint64_t reclaim_locked(uint64_t want, bool swap_ok);
+
+/* A frame for a page, making room if there is none.
+ *
+ * THIS IS WHERE PRESSURE BECOMES PAGING. The writeback thread reclaims when
+ * free memory falls under its watermark, but it wakes ten times a second and
+ * a process touching pages in a loop is faster than that. So the fault path
+ * reclaims for itself when the allocator is nearly dry -- from the cache it is
+ * standing in, under the lock it already holds -- and then allocates.
+ *
+ * A RESERVE, not "on failure". The page TABLES this page needs are allocated
+ * by vmm_map_in from the same pool, and so is every kmalloc, and neither can
+ * reclaim. Keeping a margin means the fault that paged this page in does not
+ * then fail on the table that maps it. */
+#define VMO_FAULT_RESERVE_PAGES  128     /* 512 KiB */
+#define VMO_FAULT_RECLAIM_BATCH   64
+static uint64_t frame_or_reclaim(void) {
+    if (pmm_free_pages() < VMO_FAULT_RESERVE_PAGES)
+        (void)reclaim_locked(VMO_FAULT_RECLAIM_BATCH, true);
     uint64_t phys = pmm_alloc_page();
+    if (phys)
+        return phys;
+    /* The batch did not cover it, or the allocator refused above the reserve
+     * (fragmentation is not a thing for single pages, so: it is truly empty).
+     * Once more, then the caller hears about it. */
+    (void)reclaim_locked(VMO_FAULT_RECLAIM_BATCH, true);
+    return pmm_alloc_page();
+}
+
+static struct vmo_page *page_fill(struct vm_object *o, uint64_t index, bool zero_only) {
+    uint64_t t0 = time_get_ns();
+    uint64_t phys = frame_or_reclaim();
+    uint64_t t1 = time_get_ns();
+    g_stats.fill_frame_ns += t1 - t0;
     if (!phys)
         return NULL;
 
     uint8_t *va = (uint8_t *)page_va(phys);
     memset(va, 0, PAGE_SIZE);
+    uint64_t t2 = time_get_ns();
+    g_stats.fill_zero_ns += t2 - t1;
 
     if (!zero_only && o->vn.mnt && o->vn.mnt->ops && o->vn.mnt->ops->read) {
         uint64_t off = index * PAGE_SIZE;
@@ -132,7 +264,9 @@ static struct vmo_page *page_fill(struct vm_object *o, uint64_t index, bool zero
         }
     }
 
-    struct vmo_page *p = kmalloc(sizeof *p);
+    uint64_t t3 = time_get_ns();
+    struct vmo_page *p = record_alloc();
+    g_stats.fill_record_ns += time_get_ns() - t3;
     if (!p) {
         pmm_free_page(phys);
         return NULL;
@@ -141,18 +275,48 @@ static struct vmo_page *page_fill(struct vm_object *o, uint64_t index, bool zero
     p->phys  = phys;
     p->dirty = false;
     p->wired = 0;
+    p->swap_slot = 0;
     p->owner = o;
     p->lru_prev = p->lru_next = NULL;
-    p->hnext = o->buckets[index % VMO_HASH_BUCKETS];
-    o->buckets[index % VMO_HASH_BUCKETS] = p;
+    p->hnext = o->buckets[bucket_of(o, index)];
+    o->buckets[bucket_of(o, index)] = p;
     o->resident++;
     lru_touch(p);
+    index_grow_if_needed(o);
     return p;
 }
 
 /* The page for `index`, faulting it in if absent. */
 static struct vmo_page *page_get(struct vm_object *o, uint64_t index, bool zero_only) {
     struct vmo_page *p = page_find(o, index);
+    if (p && !p->phys) {
+        /* KNOWN, BUT OUT ON THE SWAP STORE. The record survived eviction
+         * precisely so that this lookup would find the slot. Bring the page
+         * back into a fresh frame. The slot is released on the way in; a page
+         * that comes back and is later dropped unchanged could have kept it,
+         * which is the refinement swap.h notes and this does not make. */
+        uint64_t phys = frame_or_reclaim();
+        if (!phys)
+            return NULL;
+        uint64_t ts = time_get_ns();
+        int rc = swap_in(p->swap_slot, phys);
+        g_stats.swap_ns += time_get_ns() - ts;
+        if (rc != EMBK_OK) {
+            kprintf("pagecache: swap-in of slot %llu failed (%d); the fault is declined\n",
+                    (unsigned long long)p->swap_slot, rc);
+            pmm_free_page(phys);
+            return NULL;
+        }
+        swap_free(p->swap_slot);
+        p->swap_slot = 0;
+        p->phys = phys;
+        o->resident++;
+        if (o->swapped) o->swapped--;
+        g_stats.swapins++;
+        g_stats.misses++;
+        lru_touch(p);
+        return p;
+    }
     if (p) {
         g_stats.hits++;
         lru_touch(p);
@@ -174,7 +338,7 @@ static uint32_t flush_run(struct vm_object *o, uint64_t first) {
     struct vmo_page *run[VMO_FLUSH_RUN_PAGES];
     while (n < VMO_FLUSH_RUN_PAGES) {
         struct vmo_page *p = page_find(o, first + n);
-        if (!p || !p->dirty)
+        if (!p || !p->dirty || !p->phys)
             break;
         run[n] = p;
         memcpy(g_flush_buf + (uint64_t)n * PAGE_SIZE, page_va(p->phys), PAGE_SIZE);
@@ -237,24 +401,26 @@ static int flush_object_locked(struct vm_object *o) {
 /* ---- objects ------------------------------------------------------------ */
 
 static void obj_free_pages_locked(struct vm_object *o) {
-    for (int b = 0; b < VMO_HASH_BUCKETS; b++) {
+    for (uint32_t b = 0; b < o->nbuckets; b++) {
         struct vmo_page *p = o->buckets[b];
         while (p) {
             struct vmo_page *next = p->hnext;
             lru_unlink(p);
-            pmm_free_page(p->phys);
-            kfree(p);
+            if (p->phys)           pmm_free_page(p->phys);
+            else if (p->swap_slot) swap_free(p->swap_slot);
+            record_free(p);
             p = next;
         }
         o->buckets[b] = NULL;
     }
     o->resident = 0;
     o->dirty_pages = 0;
+    o->swapped = 0;
 }
 
 static struct vm_object *registry_find(struct vnode vn) {
     for (struct vm_object *o = g_registry; o; o = o->reg_next)
-        if (o->vn.mnt == vn.mnt && o->vn.ino == vn.ino)
+        if (!o->anon && o->vn.mnt == vn.mnt && o->vn.ino == vn.ino)
             return o;
     return NULL;
 }
@@ -281,7 +447,7 @@ struct vm_object *vmo_get(struct vnode vn) {
     mutex_lock(&g_lock);
     struct vm_object *o = registry_find(vn);
     if (o) {
-        o->refs++;
+        __atomic_fetch_add(&o->refs, 1, __ATOMIC_RELAXED);
         mutex_unlock(&g_lock);
         return o;
     }
@@ -292,6 +458,8 @@ struct vm_object *vmo_get(struct vnode vn) {
         return NULL;
     }
     memset(o, 0, sizeof *o);
+    o->buckets  = o->inline_buckets;
+    o->nbuckets = VMO_HASH_BUCKETS;
     o->vn = vn;
     o->refs = 1;
 
@@ -316,7 +484,7 @@ void vmo_put(struct vm_object *o) {
     if (!o)
         return;
     mutex_lock(&g_lock);
-    if (--o->refs > 0) {
+    if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL) > 0) {
         mutex_unlock(&g_lock);
         return;
     }
@@ -326,9 +494,23 @@ void vmo_put(struct vm_object *o) {
     (void)flush_object_locked(o);
     obj_free_pages_locked(o);
     registry_remove(o);
-    if (g_stats.objects) g_stats.objects--;
+    if (o->anon) { if (g_stats.anon_objects) g_stats.anon_objects--; }
+    else if (g_stats.objects) g_stats.objects--;
     mutex_unlock(&g_lock);
+    if (o->buckets != o->inline_buckets)
+        kfree(o->buckets);
     kfree(o);
+}
+
+void vmo_ref(struct vm_object *o) {
+    if (!o)
+        return;
+    /* NO LOCK, on purpose: the fault path calls this under the VMA spinlock,
+     * where sleeping on g_lock would be sleeping with interrupts off. It is
+     * safe because every caller already holds the object through something
+     * that holds a reference -- a VMA it found under vma_lock -- so refs is
+     * at least 1 and the last-reference teardown in vmo_put cannot be running. */
+    __atomic_fetch_add(&o->refs, 1, __ATOMIC_RELAXED);
 }
 
 int vmo_read(struct vm_object *o, uint64_t off, void *buf, uint64_t len,
@@ -436,7 +618,7 @@ uint64_t vmo_size(struct vm_object *o) {
 static void truncate_locked(struct vm_object *o, uint64_t size) {
     o->size = size;
     uint64_t first_gone = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    for (int b = 0; b < VMO_HASH_BUCKETS; b++) {
+    for (uint32_t b = 0; b < o->nbuckets; b++) {
         struct vmo_page *p = o->buckets[b];
         while (p) {
             struct vmo_page *next = p->hnext;
@@ -450,7 +632,7 @@ static void truncate_locked(struct vm_object *o, uint64_t size) {
      * straight back. */
     if (size % PAGE_SIZE) {
         struct vmo_page *p = page_find(o, size / PAGE_SIZE);
-        if (p)
+        if (p && p->phys)
             memset((uint8_t *)page_va(p->phys) + (size % PAGE_SIZE), 0,
                    (size_t)(PAGE_SIZE - (size % PAGE_SIZE)));
     }
@@ -496,7 +678,7 @@ uint64_t vmo_wire_page(struct vm_object *o, uint64_t index) {
      * bytes must read as ZERO, so an absent page inside the mapping is filled
      * with zeroes rather than refused. */
     bool past_eof = (index * PAGE_SIZE >= o->size);
-    struct vmo_page *p = page_get(o, index, past_eof);
+    struct vmo_page *p = page_get(o, index, past_eof || o->anon);  /* anonymous: zeroes, nothing to read */
     if (!p) { mutex_unlock(&g_lock); return 0; }
 
     p->wired++;
@@ -542,6 +724,78 @@ void vmo_mark_dirty(struct vm_object *o, uint64_t index) {
     mutex_unlock(&g_lock);
 }
 
+/* --- anonymous objects ---------------------------------------------------- */
+
+struct vm_object *vmo_create_anon(uint64_t size) {
+    if (!g_ready || size == 0)
+        return NULL;
+    struct vm_object *o = kmalloc(sizeof *o);
+    if (!o)
+        return NULL;
+    memset(o, 0, sizeof *o);
+    o->buckets  = o->inline_buckets;
+    o->nbuckets = VMO_HASH_BUCKETS;
+    o->anon = true;
+    o->no_writeback = true;          /* there is no file to write back TO */
+    o->size = size;
+    o->refs = 1;
+
+    mutex_lock(&g_lock);
+    o->reg_next = g_registry;
+    g_registry = o;
+    g_stats.anon_objects++;
+    mutex_unlock(&g_lock);
+    return o;
+}
+
+void vmo_set_mapper(struct vm_object *o, uint64_t pml4_phys, uint64_t base_va) {
+    if (!o || !o->anon)
+        return;
+    mutex_lock(&g_lock);
+    o->mapper_pml4 = pml4_phys;
+    o->mapper_base = base_va;
+    mutex_unlock(&g_lock);
+}
+
+/* Take a mapped page out of its mapper's page tables. Caller holds g_lock.
+ * Nothing happens for a page that is not mapped: never touched since it came
+ * back, or unmapped by a reclaim whose swap-out then failed. */
+static void anon_unmap_locked(struct vm_object *o, struct vmo_page *p) {
+    if (p->wired && o->mapper_pml4) {
+        vmm_unmap_in(o->mapper_pml4, o->mapper_base + p->index * PAGE_SIZE);
+        p->wired = 0;
+    }
+}
+
+void vmo_discard_range(struct vm_object *o, uint64_t first, uint64_t count) {
+    if (!o || !o->anon || count == 0)
+        return;
+    mutex_lock(&g_lock);
+    for (uint32_t b = 0; b < o->nbuckets; b++) {
+        struct vmo_page *p = o->buckets[b];
+        while (p) {
+            struct vmo_page *next = p->hnext;
+            if (p->index >= first && p->index - first < count) {
+                anon_unmap_locked(o, p);
+                page_destroy(o, p);
+            }
+            p = next;
+        }
+    }
+    mutex_unlock(&g_lock);
+}
+
+void vmo_detach_mapper(struct vm_object *o) {
+    if (!o || !o->anon)
+        return;
+    mutex_lock(&g_lock);
+    for (uint32_t b = 0; b < o->nbuckets; b++)
+        for (struct vmo_page *p = o->buckets[b]; p; p = p->hnext)
+            anon_unmap_locked(o, p);
+    o->mapper_pml4 = 0;
+    mutex_unlock(&g_lock);
+}
+
 uint64_t vmo_writeback_all(void) {
     if (!g_ready)
         return 0;
@@ -554,39 +808,158 @@ uint64_t vmo_writeback_all(void) {
     return n;
 }
 
+/* File pages, from the tail of the file LRU. Clean ones are dropped; dirty
+ * ones are flushed first, and only when `allow_dirty`. Caller holds g_lock. */
+static uint64_t reclaim_file_locked(uint64_t want, bool allow_dirty) {
+    uint64_t freed = 0;
+    struct vmo_page *p = g_lru_file.tail;
+    while (p && freed < want) {
+        struct vmo_page *prev = p->lru_prev;
+        struct vm_object *o = p->owner;
+        g_stats.lru_visited++;
+
+        if (p->wired) { p = prev; continue; }
+
+        if (p->dirty) {
+            if (!allow_dirty) { p = prev; continue; }
+            if (flush_run(o, p->index) == 0) { p = prev; continue; }
+            if (p->dirty) { p = prev; continue; }
+            prev = p->lru_prev;   /* flush_run may have moved neighbours */
+        }
+
+        page_destroy(o, p);
+        g_stats.evictions++;
+        freed++;
+        p = prev;
+    }
+    return freed;
+}
+
+/* One cluster of unmapped anonymous pages goes to the store: as ONE device
+ * command when a run of contiguous slots exists, one page at a time when it
+ * does not. A page the store refuses stays resident and unmapped -- the next
+ * touch maps it again, nothing is lost. Returns how many left RAM. */
+static uint64_t anon_batch_out_locked(struct vmo_page **batch, int n) {
+    uint64_t phys[SWAP_CLUSTER_PAGES], slots[SWAP_CLUSTER_PAGES];
+    for (int i = 0; i < n; i++) phys[i] = batch[i]->phys;
+
+    uint64_t ts = time_get_ns();
+    if (swap_out_cluster(phys, n, slots) == 0)
+        for (int i = 0; i < n; i++) slots[i] = swap_out(phys[i]);
+    g_stats.swap_ns += time_get_ns() - ts;
+
+    uint64_t out = 0;
+    for (int i = 0; i < n; i++) {
+        struct vmo_page *p = batch[i];
+        if (!slots[i]) continue;
+        struct vm_object *o = p->owner;
+        lru_unlink(p);
+        pmm_free_page(p->phys);
+        p->phys = 0;
+        p->swap_slot = slots[i];
+        o->resident--;
+        o->swapped++;
+        g_stats.swapouts++;
+        g_stats.evictions++;
+        out++;
+    }
+    return out;
+}
+
+/* Anonymous pages, from the tail of the anonymous LRU, a cluster at a time.
+ * Caller holds g_lock and has already checked that the store can take them. */
+static uint64_t reclaim_anon_locked(uint64_t want) {
+    uint64_t freed = 0;
+    struct vmo_page *batch[SWAP_CLUSTER_PAGES];
+    int n = 0;
+
+    struct vmo_page *p = g_lru_anon.tail;
+    while (p && freed + (uint64_t)n < want) {
+        struct vmo_page *prev = p->lru_prev;
+        struct vm_object *o = p->owner;
+        g_stats.lru_visited++;
+
+        bool take = p->phys != 0;
+        if (take && p->wired) {
+            if (p->wired != 1 || !o->mapper_pml4) {
+                take = false;
+            } else {
+                uint64_t va = o->mapper_base + p->index * PAGE_SIZE;
+                /* WIRED AND MAPPED, OR WIRED AND IN FLIGHT? The fault path
+                 * wires a page BEFORE it maps it, and holds no lock of ours in
+                 * between (it may have just waited on a disk to get here). A
+                 * page wired but not yet in the page table is a fault in
+                 * progress holding a frame it is about to map; swapping it out
+                 * now would free that frame under it. The page table is the
+                 * arbiter: present means mapped and evictable, absent means
+                 * leave it for this round.
+                 *
+                 * OUT OF THE PAGE TABLE FIRST, then out to disk. The other
+                 * order has a window in which the process stores through a
+                 * PTE that still points at a frame whose contents are already
+                 * on their way to the store, and that store is lost. Unmapping
+                 * flushes every core's TLB (x86 broadcasts a shootdown, the
+                 * aarch64 tlbi is broadcast by the hardware), so from this
+                 * line a touch faults and waits on g_lock -- which is held
+                 * until the page is safely in its slot. */
+                if (vmm_get_phys_in(o->mapper_pml4, va) != p->phys) {
+                    take = false;
+                } else {
+                    uint64_t tu = time_get_ns();
+                    vmm_unmap_in(o->mapper_pml4, va);
+                    g_stats.unmap_ns += time_get_ns() - tu;
+                    p->wired = 0;
+                }
+            }
+        }
+
+        if (take) {
+            batch[n++] = p;
+            if (n == SWAP_CLUSTER_PAGES) {
+                uint64_t out = anon_batch_out_locked(batch, n);
+                freed += out;
+                n = 0;
+                if (out == 0)
+                    break;              /* the store refused a whole cluster: full, or failing */
+            }
+        }
+        p = prev;                       /* still valid: only g_lock holders touch the list */
+    }
+    if (n)
+        freed += anon_batch_out_locked(batch, n);
+    return freed;
+}
+
+/* The reclaimer. Caller holds g_lock. `swap_ok` false confines it to file
+ * pages -- what the cache-size cap wants, since a cache over its budget is not
+ * memory pressure and should not cost a process its working set.
+ *
+ * THE ORDER IS THE POLICY, cheapest first: a clean file page costs a re-read,
+ * a dirty one a writeback before it can even be considered, an anonymous page
+ * a write to the swap store AND a read to bring it back. Each kind has its own
+ * list, so a request that clean file pages can satisfy never looks at an
+ * anonymous page. Anonymous pages are candidates only when there is somewhere
+ * for them to go -- decided once, here, so a full or absent store does not
+ * unmap a page and then find that out. */
+static uint64_t reclaim_locked(uint64_t want, bool swap_ok) {
+    uint64_t t_start = time_get_ns();
+    g_stats.reclaim_calls++;
+
+    uint64_t freed = reclaim_file_locked(want, false);
+    if (freed < want)
+        freed += reclaim_file_locked(want - freed, true);
+    if (freed < want && swap_ok && swap_available() && swap_free_slots() > 0)
+        freed += reclaim_anon_locked(want - freed);
+
+    g_stats.reclaim_ns += time_get_ns() - t_start;
+    return freed;
+}
+
 uint64_t vmo_reclaim(uint64_t want) {
     if (!g_ready || want == 0)
         return 0;
-
     mutex_lock(&g_lock);
-    uint64_t freed = 0;
-
-    /* Two passes, and the order is the policy: CLEAN pages first, because
-     * dropping one costs nothing but the re-read, while dropping a dirty one
-     * costs a disk write before it can even be considered. Only if clean pages
-     * do not cover the request is anything written back to make room. */
-    for (int pass = 0; pass < 2 && freed < want; pass++) {
-        struct vmo_page *p = g_lru_tail;
-        while (p && freed < want) {
-            struct vmo_page *prev = p->lru_prev;
-            struct vm_object *o = p->owner;
-
-            if (p->wired) { p = prev; continue; }
-
-            if (p->dirty) {
-                if (pass == 0) { p = prev; continue; }
-                if (flush_run(o, p->index) == 0) { p = prev; continue; }
-                if (p->dirty) { p = prev; continue; }
-                prev = p->lru_prev;   /* flush_run may have moved neighbours */
-            }
-
-            page_destroy(o, p);
-            g_stats.evictions++;
-            freed++;
-            p = prev;
-        }
-    }
-
+    uint64_t freed = reclaim_locked(want, true);
     mutex_unlock(&g_lock);
     return freed;
 }
@@ -599,7 +972,14 @@ void vmo_stats_get(struct vmo_stats *out) {
     *out = g_stats;
     out->resident_pages = 0;
     out->dirty_pages = 0;
+    out->anon_pages = 0;
+    out->swapped_pages = 0;
     for (struct vm_object *o = g_registry; o; o = o->reg_next) {
+        if (o->anon) {
+            out->anon_pages    += o->resident;
+            out->swapped_pages += o->swapped;
+            continue;
+        }
         out->resident_pages += o->resident;
         out->dirty_pages += o->dirty_pages;
     }
@@ -641,10 +1021,16 @@ static void vmo_writeback_main(void) {
         if (pmm_free_pages() < VMO_RECLAIM_LOW_PAGES)
             (void)vmo_reclaim(VMO_RECLAIM_BATCH);
         else if (g_max_resident) {
+            /* Over the CACHE budget, not under memory pressure: file pages
+             * only. Anonymous memory is a process's working set, and a cache
+             * that has grown large is no reason to page it out. */
             struct vmo_stats s;
             vmo_stats_get(&s);
-            if (s.resident_pages > g_max_resident)
-                (void)vmo_reclaim(s.resident_pages - g_max_resident);
+            if (s.resident_pages > g_max_resident) {
+                mutex_lock(&g_lock);
+                (void)reclaim_locked(s.resident_pages - g_max_resident, false);
+                mutex_unlock(&g_lock);
+            }
         }
 
         /* A REAL sleep, not a yield loop. This thread wakes ten times a

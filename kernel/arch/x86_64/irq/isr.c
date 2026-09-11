@@ -1,7 +1,8 @@
 #include <stdint.h>
 #include "drivers/char/serial.h"
 #include "include/uaccess_guard.h"
-#include "mm/vma.h"          /* vm_fault: demand paging */
+#include "mm/vma.h"            /* vm_fault: demand paging */
+#include "include/arch_irq.h"   /* arch_irq_enable/disable around vm_fault */
 #include "process/process.h"
 #include "include/spinlock.h"
 #include "process/process.h"   /* current_thread, struct process/thread */
@@ -226,7 +227,24 @@ void isr_handler(struct registers *regs) {
         if (cr2 < USER_VA_LIMIT) {
             bool w = (regs->error_code & 0x2) != 0;
             bool x = (regs->error_code & 0x10) != 0;
-            if (vm_fault(current_thread->proc, cr2, w, x))
+
+            /* WITH INTERRUPTS ON, if the faulting context had them on. #PF is
+             * an interrupt gate, so we arrive with IF clear -- and resolving a
+             * fault can mean reading the file the page comes from, or reading
+             * it back from the swap store, and waiting for the disk with
+             * interrupts off is waiting for an IRQ that cannot arrive. The ATA
+             * driver's wait loop has a canary for exactly that, and the first
+             * paging run tripped it 24,985 times. The interrupted context's
+             * own RFLAGS says whether enabling is legitimate: user mode always
+             * had them on; a kernel copy_to_user that faulted did too; a
+             * kernel path that genuinely had them off keeps them off. This is
+             * x86-specific code, so testing IF here is not the coupling
+             * arch_irq.h warns about. */
+            bool irqs_on = (regs->rflags & (1ULL << 9)) != 0;
+            if (irqs_on) arch_irq_enable();
+            bool handled = vm_fault(current_thread->proc, cr2, w, x);
+            if (irqs_on) arch_irq_disable();
+            if (handled)
                 return;                  /* retry the instruction */
         }
     }

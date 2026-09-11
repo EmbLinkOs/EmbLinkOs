@@ -1,0 +1,2 @@
+# swapper: touches nothing but its own address space.
+ro /system

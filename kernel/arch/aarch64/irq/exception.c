@@ -1,6 +1,7 @@
 #include "arch/aarch64/irq/exception.h"
 #include "include/uaccess_guard.h"
 #include "mm/vma.h"            /* vm_fault: demand paging */
+#include "include/arch_irq.h"   /* arch_irq_enable/disable around vm_fault */
 #include "arch/aarch64/drivers/pl011.h"
 #include "arch/aarch64/irq/gicv3.h"
 #include "process/process.h"
@@ -222,7 +223,22 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
         bool is_data = (ec == 0x24 || ec == 0x25);
         bool w = is_data && ((f->esr >> 6) & 1);
         bool x = !is_data;
-        if (vm_fault(current_thread->proc, f->far, w, x))
+
+        /* WITH INTERRUPTS MASKED -- unlike x86, and not by choice. The x86
+         * handler unmasks around vm_fault when the faulting context had them
+         * on, because resolving a fault can mean waiting for a disk. The same
+         * three lines here hang init before its first print, every boot, and
+         * boot cleanly with them removed (bisected, 2026-09-11). The reason is
+         * larger than this function: on aarch64 NOTHING unmasks IRQs inside an
+         * exception -- syscalls included; `daifclr` appears only in the
+         * spinlock and the context switch -- so kernel code at EL1 has never
+         * been preempted by a timer interrupt, and this would have been the
+         * first path to try it. Whatever on the tick path is not safe to run
+         * nested inside a sync handler has to be found first. docs/TODO.md
+         * carries it. Until then a fault that reads a disk waits masked, which
+         * is what it always did here. */
+        bool handled = vm_fault(current_thread->proc, f->far, w, x);
+        if (handled)
             return;                      /* retry the instruction */
     }
 

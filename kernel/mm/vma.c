@@ -8,6 +8,7 @@
 #include "include/kstring.h"
 #include "include/spinlock.h"
 #include "mm/vm_object.h"
+#include "drivers/timer/timer.h"   /* time_get_ns: the fault path times itself */
 
 /* See mm/vma.h. */
 
@@ -124,7 +125,16 @@ void vm_fault_stats(struct vm_fault_stats *out) {
     if (out) *out = g_fault_stats;
 }
 
+static bool vm_fault_resolve(struct process *proc, uint64_t addr, bool write, bool exec);
+
 bool vm_fault(struct process *proc, uint64_t addr, bool write, bool exec) {
+    uint64_t t0 = time_get_ns();
+    bool r = vm_fault_resolve(proc, addr, write, exec);
+    g_fault_stats.ns += time_get_ns() - t0;
+    return r;
+}
+
+static bool vm_fault_resolve(struct process *proc, uint64_t addr, bool write, bool exec) {
     if (!proc)
         return false;
 
@@ -173,7 +183,7 @@ bool vm_fault(struct process *proc, uint64_t addr, bool write, bool exec) {
      *
      * This is what makes MAP_PRIVATE of a file worth having: N processes
      * reading one file share its pages, and only a writer pays for a copy. */
-    if (already && write && v->obj && (v->flags & MAP_PRIVATE)) {
+    if (already && write && v->obj && !v->obj->anon && (v->flags & MAP_PRIVATE)) {
         uint64_t shared = vmo_page_phys(v->obj, idx);
         if (already == shared) {
             uint64_t copy = pmm_alloc_page();
@@ -203,7 +213,14 @@ bool vm_fault(struct process *proc, uint64_t addr, bool write, bool exec) {
         return true;
     }
 
-    /* --- A FILE-BACKED PAGE COMES FROM THE CACHE, NOT THE ALLOCATOR --------
+    /* Every mapping has an object -- anonymous ones included, see
+     * vma_map_common. A VMA without one is a bookkeeping bug, and the honest
+     * answer to a fault inside it is the same as for no VMA at all: decline,
+     * and let it be fatal. */
+    if (!v->obj) VMF_DECLINE();
+#undef VMF_DECLINE
+
+    /* --- THE PAGE COMES FROM THE OBJECT, NOT THE ALLOCATOR -----------------
      *
      * This is the whole payoff of one object per file. Mapping a file is
      * handing the process the pages the cache already holds -- so a reader and
@@ -213,57 +230,78 @@ bool vm_fault(struct process *proc, uint64_t addr, bool write, bool exec) {
      * A SHARED mapping gets the page with the VMA's permissions, and a write
      * through it reaches the file by the ordinary writeback path. A PRIVATE
      * mapping gets it READ-ONLY however much the VMA permits, so that the
-     * first write faults and lands in the copy-on-write path above. */
-    if (v->obj) {
-        uint64_t phys = vmo_wire_page(v->obj, idx);
-        if (!phys) VMF_DECLINE();
-
-        uint32_t eff = v->prot;
-        if (v->flags & MAP_PRIVATE)
-            eff &= ~(uint32_t)PROT_WRITE;      /* force the COW fault */
-
-        if (vmm_map_in(proc->pml4_phys, page, phys, prot_to_vmm(eff)) != 0) {
-            vmo_unwire_page(v->obj, idx);
-            VMF_DECLINE();
-        }
-        /* A shared writable mapping may be written at any moment and the
-         * kernel will never see the store, so the page is dirty from the
-         * instant it is mapped. Anything less loses data. */
-        if ((v->flags & MAP_SHARED) && (v->prot & PROT_WRITE))
-            vmo_mark_dirty(v->obj, idx);
-
-        g_fault_stats.handled++;
-        spin_unlock(&vma_lock);
-        return true;
-    }
-
-    uint64_t pa = pmm_alloc_page();
-    if (!pa) {
-        /* Out of memory at first touch -- the awkward consequence of demand
-         * paging, and the honest one. The alternative is refusing the mmap
-         * that might never have touched these pages at all. */
-        VMF_DECLINE();
-    }
-
-    /* ZEROED, and that is a security property rather than a courtesy: a fresh
-     * frame carries whatever the last owner left in it, and handing that to a
-     * different process is a disclosure. It is also the whole semantics of an
-     * anonymous mapping -- the caller was promised zeroes. */
-    memset((void *)(uintptr_t)P2V(pa), 0, PAGE_SIZE);
-
-    if (vmm_map_in(proc->pml4_phys, page, pa, prot_to_vmm(v->prot)) != 0) {
-        pmm_free_page(pa);
-        VMF_DECLINE();
-    }
-#undef VMF_DECLINE
-
-    g_fault_stats.handled++;
+     * first write faults and lands in the copy-on-write path above.
+     *
+     * AN ANONYMOUS PAGE COMES FROM THE SAME PLACE. Its object has no file, so
+     * the fill is zeroes and there is nothing to copy-on-write FROM: the page
+     * is the process's own from the first touch and is mapped with the VMA's
+     * full permissions. What the object buys it is a NAME -- the page can be
+     * found, unmapped and written to the swap store when memory runs short,
+     * and found again by the fault that follows. Before this, an anonymous
+     * page was a bare frame nothing tracked, and so could never be taken back.
+     *
+     * AND GETTING IT MAY MEAN DISK, so the lock is dropped for that part. The
+     * wire below can read the file, or read the page back from the swap
+     * store, and a spinlock held across a disk wait is interrupts off across a
+     * disk wait -- the ATA driver's canary for exactly that fired once per
+     * page the first time anything was paged. The first version held the lock
+     * throughout, which was tolerable while the only I/O here was a cold file
+     * page and is not tolerable when every fault under pressure is one.
+     *
+     * What the lock protected was the VMA, so the VMA is CHECKED AGAIN after
+     * the wire: the same mapping, the same object, the same page of it, and
+     * still nothing in the page table. Any of those false is a race with
+     * munmap or with another thread's fault on this page, and the answer is
+     * to give the wire back and retry the instruction -- which then finds the
+     * page mapped, or finds no mapping and is declined the ordinary way. The
+     * object itself is kept alive across the gap by a reference, since the
+     * munmap that could run in it may drop the mapping's own. */
+    struct vm_object *obj = v->obj;
+    uint32_t flags = v->flags;
+    vmo_ref(obj);
     spin_unlock(&vma_lock);
-    return true;
+
+    uint64_t tw = time_get_ns();
+    uint64_t phys = vmo_wire_page(obj, idx);         /* may sleep; may hit the disk */
+    g_fault_stats.wire_ns += time_get_ns() - tw;
+
+    spin_lock(&vma_lock);
+    v = vma_find(proc, page);
+    bool same  = v && v->obj == obj &&
+                 (v->file_off + (page - v->start)) / PAGE_SIZE == idx;
+    bool taken = same && vmm_get_phys_in(proc->pml4_phys, page) != 0;
+    bool mapped = false, mark_dirty = false;
+
+    if (phys && same && !taken) {
+        uint32_t eff = v->prot;
+        if ((flags & MAP_PRIVATE) && !obj->anon)
+            eff &= ~(uint32_t)PROT_WRITE;          /* force the COW fault */
+        uint64_t tm = time_get_ns();
+        int mrc = vmm_map_in(proc->pml4_phys, page, phys, prot_to_vmm(eff));
+        g_fault_stats.map_ns += time_get_ns() - tm;
+        if (mrc == 0) {
+            mapped = true;
+            /* A shared writable mapping may be written at any moment and the
+             * kernel will never see the store, so the page is dirty from the
+             * instant it is mapped. Anything less loses data. (Marked after
+             * the unlock: the page is wired, so it cannot go anywhere first.) */
+            mark_dirty = (flags & MAP_SHARED) && (v->prot & PROT_WRITE);
+            g_fault_stats.handled++;
+        }
+    }
+    bool retry = !same || taken;                    /* a race, not a failure */
+    if (!mapped && !retry) g_fault_stats.declined++;
+    spin_unlock(&vma_lock);
+
+    if (phys && !mapped) vmo_unwire_page(obj, idx);  /* the pin was for a mapping that did not happen */
+    if (mark_dirty)      vmo_mark_dirty(obj, idx);
+    vmo_put(obj);
+    return mapped || retry;
 }
 
-/* The shared core. `obj` NULL means anonymous; non-NULL means file-backed and
- * the caller has already taken the reference this mapping will hold. */
+/* The shared core. `obj` NULL means anonymous, and an object is made for it
+ * here; non-NULL means file-backed and the caller has already taken the
+ * reference this mapping will hold. */
 static int64_t vma_map_common(struct process *proc, uint64_t addr, uint64_t len,
                               uint32_t prot, uint32_t flags,
                               struct vm_object *obj, uint64_t file_off);
@@ -342,7 +380,22 @@ static int64_t vma_map_common(struct process *proc, uint64_t addr, uint64_t len,
     if (!v)
         { spin_unlock(&vma_lock); return -EMBK_ENOMEM; }
 
-    /* NOTHING IS ALLOCATED HERE. The VMA is the promise; vm_fault() keeps it,
+    /* ANONYMOUS MEMORY GETS AN OBJECT, so that it can be paged. Before this
+     * the fault handler handed out bare frames that nothing tracked: they
+     * could not be found again, so they could not be evicted, so an anonymous
+     * mapping was memory that had to fit or fail. The object is the record --
+     * its pages, their frames, and where each went when it was swapped -- and
+     * it is told the one address space that maps it, because evicting means
+     * unmapping first. */
+    if (!obj) {
+        obj = vmo_create_anon(len);
+        if (!obj)
+            { kfree(v); spin_unlock(&vma_lock); return -EMBK_ENOMEM; }
+        vmo_set_mapper(obj, proc->pml4_phys, start);
+        file_off = 0;
+    }
+
+    /* NO PAGES ARE ALLOCATED HERE. The VMA is the promise; vm_fault() keeps it,
      * one page at a time, as the pages are actually touched.
      *
      * That makes mmap O(1) in the size of the mapping instead of O(n), and it
@@ -364,6 +417,38 @@ static int64_t vma_map_common(struct process *proc, uint64_t addr, uint64_t len,
     return (int64_t)start;
 }
 
+/* Unmap the pages of a FILE-backed (or, historically, bare) range and settle
+ * who owns each frame. Caller holds vma_lock. */
+static void unmap_range_pages(struct process *proc, struct vm_area *v,
+                              uint64_t lo, uint64_t hi) {
+    for (uint64_t va = lo; va < hi; va += PAGE_SIZE) {
+        uint64_t pa = vmm_get_phys_in(proc->pml4_phys, va);
+        if (!pa)
+            continue;                      /* never faulted in */
+
+        vmm_unmap_in(proc->pml4_phys, va);
+
+        /* WHOSE FRAME IS THIS? For a file mapping it may be the CACHE's page,
+         * which this mapping only pinned -- freeing that would hand the
+         * allocator a frame the cache still believes it owns, and the next
+         * reader of the file would get whatever was written into it next. Or
+         * it may be a private copy-on-write copy, which is this process's
+         * alone and must be freed.
+         *
+         * The cache itself answers: ask it which frame backs that index and
+         * compare. Equal means it is the cache's and we only unpin; different
+         * means we copied it and it is ours to free. */
+        if (v->obj) {
+            uint64_t idx = (v->file_off + (va - v->start)) / PAGE_SIZE;
+            if (pa == vmo_page_phys(v->obj, idx)) {
+                vmo_unwire_page(v->obj, idx);
+                continue;
+            }
+        }
+        pmm_free_page(pa);
+    }
+}
+
 int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
     if (!proc || len == 0 || (addr & (PAGE_SIZE - 1)))
         return -EMBK_EINVAL;
@@ -380,6 +465,7 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
 
     struct vm_area **pp = &proc->vma_list;
     bool touched = false;
+    struct vm_area *gone = NULL;        /* unlinked nodes, each carrying a pending vmo_put */
 
     while (*pp) {
         struct vm_area *v = *pp;
@@ -391,45 +477,30 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
         uint64_t lo = v->start > addr ? v->start : addr;
         uint64_t hi = v->end   < end  ? v->end   : end;
 
-        for (uint64_t va = lo; va < hi; va += PAGE_SIZE) {
-            uint64_t pa = vmm_get_phys_in(proc->pml4_phys, va);
-            if (!pa)
-                continue;                      /* never faulted in */
-
-            vmm_unmap_in(proc->pml4_phys, va);
-
-            /* WHOSE FRAME IS THIS? For a file mapping it may be the CACHE's
-             * page, which this mapping only pinned -- freeing that would hand
-             * the allocator a frame the cache still believes it owns, and the
-             * next reader of the file would get whatever was written into it
-             * next. Or it may be a private copy-on-write copy, which is this
-             * process's alone and must be freed.
-             *
-             * The cache itself answers: ask it which frame backs that index
-             * and compare. Equal means it is the cache's and we only unpin;
-             * different means we copied it and it is ours to free. */
-            if (v->obj) {
-                uint64_t idx = (v->file_off + (va - v->start)) / PAGE_SIZE;
-                if (pa == vmo_page_phys(v->obj, idx)) {
-                    vmo_unwire_page(v->obj, idx);
-                    continue;
-                }
-            }
-            pmm_free_page(pa);
-        }
+        /* ANONYMOUS: the object does it. It knows which of its pages exist,
+         * which are in frames and which are out on the swap store, and the
+         * page tables it is mapped in -- so it unmaps and frees in O(pages
+         * that exist) rather than walking every address in the range, and a
+         * page that is on disk gives back its slot, which a page-table walk
+         * would never have found. */
+        if (v->obj && v->obj->anon)
+            vmo_discard_range(v->obj, (v->file_off + (lo - v->start)) / PAGE_SIZE,
+                              (hi - lo) / PAGE_SIZE);
+        else
+            unmap_range_pages(proc, v, lo, hi);
         touched = true;
 
         if (lo == v->start && hi == v->end) {
             *pp = v->next;                  /* whole mapping gone */
-            /* The reference this mapping held on the file's page object goes
-             * with it. Dropped OUTSIDE the lock would be cleaner (vmo_put can
-             * flush and therefore touch the disk) -- but it is dropped here
-             * because the alternative is a list of pending puts, and a
-             * mapping's last reference is not the common case. Recorded in
-             * docs/TODO.md. */
-            struct vm_object *o = v->obj;
-            kfree(v);
-            if (o) vmo_put(o);
+            /* The reference this mapping held on its object goes with it --
+             * AFTER the lock. A last-reference vmo_put flushes, and a flush is
+             * disk I/O; under this spinlock that is a disk wait with
+             * interrupts off, which the ATA driver's canary reported the first
+             * time posixdemo unmapped a file whose descriptor was already
+             * closed. The dead node itself carries the pending put: it is off
+             * the list, nothing else can reach it, and its `next` is free. */
+            v->next = gone;
+            gone = v;
             continue;
         }
         if (lo == v->start) { v->start = hi; pp = &v->next; continue; }
@@ -444,8 +515,7 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
             v->end = lo;
             kprintf("vma: out of memory splitting a mapping; %d KiB of VA leaked\n",
                     (int)((v->end - hi) / 1024));
-            spin_unlock(&vma_lock);
-            return EMBK_OK;
+            break;                          /* touched: reports OK below */
         }
         tail->start    = hi;
         tail->end      = v->end;
@@ -455,7 +525,7 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
         /* The tail starts further into the FILE than the head did. Copying
          * file_off unchanged would map the same bytes twice. */
         tail->file_off = v->file_off + (hi - v->start);
-        if (tail->obj) (void)vmo_get(tail->obj->vn);   /* a second holder */
+        if (tail->obj) vmo_ref(tail->obj);              /* a second holder */
         v->end         = lo;
         tail->next  = v->next;
         v->next     = tail;
@@ -463,6 +533,13 @@ int vma_munmap(struct process *proc, uint64_t addr, uint64_t len) {
     }
 
     spin_unlock(&vma_lock);
+
+    while (gone) {
+        struct vm_area *n = gone->next;
+        if (gone->obj) vmo_put(gone->obj);
+        kfree(gone);
+        gone = n;
+    }
     return touched ? EMBK_OK : -EMBK_EINVAL;
 }
 
@@ -483,7 +560,7 @@ static bool vma_split_at(struct process *proc, uint64_t at) {
         tail->flags    = v->flags;
         tail->obj      = v->obj;
         tail->file_off = v->file_off + (at - v->start);
-        if (tail->obj) (void)vmo_get(tail->obj->vn);   /* a second holder */
+        if (tail->obj) vmo_ref(tail->obj);              /* a second holder */
         tail->next     = v->next;
         v->end         = at;
         v->next     = tail;
@@ -561,18 +638,52 @@ void vma_destroy_all(struct process *proc) {
         return;
     spin_lock(&vma_lock);
     struct vm_area *v = proc->vma_list;
+    struct vm_area *gone = NULL;
     while (v) {
         struct vm_area *next = v->next;
         struct vm_object *o = v->obj;
-        kfree(v);
-        /* The frames themselves are reclaimed by the address-space teardown
-         * that follows; what has to happen HERE is the reference each file
-         * mapping holds on its page object, which nothing else knows about. */
-        if (o) vmo_put(o);
+
+        /* THE OBJECT'S FRAMES ARE THE OBJECT'S. The address-space teardown
+         * that follows frees every frame it finds in the page tables. A cache
+         * page still mapped here would be freed under the cache -- and served,
+         * later, to whoever the allocator handed the frame next -- or freed
+         * TWICE if this was the object's last holder. Until now this function
+         * only freed the vm_area records and let that happen; a process that
+         * exited with a file mapped was corrupting the cache. The mapping has
+         * to let go of the pages BEFORE the tables are walked.
+         *
+         * Anonymous: the object knows its one mapper and every resident page,
+         * so it detaches in O(resident). File-backed: the wire is this
+         * mapping's, page by page; a copy-on-write copy that is NOT the
+         * cache's stays mapped for the teardown to free, as it should. */
+        if (o) {
+            if (o->anon) {
+                vmo_detach_mapper(o);
+            } else {
+                for (uint64_t va = v->start; va < v->end; va += PAGE_SIZE) {
+                    uint64_t pa = vmm_get_phys_in(proc->pml4_phys, va);
+                    if (!pa) continue;
+                    uint64_t idx = (v->file_off + (va - v->start)) / PAGE_SIZE;
+                    if (pa == vmo_page_phys(o, idx)) {
+                        vmm_unmap_in(proc->pml4_phys, va);
+                        vmo_unwire_page(o, idx);
+                    }
+                }
+            }
+        }
+        v->next = gone;                 /* the put waits for the unlock; see vma_munmap */
+        gone = v;
         v = next;
     }
     proc->vma_list = 0;
     spin_unlock(&vma_lock);
+
+    while (gone) {
+        struct vm_area *n = gone->next;
+        if (gone->obj) vmo_put(gone->obj);
+        kfree(gone);
+        gone = n;
+    }
 }
 
 uint64_t vma_total_bytes(struct process *proc) {

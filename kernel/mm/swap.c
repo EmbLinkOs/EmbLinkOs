@@ -20,6 +20,15 @@ static uint64_t  g_next;                 /* rotating first-fit cursor */
 static spinlock_t g_lock = SPINLOCK_INIT;
 static struct swap_stats g_st;
 
+/* The cluster staging buffer: contiguous, kernel-range and below 4 GiB, so
+ * buffer_dma_ok() says yes and the block layer hands the device ONE command
+ * for the whole run instead of bouncing 32 KiB at a time through its own
+ * buffer. 64 KiB of .bss. One reclaimer at a time uses it -- the page cache's
+ * lock serialises reclaim -- and the flag turns a second concurrent user into
+ * a fallback rather than a corruption. */
+static uint8_t g_cluster_buf[SWAP_CLUSTER_PAGES * 4096] __attribute__((aligned(4096)));
+static bool    g_cluster_busy;
+
 static inline bool bm_test(uint64_t s) { return (g_bitmap[s >> 3] >> (s & 7)) & 1; }
 static inline void bm_set(uint64_t s)  { g_bitmap[s >> 3] |= (uint8_t)(1u << (s & 7)); }
 static inline void bm_clr(uint64_t s)  { g_bitmap[s >> 3] &= (uint8_t)~(1u << (s & 7)); }
@@ -103,6 +112,61 @@ uint64_t swap_out(uint64_t phys) {
     return slot;
 }
 
+/* A run of n free slots, from the cursor onward and then from the start.
+ * Caller holds g_lock. Marks the run used and returns its first slot, or 0. */
+static uint64_t alloc_run_locked(int n) {
+    for (int sweep = 0; sweep < 2; sweep++) {
+        uint64_t s   = sweep == 0 ? g_next : 1;
+        uint64_t end = sweep == 0 ? g_nslots : g_next;
+        if (s == 0) s = 1;
+        uint64_t run = 0, start = 0;
+        for (; s < end; s++) {
+            if (bm_test(s)) { run = 0; continue; }
+            if (run == 0) start = s;
+            if (++run == (uint64_t)n) {
+                for (uint64_t k = 0; k < (uint64_t)n; k++) bm_set(start + k);
+                g_used += (uint64_t)n;
+                g_next  = start + (uint64_t)n;
+                return start;
+            }
+        }
+    }
+    return 0;
+}
+
+int swap_out_cluster(const uint64_t *phys, int n, uint64_t *slots_out) {
+    if (!g_dev || !phys || !slots_out || n <= 0 || n > SWAP_CLUSTER_PAGES) return 0;
+
+    spin_lock(&g_lock);
+    uint64_t first = g_cluster_busy ? 0 : alloc_run_locked(n);
+    if (first) g_cluster_busy = true;
+    spin_unlock(&g_lock);
+    if (!first) return 0;
+
+    for (int i = 0; i < n; i++)
+        memcpy(g_cluster_buf + (size_t)i * 4096, (const void *)P2V(phys[i]), 4096);
+    int rc = embk_block_write(g_dev, first * g_spp, (uint32_t)n * g_spp, g_cluster_buf);
+
+    spin_lock(&g_lock);
+    g_cluster_busy = false;
+    if (rc != EMBK_OK) {
+        for (int i = 0; i < n; i++) bm_clr(first + (uint64_t)i);
+        g_used -= (uint64_t)n;
+        spin_unlock(&g_lock);
+        kprintf("swap: %s: cluster write at slot %llu failed: %s -- the pages stay in RAM\n",
+                g_dev->name, (unsigned long long)first, embk_strerror(rc));
+        return 0;
+    }
+    g_st.outs += (uint64_t)n;
+    g_st.bytes_written += (uint64_t)n * 4096;
+    g_st.clusters++;
+    g_st.cluster_pages += (uint64_t)n;
+    spin_unlock(&g_lock);
+
+    for (int i = 0; i < n; i++) slots_out[i] = first + (uint64_t)i;
+    return n;
+}
+
 int swap_in(uint64_t slot, uint64_t phys) {
     if (!g_dev || !phys) return -EMBK_ENODEV;
     if (slot == 0 || slot >= g_nslots) return -EMBK_EINVAL;
@@ -122,6 +186,14 @@ void swap_free(uint64_t slot) {
     spin_lock(&g_lock);
     if (bm_test(slot)) { bm_clr(slot); g_used--; g_st.frees++; }
     spin_unlock(&g_lock);
+}
+
+uint64_t swap_free_slots(void) {
+    if (!g_dev) return 0;
+    spin_lock(&g_lock);
+    uint64_t n = g_nslots - g_used;      /* both count slot 0 */
+    spin_unlock(&g_lock);
+    return n;
 }
 
 void swap_stats_get(struct swap_stats *out) {

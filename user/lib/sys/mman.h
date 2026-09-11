@@ -1,35 +1,41 @@
 /* sys/mman.h -- EmbLink override header (newlib ships none).
  *
- * mmap IS REAL NOW, for the anonymous private case: the kernel keeps a per
- * process list of mapped ranges (kernel/mm/vma.h) and hands out pages with
- * the permissions you ask for, at an address it picks -- and takes them back
- * on munmap, page tables included. That is the one thing sbrk could never do:
- * the heap only ever grows.
+ * mmap IS REAL: a per-process list of mapped ranges (kernel/mm/vma.h),
+ * DEMAND-PAGED -- a mapping costs nothing until a page is touched -- with
+ * the permissions you ask for, at an address the kernel picks, and taken
+ * back on munmap, page tables included.
  *
- * WHAT IS STILL REFUSED, and refused loudly rather than approximated:
+ *   MAP_ANONYMOUS|MAP_PRIVATE   zero-filled memory that can be PAGED OUT: it
+ *                               lives in a kernel object that writes it to
+ *                               the swap store under memory pressure and
+ *                               reads it back on the next touch. Running out
+ *                               of RAM slows a program down; it no longer
+ *                               kills it. (`make test-swap` is the proof.)
+ *   a FILE (fd >= 0)            real, over the unified page cache. MAP_SHARED
+ *                               sees the file's bytes and changes them -- a
+ *                               write is visible to read() at once and
+ *                               reaches the device by writeback. MAP_PRIVATE
+ *                               copies on the first write.
+ *   mprotect                    real, and the other half of W^X: mmap will
+ *                               not hand out a page that is writable AND
+ *                               executable, so map W, emit, flip to X.
+ *                               PROT_NONE is no access at all (a guard page),
+ *                               not rounded to read-only.
  *
- *   mmap of a FILE (fd >= 0)   ENODEV   -- needs a page cache that does not
- *                                          exist yet. Handing back anonymous
- *                                          zeroes for a named file is a bug
- *                                          that surfaces far from the call.
- *   MAP_SHARED                 ENOTSUP  -- a MAP_SHARED that behaved as
- *                                          MAP_PRIVATE is two processes each
- *                                          believing they see the other's
- *                                          writes.
- *   MAP_FIXED / a non-NULL addr ENOTSUP -- the kernel chooses the address.
- *   PROT_WRITE|PROT_EXEC       EINVAL   -- refused in the kernel; that page
- *                                          is the primitive every code
- *                                          injection needs.
- *   msync                      ENOSYS   -- meaningless until MAP_SHARED file
- *                                          mappings exist.
+ * WHAT IS REFUSED, loudly rather than approximated:
  *
- * mprotect IS real, and is the other half of the W^X rule: mmap will not give
- * you a page that is writable and executable, and with mprotect you do not
- * need one -- map W, emit, flip to X. PROT_NONE is honoured as no access at
- * all (a guard page), not rounded to read-only.
- *
- * Mapped pages arrive ZEROED, and the whole range is allocated up front: a
- * large mapping costs its full size immediately. There is no demand paging. */
+ *   MAP_SHARED|MAP_ANONYMOUS    ENOTSUP  -- shared with nobody: there is no
+ *                                           fork, and the anonymous object
+ *                                           has one mapper by design
+ *                                           (kernel/mm/vm_object.h).
+ *   MAP_FIXED / a non-NULL addr ENOTSUP  -- the kernel chooses the address.
+ *   PROT_WRITE|PROT_EXEC        EINVAL   -- refused in the kernel; that page
+ *                                           is the primitive every code
+ *                                           injection needs.
+ *   an unaligned file offset    EINVAL   -- there is no page it corresponds to.
+ *   msync                       ENOSYS   -- writeback already covers
+ *                                           durability; a caller asking by
+ *                                           name is told no, not yes. */
 #ifndef _EMBK_SYS_MMAN_H
 #define _EMBK_SYS_MMAN_H
 
