@@ -672,6 +672,7 @@ make ARCH=aarch64 check-tools-arm64     # preflight -- probes the libc by
 # 3. build + boot
 make ARCH=aarch64                       # -> build/aarch64/kernel.{elf,img},
                                         #    the userland, and the root image
+make ARCH=aarch64 run-arm64-desktop     # the OS in a window, all the way to the desktop
 make ARCH=aarch64 run-arm64             # serial on stdio; quit with Ctrl-A X
 make ARCH=aarch64 test-arm64-boot       # headless; asserts every phase's
                                         # "done when", under every accelerator

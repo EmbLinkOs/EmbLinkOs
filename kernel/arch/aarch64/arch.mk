@@ -821,6 +821,63 @@ run-arm64-hvf: $(ARM_IMG) $(ARM_ROOTFS)
 run-arm64-tcg: $(ARM_IMG) $(ARM_ROOTFS)
 	$(ARM_QEMU_tcg) -nographic $(ARM_DISK) $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -kernel $(ARM_IMG)
 
+# --- run-arm64-desktop: the whole machine, in a window ------------------------
+# `run-arm64` above is the SERIAL target: -nographic, kernel log on stdio, no
+# screen. That is the right default for a kernel you are debugging and the wrong
+# one for using the OS, because the desktop has nowhere to draw. This is the
+# other one -- the aarch64 equivalent of x86's `run-embkfs`: a real display, a
+# real keyboard and pointer, real audio, and the kernel log still on stdio so
+# you can watch the boot and type test commands while the desktop is up.
+#
+# THE THREE DISKS are not optional decoration. The kernel runs its self-tests
+# before it starts init, and two of them want a device: the crash-consistency
+# test writes to the second (sdb) and the swap witness pages out to the third
+# (sdc). Boot without them and the machine still reaches the desktop, but it
+# reports two failures on the way for no reason other than the disks being
+# absent -- which is exactly the kind of noise that teaches you to ignore
+# failures. The first disk (sda) is the root filesystem and is written in place,
+# so changes you make persist across runs.
+ARM_DESKTOP_DISKS = \
+    -drive file=$(ARM_ROOTFS),format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0 \
+    -drive file=build/crash-seed.img,format=raw,if=none,id=d1 -device virtio-blk-pci,drive=d1 \
+    -drive file=build/swap.img,format=raw,if=none,id=d2 -device virtio-blk-pci,drive=d2
+
+# The scanout size. The whole stack -- framebuffer, compositor, mouse clamp,
+# the launcher -- takes whatever the device reports, so this is a free choice:
+#   make ARCH=aarch64 run-arm64-desktop ARM_XRES=1920 ARM_YRES=1080
+ARM_XRES ?= 1280
+ARM_YRES ?= 800
+ARM_GPU_WINDOW = -device virtio-gpu-pci,xres=$(ARM_XRES),yres=$(ARM_YRES)
+
+# zoom-to-fit=off shows guest pixels 1:1 rather than stretching them to the
+# window, which is what makes an unscaled display look blurry. The BACKEND is
+# the part that differs by host: Homebrew's qemu is built without gtk, so
+# -display gtk fails outright on macOS.
+ifeq ($(UNAME_S),Darwin)
+ARM_DISPLAY  ?= cocoa,zoom-to-fit=off
+ARM_AUDIODEV ?= coreaudio
+else
+ARM_DISPLAY  ?= gtk,zoom-to-fit=off
+ARM_AUDIODEV ?= pa
+endif
+# A REAL audio backend here, unlike the test target's `none` -- the point of
+# this target is to use the machine, and `none` consumes samples and discards
+# them.
+#
+# QEMU may print `Can not open virtio-sound.in (no host audio driver)` on the
+# way up. That is the CAPTURE half of the device, which nothing in this OS uses;
+# playback opens fine and the warning is not fatal. On macOS it is the
+# microphone permission prompt you did not answer. `ARM_AUDIODEV=none` silences
+# it at the cost of hearing anything.
+ARM_SND_REAL = -device virtio-sound-pci,audiodev=a0 -audiodev $(ARM_AUDIODEV),id=a0
+
+.PHONY: run-arm64-desktop
+run-arm64-desktop: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
+	@echo "==> EmbLinkOS aarch64: log in as yves.  Kernel console is THIS terminal."
+	$(ARM_QEMU_$(ARM_ACCEL)) $(ARM_DESKTOP_DISKS) $(ARM_GPU_WINDOW) $(ARM_INPUT) \
+	    $(ARM_SND_REAL) -display $(ARM_DISPLAY) \
+	    -serial stdio -no-reboot -no-shutdown -kernel $(ARM_IMG)
+
 # Interrupt/exception tracing. TCG only -- this is the capability HVF does not
 # have, and the reason TCG stays a first-class target rather than a fallback.
 .PHONY: debug-arm64

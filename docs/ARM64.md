@@ -72,6 +72,7 @@ the devices do not exist on this machine.
 ```sh
 brew install aarch64-elf-gcc          # Linux: gcc-aarch64-none-elf
 make ARCH=aarch64                     # build
+make ARCH=aarch64 run-arm64-desktop   # USE it: a window, keyboard, pointer, audio
 make ARCH=aarch64 run-arm64           # boot it (HVF on Apple Silicon, else TCG)
 make ARCH=aarch64 test-arm64-boot     # acceptance test, headless, every accelerator
 make ARCH=aarch64 run-arm64-tcg       # force emulation
