@@ -66,6 +66,7 @@ endif
 CFLAGS = -ffreestanding -nostdlib -nostartfiles \
          -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
          -mcmodel=kernel -std=gnu11 \
+         -fstack-protector-strong -mstack-protector-guard=global \
          -Ikernel \
          -Iuser/lib/tls/crypto \
          -DEMBK_VGPU_CAP_W=$(FB_W) -DEMBK_VGPU_CAP_H=$(FB_H) \
@@ -240,6 +241,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/lib/kstring.c \
              kernel/lib/errno.c \
              kernel/lib/random.c \
+             kernel/lib/canary.c \
              kernel/lib/ksym.c \
              kernel/lib/kprintf.c
 

@@ -446,7 +446,19 @@ capabilities rather than fork/exec.
    (`docs/TODO.md`). The probe prints that address next to the ones that move,
    so the gap is visible rather than implied.
 
-11. **Job control is finished.** `^Z`, `stop`, `bg` and `fg` all work, and the
+11. **Hardening, the rest of the first pass.** SMEP, SMAP and UMIP on x86;
+   PAN on aarch64 (PXN was already there); a kernel CSPRNG (`HMAC_DRBG` over
+   SHA-256, seeded from RDSEED/RNDR where the processor has one and from every
+   clock regardless) with `getrandom()` — aarch64 userland's first entropy
+   source ever; and kernel stack canaries on both builds, seeded in the entry
+   stub before the first C frame. Every one of these is proven by a self-test
+   that *commits the violation*: a kernel read of a user page without asking
+   faults, a deliberate 8-byte overrun of a 16-byte local is caught. What is
+   still open is in `docs/TODO.md` under Security hardening — PIE userland
+   (gated on a newlib rebuild: the prebuilt `libc.a` is not PIC), KASLR, a
+   CAVP known-answer test for the DRBG, and per-CPU canaries.
+
+12. **Job control is finished.** `^Z`, `stop`, `bg` and `fg` all work, and the
    piece that had to be built for them was in the kernel: a process could be
    *interrupted* or *cancelled*, but a shell had no way to ask for one to be
    **stopped**. `process_suspend()` had existed since the debugger needed it

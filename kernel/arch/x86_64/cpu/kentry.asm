@@ -19,10 +19,29 @@ boot_stack_top:                  ; full-descending stack starts here (page-align
 section .text
 global _start
 extern kernel_main
+extern __stack_chk_guard
 _start:
     mov r12, rdi                 ; stash the boot protocol pointer
     mov rsp, boot_stack_top      ; switch to the kernel-owned stack
     xor rbp, rbp                 ; terminate stack-trace/frame chain
+    ; THE STACK CANARY, seeded here and never again. Every C function compiled
+    ; with -fstack-protector-strong reads __stack_chk_guard on entry and checks
+    ; it on exit, so the word must be final before the FIRST C frame exists --
+    ; kernel_main's frame is live for the whole boot, and rewriting the guard
+    ; later (from the CSPRNG, say) would make its epilogue see a mismatch and
+    ; halt the machine as if it had been attacked. The TSC at boot is enough:
+    ; the canary needs to be unknown to an overflow that cannot READ, not to an
+    ; attacker who already can. The low byte is cleared so a string overflow
+    ; (which stops at a NUL) cannot overwrite the canary without ending on it.
+    ; r12 (the boot record, kernel_main's argument) is not touched.
+    rdtsc
+    shl rdx, 32
+    or  rax, rdx
+    mov rcx, 0x9E3779B97F4A7C15
+    imul rax, rcx
+    and rax, ~0xFF
+    mov [rel __stack_chk_guard], rax
+
     mov rdi, r12                 ; restore as kernel_main's first argument
     call kernel_main
 .halt:                           ; kernel_main should never return; park the CPU

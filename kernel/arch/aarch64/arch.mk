@@ -77,6 +77,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/lib/kstring.c \
                   kernel/lib/errno.c \
                   kernel/lib/random.c \
+                  kernel/lib/canary.c \
                   kernel/lib/ksym.c \
                   kernel/drivers/bus/pci.c \
                   kernel/drivers/storage/virtio_blk.c \
@@ -155,7 +156,8 @@ ARM_HDRS    := $(shell find kernel -name '*.h' 2>/dev/null)
 # trap is an unexplained hang at an address with no obvious relation to any
 # floating-point code.
 #
-# -fno-stack-protector: no __stack_chk_guard exists in a freestanding kernel.
+# -fstack-protector-strong: __stack_chk_guard lives in kernel/lib/canary.c and
+# is seeded by boot.S before the first C frame exists -- see that file.
 # -Wall -Wextra: this tree is 300 lines old. Everything the compiler is willing
 # to notice is cheaper to fix now than after it has 6,000 lines of company.
 # -mno-outline-atomics: gcc 10+ compiles C11 atomics into calls to libgcc
@@ -166,7 +168,7 @@ ARM_HDRS    := $(shell find kernel -name '*.h' 2>/dev/null)
 # makes gcc emit LDAXR/STXR inline, which is what the code was written to be.
 ARM_CFLAGS  = -ffreestanding -nostdlib -nostartfiles \
               -std=gnu11 -mgeneral-regs-only -mno-outline-atomics \
-              -fno-stack-protector \
+              -fstack-protector-strong \
               -Wall -Wextra \
               -Ikernel \
               -Wl,--no-warn-rwx-segments \
@@ -885,6 +887,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'zeroed, written and read back'  MM 'mmap did not produce usable memory'; \
 	  chk 'munmap returned the memory'     MM 'munmap leaked pages -- page tables, most likely'; \
 	  chk 'PAN: EL1 reading a USER page'   MM 'PAN is not enforcing -- EL1 can read user memory'; \
+	  chk 'canary: a deliberate overrun was caught' MM 'the stack protector did not fire on a deliberate overrun'; \
 	  chk 'writable+executable mapping was refused' MM 'W^X is not enforced on mmap'; \
 	  chk 'the generated code RUNS and returns 42' MM 'mprotect W->X did not make the page executable'; \
 	  chk 'mprotect across the hole -> ENOMEM'   MM 'mprotect half-applied across an unmapped hole'; \

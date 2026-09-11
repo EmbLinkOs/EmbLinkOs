@@ -1669,14 +1669,25 @@ violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
 - [ ] **PIE userland** so the executable itself moves. Needs `-pie` in the
       user link, relocations processed by the in-kernel loader (it already does
       them for libembk.so), and the fixed `. = 0x400000` in newlib.ld replaced.
+      **Scoped, and gated on a toolchain rebuild:** the prebuilt x86 `libc.a`
+      (`~/cross/newlib-c99`) has 73,166 `R_X86_64_32` and 11,768 `R_X86_64_64`
+      absolute relocations -- it is not PIC. Linking it into a PIE would need
+      text relocations, which means the loader writing into executable pages,
+      which is exactly what W^X refuses. So step one is rebuilding newlib with
+      `-fPIC` for both targets; nothing kernel-side is worth starting before
+      that exists.
 - [ ] **KASLR.** The kernel is linked with -mcmodel=kernel at a fixed higher-
       half address and stage2 loads it there. Randomising it needs a
       relocatable kernel image (-fPIE + a relocation pass at boot, or a
       linker-generated relocation table) AND a bootloader that can place it.
       Both halves are real work; neither is started.
-- [ ] **Stack canaries in the kernel** (-fstack-protector is off on both
-      builds). Needs a per-CPU canary word and the TLS-slot plumbing the
-      compiler expects; cheap once the plumbing exists.
+- [x] **Stack canaries in the kernel.** **Done** -- `-fstack-protector-strong`
+      on both builds with a global guard (`lib/canary.c`), seeded by the entry
+      stub before the first C frame exists, low byte zero. `test canary` and
+      the aarch64 boot test both overrun a local on purpose and require
+      `__stack_chk_fail` to fire. Per-CPU canaries (via GS_BASE on x86) are
+      the refinement; a global word already stops the overflow that cannot
+      read.
 - [ ] **Guard pages between kernel heap allocations, and a poisoned free.** Listed
       under Memory Management already; it is a hardening item too.
 

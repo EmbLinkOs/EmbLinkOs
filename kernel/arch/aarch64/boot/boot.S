@@ -257,6 +257,24 @@ mmu_on:
     mov     x29, xzr
     mov     x30, xzr
 
+    /* THE STACK CANARY, seeded before the first C frame -- see the note in
+     * arch/x86_64/cpu/kentry.asm; the reasoning is the same. CNTVCT at this
+     * point is whatever the firmware and boot path have consumed, mixed with
+     * CNTPCT and the DTB address. Not much entropy, and honestly not much is
+     * needed: the word must be unknown to a linear overflow, not to a reader.
+     * Low byte cleared so a NUL-terminated overflow cannot pass it. The MMU is
+     * on here, so adrp resolves the symbol's virtual address. */
+    mrs     x2, cntvct_el0
+    mrs     x3, cntpct_el0
+    eor     x2, x2, x3, ror #17
+    eor     x2, x2, x19, ror #29
+    ldr     x3, =0x9E3779B97F4A7C15
+    mul     x2, x2, x3
+    and     x2, x2, #0xFFFFFFFFFFFFFF00
+    adrp    x3, __stack_chk_guard
+    add     x3, x3, :lo12:__stack_chk_guard
+    str     x2, [x3]
+
     mov     x0, x19                     /* PHYSICAL DTB address; C converts */
     bl      arch_early_main
 

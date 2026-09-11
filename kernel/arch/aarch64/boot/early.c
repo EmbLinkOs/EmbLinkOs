@@ -15,6 +15,7 @@
 #include "arch/aarch64/cpu/cpu_features.h"
 #include "include/uaccess_guard.h"
 #include "lib/random.h"
+#include "lib/canary.h"
 #include "drivers/timer/rtc.h"   /* rtc_now_unix: the clock cross-check */
 #include "mm/vm_object.h"
 #include "power/power.h"
@@ -1149,6 +1150,35 @@ void arch_early_main(uint64_t dtb_phys) {
 
         if (!ok || !took || !gave_back || wx >= 0)
             selftest_fails++;
+    }
+
+    /* --- the stack canary: seeded, and it FIRES ------------------------------
+     * Same test as x86's `test canary`: the guard is not the compile-time
+     * initialiser (so boot.S seeded it), and a deliberate 8-byte overrun of a
+     * 16-byte local reaches __stack_chk_fail, which lands back here through
+     * the armed recovery point instead of halting. */
+    kprintf("\n--- the stack canary ---\n");
+    {
+        uintptr_t g = canary_value();
+        bool seeded = g && g != 0x5A6B7C8D9EAFB0C1ULL;
+        kprintf("  [%s] guard 0x%lx is seeded (not the initialiser)\n",
+                seeded ? " ok " : "FAIL", (unsigned long)g);
+        if (!seeded) selftest_fails++;
+
+        uint64_t before = canary_fires();
+        int landed = 0;
+        if (canary_test_arm()) {
+            canary_smash_a_frame(24);
+            canary_test_disarm();
+            kprintf("  [FAIL] the smashed frame returned -- the protector did not fire\n");
+            selftest_fails++;
+        } else {
+            landed = 1;
+        }
+        uint64_t fired = canary_fires() - before;
+        kprintf("  [%s] canary: a deliberate overrun was caught (fired %d, recovered %d)\n",
+                (landed && fired == 1) ? " ok " : "FAIL", (int)fired, landed);
+        if (!landed || fired != 1) selftest_fails++;
     }
 
     kprintf("\n--- the desktop (A6 + A7) ---\n");

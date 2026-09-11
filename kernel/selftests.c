@@ -31,6 +31,7 @@
 #include "arch/x86_64/cpu/cpu_features.h"  /* test hardening */
 #include "include/uaccess_guard.h"           /* test hardening */
 #include "lib/random.h"                      /* test random */
+#include "lib/canary.h"                      /* test canary */
 #include <stddef.h>                            /* offsetof: test aslr */
 #include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
 #include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
@@ -60,6 +61,7 @@
  * cannot do it itself -- which is the whole point of the case. */
 static volatile uint32_t g_jobctl_victim;
 static volatile uint32_t g_jobctl_parent;
+
 
 static void jobctl_stopper(void) {
     /* Long enough for the parent to be genuinely blocked rather than merely
@@ -425,6 +427,7 @@ static void selftests_print_commands(void)
     kprintf("  test hardening\n");
     kprintf("  test random\n");
     kprintf("  test aslr\n");
+    kprintf("  test canary\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1388,6 +1391,53 @@ int selftests_handle_command(const char *cmd)
             (void)process_wait((uint32_t)pids[i]);
         }
         kprintf("[cmd] test aslr: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test canary -- does the stack protector actually fire?
+     *
+     * A canary that has never been seen to trip is a compiler flag, not a
+     * protection. This overflows a local on purpose, in a function the
+     * compiler is not allowed to inline or optimise the overflow out of, and
+     * requires __stack_chk_fail to run -- which it proves by landing back
+     * here through the recovery point instead of halting the machine.
+     *
+     * It also checks the guard is not the static initialiser: that is the
+     * only evidence the entry stub seeded it, and a canary that is the same
+     * on every boot is a canary an attacker can read from the binary.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test canary") == 0) {
+        int ok = 1;
+        uintptr_t g = canary_value();
+        kprintf("\n[canary] guard 0x%lx\n", (unsigned long)g);
+        kprintf("  [%s] the guard is non-zero and is not the compile-time initialiser\n",
+                (g && g != 0x5A6B7C8D9EAFB0C1ULL) ? "ok" : "FAIL");
+        if (!g || g == 0x5A6B7C8D9EAFB0C1ULL) ok = 0;
+
+        uint64_t before = canary_fires();
+        int landed = 0;
+        if (canary_test_arm()) {
+            canary_smash_a_frame(24);      /* 16-byte buffer, 24 bytes written */
+            /* Not reached: the smashed frame's epilogue calls __stack_chk_fail,
+             * which longjmps to the arm above. If we ARE here, the protector
+             * did not fire and the overwritten return address was taken --
+             * which means it happened to land somewhere survivable, which is
+             * luck, not protection. */
+            canary_test_disarm();
+            kprintf("  [FAIL] the smashed frame RETURNED -- the protector did not fire\n");
+            ok = 0;
+        } else {
+            landed = 1;
+        }
+        uint64_t fired = canary_fires() - before;
+        kprintf("  [%s] a deliberate 8-byte overrun of a 16-byte local was caught "
+                "(fired %llu, recovered %d)\n",
+                (landed && fired == 1) ? "ok" : "FAIL",
+                (unsigned long long)fired, landed);
+        if (!landed || fired != 1) ok = 0;
+
+        kprintf("[cmd] test canary: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
