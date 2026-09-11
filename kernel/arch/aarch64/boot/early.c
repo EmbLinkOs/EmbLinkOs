@@ -14,7 +14,8 @@
 #include "mm/swap.h"          /* swap_init: the store, if a disk carries the header */
 #include "mm/swaptest.h"
 #include "loader/pietest.h"
-#include "drivers/storage/nvme.h"      /* the swap witness, driven */
+#include "drivers/storage/nvme.h"
+#include "fs/epfs.h"      /* the swap witness, driven */
 #include "fs/vfs.h"
 #include "arch/aarch64/cpu/cpu_features.h"
 #include "include/uaccess_guard.h"
@@ -600,6 +601,29 @@ void arch_early_main(uint64_t dtb_phys) {
     kprintf("\n--- filesystem ---\n");
     process_init();
     vfs_init();
+
+    /* THE ENDPOINT FILESYSTEM AT /run, registered where kernel/main.c registers
+     * it -- right after vfs_init(), before the disk, because IPC rendezvous
+     * must not depend on a disk existing.
+     *
+     * It was simply missing here. epfs.c has always been compiled into this
+     * kernel and nothing ever started it, so on aarch64 every chan_listen() and
+     * chan_connect() through /run failed: the desktop could not open its
+     * launcher channel, and the top bar's request to open the launcher looked
+     * up "/run/emlink.desktop" on the ROOT DISK instead -- the log's only
+     * trace of it was `"emlink.desktop" not found` on sda. The launcher button
+     * did nothing, and had never done anything, on this architecture. The boot
+     * test did not notice because nothing in it presses that button; the
+     * desktop that comes up looks complete. */
+    epfs_init();
+    {
+        int rc = epfs_vfs_register("/run");
+        if (rc != EMBK_OK)
+            kprintf("VFS: epfs register at /run failed: %s\n", embk_strerror(rc));
+        else
+            kprintf("  [ ok ] endpoint filesystem mounted at /run\n");
+    }
+
     embkfs_init();
     swap_init();                 /* a raw device with the EMBKSWAP header, if any -- see mm/swap.h */
 

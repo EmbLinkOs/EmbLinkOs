@@ -109,8 +109,19 @@ static const char *bar_clock(void) {
  * /run (the desktop listens there and opens the grid). The connect itself is the
  * signal -- no payload -- so we close immediately. */
 static void request_apps(void) {
+    embk_puts(1, "TopBar: launcher button pressed\n");
     int ch = (int)embk_chan_connect("/run/emlink.desktop");
-    if (ch >= 0) embk_chan_close(ch);
+    if (ch >= 0) {
+        embk_chan_close(ch);
+        return;
+    }
+    /* SAY SO. This used to fail silently, and a launcher button that does
+     * nothing gives the user no way to tell a missing desktop listener from a
+     * missing /run from a dead click -- aarch64 had the second for its whole
+     * life and nothing on screen or in the log said which. */
+    char b[96];
+    snprintf(b, sizeof b, "TopBar: could not reach the desktop to open the launcher (%d)\n", ch);
+    embk_puts(1, b);
 }
 
 static void bar(void) {

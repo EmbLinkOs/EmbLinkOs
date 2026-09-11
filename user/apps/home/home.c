@@ -191,7 +191,16 @@ static volatile int g_apps_requested = 0;
 static void apps_listener(long arg) {
     (void)arg;
     int lh = (int)embk_chan_listen("/run/emlink.desktop");
-    if (lh < 0) embk_thread_exit(1);
+    if (lh < 0) {
+        /* Without this endpoint the top bar's launcher button can do nothing,
+         * and it used to exit here without a word -- the one line that would
+         * have explained a dead button. */
+        char b[96];
+        snprintf(b, sizeof b, "home: cannot listen at /run/emlink.desktop (%d) -- "
+                              "the launcher button will do nothing\n", lh);
+        embk_puts(1, b);
+        embk_thread_exit(1);
+    }
     for (;;) {
         int ch = (int)embk_chan_accept(lh);
         if (ch < 0) {
@@ -202,6 +211,7 @@ static void apps_listener(long arg) {
             embk_sleep_ms(100);
             continue;
         }
+        embk_puts(1, "home: launcher requested by the top bar\n");
         g_apps_requested = 1;          /* the render loop opens the launcher */
         embk_chan_close(ch);
     }
