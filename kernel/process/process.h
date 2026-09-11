@@ -169,6 +169,21 @@ struct thread {
      * access it is meant to be guarding -- which is exactly what happened:
      * the thread was right, the flag was still 0, and the fault panicked. */
     volatile bool   uaccess_armed;
+
+    /* KILL, DEFERRED. process_kill() sets `killed`; the thread dies at its
+     * next SAFE POINT rather than wherever it happens to be. `in_kernel` counts
+     * the syscalls and user-origin faults in flight on this thread's kernel
+     * stack: zero means the thread is in user mode and holds nothing of the
+     * kernel's, so the scheduler may end it on the spot; non-zero means the
+     * path it is on finishes first and the thread dies at that path's exit.
+     * The first version reaped a blocked thread's kernel stack in
+     * process_kill() itself and abandoned a running one at its core's next
+     * schedule(): a thread asleep inside the filesystem's lock took the lock
+     * with it, and nothing in the system could open a file again. Both are
+     * volatile: written by the killer on one core, read by the victim on
+     * another. */
+    volatile bool   killed;
+    volatile int    in_kernel;
     uint64_t kstack_top;       /**< Virtual address of the top of this thread's kernel stack */
     uint64_t entry_point;      /**< Ring-3 user entry (process_trampoline) OR the real
                                  *   kthread function (kthread_trampoline stashes it here) */
@@ -999,6 +1014,11 @@ int thread_join(struct process *proc, int tid);
  * no special-casing here. Never returns.
  */
 __attribute__((noreturn)) void thread_exit_self(int code);
+
+/* The end of a killed thread, reached at a safe point (syscall or fault exit).
+ * Like thread_exit_self but the exit code is the kill's, already set. Never
+ * returns. */
+__attribute__((noreturn)) void thread_die_killed(void);
 /** @} */
 
 /* One dedicated hlt-loop idle kthread, pinned to cpu_table[cpu_index], at

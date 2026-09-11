@@ -1,4 +1,5 @@
 #include "arch/x86_64/syscall/syscall.h"
+#include "process/process.h"   /* current_thread: the kill flag is checked at the exit */
 #include "arch/x86_64/irq/idt.h"
 #include "include/syscall_abi.h"
 #include <stdint.h>
@@ -53,7 +54,15 @@ void syscall_dispatch(struct regs *r) {
 
     struct sysargs a;
     sysargs_from_regs(&a, r);
+    /* IN A KERNEL PATH for the length of the call: a kill that arrives now
+     * waits for the return below, where the thread holds nothing. */
+    if (current_thread) current_thread->in_kernel++;
     r->rax = (uint64_t)syscall_invoke(&a);
+    if (current_thread) {
+        current_thread->in_kernel--;
+        if (current_thread->killed)
+            thread_die_killed();         /* never returns */
+    }
 }
 
 /* type_attr byte for a 64-bit IDT gate: P(0x80) | DPL(bits 5-6) | type(0xE =

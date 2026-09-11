@@ -241,9 +241,16 @@ void isr_handler(struct registers *regs) {
              * x86-specific code, so testing IF here is not the coupling
              * arch_irq.h warns about. */
             bool irqs_on = (regs->rflags & (1ULL << 9)) != 0;
+            bool from_user = (regs->cs & 0x3) == 0x3;
+            if (from_user) current_thread->in_kernel++;   /* a kill waits for this to finish */
             if (irqs_on) arch_irq_enable();
             bool handled = vm_fault(current_thread->proc, cr2, w, x);
             if (irqs_on) arch_irq_disable();
+            if (from_user) {
+                current_thread->in_kernel--;
+                if (handled && current_thread->killed)
+                    thread_die_killed();     /* never returns */
+            }
             if (handled)
                 return;                  /* retry the instruction */
         }

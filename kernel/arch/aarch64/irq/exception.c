@@ -237,7 +237,14 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
          * nested inside a sync handler has to be found first. docs/TODO.md
          * carries it. Until then a fault that reads a disk waits masked, which
          * is what it always did here. */
+        bool from_user = (which >> 2) == 2;
+        if (from_user) current_thread->in_kernel++;   /* a kill waits for this to finish */
         bool handled = vm_fault(current_thread->proc, f->far, w, x);
+        if (from_user) {
+            current_thread->in_kernel--;
+            if (handled && current_thread->killed)
+                thread_die_killed();         /* never returns */
+        }
         if (handled)
             return;                      /* retry the instruction */
     }

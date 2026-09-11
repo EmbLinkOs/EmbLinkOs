@@ -119,6 +119,10 @@ void embkfs_lock(void)
     sched_unlock();
 }
 
+/* Is the filesystem lock held right now? For `test kill io`: after a process
+ * is killed inside the filesystem, this must be false once it has died. */
+bool embkfs_lock_is_held(void) { return g_fs_busy != 0; }
+
 void embkfs_unlock(void)
 {
     sched_lock();

@@ -114,6 +114,11 @@ int endpoint_accept(struct process *caller, int listen_handle) {
             restore_if(fl);
             return -EMBK_EINVAL;
         }
+        if (current_process && current_process->cancelled) {   /* cancelled, or killed */
+            sched_unlock();
+            restore_if(fl);
+            return -EMBK_ECANCELED;
+        }
         sched_block_current_locked(&ep->accept_wait);   /* releases lock on resume */
         restore_if(fl);
     }

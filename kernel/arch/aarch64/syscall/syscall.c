@@ -1,4 +1,5 @@
 #include "arch/aarch64/irq/exception.h"
+#include "process/process.h"   /* current_thread: the kill flag is checked at the exit */
 #include "include/syscall_abi.h"
 #include "include/kprintf.h"
 
@@ -34,7 +35,15 @@ void aarch64_syscall(struct aarch64_frame *f) {
      * way out, so whatever happens to DAIF in between is discarded. */
     arch_irq_enable();
 
+    /* IN A KERNEL PATH for the length of the call: a kill that arrives now
+     * waits for the return below, where the thread holds nothing. */
+    if (current_thread) current_thread->in_kernel++;
     f->x[0] = (uint64_t)syscall_invoke(&a);
+    if (current_thread) {
+        current_thread->in_kernel--;
+        if (current_thread->killed)
+            thread_die_killed();         /* never returns */
+    }
 
     arch_irq_disable();
 }

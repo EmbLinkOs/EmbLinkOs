@@ -309,6 +309,8 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
     t->priority = PRIORITY_NORMAL;
     t->ticks_since_scheduled = 0;
     t->suspended = false;         /* slots are reused -- a stale true would freeze a fresh thread */
+    t->killed    = false;         /* ... and a stale kill would end it at its first syscall */
+    t->in_kernel = 0;
     t->dispatch_count = 0;
     t->migrations = 0;
     t->last_ran_cpu = -1;         /* never run yet */
@@ -1218,6 +1220,9 @@ void process_kill(uint32_t pid) {
 
     proc->exit_code = -1;   // killed, not a normal exit -- set once, for
                              // whenever the process (every thread) actually finishes
+    proc->cancelled = true;  // a killed process is certainly cancelled: every
+                             // interruptible sleep in the kernel returns, and the
+                             // thread reaches its exit
 
     /* Snapshot the thread list NOW: thread_zombie_locked() below unlinks
      * each thread as it's processed, and killing current_thread hands off
@@ -1244,35 +1249,29 @@ void process_kill(uint32_t pid) {
             continue;   // already dying; nothing left to force
         }
 
-        /* RUNNING on a DIFFERENT core right now -- must NOT touch its
-         * kernel stack synchronously: nothing guarantees it isn't still
-         * executing there this exact instant. Marking it ZOMBIE is enough:
-         * that core's OWN next schedule() call (at most one timer tick
-         * away, ~10ms) sees state == PROCESS_ZOMBIE at its own entry and
-         * runs the exact same hand-off/defer-reap logic schedule() already
-         * has, regardless of which core forced the transition. No IPI
-         * needed -- see docs/architecture/process-and-scheduling.md's SMP
-         * phase for why this is sufficient rather than a shortcut. */
-        bool running_elsewhere = (t->state == PROCESS_RUNNING);
-
+        /* A KILL IS A FLAG, AND THE THREAD DIES AT ITS NEXT SAFE POINT. The
+         * first version reaped a blocked thread's kernel stack right here and
+         * abandoned a running one at its core's next schedule() -- wherever it
+         * was. A thread asleep on the filesystem's lock inside fsync, or
+         * preempted holding the page cache's, took the lock to its grave, and
+         * every later file operation in the system waited on a dead owner:
+         * `test kill io` could not even load its second witness from disk.
+         *
+         * Now the thread finishes whatever kernel path it is on and dies at
+         * its return to user mode -- the syscall or fault exit -- or, if the
+         * tick found it in user mode, in the scheduler right there; a kernel
+         * thread, which has no user mode and holds nothing across its own
+         * schedule() calls, dies at its next schedule() as before. A blocked
+         * thread is woken: every indefinite sleep in the kernel checks
+         * `cancelled`, which a kill implies, and returns; a wait for a lock is
+         * bounded and simply completes. A suspended thread (job control, the
+         * debugger) is unfrozen -- a kill overrides a stop. The program cannot
+         * catch any of this; only the kernel's own bookkeeping gets to finish. */
+        t->killed = true;
+        t->suspended = false;
         if (t->state == PROCESS_BLOCKED && t->wait_queue) {
             wait_queue_remove(t->wait_queue, t);
-        }
-        t->state = PROCESS_ZOMBIE;
-        struct process *needs_reap = thread_zombie_locked(t);
-
-        if (running_elsewhere) {
-            continue;
-        }
-
-        /* Not running anywhere (READY or was BLOCKED) -- safe to reap
-         * this thread's stack synchronously right now. If it was also the
-         * LAST thread of its process (no live parent), the process's
-         * address space is definitively safe to free too: nothing was
-         * ever executing on it this instant. */
-        thread_reap_slot(t);
-        if (needs_reap) {
-            process_reap_slot(needs_reap);
+            sched_set_ready(t);
         }
     }
 
@@ -2669,6 +2668,18 @@ static void schedule_locked(void) {
     struct thread *dying_thread_needing_deferred_reap = NULL;
     struct process *dying_process_needing_deferred_reap = NULL;
 
+    /* A killed thread found in USER mode -- no syscall or fault of its own in
+     * flight on its kernel stack -- or a kernel thread, which never leaves
+     * kernel mode and holds nothing across its schedule() calls, dies here.
+     * One inside a kernel path dies at that path's exit instead: see
+     * process_kill(). */
+    if (current_thread->state == PROCESS_RUNNING && current_thread->killed &&
+        (current_thread->in_kernel == 0 ||
+         (current_thread->proc && current_thread->proc->pml4_phys == vmm_get_kernel_pml4()))) {
+        current_thread->exit_code = -1;
+        current_thread->state = PROCESS_ZOMBIE;
+    }
+
     if (current_thread->state == PROCESS_ZOMBIE) {
         /* Always defer THIS thread's own kstack free -- the ACTUAL
          * assignment into this_cpu()->pending_thread_reap only happens
@@ -3320,6 +3331,10 @@ retry:
             return code;
         }
 
+        if (current_process && current_process->cancelled) {   /* cancelled, or killed */
+            spin_unlock(&g_sched_lock);
+            return -EMBK_ECANCELED;
+        }
         wait_queue_block(&proc->join_wait, current_thread);
         schedule_locked();
         if (entry_flags & (1ULL << 9)) {
@@ -3342,6 +3357,17 @@ __attribute__((noreturn))
 void thread_exit_self(int code) {
     current_process->exit_code = code;
     current_thread->exit_code = code;
+    current_thread->state = PROCESS_ZOMBIE;
+    schedule();
+
+    arch_irq_enable();
+    for (;;) {
+        arch_cpu_idle();
+    }
+}
+
+void thread_die_killed(void) {
+    current_thread->exit_code = -1;      /* the process's is the kill's, set by process_kill */
     current_thread->state = PROCESS_ZOMBIE;
     schedule();
 

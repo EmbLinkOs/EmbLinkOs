@@ -1843,15 +1843,26 @@ what it left open:
 
 Open, in the order they matter:
 
-- [ ] **A thread killed while blocked inside a kernel path is reaped with its
-  locks and its work in flight.** `thread_reap_slot` frees the kernel stack
-  of a BLOCKED thread synchronously. A thread asleep on the cache mutex inside
-  `munmap` holds no spinlock any more (above), but its `VMA_DYING` nodes are
-  half-processed: the exit-path teardown will put their objects again. The
-  general fix is the usual one -- a kill is a request the thread acts on at
-  its next return to user mode or wake, never a teardown of a thread mid-path.
-  Not new; the pre-existing shape of kill. Recorded here because the dying
-  chain makes the consequence concrete.
+- [x] **A kill is a flag, and the thread dies at its next safe point.**
+  `process_kill` used to reap a BLOCKED thread's kernel stack on the spot and
+  abandon a RUNNING one at its core's next `schedule()` -- wherever it was.
+  Measured (`test kill io`, unfixed kernel): the first kill landed inside the
+  witness's `fsync`, the dead thread kept the filesystem lock, and the SECOND
+  witness could not even be loaded from disk; the run timed out. Now
+  `killed` is set, blocked threads are woken, suspended ones unfrozen, and a
+  thread dies at its syscall or fault exit (`in_kernel` counts the paths in
+  flight on its stack), or in the scheduler if the tick found it in user mode;
+  a kernel thread dies at its next `schedule()` as before. A kill implies
+  `cancelled`, so every interruptible sleep returns; accept, channel send and
+  receive, and thread join gained the check they lacked. Eight kills at eight
+  moments inside `fsync`: reaped in 1-70 ms, lock free, file ops work.
+  - [ ] Still delayed rather than interrupted: a thread blocked in `net_wait`
+    or the console's char read re-blocks until its event arrives, then dies.
+    Not a wedge; a wait.
+  - [ ] A killed thread that is BLOCKED on a non-interruptible mutex completes
+    the path -- correct -- but a thread mid-`munmap` (phase 2, no lock held)
+    that is killed simply finishes phase 2 and 3 first, so the `VMA_DYING`
+    double-put concern above is closed by construction.
 - [ ] **aarch64 keeps IRQs masked around `vm_fault`** (x86 unmasks when the
   faulting context had them on). Unmasking hangs init before its first print,
   every boot; masked, it boots (bisected 2026-09-11). The root is wider: on

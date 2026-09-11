@@ -434,6 +434,7 @@ static void selftests_print_commands(void)
     kprintf("  test embkfs crash   (needs sdc: make test-embkfs-crash)\n");
     kprintf("  test swap store     (needs a swap disk: make test-swap-store)\n");
     kprintf("  test swap           (anonymous memory > RAM survives: make test-swap)\n");
+    kprintf("  test kill io        (a process killed inside the filesystem leaves it usable)\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -1517,6 +1518,57 @@ int selftests_handle_command(const char *cmd)
         }
         int rc = embkfs_run_crash_selftests(seed);
         kprintf("[cmd] test embkfs crash: %s\n", rc == EMBK_OK ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test kill io -- kill a process while it is inside the filesystem, eight
+     * times at eight different moments, and the filesystem is still usable.
+     *
+     * The witness (user/bin/fsloop.c) creates, writes, fsyncs and unlinks a
+     * file in a loop; fsync commits a transaction under the filesystem's lock
+     * in the PROCESS's own context, so a kill that lands there lands on a
+     * thread holding that lock -- asleep on the disk, or preempted. What a
+     * kill must never do is take that lock with the thread. */
+    if (strcmp(cmd, "test kill io") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test kill io: VFS not registered\n"); return 1; }
+        const char *wp = "/data/apps/fsloop/fsloop.elf";
+        struct vfs_stat wst;
+        if (vfs_stat(wp, &wst) != EMBK_OK) { kprintf("\n[cmd] test kill io: %s not on image\n", wp); return 1; }
+
+        kprintf("\n[kill io] eight kills, each at a different moment in the witness's loop\n");
+        int ok = 1;
+        for (int i = 0; i < 8; i++) {
+            char *a[] = { (char *)wp, NULL };
+            int pid = process_create(wp, a, 1, NULL, 0);
+            if (pid < 0) { kprintf("  [FAIL] spawn %d\n", pid); ok = 0; break; }
+            sched_sleep_ms(23 + 11 * i);
+            uint64_t t0 = timer_uptime_ms();
+            process_kill((uint32_t)pid);
+            int rc = process_wait((uint32_t)pid);
+            kprintf("  [ok] kill %d after %d ms: reaped in %llu ms, exit %d\n",
+                    i, 23 + 11 * i, (unsigned long long)(timer_uptime_ms() - t0), rc);
+        }
+
+        sched_sleep_ms(50);
+        bool held = embkfs_lock_is_held();
+        kprintf("  [%s] the filesystem lock is free after the kills\n", held ? "FAIL" : "ok");
+        if (held) ok = 0;
+
+        /* And it WORKS -- create, write, sync, remove -- which is the claim;
+         * the lock state above is the diagnosis when it does not. */
+        const char *path = "/home/yves/killio.txt";
+        int fd = vfs_open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        size_t w = 0;
+        int rw = fd >= 0 ? vfs_fd_write(fd, "alive", 5, &w) : -1;
+        int rf = fd >= 0 ? vfs_fd_fsync(fd) : -1;
+        if (fd >= 0) vfs_close(fd);
+        int ru = vfs_unlink_path(path);
+        bool works = fd >= 0 && rw == EMBK_OK && w == 5 && rf == EMBK_OK && ru == EMBK_OK;
+        kprintf("  [%s] a file can still be created, written, synced and removed (open %d, write %d, fsync %d, unlink %d)\n",
+                works ? "ok" : "FAIL", fd, rw, rf, ru);
+        if (!works) ok = 0;
+
+        kprintf("[cmd] test kill io: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 

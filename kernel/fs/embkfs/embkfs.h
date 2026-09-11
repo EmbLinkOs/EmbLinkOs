@@ -730,6 +730,7 @@ struct embkfs_lockstat {
     uint64_t wait_us;    /* wall microseconds spent blocked              */
 };
 void embkfs_lockstat_get(struct embkfs_lockstat *out);
+bool embkfs_lock_is_held(void);   /* test kill io */
 void embkfs_lockstat_reset(void);
 
 /* Probe one block device: read + verify the superblock at byte 65536, and on

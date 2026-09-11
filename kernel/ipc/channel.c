@@ -163,6 +163,12 @@ int64_t channel_send(struct process *caller, int handle,
     }
     /* Backpressure (A3): block until the peer inbox has room (or peer dies). */
     while (peer->inbox_count >= CHAN_QUEUE_MAX && !chan->peer_closed[side]) {
+        if (current_process && current_process->cancelled) {   /* cancelled, or killed */
+            sched_unlock();
+            if (msg->bytes) kfree(msg->bytes);
+            kfree(msg);
+            return -EMBK_ECANCELED;
+        }
         sched_block_current_locked(&peer->send_wait);   /* releases lock on resume */
         restore_if(fl);
         sched_lock();
@@ -236,6 +242,10 @@ int64_t channel_recv(struct process *caller, int handle,
         if (chan->peer_closed[side]) {              /* A4: peer hung up + empty */
             sched_unlock();
             return -EMBK_EPIPE;
+        }
+        if (current_process && current_process->cancelled) {   /* cancelled, or killed */
+            sched_unlock();
+            return -EMBK_ECANCELED;
         }
         sched_block_current_locked(&end->recv_wait); /* releases lock on resume (A2) */
         restore_if(fl);
