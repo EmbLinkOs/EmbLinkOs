@@ -139,6 +139,111 @@ struct acpi_info{
 };
 
 
+/* ---- Generic Address Structure: how ACPI names a register ---------------- */
+#define ACPI_GAS_MEMORY   0
+#define ACPI_GAS_IO       1
+#define ACPI_GAS_PCI_CFG  2
+
+struct acpi_gas {
+    uint8_t  space_id;      /* ACPI_GAS_*                                         */
+    uint8_t  bit_width;
+    uint8_t  bit_offset;
+    uint8_t  access_size;   /* 0 = undefined, 1 = byte, 2 = word, 3 = dword, 4 = qword */
+    uint64_t address;
+} __attribute__((packed));
+
+/* ---- FADT (signature "FACP"): where the power hardware is ---------------
+ * The full ACPI 6 layout, because the fields this kernel needs are spread
+ * across all three generations of it: the ACPI 1.0 I/O-port blocks, the 2.0
+ * reset register and 64-bit addresses, and the 5.0 hardware-reduced sleep
+ * registers. A table is only as long as its header says; every field past an
+ * old table's end is ABSENT, and acpi.c checks the length before reading one. */
+struct acpi_fadt {
+    struct acpi_sdt_header header;
+    uint32_t firmware_ctrl;
+    uint32_t dsdt;
+    uint8_t  reserved0;
+    uint8_t  preferred_pm_profile;
+    uint16_t sci_int;
+    uint32_t smi_cmd;
+    uint8_t  acpi_enable;
+    uint8_t  acpi_disable;
+    uint8_t  s4bios_req;
+    uint8_t  pstate_cnt;
+    uint32_t pm1a_evt_blk;
+    uint32_t pm1b_evt_blk;
+    uint32_t pm1a_cnt_blk;
+    uint32_t pm1b_cnt_blk;
+    uint32_t pm2_cnt_blk;
+    uint32_t pm_tmr_blk;
+    uint32_t gpe0_blk;
+    uint32_t gpe1_blk;
+    uint8_t  pm1_evt_len;
+    uint8_t  pm1_cnt_len;
+    uint8_t  pm2_cnt_len;
+    uint8_t  pm_tmr_len;
+    uint8_t  gpe0_blk_len;
+    uint8_t  gpe1_blk_len;
+    uint8_t  gpe1_base;
+    uint8_t  cst_cnt;
+    uint16_t p_lvl2_lat;
+    uint16_t p_lvl3_lat;
+    uint16_t flush_size;
+    uint16_t flush_stride;
+    uint8_t  duty_offset;
+    uint8_t  duty_width;
+    uint8_t  day_alrm;
+    uint8_t  mon_alrm;
+    uint8_t  century;
+    uint16_t iapc_boot_arch;
+    uint8_t  reserved1;
+    uint32_t flags;
+    struct acpi_gas reset_reg;          /* ACPI 2.0 -- offset 116 */
+    uint8_t  reset_value;
+    uint16_t arm_boot_arch;
+    uint8_t  fadt_minor_version;
+    uint64_t x_firmware_ctrl;
+    uint64_t x_dsdt;                    /* offset 140 */
+    struct acpi_gas x_pm1a_evt_blk;
+    struct acpi_gas x_pm1b_evt_blk;
+    struct acpi_gas x_pm1a_cnt_blk;     /* offset 172 */
+    struct acpi_gas x_pm1b_cnt_blk;
+    struct acpi_gas x_pm2_cnt_blk;
+    struct acpi_gas x_pm_tmr_blk;
+    struct acpi_gas x_gpe0_blk;
+    struct acpi_gas x_gpe1_blk;
+    struct acpi_gas sleep_control_reg;  /* ACPI 5.0 -- offset 244 */
+    struct acpi_gas sleep_status_reg;
+    uint64_t hypervisor_vendor_id;
+} __attribute__((packed));
+
+#define ACPI_FADT_RESET_REG_SUP  (1u << 10)
+#define ACPI_FADT_HW_REDUCED     (1u << 20)
+
+/* What power-off and reboot need, read out of the FADT and the AML. Filled by
+ * acpi_init(); every field is honest about absence (fadt_found, s5_found,
+ * reset_supported), so the power code can say WHICH part of ACPI was missing
+ * rather than "power-off failed". */
+struct acpi_power_info {
+    bool     fadt_found;
+    uint8_t  fadt_revision;
+    bool     hw_reduced;            /* ACPI 5 hardware-reduced: no PM1 blocks  */
+    uint32_t smi_cmd;               /* port that switches the chipset to ACPI  */
+    uint8_t  acpi_enable;           /* value to write there                    */
+    struct acpi_gas pm1a_cnt;       /* address 0 = absent                      */
+    struct acpi_gas pm1b_cnt;
+    struct acpi_gas sleep_control;  /* hardware-reduced platforms only         */
+    bool     reset_supported;
+    struct acpi_gas reset_reg;
+    uint8_t  reset_value;
+    bool     s5_found;              /* \_S5_ decoded from the AML              */
+    uint8_t  s5_typa, s5_typb;      /* SLP_TYP for PM1a / PM1b                 */
+    char     s5_table[5];           /* which table it came from: DSDT or SSDT  */
+};
+
+/* The power part of the ACPI tables, or NULL before acpi_init(). */
+const struct acpi_power_info *acpi_power_info(void);
+
 // Discover and parse ACPI tables, fill the acpi_info struct with relevant data for APIC initialization and interrupt routing
 const struct acpi_info *acpi_init(void);
 

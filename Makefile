@@ -2683,6 +2683,15 @@ build/swap.img: tools/mkswap.py | $(BUILD)
 build/nvme-scratch.img: | $(BUILD)
 	python3 -c "f=open('$@','wb'); f.write(b'EMBKNVMETEST'.ljust(4096, b'\\0')); f.truncate(64 << 20); f.close()"
 
+# POWER, the way the machine's own ACPI tables say: FADT + the \_S5_ package
+# for power-off, the FADT reset register for reboot, on BOTH chipsets QEMU
+# emulates (their DSDTs differ), and judged on QEMU actually exiting. See
+# tools/power_test.py for why a power-off that works only through the emulator
+# fallback counts as a failure.
+.PHONY: test-power
+test-power: $(IMG) embkfs.img
+	python3 tools/power_test.py
+
 # The NVMe driver, three ways, on x86:
 #   1. the witness on a 512-byte-block namespace,
 #   2. the same witness on a 4096-byte-block namespace (the 4Kn format a real

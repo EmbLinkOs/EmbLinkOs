@@ -795,6 +795,25 @@ The measurement immediately earned itself twice:
 
 ## Storage
 
+### ACPI power (the first slice of the ACPI pillar)
+- [x] **Power-off and reboot the way the machine's own tables say.** The FADT
+      is parsed for PM1a/PM1b control, the SMI command that switches the chipset
+      into ACPI mode, the ACPI 5 hardware-reduced sleep register and the reset
+      register; `\_S5_` is DECODED from the DSDT or any SSDT -- NameOp, name,
+      PackageOp, PkgLength, element count, integers in all six AML encodings --
+      rather than interpreted. Power-off tries that first and the emulator
+      constants only after it; reboot tries the reset register first. Verified
+      by `make test-power` on both QEMU chipsets, which have different DSDTs:
+      PIIX4 (ACPI 1.0 FADT, no reset register -- reboot correctly falls to the
+      8042) and Q35 (reset register 0xCF9 <- 0x0F, NOT the 0x06 a hardcoded
+      guess would have written). The test counts a power-off that only worked
+      through the emulator fallback as a FAILURE.
+- [ ] A `\_S5_` that is a METHOD, not a package, is not handled: that needs
+      the interpreter. Detected and reported, not guessed at.
+- [ ] Sleep (S3), battery (`_BST`), lid (`_LID`), thermal zones, device power
+      states: all of them are AML methods. The interpreter is the rest of this
+      pillar (docs/PILLARS.md).
+
 ### NVMe (the disk interface of a modern machine)
 - [x] **NVMe driver, both architectures** (`kernel/drivers/storage/nvme.c`).
       Until it existed the OS had no disk on a machine that boots from an NVMe

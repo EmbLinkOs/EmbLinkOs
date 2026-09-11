@@ -19,7 +19,7 @@ ATA, virtio-blk, **NVMe**. Capabilities, namespaces, sessions, a real account
 store. A compositor, a UI toolkit, a desktop, a browser, a shell, git, Python.
 
 That is a lot of operating system. It is also, on a real machine, mostly
-unreachable — because of the four pillars in phase 1.
+unreachable — because of what is still open in phase 1.
 
 ## Phase 1 — it boots and runs on the machine
 
@@ -29,7 +29,8 @@ emulates the common real part, so none has to wait for the machine.
 | Pillar | Today | Why it blocks the goal |
 |---|---|---|
 | **NVMe** | ✅ done — both architectures, root filesystem verified on it | Most machines built since ~2016 boot from NVMe |
-| **ACPI AML interpreter** | absent — MADT and HPET are parsed, the DSDT is not (`power_x86.c` says so) | Power-off does not work on real x86 hardware; no sleep, no battery, no lid, no thermal |
+| **ACPI power** | ✅ power-off from the FADT and the DSDT's `\_S5_` package, reboot from the FADT reset register — verified on both QEMU chipsets (`make test-power`) | Power-off used emulator constants and did nothing on a real PC |
+| **ACPI AML interpreter** | absent — `\_S5_` is decoded as data, nothing is executed | No sleep, no battery, no lid, no thermal zones, no `_S5` that is a method |
 | **A real network card** | absent — virtio-net only | A physical machine has no network at all. Intel e1000e and Realtek r8169 cover most wired machines |
 | **Intel HD Audio** | absent — AC97 and virtio-snd only | AC97 left real hardware around 2008; no sound |
 | **USB hot-plug + mass storage mount** | ports scanned once at boot; no hot-plug | A USB stick plugged in after boot does nothing |

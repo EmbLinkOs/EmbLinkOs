@@ -1,7 +1,9 @@
 #include "acpi/acpi.h"
+#include <stddef.h>   /* offsetof: FADT field presence */
 #include "drivers/char/serial.h"
 #include "mm/pmm.h"
 #include "include/kprintf.h"
+#include "include/kstring.h"   /* memset, memcpy: the power parser */
 #include "boot/boot_protocol.h"   /* boot_acpi_rsdp — UEFI RSDP */
 #include <stdint.h>
 
@@ -85,7 +87,16 @@ static struct rsdp *find_rsdp() {
 
 // Given the RSDP, find a table by its 4-character signature. Returns pointer to the table if found and valid, NULL if not found or invalid.
 // If ACPI 2.0+ is supported, uses the XSDT which has 64-bit pointers. If only ACPI 1.0 is supported, uses the RSDT which has 32-bit pointers.
+/* The n-th table (0-based) carrying `signature`. There is ONE of most tables and
+ * several of some -- a machine commonly has a handful of SSDTs, and \_S5_ may
+ * be defined in any of them rather than in the DSDT. */
+static struct acpi_sdt_header *find_table_nth(const struct rsdp *r, const char *signature, int nth);
+
 static struct acpi_sdt_header *find_table(const struct rsdp *r, const char *signature) {
+    return find_table_nth(r, signature, 0);
+}
+
+static struct acpi_sdt_header *find_table_nth(const struct rsdp *r, const char *signature, int nth) {
     bool use_xsdt = (r->revision >= 2) && (r->xsdt_address != 0);
 
     if (use_xsdt) {
@@ -102,7 +113,8 @@ static struct acpi_sdt_header *find_table(const struct rsdp *r, const char *sign
         for (uint32_t i = 0; i < entries; i++) {
             struct acpi_sdt_header *t = (struct acpi_sdt_header *)P2V(table_ptrs[i]);
             if (checksum_ok(t, t->length) && sig_match(t->signature, signature)) {
-                return t;
+                if (nth-- == 0)
+                    return t;
             }
         }
     } else {
@@ -119,7 +131,8 @@ static struct acpi_sdt_header *find_table(const struct rsdp *r, const char *sign
         for (uint32_t i = 0; i < entries; i++) {
             struct acpi_sdt_header *t = (struct acpi_sdt_header *)P2V(table_ptrs[i]);
             if (checksum_ok(t, t->length) && sig_match(t->signature, signature)) {
-                return t;
+                if (nth-- == 0)
+                    return t;
             }
         }
     
@@ -201,6 +214,214 @@ static void parse_madt(struct madt *madt){
 }
 
 
+/* ======================================================================
+ * POWER: the FADT and \_S5_
+ *
+ * Powering off a PC is two numbers written to one register: SLP_TYP, which
+ * says WHICH sleep state, and SLP_EN, which says "now". The register's address
+ * is in the FADT. SLP_TYP for S5 (soft off) is NOT in any table -- it is the
+ * first element of the \_S5_ object in the DSDT, which is AML bytecode, which
+ * is why this kernel could not power off a real machine: it guessed SLP_TYP
+ * from constants that are true of QEMU, Bochs and VirtualBox and of nothing
+ * else.
+ *
+ * This is not an AML interpreter, and says so. \_S5_ is, on essentially every
+ * machine, a NAMED PACKAGE OF INTEGER CONSTANTS -- Name (_S5, Package () {5, 5,
+ * 0, 0}) -- which is data, not code, and can be decoded by recognising its
+ * encoding exactly: NameOp, the name, PackageOp, a PkgLength, an element
+ * count, and integer constants in any of the six ways AML writes one. What it
+ * cannot handle is a \_S5_ that is a METHOD computing the package at run time;
+ * that is rare, it is detected (no match), and the power code then says ACPI
+ * gave it nothing rather than writing a guess. The full interpreter -- battery,
+ * lid, thermal zones, sleep -- is the rest of the ACPI pillar (docs/PILLARS.md).
+ * ====================================================================== */
+
+static struct acpi_power_info g_power;
+static bool g_power_parsed;
+
+const struct acpi_power_info *acpi_power_info(void) {
+    return g_power_parsed ? &g_power : NULL;
+}
+
+static uint32_t rd32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* One AML integer constant at p, bounded by end. Returns the bytes it takes,
+ * or 0 if what is there is not an integer constant. */
+static int aml_integer(const uint8_t *p, const uint8_t *end, uint64_t *out) {
+    if (p >= end) return 0;
+    switch (p[0]) {
+    case 0x00: *out = 0;          return 1;                    /* ZeroOp      */
+    case 0x01: *out = 1;          return 1;                    /* OneOp       */
+    case 0xFF: *out = ~0ull;      return 1;                    /* OnesOp      */
+    case 0x0A: if (end - p < 2) return 0; *out = p[1]; return 2;              /* BytePrefix  */
+    case 0x0B: if (end - p < 3) return 0; *out = (uint64_t)p[1] | ((uint64_t)p[2] << 8); return 3;
+    case 0x0C: if (end - p < 5) return 0; *out = rd32le(p + 1); return 5;     /* DWordPrefix */
+    case 0x0E: if (end - p < 9) return 0;
+               *out = (uint64_t)rd32le(p + 1) | ((uint64_t)rd32le(p + 5) << 32); return 9;
+    default:   return 0;
+    }
+}
+
+/* A PkgLength at p. It counts ITSELF as well as what follows, and is 1 to 4
+ * bytes: the top two bits of the first byte say how many follow. */
+static int aml_pkglength(const uint8_t *p, const uint8_t *end, uint32_t *len) {
+    if (p >= end) return 0;
+    int follow = p[0] >> 6;
+    if (end - p < 1 + follow) return 0;
+    if (follow == 0) { *len = p[0] & 0x3Fu; return 1; }
+    uint32_t v = p[0] & 0x0Fu;
+    for (int i = 0; i < follow; i++)
+        v |= (uint32_t)p[1 + i] << (4 + 8 * i);
+    *len = v;
+    return 1 + follow;
+}
+
+/* Look for Name (\_S5_, Package () { SLP_TYPa, SLP_TYPb, ... }) in one table's
+ * AML. Every requirement below is there to refuse something that merely
+ * CONTAINS the four bytes "_S5_" -- a reference to it from inside a method, a
+ * string, a longer name: it must be the name being DEFINED by a NameOp, the
+ * object must be a package, and both values must fit the 3-bit field they go
+ * into. */
+static bool find_s5(const struct acpi_sdt_header *t, uint8_t *typa, uint8_t *typb) {
+    const uint8_t *aml = (const uint8_t *)t + sizeof(struct acpi_sdt_header);
+    const uint8_t *end = (const uint8_t *)t + t->length;
+    for (const uint8_t *p = aml; p + 4 <= end; p++) {
+        if (p[0] != '_' || p[1] != 'S' || p[2] != '5' || p[3] != '_')
+            continue;
+        bool defined = (p - aml >= 1 && p[-1] == 0x08) ||                   /* NameOp _S5_   */
+                       (p - aml >= 2 && p[-1] == '\\' && p[-2] == 0x08);   /* NameOp \_S5_  */
+        if (!defined)
+            continue;
+        const uint8_t *q = p + 4;
+        if (q >= end || *q != 0x12)                                         /* PackageOp     */
+            continue;
+        q++;
+        uint32_t pkglen;
+        int n = aml_pkglength(q, end, &pkglen);
+        if (!n)
+            continue;
+        const uint8_t *pkg_end = q + pkglen;
+        if (pkg_end > end)
+            pkg_end = end;
+        q += n;
+        if (q >= pkg_end)
+            continue;
+        uint8_t nelem = *q++;
+        uint64_t a, b;
+        int c = aml_integer(q, pkg_end, &a);
+        if (nelem < 1 || !c)
+            continue;
+        q += c;
+        /* One element means "the same for PM1b"; that is how the spec reads a
+         * short package, not a malformed one. */
+        if (nelem < 2 || !aml_integer(q, pkg_end, &b))
+            b = a;
+        if (a > 7 || b > 7)
+            continue;
+        *typa = (uint8_t)a;
+        *typb = (uint8_t)b;
+        return true;
+    }
+    return false;
+}
+
+static bool fadt_has(const struct acpi_fadt *f, size_t off, size_t size) {
+    return f->header.length >= off + size;
+}
+
+static void parse_power(const struct rsdp *r) {
+    memset(&g_power, 0, sizeof g_power);
+    g_power_parsed = true;
+
+    const struct acpi_fadt *f = (const struct acpi_fadt *)find_table(r, "FACP");
+    if (!f) {
+        kprintf("ACPI: no FADT -- the tables say nothing about power\n");
+        return;
+    }
+    g_power.fadt_found    = true;
+    g_power.fadt_revision = f->header.revision;
+    g_power.smi_cmd       = f->smi_cmd;
+    g_power.acpi_enable   = f->acpi_enable;
+
+    uint32_t flags = fadt_has(f, offsetof(struct acpi_fadt, flags), 4) ? f->flags : 0;
+    g_power.hw_reduced = (flags & ACPI_FADT_HW_REDUCED) != 0;
+
+    /* PM1 control: the 64-bit GAS when the table has one and it is filled in,
+     * otherwise the ACPI 1.0 I/O port. Both describe the same register. */
+    if (fadt_has(f, offsetof(struct acpi_fadt, x_pm1a_cnt_blk), sizeof(struct acpi_gas)) &&
+        f->x_pm1a_cnt_blk.address) {
+        g_power.pm1a_cnt = f->x_pm1a_cnt_blk;
+    } else if (f->pm1a_cnt_blk) {
+        g_power.pm1a_cnt.space_id  = ACPI_GAS_IO;
+        g_power.pm1a_cnt.bit_width = (uint8_t)(f->pm1_cnt_len * 8);
+        g_power.pm1a_cnt.address   = f->pm1a_cnt_blk;
+    }
+    if (fadt_has(f, offsetof(struct acpi_fadt, x_pm1b_cnt_blk), sizeof(struct acpi_gas)) &&
+        f->x_pm1b_cnt_blk.address) {
+        g_power.pm1b_cnt = f->x_pm1b_cnt_blk;
+    } else if (f->pm1b_cnt_blk) {
+        g_power.pm1b_cnt.space_id  = ACPI_GAS_IO;
+        g_power.pm1b_cnt.bit_width = (uint8_t)(f->pm1_cnt_len * 8);
+        g_power.pm1b_cnt.address   = f->pm1b_cnt_blk;
+    }
+    if (g_power.hw_reduced &&
+        fadt_has(f, offsetof(struct acpi_fadt, sleep_control_reg), sizeof(struct acpi_gas)))
+        g_power.sleep_control = f->sleep_control_reg;
+
+    /* Reset: ACPI 2.0 gave the reset register a flag of its own, and the flag
+     * is what counts -- plenty of tables carry a register they do not support. */
+    if ((flags & ACPI_FADT_RESET_REG_SUP) &&
+        fadt_has(f, offsetof(struct acpi_fadt, reset_value), 1) && f->reset_reg.address) {
+        g_power.reset_supported = true;
+        g_power.reset_reg       = f->reset_reg;
+        g_power.reset_value     = f->reset_value;
+    }
+
+    /* \_S5_: the DSDT first -- the FADT points at it, it is never in the
+     * XSDT -- then every SSDT. */
+    uint64_t dsdt_phys = 0;
+    if (fadt_has(f, offsetof(struct acpi_fadt, x_dsdt), 8) && f->x_dsdt)
+        dsdt_phys = f->x_dsdt;
+    else
+        dsdt_phys = f->dsdt;
+    if (dsdt_phys) {
+        const struct acpi_sdt_header *d = (const struct acpi_sdt_header *)P2V(dsdt_phys);
+        if (sig_match(d->signature, "DSDT") && checksum_ok((void *)d, d->length) &&
+            find_s5(d, &g_power.s5_typa, &g_power.s5_typb)) {
+            g_power.s5_found = true;
+            memcpy(g_power.s5_table, "DSDT", 5);
+        }
+    }
+    for (int i = 0; !g_power.s5_found && i < 32; i++) {
+        const struct acpi_sdt_header *t = find_table_nth(r, "SSDT", i);
+        if (!t)
+            break;
+        if (find_s5(t, &g_power.s5_typa, &g_power.s5_typb)) {
+            g_power.s5_found = true;
+            memcpy(g_power.s5_table, "SSDT", 5);
+        }
+    }
+
+    const char *space[] = { "mem", "io", "pci" };
+    kprintf("ACPI: FADT rev %u%s: PM1a_CNT %s 0x%llx%s, reset %s",
+            (unsigned)g_power.fadt_revision, g_power.hw_reduced ? " (hardware-reduced)" : "",
+            g_power.pm1a_cnt.space_id < 3 ? space[g_power.pm1a_cnt.space_id] : "?",
+            (unsigned long long)g_power.pm1a_cnt.address,
+            g_power.pm1b_cnt.address ? " + PM1b" : "",
+            g_power.reset_supported ? "" : "not supported\n");
+    if (g_power.reset_supported)
+        kprintf("%s 0x%llx <- 0x%x\n",
+                g_power.reset_reg.space_id < 3 ? space[g_power.reset_reg.space_id] : "?",
+                (unsigned long long)g_power.reset_reg.address, (unsigned)g_power.reset_value);
+    if (g_power.s5_found)
+        kprintf("ACPI: \\_S5_ found in the %s: SLP_TYPa=%u SLP_TYPb=%u -- power-off is real\n",
+                g_power.s5_table, (unsigned)g_power.s5_typa, (unsigned)g_power.s5_typb);
+    else
+        kprintf("ACPI: no \\_S5_ package in the DSDT or any SSDT -- power-off falls back\n");
+}
+
 const struct acpi_info *acpi_init(void) {
     serial_write_string("\n=== ACPI init ===\n");
 
@@ -222,6 +443,10 @@ const struct acpi_info *acpi_init(void) {
     }
     kprintf("ACPI: RSDP found at %p, revision %u\n", (void *)r, (unsigned int)r->revision);
     kprintf("ACPI: %s\n", r->revision >= 2 ? "using XSDT (ACPI 2.0+)" : "using RSDT (ACPI 1.0)");
+
+    /* Before the MADT, whose absence returns early: a machine with no MADT
+     * still has to be able to switch itself off. */
+    parse_power(r);
     
 
     struct acpi_sdt_header *madt_hdr = find_table(r, "APIC");
