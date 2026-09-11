@@ -1717,6 +1717,22 @@ violation; the kernel CSPRNG and getrandom() in 55a912d. What is left:
       random bytes in the tail, and a cut spanning TWO sectors of one
       4 KiB block -- would exercise the per-node checksum differently.
 
+## Filesystem: crash consistency on aarch64 too (parity gap, closed)
+
+- [x] The power-cut test ran on x86 only. The aarch64 boot test now attaches
+  the same seed image as a second virtio-blk (a per-run scratch copy, `sdb`)
+  and runs it in the early self-tests: **130 cuts, 0 inconsistent, 0
+  unmountable** under HVF, at the cost of ~12 s more boot-test time. What it
+  took was not the test: the virtio-blk driver was a SINGLETON -- one ring,
+  one bounce buffer, one lock, one block device -- and the PCI scan stopped
+  at the first match, so a second disk on aarch64 could not exist. It is
+  per-instance now (up to 4), which is also what a swap store on aarch64
+  needs.
+  - [ ] `make test-swap` has no aarch64 counterpart yet: the harness would
+    attach `build/swap.img` as a third virtio-blk and the boot would run the
+    witness. The driver side is done; the harness and the early-boot hook are
+    not.
+
 ## Filesystem: mounting is two calls, and that is a sharp edge
 
 - [x] ~~**`embkfs_mount()` does not produce a write-capable volume.**~~ **Closed:**

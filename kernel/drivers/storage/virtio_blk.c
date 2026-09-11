@@ -90,22 +90,31 @@ struct vblk_req_hdr {
 struct vring_avail { uint16_t flags; uint16_t idx; uint16_t ring[VQ_SIZE]; } __attribute__((packed));
 struct vring_used  { uint16_t flags; uint16_t idx; struct vring_used_elem ring[VQ_SIZE]; } __attribute__((packed));
 
-/* Rings live in .bss so KV2P() can turn them into the physical addresses the
+/* ONE OF THESE PER DEVICE. The first version kept everything in file-scope
+ * singletons -- one ring, one bounce buffer, one header, one status byte,
+ * one lock -- and could therefore drive exactly one disk: the second
+ * virtio-blk on the machine was found by the PCI scan and never looked at
+ * again. A second disk is how aarch64 gets a swap store and how the
+ * crash-consistency test gets its seed image, so the singletons became an
+ * array of instances, one attached per matching PCI function.
+ *
+ * Rings live in .bss so KV2P() can turn them into the physical addresses the
  * device needs; a kmalloc'd ring would be in the heap window, which is mapped
- * but not KV2P-able. Alignment is the virtio spec's. */
-static struct vring_desc  g_desc[VQ_SIZE]  __attribute__((aligned(16)));
-static struct vring_avail g_avail          __attribute__((aligned(2)));
-static struct vring_used  g_used           __attribute__((aligned(4)));
-
-/* One bounce buffer: callers hand us kernel pointers that may not be
- * physically contiguous past a page, and a descriptor addresses physical
- * memory. 64 KiB matches the filesystem's largest read. */
+ * but not KV2P-able. Alignment is the virtio spec's. One bounce buffer per
+ * device: callers hand us kernel pointers that may not be physically
+ * contiguous past a page, and a descriptor addresses physical memory. 64 KiB
+ * matches the filesystem's largest read. */
 #define BOUNCE_SZ (64u * 1024u)
-static uint8_t g_bounce[BOUNCE_SZ] __attribute__((aligned(4096)));
-static struct vblk_req_hdr g_hdr   __attribute__((aligned(16)));
-static volatile uint8_t    g_status __attribute__((aligned(16)));
+#define VBLK_MAX  4
 
-static struct {
+struct vblk {
+    struct vring_desc  desc[VQ_SIZE]  __attribute__((aligned(16)));
+    struct vring_avail avail          __attribute__((aligned(2)));
+    struct vring_used  used           __attribute__((aligned(4)));
+    uint8_t            bounce[BOUNCE_SZ] __attribute__((aligned(4096)));
+    struct vblk_req_hdr hdr           __attribute__((aligned(16)));
+    volatile uint8_t   status         __attribute__((aligned(16)));
+
     struct virtio_pci_dev vp;   /* the shared transport: windows + handshake */
     volatile uint8_t *common, *notify, *devcfg;
     uint32_t notify_multiplier;
@@ -114,29 +123,33 @@ static struct {
     uint16_t last_used;
     uint64_t capacity;          /* in 512-byte sectors */
     bool     up;
-} g_vblk;
 
-static struct embk_block_device g_blkdev;
+    struct embk_block_device blkdev;
 
-/* ONE REQUEST AT A TIME, and it has to be enforced rather than assumed.
- *
- * Everything this driver submits with lives in file-scope singletons -- one
- * descriptor table, one avail ring, one header, one status byte, one
- * last_used cursor. That was true and safe while the only caller was the boot
- * thread. It stopped being either the moment there was a real userland: init,
- * the desktop, TopBar and posixdemo all touch the filesystem, the syscall path
- * runs with interrupts ENABLED, and this function SPINS waiting for the device
- * -- which is exactly where a timer tick preempts it. A second thread then
- * overwrites g_hdr and g_avail.idx underneath the first, and both wait for a
- * completion that will never match. It shows up as
- * "virtio-blk: request timed out", far from the cause.
- *
- * A SLEEPING lock, not a spinlock: the wait is a disk round trip, and holding
- * a spinlock (with interrupts off) across one would stop the scheduler for its
- * duration. ksync's mutex handles the pre-scheduler case -- current_thread is
- * NULL then and the lock is uncontended, so it neither blocks nor complains --
- * which matters because this driver is probed before process_init(). */
-static struct mutex g_vblk_lock;
+    /* ONE REQUEST AT A TIME PER DEVICE, and it has to be enforced rather than
+     * assumed. Everything this driver submits with lives in the instance --
+     * one descriptor table, one avail ring, one header, one status byte, one
+     * last_used cursor. That was true and safe while the only caller was the
+     * boot thread. It stopped being either the moment there was a real
+     * userland: init, the desktop, TopBar and posixdemo all touch the
+     * filesystem, the syscall path runs with interrupts ENABLED, and the
+     * request SPINS waiting for the device -- which is exactly where a timer
+     * tick preempts it. A second thread then overwrites the header and
+     * avail.idx underneath the first, and both wait for a completion that
+     * will never match. It shows up as "virtio-blk: request timed out", far
+     * from the cause.
+     *
+     * A SLEEPING lock, not a spinlock: the wait is a disk round trip, and
+     * holding a spinlock (with interrupts off) across one would stop the
+     * scheduler for its duration. ksync's mutex handles the pre-scheduler
+     * case -- current_thread is NULL then and the lock is uncontended, so it
+     * neither blocks nor complains -- which matters because this driver is
+     * probed before process_init(). */
+    struct mutex lock;
+};
+
+static struct vblk g_vblks[VBLK_MAX];
+static int         g_nvblk;
 
 static inline uint8_t  vr8 (volatile uint8_t *b, uint32_t o) { return *(volatile uint8_t  *)(b + o); }
 static inline uint16_t vr16(volatile uint8_t *b, uint32_t o) { return *(volatile uint16_t *)(b + o); }
@@ -152,18 +165,17 @@ static inline void vw64(volatile uint8_t *b, uint32_t o, uint64_t v) {
 }
 static inline uint64_t dma(const volatile void *p) { return KV2P((uint64_t)(uintptr_t)p); }
 
-/* Submit one three-descriptor request and spin until the device retires it. */
-static int vblk_request(uint32_t type, uint64_t sector, void *data, uint32_t len,
-                        bool device_writes) {
-    if (!g_vblk.up)
+static int vblk_request(struct vblk *v, uint32_t type, uint64_t sector, void *data,
+                        uint32_t len, bool device_writes) {
+    if (!v->up)
         return -EMBK_EIO;
 
-    mutex_lock(&g_vblk_lock);
+    mutex_lock(&v->lock);
 
-    g_hdr.type     = type;
-    g_hdr.reserved = 0;
-    g_hdr.sector   = sector;
-    g_status       = 0xFF;          /* so "unchanged" is distinguishable */
+    v->hdr.type     = type;
+    v->hdr.reserved = 0;
+    v->hdr.sector   = sector;
+    v->status       = 0xFF;          /* so "unchanged" is distinguishable */
 
     /* TWO descriptors for a request with no payload, THREE otherwise.
      *
@@ -180,64 +192,62 @@ static int vblk_request(uint32_t type, uint64_t sector, void *data, uint32_t len
      * comes from EMBKFS's pre-commit. posixdemo's first mkdir found it. */
     uint16_t status_desc = len ? 2 : 1;
 
-    g_desc[0].addr  = dma(&g_hdr);
-    g_desc[0].len   = sizeof(g_hdr);
-    g_desc[0].flags = VRING_DESC_F_NEXT;
+    v->desc[0].addr  = dma(&v->hdr);
+    v->desc[0].len   = sizeof(v->hdr);
+    v->desc[0].flags = VRING_DESC_F_NEXT;
     /* Always 1: with a payload that is the data descriptor and the status
      * follows it at 2; without one, index 1 IS the status descriptor. */
-    g_desc[0].next  = 1;
+    v->desc[0].next  = 1;
 
     if (len) {
-        g_desc[1].addr  = dma(data);
-        g_desc[1].len   = len;
-        g_desc[1].flags = VRING_DESC_F_NEXT | (device_writes ? VRING_DESC_F_WRITE : 0);
-        g_desc[1].next  = 2;
+        v->desc[1].addr  = dma(data);
+        v->desc[1].len   = len;
+        v->desc[1].flags = VRING_DESC_F_NEXT | (device_writes ? VRING_DESC_F_WRITE : 0);
+        v->desc[1].next  = 2;
     }
 
-    g_desc[status_desc].addr  = dma(&g_status);
-    g_desc[status_desc].len   = 1;
-    g_desc[status_desc].flags = VRING_DESC_F_WRITE;
-    g_desc[2].next  = 0;
+    v->desc[status_desc].addr  = dma(&v->status);
+    v->desc[status_desc].len   = 1;
+    v->desc[status_desc].flags = VRING_DESC_F_WRITE;
+    v->desc[2].next  = 0;
 
-    uint16_t slot = g_avail.idx % g_vblk.qsize;
-    g_avail.ring[slot] = 0;
+    uint16_t slot = v->avail.idx % v->qsize;
+    v->avail.ring[slot] = 0;
     __sync_synchronize();
-    g_avail.idx++;
+    v->avail.idx++;
     __sync_synchronize();
 
-    vw16(g_vblk.notify, (uint32_t)g_vblk.notify_off * g_vblk.notify_multiplier, 0);
+    vw16(v->notify, (uint32_t)v->notify_off * v->notify_multiplier, 0);
 
     /* Spin for the completion. The bound is generous and exists only so a
      * device that never answers produces an error instead of a hung kernel --
      * a wedged disk must not be indistinguishable from a wedged machine. */
     for (uint64_t spins = 0; spins < 200000000ULL; spins++) {
         __sync_synchronize();
-        if (g_used.idx != g_vblk.last_used) {
-            g_vblk.last_used = g_used.idx;
+        if (v->used.idx != v->last_used) {
+            v->last_used = v->used.idx;
             __sync_synchronize();
-            int rc = (g_status == 0) ? EMBK_OK : -EMBK_EIO;
-            mutex_unlock(&g_vblk_lock);
+            int rc = (v->status == 0) ? EMBK_OK : -EMBK_EIO;
+            mutex_unlock(&v->lock);
             return rc;
         }
         arch_cpu_relax();
     }
-
-    kprintf("virtio-blk: request timed out (type %d sector %d)\n",
-            (int)type, (int)sector);
-    mutex_unlock(&g_vblk_lock);
+    kprintf("virtio-blk: %s: request timed out (type %d sector %d)\n",
+            v->blkdev.name, (int)type, (int)sector);
+    mutex_unlock(&v->lock);
     return -EMBK_EIO;
 }
 
 static int vblk_read(struct embk_block_device *dev, uint64_t lba, uint32_t count, void *buf) {
-    (void)dev;
+    struct vblk *v = (struct vblk *)dev->driver_data;
     uint8_t *out = (uint8_t *)buf;
-
     while (count) {
         uint32_t chunk = count > (BOUNCE_SZ / SECTOR) ? (BOUNCE_SZ / SECTOR) : count;
-        int rc = vblk_request(VIRTIO_BLK_T_IN, lba, g_bounce, chunk * SECTOR, true);
+        int rc = vblk_request(v, VIRTIO_BLK_T_IN, lba, v->bounce, chunk * SECTOR, true);
         if (rc != EMBK_OK)
             return rc;
-        memcpy(out, g_bounce, chunk * SECTOR);
+        memcpy(out, v->bounce, chunk * SECTOR);
         out   += chunk * SECTOR;
         lba   += chunk;
         count -= chunk;
@@ -246,13 +256,12 @@ static int vblk_read(struct embk_block_device *dev, uint64_t lba, uint32_t count
 }
 
 static int vblk_write(struct embk_block_device *dev, uint64_t lba, uint32_t count, const void *buf) {
-    (void)dev;
+    struct vblk *v = (struct vblk *)dev->driver_data;
     const uint8_t *in = (const uint8_t *)buf;
-
     while (count) {
         uint32_t chunk = count > (BOUNCE_SZ / SECTOR) ? (BOUNCE_SZ / SECTOR) : count;
-        memcpy(g_bounce, in, chunk * SECTOR);
-        int rc = vblk_request(VIRTIO_BLK_T_OUT, lba, g_bounce, chunk * SECTOR, false);
+        memcpy(v->bounce, in, chunk * SECTOR);
+        int rc = vblk_request(v, VIRTIO_BLK_T_OUT, lba, v->bounce, chunk * SECTOR, false);
         if (rc != EMBK_OK)
             return rc;
         in    += chunk * SECTOR;
@@ -263,28 +272,16 @@ static int vblk_write(struct embk_block_device *dev, uint64_t lba, uint32_t coun
 }
 
 static int vblk_flush(struct embk_block_device *dev) {
-    (void)dev;
+    struct vblk *v = (struct vblk *)dev->driver_data;
     /* No buffer and no length: vblk_request() builds the two-descriptor chain
-     * a payload-free request requires. g_bounce used to be passed here as a
-     * dummy, which read as harmless and was not -- see the descriptor note. */
-    return vblk_request(VIRTIO_BLK_T_FLUSH, 0, 0, 0, false);
+     * a payload-free request requires. The bounce buffer used to be passed
+     * here as a dummy, which read as harmless and was not -- see the
+     * descriptor note. */
+    return vblk_request(v, VIRTIO_BLK_T_FLUSH, 0, 0, 0, false);
 }
 
-bool virtio_blk_init(void) {
-    const struct pci_device *dev = 0;
-    for (uint32_t i = 0; i < pci_devices_count(); i++) {
-        const struct pci_device *d = pci_get_device(i);
-        if (d && d->vendor_id == VIRTIO_VENDOR &&
-            (d->device_id == VIRTIO_BLK_DEVID_T || d->device_id == VIRTIO_BLK_DEVID_M)) {
-            dev = d;
-            break;
-        }
-    }
-    if (!dev) {
-        kprintf("virtio-blk: no device\n");
-        return false;
-    }
-
+/* Attach one PCI function as instance `v`. */
+static bool vblk_attach(struct vblk *v, const struct pci_device *dev) {
     /* --- the transport ------------------------------------------------------
      * The capability walk, the three config windows, bus mastering and the
      * status handshake all live in drivers/bus/virtio_pci.c now. This driver
@@ -295,27 +292,25 @@ bool virtio_blk_init(void) {
      * options is the one whose request format cannot be subtly wrong, and
      * nothing here needs discard, write-zeroes or multi-queue to read a
      * sector. */
-    mutex_init(&g_vblk_lock);
-
-    if (!virtio_pci_attach(&g_vblk.vp, dev, "virtio-blk", 0, 0))
+    mutex_init(&v->lock);
+    if (!virtio_pci_attach(&v->vp, dev, "virtio-blk", 0, 0))
         return false;
-
-    g_vblk.common = g_vblk.vp.common;
-    g_vblk.notify = g_vblk.vp.notify;
-    g_vblk.devcfg = g_vblk.vp.devcfg;
-    g_vblk.notify_multiplier = g_vblk.vp.notify_multiplier;
+    v->common = v->vp.common;
+    v->notify = v->vp.notify;
+    v->devcfg = v->vp.devcfg;
+    v->notify_multiplier = v->vp.notify_multiplier;
 
     /* This driver DOES need the device config: capacity is its first field. */
-    if (!g_vblk.devcfg) {
+    if (!v->devcfg) {
         kprintf("virtio-blk: device exposes no device-config window\n");
         return false;
     }
 
     /* --- queue 0 ------------------------------------------------------------ */
-    memset(g_desc, 0, sizeof(g_desc));
-    memset((void *)&g_avail, 0, sizeof(g_avail));
-    memset((void *)&g_used, 0, sizeof(g_used));
-    g_vblk.last_used = 0;
+    memset(v->desc, 0, sizeof(v->desc));
+    memset((void *)&v->avail, 0, sizeof(v->avail));
+    memset((void *)&v->used, 0, sizeof(v->used));
+    v->last_used = 0;
 
     /* VRING_AVAIL_F_NO_INTERRUPT. This driver POLLS, so it must tell the
      * device not to signal completions -- otherwise the device raises its
@@ -323,37 +318,56 @@ bool virtio_blk_init(void) {
      * LEVEL-triggered interrupt, the machine stops making progress. A polled
      * driver that forgets this looks correct in isolation and wedges the
      * kernel the moment interrupts are enabled. */
-    g_avail.flags = 1;
+    v->avail.flags = 1;
 
-    uint16_t qs = virtio_pci_setup_queue(&g_vblk.vp, 0, VQ_SIZE,
-                                         g_desc, (void *)&g_avail,
-                                         (void *)&g_used, &g_vblk.notify_off);
+    uint16_t qs = virtio_pci_setup_queue(&v->vp, 0, VQ_SIZE,
+                                         v->desc, (void *)&v->avail,
+                                         (void *)&v->used, &v->notify_off);
     if (qs == 0) { kprintf("virtio-blk: queue 0 has size 0\n"); return false; }
-    g_vblk.qsize = qs;
+    v->qsize = qs;
 
-    virtio_pci_driver_ok(&g_vblk.vp);
+    virtio_pci_driver_ok(&v->vp);
 
     /* Capacity is the first field of the device-specific config, in sectors. */
-    g_vblk.capacity = vr64(g_vblk.devcfg, 0);
-    g_vblk.up = true;
+    v->capacity = vr64(v->devcfg, 0);
+    v->up = true;
 
-    g_blkdev.block_count      = g_vblk.capacity;
-    g_blkdev.block_size       = SECTOR;
-    g_blkdev.read             = vblk_read;
-    g_blkdev.write            = vblk_write;
-    g_blkdev.flush            = vblk_flush;
-    g_blkdev.driver_data      = 0;
-    g_blkdev.dma_max_phys     = UINT64_MAX;
-    g_blkdev.needs_kernel_range = true;
+    v->blkdev.block_count        = v->capacity;
+    v->blkdev.block_size         = SECTOR;
+    v->blkdev.read               = vblk_read;
+    v->blkdev.write              = vblk_write;
+    v->blkdev.flush              = vblk_flush;
+    v->blkdev.driver_data        = v;
+    v->blkdev.dma_max_phys       = UINT64_MAX;
+    v->blkdev.needs_kernel_range = true;
 
-    if (embk_block_register(&g_blkdev) != 0) {
+    if (embk_block_register(&v->blkdev) != 0) {
         kprintf("virtio-blk: block layer refused registration\n");
-        g_vblk.up = false;
+        v->up = false;
         return false;
     }
-
     kprintf("virtio-blk: %s, %d sectors (%d MiB), queue %d, polled\n",
-            g_blkdev.name, (int)g_vblk.capacity,
-            (int)(g_vblk.capacity / 2048), (int)qs);
+            v->blkdev.name, (int)v->capacity, (int)(v->capacity / 2048), (int)qs);
+    return true;
+}
+
+bool virtio_blk_init(void) {
+    /* EVERY matching function, not the first: the second disk on the machine
+     * is the swap store or the crash test's seed, and was silently ignored
+     * while this loop stopped at one. Registration order is PCI scan order,
+     * so the first is sda -- the boot disk, on every configuration the
+     * harness makes. */
+    for (uint32_t i = 0; i < pci_devices_count() && g_nvblk < VBLK_MAX; i++) {
+        const struct pci_device *d = pci_get_device(i);
+        if (!d || d->vendor_id != VIRTIO_VENDOR ||
+            (d->device_id != VIRTIO_BLK_DEVID_T && d->device_id != VIRTIO_BLK_DEVID_M))
+            continue;
+        if (vblk_attach(&g_vblks[g_nvblk], d))
+            g_nvblk++;
+    }
+    if (g_nvblk == 0) {
+        kprintf("virtio-blk: no device\n");
+        return false;
+    }
     return true;
 }

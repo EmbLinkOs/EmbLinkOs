@@ -823,7 +823,7 @@ debug-arm64: $(ARM_IMG) $(ARM_ROOTFS)
 # one's leftovers and a re-run is not the same test as the first. It showed up
 # as an EMBKFS free-block count that disagreed with the superblock by one.
 .PHONY: test-arm64-boot
-test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
+test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img
 	@overall=0; \
 	for acc in $(ARM_TEST_ACCELS); do \
 	  case $$acc in \
@@ -834,7 +834,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  echo "=== $$acc ==="; \
 	  scratch=$(ARM_BUILD)/rootfs-$$acc.img; \
 	  cp $(ARM_ROOTFS) $$scratch; \
-	  disk="-drive file=$$scratch,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0"; \
+	  seed=$(ARM_BUILD)/crash-seed-$$acc.img; cp build/crash-seed.img $$seed; \
+	  disk="-drive file=$$scratch,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0 -drive file=$$seed,format=raw,if=none,id=d1 -device virtio-blk-pci,drive=d1"; \
 	  port=$$(awk 'BEGIN{srand();print 4500+int(rand()*400)}'); \
 	  host_t0=$$(date +%s); \
 	  $$qcmd $$disk $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -display none -serial file:$$log \
@@ -871,6 +872,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS)
 	  chk 'Network controller'             A7 'PCIe enumeration found no virtio device'; \
 	  chk 'pci: assigned'                  A7 'no BAR was assigned -- there is no firmware to do it here'; \
 	  chk 'virtio-blk: sda'              A7 'the virtio-blk device did not come up'; \
+	  chk 'power cut at every write: OK' A7 'the crash-consistency test did not pass here (seed disk sdb)'; \
 	  chk 'written and read back'        A7 'the disk failed a write/read round trip'; \
 	  chk 'EMBKFS: sda: mounted'         A7 'the real filesystem did not mount'; \
 	  chk 'ELF magic intact'             A7 'could not read a file out of the mounted image'; \

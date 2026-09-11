@@ -1057,6 +1057,27 @@ void arch_early_main(uint64_t dtb_phys) {
      * address WORKS and that unmapping GIVES THE MEMORY BACK. Both are checked
      * against the physical allocator's own free count, which is the only
      * number that cannot be faked by the thing under test. */
+    /* --- crash consistency, on THIS architecture too ----------------------
+     * The same test x86 runs as `make test-embkfs-crash`: the small seed image
+     * (attached by the harness as a second virtio-blk, "sdb") is copied into a
+     * RAM-backed block device, a workload of commits runs against it with
+     * every write after the N-th dropped, and the survivor must be exactly the
+     * state after some whole number of commits -- for every N. The filesystem
+     * is shared code; the block driver, the DMA path and the cache flushes
+     * under it are not, which is why it runs here and not only there. */
+    kprintf("\n--- EMBKFS crash consistency ---\n");
+    {
+        struct embk_block_device *seed = embk_block_get_by_name("sdb");
+        if (!seed) {
+            kprintf("  [info] no seed disk (sdb) attached: not run\n");
+        } else {
+            int rc = embkfs_run_crash_selftests(seed);
+            kprintf("  [%s] power cut at every write: %s\n",
+                    rc == EMBK_OK ? " ok " : "FAIL", rc == EMBK_OK ? "OK" : embk_strerror(rc));
+            if (rc != EMBK_OK) selftest_fails++;
+        }
+    }
+
     kprintf("\n--- mmap ---\n");
     {
         struct process *p = current_thread ? current_thread->proc : 0;
