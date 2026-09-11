@@ -1,3 +1,5 @@
+#include "drivers/storage/nvme.h"
+#include "block/block.h"
 #include "power/power.h"
 #include "include/errno.h"
 #include "include/kprintf.h"
@@ -155,7 +157,31 @@ int power_transition(enum power_transition what) {
             (unsigned long long)pages,
             what == POWER_REBOOT ? "reboot" : "power off");
 
+    /* THE DEVICES' OWN CACHES, which the line above does not reach. Writeback
+     * moves dirty pages to the disk driver; a drive with a volatile write cache
+     * reports those writes complete while they are still in its RAM. A FLUSH
+     * to every block device is what makes them durable -- the same barrier the
+     * filesystem uses at commit, applied once more to everything, because the
+     * power is about to stop being there to finish anything. */
+    int nflushed = 0;
+    for (uint32_t i = 0; i < embk_block_count(); i++) {
+        struct embk_block_device *d = embk_block_get(i);
+        if (d && d->flush && embk_block_flush(d) == EMBK_OK)
+            nflushed++;
+    }
+    kprintf("power: %d block device cache(s) flushed\n", nflushed);
+
+    /* Then tell NVMe drives the power is going, so they close out cleanly
+     * rather than count an unsafe shutdown and recover on the next boot. */
+    nvme_shutdown_all();
+
     int rc = (what == POWER_REBOOT) ? arch_power_reboot() : arch_power_off();
+
+    /* STILL HERE, so the machine is still running -- and its NVMe drives have
+     * just been told it is not. Bring them back before anything touches a
+     * file: the alternative is a live system whose disk answers every request
+     * with an error, which is worse than the power-off failing at all. */
+    nvme_restart_all();
 
     /* Reaching here means the firmware did not take the machine. Say so: "the
      * kernel could not power off this hardware" is actionable, and a silent

@@ -20,6 +20,7 @@
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
+#include "drivers/storage/nvme.h"
 #include "drivers/video/bootanim.h"
 
 #include "arch/x86_64/cpu/gdt.h"
@@ -1818,6 +1819,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
 
     // Register AHCI drives as block devices (after ahci_init filled sector counts)
     ahci_register_block_devices();
+
+    // NVMe AFTER ATA and AHCI, so a machine that has both keeps its SATA boot
+    // disk as sda -- the name everything below and the test harness expect.
+    // Before the partition scan, which is what gives an NVMe disk its sdX1..
+    nvme_init();
 
 
 

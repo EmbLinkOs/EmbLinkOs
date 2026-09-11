@@ -38,6 +38,7 @@
 #include "lib/random.h"                      /* test random */
 #include "lib/canary.h"                      /* test canary */
 #include "loader/pietest.h"
+#include "drivers/storage/nvme.h"
 #include <stddef.h>                            /* offsetof: test aslr */
 #include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
 #include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
@@ -434,6 +435,7 @@ static void selftests_print_commands(void)
     kprintf("  test random\n");
     kprintf("  test aslr\n");
     kprintf("  test pie\n");
+    kprintf("  test nvme\n");
     kprintf("  test canary\n");
     kprintf("  test hardlink\n");
     kprintf("  test embkfs crash   (needs sdc: make test-embkfs-crash)\n");
@@ -1445,6 +1447,25 @@ int selftests_handle_command(const char *cmd)
      * attacker cares about: knowing where yesterday's process put its text must
      * tell you nothing about today's.
      * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test nvme -- the NVMe driver, against a disk it is allowed to destroy.
+     *
+     * Reads every NVMe namespace's first block (safe, and itself a check),
+     * then writes, reads back and verifies only the one carrying the scratch
+     * marker: every PRP shape, a transfer split across commands, the last
+     * blocks of the namespace, that the LBA is honoured, that the end is
+     * enforced, and flush. Attach the scratch image with
+     *   NVME_DISK=build/nvme-scratch.img python3 tools/console_test.py "test nvme"
+     * (`make test-nvme` does that, at 512- and 4096-byte block sizes).
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test nvme") == 0) {
+        kprintf("\n[nvme] %d namespace(s)\n", nvme_namespace_count());
+        int rc = nvme_selftest_run();
+        if (rc == -EMBK_ENOENT) { kprintf("[cmd] test nvme: SKIP\n"); return 1; }
+        kprintf("[cmd] test nvme: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test pie") == 0) {
         if (!g_vfs_ready) { kprintf("\n[cmd] test pie: VFS not registered\n"); return 1; }
         const char *pp = "/data/apps/pieprobe/pieprobe.elf";

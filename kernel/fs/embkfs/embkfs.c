@@ -1566,10 +1566,21 @@ int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume 
     }
     uint64_t sb_lba = EMBKFS_SB_OFFSET / dev->block_size;
 
-    /* The 160-byte superblock fits in one 512-byte sector. Read both copies
-     * (primary + backup) and use the newest VALID one. */
-    static uint8_t sb_primary[512] __attribute__((aligned(8)));
-    static uint8_t sb_backup[512] __attribute__((aligned(8)));
+    /* The 160-byte superblock fits in one sector. Read both copies (primary +
+     * backup) and use the newest VALID one.
+     *
+     * ONE SECTOR IS dev->block_size BYTES, not 512, and these buffers are sized
+     * for the largest sector a registered device can have. They were 512, and
+     * every read below asks for ONE SECTOR: on a device formatted with 4096-byte
+     * sectors -- an NVMe namespace in 4Kn format, which is a normal thing to buy
+     * -- that is a 4096-byte DMA into a 512-byte static buffer, over whatever
+     * .bss happened to follow it. Nothing here had ever registered such a
+     * device; the NVMe driver is the first that can. */
+    if (dev->block_size < 512 || dev->block_size > 4096) {
+        return -EMBK_EINVAL;                 /* no driver registers these */
+    }
+    static uint8_t sb_primary[4096] __attribute__((aligned(8)));
+    static uint8_t sb_backup[4096] __attribute__((aligned(8)));
 
     bool primary_valid = false;
     bool backup_valid  = false;

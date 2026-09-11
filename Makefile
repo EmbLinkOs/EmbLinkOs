@@ -201,6 +201,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/usb/ohci.c \
              kernel/drivers/storage/ata.c \
              kernel/drivers/storage/ahci.c \
+             kernel/drivers/storage/nvme.c \
+             kernel/drivers/storage/nvmetest.c \
              kernel/block/block.c \
              kernel/block/partition.c \
              kernel/mm/pmm.c \
@@ -2672,6 +2674,28 @@ build/crash-seed.img: tools/embkfs_mkfs/mkfs_embkfs.py | $(BUILD)
 # attached as the fourth IDE disk. mkswap writes only block 0.
 build/swap.img: tools/mkswap.py | $(BUILD)
 	python3 tools/mkswap.py $@ 128
+
+# A disk the NVMe witness is ALLOWED TO DESTROY: 64 MiB, whose first bytes are
+# the marker kernel/drivers/storage/nvmetest.c looks for. A namespace without
+# it is read and never written. Made fresh by each run -- the test leaves its
+# patterns behind, and a stale pattern from a previous run is one of the things
+# it is built to tell apart from a real write.
+build/nvme-scratch.img: | $(BUILD)
+	python3 -c "f=open('$@','wb'); f.write(b'EMBKNVMETEST'.ljust(4096, b'\\0')); f.truncate(64 << 20); f.close()"
+
+# The NVMe driver, three ways, on x86:
+#   1. the witness on a 512-byte-block namespace,
+#   2. the same witness on a 4096-byte-block namespace (the 4Kn format a real
+#      SSD can ship in, and the one EMBKFS's mount path used to overflow on),
+#   3. the whole OS booted with its ROOT FILESYSTEM on NVMe -- the thing that
+#      has to work on the machine this is for.
+.PHONY: test-nvme
+test-nvme: $(IMG) embkfs.img
+	rm -f build/nvme-scratch.img && $(MAKE) --no-print-directory build/nvme-scratch.img
+	NVME_DISK=build/nvme-scratch.img python3 tools/console_test.py "test nvme"
+	rm -f build/nvme-scratch.img && $(MAKE) --no-print-directory build/nvme-scratch.img
+	NVME_DISK=build/nvme-scratch.img NVME_BLOCK=4096 python3 tools/console_test.py "test nvme"
+	NVME_ROOT=1 python3 tools/console_test.py "test posix"
 
 # THE LOGIN PATH, typed on the real keyboard (QMP sendkey into the PS/2
 # controller): logout of the auto-login session, first-boot setup, a refused

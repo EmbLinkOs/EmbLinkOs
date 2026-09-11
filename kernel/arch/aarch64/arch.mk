@@ -84,6 +84,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/lib/ksym.c \
                   kernel/drivers/bus/pci.c \
                   kernel/drivers/storage/virtio_blk.c \
+                  kernel/drivers/storage/nvme.c \
+                  kernel/drivers/storage/nvmetest.c \
                   kernel/block/block.c \
                   kernel/block/partition.c \
                   kernel/process/process.c \
@@ -946,7 +948,7 @@ debug-arm64: $(ARM_IMG) $(ARM_ROOTFS)
 # one's leftovers and a re-run is not the same test as the first. It showed up
 # as an EMBKFS free-block count that disagreed with the superblock by one.
 .PHONY: test-arm64-boot
-test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
+test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img build/nvme-scratch.img
 	@overall=0; \
 	for acc in $(ARM_TEST_ACCELS); do \
 	  case $$acc in \
@@ -959,7 +961,8 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
 	  cp $(ARM_ROOTFS) $$scratch; \
 	  seed=$(ARM_BUILD)/crash-seed-$$acc.img; cp build/crash-seed.img $$seed; \
 	  swapimg=$(ARM_BUILD)/swap-$$acc.img; cp build/swap.img $$swapimg; \
-	  disk="-drive file=$$scratch,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0 -drive file=$$seed,format=raw,if=none,id=d1 -device virtio-blk-pci,drive=d1 -drive file=$$swapimg,format=raw,if=none,id=d2 -device virtio-blk-pci,drive=d2"; \
+	  nvimg=$(ARM_BUILD)/nvme-$$acc.img; cp build/nvme-scratch.img $$nvimg; \
+	  disk="-drive file=$$scratch,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0 -drive file=$$seed,format=raw,if=none,id=d1 -device virtio-blk-pci,drive=d1 -drive file=$$swapimg,format=raw,if=none,id=d2 -device virtio-blk-pci,drive=d2 -drive file=$$nvimg,format=raw,if=none,id=nv0 -device nvme,serial=EMBKSCRATCH,drive=nv0"; \
 	  port=$$(awk 'BEGIN{srand();print 4500+int(rand()*400)}'); \
 	  host_t0=$$(date +%s); \
 	  $$qcmd $$disk $(ARM_GPU) $(ARM_INPUT) $(ARM_SND) -display none -serial file:$$log \
@@ -999,6 +1002,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
 	  chk 'power cut at every write: OK' A7 'the crash-consistency test did not pass here (seed disk sdb)'; \
 	  chk 'anonymous memory larger than RAM: OK' A7 'the swap witness did not pass here (store sdc)'; \
 	  chk 'the account store and the session policy: OK' A7 'the account store test did not pass here'; \
+	  chk 'nvme: every transfer shape written and read back: OK' NV 'the NVMe driver did not pass its witness (scratch namespace)'; \
 	  chk 'written and read back'        A7 'the disk failed a write/read round trip'; \
 	  chk 'EMBKFS: sda: mounted'         A7 'the real filesystem did not mount'; \
 	  chk 'ELF magic intact'             A7 'could not read a file out of the mounted image'; \
@@ -1105,6 +1109,9 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img
 	    echo "      its RELATIVE relocations applied, its constructor run, its"; \
 	    echo "      __thread variable intact, and a DIFFERENT address each run"; \
 	  fi; \
+	  echo "  NV NVMe over PCIe: controller brought up with no firmware to help,"; \
+	  echo "     every PRP shape and a split transfer written and read back, the"; \
+	  echo "     end of the namespace enforced, and a shutdown + restart survived"; \
 	  echo "  FD dup/dup2/F_DUPFD over a real shared open file"; \
 	  echo "     description: two descriptors, ONE cursor"; \
 	  echo "  PC the unified page cache: write-back, one object per file,"; \

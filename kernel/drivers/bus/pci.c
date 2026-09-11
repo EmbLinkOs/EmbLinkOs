@@ -334,12 +334,22 @@ void pci_enable_bus_mastering(uint8_t bus, uint8_t device, uint8_t function) {
     uint32_t dword = pci_read32(bus, device, function, PCI_COMMAND); // PCI command register
     dword |= (1 << 2 ); // Set bus mastering bit
     // Also ensure I/O space and memory space are enabled (bits 0 and 1) otherwise the device won't respond to MMIO or I/O accesses even if bus mastering is enabled
-    dword |= (1 << 0);
+    //
+    // BIT 1 WAS NEVER SET, despite the line above saying it was. Every MMIO
+    // device this is called for -- AHCI, the virtio transport -- worked anyway,
+    // because the emulator's firmware (SeaBIOS; the aarch64 BAR assigner) had
+    // already turned memory decoding on. Real firmware usually does the same
+    // for the disk it booted from and is under no obligation to for anything
+    // else. A device whose memory space is off answers every MMIO read with all
+    // ones, which reads as "controller not responding", which is exactly what a
+    // perfectly good second drive would have looked like.
+    dword |= (1 << 0) | (1 << 1);
     pci_write32(bus, device, function, PCI_COMMAND, dword); // Write back to PCI command register
 
     uint32_t verify = pci_read32(bus, device, function, PCI_COMMAND);
-    kprintf("IDE PCI command now %x (bus master %s)\n",
-            (unsigned int)(verify & 0xFFFF), (verify & (1 << 2)) ? "ON" : "OFF");
+    kprintf("pci: %02x:%02x.%x command now %x (memory %s, bus master %s)\n",
+            bus, device, function, (unsigned int)(verify & 0xFFFF),
+            (verify & (1 << 1)) ? "ON" : "OFF", (verify & (1 << 2)) ? "ON" : "OFF");
 }
 
 /* --- resource assignment (see pci.h) --------------------------------------

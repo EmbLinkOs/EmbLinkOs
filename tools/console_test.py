@@ -16,6 +16,10 @@ Options via the environment, because a Makefile target sets them and a person
 rarely needs to:
     EXTRA_DISK   a third raw image, attached as IDE index 2 (the kernel names
                  it sdc). Used by tests that want a disk they may destroy.
+    NVME_DISK    a raw image on an NVMe controller, for `test nvme`; it must
+                 carry the scratch marker (make build/nvme-scratch.img).
+    NVME_BLOCK   that namespace's logical block size: 512 (default) or 4096.
+    NVME_ROOT    1 = attach embkfs.img over NVMe instead of IDE index 1.
     SWAP_DISK    a raw image with an EMBKSWAP header (tools/mkswap.py),
                  attached as IDE index 3; the kernel finds it by the header.
     SMP, MEM     cores (4) and memory (2G).
@@ -42,9 +46,27 @@ def main(cmds):
         return 2
 
     extra = os.environ.get("EXTRA_DISK")
+    # NVME_ROOT=1 moves the root filesystem off IDE and onto an NVMe controller:
+    # the boot sector and kernel still come from IDE index 0 (that is how this
+    # machine's legacy boot path finds them), and EMBKFS is found on whichever
+    # block device holds it. It is the configuration of a real machine whose
+    # only disk is an NVMe SSD, minus the firmware.
+    nvme_root = os.environ.get("NVME_ROOT")
     argv = ["qemu-system-x86_64", "-cpu", "max",
-            "-drive", "format=raw,file=%s/myos.img,if=ide,index=0" % ROOT,
-            "-drive", "format=raw,file=%s/embkfs.img,if=ide,index=1" % ROOT]
+            "-drive", "format=raw,file=%s/myos.img,if=ide,index=0" % ROOT]
+    if nvme_root:
+        argv += ["-drive", "format=raw,file=%s/embkfs.img,if=none,id=nvroot" % ROOT,
+                 "-device", "nvme,serial=EMBKROOT,drive=nvroot"]
+    else:
+        argv += ["-drive", "format=raw,file=%s/embkfs.img,if=ide,index=1" % ROOT]
+    # NVME_DISK: a scratch image on its own NVMe controller, for `test nvme`.
+    # NVME_BLOCK sets its logical block size (512 default; 4096 is 4Kn).
+    nvme = os.environ.get("NVME_DISK")
+    if nvme:
+        blk = os.environ.get("NVME_BLOCK", "512")
+        argv += ["-drive", "format=raw,file=%s,if=none,id=nvscratch" % os.path.abspath(nvme),
+                 "-device", "nvme,serial=EMBKSCRATCH,drive=nvscratch,"
+                            "logical_block_size=%s,physical_block_size=%s" % (blk, blk)]
     if extra:
         argv += ["-drive", "format=raw,file=%s,if=ide,index=2" % os.path.abspath(extra)]
     swap = os.environ.get("SWAP_DISK")

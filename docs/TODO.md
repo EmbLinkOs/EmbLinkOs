@@ -795,6 +795,67 @@ The measurement immediately earned itself twice:
 
 ## Storage
 
+### NVMe (the disk interface of a modern machine)
+- [x] **NVMe driver, both architectures** (`kernel/drivers/storage/nvme.c`).
+      Until it existed the OS had no disk on a machine that boots from an NVMe
+      SSD, which is most machines built in the last several years -- ATA and
+      AHCI are SATA, virtio-blk exists only in a VM. One admin and one I/O queue
+      pair per controller, polled with interrupts masked at the controller AND
+      at PCI, one command in flight under a sleeping lock, a physically
+      contiguous bounce buffer with the three PRP shapes (one page, two pages,
+      a list). Namespaces found through the ACTIVE list (QEMU's controller
+      declares 256 possible; counting 1..NN would be 256 identify commands).
+      Proven by the witness (`nvmetest.c`, `make test-nvme`, and in every
+      aarch64 boot test): every PRP shape, a transfer split past MDTS, the last
+      blocks of the namespace, that the LBA is honoured, that the end is
+      enforced, flush, and a shutdown notification followed by a restart --
+      at 512- AND 4096-byte block sizes. And by booting the WHOLE OS with its
+      root filesystem on NVMe: x86 (desktop, `test posix` ALL PASS) and aarch64
+      with no virtio disk at all.
+- [x] **Power-off tells the drives.** `power_transition()` now flushes every
+      block device's cache and sends NVMe drives the normal shutdown
+      notification before asking the firmware to cut power -- and, because on
+      real x86 hardware that request can fail today (no AML interpreter; see
+      power_x86.c), RESTARTS them when it does, rather than leave a running
+      machine with disks that refuse every command.
+- [ ] MSI-X and one I/O queue per core. Worth nothing while the filesystem
+      serialises above the driver; worth measuring the day it does not.
+- [ ] Dataset Management (TRIM). An SSD that is never told which blocks are
+      free degrades as it fills. EMBKFS knows exactly which blocks it frees.
+- [ ] Namespaces with per-block metadata (end-to-end protection) are skipped,
+      and so are controllers whose minimum memory page is not 4 KiB. Neither is
+      found on consumer drives; both are refused BY NAME in the boot log.
+- [ ] **4Kn disks have no partitions.** `partition.c` skips any disk whose
+      sector is not 512 bytes, so a 4096-byte-sector NVMe drive with a GPT on it
+      exposes the whole disk and none of its partitions. Whole-disk EMBKFS on a
+      4Kn namespace works (tested). An installer that partitions a 4Kn drive
+      needs this first.
+- [ ] **aarch64 never scans partitions at all** -- `embk_partition_scan_all()`
+      is called from kernel/main.c only. Harmless while every aarch64 disk is a
+      whole-disk image; not harmless on hardware.
+
+### Found on the way (fixed)
+- [x] **EMBKFS mount overflowed on 4096-byte sectors.** The superblock was read
+      as ONE SECTOR into a 512-byte static buffer, so a 4Kn device would have
+      DMA'd 4096 bytes over whatever followed it in .bss. No driver had ever
+      registered such a device; the NVMe driver was the first that could.
+- [x] **`pci_enable_bus_mastering()` never enabled memory decoding.** Its
+      comment said bits 0 and 1; its code set bit 0. Every MMIO device worked
+      because emulator firmware had already set it. Real firmware owes that to
+      no device but the one it booted from.
+
+### Found on the way (open)
+- [ ] **EMBKFS's free-block counter drifts across hard power cuts.** The x86
+      development image, hard-killed by hundreds of test runs, mounts with
+      `allocator built: 19046 used, 13722 free (superblock says 13714) --
+      MISMATCH`: the superblock's counter is 8 blocks off from its OWN tree. A
+      freshly built image mounts with OK (every aarch64 boot test copies one).
+      No data is at risk -- the allocator uses the bitmap rebuilt from the
+      tree, not the counter -- but the counter is written back at every commit,
+      so the drift never heals, and `test embkfs crash` does not check it. Find
+      which commit ordering lets the counter and the tree disagree, then make
+      the crash test assert the counter too.
+
 ### ATA / DMA
 - [x] PRD_EOT had a stray trailing semicolon (`#define PRD_EOT 0x8000;`) in
   ata.c. Works in the current single-assignment use but will break inside a

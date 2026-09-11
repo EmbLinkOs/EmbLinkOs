@@ -13,7 +13,8 @@
 #include "fs/embkfs/embkfs.h"
 #include "mm/swap.h"          /* swap_init: the store, if a disk carries the header */
 #include "mm/swaptest.h"
-#include "loader/pietest.h"      /* the swap witness, driven */
+#include "loader/pietest.h"
+#include "drivers/storage/nvme.h"      /* the swap witness, driven */
 #include "fs/vfs.h"
 #include "arch/aarch64/cpu/cpu_features.h"
 #include "include/uaccess_guard.h"
@@ -573,6 +574,22 @@ void arch_early_main(uint64_t dtb_phys) {
         selftest_blk();
     else
         kprintf("  [info] no virtio-blk attached\n");
+    /* NVMe after virtio-blk, so the root disk the harness attaches first keeps
+     * the name sda. On real aarch64 hardware there is no virtio at all and this
+     * is the only disk there is. */
+    if (nvme_init()) {
+        kprintf("  [ ok ] nvme: %d namespace(s) registered\n", nvme_namespace_count());
+        /* The same witness x86 runs as `test nvme`. It writes only to a
+         * namespace carrying the scratch marker; with none attached it reads
+         * block 0 of each namespace and stops. */
+        int rc = nvme_selftest_run();
+        if (rc == 0)
+            kprintf("  [ ok ] nvme: every transfer shape written and read back: OK\n");
+        else if (rc != -EMBK_ENOENT) {
+            kprintf("  [FAIL] nvme: the witness failed\n");
+            selftest_fails++;
+        }
+    }
 
     /* --- the real filesystem -------------------------------------------------
      * process_init() first: EMBKFS takes sleeping locks, and a sleeping lock
