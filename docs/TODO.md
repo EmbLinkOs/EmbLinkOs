@@ -576,6 +576,30 @@ approximated, which is why none of them is a silent bug waiting to be found:
     priority for reads over the writer's stream. Two things from the
     attempt stayed: the ATA driver's own lock (below) and the worst-fault
     metric `test swap` prints.
+  - [ ] **...and the concurrent device queue was then built, measured and
+    reverted too (2026-09-11).** virtio-blk (aarch64's disk) rewritten to keep
+    four requests in flight -- a slot with three descriptors and its own
+    staging buffer each, a counting semaphore for the slots, completion by
+    interrupt (which needed the transport to map virtio's ISR window: this
+    QEMU machine has no ITS, so MSI is unavailable and a legacy INTx, which
+    must be acknowledged or it wedges the machine, is the only interrupt
+    there is) -- and the block layer's one global bounce buffer taken out of
+    the path (`needs_kernel_range = false`, the driver stages per slot). It
+    worked, and it was **slower**: the swap witness 1586 ms against 1172 ms
+    polled, 1330 ms with a spin-then-sleep wait. Two reasons, and the second
+    is the one that matters:
+      1. On a device the host services in tens of microseconds, an interrupt
+         plus a wake plus a context switch each way costs more than the
+         transfer. Polling wins -- which is why the driver polled.
+      2. **Nothing above the driver can issue concurrent I/O.** Every file
+         read goes through EMBKFS's ONE filesystem lock, and all swap traffic
+         goes through the page cache's ONE lock (the entry above, from the
+         other side). Four slots have nothing to overlap: the device queue was
+         never the bottleneck, the locks above it are.
+    So the driver stays as it was, and what to build first is the locking
+    above it -- per-object cache locking, and a filesystem that admits more
+    than one reader. A device queue is worth having the day there is
+    something to put in it.
   - [x] **The ATA driver had no lock.** Its command path is file-scope state
     (one PRDT, one bounce, one completion flag per channel) and every caller
     happened to arrive under some other lock -- the filesystem's, or the
