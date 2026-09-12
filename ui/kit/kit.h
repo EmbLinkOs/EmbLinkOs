@@ -164,6 +164,13 @@ void ui_text_field_autofocus(void);
 void ui_clipboard_provider(int (*set)(const char *buf, unsigned len),
                            int (*get)(char *buf, unsigned cap));
 
+/* Use it. For widgets built OUTSIDE the kit that still need the one clipboard
+ * the application installed -- the DSL's multi-line editor is one. Both are
+ * no-ops returning 0 when no provider is installed, so a caller never has to
+ * ask whether there is one. */
+int ui_clipboard_set(const char *buf, unsigned len);
+int ui_clipboard_get(char *buf, unsigned cap);
+
 /* Pixel width of the first `nbytes` of `s` (nbytes < 0 = the whole string),
  * stepped with the RENDERER's own UTF-8 decoder. Measuring text any other way
  * than it is drawn puts a caret where the glyphs are not. */

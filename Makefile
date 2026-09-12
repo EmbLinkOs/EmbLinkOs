@@ -2594,6 +2594,14 @@ declare-test:
 
 # The text field and the keyboard: autofocus, Tab traversal (and the keys
 # typed after a Tab), wrap, Return, focus let go when its field is gone.
+# The DSL's multi-line editor, on the host. em.c compiles standalone (it knows
+# nothing about the kernel), so the editor every EmUI app uses can be driven
+# here in a second instead of only by booting a machine and typing.
+em-test:
+	$(HOSTCC) -std=c11 -Wall -Wextra -O2 $(UI_INC) -Iui/dsl \
+	    $(UI_SRC) ui/dsl/em.c ui/dsl/em_test.c -lm -o $(BUILD)/em_test
+	$(BUILD)/em_test
+
 kit-test:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 $(UI_INC) $(UI_SRC) ui/kit/kit_test.c -lm -o $(BUILD)/kit_test
 	$(BUILD)/kit_test

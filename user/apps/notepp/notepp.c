@@ -350,11 +350,36 @@ static int on_key(int ch) {
         return 0;
     }
 
+    /* THE SYSTEM'S EDITING KEYS, which are the GUI key's and not Ctrl's.
+     *
+     * Ctrl+C cannot be copy in this OS -- 0x03 is the console interrupt and is
+     * consumed in the driver whenever something has routed one, so this app's
+     * own Ctrl+C below works only while no terminal is running a job. The GUI
+     * key has no such problem, and these bytes arrive already decided by the
+     * driver, modifiers and all. The Ctrl shortcuts stay exactly as they were;
+     * this is an addition, not a replacement.
+     *
+     * Below the focus check, like every other document shortcut here: with the
+     * find box focused these bytes never reach this point and the toolkit's own
+     * field handles them, so copying in the find box copies the find box. This
+     * is the DOCUMENT's copy. */
+    if (ch == EMBK_KEY_SEL_ALL) { ed_select_all(&ED); return 1; }
+    if (ch == EMBK_KEY_COPY || ch == EMBK_KEY_CUT) {
+        char tmp[4096];
+        int n = ed_copy(&ED, tmp, sizeof tmp);
+        if (n) { embk_clip_set(tmp, (size_t)n);
+                 if (ch == EMBK_KEY_CUT) ed_delete_sel(&ED);
+                 snprintf(g_msg, sizeof g_msg, "%d bytes %s", n,
+                          ch == EMBK_KEY_CUT ? "cut" : "copied"); }
+        return 1;
+    }
+
     /* PASTE, taken raw. The runtime would otherwise replay the clipboard
      * through this hook with newlines flattened to spaces, which is the right
      * rule for a terminal and turns a pasted function into one long line here.
-     * Taking 0x16 ourselves keeps the line breaks. */
-    if (ch == 0x16) {
+     * Taking 0x16 (Ctrl+V) and EMBK_KEY_PASTE (GUI+V) ourselves keeps the line
+     * breaks. */
+    if (ch == 0x16 || ch == EMBK_KEY_PASTE) {
         static char clip[8192];
         int64_t n = embk_clip_get(clip, sizeof clip - 1);
         if (n > 0) {

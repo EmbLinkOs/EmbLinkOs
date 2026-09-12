@@ -2751,6 +2751,39 @@ Open:
       18%: a soft plate says "this row is the current one" and may whisper, but
       a selection is what the next keystroke is about to destroy.
 
+- [x] **The MULTI-LINE editor too, and a host test for the DSL at last** (done
+      2026-09-12). `em_text_editor` -- the editor every EmUI application uses --
+      got the same selection, copy, cut and paste. Its line renderer now cuts
+      each line at every boundary that matters (syntax span end, selection edge,
+      caret) and emits each piece with the colour and highlight in force there,
+      rather than nesting "is the caret in this span" against "is the selection
+      in this span".
+
+      It pastes ITSELF rather than taking the runtime's app-wide replay, because
+      that replay flattens newlines to spaces -- right for a terminal, where a
+      pasted newline would execute something, and wrong for an editor, where it
+      silently collapses a pasted block onto one line.
+
+      THIS FIXED A REGRESSION THE SAME CHANGE CREATED. The editor's default
+      branch inserts any byte >= 0x80, which is how é and € arrive -- so the
+      moment the driver began sending commands at 0xF8..0xFF, GUI+C in Note++
+      would have typed a garbage character into the document instead of copying.
+      Every command is now an explicit case AND the insert branch is bounded
+      below 0xF8.
+
+      That bug is why ui/dsl/em_test.c exists: em.c compiles standalone on the
+      host (it knows nothing about the kernel), so `make em-test` drives the
+      real editor through the real layout stack in a second, where before it
+      could only be exercised by booting a machine and typing. 11 claims. It was
+      MUTATION-CHECKED rather than trusted for passing first time: removing the
+      0xF8 bound and one command's case makes three of its claims fail.
+
+      Note++ and Vellum learned the GUI keys as well. Both had their own Ctrl+C,
+      which works only while nothing has routed an interrupt -- so copying from
+      a page or a document silently did nothing whenever a terminal was running
+      a job. Their Ctrl shortcuts are untouched; the GUI ones are the reliable
+      half beside them.
+
 ### The dock tells the truth about what is running (done 2026-09-12)
 
 - [x] **A running app the dock did not start now lights its tile.** The desktop

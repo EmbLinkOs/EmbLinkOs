@@ -3142,6 +3142,22 @@ void em_context_menu_end_(void) {
 #define EMK_HOME  0x02
 #define EMK_END   0x05
 #define EMK_DEL   0x7F
+/* The editing commands, delivered in this same byte stream at values that can
+ * never occur in valid UTF-8. Kept in step with UI_KEY_* (ui/kit/kit.h) and
+ * EK_* (kernel/drivers/input/keyboard.h).
+ *
+ * THEY MUST BE NAMED HERE OR THEY BECOME TEXT. This editor's default case
+ * inserts any byte >= 0x80 -- which is right for é and € and exactly wrong for
+ * these -- so the moment the driver started sending them, GUI+C in Note++ would
+ * have typed a garbage character into the document instead of copying. */
+#define EMK_SEL_LEFT  0xF8
+#define EMK_SEL_RIGHT 0xF9
+#define EMK_SEL_HOME  0xFA
+#define EMK_SEL_END   0xFB
+#define EMK_SEL_ALL   0xFC
+#define EMK_COPY      0xFD
+#define EMK_CUT       0xFE
+#define EMK_PASTE     0xFF
 
 /* ---- editing primitives on a NUL-terminated buffer + byte cursor -------- */
 static void te_insert(char *buf, size_t cap, int *len, int *cur, char c) {
@@ -3207,8 +3223,37 @@ void em_editor_gutter(int on) { g_gutter = on; }
  * caret box dropped in at `caret` (-1 for none) -- splitting whichever span it
  * lands inside, so the line being edited keeps its colours. Drawing that line
  * plain would make the one line you are looking at the only uncoloured one. */
+/* One run of the line, in one colour, either selected or not.
+ *
+ * The highlight is set as the one-shot text background immediately before the
+ * text node -- em_text_impl's non-wrapping path emits exactly one ui_text and
+ * nothing before it, so the one-shot cannot land on the wrong node. It is NOT
+ * passed as EmProps.background, which would be read as a request for a BOX
+ * (props_wrap) and paint a filled rectangle instead of a highlight behind the
+ * glyphs. */
+static void te_run(const char *src, int a, int b, Color col, int selected,
+                   const struct ui_theme *t) {
+    if (b <= a) return;
+    char tmp[512];
+    int n = b - a;
+    if (n > (int)sizeof tmp - 1) n = (int)sizeof tmp - 1;
+    memcpy(tmp, src + a, (size_t)n); tmp[n] = 0;
+    if (selected) ui_set_text_bg(t->selection);
+    EmProps tp = { .font = Body, .color = col };
+    em_text_impl(tmp, tp);
+}
+
+static void te_caret_box(const struct ui_theme *t) {
+    ui_box_begin(0);
+    ui_set_paint(solid(t->accent));
+    ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
+    ui_box_end();
+}
+
+/* `slo`/`shi` are ABSOLUTE buffer offsets and may lie entirely outside this
+ * line; the intersection is taken per span. */
 static void te_draw_line(const char *buf, int i, int e, int caret, int lineno,
-                         int gutter, const struct ui_theme *t) {
+                         int gutter, int slo, int shi, const struct ui_theme *t) {
     char tmp[512];
     ui_begin_hstack((uint64_t)(lineno + 1));
     ui_set_align(ALIGN_CENTER);
@@ -3228,40 +3273,35 @@ static void te_draw_line(const char *buf, int i, int e, int caret, int lineno,
     if (g_syn_fn && n > 0) ns = g_syn_fn(buf + i, n, spans, 128, g_syn_ud);
     if (ns <= 0) { spans[0].len = n; spans[0].color = t->text; ns = n > 0 ? 1 : 0; }
 
+    /* The line is cut at every boundary that matters -- where a syntax span
+     * ends, where the selection starts or stops, and where the caret is -- and
+     * each piece emitted with the colour and highlight in force there. Walking
+     * boundaries rather than nesting "is the caret in this span / is the
+     * selection in this span" keeps the caret and the selection from having to
+     * know about each other. */
     int off = 0;
     for (int k = 0; k < ns; k++) {
         int sl = spans[k].len;
         if (off + sl > n) sl = n - off;
         if (sl <= 0) continue;
-        int rel = caret - off;                 /* caret position within this span */
-        if (caret >= 0 && rel >= 0 && rel < sl) {
-            if (rel > 0) {
-                memcpy(tmp, buf + i + off, (size_t)rel); tmp[rel] = 0;
-                EmProps tp = { .font = Body, .color = spans[k].color };
-                em_text_impl(tmp, tp);
-            }
-            ui_box_begin(0);
-            ui_set_paint(solid(t->accent));
-            ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
-            ui_box_end();
-            int rest = sl - rel;
-            memcpy(tmp, buf + i + off + rel, (size_t)rest); tmp[rest] = 0;
-            EmProps tp = { .font = Body, .color = spans[k].color };
-            em_text_impl(tmp, tp);
-        } else {
-            memcpy(tmp, buf + i + off, (size_t)sl); tmp[sl] = 0;
-            EmProps tp = { .font = Body, .color = spans[k].color };
-            em_text_impl(tmp, tp);
+        int send = off + sl;
+
+        int p = off;
+        while (p < send) {
+            if (caret == p) te_caret_box(t);
+            int sel = (i + p >= slo && i + p < shi);
+            /* The next place anything changes. */
+            int q = send;
+            if (caret > p && caret < q) q = caret;
+            if (sel) { if (shi - i > p && shi - i < q) q = shi - i; }
+            else     { if (slo - i > p && slo - i < q) q = slo - i; }
+            te_run(buf + i, p, q, spans[k].color, sel, t);
+            p = q;
         }
-        off += sl;
+        off = send;
     }
     /* caret at (or past) the end of the line, including an empty line */
-    if (caret >= 0 && caret >= off) {
-        ui_box_begin(0);
-        ui_set_paint(solid(t->accent));
-        ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
-        ui_box_end();
-    }
+    if (caret >= 0 && caret >= off) te_caret_box(t);
     /* An all-empty row collapses in an ALIGN_CENTER hstack, so an empty,
      * caret-less line still needs something with a height. */
     if (!off && caret < 0 && !gutter) {
@@ -3283,6 +3323,17 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
     if (cur > len) cur = len;
     if (cur < 0) cur = 0;
 
+    /* THE SELECTION ANCHOR. The caret itself belongs to the CALLER (it is the
+     * `cursor` argument, so an app can put it where it likes and keep it across
+     * documents); the anchor is ours, and is remembered per BUFFER so that
+     * switching documents does not carry a stale selection into the new one.
+     * anchor == cur means nothing is selected. */
+    static const char *ted_buf;
+    static int ted_anchor;
+    if (ted_buf != buf) { ted_buf = buf; ted_anchor = cur; }
+    if (ted_anchor > len) ted_anchor = len;
+    if (ted_anchor < 0) ted_anchor = 0;
+
     ui_begin_vstack(0);
     struct instance_handle self = ui_open();
     if (ui_consume_click(self)) ui_request_focus(self);
@@ -3291,22 +3342,78 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
     if (focused) {
         char in[64];
         int n = ui_input_take(in, (int)sizeof in);
+        /* Remove the selected text, leaving the caret where it was. Every edit
+         * that writes runs this first: typing over a selection, backspace and
+         * delete with one, and a paste all mean "this goes away". */
+        #define TED_DROP() do {                                                 \
+            if (ted_anchor != cur) {                                            \
+                int lo = ted_anchor < cur ? ted_anchor : cur;                   \
+                int hi = ted_anchor < cur ? cur : ted_anchor;                   \
+                memmove(buf + lo, buf + hi, (size_t)(len - hi + 1));            \
+                len -= hi - lo;                                                 \
+                cur = ted_anchor = lo;                                          \
+            }                                                                   \
+        } while (0)
+
         for (int i = 0; i < n; i++) {
             unsigned char c = (unsigned char)in[i];
+            int lo = ted_anchor < cur ? ted_anchor : cur;
+            int hi = ted_anchor < cur ? cur : ted_anchor;
             switch (c) {
-                case '\b':      te_backspace(buf, &len, &cur); break;
-                case EMK_DEL:   te_delete(buf, &len, &cur); break;
-                case '\n': case '\r': te_insert(buf, cap, &len, &cur, '\n'); break;
-                case '\t':      te_insert(buf, cap, &len, &cur, ' ');
-                                te_insert(buf, cap, &len, &cur, ' '); break;
-                case EMK_LEFT:  cur = te_prev(buf, cur); break;
-                case EMK_RIGHT: cur = te_next(buf, len, cur); break;
-                case EMK_HOME:  cur = te_line_start(buf, cur); break;
-                case EMK_END:   cur = te_line_end(buf, len, cur); break;
+                case EMK_SEL_LEFT:  cur = te_prev(buf, cur); break;
+                case EMK_SEL_RIGHT: cur = te_next(buf, len, cur); break;
+                case EMK_SEL_HOME:  cur = te_line_start(buf, cur); break;
+                case EMK_SEL_END:   cur = te_line_end(buf, len, cur); break;
+                case EMK_SEL_ALL:   ted_anchor = 0; cur = len; break;
+                case EMK_COPY: case EMK_CUT:
+                    /* Nothing selected must not CLEAR the clipboard: a
+                     * mis-aimed copy that wiped it would lose the thing you
+                     * were about to paste. */
+                    if (hi > lo) ui_clipboard_set(buf + lo, (unsigned)(hi - lo));
+                    if (c == EMK_CUT) TED_DROP();
+                    break;
+                case EMK_PASTE: {
+                    /* Unlike the single-line field, this editor pastes ITSELF.
+                     * The runtime's app-wide replay flattens newlines to spaces
+                     * -- correct for a terminal, where a pasted newline would
+                     * execute something, and wrong here, where it silently
+                     * collapses a pasted block onto one line. An editor is
+                     * exactly the case that has to handle its own. */
+                    char clip[2048];
+                    int got = ui_clipboard_get(clip, (unsigned)sizeof clip);
+                    if (got > 0) {
+                        TED_DROP();
+                        for (int k = 0; k < got; k++)
+                            te_insert(buf, cap, &len, &cur, clip[k]);
+                        ted_anchor = cur;
+                    }
+                    break;
+                }
+                case '\b':      if (hi > lo) TED_DROP(); else te_backspace(buf, &len, &cur);
+                                ted_anchor = cur; break;
+                case EMK_DEL:   if (hi > lo) TED_DROP(); else te_delete(buf, &len, &cur);
+                                ted_anchor = cur; break;
+                case '\n': case '\r': TED_DROP(); te_insert(buf, cap, &len, &cur, '\n');
+                                ted_anchor = cur; break;
+                case '\t':      TED_DROP();
+                                te_insert(buf, cap, &len, &cur, ' ');
+                                te_insert(buf, cap, &len, &cur, ' ');
+                                ted_anchor = cur; break;
+                /* A plain arrow COLLAPSES a selection to the edge it moves
+                 * toward, rather than moving from wherever the caret happens to
+                 * be -- what anyone who has just selected something and changed
+                 * their mind expects. */
+                case EMK_LEFT:  cur = hi > lo ? lo : te_prev(buf, cur);
+                                ted_anchor = cur; break;
+                case EMK_RIGHT: cur = hi > lo ? hi : te_next(buf, len, cur);
+                                ted_anchor = cur; break;
+                case EMK_HOME:  cur = te_line_start(buf, cur); ted_anchor = cur; break;
+                case EMK_END:   cur = te_line_end(buf, len, cur); ted_anchor = cur; break;
                 case EMK_UP: {
                     int ls = te_line_start(buf, cur), col = cur - ls;
                     if (ls > 0) { int pls = te_line_start(buf, ls - 1), ple = ls - 1;
                                   cur = pls + (col < ple - pls ? col : ple - pls); }
+                    ted_anchor = cur;
                     break;
                 }
                 case EMK_DOWN: {
@@ -3314,17 +3421,26 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
                     int le = te_line_end(buf, len, cur);
                     if (le < len) { int nls = le + 1, nle = te_line_end(buf, len, nls);
                                     cur = nls + (col < nle - nls ? col : nle - nls); }
+                    ted_anchor = cur;
                     break;
                 }
                 default:
                     /* >= 0x80 is a byte of a real character: é, €, a dead-key
                      * composition. They arrive contiguously and are inserted in
-                     * order, so the sequence lands intact at the cursor. */
-                    if ((c >= 32 && c < 127) || c >= 0x80)
+                     * order, so the sequence lands intact at the cursor.
+                     *
+                     * The command bytes are ABOVE this range and every one of
+                     * them is handled by a case above, which is what keeps them
+                     * out of the document -- see EMK_SEL_LEFT's comment. */
+                    if ((c >= 32 && c < 127) || (c >= 0x80 && c < EMK_SEL_LEFT)) {
+                        TED_DROP();
                         te_insert(buf, cap, &len, &cur, (char)c);
+                        ted_anchor = cur;
+                    }
                     break;
             }
         }
+        #undef TED_DROP
         if (cursor) *cursor = cur;
         em_request_frame();   /* keep the loop live while typing */
     }
@@ -3359,8 +3475,10 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
         while (i <= len) {
             int e = i; while (e < len && buf[e] != '\n') e++;
             int is_cur = (cur >= i && cur <= e);
+            int slo = focused ? (ted_anchor < cur ? ted_anchor : cur) : 0;
+            int shi = focused ? (ted_anchor < cur ? cur : ted_anchor) : 0;
             te_draw_line(buf, i, e, (is_cur && focused) ? cur - i : -1,
-                         line, gutter, t);
+                         line, gutter, slo, shi, t);
             line++;
             i = e + 1;
             if (e == len) break;

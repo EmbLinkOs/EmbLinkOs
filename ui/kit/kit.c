@@ -446,6 +446,12 @@ void ui_clipboard_provider(int (*set)(const char *, unsigned),
                            int (*get)(char *, unsigned)) {
     g_clip_set = set; g_clip_get = get;
 }
+int ui_clipboard_set(const char *buf, unsigned len) {
+    return g_clip_set ? g_clip_set(buf, len) : 0;
+}
+int ui_clipboard_get(char *buf, unsigned cap) {
+    return g_clip_get ? g_clip_get(buf, cap) : 0;
+}
 
 /* Continuation bytes are 10xxxxxx: never a character's first byte. */
 static bool cp_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }

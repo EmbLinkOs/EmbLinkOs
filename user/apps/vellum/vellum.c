@@ -796,7 +796,12 @@ static int vellum_key(int ch) {
             return 1;
         }
     }
-    if (ch == 0x03) {                     /* Ctrl+C */
+    /* COPY IS ON BOTH MODIFIERS, and the GUI one is the reliable half. Ctrl+C
+     * is 0x03, which the keyboard driver consumes as an INTERRUPT whenever
+     * anything has routed one -- so copying from a page silently did nothing
+     * while a terminal was running a job. The GUI key is the interface's, and
+     * cannot be taken away like that. */
+    if (ch == 0x03 || ch == EMBK_KEY_COPY) {
         static char sel[16384];
         size_t n = vsel_copy_text(sel, sizeof sel);
         if (n) embk_clip_set(sel, n);
@@ -805,7 +810,8 @@ static int vellum_key(int ch) {
         snprintf(g_status_done, sizeof g_status_done, "%s", g_status);
         return 1;
     }
-    if (ch == 0x01) { return vsel_all(); }   /* Ctrl+A: the whole document */
+    /* Ctrl+A / GUI+A: the whole document */
+    if (ch == 0x01 || ch == EMBK_KEY_SEL_ALL) { return vsel_all(); }
     if (ch == 27 && vsel_clear()) return 1;  /* Esc drops a selection first */
     /* Enter in a form field submits it -- a search box you cannot submit from
      * the keyboard feels broken, and every browser has behaved this way since
