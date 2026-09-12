@@ -2471,6 +2471,60 @@ Open:
       mapped there. Guarded on both architectures. Nothing reaps those threads
       today, which is the only reason it never fired.
 
+### The key stream speaks Unicode now (done 2026-09-12)
+
+- [x] **AZERTY ships, and é è ç à ù type.** The driver used to refuse the
+      layout outright, and was right to: the char stream was 7-bit, so an
+      "AZERTY" on it could only have been QWERTY-with-letters-moved and silent
+      holes where the accents belong. What changed, end to end:
+
+      * layouts are tables of CODEPOINTS, not chars (the US and Dvorak tables
+        did not change one entry -- `'a'` is as valid a uint32_t initialiser);
+      * DEAD KEYS: `^` then `e` is `ê`, 46 pairings covering the Latin-1 set,
+        and a dead key pressed twice types itself so `^` stays reachable;
+      * ALTGR as a real third level -- without it a French keyboard cannot type
+        `@`, `{`, `[`, `|`, `\` or `€`, which means it cannot write an email
+        address or C;
+      * the char stream carries UTF-8. ASCII is byte-for-byte what it was, so
+        every existing reader (tty, shell, `embk_key_poll`, `ui_input_char`)
+        kept working untouched;
+      * `TextField` and `TextEditor` walk whole characters -- one backspace
+        removes one é, not half of one -- and accept bytes >= 0x80, which the
+        old `c < 127` bound silently dropped;
+      * `SYS_kbd_layout` + a Keyboard pane in Settings, applied by the shell at
+        login, so the preference survives a reboot.
+
+      Measured by `test keymap` (18/18): the exact UTF-8 bytes for é è ç à ù at
+      their real French key positions, ê from the dead key, `@ [ €` from AltGr,
+      digits from Shift, and US unchanged.
+
+      BOTH KEYBOARDS. The PS/2 driver (x86) and virtio-input (aarch64) share one
+      set of layout tables -- evdev numbers the main block the same way set 1
+      does, which is what let them share in the first place -- so the ARM path
+      got the same three levels, the same dead keys and the same UTF-8. It had
+      been truncating a codepoint into a `char`: é came out as a lone 0xE9,
+      which is not even valid UTF-8 and draws as a replacement box.
+
+      The rendering half needed nothing: `font_utf8_decode` has decoded UTF-8
+      since the font backend was written. It was only the INPUT half of the OS
+      that could not spell.
+
+      **One place still cannot draw it**, and it is worth naming rather than
+      discovering: the KERNEL's own framebuffer console (`fb_draw_string`, the
+      8x16 bitmap font used for panics, the boot log and the kernel `test`
+      commands) indexes glyphs by byte, so an é typed there shows as two boxes.
+      Every path a user actually types into -- the graphical Terminal, every
+      EmUI text field and the editor -- goes through the TTF renderer and is
+      correct. Giving the bitmap console Latin-1 glyphs is a small, separate
+      piece of work.
+- [x] **`test keyboard` reports a verdict a machine can read.** It printed
+      `[cmd] test keyboard: 6/6 checks` BEFORE its 8-second live capture -- and
+      that shape is the verdict line a scripted run reads, so the harness judged
+      the test before it had finished and recorded a permanent FAIL for a test
+      whose automated half passes. One verdict per command, at the end, and
+      SKIP when nobody typed (the live half needs a person; the keymap itself is
+      checked without one by `test keymap`).
+
 ### A USB tablet attached to the x86 guest moves nothing
 
 - [ ] **QEMU's `usb-tablet` on a `qemu-xhci` controller produced no pointer

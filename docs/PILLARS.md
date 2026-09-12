@@ -49,7 +49,7 @@ emulates the common real part, so none has to wait for the machine.
 
 | Pillar | Today | Why |
 |---|---|---|
-| **Unicode keyboard input + your layout** | the key stream is 7-bit ASCII; `keyboard.c` refuses AZERTY by name because é è ç à ù cannot be typed | You cannot type your own language |
+| **Unicode keyboard input + your layout** | ✅ done — the key stream is UTF-8, layouts are codepoint tables with dead keys and AltGr, AZERTY ships, and the layout is picked in Settings (Keyboard) and applied by the shell at login. Proven byte-for-byte by `test keymap` | You could not type your own language |
 | **Screen lock** | absent | Walking away from the machine leaves the session open |
 | **Real HiDPI scaling** | `ui_scale` exists, clamped to 80–130% | A modern laptop panel needs 200%; the desktop looks half-size |
 | **Time: NTP + time zones** | absent — the RTC only | The clock drifts and is in the wrong zone |

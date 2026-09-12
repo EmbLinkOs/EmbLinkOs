@@ -30,10 +30,10 @@
 #include "em.h"
 #include "theme.h"
 
-enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_SYSTEM, PANE_ABOUT, PANE_N };
+enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_KEYBOARD, PANE_SYSTEM, PANE_ABOUT, PANE_N };
 
-static const char *g_pane_name[PANE_N] = { "Appearance", "Desktop & Dock", "System", "About" };
-static const int   g_pane_icon[PANE_N] = { IconStar, IconGrid, IconBolt, IconInfo };
+static const char *g_pane_name[PANE_N] = { "Appearance", "Desktop & Dock", "Keyboard", "System", "About" };
+static const int   g_pane_icon[PANE_N] = { IconStar, IconGrid, IconList, IconBolt, IconInfo };
 
 static int   g_pane = PANE_APPEARANCE;
 static float g_scroll = 0;
@@ -185,6 +185,43 @@ static void pane_desktop(void) {
     }
 }
 
+/* THE KEYBOARD. The one preference on this machine that decides whether its
+ * owner can write their own language: the driver shipped for a long time with
+ * no AZERTY at all, because a 7-bit character stream cannot spell é è ç à ù.
+ * It can now, so this is a list you pick from rather than a gap explained in a
+ * comment.
+ *
+ * Applied through the KERNEL (embk_kbd_layout) as well as saved, because the
+ * layout is the driver's policy -- writing the file alone would change what
+ * the machine remembers and not what it types. */
+static void pane_keyboard(void) {
+    Section("Layout") {
+        const char *names[OSCFG_KEYMAPS];
+        for (int i = 0; i < OSCFG_KEYMAPS; i++) names[i] = oscfg_keymaps[i].label;
+        int pick = (g_cfg.keymap >= 0 && g_cfg.keymap < OSCFG_KEYMAPS) ? g_cfg.keymap : 0;
+        int was  = pick;
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
+            setting_label("Keyboard layout",
+                          "What the keys type. AZERTY reaches é è ç à ù directly, "
+                          "^ and ¨ compose (^ then e is ê), and AltGr types @ # { } [ ] | €.");
+        }
+        Segmented(names, OSCFG_KEYMAPS, &pick);
+        if (pick != was) {
+            g_cfg.keymap = pick;
+            embk_kbd_layout(oscfg_keymaps[pick].name, 0, 0);   /* take effect now */
+            commit();                                          /* and next boot */
+        }
+    }
+    Section("Try it") {
+        static char sample[64];
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
+            setting_label("Type here",
+                          "Whatever this field shows is what the keyboard really produced.");
+        }
+        TextField(sample, sizeof sample, "café, €, ça va ?");
+    }
+}
+
 static void pane_system(void) {
     Section("This machine") {
         ListRow(IconBolt, "Uptime",        g_uptime);
@@ -249,6 +286,7 @@ static void app(void) {
                         switch (g_pane) {
                             case PANE_APPEARANCE: pane_appearance(); break;
                             case PANE_DESKTOP:    pane_desktop();    break;
+                            case PANE_KEYBOARD:   pane_keyboard();   break;
                             case PANE_SYSTEM:     pane_system();     break;
                             default:              pane_about();      break;
                         }

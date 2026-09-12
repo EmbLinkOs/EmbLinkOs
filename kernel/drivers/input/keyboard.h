@@ -109,11 +109,37 @@ uint8_t keyboard_mods(void);
  * keyboard_set_layout() returns 0 on success, -1 for an unknown name (it does
  * NOT fall back to US silently -- a typo'd layout name that quietly keeps
  * QWERTY is worse than a refusal). */
+/* A layout is three tables of CODEPOINTS -- not characters.
+ *
+ * It was `const char *` until French made that untenable: é è ç à ù are on the
+ * number row of a real AZERTY keyboard, and none of them exists in 7 bits. The
+ * tables are Unicode scalar values now, the char stream carries UTF-8, and a
+ * pure-ASCII layout is unaffected -- 'a' is as valid a uint32_t initialiser as
+ * a char one, so the US and Dvorak tables did not change a single entry.
+ *
+ * A DEAD KEY is an entry wrapped in KEY_DEAD(): it produces no character of its
+ * own and instead combines with the next key (^ then e -> ê). AltGr is the
+ * third level every non-US layout needs for @ # { } [ ] | \ €. */
+#define KEY_DEAD_BIT     0x80000000u
+#define KEY_DEAD(cp)     (KEY_DEAD_BIT | (uint32_t)(cp))
+#define KEY_IS_DEAD(v)   (((v) & KEY_DEAD_BIT) != 0)
+#define KEY_BARE(v)      ((v) & ~KEY_DEAD_BIT)
+
 struct keymap {
     const char *name;
-    const char *normal;   /* [128], indexed by set-1 make code */
-    const char *shift;    /* [128] */
+    const uint32_t *normal;   /* [128], indexed by set-1 make code */
+    const uint32_t *shift;    /* [128] */
+    const uint32_t *altgr;    /* [128], or NULL if the layout has no third level */
 };
+/* Translate one set-1 MAKE code through the current layout, exactly as the
+ * interrupt handler does (dead keys, AltGr, Caps, Ctrl, UTF-8 delivery). Public
+ * for the keymap selftest; nothing else should need it. */
+void        kbd_translate(uint8_t make, int pressed);
+/* Inject a key from a NON-PS/2 keyboard (virtio-input): the event code, and
+ * the codepoint it typed, which is encoded to UTF-8 into the char stream. */
+void        keyboard_inject_cp(uint16_t code, int pressed, uint32_t cp);
+void        kbd_mods_force(uint8_t mods);   /* selftest: hold Shift/Caps/Ctrl  */
+void        kbd_altgr_force(int on);        /* selftest: hold AltGr (right Alt) */
 int         keyboard_set_layout(const char *name);
 const char *keyboard_layout(void);
 
@@ -172,10 +198,17 @@ void keyboard_inject_event(uint16_t code, int pressed, char ascii);
  * A Linux evdev keycode is an AT set-1 make code for the main key block (evdev
  * took its numbering from set 1), so a virtio-input driver can call this
  * directly and inherits `keyboard_set_layout` for free. */
-char keyboard_compose(uint8_t make, uint8_t mods);
+/* Apply the CURRENT layout to a make code: shift, AltGr, dead keys, Caps and
+ * Ctrl, returning a Unicode codepoint (0 = this key types nothing, which is
+ * also what a dead key returns while it waits for the next one).
+ *
+ * Returns a CODEPOINT, not a char, because a layout can produce é and a char
+ * cannot hold it -- the virtio path truncated exactly that into a lone 0xE9,
+ * which is not even valid UTF-8. Deliver it with keyboard_inject_cp(). */
+uint32_t keyboard_compose_cp(uint8_t make, uint8_t mods);
 
 /* The UNSHIFTED key identity for the same code -- what an event carries. */
-char keyboard_keycode_of(uint8_t make);
+uint16_t keyboard_keycode_of(uint8_t make);
 
 // Keyboard grab: while grabbed, the kernel shell stops draining the buffer so a
 // ring-3 UI app has exclusive keystrokes. Auto-released when the grabber exits.

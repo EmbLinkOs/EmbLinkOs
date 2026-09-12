@@ -3150,15 +3150,39 @@ static void te_insert(char *buf, size_t cap, int *len, int *cur, char c) {
     buf[*cur] = c;
     (*cur)++; (*len)++;
 }
+/* ONE CHARACTER, NOT ONE BYTE. The key stream is UTF-8 (the keyboard driver
+ * encodes codepoints now, so é arrives as two bytes and € as three). An editor
+ * that erases, steps over or counts BYTES splits those sequences, and a split
+ * sequence draws as a replacement box -- so every one of these walks whole
+ * characters. Continuation bytes are the ones matching 10xxxxxx. */
+static int te_is_cont(const char *buf, int i) {
+    return ((unsigned char)buf[i] & 0xC0) == 0x80;
+}
+static int te_prev(const char *buf, int cur) {
+    if (cur <= 0) return 0;
+    cur--;
+    while (cur > 0 && te_is_cont(buf, cur)) cur--;
+    return cur;
+}
+static int te_next(const char *buf, int len, int cur) {
+    if (cur >= len) return len;
+    cur++;
+    while (cur < len && te_is_cont(buf, cur)) cur++;
+    return cur;
+}
 static void te_backspace(char *buf, int *len, int *cur) {
     if (*cur <= 0) return;
-    memmove(buf + *cur - 1, buf + *cur, (size_t)(*len - *cur + 1));
-    (*cur)--; (*len)--;
+    int p = te_prev(buf, *cur);
+    int n = *cur - p;
+    memmove(buf + p, buf + *cur, (size_t)(*len - *cur + 1));
+    *cur = p; *len -= n;
 }
 static void te_delete(char *buf, int *len, int *cur) {
     if (*cur >= *len) return;
-    memmove(buf + *cur, buf + *cur + 1, (size_t)(*len - *cur));
-    (*len)--;
+    int e = te_next(buf, *len, *cur);
+    int n = e - *cur;
+    memmove(buf + *cur, buf + e, (size_t)(*len - e + 1));
+    *len -= n;
 }
 static int te_line_start(const char *buf, int cur) {
     int i = cur;
@@ -3275,8 +3299,8 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
                 case '\n': case '\r': te_insert(buf, cap, &len, &cur, '\n'); break;
                 case '\t':      te_insert(buf, cap, &len, &cur, ' ');
                                 te_insert(buf, cap, &len, &cur, ' '); break;
-                case EMK_LEFT:  if (cur > 0) cur--; break;
-                case EMK_RIGHT: if (cur < len) cur++; break;
+                case EMK_LEFT:  cur = te_prev(buf, cur); break;
+                case EMK_RIGHT: cur = te_next(buf, len, cur); break;
                 case EMK_HOME:  cur = te_line_start(buf, cur); break;
                 case EMK_END:   cur = te_line_end(buf, len, cur); break;
                 case EMK_UP: {
@@ -3293,7 +3317,11 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
                     break;
                 }
                 default:
-                    if (c >= 32 && c < 127) te_insert(buf, cap, &len, &cur, (char)c);
+                    /* >= 0x80 is a byte of a real character: é, €, a dead-key
+                     * composition. They arrive contiguously and are inserted in
+                     * order, so the sequence lands intact at the cursor. */
+                    if ((c >= 32 && c < 127) || c >= 0x80)
+                        te_insert(buf, cap, &len, &cur, (char)c);
                     break;
             }
         }

@@ -2146,6 +2146,34 @@ static int64_t sys_futex(const struct sysargs *a) {
     }
 }
 
+/* The keyboard layout. Kernel policy, because the driver is the thing that
+ * turns a scancode into a character -- userspace cannot hold this preference
+ * on its own, it can only ask.
+ *
+ * NOT CAPABILITY-GATED, deliberately: the layout is how a person types, it
+ * affects only the machine's own input, and a user who cannot select their own
+ * keyboard cannot use the computer. Refusing a name leaves the current layout
+ * untouched, which is what keeps a typo from making the machine mute. */
+static int64_t sys_kbd_layout(const struct sysargs *a) {
+    const char *uname = (const char *)a->arg[0];
+    char       *uout  = (char *)a->arg[1];
+    int         cap   = (int)a->arg[2];
+
+    if (uname) {
+        char name[24];
+        if (copy_string_from_user(name, uname, sizeof name) != EMBK_OK)
+            return -EMBK_EFAULT;
+        if (keyboard_set_layout(name) != 0) return -EMBK_EINVAL;
+    }
+    if (uout && cap > 0) {
+        const char *cur = keyboard_layout();
+        int n = 0;
+        while (cur[n] && n < cap - 1) n++;
+        if (copy_to_user(uout, cur, (size_t)n + 1) != EMBK_OK) return -EMBK_EFAULT;
+    }
+    return 0;
+}
+
 static syscall_handler_t syscall_table[] = {
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -2249,6 +2277,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_link]           = sys_link,
     [SYS_session_info]   = sys_session_info,
     [SYS_session_end]    = sys_session_end,
+    [SYS_kbd_layout]     = sys_kbd_layout,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,
     [SYS_futex]          = sys_futex,

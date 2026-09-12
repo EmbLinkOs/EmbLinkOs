@@ -130,10 +130,10 @@ static uint32_t g_key_events, g_ptr_events;
  * Only the keys a keyboard actually has. Everything absent maps to 0 and is
  * dropped, which is the honest answer for a key we cannot name -- injecting a
  * wrong code would be worse than injecting none. */
-static uint16_t vi_translate(uint16_t code, char *ascii) {
+static uint16_t vi_translate(uint16_t code, uint32_t *ascii, int pressed) {
     /* A Linux evdev keycode IS an AT set-1 make code for the main key block --
      * evdev took its numbering from set 1 -- so the printable half of this
-     * table is not ours to own: keyboard_compose() applies the CURRENT layout,
+     * table is not ours to own: keyboard_compose_cp() applies the CURRENT layout,
      * its shift table, Caps Lock and Ctrl, and a virtio keyboard therefore
      * honours `keyboard_set_layout dvorak` without another line here. The
      * hand-rolled US shift table this replaced was a second, worse answer to a
@@ -183,10 +183,19 @@ static uint16_t vi_translate(uint16_t code, char *ascii) {
      * ("which key"), the char stream the composed character ("what text") --
      * the same split the PS/2 path makes, because it is now the same code. */
     if (code < 128) {
-        char base = keyboard_keycode_of((uint8_t)code);
+        uint16_t base = keyboard_keycode_of((uint8_t)code);
         if (base) {
-            *ascii = keyboard_compose((uint8_t)code, keyboard_mods());
-            return (uint16_t)base;
+            /* A CODEPOINT, not a char: this layout can produce é, and a char
+             * cannot hold it -- truncation turned it into a lone 0xE9, which
+             * is not valid UTF-8 and drew as a replacement box.
+             *
+             * ON THE PRESS ONLY. Composing is not a pure lookup any more: a
+             * dead key sets pending state and the next key consumes it, so
+             * asking again on the RELEASE would advance that state a second
+             * time -- typing ^ then e would eat the mark on ^'s release and
+             * produce a bare e. Releases carry no text on any path. */
+            *ascii = pressed ? keyboard_compose_cp((uint8_t)code, keyboard_mods()) : 0;
+            return base;
         }
     }
     return 0;
@@ -237,10 +246,10 @@ static void vi_handle(const struct virtio_input_event *e) {
          * held key should look like to a text reader. */
         if (e->value > 2) return;
         g_key_events++;
-        char ascii = 0;
-        uint16_t code = vi_translate(e->code, &ascii);
+        uint32_t ascii = 0;
+        uint16_t code = vi_translate(e->code, &ascii, e->value != 0);
         if (!code) return;
-        keyboard_inject_event(code, e->value != 0, ascii);
+        keyboard_inject_cp(code, e->value != 0, ascii);
         return;
     }
     case EV_ABS:

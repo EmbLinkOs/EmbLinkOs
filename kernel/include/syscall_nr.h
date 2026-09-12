@@ -229,4 +229,15 @@
  * EMBK_CAP_SESSION (init). */
 #define SYS_session_end   114   /* (sid)                    -> n | -err       */
 
+/* kbd_layout(name, out, cap) -- the keyboard layout, which is kernel policy
+ * because the driver is what turns a scancode into a character.
+ *
+ *   name != NULL : switch to that layout ("us", "dvorak", "azerty")
+ *   out  != NULL : write the CURRENT layout's name into out (up to cap)
+ *
+ * Either, both, or neither. Returns 0, or -EMBK_EINVAL for a name nothing
+ * matches -- and the layout is left alone in that case, so a typo cannot
+ * leave the machine unable to type. */
+#define SYS_kbd_layout    115   /* (name, out, cap)         -> 0 | -err       */
+
 #endif /* _SYSCALL_NR_H_ */

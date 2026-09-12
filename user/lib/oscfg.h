@@ -37,12 +37,25 @@ static const struct oscfg_accent oscfg_accents[OSCFG_ACCENTS] = {
     { "Violet",  0.65f, 0.42f, 0.92f },
 };
 
+/* THE KEYBOARD LAYOUTS THE KERNEL KNOWS, by the names its driver answers to.
+ * An index rather than a string because this file's format is `key value` with
+ * integer values, and because a user picks from a list -- there is no useful
+ * layout you could type here that the driver would accept. */
+#define OSCFG_KEYMAPS 3
+struct oscfg_keymap { const char *name; const char *label; };
+static const struct oscfg_keymap oscfg_keymaps[OSCFG_KEYMAPS] = {
+    { "us",     "QWERTY (US)" },
+    { "azerty", "AZERTY (French)" },
+    { "dvorak", "Dvorak" },
+};
+
 struct oscfg {
     int accent;        /* index into oscfg_accents                       */
     int dark;          /* 1 dark, 0 light                                */
     int dock_size;     /* dock icon base size in px                      */
     int dock_dots;     /* light the socket behind a live app's icon      */
     int ui_scale;      /* interface size, PERCENT (80..130); 100 = default */
+    int keymap;        /* index into oscfg_keymaps                       */
 };
 
 /* The screen band the DOCK owns, in pixels, for a given preference.
@@ -69,7 +82,7 @@ static inline int oscfg_dock_band(const struct oscfg *c) {
 }
 
 static inline void oscfg_defaults(struct oscfg *c) {
-    c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1;
+    c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1; c->keymap = 0;
     c->ui_scale = 100;
 }
 
@@ -95,6 +108,7 @@ static inline void oscfg_load(struct oscfg *c) {
         else if (!strcmp(key, "dark"))      c->dark      = val;
         else if (!strcmp(key, "dock_size")) c->dock_size = val;
         else if (!strcmp(key, "dock_dots")) c->dock_dots = val;
+        else if (!strcmp(key, "keymap")) c->keymap = (val >= 0 && val < OSCFG_KEYMAPS) ? val : 0;
         else if (!strcmp(key, "ui_scale"))  c->ui_scale  = val;
     }
     if (c->accent < 0 || c->accent >= OSCFG_ACCENTS) c->accent = 0;
@@ -111,8 +125,9 @@ static inline int oscfg_save(const struct oscfg *c) {
     int n = snprintf(out, sizeof out,
                      "# EmbLink preferences -- written by Settings, editable by hand.\n"
                      "accent %d\n" "dark %d\n" "dock_size %d\n" "dock_dots %d\n"
-                     "ui_scale %d\n",
-                     c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale);
+                     "ui_scale %d\n" "keymap %d\n",
+                     c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale,
+                     c->keymap);
     int fd = (int)embk_open(OSCFG_PATH, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
     if (fd < 0) return -1;
     int64_t w = embk_write(fd, out, (size_t)n);

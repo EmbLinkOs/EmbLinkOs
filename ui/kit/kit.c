@@ -460,7 +460,16 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
         unsigned long len = strlen(buf);
         for (int i = 0; i < n; i++) {
             char c = in[i];
-            if (c == '\b') { if (len > 0) buf[--len] = 0; }
+            if (c == '\b') {
+                /* BACK OVER A WHOLE CHARACTER, not a byte. The stream is UTF-8
+                 * now (kernel/drivers/input/keyboard.c), so é is two bytes and
+                 * deleting one of them leaves a half character the renderer
+                 * draws as a replacement box -- one backspace, one visible
+                 * thing removed, is the only behaviour anyone would call
+                 * correct. Continuation bytes are 10xxxxxx. */
+                while (len > 0 && ((unsigned char)buf[len - 1] & 0xC0) == 0x80) buf[--len] = 0;
+                if (len > 0) buf[--len] = 0;
+            }
             else if (c == '\n') { g_field_submit = true; }   /* submit; see above */
             else if (c == '\t') {
                 /* The rest of this frame's keys belong to the next field. */
@@ -470,8 +479,15 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
                 g_tab_pending = true;
                 break;
             }
-            else if ((unsigned char)c >= 32 && (unsigned char)c < 127 && len + 1 < cap) {
-                buf[len++] = c; buf[len] = 0;
+            else if (((unsigned char)c >= 32 && (unsigned char)c < 127)
+                     || (unsigned char)c >= 0x80) {
+                /* >= 0x80 is a UTF-8 byte of a real character -- é, €, a
+                 * dead-key composition. Each byte is appended as it arrives;
+                 * they are contiguous in the queue, so the sequence lands
+                 * intact. Rejecting them (the old `< 127` bound) is what made
+                 * every accented character vanish between the keyboard and the
+                 * field. */
+                if (len + 1 < cap) { buf[len++] = c; buf[len] = 0; }
             }
         }
     }

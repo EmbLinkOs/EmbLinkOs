@@ -372,6 +372,19 @@ static void cfg_poll(void) {
      * at launch for ordinary applications; the desktop never exits, so if it
      * only read the file at startup then changing the accent would recolour
      * every window EXCEPT the one always on screen. */
+    /* THE KEYBOARD LAYOUT IS APPLIED BY THE SHELL, once at start and again
+     * whenever the preference changes. It has to be asked for: the layout is
+     * the DRIVER's policy, so the saved file records what the machine should
+     * type and only this call makes it actually type that. First poll counts
+     * as a change (`first`), which is what makes the setting survive a reboot
+     * rather than needing to be re-picked every session. */
+    static int first = 1;
+    if (first || g_cfg.keymap != was.keymap) {
+        first = 0;
+        int k = (g_cfg.keymap >= 0 && g_cfg.keymap < OSCFG_KEYMAPS) ? g_cfg.keymap : 0;
+        embk_kbd_layout(oscfg_keymaps[k].name, 0, 0);
+    }
+
     if (g_cfg.accent != was.accent || g_cfg.dark != was.dark ||
         g_cfg.ui_scale != was.ui_scale) {
         ui_theme_use_dark(g_cfg.dark != 0);

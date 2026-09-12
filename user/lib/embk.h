@@ -742,6 +742,20 @@ struct embk_key_event {
     unsigned char  pressed;   /* 1 = pressed, 0 = released */
 };
 
+/* THE KEYBOARD LAYOUT. Kernel policy, because the driver is what turns a
+ * scancode into a character -- so this is an ask, not a setting userspace can
+ * keep to itself.
+ *
+ *   name != NULL : switch to it ("us", "azerty", "dvorak")
+ *   out  != NULL : receive the CURRENT layout's name
+ *
+ * 0, or -EMBK_EINVAL for a name nothing matches -- and on a bad name the
+ * layout is left alone, so a typo cannot leave the machine unable to type. */
+static inline int embk_kbd_layout(const char *name, char *out, int cap) {
+    return (int)embk_syscall3(EMBK_SYS_kbd_layout, (int64_t)(intptr_t)name,
+                              (int64_t)(intptr_t)out, cap);
+}
+
 /* 1 = got an event, 0 = queue empty. Never blocks. */
 static inline int embk_key_event_poll(struct embk_key_event *ev) {
     return (int)embk_syscall1(EMBK_SYS_key_event_poll, (uint64_t)(uintptr_t)ev);

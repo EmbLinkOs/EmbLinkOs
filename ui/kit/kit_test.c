@@ -83,6 +83,32 @@ int main(void) {
     frame("z");
     CHECK(!strcmp(A, "z"), "and typing goes to that page's first field");
 
+    /* ---- UTF-8: the field has to hold a language, not just ASCII --------
+     *
+     * The key stream carries UTF-8 now (the keyboard driver encodes codepoints
+     * rather than truncating them to 7 bits), so é arrives as two bytes and €
+     * as three. This field used to reject every byte outside 32..126 -- which
+     * silently dropped every accented character between the keyboard and the
+     * screen -- and its backspace deleted ONE BYTE, which cuts a two-byte
+     * character in half and leaves something the renderer draws as a
+     * replacement box.
+     *
+     * Typed here as the exact bytes the driver produces, because that is what
+     * the field actually receives. */
+    page = 0x3333; autofocus = true; A[0] = 0;
+    frame(NULL); frame(NULL);
+    frame("caf\xC3\xA9");                 /* c a f + U+00E9 */
+    CHECK(!strcmp(A, "caf\xC3\xA9"), "an accented character survives into the field (café)");
+
+    frame("\b");
+    CHECK(!strcmp(A, "caf"), "one backspace removes the WHOLE é, not half of it");
+
+    A[0] = 0; frame(NULL);
+    frame("\xE2\x82\xAC");               /* U+20AC EURO SIGN, three bytes */
+    CHECK(!strcmp(A, "\xE2\x82\xAC"), "a three-byte character (€) survives too");
+    frame("\b");
+    CHECK(A[0] == 0, "and one backspace removes all three of its bytes");
+
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

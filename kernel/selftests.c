@@ -5201,6 +5201,88 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* THE KEYMAP, AND WHETHER FRENCH ACTUALLY TYPES.
+     *
+     * This OS shipped for a long time with a keyboard that could not produce
+     * é è ç à ù, and the driver said so out loud rather than ship an AZERTY
+     * full of holes. The tables carry codepoints now and the char stream
+     * carries UTF-8, so the claim to check is simply: press the keys a French
+     * keyboard has, read the stream, and compare against the exact bytes.
+     *
+     * Byte-level, deliberately. "It looked right on screen" is how an encoding
+     * bug survives -- a half-written é and a correct é differ by one byte and
+     * the renderer draws both as something. */
+    if (strcmp(cmd, "test keymap") == 0) {
+        int pass = 0, fail = 0;
+        #define MCHK(name, cond) do { if (cond) { pass++; } else { fail++; \
+            kprintf("  FAIL %s\n", name); } } while (0)
+
+        const char *saved = keyboard_layout();
+        { struct key_event e; while (keyboard_event_pop(&e)) {} }
+        while (keyboard_has_char()) (void)keyboard_getchar();
+
+        /* Press a key (make code), then read every byte it produced. */
+        char got[8];
+        int  ngot;
+        #define TYPE(mk) do { ngot = 0; kbd_translate((mk), 1); kbd_translate((mk), 0); \
+            while (keyboard_has_char() && ngot < (int)sizeof got) \
+                got[ngot++] = (char)keyboard_getchar(); } while (0)
+        #define IS2(a, b) (ngot == 2 && (unsigned char)got[0] == (a) && (unsigned char)got[1] == (b))
+        #define IS1(a)    (ngot == 1 && (unsigned char)got[0] == (a))
+
+        MCHK("the azerty layout exists", keyboard_set_layout("azerty") == 0);
+
+        /* The number row, unshifted: & é " ' ( - è _ ç à -- the five accented
+         * ones are the whole point. é is U+00E9 = C3 A9 in UTF-8. */
+        TYPE(0x03); MCHK("é on the 2 key   (C3 A9)", IS2(0xC3, 0xA9));
+        TYPE(0x08); MCHK("è on the 7 key   (C3 A8)", IS2(0xC3, 0xA8));
+        TYPE(0x0A); MCHK("ç on the 9 key   (C3 A7)", IS2(0xC3, 0xA7));
+        TYPE(0x0B); MCHK("à on the 0 key   (C3 A0)", IS2(0xC3, 0xA0));
+        TYPE(0x28); MCHK("ù on the ' key   (C3 B9)", IS2(0xC3, 0xB9));
+
+        /* Letters still work, and A is where AZERTY puts it (the Q key). */
+        TYPE(0x10); MCHK("a is on the Q position", IS1('a'));
+        TYPE(0x1E); MCHK("q is on the A position", IS1('q'));
+
+        /* A DEAD KEY: ^ then e is ê (U+00EA = C3 AA), and ^ produces nothing
+         * on its own. This is how â ê î ô û are typed on a real keyboard. */
+        TYPE(0x1A); MCHK("^ alone types nothing (it is dead)", ngot == 0);
+        TYPE(0x12); MCHK("^ then e is ê     (C3 AA)", IS2(0xC3, 0xAA));
+
+        /* Two dead keys in a row type the first one: the escape hatch that
+         * keeps ^ itself reachable. */
+        TYPE(0x1A); TYPE(0x1A); MCHK("^^ types one ^", IS1('^'));
+
+        /* Shift gives the DIGITS on this layout -- French types 1 with Shift. */
+        kbd_mods_force(EKM_SHIFT);
+        TYPE(0x02); MCHK("Shift+2 key is '1'", IS1('1'));
+        kbd_mods_force(0);
+
+        /* And the third level: without AltGr a French keyboard cannot type @,
+         * which means it cannot type an email address. */
+        kbd_altgr_force(1);
+        TYPE(0x0B); MCHK("AltGr+0 key is '@'", IS1('@'));
+        TYPE(0x06); MCHK("AltGr+5 key is '['", IS1('['));
+        TYPE(0x12); MCHK("AltGr+e is € (E2 82 AC)",
+                         ngot == 3 && (unsigned char)got[0] == 0xE2 &&
+                         (unsigned char)got[1] == 0x82 && (unsigned char)got[2] == 0xAC);
+        kbd_altgr_force(0);
+
+        /* US is untouched by any of it -- the tables changed type, not content. */
+        MCHK("the us layout is still there", keyboard_set_layout("us") == 0);
+        TYPE(0x1E); MCHK("us: the A key is 'a'", IS1('a'));
+        TYPE(0x03); MCHK("us: the 2 key is '2'", IS1('2'));
+
+        keyboard_set_layout(saved);
+        #undef TYPE
+        #undef IS1
+        #undef IS2
+        kprintf("\n[cmd] test keymap: %s (%d/%d)\n",
+                fail == 0 ? "OK" : "FAIL", pass, pass + fail);
+        #undef MCHK
+        return 1;
+    }
+
     if (strcmp(cmd, "test keyboard") == 0) {
         int pass = 0, fail = 0;
         #define KCHK(name, cond) do { if (cond) { pass++; } else { fail++; \
@@ -5228,7 +5310,11 @@ int selftests_handle_command(const char *cmd)
         kprintf("[keyboard] mods now 0x%02x (0=nothing held)\n", keyboard_mods());
         KCHK("no modifier stuck down at rest", keyboard_mods() == 0);
 
-        kprintf("\n[cmd] test keyboard: %d/%d checks\n", pass, pass + fail);
+        /* NOT the `[cmd] <name>:` form -- that shape IS the verdict a scripted
+         * run reads, and printing it here made the harness judge the test
+         * before the live capture had even started. One verdict per command,
+         * at the end. */
+        kprintf("\n[keyboard] %d/%d automated checks\n", pass, pass + fail);
         kprintf("[keyboard] NOW TYPE -- 8s live capture (events: code/mods/up-down)\n");
 
         /* 3. LIVE: whatever arrives in the next 8s, report it. This is where a
@@ -5246,6 +5332,23 @@ int selftests_handle_command(const char *cmd)
         }
         kprintf("[keyboard] captured %d events; mods at end=0x%02x\n",
                 nev, keyboard_mods());
+
+        /* A VERDICT LINE, and an honest one. The automated half above is the
+         * part a machine can judge; the live capture needs a person to type,
+         * and an unattended run captures nothing through no fault of the
+         * keyboard. Reported as a SKIP, so a scripted sweep stops recording a
+         * permanent red light for a test nobody could have passed -- the same
+         * correction `test layout` needed, and for the same reason: a light
+         * that is always red is a light people stop reading.
+         *
+         * The keymap itself IS machine-checkable, and is checked without a
+         * human anywhere near it: `test keymap`. */
+        if (fail == 0 && nev == 0)
+            kprintf("\n[cmd] test keyboard: SKIP (%d/%d automated; nobody typed "
+                    "during the live capture)\n", pass, pass + fail);
+        else
+            kprintf("\n[cmd] test keyboard: %s (%d/%d automated, %d live event(s))\n",
+                    fail == 0 ? "OK" : "FAIL", pass, pass + fail, nev);
         #undef KCHK
         return 1;
     }
