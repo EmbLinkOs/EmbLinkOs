@@ -3243,17 +3243,69 @@ static void te_run(const char *src, int a, int b, Color col, int selected,
     em_text_impl(tmp, tp);
 }
 
-static void te_caret_box(const struct ui_theme *t) {
+static void te_caret_box(const struct ui_theme *t, float h) {
     ui_box_begin(0);
     ui_set_paint(solid(t->accent));
-    ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
+    ui_set_size(sz_fixed(2), sz_fixed(h));
     ui_box_end();
+}
+
+/* WHERE THE POINTER IS, as a byte offset into the buffer.
+ *
+ * The editor had no click-to-place at all: a click focused it and left the
+ * caret wherever it happened to be, so the only way to reach a line was to
+ * arrow to it. This is the missing half.
+ *
+ * Both axes are measured the way the text is actually DRAWN -- the line pitch
+ * from the resolved Body size (not the theme's raw text_body, which misses the
+ * app's own text scale), and the column with the renderer's decoder through
+ * ui_text_width_n. Measuring differently from the drawing is how a caret ends
+ * up a character off at the end of a long line. */
+static int te_hit(const char *buf, int len, float px, float py,
+                  float rx, float ry, int gutter, float scroll,
+                  uint32_t fh, float sz, const struct ui_theme *t) {
+    float line_h = sz + 5.0f;
+    float y0 = ry + t->sp2 - scroll;
+    int want = (int)((py - y0) / line_h);
+    if (want < 0) want = 0;
+
+    /* Walk to that line; a click below the last one lands on the last one. */
+    int i = 0, l = 0;
+    while (l < want) {
+        int e = i;
+        while (e < len && buf[e] != '\n') e++;
+        if (e >= len) break;
+        i = e + 1; l++;
+    }
+    int e = i;
+    while (e < len && buf[e] != '\n') e++;
+
+    float x0 = rx + t->sp3;
+    if (gutter) {
+        char num[16];
+        snprintf(num, sizeof num, "%4d ", l + 1);
+        x0 += ui_text_width_n(fh, sz, num, -1);
+    }
+    float dx = px - x0;
+    if (dx <= 0) return i;
+
+    /* Nearest boundary, so the right half of a letter means after it. */
+    float prev = 0;
+    for (int p = i; p < e; ) {
+        int nx = te_next(buf, e, p);
+        float w = ui_text_width_n(fh, sz, buf + i, nx - i);
+        if (dx < (prev + w) * 0.5f) return p;
+        prev = w;
+        p = nx;
+    }
+    return e;
 }
 
 /* `slo`/`shi` are ABSOLUTE buffer offsets and may lie entirely outside this
  * line; the intersection is taken per span. */
 static void te_draw_line(const char *buf, int i, int e, int caret, int lineno,
-                         int gutter, int slo, int shi, const struct ui_theme *t) {
+                         int gutter, int slo, int shi, float sz,
+                         const struct ui_theme *t) {
     char tmp[512];
     ui_begin_hstack((uint64_t)(lineno + 1));
     ui_set_align(ALIGN_CENTER);
@@ -3288,7 +3340,7 @@ static void te_draw_line(const char *buf, int i, int e, int caret, int lineno,
 
         int p = off;
         while (p < send) {
-            if (caret == p) te_caret_box(t);
+            if (caret == p) te_caret_box(t, sz);
             int sel = (i + p >= slo && i + p < shi);
             /* The next place anything changes. */
             int q = send;
@@ -3301,7 +3353,7 @@ static void te_draw_line(const char *buf, int i, int e, int caret, int lineno,
         off = send;
     }
     /* caret at (or past) the end of the line, including an empty line */
-    if (caret >= 0 && caret >= off) te_caret_box(t);
+    if (caret >= 0 && caret >= off) te_caret_box(t, sz);
     /* An all-empty row collapses in an ALIGN_CENTER hstack, so an empty,
      * caret-less line still needs something with a height. */
     if (!off && caret < 0 && !gutter) {
@@ -3330,14 +3382,42 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
      * anchor == cur means nothing is selected. */
     static const char *ted_buf;
     static int ted_anchor;
-    if (ted_buf != buf) { ted_buf = buf; ted_anchor = cur; }
+    /* THE SCROLL THE LINES WERE LAID OUT WITH, kept from the previous frame.
+     * A click is answered against the geometry the person was looking at when
+     * they clicked, and this frame's scroll is not yet that -- it is
+     * recomputed below from where the caret ends up, which the click is about
+     * to change. Using it would make a click on a scrolled document land a
+     * line or two out. */
+    static float ted_scroll;
+    if (ted_buf != buf) { ted_buf = buf; ted_anchor = cur; ted_scroll = 0; }
     if (ted_anchor > len) ted_anchor = len;
     if (ted_anchor < 0) ted_anchor = 0;
 
     ui_begin_vstack(0);
     struct instance_handle self = ui_open();
-    if (ui_consume_click(self)) ui_request_focus(self);
+    uint32_t efh; float esz; em_resolve_font(Body, &efh, &esz);
+    bool clicked = ui_consume_click(self);
+    if (clicked) ui_request_focus(self);
     bool focused = ui_has_focus(self);
+
+    /* THE MOUSE CAN PLACE THE CARET, and drag to select.
+     *
+     * A click used to do nothing but focus, so the only way to reach a line
+     * was to arrow to it -- in a code editor. ui_is_active() is pointer
+     * capture: true from the press until the release even once the pointer has
+     * left the box, so dragging past the bottom keeps extending the selection
+     * instead of stopping at the edge.
+     *
+     * The rect is last frame's arranged geometry, which is what the click
+     * happened over. */
+    if (clicked || (focused && ui_is_active())) {
+        float rx, ry, rw, rh, px, py;
+        if (ui_open_rect(&rx, &ry, &rw, &rh) && rw > 0) {
+            ui_pointer_pos(&px, &py);
+            cur = te_hit(buf, len, px, py, rx, ry, gutter, ted_scroll, efh, esz, t);
+            if (clicked) ted_anchor = cur;   /* a press starts a fresh selection */
+        }
+    }
 
     if (focused) {
         char in[64];
@@ -3455,11 +3535,12 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
     ui_set_size(sz_grow(), sz_fixed(height));
 
     /* auto-scroll: shift the lines up so the cursor line stays visible */
-    float line_h = t->text_body + 5.0f;
+    float line_h = esz + 5.0f;
     int cur_line = 0; for (int i = 0; i < cur; i++) if (buf[i] == '\n') cur_line++;
     float caret_y = (cur_line + 1) * line_h;
     float view_h = height - 2 * t->sp2;
     float scroll = caret_y > view_h ? caret_y - view_h : 0.0f;
+    ted_scroll = scroll;              /* what the NEXT frame's click is measured against */
 
     ui_begin_vstack(0);
     ui_set_align(ALIGN_STRETCH);
@@ -3478,7 +3559,7 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
             int slo = focused ? (ted_anchor < cur ? ted_anchor : cur) : 0;
             int shi = focused ? (ted_anchor < cur ? cur : ted_anchor) : 0;
             te_draw_line(buf, i, e, (is_cur && focused) ? cur - i : -1,
-                         line, gutter, slo, shi, t);
+                         line, gutter, slo, shi, esz, t);
             line++;
             i = e + 1;
             if (e == len) break;

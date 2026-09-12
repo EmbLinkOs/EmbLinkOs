@@ -56,6 +56,17 @@ static void frame(const char *keys) {
     ui_run_layout(400, 300);
 }
 
+/* Press at one x, drag to another, release -- the way nearly everyone
+ * actually selects text. */
+static void drag(float x0, float x1, float y) {
+    ui_pointer(x0, y, true);
+    frame(NULL);
+    ui_pointer(x1, y, true);
+    frame(NULL);
+    ui_pointer(x1, y, false);
+    frame(NULL);
+}
+
 int main(void) {
     printf("=== kit-test: the text field and the keyboard ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -271,6 +282,32 @@ int main(void) {
     frame("secret");
     frame(SALL COPY);
     CHECK(g_clip_n == 0, "a masked field refuses to copy its text");
+
+    /* ---- THE MOUSE -----------------------------------------------------
+     *
+     * Keyboard selection is not how people select text; dragging is. Pointer
+     * capture (ui_is_active) keeps the drag alive after the pointer has left
+     * the field, so dragging off the end extends to the end rather than
+     * stopping dead at the edge -- which is the difference between this and
+     * simply asking whether the field is pressed. */
+    page = 0x7777; autofocus = true; A[0] = 0; g_clip_n = 0;
+    frame(NULL); frame(NULL);
+    frame("hello world");
+
+    /* The first field sits at the top of the form; well past its right edge
+     * and back to the far left selects everything in between. */
+    /* THE PRESS HAS TO START INSIDE THE FIELD -- that is what captures the
+     * pointer, and a drag beginning outside is somebody else's drag. The
+     * RELEASE is far outside on purpose: capture is what keeps the selection
+     * extending after the pointer has gone, and without it this would stop at
+     * the field's edge. */
+    drag(5, 1000, 20);
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "hello world"),
+          "a drag that starts in the field and leaves it selects to the end");
+
+    frame("x");
+    CHECK(!strcmp(A, "x"), "and typing replaces what the drag selected");
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

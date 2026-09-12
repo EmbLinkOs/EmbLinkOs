@@ -31,6 +31,11 @@ is enough to tell the two behaviours apart:
     move. A caret that ignored the click and went to the end would leave the
     left unchanged AND the middle unchanged, and only grow the right end.
 
+  * press inside the text, drag right, release --
+    the pixels the drag crossed must change, because a selection was painted
+    behind them. This is the one that needs a real machine most: it is the
+    pointer-capture path, and nothing on the host exercises PS/2 motion.
+
   * Shift+Left five times, then Cmd+C, Home, Cmd+V --
     the selection must SHOW (the highlight changes the field's background
     behind the selected word, which ink columns cannot see, so this one is
@@ -80,6 +85,19 @@ def type_text(q, text):
         q.cmd("input-send-event", events=[
             {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": k}}}])
         time.sleep(0.09)
+
+
+def press(q, x, y):
+    S.move(q, x, y)
+    q.cmd("input-send-event", events=[{"type": "btn",
+          "data": {"down": True, "button": "left"}}])
+    time.sleep(0.3)
+
+
+def release(q):
+    q.cmd("input-send-event", events=[{"type": "btn",
+          "data": {"down": False, "button": "left"}}])
+    time.sleep(0.3)
 
 
 def chord(q, mods, key, times=1):
@@ -241,6 +259,20 @@ def main():
         S.move(q, SCREEN_W / 2.0, 200); time.sleep(1.5)
         e = os.path.join(A.BUILD, "caret-pasted.ppm"); q.screendump(e)
 
+        # ---- and with the MOUSE, which is how people really select ------
+        # Press inside the text and drag right: the press is what captures the
+        # pointer, so it has to start ON the field.
+        type_text(q, "\x05")                      # End: drop the selection
+        time.sleep(0.5)
+        f = os.path.join(A.BUILD, "caret-nosel.ppm"); q.screendump(f)
+        press(q, FIELD_X0 + 6, FIELD[1])
+        S.move(q, FIELD_X0 + 70, FIELD[1])
+        time.sleep(0.5)
+        release(q)
+        time.sleep(0.8)
+        g = os.path.join(A.BUILD, "caret-dragsel.ppm"); q.screendump(g)
+        dragged = band_difference(f, g, FIELD_X0, FIELD_X0 + 76)
+
         ca, cb, cc = ink_columns(a), ink_columns(b), ink_columns(c)
         left_changed  = ink_differs(ca, cb, FIELD_X0, FIELD_X0 + 40)
         grew          = last_ink(cb) - last_ink(ca)
@@ -262,6 +294,8 @@ def main():
         print("caret_shot: Shift+Left changed %.0f%% of the pixels behind the last word"
               % (highlight * 100))
         print("caret_shot: after copy + Home + paste the ink end moved %+d px" % pasted)
+        print("caret_shot: dragging the pointer changed %.0f%% of the pixels it crossed"
+              % (dragged * 100))
 
         fails = []
         if last_ink(ca) == 0:
@@ -280,6 +314,8 @@ def main():
         if pasted < 20:
             fails.append("copy + paste did not put the selected text back in "
                          "(the ink only moved %+d px)" % pasted)
+        if dragged < 0.05:
+            fails.append("dragging the pointer across the text selected nothing")
 
         for f in fails:
             print("caret_shot: FAIL %s" % f)

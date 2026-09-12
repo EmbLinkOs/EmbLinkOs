@@ -2784,6 +2784,51 @@ Open:
       a job. Their Ctrl shortcuts are untouched; the GUI ones are the reliable
       half beside them.
 
+- [x] **And the MOUSE can place and select it** (done 2026-09-12). Keyboard
+      selection is not how anyone selects text; dragging is. A press in a field
+      or the editor plants the caret and a drag extends the selection from it.
+
+      The multi-line editor had NO click-to-place at all -- a click focused it
+      and left the caret wherever it happened to be, so the only way to reach a
+      line in a code editor was to arrow to it. `te_hit()` maps a point to a
+      byte: the line from the pitch, the column with the renderer's own decoder
+      through `ui_text_width_n`, the nearest boundary rather than the character
+      landed in, so the right half of a letter means after it.
+
+      DRAGGING USES POINTER CAPTURE (`ui_is_active`), not "is this widget
+      pressed": capture stays with the widget the press landed on even once the
+      pointer has left it, so dragging past the end of a field or the bottom of
+      a document keeps extending instead of stopping dead at the edge.
+
+      Two measurement bugs found while testing, both in the TEST rather than the
+      code, and both worth remembering because each looked exactly like a
+      product failure:
+        * a drag whose PRESS started outside the field selected nothing, and
+          correctly so -- the press is what captures the pointer;
+        * a calibration loop that cleared the buffers but not the clipboard
+          reported a selection at every y, because it was reading a stale copy
+          from an earlier round.
+
+      Both host suites were MUTATION-CHECKED afterwards: disabling the drag in
+      each makes exactly its own drag claims fail, and restoring makes all 37
+      (kit) and 18 (em) pass. On the machine, a real PS/2 drag changed 68% of
+      the pixels it crossed.
+
+      Line geometry also stopped ignoring the app's own text scale
+      (`em_set_text_scale`): the pitch is now the size the text is actually
+      DRAWN at, so hit-testing and the auto-scroll agree with the glyphs at any
+      scale rather than only at 1.0.
+
+- [ ] **No double-click-to-select-a-word, and no shift-click to extend.** Both
+      want a CLOCK the widget kit does not have -- it has `ui_frame_serial()`
+      and nothing else, and counting frames is not a substitute, because this is
+      a retained-mode loop that skips frames when nothing moves: the quiet gap
+      between two deliberate clicks can be fewer frames than a fast
+      double-click. The clean answer is another provider beside the clipboard
+      one (`ui_clock_provider`), which em_app fills with `embk_uptime_ms` and
+      kit_test fills with a fake clock -- making double-click testable on the
+      host, which frame-counting never would be.
+
 ### The dock tells the truth about what is running (done 2026-09-12)
 
 - [x] **A running app the dock did not start now lights its tile.** The desktop

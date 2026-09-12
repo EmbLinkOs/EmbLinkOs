@@ -164,6 +164,11 @@ interrupt and is consumed before any application sees it
 (`docs/INTERRUPTION.md`). The rule is *Ctrl belongs to the terminal, the GUI key
 belongs to the interface*. Ctrl+V still pastes, for the apps that always used it.
 
+**The mouse.** A press places the caret and a drag extends a selection, in both
+the single-line field and the multi-line editor. A drag keeps going after the
+pointer leaves the widget (pointer capture), so dragging off the end selects to
+the end. Double-click-for-a-word is not implemented yet — see `docs/TODO.md`.
+
 An app gets all of this for free — there is nothing to call. If your app
 installs a key hook, note that it sees the paste replay and can refuse it (this
 is how the terminal stops a pasted newline from executing anything).

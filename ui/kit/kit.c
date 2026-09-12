@@ -587,6 +587,28 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
             }
             g_anchor = g_caret;        /* a click starts a fresh, empty selection */
         }
+
+        /* A DRAG SELECTS, which is how nearly everyone selects text and what
+         * the keyboard-only version was missing.
+         *
+         * ui_is_active() is POINTER CAPTURE: true from the press on this field
+         * until the button comes back up, even once the pointer has slid off
+         * the field entirely. That is the behaviour worth having -- dragging
+         * past the end of a field keeps extending the selection to the end
+         * instead of stopping dead the moment you leave the box, which is what
+         * ui_is_pressed() would have given.
+         *
+         * Only the caret moves; the anchor was planted by the press above, and
+         * leaving it alone is the whole of what makes this a selection. */
+        if (!masked && ui_is_active()) {
+            float rx, ry, rw, rh, px, py;
+            if (ui_open_rect(&rx, &ry, &rw, &rh) && rw > 0) {
+                ui_pointer_pos(&px, &py);
+                (void)ry; (void)rh; (void)py;
+                g_caret = caret_from_x(buf, len, t->font_regular, t->text_body,
+                                       px - (rx + t->sp3));
+            }
+        }
     }
 
     /* while focused, apply this frame's typed characters in place -- first

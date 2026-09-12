@@ -68,6 +68,24 @@ static void click_in(void) {
     frame(NULL);
 }
 
+/* Press at (x,y), then release there: a click that PLACES the caret. */
+static void click_at(float x, float y) {
+    ui_pointer(x, y, true);
+    frame(NULL);
+    ui_pointer(x, y, false);
+    frame(NULL);
+}
+
+/* Press at one point, drag to another, release: a selection. */
+static void drag(float x0, float y0, float x1, float y1) {
+    ui_pointer(x0, y0, true);
+    frame(NULL);
+    ui_pointer(x1, y1, true);
+    frame(NULL);
+    ui_pointer(x1, y1, false);
+    frame(NULL);
+}
+
 int main(void) {
     printf("=== em-test: the multi-line editor ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -157,6 +175,59 @@ int main(void) {
     frame("caf\xC3\xA9");
     frame(SLEFT COPY);
     CHECK(!strcmp(clip_text(), "\xC3\xA9"), "a selection over é carries BOTH its bytes");
+
+    /* ---- THE MOUSE: placing the caret, and dragging a selection ---------
+     *
+     * Before this the editor answered a click by taking focus and nothing
+     * else, so the caret stayed wherever it was and the only way to reach a
+     * line was to arrow to it -- in a CODE EDITOR.
+     *
+     * The y of a line is the surface's top padding plus the line pitch, which
+     * is the drawn text size plus the 5px the lines are spaced by. Computed
+     * from the theme rather than hardcoded, so this test does not quietly
+     * become a test of one font size. */
+    {
+        const struct ui_theme *th = ui_theme();
+        float lh = th->text_body + 5.0f;
+        #define LINE_Y(n) (th->sp2 + lh * (n) + lh * 0.5f)
+
+        DOC[0] = 0; CUR = 0; g_clip_n = 0;
+        frame(NULL);
+        strcpy(DOC, "alpha\nbravo\ncharlie");
+        frame(NULL);
+
+        click_at(0, LINE_Y(1));
+        CHECK(CUR == 6, "a click lands on the line it was aimed at");
+        frame("X");
+        CHECK(!strcmp(DOC, "alpha\nXbravo\ncharlie"), "and typing goes there");
+
+        /* Far right of a line is its END, not the start of the next one. */
+        click_at(390, LINE_Y(0));
+        CHECK(CUR == 5, "clicking past the end of a line stops at the end of it");
+
+        /* Below the last line is the last line, not nothing. */
+        click_at(390, LINE_Y(9));
+        CHECK(CUR == (int)strlen(DOC), "clicking below the text lands at the very end");
+
+        /* A DRAG SELECTS. Pointer capture means it keeps extending even once
+         * the pointer has left the editor, which is why the release here is
+         * far outside it. */
+        strcpy(DOC, "alpha\nbravo\ncharlie"); CUR = 0; frame(NULL);
+        drag(0, LINE_Y(0), 390, LINE_Y(1));
+        frame(COPY);
+        CHECK(!strcmp(clip_text(), "alpha\nbravo"), "dragging across two lines selects both");
+
+        strcpy(DOC, "alpha\nbravo\ncharlie"); CUR = 0; g_clip_n = 0; frame(NULL);
+        drag(0, LINE_Y(0), 900, LINE_Y(40));
+        frame(COPY);
+        CHECK(!strcmp(clip_text(), "alpha\nbravo\ncharlie"),
+              "a drag that leaves the editor keeps going to the end");
+
+        /* And the selection a drag made is a real one: typing replaces it. */
+        frame("!");
+        CHECK(!strcmp(DOC, "!"), "typing replaces what the drag selected");
+        #undef LINE_Y
+    }
 
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
