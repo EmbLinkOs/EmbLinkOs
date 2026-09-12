@@ -154,6 +154,33 @@ static const char *cpu_text(void) {
  * useless at a glance. One core is the threshold that actually means
  * something: full means "something is working hard", and a machine with more
  * cores keeps working past it rather than the meter rescaling underfoot. */
+/* THE NETWORK, sampled on a clock like everything else in this bar.
+ *
+ * The stack has always known this and nothing could ask, so the bar could not
+ * say whether the machine was online -- and a machine that cannot tell you it
+ * is offline looks broken when it is merely unplugged. Two seconds: a link
+ * coming up is not something anyone watches for at frame rate. */
+static struct embk_net_status g_net;
+static int      g_net_ok;
+static uint64_t g_net_next;
+
+static void net_sample(void) {
+    uint64_t now = embk_uptime_ms();
+    if (now < g_net_next) return;
+    g_net_next = now + 2000;
+    g_net_ok = (embk_net_status(&g_net) == 0);
+}
+
+/* "10.0.2.15", or the empty string when there is no address to show. */
+static const char *ip_text(uint32_t ip) {
+    static char b[20];
+    if (!ip) return "";
+    snprintf(b, sizeof b, "%u.%u.%u.%u", (unsigned)(ip >> 24) & 0xFF,
+             (unsigned)(ip >> 16) & 0xFF, (unsigned)(ip >> 8) & 0xFF,
+             (unsigned)ip & 0xFF);
+    return b;
+}
+
 static void meter(int pct) {
     float frac = (float)pct / 100.0f;
     if (frac > 1.0f) frac = 1.0f;
@@ -255,7 +282,8 @@ static void bar(void) {
     static int first = 1;
     if (first) { first = 0; em_window_move_to(0, 0); }   /* flush, like Mac's */
     bar_ink_update();
-    cpu_sample();      /* once per frame == once per refresh_ms == once a second */
+    cpu_sample();
+    net_sample();      /* once per frame == once per refresh_ms == once a second */
     wins_sample();     /* who is in front, and what else is open */
 
     /* The window is TRANSLUCENT (per-pixel transparent, no blur) and grows tall
@@ -372,6 +400,41 @@ static void bar(void) {
             /* The readout, then the clock -- the trailing order a status
              * strip has, with the number that changes on the inside so the
              * clock keeps the corner it has always had. */
+            /* THE NETWORK, as a glyph that opens the details.
+             *
+             * A dot when there is a link and a dash when there is not, rather
+             * than a word: the bar is read at a glance and "Offline" spelled
+             * out is a sentence sitting permanently in the corner of a machine
+             * that is simply not plugged in. The menu behind it is where the
+             * address lives, because that is a thing you look UP, not a thing
+             * you monitor. */
+            {
+                int linked = g_net_ok && g_net.up;
+                Menu(linked ? "\xe2\x97\x8f" : "\xe2\x80\x93",
+                     .font = BodyBold, .color = g_ink) {
+                    if (!g_net_ok) {
+                        MenuItem("Network unavailable");
+                    } else if (!g_net.up) {
+                        MenuItem("Not connected");
+                    } else {
+                        char line[48];
+                        snprintf(line, sizeof line, "IP  %s", ip_text(g_net.ip));
+                        MenuItem(line);
+                        if (g_net.gateway) {
+                            snprintf(line, sizeof line, "Router  %s", ip_text(g_net.gateway));
+                            MenuItem(line);
+                        }
+                        if (g_net.dns) {
+                            snprintf(line, sizeof line, "DNS  %s", ip_text(g_net.dns));
+                            MenuItem(line);
+                        }
+                        MenuSeparator();
+                        MenuItem(g_net.dhcp ? "Configured by DHCP"
+                                            : "Configured statically");
+                    }
+                }
+            }
+            HStack(.width = 10) {}
             meter(g_cpu_pct);
             Text(cpu_text()).caption().color(g_ink);
             HStack(.width = 10) {}                 /* two readings, not a group */

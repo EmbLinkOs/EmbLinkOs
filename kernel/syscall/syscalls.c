@@ -2245,6 +2245,46 @@ static int64_t sys_win_list(const struct sysargs *a) {
  * mechanism, which power_last_error() names -- worth reporting rather than
  * hanging, because "this machine cannot power itself off" is actionable and a
  * silent halt is not. */
+/* WHAT THE NETWORK IS DOING. The stack has known all of this since it came up
+ * (struct netif) and userspace could open sockets without ever being able to
+ * ask whether it was online or what its own address was -- so nothing could
+ * show it, and a machine that cannot tell you it is offline is a machine that
+ * looks broken when it merely is not plugged in.
+ *
+ * CAP_NETWORK-gated like the rest of the socket surface. Reading the link
+ * state is not using the network, but the address is the machine's identity on
+ * it, and an application with no business on the network has none with that
+ * either. */
+struct net_status_kbuf {
+    int32_t  up, dhcp;
+    uint32_t ip, netmask, gateway, dns;     /* HOST order */
+    uint8_t  mac[6];
+    uint8_t  pad[2];
+};
+static int64_t sys_net_status(const struct sysargs *a) {
+    int cg = cap_gate(EMBK_CAP_NETWORK);
+    if (cg) return cg;
+    void *out = (void *)a->arg[0];
+    if (!out) return -EMBK_EINVAL;
+
+    struct net_status_kbuf k;
+    memset(&k, 0, sizeof k);
+    k.up      = g_netif.up ? 1 : 0;
+    k.dhcp    = g_netif.dhcp ? 1 : 0;
+    k.ip      = g_netif.ip;
+    k.netmask = g_netif.netmask;
+    k.gateway = g_netif.gateway;
+    k.dns     = g_netif.dns;
+    for (int i = 0; i < 6; i++) k.mac[i] = g_netif.mac[i];
+
+    /* Copied RAW into userland, where struct embk_net_status mirrors it field
+     * for field -- grow both together. */
+    _Static_assert(sizeof(struct net_status_kbuf) == 6 * 4 + 8,
+                   "net_status_kbuf and embk_net_status have drifted apart");
+    if (copy_to_user(out, &k, sizeof k) != EMBK_OK) return -EMBK_EFAULT;
+    return 0;
+}
+
 static int64_t sys_power(const struct sysargs *a) {
     if (!current_process) return -EMBK_EPERM;
     if (!(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_POWER)))
@@ -2366,6 +2406,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_kbd_layout]     = sys_kbd_layout,
     [SYS_win_list]       = sys_win_list,
     [SYS_power]          = sys_power,
+    [SYS_net_status]     = sys_net_status,
     [SYS_win_raise]      = sys_win_raise,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,

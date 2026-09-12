@@ -310,6 +310,25 @@ static inline int embk_fd_poll(int fd, int events) {
     return (int)embk_syscall2(EMBK_SYS_fd_poll, fd, events);
 }
 
+/* WHAT THE NETWORK IS DOING. Mirrors the kernel's struct net_status_kbuf field
+ * for field -- sys_net_status copies it raw; grow both together.
+ *
+ * Addresses are in HOST order, so 10.0.2.15 reads as 0x0A00020F and the octets
+ * come out with >>24, >>16, >>8, &0xFF in that order.
+ *
+ * `up` is the link; `dhcp` says a lease configured it rather than a static
+ * address. A machine with up = 0 is not broken, it is not plugged in -- which
+ * is exactly what nothing could say before this existed. */
+struct embk_net_status {
+    int32_t  up, dhcp;
+    uint32_t ip, netmask, gateway, dns;
+    unsigned char mac[6];
+    unsigned char pad[2];
+};
+static inline int embk_net_status(struct embk_net_status *out) {
+    return (int)embk_syscall1(EMBK_SYS_net_status, (int64_t)(intptr_t)out);
+}
+
 static inline int embk_net_socket(int type) {      /* type: 1=stream(TCP) 2=dgram(UDP); -> fd */
     return (int)embk_syscall1(EMBK_SYS_net_socket, type);
 }

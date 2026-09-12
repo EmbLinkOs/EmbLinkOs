@@ -268,4 +268,10 @@
  * the caller's. Does not return on success. */
 #define SYS_power         118   /* (what: 0 off, 1 restart) -> -err           */
 
+/* What the network is doing: link, lease, address, gateway, DNS, MAC. The
+ * stack knew all of it (struct netif) and userspace could open sockets without
+ * ever being able to ask whether it was online, or what its own address was.
+ * CAP_NETWORK-gated like the rest of the socket surface. */
+#define SYS_net_status    119   /* (out)                    -> 0 | -err        */
+
 #endif /* _SYSCALL_NR_H_ */

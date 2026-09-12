@@ -57,6 +57,13 @@ def boot(name, scratch, audio=None, tablet=False):
         "-no-reboot", "-no-shutdown", "-m", "1024m", "-smp", "2",
         "-accel", "tcg,thread=multi",
     ]
+    # A NETWORK, when the caller asks for one. Off by default because most of
+    # these tests do not care and a NIC is one more thing to go wrong -- but a
+    # test of the network indicator has to be able to produce BOTH answers, and
+    # "no device at all" is only one of them. QEMU's user-mode stack hands out
+    # 10.0.2.15 over DHCP with a router at 10.0.2.2.
+    if os.environ.get("NET") == "1":
+        argv += ["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]
     if tablet:
         # AN ABSOLUTE POINTING DEVICE, for a test that has to put the cursor on
         # a named pixel. QEMU gives a PC a PS/2 mouse, which is RELATIVE: a tool

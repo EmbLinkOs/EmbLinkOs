@@ -18,6 +18,10 @@ rarely needs to:
                  it sdc). Used by tests that want a disk they may destroy.
     NVME_DISK    a raw image on an NVMe controller, for `test nvme`; it must
                  carry the scratch marker (make build/nvme-scratch.img).
+    NET          1 = give the guest a virtio-net NIC on QEMU's user-mode stack
+                 (10.0.2.15, router .2, DNS .3). `test dhcp` and `test dns`
+                 need it; without one they fail for want of a device, which
+                 looks exactly like a broken stack.
     NVME_BLOCK   that namespace's logical block size: 512 (default) or 4096.
     NVME_ROOT    1 = attach embkfs.img over NVMe instead of IDE index 1.
     SWAP_DISK    a raw image with an EMBKSWAP header (tools/mkswap.py),
@@ -81,6 +85,12 @@ def main(cmds):
     swap = os.environ.get("SWAP_DISK")
     if swap:
         argv += ["-drive", "format=raw,file=%s,if=ide,index=3" % os.path.abspath(swap)]
+    # A NIC, when asked for. `test dhcp` and `test dns` cannot pass without one
+    # and this harness never had one, so both were permanently red here and
+    # nobody could tell that from a real failure. The Makefile's run targets
+    # have always appended the same thing ($(NET)); this is that, on request.
+    if os.environ.get("NET") == "1":
+        argv += ["-netdev", "user,id=net0", "-device", "virtio-net,netdev=net0"]
     argv += ["-serial", "stdio", "-no-reboot", "-no-shutdown",
              "-m", os.environ.get("MEM", "2G"), "-smp", os.environ.get("SMP", "4"),
              "-display", "none"]

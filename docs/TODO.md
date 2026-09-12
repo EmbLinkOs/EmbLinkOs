@@ -3084,7 +3084,46 @@ Open:
       architecture, the screen size and the uptime through the notifier now,
       which is the way any program here speaks from outside its own window.
 
-- [ ] **Still no battery or network indicator.** The power subsystem has a
+### The bar can say whether the machine is online (done 2026-09-12)
+
+- [x] **`SYS_net_status` (119), and a network indicator in the top bar.** The
+      stack has known its link, lease, address, router, DNS and MAC since it
+      came up (`struct netif`) and userspace could open sockets without ever
+      being able to ask any of it -- so nothing could show it, and a machine
+      that cannot tell you it is offline looks broken when it is merely not
+      plugged in.
+
+      CAP_NETWORK-gated like the rest of the socket surface. Reading the link
+      state is not using the network, but the address is the machine's identity
+      on it, and an application with no business on the network has none with
+      that either.
+
+      A DOT WHEN THERE IS A LINK AND A DASH WHEN THERE IS NOT, rather than a
+      word: the bar is read at a glance, and "Offline" spelled out is a sentence
+      sitting permanently in the corner of a machine that is simply unplugged.
+      The address lives in the menu behind it, because that is a thing you look
+      UP rather than monitor.
+
+      PROVED BOTH WAYS, which is the whole point -- a test that only ever boots
+      without a NIC would pass an indicator hard-wired to say "offline".
+      tools/net_shot.py boots twice, and the bar reads "Not connected" with no
+      device and "IP 10.0.2.15 / Router 10.0.2.2 / DNS 10.0.2.3 / Configured by
+      DHCP" with QEMU's user-mode stack.
+
+      Its own bug is worth keeping: shell_shot tracks the pointer in a MODULE
+      GLOBAL so it can move relatively without re-homing, and across two
+      separate guests that position is a fiction -- the second run aimed by a
+      delta from a machine that no longer existed, clicked nothing, and looked
+      exactly like an indicator that does not work.
+
+- [x] **`test dhcp` and `test dns` were permanently red under console_test.py**
+      (fixed 2026-09-12) -- and not because anything was broken. That harness
+      never gave the guest a NIC, so both failed for want of a device, which is
+      indistinguishable from a broken stack when you are reading a list of
+      results. `NET=1` now adds the same virtio-net the Makefile's run targets
+      have always appended, and both pass.
+
+- [ ] **Still no battery indicator.** The power subsystem has a
       `power_supply_driver` interface designed for exactly this -- ACPI's _BST
       on a laptop, an I2C fuel gauge on a board -- and NOTHING HAS EVER
       REGISTERED ONE, so `power_supply_get()` always returns false and the OS
