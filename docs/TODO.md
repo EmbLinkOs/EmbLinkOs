@@ -2540,6 +2540,15 @@ Open:
       editor now has Open and Save As; it previously could only edit the file
       it was handed on the command line.
 
+      MANIFESTS PACK BESIDE THEIR BINARY NOW, in BOTH image builders. Each
+      only wrote `<name>.ns` / `<name>.caps` for programs under /data/apps,
+      which silently dropped them for anything sealed in /system/bin -- and the
+      first program that needed one there was the panel, whose authority is the
+      most important in the session. The x86 builder was fixed first and the
+      aarch64 one was not, so the ARM boot log kept saying "filepanel.ns not
+      found" while x86 was clean: the same bug, twice, in two copies of the
+      same idea.
+
 - [ ] **The panel should hand back a HANDLE, not a path.** This is the version
       that matters in a capability system: the panel holds the authority to
       browse, and an app with no filesystem namespace of its own could open

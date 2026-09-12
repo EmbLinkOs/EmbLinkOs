@@ -116,20 +116,27 @@ def main(argv):
         # first time the real session ran here.
         base = name[:-4]
         dest = _dest(name)
-        if dest.startswith(b"data/apps/"):
-            for suffix in ("ns", "caps", "app"):
-                # _prog_meta, SHARED with the x86 image builder, because a
-                # program's manifests live in the program's own directory now
-                # (user/apps/<name>/, user/tests/<name>/, ...) and only the NAME
-                # is known here. Composing the path from parts locally is how
-                # this broke: a tree-wide rewrite of "user/bin/..." literals
-                # could not see it, so the aarch64 launcher came up empty and
-                # the x86 one did not. One function, one place to be wrong.
-                side = _prog_meta(base, suffix)
-                if os.path.exists(side):
-                    with open(side, "rb") as sf:
-                        objects.append((f"data/apps/{base}/{base}.{suffix}".encode(),
-                                        L.DT_REG, L.S_IFREG | L.PERM_FILE, sf.read()))
+        # BESIDE THE BINARY, WHEREVER IT LANDS -- the same correction the x86
+        # builder needed. Restricting this to /data/apps silently dropped the
+        # manifests of anything sealed in /system/bin, and the first program
+        # that needed one there was the file panel: the session's file-browsing
+        # SERVICE, whose authority is the most important in the session, came up
+        # "full inherit (no manifest)". Caught on aarch64 only, because x86 had
+        # just been fixed and this copy had not.
+        elf_dir = dest.rsplit(b"/", 1)[0]
+        for suffix in ("ns", "caps", "app"):
+            # _prog_meta, SHARED with the x86 image builder, because a
+            # program's manifests live in the program's own directory now
+            # (user/apps/<name>/, user/tests/<name>/, ...) and only the NAME
+            # is known here. Composing the path from parts locally is how
+            # this broke: a tree-wide rewrite of "user/bin/..." literals
+            # could not see it, so the aarch64 launcher came up empty and
+            # the x86 one did not. One function, one place to be wrong.
+            side = _prog_meta(base, suffix)
+            if os.path.exists(side):
+                with open(side, "rb") as sf:
+                    objects.append((elf_dir + b"/" + f"{base}.{suffix}".encode(),
+                                    L.DT_REG, L.S_IFREG | L.PERM_FILE, sf.read()))
 
     # The SEALED ABI. /system/lib/libembk.so is the ELF loader's ONE hardwired
     # library path -- every dynamic app's DT_NEEDED resolves there and nowhere
