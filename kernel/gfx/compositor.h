@@ -98,11 +98,8 @@ void compositor_exit_pid(int pid);
 /* WHAT WINDOWS EXIST -- the view a switcher, a taskbar, or a bar that names
  * the focused application all need, and which nothing could ask for before.
  *
- * A process here has no name a person would recognise: this is a capability
- * system, processes are named by handle, and `struct process` stores no path
- * or argv. The COMPOSITOR is the only part of the kernel that knows an
- * application by a human name -- its window title -- which is why this lives
- * here rather than beside process_list().
+ * The compositor is the only part of the kernel that knows a window's TITLE,
+ * which is why this lives here rather than beside process_list().
  *
  * Layers a person cannot switch to are left out: the desktop (the wallpaper),
  * widgets, translucent strips (the menu bar and the notifier), and anything
@@ -116,6 +113,20 @@ struct comp_win_info {
     uint32_t id;
     uint32_t flags;                    /* COMP_WIN_* */
     char     title[COMP_TITLE_MAX + 1];
+
+    /* WHAT PROGRAM this is, and the compositor does not fill it in -- it
+     * leaves it empty and the syscall layer annotates the snapshot, exactly
+     * as it does the session filter. The compositor deals in windows; which
+     * binary a pid came from is the process model's business.
+     *
+     * Two names, because they answer different questions. The TITLE is what
+     * the app calls this window and it changes as you work -- open a file in
+     * the editor and it becomes the file's name. The APP name is the basename
+     * of the binary, and it never changes, which is what makes it the thing
+     * you can MATCH on: the dock holds exec paths, so this is how it learns
+     * that a tile's app is running even though it was not the dock that
+     * started it. Show the title; compare the app. */
+    char     app[24];                  /* EXEC_NAME_MAX + 1 */
 };
 
 /* Fills up to `max` entries, front-most first, and returns how many. */

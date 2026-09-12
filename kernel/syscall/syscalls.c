@@ -520,7 +520,8 @@ static int64_t sys_proc_list(const struct sysargs *a) {
                    sizeof(uint32_t) * 2 + sizeof(int) + sizeof(uint8_t) +
                    sizeof(int) + sizeof(unsigned char) + sizeof(uint64_t) +
                    /* padding to the uint64_t's alignment */ 6 +
-                   sizeof(uint32_t) /* session_id */ + 4 /* tail padding */,
+                   sizeof(uint32_t) /* session_id */ +
+                   (EXEC_NAME_MAX + 1) /* name */ + 4 /* tail padding */,
                    "process_info and embk_proc_info have drifted apart");
 
     struct process_info snap[MAX_PROCESSES];
@@ -2203,6 +2204,16 @@ static int64_t sys_win_list(const struct sysargs *a) {
     int keep = 0;
     for (int i = 0; i < n; i++)
         if (win_same_session(snap[i].pid)) snap[keep++] = snap[i];
+
+    /* Annotate with the PROGRAM each window belongs to. Here rather than in the
+     * compositor for the same reason the session filter is here: the compositor
+     * knows windows, and "which binary is that pid" is the process model's
+     * question. It is what makes the list matchable -- a title changes when you
+     * open a file, a basename does not -- so the dock can tell that an app it
+     * never launched is running. Empty when the process has already gone, which
+     * is possible and harmless: the window is still on screen. */
+    for (int i = 0; i < keep; i++)
+        process_exec_name(snap[i].pid, snap[i].app, (int)sizeof snap[i].app);
 
     if (keep > 0 && copy_to_user(user_out, snap,
                                  (size_t)keep * sizeof(snap[0])) != EMBK_OK)

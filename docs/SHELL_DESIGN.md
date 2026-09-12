@@ -84,14 +84,30 @@ now exempt from that clamp. The exemption is DERIVED from the window's size
 rather than declared by the app, so an app cannot leave the flag set after it
 shrinks again.
 
+## The dock says what the machine is running, not what it started
+
+Its sockets used to be lit purely from the desktop's own record of spawns, so
+an app started from the shell showed no socket even with its window on screen.
+It reads the compositor's window list now (`embk_win_list`), and keeps the
+spawn handles for the half-second between a click and the app's first window —
+where there is nothing on screen yet, and a dark socket reads as a click that
+did not work.
+
+The match is on the **binary's basename**, not the window title. A title is
+what an app calls a window and it changes as the person works: open a document
+and the editor's window becomes the document's name, so a dock that recognised
+apps by title would light a tile only until the app was used. The kernel
+records the basename at spawn (`struct process::exec_name`) and the syscall
+layer annotates the window list with it. The name carries no authority and
+nothing decides with it — a process's rights are still its namespace and its
+capability set — and it is a basename rather than a path because the path would
+hand anything that can see a window list a map of the filesystem for free.
+
+Clicking a lit tile the dock did not launch raises that app rather than
+spawning a second copy of something you can already see.
+
 ## Still open
 
-* **The dock only knows what it launched.** Its sockets are lit from the
-  desktop's own record of spawns, so an app started from the shell shows no
-  socket even while its window is on screen. Fixing it properly needs the
-  compositor to expose a window list (pid, title, minimized) — a process here
-  has no name to match on, by design: it is a capability system, and processes
-  are named by handle. Recorded in docs/TODO.md.
 * **Icons.** The dock and desktop art is abstract placeholder glyphs, which is
   why the dock has to name what you point at. Blocked on the icon pipeline.
 * **Where an application's menus live** is undecided. Saying nothing is the

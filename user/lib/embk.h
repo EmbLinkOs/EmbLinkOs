@@ -189,6 +189,12 @@ struct embk_proc_info {
                                  * charged nothing, which is the difference
                                  * between this and wall time. */
     uint32_t      session_id;   /* whose it is: 0 = the system session */
+    char          name[24];     /* the binary's basename; "" for kernel threads.
+                                 * A NAME FOR READING, never for deciding: a
+                                 * process's rights here are its namespace and
+                                 * its capabilities, and this string is not a
+                                 * second, weaker way to say who it is. Before
+                                 * it, `ps` was a column of bare numbers. */
 };
 /* Snapshot every live process (the shell's ps). Returns the count written
  * (<= max), or -EMBK_*. */
@@ -766,9 +772,11 @@ static inline int embk_kbd_layout(const char *name, char *out, int cap) {
  * what a person cannot switch to: the wallpaper, widgets, the translucent
  * strips (menu bar, notifier) and anything that never named itself.
  *
- * This is the only way to learn an application's human-readable name: a
- * process here is named by handle and stores no path, so the compositor's
- * window title is the one name a person would recognise. */
+ * TWO NAMES, and using the wrong one is the mistake to avoid. `title` is what
+ * the app calls this window; SHOW that. `app` is the basename of the binary;
+ * COMPARE that. A title changes as the person works -- open a document and the
+ * editor's window becomes the document's name -- so anything that tries to
+ * recognise an app by its title recognises it only until it is used. */
 #define EMBK_WIN_MINIMIZED  0x1
 #define EMBK_WIN_FOCUSED    0x2
 
@@ -776,7 +784,8 @@ struct embk_win_info {
     uint32_t pid;
     uint32_t id;
     uint32_t flags;      /* EMBK_WIN_* */
-    char     title[32];  /* COMP_TITLE_MAX + 1 */
+    char     title[32];  /* COMP_TITLE_MAX + 1 -- show this */
+    char     app[24];    /* the binary's basename -- match on this */
 };
 
 static inline int embk_win_list(struct embk_win_info *out, int max) {
@@ -791,6 +800,14 @@ static inline int embk_win_list(struct embk_win_info *out, int max) {
  * for a child you started yourself (the dock's click-to-restore). */
 static inline int embk_win_raise(uint32_t pid) {
     return (int)embk_syscall1(EMBK_SYS_win_raise, pid);
+}
+
+/* The basename of an exec path: "/system/apps/term.elf" -> "term.elf". What you
+ * compare against embk_win_info::app. Returns a pointer INTO `path`. */
+static inline const char *embk_basename(const char *path) {
+    const char *b = path ? path : "";
+    for (const char *c = b; *c; c++) if (*c == '/') b = c + 1;
+    return b;
 }
 
 /* 1 = got an event, 0 = queue empty. Never blocks. */

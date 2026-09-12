@@ -750,17 +750,18 @@ static bool shell_handle_process_command(const char *cmd)
          * than a millisecond shows 0 rather than a spuriously precise figure:
          * this is a "what is the machine busy with" column, and to answer that
          * the interesting rows are the ones with big numbers. */
-        kprintf("\nPID  PPID STATE   PRI KIND     CPU(ms) EXIT\n");
+        kprintf("\nPID  PPID STATE   PRI KIND     CPU(ms) EXIT NAME\n");
         uint64_t total_ns = 0;
         for (int i = 0; i < n; i++) {
             total_ns += procs[i].cpu_ns;
-            kprintf("%-4u %-4u %-7s %-3u %-7s %-8llu %d\n",
+            kprintf("%-4u %-4u %-7s %-3u %-7s %-8llu %-4d %s\n",
                     (unsigned int)procs[i].pid, (unsigned int)procs[i].parent_pid,
                     process_state_name(procs[i].state),
                     (unsigned int)procs[i].priority,
                     procs[i].is_kthread ? "kthread" : "process",
                     (unsigned long long)(procs[i].cpu_ns / 1000000ULL),
-                    procs[i].exit_code);
+                    procs[i].exit_code,
+                    procs[i].name[0] ? procs[i].name : "-");
         }
         /* The total against uptime is the sanity check that makes the column
          * trustworthy: on a 4-core machine idling at 97%, the sum of every

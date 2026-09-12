@@ -2655,28 +2655,54 @@ Open:
       screen and no name in the bar, and the filter was right both times.
       Launch from the dock to see it.
 
-### The dock only knows what it launched
+### The dock tells the truth about what is running (done 2026-09-12)
 
-- [ ] **A running app the dock did not start shows no socket.** The desktop
-      lights a dock socket from its OWN record of spawns (`g_running[]` in
-      user/apps/home/home.c, keyed by spawn handle), so an app started from the
-      shell -- or any app whose window is plainly on screen -- leaves its dock
-      tile dark. The redesigned dock makes this more visible than the old 4px
-      dot did, because the socket is the tile.
+- [x] **A running app the dock did not start now lights its tile.** The desktop
+      used to light a socket purely from its OWN record of spawns (`g_running[]`
+      in user/apps/home/home.c, keyed by spawn handle), so an app started from
+      the shell -- or by another app -- left its tile dark with its window in
+      plain view. The redesigned dock made that more visible than the old 4px
+      dot did, because the socket IS the tile.
 
-      What it needs: the compositor to expose a WINDOW LIST (pid, window id,
-      title, minimized, focused) and a syscall to read it. A process here has
-      no name to match on and that is deliberate -- this is a capability
-      system, processes are named by handle, and `struct process` has no path
-      or argv stored anywhere. So the list has to come from the compositor,
-      which is the only part of the kernel that knows an application by a name
-      a person would recognise (its window title).
+      It reads the window list now, and keeps the spawn handles as well: the
+      handles cover the half-second between a click and the app's first window,
+      where there is nothing on screen yet and a dark socket reads as a click
+      that did not work. Sampled every 500 ms rather than per frame -- the dock
+      repaints on every pointer move over it, and a syscall per mouse event to
+      answer a question that changes when an app opens is not a trade worth
+      making.
 
-      The same list is what a window switcher would need, and what would let
-      the top bar name the focused application -- which is the honest version
-      of the app-menu space the menu bar no longer pretends to fill. See
-      docs/SHELL_DESIGN.md.
+      **Matched on the binary's basename, never on the window title.** An app
+      rewrites its title the moment you open a document in it, so a dock that
+      recognised apps by title would light a tile only until the app was
+      actually used. `struct process::exec_name` records the basename at spawn;
+      `sys_win_list` annotates the compositor's snapshot with it (the same
+      layer that applies the session filter, for the same reason -- the
+      compositor knows windows, not the process model).
 
+      That name CARRIES NO AUTHORITY and nothing consults it to decide
+      anything; a process's rights here remain its namespace and its capability
+      set. It is a basename and not a path on purpose: the path would hand
+      anything that can see a window list a free map of the filesystem.
+
+      Clicking a lit tile the dock did not launch now RAISES that app instead of
+      spawning a second copy -- with a fall-through to launching it if the
+      sample has gone stale and there is nothing to raise. A shortcut carrying a
+      start directory (Files at /data while Files is open at /home) still spawns
+      its own instance, which is the point of such a shortcut.
+
+      Measured by tools/dock_truth.py, which clicks the dock's Terminal tile and
+      then types `settings` into the TERMINAL -- a grandchild of the desktop, in
+      the user's session, which the dock did not start. It photographs each
+      socket against ITSELF across three shots (nothing running / Terminal /
+      Terminal + Settings), because each socket holds a different icon and their
+      mean colours differ by more than lighting one ever moves them.
+
+- [x] **`ps` names what it lists.** The kernel console's `ps` and the shell's
+      `ps` builtin were columns of bare pids: you could sort and filter the list
+      but not read it, and the only way to find out what a process was, was to
+      kill it. Both carry the binary's basename now (`-` for kernel threads),
+      from the same field, for reading only.
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant
 ### source of lateness
 

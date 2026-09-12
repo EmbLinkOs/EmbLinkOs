@@ -562,6 +562,27 @@ struct process {
     char     session_user[32];
     bool     session_leader;     /* spawned with NEW_SESSION: its death ends the session */
 
+    /* THE BASENAME OF THE BINARY THIS PROCESS WAS CREATED FROM, and nothing
+     * more: no argv, no working directory, no full path.
+     *
+     * It carries NO AUTHORITY and is never consulted to decide anything. A
+     * process here is named by handle, its rights are its namespace and its
+     * capability set, and that stays true -- this string is not a second,
+     * weaker name that something might be tempted to check. It exists because
+     * of a question the system genuinely could not answer: "is THIS app
+     * running?" The dock asks it to light a tile, `ps` asks it to be readable,
+     * and before this the only answer available was a window title, which an
+     * app rewrites the moment you open a document in it.
+     *
+     * A basename, not a path, because the path is the thing that tells you
+     * where a process's binary lives -- and handing that to anything that can
+     * see a window list is a map of the filesystem drawn for free. The
+     * basename identifies the program; the path locates it, and only the
+     * launcher needs that. Truncated rather than refused: a name is a
+     * convenience, and no spawn should fail over one. */
+#define EXEC_NAME_MAX 23
+    char     exec_name[EXEC_NAME_MAX + 1];
+
     /* Per-process NAMESPACE -- the OTHER grant a process is born with (the
      * "authority IS the namespace" model, docs/USERSPACE_v2.md UP2). Maps path
      * prefixes -> root object handles (+ ro/rw); path resolution starts HERE,
@@ -957,6 +978,11 @@ void process_kill_code(uint32_t pid, int code);
 /* The session `pid` belongs to, or -EMBK_ENOENT. */
 int process_session_of(uint32_t pid, uint32_t *out_session);
 
+/* The basename of `pid`'s binary (struct process::exec_name), or -EMBK_ENOENT.
+ * Always NUL-terminates `out` when cap > 0, including on failure, so a caller
+ * annotating a list can ignore the return and get an empty string. */
+int process_exec_name(uint32_t pid, char *out, int cap);
+
 /* End session `sid`: every live process in it is killed, members first and
  * the leader last (with EMBK_EXIT_LOGOUT when `logout`, -1 otherwise), and
  * whatever the session left in shared kernel state -- the clipboard -- is
@@ -1234,6 +1260,11 @@ struct process_info {
                              * included -- what `ps` needs to answer "what is
                              * this machine busy with", which it could not. */
     uint32_t session_id;    /* whose it is: 0 = the system session */
+    char name[EXEC_NAME_MAX + 1];  /* the binary's basename; "" for kthreads and
+                                    * anything the kernel started with no path.
+                                    * See struct process::exec_name -- it names
+                                    * a process for a READER and decides
+                                    * nothing. `ps` was a column of bare pids. */
 };
 
 /**

@@ -334,6 +334,7 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
 /* The dock: a centered pill sized to its apps. Captures its own world rect so
  * the drop can hit-test against it. */
 static int dock_running(const char *path);   /* below, with g_running */
+static void wins_poll(void);                 /* likewise: the live window list */
 
 /* THE DOCK DOES NOT REACT TO THE POINTER. It reacts to the MACHINE.
  *
@@ -943,16 +944,64 @@ static struct {
     int  handle_p1;
 } g_running[MAX_TRACKED];
 
-/* Is the app behind this dock chip alive right now? Drives the dock's
- * indicator dot, so a dot is a RUNNING process, not a memory of one
- * (proc_alive interrogates the spawn handle; dead handles read 0). */
+/* WHAT IS ACTUALLY ON SCREEN, as opposed to what this process remembers
+ * starting. Sampled on a clock rather than per frame: the dock repaints
+ * whenever the pointer moves over it, and asking the kernel to walk its window
+ * table for every one of those would be a syscall per mouse event to answer a
+ * question whose answer changes when an app opens or closes. Half a second is
+ * faster than a person can notice and thousands of times cheaper. */
+#define WINS_MAX 16
+static struct embk_win_info g_wins[WINS_MAX];
+static int      g_wins_n;
+static uint64_t g_wins_next;
+
+static void wins_poll(void) {
+    uint64_t now = embk_uptime_ms();
+    if (now < g_wins_next) return;
+    g_wins_next = now + 500;
+    int n = embk_win_list(g_wins, WINS_MAX);
+    g_wins_n = n > 0 ? n : 0;
+}
+
+/* The pid of a live window belonging to this exec path, or 0.
+ *
+ * MATCHED ON THE BINARY'S BASENAME, never on the window title: an app rewrites
+ * its title as soon as you open something in it, so a dock that recognised
+ * apps by title would light a tile until the moment the app was used. The
+ * kernel records the basename at spawn and never lets anything decide with it
+ * -- see struct process::exec_name. */
+static uint32_t win_pid_for(const char *path) {
+    if (!path || !path[0]) return 0;
+    const char *base = embk_basename(path);
+    for (int i = 0; i < g_wins_n; i++)
+        if (g_wins[i].app[0] && !strcmp(g_wins[i].app, base)) return g_wins[i].pid;
+    return 0;
+}
+
+/* Is the app behind this dock chip alive right now? Drives the dock's lit
+ * socket, so a lit tile is a RUNNING process, not a memory of one.
+ *
+ * TWO SOURCES, because neither alone is the truth:
+ *
+ *   * our own spawn handles answer for the instant between clicking a tile and
+ *     the app putting a window up -- there is nothing on screen yet, and a
+ *     socket that stays dark for that half-second reads as a click that did
+ *     not work;
+ *   * the window list answers for everything else in the session, which is
+ *     what this could not do before. An app started from the shell, or by
+ *     another app, or one the desktop launched and then lost the handle to,
+ *     left its tile dark while its window sat in plain view on screen.
+ *
+ * The dock's job is to say what is running on the machine, not what this
+ * particular process happens to have started. */
 static int dock_running(const char *path) {
     if (!path) return 0;
     for (int i = 0; i < MAX_TRACKED; i++)
         if (g_running[i].used && g_running[i].handle_p1 > 0 &&
-            strcmp(g_running[i].path, path) == 0)
-            return embk_proc_alive(g_running[i].handle_p1 - 1) == 1;
-    return 0;
+            strcmp(g_running[i].path, path) == 0 &&
+            embk_proc_alive(g_running[i].handle_p1 - 1) == 1)
+            return 1;
+    return win_pid_for(path) != 0;
 }
 
 /* An app declares the authority it needs in two sidecars beside its binary --
@@ -1005,6 +1054,27 @@ static void spawn_app(const char *path, const char *start_dir) {
         if (g_running[slot].used && g_running[slot].handle_p1 > 0)
             embk_wait(g_running[slot].handle_p1 - 1);   /* reap before reusing */
         g_running[slot].handle_p1 = 0;
+
+        /* NOT OURS, BUT ALREADY RUNNING -- the other half of the dock telling
+         * the truth. The tile is lit because the window list says this program
+         * has a window; clicking it must then go to that window, because
+         * spawning a second copy of an app whose tile you just saw lit is the
+         * worst of both answers: the click appears to do nothing (the new
+         * instance opens behind, or fights the first one for its window) and
+         * the machine is now running two.
+         *
+         * A ZERO RETURN MEANS "nothing to raise" -- the sample is up to half a
+         * second old, so the app may have exited since -- and then we fall
+         * through and start it, which is what the click asked for.
+         *
+         * Only for a plain launch. A shortcut that carries a START DIRECTORY
+         * (Files opened at /data while Files is already open at /home) is
+         * deliberately a SEPARATE instance, and raising the existing one would
+         * silently refuse to open the place the user pointed at. */
+        if (!sd[0]) {
+            uint32_t rpid = win_pid_for(path);
+            if (rpid && embk_win_raise(rpid) > 0) return;
+        }
     }
 
     /* Grant the child EXACTLY its declared namespace (UP4); no manifest => it
@@ -1137,6 +1207,7 @@ int main(int argc, char **argv, char **envp) {
 
     for (;;) {
         cfg_poll();            /* dock size / indicator, as Settings left them */
+        wins_poll();           /* what is actually running, ours or not */
         poll_apps_request();   /* the top bar's Apps button opens our launcher */
 
         /* Esc closes the launcher. Only worth reading while it is up: the

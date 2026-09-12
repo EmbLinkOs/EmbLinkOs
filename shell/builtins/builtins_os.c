@@ -405,6 +405,13 @@ static struct value bi_ps(const struct command *cmd, struct value input,
     for (int i = 0; i < n; i++) {
         struct value r = value_record();
         value_record_set(&r, "pid",   value_int((int64_t)info[i].pid));
+        /* WHAT IT IS, not just which number it is. A process list whose only
+         * identifier is a pid can be sorted and filtered but not READ -- you
+         * cannot answer "what is that" without killing it to find out. The
+         * kernel records the binary's basename at spawn; kernel threads have
+         * none and show "-". It is a label for a person and decides nothing:
+         * `kill` still takes the pid. */
+        value_record_set(&r, "name",  value_string(info[i].name[0] ? info[i].name : "-"));
         value_record_set(&r, "ppid",  value_int((int64_t)info[i].parent_pid));
         value_record_set(&r, "state", value_string(
             (info[i].state >= 0 && info[i].state <= 4) ? state_names[info[i].state] : "?"));

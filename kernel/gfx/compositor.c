@@ -1601,6 +1601,7 @@ int compositor_win_list(struct comp_win_info *out, int max) {
         int k = 0;
         while (k < COMP_TITLE_MAX && w->title[k]) { out[n].title[k] = w->title[k]; k++; }
         out[n].title[k] = 0;
+        out[n].app[0] = 0;         /* the syscall layer's to fill -- see the struct */
         n++;
     }
 

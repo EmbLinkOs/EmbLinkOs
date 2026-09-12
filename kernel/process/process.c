@@ -218,6 +218,10 @@ static struct process *process_alloc(void) {
             process_table[i].session_id = 0;
             process_table[i].session_user[0] = 0;
             process_table[i].session_leader = false;
+            /* Same hazard as the session fields: a reused slot showing the
+             * PREVIOUS occupant's program name is worse than showing none --
+             * the dock would light a tile for an app that has exited. */
+            process_table[i].exec_name[0] = 0;
             /* Namespace: default INACTIVE (global-mount fallback) -- the safe
              * reset for a REUSED slot and the resting state for kernel threads.
              * process_create_caps installs the real per-process view for user
@@ -1427,6 +1431,23 @@ int process_session_of(uint32_t pid, uint32_t *out_session) {
     return rc;
 }
 
+int process_exec_name(uint32_t pid, char *out, int cap) {
+    if (out && cap > 0) out[0] = 0;
+    spin_lock(&g_sched_lock);
+    struct process *p = process_find(pid);
+    int rc = -EMBK_ENOENT;
+    if (p && p->live_thread_count > 0) {
+        if (out && cap > 0) {
+            int k = 0;
+            while (p->exec_name[k] && k < cap - 1) { out[k] = p->exec_name[k]; k++; }
+            out[k] = 0;
+        }
+        rc = EMBK_OK;
+    }
+    spin_unlock(&g_sched_lock);
+    return rc;
+}
+
 int session_end(uint32_t sid, bool logout) {
     if (sid == 0)
         return -EMBK_EPERM;              /* the system session is not a user's to end */
@@ -1699,6 +1720,11 @@ int process_list(struct process_info *out, int max) {
         out[n].exit_code = p->exit_code;
         out[n].is_kthread = (p->pml4_phys == vmm_get_kernel_pml4());
         out[n].session_id = p->session_id;
+        {
+            int k = 0;
+            while (p->exec_name[k] && k < EXEC_NAME_MAX) { out[n].name[k] = p->exec_name[k]; k++; }
+            out[n].name[k] = 0;
+        }
         out[n].cpu_ns = 0;
         for (struct thread *t = p->thread_list; t; t = t->proc_thread_next) {
             out[n].cpu_ns += t->cpu_ns;
@@ -2252,6 +2278,20 @@ int process_create_caps(const char *path, char *const argv[], int argc,
      * pid to 0; they don't need to touch parent/parent_pid). */
     proc->parent = current_thread ? current_process : NULL;
     proc->parent_pid = current_thread ? current_process->pid : 0;
+
+    /* The program's name, for anything that has to SHOW this process to a
+     * person -- see struct process::exec_name for why it is a basename and why
+     * nothing is allowed to make a decision with it. Recorded here, with the
+     * parent link, because `path` is not kept anywhere else: by the time the
+     * child is running, the string belonged to the caller's stack. */
+    {
+        const char *base = path ? path : "";
+        for (const char *c = base; *c; c++)
+            if (*c == '/') base = c + 1;
+        int k = 0;
+        while (base[k] && k < EXEC_NAME_MAX) { proc->exec_name[k] = base[k]; k++; }
+        proc->exec_name[k] = 0;
+    }
 
     /* Attenuate from the parent (EMBX §6 step 9, kernel side). The grantor is
      * the spawning process; with no current process this is the kernel creating
