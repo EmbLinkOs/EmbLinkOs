@@ -2376,8 +2376,30 @@ Open:
       `test deadline` runs in one boot were clean, so it is aarch64-specific.
       `python3 tools/arm64_hang_capture.py 25` boots until it happens and
       photographs every vCPU's PC twice, 200 ms apart, symbolized -- identical
-      PCs mean a stuck core, moving ones a livelock. 10 runs so far have not
-      caught one; it needs a longer loop.
+      PCs mean a stuck core, moving ones a livelock.
+
+      **CAUGHT IN THE ACT, 2026-09-12** (run 2 of a 30-boot soak): ALL FOUR
+      cores spinning in `spin_lock`, PCs moving within the spin loop, at exactly
+      that point. Four spinners and no holder running means somebody took a lock
+      and never gave it back. Ruled out while looking: `spin_lock` masks IRQs
+      before spinning, so a core cannot deadlock against its own interrupt
+      handler; every exit of `sched_declare_period()` unlocks; and both
+      first-run trampolines already release the lock a new thread inherits
+      (their comments describe this very deadlock). The lock now RECORDS ITS
+      HOLDER -- `holder_lr` in kernel/include/spinlock.h, written by the winner
+      and cleared on release -- and the capture tool reads and symbolizes it out
+      of the hung guest, so the next occurrence names the call site.
+- [ ] **A second aarch64 failure at the same point**, from a desktop run on
+      2026-09-12: an ILLEGAL EXECUTION STATE exception (ESR EC 0x0E) taken at
+      `exc_common+0x80`, which is exactly `msr spsr_el1, x1` in the exception
+      RETURN path, on the static boot stack, with x30 = 0x5ca and a register
+      file full of packed small integers. PSTATE.IL is set by an ERET whose
+      SPSR is illegal -- on Apple silicon anything with M[4] set (AArch32) is --
+      and the reported ELR is then the address that ERET jumped to. So a frame
+      was restored whose saved PSTATE was garbage while its saved PC was intact.
+      Nothing in C ever writes `frame->spsr` (only the assembly save does), so
+      this is corruption of a frame, or a restore from a wrong SP. Whether it is
+      the same bug as the spin above is not yet known.
 
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant
 ### source of lateness
