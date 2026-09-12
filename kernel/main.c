@@ -2097,6 +2097,18 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // compositor spinlock is never taken from an IRQ handler. No-op until a
         // window exists.
         compositor_pointer_tick();
+        /* SYSTEM KEY SHORTCUTS, performed here rather than where they were
+         * pressed: the keyboard decides them in IRQ context and the compositor
+         * takes a spinlock and repaints, which an IRQ handler must not do. Same
+         * arrangement as the pointer tick above. */
+        {
+            int sk = keyboard_take_syskey();
+            if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            else if (sk == SYSKEY_CLOSE_WINDOW) {
+                int pid = compositor_close_front();
+                if (pid) process_kill((uint32_t)pid);
+            }
+        }
         // Advance any window open/minimize motion. Same reasoning as above: it
         // repaints, so it must run in schedulable context, not an IRQ.
         compositor_anim_tick();

@@ -106,6 +106,18 @@ hand anything that can see a window list a map of the filesystem for free.
 Clicking a lit tile the dock did not launch raises that app rather than
 spawning a second copy of something you can already see.
 
+## Switching windows
+
+**GUI+Tab** raises the window behind the front one and sends the old front to
+the back of the cycle, so pressing it repeatedly walks every window instead of
+flipping between the top two. **GUI+W** closes the front window.
+
+Both are swallowed by the driver and never reach an application — one that could
+see the switcher could decline it, and a switcher that works only in the apps
+that implemented it is not a switcher. They are decided in the keyboard IRQ and
+performed by the kernel's main loop, because the compositor takes a spinlock and
+repaints and an interrupt handler may do neither.
+
 ## Still open
 
 * **Icons.** The dock and desktop art is abstract placeholder glyphs, which is

@@ -3025,6 +3025,38 @@ Open:
       thumb's offset fails "it moves DOWN", and drawing it when the content fits
       fails "content that fits shows no thumb".
 
+### The window switcher the window list was built for (done 2026-09-12)
+
+- [x] **GUI+Tab switches windows; GUI+W closes one.** `embk_win_list` and
+      `embk_win_raise` were built so a switcher could exist and then nothing
+      ever bound a key to it.
+
+      "Next" is the window BEHIND the front one, and raising it sends the old
+      front to the back of the cycle. That is not the same as swapping the top
+      two, which is what the naive version gives you and is a trap: pressing the
+      shortcut repeatedly then flips between the same pair forever and a third
+      window can never be reached. The test asserts exactly this -- two tabs
+      over two windows must come back to the start.
+
+      THEY ARE SYSTEM SHORTCUTS AND ARE SWALLOWED, never delivered to an
+      application. An app that could see the switcher could decline it, and a
+      machine where window switching works only in the apps that bothered to
+      implement it has no window switcher. The same reasoning as ^C, which the
+      driver consumes rather than passing on.
+
+      DECIDED IN THE IRQ, PERFORMED IN THE MAIN LOOP. The keyboard knows the
+      modifiers at the instant the key goes down, but the compositor takes a
+      plain spinlock and repaints, which an interrupt handler must not do -- so
+      the driver records a SYSKEY_* and both kernels' main loops act on it, the
+      same arrangement `compositor_pointer_tick` already uses. Wired on BOTH
+      arches: a switcher that worked only on x86 is one nobody could rely on.
+
+      Measured by tools/switch_shot.py, which opens two apps from the dock and
+      reads the TOP BAR's application name -- the window list's first payoff,
+      now used to check the window list's second. Comparing a strip of pixels
+      rather than recognising glyphs keeps the test out of that business:
+      8% of the strip changes on each tab and 0% after cycling back around.
+
 ### Undo, in every text field (done 2026-09-12)
 
 - [x] **`GUI+Z` undoes and `GUI+Shift+Z` redoes, toolkit-wide.** Every text

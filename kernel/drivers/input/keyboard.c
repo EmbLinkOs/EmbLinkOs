@@ -174,6 +174,11 @@ static int buffer_pop(char *c) {
  * wakeup (the read hangs forever). Defined below; forward-declared so the IRQ
  * handler can reach it. */
 static void keyboard_deliver(char c);
+
+/* The pending system shortcut, decided in IRQ context and performed by the
+ * kernel's main loop -- see SYSKEY_* in keyboard.h. */
+static volatile int g_syskey;
+int keyboard_take_syskey(void) { int k = g_syskey; g_syskey = SYSKEY_NONE; return k; }
 void        kbd_translate(uint8_t make, int pressed);   /* the testable seam */
 static void keyboard_deliver_cp(uint32_t cp);   /* one codepoint, as UTF-8 */
 static uint32_t kbd_compose(uint32_t mark, uint32_t base);
@@ -408,6 +413,12 @@ void kbd_translate(uint8_t make, int pressed) {
      * and type their letter, so the key is not a hole. */
     if (g_mods & EKM_GUI) {
         uint32_t low = (cp >= 'A' && cp <= 'Z') ? cp + 0x20 : cp;
+        /* SYSTEM shortcuts first, and they are swallowed: see SYSKEY_* in
+         * keyboard.h for why an application must not be able to see -- and so
+         * decline -- the window switcher. Recorded, not performed: this is IRQ
+         * context and the compositor is not safe to call from one. */
+        if (low == '\t') { g_syskey = SYSKEY_NEXT_WINDOW;  return; }
+        if (low == 'w')   { g_syskey = SYSKEY_CLOSE_WINDOW; return; }
         char cmd = 0;
         switch (low) {
             case 'a': cmd = (char)EK_SEL_ALL; break;

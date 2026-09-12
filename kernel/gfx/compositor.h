@@ -132,6 +132,14 @@ struct comp_win_info {
 /* Fills up to `max` entries, front-most first, and returns how many. */
 int  compositor_win_list(struct comp_win_info *out, int max);
 
+/* GUI+Tab: raise the window behind the front one, sending the old front to the
+ * back of the cycle so that pressing it repeatedly walks every window rather
+ * than flipping between the top two. 1 if anything moved. */
+int  compositor_cycle_window(void);
+/* GUI+W: close the front window as its close light does. Returns the pid to
+ * kill (the caller does it, outside the compositor lock), or 0. */
+int  compositor_close_front(void);
+
 /* Un-minimize and raise a process's windows (the dock's click-to-restore). */
 int  compositor_restore_pid(int pid);
 /* An app parking its own window (chromeless apps have no kernel button). */

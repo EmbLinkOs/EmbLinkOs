@@ -1641,6 +1641,81 @@ int compositor_win_list(struct comp_win_info *out, int max) {
     return n;
 }
 
+/* CYCLE TO THE NEXT WINDOW -- what GUI+Tab does.
+ *
+ * "Next" is the one BEHIND the front one, and raising it sends the old front to
+ * the back of the switchable set rather than swapping the top two. Swapping is
+ * what you get from the naive implementation and it is a trap: pressing the
+ * shortcut repeatedly then flips between the same pair forever and the third
+ * window can never be reached.
+ *
+ * The same windows the switcher lists are the ones cycled -- the wallpaper,
+ * widgets, translucent strips and anything unnamed are furniture, not
+ * destinations. A minimized window IS a destination: it comes back.
+ *
+ * Called from the kernel's main loop, never from the keyboard IRQ: this takes
+ * the compositor lock and repaints. */
+int compositor_cycle_window(void) {
+    spin_lock(&g_comp_lock);
+
+    struct comp_window *front = 0, *next = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w->desktop || w->widget || w->translucent || !w->title[0]) continue;
+        if (!front || w->z > front->z) front = w;
+    }
+    if (!front) { spin_unlock(&g_comp_lock); return 0; }
+
+    /* The highest z BELOW the front one; with nothing below, the front stays. */
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w == front) continue;
+        if (w->desktop || w->widget || w->translucent || !w->title[0]) continue;
+        if (w->z < front->z && (!next || w->z > next->z)) next = w;
+    }
+    if (!next) { spin_unlock(&g_comp_lock); return 0; }
+
+    if (next->minimized) {
+        next->minimized = 0;
+        next->z = g_next_z++;
+        anim_start(next, ANIM_UNPARK);
+    } else {
+        next->z = g_next_z++;
+        int x0, y0, x1, y1;
+        win_repaint_rect(next, &x0, &y0, &x1, &y1);
+        paint_region(x0, y0, x1, y1);
+    }
+    enforce_focus();
+    spin_unlock(&g_comp_lock);
+    return 1;
+}
+
+/* Close the front window, exactly as its close light does -- the process is
+ * killed and its windows reclaimed. Returns the pid to kill, or 0. */
+int compositor_close_front(void) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *c = &g_wins[i];
+        if (!c->used || c->desktop || c->widget || c->translucent || !c->title[0]) continue;
+        if (!c->visible) continue;
+        if (!w || c->z > w->z) w = c;
+    }
+    int pid = 0;
+    if (w) {
+        pid = w->pid;
+        if (w->id == g_top_id) g_top_id = 0;
+        anim_start(w, ANIM_CLOSE);
+        w->visible = 0;
+        int x0, y0, x1, y1;
+        win_repaint_rect(w, &x0, &y0, &x1, &y1);
+        paint_region(x0, y0, x1, y1);
+        enforce_focus();
+    }
+    spin_unlock(&g_comp_lock);
+    return pid;
+}
+
 int compositor_restore_pid(int pid) {
     spin_lock(&g_comp_lock);
     int changed = 0;

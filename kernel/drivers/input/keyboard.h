@@ -70,6 +70,27 @@
 #define EK_UNDO      0xF6   /* GUI+Z        */
 #define EK_REDO      0xF7   /* GUI+Shift+Z, and GUI+Y */
 
+/* ---- SYSTEM shortcuts ----------------------------------------------------
+ *
+ * These never reach an application, and that is the whole point of them. GUI+
+ * Tab switches windows and GUI+W closes one: an app that could see them could
+ * also decline them, and a machine where the window switcher works only in the
+ * applications that bothered to implement it is a machine with no window
+ * switcher. Same reasoning as ^C, which the driver consumes rather than
+ * delivering (docs/INTERRUPTION.md).
+ *
+ * They are NOT acted on here. This runs in the keyboard IRQ and the compositor
+ * takes a plain spinlock and repaints -- so the driver only records what was
+ * asked, and the kernel's main loop performs it in schedulable context, the
+ * same arrangement compositor_pointer_tick() already uses. */
+enum {
+    SYSKEY_NONE = 0,
+    SYSKEY_NEXT_WINDOW,      /* GUI+Tab */
+    SYSKEY_CLOSE_WINDOW,     /* GUI+W   */
+};
+/* Take the pending system shortcut, if any, and clear it. */
+int keyboard_take_syskey(void);
+
 /* ---- the KEY EVENT stream -----------------------------------------------
  * The char stream above answers "what did the user TYPE". It cannot answer
  * "what key is DOWN", and it never will -- not from lack of effort, but

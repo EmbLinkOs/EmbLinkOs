@@ -1499,6 +1499,18 @@ void arch_early_main(uint64_t dtb_phys) {
     for (;;) {
         virtio_input_poll();
         compositor_pointer_tick();
+        /* The system key shortcuts, on this arch too -- GUI+Tab switching
+         * windows only on x86 would be a shortcut nobody could rely on. The
+         * keyboard decides them wherever the keys come from (PS/2 there,
+         * virtio-input here) and both loops perform them the same way. */
+        {
+            int sk = keyboard_take_syskey();
+            if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            else if (sk == SYSKEY_CLOSE_WINDOW) {
+                int pid = compositor_close_front();
+                if (pid) process_kill((uint32_t)pid);
+            }
+        }
         compositor_anim_tick();
         arch_cpu_idle();
     }
