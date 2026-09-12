@@ -261,4 +261,11 @@
  * A switcher knows pids, not handles. */
 #define SYS_win_raise     117   /* (pid)                    -> n | -err       */
 
+/* Turn the machine off or restart it -- what the shell's Shut Down and Restart
+ * do. The kernel could always do this (power_transition) and userspace had no
+ * way to ask, so the only way to stop an EmbLink machine was to cut its power.
+ * Gated on EMBK_CAP_POWER: this ends every process on the machine, not just
+ * the caller's. Does not return on success. */
+#define SYS_power         118   /* (what: 0 off, 1 restart) -> -err           */
+
 #endif /* _SYSCALL_NR_H_ */

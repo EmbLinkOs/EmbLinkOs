@@ -72,7 +72,12 @@
  * pid, end another session), which is the same authority seen from the
  * other side. */
 #define EMBK_CAP_SESSION    11
-#define EMBK_CAP_MAX_ID      11
+/* TURN THE MACHINE OFF. A class of its own because it is unlike every other
+ * one here: the rest gate what a process may TOUCH, and this gates something
+ * that ends every other process on the machine at once. The desktop shell
+ * holds it; an application has no business with it. */
+#define EMBK_CAP_POWER      12
+#define EMBK_CAP_MAX_ID      12
 
 #define EMBK_CAP_BIT(id)  (1ULL << (id))
 

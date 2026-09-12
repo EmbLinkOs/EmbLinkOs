@@ -142,6 +142,10 @@ int appauth_load_ns(const char *elf_path, struct embk_spawn_file_action *acts,
 static const char *const CAP_NAMES[] = {
     0, "filesystem", "network", "gpu", "audio", "camera",
     "usb", "serial", "rawdisk", "kernel_ext", "debug",
+    /* 11 and 12. The table had stopped at "debug" while the ids went on, so a
+     * manifest asking for `session` printed "?" -- a name table that silently
+     * falls behind the enum it names is worse than no names. */
+    "session", "power",
 };
 #define CAP_NAMES_N ((int)(sizeof CAP_NAMES / sizeof CAP_NAMES[0]))
 

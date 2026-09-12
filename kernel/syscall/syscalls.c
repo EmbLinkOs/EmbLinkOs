@@ -31,6 +31,7 @@
 #include "include/types.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "power/power.h"   /* power_transition: the shell's Shut Down */
 #include "lib/random.h"          /* sys_getrandom */
 #include "process/futex.h"
 #include "process/debug.h"   /* sys_debug_* handlers for the table below */
@@ -2228,6 +2229,31 @@ static int64_t sys_win_list(const struct sysargs *a) {
     return keep;
 }
 
+/* Turn the machine off, or restart it.
+ *
+ * The kernel has always been able to (power_transition, and `test power`
+ * proves the path); userspace simply had no way to ask, so the only way to
+ * stop an EmbLink machine was to cut its power. A daily driver needs a
+ * shutdown that is not a wall socket.
+ *
+ * GATED ON EMBK_CAP_POWER, a class of its own, because this is unlike every
+ * other capability here: the rest say what a process may touch, and this ends
+ * every process on the machine at once. The desktop shell holds it by
+ * inheritance from init; an application that declares a narrower set does not.
+ *
+ * Does not return on success. A negative result means the platform has no
+ * mechanism, which power_last_error() names -- worth reporting rather than
+ * hanging, because "this machine cannot power itself off" is actionable and a
+ * silent halt is not. */
+static int64_t sys_power(const struct sysargs *a) {
+    if (!current_process) return -EMBK_EPERM;
+    if (!(current_process->cap_set & EMBK_CAP_BIT(EMBK_CAP_POWER)))
+        return -EMBK_EPERM;
+    int what = (int)a->arg[0];
+    if (what != 0 && what != 1) return -EMBK_EINVAL;
+    return power_transition(what == 0 ? POWER_OFF : POWER_REBOOT);
+}
+
 static int64_t sys_win_raise(const struct sysargs *a) {
     uint32_t pid = (uint32_t)a->arg[0];
     if (!win_same_session(pid)) return -EMBK_EPERM;
@@ -2339,6 +2365,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_session_end]    = sys_session_end,
     [SYS_kbd_layout]     = sys_kbd_layout,
     [SYS_win_list]       = sys_win_list,
+    [SYS_power]          = sys_power,
     [SYS_win_raise]      = sys_win_raise,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,

@@ -88,6 +88,11 @@
 #define EMBK_CAP_KERNEL_EXT  9
 #define EMBK_CAP_DEBUG      10
 #define EMBK_CAP_SESSION    11   /* open a session for a user; init only -- see embk_action_new_session */
+/* TURN THE MACHINE OFF. A class of its own because it is unlike every other
+ * one here: the rest gate what a process may TOUCH, and this gates something
+ * that ends every other process on the machine at once. The desktop shell
+ * holds it; an application has no business with it. */
+#define EMBK_CAP_POWER      12
 #define EMBK_CAP_BIT(id)     (1u << (id))
 struct embk_spawn_file_action {
     unsigned char kind;         /* EMBK_SPAWN_ACTION_* */
@@ -819,6 +824,19 @@ static inline int embk_win_list(struct embk_win_info *out, int max) {
  *
  * Distinct from embk_win_restore, which takes a SPAWN HANDLE and so only works
  * for a child you started yourself (the dock's click-to-restore). */
+/* TURN THE MACHINE OFF (0) or RESTART IT (1).
+ *
+ * Does not return on success. -EMBK_EPERM without EMBK_CAP_POWER, which the
+ * desktop shell holds and an application should not: this ends every process
+ * on the machine, not just yours. A negative result otherwise means the
+ * platform has no mechanism -- reported rather than hung, because "this
+ * machine cannot power itself off" is something a person can act on. */
+static inline int embk_power(int what) {
+    return (int)embk_syscall1(EMBK_SYS_power, what);
+}
+static inline int embk_power_off(void)     { return embk_power(0); }
+static inline int embk_power_restart(void) { return embk_power(1); }
+
 static inline int embk_win_raise(uint32_t pid) {
     return (int)embk_syscall1(EMBK_SYS_win_raise, pid);
 }

@@ -3025,6 +3025,74 @@ Open:
       thumb's offset fails "it moves DOWN", and drawing it when the content fits
       fails "content that fits shows no thumb".
 
+### The machine could not be turned off from its own interface (done 2026-09-12)
+
+- [x] **Restart and Shut Down, in the EmbLink menu.** The kernel could always
+      take the machine down -- `power_transition`, and `make test-power` proves
+      the ACPI S5 path is real -- and nothing in userspace could ask. The only
+      way to stop an EmbLink machine was to cut its power, which is not a
+      shutdown, it is a crash you performed on purpose.
+
+      `SYS_power` (118), gated on a NEW CAPABILITY CLASS, `EMBK_CAP_POWER`.
+      A class of its own because it is unlike every other one here: the rest
+      gate what a process may TOUCH, and this ends every process on the machine
+      at once. The desktop shell holds it by inheritance from init; an
+      application that declares a narrower set does not.
+
+      No confirmation dialog, deliberately. Closing a window now ASKS each
+      application to go and a shutdown does the same to all of them, so the
+      work a confirmation would protect is already protected by the thing above
+      it in this file.
+
+      TWO BUGS FOUND BY THE TEST, both silent:
+
+        * `EMBK_CAP_MAX_ID` was still 11, so `EMBK_CAP_ALL` -- the set init is
+          rooted at -- did not include the new bit 12. Every call returned
+          -EPERM and the menu item did nothing at all, with nothing logged. A
+          capability ceiling that does not move when a capability is added
+          fails exactly this quietly.
+        * `CAP_NAMES` in user/lib/appauth.c had stopped at "debug" (10) while
+          the ids ran to 11, so a manifest asking for `session` already printed
+          "?" before this change. A name table that silently falls behind the
+          enum it names is worse than no names. Both 11 and 12 are named now.
+
+      Measured by tools/power_shot.py, which is the one test here that does not
+      judge by pixels: a frozen picture and a powered-off machine look
+      identical. It asks QMP for the run state and reads the kernel's own
+      flush on the serial line -- the second is what distinguishes an ORDERLY
+      shutdown from a halt.
+
+        qemu run state 'shutdown'; kernel reported an orderly flush: yes
+        power: 2 block device cache(s) flushed
+        power: ACPI S5 via PM1a_CNT 0x604 (SLP_TYPa 0)
+
+      The first version of that tool waited for QEMU'S PROCESS to exit, which
+      it never does here: this harness runs with -no-shutdown, so a guest that
+      powers itself off leaves a paused emulator behind. And its first aim at
+      the menu guessed a row pitch and clicked BELOW the menu entirely, which
+      looks exactly like a shutdown that did not work.
+
+- [ ] **`test power` cannot be run by tools/console_test.py**, for the same
+      reason as `test ctrlc2`: it powers the machine off, so no verdict line
+      can follow it and the harness waits out its full timeout. `make
+      test-power` is its target and it passes. Worth a SKIP-style guard or a
+      note in the test list; until then, do not put it in a scripted run.
+
+- [x] **"About EmbLink" said nothing.** It had been sitting in the menu doing
+      literally nothing -- a dead item, which is the same class of dishonesty as
+      the File/Edit/View menus that were removed earlier. It reports the
+      architecture, the screen size and the uptime through the notifier now,
+      which is the way any program here speaks from outside its own window.
+
+- [ ] **Still no battery or network indicator.** The power subsystem has a
+      `power_supply_driver` interface designed for exactly this -- ACPI's _BST
+      on a laptop, an I2C fuel gauge on a board -- and NOTHING HAS EVER
+      REGISTERED ONE, so `power_supply_get()` always returns false and the OS
+      cannot tell whether it is on mains. The interface is not the hard part: a
+      real battery driver needs an AML interpreter for _BST/_BIF, and QEMU has
+      no battery to test one against, so it wants a real machine or a
+      hypervisor channel to be worth writing.
+
 ### The window switcher the window list was built for (done 2026-09-12)
 
 - [x] **GUI+Tab switches windows; GUI+W closes one.** `embk_win_list` and

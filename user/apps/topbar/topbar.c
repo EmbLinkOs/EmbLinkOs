@@ -35,9 +35,20 @@
 #include <time.h>
 
 #include "embk.h"
+#include "emnotify.h"   /* About speaks through the notifier */
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
+
+/* Which machine this is, decided where it is actually known -- at compile
+ * time. A binary cannot be wrong about its own architecture. */
+#if defined(__aarch64__)
+#define ARCH_NAME "aarch64"
+#elif defined(__x86_64__)
+#define ARCH_NAME "x86-64"
+#else
+#define ARCH_NAME "unknown"
+#endif
 
 #define BAR_W 1024   /* replaced at startup by the real display width */
 /* Thin like a real menu bar: the strip is chrome, not a panel. */
@@ -278,7 +289,20 @@ static void bar(void) {
                 /* BOLD: the leading menu names the application these menus
                  * belong to, and weight is how a menu bar says so. */
                 Menu("EmbLink", .font = BodyBold, .color = g_ink) {
-                    MenuItem("About EmbLink");
+                    /* A DEAD MENU ITEM IS A LIE, and this one had been sitting
+                     * here doing nothing. It says something true now: the name
+                     * the system calls itself and the machine it is running
+                     * on, delivered the way any program speaks from outside its
+                     * own window. */
+                    if (MenuItem("About EmbLink")) {
+                        char body[96];
+                        uint32_t sw = 0, sh = 0;
+                        embk_screen_size(&sw, &sh);
+                        snprintf(body, sizeof body, "%s \xc2\xb7 %ux%u \xc2\xb7 up %llu min",
+                                 ARCH_NAME, (unsigned)sw, (unsigned)sh,
+                                 (unsigned long long)(embk_uptime_ms() / 60000ull));
+                        embk_notify("EmbLink OS", body);
+                    }
                     MenuSeparator();
                     /* LOG OUT ends the session -- every process in it, this
                      * bar included -- and init shows the login screen. The
@@ -293,7 +317,18 @@ static void bar(void) {
                             snprintf(logout_label, sizeof logout_label, "Log Out");
                     }
                     if (MenuItem(logout_label)) embk_session_end(0);
-                    if (MenuItem("Quit")) exit(0);
+                    MenuSeparator();
+                    /* RESTART AND SHUT DOWN. Until these existed the only way
+                     * to stop an EmbLink machine was to cut its power -- the
+                     * kernel could always do it (power_transition) and nothing
+                     * in userspace could ask. Neither returns.
+                     *
+                     * No confirmation dialog, deliberately: closing a window
+                     * now ASKS each application to go, and a shutdown does the
+                     * same thing to all of them at once, so the work that a
+                     * confirmation protects is already protected. */
+                    if (MenuItem("Restart"))   embk_power_restart();
+                    if (MenuItem("Shut Down")) embk_power_off();
                 }
                 /* THE FOCUSED APPLICATION, and a way to reach the others.
                  * This is what a menu bar is for -- saying whose window you
