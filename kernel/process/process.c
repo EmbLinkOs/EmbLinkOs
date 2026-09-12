@@ -507,10 +507,61 @@ static void process_reap_slot(struct process *proc) {
      * waiting on that memory: no thread of this process exists. */
     kworker_defer_address_space_locked(proc->pml4_phys, vma_detach_all(proc));
 
+    /* THE THREADS NOBODY JOINED. A joinable thread that exits while siblings
+     * are still alive is deliberately NOT reaped -- its slot and kernel stack
+     * have to survive so a later thread_join() can collect its exit code (see
+     * the keep_for_join decision in schedule_locked()). If no one ever joins
+     * it, that wait is forever: the slot stays ZOMBIE and the stack stays
+     * allocated for the life of the machine.
+     *
+     * Nothing can join them now. This process is being reclaimed, which means
+     * every thread of it is dead, so the only possible joiner is gone. Reaping
+     * them here is the last moment anything knows they exist -- the memset
+     * below erases the process they point at.
+     *
+     * NOT A THEORETICAL LEAK. user/tests/jitter spawns six worker threads,
+     * never joins them, and exits -- exactly what a thread pool does. Each run
+     * leaked six slots out of MAX_THREADS. The aarch64 boot runs it twice, so a
+     * single boot leaked twelve and nobody noticed; a build that ran it
+     * twenty-five times ran the table dry and thread creation started FAILING,
+     * which is how this was found. */
+    int orphans = 0;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        struct thread *t = &thread_table[i];
+        if (t->state != PROCESS_ZOMBIE || t->proc != proc || t->running_cpu != -1)
+            continue;
+
+        /* NOT ONE ANOTHER CORE IS STILL ABOUT TO REAP. A core that switched
+         * off a dying thread reaps that thread's slot at its OWN next
+         * schedule(), from this_cpu()->pending_thread_reap -- it cannot happen
+         * any earlier, because until the switch completes the core is still
+         * executing on that very stack. Reaping such a thread here frees the
+         * slot, thread_alloc() hands it to a NEW thread, and the core's stale
+         * pointer then reaps a live one.
+         *
+         * That is not hypothetical: the first version of this loop lacked the
+         * check and the very next boot printed "thread_reap: a thread of pid 20
+         * is not a zombie (state=1), refusing" -- thread_reap_slot's own guard
+         * catching a live READY thread about to be destroyed -- and then hung
+         * with all four cores in spin_lock. */
+        bool claimed = false;
+        for (uint32_t c = 0; c < cpu_count && c < MAX_CPUS; c++)
+            if (cpu_table[c].pending_thread_reap == t)
+                claimed = true;
+        if (claimed)
+            continue;
+
+        thread_reap_slot(t);
+        orphans++;
+    }
+
     uint32_t reaped_pid = proc->pid;
     keyboard_release_grab_pid(reaped_pid);   /* free the kbd grab if this proc held it */
     memset(proc, 0, sizeof(*proc));
     proc->pid = 0;
+    if (orphans)
+        kprintf("process_reap: pid %u: %d unjoined thread slot(s) reclaimed\n",
+                (unsigned int)reaped_pid, orphans);
 
     kprintf("process_reap: pid %u reclaimed\n", (unsigned int)reaped_pid);
 }
@@ -1243,6 +1294,8 @@ int process_is_cancelled(uint32_t pid) {
  * not gated on the (much larger, not-yet-built) message-port IPC model).
  * -------------------------------------------------------------------- */
 
+static void end_every_thread_locked(struct process *proc, int code);
+
 void process_kill(uint32_t pid) {
     process_kill_code(pid, -1);
 }
@@ -1262,6 +1315,21 @@ void process_kill_code(uint32_t pid, int code) {
         return;   // already fully exited; nothing left to force
     }
 
+    end_every_thread_locked(proc, code);
+}
+
+/* END THE WHOLE PROCESS: every thread of `proc`, whoever asked.
+ *
+ * Called with g_sched_lock held, and RELEASES it on every path -- including
+ * the one that never comes back here at all, when the caller's own thread is
+ * one of the ones ending.
+ *
+ * Both ways a process can end come through here. A kill from outside
+ * (process_kill_code) and the process ending ITSELF (process_exit_self) differ
+ * only in who chose the exit code and in the bookkeeping done before the lock
+ * is taken; what has to happen to the threads is identical, and when it was
+ * written twice, only one of the two copies did it. */
+static void end_every_thread_locked(struct process *proc, int code) {
     proc->exit_code = code; // killed, not a normal exit (-1 unless the killer says
                              // otherwise -- a logout) -- set once, for whenever the
                              // process (every thread) actually finishes
@@ -2093,7 +2161,6 @@ int process_handle_reap_dead(struct process *owner) {
  * anything else really does become READY). Never returns. */
 __attribute__((noreturn))
 void process_exit_self(int code) {
-    current_process->exit_code = code;
     /* Make the death VISIBLE now: hide + repaint this process's windows while
      * we are still an ordinary syscall context (framebuffer work is fine
      * here). The reap runs later under the scheduler lock and only reclaims
@@ -2105,9 +2172,29 @@ void process_exit_self(int code) {
      * we zombie-and-switch-away, so the event and status are recorded while the
      * process is still fully valid. */
     debug_notify_exit(current_process, code);
-    current_thread->state = PROCESS_ZOMBIE;
-    schedule();
 
+    /* EXIT ENDS THE PROCESS, NOT THE THREAD THAT CALLED IT. This used to
+     * zombie only the calling thread and leave every sibling running, which
+     * is not what exit() means in any operating system and is not what the
+     * program that called it intends: main() returning is the program saying
+     * it is finished.
+     *
+     * WHAT IT COST. user/tests/jitter starts six worker threads and, if one
+     * fails to start, exits with an error -- leaving the workers spinning in
+     * user space with no syscall and no fault ever again. Nothing marked them
+     * killed, so the tick's scheduler had no reason to stop them (it ends a
+     * killed thread it finds in user mode -- see schedule_locked -- but they
+     * were not killed), the process never reached zero live threads, and the
+     * parent's process_wait() never returned. The machine kept running and the
+     * boot never finished: found on aarch64, where the boot runs jitter, but
+     * neither the bug nor its consequence is architecture-specific.
+     *
+     * A thread that wants to end only ITSELF calls thread_exit_self(); that
+     * distinction is the whole point of having both. */
+    spin_lock(&g_sched_lock);
+    end_every_thread_locked(current_process, code);   /* releases the lock */
+
+    /* Only reachable if the scheduler somehow came back to a ZOMBIE. */
     arch_irq_enable();
     for (;;) {
         arch_cpu_idle();

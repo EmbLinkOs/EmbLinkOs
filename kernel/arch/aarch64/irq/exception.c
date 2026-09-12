@@ -42,6 +42,11 @@ static const char *vector_name(uint64_t which) {
 }
 
 static const char *vector_group(uint64_t which) {
+    /* Not a vector at all: the frame dumper is also used to print a frame
+     * that was never entered through the table (aarch64_bad_exception_return
+     * passes 16). Claiming an origin there would be a guess. */
+    if (which > 15)
+        return "(no vector -- this frame was not entered through the table)";
     switch (which >> 2) {
     case 0:  return "EL1t (current EL on SP_EL0 -- should be impossible)";
     case 1:  return "EL1h (current EL, kernel)";
@@ -320,6 +325,41 @@ void aarch64_exception(uint64_t which, struct aarch64_frame *f) {
     }
 
     pl011_puts("\nkernel halted (no recovery path for a fault at EL1).\n");
+    for (;;)
+        __asm__ volatile("wfi");
+}
+
+/* THE FRAME THAT COULD NOT BE RETURNED TO -- called from exc_common's
+ * epilogue (vectors.S) when the SPSR about to be restored names a state this
+ * kernel can never return to. `f` is the frame that was about to be used, on
+ * the stack it lives on.
+ *
+ * Everything interesting is in that frame, so it is printed with the ordinary
+ * fault dumper: its ESR and FAR still describe the exception that BUILT it,
+ * which is the last thing that happened before the corruption became visible,
+ * and its saved SP names the stack to look at. Printed as vector 5 (EL1h,
+ * IRQ) is wrong and would be misleading, so the vector is passed as the
+ * impossible value 16 -- vector_name()/vector_group() render it "?" rather
+ * than claiming an origin nobody knows. */
+void aarch64_bad_exception_return(struct aarch64_frame *f);
+
+void aarch64_bad_exception_return(struct aarch64_frame *f) {
+    arch_irq_disable();
+    pl011_puts("\n=== aarch64 ILLEGAL EXCEPTION RETURN ===\n");
+    pl011_puts("  the SPSR in this frame names a state that cannot be\n"
+               "  returned to from EL1 -- the frame is corrupt. `eret` was\n"
+               "  NOT executed: it would have set PSTATE.IL and jumped to\n"
+               "  ELR anyway, losing every trace of this.\n");
+    pl011_puts("  frame at  : ");
+    pl011_puthex64((uint64_t)(uintptr_t)f);
+    pl011_puts("\n  SPSR      : ");
+    pl011_puthex64(f->spsr);
+    pl011_puts("   M[4:0]=");
+    pl011_puthex32((uint32_t)(f->spsr & 0x1F));
+    pl011_puts(f->spsr & (1ULL << 20) ? "  IL set" : "");
+    pl011_puts("\n");
+    dump_frame(16, f);
+    pl011_puts("\nkernel halted (an exception return cannot be corrected).\n");
     for (;;)
         __asm__ volatile("wfi");
 }

@@ -120,6 +120,33 @@ exc_common:
      * advancing ELR, and A3's timer IRQ will return here every tick. The
      * handler may have CHANGED elr/spsr in the frame, so reload them. */
     ldp     x0, x1, [sp, #F_ELR]
+
+    /* REFUSE TO EXECUTE AN ILLEGAL EXCEPTION RETURN.
+     *
+     * An `eret` whose SPSR names a state this kernel can never be returning
+     * to does not fault: the architecture sets PSTATE.IL, leaves the mode
+     * alone, and jumps to ELR anyway. The very next instruction fetch then
+     * takes an Illegal Execution State exception -- whose own frame says IL,
+     * at this address, and NOTHING about the frame that caused it. Worse, that
+     * frame carries IL=1 forward, so returning from the report re-enters the
+     * same state: a loop that only ends because the handler halts the machine.
+     *
+     * That is exactly the crash docs/TODO.md records for 2026-09-12: EC 0x0E
+     * at exc_common+0x80, register file full of someone else's data, and no
+     * way to tell whose frame was wrong or what wrote it.
+     *
+     * Four instructions on the way out of every exception buy the frame
+     * itself, printed at the moment it is known to be bad and before the
+     * machine loses the thread that owns it:
+     *   M[4:0] > 0b00101 -- AArch32 (M[4]), EL2, EL3, or garbage. The only
+     *                       states reachable from here are EL0t (0), EL1t (4)
+     *                       and EL1h (5).
+     *   IL already set   -- returning INTO an illegal state; the loop above. */
+    and     x2, x1, #0x1F
+    cmp     x2, #5
+    b.hi    exc_bad_return
+    tbnz    x1, #20, exc_bad_return
+
     msr     elr_el1, x0
     msr     spsr_el1, x1
 
@@ -155,6 +182,16 @@ exc_common:
 
     add     sp, sp, #FRAME_SIZE
     eret
+
+/* The illegal-return trap above lands here with the offending frame in SP.
+ * Hands it to C, which prints it exactly like any other fault and halts --
+ * the frame is corrupt, so there is nothing to return to. Not a tail call:
+ * `bl` leaves a return address, which makes the report's own backtrace show
+ * where the bad return was attempted. */
+exc_bad_return:
+    mov     x0, sp
+    bl      aarch64_bad_exception_return
+    b       .
 
 /* .balign 128 before each entry, not `.org`: with `.org` an oversized stub
  * silently shifts every later entry and the table still LOOKS right. */

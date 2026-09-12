@@ -2364,7 +2364,43 @@ Open:
       passed that 44-vs-44 run. Working, the policy is 0-1 ms against 42-52 on
       aarch64 and 4 ms against 115 on x86, so both tests now require the
       deadline run to be at least FOUR TIMES better. A tie is a failure.
-- [ ] **One boot hung inside the deadline test and is not explained.** A boot
+- [x] **One boot hung inside the deadline test -- EXPLAINED AND FIXED,
+      2026-09-12.** Two bugs, both of them older and wider than this test.
+
+      **1. `exit()` ended one thread, not the process.** `process_exit_self()`
+      zombied the calling thread and left every sibling running. jitter starts
+      six workers and, when one fails to start, exits -- leaving the others
+      spinning in user space with no syscall and no fault ever again. Nothing
+      marked them killed, so the tick's scheduler had no reason to stop them
+      (`schedule_locked()` ends a KILLED thread it finds in user mode, and they
+      were not killed), the process never reached zero live threads, and the
+      boot's `process_wait()` never returned. Not architecture-specific and not
+      about jitter: any program whose main() returns while a worker runs did
+      this. `process_exit_self()` now ends every thread of the process, through
+      the same path `process_kill_code()` uses (both now call
+      `end_every_thread_locked()`); `thread_exit_self()` still ends only its own
+      thread, which is what that call is for.
+
+      **2. A never-joined thread leaked its slot and its kernel stack until
+      reboot.** A joinable thread that exits with siblings alive is deliberately
+      kept for a later `thread_join()`. If nobody ever joins it -- which is what
+      a thread pool does, and what jitter does -- nothing reaped it. Six slots
+      per jitter run out of MAX_THREADS (256). The aarch64 boot runs jitter
+      twice, so a boot leaked twelve and nobody noticed. `process_reap_slot()`
+      now reaps them: at that moment the process is being reclaimed, every
+      thread of it is dead, so no joiner can exist. It SKIPS any thread another
+      core has queued for deferred reap -- without that check the slot is freed,
+      `thread_alloc()` hands it to a new thread, and the stale pointer reaps a
+      live one (observed immediately: "a thread of pid 20 is not a zombie
+      (state=1), refusing", then a four-core `spin_lock` hang).
+
+      **The measurement.** `early.c` patched to run the deadline A/B 25 times
+      per boot with 20 cycles: before, thread creation started failing around
+      rep 20 ("jitter: could not start hog 2" -- 25 x 2 x 6 = 300 slots against
+      256, the arithmetic matches) and the boot hung with all four cores in
+      `spin_lock`. After: 25/25 reps, "6 unjoined thread slot(s) reclaimed" per
+      run, and the boot finished with 0 failures.
+- [x] **The original report, kept for the trail.** A boot
       stopped after `jitter: 6 hog thread(s) ... sched_period -> 0` (the second,
       deadline run) and made no progress for over two minutes; the whole boot
       normally takes ~25 s. Once, in a batch of four, on 2026-09-11, before the
@@ -2388,7 +2424,9 @@ Open:
       (their comments describe this very deadlock). The lock now RECORDS ITS
       HOLDER -- `holder_lr` in kernel/include/spinlock.h, written by the winner
       and cleared on release -- and the capture tool reads and symbolizes it out
-      of the hung guest, so the next occurrence names the call site.
+      of the hung guest, so the next occurrence names the call site. That
+      capture is what the two fixes above were found from: the holder read
+      `schedule+0x20`, and the serial log ended at the thread-creation failure.
 - [ ] **A second aarch64 failure at the same point**, from a desktop run on
       2026-09-12: an ILLEGAL EXECUTION STATE exception (ESR EC 0x0E) taken at
       `exc_common+0x80`, which is exactly `msr spsr_el1, x1` in the exception
@@ -2400,6 +2438,38 @@ Open:
       Nothing in C ever writes `frame->spsr` (only the assembly save does), so
       this is corruption of a frame, or a restore from a wrong SP. Whether it is
       the same bug as the spin above is not yet known.
+
+      **WHAT WAS DONE ABOUT IT, 2026-09-12.** The cause is still not proven, but
+      two things changed.
+
+      A REAL CORRUPTION SOURCE WAS FOUND AND FIXED on the way: the aarch64
+      kernel-stack VA allocator was an UNLOCKED bump pointer
+      (`kstack_va_next`, pagetable.c), while x86's equivalent has always taken
+      `vmm_lock`. Two cores spawning at the same moment read the same VA, both
+      map a stack there, and the second mapping replaces the first: two threads
+      on one kernel stack, each overwriting the other's exception frames. That
+      produces exactly this signature -- a restored SPSR that is another
+      context's data -- needs SMP, and is rare. The MMIO and kmap windows in the
+      same file had the same hole and now share one `va_lock`. Whether it is
+      THIS crash cannot be claimed without catching it again.
+
+      AND THE CRASH CAN NOW NAME ITSELF. `exc_common`'s epilogue checks the
+      frame's SPSR before the `eret` (`M[4:0] > 0b00101`, or IL already set) and
+      calls `aarch64_bad_exception_return()` instead of executing an illegal
+      return. This matters beyond tidiness: an illegal `eret` does not fault --
+      the architecture sets PSTATE.IL, jumps to ELR anyway, and the next fetch
+      takes an EC 0x0E exception that reports only ITSELF. Worse, its own frame
+      carries IL forward, so the return from the report re-enters the same
+      state. That is why the dump above says so little. The check costs four
+      instructions on every exception return and prints the offending frame at
+      the moment it is known to be bad.
+
+      Also fixed while reading that path: `vmm_free_kernel_stack(0, ...)` --
+      an adopted thread (the boot context, each secondary's) records
+      `kstack_top = 0` -- computed `base = 0 - KSTACK_SIZE`, wrapped to the top
+      of the address space, and would have unmapped and freed whatever is
+      mapped there. Guarded on both architectures. Nothing reaps those threads
+      today, which is the only reason it never fired.
 
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant
 ### source of lateness

@@ -121,19 +121,57 @@ def sched_lock_state(port):
             "    HELD BY   : %#018x%s" % (holder, symbolize(holder) if holder else "  (free)")]
 
 
+def data_symbol(addr):
+    """Exact-match name for a DATA address (locks live in .bss, and symbolize()
+    deliberately keeps only text symbols)."""
+    try:
+        out = subprocess.run(["aarch64-elf-nm", ARM + "/kernel.elf"],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) == 3 and int(f[0], 16) == addr:
+                return "  " + f[2]
+    except Exception:
+        pass
+    return ""
+
+
 def sample(port):
-    """Every vCPU's PC, symbolized."""
-    txt = qmp(port, "human-monitor-command", {"command-line": "info registers -a"})
+    """Every vCPU's PC -- and, for a core inside spin_lock(), WHICH LOCK.
+
+    Four cores stuck in spin_lock is not yet a diagnosis: one lock held forever
+    and four different locks each briefly contended look identical from the PC
+    alone. The lock's address is the answer, and it is in a register.
+
+    WHICH register is not a guess -- it is read off the compiled function
+    (aarch64-elf-objdump --disassemble=spin_lock). The pointer is spilled to
+    [sp, #24] on entry and reloaded into X1 at the top of every iteration of
+    the retry loop, which is where a stuck core is:
+
+        spin_lock+0x34:  ldr   x1, [sp, #24]     <- the lock
+        spin_lock+0x3c:  ldaxr w0, [x1]          <- X0 is now the lock's VALUE
+        spin_lock+0x40:  stxr  w4, w2, [x1]
+
+    An earlier version of this reported X0 and got "waiting on 1" from all four
+    cores -- 1 is the value of a locked lock, not an address. X1 it is."""
+    txt = str(qmp(port, "human-monitor-command", {"command-line": "info registers -a"}))
+    blocks = re.split(r"^CPU#(\d+)", txt, flags=re.M)
     out = []
-    cpu = "?"
-    for line in str(txt).splitlines():
-        m = re.match(r"CPU#(\d+)", line)
-        if m:
-            cpu = m.group(1)
-        m = re.search(r"\bPC=([0-9a-fA-F]+)", line) or re.search(r"^PC\s*=?\s*([0-9a-fA-F]+)", line)
-        if m:
-            pc = int(m.group(1), 16)
-            out.append("  cpu %s: pc %016x%s" % (cpu, pc, symbolize(pc)))
+    # re.split with one group yields [preamble, id, body, id, body, ...]
+    for i in range(1, len(blocks) - 1, 2):
+        cpu, body = blocks[i], blocks[i + 1]
+        m = re.search(r"\bPC=([0-9a-fA-F]+)", body)
+        if not m:
+            continue
+        pc = int(m.group(1), 16)
+        where = symbolize(pc)
+        waiting = ""
+        if "spin_lock" in (where or ""):
+            mx = re.search(r"\bX0?1\s*=\s*([0-9a-fA-F]+)", body)
+            if mx:
+                lock = int(mx.group(1), 16)
+                waiting = "   waiting on %016x%s" % (lock, data_symbol(lock))
+        out.append("  cpu %s: pc %016x%s%s" % (cpu, pc, where, waiting))
     return out or ["  (no PC in `info registers -a`)"]
 
 

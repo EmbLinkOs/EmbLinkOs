@@ -1014,6 +1014,13 @@ uint64_t vmm_alloc_kernel_stack(uint64_t size) {
 }
 
 void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {
+    /* An adopted thread (the boot context, each secondary's) records
+     * kstack_top = 0: it runs on a static stack it did not allocate. Freeing
+     * that would wrap to the top of the address space -- see the aarch64 copy
+     * of this function, where the same guard is spelled out. */
+    if (!stack_top)
+        return;
+
     uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t stack_base_virt = stack_top - (pages * PAGE_SIZE);
 

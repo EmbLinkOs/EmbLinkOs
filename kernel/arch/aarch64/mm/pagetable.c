@@ -3,6 +3,7 @@
 #include "mm/vmm.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
+#include "include/spinlock.h"
 
 /* See pagetable.h. Arm ARM D8.3 for the descriptor formats. */
 
@@ -560,6 +561,23 @@ void vmm_flush_tlb(uint64_t virt) {
 #define KSTACK_VA_BASE 0xFFFFFE0000000000ULL
 static uint64_t kstack_va_next = KSTACK_VA_BASE;
 
+/* EVERY VA BUMP IN THIS FILE IS SHARED BETWEEN CORES, so every one of them is
+ * taken under this lock -- kernel stacks, the MMIO window and the kmap window.
+ *
+ * Thread creation is the one that matters: it allocates a kernel stack and it
+ * runs on whichever core called spawn, with no other lock held (process.c
+ * fills a new thread's fields OUTSIDE g_sched_lock, deliberately). Two cores
+ * spawning at the same time read the same `kstack_va_next`, both add a stack
+ * at it, and the second mapping REPLACES the first: two threads then run on
+ * one stack, and the loser's exception frames are overwritten under it by the
+ * winner -- a restored ELR or SPSR that is another context's data. It is rare,
+ * it needs SMP, and it corrupts a thread nowhere near the code that caused it.
+ *
+ * The x86 side has always taken a lock here (vmm.c's vmm_lock, around exactly
+ * this bump); this side was written single-core and never revisited when the
+ * secondaries came up. */
+static struct spinlock va_lock = SPINLOCK_INIT;
+
 uint64_t vmm_create_address_space(void) {
     uint64_t root = pmm_alloc_page();
     if (!root)
@@ -786,9 +804,11 @@ uint64_t vmm_alloc_kernel_stack(uint64_t size) {
      * runs off the bottom of its stack takes a translation fault at a known
      * address instead of writing into whatever VA happens to precede it -- and
      * A1's decoder names it. Leaving a hole is cheaper than any check. */
+    spin_lock(&va_lock);
     uint64_t guard = kstack_va_next;
     uint64_t base  = guard + PAGE_SIZE;
     kstack_va_next = base + pages * PAGE_SIZE + PAGE_SIZE;
+    spin_unlock(&va_lock);
     (void)guard;
 
     for (uint64_t i = 0; i < pages; i++) {
@@ -804,6 +824,15 @@ uint64_t vmm_alloc_kernel_stack(uint64_t size) {
 }
 
 void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {
+    /* An ADOPTED thread (the boot context, and each secondary's) has no
+     * allocated stack: it runs on the static one boot.S set up, and records
+     * kstack_top = 0. Freeing that would compute base = 0 - KSTACK_SIZE, wrap
+     * to the top of the address space, and unmap-and-free whatever is mapped
+     * there. Nothing reaps those threads today, which is the only reason this
+     * has never fired. */
+    if (!stack_top)
+        return;
+
     uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t base  = stack_top - pages * PAGE_SIZE;
 
@@ -845,8 +874,10 @@ static uint64_t map_mmio_common(uint64_t phys, uint64_t size, uint32_t flags) {
     uint64_t last  = (phys + size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t pages = (last - first) / PAGE_SIZE;
 
+    spin_lock(&va_lock);
     uint64_t va = mmio_va_next;
     mmio_va_next += pages * PAGE_SIZE + PAGE_SIZE;   /* +1 page of separation */
+    spin_unlock(&va_lock);
 
     for (uint64_t i = 0; i < pages; i++)
         if (vm_map_page(va + i * PAGE_SIZE, first + i * PAGE_SIZE, flags) != PT_OK)
@@ -884,8 +915,10 @@ uint64_t vmm_kmap_pages(const uint64_t *phys, uint32_t n) {
     if (!phys || !n)
         return 0;
 
+    spin_lock(&va_lock);
     uint64_t va = kmap_va_next;
     kmap_va_next += (uint64_t)n * PAGE_SIZE + PAGE_SIZE;
+    spin_unlock(&va_lock);
 
     /* Scattered frames, one contiguous kernel view -- what the compositor
      * wants for a surface whose pixel pages came from the allocator one at a
