@@ -204,6 +204,39 @@ static void request_apps(void) {
     embk_puts(1, b);
 }
 
+/* THE WINDOWS THAT EXIST, sampled on the bar's own beat.
+ *
+ * The bar could not name the focused application before -- nothing could. A
+ * process in this system is named by handle and stores no path, so the only
+ * human-readable name an application has is the title of its window, and until
+ * embk_win_list there was no way to ask the compositor for it. In its place
+ * the bar carried three menus (File, Edit, View) that belonged to no app and
+ * did nothing, because a menu bar is SUPPOSED to say whose menus these are and
+ * this one had no way to find out.
+ *
+ * Now it says the truth: the focused application's name, and a menu of
+ * everything open that switches to it. */
+#define WINS_MAX 16
+static struct embk_win_info g_wins[WINS_MAX];
+static int      g_win_n;
+static char     g_focus_name[32];
+static uint64_t g_wins_next;
+
+static void wins_sample(void) {
+    uint64_t now = em_now_ms();
+    if (now < g_wins_next) return;
+    g_wins_next = now + 700;               /* windows do not open at frame rate */
+
+    int n = embk_win_list(g_wins, WINS_MAX);
+    g_win_n = n < 0 ? 0 : n;
+    g_focus_name[0] = 0;
+    for (int i = 0; i < g_win_n; i++)
+        if (g_wins[i].flags & EMBK_WIN_FOCUSED) {
+            snprintf(g_focus_name, sizeof g_focus_name, "%s", g_wins[i].title);
+            break;
+        }
+}
+
 static void bar(void) {
     const struct ui_theme *t = ui_theme();
 
@@ -212,6 +245,7 @@ static void bar(void) {
     if (first) { first = 0; em_window_move_to(0, 0); }   /* flush, like Mac's */
     bar_ink_update();
     cpu_sample();      /* once per frame == once per refresh_ms == once a second */
+    wins_sample();     /* who is in front, and what else is open */
 
     /* The window is TRANSLUCENT (per-pixel transparent, no blur) and grows tall
      * only while a menu is open. So the view fills the whole window, but only
@@ -261,6 +295,28 @@ static void bar(void) {
                     if (MenuItem(logout_label)) embk_session_end(0);
                     if (MenuItem("Quit")) exit(0);
                 }
+                /* THE FOCUSED APPLICATION, and a way to reach the others.
+                 * This is what a menu bar is for -- saying whose window you
+                 * are looking at -- and it is the first time this OS could
+                 * answer that question at all (embk_win_list). The name is
+                 * BOLD for the same reason the system menu is: weight is how a
+                 * bar says which of these belongs to what you are using.
+                 *
+                 * Empty when nothing is open, rather than a placeholder: the
+                 * desktop is not an application and saying so would be the
+                 * same lie the File/Edit/View menus told. */
+                if (g_focus_name[0]) {
+                    Menu(g_focus_name, .font = BodyBold, .color = g_ink) {
+                        for (int i = 0; i < g_win_n; i++) {
+                            static char label[WINS_MAX][40];
+                            snprintf(label[i], sizeof label[i], "%s%s",
+                                     g_wins[i].title,
+                                     (g_wins[i].flags & EMBK_WIN_MINIMIZED) ? "  (hidden)" : "");
+                            if (MenuItem(label[i])) embk_win_raise(g_wins[i].pid);
+                        }
+                    }
+                }
+
                 /* AND NOTHING ELSE. There were three more menus here --
                  * File (New, Open), Edit (Undo, Redo), View (Zoom In, Zoom
                  * Out) -- twelve words that did nothing at all. They were a

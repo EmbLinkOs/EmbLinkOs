@@ -759,6 +759,40 @@ static inline int embk_kbd_layout(const char *name, char *out, int cap) {
                               (int64_t)(intptr_t)out, cap);
 }
 
+/* WHAT WINDOWS EXIST. Mirrors the kernel's struct comp_win_info field for
+ * field -- sys_win_list copies it raw; grow both together.
+ *
+ * The answer is SCOPED TO YOUR SESSION and front-most first, and it leaves out
+ * what a person cannot switch to: the wallpaper, widgets, the translucent
+ * strips (menu bar, notifier) and anything that never named itself.
+ *
+ * This is the only way to learn an application's human-readable name: a
+ * process here is named by handle and stores no path, so the compositor's
+ * window title is the one name a person would recognise. */
+#define EMBK_WIN_MINIMIZED  0x1
+#define EMBK_WIN_FOCUSED    0x2
+
+struct embk_win_info {
+    uint32_t pid;
+    uint32_t id;
+    uint32_t flags;      /* EMBK_WIN_* */
+    char     title[32];  /* COMP_TITLE_MAX + 1 */
+};
+
+static inline int embk_win_list(struct embk_win_info *out, int max) {
+    return (int)embk_syscall2(EMBK_SYS_win_list, (int64_t)(intptr_t)out, max);
+}
+
+/* Bring that process's windows forward, un-minimising them. The switcher's
+ * other half. -EMBK_EPERM for a pid outside your session -- you may raise what
+ * you were allowed to see.
+ *
+ * Distinct from embk_win_restore, which takes a SPAWN HANDLE and so only works
+ * for a child you started yourself (the dock's click-to-restore). */
+static inline int embk_win_raise(uint32_t pid) {
+    return (int)embk_syscall1(EMBK_SYS_win_raise, pid);
+}
+
 /* 1 = got an event, 0 = queue empty. Never blocks. */
 static inline int embk_key_event_poll(struct embk_key_event *ev) {
     return (int)embk_syscall1(EMBK_SYS_key_event_poll, (uint64_t)(uintptr_t)ev);

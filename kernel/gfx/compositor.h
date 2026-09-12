@@ -95,6 +95,32 @@ int compositor_win_is_shared(int pid, uint32_t id);
 uint32_t compositor_focused_pid(void);
 /* exit-time: hide + repaint a dying pid's windows (reap frees them later) */
 void compositor_exit_pid(int pid);
+/* WHAT WINDOWS EXIST -- the view a switcher, a taskbar, or a bar that names
+ * the focused application all need, and which nothing could ask for before.
+ *
+ * A process here has no name a person would recognise: this is a capability
+ * system, processes are named by handle, and `struct process` stores no path
+ * or argv. The COMPOSITOR is the only part of the kernel that knows an
+ * application by a human name -- its window title -- which is why this lives
+ * here rather than beside process_list().
+ *
+ * Layers a person cannot switch to are left out: the desktop (the wallpaper),
+ * widgets, translucent strips (the menu bar and the notifier), and anything
+ * with no title. A switcher offering "the wallpaper" as a destination would be
+ * listing the furniture. */
+#define COMP_WIN_MINIMIZED  0x1
+#define COMP_WIN_FOCUSED    0x2
+
+struct comp_win_info {
+    uint32_t pid;
+    uint32_t id;
+    uint32_t flags;                    /* COMP_WIN_* */
+    char     title[COMP_TITLE_MAX + 1];
+};
+
+/* Fills up to `max` entries, front-most first, and returns how many. */
+int  compositor_win_list(struct comp_win_info *out, int max);
+
 /* Un-minimize and raise a process's windows (the dock's click-to-restore). */
 int  compositor_restore_pid(int pid);
 /* An app parking its own window (chromeless apps have no kernel button). */

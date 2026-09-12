@@ -160,6 +160,8 @@
 #define EMBK_SYS_session_info   113  /* (out)              -> 0 | -err */
 #define EMBK_SYS_session_end    114  /* (sid)              -> n | -err */
 #define EMBK_SYS_kbd_layout     115  /* (name, out, cap)   -> 0 | -err */
+#define EMBK_SYS_win_list       116  /* (out, max)         -> n | -err */
+#define EMBK_SYS_win_raise      117  /* (pid)              -> n | -err */
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

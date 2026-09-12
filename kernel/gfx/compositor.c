@@ -1574,6 +1574,56 @@ int compositor_desktop_front(int pid, int on) {
  * and raise its windows to the front. Both halves are what "click the dock
  * icon of a running app" has to mean -- a parked window comes back, and an app
  * that is merely buried comes forward. Returns 1 if anything changed. */
+/* Front-most first, because that is the order a switcher wants to show and the
+ * order "the one before this one" means. z is the compositor's own ordering,
+ * so this sorts by it rather than by slot index -- the table is a pool and its
+ * order means nothing to a person. */
+int compositor_win_list(struct comp_win_info *out, int max) {
+    if (!out || max <= 0) return 0;
+    spin_lock(&g_comp_lock);
+
+    uint32_t front = 0;
+    { struct comp_window *f = front_window(); if (f) front = (uint32_t)f->pid; }
+
+    int n = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS && n < max; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used) continue;
+        /* Not switchable: the wallpaper, the widget band, the translucent
+         * strips (menu bar, notifier), and anything that never named itself. */
+        if (w->desktop || w->widget || w->translucent) continue;
+        if (!w->title[0]) continue;
+
+        out[n].pid   = (uint32_t)w->pid;
+        out[n].id    = w->id;
+        out[n].flags = (w->minimized ? COMP_WIN_MINIMIZED : 0u) |
+                       ((uint32_t)w->pid == front && !w->minimized ? COMP_WIN_FOCUSED : 0u);
+        int k = 0;
+        while (k < COMP_TITLE_MAX && w->title[k]) { out[n].title[k] = w->title[k]; k++; }
+        out[n].title[k] = 0;
+        n++;
+    }
+
+    /* insertion sort by z, descending -- n is at most a handful of windows */
+    for (int i = 1; i < n; i++) {
+        struct comp_win_info key = out[i];
+        int kz = -1, j;
+        for (j = 0; j < COMP_MAX_WINDOWS; j++)
+            if (g_wins[j].used && g_wins[j].id == key.id) { kz = g_wins[j].z; break; }
+        for (j = i - 1; j >= 0; j--) {
+            int jz = -1;
+            for (int q = 0; q < COMP_MAX_WINDOWS; q++)
+                if (g_wins[q].used && g_wins[q].id == out[j].id) { jz = g_wins[q].z; break; }
+            if (jz >= kz) break;
+            out[j + 1] = out[j];
+        }
+        out[j + 1] = key;
+    }
+
+    spin_unlock(&g_comp_lock);
+    return n;
+}
+
 int compositor_restore_pid(int pid) {
     spin_lock(&g_comp_lock);
     int changed = 0;

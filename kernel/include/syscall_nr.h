@@ -240,4 +240,25 @@
  * leave the machine unable to type. */
 #define SYS_kbd_layout    115   /* (name, out, cap)         -> 0 | -err       */
 
+/* win_list(out, max) -- what windows exist: pid, id, flags, title, front-most
+ * first. The view a switcher, a taskbar or a bar that names the focused
+ * application needs; nothing could ask for it before.
+ *
+ * SCOPED TO THE CALLER'S SESSION. A window title is information -- "salary.ods"
+ * names a file and an intention -- so this does not hand one user's titles to
+ * another user's program. Windows belonging to another session are simply not
+ * in the answer.
+ *
+ * Returns the count written, or -EMBK_*. */
+#define SYS_win_list      116   /* (out, max)               -> n | -err       */
+
+/* win_raise(pid) -- bring that process's windows forward, un-minimising them.
+ * The switcher's other half: the list names a pid, this acts on it. Same
+ * session rule as win_list -- you may raise what you were allowed to see.
+ *
+ * Distinct from SYS_win_restore, which takes a SPAWN HANDLE and is therefore
+ * only usable by the parent that started the app (the dock's click-to-restore).
+ * A switcher knows pids, not handles. */
+#define SYS_win_raise     117   /* (pid)                    -> n | -err       */
+
 #endif /* _SYSCALL_NR_H_ */

@@ -2174,6 +2174,48 @@ static int64_t sys_kbd_layout(const struct sysargs *a) {
     return 0;
 }
 
+/* ---- the window list, and raising by pid ------------------------------- *
+ *
+ * SESSION-SCOPED, both of them. A window title says what someone is working on
+ * -- often the name of a file -- so handing the whole list to any process would
+ * leak across users on a machine that has real sessions. The filter is applied
+ * HERE rather than in the compositor because sessions are a process-model idea;
+ * the compositor knows pids and pixels and has no business knowing who is
+ * logged in. */
+static int win_same_session(uint32_t pid) {
+    if (!current_process) return 0;
+    uint32_t sid = 0;
+    if (process_session_of(pid, &sid) != EMBK_OK) return 0;
+    return sid == current_process->session_id;
+}
+
+static int64_t sys_win_list(const struct sysargs *a) {
+    struct comp_win_info *user_out = (struct comp_win_info *)a->arg[0];
+    int max = (int)a->arg[1];
+    if (!user_out || max <= 0) return -EMBK_EINVAL;
+    if (max > COMP_MAX_WINDOWS) max = COMP_MAX_WINDOWS;
+
+    struct comp_win_info snap[COMP_MAX_WINDOWS];
+    int n = compositor_win_list(snap, max);
+
+    /* Drop other sessions' windows, closing the gap so the caller sees a dense
+     * array and not a list with holes it has to know to skip. */
+    int keep = 0;
+    for (int i = 0; i < n; i++)
+        if (win_same_session(snap[i].pid)) snap[keep++] = snap[i];
+
+    if (keep > 0 && copy_to_user(user_out, snap,
+                                 (size_t)keep * sizeof(snap[0])) != EMBK_OK)
+        return -EMBK_EFAULT;
+    return keep;
+}
+
+static int64_t sys_win_raise(const struct sysargs *a) {
+    uint32_t pid = (uint32_t)a->arg[0];
+    if (!win_same_session(pid)) return -EMBK_EPERM;
+    return (int64_t)compositor_restore_pid((int)pid);
+}
+
 static syscall_handler_t syscall_table[] = {
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -2278,6 +2320,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_session_info]   = sys_session_info,
     [SYS_session_end]    = sys_session_end,
     [SYS_kbd_layout]     = sys_kbd_layout,
+    [SYS_win_list]       = sys_win_list,
+    [SYS_win_raise]      = sys_win_raise,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,
     [SYS_futex]          = sys_futex,

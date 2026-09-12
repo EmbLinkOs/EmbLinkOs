@@ -2624,6 +2624,37 @@ Open:
       this. Until it works, tools/shell_shot.py aims with paced relative PS/2
       motion, which is what its move() explains at length.
 
+### The window list (done 2026-09-12)
+
+- [x] **Anything can now ask what windows exist.** `embk_win_list` returns pid,
+      window id, flags (minimized, focused) and TITLE, front-most first --
+      and the title is the point: a process in this system is named by handle
+      and stores no path, so the compositor's window title is the only name an
+      application has that a person would recognise. That is why the call lives
+      in the compositor rather than beside process_list().
+
+      SCOPED TO THE CALLER'S SESSION, in the syscall rather than the
+      compositor: a window title says what someone is working on -- often the
+      name of a file -- and sessions are a process-model idea the compositor
+      has no business knowing about. `embk_win_raise(pid)` is the other half
+      and carries the same rule: you may raise what you were allowed to see.
+      (Distinct from `embk_win_restore`, which takes a SPAWN HANDLE and so only
+      works for a child you started -- the dock's click-to-restore. A switcher
+      knows pids, not handles.)
+
+      The top bar uses it for the thing a menu bar is actually for: naming the
+      application you are looking at, with a menu of everything else open that
+      switches to it. That space used to hold File / Edit / View -- three menus
+      belonging to no app, doing nothing, because the bar had no way to find
+      out whose window was in front.
+
+      WORTH KNOWING WHEN TESTING: a program started with `run` at the KERNEL
+      console is a child of the kernel and lives in session 0, not the user's
+      session -- so it is correctly absent from this list, and the bar stays
+      silent about it. The first capture of this feature showed two apps on
+      screen and no name in the bar, and the filter was right both times.
+      Launch from the dock to see it.
+
 ### The dock only knows what it launched
 
 - [ ] **A running app the dock did not start shows no socket.** The desktop
