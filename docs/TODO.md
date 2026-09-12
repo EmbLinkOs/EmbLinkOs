@@ -2883,16 +2883,33 @@ Open:
       it actually happened. `tools/caret_shot.py` reports this one rather than
       failing on it until it is reliable.
 
-      THE LEADING SUSPECT, recorded so the next attempt does not start from
-      nothing: `compositor_win_input()` drops a queued press when
-      `pend_count == 1 && the button is physically down`, on the grounds that
-      the live path is already delivering it. That test was written when there
-      was one latch slot and could not be wrong; with a QUEUE it can. After the
-      first of two clicks is consumed the count falls to 1, and if the button
-      happens to be down at that moment the SECOND click is discarded. The fix
-      is to know whether the live path really delivered a press for this
-      down-cycle rather than inferring it from the count -- or to let the queue
-      be the only path and solve slider drags another way.
+      THE LEADING SUSPECT WAS TRIED AND REVERTED. `compositor_win_input()`
+      drops a queued press whenever exactly ONE is waiting and the button is
+      physically down, inferring "the live path is already delivering this".
+      That inference could not be wrong with a single latch slot and looks
+      wrong with a queue: after the first of two rapid clicks is consumed the
+      count falls to 1, and a button still down at that moment would discard
+      the SECOND click.
+
+      Replacing it with an explicit once-per-down-cycle claim of the NEWEST
+      queued press (`live_claimed`) did two things, both informative:
+        * it left double-click at 2 runs in 3 -- no improvement at all;
+        * it BROKE aarch64: `test-arm64-boot` went from 0 FAILs to 1, "the
+          launcher button did nothing". Confirmed mine by stashing the change
+          and re-running (0 FAILs), which is the only way to be sure.
+
+      So claiming a press for the live path optimistically LOSES clicks
+      somewhere the reasoning did not predict -- most likely because the
+      aarch64 pointer arrives through `mouse_set_absolute` (virtio-input) and
+      the `g_ptr_win`/`g_ptr_pid` bookkeeping the claim tests against does not
+      hold there the way it does for PS/2. The change is reverted; the old rule
+      stands.
+
+      WHAT TO DO NEXT, and it is not another guess: instrument `ui_click_note`
+      and read the serial log on a FAILING run to see whether both presses
+      arrive at all, and if they do, what their `ev` times are. That is how all
+      three fixed faults were found. Guessing found none of them, and has now
+      cost a regression as well.
 
       The three already fixed, kept here because each was a separate lesson:
 
