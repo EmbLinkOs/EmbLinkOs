@@ -291,6 +291,64 @@ static void rc_begin(void) {
 }
 
 /* Called from inside a row's container, where ui_open_rect knows its box. */
+/* DRAGGING A FILE OUT OF THIS WINDOW.
+ *
+ * The press captures the pointer (the compositor routes every later motion to
+ * the window it landed on), so this keeps getting told where the cursor is the
+ * whole way across the screen -- which is what makes a cross-application drag
+ * possible at all, and also why the DROP has to be resolved by the compositor
+ * rather than by whoever is underneath.
+ *
+ * A THRESHOLD, because a click is a press that did not move. Without one, every
+ * single click on a file would announce a drag and then cancel it, and the
+ * distinction between opening a file and picking it up would be a race. */
+#define DRAG_SLOP 6.0f
+static int   g_drag_i = -1;        /* the entry being carried, or -1 */
+static int   g_drag_live;          /* embk_drag_begin has been called */
+static float g_drag_x0, g_drag_y0;
+/* OPENING HAPPENS ON RELEASE, not on press, and only when the press did not
+ * turn into a drag. The toolkit fires .clicked() on the PRESS edge, which is
+ * right for a button and wrong for a file: it meant you could not pick a file
+ * up without also opening it, and the drag arrived at its destination behind a
+ * window that had just launched. A click is a press that did not move. */
+static int   g_open_i = -1;
+
+static void drag_claim(int i) {
+    if (!ui_is_active()) {
+        /* The button is up. If we were carrying something the compositor has
+         * already worked out where it landed and all that is left is to put it
+         * down; if we were not, this press never moved and is a click. */
+        if (g_drag_i == i) {
+            /* NOT cancelled here. The compositor ends the drag itself at the
+             * release edge -- and cancelling also WIPES THE PAYLOAD, which the
+             * target has not read yet: it is woken by the release and polls on
+             * its next frame, by which time this had already thrown the path
+             * away. The drop arrived empty and looked like no drop at all.
+             *
+             * What is left behind is a payload nobody is carrying, which is
+             * exactly what the clipboard is too. */
+            if (g_drag_live) g_drag_live = 0;
+            else             g_open_i = i;
+            g_drag_i = -1;
+        }
+        return;
+    }
+    float px, py;
+    ui_pointer_pos(&px, &py);
+    if (g_drag_i != i) { g_drag_i = i; g_drag_x0 = px; g_drag_y0 = py; g_drag_live = 0; }
+    if (g_drag_live) return;
+
+    float dx = px - g_drag_x0, dy = py - g_drag_y0;
+    if (dx * dx + dy * dy < DRAG_SLOP * DRAG_SLOP) return;
+
+    /* Far enough to mean it. The payload is the full path, because a name on
+     * its own is only meaningful to the window it came from. */
+    char full[512];
+    join(full, sizeof full, g_entries[i].name);
+    embk_drag_begin("path", full, (unsigned)strlen(full));
+    g_drag_live = 1;
+}
+
 static void rc_claim(int i) {
     if (!g_rc_armed) return;
     float x, y, w, h;
@@ -333,16 +391,16 @@ static void grid_cell(int i) {
     struct entry *e = &g_entries[i];
     VStack(.spacing = 2, .width = 92, .align = Center) {
         rc_claim(i);
+        drag_claim(i);
+        /* The press is not acted on here -- drag_claim decides on RELEASE
+         * whether it was a click or the start of a drag. Both of these still
+         * have to be emitted to draw and to take the press. */
         if (e->is_dir) {
-            /* one bitmap, many folders -- each needs its own interaction
-             * identity or they share a hover state */
-            if (ImageButtonKey("/system/images/file.eic", 44, e)) enter_dir(e->name);
+            if (ImageButtonKey("/system/images/file.eic", 44, e)) { /* see drag_claim */ }
         } else {
-            if (IconButton(icon_for(e)).frame(44, 44).font(Title).clicked()) open_file(e->name);
+            if (IconButton(icon_for(e)).frame(44, 44).font(Title).clicked()) { }
         }
-        if (Button(e->name).ghost().font(Caption).py(1).color(ui_theme()->text).width(90).clicked()) {
-            if (e->is_dir) enter_dir(e->name); else open_file(e->name);
-        }
+        if (Button(e->name).ghost().font(Caption).py(1).color(ui_theme()->text).width(90).clicked()) { }
     }
 }
 
@@ -380,6 +438,18 @@ static void list_row(int i) {
 /* ---- the window -------------------------------------------------------- */
 
 static void app(void) {
+    /* A CLICK THAT NEVER BECAME A DRAG, acted on at the top of the frame after
+     * the release that produced it. Deferred rather than done in drag_claim
+     * because opening tears down and rebuilds this view, and doing that from
+     * inside it is how a tree gets rebuilt underneath the code walking it. */
+    if (g_open_i >= 0) {
+        int i = g_open_i; g_open_i = -1;
+        if (i < g_count) {
+            if (g_entries[i].is_dir) enter_dir(g_entries[i].name);
+            else                     open_file(g_entries[i].name);
+        }
+    }
+
     if (!g_initialized) {
         const char *start = getenv("FILES_PATH");
         if (!start || start[0] != '/') start = getenv("HOME");

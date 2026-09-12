@@ -419,6 +419,7 @@ void kbd_translate(uint8_t make, int pressed) {
          * context and the compositor is not safe to call from one. */
         if (low == '\t') { g_syskey = SYSKEY_NEXT_WINDOW;  return; }
         if (low == 'w')   { g_syskey = SYSKEY_CLOSE_WINDOW; return; }
+        if (low == 'q')   { g_syskey = SYSKEY_QUIT_APP;     return; }
         char cmd = 0;
         switch (low) {
             case 'a': cmd = (char)EK_SEL_ALL; break;

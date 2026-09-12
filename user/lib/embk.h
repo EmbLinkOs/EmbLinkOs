@@ -325,6 +325,38 @@ struct embk_net_status {
     unsigned char mac[6];
     unsigned char pad[2];
 };
+/* ---- DRAG AND DROP between applications ---------------------------------
+ *
+ * SESSION-SCOPED, like the clipboard: what one person drags, another session
+ * cannot see -- and a drop that arrives from a different session is not
+ * delivered at all.
+ *
+ * THE SOURCE calls embk_drag_begin while the button is down, saying what it is
+ * carrying: a short type name ("text/plain", "path") and the bytes. It keeps
+ * receiving pointer motion the whole time, because the compositor's pointer
+ * CAPTURE routes to the window the press landed on -- which is what lets it
+ * draw the thing under the cursor. Passing a null type CANCELS a drag.
+ *
+ * THE TARGET calls embk_drop_take each frame. It answers 1 exactly once, for
+ * the window the pointer was over when the button came up, with the position
+ * in that window's own content coordinates. Everything else is an ordinary
+ * frame with nothing dropped on it. */
+struct embk_drop {
+    int32_t  win;
+    int32_t  x, y;            /* content-local, like every other pointer coord */
+    uint32_t len;             /* bytes available; may exceed the cap you passed */
+    char     type[24];
+};
+static inline int embk_drag_begin(const char *type, const void *data, unsigned len) {
+    return (int)embk_syscall3(EMBK_SYS_drag_begin, (int64_t)(intptr_t)type,
+                              (int64_t)(intptr_t)data, len);
+}
+static inline int embk_drag_cancel(void) { return embk_drag_begin(0, 0, 0); }
+static inline int embk_drop_take(struct embk_drop *out, void *buf, unsigned cap) {
+    return (int)embk_syscall3(EMBK_SYS_drop_take, (int64_t)(intptr_t)out,
+                              (int64_t)(intptr_t)buf, cap);
+}
+
 static inline int embk_net_status(struct embk_net_status *out) {
     return (int)embk_syscall1(EMBK_SYS_net_status, (int64_t)(intptr_t)out);
 }
@@ -1100,6 +1132,11 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * the compositor kills the process a few seconds later, because a window that
  * cannot be closed is worse than an app that loses a moment of state. */
 #define EMBK_WIN_ACTION_CLOSE     0x80000002u
+/* SOMETHING WAS DROPPED ON YOU. Delivered so that an idle application wakes
+ * up: one that is not drawing never polls embk_drop_take, and the drop would
+ * sit in its window unread. The runtime turns this into a frame; the payload
+ * still comes from embk_drop_take. */
+#define EMBK_WIN_ACTION_DROP      0x80000003u
 /* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
  * copies it raw; grow both together.
  *

@@ -97,6 +97,12 @@ struct comp_window {
     uint8_t   pend_head;          /* ring read index */
     uint8_t   pend_count;         /* how many presses are waiting */
     uint8_t   pend_phase;         /* 0 = the press replays next, 1 = the release */
+
+    /* A DROP LANDED HERE. Set when the button comes up over this window while
+     * a drag is in flight, and taken once by the owning process. The position
+     * is content-local, like every other pointer coordinate an app sees. */
+    uint8_t   pend_drop;
+    int16_t   drop_lx, drop_ly;
     char      title[COMP_TITLE_MAX + 1];
     uint32_t *content;      /* cw*ch, 0xAARRGGBB premultiplied. For a copy      */
                             /* window this is a kmalloc'd kernel buffer the      */
@@ -1164,6 +1170,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->glass = 0;
     w->translucent = 0;
     w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->content = buf;
     int n = 0;
@@ -1256,6 +1263,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->glass = glass && !desktop;
     w->translucent = translucent && !desktop;
     w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->pend_drop = 0;
     w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->z = desktop ? 0 : widget ? g_widget_z++ : g_next_z++;   /* z band per kind */
     w->content = (uint32_t *)kview;
@@ -1756,6 +1764,40 @@ int compositor_close_front(void) {
     return 0;
 }
 
+/* GUI+Q: quit the whole APPLICATION, not the window in front of it.
+ *
+ * The distinction is the point. GUI+W asks ONE window to go; an application
+ * with three open loses one of them and keeps running. GUI+Q asks every window
+ * the same process owns, so the program itself ends. On a machine whose apps
+ * mostly have one window the two look identical, which is exactly why it is
+ * worth being right about now rather than when they diverge.
+ *
+ * Asks, like everything else that closes a window here -- the app takes itself
+ * down and the grace timer kills it if it will not. */
+int compositor_quit_front(void) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *front = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *c = &g_wins[i];
+        if (!c->used || c->desktop || c->widget || c->translucent || !c->title[0]) continue;
+        if (!c->visible) continue;
+        if (!front || c->z > front->z) front = c;
+    }
+    int n = 0;
+    if (front) {
+        int pid = front->pid;
+        for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+            struct comp_window *c = &g_wins[i];
+            if (!c->used || c->pid != pid) continue;
+            if (c->desktop || c->widget) continue;   /* not a window of its own */
+            win_ask_close(c);
+            n++;
+        }
+    }
+    spin_unlock(&g_comp_lock);
+    return n;
+}
+
 int compositor_restore_pid(int pid) {
     spin_lock(&g_comp_lock);
     int changed = 0;
@@ -1860,6 +1902,47 @@ void compositor_anim_tick(void) {
     g_anim.have_last = 1;
     paint_region(x0, y0, x1, y1);            /* draws the ghost itself */
     spin_unlock(&g_comp_lock);
+}
+
+/* IS SOMETHING BEING DRAGGED, and by whom.
+ *
+ * The compositor does not know or care WHAT -- the payload lives in the
+ * session's drag buffer, the same way the clipboard does, and the compositor
+ * deals in windows and pixels. All it needs is "a drag is in flight", so that
+ * when the button comes up it can work out which window the pointer was over
+ * and leave that window's process a note.
+ *
+ * This exists because POINTER CAPTURE would otherwise make a cross-application
+ * drop impossible: a press routes every later motion to the window it landed
+ * on, which is exactly right for a slider or a text selection and exactly
+ * wrong for carrying something to another program. The capture stays -- the
+ * source needs the motion to draw whatever it is holding -- and the DROP is
+ * resolved separately, here, at the release edge. */
+static int      g_drag_on;
+static uint32_t g_drag_pid;
+void compositor_drag_set(int on, uint32_t pid) {
+    spin_lock(&g_comp_lock);
+    g_drag_on = on ? 1 : 0;
+    g_drag_pid = on ? pid : 0;
+    spin_unlock(&g_comp_lock);
+}
+
+/* Take the drop pending for `pid`, if any. 1 and the details, or 0. */
+int compositor_drop_take(int pid, uint32_t *win, int32_t *lx, int32_t *ly) {
+    int got = 0;
+    spin_lock(&g_comp_lock);
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w->pid != pid || !w->pend_drop) continue;
+        if (win) *win = w->id;
+        if (lx) *lx = w->drop_lx;
+        if (ly) *ly = w->drop_ly;
+        w->pend_drop = 0;
+        got = 1;
+        break;
+    }
+    spin_unlock(&g_comp_lock);
+    return got;
 }
 
 void compositor_pointer_tick(void) {
@@ -2043,6 +2126,29 @@ void compositor_pointer_tick(void) {
     /* Record the content-local pointer for the topmost window under the cursor
      * (skipping its title bar) so its owning app can read it via sys_win_input.
      * A drag in progress keeps routing to no app (the compositor owns it). */
+    /* THE DROP, resolved at the release edge and before capture is dropped.
+     * The window under the pointer is the target, whoever owns it -- including
+     * the source itself, which is a drag that went nowhere and is the source's
+     * own business to ignore. */
+    if (g_drag_on && !(b & MOUSE_BTN_LEFT) && (g_prev_buttons & MOUSE_BTN_LEFT)) {
+        struct comp_window *t = topmost_at(x, y);
+        if (t && !t->widget) {
+            int lx = x - t->x, ly = y - (t->y + win_titlebar_h(t));
+            if (lx >= 0 && lx < (int)t->cw && ly >= 0 && ly < (int)t->ch) {
+                t->pend_drop = 1;
+                t->drop_lx = (int16_t)lx;
+                t->drop_ly = (int16_t)ly;
+                /* AND WAKE IT. An application that is idle does not build a
+                 * frame, and an application that does not build a frame never
+                 * polls for a drop -- so the note sat in the window unread and
+                 * the drag looked like it had done nothing. The action channel
+                 * is already an input edge the runtime reacts to. */
+                t->pending_action = 3;          /* EMBK_WIN_ACTION_DROP */
+            }
+        }
+        g_drag_on = 0; g_drag_pid = 0;
+    }
+
     g_ptr_pid = 0;
     if (!g_dragging) {
         if (!(b & MOUSE_BTN_LEFT)) g_cap_pid = 0;      /* release ends capture */

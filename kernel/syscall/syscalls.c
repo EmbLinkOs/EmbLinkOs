@@ -2170,7 +2170,13 @@ static int64_t sys_kbd_layout(const struct sysargs *a) {
 
     if (uname) {
         char name[24];
-        if (copy_string_from_user(name, uname, sizeof name) != EMBK_OK)
+        /* < 0, NOT != EMBK_OK: copy_string_from_user returns the string's
+         * LENGTH on success and EMBK_OK is 0, so this rejected every name that
+         * was not empty -- which is every name. The keyboard layout could not
+         * be changed by anything in userspace, and said -EFAULT while doing it.
+         * Every other caller in this file already takes the length into an int
+         * and tests for negative. */
+        if (copy_string_from_user(name, uname, sizeof name) < 0)
             return -EMBK_EFAULT;
         if (keyboard_set_layout(name) != 0) return -EMBK_EINVAL;
     }
@@ -2261,6 +2267,88 @@ struct net_status_kbuf {
     uint8_t  mac[6];
     uint8_t  pad[2];
 };
+/* ---- drag and drop ------------------------------------------------------
+ *
+ * SESSION-SCOPED, exactly like the clipboard and for the same reason: what one
+ * person drags is theirs, and a second session on the same machine has no
+ * business seeing it. The payload lives here rather than in the compositor,
+ * which deals in windows and pixels; the compositor knows only that a drag is
+ * in flight and where the pointer was when it ended.
+ *
+ * ONE DRAG AT A TIME. There is one pointer, so there is one thing being
+ * carried; a second drag_begin replaces the first rather than queueing, which
+ * is what a person with one hand would expect. */
+#define DRAG_TYPE_MAX 24
+#define DRAG_DATA_MAX 1024
+static char     g_drag_type[DRAG_TYPE_MAX];
+static char     g_drag_data[DRAG_DATA_MAX];
+static uint32_t g_drag_len;
+static uint32_t g_drag_sid;
+static uint32_t g_drag_from;          /* the pid that started it */
+
+static int64_t sys_drag_begin(const struct sysargs *a) {
+    const char *utype = (const char *)a->arg[0];
+    const void *ubuf  = (const void *)a->arg[1];
+    uint32_t    len   = (uint32_t)a->arg[2];
+    if (!current_process) return -EMBK_EPERM;
+
+    /* A null type CANCELS: a drag that ends without a drop still has to put
+     * the pointer down, and making the caller invent an empty type for that
+     * would be a worse interface than one call meaning both. */
+    if (!utype) {
+        g_drag_len = 0; g_drag_type[0] = 0; g_drag_sid = 0; g_drag_from = 0;
+        compositor_drag_set(0, 0);
+        return 0;
+    }
+    if (len > DRAG_DATA_MAX) return -EMBK_E2BIG;
+    /* < 0, NOT != EMBK_OK. copy_string_from_user returns the string's LENGTH
+     * on success and EMBK_OK is 0, so testing for inequality rejects every
+     * string that is not empty. sys_kbd_layout had the same bug and it meant
+     * the keyboard layout could not be changed at all. */
+    if (copy_string_from_user(g_drag_type, utype, sizeof g_drag_type) < 0)
+        return -EMBK_EFAULT;
+    if (len && copy_from_user(g_drag_data, ubuf, len) != EMBK_OK)
+        return -EMBK_EFAULT;
+    g_drag_len  = len;
+    g_drag_sid  = current_process->session_id;
+    g_drag_from = current_process->pid;
+    compositor_drag_set(1, current_process->pid);
+    return 0;
+}
+
+/* Did something land on one of my windows? 1 and the details, or 0. */
+struct drop_kbuf {
+    int32_t  win;
+    int32_t  x, y;
+    uint32_t len;
+    char     type[DRAG_TYPE_MAX];
+};
+static int64_t sys_drop_take(const struct sysargs *a) {
+    void    *uout = (void *)a->arg[0];
+    void    *ubuf = (void *)a->arg[1];
+    uint32_t cap  = (uint32_t)a->arg[2];
+    if (!current_process || !uout) return -EMBK_EINVAL;
+
+    uint32_t win = 0; int32_t lx = 0, ly = 0;
+    if (!compositor_drop_take((int)current_process->pid, &win, &lx, &ly)) return 0;
+
+    /* A DROP FROM ANOTHER SESSION IS NOT A DROP. The window was under the
+     * pointer, but the thing being carried belongs to somebody else. */
+    if (g_drag_sid != current_process->session_id) return 0;
+
+    struct drop_kbuf k;
+    memset(&k, 0, sizeof k);
+    k.win = (int32_t)win; k.x = lx; k.y = ly;
+    k.len = g_drag_len;
+    for (unsigned i = 0; i < sizeof k.type - 1 && g_drag_type[i]; i++) k.type[i] = g_drag_type[i];
+    if (copy_to_user(uout, &k, sizeof k) != EMBK_OK) return -EMBK_EFAULT;
+    if (ubuf && cap) {
+        uint32_t n = g_drag_len < cap ? g_drag_len : cap;
+        if (n && copy_to_user(ubuf, g_drag_data, n) != EMBK_OK) return -EMBK_EFAULT;
+    }
+    return 1;
+}
+
 static int64_t sys_net_status(const struct sysargs *a) {
     int cg = cap_gate(EMBK_CAP_NETWORK);
     if (cg) return cg;
@@ -2407,6 +2495,8 @@ static syscall_handler_t syscall_table[] = {
     [SYS_win_list]       = sys_win_list,
     [SYS_power]          = sys_power,
     [SYS_net_status]     = sys_net_status,
+    [SYS_drag_begin]     = sys_drag_begin,
+    [SYS_drop_take]      = sys_drop_take,
     [SYS_win_raise]      = sys_win_raise,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,

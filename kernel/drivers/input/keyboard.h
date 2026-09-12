@@ -87,6 +87,7 @@ enum {
     SYSKEY_NONE = 0,
     SYSKEY_NEXT_WINDOW,      /* GUI+Tab */
     SYSKEY_CLOSE_WINDOW,     /* GUI+W   */
+    SYSKEY_QUIT_APP,         /* GUI+Q   */
 };
 /* Take the pending system shortcut, if any, and clear it. */
 int keyboard_take_syskey(void);

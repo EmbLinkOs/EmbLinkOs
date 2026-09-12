@@ -139,6 +139,22 @@ int  compositor_cycle_window(void);
 /* GUI+W: close the front window, the same way its close light does -- by ASKING
  * it to. Returns 0; nothing is killed here. */
 int  compositor_close_front(void);
+/* GUI+Q: ask every window the FRONT window's process owns to close, so the
+ * application ends rather than one of its windows. Returns how many were
+ * asked. */
+int  compositor_quit_front(void);
+
+/* DRAG AND DROP, the compositor's half of it: it knows only that a drag is in
+ * flight and where the pointer was when it ended. The payload lives in the
+ * session's drag buffer, like the clipboard -- the compositor deals in windows
+ * and pixels and has no business with the contents.
+ *
+ * It exists because POINTER CAPTURE makes a cross-application drop impossible
+ * otherwise: a press routes every later motion to the window it landed on,
+ * which is right for a slider and wrong for carrying something to another
+ * program. The capture stays; the drop is resolved separately at the release. */
+void compositor_drag_set(int on, uint32_t pid);
+int  compositor_drop_take(int pid, uint32_t *win, int32_t *lx, int32_t *ly);
 
 /* How long a window has to take itself down after being asked, before it is
  * killed. Long enough to write a file out, short enough that a hung app does

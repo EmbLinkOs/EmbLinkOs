@@ -435,6 +435,11 @@ int em_app_run(const EmApp *app) {
          * this itself; doing nothing still closes, which is the right default
          * for the many apps with nothing to lose. */
         if (in.win == EMBK_WIN_ACTION_CLOSE) em_app_request_exit(0);
+        /* A DROP LANDED. The payload is the application's to take
+         * (embk_drop_take, in its view); all the runtime owes it is a frame in
+         * which to notice -- an idle app builds none, and the drop would sit
+         * unread while the drag looked like it had done nothing. */
+        if (in.win == EMBK_WIN_ACTION_DROP) em_request_frame();
 
         if (!have_want && in.win == EMBK_WIN_ACTION_MAXIMIZE) {
             /* The kernel chrome's zoom button is a TOGGLE, because it has no

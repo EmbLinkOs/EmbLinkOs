@@ -37,9 +37,15 @@ static const char *base_name(const char *p) {
     return *b ? b : p;
 }
 
+static void load_path(const char *path);
+
 static void load_file(void) {
     const char *p = getenv("EDIT_FILE");
     if (!p || !*p) p = "/data/tmp/untitled.txt";
+    load_path(p);
+}
+
+static void load_path(const char *p) {
     snprintf(g_path, sizeof g_path, "%s", p);
 
     FILE *f = fopen(g_path, "r");
@@ -79,6 +85,25 @@ static const char *dir_of(const char *path) {
 
 static void app(void) {
     if (!g_loaded) { load_file(); g_loaded = true; }
+
+    /* A FILE DROPPED ON THIS WINDOW. Files publishes a "path" when you drag
+     * something out of it; an editor is the obvious thing to drop a file on,
+     * and it needs to know nothing about Files to accept one -- they agree on
+     * the type, and the kernel carries the bytes.
+     *
+     * Costs one syscall a frame and answers 1 exactly once, for the window the
+     * pointer was over when the button came up. */
+    {
+        struct embk_drop d;
+        char dropped[512];
+        if (embk_drop_take(&d, dropped, sizeof dropped - 1) == 1 &&
+            !strcmp(d.type, "path") && d.len) {
+            unsigned n = d.len < sizeof dropped - 1 ? d.len : (unsigned)sizeof dropped - 1;
+            dropped[n] = 0;
+            load_path(dropped);
+            em_request_frame();
+        }
+    }
 
     Window("Editor") {
         WindowBar(base_name(g_path)) {

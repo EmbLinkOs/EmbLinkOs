@@ -164,6 +164,8 @@
 #define EMBK_SYS_win_raise      117  /* (pid)              -> n | -err */
 #define EMBK_SYS_power         118
 #define EMBK_SYS_net_status    119
+#define EMBK_SYS_drag_begin    120
+#define EMBK_SYS_drop_take     121
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

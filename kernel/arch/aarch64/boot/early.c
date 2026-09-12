@@ -1528,6 +1528,7 @@ void arch_early_main(uint64_t dtb_phys) {
               int n = compositor_close_overdue(overdue, 8);
               for (int i = 0; i < n; i++) process_kill((uint32_t)overdue[i]); }
             if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();
             else if (sk == SYSKEY_CLOSE_WINDOW) {
                 int pid = compositor_close_front();
                 if (pid) process_kill((uint32_t)pid);

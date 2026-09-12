@@ -3182,6 +3182,70 @@ Open:
       no battery to test one against, so it wants a real machine or a
       hypervisor channel to be worth writing.
 
+### Drag and drop between applications (2026-09-13)
+
+- [x] **The mechanism, and it is proven end to end.** `SYS_drag_begin` (120)
+      and `SYS_drop_take` (121), with a session-scoped payload exactly like the
+      clipboard: what one person drags, another session cannot see, and a drop
+      whose payload belongs to a different session is not delivered.
+
+      THE COMPOSITOR RESOLVES THE TARGET, and it has to. A press CAPTURES the
+      pointer -- every later motion routes to the window the press landed on,
+      which is right for a slider and for selecting text and means the window
+      you drop ON never sees the pointer at all. So the capture stays (the
+      source needs the motion to draw what it is holding) and the drop is
+      resolved separately, at the release edge, by asking which window was
+      under the pointer.
+
+      Traced working: Files publishes `/home/yves/readme.txt`, the compositor
+      finds pid 12's window at the release point, and Note++'s
+      `embk_drop_take` answers `r=1 type=path len=21`.
+
+- [ ] **The target does not visibly react yet.** Note++ receives the drop with
+      the correct payload and neither opens the document nor shows the banner
+      it now posts. That is app-level and I did not isolate it; the kernel and
+      toolkit halves are not suspects, because the trace above is taken INSIDE
+      Note++ after the call returns. `tools/dnd_shot.py` reports this rather
+      than failing, so it does not tell a lie about the parts that work.
+
+      Next: check whether `doc_open` succeeds (its result goes to `g_msg`,
+      which is in the window's header and was behind the other window all along
+      -- print it instead of looking for it), and whether the frame that takes
+      the drop is the same one that acts on `g_want_open`.
+
+- [x] **Files opened a file on PRESS, so you could not pick one up.** The
+      toolkit fires `.clicked()` on the press edge, which is right for a button
+      and wrong for a file: every attempt to drag one also launched it, and the
+      drag arrived behind a window that had just opened. A click is a press that
+      did not move, so the open happens on RELEASE now and only when no drag
+      started. This was found because the first drag test PASSED for that
+      reason -- the file opened, the pixels changed, and nothing had been
+      dropped anywhere.
+
+### GUI+Q quits the application (done 2026-09-13)
+
+- [x] **Distinct from GUI+W, which closes one window.** An application with
+      three windows loses one to GUI+W and keeps running; GUI+Q asks every
+      window the same process owns, so the program ends. On a machine whose
+      apps mostly have one window the two look identical, which is exactly why
+      it is worth being right about before they diverge. Asks, like every other
+      close here, with the same grace timer behind it.
+
+### A string could not be passed to two syscalls at all (fixed 2026-09-13)
+
+- [x] **`copy_string_from_user` returns the string's LENGTH on success, and
+      `EMBK_OK` is 0.** Two callers tested `!= EMBK_OK`, which is true for every
+      string that is not empty -- so both rejected every real argument with
+      -EFAULT. Every other caller in syscalls.c already takes the length into an
+      int and tests for negative.
+
+      The one that matters: **`sys_kbd_layout`**. The keyboard layout could not
+      be changed by anything in userspace -- Settings' AZERTY/Dvorak switch and
+      the saved keymap the desktop applies at login both failed silently, on an
+      OS that ships three layouts and a Settings pane to pick them with. Found
+      while debugging drag-and-drop, because the new drag syscall had copied the
+      same wrong idiom from it.
+
 ### The window switcher the window list was built for (done 2026-09-12)
 
 - [x] **GUI+Tab switches windows; GUI+W closes one.** `embk_win_list` and

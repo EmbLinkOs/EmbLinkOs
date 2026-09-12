@@ -274,4 +274,11 @@
  * CAP_NETWORK-gated like the rest of the socket surface. */
 #define SYS_net_status    119   /* (out)                    -> 0 | -err        */
 
+/* DRAG AND DROP between applications. The payload is session-scoped, like the
+ * clipboard: what one session drags, another cannot see. drag_begin declares
+ * what is being carried while the button is down; drop_take is how the window
+ * it was released over finds out. */
+#define SYS_drag_begin    120   /* (type, buf, len)         -> 0 | -err        */
+#define SYS_drop_take     121   /* (out, buf, cap)          -> 1 | 0 | -err    */
+
 #endif /* _SYSCALL_NR_H_ */

@@ -25,6 +25,7 @@
 #include <stdbool.h>
 
 #include "embk.h"
+#include "emnotify.h"
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
@@ -928,6 +929,31 @@ static void app(void) {
     }
     doc_init();
     bind_current();
+
+    /* SOMETHING WAS DROPPED ON THIS WINDOW. Files publishes a "path" when you
+     * drag a file out of it; anything else carrying a path works the same,
+     * because the type is what is agreed on rather than the application.
+     *
+     * Checked every frame and answers 1 exactly once, so this costs a syscall
+     * per frame and nothing else. */
+    {
+        struct embk_drop d;
+        char dropped[512];
+        if (embk_drop_take(&d, dropped, sizeof dropped - 1) == 1 &&
+            !strcmp(d.type, "path") && d.len) {
+            unsigned n = d.len < sizeof dropped - 1 ? d.len : (unsigned)sizeof dropped - 1;
+            dropped[n] = 0;
+            snprintf(g_path_field, sizeof g_path_field, "%s", dropped);
+            g_want_open = 1;
+            /* SAY SO. A file dropped on a window that is behind another one
+             * opens where nobody can see it, and a drag that appears to do
+             * nothing is a drag people stop trying. The notifier is how any
+             * program here speaks from outside its own window. */
+            { const char *base = dropped, *c;
+              for (c = dropped; *c; c++) if (*c == '/') base = c + 1;
+              embk_notify("Note++", base); }
+        }
+    }
 
     if (g_want_new)  { g_want_new = 0; doc_new(); g_path_field[0] = 0; g_bound = -1; session_save(); }
     if (g_want_open) {
