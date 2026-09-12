@@ -502,7 +502,14 @@ int em_app_run(const EmApp *app) {
                 for (int i = 0; i < n; i++) {
                     int ch = (unsigned char)clip[i];
                     if (ch == '\n' || ch == '\t') ch = ' ';
-                    if (ch < 0x20 || ch > 0x7E) continue;
+                    /* CONTROL BYTES OUT, UTF-8 THROUGH. The old bound was
+                     * 0x20..0x7E, which dropped every byte of every accented
+                     * character: you could TYPE é into a field (the driver
+                     * encodes UTF-8 now) and then not paste it, in the same
+                     * field, on the same machine. 0x80 and above is a byte of a
+                     * real character; the bytes of one arrive consecutively and
+                     * the caret advances one at a time, so it lands intact. */
+                    if (ch < 0x20 || ch == 0x7F) continue;
                     if (g_em_key_hook && g_em_key_hook(ch)) continue;
                     ui_input_char(ch);
                 }

@@ -140,6 +140,19 @@ Stepper("Devices", &g_devices, /*lo=*/1, /*hi=*/10);
 TextField(g_name, sizeof g_name, "Your name");
 ```
 
+### What a TextField can do
+
+It is a real editable field, not a box you append to. The caret moves with
+**Left / Right / Home / End**, **Backspace** takes the character before it and
+**Delete** the one after, typing inserts wherever the caret is, and **clicking
+in the text puts the caret between the two characters you pointed between**.
+Everything is measured in characters, not bytes: the stream is UTF-8, so one
+Left steps over the whole of `é` and one Backspace removes all of it.
+
+Focusing a field (Tab, autofocus) puts the caret at the end of its text, which
+is where someone arriving to add something expects it; a click is how you get
+anywhere else. There is one caret because exactly one field is focused.
+
 Text has five font roles (`.title() .heading() .body() .bold() .caption()`)
 and color roles (`.secondary() .tertiary() .accent()`). A leaf you want to
 read a click from ends with `.clicked()`; give it `.id("x")` first if you

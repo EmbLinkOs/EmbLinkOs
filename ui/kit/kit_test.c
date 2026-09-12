@@ -109,6 +109,72 @@ int main(void) {
     frame("\b");
     CHECK(A[0] == 0, "and one backspace removes all three of its bytes");
 
+    /* ---- THE CARET: editing somewhere other than the end ----------------
+     *
+     * Until it existed, this field could only be appended to and backspaced
+     * from the end -- so fixing a typo three characters back meant deleting
+     * everything after it, in every filename box and search box in the system.
+     * The navigation keys arrive as bytes in this same stream (UI_KEY_*), which
+     * is why they can be typed here exactly as the driver sends them. */
+    #define LEFT  "\x11"
+    #define RIGHT "\x12"
+    #define HOME  "\x02"
+    #define END   "\x05"
+    #define DEL   "\x7F"
+
+    page = 0x4444; autofocus = true; A[0] = 0;
+    frame(NULL); frame(NULL);
+    frame("world");
+    frame(HOME "hello ");
+    CHECK(!strcmp(A, "hello world"), "Home puts the caret at the front and typing INSERTS there");
+
+    frame(END "!");
+    CHECK(!strcmp(A, "hello world!"), "End goes back to the end");
+
+    /* "hello world!" -- three lefts put the caret before the l of "world",
+     * so backspace takes the r. */
+    frame(LEFT LEFT LEFT "\b");
+    CHECK(!strcmp(A, "hello wold!"), "backspace takes the character BEFORE the caret, mid-string");
+
+    frame(DEL);
+    CHECK(!strcmp(A, "hello wod!"), "Delete takes the one after it -- a key that used to do nothing");
+
+    frame(HOME DEL DEL DEL DEL DEL DEL);
+    CHECK(!strcmp(A, "wod!"), "Delete at the front eats forwards");
+
+    /* A caret is a CHARACTER position, not a byte position: the stream is
+     * UTF-8, and an arrow key that moved one byte would step into the middle
+     * of an é and let a backspace cut it in half. */
+    A[0] = 0; frame(NULL);
+    frame("caf\xC3\xA9s");                /* c a f é s */
+    frame(LEFT LEFT);                      /* over the s, then over the whole é */
+    frame("X");
+    CHECK(!strcmp(A, "cafX\xC3\xA9s"), "Left steps over a whole é, not one of its bytes");
+
+    frame(RIGHT);                          /* past the é, in one press */
+    frame("Y");
+    CHECK(!strcmp(A, "cafX\xC3\xA9Ys"), "and Right steps over all of it too");
+
+    /* One left puts the caret between the é and the Y, so backspace takes the
+     * whole é -- both its bytes, in one press. */
+    frame(LEFT "\b");
+    CHECK(!strcmp(A, "cafXYs"), "backspace over a multi-byte character removes all of it");
+
+    /* FOCUSING A FIELD PUTS THE CARET AT THE END OF ITS TEXT, and that is the
+     * documented behaviour rather than a limitation worked around: there is one
+     * caret because exactly one field is focused, and arriving at the end is
+     * what someone Tabbing into a field to add to it expects. Pointing at a
+     * spot is how you get anywhere else, and a click does exactly that. */
+    A[0] = 0; B[0] = 0; frame(NULL);
+    frame("abc");
+    frame(HOME);                           /* caret to the front of A */
+    frame("\t");                           /* to B */
+    frame("zz");
+    frame("\t\t");                         /* wrap back round to A */
+    frame("Q");
+    CHECK(!strcmp(A, "abcQ"), "coming back to a field puts the caret at the end of its text");
+    CHECK(!strcmp(B, "zz"), "and the other field kept its own text");
+
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

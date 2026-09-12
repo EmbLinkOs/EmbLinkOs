@@ -110,6 +110,33 @@ void ui_text_field_emphasis(unsigned start, unsigned len);
  * ready to type into (the login screen). One-shot, set before the field. */
 void ui_text_field_autofocus(void);
 
+/* The navigation keys, as BYTES in the same stream as typed text.
+ *
+ * A CONTRACT, not a convenience: these are the private codes the kernel's
+ * keyboard driver emits for keys that have no character (kernel/drivers/input/
+ * keyboard.h's EK_*, mirrored again for applications in user/lib/embk.h's
+ * EMBK_KEY_*). All three must agree. They are repeated here rather than
+ * included because this layer is built and unit-tested on the host, where
+ * there is no kernel header to reach for -- which is also why kit_test can
+ * drive a caret at all.
+ *
+ * They live in C0 because C0 is where a byte stream has room: the values are
+ * chosen not to collide with Ctrl+letter, which owns 0x01-0x1A. */
+#define UI_KEY_HOME  0x02
+#define UI_KEY_END   0x05
+#define UI_KEY_PGUP  0x0E
+#define UI_KEY_PGDN  0x0F
+#define UI_KEY_LEFT  0x11
+#define UI_KEY_RIGHT 0x12
+#define UI_KEY_UP    0x13
+#define UI_KEY_DOWN  0x14
+#define UI_KEY_DEL   0x7F
+
+/* Pixel width of the first `nbytes` of `s` (nbytes < 0 = the whole string),
+ * stepped with the RENDERER's own UTF-8 decoder. Measuring text any other way
+ * than it is drawn puts a caret where the glyphs are not. */
+float ui_text_width_n(uint32_t font_handle, float size_px, const char *s, int nbytes);
+
 /* --- scroll view --- */
 /* A fixed-height viewport that clips + vertically scrolls its children. `scroll_y`
  * is the app-owned scroll position (px from top); the wheel over the view and a

@@ -2655,6 +2655,73 @@ Open:
       screen and no name in the bar, and the filter was right both times.
       Launch from the dock to see it.
 
+### The text field has a caret (done 2026-09-12)
+
+- [x] **You can edit the middle of a text field.** Before this, a field in this
+      system could only be APPENDED to: typing went on the end, backspace came
+      off the end, and what was drawn as a caret was a 2px box emitted after the
+      whole string -- so it was not a cursor, it was a decoration sitting where
+      the next character would go. Fixing a typo three characters back meant
+      deleting everything after it, in every filename box in the Open/Save
+      panel, every search box, every setting.
+
+      Left / Right / Home / End move it, Backspace takes the character before
+      and Delete the one after (a key that previously did nothing at all),
+      typing inserts at the caret, and clicking in the text places it between
+      the two characters you pointed between -- nearest boundary, so the right
+      half of a letter means after it.
+
+      CHARACTERS, NOT BYTES, throughout. The stream is UTF-8 since the keyboard
+      work, so one Left steps over the whole of an é and one Backspace removes
+      both its bytes; the caret is kept on a character boundary even when the
+      app rewrites the buffer underneath it (the file panel does, when you click
+      a file). The value is drawn as two runs with the caret box between them,
+      which costs no measurement -- the layout already knows how wide the first
+      run is.
+
+      ONE CARET, anchored to the BUFFER rather than to the widget's instance
+      handle: a field is identified by the text it edits, which is stable across
+      frames by construction and survives the field moving in the tree. Exactly
+      one field is focused, so exactly one caret is needed. Focusing a field
+      puts it at the end of that field's text.
+
+      Paste stopped mangling text in the same change: em_app's replay dropped
+      every byte outside 0x20..0x7E, so you could TYPE é into a field and then
+      not paste it, in the same field, on the same machine.
+
+      Proved twice, because the two halves need different instruments.
+      ui/kit/kit_test.c drives the real widget through the real declare/layout
+      stack on the host -- insert at front, mid-string backspace, Delete, arrows
+      over multi-byte characters -- in about a second. tools/caret_shot.py does
+      what the host cannot: it types at a REAL keyboard and clicks with a REAL
+      pointer in Settings' "Try it" field, and judges by INK COLUMNS (for each
+      x, is there writing there), which distinguishes an insert at the front
+      from an append without reading text off a screenshot.
+
+- [ ] **A field still has no SELECTION, and so no copy.** `embk_clip_set` has no
+      caller in the shared toolkit: Ctrl+V paste is app-wide, but nothing in
+      EmUI can copy, because there is nothing to copy -- no selection exists.
+      Shift+arrows, select-all, cut and copy all wait on it.
+
+      The obstacle is which keys. **Ctrl+C cannot be copy in this OS**: 0x03 is
+      intercepted in keyboard_deliver() and routed at the console's interrupt
+      target, so in a GUI text field it would cancel whatever the terminal is
+      running instead of reaching the field. That is correct behaviour for ^C
+      and should stay. The modifier that is free is the GUI/Super key (EKM_GUI),
+      which suggests a rule worth adopting deliberately: **Ctrl belongs to the
+      terminal (interrupt, job control), the GUI key belongs to the interface**
+      -- which is why macOS separates Cmd from Ctrl.
+
+      Delivery is the other half. The char stream has no room (C0 is Ctrl's and
+      the nav keys'), and modifiers are not in it at all -- shift+Left and Left
+      are the same byte. Either em_app translates from the EVENT stream
+      (embk_key_event, which carries mods) into UI commands, or the commands
+      ride the char stream as bytes 0xF8..0xFF, which never occur in valid
+      UTF-8. The second keeps typed text and commands in ONE ordered queue,
+      which matters: a paste between two typed characters has to land between
+      them. There are exactly 8 such bytes and 8 commands wanted, which is
+      either elegant or a warning.
+
 ### The dock tells the truth about what is running (done 2026-09-12)
 
 - [x] **A running app the dock did not start now lights its tile.** The desktop

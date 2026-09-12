@@ -2,6 +2,7 @@
  * ui/declare primitives and pulls every dimension/colour from ui/theme. */
 
 #include "kit.h"
+#include "font.h"      /* glyph advances: a caret has to know where it is */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -400,6 +401,85 @@ static bool     g_autofocus_next;         /* see ui_text_field_autofocus */
 
 void ui_text_field_autofocus(void) { g_autofocus_next = true; }
 
+/* --- THE CARET -----------------------------------------------------------
+ *
+ * Until this existed a text field in this system could only be APPENDED to.
+ * Typing went on the end, backspace came off the end, and the thing drawn as a
+ * caret was a 2px box emitted after the whole string -- so it was not a cursor,
+ * it was a decoration that happened to sit where the next character would go.
+ * A typo three characters back meant deleting everything after it. Every
+ * filename in the Open/Save panel, every search box, every setting in this OS
+ * was edited that way.
+ *
+ * ONE CARET, NOT ONE PER FIELD, because only the focused field can have one and
+ * exactly one field is focused. It is anchored to the BUFFER, not to the
+ * widget's instance handle: a field is identified by the text it edits, which
+ * is stable across frames by construction and survives the field moving in the
+ * tree -- where an instance handle need not. Focus a different field and the
+ * caret adopts it, at the end of its text, which is where someone clicking into
+ * a field to add to it expects to be.
+ *
+ * BYTES, NOT CHARACTERS. The stream is UTF-8 (kernel/drivers/input/keyboard.c),
+ * so the offset is a byte offset that is always kept on a character boundary --
+ * a caret between the two bytes of an é is a caret that can split it in half. */
+static char    *g_caret_buf;              /* whose caret g_caret is */
+static unsigned g_caret;                  /* byte offset into it */
+
+/* Continuation bytes are 10xxxxxx: never a character's first byte. */
+static bool cp_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
+
+static unsigned utf8_back(const char *s, unsigned i) {
+    if (i == 0) return 0;
+    i--;
+    while (i > 0 && cp_cont(s[i])) i--;
+    return i;
+}
+static unsigned utf8_fwd(const char *s, unsigned len, unsigned i) {
+    if (i >= len) return len;
+    i++;
+    while (i < len && cp_cont(s[i])) i++;
+    return i;
+}
+
+/* Width of the first `nbytes` of `s`. Steps the string with the RENDERER's own
+ * decoder -- anything that measures text differently from the way it is drawn
+ * puts the caret somewhere the glyphs are not. */
+float ui_text_width_n(uint32_t font_handle, float size_px, const char *s, int nbytes) {
+    if (!s || !*s || nbytes == 0) return 0.0f;
+    struct font *f = font_for_handle(font_handle);
+    if (!f) return 0.0f;
+    unsigned limit = nbytes < 0 ? (unsigned)-1 : (unsigned)nbytes;
+    float w = 0;
+    for (unsigned i = 0; s[i] && i < limit; ) {
+        uint32_t cp;
+        int adv = font_utf8_decode(s + i, &cp);
+        if (adv <= 0) break;
+        struct glyph_cache_entry *e =
+            glyph_cache_lookup_or_rasterize(font_global_atlas(), f, cp, size_px);
+        if (e) w += e->advance_px;
+        i += (unsigned)adv;
+    }
+    return w;
+}
+
+/* The character boundary nearest `x`, measured from the text's left edge.
+ * NEAREST, not "the one it landed inside": clicking the right half of a letter
+ * must put the caret AFTER it, which is what everyone means by pointing between
+ * two characters. */
+static unsigned caret_from_x(const char *s, unsigned len, uint32_t font,
+                             float size_px, float dx) {
+    if (dx <= 0) return 0;
+    float prev = 0;
+    for (unsigned i = 0; i < len; ) {
+        unsigned nx = utf8_fwd(s, len, i);
+        float w = ui_text_width_n(font, size_px, s, (int)nx);
+        if (dx < (prev + w) * 0.5f) return i;
+        prev = w;
+        i = nx;
+    }
+    return len;
+}
+
 static void trav_new_frame(void) {
     uint64_t f = ui_frame_serial();
     if (f == g_trav_frame) return;
@@ -424,7 +504,8 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
 
     ui_box_begin(0);
     struct instance_handle self = ui_open();
-    if (ui_consume_click(self)) ui_request_focus(self);
+    bool clicked = ui_consume_click(self);
+    if (clicked) ui_request_focus(self);
     /* How this field came by focus decides where its keys come from. The typed
      * queue is the FRAME's, not consumed per field: a field Tabbed into in the
      * same frame must take only what followed the Tab (the carry) -- taking the
@@ -445,6 +526,38 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
     }
     bool focused = ui_has_focus(self);
 
+    /* THE CARET FOLLOWS FOCUS, and a click puts it where the pointer is.
+     *
+     * The well's rect is last frame's geometry, which is exactly right: the
+     * click being handled happened over what was on screen then. The text
+     * starts one left padding in -- the same t->sp3 set on this box a few lines
+     * below, read here rather than guessed.
+     *
+     * A masked field gets the caret at the end wherever you click it: the
+     * glyphs are asterisks, so an offset measured against them would be an
+     * offset into a string that is not the one being edited. */
+    unsigned len = (unsigned)strlen(buf);
+    if (focused) {
+        if (g_caret_buf != buf) { g_caret_buf = buf; g_caret = len; }
+        if (g_caret > len) g_caret = len;
+        /* The app may have rewritten the buffer under us (the file panel fills
+         * the name field when you click a file). Never leave the caret inside a
+         * character. */
+        while (g_caret > 0 && g_caret < len && cp_cont(buf[g_caret])) g_caret--;
+
+        if (clicked) {
+            float rx, ry, rw, rh, px, py;
+            if (!masked && ui_open_rect(&rx, &ry, &rw, &rh) && rw > 0) {
+                ui_pointer_pos(&px, &py);
+                (void)ry; (void)rh; (void)py;
+                g_caret = caret_from_x(buf, len, t->font_regular, t->text_body,
+                                       px - (rx + t->sp3));
+            } else {
+                g_caret = len;
+            }
+        }
+    }
+
     /* while focused, apply this frame's typed characters in place -- first
      * whatever the field before this one saw typed after a Tab */
     if (focused) {
@@ -457,18 +570,40 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
         }
         if (keys != CARRY_ONLY)
             n += ui_input_take(in + n, (int)sizeof in - n);
-        unsigned long len = strlen(buf);
         for (int i = 0; i < n; i++) {
-            char c = in[i];
+            unsigned char c = (unsigned char)in[i];
             if (c == '\b') {
                 /* BACK OVER A WHOLE CHARACTER, not a byte. The stream is UTF-8
-                 * now (kernel/drivers/input/keyboard.c), so é is two bytes and
+                 * (kernel/drivers/input/keyboard.c), so é is two bytes and
                  * deleting one of them leaves a half character the renderer
                  * draws as a replacement box -- one backspace, one visible
                  * thing removed, is the only behaviour anyone would call
-                 * correct. Continuation bytes are 10xxxxxx. */
-                while (len > 0 && ((unsigned char)buf[len - 1] & 0xC0) == 0x80) buf[--len] = 0;
-                if (len > 0) buf[--len] = 0;
+                 * correct. */
+                if (g_caret > 0) {
+                    unsigned p = utf8_back(buf, g_caret);
+                    memmove(buf + p, buf + g_caret, len - g_caret + 1);
+                    len -= g_caret - p;
+                    g_caret = p;
+                }
+            }
+            else if (c == UI_KEY_DEL) {
+                /* Delete is backspace's mirror: it takes the character AFTER
+                 * the caret. With an append-only field there was nothing after
+                 * the caret, so this key did nothing at all. */
+                if (g_caret < len) {
+                    unsigned nx = utf8_fwd(buf, len, g_caret);
+                    memmove(buf + g_caret, buf + nx, len - nx + 1);
+                    len -= nx - g_caret;
+                }
+            }
+            else if (c == UI_KEY_LEFT)  g_caret = utf8_back(buf, g_caret);
+            else if (c == UI_KEY_RIGHT) g_caret = utf8_fwd(buf, len, g_caret);
+            else if (c == UI_KEY_HOME)  g_caret = 0;
+            else if (c == UI_KEY_END)   g_caret = len;
+            else if (c == UI_KEY_UP || c == UI_KEY_DOWN ||
+                     c == UI_KEY_PGUP || c == UI_KEY_PGDN) {
+                /* A one-line field has nowhere vertical to go. Swallowed rather
+                 * than fallen through, so they cannot be mistaken for text. */
             }
             else if (c == '\n') { g_field_submit = true; }   /* submit; see above */
             else if (c == '\t') {
@@ -479,15 +614,19 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
                 g_tab_pending = true;
                 break;
             }
-            else if (((unsigned char)c >= 32 && (unsigned char)c < 127)
-                     || (unsigned char)c >= 0x80) {
+            else if ((c >= 32 && c < 127) || c >= 0x80) {
                 /* >= 0x80 is a UTF-8 byte of a real character -- é, €, a
-                 * dead-key composition. Each byte is appended as it arrives;
-                 * they are contiguous in the queue, so the sequence lands
-                 * intact. Rejecting them (the old `< 127` bound) is what made
+                 * dead-key composition. Each byte is inserted as it arrives;
+                 * they are contiguous in the queue and the caret advances one
+                 * byte at a time, so a multi-byte character lands intact and in
+                 * order. Rejecting them (the old `< 127` bound) is what made
                  * every accented character vanish between the keyboard and the
                  * field. */
-                if (len + 1 < cap) { buf[len++] = c; buf[len] = 0; }
+                if (len + 1 < cap) {
+                    memmove(buf + g_caret + 1, buf + g_caret, len - g_caret + 1);
+                    buf[g_caret++] = (char)c;
+                    len++;
+                }
             }
         }
     }
@@ -536,22 +675,45 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
         }
         ui_flex_spacer();
     } else {
-        char hidden[128];
-        const char *shown = buf;
+        /* THE VALUE, SPLIT AROUND THE CARET.
+         *
+         * The caret used to be a 2px box emitted AFTER the whole string, which
+         * is why it could only ever sit at the end -- the widget had no way to
+         * put it anywhere else, so the field had no way to be edited anywhere
+         * else. Two text runs with the box between them puts it at a real
+         * offset and costs no measurement at all: the layout already knows how
+         * wide the first run is, because it just laid it out.
+         *
+         * A masked field is masked by CHARACTER, not by byte: one asterisk per
+         * character, so an accented password is as long on screen as it is in
+         * the hand. */
+        char head[256], tail[256];
+        unsigned cut = focused ? g_caret : len;
+        if (cut > len) cut = len;
+
         if (masked) {
-            unsigned long n = strlen(buf);
-            if (n >= sizeof hidden) n = sizeof hidden - 1;
-            for (unsigned long i = 0; i < n; i++) hidden[i] = '*';
-            hidden[n] = 0;
-            shown = hidden;
+            unsigned nh = 0, nt = 0;
+            for (unsigned i = 0; i < len; i++) {
+                if (cp_cont(buf[i])) continue;            /* one '*' per character */
+                if (i < cut) { if (nh < sizeof head - 1) head[nh++] = '*'; }
+                else         { if (nt < sizeof tail - 1) tail[nt++] = '*'; }
+            }
+            head[nh] = 0; tail[nt] = 0;
+        } else {
+            unsigned nh = cut < sizeof head - 1 ? cut : (unsigned)sizeof head - 1;
+            memcpy(head, buf, nh); head[nh] = 0;
+            snprintf(tail, sizeof tail, "%s", buf + cut);
         }
-        text_role(t->font_regular, t->text_body, CP(text, t->text), shown);
-        if (focused) {                    /* caret */
+
+        struct color fg = CP(text, t->text);
+        if (head[0]) text_role(t->font_regular, t->text_body, fg, head);
+        if (focused) {                    /* the caret, between the two runs */
             ui_box_begin(0);
             ui_set_paint(solid(CP(focus, t->accent)));
             ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
             ui_box_end();
         }
+        if (tail[0]) text_role(t->font_regular, t->text_body, fg, tail);
         ui_flex_spacer();                 /* keep text left-aligned in the well */
     }
     ui_end_stack();
