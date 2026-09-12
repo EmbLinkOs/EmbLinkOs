@@ -13,6 +13,10 @@ These are SYSTEM shortcuts: the driver swallows them and never lets an
 application see them. An app that could see the switcher could decline it, and
 a switcher that works only in the apps that implemented it is not one.
 
+GUI+W is checked the same way, and it ASKS the application to close rather
+than killing it -- so what is asserted is that the window actually goes, not
+that a process was shot.
+
 HOW IT JUDGES. The top bar names the focused application (the window list's
 first payoff), so the test reads that strip: after each GUI+Tab the name there
 must CHANGE, and after three presses over two apps it must have come back to
@@ -47,6 +51,21 @@ def band(path):
 def differs(a, b):
     n = sum(1 for i in range(min(len(a), len(b))) if abs(a[i] - b[i]) > 24)
     return n / float(len(a) or 1)
+
+
+def band_rect(a_path, b_path, x0, y0, x1, y1):
+    """Fraction of pixels in one rectangle that differ between two shots."""
+    w, h, a = S.ppm_pixels(a_path)
+    _, _, b = S.ppm_pixels(b_path)
+    diff = tot = 0
+    for y in range(y0, min(y1, h), 2):
+        for x in range(x0, min(x1, w), 2):
+            o = (y * w + x) * 3
+            tot += 1
+            if (abs(a[o] - b[o]) > 10 or abs(a[o+1] - b[o+1]) > 10
+                    or abs(a[o+2] - b[o+2]) > 10):
+                diff += 1
+    return diff / float(tot or 1)
 
 
 def chord(q, mods, key):
@@ -127,6 +146,45 @@ def main():
         if d02 > 0.02:
             fails.append("two tabs over two windows did not come back to the start "
                          "-- it is not cycling")
+
+        # ---- GUI+W closes the front window ------------------------------
+        # It ASKS now rather than killing, so the window goes when the app takes
+        # itself down. What must be true either way: the window is gone, and the
+        # bar stops naming it.
+        # One more tab so the front window is SETTINGS -- an app with no child
+        # process to tear down. The terminal is a poor subject for this check:
+        # it closes its shell's stdin and waits for the shell to go first, which
+        # under TCG takes longer than the grace period, so it is killed rather
+        # than closing itself and would prove nothing about the request.
+        chord(q, ["meta_l"], "tab")
+        S.move(q, SCREEN_W / 2.0, 400)
+        time.sleep(1.5)
+        before_close = os.path.join(A.BUILD, "switch-preclose.ppm")
+        q.screendump(before_close)
+        chord(q, ["meta_l"], "w")
+        # LONG ENOUGH FOR A REAL SHUTDOWN, not just for the request to arrive.
+        # Asking an app to close means it runs its own teardown -- the terminal
+        # closes its shell's stdin, waits for the shell to go, and only then
+        # exits -- which is precisely the path the old kill skipped. Under TCG
+        # that takes seconds. Watching the name strip was not enough either: it
+        # goes blank the moment focus moves, whether or not the window went.
+        # MEASURED INSIDE THE GRACE WINDOW, deliberately. If the window is gone
+        # before COMP_CLOSE_GRACE_MS could have elapsed, the application took
+        # itself down -- which is the whole claim. Waiting longer would pass
+        # whether the app closed or was shot.
+        time.sleep(2.5)
+        S.move(q, SCREEN_W / 2.0, 400)
+        time.sleep(0.8)
+        after_close = os.path.join(A.BUILD, "switch-closed.ppm")
+        q.screendump(after_close)
+        # The terminal's window occupied roughly this rect; what matters is that
+        # what is drawn there CHANGED, because the window is gone.
+        gone = band_rect(before_close, after_close, 300, 120, 900, 600)
+        print("switch_shot: GUI+W changed %.0f%% of where the window was, within the "
+              "grace period (so the app closed ITSELF)" % (gone * 100))
+        if gone < 0.10:
+            fails.append("GUI+W did not close the front window inside the grace "
+                         "period -- the app is not honouring the request")
 
         for f in fails:
             print("switch_shot: FAIL %s" % f)

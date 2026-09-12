@@ -3051,6 +3051,37 @@ Open:
       same arrangement `compositor_pointer_tick` already uses. Wired on BOTH
       arches: a switcher that worked only on x86 is one nobody could rely on.
 
+- [x] **Closing a window ASKS the application, instead of killing it**
+      (done 2026-09-12). The close light -- and GUI+W when it first landed --
+      called `process_kill` the moment you clicked, so an editor with an hour of
+      unsaved work in it simply vanished. Both now set a request the app runtime
+      answers by taking itself down the ordinary way, the same path
+      `em_app_request_exit` and Escape use: main() returns, files close, the
+      window is destroyed by its owner.
+
+      THE KILL IS STILL THERE as a backstop, after four seconds -- a window you
+      cannot close is worse than an app that loses a moment of state. When it
+      fires the compositor takes the window off the screen ITSELF, and that line
+      is load-bearing: a killed process never runs its teardown, and the reap
+      path frees memory without repainting, so the first version left a frozen
+      picture of an application that no longer existed. Measured as 0% of those
+      pixels changing, which is how it was found.
+
+      A reused window slot clears the request, or it would inherit a stale one
+      and be killed for a close somebody asked of its predecessor.
+
+      PROVED GRACEFUL, not merely proved to work: the test closes Settings --
+      an app with no child process -- and measures INSIDE the grace period, so
+      the window being gone means the app took itself down rather than being
+      shot. 87% of the window's area changed within 2.5s of a 4s grace.
+
+      The terminal is a poor subject for that check and the reason is worth
+      keeping: it closes its shell's stdin and waits for the shell to exit
+      before returning, which under TCG takes longer than the grace period, so
+      it is killed rather than closing itself. That is its own shutdown being
+      slow, not the request going unheard -- the shell does exit, which only
+      happens along the path the old kill skipped entirely.
+
       Measured by tools/switch_shot.py, which opens two apps from the dock and
       reads the TOP BAR's application name -- the window list's first payoff,
       now used to check the window list's second. Comparing a strip of pixels

@@ -112,7 +112,17 @@ spawning a second copy of something you can already see.
 the back of the cycle, so pressing it repeatedly walks every window instead of
 flipping between the top two. **GUI+W** closes the front window.
 
-Both are swallowed by the driver and never reach an application — one that could
+**Closing asks; it does not kill.** The close light and GUI+W both send the
+window a request, and the application takes itself down the ordinary way — which
+is what gives it the chance to write a file out. It used to be a `process_kill`
+from the moment you clicked, and an editor with unsaved work simply vanished. An
+app that ignores the request is killed after four seconds, because a window you
+cannot close is worse than an app that loses a moment of state; when that
+happens the compositor takes the window off the screen itself, since a killed
+process never runs its own teardown and the reap path frees memory without
+repainting.
+
+GUI+Tab and GUI+W are swallowed by the driver and never reach an application — one that could
 see the switcher could decline it, and a switcher that works only in the apps
 that implemented it is not a switcher. They are decided in the keyboard IRQ and
 performed by the kernel's main loop, because the compositor takes a spinlock and

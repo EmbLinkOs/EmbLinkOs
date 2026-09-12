@@ -64,6 +64,16 @@ struct comp_window {
                              * needs to keep showing the app as running while it
                              * sits there with no pixels on screen. */
     int       pending_action; /* one-shot request delivered to the app runtime */
+    /* CLOSING ASKS FIRST. `asked_close_ms` is when the window was told to go;
+     * the main loop kills it if it has not gone by COMP_CLOSE_GRACE_MS.
+     *
+     * Killing outright is what this used to do, from the close light and from
+     * GUI+W alike, and it threw away unsaved work with no warning -- an editor
+     * with an hour in it simply vanished. Asking is what lets an application
+     * write its file out; the kill is still there, as the backstop for one that
+     * will not go, because a window you cannot close is worse than an app that
+     * loses a second of state. */
+    uint64_t  asked_close_ms;
     /* Latched click replay: a press EDGE on this window's content is remembered
      * here so an app that was busy (e.g. mid first-frame render, seconds long
      * under TCG) still receives the click on its next win_input polls instead
@@ -1154,6 +1164,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->glass = 0;
     w->translucent = 0;
     w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->content = buf;
     int n = 0;
     if (title) { while (n < COMP_TITLE_MAX && title[n]) { w->title[n] = title[n]; n++; } }
@@ -1245,6 +1256,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->glass = glass && !desktop;
     w->translucent = translucent && !desktop;
     w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->z = desktop ? 0 : widget ? g_widget_z++ : g_next_z++;   /* z band per kind */
     w->content = (uint32_t *)kview;
     w->shared = 1; w->phys = phys; w->npages = npages;
@@ -1692,6 +1704,44 @@ int compositor_cycle_window(void) {
 
 /* Close the front window, exactly as its close light does -- the process is
  * killed and its windows reclaimed. Returns the pid to kill, or 0. */
+/* Ask a window to close, and remember when we asked. */
+static void win_ask_close(struct comp_window *w) {
+    w->pending_action = 2;                     /* EMBK_WIN_ACTION_CLOSE */
+    if (!w->asked_close_ms) w->asked_close_ms = timer_uptime_ms();
+}
+
+/* Windows that were asked to close and have not gone. Returns how many pids it
+ * wrote to `out` -- the caller kills them OUTSIDE the compositor lock, because
+ * process_kill reaps, which re-enters here. */
+int compositor_close_overdue(int *out, int max) {
+    uint64_t now = timer_uptime_ms();
+    int n = 0;
+    spin_lock(&g_comp_lock);
+    for (int i = 0; i < COMP_MAX_WINDOWS && n < max; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || !w->asked_close_ms) continue;
+        if (now - w->asked_close_ms < COMP_CLOSE_GRACE_MS) continue;
+        w->asked_close_ms = 0;                 /* asked once, killed once */
+
+        /* TAKE THE WINDOW OFF THE SCREEN OURSELVES. A killed process does not
+         * run its own teardown, and the reap path frees memory without
+         * repainting -- so without this the window's last pixels simply stay
+         * there, a frozen picture of an application that no longer exists.
+         * That is exactly what the old close path did at click time and what
+         * was lost when closing became a request. */
+        w->visible = 0;
+        if (w->id == g_top_id) g_top_id = 0;
+        int x0, y0, x1, y1;
+        win_repaint_rect(w, &x0, &y0, &x1, &y1);
+        paint_region(x0, y0, x1, y1);
+        enforce_focus();
+
+        out[n++] = w->pid;
+    }
+    spin_unlock(&g_comp_lock);
+    return n;
+}
+
 int compositor_close_front(void) {
     spin_lock(&g_comp_lock);
     struct comp_window *w = 0;
@@ -1701,19 +1751,9 @@ int compositor_close_front(void) {
         if (!c->visible) continue;
         if (!w || c->z > w->z) w = c;
     }
-    int pid = 0;
-    if (w) {
-        pid = w->pid;
-        if (w->id == g_top_id) g_top_id = 0;
-        anim_start(w, ANIM_CLOSE);
-        w->visible = 0;
-        int x0, y0, x1, y1;
-        win_repaint_rect(w, &x0, &y0, &x1, &y1);
-        paint_region(x0, y0, x1, y1);
-        enforce_focus();
-    }
+    if (w) win_ask_close(w);                   /* ask; the grace timer kills */
     spin_unlock(&g_comp_lock);
-    return pid;
+    return 0;
 }
 
 int compositor_restore_pid(int pid) {
@@ -1857,7 +1897,8 @@ void compositor_pointer_tick(void) {
     }
 
     int raised = 0;
-    int close_pid = 0;   /* set when a close button is clicked */
+    int close_pid = 0;   /* unused since closing became a request, kept so the
+                          * unlock-then-act shape below stays obvious */
     /* press edge: raise the window under the pointer; title-bar press = drag,
      * close-button press = close. The desktop (home) layer is never raised or
      * dragged -- it stays pinned at the back; its clicks flow through to the app
@@ -1907,11 +1948,13 @@ void compositor_pointer_tick(void) {
                  * killed process is reaped asynchronously; don't wait on it),
                  * repaint what's behind, then kill its process below. Its shared
                  * pixel backing is freed later by compositor_reap_pid. */
-                close_pid = w->pid;
+                /* ASK, do not kill. The window stays on screen until the app
+                 * takes itself down -- hiding it here and killing the process
+                 * later is what made an unsaved document disappear with no
+                 * chance to object. A window that ignores the request is killed
+                 * by the grace timer instead. */
+                win_ask_close(w);
                 title_control = 1;
-                if (w->id == g_top_id) g_top_id = 0;
-                anim_start(w, ANIM_CLOSE);   /* hides it; the ghost collapses */
-                w->visible = 0;              /* (and stays hidden if it declined) */
                 int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
                 DIRTY(fx0, fy0, fx1, fy1);
                 raised = 1;   /* re-run enforce_focus() to promote the new front */
@@ -2038,7 +2081,7 @@ void compositor_pointer_tick(void) {
      * process_kill -> process_reap_slot -> compositor_reap_pid re-takes
      * g_comp_lock, so holding it here would deadlock. The window was already
      * hidden + repainted above, so it's gone regardless of when the reap runs. */
-    if (close_pid) process_kill((uint32_t)close_pid);
+    (void)close_pid;
 }
 
 /* Deliver the content-local pointer to the calling process IF it owns the window

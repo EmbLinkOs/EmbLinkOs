@@ -136,9 +136,17 @@ int  compositor_win_list(struct comp_win_info *out, int max);
  * back of the cycle so that pressing it repeatedly walks every window rather
  * than flipping between the top two. 1 if anything moved. */
 int  compositor_cycle_window(void);
-/* GUI+W: close the front window as its close light does. Returns the pid to
- * kill (the caller does it, outside the compositor lock), or 0. */
+/* GUI+W: close the front window, the same way its close light does -- by ASKING
+ * it to. Returns 0; nothing is killed here. */
 int  compositor_close_front(void);
+
+/* How long a window has to take itself down after being asked, before it is
+ * killed. Long enough to write a file out, short enough that a hung app does
+ * not leave a window you cannot get rid of. */
+#define COMP_CLOSE_GRACE_MS 4000
+/* Pids of windows that were asked to close and did not. The caller kills them
+ * OUTSIDE the compositor lock -- process_kill reaps, which re-enters here. */
+int  compositor_close_overdue(int *out, int max);
 
 /* Un-minimize and raise a process's windows (the dock's click-to-restore). */
 int  compositor_restore_pid(int pid);

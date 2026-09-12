@@ -425,6 +425,17 @@ int em_app_run(const EmApp *app) {
         EmWinLayout want = EmWinNormal;
         int have_want = em_window_take_layout(&want);
         if (!have_want && em_window_take_maximize()) { want = EmWinFill; have_want = 1; }
+        /* PLEASE CLOSE -- the close light, or GUI+W. The runtime takes the app
+         * down the ordinary way (the same path Escape and em_app_request_exit
+         * use), so main() returns, files close and the window is destroyed by
+         * its owner. Before this the compositor killed the process outright and
+         * an unsaved document went with it.
+         *
+         * An app that wants to ask "save first?" sets a key hook and handles
+         * this itself; doing nothing still closes, which is the right default
+         * for the many apps with nothing to lose. */
+        if (in.win == EMBK_WIN_ACTION_CLOSE) em_app_request_exit(0);
+
         if (!have_want && in.win == EMBK_WIN_ACTION_MAXIMIZE) {
             /* The kernel chrome's zoom button is a TOGGLE, because it has no
              * board to offer: fill, or go back. */

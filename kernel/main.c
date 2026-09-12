@@ -2103,6 +2103,12 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
          * arrangement as the pointer tick above. */
         {
             int sk = keyboard_take_syskey();
+            /* A window asked to close that has not gone. Killed HERE, outside
+             * the compositor lock, because process_kill reaps and reaping
+             * re-enters the compositor. */
+            { int overdue[8];
+              int n = compositor_close_overdue(overdue, 8);
+              for (int i = 0; i < n; i++) process_kill((uint32_t)overdue[i]); }
             if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
             else if (sk == SYSKEY_CLOSE_WINDOW) {
                 int pid = compositor_close_front();

@@ -1058,6 +1058,11 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * buttons is the mouse state -- EMBK_MOUSE_LEFT etc.), 0 otherwise. The home
  * launcher reads this to make its tiles clickable. */
 #define EMBK_WIN_ACTION_MAXIMIZE  0x80000001u
+/* PLEASE CLOSE. The window's close light, or GUI+W. It is a REQUEST: the app
+ * takes itself down, which is what gives it the chance to save. Ignore it and
+ * the compositor kills the process a few seconds later, because a window that
+ * cannot be closed is worse than an app that loses a moment of state. */
+#define EMBK_WIN_ACTION_CLOSE     0x80000002u
 /* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
  * copies it raw; grow both together.
  *
