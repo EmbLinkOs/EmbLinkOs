@@ -3123,6 +3123,56 @@ Open:
       results. `NET=1` now adds the same virtio-net the Makefile's run targets
       have always appended, and both pass.
 
+### aarch64 has a NIC attached and cannot yet use it (2026-09-13)
+
+- [x] **The run targets attach one.** `ARM_NET` in kernel/arch/aarch64/arch.mk
+      puts QEMU's user-mode stack on every `run-arm64*` target, matching what
+      x86 has had since M1. `virtio_net.c` was already compiled for this arch
+      and had simply never been given a device.
+
+- [ ] **But `net_init()` is NOT called on this arch, because turning it on
+      trades "no network" for "halts after a minute".** Everything works right
+      up until it does not: the NIC probes ("virtio-net: up, MAC
+      52:54:00:12:34:56"), DHCP leases (`ip 10.0.2.15 gw 10.0.2.2 dns
+      10.0.2.3`), and the desktop comes up -- and then the kernel dies on a
+      translation fault whose faulting instruction resolves inside EXC_COMMON
+      itself (vectors.S:169). A fault while taking a fault: a thread ran off its
+      32 KiB kernel stack and the handler could not even report it.
+
+      TWO POSITIONING LESSONS ON THE WAY THERE, both already paid for:
+
+        * The first attempt called net_init() beside mouse and sound init,
+          where PCI is enumerated and the SCHEDULER IS NOT YET LIVE. kernel/
+          main.c states the requirement plainly and the ARM path ignored it.
+          process_create_kthread wrote through a null scheduler structure and
+          the machine died writing to 0x378 -- a NULL pointer plus a field
+          offset. Moved down beside the first process_create, it gets past that.
+        * The acceptance test blew its 120 s budget (43 failures, every one a
+          test that never ran) because net_init leases SYNCHRONOUSLY and this
+          arch has tick-driven RX. `-nic none` on that target now, and it is
+          NOT redundant: qemu's `virt` attaches a DEFAULT NIC when none is
+          named, so removing the explicit device changed nothing and cost a run
+          to notice.
+
+      WHAT TO DO NEXT: find which thread overflows. The RX poll kthread is the
+      obvious suspect since it is new to this arch, but the boot thread is
+      equally plausible -- net_init runs a whole DHCP exchange on whatever
+      stack calls it, and by that point in early.c that stack has been through
+      the entire init sequence. Print SP at entry to net_init and at the top of
+      net_rx_thread before guessing.
+
+      THE REAL FIX UNDERNEATH: net_init should not block boot on a lease at
+      all. x86 gets away with it because the exchange is fast there; that is
+      luck, not design.
+
+- [x] **`test power` and the `Network controller` witness.** The A7 assertion
+      "PCIe enumeration found no virtio device" greped the log for a NETWORK
+      controller -- a device that target never attached, so it had been passing
+      on qemu's default NIC. The moment the default was turned off it failed
+      with nothing wrong. It witnesses the DISPLAY controller now, which
+      `ARM_GPU` attaches on every one of these runs and which cannot disappear
+      behind a default.
+
 - [ ] **Still no battery indicator.** The power subsystem has a
       `power_supply_driver` interface designed for exactly this -- ACPI's _BST
       on a laptop, an I2C fuel gauge on a board -- and NOTHING HAS EVER

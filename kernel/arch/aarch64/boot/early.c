@@ -36,6 +36,7 @@
 #include "drivers/video/console.h"
 #include "gfx/compositor.h"
 #include "drivers/input/virtio_input.h"
+#include "net/net.h"             /* net_init: this arch had never called it */
 #include "drivers/input/mouse.h"
 #include "drivers/input/keyboard.h"
 #include "drivers/audio/ac97.h"
@@ -824,6 +825,7 @@ void arch_early_main(uint64_t dtb_phys) {
          * attached -- it says so and audio_available() stays false. */
         ac97_init();
 
+
         /* AUDIO, PROVEN RATHER THAN PROBED. "stream 0 ready" means the device
          * accepted SET_PARAMS and PREPARE; it does not mean a single sample
          * ever reached it. So push a real buffer through the SHARED audio
@@ -1321,6 +1323,20 @@ void arch_early_main(uint64_t dtb_phys) {
                 (landed && fired == 1) ? " ok " : "FAIL", (int)fired, landed);
         if (!landed || fired != 1) selftest_fails++;
     }
+
+    /* NETWORKING IS NOT BROUGHT UP HERE YET, and the reason is written down in
+     * docs/TODO.md rather than left as a silence.
+     *
+     * net_init() works on this arch as far as it goes -- the NIC probes, DHCP
+     * leases 10.0.2.15, and the desktop comes up -- and then the machine dies
+     * on a KERNEL STACK OVERFLOW: a translation fault whose faulting
+     * instruction resolves inside exc_common itself, which is to say a thread
+     * ran off its 32 KiB stack and the exception handler could not even report
+     * it. Turning networking on here would trade "no network" for "halts after
+     * a minute", which is a worse machine.
+     *
+     * The device IS attached by the run targets (ARM_NET in arch.mk) so that
+     * whoever fixes the overflow has nothing left to wire up. */
 
     kprintf("\n--- the desktop (A6 + A7) ---\n");
     {
