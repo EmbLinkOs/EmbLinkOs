@@ -2952,6 +2952,62 @@ Open:
       so the answer is a third -- a mods provider the runtime fills with
       `embk_key_mods`.
 
+### Undo, in every text field (done 2026-09-12)
+
+- [x] **`GUI+Z` undoes and `GUI+Shift+Z` redoes, toolkit-wide.** Every text
+      field in the system could be typed into and none could be undone. Note++
+      has a stack of its own, so the OS's own editor was fine and every OTHER
+      place text is entered -- the Open/Save filename, a search box, any setting
+      -- had nothing: one stray keystroke over a selection and the text was
+      simply gone.
+
+      RECORDED BY DIFFING, not by instrumenting each edit. The field mutates its
+      buffer in eight or nine places (typing, backspace, delete, cut, paste,
+      replacing a selection) and a log that has to be TOLD about each one is a
+      log that will silently miss the next one added. The frame remembers the
+      text before the keys are applied and compares afterwards: one place, and
+      every mutation path is covered by construction, including ones written
+      later.
+
+      A record is a SPLICE -- at `pos`, `n_del` bytes went and `n_ins` arrived,
+      with both kept -- so one record runs in either direction and redo is undo
+      with the two swapped. A continuing run of typing or of backspacing folds
+      into the record before it, because typing "hello" is ONE thing the person
+      did and five undos to remove it is four too many; a pause of ~900 ms, a
+      move, or a change of direction ends the run.
+
+      An edit too big for a record (a large paste) DROPS THE HISTORY rather than
+      being skipped: an undo that stepped over one edit and applied the one
+      before it would put the buffer into a state that never existed, which is
+      worse than not being able to go back that far.
+
+      THE COMMAND BYTES WERE NEARLY OUT, and the earlier note that eight of them
+      was "either elegant or a warning" turned out to be the warning. It was
+      also too pessimistic: THIRTEEN byte values can never appear in valid UTF-8
+      (0xC0, 0xC1 and 0xF5..0xFF), not eight -- lead bytes stop at 0xF4 because
+      U+10FFFF encodes as F4 8F BF BF, and 0xC0/0xC1 would be overlong ASCII.
+      Undo and redo took 0xF6/0xF7; 0xF5, 0xC0 and 0xC1 remain.
+
+      Proved on the host (58 claims in kit-test) and on the machine: select all,
+      type one character, GUI+Z, and the restored text matches the original
+      column for column -- 0% of ink columns differ.
+
+      A MUTATION FOUND A WEAK TEST HERE, which is the reason to keep mutating
+      them. "A whole run of typing undoes at once" passed with coalescing
+      disabled, because the test fed six characters in ONE frame -- a single
+      diff, one record either way. Typing one key per frame, as a person does,
+      makes it fail properly when coalescing is off.
+
+- [ ] **The multi-line `TextEditor` still has no undo.** The field's approach
+      does not carry over unchanged: it snapshots the buffer each frame to diff
+      it, which is fine for a 256-byte path and not for the edit app's 32 KB
+      document, and a record holds 64 bytes of payload, so pasting a paragraph
+      would drop the history exactly when it is most wanted. It needs either a
+      larger payload with an arena, or recording at the mutation sites
+      (`te_insert` / `te_backspace` / `te_delete` / the selection drop), which
+      are few and already centralised. Note++ is unaffected -- it draws and
+      edits its own text and has its own undo.
+
 ### A host UI test could not measure text at all (fixed 2026-09-12)
 
 - [x] **Nothing loaded a font, so every width was zero -- and zero agrees with

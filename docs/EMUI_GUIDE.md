@@ -164,6 +164,15 @@ interrupt and is consumed before any application sees it
 (`docs/INTERRUPTION.md`). The rule is *Ctrl belongs to the terminal, the GUI key
 belongs to the interface*. Ctrl+V still pastes, for the apps that always used it.
 
+**Undo.** `GUI+Z` undoes and `GUI+Shift+Z` (or `GUI+Y`) redoes, in every
+single-line field, with nothing for the app to call. A *run* of typing undoes as
+one thing rather than letter by letter, and a pause of about a second ends the
+run — so one undo takes back a word, not a keystroke. The case it exists for is
+select-all-then-type: one key and the text is gone, and `GUI+Z` brings it back.
+
+The multi-line `TextEditor` does **not** have undo yet (`docs/TODO.md` says what
+it needs); Note++ carries its own.
+
 **The mouse.** A press places the caret and a drag extends a selection, in both
 the single-line field and the multi-line editor. A drag keeps going after the
 pointer leaves the widget (pointer capture), so dragging off the end selects to

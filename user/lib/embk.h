@@ -725,6 +725,8 @@ static inline int embk_ui_present_rect(const void *pixels, uint32_t w, uint32_t 
 #define EMBK_KEY_COPY       0xFD   /* GUI+C       */
 #define EMBK_KEY_CUT        0xFE   /* GUI+X       */
 #define EMBK_KEY_PASTE      0xFF   /* GUI+V       */
+#define EMBK_KEY_UNDO       0xF6   /* GUI+Z */
+#define EMBK_KEY_REDO       0xF7   /* GUI+Shift+Z, GUI+Y */
 
 /* ---- key EVENTS (make/break + modifiers) --------------------------------
  * A SECOND stream beside the characters above, not a replacement. The char

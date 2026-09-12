@@ -150,6 +150,8 @@ void ui_text_field_autofocus(void);
 #define UI_KEY_COPY       0xFD
 #define UI_KEY_CUT        0xFE
 #define UI_KEY_PASTE      0xFF
+#define UI_KEY_UNDO       0xF6
+#define UI_KEY_REDO       0xF7
 
 /* THE CLIPBOARD, AS TWO FUNCTION POINTERS.
  *

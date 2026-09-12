@@ -414,6 +414,12 @@ void kbd_translate(uint8_t make, int pressed) {
             case 'c': cmd = (char)EK_COPY;    break;
             case 'x': cmd = (char)EK_CUT;     break;
             case 'v': cmd = (char)EK_PASTE;   break;
+            /* UNDO is GUI+Z and REDO is GUI+Shift+Z -- the shift is read here
+             * because the char stream cannot carry it, so a reader downstream
+             * could never tell the two apart. GUI+Y is the other spelling of
+             * redo and costs one line to honour. */
+            case 'z': cmd = (g_mods & EKM_SHIFT) ? (char)EK_REDO : (char)EK_UNDO; break;
+            case 'y': cmd = (char)EK_REDO;    break;
             default: break;
         }
         if (cmd) { keyboard_deliver(cmd); return; }

@@ -31,6 +31,10 @@ is enough to tell the two behaviours apart:
     move. A caret that ignored the click and went to the end would leave the
     left unchanged AND the middle unchanged, and only grow the right end.
 
+  * select all, type one character, then GUI+Z --
+    the undone text must match the original column for column. This is the
+    case undo exists for: one keystroke over a selection and the text is gone.
+
   * press twice quickly in one word --
     the word must be highlighted, which is ~74% of the pixels around it. A
     caret moving there on its own is ~28%, and an early version of this test
@@ -303,6 +307,29 @@ def main():
         i_ = os.path.join(A.BUILD, "caret-dblclick.ppm"); q.screendump(i_)
         doubled = band_difference(h, i_, FIELD_X0, FIELD_X0 + 90)
 
+        # ---- undo -------------------------------------------------------
+        # Select everything and type over it, which is the case that motivated
+        # undo: one keystroke and the text is gone. Then GUI+Z must bring it
+        # back, to the byte.
+        type_text(q, "\x05")                      # End, drop any selection
+        time.sleep(0.4)
+        j = os.path.join(A.BUILD, "caret-preundo.ppm"); q.screendump(j)
+        chord(q, ["meta_l"], "a")                 # select all
+        type_text(q, "q")                         # destroy it
+        time.sleep(0.6)
+        k = os.path.join(A.BUILD, "caret-wiped.ppm"); q.screendump(k)
+        chord(q, ["meta_l"], "z")                 # and take it back
+        time.sleep(0.8)
+        S.move(q, SCREEN_W / 2.0, 200); time.sleep(1.0)
+        m = os.path.join(A.BUILD, "caret-undone.ppm"); q.screendump(m)
+
+        c_pre, c_wiped, c_undone = ink_columns(j), ink_columns(k), ink_columns(m)
+        wiped_to = last_ink(c_wiped)
+        restored = last_ink(c_undone)
+        # The undone text must match what was there before, column for column.
+        undo_same = ink_differs(c_pre, c_undone, FIELD_X0, max(last_ink(c_pre),
+                                                              restored) + 4)
+
         ca, cb, cc = ink_columns(a), ink_columns(b), ink_columns(c)
         left_changed  = ink_differs(ca, cb, FIELD_X0, FIELD_X0 + 40)
         grew          = last_ink(cb) - last_ink(ca)
@@ -328,6 +355,9 @@ def main():
               % (dragged * 100))
         print("caret_shot: a double-click changed %.0f%% of the pixels around it"
               % (doubled * 100))
+        print("caret_shot: select-all + a key left ink to x=%d; undo restored it "
+              "to x=%d (%.0f%% of columns differ from the original)"
+              % (wiped_to, restored, undo_same * 100))
 
         fails = []
         if last_ink(ca) == 0:
@@ -348,6 +378,11 @@ def main():
                          "(the ink only moved %+d px)" % pasted)
         if dragged < 0.05:
             fails.append("dragging the pointer across the text selected nothing")
+        if wiped_to >= last_ink(c_pre):
+            fails.append("select-all then a key did not replace the text")
+        if undo_same > 0.02:
+            fails.append("undo did not restore the text exactly (%.0f%% of columns "
+                         "differ)" % (undo_same * 100))
         # 0.45, NOT a token 0.05. A caret moving to the click point already
         # changes ~28% of this band, so a low bar passed for weeks while
         # double-click did not work at all -- the number was measuring the

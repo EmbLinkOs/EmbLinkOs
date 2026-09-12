@@ -416,6 +416,97 @@ int main(void) {
     CHECK(!strcmp(clip_text(), "caf\xC3\xA9"), "an accented word is not cut in two");
     #undef CHAR_X
 
+    /* ---- UNDO ----------------------------------------------------------
+     *
+     * Every text field could be typed into and none could be undone: one stray
+     * keystroke over a selection and the text was gone. The log records by
+     * DIFFING the buffer across a frame, so every way the field mutates text is
+     * covered without the log having to be told about each one. */
+    #define UNDO "\xF6"
+    #define REDO "\xF7"
+
+    page = 0x9999; autofocus = true; A[0] = 0; g_ms += 5000;
+    frame(NULL); frame(NULL);
+    frame("hello");
+    g_ms += 5000;                          /* end the typing run */
+    frame(" world");
+    frame(UNDO);
+    CHECK(!strcmp(A, "hello"), "undo takes back the last run of typing");
+    frame(UNDO);
+    CHECK(A[0] == 0, "and the one before it");
+    frame(REDO);
+    CHECK(!strcmp(A, "hello"), "redo puts it back");
+    frame(REDO);
+    CHECK(!strcmp(A, "hello world"), "and again");
+    frame(REDO);
+    CHECK(!strcmp(A, "hello world"), "redo past the end does nothing");
+
+    /* A RUN OF TYPING IS ONE THING THE PERSON DID. Five undos to remove
+     * "hello" is five times as many as anyone wants. */
+    /* ONE KEY PER FRAME, which is how a person types and the only way this
+     * tests the coalescing at all -- six characters fed in a single frame are
+     * one diff and would collapse into one record whether runs are merged or
+     * not. (They were, and this test passed without exercising the feature
+     * until a mutation showed it could not fail.) */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    for (const char *k = "abcdef"; *k; k++) {
+        char one[2] = { *k, 0 };
+        g_ms += 60;                         /* fast typing, inside the run window */
+        frame(one);
+    }
+    CHECK(!strcmp(A, "abcdef"), "typed one key per frame");
+    frame(UNDO);
+    CHECK(A[0] == 0, "a whole run of typing undoes at once, not letter by letter");
+
+    /* Backspacing is a run too, and undoes as one. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("abcdef");
+    for (int i = 0; i < 3; i++) { g_ms += 60; frame("\b"); }
+    CHECK(!strcmp(A, "abc"), "three backspaces, one per frame");
+    frame(UNDO);
+    CHECK(!strcmp(A, "abcdef"), "and one undo brings all three back");
+
+    /* A PAUSE ENDS THE RUN. Coming back to a field minutes later and typing
+     * should not let one undo swallow what you wrote before the break. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("first");
+    g_ms += 5000;                           /* well past UI_UNDO_RUN_MS */
+    frame("second");
+    frame(UNDO);
+    CHECK(!strcmp(A, "first"), "a pause ends the run, so undo stops at it");
+
+    /* THE CASE THAT MOTIVATED THIS: typing over a selection destroys it, and
+     * without undo the text is simply gone. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("important text");
+    g_ms += 5000;
+    frame(SALL "x");
+    CHECK(!strcmp(A, "x"), "select-all then a key replaces everything");
+    frame(UNDO);
+    CHECK(!strcmp(A, "important text"), "undo brings back what a selection replaced");
+
+    /* A new edit after an undo drops the redo tail -- you cannot redo a future
+     * that no longer follows from the present. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("one");
+    g_ms += 5000;
+    frame("two");
+    frame(UNDO);
+    CHECK(!strcmp(A, "one"), "undone");
+    g_ms += 5000;
+    frame("three");
+    frame(REDO);
+    CHECK(!strcmp(A, "onethree"), "a new edit drops what could have been redone");
+
+    /* Each field has its own past. */
+    A[0] = 0; B[0] = 0; g_ms += 5000; frame(NULL);
+    frame("aaa");
+    frame("\t");                            /* to B */
+    frame("bbb");
+    frame(UNDO);
+    CHECK(!strcmp(B, "") && !strcmp(A, "aaa"),
+          "undo in one field does not reach into another");
+
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

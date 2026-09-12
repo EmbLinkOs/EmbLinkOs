@@ -506,6 +506,123 @@ int ui_click_note(float x, float y) {
     return g_click_run;
 }
 
+/* --- UNDO -----------------------------------------------------------------
+ *
+ * Every text field in this system could be typed into and none could be undone.
+ * Note++ has an undo stack of its own, so the OS's own editor was fine and
+ * every OTHER place text is entered -- the Open/Save filename, a search box,
+ * any setting -- had none: one stray keystroke over a selection and the text
+ * was simply gone.
+ *
+ * RECORDED BY DIFFING, not by instrumenting each edit. The field mutates its
+ * buffer in eight or nine places (typing, backspace, delete, cut, paste,
+ * replacing a selection...), and an undo log that has to be told about each one
+ * is an undo log that will silently miss the next one added. Instead the frame
+ * remembers the text before the keys are applied and compares afterwards: one
+ * place, and every mutation path is covered by construction, including any
+ * written later.
+ *
+ * A RECORD IS A SPLICE: at `pos`, `n_del` bytes went away and `n_ins` arrived.
+ * `data` holds the removed bytes followed by the inserted ones, so one record
+ * runs in both directions and redo is undo with the two swapped. */
+#define UI_UNDO_DEPTH 24
+#define UI_UNDO_DATA  64
+struct ui_edit {
+    uint16_t pos, n_del, n_ins, caret;   /* caret = where it was BEFORE the edit */
+    uint64_t at;                         /* for coalescing a run of typing */
+    char     data[UI_UNDO_DATA];
+};
+static struct ui_edit g_undo[UI_UNDO_DEPTH];
+static int   g_undo_n;      /* records held */
+static int   g_undo_at;     /* how many are applied; undo walks it down */
+static char *g_undo_buf;    /* whose history this is */
+
+static void undo_reset(char *buf) { g_undo_buf = buf; g_undo_n = g_undo_at = 0; }
+
+/* Fold a continuing run of the same kind of edit into the record before it, so
+ * undo takes back a word rather than a letter. Typing "hello" is one thing the
+ * person did, and five undos to remove it is five times as many as anyone
+ * wants. A pause, a move, or a change of direction ends the run. */
+#define UI_UNDO_RUN_MS 900
+
+static void undo_note(const char *before, unsigned blen,
+                      const char *after, unsigned alen, unsigned caret_before) {
+    /* The changed span: everything between the common head and the common tail. */
+    unsigned p = 0;
+    while (p < blen && p < alen && before[p] == after[p]) p++;
+    unsigned s = 0;
+    while (s < blen - p && s < alen - p &&
+           before[blen - 1 - s] == after[alen - 1 - s]) s++;
+    unsigned n_del = blen - p - s, n_ins = alen - p - s;
+    if (!n_del && !n_ins) return;                     /* nothing happened */
+
+    if (n_del + n_ins > UI_UNDO_DATA) {
+        /* Too big to hold. Dropping the HISTORY rather than the record: an undo
+         * that skipped one edit and applied the one before it would put the
+         * buffer into a state that never existed, which is worse than not
+         * being able to go back that far. */
+        g_undo_n = g_undo_at = 0;
+        return;
+    }
+
+    uint64_t now = ui_now_ms();
+    /* Continuing a run: same direction, adjacent, and recent. */
+    if (g_undo_at > 0 && g_undo_at == g_undo_n) {
+        struct ui_edit *e = &g_undo[g_undo_at - 1];
+        int typing  = (n_del == 0 && e->n_del == 0 && p == (unsigned)(e->pos + e->n_ins));
+        int erasing = (n_ins == 0 && e->n_ins == 0 && p + n_del == (unsigned)e->pos);
+        if ((typing || erasing) && now - e->at <= UI_UNDO_RUN_MS &&
+            (unsigned)(e->n_del + e->n_ins) + n_del + n_ins <= UI_UNDO_DATA) {
+            if (typing) {
+                for (unsigned i = 0; i < n_ins; i++)
+                    e->data[e->n_del + e->n_ins + i] = after[p + i];
+                e->n_ins = (uint16_t)(e->n_ins + n_ins);
+            } else {
+                /* Erasing backwards: the newly removed bytes belong BEFORE the
+                 * ones already recorded, and the splice starts further left. */
+                for (int i = (int)e->n_del - 1; i >= 0; i--)
+                    e->data[i + n_del] = e->data[i];
+                for (unsigned i = 0; i < n_del; i++) e->data[i] = before[p + i];
+                e->n_del = (uint16_t)(e->n_del + n_del);
+                e->pos   = (uint16_t)p;
+            }
+            e->at = now;
+            return;
+        }
+    }
+
+    /* A new edit invalidates anything that was undone: you cannot redo a future
+     * that no longer follows from the present. */
+    if (g_undo_at == UI_UNDO_DEPTH) {
+        for (int i = 1; i < UI_UNDO_DEPTH; i++) g_undo[i - 1] = g_undo[i];
+        g_undo_at--;
+    }
+    struct ui_edit *e = &g_undo[g_undo_at];
+    e->pos = (uint16_t)p; e->n_del = (uint16_t)n_del; e->n_ins = (uint16_t)n_ins;
+    e->caret = (uint16_t)caret_before; e->at = now;
+    for (unsigned i = 0; i < n_del; i++) e->data[i] = before[p + i];
+    for (unsigned i = 0; i < n_ins; i++) e->data[n_del + i] = after[p + i];
+    g_undo_at++;
+    g_undo_n = g_undo_at;
+}
+
+/* Apply one record forwards (redo) or backwards (undo). Returns the new length,
+ * and writes the caret to leave behind. */
+static unsigned undo_apply(struct ui_edit *e, char *buf, unsigned len,
+                           unsigned long cap, int backwards, unsigned *out_caret) {
+    unsigned take = backwards ? e->n_ins : e->n_del;   /* what is there now */
+    unsigned put  = backwards ? e->n_del : e->n_ins;   /* what replaces it */
+    const char *src = backwards ? e->data : e->data + e->n_del;  /* the OTHER side */
+    if (e->pos + take > len) return len;               /* buffer moved under us */
+    if (len - take + put >= cap) return len;
+    memmove(buf + e->pos + put, buf + e->pos + take, len - e->pos - take + 1);
+    for (unsigned i = 0; i < put; i++) buf[e->pos + i] = src[i];
+    len = len - take + put;
+    buf[len] = 0;
+    *out_caret = backwards ? e->caret : (unsigned)(e->pos + put);
+    return len;
+}
+
 /* WHAT COUNTS AS A WORD. A run of letters, digits and underscore, or a run of
  * anything else that is not a space -- so double-clicking in `foo_bar(baz)`
  * gives you `foo_bar`, and double-clicking the `(` gives you the punctuation
@@ -653,7 +770,10 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
      * offset into a string that is not the one being edited. */
     unsigned len = (unsigned)strlen(buf);
     if (focused) {
-        if (g_caret_buf != buf) { g_caret_buf = buf; g_caret = len; g_anchor = len; }
+        if (g_caret_buf != buf) {
+            g_caret_buf = buf; g_caret = len; g_anchor = len;
+            undo_reset(buf);          /* a different field has a different past */
+        }
         if (g_caret > len) g_caret = len;
         if (g_anchor > len) g_anchor = len;
         /* The app may have rewritten the buffer under us (the file panel fills
@@ -726,6 +846,16 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
         }
         if (keys != CARRY_ONLY)
             n += ui_input_take(in + n, (int)sizeof in - n);
+
+        /* THE TEXT AS IT WAS, for the undo log to diff against once this
+         * frame's keys have been applied. 512 bytes covers every field in the
+         * system (the widest is a 256-byte path); a buffer beyond it simply
+         * gets no history rather than a wrong one. */
+        char undo_before[512];
+        unsigned undo_blen = len, undo_bcaret = g_caret;
+        int undo_track = (n > 0 && len < sizeof undo_before);
+        if (undo_track) { memcpy(undo_before, buf, len); undo_before[len] = 0; }
+        else if (n > 0) undo_reset(buf);
         /* Cut the selection out, leaving the caret where it was. Every edit
          * that writes goes through this first: typing over a selection, and
          * backspace or delete with one, all mean "this text goes away". */
@@ -814,6 +944,27 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
                 g_tab_pending = true;
                 break;
             }
+            else if (c == UI_KEY_UNDO || c == UI_KEY_REDO) {
+                /* Undo is applied HERE rather than folded into the diff, and
+                 * then excluded from it below: an undo is not an edit, and a
+                 * log that recorded its own undos could never move backwards. */
+                if (c == UI_KEY_UNDO && g_undo_at > 0) {
+                    unsigned nc = g_caret;
+                    len = undo_apply(&g_undo[g_undo_at - 1], buf, len, cap, 1, &nc);
+                    g_undo_at--;
+                    g_caret = g_anchor = nc > len ? len : nc;
+                } else if (c == UI_KEY_REDO && g_undo_at < g_undo_n) {
+                    unsigned nc = g_caret;
+                    len = undo_apply(&g_undo[g_undo_at], buf, len, cap, 0, &nc);
+                    g_undo_at++;
+                    g_caret = g_anchor = nc > len ? len : nc;
+                }
+                undo_track = 0;            /* not an edit: do not record it */
+                if (undo_blen < sizeof undo_before) {
+                    memcpy(undo_before, buf, len); undo_before[len] = 0;
+                    undo_blen = len;       /* keep the diff below a no-op */
+                }
+            }
             else if (c == UI_KEY_PASTE) {
                 /* The paste itself is the runtime's (ui/dsl/em_app.c): it holds
                  * the clipboard and replays it through this same queue, so that
@@ -842,6 +993,8 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
             }
         }
         #undef DROP_SEL
+
+        if (undo_track) undo_note(undo_before, undo_blen, buf, len, undo_bcaret);
     }
 
     /* the input well */

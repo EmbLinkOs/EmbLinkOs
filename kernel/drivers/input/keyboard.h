@@ -29,10 +29,17 @@
  *
  * The other half of a text field: selecting, and the clipboard. These are not
  * characters and there was nowhere to put them -- C0 is Ctrl+letter's and the
- * navigation codes' -- so they go ABOVE the character range instead, at
- * 0xF8..0xFF. That is not an arbitrary free corner: those eight byte values
- * can never occur in valid UTF-8, at any position, which is what makes it safe
- * to carry them in the same stream as text. Eight values, eight commands.
+ * navigation codes' -- so they go ABOVE the character range instead. That is
+ * not an arbitrary free corner: THIRTEEN byte values can never occur in valid
+ * UTF-8 at any position -- 0xC0, 0xC1 and 0xF5..0xFF -- because the lead bytes
+ * stop at 0xF4 (U+10FFFF encodes as F4 8F BF BF) and 0xC0/0xC1 would be
+ * overlong forms of ASCII. Carrying commands there is safe in a stream that is
+ * otherwise text.
+ *
+ * The first eight commands took 0xF8..0xFF and this comment then said "eight
+ * values, eight commands, which is either elegant or a warning". It was the
+ * warning: undo and redo arrived and needed two more. They are 0xF6/0xF7, and
+ * 0xF5, 0xC0 and 0xC1 remain.
  *
  * IN THE SAME STREAM ON PURPOSE. A separate command channel would lose the
  * ORDER: a paste between two typed characters has to land between them, and
@@ -60,6 +67,8 @@
 #define EK_COPY      0xFD   /* GUI+C        */
 #define EK_CUT       0xFE   /* GUI+X        */
 #define EK_PASTE     0xFF   /* GUI+V        */
+#define EK_UNDO      0xF6   /* GUI+Z        */
+#define EK_REDO      0xF7   /* GUI+Shift+Z, and GUI+Y */
 
 /* ---- the KEY EVENT stream -----------------------------------------------
  * The char stream above answers "what did the user TYPE". It cannot answer
