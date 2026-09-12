@@ -23,6 +23,7 @@
 void spinlock_init(spinlock_t *lock) {
     lock->locked = 0;
     lock->saved_flags = 0;
+    lock->holder_lr = 0;
 }
 
 void spin_lock(spinlock_t *lock) {
@@ -48,6 +49,7 @@ void spin_lock(spinlock_t *lock) {
     /* Safe to write only now: until the exchange succeeded, another core could
      * have been the owner and this field is the owner's. */
     lock->saved_flags = flags;
+    lock->holder_lr = (uint64_t)(uintptr_t)__builtin_return_address(0);
 
     /* Accounting, written only by the holder -- see spinlock.h. A WFE spin
      * counts iterations rather than cycles, which on this architecture means
@@ -59,6 +61,10 @@ void spin_lock(spinlock_t *lock) {
 
 void spin_unlock(spinlock_t *lock) {
     uint64_t flags = lock->saved_flags;
+
+    /* Cleared while we still hold it: a holder_lr left behind on a FREE
+     * lock would name an innocent call site the next time this is read. */
+    lock->holder_lr = 0;
 
     __atomic_store_n(&lock->locked, 0, __ATOMIC_RELEASE);
 

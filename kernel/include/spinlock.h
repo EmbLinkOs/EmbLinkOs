@@ -32,10 +32,27 @@ typedef struct spinlock {
     uint64_t acquires;      /* every successful acquisition                 */
     uint64_t contended;     /* ...that had to spin at least once            */
     uint64_t spins;         /* total spin iterations across all waiters     */
+
+    /* WHO HOLDS IT, and from where. Written by the holder right after it wins
+     * the lock and cleared just before it lets go, so the pair is meaningful
+     * exactly while `locked` is 1 -- and meaningless, deliberately, when it is
+     * 0 (holder_cpu = -1).
+     *
+     * This exists because of a deadlock that could not be diagnosed without
+     * it: a boot stops with ALL FOUR cores spinning in spin_lock, which says
+     * only that somebody never unlocked. Nothing in the machine's state says
+     * WHO -- the holder is not running, so no core's PC points at it. Two
+     * One word written by a core that already owns the cacheline turns
+     * "somebody" into a named call site. Same cost argument as the counters
+     * above: no atomics, holder-only writes. The CPU number is deliberately
+     * NOT recorded -- reading it means reaching into per-CPU data, which is
+     * built on top of locks, and the call site is the half that identifies the
+     * bug anyway. */
+    uint64_t holder_lr;     /* return address of whoever holds it; 0 = free */
 } spinlock_t;
 
 // static initializer for spinlocks
-#define SPINLOCK_INIT { 0, 0, 0, 0, 0 }
+#define SPINLOCK_INIT { 0, 0, 0, 0, 0, 0 }
 
 /* A snapshot. Racy by construction (the numbers move while being read) and
  * that is fine: they are ratios, not ledgers. */

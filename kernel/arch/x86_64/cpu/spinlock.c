@@ -4,6 +4,7 @@
 void spinlock_init(spinlock_t *lock) {
     lock->locked = 0;
     lock->saved_flags = 0;
+    lock->holder_lr = 0;
 }
 
 
@@ -28,6 +29,7 @@ void spin_lock(spinlock_t *lock) {
     // We have the lock, save the previous interrupt state inside it so unlock can restore it
     // can restore them. (safe because only the thread that holds the lock can writes this)
     lock->saved_flags = flags;
+    lock->holder_lr = (uint64_t)(uintptr_t)__builtin_return_address(0);
 
     /* Accounting, written only by the holder -- see spinlock.h. The waiting
      * loop above counted into a LOCAL, so a spinning core touches nothing
@@ -39,6 +41,10 @@ void spin_lock(spinlock_t *lock) {
 
 void spin_unlock(spinlock_t *lock) {
     uint64_t flags = lock->saved_flags;
+
+    /* Cleared while we still hold it: a holder_lr left behind on a FREE
+     * lock would name an innocent call site the next time this is read. */
+    lock->holder_lr = 0;
 
     //  Release the lock with release semantics (all our writes visible first)
     __atomic_store_n(&lock->locked, 0, __ATOMIC_RELEASE);

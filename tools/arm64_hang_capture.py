@@ -31,6 +31,14 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARM = os.path.join(ROOT, "build/aarch64")
 DONE = b"all self-tests done"
+# A CRASH looks like a hang from outside -- no more output -- but it leaves the
+# best evidence there is, and waiting out the full timeout for it wastes a
+# minute per run of a soak that already needs twenty runs to catch one.
+#
+# NOT "=== aarch64 exception ===": a healthy boot prints that FOUR times,
+# because the A1 self-tests take deliberate faults and recover from them. The
+# marker of a fatal one is the kernel saying it has no way back.
+CRASH = (b"kernel halted", b"PANIC")
 
 _syms = []
 
@@ -70,6 +78,47 @@ def qmp(port, cmd, args=None):
         if "return" in r or "error" in r:
             s.close()
             return r.get("return", "")
+
+
+def sym_addr(name):
+    """The address of a kernel symbol, or None."""
+    if not _syms:
+        symbolize(0)                      # fills _syms as a side effect
+    out = subprocess.run(["aarch64-elf-nm", ARM + "/kernel.elf"],
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 3 and f[2] == name:
+            return int(f[0], 16)
+    return None
+
+
+def sched_lock_state(port):
+    """WHO holds the scheduler lock. All cores spinning says only that somebody
+    never unlocked; the lock itself records the call site that took it."""
+    addr = sym_addr("g_sched_lock")
+    if addr is None:
+        return ["  (g_sched_lock not in the symbol table)"]
+    # The kernel window is a fixed offset from physical on this port; read the
+    # physical alias, which the monitor can address without a page walk.
+    phys = addr - 0xffffffffc0000000 + 0x40000000
+    txt = str(qmp(port, "human-monitor-command",
+                  {"command-line": "xp /6gx 0x%x" % phys}))
+    words = []
+    for line in txt.splitlines():
+        for tok in line.split(":", 1)[-1].split():
+            if tok.startswith("0x"):
+                words.append(int(tok, 16))
+    if len(words) < 6:
+        return ["  (could not read g_sched_lock at %#x)" % phys, "  " + txt.strip()]
+    # struct spinlock: uint32 locked (+4 pad), then saved_flags, acquires,
+    # contended, spins, holder_lr -- so the counters start at word 2, not 1.
+    locked = words[0] & 0xFFFFFFFF
+    acquires, contended, spins, holder = words[2], words[3], words[4], words[5]
+    return ["  g_sched_lock @ %#x (phys %#x)" % (addr, phys),
+            "    locked    : %d" % locked,
+            "    acquires  : %d  contended %d  spins %d" % (acquires, contended, spins),
+            "    HELD BY   : %#018x%s" % (holder, symbolize(holder) if holder else "  (free)")]
 
 
 def sample(port):
@@ -116,10 +165,16 @@ def one_run(n, secs):
     p = subprocess.Popen(argv, stderr=subprocess.DEVNULL)
     t0 = time.time()
     done = False
+    crashed = False
     while time.time() - t0 < secs:
         try:
-            if DONE in open(log, "rb").read():
+            blob = open(log, "rb").read()
+            if DONE in blob:
                 done = True
+                break
+            if any(c in blob for c in CRASH):
+                crashed = True
+                time.sleep(1)          # let the dump finish printing
                 break
         except OSError:
             pass
@@ -130,12 +185,22 @@ def one_run(n, secs):
         time.sleep(0.2)
         second = sample(port)
         try:
-            tail = open(log, "rb").read().decode(errors="replace").splitlines()[-25:]
+            whole = open(log, "rb").read().decode(errors="replace").splitlines()
         except OSError:
-            tail = []
-        cap = ["=== aarch64 hang, run %d, no progress in %d s ===" % (n, secs),
-               "--- last serial output ---"] + tail + \
+            whole = []
+        # A crash prints its own dump; keep plenty of context before it. A hang
+        # prints nothing, so the tail is all there is.
+        tail = whole[-120:] if crashed else whole[-25:]
+        held = sched_lock_state(port)
+        cap = ["=== aarch64 %s, run %d ===" % ("CRASH" if crashed else
+                                               "hang, no progress in %d s" % secs, n),
+               "--- serial output ---"] + tail + \
+              ["--- the scheduler lock ---"] + held + \
               ["--- sample 1 ---"] + first + ["--- sample 2, 200 ms later ---"] + second
+        try:
+            open("%s/hang-%d-full.log" % (ARM, n), "w").write("\n".join(whole) + "\n")
+        except OSError:
+            pass
     p.kill()
     p.wait()
     return done, cap
@@ -146,7 +211,7 @@ def main(argv):
     secs = int(argv[2]) if len(argv) > 2 else 90
     for n in range(1, runs + 1):
         done, cap = one_run(n, secs)
-        print("run %2d: %s" % (n, "completed" if done else "HUNG -- captured"), flush=True)
+        print("run %2d: %s" % (n, "completed" if done else "FAILED -- captured"), flush=True)
         if cap:
             path = "%s/hang-%d.txt" % (ARM, n)
             open(path, "w").write("\n".join(cap) + "\n")
