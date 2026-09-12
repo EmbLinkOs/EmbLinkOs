@@ -114,6 +114,13 @@ VStack(.spacing = 16, .padding = 20, .align = Fill) {
 }
 ```
 
+`ScrollView` shows a **scrollbar**: a thumb sized to the viewport's share of
+the content and positioned by the scroll, which you can drag. The gutter is
+always reserved, even when the content fits and no thumb is drawn — a bar that
+appeared only on overflow would make the content reflow the moment a list gained
+a row, and a list that shuffles sideways as it fills is worse than a few pixels
+of margin.
+
 Available containers: `VStack`, `HStack`, `ZStack`, `Card` (surface + border +
 shadow + padding preset), `Screen` (full-size root), `Section(title)` (a
 labeled group), `Row`, `NavBar(title)`, `ScrollView(&scroll_offset, height)`,

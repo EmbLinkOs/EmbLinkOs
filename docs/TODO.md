@@ -2952,6 +2952,37 @@ Open:
       so the answer is a third -- a mods provider the runtime fills with
       `embk_key_mods`.
 
+### A ScrollView showed no scrollbar (done 2026-09-12)
+
+- [x] **Every scrolling view in the OS scrolled blind.** The wheel worked and
+      nothing else did: no way to tell how long a list was, where you were in
+      it, or that it scrolled at all. Files, Settings, the file panel, the
+      browser, the launcher, the music list -- all of them.
+
+      The bar is sized from the SAME content/viewport extents `ui_scroll_end`
+      already used to clamp the scroll, so it cannot disagree with the thing it
+      describes: the thumb is as much of the track as the viewport is of the
+      content, and sits as far down as the scroll is through its range. Below
+      28px it stops shrinking, because a one-pixel thumb on a long document is
+      a bar you can see and not grab. It is draggable, with pointer capture so
+      a drag that wanders off it keeps scrolling -- the same rule the text
+      selection follows.
+
+      THE GUTTER IS ALWAYS RESERVED, overlay rejected. A bar that appears only
+      when the content outgrows the view makes the content REFLOW the moment a
+      list gains a row, and a list that shuffles sideways as it fills is worse
+      than a few pixels of empty margin.
+
+      The view became an HStack of [content column | track], and the OUTER box
+      stays the one the caller's props land on -- `em_scroll_` applies them
+      right after `ui_scroll_begin` returns, so a `ScrollView(..., .grow = 1)`
+      still grows. The clip and the scroll offset moved to the inner column.
+
+      Six claims in kit-test, checked by GEOMETRY rather than by eye (walk the
+      tree, read the thumb's rect) and mutation-checked both ways: pinning the
+      thumb's offset fails "it moves DOWN", and drawing it when the content fits
+      fails "content that fits shows no thumb".
+
 ### Undo, in every text field (done 2026-09-12)
 
 - [x] **`GUI+Z` undoes and `GUI+Shift+Z` redoes, toolkit-wide.** Every text

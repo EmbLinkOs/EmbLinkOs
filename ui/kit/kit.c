@@ -1129,29 +1129,102 @@ bool ui_password_field(char *buf, unsigned long cap, const char *placeholder) {
 
 static float *g_scroll_ptr;
 
+/* THE SCROLLBAR'S GUTTER, always reserved.
+ *
+ * Reserved rather than overlaid on purpose: a bar that appears only when the
+ * content outgrows the view makes the content REFLOW the moment a list gains a
+ * row, and a list that shuffles sideways as it fills is worse than a few pixels
+ * of empty margin. The gutter is narrow enough to read as margin when there is
+ * nothing in it. */
+#define UI_SCROLLBAR_W 10.0f
+#define UI_THUMB_MIN   28.0f
+
 void ui_scroll_begin(uint64_t key, float viewport_h, float *scroll_y) {
     const struct ui_theme *t = TH;
-    ui_begin_vstack(key);
-    /* wheel over the view scrolls it (40px per notch; wheel up -> content up) */
+    /* OUTER: the content column beside the bar. This is the box the caller's
+     * props land on (em_scroll_ applies them right after this returns), so it
+     * has to be the one that grows and carries the caller's background -- which
+     * is why the scroll offset and the clip live on the inner column instead. */
+    ui_begin_hstack(key);
+    /* wheel anywhere over the view -- bar included -- scrolls it
+     * (40px per notch; wheel up -> content up) */
     float w = ui_take_wheel();
     if (w != 0.0f) *scroll_y -= w * 40.0f;
     if (*scroll_y < 0) *scroll_y = 0;
     ui_set_size(sz_grow(), sz_fixed(viewport_h));
+    ui_set_align(ALIGN_STRETCH);
+    ui_set_spacing(0);
+    g_scroll_ptr = scroll_y;
+
+    ui_begin_vstack(0);                 /* the clipped, offset content column */
+    ui_set_size(sz_grow(), sz_grow());
     ui_set_clip_children(true);
     ui_set_scroll_offset(*scroll_y);
     ui_set_spacing(t->sp2);
     ui_set_align(ALIGN_STRETCH);
-    g_scroll_ptr = scroll_y;
 }
+
 void ui_scroll_end(void) {
+    const struct ui_theme *t = TH;
     /* clamp to content using last frame's measured extents (one-frame lag is ok) */
     float content = 0, viewport = 0;
-    if (ui_open_content_extent(&content, &viewport)) {
-        float maxs = content - viewport;
+    int measured = ui_open_content_extent(&content, &viewport);
+    float maxs = 0;
+    if (measured) {
+        maxs = content - viewport;
         if (maxs < 0) maxs = 0;
         if (g_scroll_ptr && *g_scroll_ptr > maxs) { *g_scroll_ptr = maxs; ui_set_scroll_offset(maxs); }
     }
-    ui_end_stack();
+    ui_end_stack();                     /* content column */
+
+    /* THE BAR. Sized from the same extents the clamp above uses, so it cannot
+     * disagree with the thing it describes: the thumb is as much of the track
+     * as the viewport is of the content, and sits as far down as the scroll is
+     * through its range. Below a minimum it stops shrinking -- a one-pixel
+     * thumb on a long document is a bar you can see but not grab. */
+    ui_box_begin(0);
+    struct instance_handle track = ui_open();
+    ui_set_size(sz_fixed(UI_SCROLLBAR_W), sz_grow());
+    ui_set_padding(2, 2, 2, 2);
+
+    if (measured && maxs > 0.5f && viewport > 0) {
+        float frac = viewport / content;
+        if (frac > 1.0f) frac = 1.0f;
+        float th = viewport * frac;
+        if (th < UI_THUMB_MIN) th = UI_THUMB_MIN;
+        if (th > viewport) th = viewport;
+        float pos = (*g_scroll_ptr) / maxs;
+        if (pos < 0) pos = 0;
+        if (pos > 1) pos = 1;
+
+        /* DRAG THE THUMB. Pointer capture (ui_is_active) so a drag that wanders
+         * off the bar keeps scrolling instead of stopping dead -- the same rule
+         * the text selection follows, and for the same reason. */
+        if (ui_is_active()) {
+            float rx, ry, rw, rh, px, py;
+            if (ui_open_rect(&rx, &ry, &rw, &rh) && rh > th) {
+                ui_pointer_pos(&px, &py);
+                (void)rx; (void)rw;
+                float want = (py - ry - th * 0.5f) / (rh - th);
+                if (want < 0) want = 0;
+                if (want > 1) want = 1;
+                *g_scroll_ptr = want * maxs;
+                pos = want;
+            }
+        }
+
+        ui_box_begin(0);
+        ui_set_size(sz_grow(), sz_fixed(th));
+        ui_set_corner_radius(UI_SCROLLBAR_W * 0.5f);
+        ui_set_paint(solid(ui_is_hovered() || ui_is_active()
+                           ? t->text_secondary : t->border_strong));
+        ui_set_offset(0, pos * (viewport - th));
+        ui_box_end();
+    }
+    (void)track;
+    ui_box_end();                       /* track */
+
+    ui_end_stack();                     /* outer */
 }
 
 /* --- overlay / modal ---------------------------------------------------- */

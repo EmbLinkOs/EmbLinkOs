@@ -91,6 +91,24 @@ static void drag(float x0, float x1, float y) {
     frame(NULL);
 }
 
+/* A ScrollView containing `rows` boxes of `row_h`, laid out twice so the
+ * extents the bar is sized from (which lag a frame by design) are settled. */
+static void scroll_view(float *sc, float view_h, int rows, float row_h) {
+    for (int pass = 0; pass < 2; pass++) {
+        ui_frame_begin();
+        ui_scroll_begin(0x5C401, view_h, sc);
+        for (int i = 0; i < rows; i++) {
+            ui_box_begin((uint64_t)(i + 1));
+            ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
+                        (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = row_h });
+            ui_box_end();
+        }
+        ui_scroll_end();
+        ui_frame_end();
+        ui_run_layout(400, 300);
+    }
+}
+
 int main(void) {
     printf("=== kit-test: the text field and the keyboard ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -506,6 +524,59 @@ int main(void) {
     frame(UNDO);
     CHECK(!strcmp(B, "") && !strcmp(A, "aaa"),
           "undo in one field does not reach into another");
+
+    /* ---- THE SCROLLBAR -------------------------------------------------
+     *
+     * A ScrollView scrolled with the wheel and showed NOTHING: no way to tell
+     * how long a list was or where you were in it. The bar is sized from the
+     * same content/viewport extents the scroll clamp uses, so it cannot
+     * disagree with the thing it describes.
+     *
+     * Checked by geometry rather than by eye: the view is the only thing in the
+     * frame, so its outer box is the root's first child, the track is that
+     * box's second child, and the thumb is the track's first. */
+    {
+        static float sc;
+        const float VIEW = 100.0f, ROW = 20.0f;
+        const int ROWS = 20;                     /* 400px of content in 100px */
+
+        struct instance_handle outer, track, thumb;
+        float tx, ty, tw, th;
+
+        sc = 0;
+        scroll_view(&sc, VIEW, ROWS, ROW);
+        outer = ui_first_child(ui_root());
+        track = ui_next_sibling(ui_first_child(outer));
+        CHECK(!instance_handle_is_null(track), "the scroll view has a bar beside its content");
+        thumb = ui_first_child(track);
+        CHECK(!instance_handle_is_null(thumb), "and a thumb in it when the content overflows");
+
+        if (!instance_handle_is_null(thumb) && ui_rect_of(thumb, &tx, &ty, &tw, &th)) {
+            /* content = 20 rows of 20 = 400 (plus the stack's own spacing);
+             * the thumb is viewport/content of the track, floored at 28. */
+            CHECK(th > 20.0f && th < VIEW * 0.6f,
+                  "the thumb is a fraction of the track, not the whole of it");
+            float top = ty;
+            sc = 1e6f;                            /* scrolled to the very bottom */
+            scroll_view(&sc, VIEW, ROWS, ROW);
+            thumb = ui_first_child(ui_next_sibling(ui_first_child(ui_first_child(ui_root()))));
+            float bx, by, bw, bh;
+            if (!instance_handle_is_null(thumb) && ui_rect_of(thumb, &bx, &by, &bw, &bh)) {
+                CHECK(by > top, "and it moves DOWN as the view scrolls down");
+                CHECK(by + bh <= ty + VIEW + 1.0f, "without running off the end of the track");
+            } else {
+                CHECK(0, "and it moves DOWN as the view scrolls down");
+            }
+        }
+
+        /* Content that FITS gets no thumb -- a full-length bar that cannot move
+         * is a lie about the content. */
+        sc = 0;
+        scroll_view(&sc, VIEW, 1, ROW);
+        track = ui_next_sibling(ui_first_child(ui_first_child(ui_root())));
+        CHECK(instance_handle_is_null(ui_first_child(track)),
+              "content that fits shows no thumb at all");
+    }
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
