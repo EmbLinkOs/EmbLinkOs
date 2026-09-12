@@ -41,6 +41,11 @@ static int clip_get(char *b, unsigned cap) {
 static uint64_t g_ms = 1000;
 static uint64_t fake_clock(void) { return g_ms; }
 
+/* Modifier keys the test holds down by hand. A click carries no byte saying
+ * whether shift was held, so the kit asks -- and here the answer is ours. */
+static unsigned g_mods;
+static unsigned fake_mods(void) { return g_mods; }
+
 static const char *clip_text(void) {
     static char out[257];
     memcpy(out, g_clip, g_clip_n); out[g_clip_n] = 0; return out;
@@ -124,6 +129,7 @@ int main(void) {
 
     ui_clipboard_provider(clip_set, clip_get);
     ui_clock_provider(fake_clock);
+    ui_mods_provider(fake_mods);
 
     frame(NULL);
     CHECK(ui_any_focus(), "a form with autofocus opens with a field focused");
@@ -577,6 +583,54 @@ int main(void) {
         CHECK(instance_handle_is_null(ui_first_child(track)),
               "content that fits shows no thumb at all");
     }
+
+    /* ---- SHIFT-CLICK ----------------------------------------------------
+     *
+     * Click once to place the caret, then shift-click elsewhere to take
+     * everything between -- the way you select a long run without dragging
+     * across it. The anchor stays put and only the caret moves, the same rule
+     * the drag follows. */
+    page = 0xAAAA; autofocus = true; A[0] = 0; g_clip_n = 0; g_mods = 0;
+    frame(NULL); frame(NULL);
+    frame("hello big world");
+
+    const struct ui_theme *th2 = ui_theme();
+    float adv2 = testfont_advance(th2->text_body);
+    #define CX(n) (th2->sp3 + adv2 * (float)(n) + adv2 * 0.5f)
+
+    press_at(CX(4), 20);                  /* caret after "hello", boundary 5 */
+    g_mods = UI_MOD_SHIFT;
+    press_at(CX(8), 20);                  /* ...extend to boundary 9, taking " big" */
+    g_mods = 0;
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), " big"), "shift-click extends the selection to it");
+
+    /* And it extends AGAIN from the same anchor rather than starting over. */
+    g_mods = UI_MOD_SHIFT;
+    press_at(CX(14), 20);                 /* boundary 15: the end */
+    g_mods = 0;
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), " big world"),
+          "a second shift-click extends further from the SAME anchor");
+
+    /* A plain click after it starts fresh. */
+    press_at(CX(2), 20);
+    g_clip_n = 0;
+    frame(COPY);
+    CHECK(g_clip_n == 0, "a plain click afterwards starts a new, empty selection");
+
+    /* Two shift-clicks in the same spot are not a double-click: that would turn
+     * a deliberate extend into a word-select. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("hello big world");
+    press_at(CX(4), 20);
+    g_mods = UI_MOD_SHIFT;
+    g_ms += 900; press_fast(CX(8), 20);
+    g_ms += 50;  press_fast(CX(8), 20);
+    g_mods = 0;
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), " big"), "two fast shift-clicks extend, they do not select a word");
+    #undef CX
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

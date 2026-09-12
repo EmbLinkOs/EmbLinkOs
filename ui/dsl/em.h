@@ -586,6 +586,11 @@ void em_context_menu_end_(void);
 /* Runtime plumbing: the app loop feeds raw right-button state here (em_app_run
  * does it). A press EDGE of the right button becomes one em_right_clicked(). */
 void em_feed_right_button(float x, float y, bool down);
+/* Look at a pending right-click without consuming it, then take it. Two calls
+ * because a click must be offered to whichever widget it landed in, and one
+ * that consumes on inspection lets the first widget asked swallow it. */
+int  em_right_peek(float *x, float *y);
+void em_right_take(void);
 
 /* ======================================================================= */
 /* EmUI V7 -- multi-line text editing                                       */

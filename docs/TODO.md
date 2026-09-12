@@ -2883,7 +2883,29 @@ Open:
       it actually happened. `tools/caret_shot.py` reports this one rather than
       failing on it until it is reliable.
 
-      THE LEADING SUSPECT WAS TRIED AND REVERTED. `compositor_win_input()`
+      THE FOURTH FAULT IS FIXED, and it was in the TOOLKIT, not the kernel --
+      after three kernel-side fixes, which is a lesson about where to look next
+      time. `ui_consume_click()` answers a YES/NO, and the declare layer's
+      `g_clicked` remembers only the LAST instance pressed: two clicks that both
+      land between two build frames are one `true`, so a double-click made
+      faster than the app renders was counted as a single click. Every layer
+      below carried the pair faithfully -- the driver queues press events, the
+      compositor queues clicks, each stamped with the time it happened -- and
+      this was where the second one was dropped. `ui_take_press_edges()` is the
+      count that layer had kept for exactly this reason, unused by the field.
+
+      Confirmed by instrumenting rather than by reasoning: the guest now logs
+      `EDGES 2` where it had logged one click, and the measurement went from 28%
+      (a caret moving) to 74% (a word highlighted).
+
+      STILL 2 RUNS IN 3, and that is the honest state. The logic is right and
+      demonstrably works; what remains is timing in emulation, where the pair
+      sometimes lands far enough apart that the window legitimately rejects it.
+      caret_shot reports the measurement rather than failing on it. Before
+      changing anything else here, instrument and read the log on a FAILING run
+      -- that is what found all four faults, and guessing found none of them.
+
+      THE EARLIER LEADING SUSPECT WAS TRIED AND REVERTED. `compositor_win_input()`
       drops a queued press whenever exactly ONE is waiting and the button is
       physically down, inferring "the live path is already delivering this".
       That inference could not be wrong with a single latch slot and looks
@@ -2945,12 +2967,32 @@ Open:
       machine from 0 runs in 3 to only 1 in 3. The press's own time is known in
       the driver and nowhere else, so it is taken there and carried through.
 
-- [ ] **No shift-click to extend a selection.** It needs the MODIFIER STATE at
-      the moment of the press, and the kit has no way to ask: the char stream
-      carries no modifiers and the kit must not call embk. The pattern is
-      established twice over now (`ui_clipboard_provider`, `ui_clock_provider`),
-      so the answer is a third -- a mods provider the runtime fills with
-      `embk_key_mods`.
+- [x] **Shift-click extends a selection** (done 2026-09-12). It needed the
+      MODIFIER STATE at the moment of the press, and the kit had no way to ask:
+      the char stream carries no modifiers, which is why the DRIVER decides what
+      Shift+Left means before sending it -- but a click has no byte to decide
+      about. So `ui_mods_provider`, the third of the pattern after the clipboard
+      and the clock, filled by the runtime with `embk_key_mods`.
+
+      A shift-click is deliberately NOT counted toward a double-click: it is a
+      second click somewhere else on purpose, and counting it would turn an
+      extend into a word-select.
+
+- [x] **Right-clicking text opens a menu** (done 2026-09-12). The `ContextMenu`
+      primitive had existed for a while with nothing ever pointing it at a text
+      field. Undo, Redo, Cut, Copy, Paste, Select All, with their ⌘ shortcuts
+      shown.
+
+      ITS ITEMS DO NOT REACH INTO THE FIELD. They push the same command bytes
+      the keyboard sends, so there is exactly one implementation of cut, copy,
+      paste, select-all and undo and the menu cannot drift away from what ⌘X
+      does -- and it works on the multi-line editor for free.
+
+      Only the FOCUSED field draws it, which is also the only field whose rect
+      the kit knows (`ui_focused_field_rect`), so a window of ten fields emits
+      one menu and not ten. The right-click is PEEKED and only taken if it
+      landed inside -- `em_right_clicked()` consumes, so the first field asked
+      would otherwise swallow a click meant for the third.
 
 ### A ScrollView showed no scrollbar (done 2026-09-12)
 
@@ -3029,7 +3071,17 @@ Open:
       diff, one record either way. Typing one key per frame, as a person does,
       makes it fail properly when coalescing is off.
 
-- [ ] **The multi-line `TextEditor` still has no undo.** The field's approach
+- [x] **The multi-line `TextEditor` has undo too** (done 2026-09-12). It shares
+      the kit's log rather than growing a second one -- two undo stacks in one
+      toolkit is one more than anyone wants to reason about when they disagree.
+      The log moved from fixed 64-byte payloads to a 16 KB ARENA, which is what
+      made sharing possible: pasting a block is exactly the edit you most want
+      back and was exactly the one the old records could not hold. The editor
+      snapshots its document to diff it, which sounds expensive and is not --
+      only when keys arrived, and 32 KB of memcpy is microseconds against a
+      frame costing tens of milliseconds.
+
+      ~~Superseded:~~ The field's approach
       does not carry over unchanged: it snapshots the buffer each frame to diff
       it, which is fine for a 256-byte path and not for the edit app's 32 KB
       document, and a record holds 64 bytes of payload, so pasting a paragraph

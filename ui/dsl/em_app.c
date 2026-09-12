@@ -229,6 +229,7 @@ static void cad_idle_tick(struct cadence *c) {
 /* Thin adapters: the kit's clipboard signatures are its own (it must not know
  * about embk), and embk_clip_get returns what the clipboard HOLDS, which can
  * exceed the buffer -- so clamp before reporting how much was written. */
+static unsigned emapp_mods(void) { return (unsigned)embk_key_mods(); }
 static int emapp_clip_set(const char *buf, unsigned len) {
     return embk_clip_set(buf, len);
 }
@@ -343,6 +344,10 @@ int em_app_run(const EmApp *app) {
      * was. Counting frames would not do -- this loop skips them when nothing
      * moves. */
     ui_clock_provider(embk_uptime_ms);
+    /* ...and the modifier keys, for shift-click. A click carries no byte, so
+     * unlike Shift+Left -- which the driver decides before sending -- the kit
+     * has to ask what was held. */
+    ui_mods_provider(emapp_mods);
 
 
     /* THE BACK BUFFER, and the reason for it.

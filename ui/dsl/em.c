@@ -874,9 +874,56 @@ static void em_stepper_impl(const char *label, int *bind, int lo, int hi, EmProp
     ui_end_stack();
     ui_end_stack();
 }
+/* THE TEXT CONTEXT MENU, which every field gets without asking.
+ *
+ * Right-clicking text did nothing anywhere in this system -- the menu
+ * primitive existed and nothing had ever pointed it at a text field. The items
+ * do not reach into the field: they push the SAME command bytes the keyboard
+ * sends (ui_input_char), so there is exactly one implementation of cut, copy,
+ * paste, select-all and undo, and the menu cannot drift away from what GUI+X
+ * does. It also means the menu works on the multi-line editor for free.
+ *
+ * Only the FOCUSED field draws it, which is also the only field whose rect the
+ * kit knows -- so a window of ten fields emits one menu, not ten. */
+static bool g_fieldmenu_open;
+static float g_fieldmenu_x, g_fieldmenu_y;
+
+static void em_text_menu(void) {
+    float rx, ry, rw, rh, cx, cy;
+    if (!g_fieldmenu_open && ui_focused_field_rect(&rx, &ry, &rw, &rh) &&
+        em_right_peek(&cx, &cy) &&
+        cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh) {
+        em_right_take();
+        g_fieldmenu_open = true;
+        g_fieldmenu_x = cx; g_fieldmenu_y = cy;
+    }
+    if (!g_fieldmenu_open) return;
+
+    ContextMenu(&g_fieldmenu_open, g_fieldmenu_x, g_fieldmenu_y) {
+        /* The shortcut glyphs are the GUI key (U+2318) and shift (U+21E7),
+         * each spelled as its own string so the hex escape cannot run on into
+         * the letter after it -- "\xE2\x8C\x98" "A" is the command glyph and an
+         * A, while "\xE2\x8C\x98A" is one escape too wide and does not compile. */
+        #define CMD_  "\xE2\x8C\x98"
+        #define SHFT_ "\xE2\x87\xA7"
+        if (MenuItemK("Undo",       CMD_ "Z"))        ui_input_char(UI_KEY_UNDO);
+        if (MenuItemK("Redo",       SHFT_ CMD_ "Z"))  ui_input_char(UI_KEY_REDO);
+        MenuSeparator();
+        if (MenuItemK("Cut",        CMD_ "X"))        ui_input_char(UI_KEY_CUT);
+        if (MenuItemK("Copy",       CMD_ "C"))        ui_input_char(UI_KEY_COPY);
+        if (MenuItemK("Paste",      CMD_ "V"))        ui_input_char(UI_KEY_PASTE);
+        MenuSeparator();
+        if (MenuItemK("Select All", CMD_ "A"))        ui_input_char(UI_KEY_SEL_ALL);
+        #undef CMD_
+        #undef SHFT_
+    }
+}
+
 static bool em_field_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
     (void)p; if (out_hov) *out_hov = false;
-    return ui_text_field(buf, cap, ph);
+    bool f = ui_text_field(buf, cap, ph);
+    if (f) em_text_menu();
+    return f;
 }
 static bool em_password_impl(char *buf, size_t cap, const char *ph, EmProps p, bool *out_hov) {
     (void)p; if (out_hov) *out_hov = false;
@@ -2905,6 +2952,17 @@ void em_feed_right_button(float x, float y, bool down) {
     if (down && !g_rbtn_prev) { g_rclick_pending = 1; g_rclick_x = x; g_rclick_y = y; }
     g_rbtn_prev = down ? 1 : 0;
 }
+/* PEEK without taking. A right-click has to be offered to whichever widget it
+ * landed in, and em_right_clicked() consumes -- so the first field asked would
+ * swallow a click meant for the third. Peek, decide, then take. */
+int em_right_peek(float *ox, float *oy) {
+    if (!g_rclick_pending) return 0;
+    if (ox) *ox = g_rclick_x;
+    if (oy) *oy = g_rclick_y;
+    return 1;
+}
+void em_right_take(void) { g_rclick_pending = 0; }
+
 int em_right_clicked(float *ox, float *oy) {
     if (!g_rclick_pending) return 0;
     g_rclick_pending = 0;
@@ -3166,6 +3224,8 @@ void em_context_menu_end_(void) {
 #define EMK_COPY      0xFD
 #define EMK_CUT       0xFE
 #define EMK_PASTE     0xFF
+#define EMK_UNDO      0xF6
+#define EMK_REDO      0xF7
 
 /* ---- editing primitives on a NUL-terminated buffer + byte cursor -------- */
 static void te_insert(char *buf, size_t cap, int *len, int *cur, char c) {
@@ -3398,6 +3458,7 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
      * line or two out. */
     static float ted_scroll;
     if (ted_buf != buf) { ted_buf = buf; ted_anchor = cur; ted_scroll = 0; }
+    ui_undo_bind(buf);          /* a different document has a different past */
     if (ted_anchor > len) ted_anchor = len;
     if (ted_anchor < 0) ted_anchor = 0;
 
@@ -3428,11 +3489,21 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
             ui_pointer_pos(&px, &py);
             cur = te_hit(buf, len, px, py, rx, ry, gutter, ted_scroll, efh, esz, t);
             if (clicked) {
-                ted_anchor = cur;            /* a press starts a fresh selection */
+                /* Shift-click EXTENDS from where the selection already is, the
+                 * way you take a long run without dragging across it. */
+                int shift = (ui_mods() & UI_MOD_SHIFT) != 0;
+                if (!shift) ted_anchor = cur;   /* a plain press starts fresh */
                 /* Twice is a word, three times is the LINE -- not the whole
                  * document, which is what a triple-click means in a one-line
                  * field but would be a surprise in a file. */
-                int run = ui_click_note(px, py);
+                /* The same count the field takes, and for the same reason:
+                 * a yes/no click cannot tell one press from three. */
+                int run = 1;
+                if (!shift) {
+                    int edges = ui_take_press_edges();
+                    if (edges < 1) edges = 1;
+                    for (int e = 0; e < edges; e++) run = ui_click_note(px, py);
+                }
                 if (run == 2) {
                     unsigned wlo, whi;
                     ui_word_bounds(buf, (unsigned)te_line_start(buf, cur),
@@ -3450,6 +3521,25 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
     if (focused) {
         char in[64];
         int n = ui_input_take(in, (int)sizeof in);
+
+        /* THE DOCUMENT AS IT WAS, for the undo log to diff against once this
+         * frame's keys have been applied -- the same recording-by-diff the
+         * single-line field uses, and for the same reason: this editor mutates
+         * `buf` through te_insert, te_backspace, te_delete, the selection drop
+         * and the paste loop, and a log that has to be TOLD about each one will
+         * miss the next one somebody writes.
+         *
+         * A copy of the whole document per keystroke FRAME sounds expensive and
+         * is not: it happens only when keys actually arrived, and a memcpy of
+         * the edit app's 32 KB costs a few microseconds against a frame that
+         * costs tens of milliseconds. A document larger than the snapshot gets
+         * NO history rather than a wrong one. */
+        static char undo_before[65536];
+        unsigned undo_blen = (unsigned)len, undo_bcaret = (unsigned)cur;
+        int undo_track = (n > 0 && (size_t)len < sizeof undo_before);
+        if (undo_track) { memcpy(undo_before, buf, (size_t)len); undo_before[len] = 0; }
+        else if (n > 0) ui_undo_bind(NULL);      /* too big to hold: no history */
+
         /* Remove the selected text, leaving the caret where it was. Every edit
          * that writes runs this first: typing over a selection, backspace and
          * delete with one, and a paste all mean "this goes away". */
@@ -3480,6 +3570,17 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
                     if (hi > lo) ui_clipboard_set(buf + lo, (unsigned)(hi - lo));
                     if (c == EMK_CUT) TED_DROP();
                     break;
+                case EMK_UNDO: case EMK_REDO: {
+                    /* Applied here and then excluded from the diff below: an
+                     * undo is not an edit, and a log that recorded its own
+                     * undos could never move backwards. */
+                    unsigned ul = (unsigned)len, uc = (unsigned)cur;
+                    if (ui_undo_step(c == EMK_REDO, buf, &ul, cap, &uc)) {
+                        len = (int)ul; cur = (int)uc; ted_anchor = cur;
+                    }
+                    undo_track = 0;
+                    break;
+                }
                 case EMK_PASTE: {
                     /* Unlike the single-line field, this editor pastes ITSELF.
                      * The runtime's app-wide replay flattens newlines to spaces
@@ -3540,7 +3641,7 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
                      * The command bytes are ABOVE this range and every one of
                      * them is handled by a case above, which is what keeps them
                      * out of the document -- see EMK_SEL_LEFT's comment. */
-                    if ((c >= 32 && c < 127) || (c >= 0x80 && c < EMK_SEL_LEFT)) {
+                    if ((c >= 32 && c < 127) || (c >= 0x80 && c < EMK_UNDO)) {
                         TED_DROP();
                         te_insert(buf, cap, &len, &cur, (char)c);
                         ted_anchor = cur;
@@ -3549,6 +3650,9 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
             }
         }
         #undef TED_DROP
+
+        if (undo_track)
+            ui_undo_note(undo_before, undo_blen, buf, (unsigned)len, undo_bcaret);
         if (cursor) *cursor = cur;
         em_request_frame();   /* keep the loop live while typing */
     }

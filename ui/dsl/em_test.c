@@ -280,6 +280,58 @@ int main(void) {
         #undef LINE_Y
     }
 
+    /* ---- UNDO IN THE EDITOR --------------------------------------------
+     *
+     * Shares the kit's log rather than growing a second one: two undo stacks in
+     * one toolkit is one more than anyone wants to reason about when they
+     * disagree. The editor records the same way the field does -- by diffing
+     * the document across a frame -- because it mutates `buf` through five
+     * different helpers and a log that must be told about each would miss the
+     * sixth. */
+    #define UNDO "\xF6"
+    #define REDO "\xF7"
+
+    DOC[0] = 0; CUR = 0; g_clip_n = 0; g_ms += 5000;
+    frame(NULL); frame(NULL);
+    click_at(0, 20);
+    frame("alpha");
+    g_ms += 5000;
+    frame("\nbravo");
+    CHECK(!strcmp(DOC, "alpha\nbravo"), "two lines typed");
+    frame(UNDO);
+    CHECK(!strcmp(DOC, "alpha"), "undo takes back the second line");
+    frame(REDO);
+    CHECK(!strcmp(DOC, "alpha\nbravo"), "and redo puts it back");
+
+    /* THE CASE THE FIELD'S 64-BYTE RECORDS COULD NOT HOLD, and the reason the
+     * log moved to an arena: pasting a block is exactly the edit you most want
+     * back, and it was exactly the one that used to drop the history. */
+    strcpy(DOC, "keep this line\nand this one\nand a third"); CUR = 0;
+    g_ms += 5000; frame(NULL);
+    frame(SALL COPY);
+    frame(END);
+    g_ms += 5000;
+    frame(PASTE);
+    CHECK(strlen(DOC) > 60, "a whole document pasted onto the end");
+    frame(UNDO);
+    CHECK(!strcmp(DOC, "keep this line\nand this one\nand a third"),
+          "and ONE undo takes the whole paste back");
+
+    /* Select-all then a key, the destructive case. */
+    strcpy(DOC, "precious\ntext"); CUR = 0; g_ms += 5000; frame(NULL);
+    frame(SALL);
+    g_ms += 5000;
+    frame("x");
+    CHECK(!strcmp(DOC, "x"), "one key replaced the document");
+    frame(UNDO);
+    CHECK(!strcmp(DOC, "precious\ntext"), "undo brings the document back");
+
+    /* A command byte must never reach the text -- 0xF6/0xF7 are above 0x80,
+     * which is where real characters live. */
+    strcpy(DOC, "z"); CUR = 1; g_ms += 5000; frame(NULL);
+    frame(UNDO REDO UNDO REDO);
+    CHECK(!strcmp(DOC, "z"), "undo and redo bytes are never inserted as text");
+
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

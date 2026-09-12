@@ -172,20 +172,27 @@ interrupt and is consumed before any application sees it
 belongs to the interface*. Ctrl+V still pastes, for the apps that always used it.
 
 **Undo.** `GUI+Z` undoes and `GUI+Shift+Z` (or `GUI+Y`) redoes, in every
-single-line field, with nothing for the app to call. A *run* of typing undoes as
+single-line field **and in the multi-line `TextEditor`**, with nothing for the
+app to call. A *run* of typing undoes as
 one thing rather than letter by letter, and a pause of about a second ends the
 run — so one undo takes back a word, not a keystroke. The case it exists for is
 select-all-then-type: one key and the text is gone, and `GUI+Z` brings it back.
 
-The multi-line `TextEditor` does **not** have undo yet (`docs/TODO.md` says what
-it needs); Note++ carries its own.
+Both share one log, so two editors in the same toolkit cannot disagree about
+what undo means. Note++ draws its own text and carries its own.
 
 **The mouse.** A press places the caret and a drag extends a selection, in both
 the single-line field and the multi-line editor. A drag keeps going after the
 pointer leaves the widget (pointer capture), so dragging off the end selects to
 the end. Double-click selects a word (`foo_bar` whole, `café` uncut); a third click
-takes the field, or in the multi-line editor the line. Shift-click to extend is
-not implemented — see `docs/TODO.md`.
+takes the field, or in the multi-line editor the line. **Shift-click** extends
+the selection from where it already starts, so you can take a long run without
+dragging across it.
+
+**Right-click** opens a text menu — Undo, Redo, Cut, Copy, Paste, Select All —
+in any field, with nothing for the app to do. Its items push the same command
+bytes the keyboard sends, so there is one implementation of each and the menu
+cannot drift away from what `⌘X` does.
 
 An app gets all of this for free — there is nothing to call. If your app
 installs a key hook, note that it sees the paste replay and can refuse it (this

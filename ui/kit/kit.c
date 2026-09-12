@@ -422,6 +422,21 @@ void ui_text_field_autofocus(void) { g_autofocus_next = true; }
  * BYTES, NOT CHARACTERS. The stream is UTF-8 (kernel/drivers/input/keyboard.c),
  * so the offset is a byte offset that is always kept on a character boundary --
  * a caret between the two bytes of an é is a caret that can split it in half. */
+/* The focused field's rect, for anything outside the kit that has to aim at it
+ * -- the DSL's right-click menu asks whether a click landed in the field that
+ * would receive its commands. Kept here because this is the only place that
+ * knows which field is focused AND where it ended up on screen. */
+static float g_focus_rect[4];
+static int   g_focus_rect_ok;
+int ui_focused_field_rect(float *x, float *y, float *w, float *h) {
+    if (!g_focus_rect_ok) return 0;
+    if (x) *x = g_focus_rect[0];
+    if (y) *y = g_focus_rect[1];
+    if (w) *w = g_focus_rect[2];
+    if (h) *h = g_focus_rect[3];
+    return 1;
+}
+
 static char    *g_caret_buf;              /* whose caret g_caret is */
 static unsigned g_caret;                  /* byte offset into it */
 
@@ -452,6 +467,10 @@ int ui_clipboard_set(const char *buf, unsigned len) {
 int ui_clipboard_get(char *buf, unsigned cap) {
     return g_clip_get ? g_clip_get(buf, cap) : 0;
 }
+
+static unsigned (*g_mods_fn)(void);
+void     ui_mods_provider(unsigned (*fn)(void)) { g_mods_fn = fn; }
+unsigned ui_mods(void) { return g_mods_fn ? g_mods_fn() : 0u; }
 
 static uint64_t (*g_now_ms)(void);
 void     ui_clock_provider(uint64_t (*now)(void)) { g_now_ms = now; }
@@ -525,19 +544,35 @@ int ui_click_note(float x, float y) {
  * A RECORD IS A SPLICE: at `pos`, `n_del` bytes went away and `n_ins` arrived.
  * `data` holds the removed bytes followed by the inserted ones, so one record
  * runs in both directions and redo is undo with the two swapped. */
-#define UI_UNDO_DEPTH 24
-#define UI_UNDO_DATA  64
+#define UI_UNDO_DEPTH 32
+#define UI_UNDO_ARENA 16384        /* the text the records hold, all together */
 struct ui_edit {
-    uint16_t pos, n_del, n_ins, caret;   /* caret = where it was BEFORE the edit */
+    uint32_t pos, n_del, n_ins, caret;   /* caret = where it was BEFORE the edit */
+    uint32_t off;                        /* where this record's text sits in the arena */
     uint64_t at;                         /* for coalescing a run of typing */
-    char     data[UI_UNDO_DATA];
 };
 static struct ui_edit g_undo[UI_UNDO_DEPTH];
-static int   g_undo_n;      /* records held */
-static int   g_undo_at;     /* how many are applied; undo walks it down */
-static char *g_undo_buf;    /* whose history this is */
+static char  g_undo_arena[UI_UNDO_ARENA];
+static uint32_t g_undo_used;   /* bump pointer into the arena */
+static int   g_undo_n;         /* records held */
+static int   g_undo_at;        /* how many are applied; undo walks it down */
+static void *g_undo_owner;     /* whose history this is */
 
-static void undo_reset(char *buf) { g_undo_buf = buf; g_undo_n = g_undo_at = 0; }
+/* AN ARENA, NOT A FIXED PAYLOAD PER RECORD, and that is what lets the
+ * multi-line editor share this. Fixed 64-byte payloads were fine for a
+ * 256-byte path field and wrong for a document: pasting a paragraph is exactly
+ * the edit you most want back, and it was exactly the one that did not fit.
+ *
+ * When the arena fills, the WHOLE history goes rather than the one record that
+ * would not fit -- for the same reason a too-big edit drops it: an undo that
+ * stepped over an edit and applied the one before it would put the buffer into
+ * a state that never existed. */
+static void undo_reset(void *owner) {
+    g_undo_owner = owner; g_undo_n = g_undo_at = 0; g_undo_used = 0;
+}
+void ui_undo_bind(void *owner) { if (g_undo_owner != owner) undo_reset(owner); }
+int  ui_undo_can_undo(void) { return g_undo_at > 0; }
+int  ui_undo_can_redo(void) { return g_undo_at < g_undo_n; }
 
 /* Fold a continuing run of the same kind of edit into the record before it, so
  * undo takes back a word rather than a letter. Typing "hello" is one thing the
@@ -556,12 +591,11 @@ static void undo_note(const char *before, unsigned blen,
     unsigned n_del = blen - p - s, n_ins = alen - p - s;
     if (!n_del && !n_ins) return;                     /* nothing happened */
 
-    if (n_del + n_ins > UI_UNDO_DATA) {
-        /* Too big to hold. Dropping the HISTORY rather than the record: an undo
-         * that skipped one edit and applied the one before it would put the
-         * buffer into a state that never existed, which is worse than not
-         * being able to go back that far. */
-        g_undo_n = g_undo_at = 0;
+    if (n_del + n_ins > UI_UNDO_ARENA) {
+        /* One edit larger than the whole arena. Dropping the HISTORY rather
+         * than the record: an undo that skipped one edit and applied the one
+         * before it would put the buffer into a state that never existed. */
+        undo_reset(g_undo_owner);
         return;
     }
 
@@ -571,21 +605,25 @@ static void undo_note(const char *before, unsigned blen,
         struct ui_edit *e = &g_undo[g_undo_at - 1];
         int typing  = (n_del == 0 && e->n_del == 0 && p == (unsigned)(e->pos + e->n_ins));
         int erasing = (n_ins == 0 && e->n_ins == 0 && p + n_del == (unsigned)e->pos);
-        if ((typing || erasing) && now - e->at <= UI_UNDO_RUN_MS &&
-            (unsigned)(e->n_del + e->n_ins) + n_del + n_ins <= UI_UNDO_DATA) {
+        /* Extending the newest record in place, which is only safe because it
+         * is the LAST thing in the arena -- nothing sits after it to overwrite. */
+        int is_last = (e->off + e->n_del + e->n_ins == g_undo_used);
+        if ((typing || erasing) && is_last && now - e->at <= UI_UNDO_RUN_MS &&
+            g_undo_used + n_del + n_ins <= UI_UNDO_ARENA) {
+            char *d = g_undo_arena + e->off;
             if (typing) {
                 for (unsigned i = 0; i < n_ins; i++)
-                    e->data[e->n_del + e->n_ins + i] = after[p + i];
-                e->n_ins = (uint16_t)(e->n_ins + n_ins);
+                    d[e->n_del + e->n_ins + i] = after[p + i];
+                e->n_ins += n_ins;
             } else {
                 /* Erasing backwards: the newly removed bytes belong BEFORE the
                  * ones already recorded, and the splice starts further left. */
-                for (int i = (int)e->n_del - 1; i >= 0; i--)
-                    e->data[i + n_del] = e->data[i];
-                for (unsigned i = 0; i < n_del; i++) e->data[i] = before[p + i];
-                e->n_del = (uint16_t)(e->n_del + n_del);
-                e->pos   = (uint16_t)p;
+                for (int i = (int)e->n_del - 1; i >= 0; i--) d[i + n_del] = d[i];
+                for (unsigned i = 0; i < n_del; i++) d[i] = before[p + i];
+                e->n_del += n_del;
+                e->pos    = p;
             }
+            g_undo_used += n_del + n_ins;
             e->at = now;
             return;
         }
@@ -593,15 +631,19 @@ static void undo_note(const char *before, unsigned blen,
 
     /* A new edit invalidates anything that was undone: you cannot redo a future
      * that no longer follows from the present. */
-    if (g_undo_at == UI_UNDO_DEPTH) {
-        for (int i = 1; i < UI_UNDO_DEPTH; i++) g_undo[i - 1] = g_undo[i];
-        g_undo_at--;
-    }
+    /* Out of room in either dimension: start again rather than keep a history
+     * with a hole in it. The person loses the ability to go further back, not
+     * the ability to trust what undo does. */
+    if (g_undo_at == UI_UNDO_DEPTH || g_undo_used + n_del + n_ins > UI_UNDO_ARENA)
+        undo_reset(g_undo_owner);
+
     struct ui_edit *e = &g_undo[g_undo_at];
-    e->pos = (uint16_t)p; e->n_del = (uint16_t)n_del; e->n_ins = (uint16_t)n_ins;
-    e->caret = (uint16_t)caret_before; e->at = now;
-    for (unsigned i = 0; i < n_del; i++) e->data[i] = before[p + i];
-    for (unsigned i = 0; i < n_ins; i++) e->data[n_del + i] = after[p + i];
+    e->pos = p; e->n_del = n_del; e->n_ins = n_ins;
+    e->caret = caret_before; e->at = now;
+    e->off = g_undo_used;
+    for (unsigned i = 0; i < n_del; i++) g_undo_arena[e->off + i] = before[p + i];
+    for (unsigned i = 0; i < n_ins; i++) g_undo_arena[e->off + n_del + i] = after[p + i];
+    g_undo_used += n_del + n_ins;
     g_undo_at++;
     g_undo_n = g_undo_at;
 }
@@ -612,7 +654,7 @@ static unsigned undo_apply(struct ui_edit *e, char *buf, unsigned len,
                            unsigned long cap, int backwards, unsigned *out_caret) {
     unsigned take = backwards ? e->n_ins : e->n_del;   /* what is there now */
     unsigned put  = backwards ? e->n_del : e->n_ins;   /* what replaces it */
-    const char *src = backwards ? e->data : e->data + e->n_del;  /* the OTHER side */
+    const char *src = g_undo_arena + e->off + (backwards ? 0 : e->n_del);
     if (e->pos + take > len) return len;               /* buffer moved under us */
     if (len - take + put >= cap) return len;
     memmove(buf + e->pos + put, buf + e->pos + take, len - e->pos - take + 1);
@@ -621,6 +663,34 @@ static unsigned undo_apply(struct ui_edit *e, char *buf, unsigned len,
     buf[len] = 0;
     *out_caret = backwards ? e->caret : (unsigned)(e->pos + put);
     return len;
+}
+
+/* --- the undo log, for editors outside the kit -----------------------------
+ *
+ * ui/dsl/em.c's multi-line editor shares this rather than growing a second
+ * one. It has the same shape of problem and would reach the same answers, and
+ * two undo logs in one toolkit is one more than anybody wants to reason about
+ * when they disagree. */
+void ui_undo_note(const char *before, unsigned blen,
+                  const char *after, unsigned alen, unsigned caret_before) {
+    undo_note(before, blen, after, alen, caret_before);
+}
+
+/* Step the buffer one record back (or forward). Returns 1 if anything moved,
+ * and writes the new length and where the caret should sit. */
+int ui_undo_step(int forward, char *buf, unsigned *len, unsigned long cap,
+                 unsigned *caret) {
+    if (!forward) {
+        if (g_undo_at <= 0) return 0;
+        *len = undo_apply(&g_undo[g_undo_at - 1], buf, *len, cap, 1, caret);
+        g_undo_at--;
+    } else {
+        if (g_undo_at >= g_undo_n) return 0;
+        *len = undo_apply(&g_undo[g_undo_at], buf, *len, cap, 0, caret);
+        g_undo_at++;
+    }
+    if (*caret > *len) *caret = *len;
+    return 1;
 }
 
 /* WHAT COUNTS AS A WORD. A run of letters, digits and underscore, or a run of
@@ -770,6 +840,10 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
      * offset into a string that is not the one being edited. */
     unsigned len = (unsigned)strlen(buf);
     if (focused) {
+        { float fx, fy, fw, fh;
+          g_focus_rect_ok = ui_open_rect(&fx, &fy, &fw, &fh);
+          if (g_focus_rect_ok) { g_focus_rect[0] = fx; g_focus_rect[1] = fy;
+                                 g_focus_rect[2] = fw; g_focus_rect[3] = fh; } }
         if (g_caret_buf != buf) {
             g_caret_buf = buf; g_caret = len; g_anchor = len;
             undo_reset(buf);          /* a different field has a different past */
@@ -792,12 +866,39 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
             } else {
                 g_caret = len;
             }
-            g_anchor = g_caret;        /* a click starts a fresh, empty selection */
+            /* SHIFT-CLICK EXTENDS from where the selection already starts,
+             * rather than beginning a new one -- the way you select a long run
+             * without dragging across it. The anchor is left exactly where it
+             * was and only the caret moves, which is the same rule the drag
+             * follows. Without an anchor to extend from (nothing selected and
+             * the caret elsewhere), the previous caret IS the anchor. */
+            int shift = (ui_mods() & UI_MOD_SHIFT) != 0;
+            if (!shift) g_anchor = g_caret;
 
-            /* Twice is a word, three times is the lot. */
+            /* HOW MANY presses landed, not whether one did.
+             *
+             * ui_consume_click answers a yes/no, and the declare layer's
+             * `g_clicked` remembers only the LAST instance pressed -- so two
+             * clicks that both land between two build frames are one `true`
+             * here, and a double-click made faster than the app renders was
+             * counted as a single click. Every layer below this one carried the
+             * pair faithfully (the driver queues press events, the compositor
+             * queues clicks, each with the time it happened); this was where
+             * the second one was dropped. ui_take_press_edges is the count that
+             * layer keeps for exactly this reason.
+             *
+             * They are all at the same spot and the same instant, so noting
+             * each in turn walks the run up: two edges make a double-click. */
             float cx, cy; ui_pointer_pos(&cx, &cy);
-            int run = ui_click_note(cx, cy);
-            if (run == 2 && !masked) {
+            int edges = ui_take_press_edges();
+            if (edges < 1) edges = 1;
+            int run = 1;
+            for (int e = 0; e < edges; e++) run = ui_click_note(cx, cy);
+            if (shift) {
+                /* A shift-click is never a double-click: it is a deliberate
+                 * second click somewhere else, and counting it would turn an
+                 * extend into a word-select. */
+            } else if (run == 2 && !masked) {
                 unsigned lo, hi;
                 ui_word_bounds(buf, 0, len, g_caret, &lo, &hi);
                 g_anchor = lo; g_caret = hi;

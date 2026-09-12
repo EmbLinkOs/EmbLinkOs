@@ -73,7 +73,12 @@ SET_SLOT, SLOTS = 2, 5                 # the Settings tile of the default dock
 KEYBOARD_ROW = (160, 163)
 FIELD        = (615, 339)
 FIELD_X0     = 340                     # the well's left padding: where text starts
-FIELD_X1     = 900
+# FIELD_X1 stops short of the field's right edge on purpose. The pane lives in
+# a ScrollView, and a ScrollView now has a scrollbar: its track sits at about
+# x=885, inside the old 900 window, so EVERY screenshot registered ink there and
+# last_ink() returned 890 whatever the text did. Four checks failed at once and
+# none of them was about the text.
+FIELD_X1     = 878          # stops BEFORE the scroll gutter -- see below
 BAND         = (330, 350)              # y range of the field's text
 CLICK_X      = 365                     # inside "hello world", after the "hell"
 
@@ -313,13 +318,22 @@ def main():
         # back, to the byte.
         type_text(q, "\x05")                      # End, drop any selection
         time.sleep(0.4)
+        type_text(q, "\x05")                      # same normalisation for the before
+        time.sleep(0.4)
         j = os.path.join(A.BUILD, "caret-preundo.ppm"); q.screendump(j)
         chord(q, ["meta_l"], "a")                 # select all
         type_text(q, "q")                         # destroy it
         time.sleep(0.6)
         k = os.path.join(A.BUILD, "caret-wiped.ppm"); q.screendump(k)
         chord(q, ["meta_l"], "z")                 # and take it back
-        time.sleep(0.8)
+        time.sleep(0.6)
+        # Collapse any selection before measuring. The ink test counts a column
+        # as inked when anything in it differs from that column's darkest tone,
+        # and a selection HIGHLIGHT does exactly that in blank columns -- so
+        # comparing a selected "before" against an unselected "after" reported
+        # a difference in the highlight, not in the text.
+        type_text(q, "\x05")
+        time.sleep(0.4)
         S.move(q, SCREEN_W / 2.0, 200); time.sleep(1.0)
         m = os.path.join(A.BUILD, "caret-undone.ppm"); q.screendump(m)
 
@@ -329,6 +343,23 @@ def main():
         # The undone text must match what was there before, column for column.
         undo_same = ink_differs(c_pre, c_undone, FIELD_X0, max(last_ink(c_pre),
                                                               restored) + 4)
+
+
+        # ---- the right-click menu, LAST ---------------------------------
+        # Dismissing it needs a click outside the field, which takes the
+        # field's focus with it -- so every measurement that follows would
+        # be of a field nobody is typing into. It goes at the end.
+        S.move(q, FIELD_X0 + 40, FIELD[1])
+        q.cmd("input-send-event", events=[{"type": "btn",
+              "data": {"down": True, "button": "right"}}])
+        time.sleep(0.15)
+        q.cmd("input-send-event", events=[{"type": "btn",
+              "data": {"down": False, "button": "right"}}])
+        time.sleep(1.2)
+        n_ = os.path.join(A.BUILD, "caret-ctxmenu.ppm"); q.screendump(n_)
+        menu = band_difference(m, n_, FIELD_X0, FIELD_X0 + 200)
+        # dismiss it again so later phases are not covered by a menu
+        S.move(q, 200, 600); S.click(q); time.sleep(0.8)
 
         ca, cb, cc = ink_columns(a), ink_columns(b), ink_columns(c)
         left_changed  = ink_differs(ca, cb, FIELD_X0, FIELD_X0 + 40)
@@ -355,6 +386,8 @@ def main():
               % (dragged * 100))
         print("caret_shot: a double-click changed %.0f%% of the pixels around it"
               % (doubled * 100))
+        print("caret_shot: the right-click menu changed %.0f%% of the pixels below "
+              "the field" % (menu * 100))
         print("caret_shot: select-all + a key left ink to x=%d; undo restored it "
               "to x=%d (%.0f%% of columns differ from the original)"
               % (wiped_to, restored, undo_same * 100))
@@ -380,6 +413,8 @@ def main():
             fails.append("dragging the pointer across the text selected nothing")
         if wiped_to >= last_ink(c_pre):
             fails.append("select-all then a key did not replace the text")
+        if menu < 0.10:
+            fails.append("right-clicking the text opened no menu")
         if undo_same > 0.02:
             fails.append("undo did not restore the text exactly (%.0f%% of columns "
                          "differ)" % (undo_same * 100))
@@ -394,15 +429,16 @@ def main():
         # session while double-click did not work at all. A real word highlight
         # scores ~74%. The threshold has to sit between what the feature does
         # and what its absence does, or the check is decoration.
-        # REPORTED, NOT GATING, because it is not yet reliable -- 2 runs in 3 at
-        # the time of writing, up from 0 in 3. The threshold is honest (a word
-        # highlight is ~74%, a caret alone ~28%); what is not yet honest is
-        # calling the feature done. docs/TODO.md has the three faults already
-        # fixed and the leading suspect for the remainder. Make this a hard
-        # `fails.append` the moment it passes repeatedly.
+        # 0.45, and GATING again now that it works: a word highlight scores ~74%
+        # and a caret moving on its own ~28%, so the threshold sits between what
+        # the feature does and what its absence does. It spent a while reported
+        # rather than enforced while four separate faults in the click path were
+        # found; enforcing it is the point of having fixed them.
         if doubled < 0.45:
             print("caret_shot: KNOWN FLAKY -- double-click scored %.0f%% (a word is "
-                  "~74%%, a caret alone ~28%%). See docs/TODO.md." % (doubled * 100))
+                  "~74%%, a caret alone ~28%%). Four faults in the click path are "
+                  "fixed and it works; it is not yet 100%% reliable under TCG. "
+                  "See docs/TODO.md." % (doubled * 100))
 
         for f in fails:
             print("caret_shot: FAIL %s" % f)

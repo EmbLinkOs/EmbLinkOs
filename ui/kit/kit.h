@@ -96,6 +96,11 @@ enum { UI_CTL_SURFACE, UI_CTL_BORDER, UI_CTL_FOCUS, UI_CTL_TEXT, UI_CTL_PLACEHOL
        UI_CTL_SELECTION };
 struct color ui_ctl_color_(int which, struct color dflt);
 
+/* Where the focused text field is on screen, or 0 if none is focused. For code
+ * outside the kit that has to aim at it -- the DSL's right-click menu asks
+ * whether a click landed in the field its commands would reach. */
+int ui_focused_field_rect(float *x, float *y, float *w, float *h);
+
 bool ui_text_field(char *buf, unsigned long cap, const char *placeholder);
 bool ui_password_field(char *buf, unsigned long cap, const char *placeholder);
 
@@ -187,6 +192,42 @@ int ui_clipboard_get(char *buf, unsigned cap);
  * -- single clicks keep working. */
 void     ui_clock_provider(uint64_t (*now_ms)(void));
 uint64_t ui_now_ms(void);
+
+/* THE MODIFIER KEYS, installed the same way and the third of the pattern
+ * (clipboard, clock, now these). Shift-click has to know whether shift was
+ * held at the moment of the press, and the char stream cannot say: it carries
+ * no modifiers at all, which is why the DRIVER has to decide what Shift+Left
+ * means before sending it. A click has no such byte, so the kit asks.
+ *
+ * ui/dsl/em_app.c installs embk_key_mods. With none installed ui_mods() is 0
+ * and every click is an unmodified one, which is the behaviour there was. */
+#define UI_MOD_SHIFT 0x01        /* mirrors EMBK_KM_SHIFT */
+void     ui_mods_provider(unsigned (*mods)(void));
+unsigned ui_mods(void);
+
+/* --- UNDO, shared -----------------------------------------------------------
+ *
+ * The single-line field uses this behind the scenes and so does the DSL's
+ * multi-line editor: one log, so that two editors in one toolkit cannot
+ * disagree about what undo means.
+ *
+ * `ui_undo_bind` says whose history is current -- pass the buffer being edited.
+ * Binding something new discards the old history, which is the point: undo must
+ * never apply one document's edits to another.
+ *
+ * `ui_undo_note` is given the text BEFORE and AFTER a frame's worth of edits
+ * and works out the splice itself. Recording by diffing rather than by being
+ * told about each edit is deliberate -- an editor mutates its buffer in many
+ * places, and a log that must be notified at each one will silently miss the
+ * next one somebody adds. */
+void ui_undo_bind(void *owner);
+void ui_undo_note(const char *before, unsigned blen,
+                  const char *after, unsigned alen, unsigned caret_before);
+/* Step one record back (forward = 0) or forward (redo). 1 if anything moved. */
+int  ui_undo_step(int forward, char *buf, unsigned *len, unsigned long cap,
+                  unsigned *caret);
+int  ui_undo_can_undo(void);
+int  ui_undo_can_redo(void);
 
 /* RECORD a press at (x,y) and say how many it makes in the current rapid run:
  * 1 single, 2 double, 3 or more triple. A press too late or too far from the
