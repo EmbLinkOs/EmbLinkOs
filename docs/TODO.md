@@ -3201,17 +3201,31 @@ Open:
       finds pid 12's window at the release point, and Note++'s
       `embk_drop_take` answers `r=1 type=path len=21`.
 
-- [ ] **The target does not visibly react yet.** Note++ receives the drop with
-      the correct payload and neither opens the document nor shows the banner
-      it now posts. That is app-level and I did not isolate it; the kernel and
-      toolkit halves are not suspects, because the trace above is taken INSIDE
-      Note++ after the call returns. `tools/dnd_shot.py` reports this rather
-      than failing, so it does not tell a lie about the parts that work.
+- [x] **And the target reacts. IT ALWAYS DID** -- the previous note here said
+      it did not, and that was wrong. One instrumented run answered all three
+      possibilities at once:
 
-      Next: check whether `doc_open` succeeds (its result goes to `g_msg`,
-      which is in the window's header and was behind the other window all along
-      -- print it instead of looking for it), and whether the frame that takes
-      the drop is the same one that acts on `g_want_open`.
+        NP drop r=1 type=[path] len=21
+        NP doc_open(/home/yves/readme.txt) -> 1
+        NP notify=-2
+
+      The document had been opening correctly the whole time. Two things hid
+      it: Note++'s content area was BEHIND the window the file was dragged out
+      of, so the change was real and off-screen; and the banner it posts to say
+      so failed with -ENOENT.
+
+      THE BANNER WAS A CAPABILITY ANSWER, not a bug. Note++ declares
+      `ro /system` and `rw $HOME` and nothing else, so /run -- where the
+      service endpoints live -- was not in its namespace and `embk_notify`
+      could not reach the notifier. The namespace IS the authority here, and an
+      application that never asked to reach a service cannot. Its manifest now
+      says `ro /run`, which is the app declaring what it needs rather than the
+      service becoming ambient.
+
+      The lesson is about the TEST, not the code: three runs were spent looking
+      for a change in the one region of the screen where it could not appear.
+      Instrumenting the app answered it immediately, as it has every other time
+      this session.
 
 - [x] **Files opened a file on PRESS, so you could not pick one up.** The
       toolkit fires `.clicked()` on the press edge, which is right for a button

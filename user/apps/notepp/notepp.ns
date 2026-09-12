@@ -16,3 +16,9 @@
 
 ro /system                  # the font it draws with, and libembk.so
 rw $HOME                    # the files being edited
+ro /run                     # the service endpoints -- the notifier, so that a
+                            # file dropped on a window that happens to be
+                            # behind another one can say so. Without this line
+                            # embk_notify returns -ENOENT and says nothing: the
+                            # namespace IS the authority here, and an app that
+                            # never asked to reach a service cannot.
