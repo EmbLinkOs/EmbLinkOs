@@ -1754,6 +1754,18 @@ void compositor_pointer_tick(void) {
 
     spin_lock(&g_comp_lock);
     int left = (b & MOUSE_BTN_LEFT) != 0, prev = (g_prev_buttons & MOUSE_BTN_LEFT) != 0;
+    /* HOW MANY presses actually happened, which the level cannot say: a whole
+     * down-up-down-up between two ticks leaves `left` equal to `prev` and the
+     * gesture would otherwise vanish here. The driver counts them as the
+     * packets arrive (mouse_take_presses), so a burst is preserved even when
+     * this tick is slower than the hand. */
+    struct { uint32_t t; } press_ev[COMP_CLICK_Q];
+    uint32_t presses = 0, ptime = 0;
+    while (presses < COMP_CLICK_Q && mouse_take_press(&ptime))
+        press_ev[presses++].t = ptime;
+    /* Belt: if the level moved but the driver reported nothing (a device that
+     * only ever sets absolute state), still treat it as one press, timed now. */
+    if (presses == 0 && left && !prev) press_ev[presses++].t = (uint32_t)timer_uptime_ms();
 
     /* one accumulated dirty bbox for the whole tick -> a single paint_region */
     int have = 0, bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
@@ -1775,30 +1787,41 @@ void compositor_pointer_tick(void) {
      * close-button press = close. The desktop (home) layer is never raised or
      * dragged -- it stays pinned at the back; its clicks flow through to the app
      * as content input below. */
-    if (left && !prev) {
-        struct comp_window *w = topmost_at(x, y);
-        /* latch a content-area press for the owner (desktop included): if the
-         * app is busy rendering when this press+release happens, win_input
-         * replays it (press then release) so the click is never eaten. */
-        if (w) {
-            int clx = x - w->x, cly = y - (w->y + win_titlebar_h(w));
-            if (clx >= 0 && clx < (int)w->cw && cly >= 0 && cly < (int)w->ch) {
-                if (w->pend_count < COMP_CLICK_Q) {
-                    uint8_t slot = (uint8_t)((w->pend_head + w->pend_count) % COMP_CLICK_Q);
-                    w->pend_q[slot].x = (int16_t)clx;
-                    w->pend_q[slot].y = (int16_t)cly;
-                    /* WHEN THE FINGER WENT DOWN, not when the app gets around
-                     * to noticing. This is the whole reason double-click can
-                     * work on a slow machine: a replayed click is delivered one
-                     * per poll, so two clicks 130 ms apart reach an app
-                     * rendering at 4 fps half a second apart, and anything
-                     * timing them by arrival decides they were two separate
-                     * clicks. Measured: that is exactly what happened. */
-                    w->pend_q[slot].t = (uint32_t)timer_uptime_ms();
-                    w->pend_count++;
+    /* LATCH EVERY PRESS, however many happened since the last tick. An app is
+     * handed them one per poll (see compositor_win_input), so a burst the user
+     * made faster than this loop runs still arrives as a burst.
+     *
+     * Separate from the window-management block below, which stays on the LEVEL
+     * edge: raising a window, starting a title drag or hitting the close button
+     * are things to do ONCE for a gesture, not once per click in it. */
+    if (presses) {
+        struct comp_window *wp = topmost_at(x, y);
+        if (wp) {
+            int clx = x - wp->x, cly = y - (wp->y + win_titlebar_h(wp));
+            if (clx >= 0 && clx < (int)wp->cw && cly >= 0 && cly < (int)wp->ch) {
+                /* WHEN THE FINGER WENT DOWN, not when the app gets around to
+                 * noticing. A replayed click is delivered one per poll, so two
+                 * clicks 130 ms apart reach an app rendering at 4 fps half a
+                 * second apart, and anything timing them by arrival decides
+                 * they were two separate clicks. Measured: exactly that.
+                 *
+                 * Each press carries the time the DRIVER recorded when the
+                 * button actually went down -- not this tick's time, which
+                 * would make two presses noticed on different ticks look as far
+                 * apart as the ticks are. */
+                for (uint32_t k = 0; k < presses && wp->pend_count < COMP_CLICK_Q; k++) {
+                    uint8_t slot = (uint8_t)((wp->pend_head + wp->pend_count) % COMP_CLICK_Q);
+                    wp->pend_q[slot].x = (int16_t)clx;
+                    wp->pend_q[slot].y = (int16_t)cly;
+                    wp->pend_q[slot].t = press_ev[k].t;   /* ITS OWN time, from the driver */
+                    wp->pend_count++;
                 }
             }
         }
+    }
+
+    if (left && !prev) {
+        struct comp_window *w = topmost_at(x, y);
         if (w && !w->desktop) {
             int title_control = 0;
             int cbx0, cby0, cbx1, cby1;

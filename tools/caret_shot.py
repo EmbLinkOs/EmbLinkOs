@@ -354,17 +354,20 @@ def main():
         # caret. A real word highlight scores ~74%. The threshold has to sit
         # between what the feature does and what its absence does, or the test
         # is decoration.
-        # NOT GATING YET, and the reason is recorded in docs/TODO.md: the PS/2
-        # driver has no button EVENT queue -- compositor_pointer_tick() finds
-        # edges by diffing mouse_get_state(), so a down/up/down/up burst between
-        # two ticks yields zero edges and the second click is lost in the kernel
-        # before any of this can count it. The number below is still the real
-        # measurement (a word highlight is ~74%, a caret alone ~28%); promote it
-        # back to a hard check the moment the driver queues edges.
+        # 0.45, NOT a token 0.05: a caret moving to the click point already
+        # changes ~28% of this band, so a low bar passed for a whole debugging
+        # session while double-click did not work at all. A real word highlight
+        # scores ~74%. The threshold has to sit between what the feature does
+        # and what its absence does, or the check is decoration.
+        # REPORTED, NOT GATING, because it is not yet reliable -- 2 runs in 3 at
+        # the time of writing, up from 0 in 3. The threshold is honest (a word
+        # highlight is ~74%, a caret alone ~28%); what is not yet honest is
+        # calling the feature done. docs/TODO.md has the three faults already
+        # fixed and the leading suspect for the remainder. Make this a hard
+        # `fails.append` the moment it passes repeatedly.
         if doubled < 0.45:
-            print("caret_shot: KNOWN GAP -- double-click scored %.0f%% (a word is "
-                  "~74%%, a caret alone ~28%%); fast clicks are lost in the mouse "
-                  "driver, see docs/TODO.md" % (doubled * 100))
+            print("caret_shot: KNOWN FLAKY -- double-click scored %.0f%% (a word is "
+                  "~74%%, a caret alone ~28%%). See docs/TODO.md." % (doubled * 100))
 
         for f in fails:
             print("caret_shot: FAIL %s" % f)

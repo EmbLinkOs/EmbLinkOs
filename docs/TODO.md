@@ -2876,10 +2876,28 @@ Open:
       what the feature does and what its absence does. A threshold below the
       noise floor is decoration, not a test.
 
-- [ ] **FAST CLICKS ARE LOST IN THE MOUSE DRIVER, so double-click is
-      unreliable.** This is the fourth fault in that chain and the only one
-      still open. It is a KERNEL defect, not a toolkit one, and it bounds how
-      fast anyone can click:
+- [ ] **Double-click works about 2 runs in 3, and the remaining third is not
+      yet explained.** Three faults in this chain are fixed (below); measured
+      progress on the machine, three runs each time: 0/3 passing, then 1/3 after
+      the driver counted press EDGES, then 2/3 after each press carried the time
+      it actually happened. `tools/caret_shot.py` reports this one rather than
+      failing on it until it is reliable.
+
+      THE LEADING SUSPECT, recorded so the next attempt does not start from
+      nothing: `compositor_win_input()` drops a queued press when
+      `pend_count == 1 && the button is physically down`, on the grounds that
+      the live path is already delivering it. That test was written when there
+      was one latch slot and could not be wrong; with a QUEUE it can. After the
+      first of two clicks is consumed the count falls to 1, and if the button
+      happens to be down at that moment the SECOND click is discarded. The fix
+      is to know whether the live path really delivered a press for this
+      down-cycle rather than inferring it from the count -- or to let the queue
+      be the only path and solve slider drags another way.
+
+      The three already fixed, kept here because each was a separate lesson:
+
+- [x] **Fast clicks were lost in the mouse driver** (fixed 2026-09-12). A KERNEL
+      defect, not a toolkit one, and it bounded how fast anyone could click:
 
       `mouse_get_state()` reports the CURRENT button state -- the IRQ handler
       keeps `g_buttons` up to date -- and `compositor_pointer_tick()` finds a
@@ -2894,18 +2912,21 @@ Open:
       -- three runs, all 28%. Faster clicking losing MORE clicks is the
       signature of sampling, not of a timeout.
 
-      THE FIX: give the driver a button EVENT COUNT instead of a state. The IRQ
-      handler already sees every packet, so it should count press and release
-      transitions as they arrive (`mouse_take_button_edges(&presses,
-      &releases)`), and `compositor_pointer_tick` should consume that count
-      rather than diff a level. A burst of two clicks between ticks then yields
-      two press edges, which is what the compositor's click queue was built to
-      carry. Both arches need it -- PS/2 here, virtio-input on aarch64.
+      FIXED by giving the driver a press EVENT QUEUE instead of a state. The IRQ
+      handler already sees every packet, so it records each left-button DOWN
+      transition as it arrives and `compositor_pointer_tick` drains them
+      (`mouse_take_press`). A burst of two clicks between ticks now yields two
+      press edges, which is what the compositor's click queue was built to
+      carry. Both arches in the same lines: the PS/2 packet path and
+      `mouse_set_absolute`, which is how aarch64 gets a pointer at all.
 
-      Until then `tools/caret_shot.py` reports the double-click measurement as a
-      KNOWN GAP rather than failing on it, so the tool stays useful for the six
-      checks that do pass. Promote it back to a hard check (threshold 0.45) the
-      moment the driver queues edges.
+- [x] **...and each press had to carry its OWN time** (fixed 2026-09-12). The
+      first version of the fix counted presses but let the compositor stamp them
+      with the time of the TICK that noticed. Two presses noticed on different
+      ticks then look as far apart as the ticks are, which on a busy kernel loop
+      is wider than any double-click window -- so counting alone moved the
+      machine from 0 runs in 3 to only 1 in 3. The press's own time is known in
+      the driver and nowhere else, so it is taken there and carried through.
 
 - [ ] **No shift-click to extend a selection.** It needs the MODIFIER STATE at
       the moment of the press, and the kit has no way to ask: the char stream

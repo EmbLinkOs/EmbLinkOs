@@ -15,6 +15,7 @@
 #include "include/io.h"
 #endif
 #include "drivers/char/serial.h"
+#include "drivers/timer/timer.h"   /* timer_uptime_ms: a press knows its own time */
 
 #define PS2_DATA   0x60
 #define PS2_STATUS 0x64
@@ -36,6 +37,58 @@
 static volatile int32_t  g_x, g_y;
 static volatile uint32_t g_buttons;
 static volatile int32_t  g_wheel;        /* accumulated scroll notches (IntelliMouse Z) */
+
+/* LEFT-BUTTON PRESSES THAT HAVE HAPPENED, counted as the packets arrive.
+ *
+ * The button STATE alone cannot answer "how many times was this clicked".
+ * compositor_pointer_tick() used to find a press by diffing mouse_get_state()
+ * against the previous tick, which works only while clicks are slower than the
+ * tick: a complete down-up-down-up between two ticks shows the same state at
+ * both ends and yields ZERO edges, so the whole gesture vanished before any of
+ * the system could see it. That is what made double-click unreliable and fast
+ * double-clicks impossible -- measured, clicks 130 ms apart survived only
+ * sometimes and 50 ms apart never.
+ *
+ * A COUNT cannot miss one. The IRQ handler already sees every packet, so it
+ * does the counting here; the compositor takes the total and latches that many
+ * clicks. Incremented in the two places a button state is set -- the PS/2
+ * packet path and mouse_set_absolute (the tablet, which is how aarch64 gets a
+ * pointer at all) -- so both arches are fixed by the same lines. */
+/* AND WHEN EACH HAPPENED. A count alone is not enough: the caller would have
+ * to stamp them with the time it NOTICED, and two presses noticed on different
+ * ticks then look as far apart as the ticks are -- which on a busy kernel loop
+ * is further apart than any double-click window. The press's own time is known
+ * here and nowhere else, so it is taken here.
+ *
+ * Eight deep: the question is only ever "how many clicks in one gesture", and
+ * a burst longer than that is not a gesture anyone is making deliberately. */
+#define MOUSE_PRESS_Q 8
+static volatile uint32_t g_press_t[MOUSE_PRESS_Q];
+static volatile uint8_t  g_press_head, g_press_n;
+
+/* Apply a new button mask, recording the DOWN transition of the left button.
+ * Both device paths go through here so neither can forget to. */
+static void buttons_set(uint32_t nb) {
+    uint32_t ob = g_buttons;
+    if ((nb & MOUSE_BTN_LEFT) && !(ob & MOUSE_BTN_LEFT)) {
+        if (g_press_n < MOUSE_PRESS_Q) {
+            uint8_t slot = (uint8_t)((g_press_head + g_press_n) % MOUSE_PRESS_Q);
+            g_press_t[slot] = (uint32_t)timer_uptime_ms();
+            g_press_n++;
+        }
+    }
+    g_buttons = nb;
+}
+
+/* Take the oldest un-taken press and the millisecond it happened. Returns 1 if
+ * there was one, 0 if not. */
+int mouse_take_press(uint32_t *when_ms) {
+    if (!g_press_n) return 0;
+    if (when_ms) *when_ms = g_press_t[g_press_head];
+    g_press_head = (uint8_t)((g_press_head + 1) % MOUSE_PRESS_Q);
+    g_press_n--;
+    return 1;
+}
 static int32_t  g_w = 1024, g_h = 768;
 
 static uint8_t  g_pkt[4];
@@ -78,7 +131,7 @@ static void apply_motion(void) {
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
     g_x = nx; g_y = ny;
-    g_buttons = g_pkt[0] & (PKT_LEFT | PKT_RIGHT | PKT_MIDDLE);
+    buttons_set(g_pkt[0] & (PKT_LEFT | PKT_RIGHT | PKT_MIDDLE));
 }
 
 #endif /* __x86_64__ */
@@ -96,7 +149,7 @@ void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
     g_x = nx; g_y = ny;
-    g_buttons = buttons & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE);
+    buttons_set(buttons & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE));
     if (wheel) g_wheel += wheel;
 }
 
@@ -136,7 +189,7 @@ void mouse_init(uint32_t screen_w, uint32_t screen_h) {
     serial_write_string("\n=== Mouse init ===\n");
     g_w = (int32_t)screen_w; g_h = (int32_t)screen_h;
     g_x = g_w / 2; g_y = g_h / 2;
-    g_cycle = 0; g_buttons = 0;
+    g_cycle = 0; g_buttons = 0; g_press_head = g_press_n = 0;
 
 #if !defined(__x86_64__)
     /* The clamp bounds and the centred cursor ARE the whole of mouse_init()
