@@ -3245,6 +3245,42 @@ Open:
       it is worth being right about before they diverge. Asks, like every other
       close here, with the same grace timer behind it.
 
+### The keyboard layout, and a path with no coverage (2026-09-13)
+
+- [x] **`test kbdlayout` covers the syscall.** It spawns primtest with a
+      `kbdlayout` role, which calls `embk_kbd_layout("azerty", ...)`, checks the
+      call is ACCEPTED, checks the name READS BACK, and puts the layout back so
+      a test does not leave the machine typing French. It passes:
+      "azerty accepted, read back, and restored".
+
+      This is the path that had none. `test keymap` beside it calls
+      `keyboard_set_layout()` directly inside the kernel -- it tests the
+      driver's tables, not the way anything reaches them -- so it went on
+      passing for as long as sys_kbd_layout rejected every name with -EFAULT.
+      A test that goes around the thing it is meant to protect is worse than no
+      test, because it also reports green.
+
+- [ ] **I could NOT demonstrate the switch through Settings, and do not know
+      why.** Six runs went into driving the Keyboard pane's Segmented control
+      and the selection never changed. What was measured, from inside
+      `ui_segmented` on the machine: the pointer IS inside the right segment's
+      rect, `ui_is_hovered()` is 1 and `ui_is_pressed()` is 1 on the press
+      frame -- and `ui_consume_click(seg)` never returns true, so `pick` never
+      moves and Settings never calls the syscall at all.
+
+      TWO POSSIBILITIES AND I DID NOT SEPARATE THEM: the harness may be
+      mis-driving it (its Settings navigation was flaky across runs -- one run
+      did not reach the pane at all), or Segmented is genuinely not clickable,
+      which would affect every one of them: theme, text size, layout, Files'
+      Grid/List. The second would be a serious UI defect and it is NOT ruled
+      out.
+
+      Next: click a Segmented control by hand in a live desktop before writing
+      any more automation, because that answers it in ten seconds and the
+      automation has already cost six runs. If it is the control, check whether
+      the compositor's click QUEUE (added earlier today) is delivering presses
+      at latched coordinates that no longer match where the pointer is.
+
 ### A string could not be passed to two syscalls at all (fixed 2026-09-13)
 
 - [x] **`copy_string_from_user` returns the string's LENGTH on success, and

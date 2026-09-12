@@ -1132,6 +1132,32 @@ void _start(long argc, char **argv, char **envp)
         if (embk_streq(argv[1], "env-child"))      env_child();
         if (embk_streq(argv[1], "cancel-child"))   cancel_child();
         if (embk_streq(argv[1], "ctrlc-child"))    ctrlc_child();
+        /* THE KEYBOARD LAYOUT, over the SYSCALL -- the path a person actually
+         * uses and the one that had no coverage at all. `test keymap` calls
+         * keyboard_set_layout() directly inside the kernel, so it went on
+         * passing while sys_kbd_layout rejected every name with -EFAULT: it
+         * tested the driver's tables, not the way anything reaches them.
+         *
+         * Exits 0 only if the switch is ACCEPTED and READS BACK, because a
+         * call that returns 0 and changes nothing would pass a weaker test. */
+        if (embk_streq(argv[1], "kbdlayout")) {
+            char got[24];
+            int rc = embk_kbd_layout("azerty", got, (int)sizeof got);
+            if (rc != 0) { embk_puts(1, "kbdlayout: switch REFUSED\n"); embk_exit(1); }
+            if (!embk_streq(got, "azerty")) {
+                embk_puts(1, "kbdlayout: accepted but did not take\n");
+                embk_exit(2);
+            }
+            /* Put it back, so a test does not leave the machine typing French. */
+            rc = embk_kbd_layout("us", got, (int)sizeof got);
+            if (rc != 0 || !embk_streq(got, "us")) {
+                embk_puts(1, "kbdlayout: could not switch back\n");
+                embk_exit(3);
+            }
+            embk_puts(1, "kbdlayout: azerty accepted, read back, and restored\n");
+            embk_exit(0);
+        }
+
         if (embk_streq(argv[1], "ctrlc-parent"))   ctrlc_parent();
 
         /* EmbLink UI Piece 1 roles, selected by argv[1]. Each exits. */
