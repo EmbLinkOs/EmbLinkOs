@@ -748,7 +748,7 @@ _SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf",
                # A SERVICE, not an application: nothing launches filepanel from
                # the dock, apps reach it through /run/emlink.files, and it is
                # part of the system the way the desktop is. Sealed with them.
-               "filepanel.elf"}   # -> /system/bin/
+               "filepanel.elf", "notifyd.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""

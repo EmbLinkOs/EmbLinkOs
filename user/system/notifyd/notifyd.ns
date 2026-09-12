@@ -1,0 +1,7 @@
+# The notifier needs to NAME almost nothing: it draws banners from messages
+# that arrive over /run/emlink.notify, and never opens a file of its own.
+#
+# It inherits the session's namespace today because that is what "no binds"
+# means here, and narrowing it to /run alone is a worthwhile follow-up -- a
+# service with no filesystem capability (see notifyd.caps) cannot use the
+# names anyway, so the namespace is belt to that braces.

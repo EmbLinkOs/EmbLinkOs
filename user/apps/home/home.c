@@ -21,6 +21,7 @@
 #include "embk.h"
 #include "appauth.h"
 #include "oscfg.h"   /* the user's dock preferences, re-read live */
+#include "emnotify.h" /* banners, for the failures a log cannot show anyone */
 #include "kit.h"
 #include "ui.h"
 #include "em.h"
@@ -1058,7 +1059,21 @@ static void spawn_app(const char *path, const char *start_dir) {
         g_running[slot].used = 1;
         g_running[slot].handle_p1 = h + 1;
     }
-    else { char e[96]; snprintf(e, sizeof e, "home: spawn %s FAILED: %d\n", path, h); embk_puts(1, e); }
+    else {
+        char e[96]; snprintf(e, sizeof e, "home: spawn %s FAILED: %d\n", path, h);
+        embk_puts(1, e);
+        /* AND SAY IT WHERE SOMEBODY CAN SEE IT. This went to fd 1 and nowhere
+         * else: on the machine this OS is meant to run on, that is a serial
+         * cable nobody has plugged in, so clicking an app that cannot start
+         * looked exactly like clicking an app that does nothing. The failure a
+         * user is most likely to meet was the one the system was quietest
+         * about. */
+        const char *leaf = path;
+        for (const char *q = path; *q; q++) if (*q == '/') leaf = q + 1;
+        char body[160];
+        snprintf(body, sizeof body, "%s could not be started (error %d).", leaf, h);
+        embk_notify_level(EMNOTE_FAIL, "Application did not start", body);
+    }
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -1117,6 +1132,7 @@ int main(int argc, char **argv, char **envp) {
      * service you have to launch by hand is a service every caller has to
      * handle the absence of. */
     spawn_app("/system/bin/filepanel.elf", NULL);
+    spawn_app("/system/bin/notifyd.elf", NULL);
     embk_puts(1, "home: desktop ready\n");
 
     for (;;) {

@@ -2549,6 +2549,36 @@ Open:
       found" while x86 was clean: the same bug, twice, in two copies of the
       same idea.
 
+- [x] **Notifications (user/system/notifyd).** The second service, and the
+      other one every app needs: a program can now say something from outside
+      its own window. The desktop's "could not start that app" used to go to
+      fd 1 and nowhere else -- a serial cable nobody has plugged in on the
+      machine this OS is for -- so clicking an app that cannot start looked
+      exactly like clicking one that does nothing. It posts a banner now.
+
+      Two threads, because a service has to wait for callers and a window has
+      to be drawn: the accept thread answers each caller IMMEDIATELY (a program
+      that has just failed to save your file must not then block for six
+      seconds telling you so) and the main thread owns the window. The window
+      exists ONLY while there is something to show -- a translucent window
+      parked in the corner would swallow every click that landed on it.
+
+      A CAPABILITY LESSON, recorded because the failure was so quiet: notifyd
+      was first declared with `gpu` and nothing else, which looks like the
+      careful choice for a program that only draws. It came up, drew its banner
+      frames, and rendered NOT ONE CHARACTER -- empty rounded boxes in the
+      corner. Every EmUI program opens /system/fonts/font.ttf at startup, and
+      without `filesystem` that open fails. The capability system did exactly
+      what it promised; the declaration was wrong. Narrowing the manifest to a
+      read-only /system/fonts binding, so the grant matches the one file it
+      really needs, is the proper fix and is still open.
+
+      Also caught here: `.glass` overrides fill AND border (em_apply_box), so a
+      `.border_color` passed beside it is silently discarded -- the level
+      colour went to the glass material's own pale outline on every banner
+      whatever the urgency. The level is a child stripe now, which a parent's
+      material cannot override.
+
 - [ ] **The panel should hand back a HANDLE, not a path.** This is the version
       that matters in a capability system: the panel holds the authority to
       browse, and an app with no filesystem namespace of its own could open

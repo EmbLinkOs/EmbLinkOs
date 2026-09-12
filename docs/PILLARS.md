@@ -54,7 +54,7 @@ emulates the common real part, so none has to wait for the machine.
 | **Real HiDPI scaling** | `ui_scale` exists, clamped to 80–130% | A modern laptop panel needs 200%; the desktop looks half-size |
 | **Time: NTP + time zones** | absent — the RTC only | The clock drifts and is in the wrong zone |
 | **A persistent system log + crash reports** | absent — `syslog.h` is deliberately a declaration-only stub | A problem on the real machine cannot be diagnosed after the fact |
-| **Notifications and status indicators** | absent | Battery, network, volume, "update ready" have nowhere to appear |
+| **Notifications and status indicators** | notifications ✅ (`/run/emlink.notify`, user/system/notifyd -- banners from any program, and the desktop now reports a failed launch through it); status indicators still absent | Battery, network, volume, "update ready" have nowhere to appear |
 | **System updates** | absent — `pkg` installs apps, nothing updates the OS | Every fix means reinstalling |
 
 ## Phase 4 — it grows
