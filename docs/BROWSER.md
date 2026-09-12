@@ -230,7 +230,7 @@ explicitly handed.
 ## 8. The application
 
 Chrome follows the house style already established by Files, Settings and the
-Terminal: `AppBar` with the control cluster leading, title centred, app controls
+Terminal: `AppBar` with the three lights leading, title centred, app controls
 trailing. Specifically:
 
 - **Bar:** back, forward, reload, then the URL field (the widest thing there),

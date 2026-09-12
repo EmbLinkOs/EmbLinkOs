@@ -365,7 +365,7 @@ void em_windowbar_(const char *title, EmProps p);
 void em_windowbar_end_(void);
 /* AppBar -- the standard chrome for an OS application window. One definition
  * so Files, Settings and the Terminal are visibly the same product: traffic
- * the control cluster leading (minimize, maximize, close), the title centred in the
+ * the three lights leading (close, minimize, zoom), the title centred in the
  * space between, and whatever the app puts in the scope trailing. The whole
  * bar is a drag zone except where a control sits.
  *
@@ -385,13 +385,36 @@ void em_window_post_maximize(void);    /* ask the runtime to maximize next pass 
 int  em_window_take_maximize(void);    /* the runtime, consuming that ask */
 #define MinimizeButton(...) em_min_button()
 EmV  em_min_button(void);              /* park the window; the dock icon brings it back */
-#define MaximizeButton(...) em_max_button()
-/* The house window controls as ONE widget: minimize, maximize and close in a
- * single hairline frame. What AppBar puts at the head of its bar -- use it in
- * any bar you assemble yourself, so every window in the OS carries the same
- * controls in the same order. */
+#define ZoomButton(...)     em_max_button()
+#define MaximizeButton(...) em_max_button()   /* the old name for ZoomButton */
+/* The house window controls as ONE widget: the three lights. What AppBar puts
+ * at the head of its bar -- use it in any bar you assemble yourself, so every
+ * window in the OS carries the same controls in the same place. */
 #define WindowControls()    em_window_controls()
 void em_window_controls(void);
+
+/* WHERE A WINDOW CAN BE PUT, which is the whole point of the zoom light: the
+ * pointer resting on it opens a small board of these, and picking one places
+ * the window. `Normal` is the size and position it had before.
+ *
+ * FILL AND FULL ARE DIFFERENT ON PURPOSE and the difference is the one people
+ * actually want a choice about: Fill takes the WORK AREA -- everything that is
+ * not the top bar and not the dock, so both stay reachable -- while Full takes
+ * the display, bar and dock included, for a video or a game. Every other
+ * system makes you learn which of its two similar-looking buttons is which;
+ * this one shows you both and names them. */
+typedef enum {
+    EmWinNormal = 0,
+    EmWinFill,          /* the work area: not under the bar, not under the dock */
+    EmWinFull,          /* the whole display, bar and dock covered */
+    EmWinLeft, EmWinRight, EmWinTop, EmWinBottom,   /* halves */
+} EmWinLayout;
+
+/* The toolkit posts a layout during the view; the runtime takes it at the top
+ * of the next pass and does the resize (it owns the shared pixel mapping).
+ * Apps do not call these -- em_app_run does. */
+void em_window_post_layout(EmWinLayout want);
+int  em_window_take_layout(EmWinLayout *out);   /* 1 if one was posted */
 EmV  em_max_button(void);              /* fill the work area, or come back to size */
 int  em_window_minimized(void);        /* 1 if the built-in MinimizeButton fired this frame */
 /* CloseGrip: EmbLink's own close GESTURE (not a fixed button). Put it in the

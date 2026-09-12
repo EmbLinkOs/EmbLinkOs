@@ -34,6 +34,15 @@ struct comp_window {
                              * pixels; the compositor BLURS the backdrop behind it
                              * and composites the window over it (frosted acrylic).
                              * Implies chromeless (the app owns its own chrome). */
+    /* 1 = this window COVERS THE DISPLAY, so the work-area clamp in
+     * compositor_win_move does not apply to it. Derived, never declared: a
+     * window whose content is exactly the size of the screen IS full screen,
+     * and deriving it means an app cannot forget to clear the flag when it
+     * shrinks again. See the shell's zoom board (ui/dsl/em.c): "Fill" takes
+     * the work area and leaves the bar and dock reachable, "Full" takes the
+     * display, and the difference is only real if the kernel lets the second
+     * one happen. */
+    int       fullscreen;
     int       translucent;  /* 1 = per-pixel translucent, NO blur (like the desktop
                              * but a raisable floating window): starts transparent
                              * and composites over the SHARP backdrop. Lets a thin
@@ -330,44 +339,39 @@ uint32_t compositor_focused_pid(void) {
     return pid;
 }
 
-/* ---- the window control cluster ----------------------------------------- *
+/* ---- the three window lights -------------------------------------------- *
  *
- * THREE SEGMENTS IN ONE HAIRLINE FRAME, LEADING: minimize, maximize, close.
- * Identical in shape and order to the toolkit's (ui/dsl/em.c, where the
- * reasoning is written out), because a window that gets its chrome from the
- * kernel and a window that draws its own must not be two different operating
- * systems. Every app this OS ships is chromeless and draws its own, so this
- * path is what everything ELSE gets -- and "everything else" is exactly who
- * cannot be relied on to match the house style by itself.
+ * Close, minimize, zoom -- leading, round, 13px in a 24px hit case, exactly
+ * the geometry and order the toolkit uses (ui/dsl/em.c, where the reasoning
+ * is written out). A window that gets its chrome from the kernel and a window
+ * that draws its own must not be two different operating systems, and every
+ * app this OS ships draws its own -- so this path is what everything ELSE
+ * gets, which is precisely who cannot be relied on to match the house style.
  *
- * What was here: three filled circles on the RIGHT, in a grey that never
- * changed, with the comment below them claiming minimize and maximize were
- * "deliberately rendered as disabled chrome until the compositor exposes
- * minimize/maximize lifecycle operations". The compositor had exposed them
- * long since -- both buttons have had working hit rects and real behaviour
- * (park, and EMBK_WIN_ACTION_MAXIMIZE) for some time. The comment was stale
- * and the paint was the only thing still saying "disabled". */
-#define COMP_SEG_W  24
-#define COMP_SEG_H  18
-#define COMP_CLOSE_SZ COMP_SEG_H       /* kept: other code measures against it */
+ * The colours are the toolkit's theme, resolved here as constants because the
+ * kernel has no theme: danger, a quiet slate, and the accent. NOT red / amber
+ * / green -- see em.c. */
+#define COMP_HIT      24
+#define COMP_DOT      13
+#define COMP_CLOSE_SZ COMP_DOT        /* kept: other code measures against it */
 
-static int win_seg_rect(const struct comp_window *w, int seg,
-                        int *x0, int *y0, int *x1, int *y1) {
+static int win_light_rect(const struct comp_window *w, int seg,
+                          int *x0, int *y0, int *x1, int *y1) {
     if (w->desktop || w->chromeless) return 0;
-    *x0 = w->x + 8 + seg * COMP_SEG_W;
-    *y0 = w->y + (COMP_TITLEBAR_H - COMP_SEG_H) / 2;
-    *x1 = *x0 + COMP_SEG_W;
-    *y1 = *y0 + COMP_SEG_H;
+    *x0 = w->x + 6 + seg * COMP_HIT;
+    *y0 = w->y + (COMP_TITLEBAR_H - COMP_HIT) / 2;
+    *x1 = *x0 + COMP_HIT;
+    *y1 = *y0 + COMP_HIT;
     return 1;
 }
+static int win_close_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
+    return win_light_rect(w, 0, x0, y0, x1, y1);
+}
 static int win_min_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
-    return win_seg_rect(w, 0, x0, y0, x1, y1);
+    return win_light_rect(w, 1, x0, y0, x1, y1);
 }
 static int win_max_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
-    return win_seg_rect(w, 1, x0, y0, x1, y1);
-}
-static int win_close_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
-    return win_seg_rect(w, 2, x0, y0, x1, y1);
+    return win_light_rect(w, 2, x0, y0, x1, y1);
 }
 
 /* ---- rounded corners ---------------------------------------------------- *
@@ -752,46 +756,47 @@ static void paint_window(struct comp_window *w, int focused,
             fb_color_t bar = focused ? FB_RGB(0x24, 0x24, 0x24) : FB_RGB(0x20, 0x20, 0x20);
             fill_clip(tbx0, tby0, (int)w->cw, COMP_TITLEBAR_H, bar, rx0, ry0, rx1, ry1);
 
-            /* The control cluster, leading: a hairline frame with two dividers
-             * and a glyph per segment. Glyphs are always drawn -- the house
-             * rule (ui/dsl/em.c): a control that only says what it does when
-             * you are already touching it is no use to anyone who has not
-             * learned it yet, and nobody has learned this OS's window
-             * controls. */
-            int s0x0, s0y0, s0x1, s0y1;
-            if (win_seg_rect(w, 0, &s0x0, &s0y0, &s0x1, &s0y1)) {
-                int gy   = (s0y0 + s0y1) / 2;
-                int fx1  = s0x0 + 3 * COMP_SEG_W;
-                fb_color_t line  = focused ? FB_RGB(0x3a, 0x3e, 0x46) : FB_RGB(0x2e, 0x31, 0x37);
-                fb_color_t glyph = focused ? FB_RGB(0x9b, 0xa1, 0xad) : FB_RGB(0x6a, 0x71, 0x80);
+            /* The lights. Dimmed as a set when the window is not focused --
+             * one lit corner on screen at a time says which window the
+             * keyboard belongs to, which is most of what an unfocused title
+             * bar is for. */
+            static const struct { uint8_t r, g, b; } LIT[3] = {
+                { 0xF2, 0x55, 0x5A },   /* close    -- theme danger        */
+                { 0x6A, 0x71, 0x80 },   /* minimize -- theme text_tertiary */
+                { 0x7C, 0x82, 0xFF },   /* zoom     -- theme accent        */
+            };
+            for (int i = 0; i < 3; i++) {
+                int lx0, ly0, lx1, ly1;
+                if (!win_light_rect(w, i, &lx0, &ly0, &lx1, &ly1)) break;
+                int cx = (lx0 + lx1) / 2, cy = (ly0 + ly1) / 2;
+                int rr = focused ? LIT[i].r : (LIT[i].r * 45) / 100;
+                int gg = focused ? LIT[i].g : (LIT[i].g * 45) / 100;
+                int bb = focused ? LIT[i].b : (LIT[i].b * 45) / 100;
+                fb_fill_circle(cx, cy, COMP_DOT / 2, FB_RGB(rr, gg, bb));
 
-                /* frame */
-                fb_draw_line(s0x0, s0y0, fx1,  s0y0, line);
-                fb_draw_line(s0x0, s0y1, fx1,  s0y1, line);
-                fb_draw_line(s0x0, s0y0, s0x0, s0y1, line);
-                fb_draw_line(fx1,  s0y0, fx1,  s0y1, line);
-                /* dividers */
-                fb_draw_line(s0x0 + COMP_SEG_W,     s0y0, s0x0 + COMP_SEG_W,     s0y1, line);
-                fb_draw_line(s0x0 + 2 * COMP_SEG_W, s0y0, s0x0 + 2 * COMP_SEG_W, s0y1, line);
+                /* The glyph, ALWAYS -- the toolkit's rule, for the same
+                 * reason: nobody has learned this OS's window controls yet. */
+                fb_color_t ink = FB_RGB(0x1a, 0x1a, 0x1e);
+                if (i == 0) {                       /* close: a cross */
+                    fb_draw_line(cx - 3, cy - 3, cx + 3, cy + 3, ink);
+                    fb_draw_line(cx + 3, cy - 3, cx - 3, cy + 3, ink);
+                } else if (i == 1) {                /* minimize: a rule */
+                    fb_draw_line(cx - 3, cy, cx + 3, cy, ink);
+                } else {                            /* zoom: a square */
+                    fb_draw_line(cx - 3, cy - 3, cx + 3, cy - 3, ink);
+                    fb_draw_line(cx - 3, cy + 3, cx + 3, cy + 3, ink);
+                    fb_draw_line(cx - 3, cy - 3, cx - 3, cy + 3, ink);
+                    fb_draw_line(cx + 3, cy - 3, cx + 3, cy + 3, ink);
+                }
+            }
 
-                /* minimize: a rule */
-                int c0 = s0x0 + COMP_SEG_W / 2;
-                fb_draw_line(c0 - 4, gy, c0 + 4, gy, glyph);
-                /* maximize: an outlined square */
-                int c1 = s0x0 + COMP_SEG_W + COMP_SEG_W / 2;
-                fb_draw_line(c1 - 4, gy - 4, c1 + 4, gy - 4, glyph);
-                fb_draw_line(c1 - 4, gy + 4, c1 + 4, gy + 4, glyph);
-                fb_draw_line(c1 - 4, gy - 4, c1 - 4, gy + 4, glyph);
-                fb_draw_line(c1 + 4, gy - 4, c1 + 4, gy + 4, glyph);
-                /* close: a cross */
-                int c2 = s0x0 + 2 * COMP_SEG_W + COMP_SEG_W / 2;
-                fb_draw_line(c2 - 4, gy - 4, c2 + 4, gy + 4, glyph);
-                fb_draw_line(c2 + 4, gy - 4, c2 - 4, gy + 4, glyph);
-
-                /* The title sits after the cluster, not at the window's edge --
-                 * one region of chrome instead of two. */
+            /* The title sits after the lights, not at the window's edge: one
+             * region of chrome instead of two. */
+            {
+                int lx0, ly0, lx1, ly1;
+                int tx = win_light_rect(w, 2, &lx0, &ly0, &lx1, &ly1) ? lx1 + 8 : tbx0 + 12;
                 int tr = focused ? 0xf2 : 0xa8;
-                fb_draw_string(w->title, fx1 + 10, tby0 + (COMP_TITLEBAR_H - 16) / 2,
+                fb_draw_string(w->title, tx, tby0 + (COMP_TITLEBAR_H - 16) / 2,
                                tr, tr, tr, 0x24, 0x24, 0x24);
             }
         }
@@ -1321,6 +1326,7 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);   /* old footprint */
     ophys = w->phys; onpages = w->npages; okview = w->kview; ocva = w->client_va; opml4 = w->client_pml4;
     w->cw = nw; w->ch = nh;
+    w->fullscreen = (nw >= fi->width && nh >= fi->height);
     w->content = (uint32_t *)kview;
     w->phys = phys; w->npages = npages; w->kview = kview;
     w->client_va = cva; w->client_pml4 = client->pml4_phys;
@@ -1431,8 +1437,16 @@ int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y) {
     int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
     const fb_info_t *fi = fb_get_info();
     /* A translucent bar IS the top-strip chrome, so it may sit above WORK_TOP
-     * (a menu bar at y=6). Ordinary app windows still stay in the work area. */
-    if (!w->desktop && !w->widget && !w->translucent && fi) {
+     * (a menu bar at y=6). Ordinary app windows still stay in the work area --
+     * and so a window can never be dragged under the bar or the dock, which is
+     * what keeps the shell reachable.
+     *
+     * A FULL-SCREEN window is the exception, and it has to be: covering the
+     * display is the whole difference between the zoom board's "Full" and its
+     * "Fill", and without this the two did the same thing. Measured before the
+     * exemption: asking for the display and y=0 left the bar untouched,
+     * because this clamp put the window back under it. */
+    if (!w->desktop && !w->widget && !w->translucent && !w->fullscreen && fi) {
         int maxx = (int)fi->width - (int)w->cw;
         int maxy = (int)fi->height - WORK_BOTTOM - win_titlebar_h(w) - (int)w->ch;
         if (maxx < 0) maxx = 0;

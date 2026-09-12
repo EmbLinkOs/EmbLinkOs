@@ -347,6 +347,14 @@ int em_app_run(const EmApp *app) {
     int pace = app->pace_ms > 0 ? app->pace_ms : 10;
     int prev_epoch = em_ui_epoch(), first = 1;
     int maximized = 0;
+    /* Where the window is RIGHT NOW, and what it was before a placement moved
+     * it. The runtime never knew its own position before: it told the
+     * compositor where to put the window and then forgot, which is fine while
+     * "restore" is the only thing that ever moves it back. With six
+     * placements, going Left then Right has to restore the size the window had
+     * when it was last normal, so both have to be tracked. */
+    EmWinLayout layout_now = EmWinNormal;
+    int wx_now = wx, wy_now = wy;
     int normal_x = wx, normal_y = wy, normal_w = winw, normal_h = winh;
     int thin_h = winh, menu_expanded = 0;   /* translucent menu-bar auto-grow */
     struct embk_win_input prev_in; memset(&prev_in, 0, sizeof prev_in);
@@ -375,21 +383,53 @@ int em_app_run(const EmApp *app) {
         struct embk_win_input in;
         embk_win_input(&in);
 
-        /* The window's OWN maximize button, folded into the compositor's path:
-         * the toolkit sets a flag during the view (which runs later in this
-         * iteration), and the next pass treats it exactly as if the request
-         * had arrived from outside. ONE resize path, so the button and the
-         * title-bar action cannot end up doing two different things. */
-        if (em_window_take_maximize()) in.win = EMBK_WIN_ACTION_MAXIMIZE;
+        /* WHERE THE WINDOW GOES, from the zoom light's board (the toolkit
+         * posts a layout during the view) or from the compositor's own
+         * title-bar action. Both arrive here and take the SAME path, so the
+         * button and the chrome cannot end up doing two different things.
+         *
+         * The resize has to happen in the client: it owns the shared pixel
+         * mapping, and the toolkit's scene renderer has to be rebuilt around
+         * the new one. */
+        EmWinLayout want = EmWinNormal;
+        int have_want = em_window_take_layout(&want);
+        if (!have_want && em_window_take_maximize()) { want = EmWinFill; have_want = 1; }
+        if (!have_want && in.win == EMBK_WIN_ACTION_MAXIMIZE) {
+            /* The kernel chrome's zoom button is a TOGGLE, because it has no
+             * board to offer: fill, or go back. */
+            want = layout_now == EmWinFill ? EmWinNormal : EmWinFill;
+            have_want = 1;
+        }
 
-        /* Native maximize/restore request from the compositor. Resizing must
-         * happen in the client because it owns the shared pixel mapping. */
-        if (in.win == EMBK_WIN_ACTION_MAXIMIZE && !app->fullscreen) {
-            int nw = maximized ? normal_w : (int)sw;
-            int nh = maximized ? normal_h : (int)sh - 32 - dock_band - 26;
-            int nx = maximized ? normal_x : 0;
-            int ny = maximized ? normal_y : 32;
+        if (have_want && !app->fullscreen) {
+            /* THE WORK AREA: the display minus the top bar and minus the dock
+             * band. Every placement but Full is measured inside it, which is
+             * what makes "Fill" different from "Full" and why both are offered
+             * -- one leaves the shell reachable, the other does not. */
+            int ax = 0, ay = 32;
+            int aw = (int)sw, ah = (int)sh - 32 - dock_band;
+            int nx = normal_x, ny = normal_y, nw = normal_w, nh = normal_h;
+
+            switch (want) {
+            case EmWinNormal:                                            break;
+            case EmWinFill:   nx = ax; ny = ay; nw = aw; nh = ah - 26;    break;
+            case EmWinFull:   nx = 0;  ny = 0;  nw = (int)sw; nh = (int)sh; break;
+            case EmWinLeft:   nx = ax; ny = ay; nw = aw / 2; nh = ah - 26; break;
+            case EmWinRight:  nx = ax + aw / 2; ny = ay; nw = aw - aw / 2; nh = ah - 26; break;
+            case EmWinTop:    nx = ax; ny = ay; nw = aw; nh = (ah - 26) / 2; break;
+            case EmWinBottom: nh = (ah - 26) / 2; nx = ax; ny = ay + nh;  nw = aw; break;
+            }
+            if (nw < 200) nw = 200;
             if (nh < 160) nh = 160;
+
+            /* Remember where it was, but only when LEAVING the normal state --
+             * otherwise going Left and then Right would record the left half
+             * as "normal" and there would be no way back to the size the
+             * window actually had. */
+            if (layout_now == EmWinNormal && want != EmWinNormal) {
+                normal_x = wx_now; normal_y = wy_now; normal_w = winw; normal_h = winh;
+            }
+
             uint32_t *npx = 0;
             if (embk_win_resize(win, (uint32_t)nw, (uint32_t)nh, (void **)&npx) >= 0 && npx) {
                 px = npx; winw = nw; winh = nh;
@@ -399,9 +439,11 @@ int em_app_run(const EmApp *app) {
                 rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
                 rt.stride = (uint32_t)winw * 4;
                 embk_win_move(win, nx, ny);
+                wx_now = nx; wy_now = ny;
                 scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                 em_request_frame();
-                maximized = !maximized;
+                layout_now = want;
+                maximized = (want == EmWinFill || want == EmWinFull);
             }
         }
 

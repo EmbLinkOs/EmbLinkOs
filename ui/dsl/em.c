@@ -367,9 +367,6 @@ static bool em_listrow_impl(int cp, const char *title, const char *value, EmProp
 static bool em_closebtn_impl(bool *hov);
 static bool em_minbtn_impl(bool *hov);
 static bool em_maxbtn_impl(bool *hov);
-static void em_wc_open(void);
-static void em_wc_divider(void);
-static void em_wc_close(void);
 static bool em_search_impl(char *buf, size_t cap, const char *ph, bool *hov);
 static void em_spinner_impl(void);
 static bool em_dropdown_impl(const char *const *labels, int count, int *sel, bool *hov);
@@ -1254,7 +1251,7 @@ void em_appbar_(const char *title, EmProps p) {
     ui_set_border(0, t->border);
     em_apply_box(p);
 
-    em_window_controls();            /* leading: minimize, maximize, close */
+    em_window_controls();            /* leading: close, minimize, zoom */
 
     /* Title, centred in whatever space is left between the lights and the
      * app's own controls, and the drag zone at the same time -- so the bar is
@@ -1290,123 +1287,292 @@ void em_drag_handle_(EmProps p) {
 }
 void em_drag_handle_end_(void) { em_flush(); ui_end_stack(); }
 
-/* ---- window controls: the cluster --------------------------------------- *
+/* ---- window controls: the three lights ----------------------------------- *
  *
- * WHAT WAS HERE, AND WHY IT IS NOT ANY MORE. Two coloured dots -- #FF5F57 and
- * #28C840, 13px in a 24px hit case, glyph on hover only -- and the comment
- * above them said "which is the whole point of the Mac design". It was a good
- * copy. That is the problem: an operating system that ships another system's
- * window controls is wearing its face, and every other difference downstream
- * reads as a variation on that face rather than as a design of its own.
+ * ROUND LIGHTS, because the shape is right: colour is legible at any size and
+ * from the corner of your eye, where a row of grey glyph-boxes is not. That is
+ * the Mac's insight and it is worth keeping.
  *
- * So: ONE CONTROL, not three. A hairline-framed cluster with the three
- * segments divided by hairlines, glyphs ALWAYS drawn, colour spent only on
- * hover -- and only ever on the segment under the pointer, in the tone that
- * says what it will do (danger for close, a plain fill for the other two).
+ * What is NOT kept is the rest of the Mac's version, and what replaces it is
+ * meant to be better rather than merely different:
  *
- * The reasoning, made explicit, because it is the opposite of the Mac's:
+ *   * THE GLYPH IS ALWAYS DRAWN. The Mac shows its symbols only under the
+ *     pointer, which it can afford because a generation already knows which
+ *     colour does what. Nobody knows ours. A light that says what it does at
+ *     rest is strictly more useful, and the cost -- a little ink inside the
+ *     dot -- is one the design can pay.
+ *   * OUR PALETTE, NOT RED / AMBER / GREEN. Close is the danger tone, zoom is
+ *     the ACCENT (the one colour this OS spends boldness on, theme.h), and
+ *     minimize is a quiet slate. Two loud dots per window plus a neutral is a
+ *     calmer corner than three loud ones, and the accent ties the window's
+ *     controls to every other live thing on screen -- a running app's dock
+ *     socket carries the same colour.
+ *   * THE ZOOM LIGHT IS A DOOR, NOT A TOGGLE. Resting on it opens a small
+ *     board of PLACEMENTS -- halves, the work area, the whole display -- so
+ *     "make this bigger" stops being one guess about what you meant. See
+ *     em_zoom_board().
  *
- *   * COLOUR AT REST IS EXPENSIVE. Two saturated dots in the corner of every
- *     window are, together, the loudest thing on a desktop full of windows.
- *     This OS spends boldness on one accent (theme.h says so in as many
- *     words), and window furniture is not where to spend it.
- *   * A GLYPH YOU CAN ONLY SEE ON HOVER IS A GLYPH YOU CANNOT USE. The Mac can
- *     afford that because a generation already knows red-means-close. Nobody
- *     knows this OS's window controls, so they have to say what they are.
- *   * THREE SEGMENTS IN ONE FRAME read as one instrument with three positions,
- *     which is what they are, and gives a grouping that needs no spacing rules
- *     to hold together at any size.
- *
- * They stay LEADING (top-left), which is not the Mac's idea -- it is just the
- * better corner: it is where the window's title already is, so the eye finds
- * one region of chrome instead of two, and it is nowhere near a scrollbar.
- *
- * Order is minimize, maximize, close: the destructive one last and outermost,
- * which is every toolkit's convention and a real protection against a
- * mis-aimed click ending your work. */
-#define WC_SEG_W  24
-#define WC_SEG_H  18
+ * The dot is 13px inside a 24px hit case: the case is deliberately larger than
+ * the light and completely transparent, so Fitts' law is satisfied by the hit
+ * area while the eye sees a small tidy light. */
+#define TL_DOT  13
+#define TL_HIT  24
 
-static bool em_wc_segment(int cp, bool destructive, bool *out_hov) {
-    const struct ui_theme *t = TH;
+/* The ink inside a light. Dark on the light dots, so it reads as a hole in the
+ * colour rather than as a second colour. */
+static Color tl_ink(void) { return (Color){ 0.f, 0.f, 0.f, 0.62f }; }
+
+static bool em_light_impl(int cp, Color base, bool *out_hov, float *out_rect) {
     ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
     if (out_hov) *out_hov = hov;
-    ui_set_size(sz_fixed(WC_SEG_W), sz_fixed(WC_SEG_H));
+    ui_set_size(sz_fixed(TL_HIT), sz_fixed(TL_HIT));
+    ui_set_paint(solid((Color){ 0.f, 0.f, 0.f, 0.f }));   /* the case is invisible */
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
 
-    /* Fill and ink are BOTH set on every path -- the retained-instance rule
-     * em_apply_box documents: a segment that stops being hovered has to say
-     * "no fill" out loud or it keeps the last one and the cluster ends up with
-     * two lit segments. */
-    Color fill = { 0, 0, 0, 0 };
-    Color ink  = t->text_secondary;
-    if (hov) {
-        fill = destructive ? t->danger : t->surface_alt;
-        ink  = destructive ? (Color){ 1.f, 1.f, 1.f, 1.f } : t->text;
-        if (pressed) fill = shade(fill, 0.86f);
-    }
-    ui_set_paint(fill.a > 0 ? solid(fill) : (struct paint){ 0 });
-
-    EmProps ip = { .font = Caption, .color = ink };
-    em_icon_impl(cp, ip);
+    ui_box_begin(1);
+    ui_set_size(sz_fixed(TL_DOT), sz_fixed(TL_DOT));
+    ui_set_paint(solid(pressed ? shade(base, 0.80f) : hov ? shade(base, 1.12f) : base));
+    ui_set_corner_radius((float)TL_DOT / 2.0f);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_justify(JUSTIFY_CENTER);
+    { EmProps ip = { .font = Caption, .color = tl_ink() }; em_icon_impl(cp, ip); }
+    ui_box_end();
 
     ui_end_stack();
+    /* Last frame's arranged geometry of the hit case -- what the zoom board
+     * hangs from. Read AFTER the box is closed, which is fine: the handle
+     * names a retained instance, not a stack position. */
+    if (out_rect) {
+        float x, y, w, h;
+        out_rect[0] = out_rect[1] = out_rect[2] = out_rect[3] = 0.f;
+        if (ui_rect_of(self, &x, &y, &w, &h)) {
+            out_rect[0] = x; out_rect[1] = y; out_rect[2] = w; out_rect[3] = h;
+        }
+    }
     return ui_consume_click(self);
 }
 
-/* The frame the segments sit in: opened and closed explicitly rather than
- * through a scope macro, because the caller has to emit three staged widgets
- * between the two halves. Spacing zero -- the dividers do the separating, and
- * the bar's own spacing must not get inside the cluster. */
-static void em_wc_open(void) {
-    const struct ui_theme *t = TH;
-    ui_begin_hstack(0x77C1);
-    ui_set_spacing(0);
-    ui_set_align(ALIGN_CENTER);
-    ui_set_corner_radius(t->radius_sm);
-    ui_set_border(1, t->border);
-    ui_set_clip_children(true);      /* so a hovered end segment keeps the radius */
-    ui_set_paint((struct paint){ 0 });
-}
-static void em_wc_divider(void) {
-    const struct ui_theme *t = TH;
-    ui_box_begin(0);
-    ui_set_size(sz_fixed(1), sz_fixed(WC_SEG_H));
-    ui_set_paint(solid(t->border));
-    ui_box_end();
-}
-static void em_wc_close(void) { ui_end_stack(); }
+/* ---- the zoom board ------------------------------------------------------ *
+ *
+ * Six placements, drawn as six little SCREENS with the window's share filled
+ * in. Pictures rather than words because the answer to "where will it go" is a
+ * shape, and a shape is what the eye is asking; each still carries its name
+ * underneath, because a picture 44px wide can be guessed wrong.
+ *
+ * It opens on HOVER and closes when the pointer leaves both the light and the
+ * board -- with a margin, so crossing the gap between them does not dismiss
+ * the thing you are reaching for. It lives inside the window's own surface (an
+ * app cannot paint outside its window), which is why it hangs BELOW the light
+ * rather than above it. */
+static int      g_zoom_open;
+static float    g_zoom_rect[4];        /* last frame's board rect, for hit-testing */
+static int      g_zoom_have_rect;
+static float    g_zoom_anchor_x, g_zoom_anchor_y;
+static float    g_zoom_light[4];       /* the light's own rect, in window coords */
 
-/* The whole cluster, for a bar an app assembles itself (Note++ and Vellum put
- * their window controls at the head of a TAB STRIP rather than in an AppBar).
- * Exposed as one call so those bars cannot end up with a different set, a
- * different order, or no frame -- which is exactly what they had: two bare
- * buttons, close first, in the order the Mac lights used to be in. */
-void em_window_controls(void) {
-    em_wc_open();
-    em_min_button();   em_flush();
-    em_wc_divider();
-    em_max_button();   em_flush();
-    em_wc_divider();
-    em_close_button(); em_flush();
-    em_wc_close();
+/* One placement tile: a screen with the window's share filled. `cols`/`rows`
+ * say how the screen is split and `on` which cell the window takes; `inset`
+ * draws the bar and dock as the strips the window does NOT cover. */
+static bool em_zoom_tile(const char *label, int cols, int rows, int on, int inset) {
+    const struct ui_theme *t = TH;
+    /* EXPLICIT CELL ARITHMETIC, not grow/grow. The first version built the
+     * screen out of grow-sized rows and cells, and every diagram came out
+     * EMPTY -- six labelled boxes with nothing drawn in them, which is a
+     * picker that has stopped picturing anything. A leaf box with no content
+     * and nothing but grow on both axes has no size to grow from here. The
+     * screen is 46x30; dividing that by hand is three lines and cannot
+     * collapse. */
+    const float SCR_W = 46.0f, SCR_H = 30.0f;
+    const float pad   = inset ? 3.0f : 0.0f;        /* the bar and dock strips */
+    const float cw    = SCR_W / (float)cols;
+    const float chh   = (SCR_H - 2.0f * pad) / (float)rows;
+
+    bool clicked = false;
+    ui_begin_vstack((uint64_t)(uintptr_t)label);
+    struct instance_handle self = ui_open();
+    bool hov = ui_is_hovered();
+    ui_set_size(sz_fixed(58), sz_intrinsic());
+    ui_set_align(ALIGN_CENTER);
+    ui_set_spacing(3);
+    ui_set_padding(4, 4, 4, 4);
+    ui_set_corner_radius(t->radius_sm);
+    ui_set_paint(hov ? solid(t->surface_alt) : (struct paint){ 0 });
+
+    /* the little screen */
+    ui_begin_vstack(1);
+    ui_set_size(sz_fixed(SCR_W), sz_fixed(SCR_H));
+    ui_set_paint(solid(t->bg));
+    ui_set_border(1, hov ? t->accent : t->border_strong);
+    ui_set_corner_radius(3);
+    ui_set_padding(pad, 0, pad, 0);
+    ui_set_spacing(0);
+    for (int r = 0; r < rows; r++) {
+        ui_begin_hstack((uint64_t)(r + 1));
+        ui_set_size(sz_fixed(SCR_W), sz_fixed(chh));
+        ui_set_spacing(0);
+        ui_set_paint((struct paint){ 0 });
+        for (int c = 0; c < cols; c++) {
+            int idx = r * cols + c;
+            int lit = (on < 0) || (idx == on);
+            ui_box_begin((uint64_t)(idx + 1));
+            ui_set_size(sz_fixed(cw), sz_fixed(chh));
+            ui_set_paint(lit ? solid(tint(t->accent, hov ? 1.0f : 0.75f))
+                             : (struct paint){ 0 });
+            ui_box_end();
+        }
+        ui_end_stack();
+    }
+    ui_end_stack();
+
+    { EmProps lp = { .font = Caption, .color = hov ? t->text : t->text_secondary };
+      em_text_impl(label, lp); }
+
+    if (ui_consume_click(self)) clicked = true;
+    ui_end_stack();
+    return clicked;
+}
+
+/* The menu machinery, declared early: the board is built on the SAME overlay
+ * the menus use. See em_zoom_board for why. */
+static void em_menu_panel_open(uint64_t key, float ax, float ay);
+static int  em_menu_panel_close(void);
+
+static void em_zoom_board(void) {
+    if (!g_zoom_open) { g_zoom_have_rect = 0; return; }
+
+    /* BUILT ON THE MENU PANEL, and that is a correction rather than a
+     * convenience. The first version hand-rolled its own overlay -- window
+     * sized, layer 2, a panel positioned with ui_set_offset -- copying the
+     * shape of em_menu_panel_open without using it. It DREW correctly and was
+     * completely dead to the pointer, and the reason took a trace inside the
+     * guest to see: the panel's arranged rect stayed 0x0 (`ZOOMDBG panel ok=1
+     * 0,0 0x0`) even while its children painted in the right places. An
+     * out-of-flow box that is never given geometry is never hit either.
+     *
+     * The menus have solved this in this exact position -- an overlay hanging
+     * out of a 26px bar -- for a long time. Using their opener means the board
+     * inherits that, and means a future fix to overlay positioning fixes both
+     * rather than one of them. */
+    em_flush();
+    em_menu_panel_open(0x2004B, g_zoom_anchor_x - 8.0f, g_zoom_anchor_y + 6.0f);
+
+    EmWinLayout pick = EmWinNormal;
+    int picked = 0;
+    for (int row = 0; row < 2; row++) {
+        ui_begin_hstack((uint64_t)(0x10 + row));
+        ui_set_spacing(2);
+        ui_set_paint((struct paint){ 0 });
+        if (row == 0) {
+            if (em_zoom_tile("Left",   2, 1,  0, 0)) { pick = EmWinLeft;   picked = 1; }
+            if (em_zoom_tile("Right",  2, 1,  1, 0)) { pick = EmWinRight;  picked = 1; }
+            if (em_zoom_tile("Top",    1, 2,  0, 0)) { pick = EmWinTop;    picked = 1; }
+        } else {
+            if (em_zoom_tile("Bottom", 1, 2,  1, 0)) { pick = EmWinBottom; picked = 1; }
+            if (em_zoom_tile("Fill",   1, 1, -1, 1)) { pick = EmWinFill;   picked = 1; }
+            if (em_zoom_tile("Full",   1, 1, -1, 0)) { pick = EmWinFull;   picked = 1; }
+        }
+        ui_end_stack();
+    }
+    em_flush();
+    int outside = em_menu_panel_close();
+
+    if (picked) {
+        em_window_post_layout(pick);
+        g_zoom_open = 0;
+    } else if (outside) {
+        /* A CLICK ON THE LIGHT ITSELF still means "fill". The board's scrim
+         * covers the whole window, the light included, so the light's own
+         * handler never sees that press -- and since the board opens on hover,
+         * that is the state every click on the light is made in. */
+        float px, py; ui_pointer_pos(&px, &py);
+        int on_light = px >= g_zoom_light[0] && px <= g_zoom_light[2] &&
+                       py >= g_zoom_light[1] && py <= g_zoom_light[3];
+        if (on_light) em_window_post_layout(EmWinFill);
+        g_zoom_open = 0;
+    }
+}
+
+/* Close the board once the pointer has left both it and the light it hangs
+ * from. The extent is COMPUTED from the anchor rather than read back from the
+ * panel: the panel is the menus' and its arranged rect is not ours to trust
+ * (see em_zoom_board). Generous margins, because the gap between the light and
+ * the board is a place the pointer legitimately passes through on its way to
+ * the thing it is reaching for. */
+#define ZB_W 200.0f
+#define ZB_H 130.0f
+static void em_zoom_track(void) {
+    if (!g_zoom_open) return;
+    float px, py; ui_pointer_pos(&px, &py);
+
+    /* TWO RECTS, NOT THEIR BOUNDING BOX. The first version kept the board open
+     * anywhere in the union of the light and the board, and that union is a
+     * tall rectangle whose top-left corner covers the OTHER TWO LIGHTS -- so
+     * with the board up, the scrim ate every click on minimize and close.
+     * (Measured: minimize stopped working the moment the board existed.)
+     *
+     * Being inside the light, inside the board, or in the small gap between
+     * them keeps it open. Anywhere else -- including the neighbouring lights,
+     * eight pixels away -- closes it. */
+    int in_light = px >= g_zoom_light[0] - 4.0f && px <= g_zoom_light[2] + 4.0f &&
+                   py >= g_zoom_light[1] - 4.0f && py <= g_zoom_light[3] + 4.0f;
+
+    float bx0 = g_zoom_anchor_x - 8.0f, by0 = g_zoom_anchor_y + 6.0f;
+    const float m = 12.0f;
+    int in_board = px >= bx0 - m && px <= bx0 + ZB_W + m &&
+                   py >= by0 - m && py <= by0 + ZB_H + m;
+
+    if (!in_light && !in_board) g_zoom_open = 0;
 }
 
 static bool em_closebtn_impl(bool *out_hov) {
-    return em_wc_segment(IconClose, true, out_hov);
+    /* The danger tone, not the Mac's #FF5F57. Close is the one control whose
+     * colour has to be learned from nothing, so it borrows the one the rest of
+     * the OS already uses to mean "this destroys something". */
+    return em_light_impl(IconClose, TH->danger, out_hov, 0);
 }
 static bool em_minbtn_impl(bool *out_hov) {
-    return em_wc_segment(IconMinus, false, out_hov);
+    /* A quiet slate where the Mac has amber: minimizing is the least eventful
+     * thing a window does, and a third loud dot in every corner of the screen
+     * buys nothing. */
+    return em_light_impl(IconMinus, TH->text_tertiary, out_hov, 0);
 }
 static bool em_maxbtn_impl(bool *out_hov) {
+    bool hov = false;
     /* U+25A1 WHITE SQUARE -- checked against DejaVuSans's cmap (gid 3705), the
      * way the icon table above demands, rather than assumed. U+26F6 (the
      * "square four corners" that would have been the obvious pick) is NOT in
      * the font and would have drawn a tofu box in every title bar. */
-    return em_wc_segment(0x25A1, false, out_hov);
+    float r[4];
+    bool clicked = em_light_impl(0x25A1, TH->accent, &hov, r);
+    if (out_hov) *out_hov = hov;
+    if (r[3] > 0.f) {
+        g_zoom_light[0] = r[0]; g_zoom_light[1] = r[1];
+        g_zoom_light[2] = r[0] + r[2]; g_zoom_light[3] = r[1] + r[3];
+    }
+    if (hov && r[3] > 0.f) {
+        /* Anchor the board under THIS light, in window coordinates. Refreshed
+         * while hovered rather than latched once: the bar moves when the
+         * window is dragged or resized, and a board pinned to where the light
+         * USED to be is a board floating in the middle of the app. */
+        g_zoom_anchor_x = r[0]; g_zoom_anchor_y = r[1] + r[3];
+        g_zoom_open = 1;
+    }
+    return clicked;
+}
+
+/* The three lights, for a bar an app assembles itself (Note++ and Vellum put
+ * their window controls at the head of a TAB STRIP rather than in an AppBar).
+ * Exposed as one call so those bars cannot end up with a different set or a
+ * different order. */
+void em_window_controls(void) {
+    em_close_button(); em_flush();
+    em_min_button();   em_flush();
+    em_max_button();   em_flush();
+    em_zoom_track();
+    em_zoom_board();
 }
 
 int em_window_closed(void) { return Clicked("__em_win_close"); }
@@ -1417,6 +1583,17 @@ int em_window_maximized(void) { return Clicked("__em_win_max"); }
  * the top of an iteration (it remaps the shared pixel pages the view is in the
  * middle of drawing into). So it is posted here and taken there -- the same
  * one-frame hand-off the close path uses. */
+static int         g_want_layout;
+static EmWinLayout g_layout_want = EmWinNormal;
+
+void em_window_post_layout(EmWinLayout want) { g_layout_want = want; g_want_layout = 1; }
+int  em_window_take_layout(EmWinLayout *out) {
+    if (!g_want_layout) return 0;
+    if (out) *out = g_layout_want;
+    g_want_layout = 0;
+    return 1;
+}
+
 static int g_want_maximize;
 void em_window_post_maximize(void) {
     /* NO em_request_frame() HERE, and that is a measured decision rather than

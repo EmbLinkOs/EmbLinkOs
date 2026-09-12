@@ -26,7 +26,8 @@ your hand is delight another system already did better.
 |---|---|---|
 | Dock icons magnified by pointer distance — the Mac dock's defining gesture, implemented as that | Icons never move or resize | A target that changes size under the pointer is a worse target. The Mac pays that price knowingly for the delight; we are not taking the delight, so we do not owe the price |
 | A 4px dot under a running app | A lit **socket**: the whole tile gets a filled plate and an accent hairline | Whether an app is running is the most useful thing the dock knows. A dot is a footnote; a socket is visible from across the room |
-| Window controls as **traffic lights** — #FF5F57 and #28C840, 13px dots, glyph on hover only | One **cluster**: three segments (minimize, maximize, close) in a single hairline frame, glyphs always drawn, colour only on the segment under the pointer | Two saturated dots per window are the loudest thing on a desktop full of windows, and this OS spends boldness on one accent. A glyph you can only see on hover is unusable to anyone who has not already learned it — and nobody has learned ours |
+| Window controls as **traffic lights** — #FF5F57 and #28C840, 13px dots, glyph on hover only | **Three lights, ours**: the round shape kept, but close is the *danger* tone, zoom is the *accent*, minimize a quiet slate — and every glyph is drawn at rest | The round light is right and worth keeping: colour is legible at any size and from the corner of the eye, where a row of grey glyph-boxes is not. What is not kept is red/amber/green, and hiding the symbol until you are already touching it — the Mac can lean on a generation knowing which colour closes, and nobody has learned ours |
+| The zoom control as a **toggle** (bigger / not bigger) | A **door**: resting on it opens a board of six placements — Left, Right, Top, Bottom, Fill, Full, each drawn as a little screen with the window's share filled in | "Make it bigger" is a guess about what you meant. Offering the placements makes it a choice, and it is the one place where a window manager can add real capability without adding a mode. Clicking the light itself still just fills, for when you did not want to choose |
 | Menu bar carrying **File / Edit / View** | Nothing — only the real system menu | They were static. Twelve words (New, Open, Undo, Redo, Zoom In, Zoom Out) wired to nothing. A Mac menu bar carries the focused app's menus, so this one grew app-shaped menus with no app behind them |
 | Four status glyphs: a star, a bolt, a gear, a heart | `CPU nn%` with a small meter, sampled from `embk_proc_list` | They were connected to nothing. The bar now reports the one thing this OS can state precisely |
 | A hard-coded clock reading **9:41** — Apple's marketing time | The real clock | (Fixed earlier; kept here because it is the same mistake as the glyphs, and it is the clearest example of it) |
@@ -49,13 +50,39 @@ belongs to the system; a pill belongs to whoever invented that pill.
 3. **A control says what it does.** Glyphs are drawn at rest, not revealed on
    hover. Convention can only be leaned on where the convention exists, and
    this OS has none yet.
-4. **Geometry comes from the theme**, not from a constant typed at the call
+4. **Nothing borrowed from Windows either.** Square control boxes in a row are
+   as much someone else's face as three coloured dots, and an OS that avoids
+   one by adopting the other has changed who it is copying, not stopped. The
+   controls here are round because the round light is genuinely the better
+   shape -- colour reads at any size and from the corner of the eye -- and
+   what makes them OURS is the palette, the always-drawn glyphs, and the board
+   behind the zoom light, not the outline.
+5. **Geometry comes from the theme**, not from a constant typed at the call
    site: `radius_lg`, the 8px spacing grid, the type scale. Restyling the OS
    stays one change.
-5. **Units are stated.** CPU is per core, like every `top` ever written, so
+6. **Units are stated.** CPU is per core, like every `top` ever written, so
    four busy cores read 400% — a real number with a real unit, needing no
    knowledge of the core count (which userspace cannot ask for anyway, and
    which is not worth inventing a lie about).
+
+## Fill and Full are two different things, on purpose
+
+The one distinction the zoom board exists to make. **Fill** takes the work
+area — everything that is not the top bar and not the dock — so the shell stays
+reachable. **Full** takes the display, bar and dock covered, for a video or a
+game. Every system has both and most make you discover which of two
+similar-looking buttons is which; this one draws them side by side, names them,
+and shows the difference in the picture (Fill's diagram has the two strips the
+window does not cover).
+
+The distinction needed a kernel change to be real. `compositor_win_move` clamps
+every ordinary app window into the work area — which is what stops a window
+being dragged under the bar or the dock, and is worth keeping — so asking for
+the whole display and y=0 quietly put the window back under the bar, and Full
+did exactly what Fill did. A window whose content is the size of the display is
+now exempt from that clamp. The exemption is DERIVED from the window's size
+rather than declared by the app, so an app cannot leave the flag set after it
+shrinks again.
 
 ## Still open
 
