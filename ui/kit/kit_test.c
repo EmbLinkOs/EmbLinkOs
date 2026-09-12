@@ -10,6 +10,8 @@
 #include "scene.h"
 #include "layout.h"
 #include "kit.h"
+#include "font.h"
+#include "testfont.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -33,6 +35,12 @@ static int clip_get(char *b, unsigned cap) {
     unsigned n = g_clip_n < cap ? g_clip_n : cap;
     memcpy(b, g_clip, n); return (int)n;
 }
+/* A CLOCK WE WIND BY HAND. Real time in a test means a test that is
+ * occasionally wrong on a loaded machine; this one is exact, and it can put
+ * two presses 10 ms or 10 s apart without waiting for either. */
+static uint64_t g_ms = 1000;
+static uint64_t fake_clock(void) { return g_ms; }
+
 static const char *clip_text(void) {
     static char out[257];
     memcpy(out, g_clip, g_clip_n); out[g_clip_n] = 0; return out;
@@ -56,9 +64,25 @@ static void frame(const char *keys) {
     ui_run_layout(400, 300);
 }
 
+/* One press-and-release at a point, with no movement -- a click.
+ *
+ * press_at ADVANCES THE CLOCK first, so consecutive gestures in this file are
+ * separate ones; press_fast does not, and is how a real double-click is
+ * driven. Getting this wrong is quiet and confusing: every press falls inside
+ * the previous one's double-click window, the run climbs, and drags stop
+ * working because a drag deliberately leaves a multi-click's selection alone. */
+static void press_fast(float x, float y) {
+    ui_pointer(x, y, true);
+    frame(NULL);
+    ui_pointer(x, y, false);
+    frame(NULL);
+}
+static void press_at(float x, float y) { g_ms += 900; press_fast(x, y); }
+
 /* Press at one x, drag to another, release -- the way nearly everyone
  * actually selects text. */
 static void drag(float x0, float x1, float y) {
+    g_ms += 900;
     ui_pointer(x0, y, true);
     frame(NULL);
     ui_pointer(x1, y, true);
@@ -70,7 +94,18 @@ static void drag(float x0, float x1, float y) {
 int main(void) {
     printf("=== kit-test: the text field and the keyboard ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
+
+    /* A REAL FONT, or every width this test measures is zero -- and a zero
+     * width does not fail loudly, it agrees with whatever you expected. See
+     * ui/testfont.h: every character is exactly half the text size wide, so a
+     * test can SAY where the caret should land. */
+    static struct testfont TF;
+    uint32_t fh = font_load(TF.data, testfont_build(&TF));
+    if (!fh) { printf("  FAIL: could not build the test font\n"); return 1; }
+    ui_theme_set_fonts(fh, fh);
+
     ui_clipboard_provider(clip_set, clip_get);
+    ui_clock_provider(fake_clock);
 
     frame(NULL);
     CHECK(ui_any_focus(), "a form with autofocus opens with a field focused");
@@ -301,6 +336,21 @@ int main(void) {
      * RELEASE is far outside on purpose: capture is what keeps the selection
      * extending after the pointer has gone, and without it this would stop at
      * the field's edge. */
+    {
+        /* A PRECISE drag: from the very start of the text to the middle of the
+         * 5th character, which is the boundary after "hello". This is the test
+         * that needs a real font -- with everything measuring zero it would
+         * pass for any expectation at all. */
+        const struct ui_theme *th = ui_theme();
+        float adv = testfont_advance(th->text_body);
+        drag(th->sp3 + 0.5f, th->sp3 + adv * 4.0f + adv * 0.5f, 20);
+        frame(COPY);
+        CHECK(!strcmp(clip_text(), "hello"), "a drag selects exactly what it crossed");
+    }
+
+    /* And one that leaves the field entirely: pointer capture keeps it
+     * extending instead of stopping at the edge. */
+    g_clip_n = 0;
     drag(5, 1000, 20);
     frame(COPY);
     CHECK(!strcmp(clip_text(), "hello world"),
@@ -308,6 +358,63 @@ int main(void) {
 
     frame("x");
     CHECK(!strcmp(A, "x"), "and typing replaces what the drag selected");
+
+    /* ---- DOUBLE AND TRIPLE CLICK ---------------------------------------
+     *
+     * The threshold is a real elapsed time, so the test drives a clock it
+     * controls rather than sleeping. Frame counting could not do this job at
+     * all: a retained loop skips frames when nothing moves, so the PAUSE
+     * between two deliberate clicks can be fewer frames than a fast
+     * double-click. */
+    page = 0x8888; autofocus = true; A[0] = 0; g_clip_n = 0; g_ms = 1000;
+    frame(NULL); frame(NULL);
+    frame("hello big_world here");
+
+    /* Land in "big_world": one press, then a second 50 ms later at the same
+     * spot. The underscore is part of the word; the spaces bound it. */
+    /* WHERE TO AIM, computed rather than guessed. The text starts one left
+     * padding (sp3) into the field, and every character of the test font is
+     * exactly half the text size wide. "hello " is six characters, so the
+     * middle of "big_world" is nine and a half in. */
+    const struct ui_theme *th = ui_theme();
+    float adv = testfont_advance(th->text_body);
+    float text_x = th->sp3;
+    #define CHAR_X(n) (text_x + adv * (float)(n) + adv * 0.5f)
+
+    g_ms += 900;  press_fast(CHAR_X(9), 20);
+    g_ms += 50;   press_fast(CHAR_X(9), 20);
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "big_world"),
+          "a double-click selects the whole word, underscore included");
+
+    g_ms += 50;   press_fast(CHAR_X(9), 20); /* the third of the run */
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "hello big_world here"),
+          "a third click takes the whole field");
+
+    /* TOO SLOW IS TWO CLICKS. Past the threshold the run restarts, so this
+     * places a caret and selects nothing. */
+    g_clip_n = 0;
+    g_ms += 900;  press_fast(CHAR_X(9), 20);
+    g_ms += 5000; press_fast(CHAR_X(9), 20);
+    frame(COPY);
+    CHECK(g_clip_n == 0, "two clicks far apart in TIME are not a double-click");
+
+    /* TOO FAR IS TWO CLICKS. Fast, but a different place. */
+    g_clip_n = 0;
+    g_ms += 900;  press_fast(CHAR_X(2), 20);
+    g_ms += 30;   press_fast(CHAR_X(16), 20);
+    frame(COPY);
+    CHECK(g_clip_n == 0, "two clicks far apart on SCREEN are not a double-click");
+
+    /* A word made of multi-byte characters is one word. */
+    A[0] = 0; g_clip_n = 0; frame(NULL);
+    frame("caf\xC3\xA9 noir");
+    g_ms += 900;  press_fast(CHAR_X(1), 20);
+    g_ms += 40;   press_fast(CHAR_X(1), 20);
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "caf\xC3\xA9"), "an accented word is not cut in two");
+    #undef CHAR_X
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

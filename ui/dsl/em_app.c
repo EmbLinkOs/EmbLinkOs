@@ -338,6 +338,12 @@ int em_app_run(const EmApp *app) {
      * is what makes copy and cut work in every field in every application
      * without a single line in any of them. */
     ui_clipboard_provider(emapp_clip_set, emapp_clip_get);
+    /* ...and a clock, for the same reason: the kit cannot ask the kernel what
+     * time it is, and double-click has to know how long ago the last press
+     * was. Counting frames would not do -- this loop skips them when nothing
+     * moves. */
+    ui_clock_provider(embk_uptime_ms);
+
 
     /* THE BACK BUFFER, and the reason for it.
      *
@@ -597,6 +603,7 @@ int em_app_run(const EmApp *app) {
                 embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
                 struct embk_win_input pin;
                 embk_win_input(&pin);
+                ui_pointer_at_time(pin.when);
                 em_feed_pointer((float)pin.x, (float)pin.y,
                                 pin.buttons & EMBK_MOUSE_LEFT,
                                 pin.buttons & EMBK_MOUSE_RIGHT,
@@ -607,6 +614,7 @@ int em_app_run(const EmApp *app) {
             continue;
         }
 
+        ui_pointer_at_time(in.when);   /* when the press HAPPENED, not now */
         em_feed_pointer((float)in.x, (float)in.y,
                         in.buttons & EMBK_MOUSE_LEFT, in.buttons & EMBK_MOUSE_RIGHT,
                         in.wheel, in.focused);
@@ -809,6 +817,7 @@ int em_widget_run(const EmWidget *wg) {
         if (!build) { cad_idle_tick(&cad); embk_sleep_ms(pace); continue; }
         if (tick) last_tick = now;
 
+        ui_pointer_at_time(in.when);   /* when it HAPPENED, not when we noticed */
         if (in.focused) ui_pointer((float)in.x, (float)in.y, (in.buttons & EMBK_MOUSE_LEFT) != 0);
         else            ui_pointer(-100.0f, -100.0f, false);
 
@@ -847,6 +856,7 @@ int em_widget_run(const EmWidget *wg) {
             embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
             struct embk_win_input pin;
             embk_win_input(&pin);
+            ui_pointer_at_time(pin.when);
             em_feed_pointer((float)pin.x, (float)pin.y,
                             pin.buttons & EMBK_MOUSE_LEFT,
                             pin.buttons & EMBK_MOUSE_RIGHT,

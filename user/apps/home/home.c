@@ -1232,6 +1232,7 @@ int main(int argc, char **argv, char **envp) {
         /* the SAME feed em_app_run uses -- home has its own loop (it owns the
          * back-pinned desktop layer, which the app runtime does not create),
          * but it must never have its own idea of what the toolkit needs. */
+        ui_pointer_at_time(in.when);
         em_feed_pointer((float)in.x, (float)in.y,
                         in.buttons & EMBK_MOUSE_LEFT, in.buttons & EMBK_MOUSE_RIGHT,
                         in.wheel, in.focused);

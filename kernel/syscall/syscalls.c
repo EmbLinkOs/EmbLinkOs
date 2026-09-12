@@ -1675,12 +1675,19 @@ static int64_t sys_win_create_desktop(const struct sysargs *a) {
 /* arg 0 = user ptr to struct { int32_t focused; int32_t x, y; uint32_t buttons,
  * win; }. Delivers the content-local pointer if this process owns the window
  * under the cursor (focused=1) else focused=0. */
-struct win_input_kbuf { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win; int32_t wheel; };
+struct win_input_kbuf { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win;
+                        int32_t wheel; uint32_t when; };
 static int64_t sys_win_input(const struct sysargs *a) {
     int pid = current_process ? (int)current_process->pid : -1;
-    int32_t lx = 0, ly = 0, wheel = 0; uint32_t btn = 0, win = 0;
-    int foc = compositor_win_input(pid, &lx, &ly, &btn, &win, &wheel);
-    struct win_input_kbuf k = { foc, lx, ly, btn, win, wheel };
+    int32_t lx = 0, ly = 0, wheel = 0; uint32_t btn = 0, win = 0, when = 0;
+    int foc = compositor_win_input(pid, &lx, &ly, &btn, &win, &wheel, &when);
+    struct win_input_kbuf k = { foc, lx, ly, btn, win, wheel, when };
+    /* Copied RAW into userland, where struct embk_win_input mirrors it field
+     * for field -- grow both together or every reader gets garbage from the
+     * field after the one it wanted. This assertion is the only thing that
+     * would notice. */
+    _Static_assert(sizeof(struct win_input_kbuf) == 7 * 4,
+                   "win_input_kbuf and embk_win_input have drifted apart");
     if (copy_to_user((void *)a->arg[0], &k, sizeof k) != EMBK_OK) return -EMBK_EFAULT;
     return 0;
 }

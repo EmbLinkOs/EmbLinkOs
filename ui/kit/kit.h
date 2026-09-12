@@ -171,6 +171,39 @@ void ui_clipboard_provider(int (*set)(const char *buf, unsigned len),
 int ui_clipboard_set(const char *buf, unsigned len);
 int ui_clipboard_get(char *buf, unsigned cap);
 
+/* A CLOCK, installed the same way and for the same reason.
+ *
+ * Double-click needs to know how long ago the last press was, and the kit has
+ * no way to ask -- it has ui_frame_serial() and nothing else. COUNTING FRAMES
+ * IS NOT A SUBSTITUTE: this is a retained-mode loop that skips frames when
+ * nothing moves, so the quiet pause between two deliberate clicks can be FEWER
+ * frames than a fast double-click, which gets the answer exactly backwards.
+ *
+ * ui/dsl/em_app.c installs embk_uptime_ms; a host test installs a clock it can
+ * wind by hand, which is what makes double-click testable at all. With none
+ * installed ui_now_ms() returns 0, and a multi-click is simply never detected
+ * -- single clicks keep working. */
+void     ui_clock_provider(uint64_t (*now_ms)(void));
+uint64_t ui_now_ms(void);
+
+/* RECORD a press at (x,y) and say how many it makes in the current rapid run:
+ * 1 single, 2 double, 3 or more triple. A press too late or too far from the
+ * last one starts a new run at 1.
+ *
+ * Every text widget must call this on its own press, including ones outside
+ * the kit -- the count is shared so that a double-click means the same thing
+ * in a field and in the DSL's editor, and so that clicking from one into the
+ * other does not read as a double-click. ui_click_run() re-reads the last
+ * answer without recording anything. */
+int ui_click_note(float x, float y);
+int ui_click_run(void);
+
+/* The word around `pos` within [start, end), as [*lo, *hi) -- what a
+ * double-click selects. Shared so the single-line field and the DSL's
+ * multi-line editor cut words the same way. */
+void ui_word_bounds(const char *s, unsigned start, unsigned end, unsigned pos,
+                    unsigned *lo, unsigned *hi);
+
 /* Pixel width of the first `nbytes` of `s` (nbytes < 0 = the whole string),
  * stepped with the RENDERER's own UTF-8 decoder. Measuring text any other way
  * than it is drawn puts a caret where the glyphs are not. */

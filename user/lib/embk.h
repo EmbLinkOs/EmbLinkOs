@@ -1056,7 +1056,17 @@ static inline int embk_screen_size(uint32_t *w, uint32_t *h) {
  * buttons is the mouse state -- EMBK_MOUSE_LEFT etc.), 0 otherwise. The home
  * launcher reads this to make its tiles clickable. */
 #define EMBK_WIN_ACTION_MAXIMIZE  0x80000001u
-struct embk_win_input { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win; int32_t wheel; };
+/* Mirrors the kernel's struct win_input_kbuf field for field -- sys_win_input
+ * copies it raw; grow both together.
+ *
+ * `when` is the millisecond the reported state was MADE. For a press the
+ * compositor had to hold back (the app was mid-render when it happened) that
+ * is when the finger actually went down, NOT when this poll ran -- which is
+ * the difference between double-click working on a slow machine and not. Held
+ * clicks are replayed one per poll, so two real clicks 130 ms apart reach an
+ * app rendering at a few frames a second half a second apart. */
+struct embk_win_input { int32_t focused; int32_t x, y; uint32_t buttons; uint32_t win;
+                        int32_t wheel; uint32_t when; };
 static inline int embk_win_input(struct embk_win_input *out) {
     return (int)embk_syscall1(EMBK_SYS_win_input, (int64_t)(intptr_t)out);
 }

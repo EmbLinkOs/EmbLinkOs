@@ -147,8 +147,14 @@ void compositor_anim_tick(void);
 int  compositor_backdrop_luma(int x, int y, int w, int h);
 /* frost the backdrop behind a window-local sub-rect (translucent windows) */
 int  compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w, int h);
+/* `when` is the millisecond the reported button state was MADE, which for a
+ * replayed press is when the finger went down and not when this poll happened.
+ * Anything timing a double-click needs that: replayed clicks arrive one per
+ * poll, so on a slow app two real clicks 130 ms apart arrive half a second
+ * apart and look like two separate ones. */
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
-                         uint32_t *buttons, uint32_t *win, int32_t *wheel);
+                         uint32_t *buttons, uint32_t *win, int32_t *wheel,
+                         uint32_t *when);
 
 /* Hand back the kernel content buffer for (pid,id) so the syscall layer can
  * copy_from_user client pixels straight into it, plus its dims. NULL if no

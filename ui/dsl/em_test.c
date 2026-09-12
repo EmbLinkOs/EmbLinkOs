@@ -20,6 +20,8 @@
 #include "kit.h"
 #include "theme.h"
 #include "em.h"
+#include "font.h"
+#include "testfont.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -50,6 +52,11 @@ static const char *clip_text(void) {
 static char DOC[512];
 static int  CUR;
 
+/* A clock the test winds by hand -- double-click is a real elapsed time, and
+ * sleeping in a test is how a test becomes flaky on a loaded machine. */
+static uint64_t g_ms = 1000;
+static uint64_t fake_clock(void) { return g_ms; }
+
 static void view(void) { em_text_editor(DOC, sizeof DOC, &CUR, 200); }
 
 static void frame(const char *keys) {
@@ -68,16 +75,25 @@ static void click_in(void) {
     frame(NULL);
 }
 
-/* Press at (x,y), then release there: a click that PLACES the caret. */
-static void click_at(float x, float y) {
+/* Press at (x,y), then release there: a click that PLACES the caret.
+ *
+ * IT ADVANCES THE CLOCK FIRST, so that consecutive gestures in this file are
+ * separate ones. Without that, every click in the test is inside the
+ * double-click window of the one before it and the run climbs forever -- which
+ * silently disabled the drags, because a drag deliberately does not move the
+ * caret while a multi-click owns the selection. Tests that want a real
+ * double-click use click_fast(). */
+static void click_fast(float x, float y) {
     ui_pointer(x, y, true);
     frame(NULL);
     ui_pointer(x, y, false);
     frame(NULL);
 }
+static void click_at(float x, float y) { g_ms += 900; click_fast(x, y); }
 
 /* Press at one point, drag to another, release: a selection. */
 static void drag(float x0, float y0, float x1, float y1) {
+    g_ms += 900;
     ui_pointer(x0, y0, true);
     frame(NULL);
     ui_pointer(x1, y1, true);
@@ -90,6 +106,14 @@ int main(void) {
     printf("=== em-test: the multi-line editor ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
     ui_theme_use_dark(true);
+
+    /* Without a font every text width is zero, and the editor's column
+     * hit-testing would agree with any expectation at all. See ui/testfont.h. */
+    static struct testfont TF;
+    uint32_t fh = font_load(TF.data, testfont_build(&TF));
+    if (!fh) { printf("  FAIL: could not build the test font\n"); return 1; }
+    ui_theme_set_fonts(fh, fh);
+    ui_clock_provider(fake_clock);
     ui_clipboard_provider(clip_set, clip_get);
 
     #define LEFT   "\x11"
@@ -196,10 +220,22 @@ int main(void) {
         strcpy(DOC, "alpha\nbravo\ncharlie");
         frame(NULL);
 
+        /* Now that there IS a font, a column can be aimed at exactly: every
+         * character is half the text size wide, and the text starts one left
+         * padding in. */
+        float adv = testfont_advance(th->text_body);
+        #define COL_X(n) (th->sp3 + adv * (float)(n) + adv * 0.5f)
+
         click_at(0, LINE_Y(1));
         CHECK(CUR == 6, "a click lands on the line it was aimed at");
         frame("X");
         CHECK(!strcmp(DOC, "alpha\nXbravo\ncharlie"), "and typing goes there");
+
+        strcpy(DOC, "alpha\nbravo\ncharlie"); CUR = 0; frame(NULL);
+        click_at(COL_X(2), LINE_Y(1));
+        CHECK(CUR == 6 + 3, "and on the COLUMN it was aimed at");
+        click_at(COL_X(2), LINE_Y(2));
+        CHECK(CUR == 12 + 3, "column and line together");
 
         /* Far right of a line is its END, not the start of the next one. */
         click_at(390, LINE_Y(0));
@@ -226,6 +262,21 @@ int main(void) {
         /* And the selection a drag made is a real one: typing replaces it. */
         frame("!");
         CHECK(!strcmp(DOC, "!"), "typing replaces what the drag selected");
+
+        /* Double-click takes a word; a third takes the LINE, not the whole
+         * document -- a triple-click in a file that selected everything would
+         * be a nasty surprise. */
+        strcpy(DOC, "alpha bravo\ncharlie"); CUR = 0; g_clip_n = 0; frame(NULL);
+        g_ms += 900;  click_fast(COL_X(8), LINE_Y(0));
+        g_ms += 50;   click_fast(COL_X(8), LINE_Y(0));
+        frame(COPY);
+        CHECK(!strcmp(clip_text(), "bravo"), "a double-click in the editor takes the word");
+
+        g_ms += 50;   click_fast(COL_X(8), LINE_Y(0));
+        frame(COPY);
+        CHECK(!strcmp(clip_text(), "alpha bravo"),
+              "a third click takes the LINE, not the whole document");
+        #undef COL_X
         #undef LINE_Y
     }
 

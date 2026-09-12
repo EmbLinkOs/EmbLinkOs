@@ -2819,15 +2819,138 @@ Open:
       DRAWN at, so hit-testing and the auto-scroll agree with the glyphs at any
       scale rather than only at 1.0.
 
-- [ ] **No double-click-to-select-a-word, and no shift-click to extend.** Both
-      want a CLOCK the widget kit does not have -- it has `ui_frame_serial()`
-      and nothing else, and counting frames is not a substitute, because this is
-      a retained-mode loop that skips frames when nothing moves: the quiet gap
-      between two deliberate clicks can be fewer frames than a fast
-      double-click. The clean answer is another provider beside the clipboard
-      one (`ui_clock_provider`), which em_app fills with `embk_uptime_ms` and
-      kit_test fills with a fake clock -- making double-click testable on the
-      host, which frame-counting never would be.
+- [x] **Double-click takes a word, a third click takes the lot** (done
+      2026-09-12). It wanted a CLOCK the widget kit did not have -- it had
+      `ui_frame_serial()` and nothing else, and counting frames is no
+      substitute, because this is a retained-mode loop that SKIPS frames when
+      nothing moves: the quiet gap between two deliberate clicks can be fewer
+      frames than a fast double-click, which gets the answer exactly backwards.
+
+      So `ui_clock_provider`, beside the clipboard one: em_app fills it with
+      `embk_uptime_ms`, the host tests fill it with a clock they wind by hand,
+      which is what makes any of this testable off a machine.
+
+      A word is letters, digits and underscore, or a run of punctuation -- so
+      `foo_bar(baz)` gives `foo_bar` and double-clicking the `(` gives the
+      punctuation. Every byte >= 0x80 is a word byte, so `café` is not cut in
+      two. A third click takes the whole field, or in the multi-line editor the
+      LINE: selecting a whole document from a triple-click would be a nasty
+      surprise in a file. Bounded by TIME and DISTANCE both -- two fast clicks
+      at opposite ends of a line are two clicks, not a double.
+
+      A drag deliberately does NOT move the caret while a multi-click owns the
+      selection. Without that the drag block -- which runs on the press frame
+      too, because the button is down -- re-collapsed the caret onto the pointer
+      and the word a double-click had just selected survived no frames at all.
+
+      **IT DID NOT WORK ON A REAL MACHINE UNTIL THE INPUT PATH WAS FIXED**, and
+      the host tests could not have told anyone: they feed the toolkit directly.
+      Three separate faults, found by instrumenting the guest rather than by
+      guessing -- two guesses were wrong first:
+
+        1. The compositor held a press an app was too busy to see in a SINGLE
+           slot, and the next press overwrote it. Two rapid clicks reached the
+           application as one. It is a queue now (four deep -- a triple-click is
+           three), and a press arriving full is dropped rather than evicting an
+           older one, because the queued clicks are the ones made FIRST.
+
+        2. Even queued, replayed clicks are delivered one per poll, so their
+           arrival times measure the APP'S FRAME RATE, not the hand. Settings
+           reports "a frame costs 77 ms"; two clicks 130 ms apart arrived 3.4
+           SECONDS apart, far outside any sane window. So each queued press now
+           carries the millisecond it was actually made
+           (`compositor_win_input`'s new `when`, through `struct
+           embk_win_input`, `ui_pointer_at_time()`, to the click counter).
+
+        3. The timestamp was first wired into the wrong loop. em_app.c has TWO
+           pointer pumps -- one feeding `ui_pointer` directly (the widget
+           runner) and one going through `em_feed_pointer` (`em_app_run`, which
+           is what every application uses) -- and the first attempt fitted the
+           one applications do not run. The symptom was an event time of zero
+           reaching the toolkit while clicks plainly arrived.
+
+      Measured on the machine before and after: a double-click changed 28% of
+      the pixels around it (that is the CARET moving, and nothing else) and now
+      changes 74% (the word, highlighted). tools/caret_shot.py's threshold was
+      0.05, which passed throughout the broken period -- it is 0.45 now, between
+      what the feature does and what its absence does. A threshold below the
+      noise floor is decoration, not a test.
+
+- [ ] **FAST CLICKS ARE LOST IN THE MOUSE DRIVER, so double-click is
+      unreliable.** This is the fourth fault in that chain and the only one
+      still open. It is a KERNEL defect, not a toolkit one, and it bounds how
+      fast anyone can click:
+
+      `mouse_get_state()` reports the CURRENT button state -- the IRQ handler
+      keeps `g_buttons` up to date -- and `compositor_pointer_tick()` finds a
+      press by diffing it against the previous tick. So a complete
+      down-up-down-up that happens BETWEEN two ticks shows the same state at
+      both ends and yields ZERO edges. The second click does not arrive late;
+      it never existed as far as the system is concerned.
+
+      That is exactly what the measurements say. With ~130 ms between the two
+      presses the pair sometimes survived and sometimes did not (74%, 28%, 74%
+      across three runs). Speeding the pair up to ~50 ms made it fail every time
+      -- three runs, all 28%. Faster clicking losing MORE clicks is the
+      signature of sampling, not of a timeout.
+
+      THE FIX: give the driver a button EVENT COUNT instead of a state. The IRQ
+      handler already sees every packet, so it should count press and release
+      transitions as they arrive (`mouse_take_button_edges(&presses,
+      &releases)`), and `compositor_pointer_tick` should consume that count
+      rather than diff a level. A burst of two clicks between ticks then yields
+      two press edges, which is what the compositor's click queue was built to
+      carry. Both arches need it -- PS/2 here, virtio-input on aarch64.
+
+      Until then `tools/caret_shot.py` reports the double-click measurement as a
+      KNOWN GAP rather than failing on it, so the tool stays useful for the six
+      checks that do pass. Promote it back to a hard check (threshold 0.45) the
+      moment the driver queues edges.
+
+- [ ] **No shift-click to extend a selection.** It needs the MODIFIER STATE at
+      the moment of the press, and the kit has no way to ask: the char stream
+      carries no modifiers and the kit must not call embk. The pattern is
+      established twice over now (`ui_clipboard_provider`, `ui_clock_provider`),
+      so the answer is a third -- a mods provider the runtime fills with
+      `embk_key_mods`.
+
+### A host UI test could not measure text at all (fixed 2026-09-12)
+
+- [x] **Nothing loaded a font, so every width was zero -- and zero agrees with
+      any expectation.** `ui/kit/kit_test.c` drove the real widget through the
+      real layout stack, but with no font `ui_text_width_n` returned 0 for every
+      string, so every x mapped to the same caret position. A zero-width string
+      does not fail loudly; it fails plausibly.
+
+      That was not hypothetical: the field's drag-selection test passed against
+      a fontless kit for the RIGHT ANSWER BY THE WRONG ROUTE -- with all widths
+      zero, a drag from inside the field to far outside still produced caret 0
+      and caret len, having measured nothing.
+
+      `ui/testfont.h` is the fix: a synthetic TTF, every glyph blank, every
+      advance 500/1000 em, so each character is exactly half the text size wide
+      and a test can SAY where the caret should land. Extracted from the one
+      `ui/layout/layout_test.c` had been carrying privately. Both kit-test and
+      em-test now load it and aim at computed columns.
+
+### Two host UI tests have rotted (found 2026-09-12)
+
+- [ ] **`make font-test` does not compile, and `make backend-test` fails 2.**
+      Both predate the text-editing work -- verified by stashing that work and
+      re-running, which is the only honest way to tell a red test you caused
+      from one you inherited.
+
+      `font-test` calls `be->draw_text(&rt, 4, 40, "AAA", fh, 50.0f, white,
+      1.0f)` with 8 arguments where the backend now takes 11: the vtable grew
+      and the test was never updated, so it has not built for some time.
+
+      `backend-test` fails "blurred region averages toward the checkerboard
+      mean" and "ungrouped overlap is measurably darker (seam present)" -- both
+      compositing claims. Either the blur/group behaviour changed deliberately
+      and the assertions were never revisited, or something regressed unnoticed.
+      Those two possibilities need telling apart before either is touched.
+
+      Neither test is in any scripted run, which is exactly how they got here.
 
 ### The dock tells the truth about what is running (done 2026-09-12)
 

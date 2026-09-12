@@ -1052,6 +1052,11 @@ void ui_pointer(float x, float y, bool down) {
 
 /* Enqueue a typed character for this frame's focused field. Called by the event
  * loop for each byte from embk_key_poll(). */
+/* The event time of the pointer state fed this frame; see ui_pointer_at_time. */
+static uint64_t g_ptr_time;
+void     ui_pointer_at_time(uint64_t ms) { g_ptr_time = ms; }
+uint64_t ui_pointer_time(void) { return g_ptr_time; }
+
 void ui_input_char(int c) {
     if (c && g_input_n < (int)sizeof(g_input_buf)) g_input_buf[g_input_n++] = (char)c;
 }

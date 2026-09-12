@@ -2871,8 +2871,16 @@ void em_feed_pointer(float x, float y, int left_down, int right_down,
         /* Timestamp the press AT THE PRESS. ui_pointer has just run, so if the
          * total moved, the edge happened in this sample -- microseconds ago,
          * not whenever the next frame gets around to noticing. */
+        /* THE PRESS'S OWN TIME when the loop knows it. em_now_ms() is when we
+         * SAMPLED, which for a press the compositor had to hold back (the app
+         * was mid-render) is late by however long the app took -- and that is
+         * exactly the case double-click has to survive. */
         { int t = ui_press_edge_total();
-          if (t != g_prev_left_down) { g_prev_left_down = t; g_press_at_ms = em_now_ms(); } }
+          if (t != g_prev_left_down) {
+              g_prev_left_down = t;
+              uint64_t ev = ui_pointer_time();
+              g_press_at_ms = ev ? ev : em_now_ms();
+          } }
         if (wheel) ui_wheel((float)wheel);
     } else {
         ui_pointer(-100.0f, -100.0f, false);
@@ -3410,12 +3418,32 @@ bool em_text_editor(char *buf, size_t cap, int *cursor, float height) {
      *
      * The rect is last frame's arranged geometry, which is what the click
      * happened over. */
-    if (clicked || (focused && ui_is_active())) {
+    /* A drag extends from the press -- except while the press was a double or
+     * triple click, which owns its selection: the drag block runs on the press
+     * frame and every frame after it, and would otherwise collapse the word or
+     * line straight back onto the pointer. */
+    if (clicked || (focused && ui_click_run() == 1 && ui_is_active())) {
         float rx, ry, rw, rh, px, py;
         if (ui_open_rect(&rx, &ry, &rw, &rh) && rw > 0) {
             ui_pointer_pos(&px, &py);
             cur = te_hit(buf, len, px, py, rx, ry, gutter, ted_scroll, efh, esz, t);
-            if (clicked) ted_anchor = cur;   /* a press starts a fresh selection */
+            if (clicked) {
+                ted_anchor = cur;            /* a press starts a fresh selection */
+                /* Twice is a word, three times is the LINE -- not the whole
+                 * document, which is what a triple-click means in a one-line
+                 * field but would be a surprise in a file. */
+                int run = ui_click_note(px, py);
+                if (run == 2) {
+                    unsigned wlo, whi;
+                    ui_word_bounds(buf, (unsigned)te_line_start(buf, cur),
+                                   (unsigned)te_line_end(buf, len, cur),
+                                   (unsigned)cur, &wlo, &whi);
+                    ted_anchor = (int)wlo; cur = (int)whi;
+                } else if (run >= 3) {
+                    ted_anchor = te_line_start(buf, cur);
+                    cur = te_line_end(buf, len, cur);
+                }
+            }
         }
     }
 

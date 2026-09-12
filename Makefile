@@ -2610,7 +2610,7 @@ kit-test:
 # toolkit's actual look can be seen (not just unit-tested).
 UI_SRC = ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c ui/backend/scene_render.c \
          ui/layout/layout.c ui/reactive/reactive.c ui/declare/declare.c ui/theme/theme.c ui/kit/kit.c
-UI_INC = -Iui/scene -Iui/backend -Iui/layout -Iui/reactive -Iui/declare -Iui/theme -Iui/kit
+UI_INC = -Iui -Iui/scene -Iui/backend -Iui/layout -Iui/reactive -Iui/declare -Iui/theme -Iui/kit
 showcase:
 	$(HOSTCC) -std=c11 -Wall -Wextra -O2 $(UI_INC) \
 	    $(UI_SRC) ui/showcase/showcase.c -lm -o $(BUILD)/showcase

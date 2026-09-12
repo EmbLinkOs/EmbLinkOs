@@ -68,9 +68,25 @@ struct comp_window {
      * here so an app that was busy (e.g. mid first-frame render, seconds long
      * under TCG) still receives the click on its next win_input polls instead
      * of the click being silently eaten (win_input is a state poll, not an
-     * event queue). 0 = none, 1 = replay press, 2 = replay release. */
-    int       pend_click;
-    int       pend_lx, pend_ly;   /* content-local coords of the latched press */
+     * event queue).
+     *
+     * A QUEUE, NOT ONE SLOT, and that is what makes DOUBLE-CLICK possible at
+     * all. The single slot this replaced was overwritten by the next press, so
+     * two rapid clicks arrived at the application as ONE -- the toolkit's
+     * double-click logic was correct and host-tested, and on a real machine it
+     * simply never saw a second click to count. Measured before the fix: a
+     * deliberate double-click 130 ms apart reached the app as a single press.
+     *
+     * Four deep because the question is only ever "how many clicks in one
+     * gesture", and a triple-click is three. A press arriving with the queue
+     * full is dropped rather than evicting an older one: the clicks already
+     * queued are the ones the person made first, and dropping those would turn
+     * a triple-click into a single. */
+#define COMP_CLICK_Q 4
+    struct comp_click { int16_t x, y; uint32_t t; } pend_q[COMP_CLICK_Q];
+    uint8_t   pend_head;          /* ring read index */
+    uint8_t   pend_count;         /* how many presses are waiting */
+    uint8_t   pend_phase;         /* 0 = the press replays next, 1 = the release */
     char      title[COMP_TITLE_MAX + 1];
     uint32_t *content;      /* cw*ch, 0xAARRGGBB premultiplied. For a copy      */
                             /* window this is a kmalloc'd kernel buffer the      */
@@ -1137,7 +1153,7 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->widget = 0;
     w->glass = 0;
     w->translucent = 0;
-    w->pend_click = 0;
+    w->pend_head = w->pend_count = w->pend_phase = 0;
     w->content = buf;
     int n = 0;
     if (title) { while (n < COMP_TITLE_MAX && title[n]) { w->title[n] = title[n]; n++; } }
@@ -1228,7 +1244,7 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->widget = widget;
     w->glass = glass && !desktop;
     w->translucent = translucent && !desktop;
-    w->pend_click = 0;
+    w->pend_head = w->pend_count = w->pend_phase = 0;
     w->z = desktop ? 0 : widget ? g_widget_z++ : g_next_z++;   /* z band per kind */
     w->content = (uint32_t *)kview;
     w->shared = 1; w->phys = phys; w->npages = npages;
@@ -1767,7 +1783,20 @@ void compositor_pointer_tick(void) {
         if (w) {
             int clx = x - w->x, cly = y - (w->y + win_titlebar_h(w));
             if (clx >= 0 && clx < (int)w->cw && cly >= 0 && cly < (int)w->ch) {
-                w->pend_click = 1; w->pend_lx = clx; w->pend_ly = cly;
+                if (w->pend_count < COMP_CLICK_Q) {
+                    uint8_t slot = (uint8_t)((w->pend_head + w->pend_count) % COMP_CLICK_Q);
+                    w->pend_q[slot].x = (int16_t)clx;
+                    w->pend_q[slot].y = (int16_t)cly;
+                    /* WHEN THE FINGER WENT DOWN, not when the app gets around
+                     * to noticing. This is the whole reason double-click can
+                     * work on a slow machine: a replayed click is delivered one
+                     * per poll, so two clicks 130 ms apart reach an app
+                     * rendering at 4 fps half a second apart, and anything
+                     * timing them by arrival decides they were two separate
+                     * clicks. Measured: that is exactly what happened. */
+                    w->pend_q[slot].t = (uint32_t)timer_uptime_ms();
+                    w->pend_count++;
+                }
             }
         }
         if (w && !w->desktop) {
@@ -1920,9 +1949,13 @@ void compositor_pointer_tick(void) {
  * inside a compositor window reads its mouse -- the home/desktop app gets every
  * click that falls through the floating windows onto it. */
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
-                         uint32_t *buttons, uint32_t *win, int32_t *wheel) {
+                         uint32_t *buttons, uint32_t *win, int32_t *wheel,
+                         uint32_t *when) {
     spin_lock(&g_comp_lock);
     int focused = (g_ptr_pid != 0 && g_ptr_pid == pid);
+    /* Live input is happening NOW; a replayed press overwrites this below with
+     * the moment it was actually made. */
+    if (when) *when = (uint32_t)timer_uptime_ms();
     if (focused) {
         if (lx) *lx = g_ptr_lx;
         if (ly) *ly = g_ptr_ly;
@@ -1940,25 +1973,36 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
      * fire), which also keeps slider drags on real button state. */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || w->pid != pid || !w->pend_click) continue;
-        if (w->pend_click == 1) {
-            if (focused && w->id == g_ptr_win && (g_ptr_buttons & MOUSE_BTN_LEFT)) {
-                w->pend_click = 0;              /* live path saw the press */
+        if (!w->used || w->pid != pid || !w->pend_count) continue;
+        struct comp_click *q = &w->pend_q[w->pend_head];
+        if (w->pend_phase == 0) {
+            /* The live path is already delivering this one if the button is
+             * STILL DOWN on this window and there is nothing queued behind it
+             * -- replaying would double-fire, and would also break slider drags
+             * by feeding them a synthetic release. With more than one waiting,
+             * the extras are by definition presses the app has not seen. */
+            if (w->pend_count == 1 && focused && w->id == g_ptr_win &&
+                (g_ptr_buttons & MOUSE_BTN_LEFT)) {
+                w->pend_count = 0;
             } else {
-                if (lx) *lx = w->pend_lx;
-                if (ly) *ly = w->pend_ly;
+                if (lx) *lx = q->x;
+                if (ly) *ly = q->y;
                 if (buttons) *buttons = MOUSE_BTN_LEFT;
                 if (win) *win = w->id;
+                if (when) *when = q->t;         /* when the press really happened */
                 focused = 1;
-                w->pend_click = 2;              /* release replays next poll */
+                w->pend_phase = 1;              /* release replays next poll */
             }
-        } else {                                 /* == 2 */
-            if (lx) *lx = w->pend_lx;
-            if (ly) *ly = w->pend_ly;
+        } else {
+            if (lx) *lx = q->x;
+            if (ly) *ly = q->y;
             if (buttons) *buttons = 0;
             if (win) *win = w->id;
+            if (when) *when = q->t;
             focused = 1;
-            w->pend_click = 0;
+            w->pend_head = (uint8_t)((w->pend_head + 1) % COMP_CLICK_Q);
+            w->pend_count--;
+            w->pend_phase = 0;
         }
         break;
     }

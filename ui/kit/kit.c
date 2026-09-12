@@ -453,6 +453,93 @@ int ui_clipboard_get(char *buf, unsigned cap) {
     return g_clip_get ? g_clip_get(buf, cap) : 0;
 }
 
+static uint64_t (*g_now_ms)(void);
+void     ui_clock_provider(uint64_t (*now)(void)) { g_now_ms = now; }
+uint64_t ui_now_ms(void) { return g_now_ms ? g_now_ms() : 0; }
+
+/* MULTI-CLICK, counted here so the single-line field and the DSL's multi-line
+ * editor agree about what a double-click is rather than each inventing a
+ * threshold.
+ *
+ * Both a TIME and a DISTANCE bound: two presses far apart on screen are two
+ * clicks however fast they were, and treating them as a double-click would
+ * make a quick correction at the other end of a line select a word you were
+ * not pointing at. 400 ms is the usual figure and 5 px is about as far as a
+ * hand moves while double-clicking deliberately.
+ *
+ * With no clock installed ui_now_ms() is a constant 0, so `now - last` is
+ * always 0 and every press would look like a continuation. Hence the explicit
+ * check: no clock means no multi-click, and single clicks still work. */
+/* 500 ms, not the textbook 400. The window has to cover the WHOLE path from
+ * the button going down to the widget counting it, and on a machine where a
+ * frame costs 77 ms that path is longer than on a desktop -- measured here as
+ * an intermittent failure at 400, where the same deliberate double-click
+ * paired on some runs and not others. 500 is also roughly what macOS ships as
+ * its default, so it is not a number invented to make a test pass. */
+#define UI_MULTICLICK_MS  500
+#define UI_MULTICLICK_PX  5.0f
+static int      g_click_run = 1;
+static uint64_t g_click_at;
+static float    g_click_x, g_click_y;
+
+int ui_click_run(void) { return g_click_run; }
+
+int ui_click_note(float x, float y) {
+    /* THE TIME THE PRESS WAS MADE, if the event loop knows it, and only
+     * otherwise the time right now. A press can arrive later than it happened
+     * -- the compositor replays clicks an app was too busy to see, one per
+     * poll -- so timing them by arrival measures the app's frame rate rather
+     * than the person's hand, and a slow app could never be double-clicked.
+     * Measured before this: two clicks 130 ms apart arrived 3.5 s apart. */
+    uint64_t ev = ui_pointer_time();
+    uint64_t now = ev ? ev : ui_now_ms();
+    float dx = x - g_click_x, dy = y - g_click_y;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    if (g_now_ms && g_click_at && now - g_click_at <= UI_MULTICLICK_MS &&
+        dx <= UI_MULTICLICK_PX && dy <= UI_MULTICLICK_PX)
+        g_click_run++;
+    else
+        g_click_run = 1;
+    g_click_at = now;
+    g_click_x = x; g_click_y = y;
+    return g_click_run;
+}
+
+/* WHAT COUNTS AS A WORD. A run of letters, digits and underscore, or a run of
+ * anything else that is not a space -- so double-clicking in `foo_bar(baz)`
+ * gives you `foo_bar`, and double-clicking the `(` gives you the punctuation
+ * run rather than the whole line.
+ *
+ * Every byte >= 0x80 is a word byte: it is part of a multi-byte character, and
+ * this OS's fields hold real languages. Treating them as punctuation would cut
+ * "café" in two. */
+static bool word_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c >= 0x80;
+}
+
+/* The word around `pos`, as [*lo, *hi). Stops at either end of [start, end). */
+void ui_word_bounds(const char *s, unsigned start, unsigned end, unsigned pos,
+                    unsigned *lo, unsigned *hi) {
+    if (pos > end) pos = end;
+    if (pos < start) pos = start;
+    /* A caret sitting just after a word belongs to that word -- it is where a
+     * double-click at the end of one puts you. */
+    unsigned p = pos;
+    if (p == end && p > start) p--;
+    else if (p < end && s[p] == ' ' && p > start && s[p - 1] != ' ') p--;
+
+    if (p >= end || s[p] == ' ') { *lo = *hi = pos; return; }   /* in whitespace */
+
+    bool w = word_byte((unsigned char)s[p]);
+    unsigned a = p, b = p;
+    while (a > start && s[a - 1] != ' ' &&
+           word_byte((unsigned char)s[a - 1]) == w) a--;
+    while (b < end && s[b] != ' ' && word_byte((unsigned char)s[b]) == w) b++;
+    *lo = a; *hi = b;
+}
+
 /* Continuation bytes are 10xxxxxx: never a character's first byte. */
 static bool cp_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
 
@@ -586,6 +673,17 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
                 g_caret = len;
             }
             g_anchor = g_caret;        /* a click starts a fresh, empty selection */
+
+            /* Twice is a word, three times is the lot. */
+            float cx, cy; ui_pointer_pos(&cx, &cy);
+            int run = ui_click_note(cx, cy);
+            if (run == 2 && !masked) {
+                unsigned lo, hi;
+                ui_word_bounds(buf, 0, len, g_caret, &lo, &hi);
+                g_anchor = lo; g_caret = hi;
+            } else if (run >= 3) {
+                g_anchor = 0; g_caret = len;
+            }
         }
 
         /* A DRAG SELECTS, which is how nearly everyone selects text and what
@@ -600,7 +698,12 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
          *
          * Only the caret moves; the anchor was planted by the press above, and
          * leaving it alone is the whole of what makes this a selection. */
-        if (!masked && ui_is_active()) {
+        /* ...but NOT while the current press is a double or triple click. The
+         * drag block runs on the press frame too (the button is down), so
+         * without this it immediately re-collapsed the caret onto the pointer
+         * and the word a double-click had just selected lasted no frames at
+         * all. A multi-click owns its selection until the next press. */
+        if (!masked && ui_click_run() == 1 && ui_is_active()) {
             float rx, ry, rw, rh, px, py;
             if (ui_open_rect(&rx, &ry, &rw, &rh) && rw > 0) {
                 ui_pointer_pos(&px, &py);
