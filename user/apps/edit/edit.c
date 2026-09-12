@@ -16,6 +16,7 @@
 #include <stdbool.h>
 
 #include "embk.h"
+#include "emfiles.h"   /* the system Open/Save panel */
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
@@ -65,6 +66,17 @@ static void save_file(void) {
                            (unsigned long)w, (unsigned long)len);
 }
 
+/* The directory part of a path, for opening the panel where the user already
+ * is rather than at a fixed place. */
+static const char *dir_of(const char *path) {
+    static char dir[256];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = dir;
+    for (char *q = dir; *q; q++) if (*q == '/') slash = q;
+    if (slash == dir) dir[1] = 0; else *slash = 0;
+    return dir[0] ? dir : "/";
+}
+
 static void app(void) {
     if (!g_loaded) { load_file(); g_loaded = true; }
 
@@ -77,6 +89,36 @@ static void app(void) {
                 Text(base_name(g_path)).heading();
                 Spacer();
                 Text(g_status).caption().secondary();
+                /* OPEN AND SAVE AS, through the SYSTEM panel -- one call, and
+                 * the same picker every other application gets. This editor
+                 * had neither: it could only ever edit the file it was handed
+                 * on the command line, because writing a file browser is a lot
+                 * of app for a program this size. That is exactly the work a
+                 * shared service is supposed to take off an application. */
+                if (Button("Open").ghost().clicked()) {
+                    char picked[256];
+                    int r = embk_file_panel(EMFILE_OPEN, "Open", dir_of(g_path),
+                                            0, picked, sizeof picked);
+                    if (r == 1) {
+                        snprintf(g_path, sizeof g_path, "%s", picked);
+                        g_loaded = false;     /* load_file() on the next frame */
+                    } else if (r < 0) {
+                        snprintf(g_status, sizeof g_status,
+                                 "no file panel (%d)", r);
+                    }
+                }
+                if (Button("Save As").ghost().clicked()) {
+                    char picked[256];
+                    int r = embk_file_panel(EMFILE_SAVE, "Save As", dir_of(g_path),
+                                            base_name(g_path), picked, sizeof picked);
+                    if (r == 1) {
+                        snprintf(g_path, sizeof g_path, "%s", picked);
+                        save_file();
+                    } else if (r < 0) {
+                        snprintf(g_status, sizeof g_status,
+                                 "no file panel (%d)", r);
+                    }
+                }
                 if (Button("Save").primary().clicked())
                     save_file();
             }

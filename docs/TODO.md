@@ -2525,6 +2525,41 @@ Open:
       SKIP when nobody typed (the live half needs a person; the keymap itself is
       checked without one by `test keymap`).
 
+### The services layer, and the first service (started 2026-09-12)
+
+- [x] **An application can ask the user for a file.** Until now the OS had
+      exactly ONE service endpoint -- `/run/emlink.desktop`, which the top bar
+      "calls" by connecting and hanging up, because there was no convention for
+      sending a message. There is one now (user/lib/emsvc.h): a service listens
+      at `/run/emlink.<name>`, a call is one request and one reply, and the
+      connection closing ends the transaction.
+
+      The first service is the Open/Save panel (user/system/filepanel), a
+      SEPARATE PROGRAM rather than a library, so every app gets the same picker
+      and improving it improves all of them without rebuilding one. The text
+      editor now has Open and Save As; it previously could only edit the file
+      it was handed on the command line.
+
+- [ ] **The panel should hand back a HANDLE, not a path.** This is the version
+      that matters in a capability system: the panel holds the authority to
+      browse, and an app with no filesystem namespace of its own could open
+      exactly the file the user pointed at -- and nothing else. `embk_chan_send`
+      already carries ancillary handles, and `struct emfile_rep` already has the
+      field reserved, so the protocol does not move. What is missing is in the
+      kernel: `kernel/ipc/handle.h` knows SURFACE, CHANNEL, ENDPOINT and PIPE,
+      and there is no FILE kind to wrap an open file in, nor an fd_install for
+      one. Until then the panel returns a path and the caller needs the
+      namespace to open it.
+
+- [ ] **The shared panel is poorer than Note++'s private one.** Note++ built
+      its own picker with something this one lacks: it probes whether a
+      directory is WRITABLE by creating a file there and removing it, and says
+      so before you commit to a save (user/apps/notepp/notepp.c, dir_writable).
+      That is a better answer than a refusal after the fact. The shared panel
+      should grow it -- and only then should Note++ switch over, because
+      replacing a richer picker with a poorer shared one would be a downgrade
+      for that app and for the idea.
+
 ### A USB tablet attached to the x86 guest moves nothing
 
 - [ ] **QEMU's `usb-tablet` on a `qemu-xhci` controller produced no pointer

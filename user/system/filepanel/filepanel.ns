@@ -1,0 +1,17 @@
+# The Open/Save panel inherits the authenticated session namespace.
+#
+# DELIBERATE, and the most important line of authority in the system to get
+# right: the panel browses ON BEHALF of whoever is asking, so it must see
+# exactly what the SESSION can see -- the user's writable home plus the
+# read-only system and application trees -- and not one directory more.
+#
+# It must not be narrower than the session, either. A panel that cannot show a
+# place the user can reach is a panel that quietly hides their own files, and
+# they would have no way to tell that from the file not existing.
+#
+# What this becomes: once the kernel can pass an open file as a handle
+# (kernel/ipc/handle.h knows surfaces, channels, endpoints and pipes today),
+# this manifest is what makes the panel a POWERBOX -- a confined application
+# with no filesystem namespace of its own could still open exactly the file the
+# user pointed at here, because the authority would travel with the handle
+# rather than with the path. Recorded in docs/TODO.md.

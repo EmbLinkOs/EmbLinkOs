@@ -744,7 +744,11 @@ def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
 # separately (fonts at root, fixtures at root -- they test the format, not the
 # layout).
 _SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf",
-               "setup.elf", "login.elf"}   # -> /system/bin/
+               "setup.elf", "login.elf",
+               # A SERVICE, not an application: nothing launches filepanel from
+               # the dock, apps reach it through /run/emlink.files, and it is
+               # part of the system the way the desktop is. Sealed with them.
+               "filepanel.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
@@ -813,9 +817,16 @@ def discover_userland_objects(build_dir="build"):
         # /data/apps/<name>/<name>.ns. The session (home) reads it and grants
         # EXACTLY those bindings (absent => the app inherits the parent's view).
         base = name[:-4]                                      # strip ".elf"
+        #
+        # BESIDE THE BINARY, WHEREVER THAT IS. This used to pack manifests only
+        # for /data/apps, which silently dropped them for anything sealed under
+        # /system/bin -- and the first program that needed one there was the
+        # file panel, the single process whose authority matters most in the
+        # whole session. It spawned "full inherit (no manifest)".
+        elf_dir = _elf_dest(name).rsplit(b"/", 1)[0]
         nsm = _read_file(_prog_meta(base, "ns"))
-        if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
-            dest = f"data/apps/{base}/{base}.ns".encode()
+        if nsm is not None:
+            dest = elf_dir + b"/" + base.encode() + b".ns"
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
         # Per-app CAPABILITY MANIFEST: the other half of the same declaration
         # (user/lib/appauth.h). <name>.caps names the capability CLASSES the app
@@ -823,8 +834,8 @@ def discover_userland_objects(build_dir="build"):
         # session grants exactly that; the kernel refuses any mask that is not a
         # subset of the grantor's, so the file can only ever narrow.
         capm = _read_file(_prog_meta(base, "caps"))
-        if capm is not None and _elf_dest(name).startswith(b"data/apps/"):
-            dest = f"data/apps/{base}/{base}.caps".encode()
+        if capm is not None:
+            dest = elf_dir + b"/" + base.encode() + b".caps"
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, capm))
         # Per-app PRESENTATION MANIFEST: an app describes itself (display name +
         # icon) in <progdir>/<name>.app, packed as /data/apps/<name>/<name>.app.

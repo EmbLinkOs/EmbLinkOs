@@ -1,0 +1,6 @@
+# The panel shows files and draws a window. That is the whole job, and this is
+# the whole list -- no network, no audio, no devices. A file picker that could
+# open a socket would be a file picker worth attacking.
+
+filesystem
+gpu            # a window is a GPU resource

@@ -360,6 +360,9 @@ static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
 #ifndef EMBK_EINVAL
 #define EMBK_EINVAL  22
 #endif
+#ifndef EMBK_E2BIG
+#define EMBK_E2BIG    7
+#endif
 
 /* --- sessions: whose a process is -------------------------------------------
  *

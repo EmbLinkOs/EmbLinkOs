@@ -1110,6 +1110,13 @@ int main(int argc, char **argv, char **envp) {
      * handle, draggable dock chips, and pin/snap. The desktop no longer draws
      * its own top status bar; this floating bar takes the top strip. */
     spawn_app("/data/apps/topbar/topbar.elf", NULL);
+    /* THE SESSION'S SERVICES. The file panel is not an application -- nothing
+     * launches it from the dock -- it is the program that answers
+     * /run/emlink.files when any app asks the user for a file. Started with
+     * the session because it must be there BEFORE the first app needs it: a
+     * service you have to launch by hand is a service every caller has to
+     * handle the absence of. */
+    spawn_app("/system/bin/filepanel.elf", NULL);
     embk_puts(1, "home: desktop ready\n");
 
     for (;;) {
