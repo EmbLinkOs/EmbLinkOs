@@ -30,6 +30,18 @@ is enough to tell the two behaviours apart:
     the ink LEFT of the click must be untouched and the ink right of it must
     move. A caret that ignored the click and went to the end would leave the
     left unchanged AND the middle unchanged, and only grow the right end.
+
+  * Shift+Left five times, then Cmd+C, Home, Cmd+V --
+    the selection must SHOW (the highlight changes the field's background
+    behind the selected word, which ink columns cannot see, so this one is
+    measured as a plain pixel difference in the band), and the paste must put
+    those five characters at the FRONT, which moves the ink end right by about
+    a word.
+
+WHY CMD AND NOT CTRL: Ctrl+C is this OS's console interrupt, consumed in
+keyboard_deliver() before any application sees it, and that is correct and
+staying. The editing commands come from the GUI key instead --
+kernel/drivers/input/keyboard.h has the whole argument.
 """
 import os, subprocess, sys, threading, time
 
@@ -68,6 +80,44 @@ def type_text(q, text):
         q.cmd("input-send-event", events=[
             {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": k}}}])
         time.sleep(0.09)
+
+
+def chord(q, mods, key, times=1):
+    """Hold modifiers, tap a key, let go. QEMU names the GUI key "meta_l"."""
+    for m in mods:
+        q.cmd("input-send-event", events=[
+            {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": m}}}])
+    time.sleep(0.08)
+    for _ in range(times):
+        q.cmd("input-send-event", events=[
+            {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": key}}}])
+        time.sleep(0.05)
+        q.cmd("input-send-event", events=[
+            {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": key}}}])
+        time.sleep(0.09)
+    for m in reversed(mods):
+        q.cmd("input-send-event", events=[
+            {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": m}}}])
+    time.sleep(0.2)
+
+
+def band_difference(a_path, b_path, x0, x1):
+    """Fraction of pixels in the field's text band that differ.
+
+    A SELECTION HIGHLIGHT IS NOT INK: it paints behind the glyphs, so the ink
+    columns are almost unchanged and only a plain pixel comparison can see it."""
+    w, h, a = S.ppm_pixels(a_path)
+    _, _, b = S.ppm_pixels(b_path)
+    y0, y1 = BAND
+    diff = tot = 0
+    for y in range(y0, min(y1, h)):
+        for x in range(x0, min(x1, w)):
+            o = (y * w + x) * 3
+            tot += 1
+            if (abs(a[o] - b[o]) > 8 or abs(a[o+1] - b[o+1]) > 8
+                    or abs(a[o+2] - b[o+2]) > 8):
+                diff += 1
+    return diff / float(tot or 1)
 
 
 def ink_columns(path):
@@ -178,6 +228,19 @@ def main():
         S.move(q, SCREEN_W / 2.0, 200); time.sleep(1.5)
         c = os.path.join(A.BUILD, "caret-clicked.ppm"); q.screendump(c)
 
+        # ---- the selection, and the clipboard --------------------------
+        type_text(q, "\x05")                      # End, so the selection is known
+        chord(q, ["shift"], "left", 5)            # select the last five characters
+        time.sleep(1)
+        d = os.path.join(A.BUILD, "caret-selected.ppm"); q.screendump(d)
+
+        chord(q, ["meta_l"], "c")                 # copy
+        type_text(q, "\x02")                      # Home
+        chord(q, ["meta_l"], "v")                 # paste at the front
+        time.sleep(1.5)
+        S.move(q, SCREEN_W / 2.0, 200); time.sleep(1.5)
+        e = os.path.join(A.BUILD, "caret-pasted.ppm"); q.screendump(e)
+
         ca, cb, cc = ink_columns(a), ink_columns(b), ink_columns(c)
         left_changed  = ink_differs(ca, cb, FIELD_X0, FIELD_X0 + 40)
         grew          = last_ink(cb) - last_ink(ca)
@@ -192,6 +255,14 @@ def main():
         print("caret_shot: the click-and-type changed %.0f%% left of the caret, "
               "%.0f%% right of it" % (before_click * 100, after_click * 100))
 
+        cd_, ce = ink_columns(d), ink_columns(e)
+        sel_end   = last_ink(cc)
+        highlight = band_difference(c, d, max(FIELD_X0, sel_end - 45), sel_end + 4)
+        pasted    = last_ink(ce) - last_ink(cd_)
+        print("caret_shot: Shift+Left changed %.0f%% of the pixels behind the last word"
+              % (highlight * 100))
+        print("caret_shot: after copy + Home + paste the ink end moved %+d px" % pasted)
+
         fails = []
         if last_ink(ca) == 0:
             fails.append("nothing was typed into the field at all")
@@ -204,6 +275,11 @@ def main():
         if after_click < 0.15:
             fails.append("typing after a click did not change the text right of it -- "
                          "the click did not place the caret")
+        if highlight < 0.05:
+            fails.append("Shift+Left drew no selection -- nothing changed behind the word")
+        if pasted < 20:
+            fails.append("copy + paste did not put the selected text back in "
+                         "(the ink only moved %+d px)" % pasted)
 
         for f in fails:
             print("caret_shot: FAIL %s" % f)

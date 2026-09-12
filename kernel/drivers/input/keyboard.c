@@ -244,15 +244,23 @@ static void keyboard_handler(void) {
             default: break;
         }
 
-        /* The real nav cluster (the keypad's twins are handled below). */
+        /* The real nav cluster (the keypad's twins are handled below).
+         *
+         * WITH SHIFT HELD these four deliver a SELECTION command instead of a
+         * movement. The decision belongs here because this is where the
+         * modifier state is known at the instant the key went down -- the char
+         * stream carries no modifiers, so Shift+Left and Left are otherwise
+         * literally the same byte and no reader downstream could ever tell
+         * them apart. See EK_SEL_* in keyboard.h. */
+        int sel = (g_mods & EKM_SHIFT) != 0;
         uint16_t kc = 0; char ch = 0;
         switch (make) {
-            case 0x4B: kc = EKC_LEFT;  ch = EK_LEFT;  break;
-            case 0x4D: kc = EKC_RIGHT; ch = EK_RIGHT; break;
+            case 0x4B: kc = EKC_LEFT;  ch = sel ? (char)EK_SEL_LEFT  : (char)EK_LEFT;  break;
+            case 0x4D: kc = EKC_RIGHT; ch = sel ? (char)EK_SEL_RIGHT : (char)EK_RIGHT; break;
             case 0x48: kc = EKC_UP;    ch = EK_UP;    break;
             case 0x50: kc = EKC_DOWN;  ch = EK_DOWN;  break;
-            case 0x47: kc = EKC_HOME;  ch = EK_HOME;  break;
-            case 0x4F: kc = EKC_END;   ch = EK_END;   break;
+            case 0x47: kc = EKC_HOME;  ch = sel ? (char)EK_SEL_HOME  : (char)EK_HOME;  break;
+            case 0x4F: kc = EKC_END;   ch = sel ? (char)EK_SEL_END   : (char)EK_END;   break;
             case 0x53: kc = EKC_DEL;   ch = EK_DEL;   break;
             case 0x49: kc = EKC_PGUP;  ch = EK_PGUP;  break;
             case 0x51: kc = EKC_PGDN;  ch = EK_PGDN;  break;
@@ -388,6 +396,28 @@ void kbd_translate(uint8_t make, int pressed) {
      * becoming stray control bytes. */
     if ((g_mods & EKM_CTRL) && cp >= 'a' && cp <= 'z') cp = cp & 0x1f;
     else if ((g_mods & EKM_CTRL) && cp >= 'A' && cp <= 'Z') cp = cp & 0x1f;
+
+    /* GUI + letter -> an editing command. The interface's modifier, kept
+     * separate from the terminal's: Ctrl+C is an INTERRUPT in this OS and
+     * always will be, so the clipboard cannot live there. See EK_SEL_ALL and
+     * friends in keyboard.h for the whole argument.
+     *
+     * Delivered as a RAW BYTE, not through keyboard_deliver_cp: these are byte
+     * values, not codepoints, and encoding 0xFD as UTF-8 would turn one command
+     * into the two bytes of ý. Unclaimed GUI+letter combinations fall through
+     * and type their letter, so the key is not a hole. */
+    if (g_mods & EKM_GUI) {
+        uint32_t low = (cp >= 'A' && cp <= 'Z') ? cp + 0x20 : cp;
+        char cmd = 0;
+        switch (low) {
+            case 'a': cmd = (char)EK_SEL_ALL; break;
+            case 'c': cmd = (char)EK_COPY;    break;
+            case 'x': cmd = (char)EK_CUT;     break;
+            case 'v': cmd = (char)EK_PASTE;   break;
+            default: break;
+        }
+        if (cmd) { keyboard_deliver(cmd); return; }
+    }
 
     keyboard_deliver_cp(cp);
 }

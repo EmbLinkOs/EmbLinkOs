@@ -23,6 +23,7 @@
 #include "embk.h"
 #include "oscfg.h"   /* the user's preferences apply to every app */
 #include "ui.h"
+#include "kit.h"   /* ui_clipboard_provider: the kit needs one handed to it */
 #include "em.h"
 #include "theme.h"
 #include "scene_render.h"
@@ -225,6 +226,18 @@ static void cad_idle_tick(struct cadence *c) {
     }
 }
 
+/* Thin adapters: the kit's clipboard signatures are its own (it must not know
+ * about embk), and embk_clip_get returns what the clipboard HOLDS, which can
+ * exceed the buffer -- so clamp before reporting how much was written. */
+static int emapp_clip_set(const char *buf, unsigned len) {
+    return embk_clip_set(buf, len);
+}
+static int emapp_clip_get(char *buf, unsigned cap) {
+    int64_t held = embk_clip_get(buf, cap);
+    if (held < 0) return 0;
+    return held > (int64_t)cap ? (int)cap : (int)held;
+}
+
 int em_app_run(const EmApp *app) {
     g_app_exit_requested = 0;
     g_app_exit_code = 0;
@@ -318,6 +331,13 @@ int em_app_run(const EmApp *app) {
     em_window_set_resizable(app->resize == Resizable);
     em_window_set_glass(glass);          /* Window() adds a faint accent cast when glass */
     embk_key_grab(1);
+
+    /* HAND THE WIDGET KIT A CLIPBOARD. It cannot call embk_clip_set itself --
+     * it is built and unit-tested on the host, where there is no kernel to ask
+     * -- so the runtime installs the real one and the kit calls through. This
+     * is what makes copy and cut work in every field in every application
+     * without a single line in any of them. */
+    ui_clipboard_provider(emapp_clip_set, emapp_clip_get);
 
     /* THE BACK BUFFER, and the reason for it.
      *
@@ -488,8 +508,15 @@ int em_app_run(const EmApp *app) {
              * where it silently flattens a pasted block onto one line. An app
              * that wants the raw clipboard handles 0x16 itself; every app that
              * does not still gets the safe replay. */
-            if (c == 0x16 && g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
-            if (c == 0x16) {                       /* Ctrl+V: paste, app-wide */
+            /* TWO KEYS, ONE PASTE. Ctrl+V is what this OS has always used and
+             * what its terminal-shaped apps expect; EMBK_KEY_PASTE is the GUI
+             * key's (Cmd+V), which is where the rest of the editing commands
+             * live now -- Ctrl+C could never be copy here, because 0x03 is the
+             * console interrupt. Keeping both means nothing that worked stops
+             * working. */
+            if ((c == 0x16 || c == EMBK_KEY_PASTE) &&
+                g_em_key_hook && g_em_key_hook(c)) { had_key = 1; continue; }
+            if (c == 0x16 || c == EMBK_KEY_PASTE) {   /* paste, app-wide */
                 /* The runtime replays the clipboard through the SAME delivery
                  * path as typing -- key hook first, else the focused field --
                  * so every app that can take a keystroke can take a paste,

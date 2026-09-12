@@ -19,6 +19,24 @@ static int g_fail;
 
 static struct scene_arena  SA;
 static struct layout_arena LA;
+
+/* A CLIPBOARD OF OUR OWN. The kit takes one as two function pointers precisely
+ * so it never has to know about the kernel -- which is what lets copy and cut
+ * be tested here, on the host, in a millisecond, instead of only in QEMU. */
+static char g_clip[256];
+static unsigned g_clip_n;
+static int clip_set(const char *b, unsigned n) {
+    if (n > sizeof g_clip) n = sizeof g_clip;
+    memcpy(g_clip, b, n); g_clip_n = n; return 0;
+}
+static int clip_get(char *b, unsigned cap) {
+    unsigned n = g_clip_n < cap ? g_clip_n : cap;
+    memcpy(b, g_clip, n); return (int)n;
+}
+static const char *clip_text(void) {
+    static char out[257];
+    memcpy(out, g_clip, g_clip_n); out[g_clip_n] = 0; return out;
+}
 static char A[32], B[32], C[32];
 static bool subA, subB, subC;
 static bool show_b = true, autofocus = true;
@@ -41,6 +59,7 @@ static void frame(const char *keys) {
 int main(void) {
     printf("=== kit-test: the text field and the keyboard ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
+    ui_clipboard_provider(clip_set, clip_get);
 
     frame(NULL);
     CHECK(ui_any_focus(), "a form with autofocus opens with a field focused");
@@ -174,6 +193,84 @@ int main(void) {
     frame("Q");
     CHECK(!strcmp(A, "abcQ"), "coming back to a field puts the caret at the end of its text");
     CHECK(!strcmp(B, "zz"), "and the other field kept its own text");
+
+    /* ---- SELECTION, AND THE CLIPBOARD ----------------------------------
+     *
+     * These commands ride the SAME byte stream as the text, at 0xF8..0xFF --
+     * byte values that can never occur in valid UTF-8, which is what makes it
+     * safe to put them there and what keeps them in ORDER with typed
+     * characters. They come from the GUI key rather than Ctrl because Ctrl+C is
+     * this OS's console interrupt and is consumed before any app sees it. */
+    #define SLEFT  "\xF8"
+    #define SRIGHT "\xF9"
+    #define SHOME  "\xFA"
+    #define SEND   "\xFB"
+    #define SALL   "\xFC"
+    #define COPY   "\xFD"
+    #define CUT    "\xFE"
+
+    page = 0x5555; autofocus = true; A[0] = 0;
+    frame(NULL); frame(NULL);
+    frame("hello world");
+    frame(SLEFT SLEFT SLEFT SLEFT SLEFT);   /* select "world" backwards */
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "world"), "Shift+Left selects, and copy puts it on the clipboard");
+    CHECK(!strcmp(A, "hello world"), "copying does not change the text");
+
+    frame("W");
+    CHECK(!strcmp(A, "hello W"), "typing REPLACES the selection");
+
+    /* Step off the end first, so this tests that Shift+Home extends from where
+     * the CARET is rather than simply selecting everything. */
+    frame(LEFT);                            /* caret between "hello " and "W" */
+    frame(SHOME);                           /* select back to the start */
+    frame(CUT);
+    CHECK(!strcmp(clip_text(), "hello ") && A[0] == 'W' && A[1] == 0,
+          "Shift+Home selects to the front from the caret, and cut removes exactly that");
+
+    /* Select-all, then one keystroke: the "clear this field" everyone does. */
+    A[0] = 0; frame(NULL);
+    frame("something long");
+    frame(SALL "x");
+    CHECK(!strcmp(A, "x"), "select-all then a key replaces the whole field");
+
+    /* An arrow with a selection COLLAPSES it to the edge it moves toward,
+     * rather than moving the caret from wherever it happened to be. */
+    A[0] = 0; frame(NULL);
+    frame("abcdef");
+    frame(SHOME);                           /* all of it selected, caret at 0 */
+    frame(RIGHT);                           /* collapse to the RIGHT edge */
+    frame("Z");
+    CHECK(!strcmp(A, "abcdefZ"), "a plain arrow collapses the selection to the edge it moves toward");
+
+    frame(SALL);
+    frame(LEFT);                            /* collapse to the LEFT edge */
+    frame("Q");
+    CHECK(!strcmp(A, "QabcdefZ"), "and Left collapses it to the other one");
+
+    /* Backspace with a selection deletes the selection, not one character. */
+    A[0] = 0; frame(NULL);
+    frame("keep this");
+    frame(SLEFT SLEFT SLEFT SLEFT);
+    frame("\b");
+    CHECK(!strcmp(A, "keep "), "backspace over a selection removes the whole selection");
+
+    /* A selection spanning a multi-byte character travels in whole characters,
+     * so what reaches the clipboard is text and not a broken fragment. */
+    A[0] = 0; frame(NULL);
+    frame("caf\xC3\xA9");
+    frame(SLEFT SLEFT);                     /* the é and the f */
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "f\xC3\xA9"), "a selection over é copies BOTH its bytes");
+
+    /* A password field keeps its secret: the caret and the selection work, but
+     * the text never leaves it. */
+    g_clip_n = 0;
+    C[0] = 0; page = 0x6666; autofocus = false; frame(NULL); frame(NULL);
+    frame("\t\t");                          /* into the password field */
+    frame("secret");
+    frame(SALL COPY);
+    CHECK(g_clip_n == 0, "a masked field refuses to copy its text");
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

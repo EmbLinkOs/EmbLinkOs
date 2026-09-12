@@ -425,6 +425,28 @@ void ui_text_field_autofocus(void) { g_autofocus_next = true; }
 static char    *g_caret_buf;              /* whose caret g_caret is */
 static unsigned g_caret;                  /* byte offset into it */
 
+/* THE SELECTION is an ANCHOR plus the caret, not a start and an end.
+ *
+ * The anchor is where the selection was begun and the caret is where it has
+ * been dragged to, so the caret can be on either side of it -- which is the
+ * whole behaviour of shift-arrowing left past your starting point and back
+ * again. Storing a start and an end instead loses which end is moving, and a
+ * selection that cannot shrink from the side you grew it is one people
+ * immediately notice. `anchor == caret` means there is no selection. */
+static unsigned g_anchor;
+
+static unsigned sel_lo(void) { return g_anchor < g_caret ? g_anchor : g_caret; }
+static unsigned sel_hi(void) { return g_anchor < g_caret ? g_caret : g_anchor; }
+static bool     has_sel(void) { return g_anchor != g_caret; }
+
+static int (*g_clip_set)(const char *, unsigned);
+static int (*g_clip_get)(char *, unsigned);
+
+void ui_clipboard_provider(int (*set)(const char *, unsigned),
+                           int (*get)(char *, unsigned)) {
+    g_clip_set = set; g_clip_get = get;
+}
+
 /* Continuation bytes are 10xxxxxx: never a character's first byte. */
 static bool cp_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
 
@@ -538,12 +560,14 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
      * offset into a string that is not the one being edited. */
     unsigned len = (unsigned)strlen(buf);
     if (focused) {
-        if (g_caret_buf != buf) { g_caret_buf = buf; g_caret = len; }
+        if (g_caret_buf != buf) { g_caret_buf = buf; g_caret = len; g_anchor = len; }
         if (g_caret > len) g_caret = len;
+        if (g_anchor > len) g_anchor = len;
         /* The app may have rewritten the buffer under us (the file panel fills
          * the name field when you click a file). Never leave the caret inside a
          * character. */
         while (g_caret > 0 && g_caret < len && cp_cont(buf[g_caret])) g_caret--;
+        while (g_anchor > 0 && g_anchor < len && cp_cont(buf[g_anchor])) g_anchor--;
 
         if (clicked) {
             float rx, ry, rw, rh, px, py;
@@ -555,6 +579,7 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
             } else {
                 g_caret = len;
             }
+            g_anchor = g_caret;        /* a click starts a fresh, empty selection */
         }
     }
 
@@ -570,36 +595,80 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
         }
         if (keys != CARRY_ONLY)
             n += ui_input_take(in + n, (int)sizeof in - n);
+        /* Cut the selection out, leaving the caret where it was. Every edit
+         * that writes goes through this first: typing over a selection, and
+         * backspace or delete with one, all mean "this text goes away". */
+        #define DROP_SEL() do { \
+            if (has_sel()) { \
+                unsigned lo = sel_lo(), hi = sel_hi(); \
+                memmove(buf + lo, buf + hi, len - hi + 1); \
+                len -= hi - lo; \
+                g_caret = g_anchor = lo; \
+            } \
+        } while (0)
+
         for (int i = 0; i < n; i++) {
             unsigned char c = (unsigned char)in[i];
-            if (c == '\b') {
+            if (c == UI_KEY_SEL_LEFT)  { g_caret = utf8_back(buf, g_caret); }
+            else if (c == UI_KEY_SEL_RIGHT) { g_caret = utf8_fwd(buf, len, g_caret); }
+            else if (c == UI_KEY_SEL_HOME)  { g_caret = 0; }
+            else if (c == UI_KEY_SEL_END)   { g_caret = len; }
+            else if (c == UI_KEY_SEL_ALL)   { g_anchor = 0; g_caret = len; }
+            else if (c == UI_KEY_COPY || c == UI_KEY_CUT) {
+                /* Nothing selected is not an error and must not clear what is
+                 * already on the clipboard: a mis-aimed copy that wiped it
+                 * would lose the thing you were about to paste. */
+                if (has_sel() && g_clip_set && !masked)
+                    g_clip_set(buf + sel_lo(), sel_hi() - sel_lo());
+                /* A masked field never yields its text -- the point of masking
+                 * it is that it does not appear, and a clipboard is a place it
+                 * would appear. The caret and selection still work; only this
+                 * one operation refuses. */
+                if (c == UI_KEY_CUT && !masked) DROP_SEL();
+            }
+            else if (c == '\b') {
                 /* BACK OVER A WHOLE CHARACTER, not a byte. The stream is UTF-8
                  * (kernel/drivers/input/keyboard.c), so é is two bytes and
                  * deleting one of them leaves a half character the renderer
                  * draws as a replacement box -- one backspace, one visible
                  * thing removed, is the only behaviour anyone would call
                  * correct. */
-                if (g_caret > 0) {
+                if (has_sel()) DROP_SEL();
+                else if (g_caret > 0) {
                     unsigned p = utf8_back(buf, g_caret);
                     memmove(buf + p, buf + g_caret, len - g_caret + 1);
                     len -= g_caret - p;
                     g_caret = p;
                 }
+                g_anchor = g_caret;
             }
             else if (c == UI_KEY_DEL) {
                 /* Delete is backspace's mirror: it takes the character AFTER
                  * the caret. With an append-only field there was nothing after
                  * the caret, so this key did nothing at all. */
-                if (g_caret < len) {
+                if (has_sel()) DROP_SEL();
+                else if (g_caret < len) {
                     unsigned nx = utf8_fwd(buf, len, g_caret);
                     memmove(buf + g_caret, buf + nx, len - nx + 1);
                     len -= nx - g_caret;
                 }
+                g_anchor = g_caret;
             }
-            else if (c == UI_KEY_LEFT)  g_caret = utf8_back(buf, g_caret);
-            else if (c == UI_KEY_RIGHT) g_caret = utf8_fwd(buf, len, g_caret);
-            else if (c == UI_KEY_HOME)  g_caret = 0;
-            else if (c == UI_KEY_END)   g_caret = len;
+            /* A plain arrow COLLAPSES a selection to the edge it moves
+             * toward, rather than moving the caret from wherever it happens to
+             * be. Pressing Left with three words selected means "put me at the
+             * start of them", which is what every editor does and what anyone
+             * who has just selected something and changed their mind expects. */
+            else if (c == UI_KEY_LEFT) {
+                g_caret = has_sel() ? sel_lo() : utf8_back(buf, g_caret);
+                g_anchor = g_caret;
+            }
+            else if (c == UI_KEY_RIGHT) {
+                g_caret = has_sel() ? sel_hi() : utf8_fwd(buf, len, g_caret);
+                g_anchor = g_caret;
+            }
+            else if (c == UI_KEY_HOME)  { g_caret = 0;   g_anchor = 0; }
+            else if (c == UI_KEY_END)   { g_caret = len; g_anchor = len; }
             else if (c == UI_KEY_UP || c == UI_KEY_DOWN ||
                      c == UI_KEY_PGUP || c == UI_KEY_PGDN) {
                 /* A one-line field has nowhere vertical to go. Swallowed rather
@@ -614,6 +683,16 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
                 g_tab_pending = true;
                 break;
             }
+            else if (c == UI_KEY_PASTE) {
+                /* The paste itself is the runtime's (ui/dsl/em_app.c): it holds
+                 * the clipboard and replays it through this same queue, so that
+                 * an app with a key hook -- a terminal, which must never let a
+                 * pasted newline execute anything -- gets a say. What arrives
+                 * here is the replayed text, one character at a time, and the
+                 * first of them replaces the selection like any other typing.
+                 * Swallowed rather than fallen through so the command byte
+                 * itself is never mistaken for text. */
+            }
             else if ((c >= 32 && c < 127) || c >= 0x80) {
                 /* >= 0x80 is a UTF-8 byte of a real character -- é, €, a
                  * dead-key composition. Each byte is inserted as it arrives;
@@ -622,13 +701,16 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
                  * order. Rejecting them (the old `< 127` bound) is what made
                  * every accented character vanish between the keyboard and the
                  * field. */
+                DROP_SEL();                 /* typing over a selection replaces it */
                 if (len + 1 < cap) {
                     memmove(buf + g_caret + 1, buf + g_caret, len - g_caret + 1);
                     buf[g_caret++] = (char)c;
                     len++;
+                    g_anchor = g_caret;
                 }
             }
         }
+        #undef DROP_SEL
     }
 
     /* the input well */
@@ -687,33 +769,48 @@ static bool ui_field(char *buf, unsigned long cap, const char *placeholder, bool
          * A masked field is masked by CHARACTER, not by byte: one asterisk per
          * character, so an accented password is as long on screen as it is in
          * the hand. */
-        char head[256], tail[256];
-        unsigned cut = focused ? g_caret : len;
-        if (cut > len) cut = len;
-
-        if (masked) {
-            unsigned nh = 0, nt = 0;
-            for (unsigned i = 0; i < len; i++) {
-                if (cp_cont(buf[i])) continue;            /* one '*' per character */
-                if (i < cut) { if (nh < sizeof head - 1) head[nh++] = '*'; }
-                else         { if (nt < sizeof tail - 1) tail[nt++] = '*'; }
-            }
-            head[nh] = 0; tail[nt] = 0;
-        } else {
-            unsigned nh = cut < sizeof head - 1 ? cut : (unsigned)sizeof head - 1;
-            memcpy(head, buf, nh); head[nh] = 0;
-            snprintf(tail, sizeof tail, "%s", buf + cut);
-        }
-
+        /* Up to three runs -- before the selection, the selection, after it --
+         * with the caret box emitted at whichever boundary the caret is on.
+         * The highlight is a property of the RUN (ui_set_text_bg) rather than a
+         * rectangle drawn at a computed x, so it lands exactly where layout put
+         * the words and needs no measurement to stay there. */
         struct color fg = CP(text, t->text);
-        if (head[0]) text_role(t->font_regular, t->text_body, fg, head);
-        if (focused) {                    /* the caret, between the two runs */
-            ui_box_begin(0);
-            ui_set_paint(solid(CP(focus, t->accent)));
-            ui_set_size(sz_fixed(2), sz_fixed(t->text_body));
-            ui_box_end();
-        }
-        if (tail[0]) text_role(t->font_regular, t->text_body, fg, tail);
+        unsigned lo = focused ? sel_lo() : len;
+        unsigned hi = focused ? sel_hi() : len;
+        if (lo > len) lo = len;
+        if (hi > len) hi = len;
+
+        char run[256];
+        /* A masked field is masked by CHARACTER, not by byte: one asterisk per
+         * character, so an accented password is as long on screen as it is in
+         * the hand. */
+        #define EMIT(a, b, selected) do {                                       \
+            unsigned n_ = 0;                                                    \
+            for (unsigned i_ = (a); i_ < (b) && n_ < sizeof run - 1; i_++) {     \
+                if (masked) { if (!cp_cont(buf[i_])) run[n_++] = '*'; }          \
+                else        { run[n_++] = buf[i_]; }                            \
+            }                                                                   \
+            run[n_] = 0;                                                        \
+            if (run[0]) {                                                       \
+                if (selected) ui_set_text_bg(CP(selection, t->selection));      \
+                text_role(t->font_regular, t->text_body, fg, run);              \
+            }                                                                   \
+        } while (0)
+
+        #define CARET() do {                                                    \
+            ui_box_begin(0);                                                    \
+            ui_set_paint(solid(CP(focus, t->accent)));                          \
+            ui_set_size(sz_fixed(2), sz_fixed(t->text_body));                   \
+            ui_box_end();                                                       \
+        } while (0)
+
+        EMIT(0, lo, 0);
+        if (focused && g_caret == lo) CARET();
+        EMIT(lo, hi, 1);
+        if (focused && g_caret == hi && hi != lo) CARET();
+        EMIT(hi, len, 0);
+        #undef EMIT
+        #undef CARET
         ui_flex_spacer();                 /* keep text left-aligned in the well */
     }
     ui_end_stack();
@@ -731,6 +828,7 @@ struct color ui_ctl_color_(int which, struct color dflt) {
                    : which == UI_CTL_BORDER      ? g_ctl.border
                    : which == UI_CTL_FOCUS       ? g_ctl.focus
                    : which == UI_CTL_TEXT        ? g_ctl.text
+                   : which == UI_CTL_SELECTION   ? g_ctl.selection
                                                  : g_ctl.placeholder;
     return c.a > 0 ? c : dflt;
 }

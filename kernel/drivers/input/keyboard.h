@@ -25,6 +25,42 @@
 #define EK_DOWN  0x14
 #define EK_DEL   0x7F
 
+/* ---- the EDITING commands -----------------------------------------------
+ *
+ * The other half of a text field: selecting, and the clipboard. These are not
+ * characters and there was nowhere to put them -- C0 is Ctrl+letter's and the
+ * navigation codes' -- so they go ABOVE the character range instead, at
+ * 0xF8..0xFF. That is not an arbitrary free corner: those eight byte values
+ * can never occur in valid UTF-8, at any position, which is what makes it safe
+ * to carry them in the same stream as text. Eight values, eight commands.
+ *
+ * IN THE SAME STREAM ON PURPOSE. A separate command channel would lose the
+ * ORDER: a paste between two typed characters has to land between them, and
+ * two queues cannot promise that. One queue can, and does, for free.
+ *
+ * WHY THE GUI KEY AND NOT CTRL, which is the question that decided all of
+ * this. Ctrl+C cannot be copy in this operating system: 0x03 is intercepted in
+ * keyboard_deliver() and routed at the console's interrupt target, so in a text
+ * field it would cancel whatever the terminal is running rather than reach the
+ * field. That is CORRECT -- ^C is an interruption here (docs/INTERRUPTION.md)
+ * and must stay one. So the rule this OS adopts is a division of the two
+ * modifiers: CTRL BELONGS TO THE TERMINAL -- interrupt, job control, the C0
+ * codes -- AND THE GUI KEY BELONGS TO THE INTERFACE. It is the same separation
+ * macOS makes between Ctrl and Cmd, and for the same reason.
+ *
+ * The driver decides these, not userspace, because the driver is where the
+ * modifier state is known at the instant the key went down -- exactly as it
+ * already decides that Ctrl+letter is a C0 code. Mirrored by EMBK_KEY_* in
+ * user/lib/embk.h and UI_KEY_* in ui/kit/kit.h; all three must agree. */
+#define EK_SEL_LEFT  0xF8   /* Shift+Left   */
+#define EK_SEL_RIGHT 0xF9   /* Shift+Right  */
+#define EK_SEL_HOME  0xFA   /* Shift+Home   */
+#define EK_SEL_END   0xFB   /* Shift+End    */
+#define EK_SEL_ALL   0xFC   /* GUI+A        */
+#define EK_COPY      0xFD   /* GUI+C        */
+#define EK_CUT       0xFE   /* GUI+X        */
+#define EK_PASTE     0xFF   /* GUI+V        */
+
 /* ---- the KEY EVENT stream -----------------------------------------------
  * The char stream above answers "what did the user TYPE". It cannot answer
  * "what key is DOWN", and it never will -- not from lack of effort, but

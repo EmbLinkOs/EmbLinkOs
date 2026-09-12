@@ -2525,6 +2525,19 @@ Open:
       SKIP when nobody typed (the live half needs a person; the keymap itself is
       checked without one by `test keymap`).
 
+- [ ] **`test ctrlc2` cannot be run by tools/console_test.py, and costs 400s to
+      discover that.** It spawns a shell running `primtest.elf spin`, which
+      loops forever and prints nothing, and waits for a person at the console to
+      press ^C -- "completion IS the pass". The harness types a ^C only when it
+      sees the marker `(send ^C now)`, which `spin` never prints, so the test
+      hangs to the full timeout and takes the rest of the run down with it (the
+      harness stops at the first command with no verdict, by design).
+
+      Either give the spin role that marker so the harness can drive it, or have
+      the test say SKIP when nobody is at the console, the way `test keyboard`
+      now does. Until then it is an INTERACTIVE test and does not belong in a
+      scripted list. `test ctrlc` beside it is fully scripted and passes.
+
 ### The services layer, and the first service (started 2026-09-12)
 
 - [x] **An application can ask the user for a file.** Until now the OS had
@@ -2698,29 +2711,45 @@ Open:
       x, is there writing there), which distinguishes an insert at the front
       from an append without reading text off a screenshot.
 
-- [ ] **A field still has no SELECTION, and so no copy.** `embk_clip_set` has no
-      caller in the shared toolkit: Ctrl+V paste is app-wide, but nothing in
-      EmUI can copy, because there is nothing to copy -- no selection exists.
-      Shift+arrows, select-all, cut and copy all wait on it.
+- [x] **And a selection, and a clipboard that any field can reach** (done
+      2026-09-12). Shift+Left/Right/Home/End extend a selection, GUI+A selects
+      all, GUI+C copies, GUI+X cuts, GUI+V pastes, typing or backspace over a
+      selection replaces it, and a plain arrow collapses it to the edge it moves
+      toward. The highlight is a property of the text RUN (`ui_set_text_bg`, a
+      facility that existed for this and had never been used), so it lands where
+      layout put the words and needs no measurement to stay there.
 
-      The obstacle is which keys. **Ctrl+C cannot be copy in this OS**: 0x03 is
-      intercepted in keyboard_deliver() and routed at the console's interrupt
-      target, so in a GUI text field it would cancel whatever the terminal is
-      running instead of reaching the field. That is correct behaviour for ^C
-      and should stay. The modifier that is free is the GUI/Super key (EKM_GUI),
-      which suggests a rule worth adopting deliberately: **Ctrl belongs to the
-      terminal (interrupt, job control), the GUI key belongs to the interface**
-      -- which is why macOS separates Cmd from Ctrl.
+      **THE MODIFIER IS THE GUI KEY, NOT CTRL, and that is now a standing rule
+      of this system.** Ctrl+C cannot be copy here: 0x03 is intercepted in
+      keyboard_deliver() and routed at the console's interrupt target, so in a
+      text field it would cancel whatever the terminal is running rather than
+      reach the field. That is correct -- ^C is an interruption
+      (docs/INTERRUPTION.md) and stays one. So: **Ctrl belongs to the terminal,
+      the GUI key belongs to the interface**, which is the separation macOS
+      makes between Ctrl and Cmd and for the same reason. Ctrl+V still pastes,
+      so nothing that worked stopped working.
 
-      Delivery is the other half. The char stream has no room (C0 is Ctrl's and
-      the nav keys'), and modifiers are not in it at all -- shift+Left and Left
-      are the same byte. Either em_app translates from the EVENT stream
-      (embk_key_event, which carries mods) into UI commands, or the commands
-      ride the char stream as bytes 0xF8..0xFF, which never occur in valid
-      UTF-8. The second keeps typed text and commands in ONE ordered queue,
-      which matters: a paste between two typed characters has to land between
-      them. There are exactly 8 such bytes and 8 commands wanted, which is
-      either elegant or a warning.
+      DELIVERED IN THE SAME BYTE STREAM AS THE TEXT, at 0xF8..0xFF -- byte
+      values that can never occur in valid UTF-8 at any position. One ordered
+      queue, which is the point: a paste between two typed characters has to
+      land between them, and two queues cannot promise that. The driver decides
+      them, because the driver is where the modifier state is known at the
+      instant the key went down -- exactly as it already decides Ctrl+letter is
+      a C0 code.
+
+      A masked field refuses to copy its text. The caret and the selection work
+      in one; only the clipboard is declined, since a clipboard is a place a
+      password would appear.
+
+      The kit takes the clipboard as TWO FUNCTION POINTERS
+      (`ui_clipboard_provider`), because it is built and unit-tested on the host
+      where there is no kernel to ask. ui/dsl/em_app.c installs the real one;
+      kit_test installs its own, which is how copying is tested on the host at
+      all. 35 claims in kit-test, 0 failures.
+
+      `t.selection` is a new theme token at 42% accent, not `accent_soft` at
+      18%: a soft plate says "this row is the current one" and may whisper, but
+      a selection is what the next keystroke is about to destroy.
 
 ### The dock tells the truth about what is running (done 2026-09-12)
 

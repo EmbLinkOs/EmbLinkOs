@@ -82,13 +82,18 @@ void ui_avatar(const char *initials);
  * colour without restating them all. */
 struct ui_ctl_palette {
     struct color surface, border, focus, text, placeholder;
+    /* Behind selected text. Left transparent (the usual case) it falls back to
+     * the theme's soft accent, so a palette written before selections existed
+     * keeps working and simply follows the theme here. */
+    struct color selection;
 };
 void ui_set_control_palette(const struct ui_ctl_palette *p);
 
 /* One colour from it, or `dflt` when the palette is unset or leaves that entry
  * transparent. For controls built OUTSIDE the kit (the DSL's Dropdown) that
  * still have to follow it. */
-enum { UI_CTL_SURFACE, UI_CTL_BORDER, UI_CTL_FOCUS, UI_CTL_TEXT, UI_CTL_PLACEHOLDER };
+enum { UI_CTL_SURFACE, UI_CTL_BORDER, UI_CTL_FOCUS, UI_CTL_TEXT, UI_CTL_PLACEHOLDER,
+       UI_CTL_SELECTION };
 struct color ui_ctl_color_(int which, struct color dflt);
 
 bool ui_text_field(char *buf, unsigned long cap, const char *placeholder);
@@ -131,6 +136,33 @@ void ui_text_field_autofocus(void);
 #define UI_KEY_UP    0x13
 #define UI_KEY_DOWN  0x14
 #define UI_KEY_DEL   0x7F
+
+/* The editing commands, in the SAME stream as the text. 0xF8..0xFF can never
+ * occur in valid UTF-8 at any position, which is what makes them safe to carry
+ * here -- and carrying them here is what keeps them in ORDER with the typed
+ * characters. A paste between two keystrokes has to land between them, and two
+ * separate queues cannot promise that. */
+#define UI_KEY_SEL_LEFT   0xF8
+#define UI_KEY_SEL_RIGHT  0xF9
+#define UI_KEY_SEL_HOME   0xFA
+#define UI_KEY_SEL_END    0xFB
+#define UI_KEY_SEL_ALL    0xFC
+#define UI_KEY_COPY       0xFD
+#define UI_KEY_CUT        0xFE
+#define UI_KEY_PASTE      0xFF
+
+/* THE CLIPBOARD, AS TWO FUNCTION POINTERS.
+ *
+ * The widget kit cannot call embk_clip_set: it is built and unit-tested on the
+ * host, where there is no kernel to ask. So the application runtime installs
+ * the real clipboard here (ui/dsl/em_app.c does it once at startup) and the
+ * kit calls through. With nothing installed, copy and cut do nothing and the
+ * field still works -- which is also how kit_test drives a clipboard of its
+ * own and can test copying at all.
+ *
+ * `get` returns the number of bytes written, or <= 0 for an empty clipboard. */
+void ui_clipboard_provider(int (*set)(const char *buf, unsigned len),
+                           int (*get)(char *buf, unsigned cap));
 
 /* Pixel width of the first `nbytes` of `s` (nbytes < 0 = the whole string),
  * stepped with the RENDERER's own UTF-8 decoder. Measuring text any other way

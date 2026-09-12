@@ -707,6 +707,25 @@ static inline int embk_ui_present_rect(const void *pixels, uint32_t w, uint32_t 
 #define EMBK_KEY_PGUP   0x0E
 #define EMBK_KEY_PGDN   0x0F
 
+/* The EDITING commands, in the same byte stream as the text. 0xF8..0xFF can
+ * never occur in valid UTF-8 at any position, which is what makes it safe to
+ * carry them there -- and carrying them there is what keeps them in ORDER with
+ * the typed characters, so a paste between two keystrokes lands between them.
+ *
+ * They come from the GUI/Super key, not Ctrl, and that is a standing rule of
+ * this system rather than a preference: Ctrl+C is the console INTERRUPT here
+ * (docs/INTERRUPTION.md) and is consumed long before any application sees it.
+ * CTRL BELONGS TO THE TERMINAL, THE GUI KEY BELONGS TO THE INTERFACE.
+ * Mirrors EK_* in kernel/drivers/input/keyboard.h. */
+#define EMBK_KEY_SEL_LEFT   0xF8   /* Shift+Left  */
+#define EMBK_KEY_SEL_RIGHT  0xF9   /* Shift+Right */
+#define EMBK_KEY_SEL_HOME   0xFA   /* Shift+Home  */
+#define EMBK_KEY_SEL_END    0xFB   /* Shift+End   */
+#define EMBK_KEY_SEL_ALL    0xFC   /* GUI+A       */
+#define EMBK_KEY_COPY       0xFD   /* GUI+C       */
+#define EMBK_KEY_CUT        0xFE   /* GUI+X       */
+#define EMBK_KEY_PASTE      0xFF   /* GUI+V       */
+
 /* ---- key EVENTS (make/break + modifiers) --------------------------------
  * A SECOND stream beside the characters above, not a replacement. The char
  * stream answers "what did the user type"; it cannot answer "what key is down"

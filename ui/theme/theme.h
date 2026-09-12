@@ -36,6 +36,11 @@ struct ui_theme {
     struct color accent;
     struct color accent_hover;
     struct color accent_soft;    /* tinted background for accent surfaces/badges */
+    /* Behind SELECTED TEXT, and a stronger tint than accent_soft on purpose: a
+     * soft plate says "this row is the current one" and may whisper, but a text
+     * selection is the thing the next keystroke is about to destroy. It has to
+     * be unmistakable, and at accent_soft's 18% it was not. */
+    struct color selection;
     struct color on_accent;      /* text/icon on an accent fill */
 
     /* --- semantic status (separate from the accent) --- */

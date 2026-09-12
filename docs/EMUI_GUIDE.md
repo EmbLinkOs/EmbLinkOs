@@ -153,6 +153,21 @@ Focusing a field (Tab, autofocus) puts the caret at the end of its text, which
 is where someone arriving to add something expects it; a click is how you get
 anywhere else. There is one caret because exactly one field is focused.
 
+**Selecting and the clipboard.** Shift+Left/Right/Home/End extend a selection,
+and the clipboard is on the **GUI (Cmd/Super) key**: GUI+A select all, GUI+C
+copy, GUI+X cut, GUI+V paste. Typing or backspace over a selection replaces it;
+a plain arrow collapses it to the edge it moves toward. A password field lets
+you select and edit but never copies its text out.
+
+The clipboard is **not** on Ctrl+C, and will not be: `0x03` is this OS's console
+interrupt and is consumed before any application sees it
+(`docs/INTERRUPTION.md`). The rule is *Ctrl belongs to the terminal, the GUI key
+belongs to the interface*. Ctrl+V still pastes, for the apps that always used it.
+
+An app gets all of this for free — there is nothing to call. If your app
+installs a key hook, note that it sees the paste replay and can refuse it (this
+is how the terminal stops a pasted newline from executing anything).
+
 Text has five font roles (`.title() .heading() .body() .bold() .caption()`)
 and color roles (`.secondary() .tertiary() .accent()`). A leaf you want to
 read a click from ends with `.clicked()`; give it `.id("x")` first if you
