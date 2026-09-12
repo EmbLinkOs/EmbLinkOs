@@ -8421,18 +8421,30 @@ int selftests_handle_command(const char *cmd)
              IS_THERE("/system/abi/crt0.o") && IS_THERE("/system/abi/syscalls.o") &&
              IS_THERE("/system/abi/libc.a"));
 
-        /* /data -- mutable state: installed apps + user/scratch dirs. */
-        LCHK("/data/apps/{tcc,git}", IS_THERE("/data/apps/tcc/tcc.elf") &&
-             IS_THERE("/data/apps/git/git.elf"));
+        /* /data -- mutable state: installed apps + user/scratch dirs.
+         *
+         * tcc is OPTIONAL -- the Makefile only stages it when a host copy was
+         * found (HAVE_TCC) -- so a build without it must SKIP this line, not
+         * fail it. A test that reports a red light for a component nobody asked
+         * to build is a test people learn to ignore. */
+        if (IS_THERE("/data/apps/tcc/tcc.elf"))
+            LCHK("/data/apps/{tcc,git}", IS_THERE("/data/apps/git/git.elf"));
+        else
+            kprintf("  SKIP /data/apps/tcc (not built: HAVE_TCC was off)\n");
         LCHK("/data/tmp and /data/users/teo exist",
              IS_THERE("/data/tmp") && IS_THERE("/data/users/teo"));
 
-        /* THE SCOPE DECISION, asserted so a future reader knows it was deliberate:
-         * demos and fonts stayed at ROOT and did NOT move under /system. */
+        /* WHERE THE SEALED ASSETS LIVE. This pair used to assert the opposite
+         * -- "demos and fonts stayed at ROOT" -- and it had been failing since
+         * 2026-07-28, when f743bd3 ("userspace v2: init as the root of
+         * authority (UP1) + fonts to /system") moved the fonts and did not
+         * come back here. Six weeks of a red light on a test whose subject had
+         * simply moved, which is worse than having no test: it teaches the
+         * reader that this one is always red. */
         LCHK("a demo moved to /data/apps (/data/apps/uidemo/uidemo.elf, not /uidemo.elf)",
              IS_THERE("/data/apps/uidemo/uidemo.elf") && !IS_THERE("/uidemo.elf"));
-        LCHK("fonts stayed at root (/font.ttf, not /system/lib/font.ttf)",
-             IS_THERE("/font.ttf") && !IS_THERE("/system/lib/font.ttf"));
+        LCHK("fonts are sealed under /system/fonts (not root stragglers)",
+             IS_THERE("/system/fonts/font.ttf") && !IS_THERE("/font.ttf"));
 
         /* The OLD flat paths must be GONE -- a lingering /system/bin/shell.elf would mean the
          * migration half-happened (dangerous: two truths for one program). */

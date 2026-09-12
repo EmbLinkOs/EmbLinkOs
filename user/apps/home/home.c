@@ -334,17 +334,32 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
  * the drop can hit-test against it. */
 static int dock_running(const char *path);   /* below, with g_running */
 
-/* Cursor-driven magnification: an icon's size is a pure function of the
- * pointer's horizontal distance to it -- the Mac dock's defining gesture.
- * No animation clock needed; the hand's own motion IS the animation. Uses
- * LAST frame's dock rect (one-frame-stale geometry is invisible at pointer
- * speeds) and stands down entirely during a drag, where a chip swelling
- * under the ghost would fight the gesture. */
-/* The dock's base size is a PREFERENCE, not a constant: Settings writes it and
- * the desktop re-reads it about once a second, so the dock changes under the
- * slider instead of after a reboot. Peak follows base by the same ratio the
- * magnifier was tuned at, so choosing a bigger dock does not also flatten the
- * magnification. */
+/* THE DOCK DOES NOT REACT TO THE POINTER. It reacts to the MACHINE.
+ *
+ * What was here was cursor-driven magnification -- an icon's size as a pure
+ * function of the pointer's horizontal distance to it. That is the Mac dock's
+ * defining gesture, it was implemented here as that, and its comment said so.
+ * Keeping it would have made every other difference cosmetic.
+ *
+ * What replaces it is the idea this dock is built on: EmbLinkOS is an
+ * operating system that measures itself -- per-core idle residency, a
+ * scheduler policy you can name, a page cache that reports its own hit rate --
+ * and its dock should show the machine, not the hand. So:
+ *
+ *   * the icons never move or swell. A dock is a target, and a target that
+ *     changes size under the pointer is a worse target (the Mac pays this
+ *     price knowingly for the delight; we are not copying the delight, so we
+ *     do not owe the price);
+ *   * a RUNNING app sits in a lit SOCKET -- a filled, hairline-framed plate
+ *     behind its icon. Not a dot underneath: the dot is a footnote, and
+ *     whether an app is running is the single most useful thing this strip
+ *     knows. A socket is visible from across the room;
+ *   * the pointer gets a quiet backplate, nothing more.
+ *
+ * What has NOT changed: the floating label that names the icon under the
+ * pointer. Every dock ever built names what you point at, because dock art is
+ * abstract everywhere and ours more than most -- see dock_label(). */
+
 static struct oscfg g_cfg;
 static uint64_t     g_cfg_next = 0;
 static void cfg_poll(void) {
@@ -365,8 +380,11 @@ static void cfg_poll(void) {
         ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f });
     }
 }
+
+/* The dock's base size is a PREFERENCE, not a constant: Settings writes it and
+ * the desktop re-reads it about once a second, so the dock changes under the
+ * slider instead of after a reboot. */
 #define DOCK_BASE ((float)g_cfg.dock_size)
-#define DOCK_PEAK (DOCK_BASE * 1.53f)
 /* Dock band geometry. These were implicit and they DISAGREED: the row reserved
  * 64px while the pill inside it was 70 tall, so the pill overflowed its row
  * and the last 6px -- its bottom edge and rounded corners -- fell off the
@@ -391,27 +409,14 @@ static void cfg_poll(void) {
  * four slots, and 4*(38+8) + 3*10 + 2*12 is exactly 238, while the +10 formula
  * predicts 216.
  *
- * The visible cost: the magnifier swells one icon while you point at another,
- * and the floating label names the wrong app. */
+ * The visible cost, when it was wrong: the label named the wrong app and the
+ * hover plate lit the wrong socket. */
 #define DOCK_SLOT_W  (DOCK_BASE + 8.0f)
 #define DOCK_PITCH   (DOCK_SLOT_W + 10.0f)
 static float dock_slot_x0(int i) { return g_dockr[0] + 12.0f + (float)i * DOCK_PITCH; }
 
-static float dock_icon_size(int i) {
-    if (!g_have_dockr || g_drag) return DOCK_BASE;
-    float px, py; ui_pointer_pos(&px, &py);
-    if (py < g_dockr[1] - 30.0f || py > g_dockr[3] + 10.0f ||
-        px < g_dockr[0] - 40.0f || px > g_dockr[2] + 40.0f) return DOCK_BASE;
-    float cx = dock_slot_x0(i) + DOCK_SLOT_W * 0.5f;
-    float d = px - cx; if (d < 0) d = -d;
-    const float radius = 96.0f;
-    if (d >= radius) return DOCK_BASE;
-    float t = 1.0f - d / radius;
-    return DOCK_BASE + (DOCK_PEAK - DOCK_BASE) * t * t;    /* eased falloff */
-}
-
-/* Which slot the pointer is over, or -1. Same slot arithmetic as the
- * magnifier, so the label always names the icon that is actually swelling. */
+/* Which slot the pointer is over, or -1. The readout and the hover plate both
+ * ask this, so they can never disagree about which app you mean. */
 static int dock_hover_index(void) {
     if (!g_have_dockr || g_drag) return -1;
     float px, py; ui_pointer_pos(&px, &py);
@@ -460,65 +465,60 @@ static void dock_label(void) {
 }
 
 static void dock_pill(void) {
-    /* GLASS, not paint: the pill blurs the wallpaper behind it (the desktop
-     * layer paints the wallpaper earlier in this same tree, which is exactly
-     * what in-window backdrop blur samples). Bottom-aligned so magnified
-     * icons grow UPWARD out of the bar, the way the Mac's do. */
-    HStack(.height = DOCK_PILL_H, .spacing = 10, .px = 12, .pb = 6, .align = Trailing,
-           .glass = 1, .corner = 20, .border = 1, .shadow = 2) {
+    const struct ui_theme *t = ui_theme();
+    int hov = dock_hover_index();
+
+    /* THE RACK. Not a pill: corner 14 against the pill's 20, which is the
+     * theme's own radius_lg -- the same curve every card and panel in the OS
+     * uses. A dock cut from the system's shape language belongs to the system;
+     * a pill belongs to whoever invented that pill.
+     *
+     * Still glass, still floating clear of the screen edge (a dock that
+     * touches the edge is a taskbar), still bottom-aligned. */
+    HStack(.height = DOCK_PILL_H, .spacing = 10, .px = 12, .pb = 6, .align = Center,
+           .glass = 1, .corner = 14, .border = 1, .shadow = 2) {
         (void)ui_open();
         { float x, y, w, h; g_have_dockr = ui_open_rect(&x, &y, &w, &h);
           if (g_have_dockr) { g_dockr[0]=x; g_dockr[1]=y; g_dockr[2]=x+w; g_dockr[3]=y+h; } }
         for (int i = 0; i < g_dock_n; i++) {
-            /* FIXED-width slot: magnification must swell the icon IN PLACE,
-             * never reflow the row -- a centered row that re-lays-out as chips
-             * grow slides the chip out from under the pointer, so the press
-             * you aimed lands in a gap. The icon box overflows its slot
-             * upward and sideways (no clip); the slot never moves. */
-            VStack(.spacing = 3, .width = DOCK_BASE + 8, .align = Center) {
-                drag_icon(g_dock[i], (int)dock_icon_size(i), 2, i);
-                /* The running dot: 4px of truth under a live app's chip.
-                 *
-                 * The paint is set EXPLICITLY in BOTH states, and that is the
-                 * whole point. Written as two branches -- a dot with a
-                 * .background, and a bare spacer without one -- the reconciler
-                 * reuses the same instance (same shape, same position) and
-                 * em_apply_box only calls ui_set_paint when .background has
-                 * alpha, so the "off" branch set nothing and the instance KEPT
-                 * last frame's fill. The dot then survived the app that owned
-                 * it: close the terminal and its light stayed on forever. Same
-                 * mechanism as the V6 menu smear -- a reused instance retains
-                 * every prop the new state fails to set. PAINT_NONE is how you
-                 * say "no fill" and mean it. */
-                int running = g_cfg.dock_dots && dock_running(g_dock[i].app);
-                em_flush();
-                /* Key by the app's IDENTITY, exactly as drag_icon does, and for
-                 * a sharper reason than tidiness: this key was the CONSTANT
-                 * 0xD07 inside the loop over dock slots, so every dot in the
-                 * dock claimed the SAME instance. Four emitters, one instance,
-                 * every frame.
-                 *
-                 * That stayed invisible while all the dots were identical --
-                 * which is the case until something is running. Launch one app
-                 * and its dot alone becomes PAINT_SOLID: now the emitters
-                 * disagree about the shared instance, they fight over it frame
-                 * after frame, and the dock's reconciled tree -- including the
-                 * hit rects of the icons above these dots -- stops matching
-                 * what is on screen. From the outside: the dock launches apps
-                 * perfectly until you launch one, and then it goes dead, while
-                 * the launcher grid and the desktop icons (which have no dots)
-                 * keep working. */
-                ui_begin_hstack(0xD0700000ULL ^ (uint64_t)(uintptr_t)g_dock[i].app);
-                ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 4 },
-                            (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 4 });
-                ui_set_corner_radius(2);
-                struct paint dot = { 0 };            /* PAINT_NONE */
-                if (running) {
-                    dot.kind = PAINT_SOLID;
-                    dot.solid = (Color){ .r=.62f, .g=.66f, .b=.78f, .a=1.f };
-                }
-                ui_set_paint(dot);
-                ui_end_stack();
+            int running = dock_running(g_dock[i].app);
+            int over    = (i == hov) && !g_drag;
+
+            /* THE SOCKET: the plate an app sits in, LIT while it runs.
+             *
+             * This replaces a 4px dot under the icon. The dot is a footnote,
+             * and whether an app is running is the most useful thing this
+             * strip knows -- worth the whole tile, not four pixels of it.
+             * (`dock_dots` still governs it: the preference is "show me what
+             * is running", and it now answers that question better.)
+             *
+             * Three states, and EVERY prop is set in all three. A reused
+             * instance keeps whatever the new state fails to restate, which is
+             * exactly how the old dot survived the app that owned it -- see
+             * em_apply_box, where both the fill and the border now honour an
+             * explicit zero so that "off" can be said out loud. */
+            Color plate  = { 0, 0, 0, 0 };
+            Color edge   = { 0, 0, 0, 0 };
+            float edge_w = EmZero;
+            if (running && g_cfg.dock_dots) {
+                plate  = t->accent_soft;
+                edge   = t->accent;
+                edge_w = 1;
+            }
+            if (over) {
+                plate  = t->surface_alt;
+                edge   = running && g_cfg.dock_dots ? t->accent : t->border_strong;
+                edge_w = 1;
+            }
+
+            /* FIXED-width slot: the tile never moves and never resizes, so the
+             * press you aimed is the press that lands. (The Mac trades this
+             * away for magnification on purpose; we are not copying the
+             * magnification, so we keep the target.) */
+            VStack(.width = DOCK_SLOT_W, .height = DOCK_SLOT_W + 6, .align = Center,
+                   .justify = Center, .corner = 10, .background = plate,
+                   .border = edge_w, .border_color = edge) {
+                drag_icon(g_dock[i], (int)DOCK_BASE, 2, i);
             }
         }
         if (g_dock_n == 0) { EmProps hp = {0}; (void)hp; Text("  drag apps here  ").caption().secondary(); }

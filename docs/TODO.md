@@ -2471,6 +2471,53 @@ Open:
       mapped there. Guarded on both architectures. Nothing reaps those threads
       today, which is the only reason it never fired.
 
+### A USB tablet attached to the x86 guest moves nothing
+
+- [ ] **QEMU's `usb-tablet` on a `qemu-xhci` controller produced no pointer
+      motion at all.** Observed 2026-09-12 while building tools/shell_shot.py:
+      booting the x86 image with `-device qemu-xhci,id=xhci -device
+      usb-tablet,bus=xhci.0` and sending QMP `input-send-event` abs events left
+      the cursor at its boot position (516, 390) for an entire run, while every
+      click landed on whatever was under that point.
+
+      The kernel has the code for this: `usb_tablet_process_report()` decodes
+      QEMU's 6-byte report and feeds `mouse_set_absolute()` (kernel/drivers/usb/
+      usb_core.c), and xhci.c, ehci.c and uhci.c are all built for x86. So the
+      driver exists and something between the controller and the report is not
+      happening -- which of the three was not investigated.
+
+      NOT A TEST-ONLY PROBLEM. A USB mouse is not optional on a real machine,
+      and this is the only path an external pointing device has: the PS/2 mouse
+      is emulated hardware that a physical laptop does not have. Worth finding
+      before the machine does.
+
+      The repro is one line: attach the two devices to any x86 boot and move
+      the pointer over QMP. tools/app_shot.py takes `tablet=True` for exactly
+      this. Until it works, tools/shell_shot.py aims with paced relative PS/2
+      motion, which is what its move() explains at length.
+
+### The dock only knows what it launched
+
+- [ ] **A running app the dock did not start shows no socket.** The desktop
+      lights a dock socket from its OWN record of spawns (`g_running[]` in
+      user/apps/home/home.c, keyed by spawn handle), so an app started from the
+      shell -- or any app whose window is plainly on screen -- leaves its dock
+      tile dark. The redesigned dock makes this more visible than the old 4px
+      dot did, because the socket is the tile.
+
+      What it needs: the compositor to expose a WINDOW LIST (pid, window id,
+      title, minimized, focused) and a syscall to read it. A process here has
+      no name to match on and that is deliberate -- this is a capability
+      system, processes are named by handle, and `struct process` has no path
+      or argv stored anywhere. So the list has to come from the compositor,
+      which is the only part of the kernel that knows an application by a name
+      a person would recognise (its window title).
+
+      The same list is what a window switcher would need, and what would let
+      the top bar name the focused application -- which is the honest version
+      of the app-menu space the menu bar no longer pretends to fill. See
+      docs/SHELL_DESIGN.md.
+
 ### The sleep wake is quantised to the timer tick -- and it is now the dominant
 ### source of lateness
 

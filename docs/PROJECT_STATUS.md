@@ -742,13 +742,16 @@ newlib-based libc port.*
   rounding, is 26px, bolds the owning app's name, and carries bare status
   glyphs in equal-width slots rather than boxed chips. It paints NOTHING at all
   -- no fill, no frost: the menu bar is its text and glyphs sitting directly on
-  the wallpaper. The dock names the app under the pointer in a floating glass
-  label, and its band is the pill plus a gap so it reads as floating rather
-  than as a taskbar welded to the screen edge; window controls are
-  **traffic lights** (red close, green minimize) whose symbol appears only on
-  hover, drawn as a small dot inside a deliberately larger invisible hit area.
-  The three essential applications share one
-  house style (`AppBar`): traffic lights leading, a centred title, the app's
+  the wallpaper -- and it reports a MEASURED number (the session's CPU use,
+  per core, from `embk_proc_list`) where four decorative glyphs used to sit.
+  The dock names the app under the pointer in a floating glass label, and its
+  band is the rack plus a gap so it reads as floating rather than as a taskbar
+  welded to the screen edge; a RUNNING app sits in a lit socket rather than
+  over a dot, and nothing magnifies under the pointer. Window controls are a
+  **cluster**: three segments in one hairline frame (minimize, maximize,
+  close), glyphs always drawn, colour spent only on the segment under the
+  pointer. The three essential applications share one
+  house style (`AppBar`): the cluster leading, a centred title, the app's
   own controls trailing. **Files** is a real file manager (places sidebar,
   back/forward/up, live search that FILTERS rather than navigates, grid/list
   views, human sizes and named kinds, New Folder); **Settings** is built to the

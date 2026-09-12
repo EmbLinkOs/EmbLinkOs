@@ -42,7 +42,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def main(cmds):
     if not cmds:
         print(__doc__); return 2
-    if subprocess.run(["pgrep", "-f", "qemu-system"], capture_output=True).returncode == 0:
+    # EXACT executable name, not a command-line substring. `pgrep -f
+    # qemu-system` matches ANY process whose command line contains that text --
+    # including a shell one-liner that waits for qemu to exit, which is exactly
+    # what a person or a script babysitting a long run will be running. It cost
+    # a real debugging session: every tool here refused to start, reporting
+    # "another qemu-system is running", while nothing was running but the
+    # waiters themselves. -x matches the program, which is the question.
+    if any(subprocess.run(["pgrep", "-x", exe], capture_output=True).returncode == 0
+           for exe in ("qemu-system-x86_64", "qemu-system-aarch64")):
         print("console_test: another qemu-system is running; refusing to start a second one", file=sys.stderr)
         return 2
 

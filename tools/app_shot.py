@@ -37,7 +37,7 @@ def sock_path(name, kind):
     return os.path.join(BUILD, "shot-%s-%s.sock" % (name, kind))
 
 
-def boot(name, scratch, audio=None):
+def boot(name, scratch, audio=None, tablet=False):
     ser, qmp = sock_path(name, "ser"), sock_path(name, "qmp")
     for p in (ser, qmp):
         if os.path.exists(p):
@@ -57,6 +57,20 @@ def boot(name, scratch, audio=None):
         "-no-reboot", "-no-shutdown", "-m", "1024m", "-smp", "2",
         "-accel", "tcg,thread=multi",
     ]
+    if tablet:
+        # AN ABSOLUTE POINTING DEVICE, for a test that has to put the cursor on
+        # a named pixel. QEMU gives a PC a PS/2 mouse, which is RELATIVE: a tool
+        # can only aim by shoving the pointer into a corner and counting deltas
+        # back out, and a dropped or coalesced packet silently lands it
+        # somewhere else -- measured, the same script hit a dock icon and then
+        # missed a 24px window button by 90px on the same boot.
+        #
+        # The kernel already drives QEMU's usb-tablet as an absolute device
+        # (usb_tablet_process_report -> mouse_set_absolute), so attaching one
+        # makes `input-send-event` with abs axes land on the pixel asked for.
+        # Off by default: it is extra hardware to enumerate, and a test that
+        # does not move the pointer should not pay for it.
+        argv += ["-device", "qemu-xhci,id=xhci", "-device", "usb-tablet,bus=xhci.0"]
     if audio:
         # The guest's audio written to a FILE on this machine. The same trick
         # `make test-audio` uses: what a speaker did is not observable from a

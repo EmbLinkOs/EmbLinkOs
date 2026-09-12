@@ -179,8 +179,14 @@ static void em_apply_box(EmProps p) {
      * a default (Card, Sidebar, Window...) now pass it through p.background
      * above rather than pre-painting behind this function's back. */
     ui_set_paint(p.background.a > 0 ? solid(p.background) : (struct paint){ 0 });
-    if (p.corner > 0)       ui_set_corner_radius(p.corner);
-    if (p.border > 0)       ui_set_border(p.border, p.border_color.a > 0 ? p.border_color : TH->border);
+    if (em_set(p.corner))   ui_set_corner_radius(em_z(p.corner));
+    /* em_set, not `> 0`, for the reason the paint above spells out at length:
+     * a container that DROPS its border must be able to say so, or the reused
+     * instance keeps last frame's. Same one-way-highlight bug, one prop over --
+     * the dock's sockets light when an app runs and have to go dark when it
+     * exits. `.border = EmZero` is how a caller means no border. */
+    if (em_set(p.border))
+        ui_set_border(em_z(p.border), p.border_color.a > 0 ? p.border_color : TH->border);
     if (p.shadow > 0) {
         const struct ui_theme *t = TH;
         struct ui_shadow_spec s = p.shadow == 1 ? t->shadow_sm : p.shadow == 2 ? t->shadow_md : t->shadow_lg;
@@ -326,7 +332,7 @@ void em_scroll_end_(void) { em_flush(); ui_scroll_end(); }
 typedef enum { PK_NONE, PK_TEXT, PK_ICON, PK_LABEL, PK_BADGE, PK_TAG, PK_AVATAR,
                PK_BANNER, PK_PROGRESS, PK_BUTTON, PK_ICONBTN, PK_TOGGLE, PK_CHECK,
                PK_SLIDER, PK_STEPPER, PK_FIELD, PK_PASSWORD, PK_SEGMENTED, PK_LISTROW,
-               PK_CLOSEBTN, PK_MINBTN, PK_SEARCH, PK_SPINNER, PK_DROPDOWN } PKind;
+               PK_CLOSEBTN, PK_MINBTN, PK_MAXBTN, PK_SEARCH, PK_SPINNER, PK_DROPDOWN } PKind;
 
 static struct {
     int active; PKind kind; EmProps props; const char *id;
@@ -360,6 +366,10 @@ static void em_segmented_impl(const char *const *labels, int count, int *b, EmPr
 static bool em_listrow_impl(int cp, const char *title, const char *value, EmProps p, bool *hov);
 static bool em_closebtn_impl(bool *hov);
 static bool em_minbtn_impl(bool *hov);
+static bool em_maxbtn_impl(bool *hov);
+static void em_wc_open(void);
+static void em_wc_divider(void);
+static void em_wc_close(void);
 static bool em_search_impl(char *buf, size_t cap, const char *ph, bool *hov);
 static void em_spinner_impl(void);
 static bool em_dropdown_impl(const char *const *labels, int count, int *sel, bool *hov);
@@ -403,6 +413,7 @@ void em_flush(void) {
         case PK_LISTROW:  clicked = em_listrow_impl(P.cp, P.str, P.str2, pr, &hovered); break;
         case PK_CLOSEBTN: clicked = em_closebtn_impl(&hovered); break;
         case PK_MINBTN:   clicked = em_minbtn_impl(&hovered); break;
+        case PK_MAXBTN:   clicked = em_maxbtn_impl(&hovered); break;
         case PK_SEARCH:   clicked = em_search_impl(P.buf, P.cap, P.str, &hovered); break;
         case PK_SPINNER:  em_spinner_impl(); break;
         case PK_DROPDOWN: clicked = em_dropdown_impl(P.labels, P.count, (int *)P.bind, &hovered); break;
@@ -628,6 +639,7 @@ EmV em_segmented(const char *const *labels, int count, int *b){ EmV v = stage(PK
 EmV em_listrow(int icon, const char *title, const char *value){ EmV v = stage(PK_LISTROW); P.cp = icon; P.str = title; P.str2 = value; return v; }
 EmV em_close_button(void){ EmV v = stage(PK_CLOSEBTN); P.id = "__em_win_close"; return v; }
 EmV em_min_button(void){ EmV v = stage(PK_MINBTN); P.id = "__em_win_min"; return v; }
+EmV em_max_button(void){ EmV v = stage(PK_MAXBTN); P.id = "__em_win_max"; return v; }
 EmV em_search_field(char *buf, size_t cap, const char *ph){ EmV v = stage(PK_SEARCH); P.buf = buf; P.cap = cap; P.str = ph; return v; }
 EmV em_spinner(void){ return stage(PK_SPINNER); }
 EmV em_dropdown(const char *const *labels, int count, int *sel){ EmV v = stage(PK_DROPDOWN); P.labels = labels; P.count = count; P.bind = sel; return v; }
@@ -1227,8 +1239,8 @@ void em_windowbar_end_(void) { em_flush(); ui_end_stack(); }
 
 /* The standard application title bar (see em.h). Deliberately NOT a variant of
  * WindowBar: WindowBar is the general "put what you like in a bar" container,
- * while this one is a house style with opinions -- lights leading in Mac
- * order, a centred title, a hairline under it -- and the point of a house
+ * while this one is a house style with opinions -- the control cluster
+ * leading, a centred title, a hairline under it -- and the point of a house
  * style is that apps do not get to disagree about it. */
 void em_appbar_(const char *title, EmProps p) {
     em_flush();
@@ -1242,9 +1254,7 @@ void em_appbar_(const char *title, EmProps p) {
     ui_set_border(0, t->border);
     em_apply_box(p);
 
-    /* the lights, leading */
-    em_close_button(); em_flush();
-    em_min_button();   em_flush();
+    em_window_controls();            /* leading: minimize, maximize, close */
 
     /* Title, centred in whatever space is left between the lights and the
      * app's own controls, and the drag zone at the same time -- so the bar is
@@ -1280,55 +1290,147 @@ void em_drag_handle_(EmProps p) {
 }
 void em_drag_handle_end_(void) { em_flush(); ui_end_stack(); }
 
-/* ---- window controls: traffic lights ------------------------------------ *
- * Colour IS the affordance, which is the whole point of the Mac design: red
- * means this window goes away, green means it comes back. That reads instantly
- * and at any size, where two identical grey pills distinguished only by a tiny
- * glyph do not -- you had to look at the symbol to know which was which.
+/* ---- window controls: the cluster --------------------------------------- *
  *
- * So the glyph is only shown on hover, and the resting state is pure colour.
- * The visible dot is small (13px, Mac's is 12) but the CONTROL is 24px: the
- * case is deliberately larger than the dot and completely transparent, so
- * Fitts' law is satisfied by the hit area while the eye sees a small tidy
- * light. That separation is why an oversized case is correct here -- it just
- * has to be invisible, and the dot has to be genuinely centred in it. */
-#define TL_DOT  13
-#define TL_HIT  24
+ * WHAT WAS HERE, AND WHY IT IS NOT ANY MORE. Two coloured dots -- #FF5F57 and
+ * #28C840, 13px in a 24px hit case, glyph on hover only -- and the comment
+ * above them said "which is the whole point of the Mac design". It was a good
+ * copy. That is the problem: an operating system that ships another system's
+ * window controls is wearing its face, and every other difference downstream
+ * reads as a variation on that face rather than as a design of its own.
+ *
+ * So: ONE CONTROL, not three. A hairline-framed cluster with the three
+ * segments divided by hairlines, glyphs ALWAYS drawn, colour spent only on
+ * hover -- and only ever on the segment under the pointer, in the tone that
+ * says what it will do (danger for close, a plain fill for the other two).
+ *
+ * The reasoning, made explicit, because it is the opposite of the Mac's:
+ *
+ *   * COLOUR AT REST IS EXPENSIVE. Two saturated dots in the corner of every
+ *     window are, together, the loudest thing on a desktop full of windows.
+ *     This OS spends boldness on one accent (theme.h says so in as many
+ *     words), and window furniture is not where to spend it.
+ *   * A GLYPH YOU CAN ONLY SEE ON HOVER IS A GLYPH YOU CANNOT USE. The Mac can
+ *     afford that because a generation already knows red-means-close. Nobody
+ *     knows this OS's window controls, so they have to say what they are.
+ *   * THREE SEGMENTS IN ONE FRAME read as one instrument with three positions,
+ *     which is what they are, and gives a grouping that needs no spacing rules
+ *     to hold together at any size.
+ *
+ * They stay LEADING (top-left), which is not the Mac's idea -- it is just the
+ * better corner: it is where the window's title already is, so the eye finds
+ * one region of chrome instead of two, and it is nowhere near a scrollbar.
+ *
+ * Order is minimize, maximize, close: the destructive one last and outermost,
+ * which is every toolkit's convention and a real protection against a
+ * mis-aimed click ending your work. */
+#define WC_SEG_W  24
+#define WC_SEG_H  18
 
-static bool em_light_impl(int cp, Color base, bool *out_hov) {
+static bool em_wc_segment(int cp, bool destructive, bool *out_hov) {
+    const struct ui_theme *t = TH;
     ui_begin_hstack(0);
     struct instance_handle self = ui_open();
     bool hov = ui_is_hovered(), pressed = ui_is_pressed();
     if (out_hov) *out_hov = hov;
-    ui_set_size(sz_fixed(TL_HIT), sz_fixed(TL_HIT));
-    ui_set_paint(solid((Color){ 0.f, 0.f, 0.f, 0.f }));   /* the case is invisible */
+    ui_set_size(sz_fixed(WC_SEG_W), sz_fixed(WC_SEG_H));
     ui_set_align(ALIGN_CENTER);
     ui_set_justify(JUSTIFY_CENTER);
 
-    ui_box_begin(1);
-    ui_set_size(sz_fixed(TL_DOT), sz_fixed(TL_DOT));
-    ui_set_paint(solid(pressed ? shade(base, 0.80f) : hov ? shade(base, 1.10f) : base));
-    ui_set_corner_radius((float)TL_DOT / 2.0f);
-    ui_set_align(ALIGN_CENTER);
-    ui_set_justify(JUSTIFY_CENTER);
-    /* the symbol appears only under the pointer -- at rest the colour says it */
-    if (hov) { EmProps ip = { .font = Caption, .color = { 0.f, 0.f, 0.f, 0.68f } };
-               em_icon_impl(cp, ip); }
-    ui_box_end();
+    /* Fill and ink are BOTH set on every path -- the retained-instance rule
+     * em_apply_box documents: a segment that stops being hovered has to say
+     * "no fill" out loud or it keeps the last one and the cluster ends up with
+     * two lit segments. */
+    Color fill = { 0, 0, 0, 0 };
+    Color ink  = t->text_secondary;
+    if (hov) {
+        fill = destructive ? t->danger : t->surface_alt;
+        ink  = destructive ? (Color){ 1.f, 1.f, 1.f, 1.f } : t->text;
+        if (pressed) fill = shade(fill, 0.86f);
+    }
+    ui_set_paint(fill.a > 0 ? solid(fill) : (struct paint){ 0 });
+
+    EmProps ip = { .font = Caption, .color = ink };
+    em_icon_impl(cp, ip);
 
     ui_end_stack();
     return ui_consume_click(self);
 }
 
-/* #FF5F57 / #28C840 -- close is red, minimize green, as asked. */
+/* The frame the segments sit in: opened and closed explicitly rather than
+ * through a scope macro, because the caller has to emit three staged widgets
+ * between the two halves. Spacing zero -- the dividers do the separating, and
+ * the bar's own spacing must not get inside the cluster. */
+static void em_wc_open(void) {
+    const struct ui_theme *t = TH;
+    ui_begin_hstack(0x77C1);
+    ui_set_spacing(0);
+    ui_set_align(ALIGN_CENTER);
+    ui_set_corner_radius(t->radius_sm);
+    ui_set_border(1, t->border);
+    ui_set_clip_children(true);      /* so a hovered end segment keeps the radius */
+    ui_set_paint((struct paint){ 0 });
+}
+static void em_wc_divider(void) {
+    const struct ui_theme *t = TH;
+    ui_box_begin(0);
+    ui_set_size(sz_fixed(1), sz_fixed(WC_SEG_H));
+    ui_set_paint(solid(t->border));
+    ui_box_end();
+}
+static void em_wc_close(void) { ui_end_stack(); }
+
+/* The whole cluster, for a bar an app assembles itself (Note++ and Vellum put
+ * their window controls at the head of a TAB STRIP rather than in an AppBar).
+ * Exposed as one call so those bars cannot end up with a different set, a
+ * different order, or no frame -- which is exactly what they had: two bare
+ * buttons, close first, in the order the Mac lights used to be in. */
+void em_window_controls(void) {
+    em_wc_open();
+    em_min_button();   em_flush();
+    em_wc_divider();
+    em_max_button();   em_flush();
+    em_wc_divider();
+    em_close_button(); em_flush();
+    em_wc_close();
+}
+
 static bool em_closebtn_impl(bool *out_hov) {
-    return em_light_impl(IconClose, (Color){ 1.00f, 0.373f, 0.341f, 1.f }, out_hov);
+    return em_wc_segment(IconClose, true, out_hov);
 }
 static bool em_minbtn_impl(bool *out_hov) {
-    return em_light_impl(IconMinus, (Color){ 0.157f, 0.784f, 0.251f, 1.f }, out_hov);
+    return em_wc_segment(IconMinus, false, out_hov);
 }
+static bool em_maxbtn_impl(bool *out_hov) {
+    /* U+25A1 WHITE SQUARE -- checked against DejaVuSans's cmap (gid 3705), the
+     * way the icon table above demands, rather than assumed. U+26F6 (the
+     * "square four corners" that would have been the obvious pick) is NOT in
+     * the font and would have drawn a tofu box in every title bar. */
+    return em_wc_segment(0x25A1, false, out_hov);
+}
+
 int em_window_closed(void) { return Clicked("__em_win_close"); }
 int em_window_minimized(void) { return Clicked("__em_win_min"); }
+int em_window_maximized(void) { return Clicked("__em_win_max"); }
+
+/* The maximize button fires DURING the view, and the resize has to happen at
+ * the top of an iteration (it remaps the shared pixel pages the view is in the
+ * middle of drawing into). So it is posted here and taken there -- the same
+ * one-frame hand-off the close path uses. */
+static int g_want_maximize;
+void em_window_post_maximize(void) {
+    /* NO em_request_frame() HERE, and that is a measured decision rather than
+     * an omission. Asking for an extra pass looked like the obvious safety --
+     * the runtime only iterates when something says the UI changed -- and it
+     * BROKE the button: the extra pass ran the view again with the click still
+     * latched, posted the flag a second time, and the window maximized and
+     * un-maximized in the same gesture. The screen-change check caught it
+     * exactly (32.3% of the screen with the flag posted once, 0.1% with it
+     * posted twice). Nothing is needed: the click that set this flag is itself
+     * an input event, and an input event already drives the next iteration. */
+    g_want_maximize = 1;
+}
+int  em_window_take_maximize(void) { int w = g_want_maximize; g_want_maximize = 0; return w; }
 
 /* ---- Spinner: phase-animated dots (indeterminate activity) ------------- */
 static void em_spinner_impl(void) {

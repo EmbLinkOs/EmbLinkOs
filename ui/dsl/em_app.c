@@ -375,6 +375,13 @@ int em_app_run(const EmApp *app) {
         struct embk_win_input in;
         embk_win_input(&in);
 
+        /* The window's OWN maximize button, folded into the compositor's path:
+         * the toolkit sets a flag during the view (which runs later in this
+         * iteration), and the next pass treats it exactly as if the request
+         * had arrived from outside. ONE resize path, so the button and the
+         * title-bar action cannot end up doing two different things. */
+        if (em_window_take_maximize()) in.win = EMBK_WIN_ACTION_MAXIMIZE;
+
         /* Native maximize/restore request from the compositor. Resizing must
          * happen in the client because it owns the shared pixel mapping. */
         if (in.win == EMBK_WIN_ACTION_MAXIMIZE && !app->fullscreen) {
@@ -555,6 +562,7 @@ int em_app_run(const EmApp *app) {
          * until its dock icon calls win_restore. Checked before the close
          * path so a frame can't do both. */
         if (em_window_minimized()) embk_win_minimize(win);
+        if (em_window_maximized()) em_window_post_maximize();   /* acted on next pass */
 
         if (g_app_exit_requested || em_window_closed() || em_window_take_close()) {
             /* Give the reservation back before leaving. The thread dying would

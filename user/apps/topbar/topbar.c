@@ -69,16 +69,96 @@ static void bar_ink_update(void) {
 }
 
 /* status-chip ids (icon codepoints); the user reorders / removes these live */
-static int g_items[8] = { IconStar, IconBolt, IconGear, IconHeart };
-static int g_n        = 4;
+/* WHAT THE MACHINE IS DOING, and it is measured.
+ *
+ * What used to trail this bar was four glyphs -- a star, a lightning bolt, a
+ * gear and a heart -- that were not connected to anything. They were there
+ * because a menu bar has status icons on its right, which is a description of
+ * someone else's menu bar, not a reason. (The clock beside them had the same
+ * problem once: it read a hard-coded 9:41, Apple's marketing time, until
+ * somebody noticed the OS could just say what time it is.)
+ *
+ * So this bar reports the one thing this OS is in a position to know better
+ * than it knows anything else: how much of the machine is being used, right
+ * now, by the user's own programs.
+ *
+ * PER CORE, like every `top` ever written: cpu_ns is time spent EXECUTING, so
+ * the delta over a wall-clock second is the fraction of ONE core, and four
+ * busy cores read 400%. That is a real number with a real unit, and it needs
+ * no idea of how many cores the machine has -- which userspace has no way to
+ * ask for anyway, and which is not worth inventing a lie about.
+ *
+ * KERNEL THREADS ARE EXCLUDED. They are the machine's own overhead, not the
+ * session's work, and the idle threads are kernel threads -- counting those
+ * would report a quiet machine as a busy one.
+ *
+ * The one thing it cannot see: time charged to a process that EXITED between
+ * two samples leaves the total, which would make the delta negative. The
+ * sample is skipped rather than reported as a wild number, so the reading
+ * holds its last value for one second after something quits. 64 rows is the
+ * kernel's whole table (MAX_PROCESSES), so nothing is missed for being past
+ * the end of the buffer. */
+static int   g_cpu_pct = 0;
+static uint64_t g_cpu_last_ns = 0, g_cpu_last_ms = 0;
 
-/* Each status item gets an equal-width slot with the glyph centred in it.
- * Spacing alone does not do this: glyphs have different widths, so a constant
- * gap puts their CENTRES at uneven distances and the row reads as drifting.
- * Fixed slots are what makes a status row look ruled. */
-static void chip(int id) {
-    HStack(.width = 22, .height = 18, .align = Center, .justify = Center) {
-        Icon(id).color(g_ink);
+static void cpu_sample(void) {
+    static struct embk_proc_info ps[64];
+    int n = embk_proc_list(ps, 64);
+    if (n <= 0) return;
+
+    uint64_t busy = 0;
+    for (int i = 0; i < n; i++)
+        if (!ps[i].is_kthread) busy += ps[i].cpu_ns;
+
+    uint64_t now = embk_uptime_ms();
+    if (g_cpu_last_ms && now > g_cpu_last_ms && busy >= g_cpu_last_ns) {
+        uint64_t dns = busy - g_cpu_last_ns;
+        uint64_t dms = now - g_cpu_last_ms;
+        /* ns per ms = fraction of one core x 1e6; x100 for a percentage. */
+        g_cpu_pct = (int)(dns / (dms * 10000ull));
+        if (g_cpu_pct > 999) g_cpu_pct = 999;
+    }
+    g_cpu_last_ns = busy;
+    g_cpu_last_ms = now;
+}
+
+/* LABELLED, and that is not decoration. A bare percentage in the corner of a
+ * menu bar is read as a battery by everyone who has ever used a computer --
+ * and this OS has no battery driver at all yet, so the one number it can
+ * honestly show there had better say what it is. */
+static const char *cpu_text(void) {
+    static char buf[24];
+    snprintf(buf, sizeof buf, "CPU %d%%", g_cpu_pct);
+    return buf;
+}
+
+/* A 24px rule that fills with the load. Small enough to read as punctuation
+ * next to the number rather than as a gauge competing with it -- the number is
+ * the reading; this is the shape of the reading, for the glance that does not
+ * stop to read.
+ *
+ * FULL SCALE IS ONE CORE, not the whole machine. Scaled to four, an ordinary
+ * desktop (measured: 45% while a terminal and the shell were up) filled three
+ * pixels of twenty-four and the meter was a dot -- technically true and
+ * useless at a glance. One core is the threshold that actually means
+ * something: full means "something is working hard", and a machine with more
+ * cores keeps working past it rather than the meter rescaling underfoot. */
+static void meter(int pct) {
+    float frac = (float)pct / 100.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    if (frac < 0.0f) frac = 0.0f;
+    Color track = g_ink; track.a = 0.22f;
+    HStack(.width = 24, .height = 4, .corner = 2, .background = track,
+           .align = Fill, .justify = Leading) {
+        /* ALWAYS EMITTED, never conditional, and at least a pixel wide. Two
+         * reasons and they point the same way: a bar that rounds a live
+         * machine down to nothing reads as "no data" rather than "idle"; and a
+         * child that comes and goes is the retained-instance trap this toolkit
+         * has paid for twice (em_apply_box has the story). A box that is
+         * always there cannot be reused as something else. */
+        float w = frac * 24.0f;
+        if (w < 1.0f) w = 1.0f;
+        HStack(.width = w, .height = 4, .corner = 2, .background = g_ink) {}
     }
 }
 
@@ -131,6 +211,7 @@ static void bar(void) {
     static int first = 1;
     if (first) { first = 0; em_window_move_to(0, 0); }   /* flush, like Mac's */
     bar_ink_update();
+    cpu_sample();      /* once per frame == once per refresh_ms == once a second */
 
     /* The window is TRANSLUCENT (per-pixel transparent, no blur) and grows tall
      * only while a menu is open. So the view fills the whole window, but only
@@ -180,9 +261,16 @@ static void bar(void) {
                     if (MenuItem(logout_label)) embk_session_end(0);
                     if (MenuItem("Quit")) exit(0);
                 }
-                Menu("File", .color = g_ink) { MenuItem("New"); MenuItem("Open"); }
-                Menu("Edit", .color = g_ink) { MenuItem("Undo"); MenuItem("Redo"); }
-                Menu("View", .color = g_ink) { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
+                /* AND NOTHING ELSE. There were three more menus here --
+                 * File (New, Open), Edit (Undo, Redo), View (Zoom In, Zoom
+                 * Out) -- twelve words that did nothing at all. They were a
+                 * costume: a Mac menu bar carries the FOCUSED APP's menus, so
+                 * this one grew a set of app-shaped menus with no app behind
+                 * them. An OS that has not yet decided where an application's
+                 * menus live is better off saying nothing than miming it.
+                 *
+                 * What is left is the one menu that is really the system's:
+                 * about, log out, quit. */
             }
 
             Spacer();   /* the menus sit left, everything else trails right */
@@ -190,7 +278,12 @@ static void bar(void) {
             /* status glyphs, then the clock -- the trailing order a menu bar
              * has. Wider spacing than a toolbar: these are separate readings,
              * not a group of related controls. */
-            Dock(g_items, &g_n, chip, .spacing = 8);
+            /* The readout, then the clock -- the trailing order a status
+             * strip has, with the number that changes on the inside so the
+             * clock keeps the corner it has always had. */
+            meter(g_cpu_pct);
+            Text(cpu_text()).caption().color(g_ink);
+            HStack(.width = 10) {}                 /* two readings, not a group */
             Text(bar_clock()).caption().color(g_ink);
         }
         Spacer();   /* transparent canvas below the bar -- dropdown room */

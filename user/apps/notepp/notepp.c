@@ -939,7 +939,7 @@ static void app(void) {
     Window("Note++") {
         /* ROW 1 -- the open files, and the window's lights. */
         HStack(.spacing = 3, .align = Center, .px = 8, .py = 4, .key = "tabs") {
-            CloseButton(); MinimizeButton();
+            WindowControls();
             static const char *KEY[DOC_MAX]  = { "d0","d1","d2","d3","d4","d5","d6","d7" };
             static const char *KEYL[DOC_MAX] = { "l0","l1","l2","l3","l4","l5","l6","l7" };
             static const char *KEYX[DOC_MAX] = { "x0","x1","x2","x3","x4","x5","x6","x7" };

@@ -41,7 +41,7 @@ struct oscfg {
     int accent;        /* index into oscfg_accents                       */
     int dark;          /* 1 dark, 0 light                                */
     int dock_size;     /* dock icon base size in px                      */
-    int dock_dots;     /* show a running indicator under live apps       */
+    int dock_dots;     /* light the socket behind a live app's icon      */
     int ui_scale;      /* interface size, PERCENT (80..130); 100 = default */
 };
 

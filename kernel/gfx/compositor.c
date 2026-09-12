@@ -330,32 +330,44 @@ uint32_t compositor_focused_pid(void) {
     return pid;
 }
 
-/* Screen rect of a window's title-bar CLOSE button (right side). The chromeless
- * desktop window has no title bar, so no close button (returns 0). */
-#define COMP_CLOSE_SZ 16
-static int win_close_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
+/* ---- the window control cluster ----------------------------------------- *
+ *
+ * THREE SEGMENTS IN ONE HAIRLINE FRAME, LEADING: minimize, maximize, close.
+ * Identical in shape and order to the toolkit's (ui/dsl/em.c, where the
+ * reasoning is written out), because a window that gets its chrome from the
+ * kernel and a window that draws its own must not be two different operating
+ * systems. Every app this OS ships is chromeless and draws its own, so this
+ * path is what everything ELSE gets -- and "everything else" is exactly who
+ * cannot be relied on to match the house style by itself.
+ *
+ * What was here: three filled circles on the RIGHT, in a grey that never
+ * changed, with the comment below them claiming minimize and maximize were
+ * "deliberately rendered as disabled chrome until the compositor exposes
+ * minimize/maximize lifecycle operations". The compositor had exposed them
+ * long since -- both buttons have had working hit rects and real behaviour
+ * (park, and EMBK_WIN_ACTION_MAXIMIZE) for some time. The comment was stale
+ * and the paint was the only thing still saying "disabled". */
+#define COMP_SEG_W  24
+#define COMP_SEG_H  18
+#define COMP_CLOSE_SZ COMP_SEG_H       /* kept: other code measures against it */
+
+static int win_seg_rect(const struct comp_window *w, int seg,
+                        int *x0, int *y0, int *x1, int *y1) {
     if (w->desktop || w->chromeless) return 0;
-    *x0 = w->x + (int)w->cw - COMP_CLOSE_SZ - 6;
-    *y0 = w->y + (COMP_TITLEBAR_H - COMP_CLOSE_SZ) / 2;
-    *x1 = *x0 + COMP_CLOSE_SZ;
-    *y1 = *y0 + COMP_CLOSE_SZ;
+    *x0 = w->x + 8 + seg * COMP_SEG_W;
+    *y0 = w->y + (COMP_TITLEBAR_H - COMP_SEG_H) / 2;
+    *x1 = *x0 + COMP_SEG_W;
+    *y1 = *y0 + COMP_SEG_H;
     return 1;
 }
-
-static int win_max_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
-    int cx0, cy0, cx1, cy1;
-    if (!win_close_rect(w, &cx0, &cy0, &cx1, &cy1)) return 0;
-    *x0 = cx0 - 22; *x1 = cx1 - 22; *y0 = cy0; *y1 = cy1;
-    return 1;
-}
-
-/* The minimize button was painted from the start but had no hit rect at all --
- * it was decoration you could click forever with nothing happening. */
 static int win_min_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
-    int cx0, cy0, cx1, cy1;
-    if (!win_close_rect(w, &cx0, &cy0, &cx1, &cy1)) return 0;
-    *x0 = cx0 - 44; *x1 = cx1 - 44; *y0 = cy0; *y1 = cy1;
-    return 1;
+    return win_seg_rect(w, 0, x0, y0, x1, y1);
+}
+static int win_max_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
+    return win_seg_rect(w, 1, x0, y0, x1, y1);
+}
+static int win_close_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
+    return win_seg_rect(w, 2, x0, y0, x1, y1);
 }
 
 /* ---- rounded corners ---------------------------------------------------- *
@@ -739,33 +751,49 @@ static void paint_window(struct comp_window *w, int focused,
         if (!(tbx1 <= rx0 || tbx0 >= rx1 || tby1 <= ry0 || tby0 >= ry1)) {
             fb_color_t bar = focused ? FB_RGB(0x24, 0x24, 0x24) : FB_RGB(0x20, 0x20, 0x20);
             fill_clip(tbx0, tby0, (int)w->cw, COMP_TITLEBAR_H, bar, rx0, ry0, rx1, ry1);
-            int tr = focused ? 0xf2 : 0xa8, tg = focused ? 0xf2 : 0xa8, tb = focused ? 0xf2 : 0xa8;
-            int br = 0x24, bg = 0x24, bb = 0x24;
-            fb_draw_string(w->title, tbx0 + 12, tby0 + (COMP_TITLEBAR_H - 16) / 2,
-                           tr, tg, tb, br, bg, bb);
 
-            /* Linux-style window controls: minimize, maximize and close.
-             * Close is connected to process teardown below. The first two are
-             * deliberately rendered as disabled chrome until the compositor
-             * exposes minimize/maximize lifecycle operations. */
-            int cbx0, cby0, cbx1, cby1;
-            win_close_rect(w, &cbx0, &cby0, &cbx1, &cby1);
-            int cy = (cby0 + cby1) / 2;
-            int cx = (cbx0 + cbx1) / 2;
-            fb_color_t ctl = focused ? FB_RGB(0x43, 0x43, 0x43) : FB_RGB(0x35, 0x35, 0x35);
-            fb_color_t glyph = focused ? FB_RGB(0xe5, 0xe5, 0xe5) : FB_RGB(0x8f, 0x8f, 0x8f);
-            fb_fill_circle(cx - 44, cy, COMP_CLOSE_SZ / 2, ctl);
-            fb_draw_line(cx - 48, cy + 2, cx - 40, cy + 2, glyph);
-            fb_fill_circle(cx - 22, cy, COMP_CLOSE_SZ / 2, ctl);
-            fb_draw_line(cx - 26, cy - 3, cx - 19, cy - 3, glyph);
-            fb_draw_line(cx - 26, cy - 3, cx - 26, cy + 4, glyph);
-            fb_draw_line(cx - 19, cy - 3, cx - 19, cy + 4, glyph);
-            fb_draw_line(cx - 26, cy + 4, cx - 19, cy + 4, glyph);
-            fb_fill_circle((cbx0 + cbx1) / 2, (cby0 + cby1) / 2, COMP_CLOSE_SZ / 2,
-                           ctl);
-            fb_color_t xc = glyph;
-            fb_draw_line(cbx0 + 5, cby0 + 5, cbx1 - 5, cby1 - 5, xc);
-            fb_draw_line(cbx1 - 5, cby0 + 5, cbx0 + 5, cby1 - 5, xc);
+            /* The control cluster, leading: a hairline frame with two dividers
+             * and a glyph per segment. Glyphs are always drawn -- the house
+             * rule (ui/dsl/em.c): a control that only says what it does when
+             * you are already touching it is no use to anyone who has not
+             * learned it yet, and nobody has learned this OS's window
+             * controls. */
+            int s0x0, s0y0, s0x1, s0y1;
+            if (win_seg_rect(w, 0, &s0x0, &s0y0, &s0x1, &s0y1)) {
+                int gy   = (s0y0 + s0y1) / 2;
+                int fx1  = s0x0 + 3 * COMP_SEG_W;
+                fb_color_t line  = focused ? FB_RGB(0x3a, 0x3e, 0x46) : FB_RGB(0x2e, 0x31, 0x37);
+                fb_color_t glyph = focused ? FB_RGB(0x9b, 0xa1, 0xad) : FB_RGB(0x6a, 0x71, 0x80);
+
+                /* frame */
+                fb_draw_line(s0x0, s0y0, fx1,  s0y0, line);
+                fb_draw_line(s0x0, s0y1, fx1,  s0y1, line);
+                fb_draw_line(s0x0, s0y0, s0x0, s0y1, line);
+                fb_draw_line(fx1,  s0y0, fx1,  s0y1, line);
+                /* dividers */
+                fb_draw_line(s0x0 + COMP_SEG_W,     s0y0, s0x0 + COMP_SEG_W,     s0y1, line);
+                fb_draw_line(s0x0 + 2 * COMP_SEG_W, s0y0, s0x0 + 2 * COMP_SEG_W, s0y1, line);
+
+                /* minimize: a rule */
+                int c0 = s0x0 + COMP_SEG_W / 2;
+                fb_draw_line(c0 - 4, gy, c0 + 4, gy, glyph);
+                /* maximize: an outlined square */
+                int c1 = s0x0 + COMP_SEG_W + COMP_SEG_W / 2;
+                fb_draw_line(c1 - 4, gy - 4, c1 + 4, gy - 4, glyph);
+                fb_draw_line(c1 - 4, gy + 4, c1 + 4, gy + 4, glyph);
+                fb_draw_line(c1 - 4, gy - 4, c1 - 4, gy + 4, glyph);
+                fb_draw_line(c1 + 4, gy - 4, c1 + 4, gy + 4, glyph);
+                /* close: a cross */
+                int c2 = s0x0 + 2 * COMP_SEG_W + COMP_SEG_W / 2;
+                fb_draw_line(c2 - 4, gy - 4, c2 + 4, gy + 4, glyph);
+                fb_draw_line(c2 + 4, gy - 4, c2 - 4, gy + 4, glyph);
+
+                /* The title sits after the cluster, not at the window's edge --
+                 * one region of chrome instead of two. */
+                int tr = focused ? 0xf2 : 0xa8;
+                fb_draw_string(w->title, fx1 + 10, tby0 + (COMP_TITLEBAR_H - 16) / 2,
+                               tr, tr, tr, 0x24, 0x24, 0x24);
+            }
         }
     }
 

@@ -1040,7 +1040,7 @@ static void app(void) {
          * TITLE lives -- before this the title was parsed, stored, and never
          * put on screen anywhere. */
         HStack(.spacing = 3, .align = Center, .px = 8, .py = 4, .key = "tabstrip") {
-            CloseButton(); MinimizeButton();
+            WindowControls();
             /* .id() is a reconciliation KEY and takes a string. Stable per
              * SLOT rather than per label, so a tab whose title arrives later
              * is still the same widget and does not inherit the geometry of

@@ -365,7 +365,7 @@ void em_windowbar_(const char *title, EmProps p);
 void em_windowbar_end_(void);
 /* AppBar -- the standard chrome for an OS application window. One definition
  * so Files, Settings and the Terminal are visibly the same product: traffic
- * lights leading (close, then minimize, Mac order), the title centred in the
+ * the control cluster leading (minimize, maximize, close), the title centred in the
  * space between, and whatever the app puts in the scope trailing. The whole
  * bar is a drag zone except where a control sits.
  *
@@ -380,8 +380,19 @@ void em_appbar_end_(void);
 #define CloseButton(...)  em_close_button()
 EmV  em_close_button(void);            /* modern single round close control; chainable (.clicked()) */
 int  em_window_closed(void);           /* 1 if the built-in CloseButton fired this frame */
+int  em_window_maximized(void);        /* 1 if the built-in MaximizeButton fired this frame */
+void em_window_post_maximize(void);    /* ask the runtime to maximize next pass */
+int  em_window_take_maximize(void);    /* the runtime, consuming that ask */
 #define MinimizeButton(...) em_min_button()
 EmV  em_min_button(void);              /* park the window; the dock icon brings it back */
+#define MaximizeButton(...) em_max_button()
+/* The house window controls as ONE widget: minimize, maximize and close in a
+ * single hairline frame. What AppBar puts at the head of its bar -- use it in
+ * any bar you assemble yourself, so every window in the OS carries the same
+ * controls in the same order. */
+#define WindowControls()    em_window_controls()
+void em_window_controls(void);
+EmV  em_max_button(void);              /* fill the work area, or come back to size */
 int  em_window_minimized(void);        /* 1 if the built-in MinimizeButton fired this frame */
 /* CloseGrip: EmbLink's own close GESTURE (not a fixed button). Put it in the
  * WindowBar; the user PULLS it -- the window fades + slides toward the drag and

@@ -170,7 +170,8 @@ static void pane_desktop(void) {
         bool dots = g_cfg.dock_dots != 0, was = dots;
         HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
             setting_label("Running indicator",
-                          "A dot under an app that is open, so the dock tells the truth.");
+                          "An app that is open sits in a lit socket, so the dock "
+                          "tells the truth about what is running.");
             Toggle("", &dots);
         }
         if (dots != was) { g_cfg.dock_dots = dots ? 1 : 0; commit(); }
