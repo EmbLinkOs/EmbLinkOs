@@ -77,7 +77,16 @@
  * that ends every other process on the machine at once. The desktop shell
  * holds it; an application has no business with it. */
 #define EMBK_CAP_POWER      12
-#define EMBK_CAP_MAX_ID      12
+/* READING THE COMPOSED SCREEN. Its own capability and not GPU's, because
+ * owning a window and reading everybody else's are opposite claims: the first
+ * says "give me a surface", the second says "show me what every other
+ * application is displaying". A screenshot tool needs it; nothing else on this
+ * machine does. */
+#define EMBK_CAP_SCREEN     13
+/* BUMP THIS WITH THE LAST ID. It stayed at 11 when POWER was added, which
+ * quietly dropped POWER out of EMBK_CAP_ALL and made every sys_power call
+ * return -EPERM with nothing to say why. */
+#define EMBK_CAP_MAX_ID      13
 
 #define EMBK_CAP_BIT(id)  (1ULL << (id))
 

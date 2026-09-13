@@ -93,6 +93,11 @@ int compositor_win_is_shared(int pid, uint32_t id);
  * window read its own mouse. */
 /* pid owning the FRONT window -- who the keyboard belongs to (0 = none). */
 uint32_t compositor_focused_pid(void);
+/* The composed screen as 0x00RRGGBB pixels, row-major, into a caller-sized
+ * buffer. Returns pixels written or -1. The syscall above it is capability
+ * gated: this is the one call that shows one application what every other one
+ * is displaying. */
+int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t cap);
 /* exit-time: hide + repaint a dying pid's windows (reap frees them later) */
 void compositor_exit_pid(int pid);
 /* WHAT WINDOWS EXIST -- the view a switcher, a taskbar, or a bar that names

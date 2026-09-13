@@ -176,7 +176,11 @@ static int   g_drag_moved = 0;       /* travelled past the click threshold -> a 
 static int   g_any_active = 0;       /* any draggable held this frame */
 static float g_dockr[4];             /* dock pill world rect: x0,y0,x1,y1 */
 static int   g_have_dockr = 0;
-static int   g_dock_dirty = 0;       /* dock changed -> the loop force-repaints (no ghosts) */
+static int   g_dock_dirty = 0;
+/* Deferred out of the menu callback: the picture must be taken with the menu
+ * GONE, or the screenshot is a photograph of the menu that asked for it. */
+static int   g_want_shot = 0;
+static int   g_shot_delay = 0;       /* dock changed -> the loop force-repaints (no ghosts) */
 /* desktop context menu (right-click on empty desktop) */
 static bool  g_ctx_open = false;
 static float g_ctx_x, g_ctx_y;
@@ -967,6 +971,155 @@ static void desktop_icons(void) {
  * full-width bottom taskbar. The right side deliberately exposes only state the
  * OS can report today; network/audio/battery indicators arrive with their
  * corresponding services instead of being decorative lies. */
+
+/* TAKE A PICTURE OF THE SCREEN.
+ *
+ * The shell is the right process for this. It is the one thing on the machine
+ * that legitimately looks at the whole display, and handing EMBK_CAP_SCREEN to
+ * a separate screenshot application would mean a program whose entire purpose
+ * is reading everybody else's windows -- sitting in the launcher, one click
+ * from anyone.
+ *
+ * Written as binary PPM because that is what this system's own image loader
+ * reads, so a screenshot lands in Pictures and opens in Photos with nothing in
+ * between. A format nobody else can open is a file you cannot look at.
+ *
+ * TWO PHASES, ON TWO THREADS, and that split is the whole design. CAPTURING is
+ * fast and must be instantaneous -- it is a photograph, and a photograph taken
+ * over several seconds is a photograph of several different screens. WRITING is
+ * slow: EMBKFS commits as it goes, and two and a half megabytes takes it the
+ * better part of a minute. Doing both here would freeze the desktop for that
+ * whole time, which is the same mistake the menu bar made with a blocking
+ * channel read, wearing different clothes.
+ *
+ * So the pixels are grabbed on the render thread and handed to a writer that
+ * gets on with it. The desktop keeps drawing; the notification arrives when the
+ * file is actually on disk, not when the work was merely started.
+ *
+ * THE WRITER NEVER TOUCHES MALLOC, and that is not fastidiousness. This
+ * userspace links newlib with no __malloc_lock: the allocator is NOT thread
+ * safe, and nothing had ever noticed because no thread in this shell had ever
+ * allocated -- the two channel listeners work entirely out of stack buffers.
+ * This writer was the first, and it crashed the desktop in free() with a
+ * general protection fault the moment its last write landed, while the render
+ * loop was allocating away in the middle of a frame. So the buffer is
+ * allocated by the render thread, and freed by the render thread when the
+ * writer says it is finished with it. */
+static uint32_t     *g_shot_px;        /* owned by the writer once handed over */
+static int           g_shot_w, g_shot_h;
+static char          g_shot_path[192];
+static volatile int  g_shot_busy;
+static volatile int  g_shot_done;      /* the writer is finished; the buffer is ours again */
+
+static void shot_writer(long arg) {
+    (void)arg;
+    int w = g_shot_w, h = g_shot_h;
+    unsigned char *out = (unsigned char *)g_shot_px;   /* already RGB: see below */
+
+    int fd = (int)embk_open(g_shot_path, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
+    if (fd < 0) {
+        char b[160];
+        snprintf(b, sizeof b, "Could not write %s (%d).", g_shot_path, fd);
+        embk_notify_level(EMNOTE_FAIL, "Screenshot", b);
+        g_shot_done = 1; g_shot_busy = 0;
+        embk_thread_exit(1);
+    }
+    char hdr[64];
+    int hn = snprintf(hdr, sizeof hdr, "P6\n%d %d\n255\n", w, h);
+    embk_write(fd, hdr, (size_t)hn);
+
+    /* BIG BLOCKS. The first version wrote one row at a time -- 768 calls for a
+     * screen -- and the log showed the object growing in three-kilobyte steps
+     * with a filesystem commit behind each one. */
+    size_t total = (size_t)w * (size_t)h * 3, off = 0;
+    int ok = 1;
+    while (off < total) {
+        size_t chunk = total - off;
+        if (chunk > 256u * 1024u) chunk = 256u * 1024u;
+        int64_t wr = embk_write(fd, out + off, chunk);
+        if (wr <= 0) { ok = 0; break; }
+        off += (size_t)wr;
+    }
+    embk_close(fd);
+
+    { const char *leaf = g_shot_path;
+      for (const char *q = g_shot_path; *q; q++) if (*q == '/') leaf = q + 1;
+      char b[200];
+      if (ok) snprintf(b, sizeof b, "Saved as Pictures/%s", leaf);
+      else    snprintf(b, sizeof b, "%s is incomplete -- the disk refused a write.", leaf);
+      embk_notify_level(ok ? EMNOTE_INFO : EMNOTE_FAIL, "Screenshot", b); }
+    { char b[220]; snprintf(b, sizeof b, "home: screenshot %s -> %s\n",
+                            ok ? "saved" : "FAILED", g_shot_path); embk_puts(1, b); }
+    g_shot_done = 1;          /* the render thread owns the buffer again */
+    g_shot_busy = 0;
+    embk_thread_exit(0);
+}
+
+static void take_screenshot(void) {
+    if (g_shot_busy) {
+        embk_notify_level(EMNOTE_INFO, "Screenshot", "The last one is still saving.");
+        return;
+    }
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) {
+        embk_notify_level(EMNOTE_FAIL, "Screenshot",
+                          "There is no home directory to save it in.");
+        return;
+    }
+    int w = (int)g_sw, h = (int)g_sh;
+    if (w <= 0 || h <= 0) return;
+
+    uint32_t *px = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+    if (!px) {
+        embk_notify_level(EMNOTE_FAIL, "Screenshot", "Not enough memory to hold it.");
+        return;
+    }
+    int got = embk_screen_read(0, 0, w, h, px, (unsigned)(w * h));
+    if (got < w * h) {
+        /* SAY WHICH FAILURE. -EPERM means the shell was spawned without
+         * EMBK_CAP_SCREEN, which is a configuration answer and not a bug in
+         * the picture-taking -- the two want completely different fixes. */
+        char b[120];
+        if (got == -EMBK_EPERM)
+            snprintf(b, sizeof b, "The shell is not allowed to read the screen.");
+        else
+            snprintf(b, sizeof b, "The screen could not be read (%d).", got);
+        embk_notify_level(EMNOTE_FAIL, "Screenshot", b);
+        free(px);
+        return;
+    }
+
+    /* First free number, so a second screenshot never silently replaces the
+     * first -- the thing you would least expect and most regret. */
+    int n = 1;
+    for (; n < 1000; n++) {
+        snprintf(g_shot_path, sizeof g_shot_path, "%s/Pictures/Screenshot %d.ppm", home, n);
+        int probe = (int)embk_open(g_shot_path, EMBK_O_RDONLY, 0);
+        if (probe < 0) break;
+        embk_close(probe);
+    }
+
+    /* CONVERTED HERE, on the render thread, for the malloc reason above -- and
+     * in place, because the output is smaller than the input (three bytes out
+     * for every four in), so the write cursor never catches the read cursor
+     * going forward and the shell avoids a second whole-screen allocation. */
+    { unsigned char *o = (unsigned char *)px;
+      for (int i = 0; i < w * h; i++) {
+          uint32_t c = px[i];                    /* read before it is overwritten */
+          o[i * 3 + 0] = (unsigned char)((c >> 16) & 255);
+          o[i * 3 + 1] = (unsigned char)((c >> 8) & 255);
+          o[i * 3 + 2] = (unsigned char)(c & 255);
+      } }
+
+    g_shot_px = px; g_shot_w = w; g_shot_h = h; g_shot_done = 0; g_shot_busy = 1;
+    if (embk_thread_create(shot_writer, 0) < 0) {
+        embk_notify_level(EMNOTE_FAIL, "Screenshot", "Could not start the writer.");
+        free(px); g_shot_px = 0; g_shot_busy = 0; g_shot_done = 0;
+        return;
+    }
+    embk_notify_level(EMNOTE_INFO, "Screenshot", "Saving to Pictures...");
+}
+
 static void home_ui(void) {
     g_any_active = 0; g_have_dockr = 0;   /* recomputed each frame during the build */
     Screen(.width = g_sw, .height = g_sh, .padding = -1, .align = Fill) {
@@ -1037,6 +1190,8 @@ static void home_ui(void) {
             if (MenuItem("Open Files"))   launch_folder(getenv("HOME") ? getenv("HOME") : "/");
             MenuSeparator();
             if (MenuItem("Show Applications")) apps_set_open(1);
+            MenuSeparator();
+            if (MenuItem("Take Screenshot")) g_want_shot = 1;
             if (MenuItem("Clean Up Icons")) {
                 /* forget every position; autoplace re-columns them next frame */
                 for (int i = 0; i < g_desk_n; i++) g_desk[i].placed = 0;
@@ -1369,6 +1524,14 @@ int main(int argc, char **argv, char **envp) {
 
     for (;;) {
         cfg_poll();            /* dock size / indicator, as Settings left them */
+        /* TAKEN HERE, a frame after the menu item was chosen and a frame after
+         * the menu closed -- a screenshot of the menu you used to ask for a
+         * screenshot is a screenshot of the wrong thing. */
+        if (g_want_shot && ++g_shot_delay > 2) { g_want_shot = 0; g_shot_delay = 0;
+                                                 take_screenshot(); }
+        /* The writer has finished with the buffer, so the thread that allocated
+         * it is the one that gives it back. */
+        if (g_shot_done) { g_shot_done = 0; free(g_shot_px); g_shot_px = 0; }
         desk_ink_poll();       /* labels legible on whatever picture is behind them */
         wins_poll();           /* what is actually running, ours or not */
         poll_apps_request();   /* the top bar's Apps button opens our launcher */

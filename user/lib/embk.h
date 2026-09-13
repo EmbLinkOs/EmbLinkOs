@@ -93,6 +93,7 @@
  * that ends every other process on the machine at once. The desktop shell
  * holds it; an application has no business with it. */
 #define EMBK_CAP_POWER      12
+#define EMBK_CAP_SCREEN     13
 #define EMBK_CAP_BIT(id)     (1u << (id))
 struct embk_spawn_file_action {
     unsigned char kind;         /* EMBK_SPAWN_ACTION_* */
@@ -1282,6 +1283,17 @@ static inline int embk_win_restore(int handle) {
 /* How bright is what is already composed under this screen rect (0-255, or
  * -1)? For a window that paints no background of its own and must still stay
  * legible over whatever wallpaper it happens to sit on. */
+/* THE COMPOSED SCREEN, as 0x00RRGGBB pixels, row-major. `cap` is how many
+ * PIXELS the buffer holds. Returns the number written, or -EMBK_EPERM without
+ * EMBK_CAP_SCREEN -- which a program asks for in its .caps manifest and almost
+ * nothing should: this is the call that shows one application what every other
+ * one is displaying. */
+static inline int embk_screen_read(int x, int y, int w, int h,
+                                   uint32_t *out, unsigned cap) {
+    return (int)embk_syscall6(EMBK_SYS_screen_read, x, y, w, h,
+                              (int64_t)(intptr_t)out, cap);
+}
+
 static inline int embk_screen_luma(int x, int y, int w, int h) {
     return (int)embk_syscall4(EMBK_SYS_screen_luma, x, y, w, h);
 }

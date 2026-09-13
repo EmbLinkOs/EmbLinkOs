@@ -1383,6 +1383,49 @@ static int64_t sys_screen_luma(const struct sysargs *a) {
 
 /* win_desktop_front(on) -- the shell lifting its own full-screen surface above
  * the app windows (the Applications launcher) and putting it back after. */
+/* screen_read(x, y, w, h, buf, cap_px) -- the composed screen, as pixels.
+ *
+ * GATED, and by a capability of its own. Every other window call asks for a
+ * surface of your own; this one asks to see everybody else's, which is a
+ * different question and deserves a different answer. A machine where any
+ * program can photograph the screen is a machine where a password field is
+ * decoration.
+ *
+ * Copied through a kernel bounce buffer in bands rather than straight into the
+ * caller's pages: a full screen is megabytes, and holding the compositor lock
+ * across a copy_to_user that can FAULT (and therefore block, and therefore
+ * schedule) would be a deadlock waiting for a demand-paged destination. */
+static int64_t sys_screen_read(const struct sysargs *a) {
+    int cg = cap_gate(EMBK_CAP_SCREEN);
+    if (cg) return cg;
+    int x = (int)a->arg[0], y = (int)a->arg[1];
+    int w = (int)a->arg[2], h = (int)a->arg[3];
+    void *ubuf = (void *)a->arg[4];
+    uint32_t ucap = (uint32_t)a->arg[5];
+    if (!ubuf || w <= 0 || h <= 0) return -EMBK_EINVAL;
+    if ((uint32_t)w > 8192u || (uint32_t)h > 8192u) return -EMBK_EINVAL;
+    if ((uint64_t)w * (uint64_t)h > (uint64_t)ucap) return -EMBK_EINVAL;
+
+    enum { BAND = 64 };                     /* rows per bounce, ~256 KB at 1024 wide */
+    uint32_t *band = kmalloc((size_t)w * BAND * sizeof(uint32_t));
+    if (!band) return -EMBK_ENOMEM;
+    int64_t done = 0;
+    for (int row = 0; row < h; row += BAND) {
+        int rows = (h - row) < BAND ? (h - row) : BAND;
+        int got = compositor_screen_read(x, y + row, w, rows, band,
+                                         (uint32_t)w * (uint32_t)rows);
+        if (got <= 0) break;                /* off-screen band: stop, keep the rest */
+        if (copy_to_user((uint8_t *)ubuf + (size_t)done * sizeof(uint32_t),
+                         band, (size_t)got * sizeof(uint32_t)) != EMBK_OK) {
+            kfree(band);
+            return -EMBK_EFAULT;
+        }
+        done += got;
+    }
+    kfree(band);
+    return done;
+}
+
 static int64_t sys_win_desktop_front(const struct sysargs *a) {
     return compositor_desktop_front(current_process ? (int)current_process->pid : 0,
                                     (int)a->arg[0]);
@@ -2533,6 +2576,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_drag_begin]     = sys_drag_begin,
     [SYS_drop_take]      = sys_drop_take,
     [SYS_meminfo]        = sys_meminfo,
+    [SYS_screen_read]    = sys_screen_read,
     [SYS_win_raise]      = sys_win_raise,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,

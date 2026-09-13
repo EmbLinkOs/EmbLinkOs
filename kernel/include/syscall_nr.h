@@ -288,4 +288,9 @@
  * the machine as a whole, not about anybody's memory in particular. */
 #define SYS_meminfo       122   /* (out)                    -> 0 | -err        */
 
+/* THE COMPOSED SCREEN, so the machine can photograph itself. EMBK_CAP_SCREEN,
+ * which nothing but a screenshot tool holds: owning a window and reading
+ * everybody else's are opposite claims. */
+#define SYS_screen_read   123   /* (x,y,w,h,buf,cap)        -> n | -err        */
+
 #endif /* _SYSCALL_NR_H_ */

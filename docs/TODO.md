@@ -3245,6 +3245,27 @@ Open:
       it is worth being right about before they diverge. Asks, like every other
       close here, with the same grace timer behind it.
 
+## malloc is NOT thread-safe in userspace (found 2026-09-13)
+
+- [ ] **newlib is linked with no `__malloc_lock`, so two threads in one process
+      must never be in the allocator at once.** Nothing had noticed because no
+      thread in any application had ever allocated -- the shell's two channel
+      listeners work entirely out of stack buffers, which is why they have
+      always been fine.
+
+      The screenshot writer was the first thread to call `free()`, and it
+      crashed the desktop instantly: a general protection fault inside
+      `_free_r` the moment its last write landed, while the render loop was
+      allocating in the middle of a frame. The backtrace names newlib's
+      `_mallocr.c`, not the caller, so it reads as a heap bug in whatever
+      allocated last rather than as a missing lock.
+
+      Worked around where it bit (the shell allocates and frees the screenshot
+      buffer on its render thread; the writer only uses it), and that
+      workaround is a rule nobody can see. The fix is to implement
+      `__malloc_lock`/`__malloc_unlock` against the futex this userspace
+      already has, so the rule stops being one you have to already know.
+
 ## The dock cannot move, and the reason is one missing z-band (2026-09-13)
 
 Two obvious Settings switches are missing and both are blocked on the same
@@ -3339,6 +3360,17 @@ a SECOND bug reachable:
 
       **Fix this first.** Networking on aarch64 is one revert-of-a-revert away
       afterwards, and nothing else is known to be in the way.
+
+- [ ] **The aarch64 acceptance test greps for log LINES that other subsystems
+      can interleave into.** Seen as `FAIL(A6): init never spawned the session`
+      on a boot where the session plainly started -- the log read
+      `init: desktop seEMBKFS: sda: "nsemblink" ... not found`, because the
+      filesystem wrote to the same serial port mid-line. The next run passed
+      with no change. Two gate failures this session have now been of this
+      shape, and a gate that fails for reasons unrelated to the change under
+      test is a gate people learn to re-run instead of read. Either give the
+      console a line lock, or have the acceptance test match on a token rather
+      than a whole line.
 
 - [ ] **The deadline-scheduler self-test is FLAKY, NIC or no NIC.** First seen
       as "touchier with a NIC attached" (one run in three failed `worst

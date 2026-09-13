@@ -1851,6 +1851,38 @@ int compositor_backdrop_luma(int x, int y, int w, int h) {
     return n ? (int)(sum / n) : -1;
 }
 
+/* THE COMPOSED SCREEN, AS PIXELS. What backdrop_luma reads, but all of it and
+ * without averaging -- one 0x00RRGGBB word per pixel, row-major, into a buffer
+ * the caller sized.
+ *
+ * It reads the FRAMEBUFFER, which is to say the finished composite: every
+ * window, the cursor's ground, the wallpaper. That is the whole point of a
+ * screenshot and also exactly why the syscall above it is gated -- this is the
+ * one call on the machine that shows one application what every other
+ * application is displaying.
+ *
+ * Under the compositor lock, so a recompose cannot land halfway through and
+ * hand back a screen that never existed: half of one frame and half of the
+ * next is not a picture of anything.
+ *
+ * Returns the number of pixels written, or -1. */
+int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t cap) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi || !out || w <= 0 || h <= 0) return -1;
+    int x0 = imax(x, 0), y0 = imax(y, 0);
+    int x1 = imin(x + w, (int)fi->width), y1 = imin(y + h, (int)fi->height);
+    if (x1 <= x0 || y1 <= y0) return -1;
+    uint32_t need = (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0);
+    if (need > cap) return -1;
+    uint32_t n = 0;
+    spin_lock(&g_comp_lock);
+    for (int yy = y0; yy < y1; yy++)
+        for (int xx = x0; xx < x1; xx++)
+            out[n++] = fb_get_pixel((uint32_t)xx, (uint32_t)yy) & 0x00FFFFFFu;
+    spin_unlock(&g_comp_lock);
+    return (int)n;
+}
+
 /* Declare (or clear, w<=0) the window-local sub-rect whose backdrop should be
  * frosted. Repaints the window so the change is visible at once. */
 int compositor_win_blur_rect(int pid, uint32_t id, int x, int y, int w_, int h_) {
