@@ -3402,6 +3402,39 @@ a dock that works. Note the menu bar has the same latent problem -- it is a
 normal window, not an always-on-top one, and nothing today makes a fullscreen
 app cover it correctly either.
 
+## The first NIC for real silicon: Intel e1000 (2026-09-13)
+
+`kernel/net/e1000.c` drives the Intel PRO/1000 legacy descriptor interface --
+the 8254x, the 8257x, and QEMU's `e1000` (82540EM) and `e1000e` (82574L).
+`make test-e1000` runs DHCP, DNS, TCP, `test net` and `test netudp` against
+BOTH parts, because a driver that works on one generation and not the other is
+a driver that got lucky.
+
+The three-function driver contract used to be spelled `virtio_net_*` and called
+from four places. It is `struct net_driver` now, and `net_init` takes the first
+whose probe succeeds -- virtio first, because a machine offering it is a virtual
+machine and its emulated e1000 is the slower path to the same wire.
+
+- [ ] **Realtek r8169**, the other half of wired machines.
+- [ ] **Intel PCH (I217/I218/I219)**, in most laptops since about 2013. They
+      split the MAC from the PHY across an internal bus and need a different
+      bring-up: a separate driver, not an extension of this one.
+- [ ] **The e1000 driver is deliberately plain** and should stay that way until
+      something measures a need: no TSO, no checksum offload, no MSI-X, no
+      multiple queues, and TX waits for Descriptor Done rather than completing
+      asynchronously. Every one of those is a separate way to be subtly wrong,
+      and the first thing a NIC on new hardware has to be is correct.
+- [ ] **It matches on vendor 0x8086 + class 02:00, not a device-id table.** A
+      table is a list of the parts somebody had on their desk, and the failure
+      mode of missing one is a machine with no network and nothing in the log
+      saying why. If a non-compatible Intel ethernet part ever appears, it will
+      fail the station-address check and say so -- but it will have been reset
+      first.
+- [ ] **`test httpd` cannot run under console_test.py**, on any NIC: it serves
+      one connection and waits for a host client through a SLIRP `hostfwd` the
+      harness does not set up. Verified the same on virtio-net before blaming
+      the new driver.
+
 ## aarch64 networking -- diagnosed, measured, and NOT turned on (2026-09-13)
 
 An entire architecture still has no network. The old note here said turning it

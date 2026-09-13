@@ -31,10 +31,18 @@ emulates the common real part, so none has to wait for the machine.
 | **NVMe** | ✅ done — both architectures, root filesystem verified on it | Most machines built since ~2016 boot from NVMe |
 | **ACPI power** | ✅ power-off from the FADT and the DSDT's `\_S5_` package, reboot from the FADT reset register — verified on both QEMU chipsets (`make test-power`) | Power-off used emulator constants and did nothing on a real PC |
 | **ACPI AML interpreter** | absent — `\_S5_` is decoded as data, nothing is executed | No sleep, no battery, no lid, no thermal zones, no `_S5` that is a method |
-| **A real network card** | absent — virtio-net only | A physical machine has no network at all. Intel e1000e and Realtek r8169 cover most wired machines |
+| **A real network card** | ✅ **Intel done** — `kernel/net/e1000.c` drives the 8254x/8257x legacy interface; verified on QEMU's `e1000` (82540EM) and `e1000e` (82574L) with DHCP, DNS, TCP, `test net` and `test netudp` (`make test-e1000`). Realtek r8169 still absent | A physical machine has no network at all. Intel e1000e and Realtek r8169 cover most wired machines |
 | **Intel HD Audio** | absent — AC97 and virtio-snd only | AC97 left real hardware around 2008; no sound |
 | **USB hot-plug + mass storage mount** | ports scanned once at boot; no hot-plug | A USB stick plugged in after boot does nothing |
 | **UEFI boot** | the bootable image can now be BUILT on macOS (`tools/mkuefidisk.py`, no external tools) and the firmware launches the loader; the loader itself still crashes before the kernel — see docs/TODO.md | A machine from the last several years boots this way and no other |
+
+**Still open on this pillar:** Realtek r8169 (the other half of wired
+machines), and the Intel PCH parts in laptops since ~2013 (I217/I218/I219),
+which split the MAC from the PHY across an internal bus and need a different
+bring-up -- a separate driver, not an extension of this one. The e1000 driver
+is also deliberately plain: no TSO, no checksum offload, no MSI-X, no multiple
+queues, and TX waits for Descriptor Done. Each of those is an addition to a
+working driver rather than a prerequisite for one.
 
 ## Phase 2 — it installs itself
 

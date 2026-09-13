@@ -18,7 +18,9 @@ rarely needs to:
                  it sdc). Used by tests that want a disk they may destroy.
     NVME_DISK    a raw image on an NVMe controller, for `test nvme`; it must
                  carry the scratch marker (make build/nvme-scratch.img).
-    NET          1 = give the guest a virtio-net NIC on QEMU's user-mode stack
+    NIC          which card NET=1 attaches (default virtio-net; e1000 and
+                 e1000e exercise kernel/net/e1000.c instead)
+    NET          1 = give the guest a NIC on QEMU's user-mode stack
                  (10.0.2.15, router .2, DNS .3). `test dhcp` and `test dns`
                  need it; without one they fail for want of a device, which
                  looks exactly like a broken stack.
@@ -90,7 +92,11 @@ def main(cmds):
     # nobody could tell that from a real failure. The Makefile's run targets
     # have always appended the same thing ($(NET)); this is that, on request.
     if os.environ.get("NET") == "1":
-        argv += ["-netdev", "user,id=net0", "-device", "virtio-net,netdev=net0"]
+        # NIC=e1000 (or e1000e, or any QEMU model name) tests a DIFFERENT
+        # driver against the same stack. The default stays virtio-net so the
+        # existing network tests mean what they always did.
+        model = os.environ.get("NIC", "virtio-net")
+        argv += ["-netdev", "user,id=net0", "-device", "%s,netdev=net0" % model]
     argv += ["-serial", "stdio", "-no-reboot", "-no-shutdown",
              "-m", os.environ.get("MEM", "2G"), "-smp", os.environ.get("SMP", "4"),
              "-display", "none"]

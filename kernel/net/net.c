@@ -84,7 +84,7 @@ void net_lock(void) {
  * At the outermost hold (depth 1) this genuinely releases; a nested caller
  * (e.g. an ARP resolve inside a connect) stays held, which is brief and rare. */
 void net_yield(void) {
-    virtio_net_poll();     /* atomic drain under the held lock */
+    net_dev_poll();        /* atomic drain under the held lock */
     net_unlock();          /* release across the yield -- the anti-camping move */
     schedule();
     net_lock();            /* reacquire; the caller re-checks state next iteration */
@@ -192,7 +192,7 @@ void net_rx(const uint8_t *frame, uint32_t len) {
 static void net_rx_thread(void) {
     for (;;) {
         net_lock();
-        virtio_net_poll();          /* drain + deliver everything pending */
+        net_dev_poll();             /* drain + deliver everything pending */
         net_unlock();
         sched_lock();
         wait_queue_wake_all(&g_net_event_wq);   /* clients re-check their state */
@@ -200,12 +200,32 @@ static void net_rx_thread(void) {
     }
 }
 
+/* Every card this kernel can drive, in the order they are tried. */
+static const struct net_driver g_drivers[] = {
+    { "virtio-net", virtio_net_init, virtio_net_tx, virtio_net_poll },
+    { "e1000",      e1000_init,      e1000_tx,      e1000_poll      },
+};
+static const struct net_driver *g_dev;
+
+int net_dev_tx(const void *frame, uint32_t len) {
+    return g_dev ? g_dev->tx(frame, len) : -1;
+}
+void net_dev_poll(void) {
+    if (g_dev) g_dev->poll();
+}
+const char *net_dev_name(void) { return g_dev ? g_dev->name : ""; }
+
 void net_init(void) {
     memset(&g_netif, 0, sizeof(g_netif));
-    if (!virtio_net_init(g_netif.mac)) {
+    g_dev = 0;
+    for (unsigned i = 0; i < sizeof g_drivers / sizeof g_drivers[0]; i++) {
+        if (g_drivers[i].init(g_netif.mac)) { g_dev = &g_drivers[i]; break; }
+    }
+    if (!g_dev) {
         kprintf("net: no NIC -- networking disabled\n");
         return;
     }
+    kprintf("net: using %s\n", g_dev->name);
     process_create_kthread(net_rx_thread, 0);   /* background RX poller */
     g_netif.up = true;
 

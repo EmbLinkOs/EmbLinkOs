@@ -185,6 +185,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/bus/virtio_pci.c \
              kernel/net/net.c \
              kernel/net/virtio_net.c \
+             kernel/net/e1000.c \
              kernel/net/ethernet/eth.c \
              kernel/net/ethernet/arp.c \
              kernel/net/ip/ipv4.c \
@@ -2698,6 +2699,20 @@ test-audio: $(IMG) $(EMBKFS_MASTER)
 .PHONY: test-x86 test-embkfs-crash test-swap-store test-swap test-login kit-test
 test-x86: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/console_test.py $(T)
+
+# THE SAME STACK, OVER A CARD A REAL MACHINE MIGHT HAVE. Every network test
+# this OS has ever run went through virtio-net, which is a contract with a
+# hypervisor; kernel/net/e1000.c is the first driver for silicon. Run against
+# BOTH generations QEMU emulates, because they are different parts -- 82540EM
+# (`e1000`, PCI, 2002) and 82574L (`e1000e`, PCIe, 2008) -- and a driver that
+# works on one and not the other is a driver that got lucky.
+.PHONY: test-e1000
+test-e1000: $(IMG) $(EMBKFS_MASTER)
+	@for nic in e1000 e1000e; do \
+	  echo "=== $$nic ==="; \
+	  NET=1 NIC=$$nic python3 tools/console_test.py "test dhcp" "test dns" "test tcp" \
+	    "test net" "test netudp" || exit 1; \
+	done
 
 # POWER LOSS, SIMULATED, AT EVERY WRITE. `test embkfs crash` copies the small
 # tree image into a RAM-backed block device inside the kernel, runs a workload

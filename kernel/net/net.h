@@ -252,9 +252,35 @@ void icmp_send_unreachable(uint32_t dst_ip, const uint8_t *orig_ip_pkt, uint32_t
 void udp_arm(uint16_t port);
 int  udp_collect(uint8_t *out, uint32_t cap, uint32_t *from_ip);
 
-/* ---- driver interface (virtio_net.c) ------------------------------------ */
-bool virtio_net_init(uint8_t mac_out[ETH_ALEN]);   /* probe + bring up; fills MAC */
-int  virtio_net_tx(const void *frame, uint32_t len);   /* send one Ethernet frame */
-void virtio_net_poll(void);                        /* drain the RX ring -> net_rx() */
+/* ---- the NIC drivers, and how the stack reaches one ----------------------
+ *
+ * Three functions is the whole contract. It was spelled virtio_net_* and called
+ * directly from four places, which was fine while a hypervisor was the only
+ * thing this OS had ever talked to -- and exactly wrong the moment a second
+ * card existed. The stack now asks net_dev_*, and net_init picks the driver
+ * whose probe succeeds.
+ *
+ * The ORDER matters and is not alphabetical: virtio first, because a machine
+ * that offers it is a virtual machine and its emulated e1000 (if any) is the
+ * slower path to the same wire. */
+struct net_driver {
+    const char *name;
+    bool (*init)(uint8_t mac_out[ETH_ALEN]);   /* probe + bring up; fills MAC */
+    int  (*tx)(const void *frame, uint32_t len);   /* send one Ethernet frame */
+    void (*poll)(void);                        /* drain the RX ring -> net_rx() */
+};
+
+int  net_dev_tx(const void *frame, uint32_t len);
+void net_dev_poll(void);
+const char *net_dev_name(void);            /* "" when no card was found */
+
+bool virtio_net_init(uint8_t mac_out[ETH_ALEN]);
+int  virtio_net_tx(const void *frame, uint32_t len);
+void virtio_net_poll(void);
+
+/* Intel PRO/1000 (8254x/8257x) -- the first card a real machine might have. */
+bool e1000_init(uint8_t mac_out[ETH_ALEN]);
+int  e1000_tx(const void *frame, uint32_t len);
+void e1000_poll(void);
 
 #endif /* __NET_H__ */

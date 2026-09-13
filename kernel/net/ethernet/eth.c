@@ -13,5 +13,5 @@ int net_tx_eth(const uint8_t dst_mac[ETH_ALEN], uint16_t ethertype,
     memcpy(e->src, g_netif.mac, ETH_ALEN);
     e->ethertype = htons(ethertype);
     memcpy(frame + ETH_HLEN, payload, len);
-    return virtio_net_tx(frame, ETH_HLEN + len);
+    return net_dev_tx(frame, ETH_HLEN + len);
 }
