@@ -3321,6 +3321,14 @@ Open:
       two lines and makes the cell taller. Coming back to short names, the
       extra line's worth of height survives.
 
+      NOT THE CELL. Giving `grid_cell` a fixed height (74 px) and clipping it
+      changes nothing: fresh still renders at 193 and a revisit still at 225.
+      So the height that survives is held by the ROW HStack or by something
+      above it, not by the cell whose label wraps -- the wrapping explains why
+      the row is taller in the first place, and not why the row stays taller.
+      That change was reverted; a behaviour change whose justification turned
+      out to be false is not worth keeping.
+
       WHAT IT IS NOT, each checked rather than assumed:
       * Not scroll position -- `g_scroll` is reset on every navigation, and the
         instrumented run shows it at 0.
@@ -4050,6 +4058,30 @@ substantially complete.
   `parent->pid == parent_pid` too (`parent_is_alive()`).
 
 ---
+
+
+### Two theories about the uaccess hang, both DISPROVED (2026-09-13)
+
+Turning the bus-wide INTx acknowledgement on makes the boot hang in the
+user-copy fault-recovery self-test. Two explanations were written down here
+before being checked; both are wrong, and they are recorded so the next attempt
+does not spend the time again:
+
+- **"The recovery longjmps out of an IRQ handler and the EOI is never
+  written."** It cannot: `exception.c` already restricts `uaccess_fault_recover`
+  to `EXC_EL1H_SYNC` with EC 0x25/0x21, so an IRQ never reaches it. The comment
+  there says so explicitly -- "an IRQ is not a fault at all".
+
+- **"The longjmp leaves interrupts masked, so the core goes deaf."** It does
+  not: `kcontext.S` saves DAIF at offset 104 (`mrs x9, daif`) and restores it
+  (`msr daif, x9`). The restored context carries the interrupt state the
+  guard was armed with.
+
+So the mechanism is still unknown. Whoever picks this up should start by
+re-applying the transport INTx work (it was reverted -- see the git history for
+`virtio_pci.c`'s ISR window and `virtio_pci_intx`) and instrumenting the
+user-copy test itself, rather than reasoning about the recovery path: two
+plausible stories about it have now been wrong.
 
 ## Core / Library
 
