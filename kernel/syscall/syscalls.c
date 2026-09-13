@@ -1529,6 +1529,11 @@ static uint64_t uptime_ms_now(void) {
  * exists to avoid. */
 /* CPU this thread has consumed, in nanoseconds. See syscall_nr.h for why the
  * clock is not a substitute. */
+static int64_t sys_thread_self(const struct sysargs *a) {
+    (void)a;
+    return (int64_t)thread_self_tid();
+}
+
 static int64_t sys_thread_cpu_ns(const struct sysargs *a) {
     (void)a;
     return (int64_t)sched_self_cpu_ns();
@@ -2506,6 +2511,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_uptime_ms]    = sys_uptime_ms,
     [SYS_sched_period] = sys_sched_period,
     [SYS_thread_cpu_ns] = sys_thread_cpu_ns,
+    [SYS_thread_self]   = sys_thread_self,
     [SYS_key_grab]     = sys_key_grab,
     [SYS_win_create]   = sys_win_create,
     [SYS_win_present]  = sys_win_present,

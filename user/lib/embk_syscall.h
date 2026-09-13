@@ -168,6 +168,7 @@
 #define EMBK_SYS_drop_take     121
 #define EMBK_SYS_meminfo       122
 #define EMBK_SYS_screen_read   123
+#define EMBK_SYS_thread_self   124
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

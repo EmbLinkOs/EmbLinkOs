@@ -1813,3 +1813,69 @@ struct servent *getservbyname(const char *name, const char *proto) {
     se.s_port = htons((unsigned short)port); se.s_proto = (char *)proto;
     return &se;
 }
+
+/* ---- the allocator's lock -----------------------------------------------
+ *
+ * MAKING newlib'S ALLOCATOR SAFE TO CALL FROM MORE THAN ONE THREAD.
+ *
+ * THE BUG THIS CLOSES, and it had already been paid for three times. newlib
+ * calls __malloc_lock/__malloc_unlock around every allocation; the copy in
+ * libc.a is a stub that locks nothing, so two threads in malloc at once
+ * corrupt the heap. Nothing noticed for a long time because no thread in any
+ * application allocated -- the shell's channel listeners work entirely out of
+ * stack buffers, and user/web/net.c and user/web/fetchjob.h both carry comments
+ * explaining that they must not allocate for exactly this reason.
+ *
+ * Then the screenshot writer did, and the desktop died instantly: a general
+ * protection fault inside _free_r the moment its last write landed, while the
+ * render loop was allocating in the middle of a frame. The backtrace names
+ * newlib's _mallocr.c and not the caller, so it reads as a heap bug in whoever
+ * allocated last rather than as a missing lock -- which is why a workaround
+ * ("do not allocate on that thread") is a rule nobody can see and everybody
+ * eventually breaks.
+ *
+ * WHY RECURSIVE. newlib's own stub takes a RECURSIVE mutex, and it is right
+ * to: the allocator can re-enter itself through _sbrk_r and through the
+ * reentrancy hooks. A plain mutex here would turn a rare crash into a certain
+ * deadlock, which is not an improvement. So this counts depth and remembers
+ * the owner -- and it needs a thread identity to do that, which is what
+ * SYS_thread_self exists for.
+ *
+ * WHY IT IS SAFE TO DEFINE THESE HERE. libc.a's mlock.o defines nothing but
+ * these two symbols, so an object file that defines them first means mlock.o
+ * is never pulled in at all: no duplicate, no link order subtlety.
+ */
+struct _reent;   /* opaque here: these hooks never look inside it */
+
+/* The lock's state. `owner` is a thread id (+1, so zero means unowned, which
+ * is what a zeroed BSS gives us and what a valid tid 0 must not be confused
+ * with). `depth` is how many times the owner has taken it. */
+static embk_mutex g_malloc_mtx;
+static volatile int g_owner_p1;
+static volatile int g_depth;
+
+void __malloc_lock(struct _reent *r) {
+    (void)r;
+    int me = embk_thread_self() + 1;
+
+    /* ALREADY MINE: count it and return without touching the mutex. Reading
+     * `owner` unlocked is safe precisely because only the owner can ever see
+     * its own id there -- another thread reads somebody else's, or zero, and
+     * either way takes the slow path below. */
+    if (g_owner_p1 == me) { g_depth++; return; }
+
+    embk_mutex_lock(&g_malloc_mtx);
+    g_owner_p1 = me;
+    g_depth = 1;
+}
+
+void __malloc_unlock(struct _reent *r) {
+    (void)r;
+    if (g_depth > 1) { g_depth--; return; }
+    /* Clear the owner BEFORE releasing: the moment the mutex is free another
+     * thread may take it and write its own id, and a store landing after that
+     * would hand it the lock with somebody else's name on it. */
+    g_owner_p1 = 0;
+    g_depth = 0;
+    embk_mutex_unlock(&g_malloc_mtx);
+}

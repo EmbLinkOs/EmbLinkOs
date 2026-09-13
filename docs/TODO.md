@@ -1,3 +1,35 @@
+## malloc in userspace: the lock exists now (2026-09-13)
+
+- [x] ~~newlib is linked with no `__malloc_lock`, so two threads in one process
+      must never be in the allocator at once.~~ -- `user/lib/syscalls.c`
+      provides a real RECURSIVE `__malloc_lock`/`__malloc_unlock`, built on the
+      futex mutex userspace already had. Recursive because newlib's own stub
+      takes a recursive mutex and is right to: the allocator re-enters itself,
+      and a plain mutex there turns a rare crash into a certain deadlock.
+
+      It needed a thread identity to answer "am I already holding this?", which
+      is why `SYS_thread_self` now exists -- it returns the thread_table index,
+      the same number `thread_create` hands back.
+
+      `syscalls.c` is the right home: it is the newlib retargeting layer, the
+      set of stubs the platform must provide, and these are two of them.
+      libc.a's `mlock.o` defines nothing else, so defining them here means it
+      is never pulled in -- no duplicate symbol, no link-order subtlety.
+
+- [ ] **`test mtmalloc` does NOT reproduce the corruption, and that is worth
+      knowing.** Four threads from a barrier, one on megabyte blocks and three
+      on small ones, every block's contents checked before it is freed --
+      80,000 allocations -- and it passes with the lock REMOVED. Three
+      workloads were tried. So the test guards against the lock being BROKEN (a
+      recursive lock done wrong deadlocks on first re-entry, which is worse
+      than the crash it replaces) and is not evidence that the lock is needed.
+
+      The evidence for that is the crash itself: the desktop's screenshot
+      writer faulted in `_free_r` the instant its last write landed, while the
+      render loop allocated mid-frame. Whoever next touches this should either
+      find the workload that reproduces it or leave this bullet alone -- a test
+      that cannot fail must not be quoted as proof.
+
 # EmbLink OS — Known Issues & Improvements
 
 Open items only, grouped by subsystem. Completed work lives in

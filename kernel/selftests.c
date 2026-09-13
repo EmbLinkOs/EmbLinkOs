@@ -5380,6 +5380,22 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* TWO THREADS IN THE ALLOCATOR. newlib's __malloc_lock is a do-nothing
+     * stub in libc.a; user/lib/syscalls.c replaces it with a real recursive
+     * lock, and this is the program that fails without one. */
+    if (strcmp(cmd, "test mtmalloc") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test mtmalloc: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/data/apps/mtmalloc/mtmalloc.elf", NULL };
+        int pid = process_create("/data/apps/mtmalloc/mtmalloc.elf", a, 1, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test mtmalloc: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test meminfo") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test meminfo: VFS not registered\n");

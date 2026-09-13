@@ -1140,6 +1140,10 @@ uint64_t process_cpu_ns(uint32_t pid);
  * of something must use: on a busy machine the clock measures preemption. */
 uint64_t sched_self_cpu_ns(void);
 
+/** This thread's thread_table index -- the same number thread_create returns.
+ * Userspace needs an identity to build a recursive lock on; see SYS_thread_self. */
+int thread_self_tid(void);
+
 /* Nanoseconds per scheduling decision, measured by re-entering the scheduler
  * `iters` times on the CALLING thread with nothing else runnable. Used to
  * compare POLICIES: the absolute number is a statement about the host. See the

@@ -293,4 +293,11 @@
  * everybody else's are opposite claims. */
 #define SYS_screen_read   123   /* (x,y,w,h,buf,cap)        -> n | -err        */
 
+/* WHICH THREAD AM I -- the thread_table index thread_create returns. Needed to
+ * build a RECURSIVE lock in userspace, which the allocator requires: newlib's
+ * own malloc stub takes a recursive mutex, so "am I already holding this?" has
+ * to be answerable or the only implementable lock is one that deadlocks the
+ * first time malloc re-enters. */
+#define SYS_thread_self   124   /* ()                       -> tid | -err      */
+
 #endif /* _SYSCALL_NR_H_ */

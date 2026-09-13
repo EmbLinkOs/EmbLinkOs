@@ -665,6 +665,11 @@ static inline int64_t embk_thread_create(void (*entry)(long arg), long arg) {
 }
 
 /* Block until thread `tid` of this process exits; returns its exit code. */
+/* WHICH THREAD AM I -- the same number embk_thread_create returned for it. */
+static inline int embk_thread_self(void) {
+    return (int)embk_syscall0(EMBK_SYS_thread_self);
+}
+
 static inline int64_t embk_thread_join(int tid) {
     return embk_syscall1(EMBK_SYS_thread_join, tid);
 }

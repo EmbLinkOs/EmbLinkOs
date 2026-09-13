@@ -996,15 +996,15 @@ static void desktop_icons(void) {
  * gets on with it. The desktop keeps drawing; the notification arrives when the
  * file is actually on disk, not when the work was merely started.
  *
- * THE WRITER NEVER TOUCHES MALLOC, and that is not fastidiousness. This
- * userspace links newlib with no __malloc_lock: the allocator is NOT thread
- * safe, and nothing had ever noticed because no thread in this shell had ever
- * allocated -- the two channel listeners work entirely out of stack buffers.
- * This writer was the first, and it crashed the desktop in free() with a
- * general protection fault the moment its last write landed, while the render
- * loop was allocating away in the middle of a frame. So the buffer is
- * allocated by the render thread, and freed by the render thread when the
- * writer says it is finished with it. */
+ * THE WRITER STILL NEVER TOUCHES MALLOC. It was forced when this was written:
+ * newlib's __malloc_lock was a stub that locked nothing, so this writer -- the
+ * first thread in the shell ever to allocate -- crashed the desktop in free()
+ * with a general protection fault the instant its last write landed, while the
+ * render loop was allocating mid-frame. user/lib/syscalls.c provides a real
+ * lock now, so this is no longer required; it is kept because one thread
+ * owning the buffer's lifetime is simpler to reason about than two, and
+ * because changing working code to use a freedom it does not need is not an
+ * improvement. */
 static uint32_t     *g_shot_px;        /* owned by the writer once handed over */
 static int           g_shot_w, g_shot_h;
 static char          g_shot_path[192];

@@ -3343,6 +3343,19 @@ void sched_account_resume(void) {
  * machine that read 40 ms for a frame whose actual work was a few
  * milliseconds, and the app then refused to declare a cadence it could
  * comfortably have kept. */
+/* WHICH THREAD AM I. The thread_table index, which is what thread_create
+ * returns and what thread_join takes, so a program can compare the two.
+ *
+ * It exists because userspace needs an identity to build a RECURSIVE lock on,
+ * and the allocator needs a recursive lock (newlib's own malloc stub uses one).
+ * Without it, "am I already holding this?" is unanswerable and the only
+ * implementable mutex is one that deadlocks the first time malloc re-enters. */
+int thread_self_tid(void) {
+    struct thread *t = current_thread;
+    if (!t) return -1;
+    return (int)(t - thread_table);
+}
+
 uint64_t sched_self_cpu_ns(void) {
     struct thread *t = current_thread;
     if (!t) return 0;
