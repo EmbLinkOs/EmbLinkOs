@@ -32,9 +32,17 @@ emulates the common real part, so none has to wait for the machine.
 | **ACPI power** | ✅ power-off from the FADT and the DSDT's `\_S5_` package, reboot from the FADT reset register — verified on both QEMU chipsets (`make test-power`) | Power-off used emulator constants and did nothing on a real PC |
 | **ACPI AML interpreter** | absent — `\_S5_` is decoded as data, nothing is executed | No sleep, no battery, no lid, no thermal zones, no `_S5` that is a method |
 | **A real network card** | ✅ **done for what can be tested** — `e1000.c` (Intel 8254x/8257x) and `rtl8139.c` (Realtek), behind a `struct net_driver` table. DHCP, DNS, TCP, `test net`, `test netudp` on `e1000`, `e1000e` AND `rtl8139`; carrier detection proved by pulling the virtual cable with QMP `set_link`, down to the menu bar's indicator. `make test-nics` | A physical machine has no network at all. Intel e1000e and Realtek r8169 cover most wired machines |
-| **Intel HD Audio** | absent — AC97 and virtio-snd only | AC97 left real hardware around 2008; no sound |
+| **Intel HD Audio** | ✅ **done for what can be tested** — `hda.c`: CORB/RIRB command ring, the codec graph walked to find a DAC→pin route from the board's own configuration defaults, and the cyclic DMA engine reconciled with the stream contract. Behind a `struct pcm_driver` table alongside AC'97 and virtio-snd. Verified on QEMU's ICH6 and ICH9 controllers and with an AC'97 attached at the same time, where the table has to choose. `make test-audio-cards` | AC97 left real hardware around 2008; no sound |
 | **USB hot-plug + mass storage mount** | ports scanned once at boot; no hot-plug | A USB stick plugged in after boot does nothing |
 | **UEFI boot** | the bootable image can now be BUILT on macOS (`tools/mkuefidisk.py`, no external tools) and the firmware launches the loader; the loader itself still crashes before the kernel — see docs/TODO.md | A machine from the last several years boots this way and no other |
+
+**Still open on the audio pillar:** a descriptor is fixed at 21 ms (HDA's
+cyclic engine fixes the buffer's total length before it starts, so
+`audio_set_latency` below that is granted in name only), there is no capture,
+no jack sensing, and a machine with two codecs takes the first with an output
+path. Each is written up in docs/TODO.md with why. None of it is testable
+beyond QEMU, and the driver prints the graph it found so the first real machine
+says which of it was wrong.
 
 **Still open on this pillar, and each needs the actual machine:** the Realtek
 RTL8168/8169 in most modern consumer boards, and the Intel PCH parts in laptops

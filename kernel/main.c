@@ -16,7 +16,7 @@
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/rtc.h"
 #include "drivers/bus/pci.h"
-#include "drivers/audio/ac97.h"
+#include "drivers/audio/audio.h"
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
@@ -730,11 +730,29 @@ static bool shell_handle_process_command(const char *cmd)
 
     if ((arg = shell_match_prefix(cmd, "run")) != NULL) {
         if (!arg[0]) {
-            kprintf("\n[run] usage: run <path>\n");
+            kprintf("\n[run] usage: run <path> [args...]\n");
             return true;
         }
-        char *argv[] = { (char *)arg, NULL };
-        int pid = process_create(arg, argv, 1, NULL, 0);
+        /* ARGUMENTS, because a program that takes them could not be started
+         * from here at all: the path and everything after it went to
+         * process_create as ONE string, which is a file that does not exist.
+         * Split in place on spaces -- `cmd` is the console's own line buffer
+         * and is finished with. No quoting: a path with a space in it is a
+         * thing this console does not do, and pretending otherwise would mean
+         * a parser nobody has tested. */
+        static char *argv[16];
+        int argc = 0;
+        char *p = (char *)arg;
+        while (*p && argc < (int)(sizeof argv / sizeof argv[0]) - 1) {
+            while (*p == ' ') *p++ = '\0';
+            if (!*p) break;
+            argv[argc++] = p;
+            while (*p && *p != ' ') p++;
+        }
+        argv[argc] = NULL;
+        if (argc == 0) { kprintf("\n[run] usage: run <path> [args...]\n"); return true; }
+        arg = argv[0];
+        int pid = process_create(arg, argv, argc, NULL, 0);
         if (pid < 0) {
             kprintf("\n[run] failed to start %s: %s\n", arg, embk_strerror(pid));
         } else {
@@ -1813,7 +1831,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // --- Devices ---
     
     pci_init();
-    ac97_init();   // sound out; harmless when no AC97 device is attached
+    audio_init();  // sound out; harmless when the machine has no card
     usb_init();
     ata_init();    // registers ATA drives as block devices internally
     ahci_init();   // runs IDENTIFY per port, stores sector counts

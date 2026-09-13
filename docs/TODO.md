@@ -1871,6 +1871,47 @@ was a real gap rather than test scaffolding:
       call exists for what comes next (a synth, a game, video sync), and the
       right time to wire it is when one of those exists.
 
+### Intel HD Audio (2026-09-13) -- and what it still cannot do
+
+`kernel/drivers/audio/hda.c`, behind the new `struct pcm_driver` table. Proven
+on QEMU's ICH6 `intel-hda`, the later `ich9-intel-hda`, and with an AC'97
+attached at the same time (the table has to choose, and chooses HDA):
+`make test-audio-cards`. `test audiostress` passes on it too, at the same
+15 ms floor as AC'97.
+
+What is NOT done, and each is a real limit rather than a tidy-up:
+
+- [ ] **A descriptor is a fixed 1024 frames (21 ms), and cannot be otherwise.**
+      HDA's DMA engine is cyclic: the buffer's TOTAL length (CBL) is written
+      before the engine runs and cannot be changed while it does, so the
+      per-descriptor length cannot vary the way AC'97's does. `audio.c` holds
+      a short remainder back rather than let the driver pad it (see the
+      staging buffer there and the measurement in its comment), which removes
+      the audible cost -- but `audio_set_latency()` below ~21 ms is still
+      granted in name only on this device. Fixing it properly means choosing
+      the period size when the stream OPENS, which the current
+      one-size-for-the-life-of-the-driver contract does not express.
+- [ ] **No capture.** The codec graph walk finds output paths only; ADCs and
+      input pins are skipped. There is no microphone API above this anyway,
+      so adding it would be a driver with nothing to drive.
+- [ ] **Polled, not interrupt-driven.** Like every other driver here. The IOC
+      bit is left clear and INTCTL's global enable is off; RIRBCTL's response
+      flag IS enabled, but only as a flag -- the controller stops fetching
+      commands until it is acknowledged, which is what made the first version
+      look like "the codec does not answer".
+- [ ] **Multi-codec machines take the first codec with an output path.** A
+      laptop with a separate HDMI audio codec will get the analogue one, which
+      is the right default and not a choice anybody can make yet.
+- [ ] **Jack sensing is not read.** The pin's configuration default says what
+      the board WIRED; it does not say what is plugged in right now, so
+      headphones do not mute the speakers. Needs unsolicited responses, which
+      needs interrupts.
+- [ ] **Untested on real hardware.** Everything above is QEMU. The codec graph
+      on a real machine is bigger and stranger -- amplifiers with several
+      indices, mixers that need the right input unmuted, EAPD on laptops --
+      and the driver prints what it found precisely so the first real machine
+      says which of those it hit.
+
 ### A killed writer's WAV reads as silence -- `make test-audio` was failing for that alone
 
 `audio_check.py` believed the RIFF and data lengths. QEMU's wav sink writes them

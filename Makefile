@@ -171,6 +171,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/video/bochs_vbe.c \
              kernel/drivers/video/virtio_gpu.c \
              kernel/drivers/audio/ac97.c \
+             kernel/drivers/audio/hda.c \
              kernel/drivers/audio/audio.c \
              kernel/drivers/video/font_8x16.c \
              kernel/drivers/video/console.c \
@@ -2694,6 +2695,32 @@ test-audio: $(IMG) $(EMBKFS_MASTER)
 	@# extending the range under a running device -- where the real bug was.
 	@AUDIO_CMD="run /data/apps/beep/beep.elf" python3 tools/audio_test.py
 
+# EVERY SOUND CARD THIS KERNEL CLAIMS TO DRIVE, from one binary.
+#
+# The drivers used to be chosen in this file, one per architecture, so "the
+# audio layer supports two devices" was a statement about the build and not
+# about any kernel that existed. It is a runtime table now, and this is what
+# holds that claim up: the same image is booted against an AC'97, an Intel HDA
+# controller on the ICH6, the later ICH9 one, and finally BOTH an AC'97 and an
+# HDA at once -- where the table has to choose, and has to choose the modern
+# part. Four boots; the WAV decides each one.
+#
+# The streaming pass on HDA is not decoration. HDA's DMA engine is cyclic and
+# pads a short descriptor with silence it then plays, so a writer whose chunk
+# is not a whole descriptor is the case that breaks: `tonestress` at a 20 ms
+# buffer measured 32% non-silent and 139.5 Hz before audio.c held the
+# remainder back, and 100% / 441.2 Hz after.
+.PHONY: test-audio-cards
+test-audio-cards: $(IMG) $(EMBKFS_MASTER)
+	@for card in ac97 hda ich9-hda both; do \
+	    AUDIO_CARD=$$card python3 tools/audio_test.py || exit 1; \
+	done
+	@AUDIO_CARD=hda AUDIO_CMD="run /data/apps/beep/beep.elf" \
+	    python3 tools/audio_test.py || exit 1
+	@AUDIO_CARD=hda AUDIO_CMD="run /data/apps/tonestress/tonestress.elf 1 400 0 20" \
+	    AUDIO_CHECK=0 python3 tools/audio_test.py >/dev/null || exit 1
+	@python3 tools/audio_check.py build/audio-out.wav --hz 440 --min-seconds 0.25
+
 # --- x86 console tests, scripted -----------------------------------------------
 # tools/console_test.py boots the kernel headless and types at its console. Any
 # self-test the kernel has can be run this way:  make test-x86 T="test mmap"
@@ -2807,7 +2834,7 @@ test-audio-latency: $(IMG) $(EMBKFS_MASTER)
 	@AUDIO_CMD="test audiostress" AUDIO_CHECK=0 AUDIO_PLAY_WAIT=300 \
 	    AUDIO_SMP=4 python3 tools/audio_test.py
 
-.PHONY: test-audio
+.PHONY: test-audio test-audio-cards
 
 web-shots:
 	@$(MAKE) --no-print-directory build/browser_render

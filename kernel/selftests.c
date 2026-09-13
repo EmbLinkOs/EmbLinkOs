@@ -60,7 +60,7 @@
 #include "ipc/channel.h"
 #include "ipc/endpoint.h"
 #include "ipc/pipe.h"
-#include "drivers/audio/ac97.h"
+#include "drivers/audio/pcm.h"
 #include "drivers/audio/audio.h" /* test audiostress: underrun accounting */
 
 /* The other half of the ^Z test below: something has to stop the child WHILE
@@ -630,13 +630,15 @@ int selftests_handle_command(const char *cmd)
      * a description of what they heard. Half a second: long enough to measure,
      * short enough that the test is not a wait. */
     if (strcmp(cmd, "test audio") == 0) {
-        if (!ac97_present()) {
-            kprintf("\n[cmd] test audio: NO DEVICE (add -device AC97 to the QEMU line)\n");
+        if (!audio_available()) {
+            kprintf("\n[cmd] test audio: NO DEVICE (add -device AC97 or "
+                    "-device intel-hda -device hda-duplex to the QEMU line)\n");
             return 1;
         }
+        kprintf("audio: the %s driver answered\n", audio_device_name());
 
-        const uint32_t rate  = ac97_sample_rate();
-        const uint32_t percb = ac97_frames_per_buffer();
+        const uint32_t rate  = audio_sample_rate();
+        const uint32_t percb = audio_frames_per_buffer();
         const uint32_t want  = rate / 2;            /* half a second */
         const int      tone  = 440;
 
@@ -664,7 +666,7 @@ int selftests_handle_command(const char *cmd)
                 chunk[f * 2 + 0] = v;               /* left  */
                 chunk[f * 2 + 1] = v;               /* right */
             }
-            uint32_t took = ac97_fill(i, chunk, n);
+            uint32_t took = audio_dev_fill(i, chunk, n);
             if (took == 0) break;
             done += took;
             last = i;
@@ -677,13 +679,13 @@ int selftests_handle_command(const char *cmd)
 
         kprintf("audio: playing %u frames of %d Hz across %d buffers\n",
                 done, tone, last + 1);
-        ac97_play(last);
+        audio_dev_play(last);
 
         /* Wait for the device to walk the list, bounded -- a driver that never
          * starts must fail rather than hang the console. */
         int spins = 0;
-        while (!ac97_done(last) && spins < 2000) { for (volatile int d = 0; d < 200000; d++) {} spins++; }
-        ac97_stop();
+        while (!audio_dev_done(last) && spins < 2000) { for (volatile int d = 0; d < 200000; d++) {} spins++; }
+        audio_dev_stop();
 
         kprintf("\n[cmd] test audio: %s (%u frames, %d Hz; check the WAV with "
                 "tools/audio_check.py)\n",
@@ -713,12 +715,12 @@ int selftests_handle_command(const char *cmd)
      * and reports the shallowest each survived.
      *
      * THE UNDERRUN COUNT IS THE HARDWARE'S. When the device reaches the end of
-     * what it was given and halts, it latches the fact; ac97_set_last() has
-     * always had to detect that to restart the stream, and now counts it.
-     * Nothing here is inferred from timings.
+     * what it was given, AC'97 latches the fact and halts and HDA plays
+     * silence past the end; each driver counts its own, from what its
+     * hardware shows. Nothing here is inferred from timings.
      * -------------------------------------------------------------------- */
     if (strcmp(cmd, "test audiostress") == 0) {
-        if (!ac97_present()) {
+        if (!audio_available()) {
             kprintf("\n[cmd] test audiostress: NO DEVICE (add -device AC97 to "
                     "the QEMU line)\n");
             return 1;

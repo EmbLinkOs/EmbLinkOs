@@ -39,7 +39,7 @@
 #include "net/net.h"             /* net_init: still not called here -- see below */
 #include "drivers/input/mouse.h"
 #include "drivers/input/keyboard.h"
-#include "drivers/audio/ac97.h"
+#include "drivers/audio/audio.h"
 #include "drivers/audio/audio.h"
 #include "include/uaccess_guard.h"
 #include "include/arch_ipi.h"
@@ -820,10 +820,11 @@ void arch_early_main(uint64_t dtb_phys) {
         mouse_init(fbi ? fbi->width : 1024, fbi ? fbi->height : 768);
         virtio_input_init();
 
-        /* Sound. Named ac97_init() because that is what the shared audio layer
-         * calls; what answers here is virtio_snd.c. Harmless with no device
-         * attached -- it says so and audio_available() stays false. */
-        ac97_init();
+        /* Sound. The driver table has exactly one entry on this
+         * architecture -- virtio-snd; AC'97 and HDA are PCI parts of an x86
+         * chipset. Harmless with no device attached: it says so and
+         * audio_available() stays false. */
+        audio_init();
 
 
         /* AUDIO, PROVEN RATHER THAN PROBED. "stream 0 ready" means the device

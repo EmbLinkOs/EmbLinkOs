@@ -1,4 +1,4 @@
-#include "drivers/audio/ac97.h"
+#include "drivers/audio/pcm.h"
 #include "drivers/bus/virtio_pci.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
@@ -179,15 +179,13 @@ static void reap(void) {
     }
 }
 
-/* --- the ac97_* interface ------------------------------------------------ */
+/* --- the pcm_driver operations ------------------------------------------- */
 
-bool ac97_present(void) { return g_up; }
+static uint32_t vsnd_sample_rate(void) { return g_up ? RATE_HZ : 0; }
 
-uint32_t ac97_sample_rate(void) { return g_up ? RATE_HZ : 0; }
+static uint32_t vsnd_frames_per_buffer(void) { return FRAMES_PER_BUF; }
 
-uint32_t ac97_frames_per_buffer(void) { return FRAMES_PER_BUF; }
-
-uint32_t ac97_fill(int i, const int16_t *frames, uint32_t nframes) {
+static uint32_t vsnd_fill(int i, const int16_t *frames, uint32_t nframes) {
     if (!g_up || i < 0 || i >= NBUFS || !frames)
         return 0;
 
@@ -202,7 +200,7 @@ uint32_t ac97_fill(int i, const int16_t *frames, uint32_t nframes) {
  * virtio-snd has no such register, so it is DERIVED: buffers retire in order,
  * so the oldest one still in flight is the one being played. With none in
  * flight the honest answer is where the next submission will go. */
-uint8_t ac97_civ(void) {
+static uint8_t vsnd_civ(void) {
     if (!g_up) return 0;
     reap();
     return (uint8_t)(g_completed % NBUFS);
@@ -231,7 +229,7 @@ uint8_t ac97_civ(void) {
  * timing. Zeroed when a stream starts. */
 static uint64_t g_underruns;
 
-uint64_t ac97_underruns(void) { return g_underruns; }
+static uint64_t vsnd_underruns(void) { return g_underruns; }
 
 static void submit_through(int last) {
     if (!g_up || last < 0 || last >= NBUFS)
@@ -284,17 +282,17 @@ static void submit_through(int last) {
     virtio_pci_notify(&g_vd, g_tnotify, VQ_TX);
 }
 
-void ac97_play(int last)     { submit_through(last); }
-void ac97_set_last(int last) { submit_through(last); }
+static void vsnd_play(int last)     { submit_through(last); }
+static void vsnd_set_last(int last) { submit_through(last); }
 
-bool ac97_done(int last) {
+static bool vsnd_done(int last) {
     (void)last;
     if (!g_up) return true;
     reap();
     return g_completed >= g_submitted;
 }
 
-void ac97_stop(void) {
+static void vsnd_stop(void) {
     if (!g_up || !g_running) return;
     pcm_simple(VIRTIO_SND_R_PCM_STOP);
     pcm_simple(VIRTIO_SND_R_PCM_RELEASE);
@@ -310,15 +308,14 @@ void ac97_stop(void) {
     memset(g_frames, 0, sizeof g_frames);
 }
 
-void ac97_init(void) {
+static bool vsnd_init(void) {
     const struct pci_device *pci = virtio_pci_find(VIRTIO_SND_DEVID, 0);
     if (!pci) {
-        kprintf("virtio-snd: no device\n");
-        return;
+        return false;
     }
 
     if (!virtio_pci_attach(&g_vd, pci, "virtio-snd", 0, 0))
-        return;
+        return false;
 
     memset(cdesc, 0, sizeof cdesc); memset((void *)&cavail, 0, sizeof cavail);
     memset((void *)&cused, 0, sizeof cused);
@@ -337,7 +334,7 @@ void ac97_init(void) {
                                       &tavail, &tused, &g_tnotify);
     if (!g_cqsize || !g_tqsize) {
         kprintf("virtio-snd: control or tx queue missing\n");
-        return;
+        return false;
     }
     virtio_pci_driver_ok(&g_vd);
 
@@ -358,14 +355,32 @@ void ac97_init(void) {
     if (!ctl(&p, sizeof p)) {
         kprintf("virtio-snd: SET_PARAMS refused (S16 %d Hz, %d ch)\n",
                 (int)RATE_HZ, (int)CHANNELS);
-        return;
+        return false;
     }
     if (!pcm_simple(VIRTIO_SND_R_PCM_PREPARE)) {
         kprintf("virtio-snd: PCM_PREPARE refused\n");
-        return;
+        return false;
     }
 
     g_up = true;
     kprintf("virtio-snd: stream 0 ready, S16 %d Hz %d ch, %d frames/buffer\n",
             (int)RATE_HZ, (int)CHANNELS, (int)FRAMES_PER_BUF);
+    return true;
 }
+
+/* virtio-snd's buffers carry their own length to the device, so a short fill
+ * plays short -- like AC'97 and unlike HDA. No desc_frames op. */
+const struct pcm_driver virtio_snd_driver = {
+    .name              = "virtio-snd",
+    .init              = vsnd_init,
+    .sample_rate       = vsnd_sample_rate,
+    .frames_per_buffer = vsnd_frames_per_buffer,
+    .fill              = vsnd_fill,
+    .desc_frames       = NULL,
+    .civ               = vsnd_civ,
+    .set_last          = vsnd_set_last,
+    .play              = vsnd_play,
+    .done              = vsnd_done,
+    .stop              = vsnd_stop,
+    .underruns         = vsnd_underruns,
+};
