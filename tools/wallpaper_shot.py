@@ -49,8 +49,11 @@ PREVIEW = (332, 352, 888, 470)          # x0, y0, x1, y1 of the preview image
                                         #  the preview, and passes for the wrong reason)
 DESKTOP = (0, 120, 78, 620)             # the strip of wallpaper left of the window
 WANT_INDEX = 3                          # oscfg_wallpapers[3] == Aurora
-DOCK_SLOTS = 5
-SETTINGS_SLOT = 2                       # Files, Terminal, Settings, Vellum, NetSurf
+DOCK_SLOTS = 4                          # Files, Terminal, Settings, Vellum --
+                                        # the dock drops entries whose program is
+                                        # not installed, so this is not "however
+                                        # many are in the table"
+SETTINGS_SLOT = 2
 
 
 def main():

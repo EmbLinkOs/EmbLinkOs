@@ -205,18 +205,31 @@ static void meter(int pct) {
 /* Live date + time. The bar used to read a hard-coded "9:41" -- Apple's
  * marketing time -- which is exactly the kind of decorative lie the rest of the
  * shell avoids. The OS can report the real clock, so it does. */
-/* The menu bar's own preferences, re-read on a clock like everything else here.
+/* The menu bar's own preferences, fetched ON A THREAD OF ITS OWN.
+ *
  * It cannot open the user's settings file -- its namespace does not name the
- * home directory, deliberately -- so it reads the copy the desktop publishes
- * into /run. oscfg_load() tries both, in that order, so this is just a load. */
-static struct oscfg g_bar_cfg;
-static uint64_t     g_bar_cfg_next;
-static void bar_cfg_poll(void) {
-    uint64_t now = embk_uptime_ms();
-    if (now && now < g_bar_cfg_next) return;
-    g_bar_cfg_next = now + 1000;
-    oscfg_load(&g_bar_cfg);
-
+ * home directory, deliberately -- so it asks the desktop over /run. That is a
+ * channel round trip, and embk_chan_recv BLOCKS: there is no timeout and no
+ * poll on it. Doing that from the render loop, which is where this started,
+ * means the bar stops drawing and stops taking clicks for as long as the
+ * desktop takes to answer. On x86 it was invisible. On aarch64 the whole menu
+ * bar went silent, and the acceptance test said so in one line: "the launcher
+ * button did nothing -- the top bar could not reach the desktop through /run".
+ *
+ * A status bar must never wait for anybody. So the waiting happens here, off
+ * the render path, and the loop just reads whatever the last answer was.
+ * `volatile` because two threads touch it: the only requirement is that the
+ * reader eventually sees new values, and the worst a torn read can do is draw
+ * one frame with a mixed pair of booleans. */
+static volatile struct oscfg g_bar_cfg = { .bar_24h = 1, .bar_date = 1, .bar_cpu = 1 };
+static void bar_cfg_thread(long arg) {
+    (void)arg;
+    for (;;) {
+        struct oscfg c;
+        oscfg_load(&c);
+        g_bar_cfg = c;
+        embk_sleep_ms(1000);
+    }
 }
 
 static const char *bar_clock(void) {
@@ -318,7 +331,6 @@ static void bar(void) {
     static int first = 1;
     if (first) { first = 0; em_window_move_to(0, 0); }   /* flush, like Mac's */
     bar_ink_update();
-    bar_cfg_poll();
     cpu_sample();
     net_sample();      /* once per frame == once per refresh_ms == once a second */
     wins_sample();     /* who is in front, and what else is open */
@@ -500,5 +512,7 @@ int main(void) {
     embk_screen_size(&sw, &sh);
     if (sw) em_app_spec_.size.w = (int)sw;    /* a menu bar spans the display */
     (void)sh;
+    /* Off the render path, deliberately -- see bar_cfg_thread. */
+    embk_thread_create(bar_cfg_thread, 0);
     return em_app_run(&em_app_spec_);
 }

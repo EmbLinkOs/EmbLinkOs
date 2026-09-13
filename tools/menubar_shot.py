@@ -30,7 +30,10 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import app_shot as A
 import shell_shot as S
 
-DOCK_SLOTS = 5
+DOCK_SLOTS = 4                          # Files, Terminal, Settings, Vellum --
+                                        # the dock drops entries whose program is
+                                        # not installed, so this is not "however
+                                        # many are in the table"
 SETTINGS_SLOT = 2
 PANE_DESKTOP = (181, 141)               # "Desktop & Dock" in the sidebar
 CPU_TOGGLE = (870, 469)                 # the "Show processor load" switch

@@ -1271,9 +1271,45 @@ static void spawn_app(const char *path, const char *start_dir) {
     }
 }
 
+/* DROP DOCK ENTRIES WHOSE PROGRAM IS NOT ON THIS IMAGE.
+ *
+ * The dock's starting line-up is a table in this file; what is actually
+ * installed is a property of the build. NetSurf is the case that made this
+ * necessary -- it is a port built from a tree that is not always present, so
+ * the image regularly ships without nsemblink.elf while the dock kept offering
+ * it. Clicking it did nothing at all, which is the exact failure this shell
+ * spends so much effort avoiding everywhere else: the Applications launcher
+ * scans the disk and correctly never showed it, and the dock, which does not,
+ * showed it every boot.
+ *
+ * A dock that offers what cannot be launched is a dock that lies, and a user
+ * has no way to tell that from a broken click. So ask the filesystem once, at
+ * start, and only offer what is there. Items the user dragged in themselves
+ * came from something that existed; this only prunes the built-in defaults. */
+static void dock_prune_missing(void) {
+    int out = 0;
+    for (int i = 0; i < g_dock_n; i++) {
+        const char *exe = g_dock[i].app;
+        if (exe) {
+            int fd = (int)embk_open(exe, EMBK_O_RDONLY, 0);
+            if (fd < 0) {
+                char b[128];
+                snprintf(b, sizeof b, "home: dock: %s is not installed -- not offering it\n", exe);
+                embk_puts(1, b);
+                continue;
+            }
+            embk_close(fd);
+        }
+        if (out != i) g_dock[out] = g_dock[i];
+        out++;
+    }
+    g_dock_n = out;
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv;
     g_session_env = envp;
+    dock_prune_missing();                   /* offer only what can actually run */
     embk_thread_create(apps_listener, 0);   /* the top bar's Apps signal listener */
     embk_thread_create(prefs_listener, 0);  /* ...and what it wears while it draws */
     /* apps describe their own icon/name (docs presentation manifest) */
