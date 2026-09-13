@@ -108,6 +108,13 @@ struct oscfg {
     int ui_scale;      /* interface size, PERCENT (80..130); 100 = default */
     int keymap;        /* index into oscfg_keymaps                       */
     int wallpaper;     /* index into oscfg_wallpapers                    */
+    /* The menu bar. Four small knobs rather than one "style": each of these is
+     * a separate question a person actually has an opinion about, and folding
+     * them into presets would mean inventing combinations nobody asked for. */
+    int bar_24h;       /* 1 = 24-hour clock, 0 = 12-hour with am/pm       */
+    int bar_seconds;   /* show seconds in the clock                       */
+    int bar_date;      /* show the date beside the time                   */
+    int bar_cpu;       /* show the CPU readout                            */
 };
 
 /* The screen band the DOCK owns, in pixels, for a given preference.
@@ -136,19 +143,89 @@ static inline int oscfg_dock_band(const struct oscfg *c) {
 static inline void oscfg_defaults(struct oscfg *c) {
     c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1; c->keymap = 0;
     c->ui_scale = 100; c->wallpaper = 0;
+    c->bar_24h = 1; c->bar_seconds = 0; c->bar_date = 1; c->bar_cpu = 1;
 }
 
-/* Read the file into `c`. Missing/unreadable => defaults, never a failure:
- * losing your preferences must not mean losing your desktop. */
+/* HOW THE SHELL'S NARROW COMPONENTS GET IT.
+ *
+ * The menu bar's namespace is `ro /system, rw /run`, and its manifest says so
+ * on purpose: "read /system, reach /run -- nothing else nameable". It has no
+ * business holding the user's home directory, and wanting to know whether the
+ * clock shows seconds is not a reason to give it one.
+ *
+ * A published FILE under /run was the obvious answer and is not available:
+ * /run is epfs, which holds endpoint nodes and nothing else, so creating a
+ * regular file there fails -- measured, `home: publish rc=-1`, before this
+ * comment replaced that design.
+ *
+ * So it goes over a CHANNEL, which is what /run is for. The desktop serves an
+ * endpoint whose entire meaning is "connect and I will hand you the
+ * preferences": no request payload, symmetric with the launcher endpoint next
+ * to it where the connect is itself the signal. The reader gets the same text
+ * the file holds, from the one serialiser, and needs no authority beyond the
+ * /run it already has. */
+#define OSCFG_ENDPOINT "/run/emlink.prefs"
+
+/* Every value the file can carry, forced back into range. A hand-edited file
+ * is a supported way to change these (Settings says so in About), so a typo
+ * must yield a working desktop and not a 4000-pixel dock. */
+static inline void oscfg_clamp(struct oscfg *c) {
+    if (c->accent < 0 || c->accent >= OSCFG_ACCENTS) c->accent = 0;
+    if (c->wallpaper < 0 || c->wallpaper >= OSCFG_WALLPAPERS) c->wallpaper = 0;
+    if (c->dock_size < 28) c->dock_size = 28;
+    if (c->dock_size > 60) c->dock_size = 60;
+    if (c->ui_scale < 80)  c->ui_scale = 80;
+    if (c->ui_scale > 130) c->ui_scale = 130;
+    c->dark = !!c->dark; c->dock_dots = !!c->dock_dots;
+    c->bar_24h = !!c->bar_24h; c->bar_seconds = !!c->bar_seconds;
+    c->bar_date = !!c->bar_date; c->bar_cpu = !!c->bar_cpu;
+}
+
+static inline void oscfg_parse(struct oscfg *c, char *buf);
+static inline int  oscfg_write_to(const struct oscfg *c, const char *path);
+
+/* Ask the desktop for the preferences over OSCFG_ENDPOINT. Silent on failure:
+ * a process that cannot reach the desktop keeps the defaults, exactly as one
+ * that cannot open the file does. */
+static inline void oscfg_ask_desktop(struct oscfg *c) {
+    int ch = (int)embk_chan_connect(OSCFG_ENDPOINT);
+    if (ch < 0) return;
+    char buf[640];
+    unsigned len = 0, nh = 0;
+    if (embk_chan_recv(ch, buf, sizeof buf - 1, &len, 0, &nh) == 0 && len) {
+        if (len > sizeof buf - 1) len = sizeof buf - 1;
+        buf[len] = 0;
+        oscfg_parse(c, buf);
+    }
+    embk_chan_close(ch);
+}
+
+/* Read one file into `c`, leaving it untouched if the file is unreadable.
+ * Returns 1 if anything was parsed. */
+static inline int oscfg_read_from(struct oscfg *c, const char *path) {
+    int fd = (int)embk_open(path, EMBK_O_RDONLY, 0);
+    if (fd < 0) return 0;
+    char b[1024];
+    int64_t n = embk_read(fd, b, sizeof b - 1);
+    embk_close(fd);
+    if (n <= 0) return 0;
+    b[n] = 0;
+    oscfg_parse(c, b);
+    return 1;
+}
+
+/* Read the preferences into `c`. The user's own file first, then the published
+ * copy for a process whose namespace cannot name it. Missing/unreadable =>
+ * defaults, never a failure: losing your preferences must not mean losing your
+ * desktop. */
 static inline void oscfg_load(struct oscfg *c) {
     oscfg_defaults(c);
-    int fd = (int)embk_open(oscfg_path(), EMBK_O_RDONLY, 0);
-    if (fd < 0) return;
-    char buf[1024];
-    int64_t n = embk_read(fd, buf, sizeof buf - 1);
-    embk_close(fd);
-    if (n <= 0) return;
-    buf[n] = 0;
+    if (!oscfg_read_from(c, oscfg_path()))
+        oscfg_ask_desktop(c);
+    oscfg_clamp(c);
+}
+
+static inline void oscfg_parse(struct oscfg *c, char *buf) {
     for (char *p = buf; *p; ) {
         char key[32]; int val = 0;
         char *line = p;
@@ -163,30 +240,48 @@ static inline void oscfg_load(struct oscfg *c) {
         else if (!strcmp(key, "keymap")) c->keymap = (val >= 0 && val < OSCFG_KEYMAPS) ? val : 0;
         else if (!strcmp(key, "ui_scale"))  c->ui_scale  = val;
         else if (!strcmp(key, "wallpaper")) c->wallpaper = val;
+        else if (!strcmp(key, "bar_24h"))     c->bar_24h     = val;
+        else if (!strcmp(key, "bar_seconds")) c->bar_seconds = val;
+        else if (!strcmp(key, "bar_date"))    c->bar_date    = val;
+        else if (!strcmp(key, "bar_cpu"))     c->bar_cpu     = val;
     }
-    if (c->accent < 0 || c->accent >= OSCFG_ACCENTS) c->accent = 0;
-    if (c->wallpaper < 0 || c->wallpaper >= OSCFG_WALLPAPERS) c->wallpaper = 0;
-    if (c->dock_size < 28) c->dock_size = 28;
-    if (c->dock_size > 60) c->dock_size = 60;
-    if (c->ui_scale < 80)  c->ui_scale = 80;
-    if (c->ui_scale > 130) c->ui_scale = 130;
 }
 
 /* Written whole rather than patched in place: the file is four lines, and a
  * rewrite cannot leave a half-updated one behind. */
-static inline int oscfg_save(const struct oscfg *c) {
-    char out[512];
-    int n = snprintf(out, sizeof out,
+/* The whole preference set as text. One serialiser, used by the file and by the
+ * channel below: two encodings of the same thing is how they drift apart. */
+static inline int oscfg_format(const struct oscfg *c, char *out, int cap) {
+    return snprintf(out, (size_t)cap,
                      "# EmbLink preferences -- written by Settings, editable by hand.\n"
                      "accent %d\n" "dark %d\n" "dock_size %d\n" "dock_dots %d\n"
-                     "ui_scale %d\n" "keymap %d\n" "wallpaper %d\n",
+                     "ui_scale %d\n" "keymap %d\n" "wallpaper %d\n"
+                     "bar_24h %d\n" "bar_seconds %d\n" "bar_date %d\n" "bar_cpu %d\n",
                      c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale,
-                     c->keymap, c->wallpaper);
-    int fd = (int)embk_open(oscfg_path(), EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
+                     c->keymap, c->wallpaper,
+                     c->bar_24h, c->bar_seconds, c->bar_date, c->bar_cpu);
+}
+
+static inline int oscfg_write_to(const struct oscfg *c, const char *path) {
+    char out[640];
+    int n = oscfg_format(c, out, (int)sizeof out);
+    int fd = (int)embk_open(path, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
     if (fd < 0) return -1;
     int64_t w = embk_write(fd, out, (size_t)n);
     embk_close(fd);
     return w == n ? 0 : -1;
+}
+
+static inline int oscfg_save(const struct oscfg *c) {
+    return oscfg_write_to(c, oscfg_path());
+}
+
+/* Hand one connected peer the preferences and be done. Called by the desktop's
+ * little server thread; see OSCFG_ENDPOINT above. */
+static inline int oscfg_serve_one(int ch, const struct oscfg *c) {
+    char out[640];
+    int n = oscfg_format(c, out, (int)sizeof out);
+    return embk_chan_send(ch, out, (unsigned)n, 0, 0, 0);
 }
 
 #endif /* _EMBLINK_OSCFG_H_ */

@@ -198,6 +198,43 @@ static void pane_desktop(void) {
         }
         if (dots != was) { g_cfg.dock_dots = dots ? 1 : 0; commit(); }
     }
+    /* THE MENU BAR. Four independent switches rather than a "style" preset:
+     * each is a question someone actually has an opinion about, and a preset
+     * would invent combinations nobody asked for. Every one of them is read by
+     * a DIFFERENT process -- the bar reads the copy the desktop publishes into
+     * /run, because its namespace does not name the user's home and should not. */
+    Section("Menu bar") {
+        bool h24 = g_cfg.bar_24h != 0,     h24_was = h24;
+        bool sec = g_cfg.bar_seconds != 0, sec_was = sec;
+        bool dat = g_cfg.bar_date != 0,    dat_was = dat;
+        bool cpu = g_cfg.bar_cpu != 0,     cpu_was = cpu;
+
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
+            setting_label("24-hour clock", "13:00 rather than 1 pm.");
+            Toggle("", &h24);
+        }
+        if (h24 != h24_was) { g_cfg.bar_24h = h24 ? 1 : 0; commit(); }
+
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
+            setting_label("Show seconds", "The clock ticks once a second either way.");
+            Toggle("", &sec);
+        }
+        if (sec != sec_was) { g_cfg.bar_seconds = sec ? 1 : 0; commit(); }
+
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
+            setting_label("Show the date", "The day and month beside the time.");
+            Toggle("", &dat);
+        }
+        if (dat != dat_was) { g_cfg.bar_date = dat ? 1 : 0; commit(); }
+
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
+            setting_label("Show processor load",
+                          "What fraction of one core the machine is using.");
+            Toggle("", &cpu);
+        }
+        if (cpu != cpu_was) { g_cfg.bar_cpu = cpu ? 1 : 0; commit(); }
+    }
+
     Section("Desktop") {
         HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
             setting_label("Icon arrangement",

@@ -39,6 +39,7 @@
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
+#include "oscfg.h"   /* the menu bar wears the user's preferences too */
 
 /* Which machine this is, decided where it is actually known -- at compile
  * time. A binary cannot be wrong about its own architecture. */
@@ -204,20 +205,55 @@ static void meter(int pct) {
 /* Live date + time. The bar used to read a hard-coded "9:41" -- Apple's
  * marketing time -- which is exactly the kind of decorative lie the rest of the
  * shell avoids. The OS can report the real clock, so it does. */
+/* The menu bar's own preferences, re-read on a clock like everything else here.
+ * It cannot open the user's settings file -- its namespace does not name the
+ * home directory, deliberately -- so it reads the copy the desktop publishes
+ * into /run. oscfg_load() tries both, in that order, so this is just a load. */
+static struct oscfg g_bar_cfg;
+static uint64_t     g_bar_cfg_next;
+static void bar_cfg_poll(void) {
+    uint64_t now = embk_uptime_ms();
+    if (now && now < g_bar_cfg_next) return;
+    g_bar_cfg_next = now + 1000;
+    oscfg_load(&g_bar_cfg);
+
+}
+
 static const char *bar_clock(void) {
-    static char buf[48];
+    static char buf[64];
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
+    if (!tm) { snprintf(buf, sizeof buf, "--:--"); return buf; }
+
     /* Standard conversions only: newlib's strftime does not implement the GNU
      * "%-d" no-pad flag and stops at it, which silently truncated the whole
-     * string to just the weekday. */
-    if (tm) snprintf(buf, sizeof buf, "%s %d %s  %02d:%02d",
-                     (const char *[]){"Sun","Mon","Tue","Wed","Thu","Fri","Sat"}[tm->tm_wday % 7],
-                     tm->tm_mday,
-                     (const char *[]){"Jan","Feb","Mar","Apr","May","Jun",
-                                      "Jul","Aug","Sep","Oct","Nov","Dec"}[tm->tm_mon % 12],
-                     tm->tm_hour, tm->tm_min);
-    else    snprintf(buf, sizeof buf, "--:--");
+     * string to just the weekday. So this is built by hand.
+     *
+     * FOUR SEPARATE PREFERENCES, not a format string. A person has an opinion
+     * about "do I want seconds" and about "do I want the date"; nobody has an
+     * opinion about a strftime pattern, and offering one would be handing over
+     * a way to make the bar say nothing at all. */
+    char date[24] = "";
+    if (g_bar_cfg.bar_date)
+        snprintf(date, sizeof date, "%s %d %s  ",
+                 (const char *[]){"Sun","Mon","Tue","Wed","Thu","Fri","Sat"}[tm->tm_wday % 7],
+                 tm->tm_mday,
+                 (const char *[]){"Jan","Feb","Mar","Apr","May","Jun",
+                                  "Jul","Aug","Sep","Oct","Nov","Dec"}[tm->tm_mon % 12]);
+
+    int hour = tm->tm_hour;
+    const char *suffix = "";
+    if (!g_bar_cfg.bar_24h) {
+        suffix = hour < 12 ? " am" : " pm";
+        hour %= 12;
+        if (hour == 0) hour = 12;          /* midnight and noon are 12, not 0 */
+    }
+
+    if (g_bar_cfg.bar_seconds)
+        snprintf(buf, sizeof buf, "%s%02d:%02d:%02d%s", date, hour, tm->tm_min,
+                 tm->tm_sec, suffix);
+    else
+        snprintf(buf, sizeof buf, "%s%02d:%02d%s", date, hour, tm->tm_min, suffix);
     return buf;
 }
 
@@ -282,6 +318,7 @@ static void bar(void) {
     static int first = 1;
     if (first) { first = 0; em_window_move_to(0, 0); }   /* flush, like Mac's */
     bar_ink_update();
+    bar_cfg_poll();
     cpu_sample();
     net_sample();      /* once per frame == once per refresh_ms == once a second */
     wins_sample();     /* who is in front, and what else is open */
@@ -434,9 +471,11 @@ static void bar(void) {
                     }
                 }
             }
-            HStack(.width = 10) {}
-            meter(g_cpu_pct);
-            Text(cpu_text()).caption().color(g_ink);
+            if (g_bar_cfg.bar_cpu) {
+                HStack(.width = 10) {}
+                meter(g_cpu_pct);
+                Text(cpu_text()).caption().color(g_ink);
+            }
             HStack(.width = 10) {}                 /* two readings, not a group */
             Text(bar_clock()).caption().color(g_ink);
         }

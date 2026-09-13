@@ -384,6 +384,10 @@ static void cfg_poll(void) {
     struct oscfg was = g_cfg;
     oscfg_load(&g_cfg);
 
+    /* The pieces of the shell that cannot name the user's home ask us for the
+     * preferences over /run/emlink.prefs; g_cfg is what we answer with, and the
+     * server thread below reads it. Nothing to push. */
+
     /* The shell wears the preference too, and live. em_app_run applies it once
      * at launch for ordinary applications; the desktop never exits, so if it
      * only read the file at startup then changing the accent would recolour
@@ -422,6 +426,42 @@ static void cfg_poll(void) {
     if (g_cfg.wallpaper != was.wallpaper)
         force_repaint();
 }
+
+/* THE PREFERENCES, FOR WHOEVER CANNOT READ THE FILE.
+ *
+ * The menu bar's namespace is `ro /system, rw /run` and its manifest means it.
+ * It cannot open ~/settings.conf and should not be handed the authority to, so
+ * the desktop -- which can -- answers for it.
+ *
+ * The endpoint's whole meaning is "connect and I will hand you the
+ * preferences": no request payload, symmetric with the launcher endpoint
+ * beside it where the connect is itself the signal. That symmetry is not
+ * tidiness; it is what keeps this thread from ever BLOCKING ON A READ. A
+ * server that waits for a client to say what it wants is a server one rude
+ * client can wedge, and this one is single-threaded and sits behind the
+ * launcher button.
+ *
+ * A published file under /run would have been simpler and is not possible:
+ * /run is epfs, which holds endpoint nodes and nothing else. Measured, as
+ * `home: publish rc=-1`, before this existed. */
+static void prefs_listener(long arg) {
+    (void)arg;
+    int lh = (int)embk_chan_listen(OSCFG_ENDPOINT);
+    if (lh < 0) {
+        char b[112];
+        snprintf(b, sizeof b, "home: cannot listen at %s (%d) -- the menu bar "
+                              "will run on default preferences\n", OSCFG_ENDPOINT, lh);
+        embk_puts(1, b);
+        embk_thread_exit(1);
+    }
+    for (;;) {
+        int ch = (int)embk_chan_accept(lh);
+        if (ch < 0) { embk_sleep_ms(100); continue; }
+        oscfg_serve_one(ch, &g_cfg);
+        embk_chan_close(ch);
+    }
+}
+
 
 /* The dock's base size is a PREFERENCE, not a constant: Settings writes it and
  * the desktop re-reads it about once a second, so the dock changes under the
@@ -1217,6 +1257,7 @@ int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv;
     g_session_env = envp;
     embk_thread_create(apps_listener, 0);   /* the top bar's Apps signal listener */
+    embk_thread_create(prefs_listener, 0);  /* ...and what it wears while it draws */
     /* apps describe their own icon/name (docs presentation manifest) */
     load_app_meta("files", g_dock[0].icon, sizeof g_dock[0].icon, g_dock[0].label, sizeof g_dock[0].label);
     load_app_meta("term",  g_dock[1].icon, sizeof g_dock[1].icon, g_dock[1].label, sizeof g_dock[1].label);
