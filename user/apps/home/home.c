@@ -362,6 +362,7 @@ static void wins_poll(void);                 /* likewise: the live window list *
  * pointer. Every dock ever built names what you point at, because dock art is
  * abstract everywhere and ours more than most -- see dock_label(). */
 
+
 static struct oscfg g_cfg;
 static uint64_t     g_cfg_next = 0;
 
@@ -440,6 +441,40 @@ static void cfg_poll(void) {
  * drift the way two copies of a constant did. */
 #define DOCK_BAND   ((float)oscfg_dock_band(&g_cfg))
 #define BAR_RESERVE 26.0f      /* must match topbar.c's BAR_H */
+
+/* WHAT COLOUR A DESKTOP LABEL SHOULD BE, which is the WALLPAPER's business and
+ * not the theme's.
+ *
+ * A caption inside a window is dark on a light surface and light on a dark
+ * one, and the theme knows which. A desktop icon's caption sits on the
+ * picture, where the theme knows nothing: switch to the light theme over a
+ * dark wallpaper and every label turns near-black on near-black and simply
+ * disappears. It is not a subtle bug -- the "System" label vanished the
+ * instant the theme changed, while the pixels behind it had not moved.
+ *
+ * Same answer the menu bar already uses, for the same reason: ask what is
+ * actually composed there. The sample is the strip directly ABOVE the first
+ * icon -- wallpaper the desktop never draws on, so reading it cannot end up
+ * measuring last frame's own text. Twice a second; a wallpaper does not change
+ * at frame rate and reading pixels is not free.
+ *
+ * The two thresholds are hysteresis. One would make a label flicker between
+ * inks on a wallpaper that happens to sit near it. */
+static Color    g_desk_ink = { .r = .93f, .g = .94f, .b = .96f, .a = 1.f };
+static int      g_desk_ink_dark = 0;
+static uint64_t g_desk_ink_next = 0;
+static void desk_ink_poll(void) {
+    uint64_t now = embk_uptime_ms();
+    if (now < g_desk_ink_next) return;
+    g_desk_ink_next = now + 500;
+    int l = embk_screen_luma(0, (int)BAR_RESERVE, DESK_CELL_W * 2, 8);
+    if (l < 0) return;
+    if (!g_desk_ink_dark && l > 150)      g_desk_ink_dark = 1;
+    else if (g_desk_ink_dark && l < 120)  g_desk_ink_dark = 0;
+    g_desk_ink = g_desk_ink_dark ? (Color){ .r = .09f, .g = .09f, .b = .10f, .a = 1.f }
+                                 : (Color){ .r = .93f, .g = .94f, .b = .96f, .a = 1.f };
+}
+
 /* Where slot `i` ACTUALLY starts, derived from the layout rather than guessed.
  *
  * The row is: px 12, then per slot a VStack of width DOCK_BASE+8 separated by
@@ -880,7 +915,7 @@ static void desktop_icons(void) {
         ui_set_offset(g_desk[i].x, g_desk[i].y);
         VStack(.spacing = 5, .width = DESK_CELL_W, .align = Center) {
             drag_icon(g_desk[i], DESK_ICON, 1, i);
-            Text(g_desk[i].label).caption();
+            Text(g_desk[i].label).caption().color(g_desk_ink);
         }
         em_flush();
         ui_end_stack();
@@ -1239,6 +1274,7 @@ int main(int argc, char **argv, char **envp) {
 
     for (;;) {
         cfg_poll();            /* dock size / indicator, as Settings left them */
+        desk_ink_poll();       /* labels legible on whatever picture is behind them */
         wins_poll();           /* what is actually running, ours or not */
         poll_apps_request();   /* the top bar's Apps button opens our launcher */
 
