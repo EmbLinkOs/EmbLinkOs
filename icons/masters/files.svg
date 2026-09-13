@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
   <defs>
     <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#5B6472"/>
-      <stop offset="1" stop-color="#2B313B"/>
+      <stop offset="0" stop-color="#4AA3FF"/>
+      <stop offset="1" stop-color="#1668D8"/>
     </linearGradient>
   </defs>
   <!-- The tile. A rounded square is what makes a symbol read as an APPLICATION
@@ -14,7 +14,7 @@
   <!-- The glyph, in the 960-unit grid Material Symbols are authored in, scaled
        into the tile and centred. White on colour, because a two-tone icon at
        16px is one muddy tone. -->
-  <g transform="translate(15.0 49.0) scale(0.035417)" fill="#fff">
-    <path d="M480-160v-80h320v80H480ZM220-320l-56-56 183-184-183-184 56-56 240 240-240 240Z"/>
+  <g transform="translate(14.0 50.0) scale(0.0375)" fill="#fff">
+    <path d="M160-160q-33 0-56.5-23.5T80-240v-480q0-33 23.5-56.5T160-800h240l80 80h320q33 0 56.5 23.5T880-640v400q0 33-23.5 56.5T800-160H160Z"/>
   </g>
 </svg>

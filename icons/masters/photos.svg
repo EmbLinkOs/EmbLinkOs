@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
   <defs>
     <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#5B6472"/>
-      <stop offset="1" stop-color="#2B313B"/>
+      <stop offset="0" stop-color="#FFB25A"/>
+      <stop offset="1" stop-color="#F2683C"/>
     </linearGradient>
   </defs>
   <!-- The tile. A rounded square is what makes a symbol read as an APPLICATION
@@ -15,6 +15,6 @@
        into the tile and centred. White on colour, because a two-tone icon at
        16px is one muddy tone. -->
   <g transform="translate(15.0 49.0) scale(0.035417)" fill="#fff">
-    <path d="M480-160v-80h320v80H480ZM220-320l-56-56 183-184-183-184 56-56 240 240-240 240Z"/>
+    <path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h560q33 0 56.5 23.5T840-760v560q0 33-23.5 56.5T760-120H200Zm40-160h480L570-480 450-320l-90-120-120 160Z"/>
   </g>
 </svg>

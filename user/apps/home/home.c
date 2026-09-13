@@ -91,11 +91,11 @@ static int g_desk_n = 1;
  * dragged in / shrinks as they are dragged out, but never below DOCK_MIN. */
 #define DOCK_MIN 2
 static struct app_item g_dock[16] = {
-    { "/system/images/file.eic",     "Files",    "/data/apps/files/files.elf",       0 },
+    { "/system/images/files.eic",    "Files",    "/data/apps/files/files.elf",       0 },
     { "/system/images/terminal.eic", "Terminal", "/data/apps/term/term.elf",         0 },
     { "/system/images/setting.eic",  "Settings", "/data/apps/settings/settings.elf", 0 },
-    { "/system/images/file.eic",     "Vellum",   "/data/apps/vellum/vellum.elf",     0 },
-    { "/system/images/file.eic",     "NetSurf",  "/data/apps/nsemblink/nsemblink.elf", 0 },
+    { "/system/images/vellum.eic",   "Vellum",   "/data/apps/vellum/vellum.elf",     0 },
+    { "/system/images/netsurf.eic",  "NetSurf",  "/data/apps/nsemblink/nsemblink.elf", 0 },
 };
 static int g_dock_n = 5;
 
