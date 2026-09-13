@@ -57,6 +57,8 @@ void pmm_scan_stats(uint64_t *out_bits, uint64_t *out_allocs);
  * can be CHECKED rather than announced: take it before and after a teardown
  * and the difference is the truth about whether anything leaked. */
 uint64_t pmm_free_pages(void);
+uint64_t pmm_total_pages(void);
+uint64_t pmm_used_pages(void);
 
 // takes a physical address and frees the corresponding virtual page
 void pmm_free_page(uint64_t phys_addr);

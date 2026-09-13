@@ -1116,6 +1116,20 @@ static void ui_proto_role(const char *scen)
  * -- the SysV main(argc, argv, envp) registers. This is the raw entry point, so
  * the third parameter simply reads rdx; envp is 0 when the parent passed no
  * environment (the default). */
+/* Freestanding string bits. This program talks to syscalls with nothing
+ * underneath it -- no stdio to borrow -- and a test that can only say "OK"
+ * cannot tell you the machine came up reporting one megabyte of memory. */
+static int pt_str(char *out, const char *s) {
+    int n = 0; while (s[n]) { out[n] = s[n]; n++; } return n;
+}
+static int pt_u64(char *out, uint64_t v) {
+    char tmp[24]; int n = 0;
+    if (!v) { out[0] = '0'; return 1; }
+    while (v) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
+    for (int i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    return n;
+}
+
 void _start(long argc, char **argv, char **envp)
 {
     /* Before anything else: publish the environment. Freestanding, so this is
@@ -1156,6 +1170,41 @@ void _start(long argc, char **argv, char **envp)
             }
             embk_close(fd);
             embk_write(1, "\n", 1);
+            embk_exit(0);
+        }
+
+        /* THE MACHINE'S MEMORY, through the syscall rather than around it.
+         *
+         * Checks the three claims that make the numbers usable at all: they
+         * are non-zero, free never exceeds total, and used + free never
+         * exceeds total either. That last one is the interesting invariant --
+         * the allocator only ever owned the USABLE pages, so the two columns
+         * must fall short of the total by the pages that never were (firmware,
+         * MMIO holes, the bitmap). A build that got the accounting backwards
+         * would report more memory in use than the machine has, and every
+         * monitor drawn from it would be confidently wrong. */
+        if (embk_streq(argv[1], "meminfo")) {
+            struct embk_meminfo m;
+            int rc = embk_meminfo(&m);
+            if (rc != 0) { embk_puts(1, "meminfo: REFUSED\n"); embk_exit(1); }
+            if (!m.total_pages || !m.page_size) {
+                embk_puts(1, "meminfo: zero total or page size\n"); embk_exit(2);
+            }
+            if (m.free_pages > m.total_pages) {
+                embk_puts(1, "meminfo: free exceeds total\n"); embk_exit(3);
+            }
+            if (m.used_pages + m.free_pages > m.total_pages) {
+                embk_puts(1, "meminfo: used + free exceeds total\n"); embk_exit(4);
+            }
+            { char b[96]; int o = 0;
+              o += pt_str(b + o, "meminfo: ");
+              o += pt_u64(b + o, ((uint64_t)m.total_pages * m.page_size) >> 20);
+              o += pt_str(b + o, " MB total, ");
+              o += pt_u64(b + o, ((uint64_t)m.free_pages * m.page_size) >> 20);
+              o += pt_str(b + o, " MB free, ");
+              o += pt_u64(b + o, m.page_size);
+              o += pt_str(b + o, " byte pages\n");
+              b[o] = 0; embk_puts(1, b); }
             embk_exit(0);
         }
 

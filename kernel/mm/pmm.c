@@ -210,6 +210,15 @@ uint64_t pmm_free_pages(void) {
     return free_pages;
 }
 
+/* The other two numbers, because "free" alone answers nothing: free OUT OF WHAT
+ * is the only form of the question anybody actually asks. `total` counts every
+ * page the machine reports; `used` is what the allocator has handed out, so
+ * used + free falls short of total by exactly the pages that were never usable
+ * (firmware, MMIO holes, the bitmap itself). */
+uint64_t pmm_total_pages(void) { return total_pages; }
+uint64_t pmm_used_pages(void)  { return used_pages; }
+
+
 uint64_t pmm_reserved_phys_end(void) {
     uint64_t bitmap_phys_end = KV2P(pmm_bitmap) + bitmap_size;
     return (bitmap_phys_end + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);

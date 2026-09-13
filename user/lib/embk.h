@@ -201,6 +201,22 @@ struct embk_proc_info {
                                  * second, weaker way to say who it is. Before
                                  * it, `ps` was a column of bare numbers. */
 };
+/* WHAT THE MACHINE'S MEMORY IS DOING -- the whole machine's, not this
+ * process's. Mirrors struct meminfo_kbuf field for field; grow both together.
+ *
+ * used + free is LESS than total, and the gap is not a bug: total counts every
+ * page the machine reports and the allocator only ever owned the usable ones
+ * (firmware, MMIO holes and the page bitmap itself are in neither column). */
+struct embk_meminfo {
+    uint64_t total_pages;
+    uint64_t free_pages;
+    uint64_t used_pages;
+    uint64_t page_size;
+};
+static inline int embk_meminfo(struct embk_meminfo *out) {
+    return (int)embk_syscall1(EMBK_SYS_meminfo, (int64_t)(intptr_t)out);
+}
+
 /* Snapshot every live process (the shell's ps). Returns the count written
  * (<= max), or -EMBK_*. */
 static inline int embk_proc_list(struct embk_proc_info *out, int max) {

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6FD3A8"/>
+      <stop offset="1" stop-color="#2A8F72"/>
+    </linearGradient>
+  </defs>
+  <!-- The tile. A rounded square is what makes a symbol read as an APPLICATION
+       rather than as a piece of punctuation: at dock size the silhouette is
+       most of what anyone actually sees. -->
+  <rect x="4" y="4" width="56" height="56" rx="13" ry="13" fill="url(#g)"/>
+  <rect x="4" y="4" width="56" height="56" rx="13" ry="13" fill="none"
+        stroke="#000" stroke-opacity="0.16" stroke-width="1"/>
+  <!-- Bars, not a gauge: this window's whole job is comparing quantities. -->
+  <g transform="translate(15.0 49.0) scale(0.035417)" fill="#fff">
+    <path d="M640-160v-280h120v280H640Zm-220 0v-640h120v640H420Zm-220 0v-440h120v440H200Z"/>
+  </g>
+</svg>

@@ -19,7 +19,8 @@
 
 #include "include/syscall_abi.h"
 #include "include/usercopy.h"
-#include "mm/vma.h"        /* sys_mmap / sys_munmap */
+#include "mm/vma.h"
+#include "mm/pmm.h"   /* sys_meminfo: the machine's page counts */        /* sys_mmap / sys_munmap */
 #include "mm/vm_object.h"   /* the file's pages, for a file-backed mmap */
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"   /* sys_read's copy_to_user fault-path diagnostic */
@@ -2349,6 +2350,40 @@ static int64_t sys_drop_take(const struct sysargs *a) {
     return 1;
 }
 
+/* WHAT THE MACHINE'S MEMORY IS DOING.
+ *
+ * Ungated, deliberately. Everything else that reports on the machine as a whole
+ * is too (proc_list, uptime), and these three numbers say nothing about any
+ * particular process's memory -- only how much of the machine's there is and
+ * how much of it is spoken for. A capability that guards a number every
+ * program can infer by watching allocations fail is a capability that only
+ * costs honest programs.
+ *
+ * PAGES, not bytes: the page size is in the struct, so a caller that wants
+ * bytes can multiply and one that wants to compare against a page count does
+ * not have to divide back. */
+struct meminfo_kbuf {
+    uint64_t total_pages;
+    uint64_t free_pages;
+    uint64_t used_pages;
+    uint64_t page_size;
+};
+
+static int64_t sys_meminfo(const struct sysargs *a) {
+    void *out = (void *)a->arg[0];
+    if (!out) return -EMBK_EINVAL;
+    struct meminfo_kbuf k;
+    memset(&k, 0, sizeof k);
+    k.total_pages = pmm_total_pages();
+    k.free_pages  = pmm_free_pages();
+    k.used_pages  = pmm_used_pages();
+    k.page_size   = PAGE_SIZE;
+    _Static_assert(sizeof(struct meminfo_kbuf) == 4 * 8,
+                   "meminfo_kbuf and embk_meminfo have drifted apart");
+    if (copy_to_user(out, &k, sizeof k) != EMBK_OK) return -EMBK_EFAULT;
+    return 0;
+}
+
 static int64_t sys_net_status(const struct sysargs *a) {
     int cg = cap_gate(EMBK_CAP_NETWORK);
     if (cg) return cg;
@@ -2497,6 +2532,7 @@ static syscall_handler_t syscall_table[] = {
     [SYS_net_status]     = sys_net_status,
     [SYS_drag_begin]     = sys_drag_begin,
     [SYS_drop_take]      = sys_drop_take,
+    [SYS_meminfo]        = sys_meminfo,
     [SYS_win_raise]      = sys_win_raise,
     [SYS_readlink]       = sys_readlink,
     [SYS_lstat]          = sys_lstat,

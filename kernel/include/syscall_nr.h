@@ -281,4 +281,11 @@
 #define SYS_drag_begin    120   /* (type, buf, len)         -> 0 | -err        */
 #define SYS_drop_take     121   /* (out, buf, cap)          -> 1 | 0 | -err    */
 
+/* WHAT THE MACHINE'S MEMORY IS DOING. Userspace could list every process and
+ * its CPU time and could not ask how much memory existed -- so no program on
+ * this system could answer "is it running out of memory?", which is the first
+ * question anybody asks a monitor. Read-only and ungated: three numbers about
+ * the machine as a whole, not about anybody's memory in particular. */
+#define SYS_meminfo       122   /* (out)                    -> 0 | -err        */
+
 #endif /* _SYSCALL_NR_H_ */

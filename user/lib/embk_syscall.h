@@ -166,6 +166,7 @@
 #define EMBK_SYS_net_status    119
 #define EMBK_SYS_drag_begin    120
 #define EMBK_SYS_drop_take     121
+#define EMBK_SYS_meminfo       122
 
 /* --- the raw trap, once per architecture ---------------------------------
  *
