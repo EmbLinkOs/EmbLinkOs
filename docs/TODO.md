@@ -3313,23 +3313,23 @@ Open:
       | in / (long names)  | 115.3 | 125.3 | 175.0 | -    |
       | back at /home/yves | 115.3 | 125.3 | 141.1 | 62.6 |
 
-      **THE LAYOUT IS RIGHT AND THE PIXELS ARE WRONG.** That is the finding.
-      The container does not move, the row does not move, and after the return
-      EVERY cell in row 0 measures the same 62.6 it did on the fresh render --
-      all eight were printed by name. Yet the icons are drawn 32 px lower.
+      **CORRECTION.** An earlier version of this entry said "the layout is
+      right and the pixels are wrong". That was wrong, and it was wrong for a
+      reason worth naming: the rects and the screenshots came from DIFFERENT
+      RUNS, and the thing being printed was the ROW's rect, which does not
+      move. Measuring the CELL, with the screenshot taken in the same run:
 
-      Stating the row's height explicitly (`.height = 78`) makes the row's
-      measured height correct in both cases -- 78.0 fresh and 78.0 after the
-      return -- and the icons are STILL drawn at y=225. So the offset does not
-      come from any size in the layout tree. Reverted, like the fixed-cell
-      experiment before it: a change that does not do what it claims is not
-      worth keeping.
+          fresh              cell0  x=246.0  y=125.3  h=62.6
+          after a navigation cell0  x=270.0  y=157.3  h=62.6
 
-      That points away from layout and at the SCENE/paint side -- a retained
-      transform or offset on the reused node, not a retained size.
-      `ui_set_offset`/`scene_set_transform` are guarded so that an unchanged
-      value does not re-dirty; a node whose offset is never restated would keep
-      whatever it last had. That is where to look next.
+      The cell moves -- 24 px right and 32 px DOWN -- inside a row whose own
+      rect and height are unchanged, and while keeping its own height exactly.
+      So it is a placement problem within the row, not a size problem and not
+      a paint problem.
+
+      Note the horizontal shift, which nothing had noticed before: whatever
+      this is, it is not purely vertical, so "an extra 32 px above row 0" was
+      never the right description of it either.
 
       Why it matters beyond looks: a right-click aimed at a file lands between
       rows and opens the FOLDER menu instead of the item menu. It cost a
