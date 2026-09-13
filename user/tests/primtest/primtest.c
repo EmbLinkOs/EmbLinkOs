@@ -1140,6 +1140,25 @@ void _start(long argc, char **argv, char **envp)
          *
          * Exits 0 only if the switch is ACCEPTED and READS BACK, because a
          * call that returns 0 and changes nothing would pass a weaker test. */
+        /* PRINT A FILE. The kernel console has no `cat` -- that lives in the
+         * terminal application -- so a test that wants to check what the guest
+         * actually WROTE has no way to look. This is that way: it is the
+         * difference between "the screen changed" and "the preference was
+         * stored", and a preference test needs both. */
+        if (embk_streq(argv[1], "catfile") && argc >= 3) {
+            int fd = (int)embk_open(argv[2], EMBK_O_RDONLY, 0);
+            if (fd < 0) { embk_puts(1, "catfile: cannot open\n"); embk_exit(1); }
+            char b[512];
+            for (;;) {
+                int64_t n = embk_read(fd, b, sizeof b);
+                if (n <= 0) break;
+                embk_write(1, b, (size_t)n);
+            }
+            embk_close(fd);
+            embk_write(1, "\n", 1);
+            embk_exit(0);
+        }
+
         if (embk_streq(argv[1], "kbdlayout")) {
             char got[24];
             int rc = embk_kbd_layout("azerty", got, (int)sizeof got);

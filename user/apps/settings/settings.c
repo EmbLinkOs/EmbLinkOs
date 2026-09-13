@@ -59,7 +59,7 @@ static void apply_now(void) {
 static void commit(void) {
     apply_now();
     if (oscfg_save(&g_cfg) == 0) snprintf(g_saved, sizeof g_saved, "Saved");
-    else snprintf(g_saved, sizeof g_saved, "Could not write %s", OSCFG_PATH);
+    else snprintf(g_saved, sizeof g_saved, "Could not write %s", oscfg_path());
 }
 
 static void sample_system(void) {
@@ -102,6 +102,25 @@ static void pane_appearance(void) {
             Segmented(modes, 2, &dark);
         }
         if (dark != (g_cfg.dark ? 1 : 0)) { g_cfg.dark = dark; commit(); }
+    }
+
+    /* THE DESKTOP PICTURE. A name and a live preview rather than a name alone:
+     * the whole point of a wallpaper is what it looks like, and four words in a
+     * row ask you to remember which one "Dusk" was. The preview is the same
+     * file the desktop draws, so what is shown here is what you get. */
+    Section("Desktop picture") {
+        const char *wnames[OSCFG_WALLPAPERS];
+        for (int i = 0; i < OSCFG_WALLPAPERS; i++) wnames[i] = oscfg_wallpapers[i].label;
+        int wpick = (g_cfg.wallpaper >= 0 && g_cfg.wallpaper < OSCFG_WALLPAPERS)
+                    ? g_cfg.wallpaper : 0;
+        int wwas = wpick;
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
+            setting_label("Picture", "What the desktop shows behind everything.");
+        }
+        Segmented(wnames, OSCFG_WALLPAPERS, &wpick);
+        Sync();                 /* the staged element writes wpick at the FLUSH */
+        if (wpick != wwas) { g_cfg.wallpaper = wpick; commit(); }
+        Image(oscfg_wallpapers[wpick].path, .height = 132, .corner = 10);
     }
 
     Section("Interface size") {
@@ -254,9 +273,12 @@ static void pane_about(void) {
              "filesystem, network stack, TLS, package manager, compiler toolchain "
              "and this user interface.").body().secondary();
         Divider();
-        Text("Preferences are stored in " OSCFG_PATH " as plain text. "
-             "Editing that file by hand is a supported way to change them.")
-            .caption().tertiary();
+        { static char where[224];
+          snprintf(where, sizeof where,
+                   "Preferences are stored in %s as plain text. "
+                   "Editing that file by hand is a supported way to change them.",
+                   oscfg_path());
+          Text(where).caption().tertiary(); }
     }
 }
 

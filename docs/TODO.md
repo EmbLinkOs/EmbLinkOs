@@ -3353,8 +3353,15 @@ a SECOND bug reachable:
       The dock-size slider had the same bug and the same fix: `Slider(&f)` then
       `int want = ...` on the next line. Dragging it moved nothing.
 
-- [ ] **Still not demonstrated end to end: the layout switch through the
-      Settings GUI.** Both halves are now covered -- the syscall by
+- [x] **Demonstrated end to end at last, by a different pane.**
+      tools/wallpaper_shot.py launches Settings FROM THE DOCK, clicks a
+      Segmented control with a real pointer, and then checks all three parties:
+      the pane's preview changes (widget -> value), the stored file says the new
+      index (value -> preference), and the desktop behind the window repaints
+      (preference -> shell). It passes. The keyboard pane uses the identical
+      idiom, so the junction that was unproven is now proven.
+
+- [ ] **Still not demonstrated end to end specifically: the KEYBOARD pane.** Both halves are now covered -- the syscall by
       `test kbdlayout`, the widget-to-app idiom by em-test -- and the fix makes
       the second half identical to the panes that already work. What no test
       touches is the two together, driven by a pointer, in a live desktop.

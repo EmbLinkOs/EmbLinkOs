@@ -364,12 +364,25 @@ static void wins_poll(void);                 /* likewise: the live window list *
 
 static struct oscfg g_cfg;
 static uint64_t     g_cfg_next = 0;
+
+/* REDRAW EVERYTHING, NOW. For a change the renderer's dirty tracking cannot
+ * see: a theme whose colours moved under an unchanged tree, or a background
+ * image that is a different picture at the same node. em_structure_changed()
+ * tells the runtime not to trust last frame's diff; the three frames of full
+ * presentation are what actually push the pixels, because the compositor
+ * presents dirty rects and there are none to present. */
+static void force_repaint(void) {
+    em_structure_changed();
+    g_full_present = 3;
+    g_dock_dirty = 1;
+}
 static void cfg_poll(void) {
     uint64_t now = embk_uptime_ms();
     if (now < g_cfg_next) return;
     g_cfg_next = now + 1000;
     struct oscfg was = g_cfg;
     oscfg_load(&g_cfg);
+
     /* The shell wears the preference too, and live. em_app_run applies it once
      * at launch for ordinary applications; the desktop never exits, so if it
      * only read the file at startup then changing the accent would recolour
@@ -393,7 +406,20 @@ static void cfg_poll(void) {
         ui_theme_set_scale((float)g_cfg.ui_scale / 100.0f);
         const struct oscfg_accent *a = &oscfg_accents[g_cfg.accent];
         ui_theme_set_accent((struct color){ a->r, a->g, a->b, 1.0f });
+        force_repaint();
     }
+
+    /* A NEW DESKTOP PICTURE REPAINTS NOTHING BY ITSELF. The renderer draws what
+     * it can see has CHANGED, and swapping the path a BackgroundImage points at
+     * builds an identical tree -- same nodes, same shape, same everything but
+     * the bytes behind one of them. So the preference was stored, Settings
+     * showed the new picture in its preview, and the desktop behind it kept
+     * the old one indefinitely: three parties, two of them right.
+     *
+     * Measured, which is the only reason this line exists: the wallpaper test
+     * reported the strip of desktop beside the window changing 0.0%. */
+    if (g_cfg.wallpaper != was.wallpaper)
+        force_repaint();
 }
 
 /* The dock's base size is a PREFERENCE, not a constant: Settings writes it and
@@ -869,7 +895,13 @@ static void desktop_icons(void) {
 static void home_ui(void) {
     g_any_active = 0; g_have_dockr = 0;   /* recomputed each frame during the build */
     Screen(.width = g_sw, .height = g_sh, .padding = -1, .align = Fill) {
-        BackgroundImage("/system/images/colibri-user.ppm");
+        /* THE DESKTOP PICTURE IS A PREFERENCE, read live like every other one.
+         * cfg_poll() re-reads it about once a second, so picking one in
+         * Settings changes the screen under you rather than at the next login
+         * -- which is the difference between a setting and a promise. */
+        BackgroundImage(oscfg_wallpapers[(g_cfg.wallpaper >= 0 &&
+                                          g_cfg.wallpaper < OSCFG_WALLPAPERS)
+                                         ? g_cfg.wallpaper : 0].path);
         VStack(.width = g_sw, .height = g_sh, .padding = 0, .spacing = 0,
                .align = Fill) {
             /* Reserve the top strip for our own floating menu bar (topbar.elf,

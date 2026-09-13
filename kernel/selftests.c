@@ -5356,6 +5356,30 @@ int selftests_handle_command(const char *cmd)
     /* The keyboard layout over the SYSCALL. `test keymap` beside this one
      * calls keyboard_set_layout() directly and so never touched sys_kbd_layout,
      * which rejected every non-empty name with -EFAULT for want of a `< 0`. */
+    /* PRINT THE USER'S PREFERENCES FILE. The console's `run` takes a path and
+     * not an argument vector, so there is no way from here to ask a program to
+     * open a named file -- and without one, a test of Settings can see that the
+     * screen changed and never that the preference was STORED. Those are
+     * different claims, and the difference is exactly where this repo's last
+     * two preference bugs lived. */
+    if (strcmp(cmd, "test cfgdump") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test cfgdump: VFS not registered\n");
+            return 1;
+        }
+        /* The SESSION's file, which is the one that matters: preferences live
+         * in the user's own directory now (user/lib/oscfg.h), and the DEV
+         * auto-login user is 'yves'. If that ever changes this fails loudly,
+         * which is the right way for a hard-coded path in a test to break. */
+        char *a[] = { "/system/bin/primtest.elf", "catfile",
+                      "/home/yves/settings.conf", NULL };
+        int pid = process_create("/system/bin/primtest.elf", a, 3, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test cfgdump: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test kbdlayout") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test kbdlayout: VFS not registered\n");
