@@ -3328,39 +3328,45 @@ Open:
       two theories about the cell. The method error that produced two of them
       was measuring in one run and photographing in another.
 
-- [ ] **THE GENERAL BUG IS STILL THERE, and the obvious fix for it BREAKS
-      something else.** Making a container's stacking axis part of its identity
-      (a `box_axis` on `struct instance`, compared alongside `kind` in
-      `match_or_create`) does fix this bug in the toolkit -- verified: the grid
-      stays at y=193 through every navigation with no keys in Files at all,
-      and all seven host suites pass.
+- [x] ~~THE GENERAL BUG: a reused instance keeps properties the new occupant
+      never sets.~~ -- FIXED IN THE TOOLKIT, and it took two changes because
+      the first one only moved the damage.
 
-      It also makes Files' SIDEBAR STOP NAVIGATING after a confirmation dialog
-      is dismissed. Measured on the same sequence, by the ink in the path
-      field: without the change a sidebar click after the delete sheet moves
-      the path (260 -> 403); with it the path never changes, through two clicks
-      and a click on empty space in between. Stricter matching destroys and
-      recreates instances, and a press and its release then land on different
-      ones, so `ui_consume_click` never sees a pair.
+      **A container's stacking axis is part of its identity.** Every container
+      was `INSTANCE_BOX`, so a VStack and an HStack in the same slot matched
+      each other and the second inherited whatever the first had declared --
+      `ui_shadow` only fires a mutation when a declared value DIFFERS, so an
+      unset property is not "the default", it is "whatever was there".
+      `struct instance` carries a `box_axis` now and `match_or_create` compares
+      it. Verified with NO keys in Files: 193 fresh, 193 after a view toggle,
+      193 after one navigation round trip, 193 after two. It was 225 for every
+      case but the first.
 
-      So the axis is probably the right idea and needs the click path to
-      survive an instance being replaced mid-gesture -- not a change to make
-      without fixing that first. Reverted; Files keeps its keys.
+      **And `is_overlay` is cleared on every container entry.** Making matching
+      stricter exposed the same rule wearing a worse property: a node that had
+      been a dialog's dismiss scrim was reused without anyone restating
+      `is_overlay`, stayed OUT OF FLOW, and was therefore never laid out and
+      never hit-tested. Files' sidebar stopped navigating after a confirmation
+      dialog -- measured by ink in the path field: 260 -> 403 without the axis
+      change, and no change at all with it, through two clicks and a click on
+      empty space between them. Instrumenting the handler showed the click
+      never arrived at all.
 
-- [ ] **The underlying rule: a reused instance keeps properties the new
-      occupant never sets.** Keying Files' three branches fixes Files. Any
-      two elements that can occupy one slot in different frames have the same
-      trap -- whatever the first one set (padding, corner, shadow, background,
-      alignment) survives into the second unless the second restates it. The
-      DSL applies a prop only `if (p.padding)`, so an unset prop is not "the
-      default", it is "whatever was there".
+      `is_overlay` is set by exactly two callers and both do it immediately
+      after entering their container, so clearing it on entry costs them
+      nothing. Out-of-flow is declared every frame now, never inherited. That
+      is the property whose staleness removes a control from the input path
+      rather than merely putting it in the wrong place, which is why it was
+      invisible until something moved.
 
-      Worth deciding deliberately: either the reconciler should reset a node's
-      box properties when the element TYPE at a slot changes, or `em_apply_box`
-      should always write every box property with a documented default. The
-      second is the simpler rule and the more invasive change -- containers
-      that set their own defaults before `em_apply_box` (Card, Section,
-      EmptyState) would have to move those into the props.
+- [ ] **The rule still holds for every OTHER box property.** Padding, corner,
+      border, shadow, background and alignment are all applied only `if (p.x)`,
+      so two elements that can occupy one slot still exchange them -- the axis
+      check makes that much rarer (it takes two containers of the SAME axis
+      now) but does not remove it. The honest fix is for `em_apply_box` to
+      write every box property every frame with a documented default, which
+      means the containers that set their own defaults first (Card, Section,
+      EmptyState) have to express them as props instead.
 
 ## The dock cannot move, and the reason is one missing z-band (2026-09-13)
 

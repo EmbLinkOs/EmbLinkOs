@@ -742,26 +742,16 @@ static void app(void) {
                  * and the status line; the rest is the list. */
                 ScrollView(&g_scroll, em_viewport_height() - 150.0f) {
                     VStack(.spacing = g_view ? 0 : 10, .align = Fill, .padding = 10) {
-                        /* KEYED, so the placeholder and the listing can never
-                         * share an instance.
-                         *
-                         * They sit in the same slot of this stack, every
-                         * container is one instance kind (INSTANCE_BOX), and
-                         * the reconciler matches by position -- so the node
-                         * that was the empty-folder placeholder came back as
-                         * the first row of the grid and kept the padding
-                         * EmptyState had set on it (sp6/sp5 = 32 and 24). The
-                         * listing then drew 32 px lower and 24 px right of
-                         * where it had been a moment earlier. Those are the
-                         * measured numbers, exactly.
-                         *
-                         * A key makes them different instances, so nothing is
-                         * inherited. Fixing it in the TOOLKIT instead -- making
-                         * a container's stacking axis part of its identity --
-                         * works for this bug and breaks something else: see
-                         * docs/TODO.md. */
+                        /* The placeholder and the listing occupy the same
+                         * slot here. That used to mean the second inherited
+                         * the first's padding -- the reconciler matched them
+                         * because every container is one instance kind -- and
+                         * the listing drew 32 px down and 24 px right of where
+                         * it belonged. Fixed in the toolkit rather than here:
+                         * a container's stacking axis is part of its identity
+                         * now (ui/declare/instance.h). */
                         if (g_vis_n == 0) {
-                            VStack(.key = "files-placeholder", .align = Fill) {
+                            VStack(.align = Fill) {
                                 if (g_query[0])
                                     EmptyState(IconSearch, "No matches",
                                                "Nothing in this folder matches what you typed.");
@@ -770,7 +760,7 @@ static void app(void) {
                                                "There is nothing here yet.");
                             }
                         } else if (g_view == 1) {
-                            VStack(.key = "files-list", .align = Fill) {
+                            VStack(.align = Fill) {
                                 for (int k = 0; k < g_vis_n; k++) list_row(g_vis[k]);
                             }
                         } else {
@@ -780,7 +770,7 @@ static void app(void) {
                             int cols = ((int)em_viewport_width() - 178 - 44) / 100;
                             if (cols < 2) cols = 2;
                             if (cols > 8) cols = 8;
-                            VStack(.key = "files-grid", .align = Fill, .spacing = 10) {
+                            VStack(.align = Fill, .spacing = 10) {
                                 for (int base = 0; base < g_vis_n; base += cols) {
                                     HStack(.spacing = 8, .align = Leading) {
                                         for (int c = 0; c < cols; c++) {
