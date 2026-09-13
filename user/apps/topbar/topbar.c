@@ -232,6 +232,53 @@ static void bar_cfg_thread(long arg) {
     }
 }
 
+
+/* THE MONTH, for the menu behind the clock.
+ *
+ * A date in a menu bar answers "what is today"; the thing people open it for is
+ * "what day of the week is the 26th", and that question needs the grid. It is
+ * built from localtime and nothing else -- no calendar store, no events -- so
+ * it cannot be out of date and cannot be wrong about a month it has never seen.
+ *
+ * Rendered as text rows rather than a grid of boxes because a menu item is the
+ * only thing a dropdown can hold, and a week is exactly one line of it. Today
+ * is bracketed, which survives being read at a glance and does not need colour
+ * the menu may not have. */
+static int days_in_month(int y, int m) {          /* m: 0..11 */
+    static const int d[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    if (m != 1) return d[m];
+    int leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    return leap ? 29 : 28;
+}
+
+/* Fills `out` with up to 6 week-lines, returns how many. */
+static int month_grid(const struct tm *tm, char out[6][32]) {
+    int mdays = days_in_month(tm->tm_year + 1900, tm->tm_mon);
+    /* The weekday the 1st fell on, derived from today rather than computed from
+     * scratch: today's weekday is known and correct, and counting back from a
+     * known point cannot disagree with the clock. */
+    int first = ((tm->tm_wday - ((tm->tm_mday - 1) % 7)) % 7 + 7) % 7;
+    int rows = 0, day = 1;
+    while (day <= mdays && rows < 6) {
+        int o = 0;
+        for (int col = 0; col < 7; col++) {
+            int cell = (rows == 0 && col < first) ? 0 : (day <= mdays ? day++ : 0);
+            if (!cell) { out[rows][o++] = ' '; out[rows][o++] = ' ';
+                         out[rows][o++] = ' '; out[rows][o++] = ' '; continue; }
+            char l = (cell == tm->tm_mday) ? '[' : ' ';
+            char r = (cell == tm->tm_mday) ? ']' : ' ';
+            out[rows][o++] = l;
+            if (cell < 10) { out[rows][o++] = ' '; out[rows][o++] = (char)('0' + cell); }
+            else { out[rows][o++] = (char)('0' + cell / 10);
+                   out[rows][o++] = (char)('0' + cell % 10); }
+            out[rows][o++] = r;
+        }
+        out[rows][o] = 0;
+        rows++;
+    }
+    return rows;
+}
+
 static const char *bar_clock(void) {
     static char buf[64];
     time_t now = time(NULL);
@@ -489,7 +536,29 @@ static void bar(void) {
                 Text(cpu_text()).caption().color(g_ink);
             }
             HStack(.width = 10) {}                 /* two readings, not a group */
-            Text(bar_clock()).caption().color(g_ink);
+            /* THE CLOCK IS A MENU. It was a label, and a label in the one
+             * corner everybody looks at is a wasted corner -- the month is the
+             * thing people actually want from a date. */
+            Menu(bar_clock(), .font = Caption, .color = g_ink, .width = 268) {
+                time_t now = time(NULL);
+                struct tm *tm = localtime(&now);
+                if (!tm) {
+                    MenuItem("The clock is unavailable");
+                } else {
+                    static const char *mon[12] = { "January","February","March",
+                        "April","May","June","July","August","September",
+                        "October","November","December" };
+                    char head[40];
+                    snprintf(head, sizeof head, "%s %d",
+                             mon[tm->tm_mon % 12], tm->tm_year + 1900);
+                    MenuItem(head);
+                    MenuSeparator();
+                    MenuItem(" Su  Mo  Tu  We  Th  Fr  Sa");
+                    char weeks[6][32];
+                    int n = month_grid(tm, weeks);
+                    for (int i = 0; i < n; i++) MenuItem(weeks[i]);
+                }
+            }
         }
         Spacer();   /* transparent canvas below the bar -- dropdown room */
     }

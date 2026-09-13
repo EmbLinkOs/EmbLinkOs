@@ -3006,6 +3006,8 @@ void em_menubar_end_(void) { em_flush(); ui_end_stack(); }
  * With one keyed container per menu the list shape never changes, and every
  * property that DIFFERS between the two states is set explicitly in BOTH
  * branches, so a state flip can never inherit the other state's leftovers. */
+static float g_menu_panel_w = 200.0f;   /* what the NEXT panel should be wide */
+
 static void em_menu_panel_open(uint64_t key, float ax, float ay) {
     const struct ui_theme *t = TH;
     ui_begin_vstack(key);                 /* the out-of-flow overlay layer */
@@ -3027,6 +3029,19 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
      * invisible: the menu is not on screen the frame it opens. */
     float ovx = 0, ovy = 0, ovw, ovh;
     if (!ui_open_rect(&ovx, &ovy, &ovw, &ovh)) { ovx = 0; ovy = 0; }
+
+    /* KEEP IT ON THE SCREEN. The anchor is where the pointer was, and a menu
+     * near the right edge ran straight off it -- the calendar behind the clock,
+     * which is as far right as anything gets, was half a screen wide and half
+     * of that was past the edge. The panel's width is known here (it is set,
+     * not measured), so the anchor can simply be pulled back until it fits.
+     * Pulled, never flipped: a menu that jumps to the other side of the thing
+     * you clicked is a menu you have to look for. */
+    { float vw = em_viewport_width();
+      float maxx = vw - g_menu_panel_w - 6.0f;
+      if (maxx < 6.0f) maxx = 6.0f;
+      if (ax > maxx) ax = maxx;
+      if (ax < 6.0f)  ax = 6.0f; }
     /* drop-in motion: the panel fades in while settling down its last 8px.
      * Keyed on WHICH menu is open, so switching between menus re-plays it;
      * with no clock (host renders) it snaps to settled, like em_nav. */
@@ -3051,7 +3066,7 @@ static void em_menu_panel_open(uint64_t key, float ax, float ay) {
     ui_set_align(ALIGN_STRETCH);
     ui_set_spacing(0);
     ui_set_padding(t->sp1, t->sp1, t->sp1, t->sp1);
-    ui_set_size(sz_fixed(200), sz_intrinsic());
+    ui_set_size(sz_fixed(g_menu_panel_w), sz_intrinsic());
 }
 /* returns 1 if the transparent scrim (outside the panel) was clicked */
 static int em_menu_panel_close(void) {
@@ -3108,6 +3123,10 @@ void em_menu_(const char *label, EmProps p) {
         is_open = (g_menu_open == (const void *)label);
     }
     g_menu_cur_open = is_open;
+    /* .width on a Menu sizes its DROPDOWN, not its label -- the label is what
+     * it is. 200 was hard-coded and is right for a list of verbs; a month grid
+     * needs more, and clipping it produced a calendar with the year cut off. */
+    g_menu_panel_w = (p.width > 0) ? p.width : 200.0f;
     if (is_open) em_menu_panel_open((uint64_t)(uintptr_t)label, g_menu_ax, g_menu_ay);
     else         em_menu_hidden_open((uint64_t)(uintptr_t)label);
 }
