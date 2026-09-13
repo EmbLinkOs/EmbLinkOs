@@ -286,6 +286,24 @@ static void format_string(struct out_sink *s, const char *fmt, va_list arg) {
 //  Public API — thin wrappers over the core
 // ============================================================
 
+/* THE SAME LOCK, FOR SOMEBODY ELSE'S BYTES.
+ *
+ * kprintf is atomic against other kprintfs and was atomic against nothing
+ * else, so a kernel line could land in the middle of a line a USER process was
+ * writing to the same serial port. That is not only ugly: the aarch64
+ * acceptance test greps for whole lines, and one boot reported
+ * "FAIL(A6): init never spawned the session" on a machine where it plainly
+ * had -- the log read `init: desktop seEMBKFS: sda: ... not found`. A gate
+ * that fails for reasons unrelated to the change under test is a gate people
+ * learn to re-run instead of read.
+ *
+ * Exposed rather than made automatic because the console write path holds it
+ * for ONE LINE at a time, not for a whole write: a program dumping a megabyte
+ * must not own the port for the duration, and a line is the unit that has to
+ * arrive whole. */
+void kprintf_line_begin(void) { spin_lock(&kprintf_lock); }
+void kprintf_line_end(void)   { spin_unlock(&kprintf_lock); }
+
 void kprintf(const char *fmt, ...) {
     struct out_sink s = { .put = sink_serial_put, .written = 0 };
     va_list arg;

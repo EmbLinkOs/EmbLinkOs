@@ -3433,16 +3433,29 @@ a SECOND bug reachable:
       **Fix this first.** Networking on aarch64 is one revert-of-a-revert away
       afterwards, and nothing else is known to be in the way.
 
-- [ ] **The aarch64 acceptance test greps for log LINES that other subsystems
-      can interleave into.** Seen as `FAIL(A6): init never spawned the session`
-      on a boot where the session plainly started -- the log read
-      `init: desktop seEMBKFS: sda: "nsemblink" ... not found`, because the
-      filesystem wrote to the same serial port mid-line. The next run passed
-      with no change. Two gate failures this session have now been of this
-      shape, and a gate that fails for reasons unrelated to the change under
-      test is a gate people learn to re-run instead of read. Either give the
-      console a line lock, or have the acceptance test match on a token rather
-      than a whole line.
+- [x] ~~The aarch64 acceptance test greps for log LINES that other subsystems
+      can interleave into.~~ -- FIXED at the source rather than in the test.
+      kprintf was atomic against other kprintfs and against nothing else, so a
+      kernel line could land inside a line a USER process was writing to the
+      same port: one boot reported `FAIL(A6): init never spawned the session`
+      on a machine where it plainly had, because the log read
+      `init: desktop seEMBKFS: sda: ... not found`.
+
+      `console_fd_write` now holds kprintf's lock A LINE AT A TIME. Not the
+      whole write -- a program dumping a megabyte must not own the serial port
+      for the duration of it, and the line is the unit that has to arrive
+      whole. The two locks nest in one order only (the user path takes the
+      console mutex then kprintf's spinlock; kprintf never takes the mutex), so
+      there is no cycle.
+
+      HONEST ABOUT THE EVIDENCE: this is a structural fix, not a measured
+      before/after. The failure was seen ONCE in roughly fifteen aarch64 runs,
+      and a scan of all 85 serial logs in build/ finds no split line either
+      side of the change -- so "it stopped happening" is not something a
+      handful of runs can show. What is checked is that the detector works: fed
+      the exact line that was observed it reports a split, and fed
+      `[ ok ] compositor: focused pid 19` -- a tag legitimately mid-line -- it
+      does not.
 
 - [ ] **The deadline-scheduler self-test is FLAKY, NIC or no NIC.** First seen
       as "touchier with a NIC attached" (one run in three failed `worst

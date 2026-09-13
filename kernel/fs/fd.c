@@ -1165,17 +1165,33 @@ static int console_fd_read(struct fd_entry *e, void *buf, size_t len, size_t *ou
  * `home: desktop ready` arrive as `home: desktop re` + TopBar's lines +
  * `ady`, and reported a working desktop as failed. A sleeping lock, because
  * the loop is long and this is syscall context; kprintf takes its own path
- * to the serial port and is not serialised against user writes -- a kernel
- * line inside a user line remains possible and is a kernel choosing to speak. */
+ * to the serial port. It IS serialised against kprintf now, a line at a time --
+ * see below. */
 static struct mutex g_console_write_lock = MUTEX_INIT;
 
 static int console_fd_write(struct fd_entry *e, const void *buf, size_t len, size_t *out_written) {
     (void)e; 
 
     const char *cbuf = (const char *)buf;
+    /* The mutex keeps two USER writers apart; kprintf's spinlock keeps the
+     * KERNEL out of the middle of a line. Both are needed and they nest in
+     * this order only -- kprintf never takes the mutex, so there is no cycle.
+     *
+     * A LINE AT A TIME, not the whole write. A program dumping a megabyte must
+     * not own the serial port for the duration of it, and the line is the unit
+     * that has to arrive whole: a kernel line inside a user line is what made
+     * the aarch64 acceptance test report `init never spawned the session` on a
+     * boot where it had (the log read `init: desktop seEMBKFS: sda: ...`). */
     mutex_lock(&g_console_write_lock);
-    for (size_t i = 0; i < len; i++) {
-        console_putchar(cbuf[i]);
+    size_t i = 0;
+    while (i < len) {
+        size_t end = i;
+        while (end < len && cbuf[end] != '\n') end++;
+        if (end < len) end++;                    /* take the newline with it */
+        kprintf_line_begin();
+        for (size_t k = i; k < end; k++) console_putchar(cbuf[k]);
+        kprintf_line_end();
+        i = end;
     }
     mutex_unlock(&g_console_write_lock);
     *out_written = len;

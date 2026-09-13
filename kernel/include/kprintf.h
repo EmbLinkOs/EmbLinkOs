@@ -20,4 +20,11 @@ void kprintf(const char *fmt, ...); // variadic function
 void kprintf_set_secondary(bool (*ready)(void), void (*put)(char));
 int  snprintf(char *buffer, size_t size, const char *fmt, ...);
 
+
+/* Hold the console's serialisation lock across bytes this file did not format
+ * -- see the note in kprintf.c. The caller must keep the hold SHORT (one line);
+ * everything on the machine that prints is waiting behind it. */
+void kprintf_line_begin(void);
+void kprintf_line_end(void);
+
 #endif /* _KPRINTF_H_ */
