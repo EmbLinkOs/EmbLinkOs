@@ -241,6 +241,50 @@ struct acpi_power_info {
     char     s5_table[5];           /* which table it came from: DSDT or SSDT  */
 };
 
+/* ---- what the AML interpreter answers (kernel/acpi/acpi_dev.c) ----------
+ *
+ * Build the PCI interrupt routing table from _PRT. Call after aml_init() and
+ * after the I/O APIC has been chosen: it tells the firmware which controller
+ * we use (_PIC), and on many machines -- QEMU included -- that changes what
+ * _PRT returns. */
+void acpi_pci_routing_init(void);
+
+/* Announce `pic_mode` (0 = 8259, 1 = I/O APIC) and rebuild the routing table.
+ * On a machine with a _PIC method the two modes give DIFFERENT tables, and
+ * that difference is how `test prt` proves the call took effect. */
+void acpi_pci_routing_rebuild(int pic_mode);
+bool acpi_pic_method_exists(void);
+
+/* Where (bus, device, pin) actually lands, pin 0..3 for INTA..INTD. False
+ * means ACPI did not describe it and the caller keeps what it had. */
+bool acpi_pci_route(uint8_t bus, uint8_t device, uint8_t pin,
+                    uint32_t *out_gsi, bool *out_active_low, bool *out_level);
+uint32_t acpi_pci_route_count(void);
+bool acpi_pci_route_at(uint32_t i, uint8_t *bus, uint8_t *device, uint8_t *pin,
+                       uint32_t *gsi, bool *active_low, bool *level);
+
+/* Writable access to the power block, for acpi_dev.c only. */
+struct acpi_power_info *acpi_power_info_mutable(void);
+
+/* Replace the byte-decoded \_S5_ with the EVALUATED one. After aml_init(). */
+void acpi_power_adopt_aml_s5(void);
+
+/* SLP_TYP values for sleep state `state`, by EVALUATING \_Sx_ rather than
+ * recognising its encoding -- so a machine whose _S5 is a method works. */
+bool acpi_aml_sleep_typ(int state, uint8_t *typa, uint8_t *typb);
+
+/* A laptop's own devices. WRITTEN BUT NEVER EXECUTED: QEMU emulates no
+ * battery, lid or thermal zone, so none of these has met its hardware. */
+bool acpi_battery_present(void);
+bool acpi_battery_state(uint64_t *remaining, uint64_t *full, uint64_t *state);
+bool acpi_lid_open(bool *open);
+bool acpi_thermal_temp(uint64_t *decikelvin);
+
+/* The DSDT and the SSDTs, for the AML interpreter. NULL before acpi_init(),
+ * and NULL past the last SSDT. */
+const struct acpi_sdt_header *acpi_dsdt(void);
+const struct acpi_sdt_header *acpi_ssdt(int nth);
+
 /* The power part of the ACPI tables, or NULL before acpi_init(). */
 const struct acpi_power_info *acpi_power_info(void);
 

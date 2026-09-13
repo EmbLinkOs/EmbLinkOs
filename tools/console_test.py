@@ -97,6 +97,26 @@ def main(cmds):
         # existing network tests mean what they always did.
         model = os.environ.get("NIC", "virtio-net")
         argv += ["-netdev", "user,id=net0", "-device", "%s,netdev=net0" % model]
+    # MACHINE: the chipset. The default is QEMU's i440fx; "q35" is the modern
+    # one, and it is a DIFFERENT machine in the way that matters here -- its
+    # firmware tables are generated separately, so an ACPI test that passes on
+    # one has said nothing about the other.
+    machine = os.environ.get("MACHINE")
+    if machine:
+        argv += ["-M", machine]
+
+    # EXTRA_DEVICES: more QEMU -device arguments, comma-separated.
+    #
+    #   EXTRA_DEVICES="intel-hda,e1000,rtl8139" python3 tools/console_test.py "test prt"
+    #
+    # Added for `test prt`, where the point is COVERAGE: the ACPI interrupt
+    # routing is cross-checked against what the firmware wrote into each PCI
+    # device's Interrupt Line register, and a machine with two cards checks two
+    # entries out of a hundred and twenty-eight.
+    for d in (os.environ.get("EXTRA_DEVICES") or "").split(","):
+        d = d.strip()
+        if d:
+            argv += ["-device", d]
     argv += ["-serial", "stdio", "-no-reboot", "-no-shutdown",
              "-m", os.environ.get("MEM", "2G"), "-smp", os.environ.get("SMP", "4"),
              "-display", "none"]

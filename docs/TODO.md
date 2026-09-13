@@ -1874,6 +1874,75 @@ was a real gap rather than test scaffolding:
       call exists for what comes next (a synth, a game, video sync), and the
       right time to wire it is when one of those exists.
 
+## ACPI
+
+### The AML interpreter (2026-09-14)
+
+`kernel/acpi/aml.c` runs the firmware's bytecode: a namespace from every DSDT
+and SSDT, the object model, control methods, and operation regions over system
+memory, I/O ports, PCI configuration space and the embedded controller.
+`kernel/acpi/acpi_dev.c` is what asks it questions. `make test-acpi`.
+
+**What it bought immediately:** PCI interrupt routing from `_PRT`, which is not
+available any other way -- where a PCI pin lands is a property of the board's
+traces, absent from the device, absent from its configuration header, absent
+from every fixed ACPI table, and on QEMU it is 1853 bytes of code that returns
+a different table depending on what the OS said about its interrupt
+controller. Also `\_S5_` by EVALUATION rather than by recognising the byte
+encoding of a package, which is what a machine whose `_S5` is a method needs.
+
+**Three bugs worth remembering, because each produced a plausible wrong
+answer rather than a failure:**
+
+- A declaration inside a method body (`Name(PRR0, ResourceTemplate(){...})`,
+  patched and returned) was treated as "not an executable opcode" and stopped
+  the method at its first byte. The routing table came out with ONE entry and
+  reported OK.
+- PCI-config operation regions took their bus/device/function from the FIELD's
+  position in the namespace. Firmware routinely declares the region inside the
+  device and the fields over it from another scope -- QEMU puts the region at
+  `\_SB.PCI0.S08.P40C` and the `PRQ0-3` fields at `\_SB` -- so every read
+  failed and every interrupt in the machine resolved to line 0.
+- Names in a package were resolved where they were WRITTEN. ACPI resolves
+  names where they are USED, and a `_PRT` near the top of a table routinely
+  names link devices declared near the bottom. All 128 entries were dropped on
+  q35. Unresolved names now keep their text and their scope and resolve later.
+
+**Still open:**
+
+- [ ] **Battery, lid and thermal zone are written and have never run.**
+      `acpi_battery_state()`, `acpi_lid_open()` and `acpi_thermal_temp()` are
+      in acpi_dev.c, and the embedded-controller transactions they depend on
+      (ports 0x62/0x66, commands 0x80/0x81) are specification-derived. QEMU
+      emulates no EC, no battery, no lid and no thermal zone, so none of it has
+      executed once. Needs the target machine. Nothing in the OS calls them
+      yet either -- there is no battery indicator to feed.
+- [ ] **No sleep state below S5 is entered.** `acpi_aml_sleep_typ()` will
+      return S3's SLP_TYP, but suspending means saving and restoring the state
+      of every driver in the system, which is a pillar of its own.
+- [ ] **`IndexField` and `BankField` are skipped, not implemented.** They
+      reach their bits through another field rather than directly; a
+      half-implementation would read the wrong register, so the names are
+      dropped and counted as refusals instead. No machine tested so far uses
+      one for anything this kernel asks about.
+- [ ] **No `Load`/`LoadTable`, no `Unload`.** Tables cannot be added at
+      runtime. Used mainly for hot-plug on servers.
+- [ ] **Mutexes are not real.** `Acquire` always succeeds and `Release` does
+      nothing, because method execution is single-threaded and serialised by
+      being called only from boot paths. A `Serialized` method called from two
+      threads would race; nothing does that yet.
+- [ ] **Names created inside a method persist.** ACPICA creates them in a
+      scope it deletes when the method returns; here they stay under the
+      method node and a second call overwrites them. Correct for every
+      method seen so far, wrong for one that relies on a name being absent on
+      entry.
+- [ ] **`Notify` is logged and dropped.** Nothing subscribes, so a battery
+      changing state or a lid closing reaches no one.
+- [ ] **The interpreter has met two DSDTs.** QEMU's `pc` and `q35`. Real
+      firmware is larger and stranger, and the load pass stops a table at the
+      first opcode it cannot follow rather than guessing -- so a real machine
+      that refuses will say so on the console with a count of what loaded.
+
 ### Intel HD Audio (2026-09-13) -- and what it still cannot do
 
 `kernel/drivers/audio/hda.c`, behind the new `struct pcm_driver` table. Proven

@@ -30,11 +30,17 @@ emulates the common real part, so none has to wait for the machine.
 |---|---|---|
 | **NVMe** | ✅ done — both architectures, root filesystem verified on it | Most machines built since ~2016 boot from NVMe |
 | **ACPI power** | ✅ power-off from the FADT and the DSDT's `\_S5_` package, reboot from the FADT reset register — verified on both QEMU chipsets (`make test-power`) | Power-off used emulator constants and did nothing on a real PC |
-| **ACPI AML interpreter** | absent — `\_S5_` is decoded as data, nothing is executed | No sleep, no battery, no lid, no thermal zones, no `_S5` that is a method |
+| **ACPI AML interpreter** | ✅ **done for what can be tested** — `kernel/acpi/aml.c`: the namespace built from every DSDT and SSDT, the object model, control methods with locals and arguments, and operation regions over system memory, I/O ports, PCI configuration space and the embedded controller. `\_S5_` is now EVALUATED rather than pattern-matched, and **PCI interrupt routing comes from `_PRT`** — cross-checked against the byte the firmware independently wrote into each device's Interrupt Line register, on both QEMU chipsets, in matching interrupt modes. `make test-acpi` | No sleep, no battery, no lid, no thermal zones, no `_S5` that is a method |
 | **A real network card** | ✅ **done for what can be tested** — `e1000.c` (Intel 8254x/8257x) and `rtl8139.c` (Realtek), behind a `struct net_driver` table. DHCP, DNS, TCP, `test net`, `test netudp` on `e1000`, `e1000e` AND `rtl8139`; carrier detection proved by pulling the virtual cable with QMP `set_link`, down to the menu bar's indicator. `make test-nics` | A physical machine has no network at all. Intel e1000e and Realtek r8169 cover most wired machines |
 | **Intel HD Audio** | ✅ **done for what can be tested** — `hda.c`: CORB/RIRB command ring, the codec graph walked to find a DAC→pin route from the board's own configuration defaults, and the cyclic DMA engine reconciled with the stream contract. Behind a `struct pcm_driver` table alongside AC'97 and virtio-snd. Verified on QEMU's ICH6 and ICH9 controllers and with an AC'97 attached at the same time, where the table has to choose. `make test-audio-cards` | AC97 left real hardware around 2008; no sound |
 | **USB hot-plug + mass storage mount** | ports scanned once at boot; no hot-plug | A USB stick plugged in after boot does nothing |
 | **UEFI boot** | ✅ **done** — the firmware launches our own EFI loader (`boot/uefi/`, no GNU-EFI), it relocates itself, draws its menu through ConOut, locates a GOP framebuffer, loads the kernel, builds page tables, exits boot services and jumps. Verified end to end under OVMF on BOTH images: loader and root on separate disks, and the single GPT disk (ESP + EMBKFS) you write to a USB stick — where the root is found on the same device the firmware booted from. `make test-uefi` | A machine from the last several years boots this way and no other |
+
+**Still open on the ACPI pillar:** battery, lid and thermal zone are WRITTEN
+(`acpi_dev.c`) and have never run — QEMU emulates none of them, so the embedded
+controller transactions underneath them are specification-derived and unproven.
+Sleep states below S5 are not entered. `IndexField`/`BankField` are skipped
+rather than half-implemented. Each is in docs/TODO.md with why.
 
 **Still open on the audio pillar:** a descriptor is fixed at 21 ms (HDA's
 cyclic engine fixes the buffer's total length before it starts, so

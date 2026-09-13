@@ -60,7 +60,27 @@
 #include "ipc/channel.h"
 #include "ipc/endpoint.h"
 #include "ipc/pipe.h"
+#include "acpi/acpi.h"
+#include "acpi/aml.h"
 #include "drivers/audio/pcm.h"
+
+/* `test aml`: run _STA on every device the firmware declared. _STA is a
+ * METHOD on most machines, so this is the check that the executor works --
+ * the loader alone would report the names and evaluate nothing. */
+struct sta_count { int ok, bad; };
+static bool sta_visit(struct aml_node *n, void *ctx) {
+    struct sta_count *c = ctx;
+    if (n->value && n->value->kind == AML_DEVICE) {
+        struct aml_node *sta = aml_lookup(n, "_STA");
+        if (sta && sta->parent == n) {
+            struct aml_object *v = aml_evaluate(sta, NULL, 0);
+            if (v && v->kind == AML_INTEGER) c->ok++;
+            else                             c->bad++;
+            aml_put(v);
+        }
+    }
+    return true;
+}
 #include "drivers/audio/audio.h" /* test audiostress: underrun accounting */
 
 /* The other half of the ^Z test below: something has to stop the child WHILE
@@ -614,6 +634,250 @@ int selftests_handle_command(const char *cmd)
 
     if (strcmp(cmd, "test list") == 0) {
         selftests_print_commands();
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test prt -- WHICH INTERRUPT DOES EACH PCI SLOT REALLY USE?
+     *
+     * The answer is in a method, not a table, and on this machine that method
+     * is 1853 bytes that branch on whether the OS said it uses the APIC. So
+     * this is the end-to-end check of the interpreter: a package of packages
+     * built by running firmware code, with link devices followed through
+     * their _CRS resource templates where the machine uses them.
+     *
+     * WHAT IS ASSERTED is the shape, not the numbers -- the numbers are the
+     * board's and differ on every machine. A routing entry that names a GSI
+     * the I/O APIC does not have is wrong ANYWHERE, and that is checkable.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test prt") == 0) {
+        if (!aml_available()) {
+            kprintf("\n[cmd] test prt: NO NAMESPACE\n");
+            return 1;
+        }
+        uint32_t n = acpi_pci_route_count();
+        int fails = 0;
+
+        const struct acpi_info *ai = acpi_get_info();
+        uint32_t gsi_max = 0;
+        for (uint32_t i = 0; i < ai->io_apic_count; i++) {
+            uint32_t top = ai->io_apic_gsi_bases[i] + 24;  /* the usual size */
+            if (top > gsi_max) gsi_max = top;
+        }
+
+        kprintf("\n[prt] %u routing entr%s from ACPI\n", n, n == 1 ? "y" : "ies");
+        if (n == 0) {
+            kprintf("  FAIL: _PRT produced nothing -- the interpreter ran it "
+                    "and got no usable package\n");
+            fails++;
+        }
+
+        uint32_t shown = 0, distinct_gsi = 0;
+        uint32_t seen[32];
+        for (uint32_t i = 0; i < n; i++) {
+            uint8_t bus, dev, pin; uint32_t gsi; bool low, lvl;
+            if (!acpi_pci_route_at(i, &bus, &dev, &pin, &gsi, &low, &lvl)) continue;
+            if (shown < 16) {
+                kprintf("  %02x:%02x INT%c -> GSI %u  %s %s\n", bus, dev,
+                        'A' + (pin & 3), gsi, lvl ? "level" : "edge",
+                        low ? "active-low" : "active-high");
+                shown++;
+            }
+            if (gsi_max && gsi >= gsi_max) {
+                kprintf("  FAIL: %02x:%02x INT%c routes to GSI %u, past the "
+                        "last I/O APIC input (%u)\n",
+                        bus, dev, 'A' + (pin & 3), gsi, gsi_max - 1);
+                fails++;
+            }
+            bool dup = false;
+            for (uint32_t k = 0; k < distinct_gsi; k++) if (seen[k] == gsi) dup = true;
+            if (!dup && distinct_gsi < 32) seen[distinct_gsi++] = gsi;
+        }
+        if (shown < n) kprintf("  ... %u more\n", n - shown);
+        kprintf("  %u distinct interrupt line(s) in use\n", distinct_gsi);
+
+        /* A TABLE THAT ROUTES EVERYTHING TO ONE LINE is the classic wrong
+         * answer: it is what you get from a _PRT evaluated in the wrong mode,
+         * or from reading the package's fields in the wrong order. It also
+         * still "works" for a single device, which is why it needs saying. */
+        if (n >= 4 && distinct_gsi < 2) {
+            kprintf("  FAIL: every entry routes to the same line -- the "
+                    "package was misread, or _PIC did not take\n");
+            fails++;
+        }
+
+        /* AND NOW THE INDEPENDENT WITNESS.
+         *
+         * The firmware ALSO wrote each device's Interrupt Line register when
+         * it configured the machine. That byte and this table describe the
+         * same wiring by two completely different routes -- one is a value
+         * left in PCI configuration space, the other is the result of running
+         * the DSDT's own code and reading a chipset register through it. They
+         * have no common failure between them.
+         *
+         * BUT THEY MUST BE COMPARED IN THE SAME MODE, and that is the whole
+         * subtlety. A legacy BIOS writes the 8259 routing into those bytes,
+         * because at that point nothing has said otherwise. Once _PIC(1) is
+         * called the firmware hands back the I/O APIC routing instead -- GSI
+         * 16 and up on this chipset -- and the two SHOULD disagree. Asserting
+         * equality there would be asserting that _PIC did nothing.
+         *
+         * So on a machine with _PIC, the comparison is made in PIC mode --
+         * where the two really do describe the same thing -- and then the
+         * mode is switched back and the table is required to CHANGE. That
+         * difference is the proof the call took; there is no other. */
+        bool has_pic = acpi_pic_method_exists();
+        if (has_pic) {
+            kprintf("  this machine has \\_PIC: comparing in 8259 mode, where "
+                    "the firmware's byte and ACPI mean the same thing\n");
+            acpi_pci_routing_rebuild(0);
+        }
+
+        int agree = 0, differ = 0, unrouted = 0;
+        uint32_t pcin = pci_devices_count();
+        for (uint32_t i = 0; i < pcin; i++) {
+            const struct pci_device *d = pci_get_device(i);
+            if (!d) continue;
+            uint8_t pin = pci_read8(d->bus, d->device, d->function, PCI_INTERRUPT_PIN);
+            if (pin == 0 || pin > 4) continue;
+            uint8_t line = pci_read8(d->bus, d->device, d->function, PCI_INTERRUPT_LINE);
+            uint32_t gsi = 0;
+            if (!acpi_pci_route(d->bus, d->device, (uint8_t)(pin - 1), &gsi, 0, 0)) {
+                unrouted++;
+                continue;
+            }
+            if (line == 0xFF || line == 0) continue;   /* firmware had no opinion */
+            if ((uint32_t)line == gsi) {
+                agree++;
+            } else {
+                differ++;
+                kprintf("  FAIL: %02x:%02x.%u INT%c -- ACPI says GSI %u, the "
+                        "firmware wrote line %u\n", d->bus, d->device,
+                        d->function, 'A' + pin - 1, gsi, line);
+            }
+        }
+        kprintf("  cross-check against the firmware's Interrupt Line byte: "
+                "%d agree, %d differ, %d not described by ACPI\n",
+                agree, differ, unrouted);
+        if (differ) fails++;
+        if (agree == 0 && differ == 0)
+            kprintf("  note: no device had both a pin and a firmware line -- "
+                    "nothing to cross-check on this machine\n");
+
+        /* BACK TO APIC MODE, and the table must be different for it. */
+        if (has_pic) {
+            uint32_t pic_gsi = 0, apic_gsi = 0;
+            bool had = acpi_pci_route(0, 2, 0, &pic_gsi, 0, 0);
+            acpi_pci_routing_rebuild(1);
+            bool has = acpi_pci_route(0, 2, 0, &apic_gsi, 0, 0);
+            kprintf("  00:02 INTA is GSI %u in 8259 mode and GSI %u in I/O APIC "
+                    "mode\n", pic_gsi, apic_gsi);
+            if (!had || !has) {
+                kprintf("  FAIL: 00:02 INTA vanished from the table across a "
+                        "mode switch\n");
+                fails++;
+            } else if (pic_gsi == apic_gsi) {
+                kprintf("  FAIL: the routing did not change -- _PIC was called "
+                        "and the firmware ignored it, or we never called it\n");
+                fails++;
+            }
+        }
+
+        kprintf("\n[cmd] test prt: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test aml -- WHAT DID THE FIRMWARE ACTUALLY SAY?
+     *
+     * An AML interpreter cannot be checked by asserting a number, because the
+     * numbers come from the machine's own firmware and differ on every one.
+     * What CAN be checked is that the namespace has the shape ACPI requires,
+     * that the methods a machine must have can be RUN, and that running them
+     * produces the kinds the specification says they produce.
+     *
+     * The dump is the other half and is not decoration: on the machine this
+     * eventually runs on, it is the only way to see what the firmware
+     * declared without a disassembler.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test aml") == 0 || strcmp(cmd, "test amldump") == 0) {
+        if (!aml_available()) {
+            kprintf("\n[cmd] test aml: NO NAMESPACE (no DSDT, or it did not parse)\n");
+            return 1;
+        }
+        const struct aml_stats *st = aml_get_stats();
+        int fails = 0;
+
+        if (strcmp(cmd, "test amldump") == 0) { aml_dump(); return 1; }
+
+        kprintf("\n[aml] %u table(s): %u names, %u methods, %u devices, "
+                "%u regions, %u fields, %u refusal(s)\n",
+                st->tables, st->nodes, st->methods, st->devices,
+                st->regions, st->fields, st->load_errors);
+
+        /* THE ROOT SCOPES. Every DSDT assumes \_SB_ exists and puts its
+         * devices under it; a namespace without it did not parse. */
+        if (!aml_lookup(NULL, "\\_SB_")) { kprintf("  FAIL: no \\_SB_ scope\n"); fails++; }
+
+        /* _OSI IS OURS, not the firmware's, and it is the single call every
+         * DSDT makes. Answering it wrongly changes which branch of the
+         * firmware's code the whole machine takes. */
+        struct aml_node *osi = aml_lookup(NULL, "\\_OSI");
+        if (!osi) { kprintf("  FAIL: \\_OSI is not defined\n"); fails++; }
+        else {
+            struct aml_object *yes_s = aml_string("Windows 2009");
+            struct aml_object *no_s  = aml_string("Plan 9");
+            struct aml_object *a1[1], *a2[1];
+            a1[0] = yes_s; a2[0] = no_s;
+            struct aml_object *r1 = aml_evaluate(osi, a1, 1);
+            struct aml_object *r2 = aml_evaluate(osi, a2, 1);
+            uint64_t v1 = (r1 && r1->kind == AML_INTEGER) ? r1->u.integer : 0;
+            uint64_t v2 = (r2 && r2->kind == AML_INTEGER) ? r2->u.integer : 1;
+            kprintf("  _OSI(\"Windows 2009\") = 0x%llx, _OSI(\"Plan 9\") = 0x%llx\n",
+                    (unsigned long long)v1, (unsigned long long)v2);
+            if (!v1) { kprintf("  FAIL: _OSI refused a string we support\n"); fails++; }
+            if (v2)  { kprintf("  FAIL: _OSI claimed one we do not\n"); fails++; }
+            aml_put(r1); aml_put(r2); aml_put(yes_s); aml_put(no_s);
+        }
+
+        /* THE COUNTS THEMSELVES. A DSDT with no methods did not parse -- the
+         * shortest real one on any machine has dozens. */
+        if (st->methods == 0) { kprintf("  FAIL: no methods loaded\n"); fails++; }
+        if (st->devices == 0) { kprintf("  FAIL: no devices loaded\n"); fails++; }
+
+        /* \_S5_, the thing acpi.c had to pattern-match for. Evaluated
+         * properly now: a package whose first two elements are the SLP_TYP
+         * values written to the PM1 registers to switch the machine off. */
+        struct aml_node *s5 = aml_lookup(NULL, "\\_S5_");
+        if (!s5) {
+            kprintf("  note: no \\_S5_ on this machine (power-off uses its fallback)\n");
+        } else {
+            struct aml_object *v = aml_evaluate(s5, NULL, 0);
+            if (!v || v->kind != AML_PACKAGE || v->u.pkg.count < 1) {
+                kprintf("  FAIL: \\_S5_ did not evaluate to a package\n"); fails++;
+            } else {
+                struct aml_object *e0 = v->u.pkg.elem[0];
+                struct aml_object *e1 = v->u.pkg.count > 1 ? v->u.pkg.elem[1] : NULL;
+                kprintf("  \\_S5_ = Package(%u) { SLP_TYPa=%llu, SLP_TYPb=%llu }\n",
+                        v->u.pkg.count,
+                        (unsigned long long)(e0 && e0->kind == AML_INTEGER ? e0->u.integer : 0),
+                        (unsigned long long)(e1 && e1->kind == AML_INTEGER ? e1->u.integer : 0));
+                if (!e0 || e0->kind != AML_INTEGER) {
+                    kprintf("  FAIL: \\_S5_[0] is not an integer\n"); fails++;
+                }
+            }
+            aml_put(v);
+        }
+
+        /* A DEVICE WALK that RUNS code: _STA is a method on most devices and
+         * returns a bitfield. This is the check that the executor works at
+         * all, as opposed to the loader. */
+        struct sta_count sta = { 0, 0 };
+        aml_walk(NULL, sta_visit, &sta);
+        kprintf("  _STA evaluated on %d device(s), %d refused\n", sta.ok, sta.bad);
+        if (sta.ok == 0) { kprintf("  FAIL: not one _STA method ran\n"); fails++; }
+
+        kprintf("\n[cmd] test aml: %s\n", fails ? "FAIL" : "OK");
         return 1;
     }
 

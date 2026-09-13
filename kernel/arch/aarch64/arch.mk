@@ -113,6 +113,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/kworker/kworker.c \
                   kernel/tty/tty.c \
                   kernel/acpi/acpi.c \
+                  kernel/acpi/aml.c \
+                  kernel/acpi/acpi_dev.c \
                   kernel/drivers/audio/audio.c \
                   kernel/drivers/audio/virtio_snd.c \
                   kernel/crypto/sha256.c \

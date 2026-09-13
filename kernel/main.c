@@ -17,6 +17,7 @@
 #include "drivers/timer/rtc.h"
 #include "drivers/bus/pci.h"
 #include "drivers/audio/audio.h"
+#include "acpi/aml.h"
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
@@ -1792,6 +1793,17 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
 
     // --- Interrupt controllers (ACPI -> LAPIC -> IO-APIC) ---
     acpi_init();
+    /* The firmware's bytecode. After acpi_init (it needs the RSDP) and after
+     * kheap_init (the namespace is allocated), and before anything that would
+     * want to ask the firmware a question. A machine whose DSDT does not parse
+     * carries on with the table-only facts it had. */
+    aml_init();
+    /* \_S5_ again, EVALUATED this time. acpi.c decoded it by recognising the
+     * encoding of a named package, which is all that was possible before the
+     * interpreter existed and which cannot read a machine whose _S5 is a
+     * method. This corrects it where they differ and fills it in where the
+     * decoder found nothing. */
+    acpi_power_adopt_aml_s5();
     lapic_init();
     // this_cpu() becomes usable core-wide from here on: needs both ACPI's
     // MADT CPU list (acpi_init, just above) and a working lapic_get_id()
@@ -1816,6 +1828,10 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                           // smp.c) as a real, adopted scheduler
                           // participant with its own LAPIC timer
     ioapic_init();
+    /* AFTER the I/O APIC, because the first thing this does is tell the
+     * firmware we are using it -- and on most machines, QEMU included, that
+     * changes which routing table _PRT hands back. */
+    acpi_pci_routing_init();
 
     // --- HPET: must come after acpi_init + vmm (for MMIO map) ---
     hpet_init();

@@ -165,6 +165,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/process/debug.c \
 			 kernel/tty/tty.c \
              kernel/acpi/acpi.c \
+             kernel/acpi/aml.c \
+             kernel/acpi/acpi_dev.c \
              kernel/drivers/char/serial.c \
              kernel/drivers/video/framebuffer.c \
              kernel/drivers/video/gpu.c \
@@ -2746,6 +2748,28 @@ test-audio-cards: $(IMG) $(EMBKFS_MASTER)
 	@AUDIO_CARD=hda AUDIO_CMD="run /data/apps/tonestress/tonestress.elf 1 400 0 20" \
 	    AUDIO_CHECK=0 python3 tools/audio_test.py >/dev/null || exit 1
 	@python3 tools/audio_check.py build/audio-out.wav --hz 440 --min-seconds 0.25
+
+# THE FIRMWARE'S OWN CODE, RUN. `test aml` checks that the namespace built and
+# that methods execute; `test prt` checks the thing the interpreter exists for,
+# and checks it against an INDEPENDENT witness -- the Interrupt Line byte the
+# firmware itself wrote into each PCI device's configuration space. Two routes
+# to the same wiring, with no common failure between them.
+#
+# Both chipsets, because their ACPI tables are generated separately: "pc" (the
+# i440fx)
+# routes PCI interrupts through the PIIX3's programmable PIRQ registers (so the
+# interpreter has to follow a link device into PCI config space and decode a
+# resource template), and q35 does not. A pass on one says nothing about the
+# other. Four extra PCI cards on each, so the cross-check has entries to check.
+.PHONY: test-acpi
+test-acpi: $(IMG) $(EMBKFS_MASTER)
+	@for m in pc q35; do \
+	  echo "--- $$m ---"; \
+	  MACHINE=$$m EXTRA_DEVICES="intel-hda,e1000,rtl8139,AC97" \
+	    python3 tools/console_test.py "test aml" || exit 1; \
+	  MACHINE=$$m EXTRA_DEVICES="intel-hda,e1000,rtl8139,AC97" \
+	    python3 tools/console_test.py "test prt" || exit 1; \
+	done
 
 # --- x86 console tests, scripted -----------------------------------------------
 # tools/console_test.py boots the kernel headless and types at its console. Any

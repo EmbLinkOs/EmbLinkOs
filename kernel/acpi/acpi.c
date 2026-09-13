@@ -243,6 +243,13 @@ const struct acpi_power_info *acpi_power_info(void) {
     return g_power_parsed ? &g_power : NULL;
 }
 
+/* The same block, writable, for the one caller allowed to correct it: the AML
+ * interpreter, which can EVALUATE \_S5_ where the decoder above can only
+ * recognise it. Deliberately not in the public header's read-only shape. */
+struct acpi_power_info *acpi_power_info_mutable(void) {
+    return g_power_parsed ? &g_power : NULL;
+}
+
 static uint32_t rd32le(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -422,6 +429,39 @@ static void parse_power(const struct rsdp *r) {
         kprintf("ACPI: no \\_S5_ package in the DSDT or any SSDT -- power-off falls back\n");
 }
 
+/* The RSDP, kept so the tables can be found again after init -- the AML
+ * interpreter needs the DSDT and every SSDT, and it runs later than this. */
+static struct rsdp *g_rsdp;
+
+/* The DSDT, from the FADT. Both the 32-bit and 64-bit pointers exist and a
+ * machine may fill in either; the 64-bit one wins where it is present. */
+const struct acpi_sdt_header *acpi_dsdt(void) {
+    if (!g_rsdp) return NULL;
+    struct acpi_sdt_header *fh = find_table(g_rsdp, "FACP");
+    if (!fh || !checksum_ok(fh, fh->length)) return NULL;
+    const struct acpi_fadt *f = (const struct acpi_fadt *)fh;
+    uint64_t phys = 0;
+    if (fadt_has(f, offsetof(struct acpi_fadt, x_dsdt), 8) && f->x_dsdt)
+        phys = f->x_dsdt;
+    else if (fadt_has(f, offsetof(struct acpi_fadt, dsdt), 4))
+        phys = f->dsdt;
+    if (!phys) return NULL;
+    const struct acpi_sdt_header *d = (const struct acpi_sdt_header *)P2V(phys);
+    if (!sig_match(d->signature, "DSDT") || !checksum_ok((void *)d, d->length))
+        return NULL;
+    return d;
+}
+
+/* SSDT number `nth`, or NULL past the last one. A machine commonly has
+ * several, and the namespace is the union of all of them -- skipping one
+ * loses whatever devices it declared. */
+const struct acpi_sdt_header *acpi_ssdt(int nth) {
+    if (!g_rsdp) return NULL;
+    struct acpi_sdt_header *t = find_table_nth(g_rsdp, "SSDT", nth);
+    if (!t || !checksum_ok(t, t->length)) return NULL;
+    return t;
+}
+
 const struct acpi_info *acpi_init(void) {
     serial_write_string("\n=== ACPI init ===\n");
 
@@ -441,6 +481,7 @@ const struct acpi_info *acpi_init(void) {
         kprintf("ACPI: RSDP not found!\n");
         return &info;
     }
+    g_rsdp = r;
     kprintf("ACPI: RSDP found at %p, revision %u\n", (void *)r, (unsigned int)r->revision);
     kprintf("ACPI: %s\n", r->revision >= 2 ? "using XSDT (ACPI 2.0+)" : "using RSDT (ACPI 1.0)");
 
