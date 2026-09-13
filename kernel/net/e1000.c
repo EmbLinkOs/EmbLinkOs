@@ -306,6 +306,13 @@ int e1000_tx(const void *frame, uint32_t len) {
     return ok;
 }
 
+/* Is the cable in? The 8254x reports it in one bit and keeps it current, so
+ * there is nothing to cache and nothing to poll for. */
+int e1000_link(void) {
+    if (!g_present) return -1;
+    return (er(E1000_STATUS) & STATUS_LU) ? 1 : 0;
+}
+
 /* Drain everything the hardware has left us, and give the descriptors back.
  *
  * The tail is moved to the LAST descriptor handed back, which is what the

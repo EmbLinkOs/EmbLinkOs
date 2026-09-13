@@ -186,6 +186,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/net/net.c \
              kernel/net/virtio_net.c \
              kernel/net/e1000.c \
+             kernel/net/rtl8139.c \
              kernel/net/ethernet/eth.c \
              kernel/net/ethernet/arp.c \
              kernel/net/ip/ipv4.c \
@@ -2700,18 +2701,27 @@ test-audio: $(IMG) $(EMBKFS_MASTER)
 test-x86: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/console_test.py $(T)
 
-# THE SAME STACK, OVER A CARD A REAL MACHINE MIGHT HAVE. Every network test
-# this OS has ever run went through virtio-net, which is a contract with a
-# hypervisor; kernel/net/e1000.c is the first driver for silicon. Run against
-# BOTH generations QEMU emulates, because they are different parts -- 82540EM
-# (`e1000`, PCI, 2002) and 82574L (`e1000e`, PCIe, 2008) -- and a driver that
-# works on one and not the other is a driver that got lucky.
-.PHONY: test-e1000
-test-e1000: $(IMG) $(EMBKFS_MASTER)
-	@for nic in e1000 e1000e; do \
+# THE SAME STACK, OVER CARDS A REAL MACHINE MIGHT HAVE. Every network test this
+# OS ran for years went through virtio-net, which is a contract with a
+# hypervisor. These are drivers for silicon.
+#
+# Run against every part QEMU emulates that we drive, because they are
+# genuinely different hardware -- 82540EM (`e1000`, PCI, 2002), 82574L
+# (`e1000e`, PCIe, 2008) and the RTL8139, which has no receive descriptor ring
+# at all -- and a driver that works on one and not the others got lucky.
+#
+# The link half is separate because it needs QMP: tools/netlink_shot.py pulls
+# the virtual cable out with `set_link` and checks the OS notices. A driver that
+# always answers "up" passes every other test here.
+.PHONY: test-nics
+test-nics: $(IMG) $(EMBKFS_MASTER)
+	@for nic in e1000 e1000e rtl8139; do \
 	  echo "=== $$nic ==="; \
 	  NET=1 NIC=$$nic python3 tools/console_test.py "test dhcp" "test dns" "test tcp" \
 	    "test net" "test netudp" || exit 1; \
+	done
+	@for nic in e1000 e1000e rtl8139 virtio-net; do \
+	  python3 tools/netlink_shot.py $$nic || exit 1; \
 	done
 
 # POWER LOSS, SIMULATED, AT EVERY WRITE. `test embkfs crash` copies the small

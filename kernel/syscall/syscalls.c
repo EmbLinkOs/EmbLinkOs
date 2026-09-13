@@ -2440,7 +2440,12 @@ static int64_t sys_net_status(const struct sysargs *a) {
 
     struct net_status_kbuf k;
     memset(&k, 0, sizeof k);
-    k.up      = g_netif.up ? 1 : 0;
+    /* `up` IS THE CABLE, not the driver. It used to mean "a NIC initialised",
+     * so the menu bar's indicator lit the moment one existed and stayed lit
+     * with the wire on the floor -- a status light that is always on is not a
+     * status light. A card that cannot report carrier answers -1 and is taken
+     * as up: refusing to work because the hardware will not say is worse. */
+    k.up      = (g_netif.up && net_dev_link() != 0) ? 1 : 0;
     k.dhcp    = g_netif.dhcp ? 1 : 0;
     k.ip      = g_netif.ip;
     k.netmask = g_netif.netmask;

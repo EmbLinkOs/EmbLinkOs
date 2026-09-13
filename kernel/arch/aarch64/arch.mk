@@ -137,6 +137,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/net/net.c \
                   kernel/net/virtio_net.c \
                   kernel/net/e1000.c \
+                  kernel/net/rtl8139.c \
                   kernel/net/ethernet/eth.c \
                   kernel/net/ethernet/arp.c \
                   kernel/net/ip/ipv4.c \

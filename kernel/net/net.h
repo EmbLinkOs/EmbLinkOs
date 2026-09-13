@@ -268,19 +268,37 @@ struct net_driver {
     bool (*init)(uint8_t mac_out[ETH_ALEN]);   /* probe + bring up; fills MAC */
     int  (*tx)(const void *frame, uint32_t len);   /* send one Ethernet frame */
     void (*poll)(void);                        /* drain the RX ring -> net_rx() */
+    /* IS THE CABLE IN. 1 up, 0 down, -1 the card cannot say.
+     *
+     * Separate from "the driver initialised", which is what net_status used to
+     * report as `up` -- so the menu bar's indicator lit the moment a NIC
+     * existed and stayed lit with the cable on the floor. A card that cannot
+     * answer returns -1 and is treated as up, because refusing to work when
+     * the hardware will not tell you is worse than believing it. */
+    int  (*link)(void);
 };
 
 int  net_dev_tx(const void *frame, uint32_t len);
 void net_dev_poll(void);
 const char *net_dev_name(void);            /* "" when no card was found */
+int  net_dev_link(void);                   /* 1 up, 0 down, -1 unknown */
 
 bool virtio_net_init(uint8_t mac_out[ETH_ALEN]);
 int  virtio_net_tx(const void *frame, uint32_t len);
 void virtio_net_poll(void);
+int  virtio_net_link(void);
 
 /* Intel PRO/1000 (8254x/8257x) -- the first card a real machine might have. */
 bool e1000_init(uint8_t mac_out[ETH_ALEN]);
 int  e1000_tx(const void *frame, uint32_t len);
 void e1000_poll(void);
+int  e1000_link(void);
+
+/* Realtek RTL8139 -- the second vendor, and what makes the table above a seam
+ * rather than a shape drawn around one implementation. */
+bool rtl8139_init(uint8_t mac_out[ETH_ALEN]);
+int  rtl8139_tx(const void *frame, uint32_t len);
+void rtl8139_poll(void);
+int  rtl8139_link(void);
 
 #endif /* __NET_H__ */

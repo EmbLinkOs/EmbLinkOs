@@ -37,7 +37,7 @@ def sock_path(name, kind):
     return os.path.join(BUILD, "shot-%s-%s.sock" % (name, kind))
 
 
-def boot(name, scratch, audio=None, tablet=False):
+def boot(name, scratch, audio=None, tablet=False, nic=None):
     ser, qmp = sock_path(name, "ser"), sock_path(name, "qmp")
     for p in (ser, qmp):
         if os.path.exists(p):
@@ -64,6 +64,11 @@ def boot(name, scratch, audio=None, tablet=False):
     # 10.0.2.15 over DHCP with a router at 10.0.2.2.
     if os.environ.get("NET") == "1":
         argv += ["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]
+    # A NIC on QEMU's user-mode stack, with an id so QMP `set_link` can
+    # reach it -- which is how a test unplugs the cable.
+    if nic:
+        argv += ["-netdev", "user,id=net0",
+                 "-device", "%s,netdev=net0" % nic]
     if tablet:
         # AN ABSOLUTE POINTING DEVICE, for a test that has to put the cursor on
         # a named pixel. QEMU gives a PC a PS/2 mouse, which is RELATIVE: a tool
@@ -106,8 +111,11 @@ class Qmp:
         self.f.readline()                       # greeting
         self.cmd("qmp_capabilities")
 
-    def cmd(self, name, **args):
-        msg = {"execute": name}
+    def cmd(self, _command, **args):
+        """The parameter is underscored because QMP has commands whose OWN
+        argument is called `name` -- set_link is one -- and a plain `name` here
+        collides with it. Every caller passes the command positionally."""
+        msg = {"execute": _command}
         if args:
             msg["arguments"] = args
         self.f.write((json.dumps(msg) + "\n").encode())

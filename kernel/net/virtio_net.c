@@ -229,6 +229,12 @@ static bool vnet_init_transport(const struct pci_device *dev) {
     return true;
 }
 
+/* This driver negotiates VIRTIO_NET_F_MAC and nothing else, so the device's
+ * link-status field is not guaranteed present -- and reading a field whose
+ * feature was never negotiated is reading whatever the device felt like
+ * leaving there. -1 says so, and the stack treats it as up. */
+int virtio_net_link(void) { return -1; }
+
 bool virtio_net_init(uint8_t mac_out[ETH_ALEN]) {
     /* Find the virtio-net PCI function: vendor 0x1AF4, device 0x1000 (legacy id)
      * or 0x1041 (modern id); network class 0x02. */

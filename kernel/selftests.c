@@ -5396,6 +5396,18 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* WHICH CARD, AND IS THE CABLE IN. Printed rather than asserted: the answer
+     * depends on what the machine has and on whether somebody has unplugged it,
+     * and both are things a test wants to READ. tools/netlink_shot.py drives
+     * QEMU's `set_link` around this and checks the reading follows. */
+    if (strcmp(cmd, "test netlink") == 0) {
+        int l = net_dev_link();
+        kprintf("\n[cmd] test netlink: card=%s link=%s\n",
+                net_dev_name()[0] ? net_dev_name() : "none",
+                l > 0 ? "up" : l == 0 ? "down" : "unknown");
+        return 1;
+    }
+
     if (strcmp(cmd, "test meminfo") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test meminfo: VFS not registered\n");

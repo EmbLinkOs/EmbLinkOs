@@ -202,8 +202,9 @@ static void net_rx_thread(void) {
 
 /* Every card this kernel can drive, in the order they are tried. */
 static const struct net_driver g_drivers[] = {
-    { "virtio-net", virtio_net_init, virtio_net_tx, virtio_net_poll },
-    { "e1000",      e1000_init,      e1000_tx,      e1000_poll      },
+    { "virtio-net", virtio_net_init, virtio_net_tx, virtio_net_poll, virtio_net_link },
+    { "e1000",      e1000_init,      e1000_tx,      e1000_poll,      e1000_link      },
+    { "rtl8139",    rtl8139_init,    rtl8139_tx,    rtl8139_poll,    rtl8139_link    },
 };
 static const struct net_driver *g_dev;
 
@@ -214,6 +215,7 @@ void net_dev_poll(void) {
     if (g_dev) g_dev->poll();
 }
 const char *net_dev_name(void) { return g_dev ? g_dev->name : ""; }
+int net_dev_link(void) { return (g_dev && g_dev->link) ? g_dev->link() : -1; }
 
 void net_init(void) {
     memset(&g_netif, 0, sizeof(g_netif));
