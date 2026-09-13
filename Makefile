@@ -2380,7 +2380,20 @@ UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
 # RIP-relative accesses (`lea 0xed03d(%rip),%rax`) -- position-independent by
 # construction, nothing to relocate. Checked instruction by instruction, not
 # assumed.
-build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds
+# -pie, NOT -shared, and the difference is the whole loader.
+#
+# With `-shared` this linker relaxes a cross-file global read into an ABSOLUTE
+# address -- `mov $0xef030,%rax`, the link-time address -- and emits NO
+# relocation to correct it. crt0's fixup loop then has nothing to apply, so
+# every global is read from low memory that is not the image, and the loader
+# dies on its first console call with the firmware's screen still blank. `-pie`
+# makes the same linker, script and objects emit `lea 0x...(%rip)`.
+#
+# THIS RULE DEPENDS ON THE MAKEFILE because that flag lives here: without it,
+# changing it rebuilds nothing and the image on disk is from the old one. That
+# is not hypothetical -- it happened while writing tools/uefi_test.py, and for
+# one run the test reported OK on a binary it had not built.
+build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds Makefile
 	$(CC) -nostdlib -pie -Bsymbolic -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
 
 # ELF -> PE32+ EFI application. The efi-app-x86_64 pseudo-target sets the EFI
@@ -2394,6 +2407,19 @@ build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds
 # machine happens to have.
 $(BOOTX64): build/uefi_loader.so
 	$(UEFI_OBJCOPY) -O efi-app-x86_64 -j .text -j .data -j .reloc $< $@
+
+# DOES IT BOOT THE WAY MACHINES BOOT NOW? Both images, under the real firmware.
+#
+# The UEFI path is not a compatibility mode here -- a machine built in the last
+# decade has no other way in, so this is the boot path that decides whether the
+# OS can be installed on one at all. It is also the path that has failed
+# silently before (a PIE that does not relocate itself dies with the screen
+# still blank), which is why the loader writes single bytes to COM1 and why
+# tools/uefi_test.py reads them back rather than settling for "the desktop
+# appeared".
+.PHONY: test-uefi
+test-uefi: uefi.img uefi-usb.img
+	@OVMF_CODE="$(OVMF_CODE)" OVMF_VARS="$(OVMF_VARS)" python3 tools/uefi_test.py
 
 # GPT + ESP disk carrying /EFI/BOOT/BOOTX64.EFI.
 uefi.img: $(BOOTX64) tools/mkuefidisk.py

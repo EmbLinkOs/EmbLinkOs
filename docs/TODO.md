@@ -333,7 +333,10 @@ web asks for them and how much they change a page:
   reset + retry (3×) a failed INT 13h read before giving up (flaky-USB spin-up).
 - [x] ~~BIOS only — no UEFI support.~~ — **from-scratch UEFI loader** (`boot/uefi/`,
   own PE32+ EFI app, no GNU-EFI) boots to the desktop under OVMF; both firmwares
-  hand the kernel the same `boot_protocol`. `make run-uefi` / `run-uefi-cow`.
+  hand the kernel the same `boot_protocol`. `make run-uefi` / `run-uefi-cow`, and
+  **`make test-uefi`** is the gate: both images, the loader's own COM1 markers,
+  GOP, the memory map, the root mount and the desktop. See the UEFI entries at
+  the end of this file for what a real machine still needs.
 - [ ] **EmbBoot** (UEFI boot manager, [EMBBOOT_Design.md](EMBBOOT_Design.md)):
   M1 (menu) done. Open: M2 `.embfw` payload format + kernel-on-ESP; M3 verify
   (HMAC v1 → Ed25519 v2); M4 Recovery + Diagnostics; M5 Boot Manager + self-update.
@@ -6987,28 +6990,55 @@ TOOLING gaps rather than anything wrong with the OS.
       needed mkfs.vfat, mmd, mcopy, sfdisk and GNU `stat`, none of which exist
       here. OVMF's path is per host now too. VERIFIED: the firmware finds the
       GPT, reads the FAT32, and launches /EFI/BOOT/BOOTX64.EFI.
-- [ ] **The UEFI loader crashes before it reaches the kernel, and the last step
-      is not understood.** Under OVMF it gets: firmware handoff, a valid system
-      table (signature `IBI SYST`), a working ConOut (a direct
-      `OutputString` call prints), into `boot_emblinkos` -- and then its FIRST
-      console call dies with #UD at a low legacy address, because the global
-      `ST` reads back as `ffffffffffffffff` instead of what `con_init` stored
-      one call earlier.
-      FOUND AND FIXED ON THE WAY: the link used `-shared`, and with this
-      binutils that plus an external `-T` script makes cross-file global
-      accesses ABSOLUTE -- the linker relaxes the compiler's GOT reference into
-      `mov $0xef030,%rax`, the link-time address, and emits NO relocation to
-      correct it, so crt0's relocation loop has nothing to apply and every
-      global is read from low memory that is not the image. `-pie` makes the
-      same linker, script and objects emit `lea 0x...(%rip)` instead. Verified
-      instruction by instruction. It is NOT the whole story: `ST` still reads
-      all-ones afterwards, so something else moves or protects that page.
-      Next: dump the loaded image's base and compare .data byte-for-byte with
-      the file (QMP `xp`), and check whether OVMF's image-protection policy is
-      write-protecting .data. The loader now marks its own progress on COM1
-      ('1' entry, '2' relocated, '3' C entry, '4' console, 'B' booting), which
-      is how all of the above was found and is what a real machine with no
-      display will need anyway.
+- [x] ~~**The UEFI loader crashes before it reaches the kernel, and the last
+      step is not understood.**~~ **It was understood, and the fix was already
+      in the tree when this entry was written.** `-shared` -> `-pie` (a3acc29)
+      was the whole story: with `-shared` this linker relaxes a cross-file
+      global read into an ABSOLUTE address -- `mov $0xef030,%rax`, the
+      link-time address -- and emits NO relocation for it, so crt0's fixup loop
+      between `__rela_start` and `__rela_end` has nothing to apply and every
+      global is read from low memory that is not the image. That is why `ST`
+      read back as `ffffffffffffffff` one call after `con_init` stored it.
+      `-pie` makes the same linker, script and objects emit `lea 0x...(%rip)`.
+      The note saying "it is NOT the whole story" was written mid-investigation
+      and never corrected; the loader had been booting all the way to the
+      desktop since that commit and nobody had looked.
+
+      **THE LESSON IS THE ENTRY, not the bug.** A pillar was recorded as broken
+      for weeks because the doc was a scratchpad and the thing had no test. It
+      has one now: `make test-uefi` boots both images under OVMF and asserts
+      the loader's own COM1 markers, the menu, a real GOP framebuffer, the
+      kernel agreeing it was booted by UEFI, a plausible memory map, the root
+      mount, and the desktop. It was verified to FAIL by putting `-shared`
+      back, which reproduced the historical symptom exactly (markers 1-2-3-4
+      present, first ConOut call dead).
+
+      Found while doing that: `build/uefi_loader.so` did not depend on the
+      Makefile, so changing that very flag rebuilt nothing -- for one run the
+      new test reported OK on a binary it had not built. Fixed.
+
+### UEFI: what is still missing for a real machine
+
+- [ ] **Secure Boot.** An unsigned `BOOTX64.EFI` is refused by a machine with
+      it enabled, which is the default on most retail hardware. Today the
+      answer is "turn it off in firmware setup", and the menu's "Secure Boot
+      Verification" entry is a placeholder. Real support means a signed loader
+      and either enrolling our own key or shipping a shim.
+- [ ] **The kernel is embedded in the EFI binary** (`boot/uefi/kernel_blob.S`),
+      so `BOOTX64.EFI` is ~1 MB and a kernel update rewrites it. That is
+      atomic and simple, and it is also why the "Recovery" menu entry cannot
+      do anything yet -- there is only ever one kernel on the ESP. Loading the
+      kernel from a FILE on the ESP is what that entry needs.
+- [ ] **The menu's other five entries are placeholders** -- Recovery,
+      Diagnostics, Firmware Update, Boot Manager, Secure Boot Verification all
+      show "(soon)" and return.
+- [ ] **No real machine has booted it.** Everything above is OVMF. The loader
+      writes its progress to COM1 precisely because a real machine that dies
+      mid-handoff shows nothing on screen; the letters are documented in
+      `boot/uefi/loader.c` and asserted by the test.
+- [ ] **aarch64 has no UEFI path at all.** The ARM machine boots by its own
+      route; a real ARM laptop or server would want this too.
+
 - [ ] Re-baseline the TIMING-dependent tests on the Mac: `make test-audio`
       durations, `tools/app_shot.py --settle`, the MP3 player's queue depth
       (QUEUE_AHEAD). Cross-architecture TCG is slower than x86-on-x86 TCG and

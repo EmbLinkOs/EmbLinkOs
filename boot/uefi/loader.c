@@ -19,18 +19,27 @@
 /* A BYTE ON COM1. See crt0.S: the firmware's console may not be ours yet, and
  * on real hardware may not exist, so the loader marks its own progress on the
  * serial port where a failure between two ConOut calls would otherwise leave
- * nothing at all. */
+ * nothing at all.
+ *
+ * THE LETTERS ARE A CONTRACT, checked by tools/uefi_test.py:
+ *
+ *   1  crt0's first instruction ran -- firmware handed off
+ *   2  the image relocated ITSELF; every global is reachable from here on
+ *   3  C code entered with the MS x64 ABI honoured
+ *   4  the system table is stored and the console is usable
+ *   B  the menu chose to boot; last marker before ExitBootServices
+ *
+ * Each is the far side of a step that has failed here before, and they are the
+ * only evidence a real machine with no display will give. `2` in particular is
+ * the one that cost a week: with `-shared` instead of `-pie` this linker
+ * relaxes cross-file global reads into ABSOLUTE addresses and emits no
+ * relocation for them, so the loop between __rela_start and __rela_end has
+ * nothing to apply and every global reads from low memory that is not the
+ * image. It printed `2` then too -- what changed is that `4` now follows. */
 static inline void mark(char c) {
     __asm__ volatile("outb %0, %1" :: "a"(c), "Nd"((unsigned short)0x3F8));
 }
 
-static void mark_hex(const char *tag, uint64_t v) {
-    while (*tag) mark(*tag++);
-    mark('=');
-    for (int i = 60; i >= 0; i -= 4)
-        mark("0123456789abcdef"[(v >> i) & 0xF]);
-    mark('\r'); mark('\n');
-}
 
 
 /* ---- boot_protocol ABI (mirrors kernel/arch/x86_64/boot/boot_protocol.h;
@@ -280,6 +289,23 @@ static void finalize_and_handoff(struct boot_protocol *bp,
         /* translate -> boot_mmap_entry (coalescing not needed; kernel handles
          * a sparse map). NO firmware allocation happens past this point. */
         UINTN n = map_size / desc_size, out = 0;
+
+        /* REFUSE RATHER THAN TRUNCATE. The loop below used to stop at
+         * mmap_cap and say nothing, and what that costs is worth being exact
+         * about: the kernel's PMM marks every page USED and then frees only
+         * what this map calls usable, so a dropped entry does not hand out
+         * reserved memory -- it loses RAM. Silently, and from the TOP, because
+         * the firmware's map is in ascending order. A machine would boot with
+         * a fraction of its memory and nothing anywhere would say why.
+         *
+         * The ceiling is 2560 entries against the ~110 OVMF produces and the
+         * couple of hundred a real machine does, so this should never fire.
+         * That is exactly why it has to be loud: an impossible case that is
+         * silently wrong is how a machine gets diagnosed for a week. Dying
+         * here is still possible -- ExitBootServices has not been called, so
+         * the firmware console is alive to say it. */
+        if (n > mmap_cap) con_die("firmware memory map is larger than the loader can carry");
+
         for (UINTN i = 0; i < n && out < mmap_cap; i++) {
             EFI_MEMORY_DESCRIPTOR *d =
                 (EFI_MEMORY_DESCRIPTOR *)((uint8_t *)map + i * desc_size);
@@ -359,9 +385,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     mark('3');
     con_init(st);
     mark('4');
-    mark_hex("st", (uint64_t)(uintptr_t)st);
-    mark_hex("sig", ((const uint64_t *)(uintptr_t)st)[0]);
-    mark_hex("conout", (uint64_t)(uintptr_t)st->ConOut);
 
     for (;;) {
         int choice = menu_run();          /* draws the menu, returns an entry id */
