@@ -79,13 +79,28 @@ static const struct oscfg_accent oscfg_accents[OSCFG_ACCENTS] = {
  * it and Settings offers it and they must agree on the list -- a picker that
  * offers a file the desktop cannot find is a preference that silently does
  * nothing. Appended to, never reordered, for the same reason as the accents. */
-#define OSCFG_WALLPAPERS 4
-struct oscfg_wallpaper { const char *path; const char *label; };
+#define OSCFG_WALLPAPERS 8
+#define OSCFG_WALLPAPER_PICTURES 4      /* the first N are files; the rest are drawn */
+struct oscfg_wallpaper {
+    const char *path;       /* NULL => a gradient the desktop DRAWS, see below */
+    const char *label;
+    float a[3], b[3], c[3]; /* three gradient stops, when path is NULL */
+    float angle;            /* degrees */
+};
+/* PICTURES AND COLOURS, in one list, because to the person choosing there is
+ * only one question. The colours are drawn rather than shipped: a 1600x1000
+ * PPM is 4.8 MB and a gradient is nine floats, so the choice costs nothing on
+ * an image that has to fit on a real machine. The renderer has had linear
+ * gradients all along; nothing here needed inventing, only using. */
 static const struct oscfg_wallpaper oscfg_wallpapers[OSCFG_WALLPAPERS] = {
     { "/system/images/colibri-user.ppm",             "Graphite" },
     { "/system/images/hummingbird-wallpaper.ppm",    "Night"    },
     { "/system/images/hummingbird-wallpaper-v2.ppm", "Dusk"     },
     { "/system/images/login-wallpaper.ppm",          "Aurora"   },
+    { 0, "Indigo", { .09f,.10f,.22f }, { .20f,.18f,.46f }, { .05f,.05f,.12f }, 160.f },
+    { 0, "Ember",  { .16f,.06f,.12f }, { .46f,.16f,.18f }, { .09f,.04f,.08f }, 150.f },
+    { 0, "Pine",   { .04f,.14f,.13f }, { .09f,.30f,.26f }, { .03f,.07f,.08f }, 155.f },
+    { 0, "Slate",  { .07f,.08f,.09f }, { .17f,.19f,.22f }, { .04f,.04f,.05f }, 165.f },
 };
 
 /* THE KEYBOARD LAYOUTS THE KERNEL KNOWS, by the names its driver answers to.

@@ -43,7 +43,10 @@ import shell_shot as S
 # and when they are not, step 4 fails with "wallpaper 0", which says the click
 # missed rather than leaving a green run that proved nothing.
 AURORA_X, AURORA_Y = 577, 285
-PREVIEW = (330, 310, 890, 435)          # x0, y0, x1, y1 of the preview image
+PREVIEW = (332, 352, 888, 470)          # x0, y0, x1, y1 of the preview image
+                                        # (below BOTH rows of choices -- a band that
+                                        #  overlaps a row measures the control, not
+                                        #  the preview, and passes for the wrong reason)
 DESKTOP = (0, 120, 78, 620)             # the strip of wallpaper left of the window
 WANT_INDEX = 3                          # oscfg_wallpapers[3] == Aurora
 DOCK_SLOTS = 5

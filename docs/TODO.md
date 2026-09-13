@@ -3306,10 +3306,16 @@ a SECOND bug reachable:
       **Fix this first.** Networking on aarch64 is one revert-of-a-revert away
       afterwards, and nothing else is known to be in the way.
 
-- [ ] The deadline-scheduler self-test is measurably touchier with a NIC
-      attached (one run in three failed `worst lateness`, and one core took an
-      illegal-execution-state fault during it). Not diagnosed. Separate from
-      the above; noted so it is not mistaken for it.
+- [ ] **The deadline-scheduler self-test is FLAKY, NIC or no NIC.** First seen
+      as "touchier with a NIC attached" (one run in three failed `worst
+      lateness`, and one core took an illegal-execution-state fault during it),
+      but it has since failed on a run with `-nic none` and no kernel change at
+      all -- `round-robin 42 ms, deadline -1 ms` -- and passed on the immediate
+      re-run. So it is not the NIC, and a gate that fails for reasons unrelated
+      to the change under test is a gate people learn to re-run instead of
+      read. Diagnose the jitter measurement itself before trusting it: a
+      `deadline -1 ms` reading is a negative lateness, which is the measurement
+      admitting something is wrong with the measurement.
 
 - [ ] The acceptance test runs `-nic none` and should grow a networking
       variant once the above is fixed -- today nothing in any gate would catch

@@ -974,9 +974,27 @@ static void home_ui(void) {
          * cfg_poll() re-reads it about once a second, so picking one in
          * Settings changes the screen under you rather than at the next login
          * -- which is the difference between a setting and a promise. */
-        BackgroundImage(oscfg_wallpapers[(g_cfg.wallpaper >= 0 &&
-                                          g_cfg.wallpaper < OSCFG_WALLPAPERS)
-                                         ? g_cfg.wallpaper : 0].path);
+        {
+            int wi = (g_cfg.wallpaper >= 0 && g_cfg.wallpaper < OSCFG_WALLPAPERS)
+                     ? g_cfg.wallpaper : 0;
+            const struct oscfg_wallpaper *wp = &oscfg_wallpapers[wi];
+            if (wp->path) {
+                BackgroundImage(wp->path);
+            } else {
+                /* A DRAWN wallpaper. Same node, same place in the tree as the
+                 * image one -- the desktop does not gain a mode, the ground
+                 * just has a different paint. */
+                em_flush();
+                ui_box_begin(0xBAC6D000ULL);
+                ui_set_paint(em_lgrad3(
+                    (Color){ wp->a[0], wp->a[1], wp->a[2], 1.f },
+                    (Color){ wp->b[0], wp->b[1], wp->b[2], 1.f },
+                    (Color){ wp->c[0], wp->c[1], wp->c[2], 1.f }, wp->angle));
+                ui_set_size((struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_sw },
+                            (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = g_sh });
+                ui_box_end();
+            }
+        }
         VStack(.width = g_sw, .height = g_sh, .padding = 0, .spacing = 0,
                .align = Fill) {
             /* Reserve the top strip for our own floating menu bar (topbar.elf,

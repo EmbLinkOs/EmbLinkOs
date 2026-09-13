@@ -109,18 +109,58 @@ static void pane_appearance(void) {
      * row ask you to remember which one "Dusk" was. The preview is the same
      * file the desktop draws, so what is shown here is what you get. */
     Section("Desktop picture") {
-        const char *wnames[OSCFG_WALLPAPERS];
-        for (int i = 0; i < OSCFG_WALLPAPERS; i++) wnames[i] = oscfg_wallpapers[i].label;
         int wpick = (g_cfg.wallpaper >= 0 && g_cfg.wallpaper < OSCFG_WALLPAPERS)
                     ? g_cfg.wallpaper : 0;
-        int wwas = wpick;
+        const int NPIC = OSCFG_WALLPAPER_PICTURES;
+        const int NCOL = OSCFG_WALLPAPERS - OSCFG_WALLPAPER_PICTURES;
+
+        /* TWO ROWS, ONE VALUE. Eight labels in a single segmented control is
+         * eight unreadable labels at this width. Split by what they ARE --
+         * photographs, and colours the desktop draws -- and let the row that
+         * does not hold the current choice show none selected, which is what
+         * `-1` means to the control. */
         HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
             setting_label("Picture", "What the desktop shows behind everything.");
         }
-        Segmented(wnames, OSCFG_WALLPAPERS, &wpick);
-        Sync();                 /* the staged element writes wpick at the FLUSH */
-        if (wpick != wwas) { g_cfg.wallpaper = wpick; commit(); }
-        Image(oscfg_wallpapers[wpick].path, .height = 132, .corner = 10);
+        {
+            const char *names[OSCFG_WALLPAPERS];
+            for (int i = 0; i < NPIC; i++) names[i] = oscfg_wallpapers[i].label;
+            int pick = (wpick < NPIC) ? wpick : -1, was = pick;
+            Segmented(names, NPIC, &pick);
+            Sync();                 /* the staged element writes pick at the FLUSH */
+            if (pick != was && pick >= 0) { g_cfg.wallpaper = pick; commit(); wpick = pick; }
+        }
+        {
+            const char *names[OSCFG_WALLPAPERS];
+            for (int i = 0; i < NCOL; i++) names[i] = oscfg_wallpapers[NPIC + i].label;
+            int pick = (wpick >= NPIC) ? wpick - NPIC : -1, was = pick;
+            Segmented(names, NCOL, &pick);
+            Sync();
+            if (pick != was && pick >= 0) {
+                g_cfg.wallpaper = NPIC + pick; commit(); wpick = NPIC + pick;
+            }
+        }
+
+        /* The preview is the same thing the desktop draws, by the same rule:
+         * the file if there is one, the gradient if there is not. A preview
+         * that approximates the result is a preview that can be wrong. */
+        {
+            const struct oscfg_wallpaper *wp = &oscfg_wallpapers[wpick];
+            if (wp->path) {
+                Image(wp->path, .height = 132, .corner = 10);
+            } else {
+                em_flush();
+                ui_box_begin(0x5E77B6C0ULL);
+                ui_set_paint(em_lgrad3(
+                    (Color){ wp->a[0], wp->a[1], wp->a[2], 1.f },
+                    (Color){ wp->b[0], wp->b[1], wp->b[2], 1.f },
+                    (Color){ wp->c[0], wp->c[1], wp->c[2], 1.f }, wp->angle));
+                ui_set_corner_radius(10);
+                ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
+                            (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = 132 });
+                ui_box_end();
+            }
+        }
     }
 
     Section("Interface size") {
