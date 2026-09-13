@@ -36,7 +36,7 @@
 #include "drivers/video/console.h"
 #include "gfx/compositor.h"
 #include "drivers/input/virtio_input.h"
-#include "net/net.h"             /* net_init: this arch had never called it */
+#include "net/net.h"             /* net_init: still not called here -- see below */
 #include "drivers/input/mouse.h"
 #include "drivers/input/keyboard.h"
 #include "drivers/audio/ac97.h"
@@ -1324,19 +1324,30 @@ void arch_early_main(uint64_t dtb_phys) {
         if (!landed || fired != 1) selftest_fails++;
     }
 
-    /* NETWORKING IS NOT BROUGHT UP HERE YET, and the reason is written down in
-     * docs/TODO.md rather than left as a silence.
+    /* NETWORKING IS STILL NOT BROUGHT UP HERE, but the reason is no longer a
+     * guess -- see docs/TODO.md, "aarch64 networking". Summarised:
      *
-     * net_init() works on this arch as far as it goes -- the NIC probes, DHCP
-     * leases 10.0.2.15, and the desktop comes up -- and then the machine dies
-     * on a KERNEL STACK OVERFLOW: a translation fault whose faulting
-     * instruction resolves inside exc_common itself, which is to say a thread
-     * ran off its 32 KiB stack and the exception handler could not even report
-     * it. Turning networking on here would trade "no network" for "halts after
-     * a minute", which is a worse machine.
+     * The old note here said a KERNEL STACK OVERFLOW. That was wrong. Kernel
+     * stacks are painted at allocation now and the deepest thread on this
+     * machine has ever been is 39% of its 32 KiB -- the report is printed by
+     * the desktop phase below, so the claim is checked every boot rather than
+     * believed.
      *
-     * The device IS attached by the run targets (ARM_NET in arch.mk) so that
-     * whoever fixes the overflow has nothing left to wire up. */
+     * What actually happens: `virt` has no MSI-X, so every virtio device is on
+     * a LEVEL-triggered shared SPI, and a virtio device drops its line only
+     * when its ISR status register is READ. Nothing read it. Measured with a
+     * counter in the NIC's handler: 46 interrupts at t=645, 395,618 at t=845,
+     * 804,349 at t=1045 -- ~204,000 a second, which starves the machine until
+     * a thread dies running on a stack pointer that is not its own.
+     *
+     * Acknowledging it in the shared transport fixes the storm completely
+     * (2 interrupts instead of 804,349; DHCP leases; the desktop comes up; two
+     * of three runs finished with zero failures) -- and it cannot be turned on
+     * yet, because connecting INTx for the other virtio devices makes a second
+     * bug reachable: uaccess_arm()'s recovery longjmps OUT of an exception
+     * handler, so an interrupt that is active at that moment is never EOI'd
+     * and the core goes deaf. That is the "a core is online but INERT -- no
+     * timer" failure, and it is the thing to fix first. */
 
     kprintf("\n--- the desktop (A6 + A7) ---\n");
     {
@@ -1447,6 +1458,31 @@ void arch_early_main(uint64_t dtb_phys) {
             kprintf("  [info] virtio-input: %u key event(s), %u pointer "
                     "event(s), cursor at %d,%d\n",
                     (unsigned)keys, (unsigned)ptr, (int)mx, (int)my);
+
+            /* HOW CLOSE ANYTHING CAME TO THE GUARD PAGE. Every kernel stack is
+             * painted at allocation, so this is the high-water mark -- how deep
+             * a thread has EVER been -- not where its SP happens to sit now.
+             *
+             * It is here because turning networking on used to kill this
+             * machine with a translation fault whose faulting instruction
+             * resolved inside exc_common itself: a thread had run off its 32
+             * KiB and the handler could not even get far enough to say so. A
+             * measurement beats the guessing that cost a day. */
+            {
+                static struct thread_info ti[MAX_THREADS];
+                int nt = thread_list(ti, MAX_THREADS);
+                uint64_t worst = 0; int wtid = -1;
+                for (int i = 0; i < nt; i++)
+                    if (ti[i].kstack_used > worst) {
+                        worst = ti[i].kstack_used; wtid = (int)ti[i].tid;
+                    }
+                bool sok = (worst * 4 <= (uint64_t)KSTACK_SIZE * 3);
+                kprintf("  [%s] kernel stacks: deepest tid %d at %u/%u bytes "
+                        "(%u%%), %d threads\n", sok ? " ok " : "FAIL", wtid,
+                        (unsigned)worst, (unsigned)KSTACK_SIZE,
+                        (unsigned)(worst * 100 / KSTACK_SIZE), nt);
+                if (!sok) selftest_fails++;
+            }
         }
     }
 

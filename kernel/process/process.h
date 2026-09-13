@@ -38,7 +38,12 @@ struct vm_area;   /* mm/vma.h -- this process's mmap()'d ranges */
  * no reason connected to why MAX_PROCESSES was raised. Written out
  * explicitly now so the two constants can never drift against each other
  * again. */
-#define KSTACK_SIZE (32 * 1024)             // 16 KiB per thread's kernel stack
+#define KSTACK_SIZE (32 * 1024)             // 32 KiB per thread's kernel stack
+
+/* Every kernel stack is painted with this at allocation, so how deep a thread
+ * has ever been is a thing that can be READ rather than estimated. See
+ * thread_kstack_used(). */
+#define KSTACK_PAINT 0xC5C5C5C5C5C5C5C5ULL
 
 /* Same "big slot" VA scheme as USER_CODE_VA (0x400000000000)/USER_STACK_VA
  * (0x700000000000) in process.c -- slot 6, between code and stack. Was
@@ -1292,11 +1297,27 @@ struct thread_info {
     int      last_ran_cpu;     /* core it last ran on, -1 if never */
     uint64_t born_tick;        /* lapic ticks at creation */
     uint64_t exit_tick;        /* lapic ticks at death, 0 if alive */
+    uint64_t kstack_used;      /* HIGH WATER of its 32 KiB kernel stack, bytes;
+                                * 0 = a thread running on the static boot stack */
 };
 
 /** Fill `out` (capacity `max`) with a snapshot of every non-UNUSED thread, for
  * `threads`/`scheduler`. Returns the count written (<= max). Self-locking. */
 int thread_list(struct thread_info *out, int max);
+
+/** How many bytes of a thread's 32 KiB kernel stack have EVER been used: the
+ * distance from the top down to the lowest word still holding KSTACK_PAINT.
+ * The high-water mark, not the current depth -- a thread that came within a
+ * word of the guard page two seconds ago reads as healthy by its SP alone.
+ * Returns 0 for a thread with kstack_top == 0 (the boot context and each
+ * secondary's, which run on the static stack boot.S set up). */
+uint64_t thread_kstack_used(uint64_t kstack_top);
+
+/** Which thread's kernel stack `addr` lies in (thread_table index), or -1.
+ * Fills *top_out with that stack's top and *off_out with the distance below
+ * it. LOCK-FREE by design -- the exception reporter calls it, and that path
+ * may already hold g_sched_lock. */
+int thread_kstack_owner(uint64_t addr, uint64_t *top_out, uint64_t *off_out);
 
 /** Detailed single-process view for `process inspect <pid>` (EmbDBG v2). A value
  * snapshot -- no live pointers escape. Pair with a thread_info[] the caller

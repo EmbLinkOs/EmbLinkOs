@@ -158,6 +158,46 @@ static void dump_frame(uint64_t which, struct aarch64_frame *f) {
     pl011_puthex64(f->sp);
     pl011_puts("\n");
 
+    /* WHOSE STACK IS THAT? An SP is a number until you know which thread's
+     * stack it belongs to and how far down it sits -- and the two most useful
+     * answers are the ones no register can give you: "nobody's", which means
+     * the SP itself is wrong, and "n bytes from the top", which separates a
+     * thread that overflowed from a thread that never had a valid stack.
+     *
+     * Both the interrupted SP and the frame this report was cut from are
+     * named, because for an EL1 fault they are the same stack and for an EL0
+     * fault they are deliberately not: f->sp is the user's SP_EL0, and the
+     * frame sits on the kernel stack of the thread that took the trap. */
+    {
+        uint64_t top = 0, off = 0;
+        int owner = thread_kstack_owner(f->sp, &top, &off);
+        pl011_puts("  SP is     : ");
+        if (owner < 0) {
+            pl011_puts("in NO thread's kernel stack");
+        } else {
+            pl011_puts("tid ");
+            pl011_putdec((uint64_t)owner);
+            pl011_puts("'s kernel stack, ");
+            pl011_putdec(off);
+            pl011_puts(" bytes below its top ");
+            pl011_puthex64(top);
+        }
+        pl011_puts("\n  frame at  : ");
+        pl011_puthex64((uint64_t)(uintptr_t)f);
+        owner = thread_kstack_owner((uint64_t)(uintptr_t)f, &top, &off);
+        if (owner < 0) {
+            pl011_puts("  (in NO thread's kernel stack)\n");
+        } else {
+            pl011_puts("  (tid ");
+            pl011_putdec((uint64_t)owner);
+            pl011_puts(", ");
+            pl011_putdec(off);
+            pl011_puts(" bytes below top ");
+            pl011_puthex64(top);
+            pl011_puts(")\n");
+        }
+    }
+
     /* Four per line: 31 registers in a wall of one-per-line is a screen and a
      * half of scrollback, and the thing you are looking for is never on the
      * part you can still see. */

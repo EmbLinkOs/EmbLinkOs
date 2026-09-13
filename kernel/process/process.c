@@ -289,7 +289,70 @@ static struct thread *thread_alloc(void) {
  * an overflow silently corrupts whatever heap allocation happens to sit
  * next to it instead of faulting at the overflow site. */
 static uint64_t alloc_kernel_stack(void) {
-    return vmm_alloc_kernel_stack(KSTACK_SIZE);
+    uint64_t top = vmm_alloc_kernel_stack(KSTACK_SIZE);
+    if (!top)
+        return 0;
+    /* PAINT IT, so the question "how close did that thread come to the guard
+     * page?" has an answer other than a guess. The guard page turns an
+     * overflow into a fault, which is the right thing to do about one that
+     * already happened; it says nothing about a thread sitting at 31 KiB of 32
+     * and about to. A known pattern costs one memset per thread and makes the
+     * high-water mark readable at any moment -- see thread_kstack_used().
+     *
+     * aarch64's allocator already zeroes these pages and x86-64's does not, so
+     * zero is not a pattern that means anything. This one is not a plausible
+     * value for a pointer, a length or a small integer, which is what stacks
+     * are mostly made of. */
+    uint64_t *w = (uint64_t *)(uintptr_t)(top - KSTACK_SIZE);
+    for (uint64_t i = 0; i < KSTACK_SIZE / sizeof *w; i++)
+        w[i] = KSTACK_PAINT;
+    return top;
+}
+
+/* WHICH THREAD'S KERNEL STACK an address lies in, or -1 for none. Fills
+ * *top_out with that stack's top and *off_out with how far below the top the
+ * address sits.
+ *
+ * DELIBERATELY LOCK-FREE. Its only caller is the exception reporter, which
+ * runs after something has already gone wrong and may well be holding
+ * g_sched_lock -- taking it here would turn a printable fault into a silent
+ * deadlock, which is a strictly worse machine to debug. The table is a static
+ * array and the read is a comparison; a torn kstack_top is a wrong ANSWER in a
+ * diagnostic, not a wrong MEMORY ACCESS. */
+int thread_kstack_owner(uint64_t addr, uint64_t *top_out, uint64_t *off_out) {
+    for (int i = 0; i < MAX_THREADS; i++) {
+        uint64_t top = thread_table[i].kstack_top;
+        if (!top || thread_table[i].state == PROCESS_UNUSED)
+            continue;
+        if (addr < top && addr >= top - KSTACK_SIZE) {
+            if (top_out) *top_out = top;
+            if (off_out) *off_out = top - addr;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* How much of a thread's kernel stack has ever been touched, in bytes: the
+ * distance from the top down to the lowest word that is no longer the paint.
+ * Scanning UP from the base finds the deepest the thread has been, which is
+ * the number that matters -- the current SP only says where it is now, and a
+ * thread that nearly died two seconds ago looks perfectly healthy by that
+ * measure.
+ *
+ * Returns 0 for a thread with no allocated stack: the boot context and each
+ * secondary's run on the static stack boot.S set up and record kstack_top = 0,
+ * and painting somebody else's memory to measure it would be worse than not
+ * knowing. */
+uint64_t thread_kstack_used(uint64_t kstack_top) {
+    if (!kstack_top)
+        return 0;
+    const uint64_t *w = (const uint64_t *)(uintptr_t)(kstack_top - KSTACK_SIZE);
+    uint64_t words = KSTACK_SIZE / sizeof *w;
+    for (uint64_t i = 0; i < words; i++)
+        if (w[i] != KSTACK_PAINT)
+            return (words - i) * sizeof *w;
+    return 0;
 }
 
 /* The shared second half of thread setup: give an ALREADY-ALLOCATED thread
@@ -2012,6 +2075,13 @@ int thread_list(struct thread_info *out, int max) {
         out[n].last_ran_cpu = t->last_ran_cpu;
         out[n].born_tick = t->born_tick;
         out[n].exit_tick = t->exit_tick;
+        /* Scanned HERE, under the lock, because that is what guarantees the
+         * stack is still mapped: a thread that exits between the snapshot and
+         * the scan would have had its pages freed, and reading them would
+         * fault inside a debug command. The cost is the lock held for a scan
+         * that early-exits at the first used word -- microseconds per thread,
+         * paid only by whoever asks. */
+        out[n].kstack_used = thread_kstack_used(t->kstack_top);
         n++;
     }
     spin_unlock(&g_sched_lock);

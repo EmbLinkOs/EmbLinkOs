@@ -3245,6 +3245,76 @@ Open:
       it is worth being right about before they diverge. Asks, like every other
       close here, with the same grace timer behind it.
 
+## aarch64 networking -- diagnosed, measured, and NOT turned on (2026-09-13)
+
+An entire architecture still has no network. The old note here said turning it
+on caused a KERNEL STACK OVERFLOW. **That was wrong**, and the way it was wrong
+matters: it was a guess read off a fault whose ELR landed inside `exc_common`,
+and nobody had measured a stack.
+
+**Kernel stacks are now painted at allocation** (`KSTACK_PAINT`,
+`thread_kstack_used`), so "how deep has this thread ever been" is a number you
+can read instead of infer. The deepest thread on this machine has ever been is
+**12,960 of 32,768 bytes -- 39%** -- on both architectures, with and without a
+NIC. It was never close. `test stacks` on x86 and a line in the aarch64 desktop
+phase check it every boot, and both FAIL past three quarters, because a guard
+page is the right answer to an overflow that already happened and no answer at
+all to one that is coming.
+
+### What actually happens
+
+`virt` has no MSI-X, so every virtio device sits on a LEVEL-triggered shared
+SPI, and a virtio device drops its line only when its **ISR status register is
+read**. That register was never mapped, by any driver, on either architecture
+-- harmless for as long as x86 (which uses MSI-X, an edge, with nothing to
+deassert) was the only arch with a NIC.
+
+Measured with a counter in the NIC's handler:
+
+| uptime | NIC interrupts |
+|-------:|---------------:|
+| t=645  |             46 |
+| t=845  |        395,618 |
+| t=1045 |        804,349 |
+
+About **204,000 interrupts a second** on a machine doing nothing but showing a
+desktop, until a thread died running on a stack pointer that was not its own.
+The device the NIC shares SPI 5 with is the GPU, which is why acking only the
+NIC is not enough -- tried, and it hangs in `gic_enable` instead.
+
+### The fix, which works and cannot be turned on yet
+
+Mapping the ISR window in `virtio_pci_attach` and acknowledging every attached
+device from one bus-wide INTx handler fixes it completely: **2 interrupts
+instead of 804,349**, DHCP leases 10.0.2.15, the desktop comes up and holds
+focus, stacks stay at 39%, and two of three runs finished with **zero**
+failures. That work is written and was reverted, deliberately, because it makes
+a SECOND bug reachable:
+
+- [ ] **`uaccess_arm()`'s recovery longjmps OUT of an exception handler.** The
+      guard is `kernel_ctx_save`/`kernel_ctx_restore`, and the fault handler
+      restores straight to the saved context -- abandoning the exception frame
+      it was called on. For a synchronous fault with no interrupt active that
+      is fine, which is why it has always worked. Connect INTx for the other
+      virtio devices and an interrupt CAN be active at that moment; its EOI is
+      never written, the CPU interface stays busy at that priority, and the
+      core goes deaf. That is the `FAIL(A9): a core is online but INERT -- no
+      timer` failure, and the boot hangs in the user-copy fault-recovery
+      self-test. Reproducible: it passed with the connect disabled and failed
+      twice in a row with it enabled.
+
+      **Fix this first.** Networking on aarch64 is one revert-of-a-revert away
+      afterwards, and nothing else is known to be in the way.
+
+- [ ] The deadline-scheduler self-test is measurably touchier with a NIC
+      attached (one run in three failed `worst lateness`, and one core took an
+      illegal-execution-state fault during it). Not diagnosed. Separate from
+      the above; noted so it is not mistaken for it.
+
+- [ ] The acceptance test runs `-nic none` and should grow a networking
+      variant once the above is fixed -- today nothing in any gate would catch
+      the storm coming back.
+
 ### The keyboard layout, and a path with no coverage (2026-09-13)
 
 - [x] **`test kbdlayout` covers the syscall.** It spawns primtest with a

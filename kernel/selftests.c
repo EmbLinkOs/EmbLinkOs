@@ -5369,6 +5369,43 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* HOW CLOSE IS ANY THREAD TO RUNNING OFF ITS KERNEL STACK.
+     *
+     * The guard page below every stack turns an overflow into a fault, which
+     * is the right answer to one that has already happened and no answer at
+     * all to one that is coming. This reads the HIGH WATER mark of each
+     * thread -- how deep it has ever been, not where its SP is now -- and
+     * FAILS if anything has used more than three quarters of its 32 KiB,
+     * because a thread at 75% is one unlucky interrupt from the guard page and
+     * the machine it takes down will not be this one.
+     *
+     * Written while chasing exactly that on aarch64 with networking on. */
+    if (strcmp(cmd, "test stacks") == 0) {
+        static struct thread_info ti[MAX_THREADS];
+        int n = thread_list(ti, MAX_THREADS);
+        uint64_t worst = 0; int worst_tid = -1, worst_pid = 0;
+        int over = 0;
+        kprintf("\n");
+        for (int i = 0; i < n; i++) {
+            if (!ti[i].kstack_used) continue;       /* static boot stack */
+            unsigned pct = (unsigned)(ti[i].kstack_used * 100 / KSTACK_SIZE);
+            if (pct >= 50 || ti[i].kstack_used > worst)
+                kprintf("  tid %-3u pid %-3u %s%-6llu bytes (%u%% of %u)\n",
+                        ti[i].tid, ti[i].pid, ti[i].is_kthread ? "k " : "  ",
+                        (unsigned long long)ti[i].kstack_used, pct,
+                        (unsigned)KSTACK_SIZE);
+            if (ti[i].kstack_used > worst) {
+                worst = ti[i].kstack_used; worst_tid = (int)ti[i].tid;
+                worst_pid = (int)ti[i].pid;
+            }
+            if (ti[i].kstack_used * 4 > (uint64_t)KSTACK_SIZE * 3) over++;
+        }
+        kprintf("[cmd] test stacks: %d threads, deepest tid %d (pid %d) at %llu/%u bytes -> %s\n",
+                n, worst_tid, worst_pid, (unsigned long long)worst,
+                (unsigned)KSTACK_SIZE, over ? "FAIL" : "OK");
+        return 1;
+    }
+
     if (strcmp(cmd, "test ctrlc") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test ctrlc: VFS not registered\n");
