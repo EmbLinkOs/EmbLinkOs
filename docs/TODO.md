@@ -3296,56 +3296,47 @@ Open:
       it is worth being right about before they diverge. Asks, like every other
       close here, with the same grace timer behind it.
 
-## Files' grid shifts down on the SECOND navigation (found 2026-09-13)
+## Files' grid: a row keeps a height from the folder you came from (2026-09-13)
 
-- [ ] **Navigate twice and the listing moves.** Open Files, go to another
-      folder, come back: the first row of the grid starts 32 px lower and the
-      rows spread 33 px further apart. Measured, on the same window at the same
-      size, by finding the first inked row of the first grid cell:
+- [ ] **Navigate away and back and the listing sits 32 px lower.** Measured, on
+      the same window at the same size, as the first inked row of the first
+      grid cell: `fresh y=193`, `after a navigation y=225`. It does NOT
+      accumulate -- three round trips all land on 225 -- so the first render is
+      the odd one out and everything after it is consistently wrong.
 
-          fresh       first grid ink at y=193
-          after-nav   first grid ink at y=225
+      NARROWED, from inside the app, with `ui_open_rect` on the nodes involved:
 
-      The FIRST navigation is fine -- a fresh Files that goes straight to the
-      Trash draws its listing in the normal place. It is the second that
-      shifts, which points at state accumulating across rebuilds rather than at
-      anything about a particular folder.
+      | | grid VStack y | row 0 height |
+      |---|---|---|
+      | fresh, /home/yves      | 115.3 | **77.1** |
+      | in / (long names)      | 115.3 | **175.0** |
+      | back at /home/yves     | 115.3 | **141.1** |
 
-      Not cosmetic. It is why the first version of tools/trash_shot.py failed:
-      a right-click aimed at a file landed in the gap between rows and opened
-      the FOLDER menu instead of the item menu, so the test reported that the
-      Trash was broken when the Trash was fine. Anything that drives this
-      window by coordinates -- a test, or a person with muscle memory -- is
-      aiming at a target that moves.
+      The container does not move. THE ROW KEEPS A HEIGHT FROM THE FOLDER YOU
+      CAME FROM -- 141 where a fresh render of the same nine names is 77, and
+      not even the 175 it had in `/`, so it is partially resettling rather than
+      simply stuck.
 
-      Where to look first: this is the same SHAPE as the launcher bug already
-      recorded above (a subtree removed and rebuilt, measured wrongly the
-      second time), which turned out to be `layout_destroy_node` leaving a
-      freed node linked into its parent. That one was fixed; this may be a
-      sibling of it in the same arena, or the grid's own container keeping a
-      measurement it should have thrown away. `g_scroll` is reset on every
-      navigation, so it is not scroll position.
+      A grid cell's label is `Button(name).width(90)`, so a long name wraps to
+      two lines and makes the cell taller. Coming back to short names, the
+      extra line's worth of height survives.
 
-## malloc is NOT thread-safe in userspace (found 2026-09-13)
+      WHAT IT IS NOT, each checked rather than assumed:
+      * Not scroll position -- `g_scroll` is reset on every navigation, and the
+        instrumented run shows it at 0.
+      * Not the viewport -- `em_viewport_height()` reads 600.0 before and after.
+      * Not "a subtree was rebuilt": toggling Grid -> List -> Grid rebuilds the
+        whole listing in the same folder and stays at 193.
+      * Not the empty-folder placeholder: navigating via `/` (many entries)
+        does it just as reliably as via an empty Trash.
+      * Probably not layout.c's wrap memo, which is keyed on the text's content
+        HASH plus font, size and width -- a changed name misses the memo.
 
-- [ ] **newlib is linked with no `__malloc_lock`, so two threads in one process
-      must never be in the allocator at once.** Nothing had noticed because no
-      thread in any application had ever allocated -- the shell's two channel
-      listeners work entirely out of stack buffers, which is why they have
-      always been fine.
-
-      The screenshot writer was the first thread to call `free()`, and it
-      crashed the desktop instantly: a general protection fault inside
-      `_free_r` the moment its last write landed, while the render loop was
-      allocating in the middle of a frame. The backtrace names newlib's
-      `_mallocr.c`, not the caller, so it reads as a heap bug in whatever
-      allocated last rather than as a missing lock.
-
-      Worked around where it bit (the shell allocates and frees the screenshot
-      buffer on its render thread; the writer only uses it), and that
-      workaround is a rule nobody can see. The fix is to implement
-      `__malloc_lock`/`__malloc_unlock` against the futex this userspace
-      already has, so the rule stops being one you have to already know.
+      Why it matters beyond looks: a right-click aimed at a file lands between
+      rows and opens the FOLDER menu instead of the item menu. It cost a
+      working feature a red test (tools/trash_shot.py) and sent me looking for
+      a bug in the Trash, which was fine. Anything driven by coordinates -- a
+      test, or a person with muscle memory -- is aiming at a target that moves.
 
 ## The dock cannot move, and the reason is one missing z-band (2026-09-13)
 
