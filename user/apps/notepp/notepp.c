@@ -150,7 +150,12 @@ static void bind_current(void) {
      * a two-character selection behind it. While a document is bound the ENGINE
      * owns the caret; the document only needs it when switching away. */
     if (g_bound == doc_current()) return;
+    /* Hand the outgoing document its history back before the engine is reset;
+     * ed_init clears the arena, so anything not saved here is gone. */
+    { struct doc *old = doc_at(g_bound);
+      if (old && old->open) ed_undo_save(&ED, &old->undo); }
     ed_init(&ED, d->text, DOC_CAP);
+    ed_undo_load(&ED, &d->undo);
     ED.cursor = ED.anchor = d->cursor <= ED.len ? d->cursor : 0;
     g_bound = doc_current();
 }

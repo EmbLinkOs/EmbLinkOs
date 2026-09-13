@@ -146,8 +146,29 @@ missing, roughly in the order a user meets it:
 - [x] ~~No scrollbar~~ -- a thin track beside the text, thumb sized to the
       visible fraction, shown only when there is something to scroll, and
       DRAGGABLE -- the thumb brightens while held.
-- [ ] Undo cannot redo an insert (the pool stores removed text only), and undo
-      is per-document only while that document is bound.
+- [x] ~~Undo cannot redo an insert (the pool stores removed text only), and
+      undo is per-document only while that document is bound.~~ -- BOTH FIXED,
+      and they were two different bugs wearing one bullet point.
+
+      REDO stored nothing to replay. The pool kept the bytes a change REMOVED,
+      which is all undo needs, so `ed_redo` returned 0 for anything that added
+      text and Ctrl+Y after typing did nothing at all -- silently, which is the
+      half of undo people actually use. Both runs are stored now and the two
+      directions are mirror images. Coalesced typing redoes as ONE step with
+      all of its characters, which needed the merge to append to the stored
+      text as well as to the length.
+
+      THE HISTORY now belongs to the DOCUMENT. `ed_init` clears the arena and
+      the editor re-binds one engine per tab switch, so visiting another file
+      and coming back threw the whole history away with nothing on screen to
+      say so. `ed_undo_save`/`ed_undo_load` move it in and out; `struct doc`
+      holds one. Costs ~68 KB per document against the 256 KB its text already
+      takes.
+
+      Six new host tests, and they were checked against the OLD engine first:
+      four fail there (redo of an insert, of a replacement, the caret it
+      leaves, and all-three-back for coalesced typing). A test that only
+      passes the fixed version proves nothing.
 - [ ] No column selection, no multiple carets, no folding, no minimap.
 - [ ] The tab bar does not scroll and caps at 8 documents.
 - [x] ~~Nothing is remembered between runs~~ -- which files were open, which
@@ -1537,14 +1558,12 @@ text.
 
 ## User Interface (EmUI), Compositor & Userland Runtime
 
-- [ ] **Six applications share one generic icon.** Files, Editor, Note++,
-      Photos, Music and Vellum all declare `/system/images/file.eic` -- a
-      document glyph -- because nobody drew theirs; only Settings and Terminal
-      have art. The pipeline is ready (`icons/masters/<name>.svg` ->
-      `system/images/<name>.eic` at build time) and `tools/mkicons.py` now finds
-      librsvg on macOS (it only knew the Linux library names, so every SVG
-      master was silently skipped on the Mac). What it needs is librsvg on the
-      build machine -- `brew install librsvg` -- and six SVGs.
+- [x] ~~Six applications share one generic icon.~~ -- every application has its
+      own now, drawn as a rounded tile with a Material glyph in white on a
+      colour that belongs to it. librsvg installed on the build machine (which
+      is what the generator had been asking for all along), eleven masters in
+      `icons/masters/`, and `.app` manifests pointing at them. The dock went
+      from three identical pictures out of five to every icon distinct.
 - [x] **The toolkit reference demos are no longer on the launcher.** A third of
       the launcher was "V4 Demo", "Editor Demo", "Windows", "Menus", "UI Demo".
       Launcher entries are now packed only for programs under `user/apps/`; the

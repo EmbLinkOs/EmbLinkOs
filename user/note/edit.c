@@ -90,7 +90,8 @@ int ed_offset_of_line(const struct editor *e, int line) {
  * `added` bytes. The removed bytes are copied into the pool so undo can put
  * them back; the added bytes are not, because redo can recompute them from the
  * buffer as it will be. */
-static void undo_push(struct editor *e, int at, int removed, int added, int coalesce) {
+static void undo_push(struct editor *e, int at, int removed,
+                      const char *add, int added, int coalesce) {
     /* A new edit truncates the redo tail -- the future you did not take. */
     e->undo_n = e->undo_at;
 
@@ -101,23 +102,37 @@ static void undo_push(struct editor *e, int at, int removed, int added, int coal
         struct ed_undo *p = &e->undo[e->undo_n - 1];
         if (p->coalesce && p->op == ED_OP_INSERT && removed == 0 &&
             p->at + p->added_len == at) {
-            p->added_len += added;
-            return;
+            /* The merged characters have to join the stored ADDED text too, or
+             * redo replays only the first of them. p is the newest record and
+             * nothing has been pushed since, so its added bytes end at the
+             * pool's tail and this is an append. */
+            if (add && added > 0 && e->undo_text_n + added <= ED_UNDO_TEXT &&
+                p->added_off + p->added_len == e->undo_text_n) {
+                memcpy(e->undo_text + e->undo_text_n, add, (size_t)added);
+                e->undo_text_n += added;
+                p->added_len += added;
+                return;
+            }
+            /* No room to remember the merge: fall through and start a new
+             * record rather than grow one whose text we did not keep. */
         }
     }
 
     if (e->undo_n >= ED_UNDO_MAX) {
         /* Drop the oldest, and its text with it. */
-        int drop = e->undo[0].removed_len;
+        int drop = e->undo[0].removed_len + e->undo[0].added_len;
         memmove(e->undo, e->undo + 1, sizeof e->undo[0] * (ED_UNDO_MAX - 1));
         if (drop > 0) {
             memmove(e->undo_text, e->undo_text + drop, (size_t)(e->undo_text_n - drop));
             e->undo_text_n -= drop;
-            for (int i = 0; i < ED_UNDO_MAX - 1; i++) e->undo[i].text_off -= drop;
+            for (int i = 0; i < ED_UNDO_MAX - 1; i++) {
+                e->undo[i].text_off  -= drop;
+                e->undo[i].added_off -= drop;
+            }
         }
         e->undo_n = ED_UNDO_MAX - 1;
     }
-    if (e->undo_text_n + removed > ED_UNDO_TEXT) {
+    if (e->undo_text_n + removed + added > ED_UNDO_TEXT) {
         /* Too big to remember. Forget the whole history rather than keep a
          * broken one: an undo stack that cannot restore what it claims to is
          * worse than no undo at all. */
@@ -138,6 +153,13 @@ static void undo_push(struct editor *e, int at, int removed, int added, int coal
         memcpy(e->undo_text + e->undo_text_n, e->buf + at, (size_t)removed);
         e->undo_text_n += removed;
     }
+    /* The added bytes come from the CALLER, not the buffer: undo_push runs
+     * before the splice, so they are not in the document yet. */
+    u->added_off = e->undo_text_n;
+    if (added > 0 && add) {
+        memcpy(e->undo_text + e->undo_text_n, add, (size_t)added);
+        e->undo_text_n += added;
+    }
     e->undo_n++;
     e->undo_at = e->undo_n;
 }
@@ -150,7 +172,7 @@ static void splice(struct editor *e, int at, int removed, const char *add, int a
     if (removed <= 0 && added <= 0) return;
     if (e->len - removed + added > (int)e->cap - 1) return;   /* refuse; never truncate */
 
-    undo_push(e, at, removed, added, coalesce);
+    undo_push(e, at, removed, add, added, coalesce);
 
     memmove(e->buf + at + added, e->buf + at + removed,
             (size_t)(e->len - at - removed + 1));           /* +1 keeps the NUL */
@@ -163,6 +185,24 @@ static void splice(struct editor *e, int at, int removed, const char *add, int a
 
 int ed_can_undo(const struct editor *e) { return e->undo_at > 0; }
 int ed_can_redo(const struct editor *e) { return e->undo_at < e->undo_n; }
+
+void ed_undo_save(const struct editor *e, struct ed_undo_state *out) {
+    if (!e || !out) return;
+    memcpy(out->undo, e->undo, sizeof out->undo);
+    memcpy(out->text, e->undo_text, sizeof out->text);
+    out->text_n = e->undo_text_n;
+    out->n      = e->undo_n;
+    out->at     = e->undo_at;
+}
+
+void ed_undo_load(struct editor *e, const struct ed_undo_state *in) {
+    if (!e || !in) return;
+    memcpy(e->undo, in->undo, sizeof e->undo);
+    memcpy(e->undo_text, in->text, sizeof e->undo_text);
+    e->undo_text_n = in->text_n;
+    e->undo_n      = in->n;
+    e->undo_at     = in->at;
+}
 
 int ed_undo(struct editor *e) {
     if (!ed_can_undo(e)) return 0;
@@ -183,23 +223,22 @@ int ed_undo(struct editor *e) {
 int ed_redo(struct editor *e) {
     if (!ed_can_redo(e)) return 0;
     struct ed_undo *u = &e->undo[e->undo_at];
-    /* We kept the removed text, not the added -- so redo needs the added bytes
-     * from somewhere. They are still where undo left them only for a pure
-     * delete; for an insert we cannot reconstruct them, so an insert's redo
-     * re-reads them out of the undo pool the other way round. To keep that
-     * honest the pool stores REMOVED text and redo of an insert is therefore
-     * only correct when added_len == 0. Everything else is a delete-redo. */
-    if (u->added_len == 0) {
-        /* redo of a delete: remove the bytes again */
-        memmove(e->buf + u->at, e->buf + u->at + u->removed_len,
-                (size_t)(e->len - u->at - u->removed_len + 1));
-        e->len -= u->removed_len;
-        e->buf[e->len] = 0;
-        e->cursor = e->anchor = u->at;
-        e->undo_at++;
-        return 1;
-    }
-    return 0;      /* redo of an insert is not supported; see above */
+    /* The mirror of ed_undo: undo puts the removed bytes back where the added
+     * ones were, so redo puts the added bytes back where the removed ones are.
+     * It used to work only for a pure delete, because the pool kept the
+     * removed text and nothing else -- so redoing anything you had TYPED did
+     * nothing at all, silently, which is the half of undo people use most. */
+    if (e->len - u->removed_len + u->added_len > (int)e->cap - 1) return 0;
+    memmove(e->buf + u->at + u->added_len, e->buf + u->at + u->removed_len,
+            (size_t)(e->len - u->at - u->removed_len + 1));   /* +1 keeps the NUL */
+    if (u->added_len > 0)
+        memcpy(e->buf + u->at, e->undo_text + u->added_off, (size_t)u->added_len);
+    e->len += u->added_len - u->removed_len;
+    e->buf[e->len] = 0;
+    e->cursor = e->anchor = u->at + u->added_len;
+    e->goal_col = -1;
+    e->undo_at++;
+    return 1;
 }
 
 /* ---- editing ------------------------------------------------------------ */
