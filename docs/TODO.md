@@ -3296,46 +3296,52 @@ Open:
       it is worth being right about before they diverge. Asks, like every other
       close here, with the same grace timer behind it.
 
-## Files' grid: a row keeps a height from the folder you came from (2026-09-13)
+## Files' grid shifted after any navigation -- FIXED (2026-09-13)
 
-- [ ] **Navigate away and back and the listing sits 32 px lower.** Measured, on
-      the same window at the same size, as the first inked row of the first
-      grid cell: `fresh y=193`, `after a navigation y=225`. It does NOT
-      accumulate -- three round trips all land on 225 -- so the first render is
-      the odd one out and everything after it is consistently wrong.
+- [x] ~~Navigate away and back and the listing sits 32 px lower.~~ -- the
+      listing was inheriting the EMPTY-FOLDER PLACEHOLDER's padding.
 
-      NARROWED, from inside the app, with `ui_open_rect` on the nodes involved.
-      Every number below is measured, not inferred:
+      `EmptyState` sets `ui_set_padding(sp6, sp5, sp6, sp5)` = 32 and 24. The
+      placeholder and the listing occupy the SAME SLOT of the same stack, and
+      the reconciler matches by position -- so the node that had been an
+      EmptyState came back as the first row of the grid and kept that padding.
+      The measured shift was 32 px down and 24 px right. Those are the numbers,
+      exactly, and the horizontal one is what finally identified it: a vertical
+      shift alone has many explanations, `(+24, +32)` has one.
 
-      | | grid VStack y | row 0 y | row 0 h | every cell h |
-      |---|---|---|---|---|
-      | fresh, /home/yves  | 115.3 | 125.3 | 77.1  | 62.6 |
-      | in / (long names)  | 115.3 | 125.3 | 175.0 | -    |
-      | back at /home/yves | 115.3 | 125.3 | 141.1 | 62.6 |
+      Fixed by keying the three branches -- `files-placeholder`, `files-list`,
+      `files-grid` -- so they can never share an instance. Measured after:
+      fresh 193, after a view toggle 193, after one round trip 193, after two
+      193. It was 225 for every case but the first.
 
-      **CORRECTION.** An earlier version of this entry said "the layout is
-      right and the pixels are wrong". That was wrong, and it was wrong for a
-      reason worth naming: the rects and the screenshots came from DIFFERENT
-      RUNS, and the thing being printed was the ROW's rect, which does not
-      move. Measuring the CELL, with the screenshot taken in the same run:
+      WHY IT LOOKED LIKE "ANY NAVIGATION DOES IT": the session namespace cannot
+      read `/`, so the sidebar's Root shows the placeholder too. Every
+      navigation in every test went through an EmptyState, including the ones
+      chosen specifically to avoid one. And toggling Grid/List -- which never
+      shows a placeholder -- never reproduced it, which at the time looked like
+      evidence AGAINST a reconciler problem and was the opposite.
 
-          fresh              cell0  x=246.0  y=125.3  h=62.6
-          after a navigation cell0  x=270.0  y=157.3  h=62.6
+      Three wrong answers were published on the way to this one, each corrected
+      in its own commit: "a row keeps a height" (the row does, but that is a
+      symptom), "the layout is right and the pixels are wrong" (they were both
+      wrong -- I had compared rects and screenshots from DIFFERENT BOOTS), and
+      two theories about the cell. The method error that produced two of them
+      was measuring in one run and photographing in another.
 
-      The cell moves -- 24 px right and 32 px DOWN -- inside a row whose own
-      rect and height are unchanged, and while keeping its own height exactly.
-      So it is a placement problem within the row, not a size problem and not
-      a paint problem.
+- [ ] **THE GENERAL BUG IS STILL THERE: a reused instance keeps properties the
+      new occupant never sets.** Keying Files' three branches fixes Files. Any
+      two elements that can occupy one slot in different frames have the same
+      trap -- whatever the first one set (padding, corner, shadow, background,
+      alignment) survives into the second unless the second restates it. The
+      DSL applies a prop only `if (p.padding)`, so an unset prop is not "the
+      default", it is "whatever was there".
 
-      Note the horizontal shift, which nothing had noticed before: whatever
-      this is, it is not purely vertical, so "an extra 32 px above row 0" was
-      never the right description of it either.
-
-      Why it matters beyond looks: a right-click aimed at a file lands between
-      rows and opens the FOLDER menu instead of the item menu. It cost a
-      working feature a red test (tools/trash_shot.py) and sent me looking for
-      a bug in the Trash, which was fine. Anything driven by coordinates -- a
-      test, or a person with muscle memory -- is aiming at a target that moves.
+      Worth deciding deliberately: either the reconciler should reset a node's
+      box properties when the element TYPE at a slot changes, or `em_apply_box`
+      should always write every box property with a documented default. The
+      second is the simpler rule and the more invasive change -- containers
+      that set their own defaults before `em_apply_box` (Card, Section,
+      EmptyState) would have to move those into the props.
 
 ## The dock cannot move, and the reason is one missing z-band (2026-09-13)
 

@@ -729,15 +729,38 @@ static void app(void) {
                  * and the status line; the rest is the list. */
                 ScrollView(&g_scroll, em_viewport_height() - 150.0f) {
                     VStack(.spacing = g_view ? 0 : 10, .align = Fill, .padding = 10) {
+                        /* KEYED, so the placeholder and the listing can never
+                         * share an instance.
+                         *
+                         * They sit in the same slot of this stack, and the
+                         * reconciler matches by POSITION -- so the node that
+                         * was an EmptyState came back as the first row of the
+                         * grid and kept the padding EmptyState had set on it
+                         * (sp6/sp5 = 32 and 24). The listing then drew 32 px
+                         * lower and 24 px right of where it had been a moment
+                         * earlier, which is exactly what was measured. A key
+                         * makes them different instances, so nothing is
+                         * inherited.
+                         *
+                         * Every navigation went through this, not just the ones
+                         * into an obviously empty folder: the session cannot
+                         * read "/", so the sidebar's Root shows the placeholder
+                         * too. That is why it looked like "any navigation does
+                         * it" and why toggling Grid/List -- which never shows a
+                         * placeholder -- never did. */
                         if (g_vis_n == 0) {
-                            if (g_query[0])
-                                EmptyState(IconSearch, "No matches",
-                                           "Nothing in this folder matches what you typed.");
-                            else
-                                EmptyState(IconFolder, "Empty folder",
-                                           "There is nothing here yet.");
+                            VStack(.key = "files-placeholder", .align = Fill) {
+                                if (g_query[0])
+                                    EmptyState(IconSearch, "No matches",
+                                               "Nothing in this folder matches what you typed.");
+                                else
+                                    EmptyState(IconFolder, "Empty folder",
+                                               "There is nothing here yet.");
+                            }
                         } else if (g_view == 1) {
-                            for (int k = 0; k < g_vis_n; k++) list_row(g_vis[k]);
+                            VStack(.key = "files-list", .align = Fill) {
+                                for (int k = 0; k < g_vis_n; k++) list_row(g_vis[k]);
+                            }
                         } else {
                             /* against the PANE's width (window less sidebar
                              * and padding), not the window's -- the last
@@ -745,12 +768,14 @@ static void app(void) {
                             int cols = ((int)em_viewport_width() - 178 - 44) / 100;
                             if (cols < 2) cols = 2;
                             if (cols > 8) cols = 8;
-                            for (int base = 0; base < g_vis_n; base += cols) {
-                                HStack(.spacing = 8, .align = Leading) {
-                                    for (int c = 0; c < cols; c++) {
-                                        int k = base + c;
-                                        if (k < g_vis_n) grid_cell(g_vis[k]);
-                                        else             Spacer();
+                            VStack(.key = "files-grid", .align = Fill, .spacing = 10) {
+                                for (int base = 0; base < g_vis_n; base += cols) {
+                                    HStack(.spacing = 8, .align = Leading) {
+                                        for (int c = 0; c < cols; c++) {
+                                            int k = base + c;
+                                            if (k < g_vis_n) grid_cell(g_vis[k]);
+                                            else             Spacer();
+                                        }
                                     }
                                 }
                             }

@@ -10,8 +10,8 @@ the verb people reach for most carelessly.
 
 THE ROUND TRIP, driven with a real pointer:
 
-    move readme.txt to the Trash  ->  it is there
-                                  ->  Put Back  ->  it is not
+    Trash is empty  ->  move readme.txt to it  ->  it is there
+                    ->  Put Back               ->  it is not
 
 It judges by ink in the FIRST GRID CELL, which is empty unless something is
 listed. Measuring the whole listing area was the obvious idea and was wrong:
@@ -105,13 +105,20 @@ def main():
                   "data": {"down": False, "button": "right"}}])
             time.sleep(1.5)
 
-        # ONE NAVIGATION, deliberately. Files' grid shifts down 32px and its
-        # rows spread 33px apart on the SECOND navigation of a session (see
-        # docs/TODO.md) -- so a test that wandered around before clicking would
-        # aim at coordinates that no longer hold and report the Trash broken
-        # when the bug is somewhere else entirely.
-        #
-        # 1. move a file to the Trash, from the view Files opens on
+        # 0. look in the Trash first. This used to be impossible: the grid
+        # shifted 32 px down and 24 px right after any navigation, so a
+        # right-click aimed at a file landed between rows and this test blamed
+        # the Trash for a fault that was in the toolkit. That is fixed, so the
+        # test can establish its own empty baseline again.
+        S.move(q, *SIDEBAR_TRASH); S.click(q); time.sleep(2)
+        empty = ink(shot("empty"), CELL)
+        print("trash_shot: Trash's first cell has %d lit pixels when empty" % empty)
+        if empty > 30:
+            fails.append("the Trash is not empty to begin with (%d lit pixels) -- "
+                         "this run cannot prove anything" % empty)
+        S.move(q, *SIDEBAR_HOME); S.click(q); time.sleep(2)
+
+        # 1. move a file to the Trash
         right_click(FILE_ICON)
         S.move(q, *menu_row(FILE_ICON, 3)); S.click(q)     # "Move to Trash..."
         time.sleep(1.5)
