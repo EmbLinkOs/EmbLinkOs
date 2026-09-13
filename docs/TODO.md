@@ -3264,6 +3264,36 @@ Open:
       it is worth being right about before they diverge. Asks, like every other
       close here, with the same grace timer behind it.
 
+## Files' grid shifts down on the SECOND navigation (found 2026-09-13)
+
+- [ ] **Navigate twice and the listing moves.** Open Files, go to another
+      folder, come back: the first row of the grid starts 32 px lower and the
+      rows spread 33 px further apart. Measured, on the same window at the same
+      size, by finding the first inked row of the first grid cell:
+
+          fresh       first grid ink at y=193
+          after-nav   first grid ink at y=225
+
+      The FIRST navigation is fine -- a fresh Files that goes straight to the
+      Trash draws its listing in the normal place. It is the second that
+      shifts, which points at state accumulating across rebuilds rather than at
+      anything about a particular folder.
+
+      Not cosmetic. It is why the first version of tools/trash_shot.py failed:
+      a right-click aimed at a file landed in the gap between rows and opened
+      the FOLDER menu instead of the item menu, so the test reported that the
+      Trash was broken when the Trash was fine. Anything that drives this
+      window by coordinates -- a test, or a person with muscle memory -- is
+      aiming at a target that moves.
+
+      Where to look first: this is the same SHAPE as the launcher bug already
+      recorded above (a subtree removed and rebuilt, measured wrongly the
+      second time), which turned out to be `layout_destroy_node` leaving a
+      freed node linked into its parent. That one was fixed; this may be a
+      sibling of it in the same arena, or the grid's own container keeping a
+      measurement it should have thrown away. `g_scroll` is reset on every
+      navigation, so it is not scroll position.
+
 ## malloc is NOT thread-safe in userspace (found 2026-09-13)
 
 - [ ] **newlib is linked with no `__malloc_lock`, so two threads in one process

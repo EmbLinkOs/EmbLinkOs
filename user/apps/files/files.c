@@ -67,7 +67,8 @@ static char  g_newname[NAME_LEN] = "";
 static bool  g_menu_open = false;
 static float g_menu_x, g_menu_y;
 static int   g_menu_i = -1;          /* entry the menu was opened on */
-static bool  g_confirm_del = false;  /* the delete sheet             */
+static bool  g_confirm_del = false;
+static bool  g_confirm_empty = false;   /* Empty Trash asks once, inline */  /* the delete sheet             */
 static bool  g_renaming = false;     /* the rename sheet             */
 static char  g_rename_to[NAME_LEN] = "";
 static char  g_clip_path[600] = "";  /* the "copied" file            */
@@ -188,19 +189,185 @@ static void create_folder(void) {
     g_newname[0] = 0; g_naming = false; g_dirty = true;
 }
 
-/* Delete. Directories go through rmdir, which refuses a non-empty one -- and
- * that refusal is reported rather than worked around: recursive delete is a
- * different, much more dangerous verb and it should have to be asked for. */
+/* --- the Trash ----------------------------------------------------------
+ *
+ * The sidebar has had a Trash folder for a long time and nothing ever went
+ * into it: Delete called unlink, and the confirmation sheet said so in as many
+ * words -- "there is no Trash yet, so the file is gone for good". Honest, and
+ * still the wrong behaviour for the verb everyone reaches for most carelessly.
+ *
+ * A trash is a RENAME, not a copy: same filesystem, so it is instant whatever
+ * the file's size, and a machine that stalls for a minute when you delete a
+ * video teaches you not to delete things.
+ *
+ * WHERE IT CAME FROM is recorded beside it, one line per item in
+ * $HOME/.trash-index ("<trashed name>\t<original full path>"). That file is
+ * what makes Put Back a click instead of an act of memory, and it is plain
+ * text on purpose: if it is ever lost, the trash is still a folder full of
+ * your files, which is the failure mode to prefer.
+ */
+static void trash_dir(char *out, size_t cap) {
+    const char *home = getenv("HOME");
+    snprintf(out, cap, "%s/Trash", home && home[0] ? home : "/");
+}
+static int in_trash(void) {
+    char t[560]; trash_dir(t, sizeof t);
+    return strcmp(g_cwd, t) == 0;
+}
+static void trash_index_path(char *out, size_t cap) {
+    const char *home = getenv("HOME");
+    snprintf(out, cap, "%s/.trash-index", home && home[0] ? home : "/");
+}
+/* Remember (or forget, orig == NULL) where one trashed item came from. The
+ * whole file is rewritten: it is a handful of lines, and a rewrite cannot
+ * leave a half-updated one behind. */
+static void trash_index_set(const char *name, const char *orig) {
+    char ip[600]; trash_index_path(ip, sizeof ip);
+    static char body[8192];
+    int n = 0;
+    FILE *f = fopen(ip, "r");
+    if (f) { n = (int)fread(body, 1, sizeof body - 1, f); fclose(f); }
+    if (n < 0) n = 0;
+    body[n] = 0;
+
+    static char out[8192];
+    int o = 0;
+    /* copy every line that is not about `name` */
+    for (char *p = body; *p; ) {
+        char *line = p;
+        while (*p && *p != '\n') p++;
+        int len = (int)(p - line);
+        if (*p) p++;
+        if (len <= 0) continue;
+        int skip = (strncmp(line, name, strlen(name)) == 0 && line[strlen(name)] == '\t');
+        if (!skip && o + len + 1 < (int)sizeof out) {
+            memcpy(out + o, line, (size_t)len); o += len; out[o++] = '\n';
+        }
+    }
+    if (orig) o += snprintf(out + o, sizeof out - (size_t)o, "%s\t%s\n", name, orig);
+    f = fopen(ip, "w");
+    if (f) { fwrite(out, 1, (size_t)o, f); fclose(f); }
+}
+/* Where `name` came from, or 0. */
+static const char *trash_index_get(const char *name) {
+    static char found[600];
+    char ip[600]; trash_index_path(ip, sizeof ip);
+    static char body[8192];
+    FILE *f = fopen(ip, "r");
+    if (!f) return 0;
+    int n = (int)fread(body, 1, sizeof body - 1, f);
+    fclose(f);
+    if (n <= 0) return 0;
+    body[n] = 0;
+    size_t nl = strlen(name);
+    for (char *p = body; *p; ) {
+        char *line = p;
+        while (*p && *p != '\n') p++;
+        if (*p) *p++ = 0;
+        if (strncmp(line, name, nl) == 0 && line[nl] == '\t') {
+            snprintf(found, sizeof found, "%s", line + nl + 1);
+            return found;
+        }
+    }
+    return 0;
+}
+
+/* Delete. Inside the Trash it is permanent -- that is what the Trash is for --
+ * and everywhere else it is a move into it.
+ *
+ * Directories go through rmdir when the delete IS permanent, which refuses a
+ * non-empty one; that refusal is reported rather than worked around, because
+ * recursive delete is a different and much more dangerous verb and should have
+ * to be asked for. A directory moved to the Trash keeps its contents, which is
+ * the one way a folder full of things can be deleted safely. */
 static void do_delete(int i) {
     if (i < 0 || i >= g_count) return;
     struct entry *e = &g_entries[i];
     char full[600];
     join(full, sizeof full, e->name);
-    int rc = e->is_dir ? embk_rmdir(full) : embk_unlink(full);
-    if (rc >= 0) snprintf(g_status, sizeof g_status, "Deleted %s", e->name);
-    else if (e->is_dir)
-        snprintf(g_status, sizeof g_status, "%s is not empty", e->name);
-    else snprintf(g_status, sizeof g_status, "Could not delete %s", e->name);
+
+    if (in_trash()) {
+        int rc = e->is_dir ? embk_rmdir(full) : embk_unlink(full);
+        if (rc >= 0) { trash_index_set(e->name, 0);
+                       snprintf(g_status, sizeof g_status, "Deleted %s for good", e->name); }
+        else if (e->is_dir)
+            snprintf(g_status, sizeof g_status, "%s is not empty", e->name);
+        else snprintf(g_status, sizeof g_status, "Could not delete %s", e->name);
+        g_dirty = true;
+        return;
+    }
+
+    char td[560]; trash_dir(td, sizeof td);
+    embk_mkdir(td);                             /* harmless if it is already there */
+
+    /* A name already in the Trash is not a reason to overwrite it: two files
+     * called notes.txt deleted a week apart are two different files. */
+    char dst[700], leaf[280];
+    snprintf(leaf, sizeof leaf, "%s", e->name);
+    snprintf(dst, sizeof dst, "%s/%s", td, leaf);
+    for (int k = 2; k < 1000; k++) {
+        int probe = (int)embk_open(dst, EMBK_O_RDONLY, 0);
+        if (probe < 0) break;
+        embk_close(probe);
+        snprintf(leaf, sizeof leaf, "%s %d", e->name, k);
+        snprintf(dst, sizeof dst, "%s/%s", td, leaf);
+    }
+    int rc = rename(full, dst);
+    { char b[256]; snprintf(b, sizeof b, "files: trash %s -> %s : rc=%d\n",
+                            full, dst, rc); embk_puts(1, b); }
+    if (rc == 0) {
+        trash_index_set(leaf, full);
+        snprintf(g_status, sizeof g_status, "Moved %s to the Trash", e->name);
+    } else {
+        snprintf(g_status, sizeof g_status, "Could not move %s to the Trash", e->name);
+    }
+    g_dirty = true;
+}
+
+/* Put one item back where it came from. */
+static void do_put_back(int i) {
+    if (i < 0 || i >= g_count) return;
+    struct entry *e = &g_entries[i];
+    const char *orig = trash_index_get(e->name);
+    if (!orig) {
+        snprintf(g_status, sizeof g_status,
+                 "Where %s came from was not recorded", e->name);
+        return;
+    }
+    char from[600];
+    join(from, sizeof from, e->name);
+    int probe = (int)embk_open(orig, EMBK_O_RDONLY, 0);
+    if (probe >= 0) {
+        embk_close(probe);
+        snprintf(g_status, sizeof g_status, "Something is already there");
+        return;
+    }
+    if (rename(from, orig) == 0) {
+        trash_index_set(e->name, 0);
+        snprintf(g_status, sizeof g_status, "Put %s back", e->name);
+    } else {
+        snprintf(g_status, sizeof g_status, "Could not put %s back", e->name);
+    }
+    g_dirty = true;
+}
+
+/* Everything in the Trash, gone. Files only: a folder in there is left alone
+ * and reported, for the same reason a recursive delete has to be asked for. */
+static void do_empty_trash(void) {
+    int gone = 0, kept = 0;
+    for (int i = 0; i < g_count; i++) {
+        struct entry *e = &g_entries[i];
+        char full[600];
+        join(full, sizeof full, e->name);
+        int rc = e->is_dir ? embk_rmdir(full) : embk_unlink(full);
+        if (rc >= 0) { trash_index_set(e->name, 0); gone++; }
+        else kept++;
+    }
+    if (kept) snprintf(g_status, sizeof g_status,
+                       "Emptied %d; %d could not be removed (a folder is not empty)",
+                       gone, kept);
+    else snprintf(g_status, sizeof g_status, "Emptied the Trash (%d item%s)",
+                  gone, gone == 1 ? "" : "s");
     g_dirty = true;
 }
 
@@ -515,6 +682,25 @@ static void app(void) {
                         TextField(g_newname, sizeof g_newname, "Folder name");
                         if (Button("Create").primary().clicked()) create_folder();
                         if (Button("Cancel").ghost().clicked()) { g_naming = false; g_newname[0] = 0; }
+                    } else if (in_trash()) {
+                        /* IN THE TRASH the folder verbs are the wrong ones:
+                         * nobody makes a new folder in there. Empty it is the
+                         * only thing this place is for, and it only appears
+                         * when there is something to empty -- a button that
+                         * would do nothing is a button you learn to ignore. */
+                        if (g_count > 0) {
+                            if (g_confirm_empty) {
+                                Text("Delete everything?").caption().secondary();
+                                if (Button("Empty Trash").destructive().font(Caption).clicked()) {
+                                    do_empty_trash(); g_confirm_empty = false;
+                                }
+                                if (Button("Cancel").ghost().font(Caption)
+                                        .color(ui_theme()->text).clicked()) g_confirm_empty = false;
+                            } else if (Button("Empty Trash").ghost().font(Caption)
+                                           .color(ui_theme()->text).clicked()) {
+                                g_confirm_empty = true;
+                            }
+                        }
                     } else {
                         if (Button("New Folder").ghost().font(Caption)
                                 .color(ui_theme()->text).clicked()) {
@@ -628,7 +814,9 @@ static void app(void) {
                             g_renaming = true;
                         }
                         MenuSeparator();
-                        if (MenuItem("Delete...")) g_confirm_del = true;
+                        if (in_trash() && MenuItem("Put Back")) do_put_back(g_menu_i);
+                        if (MenuItem(in_trash() ? "Delete for Good..." : "Move to Trash..."))
+                            g_confirm_del = true;
                     }
                 }
 
@@ -640,15 +828,26 @@ static void app(void) {
                     struct entry *e = &g_entries[g_menu_i];
                     Overlay() {
                         Dialog(.width = 380) {
-                            Text(e->is_dir ? "Delete this folder?" : "Delete this file?").title();
+                            /* THE SHEET SAYS WHICH DELETE THIS IS. Inside the
+                             * Trash it is permanent and asks like it; anywhere
+                             * else it is a move, which is recoverable and does
+                             * not deserve the same alarm. Asking the same
+                             * question for both teaches people to click
+                             * through it. */
+                            bool perm = in_trash();
+                            Text(perm ? (e->is_dir ? "Delete this folder for good?"
+                                                   : "Delete this file for good?")
+                                      : (e->is_dir ? "Move this folder to the Trash?"
+                                                   : "Move this file to the Trash?")).title();
                             Text(e->name).body().secondary();
-                            Text("This cannot be undone -- there is no Trash yet, "
-                                 "so the file is gone for good.").caption().tertiary();
+                            Text(perm ? "It is in the Trash, so this cannot be undone."
+                                      : "You can put it back from the Trash.")
+                                .caption().tertiary();
                             HStack(.spacing = 8, .align = Center, .pt = 12) {
                                 Spacer();
                                 if (Button("Cancel").ghost().color(ui_theme()->text).clicked())
                                     g_confirm_del = false;
-                                if (Button("Delete").destructive().clicked()) {
+                                if (Button(perm ? "Delete" : "Move to Trash").destructive().clicked()) {
                                     do_delete(g_menu_i); g_confirm_del = false; g_menu_i = -1;
                                 }
                             }
