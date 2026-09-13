@@ -3245,6 +3245,40 @@ Open:
       it is worth being right about before they diverge. Asks, like every other
       close here, with the same grace timer behind it.
 
+## The dock cannot move, and the reason is one missing z-band (2026-09-13)
+
+Two obvious Settings switches are missing and both are blocked on the same
+thing, so they are written down together rather than attempted twice:
+
+- [ ] **Dock position (bottom / left / right).**
+- [ ] **Automatically hide and show the dock.**
+
+WHY NEITHER IS A PREFERENCE YET. The dock is drawn by the DESKTOP window,
+which the compositor pins at z = 0 -- behind every application window. Today
+that works only because app windows are CONSTRAINED never to overlap the dock's
+band (`oscfg_dock_band`, read by home.c and em_app.c). Move the dock to a screen
+edge, or hide it and reveal it over a window, and it is behind whatever is in
+front: invisible, and its clicks go to the app on top. The failure looks exactly
+like a dead dock.
+
+WHAT IT NEEDS. The compositor already has bands -- desktop at 0, widgets at
+1..WIDGET_Z_TOP, applications above -- so this is a third one ABOVE
+applications, for panels. Two pieces:
+
+1. A `band` field compared before `z` everywhere z is compared (about a dozen
+   sites in compositor.c: the painter's ordering, topmost_at, front_window,
+   raise, the switcher). Raising the base of a reserved high band instead is
+   tempting and wrong -- `g_next_z` only ever increments, so "high enough"
+   is a number that expires.
+2. The dock moving OUT of home.c into its own process, the way the menu bar
+   already is. It is the same argument the menu bar settled: a panel is not
+   part of the desktop, it sits over it.
+
+Until then the dock stays at the bottom and always visible, which is at least
+a dock that works. Note the menu bar has the same latent problem -- it is a
+normal window, not an always-on-top one, and nothing today makes a fullscreen
+app cover it correctly either.
+
 ## aarch64 networking -- diagnosed, measured, and NOT turned on (2026-09-13)
 
 An entire architecture still has no network. The old note here said turning it
