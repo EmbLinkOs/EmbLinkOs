@@ -123,10 +123,19 @@ def main():
         S.move(q, *menu_row(FILE_ICON, 3)); S.click(q)     # "Move to Trash..."
         time.sleep(1.5)
         S.move(q, *CONFIRM_BUTTON); S.click(q)
-        time.sleep(2)
+        time.sleep(3)
 
-        # 2. it is in the Trash
+        # 2. it is in the Trash.
+        #
+        # Clicked TWICE, with a step away in between. The sheet's dismiss scrim
+        # is still up for a frame or two after the confirm and swallows the
+        # next click, so a single one lands on nothing and the test then
+        # photographs the folder it never left. navigate_to() returns early
+        # when it is already where you asked, so the second click is free.
+        S.move(q, 620, 560)
         S.move(q, *SIDEBAR_TRASH); S.click(q); time.sleep(2)
+        S.move(q, 620, 560)
+        S.move(q, *SIDEBAR_TRASH); S.click(q); time.sleep(3)
         filled = ink(shot("filled"), CELL)
         print("trash_shot: Trash's first cell has %d lit pixels after a delete" % filled)
         if filled < 30:

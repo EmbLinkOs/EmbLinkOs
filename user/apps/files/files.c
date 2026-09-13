@@ -42,6 +42,7 @@ static struct entry g_entries[MAX_ENTRIES];
 static int   g_count = 0;                 /* entries in the directory         */
 static int   g_vis[MAX_ENTRIES];          /* indices passing the filter       */
 static int   g_vis_n = 0;
+#define TRASH_INDEX_NAME ".trash-index"   /* the Trash's own bookkeeping */
 static char  g_cwd[512] = "/";
 static bool  g_dirty = true;              /* re-read the directory this frame */
 static bool  g_initialized = false;
@@ -94,6 +95,11 @@ static void read_dir(void) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL && g_count < MAX_ENTRIES) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        /* The Trash's own record of where things came from. Filtered here
+         * rather than hidden by a dotfile rule, because this shell does not
+         * have one -- .vellum is listed like anything else -- and inventing
+         * one to sweep this under would hide files the user put there. */
+        if (!strcmp(de->d_name, TRASH_INDEX_NAME)) continue;
         struct entry *e = &g_entries[g_count];
         snprintf(e->name, sizeof e->name, "%s", de->d_name);
         char full[600];
@@ -214,14 +220,21 @@ static int in_trash(void) {
     char t[560]; trash_dir(t, sizeof t);
     return strcmp(g_cwd, t) == 0;
 }
+/* THE INDEX LIVES IN THE TRASH, not in your home directory.
+ *
+ * It was $HOME/.trash-index, and Files does not hide dotfiles -- so the first
+ * thing anybody deleted put a permanent new item in their home folder. The
+ * bookkeeping belongs with the thing it describes, and it is filtered out of
+ * the listing below: the Trash's own record is not an item IN the Trash. */
 static void trash_index_path(char *out, size_t cap) {
-    const char *home = getenv("HOME");
-    snprintf(out, cap, "%s/.trash-index", home && home[0] ? home : "/");
+    char td[560]; trash_dir(td, sizeof td);
+    snprintf(out, cap, "%s/%s", td, TRASH_INDEX_NAME);
 }
 /* Remember (or forget, orig == NULL) where one trashed item came from. The
  * whole file is rewritten: it is a handful of lines, and a rewrite cannot
  * leave a half-updated one behind. */
 static void trash_index_set(const char *name, const char *orig) {
+    { char td[560]; trash_dir(td, sizeof td); embk_mkdir(td); }
     char ip[600]; trash_index_path(ip, sizeof ip);
     static char body[8192];
     int n = 0;
@@ -732,22 +745,21 @@ static void app(void) {
                         /* KEYED, so the placeholder and the listing can never
                          * share an instance.
                          *
-                         * They sit in the same slot of this stack, and the
-                         * reconciler matches by POSITION -- so the node that
-                         * was an EmptyState came back as the first row of the
-                         * grid and kept the padding EmptyState had set on it
-                         * (sp6/sp5 = 32 and 24). The listing then drew 32 px
-                         * lower and 24 px right of where it had been a moment
-                         * earlier, which is exactly what was measured. A key
-                         * makes them different instances, so nothing is
-                         * inherited.
+                         * They sit in the same slot of this stack, every
+                         * container is one instance kind (INSTANCE_BOX), and
+                         * the reconciler matches by position -- so the node
+                         * that was the empty-folder placeholder came back as
+                         * the first row of the grid and kept the padding
+                         * EmptyState had set on it (sp6/sp5 = 32 and 24). The
+                         * listing then drew 32 px lower and 24 px right of
+                         * where it had been a moment earlier. Those are the
+                         * measured numbers, exactly.
                          *
-                         * Every navigation went through this, not just the ones
-                         * into an obviously empty folder: the session cannot
-                         * read "/", so the sidebar's Root shows the placeholder
-                         * too. That is why it looked like "any navigation does
-                         * it" and why toggling Grid/List -- which never shows a
-                         * placeholder -- never did. */
+                         * A key makes them different instances, so nothing is
+                         * inherited. Fixing it in the TOOLKIT instead -- making
+                         * a container's stacking axis part of its identity --
+                         * works for this bug and breaks something else: see
+                         * docs/TODO.md. */
                         if (g_vis_n == 0) {
                             VStack(.key = "files-placeholder", .align = Fill) {
                                 if (g_query[0])

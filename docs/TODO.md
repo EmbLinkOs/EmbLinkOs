@@ -3328,8 +3328,27 @@ Open:
       two theories about the cell. The method error that produced two of them
       was measuring in one run and photographing in another.
 
-- [ ] **THE GENERAL BUG IS STILL THERE: a reused instance keeps properties the
-      new occupant never sets.** Keying Files' three branches fixes Files. Any
+- [ ] **THE GENERAL BUG IS STILL THERE, and the obvious fix for it BREAKS
+      something else.** Making a container's stacking axis part of its identity
+      (a `box_axis` on `struct instance`, compared alongside `kind` in
+      `match_or_create`) does fix this bug in the toolkit -- verified: the grid
+      stays at y=193 through every navigation with no keys in Files at all,
+      and all seven host suites pass.
+
+      It also makes Files' SIDEBAR STOP NAVIGATING after a confirmation dialog
+      is dismissed. Measured on the same sequence, by the ink in the path
+      field: without the change a sidebar click after the delete sheet moves
+      the path (260 -> 403); with it the path never changes, through two clicks
+      and a click on empty space in between. Stricter matching destroys and
+      recreates instances, and a press and its release then land on different
+      ones, so `ui_consume_click` never sees a pair.
+
+      So the axis is probably the right idea and needs the click path to
+      survive an instance being replaced mid-gesture -- not a change to make
+      without fixing that first. Reverted; Files keeps its keys.
+
+- [ ] **The underlying rule: a reused instance keeps properties the new
+      occupant never sets.** Keying Files' three branches fixes Files. Any
       two elements that can occupy one slot in different frames have the same
       trap -- whatever the first one set (padding, corner, shadow, background,
       alignment) survives into the second unless the second restates it. The
