@@ -3304,41 +3304,32 @@ Open:
       accumulate -- three round trips all land on 225 -- so the first render is
       the odd one out and everything after it is consistently wrong.
 
-      NARROWED, from inside the app, with `ui_open_rect` on the nodes involved:
+      NARROWED, from inside the app, with `ui_open_rect` on the nodes involved.
+      Every number below is measured, not inferred:
 
-      | | grid VStack y | row 0 height |
-      |---|---|---|
-      | fresh, /home/yves      | 115.3 | **77.1** |
-      | in / (long names)      | 115.3 | **175.0** |
-      | back at /home/yves     | 115.3 | **141.1** |
+      | | grid VStack y | row 0 y | row 0 h | every cell h |
+      |---|---|---|---|---|
+      | fresh, /home/yves  | 115.3 | 125.3 | 77.1  | 62.6 |
+      | in / (long names)  | 115.3 | 125.3 | 175.0 | -    |
+      | back at /home/yves | 115.3 | 125.3 | 141.1 | 62.6 |
 
-      The container does not move. THE ROW KEEPS A HEIGHT FROM THE FOLDER YOU
-      CAME FROM -- 141 where a fresh render of the same nine names is 77, and
-      not even the 175 it had in `/`, so it is partially resettling rather than
-      simply stuck.
+      **THE LAYOUT IS RIGHT AND THE PIXELS ARE WRONG.** That is the finding.
+      The container does not move, the row does not move, and after the return
+      EVERY cell in row 0 measures the same 62.6 it did on the fresh render --
+      all eight were printed by name. Yet the icons are drawn 32 px lower.
 
-      A grid cell's label is `Button(name).width(90)`, so a long name wraps to
-      two lines and makes the cell taller. Coming back to short names, the
-      extra line's worth of height survives.
+      Stating the row's height explicitly (`.height = 78`) makes the row's
+      measured height correct in both cases -- 78.0 fresh and 78.0 after the
+      return -- and the icons are STILL drawn at y=225. So the offset does not
+      come from any size in the layout tree. Reverted, like the fixed-cell
+      experiment before it: a change that does not do what it claims is not
+      worth keeping.
 
-      NOT THE CELL. Giving `grid_cell` a fixed height (74 px) and clipping it
-      changes nothing: fresh still renders at 193 and a revisit still at 225.
-      So the height that survives is held by the ROW HStack or by something
-      above it, not by the cell whose label wraps -- the wrapping explains why
-      the row is taller in the first place, and not why the row stays taller.
-      That change was reverted; a behaviour change whose justification turned
-      out to be false is not worth keeping.
-
-      WHAT IT IS NOT, each checked rather than assumed:
-      * Not scroll position -- `g_scroll` is reset on every navigation, and the
-        instrumented run shows it at 0.
-      * Not the viewport -- `em_viewport_height()` reads 600.0 before and after.
-      * Not "a subtree was rebuilt": toggling Grid -> List -> Grid rebuilds the
-        whole listing in the same folder and stays at 193.
-      * Not the empty-folder placeholder: navigating via `/` (many entries)
-        does it just as reliably as via an empty Trash.
-      * Probably not layout.c's wrap memo, which is keyed on the text's content
-        HASH plus font, size and width -- a changed name misses the memo.
+      That points away from layout and at the SCENE/paint side -- a retained
+      transform or offset on the reused node, not a retained size.
+      `ui_set_offset`/`scene_set_transform` are guarded so that an unchanged
+      value does not re-dirty; a node whose offset is never restated would keep
+      whatever it last had. That is where to look next.
 
       Why it matters beyond looks: a right-click aimed at a file lands between
       rows and opens the FOLDER menu instead of the item menu. It cost a
