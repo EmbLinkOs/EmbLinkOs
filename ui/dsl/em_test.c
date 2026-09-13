@@ -102,6 +102,69 @@ static void drag(float x0, float y0, float x1, float y1) {
     frame(NULL);
 }
 
+
+/* --- a value a widget writes through a pointer -------------------------
+ *
+ * THE BUG THIS PINS DOWN. A DSL element is STAGED, not emitted: Segmented(...)
+ * records what to draw and returns, and the widget only runs -- and only then
+ * writes through the int* it was handed -- at the next em_flush(), which is
+ * whatever element or closing brace comes after it. So Settings' Keyboard pane,
+ *
+ *     int pick = g_cfg.keymap, was = pick;
+ *     Segmented(names, n, &pick);
+ *     if (pick != was) { g_cfg.keymap = pick; embk_kbd_layout(...); }
+ *
+ * reads `pick` one flush too early, every frame. The write does land later --
+ * into a local that is about to be thrown away, and the `if` that would have
+ * saved it has already run. The keyboard layout could not be changed from
+ * Settings no matter how correct the syscall underneath it was.
+ *
+ * Worse: a brace-scoped container is a for-loop, so the body's locals die
+ * BEFORE the closing em_end_() runs. The flush writes through &pick after pick
+ * is gone. This test never leaves a staged element pointing at a dead local --
+ * a test that relies on undefined behaviour proves nothing -- so it flushes
+ * unconditionally at the end of the block and varies only the thing under
+ * test: whether the read happens before or after the widget has decided.
+ *
+ * Staging is worth keeping -- it is what lets .caption().grow() chain after a
+ * call -- so the fix is Sync(), and this states the contract in both
+ * directions. */
+static const char *const SEGN[3] = { "One", "Two", "Three" };
+static int seg_cfg;        /* the persisted setting  -- Settings' g_cfg.keymap */
+static int seg_applied;    /* how many times the app acted on a change        */
+static int seg_sync;       /* 1 = Sync() before reading, as the fix does      */
+
+static void seg_view(void) {
+    VStack(.key = "segpane") {
+        int pick = seg_cfg, was = pick;
+        Segmented(SEGN, 3, &pick);
+        if (seg_sync) Sync();
+        if (pick != was) { seg_cfg = pick; seg_applied++; }
+        Sync();            /* never let the staged element write into a dead local */
+    }
+}
+static void seg_frame(void) {
+    ui_frame_begin(); seg_view(); ui_frame_end();
+    ui_run_layout(400, 300);
+}
+static void seg_press(float x, float y) {
+    g_ms += 900;
+    ui_pointer(x, y, true);  seg_frame();
+    ui_pointer(x, y, false); seg_frame();
+}
+/* The first x on the control that selects something other than segment 0,
+ * found by sweeping rather than by guessing a coordinate: a guess that misses
+ * reports the same red as a control that does not work. */
+static float seg_x_for_change(void) {
+    for (float x = 1; x < 300; x += 1) {
+        seg_sync = 1; seg_cfg = 0; seg_applied = 0;
+        seg_frame(); seg_frame();
+        seg_press(x, 12);
+        if (seg_cfg != 0) return x;
+    }
+    return -1;
+}
+
 int main(void) {
     printf("=== em-test: the multi-line editor ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -331,6 +394,26 @@ int main(void) {
     strcpy(DOC, "z"); CUR = 1; g_ms += 5000; frame(NULL);
     frame(UNDO REDO UNDO REDO);
     CHECK(!strcmp(DOC, "z"), "undo and redo bytes are never inserted as text");
+
+    /* --- a bound value is only written when the element is flushed --- */
+    float sx = seg_x_for_change();
+    CHECK(sx >= 0, "a press on a DSL Segmented moves the value it was bound to");
+    if (sx >= 0) {
+        /* With Sync(): the app sees the change and persists it. */
+        seg_sync = 1; seg_cfg = 0; seg_applied = 0;
+        seg_frame(); seg_frame();
+        seg_press(sx, 12);
+        CHECK(seg_applied == 1 && seg_cfg != 0,
+              "with Sync() the app sees the new value and persists it");
+
+        /* Without it: the widget still moves, the app never learns, and the
+         * setting is unchanged -- exactly what Settings' Keyboard pane did. */
+        seg_sync = 0; seg_cfg = 0; seg_applied = 0;
+        seg_frame(); seg_frame();
+        seg_press(sx, 12);
+        CHECK(seg_applied == 0 && seg_cfg == 0,
+              "without it the change is read a flush too early and thrown away");
+    }
 
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

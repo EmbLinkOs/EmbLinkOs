@@ -288,6 +288,19 @@ void em_field_emphasis(unsigned start, unsigned len);
 void em_field_autofocus(void);
 #define PasswordField(...) em_password_field(__VA_ARGS__)
 #define Segmented(...)   em_segmented(__VA_ARGS__)
+/* EMIT THE STAGED ELEMENT NOW. An element is staged, not emitted -- that is
+ * what lets .caption().grow() chain after the call -- so a widget handed a
+ * pointer (Segmented, Slider, Toggle, Check, Stepper, Dropdown) writes through
+ * it at the NEXT flush, not on the line you called it. Reading the value
+ * before then reads the old one, silently. A closing brace flushes, so a
+ * widget inside a block is already settled by the time the block ends; one
+ * that is not needs this:
+ *
+ *     Segmented(names, n, &pick);
+ *     Sync();                        // <- now pick is what the widget decided
+ *     if (pick != was) apply(pick);
+ */
+#define Sync()           em_flush()
 #define Spacer()         em_spacer_()
 /* Divider() as before; Divider("key") when it sits among rows that come and
  * go -- see EmProps.key. The concatenation makes the no-argument form pass an

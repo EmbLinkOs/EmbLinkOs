@@ -114,6 +114,49 @@ static void scroll_view(float *sc, float view_h, int rows, float row_h) {
     }
 }
 
+
+/* --- the segmented control ----------------------------------------------
+ *
+ * This exists because a live desktop could not switch the keyboard layout
+ * through Settings, and the instrumentation said something that should not be
+ * possible: inside ui_segmented the pointer IS in the segment's rect,
+ * ui_is_hovered() is 1 and ui_is_pressed() is 1 -- and ui_consume_click(seg)
+ * still returns false, so the selection never moves. Either the harness was
+ * mis-driving the pane or the control is not clickable, and a control that is
+ * not clickable breaks the theme, the text size, the layout AND Files'
+ * Grid/List. Guessing between the two is what a host test is for.
+ *
+ * It SWEEPS the pointer across the control rather than pressing where I think
+ * a segment is: a guessed coordinate that misses turns "the control is broken"
+ * into "my arithmetic was wrong" and reports the same red either way. */
+static const char *const SEG3[3] = { "One", "Two", "Three" };
+static int seg_pick;
+static void seg_frame(void) {
+    ui_frame_begin();
+    ui_begin_vstack(0x5E60);
+      ui_set_padding(0, 0, 0, 0);
+      seg_pick = ui_segmented(SEG3, 3, seg_pick);
+    ui_end_stack();
+    ui_frame_end();
+    ui_run_layout(400, 300);
+}
+/* A press-and-release on the control, driven the way a hand drives one:
+ * a frame with the button down, then a frame with it up. */
+static void seg_press(float x, float y) {
+    g_ms += 900;
+    ui_pointer(x, y, true);  seg_frame();
+    ui_pointer(x, y, false); seg_frame();
+}
+/* The first x that selects `want`, or -1 if no x on the control does. */
+static float seg_x_for(int want) {
+    for (float x = 1; x < 300; x += 1) {
+        seg_pick = 0; seg_frame(); seg_frame();
+        seg_press(x, 12);
+        if (seg_pick == want) return x;
+    }
+    return -1;
+}
+
 int main(void) {
     printf("=== kit-test: the text field and the keyboard ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -631,6 +674,28 @@ int main(void) {
     frame(COPY);
     CHECK(!strcmp(clip_text(), " big"), "two fast shift-clicks extend, they do not select a word");
     #undef CX
+
+    /* --- the segmented control is clickable, or nothing that uses one works --- */
+    seg_pick = 0;
+    float x1 = seg_x_for(1), x2 = seg_x_for(2);
+    CHECK(x1 >= 0, "a press somewhere on a segmented control selects segment 1");
+    CHECK(x2 >= 0, "...and somewhere else selects segment 2");
+    CHECK(x1 < 0 || x2 < 0 || x1 < x2, "the segments are in the order they are written");
+
+    /* Selecting one and pressing it again LEAVES IT SELECTED. The selected
+     * segment is painted differently -- if being selected changed its identity
+     * or its hit rect, the second press would fall through and reset it. */
+    if (x2 >= 0) {
+        seg_press(x2, 12);
+        CHECK(seg_pick == 2, "pressing the segment that is already selected keeps it");
+    }
+
+    /* And a press OFF the control selects nothing: a control that answers
+     * clicks it never received would swallow every click on the page. */
+    if (x2 >= 0) {
+        seg_press(380, 12);
+        CHECK(seg_pick == 2, "a press outside the control changes nothing");
+    }
 
     printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
     return g_fail ? 1 : 0;

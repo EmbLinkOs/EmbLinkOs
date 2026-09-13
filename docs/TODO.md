@@ -3260,26 +3260,37 @@ Open:
       A test that goes around the thing it is meant to protect is worse than no
       test, because it also reports green.
 
-- [ ] **I could NOT demonstrate the switch through Settings, and do not know
-      why.** Six runs went into driving the Keyboard pane's Segmented control
-      and the selection never changed. What was measured, from inside
-      `ui_segmented` on the machine: the pointer IS inside the right segment's
-      rect, `ui_is_hovered()` is 1 and `ui_is_pressed()` is 1 on the press
-      frame -- and `ui_consume_click(seg)` never returns true, so `pick` never
-      moves and Settings never calls the syscall at all.
+- [x] **Found it, and it was not the control.** The suspicion recorded here --
+      that Segmented might not be clickable, which would have broken the theme,
+      the text size, the layout and Files' Grid/List -- was WRONG, and a host
+      test settled it in seconds where six QEMU runs had not: a press on a
+      segmented control selects the segment, in order, and stays.
 
-      TWO POSSIBILITIES AND I DID NOT SEPARATE THEM: the harness may be
-      mis-driving it (its Settings navigation was flaky across runs -- one run
-      did not reach the pane at all), or Segmented is genuinely not clickable,
-      which would affect every one of them: theme, text size, layout, Files'
-      Grid/List. The second would be a serious UI defect and it is NOT ruled
-      out.
+      The real fault is one line of the DSL's contract. An element is STAGED,
+      not emitted -- that is what lets `.caption().grow()` chain after a call --
+      so a widget handed a pointer writes through it at the NEXT flush, not on
+      the line you called it. Settings' Keyboard pane read `pick` on the very
+      next line, so the `if` never fired and the layout could not be changed
+      however correct the syscall below it was. Theme and Interface-size look
+      identical and work only because their Segmented sits inside an HStack
+      whose closing brace flushes first.
 
-      Next: click a Segmented control by hand in a live desktop before writing
-      any more automation, because that answers it in ten seconds and the
-      automation has already cost six runs. If it is the control, check whether
-      the compositor's click QUEUE (added earlier today) is delivering presses
-      at latched coordinates that no longer match where the pointer is.
+      Worse than a stale read: a brace-scoped container is a `for` loop, so the
+      body's locals die BEFORE the closing `em_end_()` runs -- the flush wrote
+      through a pointer to a dead stack slot. `Sync()` fixes both at once, and
+      em-test now states the contract in both directions.
+
+      The dock-size slider had the same bug and the same fix: `Slider(&f)` then
+      `int want = ...` on the next line. Dragging it moved nothing.
+
+- [ ] **Still not demonstrated end to end: the layout switch through the
+      Settings GUI.** Both halves are now covered -- the syscall by
+      `test kbdlayout`, the widget-to-app idiom by em-test -- and the fix makes
+      the second half identical to the panes that already work. What no test
+      touches is the two together, driven by a pointer, in a live desktop.
+      The harness that would do it was flaky at NAVIGATING Settings (one run in
+      six never reached the pane), so that is the piece to make reliable first,
+      not the clicking.
 
 ### A string could not be passed to two syscalls at all (fixed 2026-09-13)
 

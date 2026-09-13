@@ -163,6 +163,9 @@ static void pane_desktop(void) {
         float f = (float)(g_cfg.dock_size - 28) / 32.0f;
         static bool dragging = false;
         Slider(&f);
+        Sync();                 /* the slider writes f when it is EMITTED, not
+                                 * when it is called -- read it before the flush
+                                 * and the dock size never moves. */
         int want = 28 + (int)(f * 32.0f + 0.5f);
         if (want != g_cfg.dock_size) { g_cfg.dock_size = want; dragging = true; apply_now(); }
         else if (dragging) { dragging = false; commit(); }
@@ -206,6 +209,14 @@ static void pane_keyboard(void) {
                           "^ and ¨ compose (^ then e is ê), and AltGr types @ # { } [ ] | €.");
         }
         Segmented(names, OSCFG_KEYMAPS, &pick);
+        Sync();                 /* SAME TRAP, and this one cost a whole day:
+                                 * without it `pick` is read a flush early, the
+                                 * `if` never fires, and the layout cannot be
+                                 * changed from Settings however correct the
+                                 * syscall below is. The Theme and Interface
+                                 * panes look identical and work only because
+                                 * their Segmented sits inside an HStack whose
+                                 * closing brace flushes first. */
         if (pick != was) {
             g_cfg.keymap = pick;
             embk_kbd_layout(oscfg_keymaps[pick].name, 0, 0);   /* take effect now */
