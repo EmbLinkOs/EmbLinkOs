@@ -61,6 +61,7 @@
 #include "ipc/endpoint.h"
 #include "ipc/pipe.h"
 #include "boot/boot_protocol.h"
+#include "module/module.h"
 #include "fs/automount.h"
 #include "drivers/usb/usb_core.h"
 #include "block/block.h"
@@ -654,6 +655,153 @@ int selftests_handle_command(const char *cmd)
 
     if (strcmp(cmd, "test list") == 0) {
         selftests_print_commands();
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test modules -- CODE THE KERNEL DID NOT SHIP WITH.
+     *
+     * The whole round trip, because each step alone proves nothing: load an
+     * object the compiler produced and the kernel has never seen, watch it
+     * register a real block device, READ BACK SOMETHING IT WROTE through the
+     * block layer rather than through its own pointer, then unload it and
+     * require the device to be gone.
+     *
+     * The read-back is the part that separates a loader that works from one
+     * that merely returned success. A module whose relocations were applied
+     * wrongly still loads, still reports a registered device, and produces
+     * garbage the first time anything calls through it.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test modules") == 0) {
+        int fails = 0;
+        const char *path = "/system/modules/ramdisk.ko";
+
+        kprintf("\n[modules] the kernel exports %u symbol(s); %u module(s) loaded\n",
+                (unsigned)embk_export_count(), (unsigned)embk_module_count());
+        if (embk_export_count() == 0) {
+            kprintf("  FAIL: no export table -- the linker script did not "
+                    "gather .embk_exports\n");
+            fails++;
+        }
+
+        uint32_t blocks_before = embk_block_count();
+
+        int rc = embk_module_load(path);
+        if (rc != EMBK_OK) {
+            kprintf("  FAIL: loading %s returned %d\n", path, rc);
+            kprintf("\n[cmd] test modules: FAIL\n");
+            return 1;
+        }
+        if (embk_module_count() != 1) {
+            kprintf("  FAIL: the module is not in the table after loading\n");
+            fails++;
+        }
+
+        /* IT REGISTERED A REAL DEVICE. */
+        uint32_t blocks_after = embk_block_count();
+        kprintf("  block devices: %u before, %u after loading\n",
+                (unsigned)blocks_before, (unsigned)blocks_after);
+        if (blocks_after != blocks_before + 1) {
+            kprintf("  FAIL: the module did not register a block device\n");
+            fails++;
+        }
+
+        /* AND IT WORKS. Read block 0 back through the block layer -- a
+         * different path from the one the module wrote it by. */
+        struct embk_block_device *rd = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *d = embk_block_get(i);
+            if (d && d->block_count == 2048 && d->block_size == 512) rd = d;
+        }
+        if (!rd) {
+            kprintf("  FAIL: the new block device is not findable\n");
+            fails++;
+        } else {
+            static uint8_t buf[512];
+            memset(buf, 0, sizeof buf);
+            if (embk_block_read(rd, 0, 1, buf) != EMBK_OK) {
+                kprintf("  FAIL: reading block 0 of %s failed\n", rd->name);
+                fails++;
+            } else if (strcmp((const char *)buf, "EMBLINK-RAMDISK-MODULE") != 0) {
+                kprintf("  FAIL: block 0 reads %.32s -- the relocations are "
+                        "wrong, or the module wrote somewhere else\n", buf);
+                fails++;
+            } else {
+                kprintf("  %s block 0 reads \"%s\" -- written by module code, "
+                        "read through the block layer\n", rd->name, buf);
+            }
+
+            /* WRITE THROUGH IT TOO: a function pointer in the module's data
+             * section, called by the kernel, is a 64-bit absolute relocation
+             * and the one most likely to be silently wrong. */
+            static uint8_t wbuf[512];
+            memset(wbuf, 0xA5, sizeof wbuf);
+            if (embk_block_write(rd, 7, 1, wbuf) != EMBK_OK) {
+                kprintf("  FAIL: writing block 7 failed\n"); fails++;
+            } else {
+                memset(wbuf, 0, sizeof wbuf);
+                if (embk_block_read(rd, 7, 1, wbuf) != EMBK_OK || wbuf[0] != 0xA5 ||
+                    wbuf[511] != 0xA5) {
+                    kprintf("  FAIL: block 7 did not read back what was written\n");
+                    fails++;
+                } else {
+                    kprintf("  a write through the module's own op read back "
+                            "correctly\n");
+                }
+            }
+        }
+
+        /* W^X, CHECKED IN THE PAGE TABLES RATHER THAN ASSERTED.
+         *
+         * A module loader is the easiest thing in a kernel to get wrong this
+         * way: the simple implementation maps its memory writable AND
+         * executable and never thinks about it again, which makes the module
+         * region the one place in the system where an arbitrary write becomes
+         * arbitrary code. Reading the leaf entry is the only way to know it
+         * did not happen -- the module runs either way. */
+        const struct embk_module *mi = embk_module_at(0);
+        if (mi && mi->text_size) {
+            struct vmm_walk_result w;
+            vmm_walk(vmm_get_kernel_pml4(), mi->text_base, &w);
+            if (!w.mapped || w.levels_read < 4) {
+                kprintf("  FAIL: the module's code is not mapped\n"); fails++;
+            } else {
+                uint64_t pte = w.entry[3];
+                bool writable = (pte & (1ULL << 1)) != 0;
+                bool nx       = (pte & (1ULL << 63)) != 0;
+                kprintf("  module text PTE: %s, %s\n",
+                        writable ? "WRITABLE" : "read-only",
+                        nx ? "NO-EXECUTE" : "executable");
+                if (writable) {
+                    kprintf("  FAIL: module code is writable AND executable -- "
+                            "W^X is not being applied to the one region that "
+                            "most needs it\n");
+                    fails++;
+                }
+                if (nx) {
+                    kprintf("  FAIL: module code is marked no-execute, yet it "
+                            "ran -- the flip did not take\n");
+                    fails++;
+                }
+            }
+        }
+
+        /* AND IT LEAVES CLEANLY. */
+        if (embk_module_unload("ramdisk") != EMBK_OK) {
+            kprintf("  FAIL: unloading returned an error\n"); fails++;
+        }
+        if (embk_module_count() != 0) {
+            kprintf("  FAIL: the module is still in the table after unload\n");
+            fails++;
+        }
+        if (embk_block_count() != blocks_before) {
+            kprintf("  FAIL: the block device outlived the module (%u, "
+                    "expected %u)\n", (unsigned)embk_block_count(),
+                    (unsigned)blocks_before);
+            fails++;
+        }
+
+        kprintf("\n[cmd] test modules: %s\n", fails ? "FAIL" : "OK");
         return 1;
     }
 

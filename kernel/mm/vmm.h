@@ -172,6 +172,18 @@ uint64_t vmm_get_phys_in(uint64_t pml4_phys, uint64_t virt_addr) ;
 // pages are freed, by vmm_free_kernel_stack.
 uint64_t vmm_alloc_kernel_stack(uint64_t size);
 
+/* ---- memory a loadable module runs from ---------------------------------
+ *
+ * WRITABLE FIRST, EXECUTABLE AFTER, never both: this kernel enforces W^X, and
+ * a module region that was both would be the single place in the system where
+ * an arbitrary write becomes arbitrary code. vmm_alloc_module returns writable
+ * non-executable pages in their own region; vmm_module_make_exec flips a range
+ * to read-only + executable once the loader has finished relocating it. Data
+ * sections are simply left alone. */
+uint64_t vmm_alloc_module(uint64_t size);
+int      vmm_module_make_exec(uint64_t virt, uint64_t size);
+void     vmm_free_module(uint64_t virt, uint64_t size);
+
 // Free the physical pages backing a stack returned by vmm_alloc_kernel_stack.
 // `size` must be the same value passed to the matching alloc call.
 void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size);

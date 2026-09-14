@@ -99,6 +99,12 @@ to a working driver, not prerequisites for one.
 | **Notifications and status indicators** | notifications ✅ (`/run/emlink.notify`, user/system/notifyd -- banners from any program, and the desktop now reports a failed launch through it); status indicators still absent | Battery, network, volume, "update ready" have nowhere to appear |
 | **System updates** | absent — `pkg` installs apps, nothing updates the OS | Every fix means reinstalling |
 
+## Beyond the phases — added because the machine needs them
+
+| Pillar | Today | Why |
+|---|---|---|
+| **Loadable kernel modules** | ✅ **done** — `kernel/module/`: an ELF64 relocatable object (the `.o` a compiler already emits) is placed, its undefined symbols resolved against an explicit export table, its relocations applied, and its code flipped to read-only + executable before `init` runs. Proved by loading a RAM-disk driver into a running kernel, reading back through the block layer what its code wrote, checking the page-table entry for W^X, and unloading it. `make test-modules` | A machine has a graphics chip, a wireless part and a touchpad this tree has never seen. The alternative to loading a driver is rebuilding the kernel — which means nobody else can add one |
+
 ## Phase 4 — it grows
 
 IPv6. A packet filter. A general dynamic linker (today the kernel links exactly

@@ -958,6 +958,12 @@ def discover_userland_objects(build_dir="build"):
     # startup and a page never finishes loading without them -- which looks
     # exactly like a hung fetch, not a missing file.
     objects.extend(_tree_objects("system/netsurf", b"system/netsurf/", (".css", ".html")))
+    # LOADABLE KERNEL MODULES, under /system because they are part of the
+    # system and not the user's data -- and read-only to every session, which
+    # matters more here than anywhere else on the image: a writable path
+    # holding code the KERNEL will execute would undo every boundary the rest
+    # of this tree draws. Loading one is a kernel operation, not an app's.
+    objects.extend(_tree_objects("build/modules", b"system/modules/", (".ko",)))
     # THE ABI, sealed under /system/abi (docs/USERSPACE.md D2 §3.1): crt0.o
     # (_start), syscalls.o (the newlib retargeting layer) and libc.a ARE the
     # definition of "targeting EmbLinkOS". tcc READS them (read-only reach into

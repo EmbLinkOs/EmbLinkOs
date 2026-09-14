@@ -851,7 +851,67 @@ The measurement immediately earned itself twice:
 
 ## Storage
 
-### Secure Boot
+### Loadable kernel modules
+
+### The loader (2026-09-14)
+
+`kernel/module/` plus `modules/ramdisk/`. A module is an ordinary ELF64
+RELOCATABLE object built with the kernel's own flags -- not a shared library,
+because there is no dynamic linker in the kernel and no reason to invent one.
+The kernel places its sections, resolves undefined symbols against an explicit
+export table, applies the relocations, flips the code to read-only +
+executable, and calls `init`. `make test-modules`.
+
+**Two refusals are the design, not limitations:**
+
+- It will not map a page writable and executable at once. The image is written
+  while non-executable and flipped afterwards -- W^X is not suspended for the
+  convenience of the loader that would otherwise be the easiest thing in the
+  system to abuse. The test reads the leaf page-table entry back and asserts
+  it, because the module runs either way.
+- It will not resolve a symbol the kernel did not deliberately export.
+  `kernel/module/exports.c` IS the contract: 16 symbols today. Letting a
+  module reach every internal function means every module depends on all of
+  them, and the first rename breaks binaries built months ago.
+
+**Where module memory lives is not free choice**, and getting it wrong was the
+first bug: kernel code is built `-mcmodel=kernel`, which promises every address
+is within 2 GiB of every other. Module memory first went in the MMIO window,
+seventy TERABYTES from `kprintf`, and the very first call could not be encoded.
+It is in the kernel's own window now -- 1 GiB above the image on x86, and only
+64 MiB above it on aarch64, whose branch reaches +-128 MiB rather than +-2 GiB.
+
+**Still open:**
+
+- [ ] **Modules are not signed, and they should be.** This tree verifies the
+      loader with Secure Boot and the kernel with a build hash, and then loads
+      arbitrary code into the kernel from a file. `/system/modules` is
+      read-only to every session, so nothing in userspace can write one -- but
+      that is a filesystem permission standing in for a signature. The pieces
+      to fix it exist now (`tools/sbsign.py` builds PKCS#7, the kernel has
+      SHA-256): a detached signature over the .ko, verified against a key
+      compiled into the kernel, is the same shape as the kernel-hash check.
+- [ ] **No symbol versioning.** A module built against one kernel and loaded
+      into another resolves by NAME alone. If the meaning of an exported
+      function changes without its name changing, the module links cleanly and
+      misbehaves. A hash of each exported symbol's prototype is the usual fix.
+- [ ] **No inter-module dependencies.** A module can only call the kernel, not
+      another module. Nothing exports from a module yet, so nothing needs it.
+- [ ] **Unload is not refcounted.** `embk_module_unload` runs `exit` and frees
+      the pages, and it is only safe because nothing may hold a pointer into a
+      module -- no inter-module linking, and a module must remove every
+      callback it registered. That is a real constraint on what a module may
+      do and it is not enforced anywhere.
+- [ ] **Only the relocation types a compiler emits for kernel code.** x86-64
+      has 64/PC32/PLT32/32/32S; aarch64 has ABS64/CALL26/JUMP26. Anything else
+      is refused BY NAME rather than approximated -- notably aarch64's
+      ADR_PREL_PG_HI21 + ADD_ABS_LO12_NC pair, which a module doing anything
+      with large constants will hit.
+- [ ] **`R_X86_64_32` is applied without a range check** where `32S` gets one.
+      Unsigned 32-bit absolute references cannot be satisfied by a kernel
+      address at all; it should refuse rather than truncate.
+
+## Secure Boot
 
 ### Signed loader, enrolled keys, and a verified kernel (2026-09-14)
 

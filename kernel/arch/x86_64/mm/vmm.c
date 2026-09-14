@@ -2,6 +2,7 @@
 #include "arch/x86_64/cpu/cpu_features.h"
 #include "include/arch_ipi.h"
 #include "mm/pmm.h"
+#include "include/kstring.h"
 #include "boot/boot_protocol.h"   /* memory map now arrives via the boot protocol */
 #include "drivers/char/serial.h"
 #include "include/spinlock.h"
@@ -1011,6 +1012,91 @@ uint64_t vmm_alloc_kernel_stack(uint64_t size) {
     }
 
     return stack_base_virt + (pages * PAGE_SIZE);  // top of stack (RSP seed)
+}
+
+/* ---- memory a loadable module runs from ---------------------------------
+ *
+ * A module needs memory the kernel can WRITE (to copy sections in and apply
+ * relocations) and then EXECUTE. It cannot have both at once: this kernel
+ * enforces W^X, and a region that is writable and executable at the same time
+ * is the thing W^X exists to prevent -- it would be the one place in the
+ * system where an arbitrary write becomes arbitrary code, which is exactly
+ * the position a module loader must not create.
+ *
+ * So it is two steps. vmm_alloc_module() hands back writable, non-executable
+ * pages; vmm_module_make_exec() flips a range to read-only and executable once
+ * the loader has finished writing it. Data sections simply stay as they are.
+ *
+ * Its own region, rather than the kernel heap: heap allocations share pages,
+ * and flipping a page to executable because a module landed on it would take
+ * whatever else was on that page with it.
+ *
+ * WHERE THAT REGION IS, is not free choice. Kernel code is built
+ * -mcmodel=kernel, which promises every address is within 2 GiB of every
+ * other, so a call compiles to a 32-bit PC-relative displacement. Put module
+ * memory in the MMIO or stack windows -- which is where it went first -- and
+ * the very first call from a module into kprintf is seventy TERABYTES away
+ * and cannot be encoded at all. The loader says so and refuses, which is the
+ * right failure, but the fix is to put modules where the model says they are:
+ * in the kernel's own 2 GiB window, 1 GiB above the image.
+ *
+ * 512 MiB of it. The kernel image occupies a few megabytes at the bottom of
+ * the window and nothing else is mapped between them. */
+#define MODULE_REGION_BASE 0xFFFFFFFFC0000000ULL
+#define MODULE_REGION_END  0xFFFFFFFFE0000000ULL
+static uint64_t module_next_virt = MODULE_REGION_BASE;
+
+uint64_t vmm_alloc_module(uint64_t size) {
+    if (!size) return 0;
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    spin_lock(&vmm_lock);
+    uint64_t base = module_next_virt;
+    /* A guard page between modules, for the same reason the stacks have one:
+     * a relocation computed slightly wrong runs off the end of one module and
+     * into the next, and a fault there is a bug report rather than a mystery. */
+    uint64_t next = base + (pages + 1) * PAGE_SIZE;
+    if (next > MODULE_REGION_END || next < base) { spin_unlock(&vmm_lock); return 0; }
+    module_next_virt = next;
+    spin_unlock(&vmm_lock);
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) return 0;
+        if (vmm_map(base + i * PAGE_SIZE, phys, VMM_WRITABLE | VMM_NX) < 0) {
+            pmm_free_page(phys);
+            return 0;
+        }
+        memset((void *)(base + i * PAGE_SIZE), 0, PAGE_SIZE);
+    }
+    return base;
+}
+
+int vmm_module_make_exec(uint64_t virt, uint64_t size) {
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = 0; i < pages; i++) {
+        /* READ-ONLY AND EXECUTABLE. Both stated: VMM_EXEC is the positive ask
+         * and the absence of VMM_WRITABLE is what makes it W^X rather than a
+         * region that merely happens not to be written just now. */
+        if (vmm_protect_in(kernel_pml4_phys, virt + i * PAGE_SIZE,
+                           VMM_PRESENT | VMM_EXEC) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+void vmm_free_module(uint64_t virt, uint64_t size) {
+    if (!virt) return;
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t v = virt + i * PAGE_SIZE;
+        uint64_t phys = vmm_get_phys(v);
+        if (phys) pmm_free_page(phys);
+        vmm_unmap(v);
+    }
+    /* VA is not reclaimed -- the same bump-allocator trade-off as the stacks
+     * and the MMIO window. A machine that loads and unloads modules for long
+     * enough to exhaust 256 GiB of address space has a different problem. */
 }
 
 void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {

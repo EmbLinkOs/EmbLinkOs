@@ -14,6 +14,19 @@ SECTIONS {
 
     .rodata ALIGN(4096) : AT(ADDR(.rodata) - KERNEL_VIRTUAL_BASE) {
         *(.rodata) /* All .rodata sections from input files */
+
+        /* WHAT THE KERNEL LETS A LOADABLE MODULE CALL.
+         *
+         * Gathered by the linker rather than written out as a list, so adding
+         * an export is one EMBK_EXPORT() next to the function it exports and
+         * not an edit in a second file that somebody forgets. The start/end
+         * symbols are how module.c finds the table; KEEP because nothing
+         * REFERENCES these entries and --gc-sections would otherwise be right
+         * to remove every one of them. */
+        . = ALIGN(8);
+        __embk_exports_start = .;
+        KEEP(*(.embk_exports))
+        __embk_exports_end = .;
     }
 
     .data ALIGN(4096) : AT(ADDR(.data) - KERNEL_VIRTUAL_BASE){

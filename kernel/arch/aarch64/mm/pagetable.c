@@ -823,6 +823,68 @@ uint64_t vmm_alloc_kernel_stack(uint64_t size) {
     return base + pages * PAGE_SIZE;    /* the TOP: stacks grow down */
 }
 
+/* ---- memory a loadable module runs from ---------------------------------
+ *
+ * Writable first, executable after, never both -- see mm/vmm.h. The x86 copy
+ * of this carries the full reasoning; what differs here is WHERE.
+ *
+ * aarch64's branch instruction reaches +-128 MiB, not x86's +-2 GiB, so a
+ * module has to sit far closer to the kernel or its very first call into
+ * kprintf cannot be encoded at all. 64 MiB above the image, with 32 MiB of
+ * room: comfortably inside the branch range with the kernel at the bottom of
+ * its window, and the loader refuses with a clear message rather than
+ * truncating a relocation if it ever stops being true. */
+#define MODULE_REGION_BASE (0xFFFFFFFF80000000ULL + 0x04000000ULL)
+#define MODULE_REGION_END  (MODULE_REGION_BASE + 0x02000000ULL)
+static uint64_t module_va_next = MODULE_REGION_BASE;
+
+uint64_t vmm_alloc_module(uint64_t size) {
+    if (!size) return 0;
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    spin_lock(&va_lock);
+    uint64_t base = module_va_next;
+    uint64_t next = base + (pages + 1) * PAGE_SIZE;   /* +1: a guard page */
+    if (next > MODULE_REGION_END || next < base) { spin_unlock(&va_lock); return 0; }
+    module_va_next = next;
+    spin_unlock(&va_lock);
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) return 0;
+        memset((void *)(uintptr_t)P2V(phys), 0, PAGE_SIZE);
+        if (vm_map_page(base + i * PAGE_SIZE, phys, PT_WRITE) != PT_OK)
+            return 0;
+    }
+    return base;
+}
+
+int vmm_module_make_exec(uint64_t virt, uint64_t size) {
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = 0; i < pages; i++) {
+        /* VMM_PRESENT | VMM_EXEC and deliberately NOT VMM_WRITABLE. On this
+         * architecture execution is the POSITIVE bit (PXN clear), which is
+         * the seam vmm.h warns about: saying nothing means opposite things on
+         * the two sides. */
+        if (vmm_protect_in(vmm_get_kernel_pml4(), virt + i * PAGE_SIZE,
+                           VMM_PRESENT | VMM_EXEC) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+void vmm_free_module(uint64_t virt, uint64_t size) {
+    if (!virt) return;
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t v = virt + i * PAGE_SIZE;
+        uint64_t phys = vmm_get_phys(v);
+        if (phys) pmm_free_page(phys);
+        vmm_unmap(v);
+    }
+    /* VA is not reclaimed -- the same bump-allocator trade-off as the stacks. */
+}
+
 void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {
     /* An ADOPTED thread (the boot context, and each secondary's) has no
      * allocated stack: it runs on the static one boot.S set up, and records

@@ -242,6 +242,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/fd.c \
              kernel/fs/vfs.c \
              kernel/fs/automount.c \
+             kernel/module/module.c \
+             kernel/module/exports.c \
              kernel/fs/namespace.c \
              kernel/fs/epfs.c \
              kernel/ipc/handle.c \
@@ -1974,7 +1976,7 @@ icons: $(ICONS_STAMP)
 EMBKFS_CONTENT := $(shell find system data -type f 2>/dev/null) \
                   $(shell find system data -type d 2>/dev/null)
 
-embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT)
+embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(STAGED_APPS) $(PREBUILT_APPS) build/kernel.embdbg build/libembk.so $(if $(HAVE_TCC),build/libtcc1.o) build/emlink_dynstubs.o $(wildcard build/*.elf) $(wildcard build/*.embx) $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app) $(ICONS_STAMP) $(PICTURES_STAMP) $(MUSIC_STAMP) $(EMBKFS_CONTENT) build/modules/ramdisk.ko
 	@# Drift guard: mkfs packs every build/*.elf it finds, but make only knows
 	@# about $(EMBKFS_APPS). Anything in the first set and not the second lands
 	@# on the image yet never triggers a rebuild -- a stale-image bug that is
@@ -2856,6 +2858,46 @@ uefi-signed: $(BOOTX64) build/sbkeys/PK.crt
 	    build/sbkeys/PK.der
 	@echo "  enroll build/sbkeys/PK.der in the machine's firmware, or boot"
 	@echo "  QEMU with build/ovmf_sb_enrolled.fd as its variable store."
+
+# ---- loadable kernel modules ------------------------------------------------
+#
+# A module is an ordinary relocatable object built with the KERNEL'S flags --
+# same freestanding environment, same -mcmodel=kernel, same lack of a libc.
+# That is not a coincidence to be tidied away later: a module runs in the
+# kernel's address space at the kernel's privilege, so anything that would be
+# wrong to assume in the kernel is wrong to assume here.
+#
+# No linking. The output is the .o the compiler emits, relocations and all;
+# resolving them against the running kernel is the loader's job, which is the
+# whole point -- a linked object has already had its holes filled in against
+# addresses that were only true at build time.
+MODULE_CFLAGS = $(CFLAGS) -c -fno-pic
+MODULES_OUT = build/modules
+
+$(MODULES_OUT):
+	@mkdir -p $@
+
+build/modules/ramdisk.ko: modules/ramdisk/ramdisk.c kernel/module/module.h | $(MODULES_OUT)
+	$(CC) $(MODULE_CFLAGS) -Ikernel $< -o $@
+
+.PHONY: modules
+modules: build/modules/ramdisk.ko
+
+# CODE THE KERNEL DID NOT SHIP WITH.
+#
+# Loads a relocatable object the compiler produced and the kernel has never
+# seen, requires it to register a REAL block device, reads back through the
+# block layer something the module's own code wrote, checks in the PAGE TABLES
+# that its text came out read-only AND executable rather than writable, then
+# unloads it and requires the device to be gone.
+#
+# The read-back is what separates a loader that works from one that returned
+# success: a module whose relocations were applied wrongly still loads, still
+# reports a registered device, and produces garbage the first time anything
+# calls through it.
+.PHONY: test-modules
+test-modules: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/console_test.py "test modules"
 
 # --- x86 console tests, scripted -----------------------------------------------
 # tools/console_test.py boots the kernel headless and types at its console. Any

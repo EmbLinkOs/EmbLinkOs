@@ -64,6 +64,16 @@ SECTIONS {
     .rodata ALIGN(4096) : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) {
         __rodata_start = .;
         *(.rodata .rodata.*)
+
+        /* WHAT THE KERNEL LETS A LOADABLE MODULE CALL -- the same table the
+         * x86 script gathers, because module.c is shared and looks for the
+         * same two symbols. KEEP because nothing references these entries and
+         * a garbage collector would be right to drop every one. */
+        . = ALIGN(8);
+        __embk_exports_start = .;
+        KEEP(*(.embk_exports))
+        __embk_exports_end = .;
+
         . = ALIGN(4096);
         __rodata_end = .;
     }
