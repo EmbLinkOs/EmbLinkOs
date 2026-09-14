@@ -7438,12 +7438,18 @@ closing table instead.
 - [ ] **No persistent syslog for USERSPACE.** `user/lib/syslog.h` is still a
       declaration-only stub, deliberately. The kernel's own log now survives a
       crash; a program's does not.
-- [ ] **Kernel panic symbols are off on this host.** `ksym` loads
-      `/system/kernel.embdbg`, which the Makefile produces with `$(EMBDBG)` --
-      an external tool at `~/EmbCC/embdbg` that is not installed here, so the
-      file is zero bytes and every recorded RIP reads as a bare address.
-      `tools/crash_test.py` resolves it with the host's `nm` instead, which is
-      why that test can still check the address is real.
+- [x] ~~Kernel panic symbols are off on this host.~~ Fixed: `~/EmbCC` was
+      there, only its `embdbg` binary was missing (`make embdbg` builds it),
+      and the tool shelled out to a bare `readelf` that macOS does not have --
+      which did not fail, it emitted zero line rows. It honours `$READELF`
+      now and the Makefile passes the cross one, so a panic reads
+      `selftests_handle_command+0xaada (selftests.c:3849)`. **That change is
+      in the EmbCC repository, not this one.**
+- [ ] **aarch64 has no panic symbols.** Only the x86 Makefile emits a
+      `kernel.embdbg`; `arch.mk` has no such rule, so a fault on the ARM
+      machine still prints a bare address. The tool is architecture-neutral --
+      it reads the ELF symtab and lets binutils decode the DWARF -- so this is
+      a rule and an `EMBDBG_READELF=aarch64-elf-readelf`, not a port.
 
 **Offload**
 

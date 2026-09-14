@@ -325,9 +325,16 @@ KERNEL_BIN  = kernel/kernel.strip.elf
 # present the build still proceeds (an empty file -> symbolizer disabled, the
 # panic dump falls back to hex, exactly as before).
 EMBDBG      ?= $(HOME)/EmbCC/embdbg
+# WHICH readelf embdbg SHOULDS SHELL OUT TO for the line table. It decodes the
+# DWARF with binutils rather than parsing DWARF 5 itself, and a host that
+# cross-compiles need not have a NATIVE readelf at all -- macOS ships none, and
+# the one installed for this target is named for it. Without this the tool does
+# not fail: it emits functions and ZERO line rows, so a panic names a function
+# and never a line, with nothing to say why.
+EMBDBG_READELF ?= x86_64-elf-readelf
 build/kernel.embdbg: $(KERNEL_ELF) | $(BUILD)
 	@if [ -x "$(EMBDBG)" ]; then \
-	   echo "  EMBDBG   $@"; $(EMBDBG) $< emit-kernel $@; \
+	   echo "  EMBDBG   $@"; READELF=$(EMBDBG_READELF) $(EMBDBG) $< emit-kernel $@; \
 	 else echo "  (embdbg tool absent -> no kernel panic symbols)"; : > $@; fi
 
 

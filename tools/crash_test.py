@@ -112,10 +112,15 @@ def wait_for(s, buf, needle, seconds):
 
 def symbol_for(rip):
     """Resolve a kernel address with this host's nm, against the kernel that
-    crashed. The guest could not do it: `embdbg` is not installed here, so
-    /system/kernel.embdbg is empty and ksym stays off (the Makefile says so
-    out loud). That makes the address the guest RECORDED the thing to check,
-    and the host has everything needed to check it.
+    crashed.
+
+    DELIBERATELY NOT THE GUEST'S OWN ANSWER. The guest symbolises the address
+    itself now (kernel/lib/ksym.c, against /system/kernel.embdbg) and prints
+    "func+0xN (file:line)" in its crash banner -- but a test that checked that
+    string would be asking the record and the symbolizer to agree with each
+    other, which they would even if both were reading a bad address. Resolving
+    it here, independently, against the very kernel that crashed, is what makes
+    the ADDRESS the thing under test.
 
     CONTAINMENT, NOT PROXIMITY. The first version of this capped the distance
     from the preceding symbol at 16 KiB and rejected a perfectly good address:
