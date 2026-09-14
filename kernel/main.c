@@ -24,6 +24,9 @@
 #include "drivers/storage/atapi.h"
 #include "drivers/storage/megasas.h"
 #include "drivers/storage/pvscsi.h"
+#include "drivers/storage/mptsas.h"
+#include "drivers/storage/esp.h"
+#include "drivers/storage/lsi53c895a.h"
 #include "drivers/char/virtio_console.h"
 #include "drivers/misc/virtio_balloon.h"
 #include "drivers/i2c/smbus.h"
@@ -1952,6 +1955,9 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     atapi_init();         /* and an optical drive, which answers SCSI       */
     megasas_init();       /* a RAID controller's logical drives             */
     pvscsi_init();        /* and VMware's paravirtual one                   */
+    mptsas_init();        /* and Fusion-MPT, which passes messages          */
+    esp_init();           /* and the 53C9x, which walks the bus by hand     */
+    lsi53c895a_init();    /* and the 53c895a, which runs a program          */
     embk_partition_scan_all();
 
 

@@ -34,14 +34,14 @@ not work.
 | Device | QEMU | Why it matters | Today |
 |---|---|---|---|
 | **I²C / SMBus** | `smbus-ipmi`, `i2c-ddc`, `i2c-echo` | SMBus reaches the battery, the memory SPD, and a monitor's EDID over its DDC lines | ✅ **host controller done** — `kernel/drivers/i2c/smbus.c` drives the PIIX4 and ICH9 hosts, probes the bus, and reads + validates EDID (header *and* checksum). `make test-i2c`. ⚠️ **This is not the touchpad.** I²C-HID hangs off an Intel LPSS or AMD designware controller, which **QEMU does not emulate at all** — that driver can only be written against the target machine |
-| **SD / eMMC** | `sdhci-pci`, `sd-card`, `emmc` | Laptop card readers. Many ARM boards *boot* from eMMC | absent |
+| **SD / eMMC** | `sdhci-pci`, `sd-card`, `emmc` | Laptop card readers. Many ARM boards *boot* from eMMC | ✅ **done** — `kernel/drivers/storage/sdhci.c`, PIO. `make test-sdcard` covers SD (byte addressing), SDHC (block addressing) and eMMC (capacity from the extended CSD). ⚠️ No DMA yet: 128 register reads per block |
 | **usb-net** | `usb-net` | A USB ethernet dongle is how you get networking on a laptop whose wireless chip has no driver | ✅ **RNDIS done** — `kernel/net/usb_net.c`, registered in the `net_driver` table below the PCI cards. DHCP, DNS, TCP and UDP all verified over it. ⚠️ **CDC-ECM is what most real dongles speak and QEMU emulates none**, so that path is detected and refused rather than guessed at |
-| **usb-uas** | `usb-uas`, `usb-bot` | We speak Bulk-Only Transport only. A USB 3 stick negotiates UAS; BOT still works as a fallback, but UAS is the fast path | BOT only |
-| **ATAPI / ISO9660** | `ide-cd`, `scsi-cd` | No optical path at all — no ATAPI command set, no ISO9660 filesystem. El Torito is already open in TODO.md | absent |
-| **igb** | `igb` (Intel 82576) | Closer to modern Intel server parts than e1000. `i82559`/`i8255x` covers a lot of older machines | absent |
+| **usb-uas** | `usb-uas`, `usb-bot` | We speak Bulk-Only Transport only. A USB 3 stick negotiates UAS; BOT still works as a fallback, but UAS is the fast path | ✅ **done** — `kernel/drivers/usb/usb_uas.c`. BOT remains the fallback for a device whose pipes are not named. ⚠️ One command at a time: the tagging is on the wire but nothing above it is asynchronous yet |
+| **ATAPI / ISO9660** | `ide-cd`, `scsi-cd` | No optical path at all — no ATAPI command set, no ISO9660 filesystem. El Torito is already open in TODO.md | ✅ **done** — `drivers/storage/atapi.c` (SCSI down an IDE cable) and `fs/iso9660.c` (read-only, because the medium is). `make test-cdrom` reads the same disc over IDE **and** virtio-scsi. ⚠️ No El Torito: a disc can be read, not booted from |
+| **igb** | `igb` (Intel 82576) | Closer to modern Intel server parts than e1000. `i82559`/`i8255x` covers a lot of older machines | ✅ **both done** — `kernel/net/igb.c` (advanced descriptors; the link comes up through the PHY, not CTRL.SLU) and `kernel/net/i8255x.c` (a linked list of command blocks, MAC from a three-wire EEPROM). `make test-nics` covers both |
 | **TPM** | `tpm-tis`, `tpm-crb` | The natural continuation of Secure Boot: measured boot, and sealing the EMBKFS encryption key to the boot state so a stolen disk is useless | absent. ⚠️ **Not testable here without installing `swtpm`**, which is not on this host |
 | **IOMMU** | `intel-iommu`, `amd-iommu`, `virtio-iommu` | Any device can currently DMA anywhere in memory. This is what stops a malicious Thunderbolt device | absent |
-| **SCSI / SAS HBAs** | `megasas`, `mptsas1068`, `lsi53c895a`, `am53c974`, `pvscsi` | Workstations and servers. Lower priority than the laptop parts above | absent |
+| **SCSI / SAS HBAs** | `megasas`, `mptsas1068`, `lsi53c895a`, `am53c974`, `pvscsi` | Workstations and servers. Lower priority than the laptop parts above | ✅ **all five done**, on the shared SCSI layer: `megasas.c` (a firmware mailbox), `pvscsi.c` (paravirtual rings), `mptsas.c` (message-passing FIFOs), `esp.c` (a 16-byte FIFO and the bus phases walked by hand), `lsi53c895a.c` (a processor that executes a program the driver writes). `make test-hba` runs the same disk and the same read/write/verify through all five and virtio-scsi |
 | **UFS** | `ufs` | Modern phone and thin-laptop storage | absent |
 
 ---
@@ -70,8 +70,8 @@ already in the tables the AML interpreter now reads.
 | **`virtio-9p` / `virtio-fs`** | Share the build directory straight into the VM. **Pays for itself immediately in development turnaround** — no image rebuild to test a changed file |
 | `virtio-rng` | An entropy source. x86 has RDSEED; **aarch64 has nothing** |
 | ~~`virtio-scsi`~~ | ✅ done — `drivers/storage/virtio_scsi.c`, on the shared SCSI layer. `make test-scsi` |
-| `virtio-console` / `virtio-serial` | A serial port that is not a 16550 |
-| `virtio-balloon` | Memory ballooning |
+| ~~`virtio-console`~~ | ✅ done — `drivers/char/virtio_console.c` |
+| ~~`virtio-balloon`~~ | ✅ done — `drivers/misc/virtio_balloon.c` |
 | `virtio-crypto` | Offload |
 | `virtio-iommu` | See IOMMU above |
 | `virtio-pmem` | Persistent memory |

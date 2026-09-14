@@ -175,6 +175,9 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/storage/atapi.c \
              kernel/drivers/storage/megasas.c \
              kernel/drivers/storage/pvscsi.c \
+             kernel/drivers/storage/mptsas.c \
+             kernel/drivers/storage/esp.c \
+             kernel/drivers/storage/lsi53c895a.c \
              kernel/fs/iso9660.c \
              kernel/drivers/char/platform_misc.c \
              kernel/drivers/i2c/smbus.c \
