@@ -38,6 +38,7 @@
 #include "fs/vfs.h"
 #include "fs/fat32.h"
 #include "fs/embkfs/embkfs.h"
+#include "fs/iso9660.h"
 #include "fs/automount.h"
 
 /* One mounted removable volume. The volume structs are big and there are few
@@ -49,6 +50,7 @@ struct auto_mount {
     char   at[64];
     void  *vol;                          /* fat32_volume* or embkfs_volume* */
     bool   is_fat;
+    bool   is_iso;                       /* the volume is on the disc itself */
 };
 
 #define AUTO_MAX 8
@@ -76,7 +78,20 @@ static bool try_mount_one(struct embk_block_device *dev,
     char at[64];
     path_for(dev->name, at, sizeof at);
 
-    /* FAT32 FIRST, because that is what a stick formatted on any other
+    /* ISO 9660 FIRST WHEN THE BLOCK IS 2048, because a disc is never
+     * anything else and probing it as FAT32 reads a boot sector that is not
+     * there. The check is the medium's geometry, not a device type: an ISO
+     * image written to a USB stick is still an ISO. */
+    if (iso9660_probe(dev)) {
+        if (iso9660_mount(dev, at) == EMBK_OK) {
+            slot->used = true; slot->dev = dev; slot->parent = parent;
+            slot->vol = NULL; slot->is_iso = true;
+            memcpy(slot->at, at, sizeof at);
+            return true;
+        }
+    }
+
+    /* FAT32 next, because that is what a stick formatted on any other
      * operating system carries. */
     struct fat32_volume *fv = kmalloc(sizeof *fv);
     if (fv) {
@@ -179,7 +194,8 @@ bool automount_at(uint32_t idx, const char **at, const char **dev,
         if (seen++ != idx) continue;
         if (at)  *at  = g_auto[i].at;
         if (dev) *dev = g_auto[i].dev->name;
-        if (fs)  *fs  = g_auto[i].is_fat ? "fat32" : "embkfs";
+        if (fs)  *fs  = g_auto[i].is_iso ? "iso9660"
+                      : g_auto[i].is_fat ? "fat32" : "embkfs";
         return true;
     }
     return false;

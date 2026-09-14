@@ -20,6 +20,10 @@
 #include "acpi/aml.h"
 #include "drivers/char/virtio_rng.h"
 #include "drivers/char/platform_misc.h"
+#include "drivers/storage/sdhci.h"
+#include "drivers/storage/atapi.h"
+#include "drivers/char/virtio_console.h"
+#include "drivers/misc/virtio_balloon.h"
 #include "drivers/i2c/smbus.h"
 #include "fs/ninep.h"
 #include "drivers/storage/virtio_scsi.h"
@@ -1870,6 +1874,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         kprintf("virtio-rng: seeded the pool with %u byte(s)\n", (unsigned)got);
     }
 
+    /* A console that is not a 16550 and memory the host can ask back for.
+     * Both are no-ops on a machine that does not have them. */
+    virtio_console_init();
+    virtio_balloon_init();
+
     usb_init();
     ata_init();    // registers ATA drives as block devices internally
     ahci_init();   // runs IDENTIFY per port, stores sector counts
@@ -1936,6 +1945,8 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // Done before enumeration/mount so partitions appear in the listing and the
     // mount probe below sees them alongside whole disks.
     virtio_scsi_init();   /* before the partition scan: its targets are disks */
+    sdhci_init();         /* likewise: an SD card is a disk like any other  */
+    atapi_init();         /* and an optical drive, which answers SCSI       */
     embk_partition_scan_all();
 
 

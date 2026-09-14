@@ -294,6 +294,26 @@ int  e1000_tx(const void *frame, uint32_t len);
 void e1000_poll(void);
 int  e1000_link(void);
 
+/* Intel 82575/82576 and after -- advanced descriptors, a separate driver from
+ * e1000.c because the descriptor format is genuinely different. */
+bool igb_init(uint8_t mac_out[ETH_ALEN]);
+int  igb_tx(const void *frame, uint32_t len);
+void igb_poll(void);
+int  igb_link(void);
+/* Which PCI device ids igb claims -- e1000.c asks so the two do not fight
+ * over the same function. */
+bool igb_owns_device(uint16_t device_id);
+
+/* Intel PRO/100 (82557..82559, 8255x) -- a linked list of command blocks
+ * rather than a descriptor ring. The card in every desktop of that decade. */
+bool i8255x_init(uint8_t mac_out[ETH_ALEN]);
+/* Which PCI device ids the PRO/100 driver claims -- e1000.c asks, so that
+ * driver does not map a 4 KiB window and read past the end of it. */
+bool i8255x_owns_device(uint16_t device_id);
+int  i8255x_tx(const void *frame, uint32_t len);
+void i8255x_poll(void);
+int  i8255x_link(void);
+
 /* Realtek RTL8139 -- the second vendor, and what makes the table above a seam
  * rather than a shape drawn around one implementation. */
 bool rtl8139_init(uint8_t mac_out[ETH_ALEN]);

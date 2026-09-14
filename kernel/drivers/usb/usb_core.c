@@ -500,6 +500,7 @@ void usb_device_gone(struct usb_device *dev) {
     kprintf("USB: device %04x:%04x on port %u disconnected\n",
             (unsigned)dev->vid, (unsigned)dev->pid, (unsigned)dev->port);
     usb_msc_detach(dev);
+    usb_uas_detach(dev);
     dev->hid_active = false;
     usb_free_device(dev);
 }
@@ -548,7 +549,15 @@ static void usb_parse_config(struct usb_device *dev,
                 ep->attr = cfg[off + 3];
                 ep->mps = (uint16_t)(cfg[off + 4] | (cfg[off + 5] << 8)) & 0x7FF;
                 ep->interval = cfg[off + 6];
+                ep->pipe_id = 0;
             }
+        } else if (dtype == 0x24 && dlen >= 4 && dev->num_eps) {
+            /* A class-specific descriptor that FOLLOWS an endpoint describes
+             * that endpoint. For UAS this is the pipe usage descriptor and it
+             * is the only thing that distinguishes four otherwise identical
+             * bulk pipes -- see usb_uas.c. Attaching it to the most recently
+             * parsed endpoint is what "follows" means in a descriptor blob. */
+            dev->eps[dev->num_eps - 1].pipe_id = cfg[off + 2];
         }
         off += dlen;
     }
@@ -760,7 +769,11 @@ int usb_enumerate(struct usb_device *dev) {
                dev->if_protocol == 0x02) {
         kprintf("USB: HID boot mouse detected (relative; no driver)\n");
     } else if (dev->if_class == 0x08) {
-        usb_msc_attach(dev);
+        /* UAS FIRST, BOT AS THE FALLBACK. Protocol 0x62 is USB Attached SCSI;
+         * a device that speaks it still answers Bulk-Only Transport, so a
+         * failed UAS attach loses nothing but speed. */
+        if (dev->if_protocol != 0x62 || !usb_uas_attach(dev))
+            usb_msc_attach(dev);
     } else if (dev->if_class == 0x09) {
         usb_hub_attach(dev);
     } else if (dev->if_class == 0x02 || dev->if_class == 0x0A ||

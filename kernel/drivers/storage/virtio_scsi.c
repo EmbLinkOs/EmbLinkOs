@@ -25,6 +25,7 @@
 #include "drivers/bus/virtio_pci.h"
 #include "block/block.h"
 #include "block/scsi.h"
+#include "fs/automount.h"
 #include "mm/pmm.h"
 
 #define VIRTIO_SCSI_DEVID_M 0x1048   /* 0x1040 + device type 8 */
@@ -206,15 +207,14 @@ bool virtio_scsi_init(void) {
         t->sd.ctx = t;
         if (!scsi_probe(&t->sd)) { t->used = false; continue; }
 
-        if (t->sd.is_optical) {
-            /* An optical drive has 2048-byte blocks and no filesystem this
-             * kernel reads. Reported, not registered: a CD claiming to be a
-             * disk is worse than an absent one. */
-            kprintf("virtio-scsi: target %u is an optical drive (%s %s) -- "
-                    "no ISO9660 reader yet\n", tn, t->sd.vendor, t->sd.product);
-            t->used = false;
-            continue;
-        }
+        /* An optical target used to be reported and dropped, because there
+         * was no filesystem that could read one. kernel/fs/iso9660.c is that
+         * filesystem, so it is now registered like any other block device and
+         * automount decides what is on it. Its block is 2048, which the block
+         * layer has always carried per device rather than assumed. */
+        if (t->sd.is_optical)
+            kprintf("virtio-scsi: target %u is an optical drive (%s %s)\n",
+                    tn, t->sd.vendor, t->sd.product);
 
         memset(&t->blk, 0, sizeof t->blk);
         t->blk.block_count = t->sd.blocks;
@@ -230,6 +230,7 @@ bool virtio_scsi_init(void) {
         kprintf("virtio-scsi: %s = target %u, %s %s, %llu x %u B\n",
                 t->blk.name, tn, t->sd.vendor, t->sd.product,
                 (unsigned long long)t->sd.blocks, t->sd.block_size);
+        if (t->sd.is_optical) automount_attach(&t->blk);
         found++;
     }
 

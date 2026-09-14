@@ -203,6 +203,13 @@ static const struct pci_device *e1000_find(void) {
         if (!d) continue;
         if (d->vendor_id != 0x8086) continue;
         if (d->class_code != 0x02 || d->subclass != 0x00) continue;   /* ethernet */
+        /* NOT THE igb PARTS. The class match above is deliberately broad, and
+         * that broadness is exactly what would make this driver claim an
+         * 82576 and then fail: those parts share the vendor and the class but
+         * not the descriptor format. kernel/net/igb.c owns them and says so
+         * in one place, so the two lists cannot drift apart. */
+        if (igb_owns_device(d->device_id)) continue;
+        if (i8255x_owns_device(d->device_id)) continue;
         return d;
     }
     return 0;
@@ -215,6 +222,16 @@ bool e1000_init(uint8_t mac_out[ETH_ALEN]) {
     struct pci_bar bar = pci_read_bar(d->bus, d->device, d->function, 0);
     if (!bar.valid || !bar.is_mmio) {
         kprintf("e1000: %04x:%04x has no MMIO BAR0\n", d->vendor_id, d->device_id);
+        return false;
+    }
+    /* AND THE WINDOW MUST BE BIG ENOUGH TO HOLD THE REGISTERS THIS DRIVER
+     * READS. The highest one is the receive address at 0x5400; a part whose
+     * BAR is smaller than that is not this family however its class reads,
+     * and the alternative to refusing is a page fault in kernel context
+     * partway through bring-up. Which is precisely what happened. */
+    if (bar.size && bar.size < 0x6000) {
+        kprintf("e1000: %04x:%04x BAR0 is only %llu bytes -- not this family\n",
+                d->vendor_id, d->device_id, (unsigned long long)bar.size);
         return false;
     }
     g_mmio = (volatile uint8_t *)(uintptr_t)vmm_map_mmio(bar.address,

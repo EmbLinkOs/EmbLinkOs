@@ -206,7 +206,13 @@ static void net_rx_thread(void) {
 /* Every card this kernel can drive, in the order they are tried. */
 static const struct net_driver g_drivers[] = {
     { "virtio-net", virtio_net_init, virtio_net_tx, virtio_net_poll, virtio_net_link },
+    /* igb BEFORE e1000: both match Intel ethernet parts, and the newer
+     * descriptor format is the specific case. e1000.c skips igb's device ids
+     * as well, so the ordering is a preference rather than the thing that
+     * keeps them apart. */
+    { "igb",        igb_init,        igb_tx,        igb_poll,        igb_link        },
     { "e1000",      e1000_init,      e1000_tx,      e1000_poll,      e1000_link      },
+    { "i8255x",     i8255x_init,     i8255x_tx,     i8255x_poll,     i8255x_link     },
     { "rtl8139",    rtl8139_init,    rtl8139_tx,    rtl8139_poll,    rtl8139_link    },
     /* LAST ON PURPOSE. A USB adapter is the fallback, not the preference: a
      * machine with a real NIC should use it, and the dongle is what you reach

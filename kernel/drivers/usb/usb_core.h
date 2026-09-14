@@ -54,6 +54,12 @@ struct usb_ep_info {
     uint8_t  attr;       // bmAttributes (transfer type in bits 1:0)
     uint16_t mps;
     uint8_t  interval;
+    /* THE PIPE'S JOB, when the device bothered to say. Four bulk endpoints
+     * are otherwise indistinguishable, and UAS has exactly four with four
+     * different meanings; the class-specific "pipe usage" descriptor (type
+     * 0x24) that follows each endpoint is where the device names them.
+     * 0 = the device said nothing, which is every non-UAS endpoint. */
+    uint8_t  pipe_id;    // UAS: 1 command, 2 status, 3 data-in, 4 data-out
 };
 
 struct usb_device {
@@ -149,5 +155,11 @@ void usb_core_poll(void);
 // type: 2 = bulk, 3 = interrupt; dir_in selects bit7 of the address.
 const struct usb_ep_info *usb_find_ep(struct usb_device *dev,
                                       uint8_t type, bool dir_in);
+
+/* USB Attached SCSI (kernel/drivers/usb/usb_uas.c). Returns false when the
+ * device is not UAS or could not be brought up -- the caller then has BOT to
+ * fall back on, which is the whole reason UAS devices still declare it. */
+bool usb_uas_attach(struct usb_device *dev);
+void usb_uas_detach(struct usb_device *dev);
 
 #endif /* __USB_CORE_H__ */

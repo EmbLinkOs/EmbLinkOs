@@ -169,6 +169,11 @@ KERNEL_SRC = kernel/main.c \
              kernel/acpi/acpi_dev.c \
              kernel/drivers/char/serial.c \
              kernel/drivers/char/virtio_rng.c \
+             kernel/drivers/char/virtio_console.c \
+             kernel/drivers/misc/virtio_balloon.c \
+             kernel/drivers/storage/sdhci.c \
+             kernel/drivers/storage/atapi.c \
+             kernel/fs/iso9660.c \
              kernel/drivers/char/platform_misc.c \
              kernel/drivers/i2c/smbus.c \
              kernel/drivers/video/framebuffer.c \
@@ -192,6 +197,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/net/net.c \
              kernel/net/virtio_net.c \
              kernel/net/e1000.c \
+             kernel/net/igb.c \
+             kernel/net/i8255x.c \
              kernel/net/rtl8139.c \
              kernel/net/usb_net.c \
              kernel/net/ethernet/eth.c \
@@ -204,6 +211,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/net/tcp/tcp.c \
              kernel/drivers/usb/usb.c \
              kernel/drivers/usb/usb_core.c \
+             kernel/drivers/usb/usb_uas.c \
              kernel/drivers/usb/xhci.c \
              kernel/drivers/usb/ehci.c \
              kernel/drivers/usb/uhci.c \
@@ -2978,7 +2986,7 @@ test-x86: $(IMG) $(EMBKFS_MASTER)
 # always answers "up" passes every other test here.
 .PHONY: test-nics
 test-nics: $(IMG) $(EMBKFS_MASTER)
-	@for nic in e1000 e1000e rtl8139; do \
+	@for nic in e1000 e1000e rtl8139 igb i82559er; do \
 	  echo "=== $$nic ==="; \
 	  NET=1 NIC=$$nic python3 tools/console_test.py "test dhcp" "test dns" "test tcp" \
 	    "test net" "test netudp" || exit 1; \

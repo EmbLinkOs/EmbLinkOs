@@ -134,6 +134,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   user/lib/tls/crypto/selftest.c \
                   kernel/drivers/bus/virtio_pci.c \
                   kernel/drivers/char/virtio_rng.c \
+                  kernel/drivers/char/virtio_console.c \
+                  kernel/drivers/misc/virtio_balloon.c \
                   kernel/drivers/char/platform_misc.c \
                   kernel/drivers/i2c/smbus.c \
                   kernel/drivers/input/virtio_input.c \

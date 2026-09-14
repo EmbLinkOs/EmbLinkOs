@@ -528,6 +528,18 @@ static int vfs_first_ent_cb(const char *name, uint8_t name_len,
                             uint8_t type, uint64_t ino, void *ctx)
 {
     struct vfs_first_ent *f = (struct vfs_first_ent *)ctx;
+    /* NOT A SYMLINK. This entry is about to be resolved and compared against
+     * the object id readdir reported -- and vfs_resolve FOLLOWS a symlink, by
+     * design, so it lands on the target's id and never on the link's. The
+     * check then fails on a correct walk.
+     *
+     * It did exactly that: adding /host and /media to the master image moved
+     * a symlink to the front of the root directory's hash order, and a test
+     * that had been silently depending on "the first entry happens to be a
+     * regular file" started failing with rc=0 and two different inode
+     * numbers -- the most confusing possible way for a passing walk to look
+     * broken. */
+    if (type == VFS_DT_LNK) return EMBK_OK;
     if (!f->have) {
         for (uint8_t i = 0; i < name_len; i++) f->name[i] = name[i];
         f->name[name_len] = '\0';
