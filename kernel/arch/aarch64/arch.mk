@@ -136,6 +136,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/char/virtio_rng.c \
                   kernel/drivers/char/virtio_console.c \
                   kernel/drivers/misc/virtio_balloon.c \
+                  kernel/fs/iso9660.c \
                   kernel/drivers/char/platform_misc.c \
                   kernel/drivers/i2c/smbus.c \
                   kernel/drivers/input/virtio_input.c \
@@ -150,6 +151,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/net/net.c \
                   kernel/net/virtio_net.c \
                   kernel/net/e1000.c \
+                  kernel/net/igb.c \
+                  kernel/net/i8255x.c \
                   kernel/net/rtl8139.c \
                   kernel/net/ethernet/eth.c \
                   kernel/net/ethernet/arp.c \

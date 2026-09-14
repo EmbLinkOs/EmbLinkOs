@@ -31,10 +31,19 @@
 #include "drivers/bus/pci.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
+/* THE I/O-PORT FALLBACK IS x86-ONLY. This card exposes the same registers
+ * twice -- once as memory and once as I/O ports -- and the second window only
+ * means anything on a machine that HAS an I/O port space. aarch64 does not,
+ * so there the memory window is the only one and a card without it is
+ * refused rather than reached for through an instruction that does not
+ * exist. */
+#if defined(__x86_64__)
 #include "include/io.h"
+#endif
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "include/spinlock.h"
+#include "include/arch_irq.h"       /* arch_cpu_relax */
 
 /* ---- the control/status block (CSR), the card's only registers ---------- */
 #define SCB_STATUS   0x00   /* 16-bit: status word; ack byte is the high half */
@@ -126,11 +135,19 @@ static uint8_t g_mac[ETH_ALEN];
 static inline uint32_t dma32(const volatile void *p) {
     return (uint32_t)KV2P((uint64_t)(uintptr_t)p);
 }
+#if defined(__x86_64__)
 static inline uint8_t  cr8 (uint32_t o) { return g_use_mmio ? *(volatile uint8_t  *)(g_mmio+o) : inb ((uint16_t)(g_io+o)); }
 static inline uint16_t cr16(uint32_t o) { return g_use_mmio ? *(volatile uint16_t *)(g_mmio+o) : inw ((uint16_t)(g_io+o)); }
 static inline void cw8 (uint32_t o, uint8_t v)  { if (g_use_mmio) *(volatile uint8_t  *)(g_mmio+o)=v; else outb((uint16_t)(g_io+o), v); }
 static inline void cw16(uint32_t o, uint16_t v) { if (g_use_mmio) *(volatile uint16_t *)(g_mmio+o)=v; else outw((uint16_t)(g_io+o), v); }
 static inline void cw32(uint32_t o, uint32_t v) { if (g_use_mmio) *(volatile uint32_t *)(g_mmio+o)=v; else outl((uint16_t)(g_io+o), v); }
+#else
+static inline uint8_t  cr8 (uint32_t o) { return *(volatile uint8_t  *)(g_mmio+o); }
+static inline uint16_t cr16(uint32_t o) { return *(volatile uint16_t *)(g_mmio+o); }
+static inline void cw8 (uint32_t o, uint8_t v)  { *(volatile uint8_t  *)(g_mmio+o)=v; }
+static inline void cw16(uint32_t o, uint16_t v) { *(volatile uint16_t *)(g_mmio+o)=v; }
+static inline void cw32(uint32_t o, uint32_t v) { *(volatile uint32_t *)(g_mmio+o)=v; }
+#endif
 
 static void tiny_delay(void) { for (volatile int i = 0; i < 200; i++) { } }
 
@@ -140,7 +157,7 @@ static void tiny_delay(void) { for (volatile int i = 0; i < 200; i++) { } }
 static bool scb_wait(void) {
     for (int i = 0; i < 1000000; i++) {
         if (cr8(SCB_CMD) == 0) return true;
-        __asm__ volatile("pause");
+        arch_cpu_relax();
     }
     return false;
 }
@@ -210,7 +227,7 @@ static bool run_setup_cb(uint16_t opcode, const uint8_t *data, uint32_t len) {
     if (!scb_command(CU_START, dma32(&g_setup))) return false;
     for (int i = 0; i < 2000000; i++) {
         if (g_setup.status & CB_STATUS_C) return (g_setup.status & CB_STATUS_OK) != 0;
-        __asm__ volatile("pause");
+        arch_cpu_relax();
     }
     return false;
 }
@@ -289,12 +306,20 @@ bool i8255x_init(uint8_t mac_out[ETH_ALEN]) {
         g_use_mmio = g_mmio != 0;
     }
     if (!g_use_mmio) {
+#if defined(__x86_64__)
         if (!b1.valid || b1.is_mmio) {
             kprintf("i8255x: %04x:%04x has neither an MMIO nor an I/O CSR\n",
                     d->vendor_id, d->device_id);
             return false;
         }
         g_io = (uint16_t)b1.address;
+#else
+        (void)b1;
+        kprintf("i8255x: %04x:%04x has no memory-mapped CSR, and this "
+                "machine has no I/O port space to fall back on\n",
+                d->vendor_id, d->device_id);
+        return false;
+#endif
     }
     pci_enable_bus_mastering(d->bus, d->device, d->function);
 
@@ -395,7 +420,7 @@ int i8255x_tx(const void *frame, uint32_t len) {
     if (!scb_command(CU_START, dma32(cb))) { spin_unlock(&g_tx_lock); return -1; }
 
     for (int spin = 0; spin < 2000000 && !(cb->status & CB_STATUS_C); spin++)
-        __asm__ volatile("pause");
+        arch_cpu_relax();
 
     int ok = (cb->status & CB_STATUS_C) ? (int)len : -1;
     g_tx_next = (i + 1) % I8255X_TX_DESCS;
