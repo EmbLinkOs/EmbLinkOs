@@ -792,7 +792,12 @@ _SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf",
                # A SERVICE, not an application: nothing launches filepanel from
                # the dock, apps reach it through /run/emlink.files, and it is
                # part of the system the way the desktop is. Sealed with them.
-               "filepanel.elf", "notifyd.elf"}   # -> /system/bin/
+               "filepanel.elf", "notifyd.elf",
+               # THE PASSWORD CHECKER for one session, started by init and
+               # never by a user: it is the only program in reach of a session
+               # that can read /etc/shadow, so it belongs with the system's
+               # own, not among the applications.
+               "authd.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""

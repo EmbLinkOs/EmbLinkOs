@@ -20,6 +20,7 @@
 
 #include "embk.h"
 #include "appauth.h"
+#include "emauth.h"   /* the screen lock asks authd, which is outside this session */
 #include "oscfg.h"   /* the user's dock preferences, re-read live */
 #include "emnotify.h" /* banners, for the failures a log cannot show anyone */
 #include "kit.h"
@@ -239,6 +240,133 @@ static void apps_listener(long arg) {
  * surface present for the frames either side of the flip is what makes the two
  * agree. */
 static int g_full_present = 0;
+
+/* ---- THE SCREEN LOCK ---------------------------------------------------
+ *
+ * WHY THE DESKTOP DRAWS IT AND NOT A SEPARATE PROGRAM. A lock must be in front
+ * of everything and must take every click and every keystroke. The desktop
+ * already owns the one surface with that property: the layer at z=0 that
+ * embk_win_desktop_front() lifts above every application window -- the same
+ * mechanism the Applications launcher uses. A separate lock program would be
+ * an ordinary window, and an ordinary window can be lowered.
+ *
+ * WHAT IT CANNOT DO IS CHECK THE PASSWORD. /etc/shadow is outside this
+ * session's namespace, deliberately, so the check goes to authd over
+ * /run/emlink.auth -- see user/lib/emauth.h for why that division is the whole
+ * design and not an inconvenience.
+ *
+ * WHAT THIS IS NOT. It is not a privilege boundary inside the session: every
+ * process already running in it keeps running, keeps its files open, and could
+ * draw over the screen if it wanted to. It is the answer to "someone walked
+ * past the machine", which is the threat a screen lock is actually for. */
+static int  g_locked;                  /* is the lock surface up? */
+/* Frames on which the renderer's rect cache is thrown away, so it repaints
+ * every pixel rather than what it believes changed.
+ *
+ * A whole-screen surface appearing or disappearing is the one change where
+ * "repaint what moved" has nothing to work with and the cheap thing to do is
+ * the whole screen. Two frames: the one that puts the lock up, and the one
+ * after it, which is when the layer's z-flip has landed in the compositor. */
+static int  g_invalidate;
+static int  g_lock_req;                /* the menu bar asked for one */
+static int  g_lock_checking;           /* a verify is in flight on its own thread */
+static int  g_lock_result;             /* what it came back with (EMAUTH_*) */
+static int  g_lock_done;               /* ...and that it came back at all */
+static char g_lock_pw[EMBK_AUTH_PASSWORD_MAX + 1];
+static char g_lock_msg[96];
+static char g_lock_user[EMBK_AUTH_USERNAME_MAX + 1];
+static unsigned g_lock_gen;            /* keys the subtree; see apps_grid's comment */
+
+/* The menu bar's Lock signal. Its own endpoint rather than a payload on the
+ * launcher's: the connect IS the message there, and adding a first byte to it
+ * would make every existing client's silence mean something. */
+static void lock_listener(long arg) {
+    (void)arg;
+    int lh = (int)embk_chan_listen("/run/emlink.lock");
+    if (lh < 0) {
+        char b[96];
+        snprintf(b, sizeof b, "home: cannot listen at /run/emlink.lock (%d) -- "
+                              "the menu bar's Lock Screen will do nothing\n", lh);
+        embk_puts(1, b);
+        embk_thread_exit(1);
+    }
+    for (;;) {
+        int ch = (int)embk_chan_accept(lh);
+        if (ch < 0) { embk_sleep_ms(100); continue; }
+        g_lock_req = 1;
+        embk_chan_close(ch);
+    }
+}
+
+/* THE CHECK RUNS ON ITS OWN THREAD because a wrong password is SUPPOSED to be
+ * slow -- authd waits out an escalating penalty before answering, up to thirty
+ * seconds. Done on the render thread that would be thirty seconds of a frozen
+ * screen, which looks exactly like a crash and is also a lie: the machine is
+ * fine, it is refusing you on purpose. */
+static void lock_verify_thread(long arg) {
+    (void)arg;
+    struct emauth_rep rep;
+    int v = emauth_verify(g_lock_pw, &rep);
+    for (unsigned i = 0; i < sizeof g_lock_pw; i++) g_lock_pw[i] = 0;   /* not kept */
+    g_lock_result = v;
+    g_lock_done = 1;
+    embk_thread_exit(0);
+}
+
+static void lock_set(int on) {
+    if (on == g_locked) return;
+    g_locked = on;
+    if (on) {
+        g_apps_open = 0;                      /* one modal surface at a time */
+        g_lock_gen++;
+        g_lock_msg[0] = 0;
+        for (unsigned i = 0; i < sizeof g_lock_pw; i++) g_lock_pw[i] = 0;
+    }
+    /* The launcher may have owned the layer; the lock does now, and when it
+     * goes the layer goes back to the ground unless the launcher still wants
+     * it -- which it cannot, because locking closed it. */
+    int rc = embk_win_desktop_front(on || g_apps_open);
+    em_structure_changed();
+    g_full_present = 3;
+    g_invalidate = 2;
+    g_dock_dirty = 1;
+    { char b[96];
+      snprintf(b, sizeof b, "home: screen %s (desktop_front rc=%d)\n",
+               on ? "LOCKED" : "unlocked", rc);
+      embk_puts(1, b); }
+}
+
+/* Asked for a lock. Refused, out loud, when there is nothing to unlock with:
+ * the development auto-login opens a session for an account the store has
+ * never heard of, and putting a password prompt in front of that would lock
+ * the machine until it is rebooted. */
+static void poll_lock_request(void) {
+    if (!g_lock_req) return;
+    g_lock_req = 0;
+    if (g_locked) return;
+
+    struct emauth_rep rep;
+    int st = emauth_status(&rep);
+    if (st == EMAUTH_NOACCOUNT) {
+        embk_notify_level(EMNOTE_WARN, "Lock Screen",
+                          "This account has no password, so there would be no way "
+                          "to unlock. Set one from the login screen first.");
+        embk_puts(1, "home: lock refused -- this session's user has no account\n");
+        return;
+    }
+    if (st < 0) {
+        embk_notify_level(EMNOTE_FAIL, "Lock Screen",
+                          "The password service is not running; the screen cannot "
+                          "be locked.");
+        char b[96];
+        snprintf(b, sizeof b, "home: lock refused -- no authd (%d)\n", st);
+        embk_puts(1, b);
+        return;
+    }
+    snprintf(g_lock_user, sizeof g_lock_user, "%s", rep.user);
+    lock_set(1);
+}
+
 
 
 static void apps_set_open(int open) {
@@ -704,6 +832,19 @@ static Color launch_tint(void) {
     return c;
 }
 
+/* The lock's wash is DARKER and far more opaque than the launcher's: the point
+ * of the launcher is that you can still see your desktop behind it, and the
+ * point of this is that you cannot. What is on your screen is as much yours as
+ * what is in your files. */
+static Color lock_tint(void) {
+    Color c = { .r = 0.03f, .g = 0.04f, .b = 0.08f, .a = 1.0f };
+    return c;
+}
+static Color lock_warn(void) {
+    Color c = { .r = 0.96f, .g = 0.55f, .b = 0.45f, .a = 1.0f };
+    return c;
+}
+
 
 /* Does this app match what has been typed? Case-insensitive substring, which
  * is the whole of "search" at this scale: with a dozen apps, ranking is a
@@ -720,6 +861,84 @@ static int app_matches(const char *label, const char *q) {
         if (!*y) return 1;
     }
     return 0;
+}
+
+/* The lock surface. Drawn from the same place in the tree as the launcher and
+ * for the same reason -- last, so it is on top of everything the desktop
+ * itself draws, while the LAYER being in front puts it over every app. */
+static void lock_ui(void) {
+    if (!g_locked) return;
+
+    /* The verify thread's answer, collected on the render thread so nothing
+     * below has to think about two threads touching the same strings. */
+    if (g_lock_done) {
+        g_lock_done = 0;
+        g_lock_checking = 0;
+        if (g_lock_result == EMAUTH_OK) {
+            g_lock_msg[0] = 0;
+            lock_set(0);
+            return;
+        }
+        snprintf(g_lock_msg, sizeof g_lock_msg,
+                 g_lock_result == EMAUTH_NOACCOUNT
+                     ? "There is no account to check against."
+                     : "That is not the password.");
+        g_lock_gen++;            /* a fresh field, empty, focused */
+    }
+
+    char key[24];
+    snprintf(key, sizeof key, "lock%u", g_lock_gen);
+    Overlay() {
+        /* OPAQUE, and not the Glass the launcher uses. The launcher is glass on
+         * purpose -- you are meant to see the desktop you are choosing an app
+         * to put on top of. A lock is the opposite: what is on your screen is
+         * as much yours as what is in your files, and a wash you can read
+         * through protects neither.
+         *
+         * It is also what MAKES it cover. The desktop's canvas is composited
+         * PER PIXEL over the windows below it (compositor.c: "empty regions
+         * reveal the desktop below"), so a surface at alpha 0.96 let the menu
+         * bar's window -- 1016x340 while its dropdown is open, which is exactly
+         * how a lock gets asked for -- show straight through the top of the
+         * lock screen. Measured: the whole of that rectangle was still the
+         * desktop, seconds later, hummingbird and all. */
+        VStack(.width = g_sw, .height = g_sh, .align = Center, .justify = Center,
+               .spacing = 0, .background = lock_tint(), .key = key) {
+            /* FILL, not Leading: a Leading card hugs its children, and a
+             * password field that hugs its (empty) content is a 28-pixel box
+             * -- which is what the first version drew. */
+            Card(.width = 380, .px = 28, .py = 26, .spacing = 14, .align = Fill) {
+                Text(g_datetime).caption().tertiary();
+                Text(g_lock_user[0] ? g_lock_user : "Locked").heading();
+                Text("Type your password to come back.").caption().secondary();
+                if (g_lock_checking) {
+                    HStack(.spacing = 10, .align = Center) {
+                        Spinner();
+                        Text("Checking...").caption().secondary();
+                    }
+                } else {
+                    em_field_autofocus();
+                    bool enter = PasswordField(g_lock_pw, sizeof g_lock_pw,
+                                               "password").submitted();
+                    if (Button("Unlock").primary().clicked() || enter) {
+                        g_lock_msg[0] = 0;
+                        g_lock_checking = 1;
+                        g_lock_done = 0;
+                        if (embk_thread_create(lock_verify_thread, 0) < 0) {
+                            g_lock_checking = 0;
+                            snprintf(g_lock_msg, sizeof g_lock_msg,
+                                     "The check could not be started.");
+                        }
+                    }
+                }
+                if (g_lock_msg[0]) Text(g_lock_msg).caption().color(lock_warn());
+            }
+        }
+    }
+    /* NO dismissal. The launcher closes when the scrim is clicked and Esc
+     * closes it; this is the one surface in the system where neither may do
+     * anything, and saying so here is cheaper than finding out later that a
+     * key nobody thought about opens the machine. */
 }
 
 static void apps_grid(void) {
@@ -1193,7 +1412,7 @@ static void home_ui(void) {
          * again. */
         {
             float rx, ry;
-            if (RightClicked(&rx, &ry)) {
+            if (!g_locked && RightClicked(&rx, &ry)) {
                 g_ctx_x = rx; g_ctx_y = ry; g_ctx_open = true;
                 g_dock_dirty = 1;
             }
@@ -1213,6 +1432,7 @@ static void home_ui(void) {
             }
         }
         apps_grid();           /* the Apps launcher (modal grid), when open */
+        lock_ui();             /* ...and the screen lock, over even that */
         dock_label();          /* names the dock icon under the pointer (overlay) */
         drag_ghost();          /* the dragged icon follows the cursor (overlay) */
     }
@@ -1495,6 +1715,7 @@ int main(int argc, char **argv, char **envp) {
     dock_prune_missing();                   /* offer only what can actually run */
     embk_thread_create(apps_listener, 0);   /* the top bar's Apps signal listener */
     embk_thread_create(prefs_listener, 0);  /* ...and what it wears while it draws */
+    embk_thread_create(lock_listener, 0);   /* ...and the menu bar's Lock Screen */
     /* apps describe their own icon/name (docs presentation manifest) */
     load_app_meta("files", g_dock[0].icon, sizeof g_dock[0].icon, g_dock[0].label, sizeof g_dock[0].label);
     load_app_meta("term",  g_dock[1].icon, sizeof g_dock[1].icon, g_dock[1].label, sizeof g_dock[1].label);
@@ -1555,6 +1776,8 @@ int main(int argc, char **argv, char **envp) {
         /* TAKEN HERE, a frame after the menu item was chosen and a frame after
          * the menu closed -- a screenshot of the menu you used to ask for a
          * screenshot is a screenshot of the wrong thing. */
+        if (g_locked) g_want_shot = 0;      /* not of a locked screen, and not to
+                                             * the locked-out user's Pictures */
         if (g_want_shot && ++g_shot_delay > 2) { g_want_shot = 0; g_shot_delay = 0;
                                                  take_screenshot(); }
         /* The writer has finished with the buffer, so the thread that allocated
@@ -1563,12 +1786,19 @@ int main(int argc, char **argv, char **envp) {
         desk_ink_poll();       /* labels legible on whatever picture is behind them */
         wins_poll();           /* what is actually running, ours or not */
         poll_apps_request();   /* the top bar's Apps button opens our launcher */
+        poll_lock_request();   /* ...and its Lock Screen puts the lock up */
 
         /* Esc closes the launcher. Only worth reading while it is up: the
          * desktop layer is in FRONT then, so the compositor gives it the
          * keyboard, and draining keys at any other time would take them from
          * whichever app the user is actually typing into. */
-        if (g_apps_open) {
+        /* LOCKED FIRST, and Esc is not a way out. Every key goes to the
+         * password field -- there is nothing else on the screen to type into,
+         * and nothing behind it may have them either. */
+        if (g_locked) {
+            for (int c; (c = embk_key_poll()) > 0; )
+                if (!g_lock_checking) ui_input_char(c);
+        } else if (g_apps_open) {
             for (int c; (c = embk_key_poll()) > 0; ) {
                 if (c == 27) { apps_set_open(0); break; }   /* Esc dismisses */
                 /* Everything else goes to the search field. The desktop has no
@@ -1621,6 +1851,7 @@ int main(int argc, char **argv, char **envp) {
          * repaints are simply always correct now, and cost what changed. */
         g_dock_dirty = 0;
 
+        if (g_invalidate > 0) { g_invalidate--; scene_render_invalidate(&r); }
         scene_render_frame(&r, &sa, ui_scene_of(ui_root()), &rt);
 
         if (r.full || r.n_dirty == 0 || g_full_present > 0) {
@@ -1649,8 +1880,11 @@ int main(int argc, char **argv, char **envp) {
                 embk_win_present_rect(win, pixels, sw, sh, x0, y0, x1 - x0, y1 - y0);
         }
 
-        /* a tile was clicked this frame -> launch it as a floating window */
-        if (g_launch) spawn_app(g_launch, g_launch_dir);
+        /* a tile was clicked this frame -> launch it as a floating window.
+         * Never while locked: the surface is over the dock, but a stray click
+         * that reached one anyway must not start a program on a machine whose
+         * owner has walked away. */
+        if (g_launch && !g_locked) spawn_app(g_launch, g_launch_dir);
 
         embk_sleep_ms(15);   /* pace ~60Hz while YIELDING -- never starve the apps */
     }

@@ -34,6 +34,7 @@
 #define DESKTOP      "/system/bin/home.elf"
 #define SETUP        "/system/bin/setup.elf"
 #define LOGIN        "/system/bin/login.elf"
+#define AUTHD        "/system/bin/authd.elf"
 #define SHADOW       "/etc/shadow"
 #define PASSWD       "/etc/passwd"
 #define NS_ACTS_MAX  9           /* up to 8 bindings + the NEW_SESSION action */
@@ -260,6 +261,24 @@ static int64_t spawn_narrow(const char *path, struct embk_spawn_file_action *ext
     return embk_spawn(path, argv_, acts, n);
 }
 
+/* THE PASSWORD CHECKER FOR ONE SESSION, and the reason it is started here.
+ *
+ * A screen lock has to verify a password, and /etc/shadow is outside every
+ * session's namespace on purpose -- an account store the session can read is
+ * one every program in it can read. init is where the authority to see /etc
+ * already lives, so the check lives here too, in a process that is told whose
+ * session it serves and will answer about no other account.
+ *
+ * The filesystem and nothing else: no display (it has no window), no network,
+ * and above all not EMBK_CAP_SESSION. It is killed when the desktop exits --
+ * the next session gets its own, named for whoever logs in next. */
+static int64_t spawn_authd(const char *user) {
+    struct embk_spawn_file_action acts[1];
+    embk_action_set_caps(&acts[0], EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
+    char *argv_[] = { (char *)AUTHD, (char *)user, NULL };
+    return embk_spawn(AUTHD, argv_, acts, 1);
+}
+
 void _start(long argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     log_line("init: up -- root of EmbLink userspace authority\n");
@@ -353,6 +372,13 @@ void _start(long argc, char **argv, char **envp) {
             log_line(b);
         }
 
+        /* Before the desktop, so the endpoint is already published when the
+         * desktop's first frame goes up and a lock can be asked for from the
+         * first second of the session rather than the second one. */
+        int authd = (int)spawn_authd(user);
+        if (authd < 0)
+            log_line("init: no authd -- this session will not be able to lock\n");
+
         char *dargv[] = { (char *)DESKTOP, NULL };
         int h = (int)embk_spawn_env(DESKTOP, dargv, session_env, sacts, snacts);
         if (h < 0) {
@@ -367,6 +393,11 @@ void _start(long argc, char **argv, char **envp) {
          * would leak one of init's 16 handles. The kernel has already stopped
          * whatever the session left running: its leader is gone. */
         int code = embk_wait(h);
+
+        /* AND THE SESSION'S PASSWORD CHECKER GOES WITH IT. It is init's child,
+         * not the session's, so nothing else would end it -- and leaving it
+         * running would hold /run/emlink.auth open in the NEXT user's name. */
+        if (authd >= 0) { embk_kill(authd); embk_wait(authd); }
 
         if (code == EMBK_EXIT_LOGOUT) {
             char b[96], *q = b;

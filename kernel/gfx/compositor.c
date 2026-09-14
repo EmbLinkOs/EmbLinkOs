@@ -1570,6 +1570,18 @@ int compositor_win_minimize(int pid, uint32_t id) {
  * everything the user has open, which is not a thing one app may do to another.
  * A MODE, not a raise: clearing it restores z=0 exactly, so the ground does not
  * end up parked somewhere in the middle of the stack. */
+/* IS A FULL-SCREEN SHELL SURFACE UP? -- the launcher, or the screen lock.
+ *
+ * Read by the system key shortcuts, which are performed by the kernel and
+ * therefore cannot be declined by whatever is on screen. GUI+Tab raising an
+ * application window OVER a locked screen is not a cosmetic problem: the lock
+ * is the desktop layer in front, and a window above it is the session, open,
+ * to whoever pressed the key. So the kernel stops honouring the shortcuts for
+ * as long as the layer is up. */
+static int g_desktop_front;
+
+int compositor_shell_modal(void) { return g_desktop_front; }
+
 int compositor_desktop_front(int pid, int on) {
     spin_lock(&g_comp_lock);
     int rc = -1;
@@ -1579,6 +1591,7 @@ int compositor_desktop_front(int pid, int on) {
         if (w->pid != pid) break;                  /* not yours to move */
         int want = on ? DESKTOP_FRONT_Z : 0;
         rc = 0;
+        g_desktop_front = on ? 1 : 0;
         if (w->z != want) {
             w->z = want;
             /* THE MENU BAR IS NOT LIFTED WITH IT, and the attempt is worth

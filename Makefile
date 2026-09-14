@@ -3326,6 +3326,14 @@ test-nvme: $(IMG) embkfs.img
 test-login: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/login_test.py
 
+# THE SCREEN LOCK, end to end: the refusal on an account with no password,
+# first-boot setup typed on the real keyboard, then lock / wrong password /
+# right password on the session that account opens. Every claim is checked
+# where the two processes meet -- what the desktop says, and what authd says.
+.PHONY: test-lock
+test-lock: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/lock_test.py
+
 test-swap-store: $(IMG) $(EMBKFS_MASTER) build/swap.img
 	@SWAP_DISK=build/swap.img python3 tools/console_test.py "test swap store"
 

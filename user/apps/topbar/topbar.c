@@ -322,6 +322,19 @@ static const char *bar_clock(void) {
  * separate process, so it signals by CONNECTING to the desktop's IPC channel in
  * /run (the desktop listens there and opens the grid). The connect itself is the
  * signal -- no payload -- so we close immediately. */
+/* LOCK THE SCREEN. Its own endpoint beside the launcher's, and the connect is
+ * again the whole message. The bar cannot draw the lock itself -- it is an
+ * ordinary window and an ordinary window can be lowered -- so it asks the
+ * desktop, which owns the layer that goes in front of everything. */
+static void request_lock(void) {
+    embk_puts(1, "TopBar: lock screen requested\n");
+    int ch = (int)embk_chan_connect("/run/emlink.lock");
+    if (ch >= 0) { embk_chan_close(ch); return; }
+    char b[96];
+    snprintf(b, sizeof b, "TopBar: could not reach the desktop to lock the screen (%d)\n", ch);
+    embk_puts(1, b);
+}
+
 static void request_apps(void) {
     embk_puts(1, "TopBar: launcher button pressed\n");
     int ch = (int)embk_chan_connect("/run/emlink.desktop");
@@ -440,6 +453,11 @@ static void bar(void) {
                         else
                             snprintf(logout_label, sizeof logout_label, "Log Out");
                     }
+                    /* LOCK SCREEN above Log Out, because it is the one you
+                     * want when you stand up and the one you would otherwise
+                     * reach for Log Out to do -- losing everything you had
+                     * open to answer the door. */
+                    if (MenuItem("Lock Screen")) request_lock();
                     if (MenuItem(logout_label)) embk_session_end(0);
                     MenuSeparator();
                     /* RESTART AND SHUT DOWN. Until these existed the only way

@@ -178,6 +178,10 @@ int  compositor_win_minimize(int pid, uint32_t id);
  * is drawn by the desktop process, and at z=0 it opened behind whatever the
  * user already had open. Refused for any process but the layer's owner. */
 int  compositor_desktop_front(int pid, int on);
+/* 1 while that layer is in front -- a full-screen shell surface (the launcher,
+ * the screen lock) is covering everything. The kernel's own key shortcuts stop
+ * working then; see compositor.c. */
+int  compositor_shell_modal(void);
 /* Advance window open/park motion one frame; no-op when nothing is moving. */
 void compositor_anim_tick(void);
 /* Average luminance (0-255) of what is composed under a screen rect, or -1. */

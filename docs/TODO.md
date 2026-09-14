@@ -7465,3 +7465,23 @@ closing table instead.
       `nvdimm.c`), which is correct and slow. A cached mapping needs explicit
       cache-line writeback before each flush; a persistence guarantee that is
       nearly right is worse than a slow one that is right.
+
+**The session**
+
+- [ ] **The screen lock has no idle timer.** It locks when you choose Lock
+      Screen, which is the half a person controls; the half that protects a
+      machine its owner walked away from without thinking about it is a timer,
+      and a preference saying how long. The pieces that are missing are an
+      idle measure the desktop can read (last input, which the compositor
+      already knows) and one more key in `user/lib/oscfg.h`.
+- [ ] **A locked session's applications keep running, and are supposed to.**
+      The lock is the answer to "someone walked past this machine", not a
+      privilege boundary inside the session: every process in it still holds
+      its files open and could draw on the screen if it tried. Anything
+      stronger means the compositor refusing to composite a session's windows
+      while it is locked, which is a compositor change and a different claim.
+- [ ] **A time zone change reaches applications only when they next start.**
+      The desktop hands TZ to every process it spawns, and a running one keeps
+      what it was given -- the Date & Time pane says so. Changing it live means
+      a way to tell a process its environment moved, which nothing in this
+      system has.
