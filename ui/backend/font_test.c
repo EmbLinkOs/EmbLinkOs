@@ -251,12 +251,22 @@ static void t5_pen_advance(struct font *f, uint32_t fh) {
 
     /* render "AAA" and confirm three inked squares spaced by the advance. */
     int W = 128, H = 64;
+    /* ZEROED FIRST. render_target has fields beyond the five set here --
+     * clear_dirty among them -- and leaving them as stack garbage makes the
+     * test depend on what happened to be on the stack. That is not
+     * theoretical: a non-zero clear_dirty makes begin_frame() wipe the target,
+     * so the checkerboard T2 paints was being erased before the blur sampled
+     * it, and the blur "failed" by reading the zeros it had been handed. */
     struct render_target rt;
+    memset(&rt, 0, sizeof rt);
     rt.pixels = calloc((size_t)W*H, 4); rt.width = W; rt.height = H; rt.stride = W*4;
     rt.format = EMBK_PIXFMT_BGRA8888_PRE;
     be->begin_frame(&rt, NULL, 0);
     struct color white = {1,1,1,1};
-    be->draw_text(&rt, 4, 40, "AAA", fh, 50.0f, white, 1.0f);
+    /* draw_text grew a paint and a box after this test was written: a
+     * gradient-stroked glyph needs the box it is stroked over. NULL paint is
+     * the plain-fill case this test has always been about. */
+    be->draw_text(&rt, 4, 40, "AAA", fh, 50.0f, white, 1.0f, NULL, 0.0f, 0.0f);
     be->end_frame(&rt);
 
     /* advance = 500 * 50/1000 = 25px; square 'A' ~ x in [bearing, bearing+15] */

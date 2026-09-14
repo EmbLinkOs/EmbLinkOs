@@ -8,6 +8,7 @@
 #include "backend.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 static int g_fail = 0;
@@ -24,7 +25,14 @@ static void unbgra(uint32_t p, int *b, int *g, int *r, int *a) {
     *b = p & 255; *g = (p >> 8) & 255; *r = (p >> 16) & 255; *a = (p >> 24) & 255;
 }
 static struct render_target make_target(int w, int h) {
+    /* ZEROED FIRST. render_target has fields beyond the five set here --
+     * clear_dirty among them -- and leaving them as stack garbage makes the
+     * test depend on what happened to be on the stack. That is not
+     * theoretical: a non-zero clear_dirty makes begin_frame() wipe the target,
+     * so the checkerboard T2 paints was being erased before the blur sampled
+     * it, and the blur "failed" by reading the zeros it had been handed. */
     struct render_target rt;
+    memset(&rt, 0, sizeof rt);
     rt.pixels = calloc((size_t)w * h, 4);
     rt.width = w; rt.height = h; rt.stride = w * 4;
     rt.format = EMBK_PIXFMT_BGRA8888_PRE;
@@ -103,13 +111,15 @@ static void t2_backdrop(void) {
     /* a real sample of the checkerboard averages toward mid-grey; black
      * scratch memory or an unsampled region would be ~0 */
     CHECK(avg > 80 && avg < 175, "blurred region averages toward the checkerboard mean");
+    printf("    blurred region mean red = %d (checkerboard mean is ~127)\n", avg);
 
     free(rt.pixels);
 }
 
 /* build: two overlapping red rects; `grouped` wraps them in a 50%-opacity
  * group, else each rect is individually 50% opaque. Returns overlap+solo px. */
-static void build_two_rects(int grouped, int *overlap_g, int *solo_g) {
+static void build_two_rects(int grouped, int *overlap_g, int *solo_g,
+                            uint32_t *overlap_px, uint32_t *solo_px) {
     struct scene_arena a; scene_arena_init(&a);
     struct scene_renderer r; scene_render_init(&r, cpu_backend_get());
     struct render_target rt = make_target(64, 64);
@@ -133,6 +143,8 @@ static void build_two_rects(int grouped, int *overlap_g, int *solo_g) {
     scene_render_frame(&r, &a, root, &rt);
     *overlap_g = green_at(&rt, 30, 30);   /* inside both rects */
     *solo_g    = green_at(&rt, 14, 14);   /* inside A only */
+    *overlap_px = px_at(&rt, 30, 30);
+    *solo_px    = px_at(&rt, 14, 14);
 
     free(rt.pixels); scene_render_destroy(&r); scene_arena_destroy(&a);
 }
@@ -141,15 +153,35 @@ static void build_two_rects(int grouped, int *overlap_g, int *solo_g) {
 static void t3_opacity_group(void) {
     printf("T3 opacity group removes the overlap seam:\n");
     int g_overlap, g_solo, u_overlap, u_solo;
-    build_two_rects(1, &g_overlap, &g_solo);   /* grouped */
-    build_two_rects(0, &u_overlap, &u_solo);   /* ungrouped (per-rect alpha) */
+    uint32_t g_px_overlap, g_px_solo, u_px_overlap, u_px_solo;
+    build_two_rects(1, &g_overlap, &g_solo, &g_px_overlap, &g_px_solo);
+    build_two_rects(0, &u_overlap, &u_solo, &u_px_overlap, &u_px_solo);
 
-    /* grouped: overlap blends as ONE flattened red at 50% -> ~= solo region */
+    /* THE ORIGINAL ASSERTIONS, restored. They were never wrong: the target was.
+     *
+     * make_target() left render_target's tail as stack garbage, clear_dirty
+     * among it -- so begin_frame() sometimes wiped the white background this
+     * test paints, and every reading came back as premultiplied red on
+     * nothing (g=0 four times, which cannot distinguish a flattened group from
+     * a double-blended one). With the struct zeroed, red at 50% over white is
+     * (255,128,128) and the double-blended overlap is (255,64,64), which is
+     * exactly what these two lines have always been looking for.
+     *
+     * Worth recording because the first fix here was to rewrite the
+     * assertions in terms of alpha to match what the broken target produced --
+     * fitting the test to the bug, which would have locked it in. */
     CHECK(abs(g_overlap - g_solo) < 20, "grouped: overlap matches non-overlap (no seam)");
-    /* ungrouped: the overlap double-blends -> measurably darker (lower green) */
     CHECK(u_overlap < g_overlap - 25, "ungrouped overlap is measurably darker (seam present)");
+    /* THE WHOLE PIXEL, not one channel of it. Printing only green cannot tell
+     * "red at full opacity" (r=255 g=0) from "nothing was drawn at all"
+     * (0,0,0), and those need completely different fixes. */
+    /* THE WHOLE PIXEL, not one channel. Printing only green cannot tell "red
+     * at full opacity" from "nothing was drawn at all", and those need
+     * completely different fixes -- which cost an hour here. */
     printf("    grouped overlap g=%d solo g=%d | ungrouped overlap g=%d solo g=%d\n",
            g_overlap, g_solo, u_overlap, u_solo);
+    printf("    rgba: grouped %08x/%08x | ungrouped %08x/%08x (overlap/solo)\n",
+           g_px_overlap, g_px_solo, u_px_overlap, u_px_solo);
 }
 
 /* ---- T4: dirty-rect + backdrop-blur -> fresh sample on frame 2 --------- */
