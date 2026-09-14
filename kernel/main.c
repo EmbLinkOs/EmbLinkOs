@@ -10,6 +10,7 @@
 #include "drivers/video/gpu.h"
 #include "drivers/video/console.h"
 #include "drivers/input/keyboard.h"
+#include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
 #include "gfx/compositor.h"   /* compositor_pointer_tick() -- cursor/focus/drag */
 #include "drivers/timer/timer.h"
@@ -1905,6 +1906,15 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     fb_init();
     console_init();
     keyboard_init();
+    /* A KEYBOARD, TABLET OR TOUCHSCREEN THAT IS NOT A PS/2 PART.
+     *
+     * aarch64 has driven virtio-input since it had no i8042 to fall back on.
+     * x86 has one, so this was never built here -- and that made a whole class
+     * of device unreachable on the architecture most people run: a virtio
+     * touchscreen is not a PS/2 device and never will be, and a machine with
+     * no PS/2 controller at all is now the normal kind. The driver attaches
+     * only to devices that exist, so a machine with both keeps both. */
+    virtio_input_init();
     ioapic_route_isa(1, 33, 0);   // keyboard: ISA IRQ 1 -> vector 33 -> CPU 0 (override-aware)
     // Clamp the cursor to the ACTUAL screen size (varies by GPU: virtio-gpu is
     // 1280x800, stdvga 1024x768) so it can reach every corner of the desktop.
@@ -2190,6 +2200,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // Legacy USB HCs (UHCI/OHCI/EHCI) are polled: drain any completed
         // interrupt-IN transfers and re-arm them. xHCI input is IRQ-driven.
         usb_poll();
+        virtio_input_poll();
         // Drive the window compositor's pointer: cursor, click-to-focus, and
         // title-bar drag. Runs here (schedulable shell-process context) so the
         // compositor spinlock is never taken from an IRQ handler. No-op until a

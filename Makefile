@@ -198,6 +198,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/timer/rtc.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
+             kernel/drivers/input/virtio_input.c \
              kernel/drivers/bus/pci.c \
              kernel/drivers/bus/virtio_pci.c \
              kernel/net/net.c \
@@ -2961,6 +2962,17 @@ test-scsi: $(IMG) $(EMBKFS_MASTER)
 # kernel/block/scsi.c makes is that they differ only in the envelope. This is
 # how that claim is checked instead of asserted: the same disk, the same
 # signature, the same read-write-verify, over each of them in turn.
+# A TOUCHSCREEN IS NOT A MOUSE WITH A DIFFERENT NAME.
+#
+# It reports contacts, each with a slot, a position and a lifetime that ends
+# when its tracking id goes to -1 -- there is no release event. The failures
+# are quiet: one finger reported at the average of two, or a contact that
+# never lifts. tools/touch_test.py puts the fingers down from the host, so the
+# host knows what the guest's report should say.
+.PHONY: test-touch
+test-touch: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/touch_test.py
+
 .PHONY: test-hba
 test-hba: $(IMG) $(EMBKFS_MASTER)
 	@dd if=/dev/zero of=build/sas.img bs=1m count=32 2>/dev/null

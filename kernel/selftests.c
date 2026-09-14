@@ -67,6 +67,7 @@
 #include "drivers/i2c/smbus.h"
 #include "lib/random.h"
 #include "fs/automount.h"
+#include "drivers/input/virtio_input.h"
 #include "drivers/storage/atapi.h"
 #include "drivers/storage/sdhci.h"
 #include "fs/ninep.h"
@@ -3054,6 +3055,34 @@ int selftests_handle_command(const char *cmd)
      * which controller carries it is not this test's business -- it looks for
      * the geometry, not for a driver.
      * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test touch -- a touchscreen's contacts, reported rather than asserted.
+     *
+     * The guest cannot claim "a finger is on the glass"; only the host that
+     * put it there can. So this REPORTS -- whether a multitouch device was
+     * found, how many contacts have ever begun, and how many are down right
+     * now -- and tools/touch_test.py, which did the touching, checks the
+     * numbers against what it sent. Same division of labour as the USB
+     * hot-plug test, for the same reason.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test touch") == 0) {
+        if (!virtio_input_touch_present()) {
+            kprintf("\n[touch] no multitouch device on this machine\n");
+            kprintf("\n[cmd] test touch: SKIP\n");
+            return 1;
+        }
+        uint32_t down = virtio_input_touch_count();
+        kprintf("\n[touch] %u contact(s) began, %u down now\n",
+                (unsigned)virtio_input_touch_events(), (unsigned)down);
+        for (uint32_t i = 0; i < 10; i++) {
+            int32_t x = 0, y = 0;
+            if (virtio_input_touch_at(i, &x, &y))
+                kprintf("  slot %u at %d,%d\n", (unsigned)i, (int)x, (int)y);
+        }
+        kprintf("\n[cmd] test touch: OK\n");
+        return 1;
+    }
+
     if (strcmp(cmd, "test hba") == 0) {
         /* THIRTY-TWO MEGABYTES, HOWEVER THEY ARE DIVIDED UP. Matching on a
          * block COUNT would have quietly skipped UFS, whose logical units use

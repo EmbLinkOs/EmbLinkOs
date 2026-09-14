@@ -19,6 +19,15 @@ void virtio_input_poll(void);
 
 bool virtio_input_present(void);
 
+/* MULTITOUCH. A touchscreen reports CONTACTS, not a cursor: each has a slot,
+ * a position and a lifetime that ends when its tracking id goes to -1. The
+ * pointer follows the first contact (see the .c); these expose the rest so a
+ * gesture recogniser can be written above this layer rather than inside it. */
+bool     virtio_input_touch_present(void);
+uint32_t virtio_input_touch_count(void);
+uint32_t virtio_input_touch_events(void);
+bool     virtio_input_touch_at(uint32_t slot, int32_t *x, int32_t *y);
+
 /* Set the three lock LEDs from an EKM_* modifier bitmap. Called by
  * keyboard.c's kbd_set_leds() where there is no PS/2 controller to send an
  * 0xED to. Safe with no keyboard attached: it does nothing. */

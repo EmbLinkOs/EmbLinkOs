@@ -63,6 +63,21 @@
 #define ABS_X     0x00
 #define ABS_Y     0x01
 
+/* MULTITOUCH, which is a protocol inside the event stream rather than a new
+ * event type. A touchscreen does not report "finger 2 moved": it reports
+ * ABS_MT_SLOT to say which contact it is talking about, and then that
+ * contact's fields, until the next SLOT changes the subject. A TRACKING_ID of
+ * -1 is how a contact says it has lifted -- there is no release event.
+ *
+ * That stateful framing is the whole difficulty. A driver that treats these
+ * as independent axes sees one finger at the average of all of them. */
+#define ABS_MT_SLOT        0x2F
+#define ABS_MT_POSITION_X  0x35
+#define ABS_MT_POSITION_Y  0x36
+#define ABS_MT_TRACKING_ID 0x39
+#define BTN_TOUCH          0x14A
+#define MT_MAX_SLOTS       10
+
 #define BTN_LEFT   0x110
 #define BTN_RIGHT  0x111
 #define BTN_MIDDLE 0x112
@@ -119,6 +134,27 @@ static uint32_t      g_vi_count;
 static int32_t g_abs_max_x = 32767, g_abs_max_y = 32767;
 static int32_t g_last_x, g_last_y;
 static uint32_t g_buttons;
+
+/* The contacts currently on the glass. Reported state, not derived: a slot
+ * stays active until its tracking id goes to -1, whatever else arrives. */
+static struct { bool active; int32_t x, y; } g_mt[MT_MAX_SLOTS];
+static uint32_t g_mt_slot;        /* which contact the device is talking about */
+static uint32_t g_mt_events;
+static bool g_mt_present;
+
+uint32_t virtio_input_touch_count(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < MT_MAX_SLOTS; i++) if (g_mt[i].active) n++;
+    return n;
+}
+uint32_t virtio_input_touch_events(void) { return g_mt_events; }
+bool virtio_input_touch_present(void) { return g_mt_present; }
+bool virtio_input_touch_at(uint32_t slot, int32_t *x, int32_t *y) {
+    if (slot >= MT_MAX_SLOTS || !g_mt[slot].active) return false;
+    if (x) *x = g_mt[slot].x;
+    if (y) *y = g_mt[slot].y;
+    return true;
+}
 
 /* Counters, for the boot self-test. "The device came up" and "events actually
  * arrive" are different claims, and only the second one is worth making --
@@ -254,9 +290,48 @@ static void vi_handle(const struct virtio_input_event *e) {
     }
     case EV_ABS:
         g_ptr_events++;
-        if (e->code == ABS_X) g_last_x = (int32_t)e->value;
-        else if (e->code == ABS_Y) g_last_y = (int32_t)e->value;
-        return;
+        switch (e->code) {
+        case ABS_X: g_last_x = (int32_t)e->value; return;
+        case ABS_Y: g_last_y = (int32_t)e->value; return;
+
+        /* THE SLOT IS A MODE, NOT A VALUE. Everything after it belongs to
+         * that contact until another SLOT event changes the subject, so it
+         * has to be remembered across events -- which is the one thing a
+         * per-event switch statement naturally does not do. */
+        case ABS_MT_SLOT:
+            g_mt_slot = e->value < MT_MAX_SLOTS ? e->value : 0;
+            return;
+
+        /* AND -1 IS HOW A FINGER LIFTS. There is no release event: the
+         * tracking id going negative is the whole notification, and a driver
+         * that only watches positions leaves a contact on the screen
+         * forever. */
+        case ABS_MT_TRACKING_ID:
+            if ((int32_t)e->value < 0) {
+                g_mt[g_mt_slot].active = false;
+            } else if (!g_mt[g_mt_slot].active) {
+                g_mt[g_mt_slot].active = true;
+                g_mt_events++;
+            }
+            return;
+
+        /* POSITION DOES NOT MAKE A CONTACT EXIST. Only the tracking id does,
+         * in both directions -- that is the whole of protocol B's lifetime
+         * rule. Marking a slot active here as well reads as a harmless
+         * belt-and-braces line, and it makes a lifted finger impossible to
+         * remove on any device that sends one more position for the slot
+         * after the tracking id goes to -1. Nothing here has been seen doing
+         * that; the rule is followed because it is the rule, not because
+         * something broke. */
+        case ABS_MT_POSITION_X:
+            g_mt[g_mt_slot].x = (int32_t)e->value;
+            return;
+        case ABS_MT_POSITION_Y:
+            g_mt[g_mt_slot].y = (int32_t)e->value;
+            return;
+        default:
+            return;
+        }
     case EV_REL:
         if (e->code == REL_WHEEL)
             mouse_set_absolute(g_last_x, g_last_y, g_abs_max_x, g_buttons,
@@ -265,7 +340,28 @@ static void vi_handle(const struct virtio_input_event *e) {
     case EV_SYN:
         /* The frame is complete: publish the accumulated position. Doing it
          * here rather than per-axis is what stops the cursor from tracking
-         * through an intermediate (newX, oldY) point on every move. */
+         * through an intermediate (newX, oldY) point on every move.
+         *
+         * A TOUCHSCREEN DRIVES THE POINTER FROM ITS FIRST CONTACT, and the
+         * contact existing IS the button being down -- there is no separate
+         * press. Later contacts are counted and kept but do nothing on their
+         * own: a gesture recogniser is a different piece of software, and
+         * inventing one here would put guesses in the input path. */
+        if (g_mt_present) {
+            uint32_t buttons = g_buttons;
+            int32_t x = g_last_x, y = g_last_y;
+            if (g_mt[0].active) {
+                x = g_mt[0].x;
+                y = g_mt[0].y;
+                buttons |= MOUSE_BTN_LEFT;
+            } else {
+                buttons &= ~MOUSE_BTN_LEFT;
+            }
+            g_last_x = x;
+            g_last_y = y;
+            mouse_set_absolute(x, y, g_abs_max_x, buttons, 0);
+            return;
+        }
         mouse_set_absolute(g_last_x, g_last_y, g_abs_max_x, g_buttons, 0);
         return;
     default:
@@ -331,8 +427,30 @@ void virtio_input_init(void) {
         uint8_t nabs = vi_cfg(d, VI_SEL_EV_BITS, EV_ABS, bits, sizeof bits);
         bool is_tablet = (nabs > 0) && (bits[0] & 0x03);  /* ABS_X | ABS_Y */
 
+        /* A TOUCHSCREEN IS NOT A TABLET WITH MORE AXES. It is recognised by
+         * the multitouch position axis being in its capability bitmap --
+         * ABS_MT_POSITION_X, code 0x35, which is byte 6 bit 5. Probing for
+         * the capability rather than the device's name string, for the same
+         * reason as everything else here: the name belongs to QEMU. */
+        bool is_touch = (nabs > 6) && (bits[6] & (1u << (ABS_MT_POSITION_X & 7)));
+        if (is_touch) {
+            is_tablet = true;                /* it reports ABS_X/Y as well */
+            g_mt_present = true;
+            /* The touch surface's own range, which is the one the contacts
+             * are reported in. */
+            uint8_t ai[24];
+            if (vi_cfg(d, 0x12, ABS_MT_POSITION_X, ai, sizeof ai) >= 8)
+                g_abs_max_x = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
+                                        ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
+            if (vi_cfg(d, 0x12, ABS_MT_POSITION_Y, ai, sizeof ai) >= 8)
+                g_abs_max_y = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
+                                        ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
+            if (g_abs_max_x <= 0) g_abs_max_x = 32767;
+            if (g_abs_max_y <= 0) g_abs_max_y = 32767;
+        }
+
         /* The tablet's real coordinate range, read rather than assumed. */
-        if (is_tablet) {
+        if (is_tablet && !is_touch) {
             uint8_t ai[24];
             if (vi_cfg(d, 0x12 /* ID_ABS_INFO */, ABS_X, ai, sizeof ai) >= 8)
                 g_abs_max_x = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
@@ -376,7 +494,9 @@ void virtio_input_init(void) {
 
         kprintf("virtio-input: %u:%u.%u is a %s, queue %u, polled%s\n",
                 pci->bus, pci->device, pci->function,
-                d->is_keyboard ? "keyboard" : (is_tablet ? "tablet" : "device"),
+                d->is_keyboard ? "keyboard"
+                               : (is_touch ? "touchscreen"
+                                           : (is_tablet ? "tablet" : "device")),
                 d->qsize,
                 d->sqsize ? ", statusq (LEDs)" : "");
     }
