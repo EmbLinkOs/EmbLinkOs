@@ -69,6 +69,7 @@
 #include "fs/automount.h"
 #include "drivers/input/virtio_input.h"
 #include "drivers/storage/virtio_pmem.h"
+#include "drivers/storage/nvdimm.h"
 #include "drivers/crypto/virtio_crypto.h"
 #include "drivers/iommu/virtio_iommu.h"
 #include "drivers/iommu/intel_iommu.h"
@@ -3319,7 +3320,15 @@ int selftests_handle_command(const char *cmd)
     }
 
     if (strcmp(cmd, "test pmem") == 0) {
-        if (!virtio_pmem_present()) {
+        /* TWO WAYS TO HAVE PERSISTENT MEMORY and the test is about neither of
+         * them: virtio-pmem is a device that says where its region is, an
+         * NVDIMM is memory in a slot with an ACPI table saying it is special.
+         * What has to be true afterwards is identical. */
+        uint64_t bytes = 0;
+        const char *kind = NULL;
+        if (virtio_pmem_present()) { bytes = virtio_pmem_size(); kind = "virtio-pmem"; }
+        else if (nvdimm_count())   { bytes = nvdimm_bytes(0);    kind = "nvdimm"; }
+        if (!bytes) {
             kprintf("\n[pmem] no persistent memory on this machine\n");
             kprintf("\n[cmd] test pmem: SKIP\n");
             return 1;
@@ -3327,7 +3336,7 @@ int selftests_handle_command(const char *cmd)
         struct embk_block_device *d = NULL;
         for (uint32_t i = 0; i < embk_block_count(); i++) {
             struct embk_block_device *c = embk_block_get(i);
-            if (c && c->block_count == virtio_pmem_size() / 512) d = c;
+            if (c && c->block_count == bytes / 512) d = c;
         }
         if (!d) {
             kprintf("  FAIL: the region is not in the block table\n");
@@ -3345,8 +3354,8 @@ int selftests_handle_command(const char *cmd)
             found = (uint32_t)buf[12] | ((uint32_t)buf[13] << 8) |
                     ((uint32_t)buf[14] << 16) | ((uint32_t)buf[15] << 24);
         }
-        kprintf("\n[pmem] %llu MiB, generation found: %u\n",
-                (unsigned long long)(virtio_pmem_size() >> 20), (unsigned)found);
+        kprintf("\n[pmem] %s, %llu MiB, generation found: %u\n", kind,
+                (unsigned long long)(bytes >> 20), (unsigned)found);
 
         uint32_t next = found + 1;
         memset(buf, 0, sizeof buf);

@@ -30,6 +30,7 @@
 #include "drivers/storage/lsi53c895a.h"
 #include "drivers/storage/ufs.h"
 #include "drivers/storage/virtio_pmem.h"
+#include "drivers/storage/nvdimm.h"
 #include "drivers/crypto/virtio_crypto.h"
 #include "drivers/iommu/virtio_iommu.h"
 #include "drivers/iommu/intel_iommu.h"
@@ -37,6 +38,7 @@
 #include "drivers/tpm/tpm.h"
 #include "acpi/hotplug.h"
 #include "acpi/erst.h"
+#include "drivers/misc/virtio_mem.h"
 #include "drivers/char/virtio_console.h"
 #include "drivers/misc/virtio_balloon.h"
 #include "drivers/i2c/smbus.h"
@@ -1888,6 +1890,8 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     tpm_init();           /* the chip that remembers what booted, if there is one */
     acpi_hotplug_init();  /* and watch for a CPU or a DIMM arriving later   */
     erst_init();          /* somewhere to leave a crash record              */
+    /* AFTER the heap exists: growing the page bitmap allocates. */
+    virtio_mem_init();    /* memory offered a block at a time               */
 
     audio_init();  // sound out; harmless when the machine has no card
     /* The chipset's two-wire bus: the battery, the memory SPD, a monitor's
@@ -1996,6 +2000,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     lsi53c895a_init();    /* and the 53c895a, which runs a program          */
     ufs_init();           /* and UFS, which a phone would have              */
     virtio_pmem_init();   /* and memory that survives a reboot              */
+    nvdimm_init();        /* and the kind that is just memory in a slot     */
     virtio_crypto_init(); /* and a cipher engine, if the host lends one     */
     embk_partition_scan_all();
 

@@ -33,13 +33,24 @@ BACKING = os.path.join(BUILD, "pmem.img")
 SIZE_MB = 64
 
 
+KIND = sys.argv[1] if len(sys.argv) > 1 else "virtio-pmem"
+
+
 def run_guest():
     env = dict(os.environ)
     env["MEM"] = "1024M,slots=2,maxmem=4G"
-    env["EXTRA_QEMU"] = (
-        "-machine pc,nvdimm=on "
-        "-object memory-backend-file,id=pm0,share=on,mem-path=%s,size=%dM "
-        "-device virtio-pmem-pci,memdev=pm0,id=nv0" % (BACKING, SIZE_MB))
+    if KIND == "nvdimm":
+        # THE OTHER KIND. No device at all: memory in a slot, and an ACPI
+        # table saying it is persistent. Same guest-visible outcome.
+        env["EXTRA_QEMU"] = (
+            "-machine pc,nvdimm=on "
+            "-object memory-backend-file,id=pm0,share=on,mem-path=%s,size=%dM "
+            "-device nvdimm,memdev=pm0,id=nv0" % (BACKING, SIZE_MB))
+    else:
+        env["EXTRA_QEMU"] = (
+            "-machine pc,nvdimm=on "
+            "-object memory-backend-file,id=pm0,share=on,mem-path=%s,size=%dM "
+            "-device virtio-pmem-pci,memdev=pm0,id=nv0" % (BACKING, SIZE_MB))
     p = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "console_test.py"),
                         "test pmem"],
                        cwd=ROOT, env=env, capture_output=True, text=True)
@@ -47,7 +58,7 @@ def run_guest():
 
 
 def generations(text):
-    found = re.search(r"\[pmem\] \d+ MiB, generation found: (\d+)", text)
+    found = re.search(r"\[pmem\] \S+, \d+ MiB, generation found: (\d+)", text)
     wrote = re.search(r"\[pmem\] generation written: (\d+)", text)
     return (int(found.group(1)) if found else None,
             int(wrote.group(1)) if wrote else None)
@@ -60,7 +71,7 @@ def main():
     # "generation 1" mean nothing.
     with open(BACKING, "wb") as f:
         f.truncate(SIZE_MB * 1024 * 1024)
-    print("pmem: %d MiB backing file, zeroed" % SIZE_MB)
+    print("pmem: %s, %d MiB backing file, zeroed" % (KIND, SIZE_MB))
 
     out1 = run_guest()
     f1, w1 = generations(out1)

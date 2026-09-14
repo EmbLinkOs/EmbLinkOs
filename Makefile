@@ -173,6 +173,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/char/virtio_rng.c \
              kernel/drivers/char/virtio_console.c \
              kernel/drivers/misc/virtio_balloon.c \
+             kernel/drivers/misc/virtio_mem.c \
              kernel/drivers/storage/sdhci.c \
              kernel/drivers/storage/atapi.c \
              kernel/drivers/storage/megasas.c \
@@ -182,6 +183,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/storage/lsi53c895a.c \
              kernel/drivers/storage/ufs.c \
              kernel/drivers/storage/virtio_pmem.c \
+             kernel/drivers/storage/nvdimm.c \
              kernel/drivers/crypto/virtio_crypto.c \
              kernel/drivers/iommu/virtio_iommu.c \
              kernel/drivers/iommu/intel_iommu.c \
@@ -3045,7 +3047,11 @@ test-crypto: $(IMG) $(EMBKFS_MASTER)
 
 .PHONY: test-pmem
 test-pmem: $(IMG) $(EMBKFS_MASTER)
-	@python3 tools/pmem_test.py
+	@echo "=== virtio-pmem ==="
+	@python3 tools/pmem_test.py virtio-pmem || exit 1
+	@echo "=== nvdimm (no device at all: memory in a slot) ==="
+	@python3 tools/pmem_test.py nvdimm || exit 1
+	@echo "=== test-pmem: OK"
 
 .PHONY: test-touch
 test-touch: $(IMG) $(EMBKFS_MASTER)

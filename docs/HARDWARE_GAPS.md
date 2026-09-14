@@ -55,7 +55,7 @@ already in the tables the AML interpreter now reads.
 |---|---|---|
 | **PCI bridge configuration** | `pcie-root-port`, `pci-bridge`, `pxb` | ✅ **done** — `pci_bridge_configure()` in `drivers/bus/pci.c`: reports every bridge, fills in a bus range or memory window nobody assigned, and turns on decoding **and bus mastering on the bridge itself** — without which a device behind it cannot complete a single DMA however it is configured. Never rewrites a window firmware already set. `make test-bridge` drives a SCSI controller behind a `pcie-root-port` and behind a legacy `pci-bridge` |
 | **CPU hot-plug** | built into `-smp` | ✅ **done** — `kernel/acpi/hotplug.c` polls the ACPI hot-plug register block (0x0CD8 on q35, 0xAF00 on i440fx — the two chipsets differ and nothing says which) and `smp_hotplug_cpu()` runs the same trampoline and startup-IPI sequence boot does. `make test-hotplug`: 2 cores → add one over QMP → 3 online |
-| **Memory hot-plug** | `pc-dimm`, `nvdimm`, `virtio-mem` | ✅ **`pc-dimm` done** — the same poller reads the memory slot's base and size and `pmm_add_region()` grows the page bitmap, which cannot be extended in place (it sits immediately after the kernel image) so it is reallocated from the heap. `make test-hotplug` adds 256 MiB and checks the allocator grew by exactly 65536 pages. ⚠️ `virtio-mem` is a different protocol and is not driven; removal is not implemented |
+| **Memory hot-plug** | `pc-dimm`, `nvdimm`, `virtio-mem` | ✅ **`pc-dimm` and `nvdimm` done.** The ACPI poller reads a memory slot's base and size and `pmm_add_region()` grows the page bitmap — which cannot be extended in place (it sits immediately after the kernel image) so it is reallocated from the heap. `make test-hotplug` adds 256 MiB and checks the allocator grew by exactly 65536 pages. `nvdimm` is a different thing entirely — no device, just memory in a slot and an NFIT entry whose type GUID says it is persistent — and is in `drivers/storage/nvdimm.c`, covered by `make test-pmem`. ⚠️ **`virtio-mem` is written and has never run:** this build of QEMU has no such device (*"'virtio-mem-pci' is not a valid device model name"*), so only the probe declining is verified. Removal is not implemented for any of them: this allocator cannot vacate a range that is in use |
 | **`acpi-erst`** | `acpi-erst` | ✅ **done** — `kernel/acpi/erst.c`. The unusual part: the ACPI table does not describe a device, it contains a PROGRAM, and the OS is the interpreter. `make test-erst` writes a UEFI CPER record, kills the machine, reads the backing file from the host, and boots again to find it. ⚠️ Nothing writes a record on an actual panic yet — that is the panic path's change, not the driver's |
 | **`pvpanic`** | `pvpanic`, `pvpanic-pci` | Tells the host the guest panicked. A dozen lines; makes CI failures loud instead of a timeout |
 | **Watchdog** | `i6300esb` | Auto-reset on a hang |
@@ -97,12 +97,35 @@ framebuffer, mildly useful on aarch64 where there is no VGA to fall back to.
 
 ---
 
-## If you pick three
+## Where this stands
 
-1. ~~**I²C / SMBus**~~ — the host controller is done. What is left of it is
-   I²C-HID for the touchpad, and that needs the target machine: no emulator
-   here has an LPSS/designware controller to develop against.
-2. ~~**usb-net**~~ — done for RNDIS. CDC-ECM needs a real dongle to develop
-   against; its MAC lives in a string descriptor named by a functional
-   descriptor the USB core does not parse yet.
-3. **virtio-9p** — the only item here that makes every *future* item cheaper.
+**Sections A, B and C are done**, with four exceptions, and every one of them
+is a limit of THIS MACHINE rather than a decision:
+
+| Not done | Why |
+|---|---|
+| **I²C-HID** (the touchpad) | Hangs off an Intel LPSS or AMD designware controller. **QEMU emulates neither.** Needs the target machine to develop against |
+| **CDC-ECM** (most real USB ethernet dongles) | QEMU emulates no ECM device. The path is detected and refused rather than guessed at |
+| **TPM** | Written for both interfaces; **never executed.** `swtpm` is not installed and QEMU's TPM devices require it |
+| **virtio-mem**, **vhost-vsock** | This QEMU build has neither device. virtio-mem is written and unrun; vhost-vsock is not written, because vsock in QEMU is vhost-only and vhost is a Linux kernel interface |
+
+Everything else in A, B and C has a driver and a test that runs it:
+
+    make test-hba      seven SCSI transports, one disk, one read/write/verify
+    make test-sdcard   SD, SDHC and eMMC
+    make test-cdrom    ATAPI over IDE and over virtio-scsi
+    make test-nics     five network cards
+    make test-iommu    virtio-iommu, Intel VT-d, AMD-Vi
+    make test-pmem     virtio-pmem and nvdimm, across a kill and a reboot
+    make test-erst     a crash record, likewise
+    make test-hotplug  a CPU and a DIMM added to a running machine
+    make test-bridge   a controller behind a PCIe root port and a pci-bridge
+    make test-touch    a touchscreen's contacts
+    make test-crypto   the device's AES against our own
+    make test-i2c      SMBus and EDID
+    make test-ninep    the host's filesystem, mounted
+
+**What is left is not on this list.** The next real gaps are the ones
+PILLARS.md names and no emulator can answer: a GPU driver for a machine whose
+framebuffer the firmware did not set up, wireless, and suspend-to-RAM. For
+those the missing thing is hardware, not code.
