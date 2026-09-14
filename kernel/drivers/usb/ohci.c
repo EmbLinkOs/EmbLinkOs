@@ -13,6 +13,7 @@
 #include "drivers/usb/usb_core.h"
 
 #include "include/kprintf.h"
+#include "drivers/timer/timer.h"
 #include "include/kstring.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -191,9 +192,21 @@ static int ohci_run_ed(struct ohci_hc *hc, bool control,
         ohci_write(hc, OHCI_CMDSTATUS, OHCI_CS_BLF);
     }
 
+    /* A DEADLINE OFF THE CLOCK, NOT A SPIN COUNT.
+     *
+     * This waited `timeout_ms * 20000` iterations of a tight loop, which is
+     * not a timeout -- it is a guess about how fast the processor is, and it
+     * is wrong by whatever ratio this machine differs from the one it was
+     * calibrated on. Here it was wrong in the direction that matters: a
+     * 64-descriptor transfer got 34 of them done before the count ran out,
+     * so a stick enumerated perfectly and every read of it failed. The
+     * controller was fine and the driver simply stopped waiting.
+     *
+     * A millisecond is a millisecond on every machine, and it is also the
+     * unit the hardware works in: one USB frame. */
     int result = -2;
-    uint64_t spins = (uint64_t)timeout_ms * 20000;
-    for (uint64_t i = 0; i < spins; i++) {
+    uint64_t deadline = timer_uptime_ms() + timeout_ms;
+    while (timer_uptime_ms() <= deadline) {
         uint32_t head = ((volatile struct ohci_ed *)&hc->ed_work)->head;
         if (head & 1) {                       // halted (error/stall)
             for (uint32_t t = 0; t < ntd; t++) {
@@ -244,7 +257,12 @@ static int ohci_control_xfer(struct usb_device *dev,
     memcpy(hc->setup_buf, setup, 8);
     if (wlen && !dir_in && data) memcpy(hc->bounce, data, wlen);
 
-    uint32_t ndata = (wlen + mps - 1) / mps;
+    /* One descriptor per page-pair, as in the bulk path -- not one per packet.
+     * A control transfer is usually small enough that the difference does not
+     * show, which is exactly why the same mistake could sit here unnoticed:
+     * a descriptor read big enough to need thirty of them would have hit the
+     * same controller limit that made every bulk read fail. */
+    uint32_t ndata = wlen ? (wlen + 4095) / 4096 : 0;
     uint32_t ntd = 2 + ndata;
     if (ntd > OHCI_NUM_TD) return USB_ERR_IO;
 
@@ -254,16 +272,17 @@ static int ohci_control_xfer(struct usb_device *dev,
     ohci_fill_td(&hc->td[0], OHCI_TD_DP_SETUP, OHCI_TD_T_DATA0,
                  hc->setup_buf, 8, 0);
 
-    // Data stage (toggles start at DATA1)
-    uint32_t idx = 1, off = 0, toggle = 1;
+    /* Data stage. Its first packet is DATA1 by definition; the controller
+     * alternates from there, within a descriptor and across them, so only the
+     * first has its toggle forced. */
+    uint32_t idx = 1, off = 0;
     while (off < wlen) {
         uint32_t chunk = wlen - off;
-        if (chunk > mps) chunk = mps;
+        if (chunk > 4096) chunk = 4096;
         ohci_fill_td(&hc->td[idx],
                      dir_in ? OHCI_TD_DP_IN : OHCI_TD_DP_OUT,
-                     toggle ? OHCI_TD_T_DATA1 : OHCI_TD_T_DATA0,
+                     idx == 1 ? OHCI_TD_T_DATA1 : 0,
                      hc->bounce + off, chunk, 0);
-        toggle ^= 1;
         off += chunk;
         idx++;
     }
@@ -294,7 +313,7 @@ static int ohci_control_xfer(struct usb_device *dev,
     uint32_t got = 0, sz_off = 0;
     for (uint32_t i = 1; i < idx; i++) {
         uint32_t chunk = wlen - sz_off;
-        if (chunk > mps) chunk = mps;
+        if (chunk > 4096) chunk = 4096;
         got += ohci_td_done_bytes(&hc->td[i], chunk);
         sz_off += chunk;
     }
@@ -313,24 +332,48 @@ static int ohci_bulk_xfer(struct usb_device *dev, uint8_t ep_addr,
     if (len > sizeof(hc->bounce)) return USB_ERR_IO;
     if (!dir_in && data && len) memcpy(hc->bounce, data, len);
 
-    uint32_t npkts = len ? (len + mps - 1) / mps : 1;
-    if (npkts > OHCI_NUM_TD) return USB_ERR_IO;
-
+    /* ONE DESCRIPTOR FOR THE WHOLE TRANSFER, NOT ONE PER PACKET.
+     *
+     * This built a TD for every max-packet: sixty-four of them for a 4 KiB
+     * read. That is legal and it is not how the hardware is meant to be
+     * driven -- a single OHCI descriptor carries up to two pages and the
+     * controller does the packetising itself, one frame instead of sixty-four.
+     *
+     * It was also WRONG, and quietly. Past about thirty descriptors on one
+     * endpoint the controller stopped and raised UnrecoverableError, so a
+     * stick enumerated perfectly (INQUIRY and READ CAPACITY are one
+     * descriptor each) and every actual read of it failed -- and with the
+     * controller then halted, every command after it timed out too, which
+     * made it look like the device had gone away.
+     *
+     * THE TOGGLE IS WHY IT WAS WRITTEN THIS WAY. The file's own header says
+     * toggles are "forced per-TD from the core's per-endpoint state, so the
+     * ED toggle-carry mechanism is never relied upon" -- and forcing one per
+     * TD means one TD per packet. It does not have to: the T field sets the
+     * toggle for the descriptor's FIRST packet and the controller alternates
+     * correctly through the rest of it. So the toggle is still forced, once,
+     * and what the core believes afterwards is computed from the bytes that
+     * actually moved. */
     uint32_t tail_phys = ohci_dma(&hc->td_tail);
     uint8_t toggle = usb_toggle_get(dev, ep_addr);
     uint32_t idx = 0, off = 0;
 
     do {
+        /* A descriptor's buffer may cross ONE page boundary and no more, so
+         * 4096 bytes starting anywhere is always expressible. */
         uint32_t chunk = len - off;
-        if (chunk > mps) chunk = mps;
+        if (chunk > 4096) chunk = 4096;
         ohci_fill_td(&hc->td[idx],
                      dir_in ? OHCI_TD_DP_IN : OHCI_TD_DP_OUT,
-                     toggle ? OHCI_TD_T_DATA1 : OHCI_TD_T_DATA0,
+                     /* Force the toggle on the FIRST descriptor only; after
+                      * that the controller's own carry is correct and
+                      * overriding it would restart the sequence. */
+                     idx == 0 ? (toggle ? OHCI_TD_T_DATA1 : OHCI_TD_T_DATA0) : 0,
                      hc->bounce + off, chunk, 0);
-        toggle ^= 1;
         off += chunk;
         idx++;
-    } while (off < len);
+    } while (off < len && idx < OHCI_NUM_TD);
+    if (off < len) return USB_ERR_IO;
 
     for (uint32_t i = 0; i + 1 < idx; i++) {
         hc->td[i].next = ohci_dma(&hc->td[i + 1]);
@@ -346,21 +389,39 @@ static int ohci_bulk_xfer(struct usb_device *dev, uint8_t ep_addr,
     hc->ed_work.next = 0;
 
     int rc = ohci_run_ed(hc, false, idx, 2000);
-    if (rc == -2) return USB_ERR_TIMEOUT;
-    if (rc >= 0) {
-        usb_toggle_set(dev, ep_addr, usb_toggle_get(dev, ep_addr) ^ (rc & 1));
-        return (ohci_td_cc(&hc->td[rc]) == OHCI_CC_STALL)
-            ? USB_ERR_STALL : USB_ERR_IO;
+    if (rc == -2) {
+        kprintf("OHCI: bulk ep %02x, %u byte(s) in %u TD(s): timed out\n",
+                ep_addr, len, idx);
+        return USB_ERR_TIMEOUT;
     }
-
-    usb_toggle_set(dev, ep_addr, toggle);
+    if (rc >= 0) {
+        /* SAY WHICH WAY IT FAILED. The condition code is the only thing the
+         * controller tells you about a failed transfer, and returning a bare
+         * USB_ERR_IO throws it away -- which left "the stick enumerates and
+         * its filesystem cannot be read" with nothing to go on at all. */
+        uint8_t cc = ohci_td_cc(&hc->td[rc]);
+        kprintf("OHCI: bulk ep %02x, %u byte(s): TD %d failed, condition %u\n",
+                ep_addr, len, rc, cc);
+        usb_toggle_set(dev, ep_addr, usb_toggle_get(dev, ep_addr) ^ (rc & 1));
+        return (cc == OHCI_CC_STALL) ? USB_ERR_STALL : USB_ERR_IO;
+    }
 
     uint32_t got = 0, sz_off = 0;
     for (uint32_t i = 0; i < idx; i++) {
         uint32_t chunk = len - sz_off;
-        if (chunk > mps) chunk = mps;
+        if (chunk > 4096) chunk = 4096;
         got += ohci_td_done_bytes(&hc->td[i], chunk);
         sz_off += chunk;
+    }
+
+    /* WHAT THE TOGGLE IS NOW depends on how many packets actually went, not
+     * on how many were asked for: a device that answers short ends the
+     * sequence early, and the next transfer on this endpoint has to agree
+     * with it or the device ignores everything that follows. A zero-length
+     * transfer is still one packet. */
+    {
+        uint32_t pkts = got ? (got + mps - 1) / mps : 1;
+        usb_toggle_set(dev, ep_addr, (uint8_t)(toggle ^ (pkts & 1)));
     }
     if (got > len) got = len;
     if (dir_in && data && got) memcpy(data, hc->bounce, got);

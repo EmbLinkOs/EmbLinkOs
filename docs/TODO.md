@@ -7361,13 +7361,12 @@ closing table instead.
 
 **USB**
 
-- [ ] **OHCI enumerates a stick and cannot read its filesystem.** The device
-      is found, the medium registers as a block device with the right
-      capacity, and then `automount` reports "no filesystem this kernel can
-      read" -- for the identical image that mounts over UHCI, EHCI and xHCI.
-      So the defect is in OHCI's own transfer path, not in the filesystem or
-      the SCSI layer. Found by running the same boot-time enumeration across
-      all four controllers, which nothing had done before.
+- [x] ~~OHCI enumerates a stick and cannot read its filesystem.~~ Fixed: it
+      built one descriptor per 64-byte packet, so a 4 KiB read needed 64 of
+      them and the controller gave up partway through with
+      UnrecoverableError. One descriptor per transfer instead. `make
+      test-usb-all` compares all four controllers so this cannot come back
+      unnoticed.
 - [ ] **xHCI's hot-plug is polled, like the other three.** The controller
       reports connect and disconnect as Port Status Change events on the event
       ring, which would be immediate and free; the driver reads PORTSC every

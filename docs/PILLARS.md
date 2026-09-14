@@ -84,11 +84,11 @@ controller saw one of them; and its mass storage registered a block device
 without ever mounting it, which the other three controllers have done since
 automount was written.
 
-**Still open on it:** OHCI enumerates a stick and registers the medium, and
-then the filesystem on it cannot be read (`automount: sda has no filesystem
-this kernel can read`) where the identical image mounts over UHCI, EHCI and
-xHCI. That is a defect in OHCI's transfer path, found by running the same
-test across all four, and it is in docs/TODO.md.
+**And all four controllers now agree.** `make test-usb-all` runs the same
+stick through UHCI, EHCI, OHCI and xHCI at boot, and `make test-usb-hotplug`
+plugs it into each of them while the machine runs. Nothing had ever compared
+them, which is how OHCI got away with enumerating a device it could not read
+from: every test used one controller, and the one it used worked.
 
 **Still open on the ACPI pillar:** battery, lid and thermal zone are WRITTEN
 (`acpi_dev.c`) and have never run — QEMU emulates none of them, so the embedded

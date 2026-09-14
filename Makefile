@@ -2869,6 +2869,10 @@ test-acpi: $(IMG) $(EMBKFS_MASTER)
 test-usb-hotplug: $(IMG) $(EMBKFS_MASTER)
 	@echo "=== UHCI (the shared core) ==="
 	@python3 tools/usb_hotplug.py piix3-usb-uhci || exit 1
+	@echo "=== OHCI ==="
+	@python3 tools/usb_hotplug.py pci-ohci || exit 1
+	@echo "=== EHCI ==="
+	@python3 tools/usb_hotplug.py usb-ehci || exit 1
 	@# xHCI has its own enumeration, its own slot model and its own transfer
 	@# rings -- it shares none of usb_core, so "hot-plug works" has to be
 	@# shown for it separately. Modern machines put USB 3 on xHCI, which
@@ -3054,6 +3058,24 @@ test-bridge: $(IMG) $(EMBKFS_MASTER)
 # registered" and "the partition addresses the sectors the table named" are
 # different claims, and a parser reading the array with the wrong stride
 # registers plausible partitions at wrong offsets and looks entirely healthy.
+# THE SAME STICK, THROUGH ALL FOUR HOST CONTROLLERS.
+#
+# Nothing had ever done this, and that is how OHCI got away with enumerating a
+# device it could not then read from: every test used one controller, and the
+# one it used worked. The claim being checked is the whole chain -- the device
+# is found, the medium registers, its filesystem mounts, and a named file on
+# it can be listed -- because "enumerated" and "readable" turned out to be
+# very different things.
+.PHONY: test-usb-all
+test-usb-all: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/mkfat32_stick.py 2>/dev/null || true
+	@for hc in piix3-usb-uhci usb-ehci pci-ohci qemu-xhci; do \
+	  echo "=== $$hc ==="; \
+	  EXTRA_QEMU="-device $$hc,id=hc -drive id=usbstick,file=$(CURDIR)/build/usbstick.img,format=raw,if=none -device usb-storage,bus=hc.0,drive=usbstick" \
+	    python3 tools/console_test.py "test usbdevs" || exit 1; \
+	done
+	@echo "=== test-usb-all: OK"
+
 .PHONY: test-parts
 test-parts: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/mkgpt.py build/gpt512.img --block 512 --mib 64 --parts 2
