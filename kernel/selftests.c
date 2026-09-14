@@ -3055,10 +3055,15 @@ int selftests_handle_command(const char *cmd)
      * the geometry, not for a driver.
      * -------------------------------------------------------------------- */
     if (strcmp(cmd, "test hba") == 0) {
+        /* THIRTY-TWO MEGABYTES, HOWEVER THEY ARE DIVIDED UP. Matching on a
+         * block COUNT would have quietly skipped UFS, whose logical units use
+         * 4096-byte blocks -- and skipping is the one outcome a test must not
+         * produce when the thing it tests is present. */
         struct embk_block_device *d = NULL;
         for (uint32_t i = 0; i < embk_block_count(); i++) {
             struct embk_block_device *c = embk_block_get(i);
-            if (c && c->block_count == 65536 && c->block_size == 512) d = c;
+            if (c && c->block_count * (uint64_t)c->block_size == 32u * 1024 * 1024)
+                d = c;
         }
         if (!d) {
             kprintf("\n[hba] no 32 MB target on this machine\n");
@@ -3066,10 +3071,18 @@ int selftests_handle_command(const char *cmd)
             return 1;
         }
         int fails = 0;
+        uint32_t bs = d->block_size;
         kprintf("\n[hba] %s: %llu blocks x %u B\n", d->name,
-                (unsigned long long)d->block_count, d->block_size);
+                (unsigned long long)d->block_count, bs);
 
-        static uint8_t buf[512], back[512];
+        #define HBA_MAX_BS 4096u
+        static uint8_t buf[HBA_MAX_BS], back[HBA_MAX_BS];
+        if (bs > HBA_MAX_BS) {
+            kprintf("  FAIL: a %u-byte block is larger than this test's buffer\n", bs);
+            kprintf("\n[cmd] test hba: FAIL\n");
+            return 1;
+        }
+
         memset(buf, 0, sizeof buf);
         if (embk_block_read(d, 0, 1, buf) != EMBK_OK) {
             kprintf("  FAIL: reading block 0 failed\n"); fails++;
@@ -3082,13 +3095,13 @@ int selftests_handle_command(const char *cmd)
 
         /* The other direction is a different descriptor layout on every one
          * of these controllers, and a driver can easily have one right. */
-        memset(buf, 0x5A, sizeof buf);
+        memset(buf, 0x5A, bs);
         if (embk_block_write(d, 100, 1, buf) != EMBK_OK) {
             kprintf("  FAIL: writing block 100 failed\n"); fails++;
         } else {
             memset(back, 0, sizeof back);
             if (embk_block_read(d, 100, 1, back) != EMBK_OK ||
-                back[0] != 0x5A || back[511] != 0x5A) {
+                back[0] != 0x5A || back[bs - 1] != 0x5A) {
                 kprintf("  FAIL: block 100 did not read back what was written\n");
                 fails++;
             } else {
@@ -3099,18 +3112,20 @@ int selftests_handle_command(const char *cmd)
         /* AND A TRANSFER BIGGER THAN ONE BLOCK, which is where a
          * scatter-gather list that was only ever exercised with one element
          * stops working. */
-        static uint8_t big[4096], bigback[4096];
-        for (int i = 0; i < 4096; i++) big[i] = (uint8_t)(i * 31 + 7);
-        if (embk_block_write(d, 200, 8, big) != EMBK_OK) {
+        #define HBA_MULTI 8u
+        static uint8_t big[HBA_MAX_BS * HBA_MULTI], bigback[HBA_MAX_BS * HBA_MULTI];
+        uint32_t span = bs * HBA_MULTI;
+        for (uint32_t i = 0; i < span; i++) big[i] = (uint8_t)(i * 31 + 7);
+        if (embk_block_write(d, 200, HBA_MULTI, big) != EMBK_OK) {
             kprintf("  FAIL: an 8-block write failed\n"); fails++;
         } else {
-            memset(bigback, 0, sizeof bigback);
-            if (embk_block_read(d, 200, 8, bigback) != EMBK_OK) {
+            memset(bigback, 0, span);
+            if (embk_block_read(d, 200, HBA_MULTI, bigback) != EMBK_OK) {
                 kprintf("  FAIL: an 8-block read failed\n"); fails++;
             } else {
-                for (int i = 0; i < 4096; i++)
+                for (uint32_t i = 0; i < span; i++)
                     if (bigback[i] != (uint8_t)(i * 31 + 7)) {
-                        kprintf("  FAIL: multi-block byte %d differs\n", i);
+                        kprintf("  FAIL: multi-block byte %u differs\n", i);
                         fails++; break;
                     }
                 if (!fails) kprintf("  an 8-block transfer round-tripped\n");

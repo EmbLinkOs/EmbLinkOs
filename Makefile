@@ -178,6 +178,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/storage/mptsas.c \
              kernel/drivers/storage/esp.c \
              kernel/drivers/storage/lsi53c895a.c \
+             kernel/drivers/storage/ufs.c \
              kernel/fs/iso9660.c \
              kernel/drivers/char/platform_misc.c \
              kernel/drivers/i2c/smbus.c \
@@ -2969,6 +2970,12 @@ test-hba: $(IMG) $(EMBKFS_MASTER)
 	  EXTRA_QEMU="-device $$hba,id=hba0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device scsi-hd,bus=hba0.0,drive=hbad" \
 	    python3 tools/console_test.py "test hba" || exit 1; \
 	done
+	@# UFS attaches its logical units to its own bus, not a SCSI one, and its
+	@# blocks are 4096 bytes rather than 512 -- which is why the test matches
+	@# on the disk's SIZE and not on its block count.
+	@echo "=== ufs ==="
+	@EXTRA_QEMU="-device ufs,id=ufs0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device ufs-lu,bus=ufs0,drive=hbad,lun=0" \
+	  python3 tools/console_test.py "test hba" || exit 1
 	@echo "=== test-hba: OK"
 
 .PHONY: test-sdcard

@@ -619,21 +619,65 @@ def build_btree(items, gen, first_block, forced_leaf_splits=None):
         leaf = build_leaf_block(gen, first_block, leaf_lists[0])
         return first_block, crc32c(leaf[8:]), [(first_block, leaf)], 1
 
-    if len(leaf_lists) > INTERNAL_SLOT_MAX:
-        raise ValueError(f"{len(leaf_lists)} leaves exceed one internal node "
-                         f"({INTERNAL_SLOT_MAX} slots); a level-2 tree is not "
-                         f"implemented -- add it here if an image ever needs it")
+    if len(leaf_lists) <= INTERNAL_SLOT_MAX:
+        meta_blocks, slots = [], []
+        leaf_block = first_block + 1                   # leaves live above the root
+        for il in leaf_lists:
+            leaf = build_leaf_block(gen, leaf_block, il)
+            leaf_csum = crc32c(leaf[8:])
+            meta_blocks.append((leaf_block, leaf))
+            # slot key = smallest key in that child's subtree = its first item's key
+            slots.append((il[0][0], L.pack_block_ptr(leaf_block, leaf_csum, gen)))
+            leaf_block += 1
+        root = build_internal_block(gen, first_block, level=1, slots=slots)
+        root_csum = crc32c(root[8:])
+        meta_blocks.insert(0, (first_block, root))
+        return first_block, root_csum, meta_blocks, len(meta_blocks)
 
-    meta_blocks, slots = [], []
-    leaf_block = first_block + 1                       # leaves live above the root
+    # --- more leaves than one internal node can route: grow a level ---------
+    #
+    # THE ROOT STAYS AT `first_block` WHATEVER THE HEIGHT. The superblock's
+    # root pointer is a fixed field written before this runs, so a taller tree
+    # may not move its root -- it grows DOWNWARD, with the level-1 nodes and
+    # then the leaves laid out after it.
+    #
+    # This used to be an explicit refusal ("a level-2 tree is not implemented
+    # -- add it here if an image ever needs it"). An image needed it: the
+    # master image passed 72 leaves as the build directory filled up, and
+    # every `make` failed with that message. The kernel's reader has always
+    # descended by the node's own level field and needed no change.
+    n_l1 = (len(leaf_lists) + INTERNAL_SLOT_MAX - 1) // INTERNAL_SLOT_MAX
+    if n_l1 > INTERNAL_SLOT_MAX:
+        raise ValueError(f"{len(leaf_lists)} leaves need {n_l1} level-1 nodes, "
+                         f"which exceeds one root ({INTERNAL_SLOT_MAX} slots); "
+                         f"a level-3 tree is not implemented -- add it here")
+
+    # Spread the leaves EVENLY rather than filling each node to the brim. A
+    # 72/1 split is legal and horrible: the second node exists to route one
+    # leaf, and the next leaf added rebalances the whole image.
+    per = (len(leaf_lists) + n_l1 - 1) // n_l1
+
+    meta_blocks = []
+    leaf_block = first_block + 1 + n_l1               # leaves after the L1 nodes
+    leaf_slots = []
     for il in leaf_lists:
         leaf = build_leaf_block(gen, leaf_block, il)
-        leaf_csum = crc32c(leaf[8:])
         meta_blocks.append((leaf_block, leaf))
-        # slot key = smallest key in that child's subtree = its first item's key
-        slots.append((il[0][0], L.pack_block_ptr(leaf_block, leaf_csum, gen)))
+        leaf_slots.append((il[0][0],
+                           L.pack_block_ptr(leaf_block, crc32c(leaf[8:]), gen)))
         leaf_block += 1
-    root = build_internal_block(gen, first_block, level=1, slots=slots)
+
+    l1_block = first_block + 1
+    root_slots = []
+    for i in range(0, len(leaf_slots), per):
+        group = leaf_slots[i:i + per]
+        node = build_internal_block(gen, l1_block, level=1, slots=group)
+        meta_blocks.append((l1_block, node))
+        root_slots.append((group[0][0],
+                           L.pack_block_ptr(l1_block, crc32c(node[8:]), gen)))
+        l1_block += 1
+
+    root = build_internal_block(gen, first_block, level=2, slots=root_slots)
     root_csum = crc32c(root[8:])
     meta_blocks.insert(0, (first_block, root))
     return first_block, root_csum, meta_blocks, len(meta_blocks)
