@@ -148,6 +148,22 @@ def main(argv):
             objects.append((b"system/lib/libembk.so", L.DT_REG,
                             L.S_IFREG | 0o755, fh.read()))
 
+    # THE PANIC SYMBOLIZER'S TABLE. kernel/lib/ksym.c reads this at boot and
+    # turns a faulting address into func+off (file:line); without it a kernel
+    # fault on this machine prints a bare hex number and the person looking at
+    # it has to go and find the ELF that produced it. The x86 image has carried
+    # one since EmbDBG was written and this one did not, for no reason beyond
+    # nobody adding the file. Absent is not an error -- the symbolizer stays
+    # off and the dump falls back to hex, exactly as before.
+    # Alongside the image being written, which is where the ARM build puts its
+    # kernel and everything derived from it.
+    dbg_path = os.path.join(os.path.dirname(os.path.abspath(out_path)),
+                            "kernel.embdbg")
+    if os.path.exists(dbg_path) and os.path.getsize(dbg_path) > 64:
+        with open(dbg_path, "rb") as fh:
+            objects.append((b"system/kernel.embdbg", L.DT_REG,
+                            L.S_IFREG | 0o644, fh.read()))
+
     # The UI fonts, from the HOST's DejaVu install, exactly as the x86 image
     # gets them (_read_font is the same finder, so the two images cannot end up
     # with different faces). The toolkit renders no text without these -- a

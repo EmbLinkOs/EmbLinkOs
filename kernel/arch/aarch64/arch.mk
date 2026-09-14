@@ -743,10 +743,20 @@ $(foreach p,$(ARM_EMLIBC_PROGS),$(eval $(call ARM_EMLIBC_PROG,$(p))))
 # changed what the image SHOULD hold while make considered it up to date. The
 # symptom was an x86 image and an aarch64 image built from the same tree
 # disagreeing about which apps the launcher shows.
+# The panic symbolizer's table for THIS kernel. Same tool and same reason as
+# the x86 rule in the top-level Makefile -- it reads the ELF symtab and lets
+# binutils decode the DWARF, so it is architecture-neutral as long as it is
+# handed the readelf that matches the ELF.
+ARM_EMBDBG_READELF ?= aarch64-elf-readelf
+$(ARM_BUILD)/kernel.embdbg: $(ARM_ELF) | $(ARM_BUILD)
+	@if [ -x "$(EMBDBG)" ]; then \
+	   echo "  EMBDBG   $@"; READELF=$(ARM_EMBDBG_READELF) $(EMBDBG) $< emit-kernel $@; \
+	 else echo "  (embdbg tool absent -> no kernel panic symbols on aarch64)"; : > $@; fi
+
 ARM_ROOTFS_INPUTS := tools/embkfs_mkfs/mkfs_arm64.py tools/embkfs_mkfs/mkfs_embkfs.py \
                      tools/embkfs_mkfs/layout.py \
                      $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app)
-$(ARM_ROOTFS): $(ARM_ROOTFS_INPUTS) $(ARM_USER_ELVES) $(ARM_LIBEMBK) | $(ARM_BUILD)
+$(ARM_ROOTFS): $(ARM_ROOTFS_INPUTS) $(ARM_USER_ELVES) $(ARM_LIBEMBK) $(ARM_BUILD)/kernel.embdbg | $(ARM_BUILD)
 	python3 tools/embkfs_mkfs/mkfs_arm64.py $@ $(ARM_USER)
 
 .PHONY: arm64-rootfs

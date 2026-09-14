@@ -11,6 +11,7 @@
 #include "drivers/storage/virtio_blk.h"
 #include "block/block.h"
 #include "block/partition.h"
+#include "lib/ksym.h"
 #include "fs/embkfs/embkfs.h"
 #include "mm/swap.h"          /* swap_init: the store, if a disk carries the header */
 #include "mm/swaptest.h"
@@ -673,6 +674,31 @@ void arch_early_main(uint64_t dtb_phys) {
         }
         if (!ok)
             selftest_fails++;
+    }
+
+    /* THE PANIC SYMBOLIZER'S TABLE, now that there is a filesystem to read it
+     * from. Without this a kernel fault here prints a bare hex address and
+     * the person looking at the machine has to go and find the ELF that
+     * produced it -- which on the target machine they do not have.
+     *
+     * x86 has loaded this since EmbDBG was written (kernel/main.c) and this
+     * side never did, for no reason beyond nobody adding the call.
+     * Best-effort in exactly the same way: a missing or short file leaves the
+     * symbolizer off and the dump falls back to hex. */
+    {
+        struct vfs_stat kst;
+        if (vfs_stat("/system/kernel.embdbg", &kst) == 0 && kst.size > 64) {
+            uint32_t sz = (uint32_t)kst.size;
+            void *buf = kmalloc(sz);
+            if (buf) {
+                size_t got = 0;
+                if (vfs_read("/system/kernel.embdbg", 0, buf, sz, &got) == EMBK_OK &&
+                    got == sz && ksym_load(buf, sz) == 0)
+                    kprintf("ksym: kernel panic symbols loaded (%u bytes)\n", sz);
+                else
+                    kprintf("ksym: /system/kernel.embdbg present but unusable\n");
+            }
+        }
     }
 
     /* The deferred-teardown worker and the page cache's writeback thread.

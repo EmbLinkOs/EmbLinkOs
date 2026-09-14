@@ -7445,11 +7445,16 @@ closing table instead.
       now and the Makefile passes the cross one, so a panic reads
       `selftests_handle_command+0xaada (selftests.c:3849)`. **That change is
       in the EmbCC repository, not this one.**
-- [ ] **aarch64 has no panic symbols.** Only the x86 Makefile emits a
-      `kernel.embdbg`; `arch.mk` has no such rule, so a fault on the ARM
-      machine still prints a bare address. The tool is architecture-neutral --
-      it reads the ELF symtab and lets binutils decode the DWARF -- so this is
-      a rule and an `EMBDBG_READELF=aarch64-elf-readelf`, not a port.
+- [x] ~~aarch64 has no panic symbols.~~ Fixed: `arch.mk` emits one with
+      `aarch64-elf-readelf`, `mkfs_arm64.py` stages it, and `early.c` loads it
+      -- the file had to be built, packed AND read, and none of the three
+      existed. 2328 funcs, 60149 line rows, and the read costs 0 ms.
+- [ ] **`test-arm64-boot`'s A7 (the launcher click) is close to its wall-clock
+      budget.** It failed once at the default 120 s and then passed three times
+      running, twice at that same default. A UI click sequence judged against a
+      fixed window on a machine whose load varies is a test people learn to
+      ignore; the fix is a marker the harness waits FOR rather than a duration
+      it waits THROUGH.
 
 **Offload**
 
