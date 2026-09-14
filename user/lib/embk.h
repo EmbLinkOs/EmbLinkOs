@@ -299,6 +299,50 @@ static inline int64_t embk_spawn_env(const char *path, char *const argv[],
 /* embk_spawn_env() with NO environment for the child. This is the plain spawn:
  * every existing caller keeps its exact behaviour, because "no environment" is
  * what they always got. */
+/* ---- raw block devices --------------------------------------------------
+ *
+ * BELOW THE FILESYSTEM, and gated on EMBK_CAP_RAWDISK -- which is the most
+ * dangerous capability this system has. A program holding it can overwrite the
+ * running root filesystem, the partition table and the boot loader, with
+ * nothing between it and the platter.
+ *
+ * That is what installing an operating system consists of, which is why the
+ * capability exists and why it is separate from FILESYSTEM: holding one never
+ * implies the other, and an app that only wants to read your documents can
+ * never reach a disk this way.
+ *
+ * A transfer is capped at 64 blocks per call. Read or write more by looping;
+ * the cap is what stops a bad count from becoming a read of the whole address
+ * space. */
+#define EMBK_DISK_MAX_BLOCKS 64
+
+/* flags */
+#define EMBK_DISK_IS_PARTITION 1u   /* a partition OF a disk, not a whole one */
+
+struct embk_disk_info {
+    char     name[16];      /* "sda", "sda1" ...                            */
+    uint64_t block_count;
+    uint32_t block_size;
+    uint32_t flags;         /* EMBK_DISK_*                                  */
+};
+
+static inline int embk_disk_count(void) {
+    return (int)embk_syscall0(EMBK_SYS_disk_count);
+}
+static inline int embk_disk_info(int index, struct embk_disk_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_disk_info, index, (int64_t)(intptr_t)out);
+}
+static inline int embk_disk_read(int index, uint64_t lba, uint32_t count,
+                                 void *buf) {
+    return (int)embk_syscall4(EMBK_SYS_disk_read, index, (int64_t)lba,
+                              (int64_t)count, (int64_t)(intptr_t)buf);
+}
+static inline int embk_disk_write(int index, uint64_t lba, uint32_t count,
+                                  const void *buf) {
+    return (int)embk_syscall4(EMBK_SYS_disk_write, index, (int64_t)lba,
+                              (int64_t)count, (int64_t)(intptr_t)buf);
+}
+
 /* This process's own capability set (a bitmask of EMBK_CAP_BIT(id)). */
 static inline unsigned long embk_getcaps(void) {
     return (unsigned long)embk_syscall0(EMBK_SYS_getcaps);
@@ -438,6 +482,9 @@ static inline void embk_action_set_caps(struct embk_spawn_file_action *a,
 #endif
 #ifndef EMBK_EINVAL
 #define EMBK_EINVAL  22
+#endif
+#ifndef EMBK_ENODEV
+#define EMBK_ENODEV  19
 #endif
 #ifndef EMBK_E2BIG
 #define EMBK_E2BIG    7

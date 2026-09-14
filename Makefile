@@ -1068,6 +1068,17 @@ iconv-test:
 
 # beep: the first program to use the audio syscalls, and the first user of
 # EMBK_CAP_AUDIO. Plain newlib link -- sound needs no toolkit.
+# THE INSTALLER. The first and only program that holds EMBK_CAP_RAWDISK, which
+# capabilities.h reserved long before anything could use it. It reaches below
+# the filesystem to a disk with no filesystem on it yet -- which is what
+# installing an operating system is, and why the capability is separate from
+# FILESYSTEM rather than implied by it.
+build/install.o: user/tools/install/install.c user/lib/embk.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
+
+build/install.elf: build/crt0.o build/syscalls.o build/install.o $(NEWLIB_LDSCRIPT)
+	$(USER_CC) $(NEWLIB_LDFLAGS) build/crt0.o build/syscalls.o build/install.o -lc -lgcc -o $@
+
 build/beep.o: user/tools/beep/beep.c user/lib/embk.h | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -c $< -o $@
 build/beep.elf: build/crt0.o build/syscalls.o build/beep.o $(NEWLIB_LDSCRIPT)
@@ -1538,7 +1549,7 @@ libembk: build/libembk.so
 # posixdemo.c is filtered out for the same reason as hello.c: it's a plain
 # static-newlib console program with its own rule above, NOT an EmUI app to be
 # linked against libembk.so.
-EMUI_APP_SRCS := $(filter-out user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
+EMUI_APP_SRCS := $(filter-out user/tests/pieprobe/pieprobe.c user/system/init/init.c user/tests/hello/hello.c user/tests/posixdemo/posixdemo.c user/tests/ioracer/ioracer.c user/tests/crasher/crasher.c user/tests/httpget/httpget.c user/tools/httpd/httpd.c user/tests/udptest/udptest.c user/tools/wget/wget.c user/tests/tlstest/tlstest.c user/tools/pkgfetch/pkgfetch.c user/tests/sockdemo/sockdemo.c user/tests/nbsock/nbsock.c user/tools/gitclone/gitclone.c user/tools/gitpush/gitpush.c user/tools/pkg/pkg.c user/tools/pkgbuild/pkgbuild.c user/tests/pkgprobe/pkgprobe.c user/tests/emlibc_net/emlibc_net.c user/tests/emlibc_demo/emlibc_demo.c user/tests/emlibc_caps/emlibc_caps.c user/tests/emlibc_embxapp/emlibc_embxapp.c user/tests/emlibc_math/emlibc_math.c user/tests/mathself/mathself.c user/tests/capchild/capchild.c user/tests/capspawn/capspawn.c user/tests/capreload/capreload.c user/tests/capgpu/capgpu.c user/tests/capfs/capfs.c user/tests/capnet/capnet.c user/tests/jitter/jitter.c user/tests/tonestress/tonestress.c user/apps/vellum/vellum.c user/apps/js/js.c user/apps/photos/photos.c user/apps/mp3play/mp3play.c user/tools/beep/beep.c user/tools/install/install.c user/tests/lockdemo/lockdemo.c user/tests/primtest/primtest.c user/apps/notepp/notepp.c, $(USER_PROG_SRCS))
 EMUI_APPS     := $(patsubst %.c,build/%.elf,$(notdir $(EMUI_APP_SRCS)))
 EMUI_APP_NAMES := $(basename $(notdir $(EMUI_APP_SRCS)))
 
@@ -1909,6 +1920,7 @@ EMBKFS_APPS := build/init.elf build/primtest.elf build/mtmalloc.elf build/hello.
                build/crasher.elf build/httpget.elf build/httpd.elf build/udptest.elf build/wget.elf build/tlstest.elf build/pkgfetch.elf build/sockdemo.elf build/nbsock.elf $(if $(wildcard $(ZLIB_A)),build/gitclone.elf build/gitpush.elf,) \
                build/emlibc_demo.elf build/emlibc_net.elf build/emlibc_caps.elf build/emlibc_math.elf $(if $(wildcard $(HOST_EMBLD)),build/emlibc_embxapp.embx,) $(if $(and $(wildcard $(HOST_EMBCC)),$(wildcard $(HOST_EMBLD))),build/mathself.embx,) \
                build/shell.elf build/sysinfo.elf build/tally.elf build/beep.elf build/notepp.elf \
+               build/install.elf \
                build/embbuild.elf build/pkg.elf build/pkgbuild.elf \
                build/pkgprobe.elf build/pkgprobe.embx build/pkgprobe.pkg \
                build/pk_v11/pkgprobe.pkg build/pk_wide/pkgprobe.pkg \
@@ -2898,6 +2910,17 @@ modules: build/modules/ramdisk.ko
 .PHONY: test-modules
 test-modules: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/console_test.py "test modules"
+
+# PUTTING THE OS ON A DISK, and then booting that disk.
+#
+# The test is the SECOND boot and nothing before it counts: an installer that
+# writes plausible bytes and reports success has failed in the only way that
+# matters if the firmware will not boot the result. So the stick is detached
+# before the second boot -- leaving it attached would let the firmware boot
+# from it and pass with the target completely empty.
+.PHONY: test-install
+test-install: uefi-usb.img
+	@OVMF_CODE="$(OVMF_CODE)" OVMF_VARS="$(OVMF_VARS)" python3 tools/install_test.py
 
 # --- x86 console tests, scripted -----------------------------------------------
 # tools/console_test.py boots the kernel headless and types at its console. Any

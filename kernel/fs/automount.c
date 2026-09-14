@@ -125,7 +125,11 @@ int automount_attach(struct embk_block_device *disk) {
          * and a partition is recognisable by having this disk as its parent. */
         for (uint32_t i = 0; i < embk_block_count(); i++) {
             struct embk_block_device *d = embk_block_get(i);
-            if (!d || embk_partition_parent(d) != disk) continue;
+            /* A PARTITION OF THIS DISK, which is not the same test as "has
+             * this disk as a parent": embk_partition_parent returns the
+             * device itself for a whole disk, so the disk would match its own
+             * filter and be mounted a second time alongside its partitions. */
+            if (!d || d == disk || embk_partition_parent(d) != disk) continue;
             if (try_mount_one(d, disk)) mounted++;
         }
     }

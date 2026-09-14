@@ -36,6 +36,12 @@ emulates the common real part, so none has to wait for the machine.
 | **USB hot-plug + mass storage mount** | ✅ **done for the shared-core controllers** — ports are compared against the device table every 500 ms, a device that appears is enumerated and a device that leaves is torn down. A mass-storage device is scanned for partitions and mounted under `/media/<device>` (FAT32 or EMBKFS) by `kernel/fs/automount.c`, and unmounted before its block device is unregistered. Proved by attaching a FAT32 stick over QMP to a RUNNING machine, reading a named file off it, and pulling it out again: `make test-usb-hotplug`. **xHCI is not covered** — it has its own device model and never touches the shared core. | A USB stick plugged in after boot does nothing |
 | **UEFI boot** | ✅ **done** — the firmware launches our own EFI loader (`boot/uefi/`, no GNU-EFI), it relocates itself, draws its menu through ConOut, locates a GOP framebuffer, loads the kernel, builds page tables, exits boot services and jumps. Verified end to end under OVMF on BOTH images: loader and root on separate disks, and the single GPT disk (ESP + EMBKFS) you write to a USB stick — where the root is found on the same device the firmware booted from. `make test-uefi` | A machine from the last several years boots this way and no other |
 
+**Still open on the installer pillar:** it COPIES a layout rather than
+creating one, so the installed root filesystem comes out the same size as the
+source's — installing from a 200 MB stick onto a 1 TB disk uses 200 MB of it,
+and growing the filesystem afterwards is not written. It also needs a source
+that already has a GPT, and it has no interface beyond the command line.
+
 **Still open on the Secure Boot pillar:** the key is ours, so this boots on a
 machine whose owner has enrolled it — not on a stock laptop, where the enrolled
 keys are Microsoft's. That needs either their signature on a shim or the owner
@@ -82,7 +88,7 @@ to a working driver, not prerequisites for one.
 | Pillar | Today | Why |
 |---|---|---|
 | **Secure Boot** | ✅ **done for what can be tested** — the loader is Authenticode-signed by `tools/sbsign.py` (PE hash + PKCS#7, written here because the signing tools are Linux-only), keys are enrolled into the firmware's variable store by `tools/efivars.py`, and the loader reports the firmware's `SecureBoot` state and verifies the kernel's build hash before jumping. Proved as a PAIR: unsigned is REFUSED and signed BOOTS, on enforcing OVMF. `make test-secureboot` | Retail hardware ships with it on, and refuses an unsigned loader without a warning |
-| **Installer** | absent | There is no way to put the OS onto the target's disk: partition (GPT), create the EFI system partition, format EMBKFS, copy the system, register the UEFI boot entry |
+| **Installer** | ✅ **done** — `user/tools/install/install.c`, the first and only holder of `EMBK_CAP_RAWDISK`. It reads the GPT of the medium it booted from, writes an equivalent one to the target, copies the partitions across and rebuilds the backup GPT at the target's own last LBA. Proved by installing onto a blank disk and then booting that disk **with the stick detached**. `make test-install` | There is no way to put the OS onto the target's disk |
 | **Partitions on 4096-byte-sector disks** | `partition.c` skips them | Many NVMe drives can be 4Kn; the installer must partition them |
 | **Partitions on aarch64 at all** | never scanned | An ARM machine's disk is partitioned |
 | **Encrypted install** | XTS and encrypted EMBKFS exist | Offer it in the installer, unlock at boot |

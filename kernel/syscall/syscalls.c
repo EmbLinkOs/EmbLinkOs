@@ -24,6 +24,9 @@
 #include "mm/vm_object.h"   /* the file's pages, for a file-backed mmap */
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"   /* sys_read's copy_to_user fault-path diagnostic */
+#include "block/block.h"
+#include "block/partition.h"
+#define EMBK_DISK_IS_PARTITION 1u
 #include "ipc/pipe.h"          /* sys_pipe: pipe_create */
 #include "drivers/timer/rtc.h"
 #include "drivers/timer/hpet.h"
@@ -1534,6 +1537,101 @@ static int64_t sys_thread_self(const struct sysargs *a) {
     return (int64_t)thread_self_tid();
 }
 
+/* ---- raw block devices: the installer's reach below the filesystem -------
+ *
+ * EMBK_CAP_RAWDISK, and it is the most dangerous capability this system has.
+ * A holder can overwrite the running root filesystem, the partition table and
+ * the boot loader, in any order, with nothing between it and the platter. That
+ * is not a flaw in the design -- it is what installing an operating system
+ * consists of -- which is exactly why it is its own capability and why holding
+ * FILESYSTEM never implies it.
+ *
+ * THE TRANSFER IS BOUNDED so that a bad `count` cannot be turned into a read
+ * of the whole address space: one call moves at most 64 blocks, and the
+ * userspace side loops. */
+#define RAWDISK_MAX_BLOCKS 64u
+
+static bool rawdisk_permitted(void)
+{
+    return (process_current_caps() & EMBK_CAP_BIT(EMBK_CAP_RAWDISK)) != 0;
+}
+
+static int64_t sys_disk_count(const struct sysargs *a) {
+    (void)a;
+    if (!rawdisk_permitted()) return -EMBK_EPERM;
+    return (int64_t)embk_block_count();
+}
+
+struct k_disk_info {
+    char     name[16];
+    uint64_t block_count;
+    uint32_t block_size;
+    uint32_t flags;
+};
+
+static int64_t sys_disk_info(const struct sysargs *a) {
+    if (!rawdisk_permitted()) return -EMBK_EPERM;
+    struct embk_block_device *d = embk_block_get((uint32_t)a->arg[0]);
+    if (!d) return -EMBK_ENODEV;
+
+    struct k_disk_info info;
+    memset(&info, 0, sizeof info);
+    uint32_t i = 0;
+    while (d->name[i] && i < sizeof info.name - 1) { info.name[i] = d->name[i]; i++; }
+    info.block_count = d->block_count;
+    info.block_size  = d->block_size;
+    /* A PARTITION IS NOT A DISK, and an installer that cannot tell them apart
+     * writes a partition table into a partition. The block layer already knows
+     * which is which; this is the only place userspace can learn it. */
+    /* embk_partition_parent returns the device ITSELF for a whole disk, not
+     * NULL -- so the test is inequality, not existence. Getting that backwards
+     * reported every disk on the machine as a partition and left the installer
+     * with nothing it was willing to write to. */
+    info.flags = (embk_partition_parent(d) != d) ? EMBK_DISK_IS_PARTITION : 0u;
+
+    if (copy_to_user((void *)(uintptr_t)a->arg[1], &info, sizeof info) != 0)
+        return -EMBK_EFAULT;
+    return EMBK_OK;
+}
+
+static int64_t sys_disk_read(const struct sysargs *a) {
+    if (!rawdisk_permitted()) return -EMBK_EPERM;
+    struct embk_block_device *d = embk_block_get((uint32_t)a->arg[0]);
+    if (!d) return -EMBK_ENODEV;
+    uint32_t count = (uint32_t)a->arg[2];
+    if (count == 0 || count > RAWDISK_MAX_BLOCKS) return -EMBK_EINVAL;
+
+    static uint8_t bounce[RAWDISK_MAX_BLOCKS * 4096];
+    if ((uint64_t)count * d->block_size > sizeof bounce) return -EMBK_EINVAL;
+
+    /* THROUGH A KERNEL BOUNCE BUFFER, not straight into the user's pages. The
+     * block drivers require a KV2P-able address and a DMA-reachable one; a
+     * user pointer is neither, and handing one to a controller is a write to
+     * whatever physical page happened to be there. */
+    int rc = embk_block_read(d, a->arg[1], count, bounce);
+    if (rc != EMBK_OK) return rc;
+    if (copy_to_user((void *)(uintptr_t)a->arg[3], bounce,
+                     (uint64_t)count * d->block_size) != 0)
+        return -EMBK_EFAULT;
+    return EMBK_OK;
+}
+
+static int64_t sys_disk_write(const struct sysargs *a) {
+    if (!rawdisk_permitted()) return -EMBK_EPERM;
+    struct embk_block_device *d = embk_block_get((uint32_t)a->arg[0]);
+    if (!d) return -EMBK_ENODEV;
+    uint32_t count = (uint32_t)a->arg[2];
+    if (count == 0 || count > RAWDISK_MAX_BLOCKS) return -EMBK_EINVAL;
+
+    static uint8_t bounce[RAWDISK_MAX_BLOCKS * 4096];
+    if ((uint64_t)count * d->block_size > sizeof bounce) return -EMBK_EINVAL;
+
+    if (copy_from_user(bounce, (const void *)(uintptr_t)a->arg[3],
+                       (uint64_t)count * d->block_size) != 0)
+        return -EMBK_EFAULT;
+    return embk_block_write(d, a->arg[1], count, bounce);
+}
+
 static int64_t sys_thread_cpu_ns(const struct sysargs *a) {
     (void)a;
     return (int64_t)sched_self_cpu_ns();
@@ -1962,7 +2060,19 @@ static bool audio_permitted(void)
  * buffers before it commits to owning the speaker. */
 static int64_t sys_audio_open(const struct sysargs *a) {
     if (!audio_permitted()) return -EMBK_EPERM;
-    if (a->arg[0] != 0) return (int64_t)audio_sample_rate();
+    if (a->arg[0] != 0) {
+        /* PERMITTED BUT ABSENT IS NOT THE SAME AS REFUSED, and the difference
+         * has to be visible: a caller that cannot tell "you may not" from
+         * "there is no sound card" cannot report either one correctly.
+         *
+         * This used to be indistinguishable because the AC'97 driver returned
+         * its nominal 48000 whether or not a device was there. Once the audio
+         * layer started answering honestly -- 0 with no card -- the query
+         * returned 0, which is neither a rate nor an error, and `test capgate`
+         * read it as a broken probe. It says ENODEV now. */
+        if (!audio_available()) return -EMBK_ENODEV;
+        return (int64_t)audio_sample_rate();
+    }
 
     struct process *proc = current_process_atomic();
     if (!proc) return -EMBK_ENOMEM;   /* no process context: nothing to own the stream */
@@ -2517,6 +2627,10 @@ static syscall_handler_t syscall_table[] = {
     [SYS_sched_period] = sys_sched_period,
     [SYS_thread_cpu_ns] = sys_thread_cpu_ns,
     [SYS_thread_self]   = sys_thread_self,
+    [SYS_disk_count]    = sys_disk_count,
+    [SYS_disk_info]     = sys_disk_info,
+    [SYS_disk_read]     = sys_disk_read,
+    [SYS_disk_write]    = sys_disk_write,
     [SYS_key_grab]     = sys_key_grab,
     [SYS_win_create]   = sys_win_create,
     [SYS_win_present]  = sys_win_present,

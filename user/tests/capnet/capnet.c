@@ -33,10 +33,16 @@ int main(void) {
         return 8;                        /* not -EMBK_EPERM: an unexpected failure */
     }
 
-    /* --- AUDIO: the query form, which is gated before it answers. --- */
+    /* --- AUDIO: the query form, which is gated before it answers. ---
+     *
+     * THE GATE IS THE QUESTION, NOT THE HARDWARE. A machine with no sound card
+     * answers ENODEV, and that is the capability having been GRANTED -- the
+     * call got past the check and reached a device that is not there. Treating
+     * it as a denial would make this witness pass on a machine with a speaker
+     * and fail on one without, which tests the machine rather than the gate. */
     int rate = (int)embk_audio_rate();
-    if (rate > 0)       bits |= 2;
-    else if (rate != -1) return 8;       /* again: only a clean denial is legal */
+    if (rate > 0 || rate == -EMBK_ENODEV) bits |= 2;
+    else if (rate != -EMBK_EPERM) return 8;  /* only a clean denial is legal */
 
     return bits;
 }

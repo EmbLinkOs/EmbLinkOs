@@ -169,6 +169,10 @@
 #define EMBK_SYS_meminfo       122
 #define EMBK_SYS_screen_read   123
 #define EMBK_SYS_thread_self   124
+#define EMBK_SYS_disk_count    125
+#define EMBK_SYS_disk_info     126
+#define EMBK_SYS_disk_read     127
+#define EMBK_SYS_disk_write    128
 
 /* --- the raw trap, once per architecture ---------------------------------
  *

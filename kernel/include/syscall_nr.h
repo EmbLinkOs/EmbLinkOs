@@ -300,4 +300,26 @@
  * first time malloc re-enters. */
 #define SYS_thread_self   124   /* ()                       -> tid | -err      */
 
+/* ---- RAW BLOCK DEVICES, for the installer ------------------------------
+ *
+ * THE FIRST SYSCALLS EVER GATED ON EMBK_CAP_RAWDISK, which capabilities.h has
+ * carried since before anything could use it, saying "each becomes a gate on
+ * the day it becomes a syscall". This is that day.
+ *
+ * WHY USERSPACE NEEDS THEM AT ALL, given the VFS: an installer does not want
+ * files. It wants to write a partition table onto a disk that has no
+ * filesystem yet, and then copy whole partitions across. Every one of those
+ * operations is below the filesystem layer by definition.
+ *
+ * WHY THIS IS THE MOST DANGEROUS CAPABILITY IN THE SYSTEM, said plainly: a
+ * program holding it can overwrite the running root filesystem, the partition
+ * table, and the boot loader, in any order, with no filesystem or permission
+ * check between it and the platter. That is what installing an operating
+ * system IS. It is a separate capability from FILESYSTEM precisely so that
+ * holding one never implies the other. */
+#define SYS_disk_count    125   /* ()                       -> n | -err       */
+#define SYS_disk_info     126   /* (idx, struct embk_disk_info*) -> 0 | -err  */
+#define SYS_disk_read     127   /* (idx, lba, count, buf)   -> 0 | -err       */
+#define SYS_disk_write    128   /* (idx, lba, count, buf)   -> 0 | -err       */
+
 #endif /* _SYSCALL_NR_H_ */

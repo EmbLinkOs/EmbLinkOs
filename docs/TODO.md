@@ -851,7 +851,59 @@ The measurement immediately earned itself twice:
 
 ## Storage
 
-### Loadable kernel modules
+### The installer
+
+### Putting the OS on a disk (2026-09-14)
+
+`user/tools/install/install.c` plus four syscalls -- the first ever gated on
+`EMBK_CAP_RAWDISK`, which `capabilities.h` reserved long before anything could
+use it, saying "each becomes a gate on the day it becomes a syscall".
+
+**Why it copies rather than formats.** The medium it runs from already has the
+right layout: a GPT, an ESP with the loader, an EMBKFS root with the system.
+Reproducing that means writing an equivalent partition table and copying the
+partitions -- no mkfs, no second implementation of EMBKFS's on-disk format to
+drift from the first, and the thing installed is byte-for-byte the thing that
+was tested. Only the BACKUP GPT is rebuilt, because "the end of the disk" is a
+different LBA on a different-sized disk.
+
+**The test is the second boot and nothing before it counts.** An installer that
+writes plausible bytes and reports success has failed in the only way that
+matters if the firmware will not boot the result. `make test-install` installs
+onto a blank disk, then boots that disk **with the source detached** -- leaving
+it attached would let the firmware boot from it and pass with the target empty.
+
+**Still open:**
+
+- [ ] **The root filesystem is not grown.** It comes out the size of the
+      source's, so a 200 MB stick installed onto a 1 TB disk uses 200 MB of it.
+      Growing an EMBKFS volume in place is a real piece of filesystem work.
+- [ ] **It needs a source that already has a GPT.** It cannot create a layout
+      from nothing, so it installs from the USB image and not from, say, a
+      network stream.
+- [ ] **No user interface.** It is a command line: `install sda sdb`. A person
+      installing an operating system should be shown what is about to be
+      destroyed and made to confirm it, and there is no such screen.
+- [ ] **No UEFI boot entry is registered.** It relies on the removable-media
+      path `/EFI/BOOT/BOOTX64.EFI`, which every UEFI machine tries without a
+      boot entry. That works and is what the test proves; a machine with a
+      crowded boot order may still prefer something else, and setting a real
+      entry needs `SetVariable` on `BootXXXX`/`BootOrder` at runtime.
+- [ ] **It will not install onto the disk it booted from**, by design -- but it
+      also cannot install onto a disk that is currently MOUNTED, and it does not
+      check for that. Overwriting a mounted volume's blocks underneath the page
+      cache is a corruption the filesystem cannot see coming.
+
+### A bug this pillar found
+
+`embk_partition_parent()` returns the device ITSELF for a whole disk, not NULL.
+Two places had read that as "non-NULL means partition": the new disk-info
+syscall, which reported every disk on the machine as a partition and left the
+installer refusing to write anywhere, and `automount_attach`, where a whole
+disk matched its own partition filter and would have been mounted a second time
+alongside its partitions.
+
+## Loadable kernel modules
 
 ### The loader (2026-09-14)
 
@@ -2104,6 +2156,21 @@ answer rather than a failure:**
       firmware is larger and stranger, and the load pass stops a table at the
       first opcode it cannot follow rather than guessing -- so a real machine
       that refuses will say so on the console with a count of what loaded.
+
+### A regression the HDA work caused, and the fix (2026-09-14)
+
+`audio_sample_rate()` used to return AC'97's nominal 48000 whether or not a
+sound card was present -- the old `ac97_sample_rate()` never checked. The
+driver table made it honest (0 with no device), and that broke `test capgate`:
+the audio capability probe uses the sample-rate QUERY, and 0 is neither a rate
+nor an error, so the witness reported a broken probe.
+
+Fixed where the distinction belongs rather than by restoring the lie: the query
+syscall now answers `-ENODEV` when the capability was granted and there is no
+device. PERMITTED BUT ABSENT IS NOT REFUSED, and a caller that cannot tell them
+apart cannot report either correctly. The witness treats ENODEV as granted,
+which is what it is -- the call got past the gate and reached hardware that is
+not there.
 
 ### Intel HD Audio (2026-09-13) -- and what it still cannot do
 
