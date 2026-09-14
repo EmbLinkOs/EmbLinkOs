@@ -20,6 +20,7 @@
 #include "acpi/aml.h"
 #include "drivers/char/virtio_rng.h"
 #include "drivers/char/platform_misc.h"
+#include "drivers/i2c/smbus.h"
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
@@ -1850,6 +1851,10 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     
     pci_init();
     audio_init();  // sound out; harmless when the machine has no card
+    /* The chipset's two-wire bus: the battery, the memory SPD, a monitor's
+     * EDID. After pci_init, which is where the host controller is found. */
+    smbus_init();
+
     /* pvpanic, the watchdog and the debug-exit port. After pci_init, which is
      * where the watchdog is found. */
     platform_misc_init();

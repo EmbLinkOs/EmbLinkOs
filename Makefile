@@ -170,6 +170,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/char/serial.c \
              kernel/drivers/char/virtio_rng.c \
              kernel/drivers/char/platform_misc.c \
+             kernel/drivers/i2c/smbus.c \
              kernel/drivers/video/framebuffer.c \
              kernel/drivers/video/gpu.c \
              kernel/drivers/video/bochs_vbe.c \
@@ -2810,9 +2811,9 @@ test-audio-cards: $(IMG) $(EMBKFS_MASTER)
 test-acpi: $(IMG) $(EMBKFS_MASTER)
 	@for m in pc q35; do \
 	  echo "--- $$m ---"; \
-	  MACHINE=$$m EXTRA_DEVICES="intel-hda,e1000,rtl8139,AC97" \
+	  MACHINE=$$m EXTRA_DEVICES="intel-hda;e1000;rtl8139;AC97" \
 	    python3 tools/console_test.py "test aml" || exit 1; \
-	  MACHINE=$$m EXTRA_DEVICES="intel-hda,e1000,rtl8139,AC97" \
+	  MACHINE=$$m EXTRA_DEVICES="intel-hda;e1000;rtl8139;AC97" \
 	    python3 tools/console_test.py "test prt" || exit 1; \
 	done
 
@@ -2909,6 +2910,13 @@ modules: build/modules/ramdisk.ko
 # success: a module whose relocations were applied wrongly still loads, still
 # reports a registered device, and produces garbage the first time anything
 # calls through it.
+# THE TWO-WIRE BUS. A monitor is attached at an address the memory SPD EEPROMs
+# do not already occupy -- on a PC, DDC and the first DIMM's SPD share 0x50 on
+# different bus segments, which an emulator has only one of.
+.PHONY: test-i2c
+test-i2c: $(IMG) $(EMBKFS_MASTER)
+	@EXTRA_DEVICES="i2c-ddc,address=0x38" python3 tools/console_test.py "test i2c"
+
 .PHONY: test-modules
 test-modules: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/console_test.py "test modules"

@@ -33,7 +33,7 @@ not work.
 
 | Device | QEMU | Why it matters | Today |
 |---|---|---|---|
-| **I²C / SMBus** | `smbus-ipmi`, `i2c-ddc`, `i2c-echo` | **The biggest single gap.** I²C-HID is how a modern laptop's *touchpad*, and often its keyboard, attaches. SMBus reaches the battery and the memory SPD. DDC/EDID over I²C is how you learn what a monitor can do. | **No driver of any kind.** `grep` finds no i2c/smbus file in `kernel/drivers/` |
+| **I²C / SMBus** | `smbus-ipmi`, `i2c-ddc`, `i2c-echo` | SMBus reaches the battery, the memory SPD, and a monitor's EDID over its DDC lines | ✅ **host controller done** — `kernel/drivers/i2c/smbus.c` drives the PIIX4 and ICH9 hosts, probes the bus, and reads + validates EDID (header *and* checksum). `make test-i2c`. ⚠️ **This is not the touchpad.** I²C-HID hangs off an Intel LPSS or AMD designware controller, which **QEMU does not emulate at all** — that driver can only be written against the target machine |
 | **SD / eMMC** | `sdhci-pci`, `sd-card`, `emmc` | Laptop card readers. Many ARM boards *boot* from eMMC | absent |
 | **usb-net** | `usb-net` | A USB ethernet dongle is how you get networking on a laptop whose wireless chip has no driver. Cheap to write, high value | absent |
 | **usb-uas** | `usb-uas`, `usb-bot` | We speak Bulk-Only Transport only. A USB 3 stick negotiates UAS; BOT still works as a fallback, but UAS is the fast path | BOT only |
@@ -99,8 +99,9 @@ framebuffer, mildly useful on aarch64 where there is no VGA to fall back to.
 
 ## If you pick three
 
-1. **I²C / SMBus** — unlocks the touchpad and the battery on real laptops, and
-   nothing else in this list blocks as much.
+1. ~~**I²C / SMBus**~~ — the host controller is done. What is left of it is
+   I²C-HID for the touchpad, and that needs the target machine: no emulator
+   here has an LPSS/designware controller to develop against.
 2. **usb-net** — the escape hatch that gets a machine online when its wireless
    chip has no driver.
 3. **virtio-9p** — the only item here that makes every *future* item cheaper.

@@ -132,6 +132,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/bus/virtio_pci.c \
                   kernel/drivers/char/virtio_rng.c \
                   kernel/drivers/char/platform_misc.c \
+                  kernel/drivers/i2c/smbus.c \
                   kernel/drivers/input/virtio_input.c \
                   kernel/drivers/input/keyboard.c \
                   kernel/drivers/input/mouse.c \

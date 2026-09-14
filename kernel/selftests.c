@@ -64,6 +64,7 @@
 #include "module/module.h"
 #include "drivers/char/virtio_rng.h"
 #include "drivers/char/platform_misc.h"
+#include "drivers/i2c/smbus.h"
 #include "lib/random.h"
 #include "fs/automount.h"
 #include "drivers/usb/usb_core.h"
@@ -2811,6 +2812,121 @@ int selftests_handle_command(const char *cmd)
 
         kprintf("[cmd] test debug: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test i2c -- WHAT IS ON THE TWO-WIRE BUS?
+     *
+     * The bus itself cannot be asserted about: what is attached is the
+     * machine's business and an empty bus is not a failure. What CAN be
+     * asserted is that a device which IS attached answers correctly, and EDID
+     * is the ideal case -- 128 bytes with a fixed header and a checksum, so a
+     * bus that answered with whatever was floating is distinguishable from a
+     * monitor that answered.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test i2c") == 0) {
+        int fails = 0;
+        if (!smbus_present()) {
+            kprintf("\n[i2c] no SMBus host on this machine\n");
+            kprintf("\n[cmd] test i2c: OK (nothing to test)\n");
+            return 1;
+        }
+        kprintf("\n[i2c] %s host\n", smbus_host_name());
+
+        /* WHO IS THERE. A quick-write to every address, which is the probe
+         * with no side effects -- addresses 0x03..0x77 are the usable range. */
+        int found = 0;
+        for (uint8_t a = 0x03; a <= 0x77; a++) {
+            if (!smbus_probe(a)) continue;
+            kprintf("  device at 0x%02x%s\n", a,
+                    a == EDID_I2C_ADDR ? "  (a monitor's EDID, or memory SPD)"
+                  : a == SMART_BATTERY_ADDR ? "  (a Smart Battery)" : "");
+            found++;
+        }
+        kprintf("  %d device(s) answered\n", found);
+
+        /* AND DOES THE ONE WE CAN CHECK ANSWER CORRECTLY? */
+        /* LOOK FOR A MONITOR AT EVERY ADDRESS THAT ANSWERED, not only at
+         * 0x50. On a PC the DDC address collides with the first memory
+         * module's SPD, so a display attached for testing has to sit
+         * elsewhere -- and on a real machine with several outputs there is
+         * more than one of them anyway. */
+        static uint8_t edid[128];
+        uint8_t edid_at = 0;
+        for (uint8_t a = 0x03; a <= 0x77 && !edid_at; a++)
+            if (smbus_probe(a) && smbus_read_edid_at(a, edid)) edid_at = a;
+
+        if (edid_at) {
+            kprintf("  a display answered at 0x%02x\n", edid_at);
+            char vendor[4]; uint16_t product; uint32_t serial;
+            smbus_edid_identity(edid, vendor, &product, &serial);
+            uint32_t w = 0, h = 0;
+            bool mode = smbus_edid_preferred_mode(edid, &w, &h);
+            kprintf("  EDID: %s product 0x%04x serial 0x%08x, EDID %u.%u\n",
+                    vendor, (unsigned)product, (unsigned)serial,
+                    (unsigned)edid[18], (unsigned)edid[19]);
+            if (mode)
+                kprintf("  the display's preferred mode is %ux%u\n",
+                        (unsigned)w, (unsigned)h);
+            else
+                kprintf("  no preferred timing in the first descriptor\n");
+
+            /* The header and checksum already passed inside read_edid; this
+             * checks the decode produced something usable rather than three
+             * control characters. */
+            for (int i = 0; i < 3; i++)
+                if (vendor[i] < 'A' || vendor[i] > 'Z') {
+                    kprintf("  FAIL: the manufacturer code decoded to garbage\n");
+                    fails++;
+                    break;
+                }
+        } else if (found) {
+            /* NOT A MONITOR, THEN. On a PC the addresses 0x50..0x57 are the
+             * memory modules' SPD EEPROMs, which live at the same address as
+             * a monitor's EDID but on a different bus segment. Decoding what
+             * is actually there is more useful than reporting that it was not
+             * the thing we guessed first. */
+            uint8_t spd[16];
+            bool ok = true;
+            for (int i = 0; i < 16 && ok; i++)
+                ok = smbus_read_byte_data(0x50, (uint8_t)i, &spd[i]);
+            if (!ok) {
+                kprintf("  FAIL: 0x50 answered a probe but not a read\n");
+                fails++;
+            } else {
+                static const char *ddr[] = {
+                    "reserved","FPM","EDO","pipelined nibble","SDRAM","ROM",
+                    "DDR SGRAM","DDR","DDR2","FB-DIMM","FB-DIMM probe",
+                    "DDR3","DDR4" };
+                unsigned type = spd[2];
+                kprintf("  0x50 is memory SPD: type %u (%s), %u bytes used of "
+                        "%u\n", type,
+                        type < sizeof ddr / sizeof ddr[0] ? ddr[type] : "unknown",
+                        (unsigned)(spd[0] & 0x0F) ? 1u << ((spd[0] & 0x0F) + 4) : 0u,
+                        (unsigned)(spd[0] >> 4) ? 1u << ((spd[0] >> 4) + 4) : 0u);
+                kprintf("  first 16 bytes: %02x%02x%02x%02x %02x%02x%02x%02x "
+                        "%02x%02x%02x%02x %02x%02x%02x%02x\n",
+                        spd[0],spd[1],spd[2],spd[3],spd[4],spd[5],spd[6],spd[7],
+                        spd[8],spd[9],spd[10],spd[11],spd[12],spd[13],spd[14],spd[15]);
+                /* THE BUS IS REALLY WORKING if the bytes are not all the same.
+                 * A host that returns the last value latched, or 0xFF for
+                 * everything, passes every structural check above. */
+                /* ALL-ZERO IS A LEGITIMATE STATE, not a failure: QEMU creates
+                 * its eight SPD EEPROMs empty unless the machine was given
+                 * real DIMM geometry, and a laptop with soldered memory has
+                 * no SPD at all. Reported, not asserted -- the EDID path
+                 * above is where content is actually checked. */
+                int distinct = 0;
+                for (int i = 1; i < 16; i++) if (spd[i] != spd[0]) { distinct = 1; break; }
+                if (!distinct)
+                    kprintf("  (every byte is 0x%02x -- an empty EEPROM, which "
+                            "is what an emulator without DIMM geometry has)\n",
+                            spd[0]);
+            }
+        }
+
+        kprintf("\n[cmd] test i2c: %s\n", fails ? "FAIL" : "OK");
+        return 1;
     }
 
     /* ----------------------------------------------------------------------

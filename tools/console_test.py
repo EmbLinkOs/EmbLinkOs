@@ -105,15 +105,21 @@ def main(cmds):
     if machine:
         argv += ["-M", machine]
 
-    # EXTRA_DEVICES: more QEMU -device arguments, comma-separated.
+    # EXTRA_DEVICES: more QEMU -device arguments, SEMICOLON-separated.
     #
-    #   EXTRA_DEVICES="intel-hda,e1000,rtl8139" python3 tools/console_test.py "test prt"
+    #   EXTRA_DEVICES="intel-hda;e1000;rtl8139" python3 tools/console_test.py "test prt"
+    #   EXTRA_DEVICES="i2c-ddc,address=0x38,xres=2560" ... "test i2c"
+    #
+    # Semicolons, not commas: a device's own OPTIONS are comma-separated, so
+    # splitting on commas turned one device with three options into three
+    # devices with no driver -- which QEMU reports as "Parameter 'driver' is
+    # missing" and which looks nothing like the mistake it is.
     #
     # Added for `test prt`, where the point is COVERAGE: the ACPI interrupt
     # routing is cross-checked against what the firmware wrote into each PCI
     # device's Interrupt Line register, and a machine with two cards checks two
     # entries out of a hundred and twenty-eight.
-    for d in (os.environ.get("EXTRA_DEVICES") or "").split(","):
+    for d in (os.environ.get("EXTRA_DEVICES") or "").split(";"):
         d = d.strip()
         if d:
             argv += ["-device", d]
