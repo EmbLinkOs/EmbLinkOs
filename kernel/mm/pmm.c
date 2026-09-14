@@ -1,4 +1,7 @@
 #include "mm/pmm.h"
+#include "mm/kheap.h"
+#include "include/kprintf.h"
+#include "include/kstring.h"
 #include "drivers/char/serial.h"
 #include "include/spinlock.h"
 #include "boot/boot_protocol.h"
@@ -321,3 +324,62 @@ void pmm_reserve_page(uint64_t phys_addr) {
 }
 
 
+
+
+/* ---- memory that arrived after boot --------------------------------------
+ *
+ * The bitmap is sized once, at boot, from the highest address the firmware's
+ * memory map mentioned, and it lives immediately after the kernel image --
+ * which means it cannot simply be extended in place: what follows it is
+ * whatever the linker put there.
+ *
+ * So a region above the current coverage gets a NEW bitmap, allocated from
+ * the kernel heap, with the old one copied in. That is the only moving part,
+ * and it is why this cannot run before the heap exists.
+ *
+ * A region BELOW the current coverage needs none of that: the bits are
+ * already there and were marked used, so freeing them is the whole job. That
+ * is the common case -- firmware usually reports the hot-plug window's
+ * address range as reserved, so the bitmap already spans it. */
+bool pmm_add_region(uint64_t phys, uint64_t length) {
+    if (!length) return false;
+    uint64_t start_page = (phys + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t end_page = (phys + length) / PAGE_SIZE;
+    if (end_page <= start_page) return false;
+
+    if (end_page > total_pages) {
+        uint64_t new_total = end_page;
+        uint64_t new_size = (new_total + 7) / 8;
+        uint8_t *nb = (uint8_t *)kmalloc(new_size);
+        if (!nb) {
+            kprintf("pmm: cannot grow the bitmap to %llu bytes for %llu MiB "
+                    "of new memory\n", (unsigned long long)new_size,
+                    (unsigned long long)(length >> 20));
+            return false;
+        }
+        /* EVERYTHING NEW IS USED UNTIL SAID OTHERWISE. Copying the old bits
+         * and then setting the rest is the order that matters: the other way
+         * round would briefly present the new pages as free while the old
+         * ones were still being written. */
+        memcpy(nb, pmm_bitmap, bitmap_size);
+        for (uint64_t i = bitmap_size; i < new_size; i++) nb[i] = 0xFF;
+        used_pages += (new_total - total_pages);
+        pmm_bitmap = nb;
+        bitmap_size = new_size;
+        total_pages = new_total;
+    }
+
+    uint64_t added = 0;
+    for (uint64_t p = start_page; p < end_page; p++) {
+        if (bitmap_test(p)) {
+            bitmap_clear(p);
+            free_pages++;
+            used_pages--;
+            added++;
+        }
+    }
+    kprintf("pmm: +%llu MiB at %llx (%llu page(s) now free)\n",
+            (unsigned long long)((added * PAGE_SIZE) >> 20),
+            (unsigned long long)phys, (unsigned long long)free_pages);
+    return added > 0;
+}

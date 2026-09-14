@@ -84,6 +84,12 @@ extern struct cpu_data cpu_table[MAX_CPUS];
  * percpu_init_topology(). */
 extern uint32_t cpu_count;
 
+/* Add a processor the MADT never mentioned, because it did not exist when the
+ * firmware wrote that list. Returns its table entry, or NULL when the table
+ * is full. Does NOT start it -- see smp_hotplug_cpu(). */
+struct cpu_data *percpu_register_cpu(uint8_t apic_id);
+struct cpu_data *percpu_by_apic_id(uint8_t apic_id);
+
 /* Build cpu_table[]/the APIC-ID reverse lookup from ACPI's MADT CPU list
  * (acpi_get_info()). Must run after BOTH acpi_init() (needs cpu_apic_ids[])
  * and lapic_init() (needs lapic_get_id() to work, to identify the BSP's own

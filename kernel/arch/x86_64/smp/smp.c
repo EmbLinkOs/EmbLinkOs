@@ -155,6 +155,59 @@ void ap_main(void) {
     }
 }
 
+/* Start ONE application processor: copy the trampoline, poke its three data
+ * slots, send the startup IPI, and wait for it to say it arrived.
+ *
+ * Factored out of smp_bringup because a CPU that is plugged in while the
+ * machine runs needs exactly this and nothing else -- and duplicating it
+ * would mean the hot-plug path drifting away from the boot path, which is
+ * the one place where two copies of a bring-up sequence would be worst. */
+static bool smp_start_one(struct cpu_data *ap) {
+    uint64_t trampoline_virt = P2V(AP_TRAMPOLINE_PHYS);
+
+    /* Fresh copy of the trampoline for every AP: the previous AP's own
+     * bring-up may have left the poked data slots pointing at ITS values.
+     * APs are started strictly one at a time, so reusing the one trampoline
+     * page between them is safe as long as each start re-copies first. */
+    memcpy((void *)trampoline_virt, ap_trampoline_blob_start, blob_size());
+    *AP_SLOT_PML4_PHYS(trampoline_virt)   = vmm_get_kernel_pml4();
+    *AP_SLOT_STACK_TOP(trampoline_virt)   = (uint64_t)(ap->rsp0_stack + sizeof(ap->rsp0_stack));
+    *AP_SLOT_ENTRY_POINT(trampoline_virt) = (uint64_t)(uintptr_t)ap_entry64;
+
+    lapic_start_ap(ap->apic_id, AP_TRAMPOLINE_PHYS);
+
+    /* Bounded wait, not indefinite: an AP that never reports in must not
+     * hang whoever started it. */
+    for (int spin = 0; spin < 2000000; spin++) {
+        if (ap->online) return true;
+        __asm__ volatile ("pause");
+    }
+    return false;
+}
+
+/* A CPU THAT WAS NOT IN THE MADT. Everything about starting it is the same;
+ * what is different is that it has no entry in the topology table, because
+ * that table was built from a list made before this processor existed. */
+bool smp_hotplug_cpu(uint8_t apic_id) {
+    struct cpu_data *existing = percpu_by_apic_id(apic_id);
+    if (existing) {
+        if (existing->online) return true;
+        return smp_start_one(existing);
+    }
+    struct cpu_data *ap = percpu_register_cpu(apic_id);
+    if (!ap) {
+        kprintf("smp: no room in the topology table for apic_id=%u\n",
+                (unsigned int)apic_id);
+        return false;
+    }
+    kprintf("smp: a processor appeared (apic_id=%u, index %u); starting it\n",
+            (unsigned int)apic_id, (unsigned int)ap->cpu_index);
+    bool ok = smp_start_one(ap);
+    if (!ok)
+        kprintf("smp: apic_id=%u did not come online\n", (unsigned int)apic_id);
+    return ok;
+}
+
 void smp_bringup(void) {
     kprintf("\n=== SMP bring-up ===\n");
 
@@ -163,46 +216,14 @@ void smp_bringup(void) {
         return;
     }
 
-    uint64_t trampoline_virt = P2V(AP_TRAMPOLINE_PHYS);
-
     for (uint32_t i = 1; i < cpu_count; i++) {
         struct cpu_data *ap = &cpu_table[i];
 
-        /* Fresh copy of the trampoline for every AP: the previous AP's own
-         * bring-up may have left the poked data slots (and, in principle,
-         * self-modifying real-mode state) pointing at ITS values -- APs
-         * are started strictly one at a time (see the loop structure), so
-         * reusing the one trampoline page between them is safe as long as
-         * each iteration re-copies and re-pokes before its own SIPI. */
-        memcpy((void *)trampoline_virt, ap_trampoline_blob_start, blob_size());
-
-        *AP_SLOT_PML4_PHYS(trampoline_virt)   = vmm_get_kernel_pml4();
-        *AP_SLOT_STACK_TOP(trampoline_virt)   = (uint64_t)(ap->rsp0_stack + sizeof(ap->rsp0_stack));
-        *AP_SLOT_ENTRY_POINT(trampoline_virt) = (uint64_t)(uintptr_t)ap_entry64;
-
         kprintf("smp: starting AP apic_id=%u (index %u)...\n",
                 (unsigned int)ap->apic_id, (unsigned int)i);
-
-        lapic_start_ap(ap->apic_id, AP_TRAMPOLINE_PHYS);
-
-        /* Bounded wait, not indefinite: an AP that never reports in (wrong
-         * SIPI vector encoding, a bug in the trampoline, hardware that
-         * doesn't support MP bring-up the way this code assumes) must not
-         * hang the BSP's entire boot -- log it and move on to the next
-         * core rather than getting stuck forever. */
-        bool came_online = false;
-        for (int spin = 0; spin < 2000000; spin++) {
-            if (ap->online) {
-                came_online = true;
-                break;
-            }
-            __asm__ volatile ("pause");
-        }
-
-        if (!came_online) {
+        if (!smp_start_one(ap))
             kprintf("smp: AP apic_id=%u did NOT come online (timed out)\n",
                     (unsigned int)ap->apic_id);
-        }
     }
 
     kprintf("=== SMP bring-up done ===\n");

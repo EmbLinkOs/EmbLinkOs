@@ -3,6 +3,7 @@
 
 
 #include <stdint.h>
+#include "include/types.h"
 
 
 // The memory map now arrives via the boot protocol (struct boot_mmap_entry in
@@ -89,6 +90,13 @@ void pmm_reserve_page(uint64_t phys_addr);
  * is the correct outcome -- silently reserving nothing would be a bug that only
  * appears when a second CPU starts. */
 void arch_pmm_reserve_fixed(void);
+
+/* MEMORY THAT ARRIVED AFTER BOOT. The bitmap is sized once from the firmware's
+ * memory map and sits immediately after the kernel image, so it cannot be
+ * extended in place -- a region above its coverage gets a new bitmap from the
+ * kernel heap with the old one copied in. Needs the heap, so it cannot run
+ * during early boot. Returns true if any page actually became available. */
+bool pmm_add_region(uint64_t phys, uint64_t length);
 
 
 

@@ -73,6 +73,8 @@
 #include "drivers/iommu/virtio_iommu.h"
 #include "drivers/iommu/intel_iommu.h"
 #include "drivers/iommu/amd_iommu.h"
+#include "acpi/hotplug.h"
+#include "acpi/erst.h"
 #include "crypto/aes.h"
 #include "drivers/storage/atapi.h"
 #include "drivers/storage/sdhci.h"
@@ -3107,6 +3109,110 @@ int selftests_handle_command(const char *cmd)
      * mounts. What this adds is a READ ISSUED NOW, after everything is up, so
      * the claim is about the running system rather than about the boot.
      * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test hotplug -- a processor or a memory stick that arrived after boot.
+     *
+     * Reported, not asserted, for the same reason as the USB stick: the guest
+     * cannot claim somebody plugged something in. tools/hotplug_test.py does
+     * the plugging and checks the numbers move.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test erst -- a record written before the machine stopped existing.
+     *
+     * Same shape as `test pmem`, and for the same reason: the claim is about
+     * what survives, and nothing observable in one boot distinguishes a
+     * record that reached persistent storage from one that did not.
+     * tools/erst_test.py runs this twice and kills the machine in between.
+     *
+     * The record is a real UEFI Common Platform Error Record, because the
+     * firmware reads its header: the record's own IDENTIFIER lives at offset
+     * 96 of it and is what the platform indexes by. A blob with a marker in
+     * it would be stored and then impossible to find again.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test erst") == 0) {
+        if (!erst_present()) {
+            kprintf("\n[erst] no error record storage on this machine\n");
+            kprintf("\n[cmd] test erst: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        uint64_t count = erst_record_count();
+        kprintf("\n[erst] %llu record(s) stored, %llu-byte buffer\n",
+                (unsigned long long)count, (unsigned long long)erst_buffer_size());
+
+        static uint8_t rec[256];
+        uint32_t found = 0;
+        if (count) {
+            uint64_t id = erst_first_record();
+            memset(rec, 0, sizeof rec);
+            int n = erst_read(id, rec, sizeof rec);
+            if (n < 128) {
+                kprintf("  FAIL: record %llu did not read back (%d)\n",
+                        (unsigned long long)id, n);
+                fails++;
+            } else if (memcmp(rec + 128, "EMBLINK-ERST", 12) != 0) {
+                kprintf("  FAIL: record %llu holds \"%s\", not ours\n",
+                        (unsigned long long)id, rec + 128);
+                fails++;
+            } else {
+                found = (uint32_t)rec[140] | ((uint32_t)rec[141] << 8) |
+                        ((uint32_t)rec[142] << 16) | ((uint32_t)rec[143] << 24);
+                kprintf("[erst] generation found: %u (record id %llu)\n",
+                        (unsigned)found, (unsigned long long)id);
+            }
+        } else {
+            kprintf("[erst] generation found: 0\n");
+        }
+
+        /* Build the next one. A CPER header is 128 bytes and three of its
+         * fields are not decoration: the signature, the total length, and
+         * the record identifier the platform indexes by. */
+        uint32_t next = found + 1;
+        memset(rec, 0, sizeof rec);
+        memcpy(rec + 0, "CPER", 4);
+        rec[4] = 0x00; rec[5] = 0x01;                 /* revision 1.0 */
+        rec[6] = 0xFF; rec[7] = 0xFF; rec[8] = 0xFF; rec[9] = 0xFF;
+        rec[10] = 0; rec[11] = 0;                     /* no sections   */
+        rec[12] = 1;                                  /* severity: fatal */
+        uint32_t total = 160;
+        rec[20] = (uint8_t)total;        rec[21] = (uint8_t)(total >> 8);
+        rec[22] = (uint8_t)(total >> 16); rec[23] = (uint8_t)(total >> 24);
+        uint64_t id = 0x454D424B00000000ULL | next;   /* "EMBK" and a counter */
+        for (int i = 0; i < 8; i++) rec[96 + i] = (uint8_t)(id >> (i * 8));
+        memcpy(rec + 128, "EMBLINK-ERST", 12);
+        rec[140] = (uint8_t)next;        rec[141] = (uint8_t)(next >> 8);
+        rec[142] = (uint8_t)(next >> 16); rec[143] = (uint8_t)(next >> 24);
+
+        int rc = erst_write(id, rec, total);
+        if (rc != EMBK_OK) {
+            kprintf("  FAIL: writing the record returned %d\n", rc);
+            fails++;
+        } else {
+            kprintf("[erst] generation written: %u (now %llu record(s))\n",
+                    (unsigned)next, (unsigned long long)erst_record_count());
+        }
+        kprintf("\n[cmd] test erst: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test hotplug") == 0) {
+        if (!acpi_hotplug_available()) {
+            kprintf("\n[hotplug] this machine has no ACPI hot-plug registers\n");
+            kprintf("\n[cmd] test hotplug: SKIP\n");
+            return 1;
+        }
+        uint32_t online = 0;
+        for (uint32_t i = 0; i < cpu_count; i++)
+            if (cpu_table[i].online) online++;
+        kprintf("\n[hotplug] %u cpu(s) online, %llu free page(s); "
+                "added since boot: %u cpu(s), %u region(s)\n",
+                (unsigned)online, (unsigned long long)pmm_free_pages(),
+                (unsigned)acpi_hotplug_cpus_added(),
+                (unsigned)acpi_hotplug_memory_added());
+        kprintf("\n[cmd] test hotplug: OK\n");
+        return 1;
+    }
+
     if (strcmp(cmd, "test iommu") == 0) {
         /* THREE DIFFERENT IOMMUs, ONE TEST. VT-d, AMD-Vi and virtio-iommu are
          * three unrelated ways of describing the same restriction, and what

@@ -167,6 +167,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/acpi/acpi.c \
              kernel/acpi/aml.c \
              kernel/acpi/acpi_dev.c \
+             kernel/acpi/hotplug.c \
+             kernel/acpi/erst.c \
              kernel/drivers/char/serial.c \
              kernel/drivers/char/virtio_rng.c \
              kernel/drivers/char/virtio_console.c \
@@ -2989,6 +2991,40 @@ test-scsi: $(IMG) $(EMBKFS_MASTER)
 # it is also the one driver that can stop the machine by working: an endpoint
 # attached to an empty domain cannot reach its own descriptors. So the test is
 # that the machine still boots AND still reads a block afterwards.
+# THE FIRMWARE HAS BEEN OFFERING THIS THE WHOLE TIME. `test amldump` has shown
+# \_SB.CPUS with an _EJ0 on every processor since the AML interpreter was
+# written, and the DSDT declares the memory devices too. This adds a CPU and a
+# DIMM to a running machine and checks the guest's numbers move -- the memory
+# half being the stricter, because it is only real if the page bitmap grew past
+# the end the firmware's memory map described at boot.
+# A CRASH REPORT THAT SURVIVES THE CRASH. Writing one to the disk is the
+# obvious way and the wrong one -- the disk driver may be what panicked. The
+# test runs the guest twice over one backing store and kills it in between.
+# A CONTROLLER BEHIND A BRIDGE. The brute-force PCI scan finds devices behind
+# bridges without ever looking AT the bridge -- and a device behind one cannot
+# DMA unless the BRIDGE has bus mastering on, whatever the device is set to.
+# So: put a SCSI controller behind a PCIe root port and behind a legacy
+# pci-bridge, and run the same read/write/verify through each.
+.PHONY: test-bridge
+test-bridge: $(IMG) $(EMBKFS_MASTER)
+	@dd if=/dev/zero of=build/sas.img bs=1m count=32 2>/dev/null
+	@printf 'EMBLINK-HBA\0' | dd of=build/sas.img bs=512 conv=notrunc 2>/dev/null
+	@echo "=== behind a pcie-root-port ==="
+	@MACHINE=q35 EXTRA_QEMU="-device pcie-root-port,id=rp0,chassis=1 -device virtio-scsi-pci,id=hba0,bus=rp0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device scsi-hd,bus=hba0.0,drive=hbad" \
+	  python3 tools/console_test.py "test hba" || exit 1
+	@echo "=== behind a legacy pci-bridge ==="
+	@EXTRA_QEMU="-device pci-bridge,id=br0,chassis_nr=1 -device virtio-scsi-pci,id=hba0,bus=br0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device scsi-hd,bus=hba0.0,drive=hbad" \
+	  python3 tools/console_test.py "test hba" || exit 1
+	@echo "=== test-bridge: OK"
+
+.PHONY: test-erst
+test-erst: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/erst_test.py
+
+.PHONY: test-hotplug
+test-hotplug: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/hotplug_test.py
+
 .PHONY: test-iommu
 test-iommu: $(IMG) $(EMBKFS_MASTER)
 	@echo "=== virtio-iommu ==="

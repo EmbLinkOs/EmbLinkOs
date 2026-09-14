@@ -428,3 +428,148 @@ void pci_assign_resources(uint64_t window_base, uint64_t window_size) {
     kprintf("pci: assigned %d BAR(s) from %p + %d MiB\n", (int)assigned,
             (void *)(uintptr_t)window_base, (int)(window_size >> 20));
 }
+
+/* ---- bridges -------------------------------------------------------------
+ *
+ * pci_init above finds every device by brute force: it asks all 256 buses
+ * whether anything answers. That works, and it hides a gap -- it finds
+ * devices BEHIND a bridge without ever looking at the bridge itself.
+ *
+ * A bridge is not passive. It forwards a transaction only if the target is in
+ * a range it was TOLD to forward: a secondary/subordinate bus number pair for
+ * configuration traffic, a memory base/limit pair for memory, and a separate
+ * prefetchable pair. And -- the one that bites -- a device behind a bridge
+ * cannot DMA unless THE BRIDGE has bus mastering enabled, whatever the device
+ * itself is set to.
+ *
+ * On a PC, firmware has already programmed all of this before the kernel
+ * runs, which is exactly why this was missing for so long and why nothing
+ * appeared to be wrong. It is not true on a machine booted with `-kernel` and
+ * no firmware, where the bridges read back as zeros, and it is not true after
+ * a hot-plug into a root port that firmware never saw.
+ *
+ * What this does: report every bridge, make sure decoding and mastering are
+ * on, and fill in a bus range or a memory window that nobody assigned. It
+ * does NOT re-lay-out windows that firmware already set -- rewriting a
+ * working configuration to a theoretically nicer one is how you lose a boot
+ * disk.
+ */
+
+/* Type 1 (bridge) configuration header. */
+#define PCI_PRIMARY_BUS      0x18
+#define PCI_SECONDARY_BUS    0x19
+#define PCI_SUBORDINATE_BUS  0x1A
+#define PCI_IO_BASE          0x1C
+#define PCI_IO_LIMIT         0x1D
+#define PCI_MEM_BASE         0x20
+#define PCI_MEM_LIMIT        0x22
+#define PCI_PREF_MEM_BASE    0x24
+#define PCI_PREF_MEM_LIMIT   0x26
+#define PCI_BRIDGE_CONTROL   0x3E
+
+static uint32_t g_bridges;
+static uint32_t g_bridges_fixed;
+
+uint32_t pci_bridge_count(void) { return g_bridges; }
+uint32_t pci_bridges_configured(void) { return g_bridges_fixed; }
+
+/* The highest bus number anything answered on, so an unassigned subordinate
+ * can be given a range that is at least honest. */
+static uint8_t pci_highest_bus(void) {
+    uint8_t high = 0;
+    for (uint32_t i = 0; i < pci_device_count; i++)
+        if (devices[i].bus > high) high = devices[i].bus;
+    return high;
+}
+
+/* Does anything live behind this bridge, and where are its BARs? */
+static bool pci_behind_bridge(uint8_t secondary, uint8_t subordinate,
+                              uint64_t *out_lo, uint64_t *out_hi) {
+    uint64_t lo = ~0ULL, hi = 0;
+    bool any = false;
+    for (uint32_t i = 0; i < pci_device_count; i++) {
+        const struct pci_device *d = &devices[i];
+        if (d->bus < secondary || d->bus > subordinate) continue;
+        any = true;
+        for (uint8_t b = 0; b < 6; b++) {
+            struct pci_bar bar = pci_read_bar(d->bus, d->device, d->function, b);
+            if (!bar.valid || !bar.is_mmio || !bar.size) { if (bar.is_64bit) b++; continue; }
+            if (bar.address < lo) lo = bar.address;
+            if (bar.address + bar.size > hi) hi = bar.address + bar.size;
+            if (bar.is_64bit) b++;
+        }
+    }
+    if (!any) return false;
+    *out_lo = lo; *out_hi = hi;
+    return true;
+}
+
+void pci_bridge_configure(void) {
+    g_bridges = 0;
+    g_bridges_fixed = 0;
+    uint8_t highest = pci_highest_bus();
+
+    for (uint32_t i = 0; i < pci_device_count; i++) {
+        struct pci_device *d = &devices[i];
+        /* Class 06 subclass 04 is a PCI-to-PCI bridge; a PCIe root port is
+         * the same class with a PCI Express capability, and is configured
+         * identically as far as this is concerned. */
+        if (d->class_code != 0x06 || d->subclass != 0x04) continue;
+        g_bridges++;
+
+        uint8_t sec = pci_read8(d->bus, d->device, d->function, PCI_SECONDARY_BUS);
+        uint8_t sub = pci_read8(d->bus, d->device, d->function, PCI_SUBORDINATE_BUS);
+        bool fixed = false;
+
+        if (sec == 0 || sub < sec) {
+            /* NOBODY ASSIGNED A BUS RANGE. Give it one past everything that
+             * answered, so configuration traffic to whatever is plugged in
+             * later is forwarded rather than dropped. */
+            sec = (uint8_t)(highest + 1);
+            sub = 0xFF;
+            pci_write16(d->bus, d->device, d->function, PCI_PRIMARY_BUS,
+                        (uint16_t)(d->bus | (sec << 8)));
+            pci_write16(d->bus, d->device, d->function, PCI_SUBORDINATE_BUS,
+                        (uint16_t)sub);
+            highest = sec;
+            fixed = true;
+        }
+
+        uint16_t mbase = pci_read16(d->bus, d->device, d->function, PCI_MEM_BASE);
+        uint16_t mlimit = pci_read16(d->bus, d->device, d->function, PCI_MEM_LIMIT);
+        /* BASE GREATER THAN LIMIT IS HOW A WINDOW IS TURNED OFF, and it is
+         * also what an unprogrammed bridge reads back as. Either way, nothing
+         * behind it is reachable. */
+        if (mbase > mlimit) {
+            uint64_t lo = 0, hi = 0;
+            if (pci_behind_bridge(sec, sub, &lo, &hi)) {
+                /* The window granularity is one megabyte and the register
+                 * holds only the top sixteen bits of the address. */
+                uint16_t nb = (uint16_t)((lo & 0xFFF00000ULL) >> 16);
+                uint16_t nl = (uint16_t)(((hi - 1) & 0xFFF00000ULL) >> 16);
+                pci_write16(d->bus, d->device, d->function, PCI_MEM_BASE, nb);
+                pci_write16(d->bus, d->device, d->function, PCI_MEM_LIMIT, nl);
+                fixed = true;
+            }
+        }
+
+        /* DECODING AND MASTERING ON THE BRIDGE ITSELF. A device behind a
+         * bridge whose bus-master bit is clear cannot complete a single DMA,
+         * however it is configured -- the transaction is refused upstream of
+         * it, and the symptom is a controller that answers every register
+         * read and never finishes a transfer. */
+        uint16_t cmd = pci_read16(d->bus, d->device, d->function, PCI_COMMAND);
+        uint16_t want = (uint16_t)(cmd | (1u << 0) | (1u << 1) | (1u << 2));
+        if (want != cmd) {
+            pci_write16(d->bus, d->device, d->function, PCI_COMMAND, want);
+            fixed = true;
+        }
+
+        if (fixed) g_bridges_fixed++;
+        kprintf("pci: bridge %02x:%02x.%u -> buses %02x-%02x, mem %04x-%04x%s\n",
+                d->bus, d->device, d->function, sec, sub,
+                pci_read16(d->bus, d->device, d->function, PCI_MEM_BASE),
+                pci_read16(d->bus, d->device, d->function, PCI_MEM_LIMIT),
+                fixed ? " (configured here)" : "");
+    }
+}

@@ -35,6 +35,8 @@
 #include "drivers/iommu/intel_iommu.h"
 #include "drivers/iommu/amd_iommu.h"
 #include "drivers/tpm/tpm.h"
+#include "acpi/hotplug.h"
+#include "acpi/erst.h"
 #include "drivers/char/virtio_console.h"
 #include "drivers/misc/virtio_balloon.h"
 #include "drivers/i2c/smbus.h"
@@ -1870,6 +1872,10 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // --- Devices ---
     
     pci_init();
+    /* And the bridges, which the scan above walks THROUGH without ever
+     * looking AT. Before the IOMMU and before any driver: a device behind a
+     * bridge with mastering off cannot complete a transfer. */
+    pci_bridge_configure();
 
     /* THE IOMMU BEFORE ANY DEVICE THAT DMAs. Attaching an endpoint to a
      * domain redirects everything it does through that domain's table, so
@@ -1880,6 +1886,8 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     intel_iommu_init();
     amd_iommu_init();
     tpm_init();           /* the chip that remembers what booted, if there is one */
+    acpi_hotplug_init();  /* and watch for a CPU or a DIMM arriving later   */
+    erst_init();          /* somewhere to leave a crash record              */
 
     audio_init();  // sound out; harmless when the machine has no card
     /* The chipset's two-wire bus: the battery, the memory SPD, a monitor's
@@ -2220,6 +2228,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // interrupt-IN transfers and re-arm them. xHCI input is IRQ-driven.
         usb_poll();
         virtio_input_poll();
+        acpi_hotplug_poll();
         // Drive the window compositor's pointer: cursor, click-to-focus, and
         // title-bar drag. Runs here (schedulable shell-process context) so the
         // compositor spinlock is never taken from an IRQ handler. No-op until a

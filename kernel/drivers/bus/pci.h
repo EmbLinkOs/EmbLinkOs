@@ -160,4 +160,14 @@ uint32_t arch_pci_irq_line(const struct pci_device *dev);
 
 // Enable bus mastering (command register bit 2) for a device
 void pci_enable_bus_mastering(uint8_t bus, uint8_t device, uint8_t function);
+
+/* Look at the BRIDGES, which the brute-force scan never does: it finds the
+ * devices behind them without ever touching the bridge itself. A bridge
+ * forwards only what it was told to forward -- a bus range, a memory window --
+ * and a device behind one cannot DMA unless the BRIDGE has bus mastering on.
+ * Call after pci_init(). Reports every bridge; fills in a range or a window
+ * that nobody assigned; never rewrites one firmware already set. */
+void pci_bridge_configure(void);
+uint32_t pci_bridge_count(void);
+uint32_t pci_bridges_configured(void);
 #endif /* __PCI_H__ */
