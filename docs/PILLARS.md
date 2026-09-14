@@ -52,11 +52,19 @@ emulates the common real part, so none has to wait for the machine.
 | **USB hot-plug + mass storage mount** | ✅ **done for the shared-core controllers** — ports are compared against the device table every 500 ms, a device that appears is enumerated and a device that leaves is torn down. A mass-storage device is scanned for partitions and mounted under `/media/<device>` (FAT32 or EMBKFS) by `kernel/fs/automount.c`, and unmounted before its block device is unregistered. Proved by attaching a FAT32 stick over QMP to a RUNNING machine, reading a named file off it, and pulling it out again: `make test-usb-hotplug`. **xHCI is not covered** — it has its own device model and never touches the shared core. | A USB stick plugged in after boot does nothing |
 | **UEFI boot** | ✅ **done** — the firmware launches our own EFI loader (`boot/uefi/`, no GNU-EFI), it relocates itself, draws its menu through ConOut, locates a GOP framebuffer, loads the kernel, builds page tables, exits boot services and jumps. Verified end to end under OVMF on BOTH images: loader and root on separate disks, and the single GPT disk (ESP + EMBKFS) you write to a USB stick — where the root is found on the same device the firmware booted from. `make test-uefi` | A machine from the last several years boots this way and no other |
 
-**Still open on the installer pillar:** it COPIES a layout rather than
-creating one, so the installed root filesystem comes out the same size as the
-source's — installing from a 200 MB stick onto a 1 TB disk uses 200 MB of it,
-and growing the filesystem afterwards is not written. It also needs a source
-that already has a GPT, and it has no interface beyond the command line.
+**The installer now grows what it copies.** After the copy it extends the last
+partition to the end of the target and tells the filesystem inside it that it
+is bigger — neither of which moves a byte of file data: a GPT entry is a first
+and last block number, and EMBKFS records its size in a superblock and builds
+its allocator bitmap from that at every mount. `make test-install` checks the
+whole thing from both ends: 128 MB → 254 MB on a 320 MB target, and the
+machine that boots the result reports mounting 254 MB with its allocator
+agreeing with the superblock's free count exactly.
+
+**Still open on it:** it needs a source that already has a GPT — it copies a
+layout rather than creating one — and it has no interface beyond the command
+line. Source and target must also have the same logical block size; installing
+a 512-byte-sector stick onto a 4Kn disk is not a block copy at all.
 
 **Still open on the Secure Boot pillar:** the key is ours, so this boots on a
 machine whose owner has enrolled it — not on a stock laptop, where the enrolled
@@ -115,8 +123,8 @@ to a working driver, not prerequisites for one.
 |---|---|---|
 | **Secure Boot** | ✅ **done for what can be tested** — the loader is Authenticode-signed by `tools/sbsign.py` (PE hash + PKCS#7, written here because the signing tools are Linux-only), keys are enrolled into the firmware's variable store by `tools/efivars.py`, and the loader reports the firmware's `SecureBoot` state and verifies the kernel's build hash before jumping. Proved as a PAIR: unsigned is REFUSED and signed BOOTS, on enforcing OVMF. `make test-secureboot` | Retail hardware ships with it on, and refuses an unsigned loader without a warning |
 | **Installer** | ✅ **done** — `user/tools/install/install.c`, the first and only holder of `EMBK_CAP_RAWDISK`. It reads the GPT of the medium it booted from, writes an equivalent one to the target, copies the partitions across and rebuilds the backup GPT at the target's own last LBA. Proved by installing onto a blank disk and then booting that disk **with the stick detached**. `make test-install` | There is no way to put the OS onto the target's disk |
-| **Partitions on 4096-byte-sector disks** | `partition.c` skips them | Many NVMe drives can be 4Kn; the installer must partition them |
-| **Partitions on aarch64 at all** | never scanned | An ARM machine's disk is partitioned |
+| **Partitions on 4096-byte-sector disks** | ✅ **done** — everything in GPT is counted in LOGICAL blocks (the header is in block 1, the entry array starts at a block number, and how many entries fit in one read is the block size divided by the entry size); `partition.c` hard-coded 512 in all three places. `make test-parts` parses the same layout at 512 and at 4096, and reads a signature out of each partition's first block — because "a partition was registered" and "the partition addresses the sectors the table named" are different claims |
+| **Partitions on aarch64 at all** | ✅ **done** — `embk_partition_scan_all()` now runs there too, between the disk drivers and the filesystem probe, exactly where kernel/main.c puts it. Verified by attaching a GPT disk to the ARM machine and watching it register sdb1 and sdb2. Until this ran, that machine could only mount a bare filesystem written to a whole device — so it could not have booted what the installer produces |
 | **Encrypted install** | XTS and encrypted EMBKFS exist | Offer it in the installer, unlock at boot |
 
 ## Phase 3 — you can live in it

@@ -13,10 +13,14 @@
  * EMBKFS's on-disk format to drift from the first one, and the thing installed
  * is byte-for-byte the thing that was tested.
  *
- * The cost is honest and worth stating: the target's root partition comes out
- * the same SIZE as the source's, so installing from a 200 MB stick onto a 1 TB
- * disk uses 200 MB of it. Growing the filesystem afterwards is a separate
- * operation and it is not written yet (docs/TODO.md).
+ * AND THEN IT GROWS WHAT IT COPIED. A copy alone would give the target a root
+ * partition the same SIZE as the source's -- install from a 200 MB stick onto
+ * a 1 TB disk and use 200 MB of it -- so after the copy the last partition is
+ * extended to the end of the target and the filesystem inside it is told it is
+ * bigger. Both are small operations and neither touches a single byte of file
+ * data: a GPT entry is a first and last block number, and EMBKFS records its
+ * size in a superblock and builds its allocator bitmap from that at every
+ * mount. Nothing has to be moved.
  *
  * WHAT IT REFUSES TO DO. It will not write to the disk it is running from, and
  * it will not write to a partition. Both are cheap to check and both are
@@ -52,6 +56,41 @@ struct gpt_entry {
     uint64_t first_lba, last_lba;
     uint64_t attrs;
     uint16_t name[36];
+} __attribute__((packed));
+
+/* CRC32C (Castagnoli), which is what EMBKFS checksums with -- a different
+ * polynomial from the CRC32 above, which is GPT's. Two checksums, two
+ * standards, one installer that has to speak both. */
+static uint32_t crc32c(const void *data, size_t len) {
+    static uint32_t tab[256];
+    static int built;
+    if (!built) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++)
+                c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+            tab[i] = c;
+        }
+        built = 1;
+    }
+    const uint8_t *p = data;
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+/* ---- EMBKFS, only as much of it as growing a volume needs --------------- */
+#define EMBKFS_MAGIC_LO 0x53464B424D45ULL      /* "EMBKFS" little-endian    */
+#define EMBKFS_SB_OFFSET 65536                 /* the superblock's byte offset */
+#define EMBKFS_SB_BODY 152                     /* the checksum covers [0,152) */
+
+struct embkfs_sb_head {
+    uint64_t magic;
+    uint32_t version_major, version_minor;
+    uint64_t feature_compat, feature_ro_compat, feature_incompat;
+    uint64_t block_size;
+    uint64_t total_blocks;
+    uint64_t free_blocks;
 } __attribute__((packed));
 
 static uint32_t crc32(const void *data, size_t len) {
@@ -269,6 +308,146 @@ int main(int argc, char **argv) {
     if (embk_disk_write(di, alt_lba, 1, sec) != 0) {
         printf("install: cannot write the backup GPT header\n");
         return 1;
+    }
+
+    /* ---- grow the last partition to fill the target -------------------
+     *
+     * The copy above reproduced the source's layout exactly, which leaves the
+     * root partition the size it was on a USB stick. Extending it is two
+     * numbers: the entry's LAST block, and every checksum that covers it.
+     *
+     * THREE CHECKSUMS, AND MISSING ONE IS WORSE THAN NOT TRYING. The entry
+     * array has its own CRC, that CRC is a field inside each header, and each
+     * header has a CRC of its own. Change an entry and all three are stale --
+     * at which point firmware sees a corrupt primary, "repairs" it from a
+     * backup that disagrees, and the partition table is whatever the two of
+     * them average out to. */
+    uint32_t last_idx = 0;
+    uint64_t last_end = 0;
+    for (uint32_t i = 0; i < nent; i++) {
+        struct gpt_entry e;
+        memcpy(&e, table + (uint64_t)i * esz, sizeof e);
+        int empty = 1;
+        for (int k = 0; k < 16; k++) if (e.type_guid[k]) empty = 0;
+        if (empty) continue;
+        if (e.last_lba >= last_end) { last_end = e.last_lba; last_idx = i; }
+    }
+
+    struct gpt_entry last;
+    memcpy(&last, table + (uint64_t)last_idx * esz, sizeof last);
+    uint64_t grown_last = alt_entries - 1;          /* the new last usable block */
+    uint64_t old_blocks = last.last_lba - last.first_lba + 1;
+    uint64_t new_blocks = grown_last - last.first_lba + 1;
+
+    if (grown_last > last.last_lba) {
+        last.last_lba = grown_last;
+        memcpy(table + (uint64_t)last_idx * esz, &last, sizeof last);
+
+        gh.entries_crc = crc32(table, table_bytes);
+        gh.header_crc  = 0;
+        gh.header_crc  = crc32(&gh, gh.header_size);
+        memset(sec, 0, SECTOR);
+        memcpy(sec, &gh, sizeof gh);
+        if (embk_disk_write(di, 1, 1, sec) != 0) {
+            printf("install: cannot rewrite the primary GPT header after growing\n");
+            return 1;
+        }
+        for (uint64_t b = 0; b < table_blocks; b += CHUNK) {
+            uint32_t n = (uint32_t)((table_blocks - b) < CHUNK ? (table_blocks - b) : CHUNK);
+            if (embk_disk_write(di, gh.entries_lba + b, n, table + b * SECTOR) != 0) {
+                printf("install: cannot rewrite the primary partition entries\n");
+                return 1;
+            }
+        }
+
+        bh.entries_crc = gh.entries_crc;
+        bh.last_usable = gh.last_usable;
+        bh.header_crc  = 0;
+        bh.header_crc  = crc32(&bh, bh.header_size);
+        for (uint64_t b = 0; b < table_blocks; b += CHUNK) {
+            uint32_t n = (uint32_t)((table_blocks - b) < CHUNK ? (table_blocks - b) : CHUNK);
+            if (embk_disk_write(di, alt_entries + b, n, table + b * SECTOR) != 0) {
+                printf("install: cannot rewrite the backup partition entries\n");
+                return 1;
+            }
+        }
+        memset(sec, 0, SECTOR);
+        memcpy(sec, &bh, sizeof bh);
+        if (embk_disk_write(di, alt_lba, 1, sec) != 0) {
+            printf("install: cannot rewrite the backup GPT header\n");
+            return 1;
+        }
+        printf("install: grew partition %u from %llu MB to %llu MB\n",
+               (unsigned)(last_idx + 1),
+               (unsigned long long)((old_blocks * SECTOR) >> 20),
+               (unsigned long long)((new_blocks * SECTOR) >> 20));
+    }
+
+    /* ---- and tell the filesystem inside it that it is bigger ----------
+     *
+     * EMBKFS records its size in its superblock and BUILDS ITS ALLOCATOR
+     * BITMAP FROM THAT AT EVERY MOUNT -- there is no on-disk free map to
+     * extend. So growing a volume is: write a larger total, add the
+     * difference to the free count, and put the backup superblock where the
+     * end of the volume now is.
+     *
+     * THE OLD BACKUP MUST BE DESTROYED, not left behind. It sits in what is
+     * now free space, it still passes its own checksum, and it still claims
+     * the old size. A mount that found it would believe a volume half the
+     * size of the one it is looking at, and start allocating over the half it
+     * could not see. */
+    if (grown_last > last_end) {
+        static uint8_t sb[SECTOR];
+        uint64_t sb_lba = last.first_lba + (EMBKFS_SB_OFFSET / SECTOR);
+        if (embk_disk_read(di, sb_lba, 1, sb) != 0) {
+            printf("install: cannot read the filesystem's superblock\n");
+            return 1;
+        }
+        struct embkfs_sb_head *h = (struct embkfs_sb_head *)sb;
+        uint32_t want = crc32c(sb, EMBKFS_SB_BODY);
+        uint32_t have = (uint32_t)*(uint64_t *)(sb + EMBKFS_SB_BODY);
+
+        if (want != have || h->block_size == 0 || (h->block_size % SECTOR) != 0) {
+            printf("install: the root partition holds no EMBKFS superblock this "
+                   "installer recognises -- leaving it at %llu MB\n",
+                   (unsigned long long)((old_blocks * SECTOR) >> 20));
+        } else {
+            uint64_t spb = h->block_size / SECTOR;          /* sectors per fs block */
+            uint64_t old_total = h->total_blocks;
+            uint64_t new_total = new_blocks / spb;
+            if (new_total > old_total) {
+                uint64_t old_backup_lba = last.first_lba + (old_total - 1) * spb;
+
+                h->total_blocks = new_total;
+                h->free_blocks += (new_total - old_total);
+                *(uint64_t *)(sb + EMBKFS_SB_BODY) = crc32c(sb, EMBKFS_SB_BODY);
+
+                if (embk_disk_write(di, sb_lba, 1, sb) != 0) {
+                    printf("install: cannot rewrite the filesystem superblock\n");
+                    return 1;
+                }
+                /* The backup lives at the start of the volume's LAST block. */
+                uint64_t new_backup_lba = last.first_lba + (new_total - 1) * spb;
+                if (embk_disk_write(di, new_backup_lba, 1, sb) != 0) {
+                    printf("install: cannot write the backup superblock\n");
+                    return 1;
+                }
+                if (old_backup_lba != new_backup_lba) {
+                    static uint8_t zero[SECTOR];
+                    memset(zero, 0, sizeof zero);
+                    if (embk_disk_write(di, old_backup_lba, 1, zero) != 0) {
+                        printf("install: cannot erase the stale backup superblock\n");
+                        return 1;
+                    }
+                }
+                printf("install: grew the filesystem from %llu MB to %llu MB "
+                       "(%llu blocks of %llu bytes)\n",
+                       (unsigned long long)((old_total * h->block_size) >> 20),
+                       (unsigned long long)((new_total * h->block_size) >> 20),
+                       (unsigned long long)new_total,
+                       (unsigned long long)h->block_size);
+            }
+        }
     }
 
     printf("install: DONE -- %s now carries EmbLinkOS\n", dst.name);

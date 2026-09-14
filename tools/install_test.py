@@ -202,6 +202,27 @@ def main():
                 print("   " + line.strip())
         if "install: DONE" not in out:
             fails.append("the installer did not report DONE")
+
+        # AND IT HAS TO HAVE GROWN WHAT IT COPIED. Installing from a 200 MB
+        # stick onto a 320 MB disk and using 200 MB of it is the behaviour
+        # this test exists to stop being acceptable -- it is not a failure the
+        # second boot would catch, because a small filesystem boots perfectly.
+        if "install: grew partition" not in out:
+            fails.append("the installer did not grow the last partition to "
+                         "fill the target")
+        if "install: grew the filesystem" not in out:
+            fails.append("the partition grew and the filesystem inside it did "
+                         "not -- the extra space is unreachable")
+        m = re.search(r"install: grew the filesystem from (\d+) MB to (\d+) MB", out)
+        if m:
+            before_mb, after_mb = int(m.group(1)), int(m.group(2))
+            if after_mb <= before_mb:
+                fails.append("the filesystem did not actually get bigger "
+                             "(%d -> %d MB)" % (before_mb, after_mb))
+            else:
+                globals()["GREW_TO_MB"] = after_mb
+                print("install-test: filesystem grown %d MB -> %d MB"
+                      % (before_mb, after_mb))
     finally:
         p.terminate()
         try:
@@ -216,6 +237,12 @@ def main():
         return 1
 
     # ---- phase two: boot the TARGET ALONE --------------------------------
+    #
+    # And read the size back from the machine that mounted it. The installer
+    # SAYING it grew the filesystem and the kernel AGREEING when it next mounts
+    # it are different claims: a superblock whose checksum no longer matches is
+    # refused, and one whose total is bigger than the partition is worse than
+    # that -- it allocates off the end.
     #
     # The source is not attached. If the installer wrote nothing, there is
     # nothing here to boot and the firmware says so.
@@ -249,6 +276,24 @@ def main():
         print("install-test: the installed disk mounted its root on %s" % m.group(1))
     if "desktop ready" not in text:
         fails.append("the installed disk did not reach a desktop")
+
+    # THE KERNEL'S OWN READING OF THE SIZE. The mount banner prints the
+    # superblock's totals, so this is the volume as the machine that just
+    # mounted it understands it -- not as the installer claimed.
+    m = re.search(r"EMBKFS: sd\w+: mounted.*?block_size (\d+)\s+blocks (\d+)", text)
+    grew_to = globals().get("GREW_TO_MB")
+    if not m:
+        fails.append("the installed disk's mount banner did not report a size")
+    elif grew_to:
+        mounted_mb = (int(m.group(1)) * int(m.group(2))) >> 20
+        print("install-test: the installed root mounted as %d MB" % mounted_mb)
+        # Within a megabyte: the installer counts the partition, the
+        # filesystem counts whole blocks of it, and the last partial block is
+        # not usable.
+        if abs(mounted_mb - grew_to) > 1:
+            fails.append("the installer grew the filesystem to %d MB and the "
+                         "kernel mounted %d MB -- the superblock and the "
+                         "partition disagree" % (grew_to, mounted_mb))
 
     for f in fails:
         print("  FAIL: " + f)

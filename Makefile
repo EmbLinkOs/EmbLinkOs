@@ -3035,6 +3035,30 @@ test-bridge: $(IMG) $(EMBKFS_MASTER)
 # the target machine. The record has to survive, and the check that it is a
 # REAL record rather than a plausible one is that the RIP it stored resolves --
 # through this host's nm, against the very kernel that crashed -- to a function.
+# PARTITIONS, AT BOTH LOGICAL BLOCK SIZES.
+#
+# Everything in GPT is counted in logical blocks -- the header is in block 1,
+# the entry array starts at a block number, and how many entries fit in one
+# read is the block size divided by the entry size. A parser that assumes 512
+# works on every image anyone here has ever built, because every tool that
+# builds them assumes 512 too. tools/mkgpt.py writes the one that is different.
+#
+# Each partition carries a signature in its first block: "a partition was
+# registered" and "the partition addresses the sectors the table named" are
+# different claims, and a parser reading the array with the wrong stride
+# registers plausible partitions at wrong offsets and looks entirely healthy.
+.PHONY: test-parts
+test-parts: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/mkgpt.py build/gpt512.img --block 512 --mib 64 --parts 2
+	@python3 tools/mkgpt.py build/gpt4k.img  --block 4096 --mib 64 --parts 2
+	@echo "=== 512-byte blocks ==="
+	@EXTRA_QEMU="-drive id=gptd,file=$(CURDIR)/build/gpt512.img,format=raw,if=none -device nvme,serial=gpt512,drive=gptd" \
+	  python3 tools/console_test.py "test parts" || exit 1
+	@echo "=== 4096-byte blocks (a 4Kn drive) ==="
+	@EXTRA_QEMU="-drive id=gptd,file=$(CURDIR)/build/gpt4k.img,format=raw,if=none -device nvme,serial=gpt4k,drive=gptd,logical_block_size=4096,physical_block_size=4096" \
+	  python3 tools/console_test.py "test parts" || exit 1
+	@echo "=== test-parts: OK"
+
 .PHONY: test-crash
 test-crash: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/crash_test.py

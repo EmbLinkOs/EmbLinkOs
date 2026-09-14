@@ -4,7 +4,8 @@
 #include "include/kstring.h"
 #include "include/errno.h"
 #include "fs/embkfs/embkfs.h"
-#include "block/block.h"   /* blkstat request counters (test ioperf) */
+#include "block/block.h"
+#include "block/partition.h"   /* blkstat request counters (test ioperf) */
 #include "net/net.h"       /* g_netif, net_ping (test net) */
 #include "include/usercopy.h"   /* transient-EFAULT retry counters */
 #include "drivers/timer/hpet.h"
@@ -3146,6 +3147,45 @@ int selftests_handle_command(const char *cmd)
      * register dump says where the machine stopped and almost never what it
      * was doing.
      * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test parts -- the partition table, and whether it addresses anything.
+     *
+     * "A partition was registered" and "the partition addresses the sectors
+     * the table named" are different claims, and only the second is worth
+     * having: a parser that reads the entry array with the wrong stride
+     * registers plausible partitions at wrong offsets and looks entirely
+     * healthy. So this reads the FIRST BLOCK of every partition and reports
+     * what is there -- tools/mkgpt.py puts a signature in each.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test parts") == 0) {
+        int fails = 0;
+        uint32_t parts = 0;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *d = embk_block_get(i);
+            if (!d) continue;
+            struct embk_block_device *parent = embk_partition_parent(d);
+            if (!parent || parent == d) continue;     /* a whole disk, not a partition */
+            parts++;
+
+            static uint8_t buf[4096];
+            memset(buf, 0, sizeof buf);
+            const char *mark = "(unreadable)";
+            if (embk_block_read(d, 0, 1, buf) == EMBK_OK) {
+                buf[63] = '\0';
+                mark = (const char *)buf;
+                if (buf[0] == '\0') mark = "(empty)";
+            } else {
+                fails++;
+            }
+            kprintf("[parts] %s on %s: %llu x %u B, first block says \"%s\"\n",
+                    d->name, parent->name,
+                    (unsigned long long)d->block_count, d->block_size, mark);
+        }
+        kprintf("\n[parts] %u partition(s) registered\n", (unsigned)parts);
+        kprintf("\n[cmd] test parts: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
     if (strcmp(cmd, "test crashlog") == 0) {
         if (!crashlog_have_previous() && !crashlog_load_previous()) {
             kprintf("\n[crashlog] no crash record from a previous boot\n");

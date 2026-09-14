@@ -10,6 +10,7 @@
 #include "drivers/bus/pci.h"
 #include "drivers/storage/virtio_blk.h"
 #include "block/block.h"
+#include "block/partition.h"
 #include "fs/embkfs/embkfs.h"
 #include "mm/swap.h"          /* swap_init: the store, if a disk carries the header */
 #include "mm/swaptest.h"
@@ -592,6 +593,18 @@ void arch_early_main(uint64_t dtb_phys) {
             selftest_fails++;
         }
     }
+
+    /* PARTITIONS. Every disk above is a whole device; a disk that carries a
+     * partition table holds its filesystems INSIDE it, and until this ran the
+     * aarch64 machine could only ever mount a bare filesystem written to the
+     * whole device. An ARM machine's disk is partitioned like any other, and
+     * the installer writes a GPT -- so a machine that cannot read one cannot
+     * boot what the installer produced.
+     *
+     * Before the filesystem probe, which is what needs the partitions to
+     * exist, and after every driver that registers a disk. Exactly where
+     * kernel/main.c puts it. */
+    embk_partition_scan_all();
 
     /* --- the real filesystem -------------------------------------------------
      * process_init() first: EMBKFS takes sleeping locks, and a sleeping lock

@@ -7388,6 +7388,12 @@ closing table instead.
       is on the wire and the device would accept a queue; what is missing is
       anything asynchronous ABOVE the driver to produce one.
 - [ ] **No El Torito.** `fs/iso9660.c` reads a disc; nothing boots from one.
+- [ ] **The installer cannot CREATE a layout, only copy one.** It needs a
+      source that already carries a GPT, and source and target must have the
+      same logical block size -- copying a 512-byte-sector stick onto a 4Kn
+      disk is not a block copy at all, and it is refused rather than
+      attempted. Partitioning a bare disk from nothing is the missing piece.
+- [ ] **The installer has no interface beyond the command line.**
 - [ ] **No removal path for hot-added memory.** `pmm_add_region()` grows; the
       allocator cannot vacate a range that is in use, so `pc-dimm` ejection
       and virtio-mem unplug are both refused rather than half-done.
