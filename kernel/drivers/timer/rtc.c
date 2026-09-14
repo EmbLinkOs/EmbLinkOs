@@ -74,7 +74,39 @@ static int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
     return era * 146097 + (int64_t)doe - 719468;
 }
 
+/* HOW FAR THE HARDWARE CLOCK IS WRONG, in seconds, as told to us by something
+ * that knows better -- NTP, or a person setting the clock.
+ *
+ * An OFFSET rather than writing the CMOS chip, deliberately. Writing it means
+ * a read-modify-write of a register set that updates once a second underneath
+ * you, in whichever of BCD or binary and 12- or 24-hour this board happens to
+ * use; getting any of that wrong leaves the machine with a clock that is wrong
+ * in a way that survives a power cycle. An offset is one addition, it cannot
+ * corrupt anything, and the hardware keeps ticking underneath it. What it does
+ * not do is persist across a reboot -- which is honest: NTP runs at every boot
+ * and that is where the answer comes from. */
+static int64_t g_clock_offset;
+
+static uint64_t rtc_read_hardware(void);
+
 uint64_t rtc_now_unix(void)
+{
+    uint64_t hw = rtc_read_hardware();
+    int64_t adjusted = (int64_t)hw + g_clock_offset;
+    /* Never hand back a time before the epoch, whatever the offset says. */
+    return adjusted < 0 ? 0 : (uint64_t)adjusted;
+}
+
+void rtc_set_unix(uint64_t unix_seconds)
+{
+    g_clock_offset = (int64_t)unix_seconds - (int64_t)rtc_read_hardware();
+}
+
+int64_t rtc_offset(void) { return g_clock_offset; }
+
+uint64_t rtc_hardware_unix(void) { return rtc_read_hardware(); }
+
+static uint64_t rtc_read_hardware(void)
 {
     struct cmos_snapshot prev, cur;
 

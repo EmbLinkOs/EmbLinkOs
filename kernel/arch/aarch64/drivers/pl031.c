@@ -53,12 +53,36 @@ static void pl031_probe(void) {
             (void *)(uintptr_t)base, (int)base_unix);
 }
 
-uint64_t rtc_now_unix(void) {
+/* HOW FAR THE HARDWARE CLOCK IS WRONG, as told to us by NTP or by a person.
+ * The same design as x86's CMOS driver, and for the same reason: the offset is
+ * one addition and cannot corrupt a clock, where writing the chip back can.
+ * See kernel/drivers/timer/rtc.c for the argument in full.
+ *
+ * It matters more here, not less. The PL031 in QEMU `virt` has no battery
+ * behind it and boards without one read zero -- 1970 -- so on aarch64 the
+ * offset is frequently the only thing standing between the filesystem and a
+ * tree of files dated the first of January 1970. */
+static int64_t g_clock_offset;
+
+static uint64_t pl031_read_hardware(void) {
     pl031_probe();
     if (!pl031)
         return 0;
     return *(volatile uint32_t *)(pl031 + RTC_DR);
 }
+
+uint64_t rtc_now_unix(void) {
+    int64_t adjusted = (int64_t)pl031_read_hardware() + g_clock_offset;
+    return adjusted < 0 ? 0 : (uint64_t)adjusted;
+}
+
+void rtc_set_unix(uint64_t unix_seconds) {
+    g_clock_offset = (int64_t)unix_seconds - (int64_t)pl031_read_hardware();
+}
+
+int64_t rtc_offset(void) { return g_clock_offset; }
+
+uint64_t rtc_hardware_unix(void) { return pl031_read_hardware(); }
 
 uint64_t rtc_now_ns(void) {
     pl031_probe();
@@ -70,5 +94,7 @@ uint64_t rtc_now_ns(void) {
      * files in the same second with the same nanosecond value cannot order
      * them. */
     uint64_t now_ns = time_get_ns();
-    return (base_unix * 1000000000ULL) + (now_ns - base_ns);
+    int64_t  base = (int64_t)base_unix + g_clock_offset;
+    if (base < 0) base = 0;
+    return ((uint64_t)base * 1000000000ULL) + (now_ns - base_ns);
 }

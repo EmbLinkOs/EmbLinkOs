@@ -167,6 +167,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/net/udp/udp.c \
                   kernel/net/dhcp/dhcp.c \
                   kernel/net/dns/dns.c \
+                  kernel/net/ntp/ntp.c \
                   kernel/net/tcp/tcp.c
 
 # Coarse on purpose, exactly as $(KERNEL_HDRS) is on the x86 side: one

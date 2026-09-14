@@ -16,6 +16,15 @@
 // "YY" and adds 2000. Revisit only if this kernel is still running in 2100.
 uint64_t rtc_now_unix(void);
 
+/* Tell the clock what time it really is -- from NTP, or from a person.
+ * Recorded as an OFFSET from what the CMOS chip reads rather than written back
+ * to the chip: see the .c for why writing it is the dangerous option. The
+ * offset does not survive a reboot, which is honest -- NTP runs at every boot
+ * and that is where the answer comes from. */
+void    rtc_set_unix(uint64_t unix_seconds);
+int64_t rtc_offset(void);          /* how far off the hardware clock is */
+uint64_t rtc_hardware_unix(void);  /* what the chip itself says, uncorrected */
+
 // rtc_now_unix() * 1,000,000,000 -- matches EMBKFS's nanosecond-precision
 // inode timestamp fields (embkfs.h's atime/mtime/ctime/btime), but carries
 // NO real sub-second precision: a CMOS RTC's own resolution is one second.

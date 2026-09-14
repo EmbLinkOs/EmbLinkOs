@@ -225,6 +225,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/net/udp/udp.c \
              kernel/net/dhcp/dhcp.c \
              kernel/net/dns/dns.c \
+             kernel/net/ntp/ntp.c \
              kernel/net/tcp/tcp.c \
              kernel/drivers/usb/usb.c \
              kernel/drivers/usb/usb_core.c \
@@ -3200,6 +3201,15 @@ test-i2c: $(IMG) $(EMBKFS_MASTER)
 .PHONY: test-modules
 test-modules: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/console_test.py "test modules"
+
+# TIME. Two witnesses: the guest breaks its own clock by four hundred days and
+# measures what SNTP leaves behind against the CMOS chip, and the harness
+# brackets the whole run with the HOST's clock so that a wrong epoch constant
+# -- the classic NTP bug, seventy years -- cannot pass by being wrong twice.
+# Needs outbound UDP/123 through SLIRP, like test-dns needs outbound DNS.
+.PHONY: test-ntp
+test-ntp: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/ntp_test.py
 
 # PUTTING THE OS ON A DISK, and then booting that disk.
 #

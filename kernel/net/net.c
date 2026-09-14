@@ -18,6 +18,7 @@
  * so a caller does not depend on the background RX kthread being scheduled. */
 
 #include "net/net.h"
+#include "net/ntp.h"
 #if defined(__x86_64__)
 #include "net/usb_net.h"
 #endif
@@ -264,4 +265,16 @@ void net_init(void) {
         g_netif.gateway = IPV4(10, 0, 2, 2);
         kprintf("net: DHCP failed -- static 10.0.2.15/24 gw 10.0.2.2\n");
     }
+
+    /* AND ASK SOMETHING WHAT TIME IT IS. Every timestamp this system writes
+     * came from a CMOS chip with nothing to check itself against, and a clock
+     * that is years out cannot verify a certificate -- TLS refuses one that is
+     * not yet valid, so a wrong clock looks exactly like an attack.
+     *
+     * Here, because this is the moment the network first works and because a
+     * timestamp is wanted from the first file written afterwards. Failure is
+     * not an error: a machine with no route to a time server keeps the clock
+     * it has, which is what it would have had anyway. */
+    if (!net_ntp_sync_default())
+        kprintf("ntp: no time server answered; keeping the hardware clock\n");
 }

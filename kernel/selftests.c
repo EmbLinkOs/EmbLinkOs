@@ -7,6 +7,7 @@
 #include "block/block.h"
 #include "block/partition.h"   /* blkstat request counters (test ioperf) */
 #include "net/net.h"       /* g_netif, net_ping (test net) */
+#include "net/ntp.h"       /* net_ntp_sync_default (test ntp) */
 #include "include/usercopy.h"   /* transient-EFAULT retry counters */
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
@@ -3971,6 +3972,53 @@ int selftests_handle_command(const char *cmd)
         }
         if (!ok) kprintf("[dns] no resolution (needs outbound DNS via SLIRP/host)\n");
         kprintf("[cmd] test dns: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test ntp") == 0) {
+        /* TIME. The question is not "did a packet come back" -- it is "is the
+         * clock right afterwards", and the only way to ask that is to break it
+         * first. So this puts the clock four hundred days in the past, syncs,
+         * and measures what is left over against the hardware clock, which
+         * under QEMU is the host's and is therefore a reference this kernel
+         * did not itself produce.
+         *
+         * A test that only checked the answer parsed would pass with the
+         * epoch off by seventy years, which is exactly the bug NTP code has. */
+        if (!g_netif.up) { kprintf("\n[cmd] test ntp: NIC not up\n"); return 1; }
+
+        uint64_t reference = rtc_hardware_unix();
+        const uint64_t skew = 400ULL * 86400ULL;   /* four hundred days back */
+        rtc_set_unix(reference - skew);
+        kprintf("[ntp] clock broken on purpose: now reads %llu, should read %llu\n",
+                (unsigned long long)rtc_now_unix(), (unsigned long long)reference);
+
+        if (!net_ntp_sync_default()) {
+            rtc_set_unix(rtc_hardware_unix());     /* put it back, then fail */
+            kprintf("[ntp] no server answered (needs outbound UDP/123 via SLIRP/host)\n");
+            kprintf("[cmd] test ntp: FAIL\n");
+            return 1;
+        }
+
+        uint64_t adopted = rtc_now_unix();
+        int64_t  step    = net_ntp_last_step();
+        int64_t  residual = (int64_t)adopted - (int64_t)rtc_hardware_unix();
+        if (residual < 0) residual = -residual;
+
+        kprintf("[ntp] server %u.%u.%u.%u  adopted %llu  step %lld s  residual %lld s\n",
+                IP_OCTETS(net_ntp_server()), (unsigned long long)adopted,
+                (long long)step, (long long)residual);
+
+        /* The step must be the skew we introduced, near enough, and what is
+         * left must be small. Five seconds is the round trip plus the one
+         * second of resolution a CMOS chip has. */
+        int64_t step_err = step - (int64_t)skew;
+        if (step_err < 0) step_err = -step_err;
+        int ok = (step_err <= 5) && (residual <= 5) && net_ntp_synced();
+        if (!ok)
+            kprintf("[ntp] expected a step of %llu s and a residual of 0\n",
+                    (unsigned long long)skew);
+        kprintf("[cmd] test ntp: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
     }
 
