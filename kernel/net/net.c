@@ -240,6 +240,20 @@ void net_dev_poll(void) {
 const char *net_dev_name(void) { return g_dev ? g_dev->name : ""; }
 int net_dev_link(void) { return (g_dev && g_dev->link) ? g_dev->link() : -1; }
 
+/* The boot-time clock sync, off the boot path -- see the call site.
+ *
+ * It ENDS, unlike every other kthread in this system, and a kthread that ends
+ * has to say so: kthread_trampoline() does not handle a return, so falling off
+ * the end of this function jumps to whatever the poison pattern in a fresh
+ * kernel stack decodes as. Measured, the first time this was written without
+ * the line below: "RIP: 0xC5C5C5C5C5C5C5C5", a general protection fault
+ * moments after a perfectly successful sync. */
+static void net_ntp_boot_thread(void) {
+    if (!net_ntp_sync_default())
+        kprintf("ntp: no time server answered; keeping the hardware clock\n");
+    process_exit_self(0);
+}
+
 void net_init(void) {
     memset(&g_netif, 0, sizeof(g_netif));
     g_dev = 0;
@@ -271,10 +285,14 @@ void net_init(void) {
      * that is years out cannot verify a certificate -- TLS refuses one that is
      * not yet valid, so a wrong clock looks exactly like an attack.
      *
-     * Here, because this is the moment the network first works and because a
-     * timestamp is wanted from the first file written afterwards. Failure is
-     * not an error: a machine with no route to a time server keeps the clock
-     * it has, which is what it would have had anyway. */
-    if (!net_ntp_sync_default())
-        kprintf("ntp: no time server answered; keeping the hardware clock\n");
+     * ON A THREAD, NOT HERE. Measured before it was: the gateway does not
+     * answer NTP under an emulator, so the first query waits out the stack's
+     * whole 3 s timeout, and resolving pool.ntp.org can spend another one --
+     * six seconds of a boot spent on an answer nothing is waiting for. The
+     * desktop does not need the date to come up, and a machine that boots
+     * slower to be right about the clock is not the trade anyone wants.
+     *
+     * Failure is not an error: a machine with no route to a time server keeps
+     * the clock it has, which is what it would have had anyway. */
+    process_create_kthread(net_ntp_boot_thread, 0);
 }

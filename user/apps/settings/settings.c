@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 
 #include "embk.h"
 #include "oscfg.h"
@@ -30,10 +31,10 @@
 #include "em.h"
 #include "theme.h"
 
-enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_KEYBOARD, PANE_SYSTEM, PANE_ABOUT, PANE_N };
+enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_KEYBOARD, PANE_TIME, PANE_SYSTEM, PANE_ABOUT, PANE_N };
 
-static const char *g_pane_name[PANE_N] = { "Appearance", "Desktop & Dock", "Keyboard", "System", "About" };
-static const int   g_pane_icon[PANE_N] = { IconStar, IconGrid, IconList, IconBolt, IconInfo };
+static const char *g_pane_name[PANE_N] = { "Appearance", "Desktop & Dock", "Keyboard", "Date & Time", "System", "About" };
+static const int   g_pane_icon[PANE_N] = { IconStar, IconGrid, IconList, IconClock, IconBolt, IconInfo };
 
 static int   g_pane = PANE_APPEARANCE;
 static float g_scroll = 0;
@@ -45,6 +46,8 @@ static char  g_saved[64] = "";       /* the quiet confirmation line */
 static char g_uptime[32] = "--";
 static char g_res[32]    = "--";
 static char g_procs[32]  = "--";
+static char g_local[48]  = "--";     /* the clock, in the chosen zone */
+static char g_utc[48]    = "--";     /* and the clock the kernel actually keeps */
 
 static void apply_now(void) {
     ui_theme_use_dark(g_cfg.dark != 0);
@@ -75,6 +78,16 @@ static void sample_system(void) {
     struct embk_proc_info p[64];
     int n = embk_proc_list(p, 64);
     snprintf(g_procs, sizeof g_procs, "%d", n < 0 ? 0 : n);
+
+    /* BOTH CLOCKS, SIDE BY SIDE, because the difference between them IS the
+     * setting. A preview that showed only local time would look identical
+     * whether the zone had been applied or silently ignored. */
+    time_t now = time(NULL);
+    struct tm lt, gt;
+    if (localtime_r(&now, &lt))
+        strftime(g_local, sizeof g_local, "%a %d %b  %H:%M:%S  %Z", &lt);
+    if (gmtime_r(&now, &gt))
+        strftime(g_utc, sizeof g_utc, "%a %d %b  %H:%M:%S", &gt);
 }
 
 /* ---- shared row shapes ------------------------------------------------- */
@@ -329,6 +342,73 @@ static void pane_keyboard(void) {
     }
 }
 
+/* DATE & TIME. The kernel keeps UTC and will keep keeping it -- every inode
+ * and every log line is stamped in it, which is the only way two machines can
+ * compare notes. This pane is about the OTHER clock: the one a person reads.
+ *
+ * A DROPDOWN, NOT A SEGMENTED CONTROL. Twenty labels in a row of buttons is
+ * twenty labels nobody can read; this is the one preference in this window
+ * with more choices than fit across it.
+ *
+ * The zone is applied HERE as well as saved, for the same reason the keyboard
+ * layout is: writing the file alone would change what the machine remembers
+ * and not what it shows. */
+static void pane_time(void) {
+    int cur = (g_cfg.tz >= 0 && g_cfg.tz < OSCFG_TIMEZONES) ? g_cfg.tz : 0;
+
+    /* WHICH HALF OF THE WORLD, then which city in it. Not a taxonomy for its
+     * own sake: a dropdown of all twenty opens past the bottom of the window
+     * and the last eight zones cannot be reached at all -- measured, the list
+     * ended at Athens. Seven at a time fits.
+     *
+     * The group starts as the one the current zone is in and then belongs to
+     * the user: browsing Asia must not quietly move a machine to Tokyo, so
+     * changing the group changes what the list OFFERS and nothing else. The
+     * rows underneath always show what is actually in force. */
+    static int group = -1;
+    if (group < 0) group = oscfg_timezones[cur].group;
+
+    Section("Time zone") {
+        HStack(.spacing = 16, .align = Center, .py = 4, .grow = 1) {
+            setting_label("Region", "Which clock everything you see shows.");
+        }
+        Segmented(oscfg_tz_group_names, OSCFG_TZ_GROUPS, &group);
+        Sync();                 /* the staged element writes at the FLUSH */
+        if (group < 0 || group >= OSCFG_TZ_GROUPS) group = 0;
+
+        const char *names[OSCFG_TIMEZONES];
+        int         idx[OSCFG_TIMEZONES];
+        int n = 0, sel = -1;
+        for (int i = 0; i < OSCFG_TIMEZONES; i++) {
+            if (oscfg_timezones[i].group != group) continue;
+            if (i == cur) sel = n;
+            names[n] = oscfg_timezones[i].label;
+            idx[n++] = i;
+        }
+        if (sel < 0) sel = 0;           /* a group that does not hold the current
+                                         * zone offers its first, and commits
+                                         * nothing until the user picks. */
+        int was = sel;
+        Dropdown(names, n, &sel);
+        Sync();
+        if (sel != was && sel >= 0 && sel < n) {
+            g_cfg.tz = idx[sel];
+            oscfg_apply_tz(&g_cfg);      /* this window, now */
+            commit();                    /* everything else, from its next launch */
+        }
+    }
+    Section("Now") {
+        ListRow(IconGear,  "Zone",       oscfg_tz_label(&g_cfg));
+        ListRow(IconClock, "Local time", g_local);
+        ListRow(IconInfo,  "UTC",        g_utc);
+        ListRow(IconList,  "Rule",       oscfg_tz_string(&g_cfg));
+    }
+    Section("About the change") {
+        Text("Open applications keep the zone they started with.")
+            .caption().tertiary();
+    }
+}
+
 static void pane_system(void) {
     Section("This machine") {
         ListRow(IconBolt, "Uptime",        g_uptime);
@@ -397,6 +477,7 @@ static void app(void) {
                             case PANE_APPEARANCE: pane_appearance(); break;
                             case PANE_DESKTOP:    pane_desktop();    break;
                             case PANE_KEYBOARD:   pane_keyboard();   break;
+                            case PANE_TIME:       pane_time();       break;
                             case PANE_SYSTEM:     pane_system();     break;
                             default:              pane_about();      break;
                         }

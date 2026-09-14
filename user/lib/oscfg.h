@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include "embk.h"
 
 /* WHERE THE FILE LIVES, resolved once, from the environment.
@@ -115,6 +116,60 @@ static const struct oscfg_keymap oscfg_keymaps[OSCFG_KEYMAPS] = {
     { "dvorak", "Dvorak" },
 };
 
+/* WHAT TIME IT IS HERE, as opposed to what time it is.
+ *
+ * The kernel's clock is UTC and stays UTC -- every timestamp on disk, every
+ * inode, every log line. That is the right thing for a filesystem and the
+ * wrong thing for a person, who wants the menu bar to agree with the clock on
+ * their wall.
+ *
+ * A POSIX TZ STRING, NOT AN OLSON NAME. "Europe/Paris" is a lookup into a
+ * database of every rule change since 1970 -- megabytes of it, revised several
+ * times a year, needing a path in every namespace that wants a date. The TZ
+ * string carries the rule itself: the offset, the abbreviation, and when
+ * summer time starts and ends, in thirty characters that libc already knows
+ * how to read. What it cannot do is tell you what the rule was in 1974, which
+ * matters for a calendar application and does not matter for a clock.
+ *
+ * So the labels here name CITIES and the strings carry RULES, and the pair is
+ * what a person picks from. Appended to, never reordered: the file stores an
+ * index, and moving an entry moves somebody's clock. */
+#define OSCFG_TIMEZONES 20
+/* THE GROUP IS NOT DECORATION. Twenty entries do not fit in a dropdown that is
+ * clipped by the window it opens in -- measured, the list ended at Athens and
+ * the last eight zones could not be picked at all. So the picker asks two
+ * questions, and this is the first one. */
+#define OSCFG_TZ_GROUPS 3
+static const char *const oscfg_tz_group_names[OSCFG_TZ_GROUPS] = {
+    "Americas", "Europe & Africa", "Asia & Pacific"
+};
+struct oscfg_timezone { const char *label; const char *tz; int group; };
+static const struct oscfg_timezone oscfg_timezones[OSCFG_TIMEZONES] = {
+    /* Index 0 is UTC and is the default: a machine that has never been told
+     * where it is should say so rather than guess a continent. */
+    { "UTC",                     "UTC0", 1 },
+    { "Honolulu",                "HST10", 0 },
+    { "Los Angeles \xc2\xb7 Vancouver", "PST8PDT,M3.2.0,M11.1.0", 0 },
+    { "Denver \xc2\xb7 Phoenix",        "MST7MDT,M3.2.0,M11.1.0", 0 },
+    { "Chicago \xc2\xb7 Mexico City",   "CST6CDT,M3.2.0,M11.1.0", 0 },
+    { "New York \xc2\xb7 Toronto",      "EST5EDT,M3.2.0,M11.1.0", 0 },
+    { "S\xc3\xa3o Paulo",               "BRT3", 0 },
+    { "London \xc2\xb7 Dublin \xc2\xb7 Lisbon", "GMT0BST,M3.5.0/1,M10.5.0/2", 1 },
+    { "Lagos \xc2\xb7 Algiers",         "WAT-1", 1 },
+    { "Paris \xc2\xb7 Berlin \xc2\xb7 Madrid", "CET-1CEST,M3.5.0,M10.5.0/3", 1 },
+    { "Johannesburg \xc2\xb7 Cairo",    "SAST-2", 1 },
+    { "Athens \xc2\xb7 Helsinki",       "EET-2EEST,M3.5.0/3,M10.5.0/4", 1 },
+    { "Moscow \xc2\xb7 Istanbul",       "MSK-3", 1 },
+    { "Dubai",                   "GST-4", 2 },
+    { "Karachi",                 "PKT-5", 2 },
+    { "Mumbai \xc2\xb7 Delhi",          "IST-5:30", 2 },
+    { "Bangkok \xc2\xb7 Jakarta",       "WIB-7", 2 },
+    { "Beijing \xc2\xb7 Singapore",     "CST-8", 2 },
+    { "Tokyo \xc2\xb7 Seoul",           "JST-9", 2 },
+    { "Sydney \xc2\xb7 Melbourne",      "AEST-10AEDT,M10.1.0,M4.1.0/3", 2 },
+};
+
+
 struct oscfg {
     int accent;        /* index into oscfg_accents                       */
     int dark;          /* 1 dark, 0 light                                */
@@ -123,6 +178,7 @@ struct oscfg {
     int ui_scale;      /* interface size, PERCENT (80..130); 100 = default */
     int keymap;        /* index into oscfg_keymaps                       */
     int wallpaper;     /* index into oscfg_wallpapers                    */
+    int tz;            /* index into oscfg_timezones; 0 = UTC            */
     /* The menu bar. Four small knobs rather than one "style": each of these is
      * a separate question a person actually has an opinion about, and folding
      * them into presets would mean inventing combinations nobody asked for. */
@@ -157,7 +213,7 @@ static inline int oscfg_dock_band(const struct oscfg *c) {
 
 static inline void oscfg_defaults(struct oscfg *c) {
     c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1; c->keymap = 0;
-    c->ui_scale = 100; c->wallpaper = 0;
+    c->ui_scale = 100; c->wallpaper = 0; c->tz = 0;
     c->bar_24h = 1; c->bar_seconds = 0; c->bar_date = 1; c->bar_cpu = 1;
 }
 
@@ -187,6 +243,7 @@ static inline void oscfg_defaults(struct oscfg *c) {
 static inline void oscfg_clamp(struct oscfg *c) {
     if (c->accent < 0 || c->accent >= OSCFG_ACCENTS) c->accent = 0;
     if (c->wallpaper < 0 || c->wallpaper >= OSCFG_WALLPAPERS) c->wallpaper = 0;
+    if (c->tz < 0 || c->tz >= OSCFG_TIMEZONES) c->tz = 0;
     if (c->dock_size < 28) c->dock_size = 28;
     if (c->dock_size > 60) c->dock_size = 60;
     if (c->ui_scale < 80)  c->ui_scale = 80;
@@ -194,6 +251,35 @@ static inline void oscfg_clamp(struct oscfg *c) {
     c->dark = !!c->dark; c->dock_dots = !!c->dock_dots;
     c->bar_24h = !!c->bar_24h; c->bar_seconds = !!c->bar_seconds;
     c->bar_date = !!c->bar_date; c->bar_cpu = !!c->bar_cpu;
+}
+
+/* The rule for a preference, always valid -- an out-of-range index reads as
+ * UTC rather than off the end of the table. */
+static inline const char *oscfg_tz_string(const struct oscfg *c) {
+    int i = (c && c->tz >= 0 && c->tz < OSCFG_TIMEZONES) ? c->tz : 0;
+    return oscfg_timezones[i].tz;
+}
+static inline const char *oscfg_tz_label(const struct oscfg *c) {
+    int i = (c && c->tz >= 0 && c->tz < OSCFG_TIMEZONES) ? c->tz : 0;
+    return oscfg_timezones[i].label;
+}
+
+/* WEAR THE ZONE. TZ in the environment plus tzset() is the whole mechanism:
+ * libc reads that variable and nothing else, so this is what makes localtime()
+ * -- and therefore every clock, every file date, every `date` -- agree with
+ * the preference.
+ *
+ * Guarded by a comparison because it is called from a poll loop once a second
+ * for the life of the machine, and because setenv() frees and reallocates the
+ * old string: doing that under a thread that is inside getenv() is a real
+ * hazard, and not doing it at all unless the answer changed removes it for
+ * every second but the one where the user actually picked a new zone. */
+static inline void oscfg_apply_tz(const struct oscfg *c) {
+    const char *want = oscfg_tz_string(c);
+    const char *cur  = getenv("TZ");
+    if (cur && !strcmp(cur, want)) return;
+    setenv("TZ", want, 1);
+    tzset();
 }
 
 static inline void oscfg_parse(struct oscfg *c, char *buf);
@@ -238,6 +324,11 @@ static inline void oscfg_load(struct oscfg *c) {
     if (!oscfg_read_from(c, oscfg_path()))
         oscfg_ask_desktop(c);
     oscfg_clamp(c);
+    /* LOADING THE PREFERENCES MEANS WEARING THEM, for the one preference that
+     * is invisible until something formats a date. An app that reads the
+     * config to find the accent colour also gets the right clock, and no app
+     * has to remember a second call it would only notice missing at 1am. */
+    oscfg_apply_tz(c);
 }
 
 static inline void oscfg_parse(struct oscfg *c, char *buf) {
@@ -255,6 +346,7 @@ static inline void oscfg_parse(struct oscfg *c, char *buf) {
         else if (!strcmp(key, "keymap")) c->keymap = (val >= 0 && val < OSCFG_KEYMAPS) ? val : 0;
         else if (!strcmp(key, "ui_scale"))  c->ui_scale  = val;
         else if (!strcmp(key, "wallpaper")) c->wallpaper = val;
+        else if (!strcmp(key, "timezone"))  c->tz        = val;
         else if (!strcmp(key, "bar_24h"))     c->bar_24h     = val;
         else if (!strcmp(key, "bar_seconds")) c->bar_seconds = val;
         else if (!strcmp(key, "bar_date"))    c->bar_date    = val;
@@ -270,10 +362,10 @@ static inline int oscfg_format(const struct oscfg *c, char *out, int cap) {
     return snprintf(out, (size_t)cap,
                      "# EmbLink preferences -- written by Settings, editable by hand.\n"
                      "accent %d\n" "dark %d\n" "dock_size %d\n" "dock_dots %d\n"
-                     "ui_scale %d\n" "keymap %d\n" "wallpaper %d\n"
+                     "ui_scale %d\n" "keymap %d\n" "wallpaper %d\n" "timezone %d\n"
                      "bar_24h %d\n" "bar_seconds %d\n" "bar_date %d\n" "bar_cpu %d\n",
                      c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale,
-                     c->keymap, c->wallpaper,
+                     c->keymap, c->wallpaper, c->tz,
                      c->bar_24h, c->bar_seconds, c->bar_date, c->bar_cpu);
 }
 

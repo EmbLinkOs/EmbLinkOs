@@ -1236,13 +1236,25 @@ static void test_env(void) {
     while (environ[n]) n++;
 
     const char *marker = getenv("EMBK_ENV_TEST");
-    if (!marker) {
+    if (!marker && n == 0) {
         /* Spawned WITHOUT an environment. */
         printf("       (spawned with NO environment -- the default)\n");
         ck("environ is an empty vector (environ[0] == NULL)", n == 0);
         ck("getenv(\"HOME\") -> NULL (unset, not fabricated)", getenv("HOME") == NULL);
         ck("getenv(\"PATH\") -> NULL", getenv("PATH") == NULL);
         ck("getenv(\"\") -> NULL", getenv("") == NULL);
+        return;
+    }
+    if (!marker) {
+        /* An environment, but not the one `test env` hands over -- `test tz`
+         * starts this program with a zone and nothing else. The detailed
+         * expectations below belong to `test env` and asserting them here
+         * would fail every other caller for being a different caller. */
+        printf("       (an environment, but not `test env`'s -- %d entr%s)\n",
+               n, n == 1 ? "y" : "ies");
+        ck("environ is non-empty and NULL-terminated", n > 0);
+        ck("getenv(\"EMBK_ABSENT\") -> NULL (still honest about unset)",
+           getenv("EMBK_ABSENT") == NULL);
         return;
     }
 
@@ -1275,6 +1287,104 @@ static void test_env(void) {
  * That is a reading, not evidence -- hence this test. Runs in BOTH spawn modes:
  * with no environment, `environ` is the static empty vector instead, which is
  * the same question with a different array. */
+/* TIME ZONES. The kernel keeps UTC and hands it over as seconds; turning that
+ * into "what time is it here" is entirely libc's job, driven by one
+ * environment variable. So this is the check that the OS's clock preference
+ * can work at all -- and it is worth making, because the failure mode is
+ * silent: a TZ that libc cannot parse is not an error, it is UTC.
+ *
+ * Fixed instants, not "now". A test that formats the current time can only
+ * compare against itself; these two timestamps have known answers in every
+ * zone, one in northern winter and one in northern summer, so the summer
+ * daylight rules are exercised rather than merely present in the string.
+ *
+ * The second instant matters more than it looks: an implementation that
+ * applies a fixed offset and ignores the ",M3.2.0,M11.1.0" tail passes every
+ * winter check and is an hour out for half the year. */
+static void tz_at(const char *tz, time_t t, const char *want, int want_isdst) {
+    setenv("TZ", tz, 1);
+    tzset();
+    struct tm lt;
+    char got[64] = "";
+    if (localtime_r(&t, &lt))
+        strftime(got, sizeof got, "%Y-%m-%d %H:%M:%S", &lt);
+    char what[160];
+    snprintf(what, sizeof what, "TZ=%s at %lld -> %s", tz, (long long)t, want);
+    int ok = strcmp(got, want) == 0 && (lt.tm_isdst > 0) == (want_isdst > 0);
+    if (!ok)
+        printf("       got \"%s\" isdst=%d\n", got, lt.tm_isdst);
+    ck(what, ok);
+}
+
+static void test_timezones(void) {
+    printf("time zones (TZ -> localtime):\n");
+
+    /* 2023-11-14 22:13:20 UTC (northern winter) and
+     * 2023-07-10 14:40:00 UTC (northern summer). */
+    const time_t winter = 1700000000, summer = 1689000000;
+
+    /* THE ZONE WE WERE STARTED WITH, read and used BEFORE anything below
+     * touches the environment. This is the path the desktop uses for every
+     * application it launches -- the preference becomes a TZ in the child's
+     * environment and libc does the rest -- and the only way to test it is to
+     * convert a date before any setenv of our own could have supplied it.
+     * `test tz` starts this program with a zone; `test posix` does not. */
+    char inherited[64] = "", at_startup[64] = "";
+    {
+        const char *p = getenv("TZ");
+        if (p && p[0]) {
+            strncpy(inherited, p, sizeof inherited - 1);
+            struct tm lt;
+            if (localtime_r(&winter, &lt))
+                strftime(at_startup, sizeof at_startup, "%Y-%m-%d %H:%M:%S", &lt);
+        }
+    }
+
+    tz_at("UTC0", winter, "2023-11-14 22:13:20", 0);
+    tz_at("UTC0", summer, "2023-07-10 14:40:00", 0);
+
+    tz_at("EST5EDT,M3.2.0,M11.1.0", winter, "2023-11-14 17:13:20", 0);
+    tz_at("EST5EDT,M3.2.0,M11.1.0", summer, "2023-07-10 10:40:00", 1);
+
+    tz_at("CET-1CEST,M3.5.0,M10.5.0/3", winter, "2023-11-14 23:13:20", 0);
+    tz_at("CET-1CEST,M3.5.0,M10.5.0/3", summer, "2023-07-10 16:40:00", 1);
+
+    /* Half-hour offsets, and a date that rolls over into the next day. */
+    tz_at("IST-5:30", winter, "2023-11-15 03:43:20", 0);
+
+    /* The southern hemisphere, where the daylight rule runs the other way
+     * round: summer time in NOVEMBER and standard time in July. */
+    tz_at("AEST-10AEDT,M10.1.0,M4.1.0/3", winter, "2023-11-15 09:13:20", 1);
+    tz_at("AEST-10AEDT,M10.1.0,M4.1.0/3", summer, "2023-07-11 00:40:00", 0);
+
+    /* gmtime is NOT affected by the zone: a preference must not be able to
+     * redefine the clock the filesystem stamps files with. */
+    setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
+    tzset();
+    struct tm g;
+    char gs[64] = "";
+    if (gmtime_r(&winter, &g))
+        strftime(gs, sizeof gs, "%Y-%m-%d %H:%M:%S", &g);
+    ck("gmtime ignores TZ (still UTC)", strcmp(gs, "2023-11-14 22:13:20") == 0);
+
+    if (inherited[0]) {
+        /* The same string, now applied by hand. It must give what the
+         * inherited one gave at startup -- if the environment had been
+         * ignored, `at_startup` would read 22:13:20 and this would not. */
+        setenv("TZ", inherited, 1);
+        tzset();
+        struct tm lt;
+        char got[64] = "";
+        if (localtime_r(&winter, &lt))
+            strftime(got, sizeof got, "%Y-%m-%d %H:%M:%S", &lt);
+        printf("       (started with TZ=%s -> %s)\n", inherited, at_startup);
+        ck("the zone the parent handed over was in force at startup",
+           got[0] && strcmp(at_startup, got) == 0);
+        ck("...and it is not UTC, so the comparison has teeth",
+           strcmp(at_startup, "2023-11-14 22:13:20") != 0);
+    }
+}
+
 static void test_env_mutation(void) {
     printf("environment mutation (over memory newlib did not allocate):\n");
 
@@ -1558,6 +1668,7 @@ int main(void) {
     test_sysparams();
     test_env();
     test_env_mutation();   /* AFTER test_env: it deliberately mutates the env */
+    test_timezones();      /* ...and AFTER that: this one sets TZ repeatedly */
     test_errno_translation();
     test_rename();
     test_signals();

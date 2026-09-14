@@ -3211,6 +3211,22 @@ test-modules: $(IMG) $(EMBKFS_MASTER)
 test-ntp: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/ntp_test.py
 
+# THE TIME ZONE. posixdemo.elf, spawned with a zone in its environment -- the
+# same path the desktop uses to hand the user's choice to every app it starts.
+# Fixed instants with known answers, one in each hemisphere's summer, so a
+# daylight rule that is parsed and ignored cannot pass.
+.PHONY: test-tz
+test-tz: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/console_test.py "test tz"
+
+# ...and the half a person touches: pick Tokyo in Settings, and watch the
+# desktop say it has adopted it. The claim is the whole route -- Settings
+# writes the file, the desktop re-reads it, applies it, and hands it to every
+# app it launches next -- not that a widget moved.
+.PHONY: test-timezone
+test-timezone: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/timezone_shot.py
+
 # PUTTING THE OS ON A DISK, and then booting that disk.
 #
 # The test is the SECOND boot and nothing before it counts: an installer that

@@ -6648,6 +6648,30 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* THE TIME ZONE, down the path the desktop actually uses. The kernel keeps
+     * UTC; turning it into the time on somebody's wall is libc's job, driven
+     * by a TZ the PARENT hands over -- nothing is inherited in this system, so
+     * the desktop puts the user's chosen zone into every app it launches.
+     *
+     * This is that spawn, with a zone whose answer is known: Sydney in
+     * November is on summer time, eleven hours ahead, and the date rolls over.
+     * A child that ignored its environment would report UTC and pass a weaker
+     * test; posixdemo compares against the conversion it did before it touched
+     * the environment at all. */
+    if (strcmp(cmd, "test tz") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test tz: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/data/apps/posixdemo/posixdemo.elf", NULL };
+        char *env[] = { "TZ=AEST-10AEDT,M10.1.0,M4.1.0/3", "HOME=/", NULL };
+        int pid = process_create_env("/data/apps/posixdemo/posixdemo.elf", a, 1, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test tz: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* Console ^C routing, END TO END (docs/INTERRUPTION.md Phase 2). Spawns a
      * userspace parent that routes ^C to a child blocked reading the console,
      * then BLOCKS waiting for the harness to inject a real Ctrl+C through QMP

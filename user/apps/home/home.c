@@ -429,6 +429,19 @@ static void cfg_poll(void) {
      * reported the strip of desktop beside the window changing 0.0%. */
     if (g_cfg.wallpaper != was.wallpaper)
         force_repaint();
+
+    /* The zone is applied by oscfg_load() -- this only SAYS so, once, because
+     * a clock that is an hour out is the kind of wrong a person blames on the
+     * clock rather than on a setting they changed. Applications launched from
+     * here get it in their environment; ones already running keep the zone
+     * they were started with, which is why this line names the change. */
+    static int tz_first = 1;
+    if (tz_first || g_cfg.tz != was.tz) {
+        tz_first = 0;
+        printf("home: time zone %s (TZ=%s)\n", oscfg_tz_label(&g_cfg),
+               oscfg_tz_string(&g_cfg));
+        fflush(stdout);
+    }
 }
 
 /* THE PREFERENCES, FOR WHOEVER CANNOT READ THE FILE.
@@ -1379,19 +1392,34 @@ static void spawn_app(const char *path, const char *start_dir) {
 
     char *argv[] = { (char *)path, NULL };
     char file_path_env[640];
+    char tz_env[72];
     char *launch_env[64];
-    char **env = g_session_env;
+
+    /* THE ZONE TRAVELS WITH THE CHILD. Nothing is inherited in this system --
+     * the kernel gives a child no environment unless the parent names one (see
+     * the kernel's spawn.h) -- so an application that formats a date gets the
+     * user's zone only because the desktop hands it over here.
+     *
+     * This is the one place it can happen. An app that reads the preferences
+     * wears the zone itself, but most do not read them: the file manager
+     * showing modification times, a text editor, anything run from the
+     * terminal. They all come through this function.
+     *
+     * A zone already in the session environment is dropped rather than
+     * duplicated -- the live preference is the newer answer. */
+    int en = 0;
+    for (int k = 0; g_session_env && g_session_env[k] && en < 61; k++) {
+        if (!strncmp(g_session_env[k], "TZ=", 3)) continue;
+        launch_env[en++] = g_session_env[k];
+    }
+    snprintf(tz_env, sizeof tz_env, "TZ=%s", oscfg_tz_string(&g_cfg));
+    launch_env[en++] = tz_env;
     if (start_dir && start_dir[0] == '/') {
-        int en = 0;
-        while (g_session_env && g_session_env[en] && en < 62) {
-            launch_env[en] = g_session_env[en];
-            en++;
-        }
         snprintf(file_path_env, sizeof file_path_env, "FILES_PATH=%s", start_dir);
         launch_env[en++] = file_path_env;
-        launch_env[en] = NULL;
-        env = launch_env;
     }
+    launch_env[en] = NULL;
+    char **env = launch_env;
     int h = (int)embk_spawn_env(path, argv, env, nacts ? acts : NULL, nacts);
 
     char b[448];
