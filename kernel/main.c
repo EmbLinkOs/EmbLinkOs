@@ -38,6 +38,7 @@
 #include "drivers/tpm/tpm.h"
 #include "acpi/hotplug.h"
 #include "acpi/erst.h"
+#include "lib/crashlog.h"
 #include "drivers/misc/virtio_mem.h"
 #include "drivers/char/virtio_console.h"
 #include "drivers/misc/virtio_balloon.h"
@@ -1890,6 +1891,10 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     tpm_init();           /* the chip that remembers what booted, if there is one */
     acpi_hotplug_init();  /* and watch for a CPU or a DIMM arriving later   */
     erst_init();          /* somewhere to leave a crash record              */
+    /* AND READ THE LAST ONE BACK. If the previous boot ended in a fault,
+     * this is where it says so -- registers, the symbolised address, and
+     * the kernel log leading up to it. */
+    crashlog_report();
     /* AFTER the heap exists: growing the page bitmap allocates. */
     virtio_mem_init();    /* memory offered a block at a time               */
 

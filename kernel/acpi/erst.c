@@ -108,6 +108,41 @@ static uint64_t g_written;
 /* The record identifier the firmware uses to mean "there are no more". */
 #define ERST_ID_INVALID 0xFFFFFFFFFFFFFFFFULL
 
+/* ---- the registers, mapped ONCE ------------------------------------------
+ *
+ * These were mapped and unmapped around every single access, which is
+ * wasteful in normal use and DANGEROUS in the one that matters: the panic
+ * path writes a crash record through this interpreter, and mapping a page
+ * means allocating virtual address space and editing page tables -- on a
+ * machine that has already gone wrong, possibly while another core holds the
+ * lock that protects them.
+ *
+ * So every distinct page any instruction names is mapped at init and kept.
+ * After that a register access is a load or a store and nothing else. */
+#define ERST_MAX_PAGES 8
+static struct { uint64_t phys; volatile uint8_t *virt; } g_pages[ERST_MAX_PAGES];
+static uint32_t g_npages;
+
+static volatile uint8_t *erst_map_page(uint64_t phys) {
+    uint64_t page = phys & ~0xFFFULL;
+    for (uint32_t i = 0; i < g_npages; i++)
+        if (g_pages[i].phys == page) return g_pages[i].virt;
+    if (g_npages >= ERST_MAX_PAGES) return NULL;
+    volatile uint8_t *v = (volatile uint8_t *)(uintptr_t)vmm_map_mmio(page, 0x1000);
+    if (!v) return NULL;
+    g_pages[g_npages].phys = page;
+    g_pages[g_npages].virt = v;
+    g_npages++;
+    return v;
+}
+
+static volatile uint8_t *erst_reg_ptr(const struct gas *g) {
+    for (uint32_t i = 0; i < g_npages; i++)
+        if (g_pages[i].phys == (g->address & ~0xFFFULL))
+            return g_pages[i].virt + (g->address & 0xFFF);
+    return NULL;
+}
+
 static uint64_t reg_read(const struct gas *g) {
     uint32_t width = g->bit_width ? g->bit_width : 32;
     if (g->space_id == 1) {                 /* system I/O */
@@ -118,20 +153,14 @@ static uint64_t reg_read(const struct gas *g) {
         default: return inl(port);
         }
     }
-    /* System memory. Mapped uncacheable: these are device registers that
-     * happen to be addressed like memory. */
-    volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)vmm_map_mmio(g->address & ~0xFFFULL, 0x1000);
-    if (!p) return 0;
-    volatile uint8_t *q = p + (g->address & 0xFFF);
-    uint64_t v;
+    volatile uint8_t *q = erst_reg_ptr(g);
+    if (!q) return 0;
     switch (width) {
-    case 8:  v = *(volatile uint8_t  *)q; break;
-    case 16: v = *(volatile uint16_t *)q; break;
-    case 64: v = *(volatile uint64_t *)q; break;
-    default: v = *(volatile uint32_t *)q; break;
+    case 8:  return *(volatile uint8_t  *)q;
+    case 16: return *(volatile uint16_t *)q;
+    case 64: return *(volatile uint64_t *)q;
+    default: return *(volatile uint32_t *)q;
     }
-    vmm_unmap_mmio((uint64_t)(uintptr_t)p, 0x1000);
-    return v;
 }
 
 static void reg_write(const struct gas *g, uint64_t v) {
@@ -144,16 +173,14 @@ static void reg_write(const struct gas *g, uint64_t v) {
         default: outl(port, (uint32_t)v); return;
         }
     }
-    volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)vmm_map_mmio(g->address & ~0xFFFULL, 0x1000);
-    if (!p) return;
-    volatile uint8_t *q = p + (g->address & 0xFFF);
+    volatile uint8_t *q = erst_reg_ptr(g);
+    if (!q) return;
     switch (width) {
     case 8:  *(volatile uint8_t  *)q = (uint8_t)v; break;
     case 16: *(volatile uint16_t *)q = (uint16_t)v; break;
     case 64: *(volatile uint64_t *)q = v; break;
     default: *(volatile uint32_t *)q = (uint32_t)v; break;
     }
-    vmm_unmap_mmio((uint64_t)(uintptr_t)p, 0x1000);
 }
 
 /* The interpreter's state for one action. */
@@ -244,13 +271,23 @@ static bool erst_wait(void) {
     return false;
 }
 
-/* One complete operation: begin, point at the record, execute, wait, ask how
- * it went, end. The shape is the same for write, read and clear -- only the
- * action that begins it differs. */
-static int erst_operation(uint8_t begin, uint64_t offset) {
+/* One complete operation: begin, point at the record, name it, execute, wait,
+ * ask how it went, end. The shape is the same for write, read and clear --
+ * only the action that begins it differs.
+ *
+ * THE ORDER IS THE SPECIFICATION'S AND IT IS NOT A STYLE. Setting the record
+ * identifier BEFORE the operation begins was this driver's first attempt, and
+ * it appeared to work: the write went in, the read came back. What it
+ * actually did was set an identifier that beginning the operation then
+ * discarded, so every read ran against whatever the platform had left there.
+ * The identifier belongs between the offset and the execute, which is where
+ * the specification puts it and where every other implementation puts it. */
+static int erst_operation(uint8_t begin, uint64_t record_id, uint64_t offset) {
     bool ok = false;
     erst_action(begin, 0, &ok);          /* optional on some platforms */
     erst_action(ERST_SET_RECORD_OFFSET, offset, &ok);
+    if (!ok) return -EMBK_EIO;
+    erst_action(ERST_SET_RECORD_ID, record_id, &ok);
     if (!ok) return -EMBK_EIO;
     erst_action(ERST_EXECUTE_OPERATION, 0, &ok);
     if (!ok) return -EMBK_EIO;
@@ -276,40 +313,43 @@ int erst_write(uint64_t record_id, const void *data, uint32_t len) {
      * take a pointer: it serialises whatever is sitting in the error log
      * address range the table named. */
     for (uint32_t i = 0; i < len; i++) g_range[i] = ((const uint8_t *)data)[i];
-    /* The record id is part of the record's own header, and the firmware also
-     * wants it separately. */
-    bool ok = false;
-    erst_action(ERST_SET_RECORD_ID, record_id, &ok);
-    int rc = erst_operation(ERST_BEGIN_WRITE, 0);
+    int rc = erst_operation(ERST_BEGIN_WRITE, record_id, 0);
     if (rc == EMBK_OK) g_written++;
     return rc;
 }
 
 int erst_read(uint64_t record_id, void *out, uint32_t cap) {
     if (!g_up || !g_range) return -EMBK_ENODEV;
-    bool ok = false;
-    erst_action(ERST_SET_RECORD_ID, record_id, &ok);
-    int rc = erst_operation(ERST_BEGIN_READ, 0);
+    int rc = erst_operation(ERST_BEGIN_READ, record_id, 0);
     if (rc != EMBK_OK) return rc;
     uint32_t n = cap < g_range_len ? cap : (uint32_t)g_range_len;
     for (uint32_t i = 0; i < n; i++) ((uint8_t *)out)[i] = g_range[i];
     return (int)n;
 }
 
+/* ---- walking the records ------------------------------------------------
+ *
+ * The platform hands them out one at a time, and the identifier it is
+ * currently pointing at is what decides which comes next. Setting that to the
+ * invalid identifier means "start again from the beginning"; the enumeration
+ * ends by handing back the invalid identifier, which conveniently leaves the
+ * platform ready to start again for whoever asks next. */
 uint64_t erst_first_record(void) {
     if (!g_up) return ERST_ID_INVALID;
     bool ok = false;
-    /* Asking for the "next" id starting from the invalid one is how the
-     * enumeration is restarted: it means "from the beginning". */
     erst_action(ERST_SET_RECORD_ID, ERST_ID_INVALID, &ok);
+    return erst_action(ERST_GET_RECORD_ID, 0, &ok);
+}
+
+uint64_t erst_next_record(void) {
+    if (!g_up) return ERST_ID_INVALID;
+    bool ok = false;
     return erst_action(ERST_GET_RECORD_ID, 0, &ok);
 }
 
 int erst_clear(uint64_t record_id) {
     if (!g_up) return -EMBK_ENODEV;
-    bool ok = false;
-    erst_action(ERST_SET_RECORD_ID, record_id, &ok);
-    return erst_operation(ERST_BEGIN_CLEAR, 0);
+    return erst_operation(ERST_BEGIN_CLEAR, record_id, 0);
 }
 
 bool erst_init(void) {
@@ -331,6 +371,19 @@ bool erst_init(void) {
 
     for (uint32_t i = 0; i < count; i++) g_entries[i] = ents[i];
     g_nentries = count;
+
+    /* MAP EVERY REGISTER PAGE NOW, while there is a working machine to do it
+     * on. After this the interpreter never touches the memory manager, which
+     * is what lets the panic path use it. */
+    for (uint32_t i = 0; i < g_nentries; i++) {
+        if (g_entries[i].reg.space_id != 1 && g_entries[i].reg.address) {
+            if (!erst_map_page(g_entries[i].reg.address)) {
+                kprintf("erst: could not map the register page at %llx\n",
+                        (unsigned long long)g_entries[i].reg.address);
+                return false;
+            }
+        }
+    }
     g_up = true;
 
     bool ok = false;

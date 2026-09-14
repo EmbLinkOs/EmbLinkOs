@@ -9,6 +9,8 @@
 #include "process/debug.h"     /* debug_on_exception (§6.6 exception routing) */
 #include "lib/ksym.h"          /* the panic symbolizer (§7) */
 #include "drivers/char/platform_misc.h"
+#include "lib/crashlog.h"
+#include "drivers/timer/timer.h"
 #include "include/usercopy.h"   /* access_ok, for the ring-3 walk */
 
 /* Serializes the exception dump so two faulting cores don't interleave their
@@ -340,6 +342,42 @@ void isr_handler(struct registers *regs) {
     }
 
     serial_write_string("kernel-mode fault -- system halted.\n");
+
+    /* AND LEAVE A RECORD SOMEWHERE THAT SURVIVES THE POWER GOING OFF.
+     *
+     * Everything above this line goes to a serial port. On a developer's desk
+     * that is enough; on the target machine there is no cable, the screen
+     * holds whatever was on it, and the next thing that happens is somebody
+     * pressing the power button. docs/PILLARS.md phase 3 names the gap: "a
+     * problem on the real machine cannot be diagnosed after the fact."
+     *
+     * FIRST, AND BEFORE TELLING THE HOST. pvpanic is a request to the
+     * hypervisor, and a host configured to act on it may stop this machine
+     * between the two statements -- which would lose exactly the record that
+     * is being written. The order is not stylistic.
+     *
+     * crashlog_capture allocates nothing, takes no lock (this core already
+     * holds panic_lock, which is what keeps two faulting cores apart), and
+     * touches no page tables. See kernel/lib/crashlog.c for why each of those
+     * is a requirement rather than a preference. */
+    {
+        uint64_t cr2 = 0, cr3 = 0;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        struct crash_state st = {
+            .vector = regs->vector,
+            .error_code = regs->error_code,
+            .rip = regs->rip, .rsp = regs->rsp, .rbp = regs->rbp,
+            .rflags = regs->rflags, .cr2 = cr2, .cr3 = cr3,
+            .cs = regs->cs, .ss = regs->ss,
+            .cpu = this_cpu() ? this_cpu()->cpu_index : 0,
+            .pid = (current_thread && current_thread->proc)
+                       ? current_thread->proc->pid : 0,
+            .uptime_ms = timer_uptime_ms(),
+        };
+        crashlog_capture(&st);
+    }
+
     /* TELL THE HOST, if there is one. A halted guest and a slow one look
      * identical from outside -- both are a test harness waiting for a line
      * that never comes, and both time out the same way. pvpanic makes the

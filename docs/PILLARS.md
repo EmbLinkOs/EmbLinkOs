@@ -117,7 +117,7 @@ to a working driver, not prerequisites for one.
 | **Screen lock** | absent | Walking away from the machine leaves the session open |
 | **Real HiDPI scaling** | `ui_scale` exists, clamped to 80–130% | A modern laptop panel needs 200%; the desktop looks half-size |
 | **Time: NTP + time zones** | absent — the RTC only | The clock drifts and is in the wrong zone |
-| **A persistent system log + crash reports** | absent — `syslog.h` is deliberately a declaration-only stub | A problem on the real machine cannot be diagnosed after the fact |
+| **A persistent system log + crash reports** | ✅ **crash reports done** — a kernel fault now writes a UEFI CPER record through ACPI's error-record store (`kernel/acpi/erst.c`), which does not involve this OS's own storage stack: the disk driver may be what panicked. The record carries the registers, the symbolised address, AND the last 3 KB of kernel log, which `kernel/lib/klog.c` keeps for exactly this. The next boot reads it back and says so. `make test-crash` crashes the machine, KILLS it, reads the record out of the store from the host, boots again, and checks the recorded RIP resolves to a real function. ⚠️ **A persistent syslog for USERSPACE is still absent** (`syslog.h` remains a declaration-only stub), one crash is kept rather than a history, and aarch64 has no equivalent store |
 | **Notifications and status indicators** | notifications ✅ (`/run/emlink.notify`, user/system/notifyd -- banners from any program, and the desktop now reports a failed launch through it); status indicators still absent | Battery, network, volume, "update ready" have nowhere to appear |
 | **System updates** | absent — `pkg` installs apps, nothing updates the OS | Every fix means reinstalling |
 

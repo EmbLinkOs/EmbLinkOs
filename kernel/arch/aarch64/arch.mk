@@ -74,6 +74,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/mm/kheap.c \
                   kernel/mm/kmalloc.c \
                   kernel/lib/kprintf.c \
+                  kernel/lib/klog.c \
+                  kernel/lib/crashlog.c \
                   kernel/lib/kstring.c \
                   kernel/lib/errno.c \
                   kernel/lib/random.c \

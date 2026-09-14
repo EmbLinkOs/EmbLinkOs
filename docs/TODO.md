@@ -7398,11 +7398,27 @@ closing table instead.
 
 **Crash reporting**
 
-- [ ] **Nothing writes an ERST record on an actual panic.** `acpi/erst.c`
-      works and is tested across a kill and a reboot, but the panic path does
-      not call it. That is a change to the panic handler -- and it has to be
-      written with the care a panic path needs, because by then the machine is
-      already wrong.
+- [x] ~~Nothing writes an ERST record on an actual panic.~~ Done:
+      `kernel/lib/crashlog.c`, called from the fault handler before pvpanic is
+      told (a host acting on that notification can stop the machine between
+      the two). `make test-crash`.
+- [ ] **One crash is kept, not a history.** The record is written to a fixed
+      identifier and overwritten. Choosing which old crash to evict is
+      bookkeeping, and bookkeeping on a broken machine is how a report gets
+      lost -- but a boot loop currently overwrites the first failure with the
+      second, which is the one case where the history would matter most.
+- [ ] **aarch64 has nowhere to put a crash record.** ERST is an ACPI
+      mechanism and that machine boots from a device tree. A fault there still
+      prints to the serial port and is still lost when the power goes.
+- [ ] **No persistent syslog for USERSPACE.** `user/lib/syslog.h` is still a
+      declaration-only stub, deliberately. The kernel's own log now survives a
+      crash; a program's does not.
+- [ ] **Kernel panic symbols are off on this host.** `ksym` loads
+      `/system/kernel.embdbg`, which the Makefile produces with `$(EMBDBG)` --
+      an external tool at `~/EmbCC/embdbg` that is not installed here, so the
+      file is zero bytes and every recorded RIP reads as a bare address.
+      `tools/crash_test.py` resolves it with the host's `nm` instead, which is
+      why that test can still check the address is real.
 
 **Offload**
 

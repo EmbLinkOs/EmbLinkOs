@@ -294,6 +294,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/mm/swaptest.c \
              kernel/loader/pietest.c \
              kernel/lib/ksym.c \
+             kernel/lib/klog.c \
+             kernel/lib/crashlog.c \
              kernel/lib/kprintf.c
 
 LINKER      = kernel/linker.ld
@@ -3018,6 +3020,16 @@ test-bridge: $(IMG) $(EMBKFS_MASTER)
 	@EXTRA_QEMU="-device pci-bridge,id=br0,chassis_nr=1 -device virtio-scsi-pci,id=hba0,bus=br0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device scsi-hd,bus=hba0.0,drive=hbad" \
 	  python3 tools/console_test.py "test hba" || exit 1
 	@echo "=== test-bridge: OK"
+
+# CRASH THE KERNEL, TAKE THE POWER AWAY, ASK IT WHAT HAPPENED.
+#
+# A register dump to a serial port is enough on a desk and nothing at all on
+# the target machine. The record has to survive, and the check that it is a
+# REAL record rather than a plausible one is that the RIP it stored resolves --
+# through this host's nm, against the very kernel that crashed -- to a function.
+.PHONY: test-crash
+test-crash: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/crash_test.py
 
 .PHONY: test-erst
 test-erst: $(IMG) $(EMBKFS_MASTER)

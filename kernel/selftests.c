@@ -76,6 +76,7 @@
 #include "drivers/iommu/amd_iommu.h"
 #include "acpi/hotplug.h"
 #include "acpi/erst.h"
+#include "lib/crashlog.h"
 #include "crypto/aes.h"
 #include "drivers/storage/atapi.h"
 #include "drivers/storage/sdhci.h"
@@ -3130,6 +3131,31 @@ int selftests_handle_command(const char *cmd)
      * 96 of it and is what the platform indexes by. A blob with a marker in
      * it would be stored and then impossible to find again.
      * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test crashlog -- everything the last crash left behind.
+     *
+     * The boot message shows the registers and the last few lines. This is
+     * the rest of the log, which is the part that usually says WHY: a
+     * register dump says where the machine stopped and almost never what it
+     * was doing.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test crashlog") == 0) {
+        if (!crashlog_have_previous() && !crashlog_load_previous()) {
+            kprintf("\n[crashlog] no crash record from a previous boot\n");
+            kprintf("\n[cmd] test crashlog: OK (nothing to report)\n");
+            return 1;
+        }
+        const char *sym = crashlog_previous_symbol();
+        const char *log = crashlog_previous_log();
+        kprintf("\n[crashlog] vector %u at %s\n",
+                (unsigned)crashlog_previous_vector(),
+                (sym && sym[0]) ? sym : "(not symbolised)");
+        kprintf("[crashlog] %u byte(s) of kernel log:\n%s\n",
+                (unsigned)(log ? strlen(log) : 0), log ? log : "");
+        kprintf("\n[cmd] test crashlog: OK\n");
+        return 1;
+    }
+
     if (strcmp(cmd, "test erst") == 0) {
         if (!erst_present()) {
             kprintf("\n[erst] no error record storage on this machine\n");

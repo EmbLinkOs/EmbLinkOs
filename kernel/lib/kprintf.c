@@ -1,4 +1,5 @@
 #include "include/kprintf.h"
+#include "lib/klog.h"
 #include "drivers/char/serial.h"
 #include "include/spinlock.h"
 #include <stdint.h>
@@ -62,6 +63,11 @@ void kprintf_set_secondary(bool (*ready)(void), void (*put)(char)) {
 }
 
 static void sink_serial_put(struct out_sink *s, char c) {
+    /* AND KEEP IT. Both destinations above are gone the moment the machine
+     * stops -- a crashed laptop has no serial cable attached and its screen
+     * shows whatever was there before. The ring is what the crash record
+     * carries into storage that survives a power cycle. */
+    klog_putc(c);
     if (log_secondary_ready && log_secondary_ready() && log_secondary_put)
         log_secondary_put(c);
     else
@@ -113,8 +119,19 @@ static void emit_padding(struct out_sink *s, uint8_t n, char ch) {
     while (n--) s->put(s, ch);
 }
 
-static uint8_t strnlen_u8(const char *p) {
-    uint8_t n = 0;
+/* THE LENGTH IS NOT A BYTE, AND THE COUNTER MUST NOT BE EITHER.
+ *
+ * This counted into a uint8_t. At 255 the counter wrapped to zero and started
+ * again, so any %s argument with no terminator in its first 256 bytes looped
+ * FOREVER -- a hang, in the one function a broken kernel uses to say what
+ * went wrong. It went unnoticed for as long as nothing printed a long string;
+ * the first one to do so was the crash report printing the kernel log that
+ * led up to a fault, which is about as bad a place to discover it as exists.
+ *
+ * The PADDING width stays a byte, because that is what the format parser
+ * accepts and a field wider than 255 is not expressible anyway. */
+static uint32_t str_len(const char *p) {
+    uint32_t n = 0;
     while (p[n]) n++;
     return n;
 }
@@ -122,11 +139,11 @@ static uint8_t strnlen_u8(const char *p) {
 static void emit_string(struct out_sink *s, const char *string,
                         uint8_t width, uint8_t left_justify) {
     if (!string) string = "(null)";
-    uint8_t len = strnlen_u8(string);
+    uint32_t len = str_len(string);
     uint8_t pad = (width > len) ? (uint8_t)(width - len) : 0;
 
     if (!left_justify) emit_padding(s, pad, ' ');
-    for (uint8_t i = 0; i < len; i++) s->put(s, string[i]);
+    for (uint32_t i = 0; i < len; i++) s->put(s, string[i]);
     if (left_justify) emit_padding(s, pad, ' ');
 }
 
