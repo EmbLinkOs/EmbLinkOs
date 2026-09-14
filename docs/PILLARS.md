@@ -32,6 +32,11 @@ What that leaves is a machine this OS can be installed on, boot on, hear
 through, route interrupts on, and have drivers added to without rebuilding it.
 The remaining phase-1 and phase-3 entries below are what it still cannot do.
 
+**A companion list:** [HARDWARE_GAPS.md](HARDWARE_GAPS.md) asks the narrower
+question — of everything this development machine can EMULATE, what can we not
+yet drive? That is the list of work that can be started and tested today,
+without waiting for the target machine.
+
 ## Phase 1 — it boots and runs on the machine
 
 Hardware nobody can route around. Each of these is testable on QEMU, which

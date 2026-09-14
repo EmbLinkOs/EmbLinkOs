@@ -1,0 +1,106 @@
+# Hardware this machine can emulate and this OS cannot drive
+
+**Companion to [PILLARS.md](PILLARS.md), held to the same goal:** EmbLinkOS as
+the main operating system of a separate, physical machine. PILLARS.md asks
+"what is missing"; this asks the narrower and more actionable question —
+**what can we build and TEST right now, on the machine we develop on.**
+
+Everything below was checked on 2026-09-14 against `qemu-system-x86_64 -device
+help`, `qemu-system-aarch64 -M virt -device help`, and the driver files in
+`kernel/drivers/`. Not recalled. Where something is marked untestable, the
+reason is named.
+
+## What is already driven
+
+| Class | Drivers |
+|---|---|
+| Storage | ATA/IDE, AHCI, NVMe, virtio-blk, USB mass storage (Bulk-Only Transport) |
+| Network | virtio-net, e1000 (covers e1000e), rtl8139 |
+| Display | bochs/VGA (`bochs_vbe.c`), virtio-gpu, UEFI GOP framebuffer |
+| Input | i8042 PS/2, USB HID (keyboard + tablet), virtio-input |
+| Audio | AC'97, Intel HDA, virtio-snd — behind a runtime `struct pcm_driver` table |
+| USB host | UHCI, OHCI, EHCI, xHCI (+ single-level hubs, not on the hot-plug path) |
+| Timers | PIT, HPET, RTC, LAPIC timer, ARM generic timer |
+| Firmware | ACPI tables + a real AML interpreter; `_PRT` PCI interrupt routing |
+| Entropy | RDRAND/RDSEED where the CPU has them (`cpu_features.c`) |
+
+---
+
+## A. Matters on a real machine
+
+These are the ones where "we cannot drive it" means a person's hardware does
+not work.
+
+| Device | QEMU | Why it matters | Today |
+|---|---|---|---|
+| **I²C / SMBus** | `smbus-ipmi`, `i2c-ddc`, `i2c-echo` | **The biggest single gap.** I²C-HID is how a modern laptop's *touchpad*, and often its keyboard, attaches. SMBus reaches the battery and the memory SPD. DDC/EDID over I²C is how you learn what a monitor can do. | **No driver of any kind.** `grep` finds no i2c/smbus file in `kernel/drivers/` |
+| **SD / eMMC** | `sdhci-pci`, `sd-card`, `emmc` | Laptop card readers. Many ARM boards *boot* from eMMC | absent |
+| **usb-net** | `usb-net` | A USB ethernet dongle is how you get networking on a laptop whose wireless chip has no driver. Cheap to write, high value | absent |
+| **usb-uas** | `usb-uas`, `usb-bot` | We speak Bulk-Only Transport only. A USB 3 stick negotiates UAS; BOT still works as a fallback, but UAS is the fast path | BOT only |
+| **ATAPI / ISO9660** | `ide-cd`, `scsi-cd` | No optical path at all — no ATAPI command set, no ISO9660 filesystem. El Torito is already open in TODO.md | absent |
+| **igb** | `igb` (Intel 82576) | Closer to modern Intel server parts than e1000. `i82559`/`i8255x` covers a lot of older machines | absent |
+| **TPM** | `tpm-tis`, `tpm-crb` | The natural continuation of Secure Boot: measured boot, and sealing the EMBKFS encryption key to the boot state so a stolen disk is useless | absent. ⚠️ **Not testable here without installing `swtpm`**, which is not on this host |
+| **IOMMU** | `intel-iommu`, `amd-iommu`, `virtio-iommu` | Any device can currently DMA anywhere in memory. This is what stops a malicious Thunderbolt device | absent |
+| **SCSI / SAS HBAs** | `megasas`, `mptsas1068`, `lsi53c895a`, `am53c974`, `pvscsi` | Workstations and servers. Lower priority than the laptop parts above | absent |
+| **UFS** | `ufs` | Modern phone and thin-laptop storage | absent |
+
+---
+
+## B. Platform plumbing the firmware already describes and nothing listens to
+
+Each of these is something the machine is *offering* — the information is
+already in the tables the AML interpreter now reads.
+
+| Thing | QEMU | Note |
+|---|---|---|
+| **PCI bridge configuration** | `pcie-root-port`, `pci-bridge`, `pxb` | `pci_init` brute-forces all 256 buses, so devices *behind* a bridge are found. It never **configures** one — secondary/subordinate numbers, memory windows. Fine when firmware did it; not fine for hot-plug or a firmware that left something unassigned |
+| **CPU hot-plug** | built into `-smp` | `test amldump` shows `\_SB.CPUS` with a `_EJ0` on every processor. The firmware is offering it and nothing listens |
+| **Memory hot-plug** | `pc-dimm`, `nvdimm`, `virtio-mem` | Same shape: declared in the DSDT, ignored |
+| **`acpi-erst`** | `acpi-erst` | Persists crash records across a reboot. This is the phase-3 "persistent syslog + crash reports" pillar, with hardware help |
+| **`pvpanic`** | `pvpanic`, `pvpanic-pci` | Tells the host the guest panicked. A dozen lines; makes CI failures loud instead of a timeout |
+| **Watchdog** | `i6300esb` | Auto-reset on a hang |
+| **`isa-debug-exit`** | `isa-debug-exit` | Lets the guest exit QEMU with a status code. Would let a test return pass/fail **directly** instead of every harness scraping serial for a verdict string — see `tools/console_test.py` and the six other harnesses that all reimplement that |
+
+---
+
+## C. virtio we do not drive
+
+| Device | Why it is worth something |
+|---|---|
+| **`virtio-9p` / `virtio-fs`** | Share the build directory straight into the VM. **Pays for itself immediately in development turnaround** — no image rebuild to test a changed file |
+| `virtio-rng` | An entropy source. x86 has RDSEED; **aarch64 has nothing** |
+| `virtio-scsi` | The other standard VM storage path; multi-LUN and hot-plug |
+| `virtio-console` / `virtio-serial` | A serial port that is not a 16550 |
+| `virtio-balloon` | Memory ballooning |
+| `virtio-crypto` | Offload |
+| `virtio-iommu` | See IOMMU above |
+| `virtio-pmem` | Persistent memory |
+| `vhost-vsock` | Host/guest sockets |
+| `virtio-multitouch` | Touchscreens |
+
+---
+
+## D. Deliberately not worth it
+
+Said out loud so the absence does not read as an oversight.
+
+`pcnet`, `tulip`, `ne2k`, `rocker` (legacy or toy NICs) · `cirrus-vga`,
+`vmware-svga`, `ati-vga`, `qxl` (legacy or SPICE-specific display) · floppy ·
+CAN bus, IndustryPack, SSI serial flash · `edu`, `pci-testdev`, `pc-testdev`,
+`iommu-testdev` · `applesmc`.
+
+**On display specifically:** QEMU cannot emulate an Intel, AMD or NVIDIA GPU.
+For real hardware the UEFI GOP framebuffer we already have **is the ceiling**
+until somebody writes a native GPU driver, and nothing in QEMU's device list
+moves that. `ramfb` is the one small exception — a plain firmware-set
+framebuffer, mildly useful on aarch64 where there is no VGA to fall back to.
+
+---
+
+## If you pick three
+
+1. **I²C / SMBus** — unlocks the touchpad and the battery on real laptops, and
+   nothing else in this list blocks as much.
+2. **usb-net** — the escape hatch that gets a machine online when its wireless
+   chip has no driver.
+3. **virtio-9p** — the only item here that makes every *future* item cheaper.
