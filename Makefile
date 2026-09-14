@@ -211,8 +211,10 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/storage/ata.c \
              kernel/drivers/storage/ahci.c \
              kernel/drivers/storage/nvme.c \
+             kernel/drivers/storage/virtio_scsi.c \
              kernel/drivers/storage/nvmetest.c \
              kernel/block/block.c \
+             kernel/block/scsi.c \
              kernel/block/partition.c \
              kernel/mm/pmm.c \
              kernel/mm/uaccess_guard.c \
@@ -2919,6 +2921,15 @@ modules: build/modules/ramdisk.ko
 # test owns its own fixture: a file whose exact bytes the guest has to read
 # back, which is the difference between "the protocol walked" and "the data
 # arrived".
+# virtio-scsi, with a disk whose block 0 the HOST signed -- so a read that
+# returns zeroes is distinguishable from one that returns the truth.
+.PHONY: test-scsi
+test-scsi: $(IMG) $(EMBKFS_MASTER)
+	@python3 -c "import sys; d=bytearray(32*1024*1024); d[0:13]=b'EMBLINK-VSCSI'; open('build/vscsi.img','wb').write(bytes(d))"
+	@EXTRA_QEMU="-drive format=raw,file=build/vscsi.img,if=none,id=vsd" \
+	 EXTRA_DEVICES="virtio-scsi-pci,id=vs;scsi-hd,bus=vs.0,drive=vsd" \
+	    python3 tools/console_test.py "test scsi"
+
 .PHONY: test-ninep
 test-ninep: $(IMG) $(EMBKFS_MASTER)
 	@rm -rf build/9pshare && mkdir -p build/9pshare/sub

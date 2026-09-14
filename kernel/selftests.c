@@ -68,6 +68,7 @@
 #include "lib/random.h"
 #include "fs/automount.h"
 #include "fs/ninep.h"
+#include "drivers/storage/virtio_scsi.h"
 #include "drivers/usb/usb_core.h"
 #include "block/block.h"
 #include "acpi/acpi.h"
@@ -2813,6 +2814,79 @@ int selftests_handle_command(const char *cmd)
 
         kprintf("[cmd] test debug: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test scsi -- DOES THE CONTROLLER MOVE DATA, not just enumerate?
+     *
+     * A controller that finds its targets and reports their geometry has
+     * proved the command path for INQUIRY and READ CAPACITY and nothing else.
+     * Reads and writes go through a different descriptor layout -- a data
+     * buffer in the chain, in one direction or the other -- and that is the
+     * part that is wrong when a disk is silently garbage.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test scsi") == 0) {
+        if (!virtio_scsi_present()) {
+            kprintf("\n[scsi] no virtio-scsi controller\n");
+            kprintf("\n[cmd] test scsi: OK (nothing to test)\n");
+            return 1;
+        }
+        int fails = 0;
+        kprintf("\n[scsi] controller up, %u target(s) registered\n",
+                (unsigned)virtio_scsi_target_count());
+        if (virtio_scsi_target_count() == 0) {
+            kprintf("  FAIL: the controller found no targets\n");
+            kprintf("\n[cmd] test scsi: FAIL\n");
+            return 1;
+        }
+
+        /* The LAST block device is the one virtio-scsi just registered: the
+         * root and its partitions came first. */
+        struct embk_block_device *d = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *c = embk_block_get(i);
+            if (c && c->block_count == 65536 && c->block_size == 512) d = c;
+        }
+        if (!d) {
+            kprintf("  FAIL: the 32 MB target is not in the block table\n");
+            fails++;
+        } else {
+            static uint8_t buf[512], back[512];
+            /* THE HOST WROTE A SIGNATURE AT BLOCK 0. Reading it back proves
+             * the read path carries real bytes rather than zeroes. */
+            memset(buf, 0, sizeof buf);
+            if (embk_block_read(d, 0, 1, buf) != EMBK_OK) {
+                kprintf("  FAIL: reading block 0 of %s failed\n", d->name);
+                fails++;
+            } else if (strcmp((const char *)buf, "EMBLINK-VSCSI") != 0) {
+                kprintf("  FAIL: block 0 reads \"%.20s\", not the host's "
+                        "signature\n", buf);
+                fails++;
+            } else {
+                kprintf("  %s block 0 = \"%s\" (written by the host)\n",
+                        d->name, buf);
+            }
+
+            /* AND THE OTHER DIRECTION, which is a different descriptor
+             * layout: the data buffer moves from the out-group to the
+             * in-group and a driver can easily have only one of them right. */
+            memset(buf, 0x5A, sizeof buf);
+            if (embk_block_write(d, 100, 1, buf) != EMBK_OK) {
+                kprintf("  FAIL: writing block 100 failed\n"); fails++;
+            } else {
+                memset(back, 0, sizeof back);
+                if (embk_block_read(d, 100, 1, back) != EMBK_OK ||
+                    back[0] != 0x5A || back[511] != 0x5A) {
+                    kprintf("  FAIL: block 100 did not read back what was "
+                            "written\n");
+                    fails++;
+                } else {
+                    kprintf("  a write to block 100 read back correctly\n");
+                }
+            }
+        }
+        kprintf("\n[cmd] test scsi: %s\n", fails ? "FAIL" : "OK");
+        return 1;
     }
 
     /* ----------------------------------------------------------------------

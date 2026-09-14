@@ -22,6 +22,7 @@
 #include "drivers/char/platform_misc.h"
 #include "drivers/i2c/smbus.h"
 #include "fs/ninep.h"
+#include "drivers/storage/virtio_scsi.h"
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
@@ -1934,6 +1935,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // IRQ-driven and would hang waiting on an interrupt that can't fire yet.
     // Done before enumeration/mount so partitions appear in the listing and the
     // mount probe below sees them alongside whole disks.
+    virtio_scsi_init();   /* before the partition scan: its targets are disks */
     embk_partition_scan_all();
 
 

@@ -69,7 +69,7 @@ already in the tables the AML interpreter now reads.
 |---|---|
 | **`virtio-9p` / `virtio-fs`** | Share the build directory straight into the VM. **Pays for itself immediately in development turnaround** — no image rebuild to test a changed file |
 | `virtio-rng` | An entropy source. x86 has RDSEED; **aarch64 has nothing** |
-| `virtio-scsi` | The other standard VM storage path; multi-LUN and hot-plug |
+| ~~`virtio-scsi`~~ | ✅ done — `drivers/storage/virtio_scsi.c`, on the shared SCSI layer. `make test-scsi` |
 | `virtio-console` / `virtio-serial` | A serial port that is not a 16550 |
 | `virtio-balloon` | Memory ballooning |
 | `virtio-crypto` | Offload |

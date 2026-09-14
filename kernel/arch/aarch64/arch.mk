@@ -85,8 +85,10 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/bus/pci.c \
                   kernel/drivers/storage/virtio_blk.c \
                   kernel/drivers/storage/nvme.c \
+                  kernel/drivers/storage/virtio_scsi.c \
                   kernel/drivers/storage/nvmetest.c \
                   kernel/block/block.c \
+                  kernel/block/scsi.c \
                   kernel/block/partition.c \
                   kernel/process/process.c \
                   kernel/process/ksync.c \

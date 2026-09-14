@@ -117,6 +117,13 @@ def main(cmds):
         argv += ["-fsdev", "local,id=hostfs,path=%s,security_model=none" % share,
                  "-device", "virtio-9p-pci,fsdev=hostfs,mount_tag=hostshare"]
 
+    # EXTRA_QEMU: raw arguments, space-separated. Needed whenever a device has
+    # a BACKEND -- a virtio-scsi disk is a -device that references a -drive,
+    # and EXTRA_DEVICES can only express the first half.
+    extra_q = (os.environ.get("EXTRA_QEMU") or "").split()
+    if extra_q:
+        argv += extra_q
+
     machine = os.environ.get("MACHINE")
     if machine:
         argv += ["-M", machine]
