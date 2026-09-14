@@ -13,4 +13,9 @@ void xhci_enable_irq(void);
 // the IRQ vector by xhci_enable_irq (exposed for the IRQ dispatch layer).
 void xhci_irq(void);
 
+/* Devices addressed on xHCI controllers. Counted separately from
+ * usb_device_count() because xHCI does not use usb_core's device table -- see
+ * the .c. */
+uint32_t xhci_device_count(void);
+
 #endif /* __XHCI_H__ */

@@ -44,6 +44,11 @@ STICK = os.path.join(BUILD, "usbstick.img")
 SOCK = os.path.join(BUILD, "usbhp-ser.sock")
 QMP = os.path.join(BUILD, "usbhp-qmp.sock")
 
+# Which host controller to plug into. UHCI by default, because it is the one
+# the shared core has always covered.
+HC = sys.argv[1] if len(sys.argv) > 1 else "piix3-usb-uhci"
+BUS = "uhc.0"
+
 # The file the guest must find. Short and 8.3-clean so it survives FAT32's
 # short-name rules without depending on long-name support being right.
 MARKER = "HOTPLUG.TXT"
@@ -112,10 +117,13 @@ def main():
         "qemu-system-x86_64", "-cpu", "max",
         "-drive", "format=raw,file=myos.img,if=ide,index=0",
         "-drive", "format=raw,file=%s,if=ide,index=1" % scratch,
-        # A UHCI controller with NOTHING on it. The stick is added later, which
-        # is the whole point -- a device present at boot proves only that the
-        # boot-time scan still works.
-        "-device", "piix3-usb-uhci,id=uhc",
+        # A CONTROLLER WITH NOTHING ON IT. The stick is added later, which is
+        # the whole point -- a device present at boot proves only that the
+        # boot-time scan still works. Which controller is the argument: UHCI
+        # shares kernel/drivers/usb/usb_core.c with OHCI and EHCI, and xHCI
+        # has its own enumeration entirely, so "hot-plug works" has to be
+        # shown separately for each.
+        "-device", "%s,id=uhc" % HC,
         "-drive", "format=raw,file=%s,if=none,id=stickdrv" % STICK,
         "-vga", "none", "-device", "virtio-vga,xres=800,yres=600", "-display", "none",
         "-serial", "unix:%s,server,nowait" % SOCK,
@@ -172,7 +180,7 @@ def main():
 
         q = Qmp(QMP)
         q.cmd("device_add", driver="usb-storage", drive="stickdrv",
-              id="stick", bus="uhc.0")
+              id="stick", bus=BUS)
         print("usb-hotplug: stick attached over QMP")
         time.sleep(6)
         after, text = report("plugged in")

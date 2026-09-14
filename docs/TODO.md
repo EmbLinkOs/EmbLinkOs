@@ -7359,6 +7359,25 @@ decision rather than an oversight. The four items no emulator here can reach
 at all (I²C-HID, CDC-ECM, the TPM, virtio-mem/vhost-vsock) are in that doc's
 closing table instead.
 
+**USB**
+
+- [ ] **OHCI enumerates a stick and cannot read its filesystem.** The device
+      is found, the medium registers as a block device with the right
+      capacity, and then `automount` reports "no filesystem this kernel can
+      read" -- for the identical image that mounts over UHCI, EHCI and xHCI.
+      So the defect is in OHCI's own transfer path, not in the filesystem or
+      the SCSI layer. Found by running the same boot-time enumeration across
+      all four controllers, which nothing had done before.
+- [ ] **xHCI's hot-plug is polled, like the other three.** The controller
+      reports connect and disconnect as Port Status Change events on the event
+      ring, which would be immediate and free; the driver reads PORTSC every
+      500 ms instead. Correct, and slower than the hardware offers.
+- [ ] **A hot-plugged xHCI device silences the interrupter while it
+      enumerates.** Necessary -- the enumeration busy-polls the event ring and
+      the interrupt handler would consume its completions -- but it means HID
+      reports from an already-attached keyboard are deferred for the length of
+      a plug. A command mailbox the handler fills would remove the need.
+
 **Storage**
 
 - [ ] **SD/eMMC is PIO only** (`drivers/storage/sdhci.c`). 128 register reads

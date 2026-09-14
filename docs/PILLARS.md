@@ -65,12 +65,22 @@ going into firmware setup, and no amount of code here changes it. The signing
 key is generated into `build/` and is a DEVELOPMENT key; a release one is a
 policy about where a private key lives, not a Makefile rule.
 
-**Still open on the USB pillar:** xHCI. It keeps its own enumeration path
-rather than the shared `usb_core` one, so its ports are still scanned once at
-boot; its `rescan` hook is left NULL and skipped rather than guessed at. Modern
-machines put USB 3 ports on xHCI, so this is the half that a recent laptop
-actually needs, and it is a real piece of work rather than a copy of the
-three controllers that do share the core.
+**The USB pillar is now closed for hot-plug:** xHCI has a `rescan` hook of its
+own, expressed in its own terms (PORTSC, slot commands) rather than over
+`usb_core`'s device table, which it does not use. `make test-usb-hotplug` runs
+the whole sequence -- plug, enumerate, mount, read a named file, unplug,
+unmount -- over UHCI **and** over xHCI. Two things had to be fixed to get
+there, and both were older than the hot-plug work: xHCI enumerated only the
+FIRST connected port, so a machine with a keyboard and a stick on one
+controller saw one of them; and its mass storage registered a block device
+without ever mounting it, which the other three controllers have done since
+automount was written.
+
+**Still open on it:** OHCI enumerates a stick and registers the medium, and
+then the filesystem on it cannot be read (`automount: sda has no filesystem
+this kernel can read`) where the identical image mounts over UHCI, EHCI and
+xHCI. That is a defect in OHCI's transfer path, found by running the same
+test across all four, and it is in docs/TODO.md.
 
 **Still open on the ACPI pillar:** battery, lid and thermal zone are WRITTEN
 (`acpi_dev.c`) and have never run — QEMU emulates none of them, so the embedded

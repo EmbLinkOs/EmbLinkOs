@@ -6,7 +6,8 @@
 #include "include/errno.h"     // EMBK_* error codes
 #include "mm/vmm.h"
 #include "mm/pmm.h"   // KV2P: kernel-image virtual -> physical for DMA
-#include "block/block.h"       // block-device registration for USB mass storage
+#include "block/block.h"
+#include "fs/automount.h"       // block-device registration for USB mass storage
 #include "arch/x86_64/irq/irq.h"           // irq_register (interrupt-driven event servicing)
 #include "arch/x86_64/irq/ioapic.h"        // ioapic_route_level for the PCI interrupt
 
@@ -58,6 +59,13 @@
 #define XHCI_TRB_ENABLE_SLOT     9U
 #define XHCI_TRB_ADDRESS_DEVICE 11U
 #define XHCI_TRB_CFG_ENDPOINT   12U  // Configure Endpoint command TRB type
+#define XHCI_TRB_DISABLE_SLOT   10U  // Disable Slot command TRB type
+
+/* How many root ports this driver remembers the state of. The controller
+ * reports its own count; this is the cap on what can be tracked for hot-plug,
+ * and a port beyond it is enumerated at boot like before and simply not
+ * watched. Real controllers have well under this; QEMU's has eight. */
+#define XHCI_MAX_PORTS_TRACKED 24
 #define XHCI_TRB_CMD_COMPLETION 33U
 
 #define XHCI_TRB_CYCLE_BIT  (1U << 0)
@@ -128,6 +136,13 @@ struct xhci_runtime_state {
     uint16_t evt_dequeue;
     uint8_t context_size;
     uint8_t tracked_slots;
+
+    /* WHICH PORT HAS WHAT, so a rescan can tell "still there" from "new".
+     * A controller that is only ever enumerated once needs none of this --
+     * which is exactly why it was not here. */
+    uint32_t max_ports;
+    uint8_t  port_slot[XHCI_MAX_PORTS_TRACKED];      /* slot serving it, 0 = none */
+    bool     port_connected[XHCI_MAX_PORTS_TRACKED]; /* what we last saw           */
 
     uint8_t slot_to_port[XHCI_MAX_SLOTS_TRACKED];
     uint8_t slot_speed[XHCI_MAX_SLOTS_TRACKED];
@@ -1748,8 +1763,234 @@ static bool xhci_msc_setup(struct xhci_runtime_state *rt, uint8_t slot_id,
     m->blk.driver_data = m;
     m->blk.dma_max_phys = 0xFFFFFFFFFFFFFFFFULL; // DMA goes through kernel-BSS bounce
     m->blk.needs_kernel_range = true;
-    embk_block_register(&m->blk);
+    if (embk_block_register(&m->blk) != EMBK_OK) {
+        kprintf("xHCI slot%u: block registration failed\n", (unsigned int)slot_id);
+        m->used = false;
+        return false;
+    }
+    /* AND MAKE IT REACHABLE. Registering a block device is where this stopped,
+     * which is correct for a disk the boot code knows how to find and useless
+     * for one somebody just pushed into a socket -- the point of plugging a
+     * stick in is to read what is on it. The other three controllers have done
+     * this since automount was written; xHCI never did. */
+    automount_attach(&m->blk);
     return true;
+}
+
+/* ==========================================================================
+ * HOT-PLUG: bringing a port up, taking it down, and noticing the difference.
+ *
+ * The other three controllers share kernel/drivers/usb/usb_core.c, whose
+ * rescan compares the ports against a device table every 500 ms. xHCI never
+ * joined that path -- it has its own enumeration, its own slot model and its
+ * own transfer rings -- so its ports were scanned once at boot and never
+ * again. docs/PILLARS.md says it plainly: "modern machines put USB 3 ports on
+ * xHCI, so this is the half that a recent laptop actually needs."
+ *
+ * What follows is that same idea expressed in this driver's own terms: the
+ * shared core's `rescan` hook, implemented over xHCI's PORTSC registers and
+ * slot commands rather than over usb_core's device table.
+ * ========================================================================== */
+
+/* A NEWLY CONNECTED PORT IS NOT AN ENABLED ONE. At boot the firmware has
+ * already reset every port it found something on, which is why enumeration
+ * worked without this and why a hot-plugged device does not: a USB 2 device
+ * arrives in the Disabled state and reaches Enabled only through a port
+ * reset. (USB 3 ports train themselves and come up Enabled, which is why a
+ * USB 3 stick would have appeared to work and a USB 2 one in the same socket
+ * would not.)
+ *
+ * The change bits are write-1-to-clear and live in the same register as the
+ * control bits, so every write has to preserve the ones it does not mean to
+ * touch -- XHCI_PORTSC_RW1C_MASK is exactly that set. */
+static bool xhci_port_reset(volatile uint8_t *op, uint32_t port_index) {
+    uint32_t reg = XHCI_PORTSC_BASE + (port_index * XHCI_PORT_STRIDE);
+    uint32_t portsc = xhci_read32(op, reg);
+
+    if (portsc & XHCI_PORTSC_PED) return true;      /* already enabled */
+
+    xhci_write32(op, reg, (portsc & ~XHCI_PORTSC_RW1C_MASK) | XHCI_PORTSC_PR);
+    for (int i = 0; i < 2000000; i++) {
+        portsc = xhci_read32(op, reg);
+        if (!(portsc & XHCI_PORTSC_PR)) break;
+        __asm__ volatile("" ::: "memory");
+    }
+    /* Acknowledge every change bit the reset raised, or the next read of this
+     * register reports a connection that already happened. */
+    portsc = xhci_read32(op, reg);
+    xhci_write32(op, reg, portsc);
+    return (xhci_read32(op, reg) & XHCI_PORTSC_PED) != 0;
+}
+
+/* Enumerate whatever is on `root_port`: a slot, an address, the descriptors,
+ * and the class dispatch. This is the sequence that used to sit inline at the
+ * end of xhci_init_controller, lifted out unchanged in substance -- because a
+ * device plugged in while the machine runs needs exactly it, and a second
+ * copy would drift from the boot path. */
+static bool xhci_bring_up_port(struct xhci_runtime_state *rt, uint32_t root_port) {
+    volatile uint8_t *op = rt->op_regs;
+    volatile uint8_t *runtime = rt->runtime_regs;
+    volatile uint8_t *doorbell = rt->doorbell_regs;
+    if (!op || !runtime || !doorbell) return false;
+    if (root_port == 0 || root_port > XHCI_MAX_PORTS_TRACKED) return false;
+
+    /* SILENCE THE INTERRUPTER FIRST. Everything below busy-polls the event
+     * ring for its own completions, and by the time a device can be plugged
+     * in the interrupt handler is live and draining that same ring. The
+     * handler wins the race, the poll times out, and the device does not
+     * enumerate -- which is exactly what happened the first time this ran:
+     * "Enable Slot completion timeout on port 1", on a controller that had
+     * enumerated the identical device perfectly at boot, when the interrupt
+     * was not yet armed. The MSC block path has masked it for this reason
+     * since it was written; this needs it for the same one. */
+    xhci_intr_enable(rt, false);
+
+    if (!xhci_port_reset(op, root_port - 1U)) {
+        kprintf("xHCI: port %u would not enable after a reset\n",
+                (unsigned int)root_port);
+        { xhci_intr_enable(rt, true); return false; }
+    }
+
+    if (!xhci_submit_enable_slot(rt, doorbell)) {
+        kprintf("xHCI: failed to submit Enable Slot for port %u\n",
+                (unsigned int)root_port);
+        { xhci_intr_enable(rt, true); return false; }
+    }
+    uint8_t cc = 0xFF, slot = 0;
+    if (!xhci_poll_cmd_completion(rt, runtime, 4000000, &cc, &slot)) {
+        kprintf("xHCI: Enable Slot completion timeout on port %u\n",
+                (unsigned int)root_port);
+        { xhci_intr_enable(rt, true); return false; }
+    }
+    if (cc != 1U || slot == 0U || slot > rt->tracked_slots) {
+        kprintf("xHCI: Enable Slot for port %u gave code=%u slot=%u\n",
+                (unsigned int)root_port, (unsigned int)cc, (unsigned int)slot);
+        { xhci_intr_enable(rt, true); return false; }
+    }
+
+    uint8_t speed = xhci_port_speed(op, root_port - 1U);
+    if (!xhci_prepare_address_device_context(rt, slot, (uint8_t)root_port, speed)) {
+        kprintf("xHCI: failed to prepare input context for slot %u\n",
+                (unsigned int)slot);
+        { xhci_intr_enable(rt, true); return false; }
+    }
+
+    uint64_t ictx = xhci_dma(rt->input_ctx[(uint32_t)slot - 1U]);
+    if (!xhci_submit_address_device(rt, doorbell, slot, ictx)) {
+        kprintf("xHCI: failed to submit Address Device for slot %u\n",
+                (unsigned int)slot);
+        { xhci_intr_enable(rt, true); return false; }
+    }
+    uint8_t cc2 = 0xFF, slot2 = 0;
+    if (!xhci_poll_cmd_completion(rt, runtime, 4000000, &cc2, &slot2)) {
+        kprintf("xHCI: Address Device completion timeout\n");
+        { xhci_intr_enable(rt, true); return false; }
+    }
+    kprintf("xHCI: Address Device code=%u slot=%u port=%u speed=%u\n",
+            (unsigned int)cc2, (unsigned int)slot2,
+            (unsigned int)root_port, (unsigned int)speed);
+    if (cc2 != 1U) { xhci_intr_enable(rt, true); return false; }
+
+    uint32_t sidx = (uint32_t)slot - 1U;
+    rt->ep0_enqueue[sidx] = 0;
+    rt->ep0_cycle[sidx]   = 1;
+
+    if (!xhci_get_device_descriptor(rt, runtime, doorbell, slot)) { xhci_intr_enable(rt, true); return false; }
+    xhci_set_address(rt, runtime, doorbell, slot, slot);
+    if (!xhci_get_config_descriptor(rt, runtime, doorbell, slot)) { xhci_intr_enable(rt, true); return false; }
+    uint8_t cfg_val = rt->xfr_buf[sidx][5];
+    xhci_set_configuration(rt, runtime, doorbell, slot, cfg_val);
+    xhci_dispatch_class(rt, slot, op, runtime, doorbell);
+
+    rt->port_slot[root_port - 1U] = slot;
+    rt->slot_to_port[sidx] = (uint8_t)root_port;
+    xhci_intr_enable(rt, true);
+    return true;
+}
+
+/* The device on `root_port` has gone. Release everything that named it.
+ *
+ * ORDER, AS EVERYWHERE ELSE A MEDIUM CAN LEAVE: unmount before the block
+ * device is unregistered, unregister before the slot is disabled. Doing it
+ * the other way means an in-flight path walk going through a registration
+ * whose transfer ring has already been handed back. */
+static void xhci_teardown_port(struct xhci_runtime_state *rt, uint32_t root_port) {
+    if (root_port == 0 || root_port > XHCI_MAX_PORTS_TRACKED) return;
+    uint8_t slot = rt->port_slot[root_port - 1U];
+    if (!slot || slot > rt->tracked_slots) return;
+    uint32_t sidx = (uint32_t)slot - 1U;
+
+    for (uint32_t i = 0; i < (uint32_t)(XHCI_MAX_CONTROLLERS * XHCI_MAX_SLOTS_TRACKED); i++) {
+        struct xhci_msc_dev *m = &g_msc_devs[i];
+        if (!m->used || m->rt != rt || m->slot_id != slot) continue;
+        automount_detach(&m->blk);
+        embk_block_unregister(&m->blk);
+        kprintf("xHCI: %s removed (port %u)\n", m->blk.name,
+                (unsigned int)root_port);
+        m->used = false;
+    }
+
+    /* NOTHING MAY BE ARMED ON A RING WHOSE DEVICE IS GONE. The interrupt-IN
+     * poll walks every slot marked active; one left set is a poll that reads
+     * a buffer the controller will never fill again. */
+    rt->intin_active[sidx] = false;
+    rt->msc_active[sidx] = false;
+    rt->slot_active[sidx] = 0;
+    rt->slot_to_port[sidx] = 0;
+    rt->port_slot[root_port - 1U] = 0;
+
+    /* Give the slot back to the controller. Same reason as the bring-up: the
+     * completion is busy-polled and the interrupt handler must not take it. */
+    xhci_intr_enable(rt, false);
+    if (rt->doorbell_regs && rt->cmd_enqueue < (XHCI_CMD_RING_TRBS - 1U)) {
+        struct xhci_trb *trb = &rt->cmd_ring[rt->cmd_enqueue];
+        trb->d0 = 0; trb->d1 = 0; trb->d2 = 0;
+        trb->d3 = (XHCI_TRB_DISABLE_SLOT << XHCI_TRB_TYPE_SHIFT) |
+                  ((uint32_t)slot << 24) |
+                  (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+        rt->cmd_enqueue++;
+        if (rt->cmd_enqueue == (XHCI_CMD_RING_TRBS - 1U)) {
+            rt->cmd_enqueue = 0;
+            rt->cmd_cycle ^= 1U;
+        }
+        xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+        uint8_t cc = 0, got = 0;
+        xhci_poll_cmd_completion(rt, rt->runtime_regs, 2000000, &cc, &got);
+    }
+    xhci_intr_enable(rt, true);
+    rt->dcbaa[slot] = 0;
+}
+
+/* The shared core's hot-plug hook, called every 500 ms from usb_poll(). */
+void xhci_rescan(void *hc) {
+    struct xhci_runtime_state *rt = (struct xhci_runtime_state *)hc;
+    if (!rt || !rt->used || !rt->op_regs) return;
+
+    for (uint32_t port = 1; port <= rt->max_ports; port++) {
+        uint32_t reg = XHCI_PORTSC_BASE + ((port - 1U) * XHCI_PORT_STRIDE);
+        uint32_t portsc = xhci_read32(rt->op_regs, reg);
+        bool now = (portsc & XHCI_PORTSC_CCS) != 0;
+        bool was = rt->port_connected[port - 1U];
+
+        /* ACKNOWLEDGE THE CHANGE BITS WHATEVER HAPPENED. They are
+         * write-1-to-clear and they latch: a connect that is noticed but not
+         * acknowledged is reported again on every pass, and on a controller
+         * driven by its interrupt it never stops. */
+        if (portsc & XHCI_PORTSC_RW1C_MASK)
+            xhci_write32(rt->op_regs, reg, portsc);
+
+        if (now == was) continue;
+        rt->port_connected[port - 1U] = now;
+
+        if (now) {
+            kprintf("xHCI: something was plugged into port %u\n",
+                    (unsigned int)port);
+            xhci_bring_up_port(rt, port);
+        } else {
+            kprintf("xHCI: port %u went empty\n", (unsigned int)port);
+            xhci_teardown_port(rt, port);
+        }
+    }
 }
 
 // Count connected root ports for diagnostics. This MUST be read-only: issuing a
@@ -1872,94 +2113,53 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
     cfg |= (max_slots > 8U) ? 8U : (max_slots ? max_slots : 1U);
     xhci_write32(op, XHCI_OP_CONFIG, cfg);
 
-    // First real command path: Enable Slot. This validates command/event rings.
-    if (xhci_submit_enable_slot(rt, doorbell)) {
-        uint8_t cc = 0xFF;
-        uint8_t slot = 0;
-        if (xhci_poll_cmd_completion(rt, runtime, 4000000, &cc, &slot)) {
-            kprintf("xHCI: Enable Slot completion code=%u slot=%u\n",
-                    (unsigned int)cc, (unsigned int)slot);
-
-            // Address the first connected root port as the first real device flow.
-            uint32_t root_port = xhci_find_first_connected_port(op, max_ports);
-            if (cc == 1U && slot != 0U && root_port != 0U) {
-                uint8_t speed = xhci_port_speed(op, root_port - 1U);
-                if (!xhci_prepare_address_device_context(rt, slot,
-                                                         (uint8_t)root_port,
-                                                         speed)) {
-                    kprintf("xHCI: failed to prepare input context for slot %u\n",
-                            (unsigned int)slot);
-                } else {
-                    uint64_t ictx = xhci_dma(rt->input_ctx[(uint32_t)slot - 1U]);
-                    if (xhci_submit_address_device(rt, doorbell, slot, ictx)) {
-                        uint8_t cc2 = 0xFF;
-                        uint8_t slot2 = 0;
-                        if (xhci_poll_cmd_completion(rt, runtime, 4000000,
-                                                     &cc2, &slot2)) {
-                            kprintf("xHCI: Address Device completion code=%u slot=%u port=%u speed=%u\n",
-                                    (unsigned int)cc2,
-                                    (unsigned int)slot2,
-                                    (unsigned int)root_port,
-                                    (unsigned int)speed);
-
-                            // Address Device succeeded (cc2==1) — the slot now
-                            // has a real USB address and EP0 is live.  Fetch the
-                            // standard 18-byte Device Descriptor as the first
-                            // real data transfer to confirm end-to-end function.
-                            if (cc2 == 1U) {
-                                uint32_t sidx = (uint32_t)slot - 1U;
-                                // Initialise the EP0 enqueue/cycle for this slot.
-                                rt->ep0_enqueue[sidx] = 0;
-                                rt->ep0_cycle[sidx]   = 1;
-
-                                // Step 1: GET_DESCRIPTOR(Device) — confirm EP0 works.
-                                if (xhci_get_device_descriptor(rt, runtime,
-                                                               doorbell, slot)) {
-                                    // Step 2: SET_ADDRESS — assign a stable device addr.
-                                    // Use slot_id as the USB address (legal range 1-127).
-                                    xhci_set_address(rt, runtime, doorbell,
-                                                     slot, slot);
-
-                                    // Step 3: GET_DESCRIPTOR(Configuration) — fetch the
-                                    // full config blob so we can identify the class.
-                                    if (xhci_get_config_descriptor(rt, runtime,
-                                                                   doorbell, slot)) {
-                                        // Step 4: SET_CONFIGURATION — activate the
-                                        // interfaces/endpoints (bConfigurationValue is
-                                        // byte 5 of the configuration descriptor). The
-                                        // device only produces HID reports once this
-                                        // moves it into the Configured state.
-                                        uint8_t cfg_val =
-                                            rt->xfr_buf[(uint32_t)slot - 1U][5];
-                                        xhci_set_configuration(rt, runtime, doorbell,
-                                                               slot, cfg_val);
-
-                                        // Step 5: Walk descriptors and dispatch by class.
-                                        xhci_dispatch_class(rt, slot, op,
-                                                            runtime, doorbell);
-                                    }
-                                }
-                            }
-                        } else {
-                            kprintf("xHCI: Address Device completion timeout\n");
-                        }
-                    } else {
-                        kprintf("xHCI: failed to submit Address Device command\n");
-                    }
-                }
-            }
-        } else {
-            kprintf("xHCI: Enable Slot completion timeout\n");
-        }
-    } else {
-        kprintf("xHCI: failed to submit Enable Slot command\n");
+    /* EVERY CONNECTED PORT, NOT THE FIRST ONE.
+     *
+     * This used to enumerate exactly one device: it found the first port with
+     * something on it and stopped. A machine with a keyboard and a stick on
+     * the same controller got whichever the firmware happened to put first,
+     * and the other was invisible -- with nothing in the log to say so,
+     * because nothing had looked. */
+    rt->max_ports = max_ports < XHCI_MAX_PORTS_TRACKED ? max_ports
+                                                       : XHCI_MAX_PORTS_TRACKED;
+    for (uint32_t port = 1; port <= rt->max_ports; port++) {
+        uint32_t portsc = xhci_read32(op, XHCI_PORTSC_BASE +
+                                          ((port - 1U) * XHCI_PORT_STRIDE));
+        if (!(portsc & XHCI_PORTSC_CCS)) continue;
+        rt->port_connected[port - 1U] = true;
+        xhci_bring_up_port(rt, port);
     }
 
     ctrl->max_ports = (uint8_t)max_ports;
+    /* AND THE WAY BACK IN. usb.c polls every controller that offers a rescan
+     * hook; xHCI has left it NULL since the hot-plug path was written, which
+     * is why a stick pushed into a USB 3 socket did nothing at all. */
+    ctrl->hc = rt;
+    ctrl->rescan = xhci_rescan;
     ctrl->devices_present = (uint8_t)xhci_probe_ports(op, max_ports);
     kprintf("xHCI: detected %u connected device(s) on %u port(s)\n",
             (unsigned int)ctrl->devices_present,
             (unsigned int)ctrl->max_ports);
 
     return true;
+}
+
+/* How many devices this driver currently has addressed, across every xHCI
+ * controller.
+ *
+ * usb_device_count() counts kernel/drivers/usb/usb_core.c's table, which xHCI
+ * does not use -- it has its own slots, its own rings and its own enumeration.
+ * So a report built only from that table said "0 devices" on a machine with a
+ * USB 3 stick plugged in and mounted, which is not a small thing to be wrong
+ * about: it is the report a person reads to find out whether the machine saw
+ * what they plugged in. */
+uint32_t xhci_device_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
+        struct xhci_runtime_state *rt = &g_xhci_runtime[i];
+        if (!rt->used) continue;
+        for (uint32_t p = 0; p < XHCI_MAX_PORTS_TRACKED; p++)
+            if (rt->port_slot[p]) n++;
+    }
+    return n;
 }

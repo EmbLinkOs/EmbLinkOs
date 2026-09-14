@@ -2860,7 +2860,15 @@ test-acpi: $(IMG) $(EMBKFS_MASTER)
 # the boot-time scan still works, which was never the missing part.
 .PHONY: test-usb-hotplug
 test-usb-hotplug: $(IMG) $(EMBKFS_MASTER)
-	@python3 tools/usb_hotplug.py
+	@echo "=== UHCI (the shared core) ==="
+	@python3 tools/usb_hotplug.py piix3-usb-uhci || exit 1
+	@# xHCI has its own enumeration, its own slot model and its own transfer
+	@# rings -- it shares none of usb_core, so "hot-plug works" has to be
+	@# shown for it separately. Modern machines put USB 3 on xHCI, which
+	@# makes this the half a recent laptop actually needs.
+	@echo "=== xHCI (its own path entirely) ==="
+	@python3 tools/usb_hotplug.py qemu-xhci || exit 1
+	@echo "=== test-usb-hotplug: OK"
 
 # WILL A MACHINE WITH SECURE BOOT ON ACTUALLY RUN THIS?
 #

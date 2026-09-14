@@ -46,6 +46,7 @@
 #include "process/futex.h" /* test futex */
 #include "process/sched.h" /* test deadline: swapping the policy */
 #include "drivers/usb/usb.h"
+#include "drivers/usb/xhci.h"
 #include "drivers/video/framebuffer.h"
 #include "arch/x86_64/cpu/percpu.h"
 #include "crypto/sha256.h"
@@ -958,9 +959,15 @@ int selftests_handle_command(const char *cmd)
     if (strcmp(cmd, "test usbdevs") == 0) {
         usb_hotplug_scan_now();       /* do not make the harness wait a tick */
 
+        /* BOTH TABLES. usb_core's covers UHCI, OHCI and EHCI; xHCI keeps its
+         * own slots and appears in neither. Reporting only the first said "0
+         * devices" on a machine with a USB 3 stick plugged in and mounted --
+         * and this is the line a person reads to find out whether the machine
+         * saw what they plugged in. */
         kprintf("\n[usb] %u device(s) enumerated, %u block device(s), "
                 "%u removable volume(s) mounted\n",
-                (unsigned)usb_device_count(), (unsigned)embk_block_count(),
+                (unsigned)(usb_device_count() + xhci_device_count()),
+                (unsigned)embk_block_count(),
                 (unsigned)automount_count());
 
         for (uint32_t i = 0; i < embk_block_count(); i++) {
