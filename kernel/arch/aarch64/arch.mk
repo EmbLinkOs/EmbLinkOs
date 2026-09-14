@@ -130,6 +130,8 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   user/lib/tls/crypto/x25519.c \
                   user/lib/tls/crypto/selftest.c \
                   kernel/drivers/bus/virtio_pci.c \
+                  kernel/drivers/char/virtio_rng.c \
+                  kernel/drivers/char/platform_misc.c \
                   kernel/drivers/input/virtio_input.c \
                   kernel/drivers/input/keyboard.c \
                   kernel/drivers/input/mouse.c \

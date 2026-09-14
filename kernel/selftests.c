@@ -62,6 +62,9 @@
 #include "ipc/pipe.h"
 #include "boot/boot_protocol.h"
 #include "module/module.h"
+#include "drivers/char/virtio_rng.h"
+#include "drivers/char/platform_misc.h"
+#include "lib/random.h"
 #include "fs/automount.h"
 #include "drivers/usb/usb_core.h"
 #include "block/block.h"
@@ -655,6 +658,57 @@ int selftests_handle_command(const char *cmd)
 
     if (strcmp(cmd, "test list") == 0) {
         selftests_print_commands();
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test rng -- IS THE ENTROPY SOURCE ACTUALLY PRODUCING ENTROPY?
+     *
+     * A virtqueue that completes proves the DANCE worked. It does not prove
+     * the device returned anything: 64 zero bytes satisfy every structural
+     * check and contribute nothing to the pool, and a machine seeded from
+     * them generates keys anybody can guess.
+     *
+     * So this looks at the bytes. Not a statistical test -- 64 bytes cannot
+     * support one -- but the three degenerate cases that a broken or absent
+     * source actually produces: all zero, all identical, and unchanged between
+     * two reads.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test rng") == 0) {
+        int fails = 0;
+        kprintf("\n[rng] kernel pool quality: %d\n", (int)random_quality());
+
+        if (!virtio_rng_present()) {
+            kprintf("  no virtio-rng on this machine -- the pool is seeded "
+                    "from the CPU and clocks alone\n");
+            kprintf("\n[cmd] test rng: OK (nothing to test)\n");
+            return 1;
+        }
+
+        static uint8_t a[64], b[64];
+        uint32_t na = virtio_rng_read(a, sizeof a);
+        uint32_t nb = virtio_rng_read(b, sizeof b);
+        kprintf("  virtio-rng returned %u and %u byte(s); %llu total this boot\n",
+                na, nb, (unsigned long long)virtio_rng_bytes());
+        if (na == 0 || nb == 0) {
+            kprintf("  FAIL: the device returned nothing\n"); fails++;
+        } else {
+            int zero = 1, same = 1, identical = (na == nb);
+            for (uint32_t i = 0; i < na; i++) {
+                if (a[i] != 0)    zero = 0;
+                if (a[i] != a[0]) same = 0;
+                if (identical && i < nb && a[i] != b[i]) identical = 0;
+            }
+            if (zero)      { kprintf("  FAIL: 64 zero bytes\n"); fails++; }
+            if (same)      { kprintf("  FAIL: every byte is 0x%02x\n", a[0]); fails++; }
+            if (identical) { kprintf("  FAIL: two reads returned the SAME bytes -- "
+                                     "the buffer is not being refilled\n"); fails++; }
+            if (!fails)
+                kprintf("  two reads differ, neither is degenerate: %02x%02x%02x%02x... "
+                        "then %02x%02x%02x%02x...\n",
+                        a[0],a[1],a[2],a[3], b[0],b[1],b[2],b[3]);
+        }
+        kprintf("\n[cmd] test rng: %s\n", fails ? "FAIL" : "OK");
         return 1;
     }
 
@@ -2757,6 +2811,56 @@ int selftests_handle_command(const char *cmd)
 
         kprintf("[cmd] test debug: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * qemu-exit pass|fail -- END THE EMULATOR WITH A VERDICT.
+     *
+     * Seven harnesses in tools/ each boot a machine, wait, and scrape the
+     * serial log for a sentence -- each with its own timeout, its own idea of
+     * what "no verdict" means, and its own way of being wrong about it. An
+     * exit status is a different KIND of thing: it cannot be garbled by a log
+     * line that happened to contain the word OK, and "the guest never
+     * answered" stops being indistinguishable from "the guest said no".
+     *
+     * Does nothing on a machine without the device, so it is safe to leave in
+     * a path that also runs for real.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "qemu-exit pass") == 0 || strcmp(cmd, "qemu-exit fail") == 0) {
+        bool pass = (cmd[10] == 'p');
+        kprintf("\n[qemu-exit] %s -- ending the emulator with status %d\n",
+                pass ? "PASS" : "FAIL",
+                pass ? ((PLATFORM_EXIT_PASS << 1) | 1) : ((PLATFORM_EXIT_FAIL << 1) | 1));
+        platform_debug_exit(pass ? PLATFORM_EXIT_PASS : PLATFORM_EXIT_FAIL);
+        kprintf("[qemu-exit] still here -- there is no debug-exit device\n");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test panicnow -- DELIBERATELY FAULT IN THE KERNEL.
+     *
+     * This halts the machine. That is the point: it is the only way to reach
+     * the kernel-mode fault path, and therefore the only way to check that
+     * pvpanic tells the host about it rather than leaving a harness to guess
+     * from a timeout.
+     *
+     * Named so nobody runs it by accident, and it prints what it is about to
+     * do first -- a machine that dies with no explanation is the failure mode
+     * this whole path exists to prevent.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test panicnow") == 0) {
+        kprintf("\n[panicnow] faulting the kernel ON PURPOSE. The machine will "
+                "halt.\n");
+        kprintf("[panicnow] pvpanic is %s -- the host %s be told\n",
+                platform_pvpanic_present() ? "present" : "absent",
+                platform_pvpanic_present() ? "will" : "will NOT");
+        /* A write through a pointer into the non-canonical hole: a #GP that
+         * cannot be confused with a page fault on real memory, and cannot be
+         * recovered by demand paging. */
+        volatile uint64_t *bad = (volatile uint64_t *)0x0000800000000000ULL;
+        *bad = 0xDEAD;
+        kprintf("[panicnow] still running -- the fault did not happen\n");
+        return 1;
     }
 
     if (strcmp(cmd, "test faultkill") == 0) {

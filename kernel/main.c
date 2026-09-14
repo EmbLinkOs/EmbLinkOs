@@ -18,6 +18,8 @@
 #include "drivers/bus/pci.h"
 #include "drivers/audio/audio.h"
 #include "acpi/aml.h"
+#include "drivers/char/virtio_rng.h"
+#include "drivers/char/platform_misc.h"
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
@@ -1848,6 +1850,19 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     
     pci_init();
     audio_init();  // sound out; harmless when the machine has no card
+    /* pvpanic, the watchdog and the debug-exit port. After pci_init, which is
+     * where the watchdog is found. */
+    platform_misc_init();
+
+    /* ENTROPY FROM THE HOST, if this is a guest. Folded into the pool rather
+     * than replacing it, so a hypervisor feeding predictable bytes cannot
+     * make the CSPRNG worse than it already was. After pci_init, which is
+     * where the device is found. */
+    if (virtio_rng_init()) {
+        uint32_t got = virtio_rng_harvest(64);
+        kprintf("virtio-rng: seeded the pool with %u byte(s)\n", (unsigned)got);
+    }
+
     usb_init();
     ata_init();    // registers ATA drives as block devices internally
     ahci_init();   // runs IDENTIFY per port, stores sector counts

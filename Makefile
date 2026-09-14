@@ -168,6 +168,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/acpi/aml.c \
              kernel/acpi/acpi_dev.c \
              kernel/drivers/char/serial.c \
+             kernel/drivers/char/virtio_rng.c \
+             kernel/drivers/char/platform_misc.c \
              kernel/drivers/video/framebuffer.c \
              kernel/drivers/video/gpu.c \
              kernel/drivers/video/bochs_vbe.c \

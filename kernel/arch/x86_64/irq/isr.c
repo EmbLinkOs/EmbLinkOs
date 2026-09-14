@@ -8,6 +8,7 @@
 #include "process/process.h"   /* current_thread, struct process/thread */
 #include "process/debug.h"     /* debug_on_exception (§6.6 exception routing) */
 #include "lib/ksym.h"          /* the panic symbolizer (§7) */
+#include "drivers/char/platform_misc.h"
 #include "include/usercopy.h"   /* access_ok, for the ring-3 walk */
 
 /* Serializes the exception dump so two faulting cores don't interleave their
@@ -339,6 +340,12 @@ void isr_handler(struct registers *regs) {
     }
 
     serial_write_string("kernel-mode fault -- system halted.\n");
+    /* TELL THE HOST, if there is one. A halted guest and a slow one look
+     * identical from outside -- both are a test harness waiting for a line
+     * that never comes, and both time out the same way. pvpanic makes the
+     * difference a reported event instead of an inference. Silent no-op on
+     * real hardware. */
+    platform_pvpanic_notify();
     while (1) {
         __asm__ volatile ("cli; hlt");
     }
