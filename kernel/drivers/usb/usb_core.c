@@ -7,6 +7,7 @@
 #include "include/errno.h"
 #include "block/block.h"
 #include "fs/automount.h"
+#include "net/usb_net.h"
 #include "drivers/timer/pit.h"
 
 // ---------------------------------------------------------------------------
@@ -520,11 +521,26 @@ static void usb_parse_config(struct usb_device *dev,
         if (dlen == 0 || off + dlen > len) break;
 
         if (dtype == USB_DESC_INTERFACE && dlen >= 9) {
-            if (in_first_iface) break;      // second interface: stop
-            in_first_iface = true;
-            dev->if_class = cfg[off + 5];
-            dev->if_subclass = cfg[off + 6];
-            dev->if_protocol = cfg[off + 7];
+            /* EVERY INTERFACE'S ENDPOINTS, not just the first one's.
+             *
+             * This used to stop at the second interface, which is correct for
+             * a keyboard and wrong for anything built out of more than one.
+             * A USB ethernet adapter is the case that forced it: CDC splits a
+             * device across a CONTROL interface (class 2, where the class
+             * triple is) and a DATA interface (class 0x0A, where both bulk
+             * endpoints are). Parsing only the first found a device with one
+             * interrupt endpoint and no way to move a frame -- "no bulk
+             * endpoints", from a device that has two.
+             *
+             * The CLASS TRIPLE still comes from the first interface only, so
+             * every existing dispatch decision is unchanged. */
+            if (!in_first_iface) {
+                in_first_iface = true;
+                dev->if_class = cfg[off + 5];
+                dev->if_subclass = cfg[off + 6];
+                dev->if_protocol = cfg[off + 7];
+            }
+            dev->num_ifaces++;
         } else if (dtype == USB_DESC_ENDPOINT && dlen >= 7 && in_first_iface) {
             if (dev->num_eps < USB_MAX_ENDPOINTS) {
                 struct usb_ep_info *ep = &dev->eps[dev->num_eps++];
@@ -747,6 +763,14 @@ int usb_enumerate(struct usb_device *dev) {
         usb_msc_attach(dev);
     } else if (dev->if_class == 0x09) {
         usb_hub_attach(dev);
+    } else if (dev->if_class == 0x02 || dev->if_class == 0x0A ||
+               dev->if_class == 0xFF) {
+        /* Communications, CDC data, or vendor-specific -- a USB ethernet
+         * adapter appears as any of the three depending on whether its
+         * descriptors were written for the standard or for Windows. The
+         * driver decides; a device that is none of these returns false and
+         * nothing is lost. */
+        usb_net_attach(dev);
     }
 
     return 0;

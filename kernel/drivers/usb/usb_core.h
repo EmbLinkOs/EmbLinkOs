@@ -77,6 +77,10 @@ struct usb_device {
 
     struct usb_ep_info eps[USB_MAX_ENDPOINTS];
     uint8_t num_eps;
+    /* How many interfaces the configuration declared. The class triple above
+     * is the FIRST interface's; the endpoints are every interface's, because
+     * a CDC device keeps its class on one and its bulk pipes on another. */
+    uint8_t num_ifaces;
 
     // Data-toggle state per endpoint number, one bit each way (owned by the
     // core, used by UHCI/OHCI/EHCI to seed their TDs).

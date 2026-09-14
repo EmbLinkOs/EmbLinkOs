@@ -18,6 +18,7 @@
  * so a caller does not depend on the background RX kthread being scheduled. */
 
 #include "net/net.h"
+#include "net/usb_net.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"   /* process_create_kthread, schedule */
@@ -205,6 +206,13 @@ static const struct net_driver g_drivers[] = {
     { "virtio-net", virtio_net_init, virtio_net_tx, virtio_net_poll, virtio_net_link },
     { "e1000",      e1000_init,      e1000_tx,      e1000_poll,      e1000_link      },
     { "rtl8139",    rtl8139_init,    rtl8139_tx,    rtl8139_poll,    rtl8139_link    },
+    /* LAST ON PURPOSE. A USB adapter is the fallback, not the preference: a
+     * machine with a real NIC should use it, and the dongle is what you reach
+     * for when there is nothing else. It is also the only entry whose probe
+     * depends on something that happened EARLIER in boot -- usb_init has
+     * already enumerated by the time net_init runs, so `up` is a fact by then
+     * rather than a race. */
+    { "usb-net",    usb_net_drv_init, usb_net_drv_tx, usb_net_drv_poll, usb_net_drv_link },
 };
 static const struct net_driver *g_dev;
 

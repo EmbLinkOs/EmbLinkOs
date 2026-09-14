@@ -35,7 +35,7 @@ not work.
 |---|---|---|---|
 | **I²C / SMBus** | `smbus-ipmi`, `i2c-ddc`, `i2c-echo` | SMBus reaches the battery, the memory SPD, and a monitor's EDID over its DDC lines | ✅ **host controller done** — `kernel/drivers/i2c/smbus.c` drives the PIIX4 and ICH9 hosts, probes the bus, and reads + validates EDID (header *and* checksum). `make test-i2c`. ⚠️ **This is not the touchpad.** I²C-HID hangs off an Intel LPSS or AMD designware controller, which **QEMU does not emulate at all** — that driver can only be written against the target machine |
 | **SD / eMMC** | `sdhci-pci`, `sd-card`, `emmc` | Laptop card readers. Many ARM boards *boot* from eMMC | absent |
-| **usb-net** | `usb-net` | A USB ethernet dongle is how you get networking on a laptop whose wireless chip has no driver. Cheap to write, high value | absent |
+| **usb-net** | `usb-net` | A USB ethernet dongle is how you get networking on a laptop whose wireless chip has no driver | ✅ **RNDIS done** — `kernel/net/usb_net.c`, registered in the `net_driver` table below the PCI cards. DHCP, DNS, TCP and UDP all verified over it. ⚠️ **CDC-ECM is what most real dongles speak and QEMU emulates none**, so that path is detected and refused rather than guessed at |
 | **usb-uas** | `usb-uas`, `usb-bot` | We speak Bulk-Only Transport only. A USB 3 stick negotiates UAS; BOT still works as a fallback, but UAS is the fast path | BOT only |
 | **ATAPI / ISO9660** | `ide-cd`, `scsi-cd` | No optical path at all — no ATAPI command set, no ISO9660 filesystem. El Torito is already open in TODO.md | absent |
 | **igb** | `igb` (Intel 82576) | Closer to modern Intel server parts than e1000. `i82559`/`i8255x` covers a lot of older machines | absent |
@@ -102,6 +102,7 @@ framebuffer, mildly useful on aarch64 where there is no VGA to fall back to.
 1. ~~**I²C / SMBus**~~ — the host controller is done. What is left of it is
    I²C-HID for the touchpad, and that needs the target machine: no emulator
    here has an LPSS/designware controller to develop against.
-2. **usb-net** — the escape hatch that gets a machine online when its wireless
-   chip has no driver.
+2. ~~**usb-net**~~ — done for RNDIS. CDC-ECM needs a real dongle to develop
+   against; its MAC lives in a string descriptor named by a functional
+   descriptor the USB core does not parse yet.
 3. **virtio-9p** — the only item here that makes every *future* item cheaper.

@@ -193,6 +193,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/net/virtio_net.c \
              kernel/net/e1000.c \
              kernel/net/rtl8139.c \
+             kernel/net/usb_net.c \
              kernel/net/ethernet/eth.c \
              kernel/net/ethernet/arp.c \
              kernel/net/ip/ipv4.c \

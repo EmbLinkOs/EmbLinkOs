@@ -53,6 +53,12 @@
 #define UHCI_TD_IOC       (1 << 24)
 #define UHCI_TD_LS        (1 << 26)
 #define UHCI_TD_CERR_3    (3 << 27)
+/* SHORT PACKET DETECT. On an IN transfer, a packet smaller than the endpoint's
+ * maximum IS the end of the transfer -- that is how USB says "that is all I
+ * had". Without this bit the controller keeps the remaining TDs active waiting
+ * for data that will never come, and a read of 2048 bytes that received 60
+ * times out and DISCARDS them. See uhci_run_chain. */
+#define UHCI_TD_SPD       (1 << 29)
 
 // TD token PIDs.
 #define UHCI_PID_IN    0x69
@@ -152,6 +158,28 @@ static int uhci_run_chain(struct uhci_hc *hc, struct uhci_td *first,
             if (!(tcs & UHCI_TD_ACTIVE) && (tcs & UHCI_TD_ANY_ERR)) {
                 hc->qh_work.element = UHCI_LINK_TERM;
                 return (int)(t - first);
+            }
+            /* A RETIRED TD THAT MOVED LESS THAN IT ASKED FOR ends the whole
+             * transfer, and is a SUCCESS rather than an error.
+             *
+             * This is what a variable-length read looks like on USB: a
+             * network adapter asked for 2048 bytes hands back one 60-byte
+             * frame and nothing more, and the short packet is how it says so.
+             * Without this the chain's later TDs stay active forever, the
+             * transfer times out, and the 60 bytes that DID arrive are thrown
+             * away -- which reads as a network that receives nothing while
+             * transmitting perfectly.
+             *
+             * MaxLen is stored as length-1 (0x7FF means zero), which is why
+             * both sides of the comparison add one. */
+            if (!(tcs & UHCI_TD_ACTIVE)) {
+                uint32_t actlen = (tcs + 1) & UHCI_TD_ACTLEN_MASK;
+                uint32_t maxlen = (((volatile struct uhci_td *)t)->token >> 21) + 1;
+                maxlen &= UHCI_TD_ACTLEN_MASK;
+                if (actlen < maxlen) {
+                    hc->qh_work.element = UHCI_LINK_TERM;
+                    return -1;               /* short packet: done, not failed */
+                }
             }
             if (t == last) break;
         }
@@ -255,6 +283,9 @@ static int uhci_bulk(struct usb_device *dev, uint8_t ep_addr,
                      dir_in ? UHCI_PID_IN : UHCI_PID_OUT,
                      dev->addr, ep_addr & 0x0F, toggle, chunk,
                      chunk ? (uint32_t)uhci_dma(hc->bounce + off) : 0);
+        /* Only on IN: an OUT transfer's length is ours to decide and a short
+         * one is not a signal from anybody. */
+        if (dir_in) tds[idx].cs |= UHCI_TD_SPD;
         toggle ^= 1;
         off += chunk;
         idx++;
@@ -274,12 +305,19 @@ static int uhci_bulk(struct usb_device *dev, uint8_t ep_addr,
         return (tds[rc].cs & UHCI_TD_STALLED) ? USB_ERR_STALL : USB_ERR_IO;
     }
 
-    usb_toggle_set(dev, ep_addr, toggle);
-
-    uint32_t got = 0;
+    /* COUNT ONLY THE TDs THAT RAN. After a short packet the rest are still
+     * active and their length fields are meaningless -- and the data toggle
+     * must reflect the packets that actually moved, or the next transfer on
+     * this endpoint is rejected for having the wrong one. */
+    uint32_t got = 0, ran = 0;
     for (uint32_t i = 0; i < idx; i++) {
-        got += (tds[i].cs + 1) & UHCI_TD_ACTLEN_MASK;
+        uint32_t tcs = ((volatile struct uhci_td *)&tds[i])->cs;
+        if (tcs & UHCI_TD_ACTIVE) break;
+        got += (tcs + 1) & UHCI_TD_ACTLEN_MASK;
+        ran++;
     }
+    usb_toggle_set(dev, ep_addr,
+                   (uint8_t)((usb_toggle_get(dev, ep_addr) + ran) & 1));
     if (got > len) got = len;
     if (dir_in && data && got) memcpy(data, hc->bounce, got);
     return (int)got;

@@ -96,7 +96,15 @@ def main(cmds):
         # driver against the same stack. The default stays virtio-net so the
         # existing network tests mean what they always did.
         model = os.environ.get("NIC", "virtio-net")
-        argv += ["-netdev", "user,id=net0", "-device", "%s,netdev=net0" % model]
+        # NIC=usb-net needs a USB controller to hang off, and no PCI NIC beside
+        # it -- the driver table prefers a real card, which is the right order
+        # and would make this test measure virtio-net instead.
+        if model == "usb-net":
+            argv += ["-device", "piix3-usb-uhci,id=uhc",
+                     "-netdev", "user,id=net0",
+                     "-device", "usb-net,netdev=net0,bus=uhc.0"]
+        else:
+            argv += ["-netdev", "user,id=net0", "-device", "%s,netdev=net0" % model]
     # MACHINE: the chipset. The default is QEMU's i440fx; "q35" is the modern
     # one, and it is a DIFFERENT machine in the way that matters here -- its
     # firmware tables are generated separately, so an ACPI test that passes on
