@@ -4,9 +4,10 @@
 of a separate, physical machine — installed on its disk, booted by its firmware,
 used every day. Not a demo on QEMU.
 
-Everything below was checked against the source on 2026-09-11, not recalled.
-Where a pillar is "absent", the audit searched the tree for it and found nothing;
-where it is "partial", the file that has the partial version is named.
+Everything below was checked against the source on 2026-09-11 and revised
+2026-09-14, not recalled. Where a pillar is "absent", the audit searched the
+tree for it and found nothing; where it is "partial", the file that has the
+partial version is named.
 
 ## What already stands
 
@@ -18,8 +19,18 @@ cache. TCP/IPv4, DHCP, DNS, userland TLS. USB (UHCI/OHCI/EHCI/xHCI, HID). AHCI,
 ATA, virtio-blk, **NVMe**. Capabilities, namespaces, sessions, a real account
 store. A compositor, a UI toolkit, a desktop, a browser, a shell, git, Python.
 
-That is a lot of operating system. It is also, on a real machine, mostly
-unreachable — because of what is still open in phase 1.
+**Added 2026-09-13/14, and this is the part that changed the answer to "can it
+run on a machine":** Intel HD Audio and a runtime sound-driver table; a UEFI
+loader proved end to end and gated; an ACPI **AML interpreter** running the
+firmware's own bytecode, with PCI interrupt routing taken from `_PRT`; USB
+**hot-plug** with removable media mounted under `/media`; **Secure Boot** — a
+signed loader, enrolled keys, and a kernel verified before it is entered;
+**loadable kernel modules** behind an explicit export table and W^X; and an
+**installer** that puts the system on a disk that then boots on its own.
+
+What that leaves is a machine this OS can be installed on, boot on, hear
+through, route interrupts on, and have drivers added to without rebuilding it.
+The remaining phase-1 and phase-3 entries below are what it still cannot do.
 
 ## Phase 1 — it boots and runs on the machine
 
