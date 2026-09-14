@@ -182,6 +182,9 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/storage/virtio_pmem.c \
              kernel/drivers/crypto/virtio_crypto.c \
              kernel/drivers/iommu/virtio_iommu.c \
+             kernel/drivers/iommu/intel_iommu.c \
+             kernel/drivers/iommu/amd_iommu.c \
+             kernel/drivers/tpm/tpm.c \
              kernel/fs/iso9660.c \
              kernel/drivers/char/platform_misc.c \
              kernel/drivers/i2c/smbus.c \
@@ -2988,8 +2991,16 @@ test-scsi: $(IMG) $(EMBKFS_MASTER)
 # that the machine still boots AND still reads a block afterwards.
 .PHONY: test-iommu
 test-iommu: $(IMG) $(EMBKFS_MASTER)
+	@echo "=== virtio-iommu ==="
 	@MACHINE=q35 EXTRA_QEMU="-device virtio-iommu-pci" \
-	  python3 tools/console_test.py "test iommu"
+	  python3 tools/console_test.py "test iommu" || exit 1
+	@echo "=== Intel VT-d ==="
+	@MACHINE=q35 EXTRA_QEMU="-device intel-iommu,intremap=off" \
+	  python3 tools/console_test.py "test iommu" || exit 1
+	@echo "=== AMD-Vi ==="
+	@MACHINE=q35 EXTRA_QEMU="-device amd-iommu" \
+	  python3 tools/console_test.py "test iommu" || exit 1
+	@echo "=== test-iommu: OK"
 
 .PHONY: test-crypto
 test-crypto: $(IMG) $(EMBKFS_MASTER)

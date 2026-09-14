@@ -71,6 +71,8 @@
 #include "drivers/storage/virtio_pmem.h"
 #include "drivers/crypto/virtio_crypto.h"
 #include "drivers/iommu/virtio_iommu.h"
+#include "drivers/iommu/intel_iommu.h"
+#include "drivers/iommu/amd_iommu.h"
 #include "crypto/aes.h"
 #include "drivers/storage/atapi.h"
 #include "drivers/storage/sdhci.h"
@@ -3106,16 +3108,28 @@ int selftests_handle_command(const char *cmd)
      * the claim is about the running system rather than about the boot.
      * -------------------------------------------------------------------- */
     if (strcmp(cmd, "test iommu") == 0) {
-        if (!virtio_iommu_present()) {
+        /* THREE DIFFERENT IOMMUs, ONE TEST. VT-d, AMD-Vi and virtio-iommu are
+         * three unrelated ways of describing the same restriction, and what
+         * has to be true afterwards is identical: the devices are in a
+         * domain, and DMA still works. */
+        const char *which = NULL;
+        uint32_t endpoints = 0;
+        if (virtio_iommu_present()) {
+            which = "virtio-iommu"; endpoints = virtio_iommu_endpoints();
+        } else if (intel_iommu_present()) {
+            which = "intel VT-d";   endpoints = intel_iommu_devices();
+        } else if (amd_iommu_present()) {
+            which = "AMD-Vi";       endpoints = amd_iommu_devices();
+        }
+        if (!which) {
             kprintf("\n[iommu] no IOMMU on this machine\n");
             kprintf("\n[cmd] test iommu: SKIP\n");
             return 1;
         }
         int fails = 0;
-        kprintf("\n[iommu] %u endpoint(s) attached, %llu MiB translated\n",
-                (unsigned)virtio_iommu_endpoints(),
-                (unsigned long long)(virtio_iommu_mapped() >> 20));
-        if (virtio_iommu_endpoints() == 0) {
+        kprintf("\n[iommu] %s: %u device(s) translated\n", which,
+                (unsigned)endpoints);
+        if (endpoints == 0) {
             kprintf("  FAIL: the IOMMU is up and translating nothing\n");
             fails++;
         }

@@ -563,3 +563,16 @@ void acpi_resolve_isa_irq(uint8_t isa_irq, uint32_t *out_gsi,
     if (out_active_low) *out_active_low = active_low;
     if (out_level)      *out_level = level;
 }
+/* ---- a table by its signature, for drivers that need one we do not parse ---
+ *
+ * Most tables the kernel cares about are read here and turned into a struct.
+ * DMAR (Intel VT-d) and IVRS (AMD-Vi) are not: they describe hardware that one
+ * driver owns and nothing else looks at, and copying their layouts into this
+ * file would put a second parser in the wrong place. So this hands out the
+ * raw, checksum-verified table and the driver reads its own fields. */
+const struct acpi_sdt_header *acpi_find_table(const char *signature) {
+    if (!g_rsdp || !signature) return NULL;
+    struct acpi_sdt_header *h = find_table(g_rsdp, signature);
+    if (!h || !checksum_ok(h, h->length)) return NULL;
+    return h;
+}

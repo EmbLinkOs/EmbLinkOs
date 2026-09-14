@@ -32,6 +32,9 @@
 #include "drivers/storage/virtio_pmem.h"
 #include "drivers/crypto/virtio_crypto.h"
 #include "drivers/iommu/virtio_iommu.h"
+#include "drivers/iommu/intel_iommu.h"
+#include "drivers/iommu/amd_iommu.h"
+#include "drivers/tpm/tpm.h"
 #include "drivers/char/virtio_console.h"
 #include "drivers/misc/virtio_balloon.h"
 #include "drivers/i2c/smbus.h"
@@ -1874,6 +1877,9 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
      * the bus scan and the first driver that touches memory on a device's
      * behalf. */
     virtio_iommu_init();
+    intel_iommu_init();
+    amd_iommu_init();
+    tpm_init();           /* the chip that remembers what booted, if there is one */
 
     audio_init();  // sound out; harmless when the machine has no card
     /* The chipset's two-wire bus: the battery, the memory SPD, a monitor's

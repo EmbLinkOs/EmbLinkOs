@@ -283,6 +283,11 @@ bool acpi_thermal_temp(uint64_t *decikelvin);
 /* The DSDT and the SSDTs, for the AML interpreter. NULL before acpi_init(),
  * and NULL past the last SSDT. */
 const struct acpi_sdt_header *acpi_dsdt(void);
+
+/* Any table, by signature, checksum-verified and raw. For hardware whose
+ * description one driver owns -- DMAR, IVRS -- where a second parser in
+ * acpi.c would be a parser in the wrong place. NULL when absent. */
+const struct acpi_sdt_header *acpi_find_table(const char *signature);
 const struct acpi_sdt_header *acpi_ssdt(int nth);
 
 /* The power part of the ACPI tables, or NULL before acpi_init(). */
