@@ -18,7 +18,9 @@
  * so a caller does not depend on the background RX kthread being scheduled. */
 
 #include "net/net.h"
+#if defined(__x86_64__)
 #include "net/usb_net.h"
+#endif
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"   /* process_create_kthread, schedule */
@@ -212,7 +214,13 @@ static const struct net_driver g_drivers[] = {
      * depends on something that happened EARLIER in boot -- usb_init has
      * already enumerated by the time net_init runs, so `up` is a fact by then
      * rather than a race. */
+#if defined(__x86_64__)
+    /* x86 ONLY, because the USB host controllers are. aarch64's machine has
+     * no UHCI/OHCI/EHCI/xHCI in this tree, so usb_core is not compiled there
+     * and neither is anything that calls into it -- the same per-architecture
+     * split audio.c's driver table makes, and for the same reason. */
     { "usb-net",    usb_net_drv_init, usb_net_drv_tx, usb_net_drv_poll, usb_net_drv_link },
+#endif
 };
 static const struct net_driver *g_dev;
 
