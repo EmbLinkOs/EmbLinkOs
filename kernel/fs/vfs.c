@@ -359,6 +359,26 @@ int vfs_resolve_ex(const char *path, struct vnode *out, uint8_t *mode_out) {
             return rc;                                      // unbound => ENOENT (absence)
         if (mode_out)
             *mode_out = mode;
+
+        /* A MOUNT DEEPER THAN THE BINDING DECIDES WHAT THE PATH *IS*.
+         *
+         * The binding answers "may this process name /host at all" -- that is
+         * the security question and it is still answered first, above. It does
+         * not answer "what is at /host", and it must not: the bound vnode was
+         * captured when the binding was made, from whatever filesystem held
+         * that name THEN. A filesystem mounted there is invisible to every
+         * namespaced process, which is every process on the machine.
+         *
+         * That is not only the 9p share. A USB stick automounted at
+         * /media/sdc1 had exactly the same problem -- mounted, correct, and
+         * unreachable by any program. Starting the walk at the deeper mount's
+         * root widens nothing: the prefix is still gated by the binding, and
+         * this is what the global fallback below has always done. */
+        struct vfs_mount *deeper = vfs_find_mount(path);
+        if (deeper) {
+            size_t mlen = strlen(deeper->at);
+            if (mlen > plen) { root = deeper->root; plen = mlen; }
+        }
         return vfs_walk_from(root, path + plen, out);       // walk relative to the bound root
     }
 

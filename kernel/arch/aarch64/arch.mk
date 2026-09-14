@@ -96,6 +96,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/syscall/syscalls.c \
                   kernel/fs/vfs.c \
                   kernel/fs/automount.c \
+                  kernel/fs/ninep.c \
                   kernel/module/module.c \
                   kernel/module/exports.c \
                   kernel/fs/fd.c \

@@ -129,12 +129,25 @@ static int default_profile(const char *user, struct embk_spawn_file_action *acts
     embk_action_ns_bind(&acts[1], "/data/apps", EMBK_NS_RO);
     embk_action_ns_bind(&acts[2], home, EMBK_NS_RW);
     embk_action_ns_bind(&acts[3], "/run", EMBK_NS_RW);
+    int n = 4;
+
+    /* THE HOST'S SHARE, when there is one. A virtio-9p mount at /host is
+     * useless if no session can name it -- a binding is what makes a mount
+     * reachable, and without this the filesystem is mounted, correct, and
+     * invisible to every program on the machine.
+     *
+     * READ-ONLY, and not only because the driver is: a directory on the
+     * DEVELOPMENT machine is not something a guest being debugged should be
+     * able to write through. A binding that is absent when there is no share
+     * costs nothing -- ns_bind of a path that does not resolve is dropped. */
+    embk_action_ns_bind(&acts[n++], "/host", EMBK_NS_RO);
+
     char *d = desc;
     if (desc_cap > 96) {
         d = put_str(d, "ro /system, ro /data/apps, rw "); d = put_str(d, home);
-        d = put_str(d, ", rw /run"); *d = 0;
+        d = put_str(d, ", rw /run, ro /host"); *d = 0;
     }
-    return 4;
+    return n;
 }
 
 /* Load <user>'s SESSION PROFILE -- /etc/sessions/<user>.ns -- into NS_BIND

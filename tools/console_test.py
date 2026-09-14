@@ -109,6 +109,14 @@ def main(cmds):
     # one, and it is a DIFFERENT machine in the way that matters here -- its
     # firmware tables are generated separately, so an ACPI test that passes on
     # one has said nothing about the other.
+    # NINEP=<host dir> shares a directory with the guest over virtio-9p, which
+    # the kernel mounts at /host. The whole point of the driver: read a file
+    # the host just wrote without rebuilding a disk image.
+    share = os.environ.get("NINEP")
+    if share:
+        argv += ["-fsdev", "local,id=hostfs,path=%s,security_model=none" % share,
+                 "-device", "virtio-9p-pci,fsdev=hostfs,mount_tag=hostshare"]
+
     machine = os.environ.get("MACHINE")
     if machine:
         argv += ["-M", machine]

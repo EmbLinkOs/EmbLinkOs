@@ -67,6 +67,7 @@
 #include "drivers/i2c/smbus.h"
 #include "lib/random.h"
 #include "fs/automount.h"
+#include "fs/ninep.h"
 #include "drivers/usb/usb_core.h"
 #include "block/block.h"
 #include "acpi/acpi.h"
@@ -2812,6 +2813,84 @@ int selftests_handle_command(const char *cmd)
 
         kprintf("[cmd] test debug: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test ninep -- THE HOST'S FILESYSTEM, READ FROM THE GUEST.
+     *
+     * The point of the driver is development turnaround: change a file on the
+     * host, read it in the guest, with no image rebuild in between. So the
+     * test reads a file the HOST wrote and compares the bytes -- a mount that
+     * lists a directory proves the protocol walked, and only a read proves
+     * anything came back.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test ninep") == 0) {
+        if (!ninep_present()) {
+            kprintf("\n[9p] no virtio-9p share attached\n");
+            kprintf("\n[cmd] test ninep: OK (nothing to test)\n");
+            return 1;
+        }
+        int fails = 0;
+        kprintf("\n[9p] share \"%s\" at /host\n", ninep_tag());
+
+        struct media_listing ml = { 0, { 0 } };
+        int rc = vfs_readdir("/host", media_count_cb, &ml);
+        kprintf("  /host lists %d entr%s (rc %d)%s%s\n", ml.n,
+                ml.n == 1 ? "y" : "ies", rc,
+                ml.n ? ", first: " : "", ml.n ? ml.first : "");
+        if (ml.n == 0) { kprintf("  FAIL: the share listed nothing\n"); fails++; }
+
+        /* A SUBDIRECTORY, because a walk of depth one can be right by
+         * accident -- the root fid needs no walk at all. */
+        struct media_listing sub = { 0, { 0 } };
+        if (vfs_readdir("/host/sub", media_count_cb, &sub) == EMBK_OK)
+            kprintf("  /host/sub lists %d entr%s%s%s\n", sub.n,
+                    sub.n == 1 ? "y" : "ies",
+                    sub.n ? ", first: " : "", sub.n ? sub.first : "");
+
+        /* AND THE BYTES. stat first, so a size that disagrees with what comes
+         * back is visible rather than silently truncated. */
+        struct vfs_stat st;
+        if (vfs_stat("/host/HELLO.txt", &st) != EMBK_OK) {
+            kprintf("  FAIL: /host/HELLO.txt does not stat\n"); fails++;
+        } else {
+            static char buf[256];
+            size_t got = 0;
+            memset(buf, 0, sizeof buf);
+            rc = vfs_read("/host/HELLO.txt", 0, buf, sizeof buf - 1, &got);
+            kprintf("  HELLO.txt: stat says %llu bytes, read returned %llu\n",
+                    (unsigned long long)st.size, (unsigned long long)got);
+            if (rc != EMBK_OK || got == 0) {
+                kprintf("  FAIL: reading it returned %d\n", rc); fails++;
+            } else {
+                /* Trim the newline so the comparison is about the content. */
+                for (size_t i = 0; i < got; i++) if (buf[i] == '\n') buf[i] = 0;
+                kprintf("  it says: \"%s\"\n", buf);
+                if (strcmp(buf, "the host wrote this") != 0) {
+                    kprintf("  FAIL: that is not what the host wrote\n");
+                    fails++;
+                }
+                if (got != st.size) {
+                    kprintf("  FAIL: read %llu bytes but stat said %llu\n",
+                            (unsigned long long)got, (unsigned long long)st.size);
+                    fails++;
+                }
+            }
+        }
+
+        /* IT IS READ-ONLY AND SAYS SO. A write that silently did nothing
+         * would look like a successful save of work that was never stored. */
+        size_t wrote = 0;
+        rc = vfs_write("/host/HELLO.txt", 0, "x", 1, &wrote);
+        if (rc == EMBK_OK) {
+            kprintf("  FAIL: a write to the read-only share SUCCEEDED\n");
+            fails++;
+        } else {
+            kprintf("  a write is refused (%d), as it should be\n", rc);
+        }
+
+        kprintf("\n[cmd] test ninep: %s\n", fails ? "FAIL" : "OK");
+        return 1;
     }
 
     /* ----------------------------------------------------------------------

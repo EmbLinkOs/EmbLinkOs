@@ -21,6 +21,7 @@
 #include "drivers/char/virtio_rng.h"
 #include "drivers/char/platform_misc.h"
 #include "drivers/i2c/smbus.h"
+#include "fs/ninep.h"
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
@@ -1935,6 +1936,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // mount probe below sees them alongside whole disks.
     embk_partition_scan_all();
 
+
     kprintf("\n=== Block devices ===\n");
     for (uint32_t i = 0; i < embk_block_count(); i++) {
         struct embk_block_device *dev = embk_block_get(i);
@@ -1968,6 +1970,17 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     }
 
     vfs_init();
+
+    /* THE HOST'S FILESYSTEM, if one was shared. Mounted read-only at /host so
+     * a build directory on the development machine is readable in the guest
+     * without rebuilding a disk image -- which is the whole reason this
+     * driver exists. Absent on a real machine, and absent is normal.
+     *
+     * AFTER vfs_init(), which ZEROES the mount table. Mounting before it
+     * leaves a share that was mounted, reported itself mounted, resolved
+     * correctly once -- and was then silently erased before anything could
+     * use it. */
+    ninep_init("/host");
 
     // EmbLink UI Piece 1, Layer B: the RAM-backed endpoint filesystem, mounted
     // at /run independent of whatever real storage was found above -- IPC

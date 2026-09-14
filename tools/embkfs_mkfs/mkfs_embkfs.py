@@ -1244,6 +1244,14 @@ def discover_userland_objects(build_dir="build"):
     # Empty user/scratch directories the layout commits to now (D4 §5, D3 §4.1),
     # so a session can chdir into a home and tcc has a scratch dir to write to.
     objects.append((b"data/tmp", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    # A MOUNT POINT HAS TO EXIST. /host is where a virtio-9p share from the
+    # development machine is mounted, and /media is where a USB stick lands.
+    # Mounting does not CREATE the name -- the VFS shadows a directory that is
+    # already there -- and anything that resolves a path component by
+    # component, ns_bind included, fails on a name the root filesystem has
+    # never heard of. An empty directory costs one inode.
+    objects.append((b"host",     L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"media",    L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"home",     L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     # ...and the dev user's home INSIDE it. init sets HOME=/home/<user> and the
     # terminal starts the shell there, so with only an empty /home the shell

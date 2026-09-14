@@ -246,6 +246,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/fd.c \
              kernel/fs/vfs.c \
              kernel/fs/automount.c \
+             kernel/fs/ninep.c \
              kernel/module/module.c \
              kernel/module/exports.c \
              kernel/fs/namespace.c \
@@ -2914,6 +2915,18 @@ modules: build/modules/ramdisk.ko
 # THE TWO-WIRE BUS. A monitor is attached at an address the memory SPD EEPROMs
 # do not already occupy -- on a PC, DDC and the first DIMM's SPD share 0x50 on
 # different bus segments, which an emulator has only one of.
+# THE HOST'S FILESYSTEM, READ FROM THE GUEST. The share is built here so the
+# test owns its own fixture: a file whose exact bytes the guest has to read
+# back, which is the difference between "the protocol walked" and "the data
+# arrived".
+.PHONY: test-ninep
+test-ninep: $(IMG) $(EMBKFS_MASTER)
+	@rm -rf build/9pshare && mkdir -p build/9pshare/sub
+	@printf 'the host wrote this\n' > build/9pshare/HELLO.txt
+	@printf 'second\n' > build/9pshare/second.txt
+	@printf 'deep\n' > build/9pshare/sub/deep.txt
+	@NINEP=$(CURDIR)/build/9pshare python3 tools/console_test.py "test ninep"
+
 .PHONY: test-i2c
 test-i2c: $(IMG) $(EMBKFS_MASTER)
 	@EXTRA_DEVICES="i2c-ddc,address=0x38" python3 tools/console_test.py "test i2c"
