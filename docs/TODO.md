@@ -851,7 +851,66 @@ The measurement immediately earned itself twice:
 
 ## Storage
 
-### USB
+### Secure Boot
+
+### Signed loader, enrolled keys, and a verified kernel (2026-09-14)
+
+`make test-secureboot`. Three pieces, none of which existed:
+
+- `tools/sbsign.py` computes the Authenticode PE hash and builds the PKCS#7
+  by hand. sbsign/pesign are Linux-only and absent on this host, so this
+  writes the bytes -- the same choice `mkuefidisk.py` and `mkfat32.py` make.
+- `tools/efivars.py` writes PK/KEK/db into a UEFI variable store, because a
+  firmware with no Platform Key is in SETUP MODE and enforces nothing.
+- the loader reads the firmware's `SecureBoot` variable through runtime
+  services and checks the kernel against the hash the build computed, both
+  reported to the kernel in boot protocol v2.
+
+**Four bugs, and every one of them produced the identical symptom** -- the
+firmware says "Access Denied" and nothing else, whether the signature is
+absent, malformed, or perfectly valid over the wrong bytes. Found by turning
+on OVMF's debug console, which says exactly which check failed:
+
+1. `openssl cms` emits SignedData version 3 and wraps the content in an OCTET
+   STRING. Authenticode is PKCS#7 1.5: version 1, content embedded directly.
+   The container is built by hand now; openssl only does the RSA signature.
+2. `SpcString` is `[0] IMPLICIT BMPString` -- PRIMITIVE. Tagged constructed,
+   every parser walks into the UCS-2 and chokes.
+3. The certificate table must start 8-byte aligned, so padding is added to the
+   file -- and that padding is INSIDE the region the Authenticode hash covers.
+   Padding after hashing signs a file that no longer exists.
+4. The messageDigest attribute covers the SpcIndirectDataContent's VALUE, not
+   its TLV: the firmware walks past the SEQUENCE header before handing the
+   bytes to the verifier.
+
+**Still open:**
+
+- [ ] **It boots on a machine that has enrolled OUR key, not on a stock one.**
+      A retail laptop trusts Microsoft's keys. The options are a shim signed by
+      them, or the owner enrolling ours in firmware setup -- and the second is
+      what the test does. Nothing in this tree can change that.
+- [ ] **The signing key is a development key**, generated into `build/sbkeys/`
+      and git-ignored. A release key is a policy about where a private key
+      lives and who can use it, not a build rule.
+- [ ] **No `dbx` handling.** The firmware checks the revocation list itself
+      before ours is consulted, so nothing is bypassed -- but this tree has no
+      way to ship a revocation of its own key.
+- [ ] **The kernel hash is a hash, not a signature, and it is embedded in the
+      loader.** That is exactly right while the kernel is embedded too -- the
+      firmware's signature covers both -- and it is NOT enough once the kernel
+      becomes a separate file on the ESP, which is what the Recovery menu
+      entry needs. A detached signature over the kernel is the next step.
+- [ ] **Nothing is gated on any of it.** The kernel REPORTS secure_boot and
+      kernel_verified and refuses to boot an unverified kernel, but userspace
+      does not yet change behaviour based on how the machine was trusted.
+- [ ] **Boot protocol v1 loaders are accepted**, and must be: the BIOS stage2
+      still writes v1. The capture code zero-fills what a short record lacks
+      and every new field reads as "unknown" -- which had to be IMPLEMENTED,
+      because the version scheme was documented but the code demanded an exact
+      match and would have broken the BIOS path the first time a field was
+      added.
+
+## USB
 
 ### Hot-plug and removable media (2026-09-14)
 

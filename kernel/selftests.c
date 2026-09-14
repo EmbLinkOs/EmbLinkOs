@@ -60,6 +60,7 @@
 #include "ipc/channel.h"
 #include "ipc/endpoint.h"
 #include "ipc/pipe.h"
+#include "boot/boot_protocol.h"
 #include "fs/automount.h"
 #include "drivers/usb/usb_core.h"
 #include "block/block.h"
@@ -653,6 +654,76 @@ int selftests_handle_command(const char *cmd)
 
     if (strcmp(cmd, "test list") == 0) {
         selftests_print_commands();
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test secureboot -- WHAT, IF ANYTHING, WAS VERIFIED ON THE WAY IN?
+     *
+     * Two separate facts and the machine cannot work either one out for
+     * itself: by the time this runs, boot services are gone and the only
+     * record of what was checked is what the loader wrote into the boot
+     * protocol.
+     *
+     * THE HONEST ANSWER INCLUDES "NOBODY CHECKED", and it is the one worth
+     * printing loudly. A machine that booted unverified code and a machine
+     * that verified every stage look identical from userspace, and that is
+     * exactly the confusion this exists to end.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test secureboot") == 0) {
+        const struct boot_protocol *bp = boot_protocol_get();
+        if (!bp) {
+            kprintf("\n[cmd] test secureboot: no boot protocol record\n");
+            return 1;
+        }
+        int fails = 0;
+
+        kprintf("\n[secureboot] boot protocol v%u, %u bytes, firmware %s\n",
+                (unsigned)bp->version, (unsigned)bp->size,
+                bp->firmware == BOOT_FW_UEFI ? "UEFI"
+                : bp->firmware == BOOT_FW_BIOS ? "BIOS" : "device tree");
+
+        /* A v1 loader did not have these fields at all. Reporting their zero
+         * bytes as facts would be inventing them. */
+        if (bp->size < sizeof(struct boot_protocol)) {
+            kprintf("  this loader predates the verification fields -- nothing "
+                    "to report, which is itself the answer\n");
+            kprintf("\n[cmd] test secureboot: OK\n");
+            return 1;
+        }
+
+        const char *sb = bp->secure_boot == BOOT_SB_ON  ? "ENABLED"
+                       : bp->secure_boot == BOOT_SB_OFF ? "disabled"
+                                                        : "not reported";
+        kprintf("  firmware secure boot: %s%s\n", sb,
+                bp->setup_mode ? "  (setup mode: no platform key enrolled, so "
+                                 "nothing is enforced)" : "");
+        kprintf("  kernel image:         %s\n",
+                bp->kernel_verified == BOOT_KV_OK ? "verified against its build hash"
+              : bp->kernel_verified == BOOT_KV_FAILED ? "FAILED VERIFICATION"
+                                                      : "not verified (BIOS path)");
+
+        /* THE ONE THING THAT IS ALWAYS WRONG. Reaching here having failed
+         * verification means the loader jumped anyway, which it must never do. */
+        if (bp->kernel_verified == BOOT_KV_FAILED) {
+            kprintf("  FAIL: this kernel is RUNNING after failing its own "
+                    "verification -- the loader should have refused\n");
+            fails++;
+        }
+        /* Under UEFI the loader always checks, so "not verified" there means
+         * the check did not run and nobody noticed. */
+        if (bp->firmware == BOOT_FW_UEFI &&
+            bp->kernel_verified == BOOT_KV_UNKNOWN) {
+            kprintf("  FAIL: booted by UEFI but the kernel was never checked\n");
+            fails++;
+        }
+
+        if (bp->secure_boot != BOOT_SB_ON)
+            kprintf("  note: nothing outside this machine vouched for the "
+                    "loader itself. The kernel hash above is checked BY the "
+                    "loader, so it is only as trustworthy as the loader is.\n");
+
+        kprintf("\n[cmd] test secureboot: %s\n", fails ? "FAIL" : "OK");
         return 1;
     }
 

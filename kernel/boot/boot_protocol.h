@@ -26,7 +26,7 @@
  * and check `size` before reading anything new. Never reorder. */
 
 #define BOOT_PROTOCOL_MAGIC    0x4F52504B4E494C45ULL  /* "ELINKPRO" */
-#define BOOT_PROTOCOL_VERSION  1
+#define BOOT_PROTOCOL_VERSION  2
 
 /* Which firmware built this record. The kernel should need this for almost
  * nothing -- if a subsystem starts branching on it, that is a sign the
@@ -72,7 +72,43 @@ struct boot_protocol {
     uint64_t acpi_rsdp;      /* +0x48  ACPI RSDP phys, 0 = unknown (BIOS: the
                               *        kernel falls back to the legacy scan;
                               *        UEFI: from the EFI configuration table) */
-};                           /*  size  0x50                                  */
+
+    /* ---- v2: HOW THIS MACHINE WAS TRUSTED ---------------------------------
+     *
+     * Whether the firmware verified the thing it launched, and whether the
+     * thing it launched verified what IT launched. Two separate facts and the
+     * kernel has no way to learn either one for itself -- by the time it runs,
+     * boot services are gone and the only record of what was checked is
+     * whatever the loader chose to write down.
+     *
+     * The kernel does not GATE anything on these yet. It reports them, which
+     * is the honest first step: a machine that quietly boots unverified code
+     * and a machine that verified every stage look identical from userspace
+     * today, and that is the part worth fixing first. */
+    uint8_t  secure_boot;    /* +0x50  BOOT_SB_*                             */
+    uint8_t  setup_mode;     /* +0x51  1 = firmware has no platform key      */
+    uint8_t  kernel_verified;/* +0x52  BOOT_KV_*                             */
+    uint8_t  _reserved2;     /* +0x53                                        */
+    /* Padded to the struct's own 8-byte alignment EXPLICITLY. Without this the
+     * compiler adds the same four bytes silently and the next person to add a
+     * field puts it at an offset the assertions below do not describe. */
+    uint32_t _reserved3;     /* +0x54                                        */
+};                           /*  size  0x58                                  */
+
+/* What the firmware's SecureBoot variable said. UNKNOWN is not "off": a BIOS
+ * machine has no such variable and neither does a UEFI one whose firmware
+ * refused the read, and reporting either as "off" would be inventing a fact. */
+#define BOOT_SB_UNKNOWN  0
+#define BOOT_SB_OFF      1
+#define BOOT_SB_ON       2
+
+/* Whether the LOADER checked the kernel before jumping to it -- a separate
+ * question from what the firmware checked, and the only one this project
+ * controls. */
+#define BOOT_KV_UNKNOWN  0   /* nothing checked (BIOS path)                  */
+#define BOOT_KV_OK       1   /* the embedded kernel matched its build hash   */
+#define BOOT_KV_FAILED   2   /* it did not -- and we are running anyway only
+                              *   because the loader was told to             */
 
 /* Why mmap_stride exists when the loader normalizes every entry to
  * sizeof(struct boot_mmap_entry) anyway: it lets the ENTRY grow later
@@ -84,7 +120,14 @@ struct boot_protocol {
 #define BOOT_MMAP_STRIDE_MIN  24
 
 _Static_assert(sizeof(struct boot_mmap_entry) == 24, "mmap entry is 24 bytes");
-_Static_assert(sizeof(struct boot_protocol)   == 0x50, "boot_protocol is 0x50");
+/* THE SIZE OF EVERY VERSION THAT HAS EXISTED, not just the current one. The
+ * whole point of the scheme in the header comment is that a loader older than
+ * the kernel still boots it; that only works if the kernel knows how short a
+ * record is allowed to be. v1 ended at acpi_rsdp. */
+#define BOOT_PROTOCOL_SIZE_V1  0x50
+
+_Static_assert(sizeof(struct boot_protocol)   == 0x58, "boot_protocol is 0x58");
+_Static_assert(offsetof(struct boot_protocol, secure_boot)   == 0x50, "off");
 _Static_assert(offsetof(struct boot_protocol, magic)         == 0x00, "off");
 _Static_assert(offsetof(struct boot_protocol, version)       == 0x08, "off");
 _Static_assert(offsetof(struct boot_protocol, size)          == 0x0C, "off");

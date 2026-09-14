@@ -25,3 +25,4 @@ __pycache__/
 .claude/settings.json
 .claude/settings.local.json
 build/webreal/
+build/sbkeys/

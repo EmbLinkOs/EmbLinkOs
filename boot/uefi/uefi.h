@@ -218,6 +218,30 @@ typedef struct {
     /* ... remaining members unused ... */
 } EFI_BOOT_SERVICES;
 
+/* ---- runtime services: the part that survives ExitBootServices ----------
+ *
+ * Only the variable reads are declared. The layout is fixed by the
+ * specification and the ORDER is load-bearing -- the entries before
+ * GetVariable are declared as raw pointers rather than typed function
+ * pointers precisely so that nobody is tempted to call one through a
+ * signature this file never checked. Getting the offset wrong does not fail
+ * to compile; it calls SetTime with a variable name. */
+typedef struct {
+    EFI_TABLE_HEADER Hdr;
+    void *GetTime, *SetTime, *GetWakeupTime, *SetWakeupTime;
+    void *SetVirtualAddressMap, *ConvertPointer;
+    EFI_STATUS (EFIAPI *GetVariable)(CHAR16 *VariableName, EFI_GUID *VendorGuid,
+                                     uint32_t *Attributes, UINTN *DataSize,
+                                     void *Data);
+    void *GetNextVariableName, *SetVariable;
+    void *GetNextHighMonotonicCount, *ResetSystem;
+} EFI_RUNTIME_SERVICES;
+
+/* The namespace the firmware's own variables live in. `SecureBoot` and
+ * `SetupMode` are both one byte here. */
+#define EFI_GLOBAL_VARIABLE_GUID \
+    { 0x8BE4DF61, 0x93CA, 0x11d2, { 0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C } }
+
 typedef struct {
     EFI_TABLE_HEADER                 Hdr;
     CHAR16                          *FirmwareVendor;
@@ -228,7 +252,7 @@ typedef struct {
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
     EFI_HANDLE                       StandardErrorHandle;
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *StdErr;
-    void                            *RuntimeServices;
+    EFI_RUNTIME_SERVICES            *RuntimeServices;
     EFI_BOOT_SERVICES               *BootServices;
     UINTN                            NumberOfTableEntries;
     EFI_CONFIGURATION_TABLE         *ConfigurationTable;

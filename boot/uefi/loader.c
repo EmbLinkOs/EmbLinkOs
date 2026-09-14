@@ -13,6 +13,7 @@
  * map higher-half -> phys 0, exactly like stage2 does.
  */
 #include "uefi.h"
+#include "crypto/sha256.h"
 #include "console.h"
 #include "menu.h"
 
@@ -42,11 +43,15 @@ static inline void mark(char c) {
 
 
 
-/* ---- boot_protocol ABI (mirrors kernel/arch/x86_64/boot/boot_protocol.h;
- *      that header's _Static_asserts are the master copy -- keep in sync). --- */
-#define BOOT_PROTOCOL_MAGIC   0x4F52504B4E494C45ULL   /* "ELINKPRO" */
-#define BOOT_PROTOCOL_VERSION 1
-#define BOOT_FW_UEFI          2
+/* ---- the boot protocol: THE REAL HEADER, not a copy of it ----------------
+ *
+ * This used to be a hand-transcribed duplicate of the struct with a comment
+ * asking the next person to keep it in sync. It went stale the first time a
+ * field was added to the other one, which is the only thing that kind of
+ * comment ever achieves. The loader compiles with -Ikernel now and includes
+ * the master definition, so the two CANNOT disagree -- and the assertions in
+ * that header check the layout for both sides at once. */
+#include "boot/boot_protocol.h"
 
 /* our memory-map type numbering (kernel pmm.h) */
 #define E820_USABLE       1
@@ -54,35 +59,6 @@ static inline void mark(char c) {
 #define E820_ACPI_RECLAIM 3
 #define E820_ACPI_NVS     4
 #define E820_BAD_MEMORY   5
-
-struct boot_mmap_entry {
-    uint64_t base;
-    uint64_t length;
-    uint32_t type;
-    uint32_t attr;
-};
-
-struct boot_protocol {
-    uint64_t magic;
-    uint32_t version;
-    uint32_t size;
-    uint32_t firmware;
-    uint32_t mmap_count;
-    uint64_t mmap_phys;
-    uint32_t mmap_stride;
-    uint32_t boot_disk_sig;
-    uint64_t fb_addr;
-    uint32_t fb_width;
-    uint32_t fb_height;
-    uint32_t fb_pitch;
-    uint32_t fb_bpp;
-    uint32_t fb_format;
-    uint8_t  boot_drive;
-    uint8_t  _reserved[3];
-    uint64_t acpi_rsdp;
-};
-_Static_assert(sizeof(struct boot_mmap_entry) == 24, "mmap entry 24");
-_Static_assert(sizeof(struct boot_protocol)   == 0x50, "boot_protocol 0x50");
 
 /* ---- ELF64 (only what we parse) ----------------------------------------- */
 typedef struct {
@@ -114,6 +90,22 @@ extern const uint8_t kernel_elf_start[] __attribute__((visibility("hidden")));
 extern const uint8_t kernel_elf_end[]   __attribute__((visibility("hidden")));
 
 /* ---- tiny freestanding helpers ------------------------------------------ */
+
+/* PLAIN memcpy/memset, not just the mini_ ones, because kernel/crypto/sha256.c
+ * is compiled into this loader and calls them by their real names -- and
+ * because GCC emits calls to them for structure assignment whether or not
+ * anything wrote one. There is no libc here to provide them. */
+void *memcpy(void *d, const void *s, unsigned long n) {
+    uint8_t *dp = d; const uint8_t *sp = s;
+    while (n--) *dp++ = *sp++;
+    return d;
+}
+void *memset(void *d, int c, unsigned long n) {
+    uint8_t *dp = d;
+    while (n--) *dp++ = (uint8_t)c;
+    return d;
+}
+
 static void *mini_memcpy(void *d, const void *s, uint64_t n) {
     uint8_t *dp = d; const uint8_t *sp = s;
     while (n--) *dp++ = *sp++;
@@ -333,6 +325,81 @@ static void finalize_and_handoff(struct boot_protocol *bp,
     __builtin_unreachable();
 }
 
+/* ---- what the firmware checked, and what we check ------------------------
+ *
+ * TWO DIFFERENT QUESTIONS, and conflating them is how a machine ends up
+ * claiming a security property it does not have.
+ *
+ *   `SecureBoot` says whether the FIRMWARE verified the image it launched --
+ *   this loader. It is the firmware's answer about its own behaviour and
+ *   there is no way to check it from here; we report it and say where it
+ *   came from.
+ *
+ *   The kernel hash below is OURS. The kernel is embedded in this binary, so
+ *   when Secure Boot is on the firmware's signature already covers it and
+ *   this check adds nothing against a determined attacker -- it is the same
+ *   bytes under the same signature. What it DOES catch is the case Secure
+ *   Boot cannot: a machine with it turned off, where nothing checks anything,
+ *   and a corrupted or substituted image boots silently. And it is the
+ *   mechanism that has to exist before the kernel can move out into a file on
+ *   the ESP, which is what the Recovery entry needs.
+ *
+ * Both end up in the boot protocol because the kernel cannot learn either one
+ * for itself: by the time it runs, boot services are gone. */
+static uint8_t read_secure_boot(uint8_t *setup_mode) {
+    *setup_mode = 0;
+    if (!ST || !ST->RuntimeServices || !ST->RuntimeServices->GetVariable)
+        return BOOT_SB_UNKNOWN;
+
+    EFI_GUID g = EFI_GLOBAL_VARIABLE_GUID;
+    uint8_t val = 0;
+    UINTN sz = 1;
+    CHAR16 nm_sb[] = { 'S','e','c','u','r','e','B','o','o','t', 0 };
+    CHAR16 nm_sm[] = { 'S','e','t','u','p','M','o','d','e', 0 };
+
+    uint8_t sm = 0;
+    sz = 1;
+    if (!EFI_ERROR(ST->RuntimeServices->GetVariable(nm_sm, &g, 0, &sz, &sm)))
+        *setup_mode = sm ? 1 : 0;
+
+    sz = 1;
+    EFI_STATUS s = ST->RuntimeServices->GetVariable(nm_sb, &g, 0, &sz, &val);
+    if (EFI_ERROR(s)) return BOOT_SB_UNKNOWN;
+    return val ? BOOT_SB_ON : BOOT_SB_OFF;
+}
+
+/* The digest the build computed over exactly these bytes, generated into
+ * build/uefi_kernel_hash.h. */
+#include "uefi_kernel_hash.h"
+
+static uint8_t verify_kernel(void) {
+    uint64_t len = (uint64_t)(kernel_elf_end - kernel_elf_start);
+    uint8_t got[SHA256_DIGEST_SIZE];
+    sha256(kernel_elf_start, (size_t)len, got);
+
+    for (int i = 0; i < SHA256_DIGEST_SIZE; i++)
+        if (got[i] != EMBK_KERNEL_SHA256[i]) {
+            con_print("\n*** THE KERNEL IMAGE DOES NOT MATCH ITS BUILD HASH ***\n");
+            con_print("  expected "); con_printhex(
+                ((uint64_t)EMBK_KERNEL_SHA256[0] << 56) |
+                ((uint64_t)EMBK_KERNEL_SHA256[1] << 48) |
+                ((uint64_t)EMBK_KERNEL_SHA256[2] << 40) |
+                ((uint64_t)EMBK_KERNEL_SHA256[3] << 32) |
+                ((uint64_t)EMBK_KERNEL_SHA256[4] << 24) |
+                ((uint64_t)EMBK_KERNEL_SHA256[5] << 16) |
+                ((uint64_t)EMBK_KERNEL_SHA256[6] << 8)  |
+                ((uint64_t)EMBK_KERNEL_SHA256[7]));
+            con_print("\n  found    "); con_printhex(
+                ((uint64_t)got[0] << 56) | ((uint64_t)got[1] << 48) |
+                ((uint64_t)got[2] << 40) | ((uint64_t)got[3] << 32) |
+                ((uint64_t)got[4] << 24) | ((uint64_t)got[5] << 16) |
+                ((uint64_t)got[6] << 8)  | ((uint64_t)got[7]));
+            con_print("\n");
+            return BOOT_KV_FAILED;
+        }
+    return BOOT_KV_OK;
+}
+
 /* Boot EmbLinkOS: the OS-handoff backend. Loads the (embedded, for M1) kernel,
  * builds the boot_protocol + page tables, ExitBootServices, and jumps. Never
  * returns. This is the machinery the "Boot EmbLinkOS" and (later) "Recovery"
@@ -359,6 +426,25 @@ void boot_emblinkos(EFI_HANDLE image) {
     bp->boot_disk_sig = 0;      /* not resolved yet (kernel probes all disks) */
     bp->boot_drive    = 0xFF;   /* n/a under UEFI */
     bp->acpi_rsdp     = find_acpi_rsdp();
+
+    /* WHAT WAS TRUSTED, recorded before boot services go away and the
+     * question becomes unanswerable. */
+    uint8_t setup_mode = 0;
+    bp->secure_boot = read_secure_boot(&setup_mode);
+    bp->setup_mode  = setup_mode;
+    con_print("secure boot: ");
+    con_print(bp->secure_boot == BOOT_SB_ON  ? "ENABLED"
+            : bp->secure_boot == BOOT_SB_OFF ? "disabled"
+                                             : "not reported by this firmware");
+    if (setup_mode) con_print("  (firmware is in setup mode: no platform key)");
+    con_print("\n");
+
+    bp->kernel_verified = verify_kernel();
+    con_print("kernel image: ");
+    con_print(bp->kernel_verified == BOOT_KV_OK ? "matches its build hash\n"
+                                                : "DOES NOT MATCH\n");
+    if (bp->kernel_verified != BOOT_KV_OK)
+        con_die("refusing to boot a kernel that does not match its build hash");
 
     con_print("locating GOP...\n");
     fill_framebuffer(bp);

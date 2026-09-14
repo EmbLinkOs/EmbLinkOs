@@ -1,4 +1,5 @@
 #include "boot/boot_protocol.h"
+#include "include/kstring.h"
 #include "mm/pmm.h"                  /* KP2V */
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"
@@ -27,10 +28,23 @@ void boot_protocol_capture(uint64_t phys)
 
     if (src->magic != BOOT_PROTOCOL_MAGIC)
         boot_fatal("bad magic (loader too old, or RDI clobbered)");
-    if (src->version != BOOT_PROTOCOL_VERSION)
-        boot_fatal("version mismatch between loader and kernel");
-    if (src->size < sizeof(struct boot_protocol))
-        boot_fatal("record shorter than this kernel expects");
+    /* A LOADER OLDER THAN THE KERNEL STILL BOOTS IT, which is what the
+     * versioning scheme in boot_protocol.h promises and what this code did
+     * not actually do: it demanded an exact version and a full-length record,
+     * so the first time a field was ever added the BIOS path -- whose stage2
+     * writes v1 -- would have stopped booting with "version mismatch".
+     *
+     * The rule is the one the header states. Anything from v1 up to what this
+     * kernel knows is acceptable; the record must reach at least the end of
+     * v1; and whatever the loader did not fill is left ZERO, which every new
+     * field is defined to read as "unknown". A NEWER loader is refused,
+     * because a field this kernel has never heard of cannot be ignored
+     * safely -- it might be the one saying the memory map means something
+     * different. */
+    if (src->version < 1 || src->version > BOOT_PROTOCOL_VERSION)
+        boot_fatal("loader speaks a boot protocol version this kernel does not");
+    if (src->size < BOOT_PROTOCOL_SIZE_V1)
+        boot_fatal("record shorter than the smallest version that ever existed");
     if (src->mmap_count == 0)
         boot_fatal("empty memory map");
     if (src->mmap_stride < BOOT_MMAP_STRIDE_MIN)
@@ -39,7 +53,11 @@ void boot_protocol_capture(uint64_t phys)
     /* Copy the header into .bss. The header is then ours forever; the entry
      * ARRAY is not copied and stays subject to the ordering constraint in
      * the header comment. */
-    g_bp    = *src;
+    uint32_t take = src->size;
+    if (take > sizeof(struct boot_protocol)) take = sizeof(struct boot_protocol);
+    memset(&g_bp, 0, sizeof g_bp);
+    memcpy(&g_bp, src, take);
+    g_bp.size = take;          /* what we actually HAVE, not what was offered */
     g_valid = true;
 }
 

@@ -155,8 +155,21 @@ def check(name, image, extra_drive, single_device):
 
     # THE KERNEL'S OWN ACCOUNT of how it was booted. This is the line that
     # distinguishes a UEFI boot from the BIOS path reaching the same desktop.
-    want("bootproto: v1" in out and "fw UEFI" in out,
+    want(re.search(r"bootproto: v\d+ size \d+ fw UEFI", out) is not None,
          "the kernel did not report being booted by UEFI")
+
+    # WHAT WAS TRUSTED. The loader reports the firmware's own SecureBoot
+    # variable and, separately, whether the kernel it is about to jump to
+    # matches the hash the build computed over it. The second one is ours and
+    # must always pass; the first is the firmware's and depends on which
+    # firmware this is, so it is reported rather than asserted.
+    m = re.search(r"secure boot: ([^\n]+)", out)
+    if m:
+        print("  firmware secure boot: %s" % m.group(1).strip())
+    else:
+        fails.append("the loader never reported the firmware's secure-boot state")
+    want("kernel image: matches its build hash" in out,
+         "the loader did not verify the kernel against its build hash")
 
     m = re.search(r"bootproto: mmap (\d+) entries", out)
     if not m:
