@@ -72,11 +72,11 @@ already in the tables the AML interpreter now reads.
 | ~~`virtio-scsi`~~ | ✅ done — `drivers/storage/virtio_scsi.c`, on the shared SCSI layer. `make test-scsi` |
 | ~~`virtio-console`~~ | ✅ done — `drivers/char/virtio_console.c` |
 | ~~`virtio-balloon`~~ | ✅ done — `drivers/misc/virtio_balloon.c` |
-| `virtio-crypto` | Offload |
-| `virtio-iommu` | See IOMMU above |
-| `virtio-pmem` | Persistent memory |
-| `vhost-vsock` | Host/guest sockets |
-| `virtio-multitouch` | Touchscreens |
+| ~~`virtio-crypto`~~ | ✅ done — `drivers/crypto/virtio_crypto.c`. `make test-crypto` checks the device's AES-CBC against `kernel/crypto/aes.c`. ⚠️ Nothing above it uses the offload yet: EMBKFS still encrypts in software |
+| ~~`virtio-iommu`~~ | ✅ done — `drivers/iommu/virtio_iommu.c`. `make test-iommu`. ⚠️ The map is an IDENTITY one over the low 4 GiB, so it protects nothing yet; per-buffer map/unmap is what would actually contain a hostile device |
+| ~~`virtio-pmem`~~ | ✅ done — `drivers/storage/virtio_pmem.c`. `make test-pmem` proves durability by killing the machine and reading the backing file from the host. ⚠️ Mapped uncacheable, which costs the speed that is the point of it |
+| `vhost-vsock` | ⚠️ **Not emulable on this host.** vsock in QEMU is vhost-only and vhost is a Linux kernel interface; `qemu-system-x86_64 -device help` on macOS lists no vsock device at all. A driver written here could not be run even once |
+| ~~`virtio-multitouch`~~ | ✅ done — `drivers/input/virtio_input.c`, which is also now built on x86 for the first time. `make test-touch` |
 
 ---
 

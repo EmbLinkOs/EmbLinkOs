@@ -179,6 +179,9 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/storage/esp.c \
              kernel/drivers/storage/lsi53c895a.c \
              kernel/drivers/storage/ufs.c \
+             kernel/drivers/storage/virtio_pmem.c \
+             kernel/drivers/crypto/virtio_crypto.c \
+             kernel/drivers/iommu/virtio_iommu.c \
              kernel/fs/iso9660.c \
              kernel/drivers/char/platform_misc.c \
              kernel/drivers/i2c/smbus.c \
@@ -2969,6 +2972,34 @@ test-scsi: $(IMG) $(EMBKFS_MASTER)
 # are quiet: one finger reported at the average of two, or a contact that
 # never lifts. tools/touch_test.py puts the fingers down from the host, so the
 # host knows what the guest's report should say.
+# PERSISTENT MEMORY'S ONLY INTERESTING PROPERTY cannot be checked in one boot.
+# Reading back what you just wrote proves nothing -- the bytes are in memory
+# either way. tools/pmem_test.py runs the guest twice over one backing file and
+# KILLS it in between, then reads the file from this side.
+# AN OFFLOAD ENGINE IS ONLY USEFUL IF IT COMPUTES THE SAME FUNCTION.
+# A wrong key length, a byte-swapped IV or a mode that is nearly CBC all
+# produce output as random-looking as the right answer, so the guest checks
+# the device's AES against kernel/crypto/aes.c, which has FIPS-197
+# known-answer tests of its own.
+# ANY DEVICE ON THE BUS CAN CURRENTLY READ ANY BYTE OF MEMORY -- the kernel's
+# page tables, the disk encryption key. An IOMMU is the page table for DMA, and
+# it is also the one driver that can stop the machine by working: an endpoint
+# attached to an empty domain cannot reach its own descriptors. So the test is
+# that the machine still boots AND still reads a block afterwards.
+.PHONY: test-iommu
+test-iommu: $(IMG) $(EMBKFS_MASTER)
+	@MACHINE=q35 EXTRA_QEMU="-device virtio-iommu-pci" \
+	  python3 tools/console_test.py "test iommu"
+
+.PHONY: test-crypto
+test-crypto: $(IMG) $(EMBKFS_MASTER)
+	@EXTRA_QEMU="-object cryptodev-backend-builtin,id=cd0 -device virtio-crypto-pci,id=vc0,cryptodev=cd0" \
+	  python3 tools/console_test.py "test crypto"
+
+.PHONY: test-pmem
+test-pmem: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/pmem_test.py
+
 .PHONY: test-touch
 test-touch: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/touch_test.py

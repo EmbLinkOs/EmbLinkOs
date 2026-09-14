@@ -136,6 +136,9 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/char/virtio_rng.c \
                   kernel/drivers/char/virtio_console.c \
                   kernel/drivers/misc/virtio_balloon.c \
+                  kernel/drivers/storage/virtio_pmem.c \
+                  kernel/drivers/crypto/virtio_crypto.c \
+                  kernel/drivers/iommu/virtio_iommu.c \
                   kernel/fs/iso9660.c \
                   kernel/drivers/char/platform_misc.c \
                   kernel/drivers/i2c/smbus.c \

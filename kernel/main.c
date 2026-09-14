@@ -29,6 +29,9 @@
 #include "drivers/storage/esp.h"
 #include "drivers/storage/lsi53c895a.h"
 #include "drivers/storage/ufs.h"
+#include "drivers/storage/virtio_pmem.h"
+#include "drivers/crypto/virtio_crypto.h"
+#include "drivers/iommu/virtio_iommu.h"
 #include "drivers/char/virtio_console.h"
 #include "drivers/misc/virtio_balloon.h"
 #include "drivers/i2c/smbus.h"
@@ -1864,6 +1867,14 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // --- Devices ---
     
     pci_init();
+
+    /* THE IOMMU BEFORE ANY DEVICE THAT DMAs. Attaching an endpoint to a
+     * domain redirects everything it does through that domain's table, so
+     * this has to happen while nothing is in flight -- which is here, between
+     * the bus scan and the first driver that touches memory on a device's
+     * behalf. */
+    virtio_iommu_init();
+
     audio_init();  // sound out; harmless when the machine has no card
     /* The chipset's two-wire bus: the battery, the memory SPD, a monitor's
      * EDID. After pci_init, which is where the host controller is found. */
@@ -1970,6 +1981,8 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     esp_init();           /* and the 53C9x, which walks the bus by hand     */
     lsi53c895a_init();    /* and the 53c895a, which runs a program          */
     ufs_init();           /* and UFS, which a phone would have              */
+    virtio_pmem_init();   /* and memory that survives a reboot              */
+    virtio_crypto_init(); /* and a cipher engine, if the host lends one     */
     embk_partition_scan_all();
 
 

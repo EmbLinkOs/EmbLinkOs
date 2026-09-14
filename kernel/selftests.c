@@ -68,6 +68,10 @@
 #include "lib/random.h"
 #include "fs/automount.h"
 #include "drivers/input/virtio_input.h"
+#include "drivers/storage/virtio_pmem.h"
+#include "drivers/crypto/virtio_crypto.h"
+#include "drivers/iommu/virtio_iommu.h"
+#include "crypto/aes.h"
 #include "drivers/storage/atapi.h"
 #include "drivers/storage/sdhci.h"
 #include "fs/ninep.h"
@@ -3065,6 +3069,180 @@ int selftests_handle_command(const char *cmd)
      * numbers against what it sent. Same division of labour as the USB
      * hot-plug test, for the same reason.
      * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test pmem -- does persistent memory actually persist?
+     *
+     * The only claim worth making about this device is the one that cannot be
+     * checked in a single boot: that a write which was flushed is still there
+     * after the power went away. So this reads what a PREVIOUS run left,
+     * reports the generation number it found, writes the next one, and
+     * flushes. tools/pmem_test.py runs it twice over the same backing file
+     * and kills the machine in between -- no clean shutdown, because a clean
+     * shutdown would let a write survive that had never been made durable,
+     * which is the exact bug this is looking for.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test crypto -- does the device's AES agree with ours?
+     *
+     * An offload engine is only useful if it computes the same function the
+     * software path does. That is not a thing to assume: a wrong key length,
+     * a byte-swapped IV or a mode that is nearly CBC all produce output that
+     * looks exactly as random as the right answer.
+     *
+     * kernel/crypto/aes.c is already here and already has known-answer tests
+     * against FIPS-197, so it is the reference. The device encrypts; we
+     * decrypt its output with our own code and check we get the plaintext
+     * back. Then the device decrypts and we compare against the plaintext
+     * directly. Two directions, because a driver can have one right.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test iommu -- is DMA still working now that it is being translated?
+     *
+     * THE MACHINE BOOTING IS MOST OF THE ANSWER. Every attached endpoint's
+     * transfers go through the domain's table from the moment it is attached,
+     * so a wrong mapping does not produce a wrong answer -- it produces a
+     * disk controller that cannot reach its own descriptors, and nothing
+     * mounts. What this adds is a READ ISSUED NOW, after everything is up, so
+     * the claim is about the running system rather than about the boot.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test iommu") == 0) {
+        if (!virtio_iommu_present()) {
+            kprintf("\n[iommu] no IOMMU on this machine\n");
+            kprintf("\n[cmd] test iommu: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        kprintf("\n[iommu] %u endpoint(s) attached, %llu MiB translated\n",
+                (unsigned)virtio_iommu_endpoints(),
+                (unsigned long long)(virtio_iommu_mapped() >> 20));
+        if (virtio_iommu_endpoints() == 0) {
+            kprintf("  FAIL: the IOMMU is up and translating nothing\n");
+            fails++;
+        }
+
+        /* A real transfer, through a real controller, right now. */
+        struct embk_block_device *d = embk_block_get(0);
+        static uint8_t buf[512];
+        if (!d) {
+            kprintf("  FAIL: no block device to read from\n"); fails++;
+        } else if (embk_block_read(d, 0, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: reading %s through the IOMMU failed\n", d->name);
+            fails++;
+        } else {
+            kprintf("  read block 0 of %s through translated DMA\n", d->name);
+        }
+        kprintf("\n[cmd] test iommu: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test crypto") == 0) {
+        if (!virtio_crypto_present()) {
+            kprintf("\n[crypto] no virtio-crypto device on this machine\n");
+            kprintf("\n[cmd] test crypto: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        static const uint8_t key[32] = {
+            0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,
+            0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4
+        };
+        static const uint8_t iv[16] = {
+            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+        };
+        static uint8_t plain[64], cipher[64], back[64];
+        for (int i = 0; i < 64; i++) plain[i] = (uint8_t)(i * 13 + 5);
+
+        int rc = virtio_crypto_aes_cbc(true, key, 32, iv, plain, cipher, 64);
+        if (rc != EMBK_OK) {
+            kprintf("  FAIL: the device would not encrypt (rc=%d)\n", rc);
+            fails++;
+        } else {
+            /* DECRYPT IT WITH OUR OWN AES. CBC is ECB-decrypt then XOR with
+             * the previous ciphertext block -- the previous block, not the
+             * previous plaintext, which is the classic way to get a CBC
+             * implementation that decrypts its own output and nothing
+             * else's. */
+            struct aes256_ctx ctx;
+            aes256_init(&ctx, key);
+            uint8_t prev[16];
+            memcpy(prev, iv, 16);
+            for (int b = 0; b < 64; b += 16) {
+                uint8_t tmp[16];
+                aes256_decrypt_block(&ctx, cipher + b, tmp);
+                for (int i = 0; i < 16; i++) back[b + i] = tmp[i] ^ prev[i];
+                memcpy(prev, cipher + b, 16);
+            }
+            if (memcmp(back, plain, 64) != 0) {
+                kprintf("  FAIL: our AES does not agree with the device's\n");
+                fails++;
+            } else {
+                kprintf("\n[crypto] the device's ciphertext decrypts to the "
+                        "plaintext under our own AES-256\n");
+            }
+        }
+
+        /* And the other direction. */
+        memset(back, 0, sizeof back);
+        rc = virtio_crypto_aes_cbc(false, key, 32, iv, cipher, back, 64);
+        if (rc != EMBK_OK) {
+            kprintf("  FAIL: the device would not decrypt (rc=%d)\n", rc);
+            fails++;
+        } else if (memcmp(back, plain, 64) != 0) {
+            kprintf("  FAIL: the device's decryption is not the plaintext\n");
+            fails++;
+        } else {
+            kprintf("[crypto] and its own decryption round-trips (%u op(s))\n",
+                    (unsigned)virtio_crypto_ops());
+        }
+        kprintf("\n[cmd] test crypto: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test pmem") == 0) {
+        if (!virtio_pmem_present()) {
+            kprintf("\n[pmem] no persistent memory on this machine\n");
+            kprintf("\n[cmd] test pmem: SKIP\n");
+            return 1;
+        }
+        struct embk_block_device *d = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *c = embk_block_get(i);
+            if (c && c->block_count == virtio_pmem_size() / 512) d = c;
+        }
+        if (!d) {
+            kprintf("  FAIL: the region is not in the block table\n");
+            kprintf("\n[cmd] test pmem: FAIL\n");
+            return 1;
+        }
+
+        static uint8_t buf[512];
+        int fails = 0;
+        uint32_t found = 0;
+        memset(buf, 0, sizeof buf);
+        if (embk_block_read(d, 0, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: reading block 0 failed\n"); fails++;
+        } else if (memcmp(buf, "EMBLINK-PMEM", 12) == 0) {
+            found = (uint32_t)buf[12] | ((uint32_t)buf[13] << 8) |
+                    ((uint32_t)buf[14] << 16) | ((uint32_t)buf[15] << 24);
+        }
+        kprintf("\n[pmem] %llu MiB, generation found: %u\n",
+                (unsigned long long)(virtio_pmem_size() >> 20), (unsigned)found);
+
+        uint32_t next = found + 1;
+        memset(buf, 0, sizeof buf);
+        memcpy(buf, "EMBLINK-PMEM", 12);
+        buf[12] = (uint8_t)next;        buf[13] = (uint8_t)(next >> 8);
+        buf[14] = (uint8_t)(next >> 16); buf[15] = (uint8_t)(next >> 24);
+        if (embk_block_write(d, 0, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: writing block 0 failed\n"); fails++;
+        } else {
+            kprintf("[pmem] generation written: %u (%llu flush(es) so far)\n",
+                    (unsigned)next, (unsigned long long)virtio_pmem_flushes());
+        }
+        kprintf("\n[cmd] test pmem: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
     if (strcmp(cmd, "test touch") == 0) {
         if (!virtio_input_touch_present()) {
             kprintf("\n[touch] no multitouch device on this machine\n");
