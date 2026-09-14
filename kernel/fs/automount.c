@@ -56,6 +56,25 @@ struct auto_mount {
 #define AUTO_MAX 8
 static struct auto_mount g_auto[AUTO_MAX];
 
+/* ---- "the VFS is not ready yet" ----------------------------------------
+ *
+ * vfs_init() ZEROES THE MOUNT TABLE, and it runs well after the storage
+ * drivers do. Anything mounted before it is mounted correctly, reports
+ * itself mounted, resolves once -- and is then silently erased with no
+ * message anywhere. The 9p share hit this and was fixed by moving one call;
+ * an optical drive hit it next, because atapi_init has to run before the
+ * partition scan for the block-device names to come out in the right order.
+ *
+ * Moving calls one at a time is how you get a third of these. So devices
+ * offered before the VFS exists are REMEMBERED and replayed by
+ * automount_start(), which main.c calls once, after vfs_init and after the
+ * root is mounted. A driver no longer has to know where it sits relative to
+ * a subsystem it does not touch. */
+#define AUTO_PENDING_MAX 8
+static struct embk_block_device *g_pending[AUTO_PENDING_MAX];
+static uint32_t g_pending_n;
+static bool g_ready;
+
 static void path_for(const char *name, char *out, uint32_t cap) {
     uint32_t i = 0;
     const char *pfx = "/media/";
@@ -128,6 +147,16 @@ static bool try_mount_one(struct embk_block_device *dev,
 int automount_attach(struct embk_block_device *disk) {
     if (!disk) return -EMBK_EINVAL;
 
+    if (!g_ready) {
+        if (g_pending_n < AUTO_PENDING_MAX) {
+            g_pending[g_pending_n++] = disk;
+            return 0;   /* nothing mounted YET, which is not a failure */
+        }
+        kprintf("automount: %s offered before the VFS was ready and the "
+                "queue is full\n", disk->name);
+        return -EMBK_ENOMEM;
+    }
+
     /* PARTITIONS FIRST. The scan registers each one as its own block device,
      * so after this the table has sdc1, sdc2 ... and those are what get
      * mounted -- mounting the whole disk over a partition table finds
@@ -199,4 +228,15 @@ bool automount_at(uint32_t idx, const char **at, const char **dev,
         return true;
     }
     return false;
+}
+
+/* The VFS exists now: mount everything that was offered before it did. Called
+ * once from main.c, after vfs_init() and after the root mount -- /media has
+ * to be a real directory for a mount point to resolve. */
+void automount_start(void) {
+    g_ready = true;
+    uint32_t n = g_pending_n;
+    g_pending_n = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (g_pending[i]) automount_attach(g_pending[i]);
 }

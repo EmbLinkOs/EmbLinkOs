@@ -54,6 +54,7 @@
 #include "net/net.h"
 #include "block/block.h"
 #include "block/partition.h"
+#include "fs/automount.h"
 #include "fs/fat32.h"
 #include "fs/embkfs/embkfs.h"
 #include "fs/vfs.h"
@@ -1994,6 +1995,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
      * correctly once -- and was then silently erased before anything could
      * use it. */
     ninep_init("/host");
+
+    /* AND EVERYTHING THAT WAS PLUGGED IN BEFORE THE VFS EXISTED. An optical
+     * drive or an SD card found during device bring-up has been waiting in
+     * automount's queue since; this is where those become paths. */
+    automount_start();
 
     // EmbLink UI Piece 1, Layer B: the RAM-backed endpoint filesystem, mounted
     // at /run independent of whatever real storage was found above -- IPC

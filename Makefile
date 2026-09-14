@@ -2938,6 +2938,53 @@ test-scsi: $(IMG) $(EMBKFS_MASTER)
 	 EXTRA_DEVICES="virtio-scsi-pci,id=vs;scsi-hd,bus=vs.0,drive=vsd" \
 	    python3 tools/console_test.py "test scsi"
 
+# THE CARD READER, over both kinds of card and both addressing modes.
+#
+# An SD driver's characteristic bug is invisible on a small card: a
+# high-capacity part takes a BLOCK NUMBER where a standard one takes a BYTE
+# OFFSET, and a driver that guesses reads block zero for every request. So the
+# 4 GiB case is not decoration -- it is the one that catches it. eMMC is the
+# third case: it is woken by a different command, told its address rather than
+# asked for one, and keeps its real capacity in a register the CSD does not
+# reach.
+.PHONY: test-sdcard
+test-sdcard: $(IMG) $(EMBKFS_MASTER)
+	@dd if=/dev/zero of=build/sdcard.img bs=1m count=64 2>/dev/null
+	@dd if=/dev/zero of=build/sdhc.img bs=1m count=0 seek=4096 2>/dev/null
+	@echo "=== SD, 64 MiB (byte addressing) ==="
+	@EXTRA_QEMU="-device sdhci-pci -drive id=sd0,file=$(CURDIR)/build/sdcard.img,format=raw,if=none -device sd-card,drive=sd0" \
+	  python3 tools/console_test.py "test sdcard" || exit 1
+	@echo "=== SDHC, 4 GiB (block addressing) ==="
+	@EXTRA_QEMU="-device sdhci-pci -drive id=sd0,file=$(CURDIR)/build/sdhc.img,format=raw,if=none -device sd-card,drive=sd0" \
+	  python3 tools/console_test.py "test sdcard" || exit 1
+	@echo "=== eMMC, 64 MiB ==="
+	@EXTRA_QEMU="-device sdhci-pci -drive id=sd0,file=$(CURDIR)/build/sdcard.img,format=raw,if=none -device emmc,drive=sd0" \
+	  python3 tools/console_test.py "test sdcard" || exit 1
+	@echo "=== test-sdcard: OK"
+
+# THE OPTICAL PATH, from the ATAPI envelope to a filename.
+#
+# Over both transports that carry SCSI to a drive: an IDE cable (`ide-cd`, the
+# PACKET command) and virtio-scsi (`scsi-cd`). They share every command and
+# differ only in the envelope, which is the entire point of kernel/block/scsi.c
+# -- and the way to prove it is to run the same test through both.
+#
+# tools/mkiso.py writes the disc, because mkisofs is a Linux package and
+# hdiutil produces a hybrid image whose ISO half is not what a plain reader
+# sees first. Same reasoning as tools/mkfat32.py.
+.PHONY: test-cdrom
+test-cdrom: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/mkiso.py build/test.iso \
+	  "HELLO.TXT=Hello from an ISO 9660 disc." \
+	  "SECOND.TXT=a second file, so the directory has more than one entry."
+	@echo "=== ATAPI over IDE ==="
+	@EXTRA_QEMU="-drive id=cd0,file=$(CURDIR)/build/test.iso,format=raw,if=none,media=cdrom -device ide-cd,drive=cd0,bus=ide.1" \
+	  python3 tools/console_test.py "test cdrom" || exit 1
+	@echo "=== the same disc over virtio-scsi ==="
+	@EXTRA_QEMU="-device virtio-scsi-pci,id=vscsi1 -drive id=cd1,file=$(CURDIR)/build/test.iso,format=raw,if=none,media=cdrom -device scsi-cd,bus=vscsi1.0,drive=cd1" \
+	  python3 tools/console_test.py "test cdrom" || exit 1
+	@echo "=== test-cdrom: OK"
+
 .PHONY: test-ninep
 test-ninep: $(IMG) $(EMBKFS_MASTER)
 	@rm -rf build/9pshare && mkdir -p build/9pshare/sub

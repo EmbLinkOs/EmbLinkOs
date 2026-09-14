@@ -67,6 +67,8 @@
 #include "drivers/i2c/smbus.h"
 #include "lib/random.h"
 #include "fs/automount.h"
+#include "drivers/storage/atapi.h"
+#include "drivers/storage/sdhci.h"
 #include "fs/ninep.h"
 #include "drivers/storage/virtio_scsi.h"
 #include "drivers/usb/usb_core.h"
@@ -2825,6 +2827,219 @@ int selftests_handle_command(const char *cmd)
      * buffer in the chain, in one direction or the other -- and that is the
      * part that is wrong when a disk is silently garbage.
      * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test cdrom -- the optical path, from the ATAPI transport to a file.
+     *
+     * Three separate things have to be right and only the last one is
+     * visible: the PACKET envelope carries a SCSI command, READ(10) returns
+     * 2048-byte blocks, and ISO 9660 turns those into names. A test that
+     * only checked "a drive was found" would pass with every one of them
+     * broken.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test cdrom") == 0) {
+        /* WHICH TRANSPORT CARRIED THE DISC IS NOT THE SUBJECT. The same SCSI
+         * commands reach an optical drive over an IDE cable and over
+         * virtio-scsi, and the filesystem on top cannot tell the difference.
+         * So the ATAPI-specific half runs only when there is an ATAPI drive,
+         * and the ISO 9660 half runs whenever a disc is mounted -- otherwise
+         * running this against `scsi-cd` would report SKIP while quietly
+         * testing nothing. */
+        bool have_iso = false;
+        for (uint32_t i = 0; i < automount_count(); i++) {
+            const char *at = NULL, *dev = NULL, *fs = NULL;
+            if (automount_at(i, &at, &dev, &fs) && fs && strcmp(fs, "iso9660") == 0)
+                have_iso = true;
+        }
+        if (atapi_drive_count() == 0 && !have_iso) {
+            kprintf("\n[cdrom] no optical drive and no mounted disc\n");
+            kprintf("\n[cmd] test cdrom: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        kprintf("\n[cdrom] %u ATAPI drive(s), disc mounted: %s\n",
+                (unsigned)atapi_drive_count(), have_iso ? "yes" : "no");
+
+        const char *name = atapi_drive_count() ? atapi_drive_name(0) : NULL;
+        if (atapi_drive_count() && !name) {
+            kprintf("  FAIL: the drive registered no block device (empty?)\n");
+            fails++;
+        } else if (name) {
+            kprintf("  %s: %llu blocks\n", name,
+                    (unsigned long long)atapi_drive_blocks(0));
+            /* THE BLOCK SIZE IS THE TEST. A driver that reports 512 has
+             * defaulted rather than asked, and every LBA after that is off
+             * by a factor of four. */
+            struct embk_block_device *d = NULL;
+            for (uint32_t i = 0; i < embk_block_count(); i++) {
+                struct embk_block_device *c = embk_block_get(i);
+                if (c && strcmp(c->name, name) == 0) d = c;
+            }
+            if (!d) { kprintf("  FAIL: %s is not in the block table\n", name); fails++; }
+            else if (d->block_size != 2048) {
+                kprintf("  FAIL: %s has a %u-byte block, not 2048\n",
+                        d->name, d->block_size);
+                fails++;
+            } else {
+                kprintf("  %s block size is 2048\n", d->name);
+            }
+        }
+
+        /* And the filesystem on it. The disc the harness attaches carries
+         * HELLO.TXT; reading its contents proves the whole stack. The mount
+         * point is whatever automount chose, so it is looked up rather than
+         * assumed -- an ISO on a USB stick would land somewhere else and the
+         * test should still find it.
+         *
+         * The stored name is "HELLO.TXT;1" and the name asked for here is
+         * lower case with no version. Both of those are the filesystem's job
+         * and both are part of what is being tested. */
+        char path[96];
+        path[0] = 0;
+        for (uint32_t i = 0; i < automount_count(); i++) {
+            const char *at = NULL, *dev = NULL, *fs = NULL;
+            if (!automount_at(i, &at, &dev, &fs) || !at) continue;
+            if (!fs || strcmp(fs, "iso9660") != 0) continue;
+            uint32_t n = 0;
+            while (at[n] && n < sizeof path - 12) { path[n] = at[n]; n++; }
+            const char *tail = "/hello.txt";
+            while (*tail && n < sizeof path - 1) path[n++] = *tail++;
+            path[n] = 0;
+            break;
+        }
+        if (!path[0]) {
+            kprintf("  FAIL: no ISO 9660 volume is mounted\n");
+            fails++;
+        } else {
+            struct vfs_stat st;
+            int rc = vfs_stat(path, &st);
+            if (rc != EMBK_OK) {
+                kprintf("  FAIL: %s does not stat (rc=%d)\n", path, rc);
+                fails++;
+            } else {
+                static char text[64];
+                size_t got = 0;
+                memset(text, 0, sizeof text);
+                rc = vfs_read(path, 0, text, sizeof text - 1, &got);
+                if (rc != EMBK_OK || got == 0) {
+                    kprintf("  FAIL: %s read no bytes (rc=%d)\n", path, rc);
+                    fails++;
+                } else if (text[0] != 'H' || text[1] != 'e') {
+                    kprintf("  FAIL: %s reads \"%s\"\n", path, text);
+                    fails++;
+                } else {
+                    /* Trim the trailing newline so the line reads cleanly. */
+                    for (size_t i = 0; i < got && i < sizeof text; i++)
+                        if (text[i] == '\n') { text[i] = 0; break; }
+                    kprintf("  %s: stat %llu bytes, read %llu, \"%s\"\n",
+                            path, (unsigned long long)st.size,
+                            (unsigned long long)got, text);
+                }
+            }
+        }
+        kprintf("\n[cmd] test cdrom: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test sdcard -- the SD/eMMC host controller moves data both ways.
+     *
+     * The interesting failure is not "no card": it is a card whose ADDRESSING
+     * MODE was guessed. A high-capacity card given a byte offset reads block
+     * zero for every request that fits in 512 bytes, so a test that only read
+     * block 0 would pass. This writes a pattern to a block a long way in and
+     * reads it back, which that bug cannot survive.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test sdcard") == 0) {
+        if (sdhci_host_count() == 0) {
+            kprintf("\n[sdcard] no SD host controller on this machine\n");
+            kprintf("\n[cmd] test sdcard: SKIP\n");
+            return 1;
+        }
+        if (!sdhci_card_present(0) || sdhci_blocks(0) == 0) {
+            kprintf("\n[sdcard] controller present, slot empty\n");
+            kprintf("\n[cmd] test sdcard: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        uint64_t blocks = sdhci_blocks(0);
+        kprintf("\n[sdcard] card of %llu blocks\n", (unsigned long long)blocks);
+
+        struct embk_block_device *d = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *c = embk_block_get(i);
+            if (c && c->block_count == blocks && c->block_size == 512) d = c;
+        }
+        if (!d) {
+            kprintf("  FAIL: the card is not in the block table\n");
+            kprintf("\n[cmd] test sdcard: FAIL\n");
+            return 1;
+        }
+
+        static uint8_t buf[512], back[512];
+        /* READ BEFORE WRITE, so a broken read is not reported as a broken
+         * write. They are different commands and different directions
+         * through the buffer port. */
+        if (embk_block_read(d, 0, 1, back) != EMBK_OK) {
+            kprintf("  FAIL: reading block 0 failed\n");
+            fails++;
+        } else {
+            kprintf("  block 0 read %02x %02x %02x %02x\n",
+                    back[0], back[1], back[2], back[3]);
+        }
+
+        /* A block FAR from zero: 0x2000 is 8 MiB in, which a byte-addressed
+         * argument cannot reach on a card this size without wrapping. */
+        uint64_t far = blocks > 0x2000 ? 0x2000 : blocks / 2;
+        for (int i = 0; i < 512; i++) buf[i] = (uint8_t)(i ^ 0xA5);
+        if (embk_block_write(d, far, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: writing block %llu failed\n",
+                    (unsigned long long)far);
+            fails++;
+        } else {
+            memset(back, 0, sizeof back);
+            if (embk_block_read(d, far, 1, back) != EMBK_OK) {
+                kprintf("  FAIL: reading block %llu back failed\n",
+                        (unsigned long long)far);
+                fails++;
+            } else {
+                for (int i = 0; i < 512; i++)
+                    if (back[i] != (uint8_t)(i ^ 0xA5)) {
+                        kprintf("  FAIL: block %llu byte %d is %02x, want %02x\n",
+                                (unsigned long long)far, i, back[i],
+                                (uint8_t)(i ^ 0xA5));
+                        fails++;
+                        break;
+                    }
+                if (!fails) kprintf("  block %llu wrote and read back "
+                                    "512 matching bytes\n",
+                                    (unsigned long long)far);
+            }
+        }
+
+        /* Multi-block, which uses a different command (READ/WRITE MULTIPLE)
+         * and the block-count register rather than a single transfer. */
+        static uint8_t big[2048];
+        for (int i = 0; i < 2048; i++) big[i] = (uint8_t)(i * 7 + 1);
+        if (embk_block_write(d, far + 8, 4, big) != EMBK_OK) {
+            kprintf("  FAIL: a 4-block write failed\n"); fails++;
+        } else {
+            static uint8_t bigback[2048];
+            memset(bigback, 0, sizeof bigback);
+            if (embk_block_read(d, far + 8, 4, bigback) != EMBK_OK) {
+                kprintf("  FAIL: a 4-block read failed\n"); fails++;
+            } else {
+                for (int i = 0; i < 2048; i++)
+                    if (bigback[i] != (uint8_t)(i * 7 + 1)) {
+                        kprintf("  FAIL: multi-block byte %d differs\n", i);
+                        fails++; break;
+                    }
+                if (!fails) kprintf("  a 4-block transfer round-tripped\n");
+            }
+        }
+        kprintf("\n[cmd] test sdcard: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
     if (strcmp(cmd, "test scsi") == 0) {
         if (!virtio_scsi_present()) {
             kprintf("\n[scsi] no virtio-scsi controller\n");

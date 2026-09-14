@@ -19,6 +19,11 @@ struct embk_block_device;
  * kernel cannot read. */
 int automount_attach(struct embk_block_device *disk);
 
+/* Mount everything that was offered before vfs_init() ran. Call once, after
+ * the root is mounted; automount_attach queues rather than mounts until then.
+ * See the .c for why this is not "just call the drivers later". */
+void automount_start(void);
+
 /* The medium left. Unmounts everything that came from it, including its
  * partitions. Returns how many mounts went away. */
 int automount_detach(struct embk_block_device *disk);
