@@ -7350,3 +7350,67 @@ TOOLING gaps rather than anything wrong with the OS.
 - [ ] Keep the tree free of case-only filename collisions -- APFS is
       case-insensitive by default, so a collision is invisible on macOS and
       breaks Linux. Check: `git ls-files | tr A-Z a-z | sort | uniq -d`.
+
+### The hardware pass: what was left undone, deliberately
+
+Sections A, B and C of [HARDWARE_GAPS.md](HARDWARE_GAPS.md) are implemented.
+These are the edges each driver stopped at, recorded so the absence reads as a
+decision rather than an oversight. The four items no emulator here can reach
+at all (I²C-HID, CDC-ECM, the TPM, virtio-mem/vhost-vsock) are in that doc's
+closing table instead.
+
+**Storage**
+
+- [ ] **SD/eMMC is PIO only** (`drivers/storage/sdhci.c`). 128 register reads
+      per 512-byte block. SDMA and ADMA2 are what make this fast, and they are
+      a change to that one file -- the command sequence, which is where an SD
+      driver is actually wrong or right, is already correct and tested.
+- [ ] **UAS issues one command at a time** (`drivers/usb/usb_uas.c`). The tag
+      is on the wire and the device would accept a queue; what is missing is
+      anything asynchronous ABOVE the driver to produce one.
+- [ ] **No El Torito.** `fs/iso9660.c` reads a disc; nothing boots from one.
+- [ ] **No removal path for hot-added memory.** `pmm_add_region()` grows; the
+      allocator cannot vacate a range that is in use, so `pc-dimm` ejection
+      and virtio-mem unplug are both refused rather than half-done.
+
+**Protection**
+
+- [ ] **Every IOMMU here installs an IDENTITY MAP and protects nothing.**
+      Intel VT-d, AMD-Vi and virtio-iommu all attach every device to one
+      domain that can reach the low 4 GiB. What would actually contain a
+      hostile device is a per-driver map/unmap around each DMA buffer, so that
+      a device can reach the buffer it was given and nothing else. That is a
+      change to every driver's DMA path, not to the IOMMU drivers.
+- [ ] **Intel VT-d shares one context table across all buses**
+      (`drivers/iommu/intel_iommu.c`). Safe only while every device is in the
+      same domain with the same page table, which is true today and stops
+      being true the moment domains differ.
+- [ ] **AMD-Vi's device table covers requester ids 0..0x7FF** (buses 0-7). A
+      full table is 2 MiB. A device above bus 7 is refused, not passed
+      through -- which is the safe direction, and still wrong.
+- [ ] **virtio-iommu's event queue is not read.** Translation faults are
+      reported there and would name the offending device; today a fault is
+      only visible as a transfer that did not happen.
+- [ ] **The TPM has never executed** (`drivers/tpm/tpm.c`) and there is no
+      sealing. TPM2_Create/Load/Unseal under a PCR policy is what would let
+      the EMBKFS key be bound to a boot state; PCR extend and read are
+      written, unrun, and are the foundation for it.
+
+**Crash reporting**
+
+- [ ] **Nothing writes an ERST record on an actual panic.** `acpi/erst.c`
+      works and is tested across a kill and a reboot, but the panic path does
+      not call it. That is a change to the panic handler -- and it has to be
+      written with the care a panic path needs, because by then the machine is
+      already wrong.
+
+**Offload**
+
+- [ ] **Nothing uses virtio-crypto.** EMBKFS still encrypts in software. The
+      device's AES is checked against ours (`make test-crypto`); choosing it
+      when present is a filesystem policy change and belongs in a commit about
+      the filesystem.
+- [ ] **Persistent memory is mapped uncacheable** (`virtio_pmem.c`,
+      `nvdimm.c`), which is correct and slow. A cached mapping needs explicit
+      cache-line writeback before each flush; a persistence guarantee that is
+      nearly right is worse than a slow one that is right.
