@@ -3040,6 +3040,86 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* ----------------------------------------------------------------------
+     * test hba -- ONE TEST FOR EVERY SCSI CONTROLLER.
+     *
+     * MegaRAID, PVSCSI, Fusion-MPT, ESP, the 53c895a and virtio-scsi are six
+     * completely different ways of handing a command to a device, and every
+     * one of them ends at the same place: kernel/block/scsi.c builds the CDB
+     * and the block layer reads and writes 512-byte blocks. If that claim is
+     * true then a single test proves all six, and if it is not true then this
+     * test is where it shows.
+     *
+     * The disk the harness attaches is 32 MB with a signature at block 0, and
+     * which controller carries it is not this test's business -- it looks for
+     * the geometry, not for a driver.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test hba") == 0) {
+        struct embk_block_device *d = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *c = embk_block_get(i);
+            if (c && c->block_count == 65536 && c->block_size == 512) d = c;
+        }
+        if (!d) {
+            kprintf("\n[hba] no 32 MB target on this machine\n");
+            kprintf("\n[cmd] test hba: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        kprintf("\n[hba] %s: %llu blocks x %u B\n", d->name,
+                (unsigned long long)d->block_count, d->block_size);
+
+        static uint8_t buf[512], back[512];
+        memset(buf, 0, sizeof buf);
+        if (embk_block_read(d, 0, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: reading block 0 failed\n"); fails++;
+        } else if (buf[0] != 'E' || buf[1] != 'M' || buf[2] != 'B') {
+            kprintf("  FAIL: block 0 reads \"%s\", not the host's signature\n", buf);
+            fails++;
+        } else {
+            kprintf("  block 0 = \"%s\" (written by the host)\n", buf);
+        }
+
+        /* The other direction is a different descriptor layout on every one
+         * of these controllers, and a driver can easily have one right. */
+        memset(buf, 0x5A, sizeof buf);
+        if (embk_block_write(d, 100, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: writing block 100 failed\n"); fails++;
+        } else {
+            memset(back, 0, sizeof back);
+            if (embk_block_read(d, 100, 1, back) != EMBK_OK ||
+                back[0] != 0x5A || back[511] != 0x5A) {
+                kprintf("  FAIL: block 100 did not read back what was written\n");
+                fails++;
+            } else {
+                kprintf("  a write to block 100 read back correctly\n");
+            }
+        }
+
+        /* AND A TRANSFER BIGGER THAN ONE BLOCK, which is where a
+         * scatter-gather list that was only ever exercised with one element
+         * stops working. */
+        static uint8_t big[4096], bigback[4096];
+        for (int i = 0; i < 4096; i++) big[i] = (uint8_t)(i * 31 + 7);
+        if (embk_block_write(d, 200, 8, big) != EMBK_OK) {
+            kprintf("  FAIL: an 8-block write failed\n"); fails++;
+        } else {
+            memset(bigback, 0, sizeof bigback);
+            if (embk_block_read(d, 200, 8, bigback) != EMBK_OK) {
+                kprintf("  FAIL: an 8-block read failed\n"); fails++;
+            } else {
+                for (int i = 0; i < 4096; i++)
+                    if (bigback[i] != (uint8_t)(i * 31 + 7)) {
+                        kprintf("  FAIL: multi-block byte %d differs\n", i);
+                        fails++; break;
+                    }
+                if (!fails) kprintf("  an 8-block transfer round-tripped\n");
+            }
+        }
+        kprintf("\n[cmd] test hba: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
     if (strcmp(cmd, "test scsi") == 0) {
         if (!virtio_scsi_present()) {
             kprintf("\n[scsi] no virtio-scsi controller\n");

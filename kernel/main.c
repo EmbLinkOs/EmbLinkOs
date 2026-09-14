@@ -22,6 +22,8 @@
 #include "drivers/char/platform_misc.h"
 #include "drivers/storage/sdhci.h"
 #include "drivers/storage/atapi.h"
+#include "drivers/storage/megasas.h"
+#include "drivers/storage/pvscsi.h"
 #include "drivers/char/virtio_console.h"
 #include "drivers/misc/virtio_balloon.h"
 #include "drivers/i2c/smbus.h"
@@ -1948,6 +1950,8 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     virtio_scsi_init();   /* before the partition scan: its targets are disks */
     sdhci_init();         /* likewise: an SD card is a disk like any other  */
     atapi_init();         /* and an optical drive, which answers SCSI       */
+    megasas_init();       /* a RAID controller's logical drives             */
+    pvscsi_init();        /* and VMware's paravirtual one                   */
     embk_partition_scan_all();
 
 

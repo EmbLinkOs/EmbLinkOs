@@ -173,6 +173,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/misc/virtio_balloon.c \
              kernel/drivers/storage/sdhci.c \
              kernel/drivers/storage/atapi.c \
+             kernel/drivers/storage/megasas.c \
+             kernel/drivers/storage/pvscsi.c \
              kernel/fs/iso9660.c \
              kernel/drivers/char/platform_misc.c \
              kernel/drivers/i2c/smbus.c \
@@ -2947,6 +2949,25 @@ test-scsi: $(IMG) $(EMBKFS_MASTER)
 # third case: it is woken by a different command, told its address rather than
 # asked for one, and keeps its real capacity in a register the CSD does not
 # reach.
+# EVERY SCSI CONTROLLER, THROUGH ONE TEST.
+#
+# These are six genuinely different ways of handing a command to a disk -- a
+# firmware mailbox, a paravirtual ring pair, a message-passing FIFO, a 1986
+# FIFO chip, a controller that executes a program, and virtio. The claim
+# kernel/block/scsi.c makes is that they differ only in the envelope. This is
+# how that claim is checked instead of asserted: the same disk, the same
+# signature, the same read-write-verify, over each of them in turn.
+.PHONY: test-hba
+test-hba: $(IMG) $(EMBKFS_MASTER)
+	@dd if=/dev/zero of=build/sas.img bs=1m count=32 2>/dev/null
+	@printf 'EMBLINK-HBA\0' | dd of=build/sas.img bs=512 conv=notrunc 2>/dev/null
+	@for hba in megasas pvscsi mptsas1068 am53c974 lsi53c895a virtio-scsi-pci; do \
+	  echo "=== $$hba ==="; \
+	  EXTRA_QEMU="-device $$hba,id=hba0 -drive id=hbad,file=$(CURDIR)/build/sas.img,format=raw,if=none -device scsi-hd,bus=hba0.0,drive=hbad" \
+	    python3 tools/console_test.py "test hba" || exit 1; \
+	done
+	@echo "=== test-hba: OK"
+
 .PHONY: test-sdcard
 test-sdcard: $(IMG) $(EMBKFS_MASTER)
 	@dd if=/dev/zero of=build/sdcard.img bs=1m count=64 2>/dev/null
