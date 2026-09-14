@@ -851,7 +851,50 @@ The measurement immediately earned itself twice:
 
 ## Storage
 
-### ACPI power (the first slice of the ACPI pillar)
+### USB
+
+### Hot-plug and removable media (2026-09-14)
+
+Ports used to be scanned once, during boot. `usb_poll()` now compares each
+controller's ports against the device table every 500 ms; what appeared is
+enumerated through exactly the same code path as boot, and what left is torn
+down. A mass-storage device is partition-scanned and mounted under
+`/media/<device name>` by `kernel/fs/automount.c`, which takes a BLOCK DEVICE
+rather than a USB one so a card reader or a runtime-attached image lands the
+same way. `make test-usb-hotplug` attaches a FAT32 stick over QMP to a running
+machine, requires the guest to read a named file off it, then removes it and
+requires the device, the block device and the mount all to go away.
+
+**Why polling and not the controllers' change interrupts:** EHCI shares its
+port-change interrupt with its companion controller, several of these are
+reached through a legacy INTx line this kernel does not always route, and a
+missed edge is a stick that never appears -- a failure whose only symptom is
+that the machine seems broken. A level read on a timer cannot miss anything,
+it can only be late.
+
+**Still open:**
+
+- [ ] **xHCI has no hot-plug.** It keeps its own enumeration rather than the
+      shared `usb_core` path, so `usb_alloc_device`/`usb_enumerate` are never
+      called on it and the port-tracking this is built on does not exist there.
+      Its `rescan` hook is NULL and skipped. This is the half a recent laptop
+      needs, since USB 3 ports are xHCI.
+- [ ] **No hub support on the hot-plug path.** Only ROOT ports are compared.
+      A device plugged into an external hub after boot is not seen; one
+      present at boot still enumerates through the existing hub code.
+- [ ] **Nothing is flushed on removal, and nothing can be.** A write still
+      buffered when the connector separates is lost. That is what "safely
+      remove" exists to let a person avoid, and there is no UI for it yet --
+      no way to ask for an unmount before pulling the stick.
+- [ ] **The mount point is the kernel's device name, not the volume label.**
+      `/media/sdc1`, not `/media/MYSTICK`. A label is attacker-controlled text
+      from an untrusted medium and putting it straight into a path is how you
+      get a volume called `../../system`; making it safe means a sanitiser and
+      a collision rule, which is a small design rather than a small change.
+- [ ] **One cluster per file in tools/mkfat32.py.** It writes test fixtures,
+      not archives, and refuses anything larger rather than truncating.
+
+## ACPI power (the first slice of the ACPI pillar)
 - [x] **Power-off and reboot the way the machine's own tables say.** The FADT
       is parsed for PM1a/PM1b control, the SMI command that switches the chipset
       into ACPI mode, the ACPI 5 hardware-reduced sleep register and the reset
@@ -7043,6 +7086,12 @@ The project is now built from two machines. The core build was made portable
 (see docs/BUILD_SETUP.md); these are the parts that are not, and they are host
 TOOLING gaps rather than anything wrong with the OS.
 
+- [x] ~~`mkfs.vfat` + `mcopy` are Linux-only, so `fat32.img` could not be built
+      on macOS and `test fat32` could not run there.~~ `tools/mkfat32.py` writes
+      the volume itself -- boot sector and backup, FSInfo, both FATs, and a root
+      directory -- the same approach `tools/mkuefidisk.py` already took for the
+      EFI system partition. `make fat32.img` works on both hosts now, and the
+      USB hot-plug test uses the same builder for its stick.
 - [ ] `sfdisk` is Linux-only, so partitioned + USB images cannot be built on
       macOS: `tools/mkbootdisk.sh`, `make run-usb`, `run-usb-ide`, and the
       partition-table tests. A replacement would have to write the MBR/GPT

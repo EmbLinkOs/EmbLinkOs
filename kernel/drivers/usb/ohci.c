@@ -455,11 +455,12 @@ static const struct usb_hcd_ops g_ohci_ops = {
 // Controller bring-up
 // ---------------------------------------------------------------------------
 
-static void ohci_port_scan(struct ohci_hc *hc) {
-    for (uint32_t p = 0; p < hc->nports; p++) {
+/* One port, probed -- see uhci.c on why this is split out of the scan. */
+static void ohci_port_probe(struct ohci_hc *hc, uint32_t p) {
+    {
         uint32_t reg = OHCI_RHPORTSTATUS + p * 4;
         uint32_t sc = ohci_read(hc, reg);
-        if (!(sc & OHCI_PORT_CCS)) continue;
+        if (!(sc & OHCI_PORT_CCS)) return;
 
         ohci_write(hc, reg, OHCI_PORT_PRS);
         for (int i = 0; i < 500; i++) {
@@ -473,7 +474,7 @@ static void ohci_port_scan(struct ohci_hc *hc) {
         if (!(sc & OHCI_PORT_PES)) {
             kprintf("OHCI: port %u failed to enable (sc=%x)\n",
                     (unsigned int)(p + 1), (unsigned int)sc);
-            continue;
+            return;
         }
 
         uint8_t speed = (sc & OHCI_PORT_LSDA) ? USB_SPEED_LOW : USB_SPEED_FULL;
@@ -483,9 +484,38 @@ static void ohci_port_scan(struct ohci_hc *hc) {
 
         struct usb_device *dev = usb_alloc_device(&g_ohci_ops, hc, NULL, speed);
         if (!dev) return;
+        dev->port = (uint8_t)(p + 1);
         if (usb_enumerate(dev) != 0) {
             usb_free_device(dev);
         }
+    }
+}
+
+static void ohci_port_scan(struct ohci_hc *hc) {
+    for (uint32_t p = 0; p < hc->nports; p++) ohci_port_probe(hc, p);
+}
+
+void ohci_rescan(void *hcv) {
+    struct ohci_hc *hc = hcv;
+    for (uint32_t p = 0; p < hc->nports; p++) {
+        uint32_t reg = OHCI_RHPORTSTATUS + p * 4;
+        uint32_t sc = ohci_read(hc, reg);
+        if (sc & OHCI_PORT_CSC) ohci_write(hc, reg, OHCI_PORT_CSC);
+
+        bool connected = (sc & OHCI_PORT_CCS) != 0;
+        struct usb_device *known = usb_device_on_port(hc, (uint8_t)(p + 1));
+        if (!connected) {
+            usb_port_clear_dead(hc, (uint8_t)(p + 1));
+            if (known) usb_device_gone(known);
+            continue;
+        }
+        if (known || usb_port_is_dead(hc, (uint8_t)(p + 1))) continue;
+
+        kprintf("OHCI: port %u -- something was plugged in\n",
+                (unsigned int)(p + 1));
+        ohci_port_probe(hc, p);
+        if (!usb_device_on_port(hc, (uint8_t)(p + 1)))
+            usb_port_mark_dead(hc, (uint8_t)(p + 1));
     }
 }
 
@@ -556,6 +586,8 @@ bool ohci_init_controller(struct usb_controller *ctrl) {
     hc->nports = rhda & 0xFF;
     if (hc->nports > 15) hc->nports = 15;
     ctrl->max_ports = (uint8_t)hc->nports;
+    ctrl->hc = hc;
+    ctrl->rescan = ohci_rescan;
     kprintf("OHCI: running, %u root ports\n", (unsigned int)hc->nports);
 
     // Interrupt EDs live on the periodic list; a skipped ED with SKIP set

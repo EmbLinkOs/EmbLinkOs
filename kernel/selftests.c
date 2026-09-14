@@ -60,6 +60,9 @@
 #include "ipc/channel.h"
 #include "ipc/endpoint.h"
 #include "ipc/pipe.h"
+#include "fs/automount.h"
+#include "drivers/usb/usb_core.h"
+#include "block/block.h"
 #include "acpi/acpi.h"
 #include "acpi/aml.h"
 #include "drivers/audio/pcm.h"
@@ -67,6 +70,22 @@
 /* `test aml`: run _STA on every device the firmware declared. _STA is a
  * METHOD on most machines, so this is the check that the executor works --
  * the loader alone would report the names and evaluate nothing. */
+/* `test usbdevs`: count what is on a removable volume and remember the first
+ * name, which is how the host harness tells a mount that WORKS from one that
+ * merely exists. */
+struct media_listing { int n; char first[64]; };
+static int media_count_cb(const char *name, uint8_t name_len, uint8_t type,
+                          uint64_t ino, void *ctx) {
+    (void)type; (void)ino;
+    struct media_listing *m = ctx;
+    if (m->n == 0 && name_len < sizeof m->first) {
+        memcpy(m->first, name, name_len);
+        m->first[name_len] = 0;
+    }
+    m->n++;
+    return EMBK_OK;
+}
+
 struct sta_count { int ok, bad; };
 static bool sta_visit(struct aml_node *n, void *ctx) {
     struct sta_count *c = ctx;
@@ -634,6 +653,58 @@ int selftests_handle_command(const char *cmd)
 
     if (strcmp(cmd, "test list") == 0) {
         selftests_print_commands();
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test usbdevs -- WHAT IS PLUGGED IN RIGHT NOW?
+     *
+     * Deliberately a REPORT, not a pass/fail: what is attached to a machine is
+     * the machine's business, and a test that asserted "there is a stick" would
+     * fail on every machine without one. tools/usb_hotplug.py runs this before
+     * and after plugging something in over QMP, and the DIFFERENCE is the
+     * verdict. That keeps the assertion on the host, where it knows what it
+     * attached, instead of in the guest, where it would have to be told.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test usbdevs") == 0) {
+        usb_hotplug_scan_now();       /* do not make the harness wait a tick */
+
+        kprintf("\n[usb] %u device(s) enumerated, %u block device(s), "
+                "%u removable volume(s) mounted\n",
+                (unsigned)usb_device_count(), (unsigned)embk_block_count(),
+                (unsigned)automount_count());
+
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *d = embk_block_get(i);
+            if (d) kprintf("  block %s: %llu x %u B\n", d->name,
+                           (unsigned long long)d->block_count,
+                           (unsigned)d->block_size);
+        }
+        for (uint32_t i = 0; ; i++) {
+            const char *at = 0, *dev = 0, *fs = 0;
+            if (!automount_at(i, &at, &dev, &fs)) break;
+            kprintf("  mount %s <- %s (%s)\n", at, dev, fs);
+        }
+
+        /* AND READ SOMETHING OFF IT. A mount that cannot be listed is not a
+         * mount; this is the difference between "the filesystem was
+         * recognised" and "the medium is readable". */
+        for (uint32_t i = 0; ; i++) {
+            const char *at = 0;
+            if (!automount_at(i, &at, 0, 0)) break;
+            struct media_listing ml = { 0, { 0 } };
+            int rc = vfs_readdir(at, media_count_cb, &ml);
+            if (rc != EMBK_OK && ml.n == 0) {
+                kprintf("  FAIL: %s is mounted but cannot be listed (%d)\n",
+                        at, rc);
+                continue;
+            }
+            kprintf("  %s lists %d entr%s%s%s\n", at, ml.n,
+                    ml.n == 1 ? "y" : "ies",
+                    ml.n > 0 ? ", first: " : "", ml.n > 0 ? ml.first : "");
+        }
+
+        kprintf("\n[cmd] test usbdevs: OK\n");
         return 1;
     }
 

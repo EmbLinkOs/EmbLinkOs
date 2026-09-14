@@ -6,6 +6,7 @@
 #include "include/kstring.h"
 #include "include/errno.h"
 #include "block/block.h"
+#include "fs/automount.h"
 #include "drivers/timer/pit.h"
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,59 @@ struct usb_device *usb_alloc_device(const struct usb_hcd_ops *ops,
 
 void usb_free_device(struct usb_device *dev) {
     if (dev) dev->in_use = false;
+}
+
+/* A PORT THAT HAS SOMETHING ON IT WE CANNOT ENUMERATE.
+ *
+ * Without this the rescan retries it every half second forever: a full reset
+ * sequence, seventy milliseconds of delay in the main loop, and a line of log,
+ * over and over, for a device that is never going to work. The machine does
+ * not break, it just gets quietly slower and noisier the longer it runs -- and
+ * the cause looks like nothing at all.
+ *
+ * The mark is cleared when the port reads DISCONNECTED, so pulling the thing
+ * out and putting it back is a fresh attempt. That is the only retry a person
+ * can ask for and it is the one they will try. */
+#define USB_DEAD_PORTS 16
+static struct { void *hc; uint8_t port; bool used; } g_dead[USB_DEAD_PORTS];
+
+bool usb_port_is_dead(void *hc, uint8_t port) {
+    for (uint32_t i = 0; i < USB_DEAD_PORTS; i++)
+        if (g_dead[i].used && g_dead[i].hc == hc && g_dead[i].port == port)
+            return true;
+    return false;
+}
+
+void usb_port_mark_dead(void *hc, uint8_t port) {
+    if (usb_port_is_dead(hc, port)) return;
+    for (uint32_t i = 0; i < USB_DEAD_PORTS; i++) {
+        if (g_dead[i].used) continue;
+        g_dead[i].hc = hc; g_dead[i].port = port; g_dead[i].used = true;
+        kprintf("USB: port %u has something this kernel cannot enumerate -- "
+                "not retrying until it is unplugged\n", (unsigned)port);
+        return;
+    }
+}
+
+void usb_port_clear_dead(void *hc, uint8_t port) {
+    for (uint32_t i = 0; i < USB_DEAD_PORTS; i++)
+        if (g_dead[i].used && g_dead[i].hc == hc && g_dead[i].port == port)
+            g_dead[i].used = false;
+}
+
+struct usb_device *usb_device_on_port(void *hc, uint8_t port) {
+    for (uint32_t i = 0; i < USB_MAX_DEVICES; i++) {
+        struct usb_device *d = &g_usb_devices[i];
+        if (d->in_use && d->hc == hc && d->port == port) return d;
+    }
+    return NULL;
+}
+
+uint32_t usb_device_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < USB_MAX_DEVICES; i++)
+        if (g_usb_devices[i].in_use) n++;
+    return n;
 }
 
 const struct usb_ep_info *usb_find_ep(struct usb_device *dev,
@@ -402,7 +456,51 @@ static bool usb_msc_attach(struct usb_device *dev) {
             m->blk.name,
             (unsigned int)m->blocks, (unsigned int)m->block_size,
             (unsigned int)((m->blocks * m->block_size) >> 20));
+
+    /* AND MAKE IT REACHABLE. Registering a block device used to be the end of
+     * the story, which is correct for a disk the boot code knows how to find
+     * and useless for one somebody just pushed into a socket: the point of
+     * plugging a stick in is to read what is on it. */
+    automount_attach(&m->blk);
     return true;
+}
+
+/* THE STICK CAME OUT.
+ *
+ * ORDER IS THE WHOLE THING HERE, and it is the reverse of attach:
+ *
+ *   1. unmount, so the VFS stops dispatching reads at a volume whose medium
+ *      has left. Doing this after the block device is gone means every
+ *      in-flight path walk goes through a freed registration.
+ *   2. unregister the block device, so nothing new can find it.
+ *   3. release the slot.
+ *
+ * Note what is NOT done: no attempt to flush. There is nothing to flush TO.
+ * A write that was still buffered when the connector separated is lost, and
+ * pretending otherwise by issuing SCSI to an absent device would hang the
+ * poll loop for the length of every timeout. That loss is what "safely
+ * remove" exists to let a person avoid, and saying so is more useful than a
+ * flush that cannot work. */
+static void usb_msc_detach(struct usb_device *dev) {
+    for (uint32_t i = 0; i < USB_MSC_MAX_DEVS; i++) {
+        struct usb_msc *m = &g_usb_msc[i];
+        if (!m->used || m->dev != dev) continue;
+
+        automount_detach(&m->blk);
+        embk_block_unregister(&m->blk);
+        kprintf("USB MSC: %s removed\n", m->blk.name);
+        m->used = false;
+        m->dev = NULL;
+    }
+}
+
+void usb_device_gone(struct usb_device *dev) {
+    if (!dev || !dev->in_use) return;
+    kprintf("USB: device %04x:%04x on port %u disconnected\n",
+            (unsigned)dev->vid, (unsigned)dev->pid, (unsigned)dev->port);
+    usb_msc_detach(dev);
+    dev->hid_active = false;
+    usb_free_device(dev);
 }
 
 // ---------------------------------------------------------------------------

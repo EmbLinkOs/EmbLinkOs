@@ -241,6 +241,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/fs/embkfs/embk_vfs.c \
              kernel/fs/fd.c \
              kernel/fs/vfs.c \
+             kernel/fs/automount.c \
              kernel/fs/namespace.c \
              kernel/fs/epfs.c \
              kernel/ipc/handle.c \
@@ -2022,16 +2023,15 @@ embkfs.img embkfs_tree.img &: tools/embkfs_mkfs/mkfs_embkfs.py $(EMBKFS_APPS) $(
 ahci.img:
 	dd if=/dev/zero of=ahci.img bs=1M count=64
 
+# mkfs.vfat and mcopy are Linux tools and this tree builds on two hosts, so the
+# volume is written directly by tools/mkfat32.py -- the same thing
+# tools/mkuefidisk.py already does for the EFI system partition. It writes no
+# subdirectory: that needs a second cluster chain and the driver's directory
+# walk is exercised by the root, which has several entries in it.
 fat32.img:
-	dd if=/dev/zero of=fat32.img bs=1M count=64
-	mkfs.vfat -F 32 -n EMBLINK fat32.img
-	echo "Hello from EmbLink filesystem!" > /tmp/hello.txt
-	mcopy -i fat32.img /tmp/hello.txt ::HELLO.TXT
-	echo "second file for testing the directory walk" > /tmp/test.txt
-	mcopy -i fat32.img /tmp/test.txt ::TEST.TXT
-	mmd -i fat32.img ::SUBDIR
-	echo "file inside a subdirectory" > /tmp/sub.txt
-	mcopy -i fat32.img /tmp/sub.txt ::SUBDIR/INSIDE.TXT
+	python3 tools/mkfat32.py fat32.img 64 \
+	    HELLO.TXT="Hello from EmbLink filesystem!" \
+	    TEST.TXT="second file for testing the directory walk"
 
 
 # NOTE: embkfs.img / embkfs_tree.img are built by the GROUPED rule further up
@@ -2770,6 +2770,20 @@ test-acpi: $(IMG) $(EMBKFS_MASTER)
 	  MACHINE=$$m EXTRA_DEVICES="intel-hda,e1000,rtl8139,AC97" \
 	    python3 tools/console_test.py "test prt" || exit 1; \
 	done
+
+# CAN YOU PLUG A STICK IN WHILE IT IS RUNNING?
+#
+# The ports used to be scanned once, at boot, so the answer was no -- a stick
+# pushed in afterwards did nothing at all. tools/usb_hotplug.py boots with an
+# EMPTY UHCI controller, attaches a FAT32 stick over QMP, requires the guest to
+# notice it, mount it AND READ A NAMED FILE off it, then pulls it out and
+# requires all three to go away again.
+#
+# The empty controller matters: a device present at boot would prove only that
+# the boot-time scan still works, which was never the missing part.
+.PHONY: test-usb-hotplug
+test-usb-hotplug: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/usb_hotplug.py
 
 # --- x86 console tests, scripted -----------------------------------------------
 # tools/console_test.py boots the kernel headless and types at its console. Any

@@ -123,6 +123,33 @@ int embk_block_register(struct embk_block_device *dev) {
     return EMBK_OK ; // Success
 }
 
+/* THE DEVICE IS GONE -- not "please stop using it", but "the medium left the
+ * machine and every outstanding read is already wrong".
+ *
+ * Order matters and it is the opposite of the intuitive one. The device comes
+ * OUT OF THE TABLE FIRST, before anything is torn down, so that nothing can
+ * look it up and start a transfer into hardware that is no longer there. Only
+ * then is anything holding it told.
+ *
+ * The slot is compacted rather than left as a hole: every caller of
+ * embk_block_get() walks 0..count-1, and a NULL in the middle would be a null
+ * dereference in a dozen places that have never had to expect one. The name
+ * is NOT recycled -- a stick plugged into the same port twice gets a new
+ * letter, because handing out "sdb" again while a program still has the old
+ * one open is the kind of bug nobody finds. */
+int embk_block_unregister(struct embk_block_device *dev) {
+    if (!dev) return -EMBK_EINVAL;
+    for (uint32_t i = 0; i < device_count; i++) {
+        if (devices[i] != dev) continue;
+        for (uint32_t j = i; j + 1 < device_count; j++) devices[j] = devices[j + 1];
+        device_count--;
+        devices[device_count] = NULL;
+        kprintf("block: unregistered %s\n", dev->name);
+        return EMBK_OK;
+    }
+    return -EMBK_ENODEV;
+}
+
 uint32_t embk_block_count(void) {
     return device_count;
 }

@@ -226,6 +226,13 @@ void vfs_init(void);
 int  vfs_mount(const char *path, const struct vfs_ops *ops, void *fs_data,
                uint64_t root_ino);
 
+/* Remove a mount: the medium is gone. No busy check -- see vfs.c on why
+ * refusing would be worse than failing the next read. */
+int  vfs_unmount(const char *path);
+
+/* The volume serving `path`, or NULL -- so an unmounter can free it. */
+void *vfs_mount_fs_data(const char *path);
+
 /* Resolve an absolute path to a vnode. This is the component-by-component
  * walk — the ONLY path parser in the kernel. Honors the current process's
  * namespace (UP2); falls back to the global mount table in kernel context. */

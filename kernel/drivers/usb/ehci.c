@@ -391,8 +391,9 @@ static const struct usb_hcd_ops g_ehci_ops = {
 // Controller bring-up
 // ---------------------------------------------------------------------------
 
-static void ehci_port_scan(struct ehci_hc *hc, bool ppc) {
-    for (uint32_t p = 0; p < hc->nports; p++) {
+/* One port, probed -- see uhci.c on why this is split out of the scan. */
+static void ehci_port_probe(struct ehci_hc *hc, bool ppc, uint32_t p) {
+    {
         uint32_t reg = EHCI_PORTSC + p * 4;
         uint32_t sc = ehci_op_read(hc, reg);
 
@@ -402,14 +403,14 @@ static void ehci_port_scan(struct ehci_hc *hc, bool ppc) {
             sc = ehci_op_read(hc, reg);
         }
 
-        if (!(sc & EHCI_PORT_CCS)) continue;
+        if (!(sc & EHCI_PORT_CCS)) return;
 
         // A K-state line means a low-speed device: hand it to the companion.
         if ((sc & EHCI_PORT_LINE_MASK) == EHCI_PORT_LINE_K) {
             kprintf("EHCI: port %u low-speed device -> companion\n",
                     (unsigned int)(p + 1));
             ehci_op_write(hc, reg, (sc & ~EHCI_PORT_W1C) | EHCI_PORT_OWNER);
-            continue;
+            return;
         }
 
         // Reset. If the port doesn't come up enabled, the device is
@@ -431,7 +432,7 @@ static void ehci_port_scan(struct ehci_hc *hc, bool ppc) {
             kprintf("EHCI: port %u full-speed device -> companion\n",
                     (unsigned int)(p + 1));
             ehci_op_write(hc, reg, (sc & ~EHCI_PORT_W1C) | EHCI_PORT_OWNER);
-            continue;
+            return;
         }
 
         ehci_op_write(hc, reg, sc | EHCI_PORT_CSC | EHCI_PORT_PEDC);
@@ -441,9 +442,45 @@ static void ehci_port_scan(struct ehci_hc *hc, bool ppc) {
         struct usb_device *dev = usb_alloc_device(&g_ehci_ops, hc, NULL,
                                                   USB_SPEED_HIGH);
         if (!dev) return;
+        dev->port = (uint8_t)(p + 1);
         if (usb_enumerate(dev) != 0) {
             usb_free_device(dev);
         }
+    }
+}
+
+static void ehci_port_scan(struct ehci_hc *hc, bool ppc) {
+    for (uint32_t p = 0; p < hc->nports; p++) ehci_port_probe(hc, ppc, p);
+}
+
+void ehci_rescan(void *hcv) {
+    struct ehci_hc *hc = hcv;
+    for (uint32_t p = 0; p < hc->nports; p++) {
+        uint32_t reg = EHCI_PORTSC + p * 4;
+        uint32_t sc = ehci_op_read(hc, reg);
+        if (sc & EHCI_PORT_CSC)
+            ehci_op_write(hc, reg, (sc & ~EHCI_PORT_W1C) | EHCI_PORT_CSC);
+
+        /* A PORT WE HANDED TO THE COMPANION IS NOT OURS. EHCI releases
+         * low- and full-speed devices to the UHCI/OHCI beside it by setting
+         * the owner bit, and re-probing one from here would fight that
+         * controller for the same device. */
+        if (sc & EHCI_PORT_OWNER) continue;
+
+        bool connected = (sc & EHCI_PORT_CCS) != 0;
+        struct usb_device *known = usb_device_on_port(hc, (uint8_t)(p + 1));
+        if (!connected) {
+            usb_port_clear_dead(hc, (uint8_t)(p + 1));
+            if (known) usb_device_gone(known);
+            continue;
+        }
+        if (known || usb_port_is_dead(hc, (uint8_t)(p + 1))) continue;
+
+        kprintf("EHCI: port %u -- something was plugged in\n",
+                (unsigned int)(p + 1));
+        ehci_port_probe(hc, true, p);
+        if (!usb_device_on_port(hc, (uint8_t)(p + 1)))
+            usb_port_mark_dead(hc, (uint8_t)(p + 1));
     }
 }
 
@@ -479,6 +516,8 @@ bool ehci_init_controller(struct usb_controller *ctrl) {
     hc->nports = hcsparams & 0xF;
     bool ppc = (hcsparams & (1 << 4)) != 0;
     ctrl->max_ports = (uint8_t)hc->nports;
+    ctrl->hc = hc;
+    ctrl->rescan = ehci_rescan;
 
     // Halt + reset.
     ehci_op_write(hc, EHCI_USBCMD,

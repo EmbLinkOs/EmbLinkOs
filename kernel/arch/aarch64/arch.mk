@@ -95,6 +95,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/loader/embx.c \
                   kernel/syscall/syscalls.c \
                   kernel/fs/vfs.c \
+                  kernel/fs/automount.c \
                   kernel/fs/fd.c \
                   kernel/fs/namespace.c \
                   kernel/fs/epfs.c \

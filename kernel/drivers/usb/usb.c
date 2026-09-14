@@ -1,4 +1,5 @@
 #include "drivers/usb/usb.h"
+#include "drivers/timer/timer.h"
 #include "drivers/usb/xhci.h"
 #include "drivers/usb/uhci.h"
 #include "drivers/usb/ohci.h"
@@ -179,10 +180,42 @@ void usb_init(void) {
     xhci_enable_irq();
 }
 
+/* HOW OFTEN TO LOOK, and why looking at all.
+ *
+ * Every one of these controllers can raise an interrupt when a port changes,
+ * and using it would be the obvious design. It is also the one that cannot be
+ * relied on here: EHCI shares its port-change interrupt with its companion
+ * UHCI/OHCI, several of these controllers are reached through a legacy INTx
+ * line this kernel does not always route, and a missed edge means a stick that
+ * never appears -- a failure with no symptom except that the machine seems
+ * broken. A level read on a timer cannot miss anything; it can only be late.
+ *
+ * 500 ms is late enough to cost nothing (it is four register reads per
+ * controller) and soon enough that plugging something in feels like it worked.
+ * A person takes longer than that to look at the screen. */
+#define USB_HOTPLUG_INTERVAL_MS 500
+
+static uint64_t g_next_hotplug_ms;
+
+void usb_hotplug_scan_now(void) {
+    for (uint32_t i = 0; i < g_usb_controller_count; i++) {
+        struct usb_controller *c = &g_usb_controllers[i];
+        if (c->initialized && c->rescan && c->hc) c->rescan(c->hc);
+    }
+}
+
+void usb_hotplug_poll(void) {
+    uint64_t now = timer_uptime_ms();
+    if (now < g_next_hotplug_ms) return;
+    g_next_hotplug_ms = now + USB_HOTPLUG_INTERVAL_MS;
+    usb_hotplug_scan_now();
+}
+
 // Called from the kernel main loop: services interrupt-IN endpoints on the
 // polled legacy controllers (UHCI/OHCI/EHCI). xHCI input is IRQ-driven.
 void usb_poll(void) {
     usb_core_poll();
+    usb_hotplug_poll();
 }
 
 uint32_t usb_controller_count(void) {

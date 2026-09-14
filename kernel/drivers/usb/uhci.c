@@ -359,11 +359,15 @@ static const struct usb_hcd_ops g_uhci_ops = {
 // Controller bring-up
 // ---------------------------------------------------------------------------
 
-static void uhci_port_scan(struct uhci_hc *hc) {
-    for (uint32_t p = 0; p < 2; p++) {
+/* ONE PORT, PROBED. Split out of the scan loop below so that hot-plug runs
+ * exactly the same code as boot -- a rescan that enumerates differently from
+ * the first scan is two implementations of the same thing, and the second one
+ * is the one nobody tests. */
+static void uhci_port_probe(struct uhci_hc *hc, uint32_t p) {
+    {
         uint16_t reg = (uint16_t)(hc->io + UHCI_PORTSC1 + p * 2);
         uint16_t sc = inw(reg);
-        if (!(sc & UHCI_PORT_CCS)) continue;
+        if (!(sc & UHCI_PORT_CCS)) return;
 
         // Reset the port, then enable it.
         outw(reg, UHCI_PORT_PR);
@@ -377,7 +381,7 @@ static void uhci_port_scan(struct uhci_hc *hc) {
         if (!(sc & UHCI_PORT_PED)) {
             kprintf("UHCI: port %u failed to enable (sc=%x)\n",
                     (unsigned int)(p + 1), (unsigned int)sc);
-            continue;
+            return;
         }
 
         uint8_t speed = (sc & UHCI_PORT_LSDA) ? USB_SPEED_LOW : USB_SPEED_FULL;
@@ -387,9 +391,51 @@ static void uhci_port_scan(struct uhci_hc *hc) {
 
         struct usb_device *dev = usb_alloc_device(&g_uhci_ops, hc, NULL, speed);
         if (!dev) return;
+        dev->port = (uint8_t)(p + 1);
         if (usb_enumerate(dev) != 0) {
             usb_free_device(dev);
         }
+    }
+}
+
+static void uhci_port_scan(struct uhci_hc *hc) {
+    for (uint32_t p = 0; p < 2; p++) uhci_port_probe(hc, p);
+}
+
+/* WHAT CHANGED SINCE LAST TIME. Two questions per port and they are not the
+ * same question: a port that reads connected may hold the device that was
+ * already there, and a port that reads empty may be one we never had anything
+ * on. Only the transitions matter.
+ *
+ * UHCI's Connect Status Change bit latches an edge and is write-1-to-clear;
+ * it is cleared here whether or not the level changed, because a latch nobody
+ * clears reports the same plug event forever. The DECISION is made on the
+ * level (CCS) against what the device table remembers -- a level and a
+ * record, not an edge -- so a plug and an unplug between two polls resolves to
+ * "nothing changed" rather than to a device that is half torn down. */
+void uhci_rescan(void *hcv) {
+    struct uhci_hc *hc = hcv;
+    for (uint32_t p = 0; p < 2; p++) {
+        uint16_t reg = (uint16_t)(hc->io + UHCI_PORTSC1 + p * 2);
+        uint16_t sc = inw(reg);
+        if (sc & UHCI_PORT_CSC)
+            outw(reg, (uint16_t)((sc & ~UHCI_PORT_PEDC) | UHCI_PORT_CSC));
+
+        bool connected = (sc & UHCI_PORT_CCS) != 0;
+        struct usb_device *known = usb_device_on_port(hc, (uint8_t)(p + 1));
+
+        if (!connected) {
+            usb_port_clear_dead(hc, (uint8_t)(p + 1));
+            if (known) usb_device_gone(known);
+            continue;
+        }
+        if (known || usb_port_is_dead(hc, (uint8_t)(p + 1))) continue;
+
+        kprintf("UHCI: port %u -- something was plugged in\n",
+                (unsigned int)(p + 1));
+        uhci_port_probe(hc, p);
+        if (!usb_device_on_port(hc, (uint8_t)(p + 1)))
+            usb_port_mark_dead(hc, (uint8_t)(p + 1));
     }
 }
 
@@ -451,6 +497,8 @@ bool uhci_init_controller(struct usb_controller *ctrl) {
 
     kprintf("UHCI: controller at io 0x%x running\n", (unsigned int)hc->io);
     ctrl->max_ports = 2;
+    ctrl->hc = hc;
+    ctrl->rescan = uhci_rescan;
 
     uhci_port_scan(hc);
     return true;

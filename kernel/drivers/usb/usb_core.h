@@ -62,6 +62,11 @@ struct usb_device {
     void *hc;         // controller-instance state (HCD-owned)
     void *hc_priv;    // per-device HCD state (HCD-owned)
 
+    // WHICH PORT IT IS ON, which nothing needed until a device could LEAVE.
+    // A rescan has to answer two questions -- "is there something new here"
+    // and "is the thing that was here gone" -- and neither is answerable from
+    // a device table that does not record where each device came from.
+    uint8_t port;     // 1-based, 0 = not attached to a root port
     uint8_t addr;     // assigned USB address (0 while defaulting)
     uint8_t speed;    // USB_SPEED_*
     uint8_t ep0_mps;
@@ -105,6 +110,25 @@ static inline void usb_toggle_set(struct usb_device *dev, uint8_t ep_addr,
 struct usb_device *usb_alloc_device(const struct usb_hcd_ops *ops,
                                     void *hc, void *hc_priv, uint8_t speed);
 void usb_free_device(struct usb_device *dev);
+
+// The device currently on (controller, port), or NULL. A rescan uses this to
+// tell "something new appeared" from "the same thing is still there".
+struct usb_device *usb_device_on_port(void *hc, uint8_t port);
+
+// THE DEVICE LEFT. Detaches whatever class driver claimed it -- a mass-storage
+// device's block device is unregistered and its filesystems unmounted -- and
+// then frees the slot. Safe to call for a device no class driver claimed.
+void usb_device_gone(struct usb_device *dev);
+
+// How many devices are enumerated right now, for the hot-plug test.
+uint32_t usb_device_count(void);
+
+// A port holding something that would not enumerate. Without this a rescan
+// retries the same failure every half second for the life of the machine --
+// see usb_core.c. Cleared when the port reads disconnected.
+bool usb_port_is_dead(void *hc, uint8_t port);
+void usb_port_mark_dead(void *hc, uint8_t port);
+void usb_port_clear_dead(void *hc, uint8_t port);
 
 // Standard control request helper.
 int usb_control(struct usb_device *dev, uint8_t bmRequestType,

@@ -102,6 +102,42 @@ int vfs_mount(const char *path, const struct vfs_ops *ops, void *fs_data,
     return EMBK_OK;
 }
 
+/* TAKE A MOUNT BACK OUT, because the medium left.
+ *
+ * There is no "busy" check here and that is a decision, not an omission. A USB
+ * stick pulled out of a running machine is gone whether or not a program had a
+ * file open on it; refusing the unmount would leave the VFS dispatching
+ * through a volume whose block device has already been unregistered, which is
+ * strictly worse than failing the next read. The mount slot is cleared so that
+ * every subsequent resolve misses cleanly.
+ *
+ * Anything still holding a vnode into this mount will fail on its next
+ * operation rather than at the moment of the unplug. That is the honest
+ * behaviour for removable media and it is what "safely remove" exists to let
+ * a person avoid. */
+int vfs_unmount(const char *path)
+{
+    if (!path) return -EMBK_EINVAL;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (!g_mounts[i].used || strcmp(g_mounts[i].at, path) != 0) continue;
+        kprintf("VFS: unmounted \"%s\"\n", g_mounts[i].at);
+        memset(&g_mounts[i], 0, sizeof g_mounts[i]);
+        return EMBK_OK;
+    }
+    return -EMBK_ENOENT;
+}
+
+/* The volume a mount point is serving, or NULL. Lets a caller that unmounted
+ * something find the fs_data it has to release. */
+void *vfs_mount_fs_data(const char *path)
+{
+    if (!path) return NULL;
+    for (int i = 0; i < VFS_MAX_MOUNTS; i++)
+        if (g_mounts[i].used && strcmp(g_mounts[i].at, path) == 0)
+            return g_mounts[i].fs_data;
+    return NULL;
+}
+
 /* Find the mount whose mount point matches `path`. v1: a simple mount, so this 
  * just returns the one used slot. When real multi-mount lands, this becomes a 
  * longest-prefix match (the deepest mount point that is a prefix of path wins),
