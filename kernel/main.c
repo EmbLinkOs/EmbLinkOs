@@ -9,6 +9,7 @@
 #include "drivers/video/framebuffer.h"
 #include "drivers/video/gpu.h"
 #include "drivers/video/console.h"
+#include "drivers/video/rawcon.h"
 #include "drivers/input/keyboard.h"
 #include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
@@ -1816,6 +1817,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     pmm_init();
     vmm_init();
     kheap_init();
+    /* THE KERNEL LOG ON THE SCREEN FROM HERE, not from console_init() -- which
+     * is two hundred lines and every driver on the machine further on. On a
+     * laptop, with no serial port, a hang anywhere in between used to leave the
+     * loader's last line on the screen and nothing else. */
+    rawcon_init();
     ap_bootstrap_map();   // permanent low-1MB identity map, needed before
                           // any AP can be started (see smp.h's comment)
 
@@ -1832,6 +1838,17 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
      * method. This corrects it where they differ and fills it in where the
      * decoder found nothing. */
     acpi_power_adopt_aml_s5();
+    /* THE TSC'S FREQUENCY, BEFORE ANYTHING TIMES ANYTHING. Every busy-wait in
+     * the USB, storage and SMP code goes through pit_delay_ms(), which becomes
+     * an exact TSC wait the moment this is known -- and every other core
+     * calibrates its scheduler tick against it as soon as smp_bringup() below
+     * starts it. Measured with the PIT and HPET switched off, which is what a
+     * recent laptop looks like: called later, after the cores were up, the
+     * three secondaries timed their ticks against a PIT that was not counting
+     * and ran five times fast. It needs only the ACPI tables (the PM timer's
+     * port, parsed in acpi_init just above); the HPET is not mapped yet and is
+     * simply not one of the references it can use this early. */
+    tsc_calibrate();
     lapic_init();
     // this_cpu() becomes usable core-wide from here on: needs both ACPI's
     // MADT CPU list (acpi_init, just above) and a working lapic_get_id()

@@ -115,8 +115,23 @@ void hpet_delay_us(uint64_t us)
         ticks_per_us = 1;
 
     uint64_t target = hpet_reg_read(HPET_REG_COUNTER) + us * ticks_per_us;
-    while (hpet_reg_read(HPET_REG_COUNTER) < target)
-        ;
+    /* Bounded: an HPET the tables describe but the firmware left stopped
+     * reads the same count forever. Stop believing it the first time. */
+    uint64_t last = 0, stuck = 0;
+    for (;;) {
+        uint64_t now = hpet_reg_read(HPET_REG_COUNTER);
+        if (now >= target) return;
+        if (now == last) {
+            if (++stuck > 50000000ULL) {
+                kprintf("HPET: the counter is not moving -- no longer used\n");
+                hpet_ready = false;
+                return;
+            }
+        } else {
+            stuck = 0;
+            last = now;
+        }
+    }
 }
 
 void hpet_delay_ms(uint32_t ms)

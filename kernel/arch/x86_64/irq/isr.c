@@ -10,6 +10,8 @@
 #include "lib/ksym.h"          /* the panic symbolizer (§7) */
 #include "drivers/char/platform_misc.h"
 #include "lib/crashlog.h"
+#include "lib/klog.h"
+#include "drivers/video/rawcon.h"
 #include "drivers/timer/timer.h"
 #include "include/usercopy.h"   /* access_ok, for the ring-3 walk */
 
@@ -376,6 +378,64 @@ void isr_handler(struct registers *regs) {
             .uptime_ms = timer_uptime_ms(),
         };
         crashlog_capture(&st);
+    }
+
+    /* AND ON THE SCREEN. A laptop has no serial port: until this block, a
+     * kernel fault on one froze the display on whatever the desktop had last
+     * drawn and said nothing at all. Everything here writes pixels straight
+     * into the firmware's framebuffer -- no lock, no allocation, no graphics
+     * stack -- and from its first line every other core's attempt to present
+     * a frame is refused, so the desktop cannot paint back over it. */
+    {
+        rawcon_panic_begin(regs->vector < 32 ? exception_messages[regs->vector]
+                                             : "unknown exception");
+        uint64_t cr2 = 0;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        rawcon_puts("  vector "); rawcon_hex(regs->vector);
+        rawcon_puts("   error "); rawcon_hex(regs->error_code);
+        rawcon_puts("   cpu "); rawcon_hex(this_cpu() ? this_cpu()->cpu_index : 0);
+        rawcon_puts("   uptime ms "); rawcon_hex(timer_uptime_ms());
+        rawcon_putc('\n');
+        rawcon_puts("  RIP "); rawcon_hex(regs->rip); rawcon_puts("  ");
+        if (ksym_ready()) {
+            static char sym[128];
+            ksym_symbolize(regs->rip, sym, sizeof sym);
+            rawcon_puts(sym);
+        } else {
+            rawcon_puts("(no symbols loaded yet)");
+        }
+        rawcon_putc('\n');
+        rawcon_puts("  RSP "); rawcon_hex(regs->rsp);
+        rawcon_puts("  RBP "); rawcon_hex(regs->rbp);
+        rawcon_puts("  CR2 "); rawcon_hex(cr2);
+        rawcon_putc('\n');
+        if (current_thread && current_thread->proc) {
+            rawcon_puts("  pid "); rawcon_hex(current_thread->proc->pid);
+            rawcon_putc('\n');
+        }
+        rawcon_puts("\n  Photograph this whole screen. The last of the kernel log:\n\n");
+
+        /* As much of the log as FITS, counted in screen rows from the end,
+         * because the lines nearest the fault are the ones that say what it
+         * was doing -- and a log that runs off the bottom loses exactly those. */
+        static char tail[6000];
+        uint32_t n = klog_tail(tail, sizeof tail);
+        uint32_t rows = rawcon_rows_left(), cols = rawcon_cols();
+        if (rows > 1) rows -= 1;
+        uint32_t used = 0, start = n, linelen = 0;
+        while (start > 0 && used < rows) {
+            char c = tail[start - 1];
+            if (c == '\n') {
+                used += cols ? (linelen / cols) + 1 : 1;
+                if (used > rows) break;
+                linelen = 0;
+            } else {
+                linelen++;
+            }
+            start--;
+        }
+        while (start < n && tail[start] == '\n') start++;
+        rawcon_puts(tail + start);
     }
 
     /* TELL THE HOST, if there is one. A halted guest and a slow one look

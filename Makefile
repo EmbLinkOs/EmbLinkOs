@@ -201,6 +201,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/audio/audio.c \
              kernel/drivers/video/font_8x16.c \
              kernel/drivers/video/console.c \
+             kernel/drivers/video/rawcon.c \
              kernel/drivers/video/bootanim.c \
              kernel/drivers/timer/timer.c \
              kernel/drivers/timer/hpet.c \
@@ -3234,6 +3235,16 @@ test-timezone: $(IMG) $(EMBKFS_MASTER)
 # matters if the firmware will not boot the result. So the stick is detached
 # before the second boot -- leaving it attached would let the firmware boot
 # from it and pass with the target completely empty.
+# THE STICK, BOOTED THE WAY A LAPTOP BOOTS IT: over USB, through xHCI, with no
+# PIT, no HPET, and -- in one of the three runs -- no serial port at all. Two
+# emulated internal disks (NVMe and SATA) are hashed before and after and must
+# not change. `make test-uefi` attaches the same image as an IDE disk, which is
+# not how any laptop has ever read a USB stick. See tools/laptop_test.py for
+# the list of what this found before the stick went near real hardware.
+.PHONY: test-laptop
+test-laptop: uefi-usb.img
+	@python3 tools/laptop_test.py
+
 .PHONY: test-install
 test-install: uefi-usb.img
 	@OVMF_CODE="$(OVMF_CODE)" OVMF_VARS="$(OVMF_VARS)" python3 tools/install_test.py

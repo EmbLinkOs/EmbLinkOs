@@ -188,6 +188,22 @@ bool intel_iommu_init(void) {
     const struct acpi_sdt_header *dmar = acpi_find_table("DMAR");
     if (!dmar) return false;
 
+    /* THE MAP THIS DRIVER BUILDS COVERS THE LOW 4 GiB, and translation on
+     * means every DMA outside the map is REFUSED. On a machine whose RAM runs
+     * past 4 GiB -- every laptop with 8 GB, because the PCI hole pushes memory
+     * up there even when there is less -- a USB or NVMe buffer allocated above
+     * the line would be refused, and the stick the machine booted from would
+     * stop reading. This driver protects nothing yet (see the header), so
+     * turning it on there buys nothing and can cost the boot. */
+    {
+        uint64_t top = pmm_total_pages() * PAGE_SIZE;
+        if (top > IDENTITY_LIMIT) {
+            kprintf("intel-iommu: RAM reaches %llu MiB, past the 4 GiB this driver "
+                    "maps -- translation left OFF\n", (unsigned long long)(top >> 20));
+            return false;
+        }
+    }
+
     /* Walk the DMAR's remapping-hardware entries. Each one is a separate
      * engine covering some of the buses; a desktop has one, a server has
      * several. */

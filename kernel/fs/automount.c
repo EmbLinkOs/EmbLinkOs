@@ -86,6 +86,31 @@ static void path_for(const char *name, char *out, uint32_t cap) {
 /* Offer one block device to each filesystem in turn. */
 static bool try_mount_one(struct embk_block_device *dev,
                           struct embk_block_device *parent) {
+    /* ALREADY MOUNTED IS NOT A MEDIUM TO MOUNT. The first boot from a real
+     * USB stick -- the machine's root filesystem on the stick -- mounted that
+     * root partition a SECOND time, read-write, at /media/sda2, the moment the
+     * USB driver announced the stick. Two independent in-memory allocators
+     * writing to one filesystem is corruption with a delay on it. Measured in
+     * the emulated-laptop boot: "EMBKFS: sda2: mounted ... (read-write)" three
+     * times. So: whatever the boot-time probe mounted, and whatever this file
+     * mounted already, is left alone. */
+    for (int i = 0; i < AUTO_MAX; i++)
+        if (g_auto[i].used && g_auto[i].dev == dev) return true;
+    /* BY NAME as well as by pointer: announcing a USB stick scans its
+     * partition table again, and the partitions come back as NEW device
+     * records with the same names -- so the pointer the boot volume holds is
+     * not the one offered here. Measured: the pointer check alone still
+     * mounted sda2 a second time. */
+    for (uint32_t i = 0; i < embkfs_volume_count(); i++) {
+        struct embkfs_volume *v = embkfs_volume_at(i);
+        if (v && v->mounted && v->dev &&
+            (v->dev == dev || strcmp(v->dev->name, dev->name) == 0)) {
+            kprintf("automount: %s is already mounted (the boot volume) -- left alone\n",
+                    dev->name);
+            return true;
+        }
+    }
+
     struct auto_mount *slot = NULL;
     for (int i = 0; i < AUTO_MAX; i++)
         if (!g_auto[i].used) { slot = &g_auto[i]; break; }

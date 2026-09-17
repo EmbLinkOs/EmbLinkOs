@@ -355,6 +355,18 @@ static void parse_power(const struct rsdp *r) {
     uint32_t flags = fadt_has(f, offsetof(struct acpi_fadt, flags), 4) ? f->flags : 0;
     g_power.hw_reduced = (flags & ACPI_FADT_HW_REDUCED) != 0;
 
+    /* The PM timer: the 64-bit GAS when it is filled in and in I/O space, the
+     * ACPI 1.0 port otherwise. A hardware-reduced platform has none. */
+    if (!g_power.hw_reduced) {
+        if (fadt_has(f, offsetof(struct acpi_fadt, x_pm_tmr_blk), sizeof(struct acpi_gas)) &&
+            f->x_pm_tmr_blk.address && f->x_pm_tmr_blk.space_id == ACPI_GAS_IO &&
+            f->x_pm_tmr_blk.address <= 0xFFFF)
+            g_power.pm_tmr_port = (uint16_t)f->x_pm_tmr_blk.address;
+        else if (fadt_has(f, offsetof(struct acpi_fadt, pm_tmr_blk), 4) &&
+                 f->pm_tmr_blk && f->pm_tmr_blk <= 0xFFFF)
+            g_power.pm_tmr_port = (uint16_t)f->pm_tmr_blk;
+    }
+
     /* PM1 control: the 64-bit GAS when the table has one and it is filled in,
      * otherwise the ACPI 1.0 I/O port. Both describe the same register. */
     if (fadt_has(f, offsetof(struct acpi_fadt, x_pm1a_cnt_blk), sizeof(struct acpi_gas)) &&

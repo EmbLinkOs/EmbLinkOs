@@ -125,6 +125,22 @@ bool amd_iommu_init(void) {
     const struct acpi_sdt_header *ivrs = acpi_find_table("IVRS");
     if (!ivrs) return false;
 
+    /* THE MAP THIS DRIVER BUILDS COVERS THE LOW 4 GiB, and translation on
+     * means every DMA outside the map is REFUSED. On a machine whose RAM runs
+     * past 4 GiB -- every laptop with 8 GB, because the PCI hole pushes memory
+     * up there even when there is less -- a USB or NVMe buffer allocated above
+     * the line would be refused, and the stick the machine booted from would
+     * stop reading. This driver protects nothing yet (see the header), so
+     * turning it on there buys nothing and can cost the boot. */
+    {
+        uint64_t top = pmm_total_pages() * PAGE_SIZE;
+        if (top > 0x100000000ULL) {
+            kprintf("amd-iommu: RAM reaches %llu MiB, past the 4 GiB this driver "
+                    "maps -- translation left OFF\n", (unsigned long long)(top >> 20));
+            return false;
+        }
+    }
+
     /* Walk the IVRS for an IVHD entry; its type is 0x10, 0x11 or 0x40 and the
      * MMIO base is at a fixed offset in all three. */
     const uint8_t *p = (const uint8_t *)ivrs + 48;

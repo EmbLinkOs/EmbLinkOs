@@ -7485,3 +7485,33 @@ closing table instead.
       what it was given -- the Date & Time pane says so. Changing it live means
       a way to tell a process its environment moved, which nothing in this
       system has.
+
+**Real hardware -- written to the specification, not yet run on silicon**
+
+`make test-laptop` boots the stick the way a laptop does and catches what an
+emulator can show. These are the parts it cannot, because QEMU offers nothing
+for them to run against:
+
+- [ ] **xHCI scratchpad buffers and the firmware handoff** (`xhci.c`). QEMU's
+      controller asks for zero scratchpad pages and has no USB Legacy Support
+      capability, so both paths are dead code under test. Real Intel and AMD
+      controllers use both. The init ORDER fix (Run last) is exercised by every
+      xHCI test.
+- [ ] **TSC from CPUID 0x15/0x16.** TCG reports zeros there, so every test has
+      measured against the ACPI PM timer (or the HPET) instead. A real Intel
+      part will take the CPUID path first.
+- [ ] **TSC-deadline LAPIC timer** is switched OFF (`LAPIC_TRY_TSC_DEADLINE`)
+      until it has been seen working once; the one-shot LVT timer, which every
+      boot has used, runs instead.
+- [ ] **The loader must be running below 4 GiB when it switches page tables.**
+      The tables it builds identity-map 0-4 GiB only. Firmware that loads
+      BOOTX64.EFI higher would reset the machine right after "exiting boot
+      services + jumping to kernel..." -- which is at least a recognisable
+      symptom.
+- [ ] **The early on-screen log is lost when a graphics driver changes mode.**
+      Only VMs do that (Bochs, virtio-gpu); a laptop's firmware framebuffer
+      stays. The panic screen follows the mode change (`rawcon_adopt`).
+- [ ] **`test posix` reported FAIL once while posixdemo printed ALL PASS**, in
+      a long sequential run; the rerun passed. The harness missed the verdict
+      line rather than the program failing -- but that is an inference, not a
+      measurement.

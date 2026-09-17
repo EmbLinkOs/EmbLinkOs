@@ -90,6 +90,31 @@ static void lapic_timer_arm_tsc_deadline(void) {
 static void lapic_enable_this_core(void) {
     // Enable the local APIC by setting the enable bit in the Spurious Interrupt Vector Register
     uint64_t base = rdmsr(IA32_APIC_BASE_MSR);
+
+    /* THE FIRMWARE MAY HAVE LEFT THIS CORE IN x2APIC MODE. Recent Intel
+     * machines commonly do, and in x2APIC mode the memory-mapped register page
+     * this whole file talks to is switched OFF: reads return nothing useful and
+     * writes go nowhere. The kernel would come up with no timer, no IPIs and no
+     * other cores, and hang without a word. QEMU never does this, so nothing
+     * here had ever met it.
+     *
+     * The SDM does not allow x2APIC -> xAPIC directly (that write faults); the
+     * legal path is through DISABLED -- clear EN and EXTD together -- and then
+     * EN alone. That is safe on any machine whose APIC IDs fit in eight bits,
+     * which every laptop's do. Each core does it for itself: the mode is
+     * per-core state and survives the INIT that starts a secondary. */
+#define IA32_APIC_BASE_EXTD (1ULL << 10)
+    if (base & IA32_APIC_BASE_EXTD) {
+        wrmsr(IA32_APIC_BASE_MSR, base & ~(IA32_APIC_BASE_EXTD | (uint64_t)A32_APIC_BASE_ENABLE));
+        base = rdmsr(IA32_APIC_BASE_MSR);
+        static bool said;
+        if (!said) {
+            said = true;
+            kprintf("LAPIC: the firmware left x2APIC mode on -- switched back to the "
+                    "memory-mapped interface\n");
+        }
+    }
+
     base |= A32_APIC_BASE_ENABLE; // Set the enable bit
     wrmsr(IA32_APIC_BASE_MSR, base);
 
@@ -246,7 +271,15 @@ void lapic_timer_init(uint8_t vector) {
      * read the bit as 0), and no KVM is available here to advertise it. The gate
      * therefore always picks periodic under TCG; this path activates only on
      * KVM/real hardware. Written to the SDM (Vol.3 10.5.4.1) but not yet run. */
-    if (tsc_deadline_supported() && tsc_get_freq_hz() != 0) {
+    /* OFF UNTIL IT HAS RUN ONCE. The paragraph above is honest that this path
+     * has never executed -- TCG cannot offer TSC-deadline and this project has
+     * no KVM -- and a real laptop is the first machine that would take it.
+     * The scheduler's heartbeat is the wrong thing to debut on unfamiliar
+     * silicon with no serial port: if it is wrong, nothing ticks, and nothing
+     * says so. The one-shot LVT timer below has run on every boot of this
+     * kernel. Flip this after TSC-deadline has been seen working. */
+#define LAPIC_TRY_TSC_DEADLINE 0
+    if (LAPIC_TRY_TSC_DEADLINE && tsc_deadline_supported() && tsc_get_freq_hz() != 0) {
         lapic_timer_tsc_deadline = true;
         lapic_tsc_period = tsc_get_freq_hz() / 100;   // 100 Hz quantum
 
@@ -271,8 +304,21 @@ void lapic_timer_init(uint8_t vector) {
     lapic_write(LAPIC_REG_LVT_TIMER, LAPIC_TIMER_MASKED); // Max initial count
     lapic_write(LAPIC_REG_TIMER_INIT, 0XFFFFFFFF); // Set the interrupt vector (unmasked, one-shot)
 
-    // Wait for the timer to count down for the calibration time
-    if (hpet_available()) {
+    // Wait for the timer to count down for the calibration time. Against the
+    // TSC when its frequency is known -- it is on every boot now, and it is the
+    // one reference that cannot be missing -- else the HPET, else the PIT.
+    if (tsc_get_freq_hz()) {
+        uint64_t hz = tsc_get_freq_hz();
+        uint64_t ticks = hz / 1000ULL * calibration_time_ms;
+        uint32_t lo, hi;
+        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t t0 = ((uint64_t)hi << 32) | lo, t = t0;
+        while (t - t0 < ticks) {
+            __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+            t = ((uint64_t)hi << 32) | lo;
+        }
+        kprintf("LAPIC timer: calibrating against the TSC\n");
+    } else if (hpet_available()) {
         hpet_delay_ms(calibration_time_ms);
         kprintf("LAPIC timer: calibrating against HPET\n");
     } else {

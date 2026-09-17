@@ -6,6 +6,8 @@
 
 
 void serial_init(void);
+/* 0 on a machine with no UART at COM1 -- every laptop. Writes are then no-ops. */
+int serial_present(void);
 void serial_write_char(char c);
 void serial_write_string(const char *str);
 void serial_write_hex(uint64_t value);

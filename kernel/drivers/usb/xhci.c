@@ -6,6 +6,7 @@
 #include "include/errno.h"     // EMBK_* error codes
 #include "mm/vmm.h"
 #include "mm/pmm.h"   // KV2P: kernel-image virtual -> physical for DMA
+#include "drivers/timer/pit.h"   // pit_delay_ms: the firmware handoff wait
 #include "block/block.h"
 #include "fs/automount.h"       // block-device registration for USB mass storage
 #include "arch/x86_64/irq/irq.h"           // irq_register (interrupt-driven event servicing)
@@ -16,6 +17,7 @@
 #define XHCI_CAPLENGTH   0x00
 #define XHCI_HCIVERSION  0x02
 #define XHCI_HCSPARAMS1  0x04
+#define XHCI_HCSPARAMS2  0x08
 #define XHCI_HCCPARAMS1  0x10
 #define XHCI_DBOFF       0x14
 #define XHCI_RTSOFF      0x18
@@ -127,6 +129,13 @@ struct xhci_erst_entry {
 // into command/event structures from very early boot without allocator coupling.
 struct xhci_runtime_state {
     bool used;
+    /* SCRATCHPAD: pages the controller asked for (HCSPARAMS2) and owns. QEMU
+     * asks for none, so a driver written against it never allocates them --
+     * and a real Intel or AMD controller that asked and was given nothing is
+     * entitled to fail the first time it needs one. */
+    uint16_t scratchpad_n;
+    uint64_t scratchpad_array_phys;
+    bool     ac64;                /* controller can address above 4 GiB */
     uint8_t bus;
     uint8_t device;
     uint8_t function;
@@ -317,7 +326,7 @@ static uint32_t xhci_find_first_connected_port(volatile uint8_t *op, uint32_t ma
 }
 
 // Minimal xHCI startup sequence: stop -> reset -> wait ready -> run.
-static bool xhci_controller_reset_and_run(volatile uint8_t *op) {
+static bool xhci_controller_reset(volatile uint8_t *op) {
     uint32_t cmd = xhci_read32(op, XHCI_OP_USBCMD);
     cmd &= ~XHCI_USBCMD_RUN_STOP;
     xhci_write32(op, XHCI_OP_USBCMD, cmd);
@@ -340,8 +349,18 @@ static bool xhci_controller_reset_and_run(volatile uint8_t *op) {
         kprintf("xHCI: timeout waiting CNR clear\n");
         return false;
     }
+    return true;
+}
 
-    cmd = xhci_read32(op, XHCI_OP_USBCMD);
+/* RUN, LAST. xHCI 4.2 is an ordered list -- reset, MaxSlotsEn, DCBAAP, the
+ * command ring, the interrupter, and only then Run/Stop -- and several of
+ * those registers are defined as "shall not be modified while running". This
+ * used to set Run straight after the reset and program everything else into
+ * a running controller. QEMU accepts that. A real controller is entitled not
+ * to, and a machine whose USB stick is its root filesystem is not where to
+ * find out. */
+static bool xhci_controller_run(volatile uint8_t *op) {
+    uint32_t cmd = xhci_read32(op, XHCI_OP_USBCMD);
     cmd |= (XHCI_USBCMD_RUN_STOP | XHCI_USBCMD_INTE);
     xhci_write32(op, XHCI_OP_USBCMD, cmd);
 
@@ -351,6 +370,54 @@ static bool xhci_controller_reset_and_run(volatile uint8_t *op) {
     }
 
     return true;
+}
+
+/* TAKE THE CONTROLLER FROM THE FIRMWARE. On a real machine the firmware has
+ * been driving this controller -- it is how the keyboard worked in the setup
+ * screen and how the loader was read off the stick -- and its System
+ * Management Mode code keeps a claim on it: USB Legacy Support, the first
+ * extended capability. Until the OS asks for ownership and switches the SMIs
+ * off, that code may still reach into the controller while this driver is
+ * using it. QEMU's xHCI has no such capability, so this is the other half of
+ * the code a QEMU-only driver never needed. xHCI 7.1. */
+static void xhci_bios_handoff(volatile uint8_t *mmio, uint32_t hccparams1, uint64_t map_size) {
+    uint32_t off = (hccparams1 >> 16) & 0xFFFFU;         /* in 32-bit words */
+    for (int guard = 0; off && guard < 64; guard++) {
+        uint64_t base = (uint64_t)off * 4U;
+        if (base + 8U > map_size) return;
+        uint32_t cap = xhci_read32(mmio, (uint32_t)base);
+        if ((cap & 0xFFU) == 1U) {                        /* USB Legacy Support */
+            if (cap & (1U << 16)) {                       /* BIOS owns it */
+                xhci_write32(mmio, (uint32_t)base, cap | (1U << 24));
+                int waited = 0;
+                while ((xhci_read32(mmio, (uint32_t)base) & (1U << 16)) && waited < 1000) {
+                    pit_delay_ms(1);
+                    waited++;
+                }
+                if (xhci_read32(mmio, (uint32_t)base) & (1U << 16)) {
+                    /* What Linux does too: a firmware that will not let go is
+                     * a firmware bug, and the controller is taken anyway. */
+                    kprintf("xHCI: firmware did not release the controller in 1 s -- taking it\n");
+                    xhci_write32(mmio, (uint32_t)base,
+                                 (xhci_read32(mmio, (uint32_t)base) & ~(1U << 16)) | (1U << 24));
+                } else {
+                    kprintf("xHCI: firmware handed the controller over (%d ms)\n", waited);
+                }
+            } else {
+                xhci_write32(mmio, (uint32_t)base, cap | (1U << 24));
+            }
+            /* SMIs off, pending SMI events acknowledged: keep the reserved bits,
+             * clear the enables, write 1 to the three RW1C status bits. */
+            uint32_t ctl = xhci_read32(mmio, (uint32_t)base + 4U);
+            ctl &= ((0x7U << 1) | (0xFFU << 5) | (0x7U << 17));
+            ctl |= (0x7U << 29);
+            xhci_write32(mmio, (uint32_t)base + 4U, ctl);
+            return;
+        }
+        uint32_t next = (cap >> 8) & 0xFFU;
+        if (!next) return;
+        off += next;
+    }
 }
 
 static void xhci_ring_doorbell(volatile uint8_t *db, uint32_t target, uint32_t val) {
@@ -366,6 +433,42 @@ static bool xhci_setup_rings(struct xhci_runtime_state *rt,
     }
 
     xhci_bzero(rt->dcbaa, sizeof(rt->dcbaa));
+
+    /* THE SCRATCHPAD ARRAY GOES IN DCBAA[0], and it has to be there before the
+     * controller runs. One page of pointers holds 512; no controller asks for
+     * more than a few dozen, and one that did is refused out loud rather than
+     * given half. Pages above 4 GiB are refused on a controller that cannot
+     * address them. */
+    if (rt->scratchpad_n) {
+        if (!rt->scratchpad_array_phys) {
+            if (rt->scratchpad_n > 512) {
+                kprintf("xHCI: asks for %u scratchpad pages; this driver provides at most 512\n",
+                        (unsigned)rt->scratchpad_n);
+                return false;
+            }
+            uint64_t arr = pmm_alloc_page();
+            if (!arr || (!rt->ac64 && arr >= 0x100000000ULL)) {
+                kprintf("xHCI: no addressable page for the scratchpad array\n");
+                return false;
+            }
+            uint64_t *slots = (uint64_t *)(uintptr_t)P2V(arr);
+            xhci_bzero(slots, 4096);
+            for (uint32_t i = 0; i < rt->scratchpad_n; i++) {
+                uint64_t pg = pmm_alloc_page();
+                if (!pg || (!rt->ac64 && pg >= 0x100000000ULL)) {
+                    kprintf("xHCI: scratchpad page %u unavailable\n", (unsigned)i);
+                    return false;
+                }
+                xhci_bzero((void *)(uintptr_t)P2V(pg), 4096);
+                slots[i] = pg;
+            }
+            rt->scratchpad_array_phys = arr;
+            kprintf("xHCI: %u scratchpad page(s) given to the controller\n",
+                    (unsigned)rt->scratchpad_n);
+        }
+        rt->dcbaa[0] = rt->scratchpad_array_phys;
+    }
+
     xhci_bzero(rt->cmd_ring, sizeof(rt->cmd_ring));
     xhci_bzero(rt->evt_ring, sizeof(rt->evt_ring));
     xhci_bzero(rt->erst, sizeof(rt->erst));
@@ -2082,7 +2185,9 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
         return false;
     }
 
-    if (!xhci_controller_reset_and_run(op)) {
+    xhci_bios_handoff(mmio, hccparams1, map_size);
+
+    if (!xhci_controller_reset(op)) {
         return false;
     }
 
@@ -2090,6 +2195,11 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
     if (!rt) {
         kprintf("xHCI: no runtime slots available\n");
         return false;
+    }
+    {
+        uint32_t hcs2 = xhci_read32(mmio, XHCI_HCSPARAMS2);
+        rt->scratchpad_n = (uint16_t)((((hcs2 >> 21) & 0x1FU) << 5) | ((hcs2 >> 27) & 0x1FU));
+        rt->ac64 = (hccparams1 & 1U) != 0;
     }
 
     // Remember the register blocks so the IRQ handler and runtime poll can reach
@@ -2102,16 +2212,20 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
     rt->tracked_slots = (uint8_t)((max_slots < XHCI_MAX_SLOTS_TRACKED) ?
                                   max_slots : XHCI_MAX_SLOTS_TRACKED);
 
+    // Program Max Device Slots Enabled (CONFIG[7:0]) -- while halted.
+    uint32_t cfg = xhci_read32(op, XHCI_OP_CONFIG);
+    cfg &= ~0xFFU;
+    cfg |= (max_slots > 8U) ? 8U : (max_slots ? max_slots : 1U);
+    xhci_write32(op, XHCI_OP_CONFIG, cfg);
+
     if (!xhci_setup_rings(rt, op, runtime)) {
         kprintf("xHCI: ring setup failed\n");
         return false;
     }
 
-    // Program Max Device Slots Enabled (CONFIG[7:0]).
-    uint32_t cfg = xhci_read32(op, XHCI_OP_CONFIG);
-    cfg &= ~0xFFU;
-    cfg |= (max_slots > 8U) ? 8U : (max_slots ? max_slots : 1U);
-    xhci_write32(op, XHCI_OP_CONFIG, cfg);
+    if (!xhci_controller_run(op)) {
+        return false;
+    }
 
     /* EVERY CONNECTED PORT, NOT THE FIRST ONE.
      *

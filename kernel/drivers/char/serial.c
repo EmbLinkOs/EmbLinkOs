@@ -39,14 +39,39 @@ static void serial_rx_push(unsigned char c) {
  * there: this is an edge-ish source in practice, and a handler that returns
  * with data still pending is a handler that can stall until the next byte
  * happens to arrive. */
+/* IS THERE A UART AT ALL? A laptop has none, and an I/O port with nothing
+ * behind it reads 0xFF -- which to the line-status register means "a byte is
+ * waiting" (bit 0) AND "ready to transmit" (bit 5), forever. The drain below
+ * was an infinite loop on every such machine, and the transmit wait only
+ * escaped by luck of the same bit. Starts TRUE so the bytes written before
+ * serial_init() ran still go out on a machine that has one. */
+static int g_uart_present = 1;
+
+int serial_present(void) { return g_uart_present; }
+
 void serial_irq_drain(void) {
-    while (inb(SERIAL_PORT + 5) & 0x01)
+    if (!g_uart_present) return;
+    /* Bounded even with a UART: a FIFO that reports data forever is a broken
+     * part, and a broken part must not be able to stop the machine. */
+    for (int n = 0; n < 4096 && (inb(SERIAL_PORT + 5) & 0x01); n++)
         serial_rx_push((unsigned char)inb(SERIAL_PORT));
 }
 
 uint32_t serial_rx_dropped(void) { return s_dropped; }
 
 void serial_init(void) {
+    /* THE SCRATCH REGISTER: a byte written to it reads back on every 16450 and
+     * later, and on an empty port it reads 0xFF whatever was written. Two
+     * patterns, because 0xFF is itself one of the values a real part could
+     * hold. */
+    outb(SERIAL_PORT + 7, 0x5A);
+    uint8_t a = inb(SERIAL_PORT + 7);
+    outb(SERIAL_PORT + 7, 0xA5);
+    uint8_t b = inb(SERIAL_PORT + 7);
+    if (a != 0x5A || b != 0xA5 || inb(SERIAL_PORT + 5) == 0xFF) {
+        g_uart_present = 0;
+        return;
+    }
     outb(SERIAL_PORT + 1, 0x00); // Disable all interrupts
     outb(SERIAL_PORT + 3, 0x80); // Enable DLAB (set baud rate divisor)
     outb(SERIAL_PORT + 0, 0x01); // Set divisor to 1 (lo byte) 115200 baud
@@ -66,8 +91,11 @@ static int serial_is_ready() {
 
 
 void serial_write_char(char c) {
-    // Wait for the transmit buffer to be empty
-    while (!serial_is_ready());
+    if (!g_uart_present) return;
+    // Wait for the transmit buffer to be empty -- for a while, not forever: a
+    // UART that never drains is a stuck part, and dropping a byte of log is
+    // the right price for a machine that keeps booting.
+    for (int spin = 0; spin < 200000 && !serial_is_ready(); spin++) { }
     outb(SERIAL_PORT, c);
 }
 
@@ -85,6 +113,7 @@ void serial_write_char(char c) {
 int serial_has_char(void) {
     if (s_irq_driven)
         return s_head != s_tail;
+    if (!g_uart_present) return 0;
     return inb(SERIAL_PORT + 5) & 0x01;
 }
 
@@ -104,6 +133,7 @@ char serial_read_char(void) {
  * ring. Called once the IRQ is routed -- never before, or bytes would land in
  * a ring nobody is filling. */
 void serial_irq_enable(void) {
+    if (!g_uart_present) return;        /* no part, no interrupt to believe in */
     serial_irq_drain();                 /* anything already in the FIFO */
     outb(SERIAL_PORT + 1, 0x01);        /* IER bit 0: Received Data Available */
     s_irq_driven = 1;

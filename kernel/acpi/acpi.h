@@ -239,6 +239,13 @@ struct acpi_power_info {
     bool     s5_found;              /* \_S5_ decoded from the AML              */
     uint8_t  s5_typa, s5_typb;      /* SLP_TYP for PM1a / PM1b                 */
     char     s5_table[5];           /* which table it came from: DSDT or SSDT  */
+    /* THE ACPI PM TIMER: a free-running counter at exactly 3,579,545 Hz, on
+     * every PC chipset that is not hardware-reduced. It matters because it is
+     * often the ONLY known-frequency clock a modern laptop leaves standing --
+     * the HPET is commonly hidden and the 8254 PIT is clock-gated -- and a
+     * kernel with no reference cannot know how fast its own TSC runs. 0 =
+     * absent (or not in I/O space, which is the only kind read here). */
+    uint16_t pm_tmr_port;
 };
 
 /* ---- what the AML interpreter answers (kernel/acpi/acpi_dev.c) ----------
