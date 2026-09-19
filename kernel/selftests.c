@@ -560,6 +560,7 @@ static void selftests_print_commands(void)
     kprintf("  test tcc dyn\n");
     kprintf("  test tcc tally\n");
     kprintf("  test embcc\n");
+    kprintf("  test embcc cxx\n");
     kprintf("  test embcc self\n");
     kprintf("  test embcc selfhost\n");
     kprintf("  test embld\n");
@@ -7570,6 +7571,157 @@ int selftests_handle_command(const char *cmd)
         int ok = (pid >= 0 && code == 0 && is_elf && is_64 && is_rel &&
                   is_exec && rcode == 42);
         kprintf("\n[cmd] test embcc: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* C++ ON THE METAL (EmbCC CX9). The same shape as `test embcc` one step up:
+ * the on-image embcc -- itself built by EmbCC -- compiles a C++ program HERE,
+ * EmbLD links it against the sealed ABI (crt0 + syscalls + libc), and the
+ * result runs -- compiler and linker both EmbCC's, on the metal. The program is deliberately self-contained: it defines the
+ * few runtime entry points a plain C++ program needs (operator new/delete, a
+ * local static's guard, __cxa_pure_virtual) so nothing but the C ABI has to
+ * be on the image -- what is being judged is the COMPILER, not a C++ library.
+ * It exercises what a C++ port breaks on: a global constructor, virtual
+ * dispatch through a base, templates over two types, new/delete and
+ * new[]/delete[], a guarded function-local static, and recursion. Exit 42. */
+    if (strcmp(cmd, "test embcc cxx") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc cxx: VFS not registered\n"); return 1; }
+        struct vfs_stat est;
+        if (vfs_stat("/data/apps/embcc/embcc.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc cxx: /data/apps/embcc/embcc.elf not on image\n");
+            return 1; }
+        if (vfs_stat("/data/apps/embld/embld.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc cxx: embld.elf not on image (the linker)\n");
+            return 1; }
+
+        static const char src[] =
+            "/* Compiled BY EmbCC, ON EmbLinkOS. Self-contained: the runtime\n"
+            "   entry points a plain C++ program needs are defined here, so it\n"
+            "   links against the C ABI alone. */\n"
+            "#include <stdlib.h>\n"
+            "#include <string.h>\n"
+            "void *operator new(unsigned long n) { return malloc(n); }\n"
+            "void *operator new[](unsigned long n) { return malloc(n); }\n"
+            "void operator delete(void *p) noexcept { free(p); }\n"
+            "void operator delete[](void *p) noexcept { free(p); }\n"
+            "void operator delete(void *p, unsigned long) noexcept { free(p); }\n"
+            "void operator delete[](void *p, unsigned long) noexcept { free(p); }\n"
+            "extern \"C\" int __cxa_guard_acquire(long long *g) { return !*(char *)g; }\n"
+            "extern \"C\" void __cxa_guard_release(long long *g) { *(char *)g = 1; }\n"
+            "extern \"C\" void __cxa_guard_abort(long long *) {}\n"
+            "extern \"C\" int __cxa_atexit(void (*)(void *), void *, void *) { return 0; }\n"
+            "extern \"C\" void __cxa_pure_virtual(void) { abort(); }\n"
+            "struct Shape {\n"
+            "    virtual ~Shape() {}\n"
+            "    virtual int sides() const = 0;\n"
+            "    int twice() const { return sides() * 2; }\n"
+            "};\n"
+            "struct Tri : Shape { int sides() const override { return 3; } };\n"
+            "struct Quad : Shape { int sides() const override { return 4; } };\n"
+            "template <class T> struct Box {\n"
+            "    T v;\n"
+            "    explicit Box(T x) : v(x) {}\n"
+            "    T twice() const { return v + v; }\n"
+            "};\n"
+            "static int ctors;\n"
+            "struct Counted { Counted() { ctors++; } ~Counted() { ctors--; } };\n"
+            "static Counted g_one;\n"
+            "static int fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }\n"
+            "int main(void)\n"
+            "{\n"
+            "    int fails = 0;\n"
+            "    if (ctors != 1) fails |= 1;\n"
+            "    Shape *s[2] = { new Tri(), new Quad() };\n"
+            "    if (s[0]->twice() != 6 || s[1]->twice() != 8) fails |= 2;\n"
+            "    delete s[0];\n"
+            "    delete s[1];\n"
+            "    Box<int> bi(21);\n"
+            "    Box<double> bd(1.5);\n"
+            "    if (bi.twice() != 42 || bd.twice() != 3.0) fails |= 4;\n"
+            "    for (int i = 0; i < 3; i++) {\n"
+            "        static Box<int> lazy(7);\n"
+            "        if (lazy.v != 7) fails |= 8;\n"
+            "    }\n"
+            "    Shape **arr = new Shape *[2];\n"
+            "    arr[0] = new Tri(); arr[1] = new Quad();\n"
+            "    int sum = arr[0]->sides() + arr[1]->sides();\n"
+            "    delete arr[0]; delete arr[1]; delete[] arr;\n"
+            "    if (sum != 7) fails |= 16;\n"
+            "    char *p = (char *)malloc(64);\n"
+            "    strcpy(p, \"EmbCC\");\n"
+            "    if (strlen(p) != 5) fails |= 32;\n"
+            "    free(p);\n"
+            "    if (fib(12) != 144) fails |= 64;\n"
+            "    return fails ? fails : 42;\n"
+            "}\n";
+        {
+            int fd = vfs_open("/data/tmp/cxx.cc", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { kprintf("test embcc cxx: cannot write /data/tmp/cxx.cc\n"); return 1; }
+            size_t w = 0;
+            vfs_fd_write(fd, src, sizeof src - 1, &w);
+            vfs_close(fd);
+        }
+        (void)vfs_unlink_path("/data/tmp/cxx.o");
+        (void)vfs_unlink_path("/data/tmp/cxx.elf");
+
+        /* 1. EmbCC compiles the C++ on the OS. -fno-rtti/-fno-exceptions keep
+         *    it free of libsupc++ (typeinfo, the personality routine). */
+        char *a[] = { "/data/apps/embcc/embcc.elf", "-c", "/data/tmp/cxx.cc",
+                      "-fno-rtti", "-fno-exceptions",
+                      "-I", "/data/apps/embcc/include",
+                      "-I", "/system/abi/include",
+                      "-o", "/data/tmp/cxx.o" };
+        char *env[] = { "HOME=/", NULL };
+        kprintf("[embcc c++] -c /data/tmp/cxx.cc -fno-rtti -fno-exceptions -o /data/tmp/cxx.o\n");
+        int pid = process_create_env("/data/apps/embcc/embcc.elf", a, 11, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embcc c++] exit=%d\n", code);
+
+        unsigned char hdr[20] = {0};
+        struct vfs_stat st;
+        int have = (vfs_stat("/data/tmp/cxx.o", &st) == 0);
+        if (have) {
+            int fd = vfs_open("/data/tmp/cxx.o", O_RDONLY, 0);
+            if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+        }
+        int is_elf = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
+        int is_64  = is_elf && hdr[4] == 2;
+        int is_rel = is_elf && hdr[16] == 1;
+        kprintf("[embcc c++] /data/tmp/cxx.o: %s, %llu bytes; ELF=%d 64-bit=%d ET_REL=%d\n",
+                have ? "written" : "MISSING",
+                have ? (unsigned long long)st.size : 0ULL, is_elf, is_64, is_rel);
+
+        /* 2. EmbLD links it against the sealed ABI -- EmbCC's own linker, so
+         *    the whole toolchain in this test is EmbCC's. */
+        int rcode = -1, is_exec = 0;
+        if (is_elf && is_64 && is_rel) {
+            char *b[] = { "/data/apps/embld/embld.elf", "-o",
+                          "/data/tmp/cxx.elf", "/system/abi/crt0.o",
+                          "/system/abi/syscalls.o", "/data/tmp/cxx.o",
+                          "/system/abi/libc.a" };
+            int lp = process_create_env("/data/apps/embld/embld.elf", b, 7, env, NULL, 0);
+            int lcode = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            struct vfs_stat lst;
+            unsigned char lhdr[20] = {0};
+            if (vfs_stat("/data/tmp/cxx.elf", &lst) == 0) {
+                int fd = vfs_open("/data/tmp/cxx.elf", O_RDONLY, 0);
+                if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, lhdr, sizeof lhdr, &r); vfs_close(fd); }
+                is_exec = lhdr[0] == 0x7f && lhdr[16] == 2;
+            }
+            kprintf("[embcc c++] embld link: exit=%d, ET_EXEC=%d\n", lcode, is_exec);
+
+            /* 3. Run it. Exit 42 is the whole claim. */
+            if (is_exec) {
+                char *c[] = { "/data/tmp/cxx.elf", NULL };
+                int p2 = process_create_env("/data/tmp/cxx.elf", c, 1, env, NULL, 0);
+                rcode = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+                kprintf("[embcc c++] /data/tmp/cxx.elf ran: exit=%d (want 42)\n", rcode);
+            }
+        }
+
+        int okc = (pid >= 0 && code == 0 && is_elf && is_64 && is_rel &&
+                   is_exec && rcode == 42);
+        kprintf("\n[cmd] test embcc cxx: %s\n", okc ? "OK" : "FAIL");
         return 1;
     }
 

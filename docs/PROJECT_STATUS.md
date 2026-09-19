@@ -861,6 +861,17 @@ The OS now owns and rebuilds its whole toolchain, on itself:
   fdlibm tree + app) on the metal and passes real math at 1e-12. **The loop is
   closed: compiler + the libc it built + linker + format + loader, one owned
   system.** (`SPAWN_ARGV_MAX` 32→64 to fit a 39-object link in one argv.)
+- **C++ on the metal** (`test embcc cxx`): the on-image `embcc.elf` compiles a
+  C++ program *here* — a global constructor, virtual dispatch through a base,
+  templates, `new`/`delete` and `new[]`/`delete[]`, a guarded function-local
+  static — `embld.elf` links it against the sealed ABI (`/system/abi`: crt0.o,
+  syscalls.o, libc.a), and it runs and exits 42. No host compiler and no TCC in
+  that loop. The program defines the handful of runtime entry points a plain
+  C++ program needs (`operator new`/`delete`, `__cxa_guard_*`,
+  `__cxa_pure_virtual`), so only the C ABI has to be on the image: what is
+  judged is the compiler, not a C++ library. `test cxx` is its companion at the
+  other end — `cxxdemo.elf`, with `<iostream>`, compiled by EmbCC on the host
+  against the libstdc++ EmbCC itself built from GCC's sources.
 
 ---
 
