@@ -170,6 +170,12 @@ kernel_ctx_switch:
  * exactly the kind of leak that makes every other mitigation pointless. */
     .globl aarch64_eret_to_el0
 aarch64_eret_to_el0:
+    /* Masked before ELR/SPSR are written and until the eret, for the reason
+     * irq/vectors.S's exception return gives: an interrupt in between
+     * overwrites both. A new thread reaches here straight from its
+     * trampoline's spin_unlock, which may have turned interrupts on. SPSR = 0
+     * below turns them back on in EL0. */
+    msr     daifset, #0xf
     msr     sp_el0, x1
     msr     elr_el1, x0
     msr     spsr_el1, xzr

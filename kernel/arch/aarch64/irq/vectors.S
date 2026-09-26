@@ -119,6 +119,23 @@ exc_common:
     /* Returning is normal: exception_probe() recovers from a fault by
      * advancing ELR, and A3's timer IRQ will return here every tick. The
      * handler may have CHANGED elr/spsr in the frame, so reload them. */
+
+    /* EVERYTHING MASKED FROM HERE TO THE ERET, because ELR_EL1 and SPSR_EL1
+     * are ONE register each and any exception taken in between overwrites
+     * them. The handler above may return with interrupts ON -- every system
+     * call runs with them on -- and an IRQ taken just after `msr elr_el1`
+     * below replaced ELR with the address of the next instruction; the eret
+     * then went THERE, in the mode the SPSR named. Returning to EL0, that is
+     * user mode at a kernel address: an instruction abort, and the program
+     * killed for nothing it did. Returning to EL1, it re-ran this sequence
+     * with the frame's registers already reloaded, wrote a user register into
+     * SPSR, and took an ILLEGAL EXECUTION STATE at `msr spsr_el1` -- the crash
+     * docs/TODO.md recorded on 2026-09-12 without a cause. Found by the
+     * Raspberry Pi's boot (docs/RPI4.md P3). The eret restores the returning
+     * context's own DAIF from SPSR, so masking here costs that context
+     * nothing. */
+    msr     daifset, #0xf
+
     ldp     x0, x1, [sp, #F_ELR]
 
     /* REFUSE TO EXECUTE AN ILLEGAL EXCEPTION RETURN.

@@ -3,6 +3,7 @@
 #include "mm/pmm.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
+#include "include/arch_irq.h"
 
 /* See bringup.h. This file has a scheduled deletion date. */
 
@@ -12,6 +13,7 @@
 
 struct kthread {
     struct kcontext ctx;
+    void          (*entry)(void);   /* run by bringup_entry(), below */
     uint64_t        stack_phys;
     uint64_t        slices;
     const char     *name;
@@ -50,14 +52,39 @@ void kernel_ctx_prepare(struct kcontext *ctx, void (*entry)(void),
      * same goal, because there the return address lives on the stack. */
     ctx->sp = kstack_top & ~0xFULL;
 
-    /* DAIF = 0: the thread starts with interrupts ENABLED. This is the
-     * subtle one. A thread is first entered from inside the timer IRQ
-     * handler, where PSTATE.I is set by the exception itself, and unlike
-     * every later resumption it never returns through the vector epilogue's
-     * eret to have PSTATE restored. Inherit the handler's DAIF and the new
-     * thread runs forever without ever being preempted -- the scheduler looks
-     * like it works exactly once. */
-    ctx->daif = 0;
+    /* DAIF: EVERYTHING MASKED. The thread's entry code turns interrupts on,
+     * and it must be the one to do it, because of what it does FIRST.
+     *
+     * A new thread is entered from inside schedule_locked(), which holds
+     * g_sched_lock across the switch; the lock is released by the thread's
+     * own first action (process.c: kthread_trampoline / process_trampoline).
+     * Until then this core holds the scheduler lock. This was DAIF = 0 --
+     * interrupts on from the first instruction -- and so a timer interrupt
+     * already pending at the switch was taken in the few instructions
+     * between the `msr daif` in CTX_LOAD and that release: its handler
+     * called schedule(), which spun forever on the lock this same core
+     * held, and the other three cores piled up behind it. A rare, total
+     * hang, found by the Raspberry Pi's boot (docs/RPI4.md P3): all four
+     * cores in spin_lock, g_sched_lock's holder_lr naming schedule(), and
+     * two backtraces ending at the trampoline's frame-chain reset.
+     *
+     * What DAIF = 0 was protecting against is still true -- a thread that
+     * inherited the IRQ handler's masked state would never be preempted --
+     * and it is answered where x86 answers it (x86 fabricates IF=0 too): by
+     * the entry code enabling interrupts explicitly once the lock is gone.
+     * The scheduler's trampolines do (kthread_trampoline's arch_irq_enable;
+     * process_trampoline's eret to EL0); the bring-up threads below do in
+     * bringup_entry(). */
+    ctx->daif = 0x3c0;
+}
+
+/* The entry of every bring-up thread. This scheduler holds no lock across a
+ * switch, so there is nothing to release -- only the interrupts that
+ * kernel_ctx_prepare() now leaves masked to turn on, or the thread is never
+ * preempted. */
+static void bringup_entry(void) {
+    arch_irq_enable();
+    threads[current].entry();
 }
 
 void bringup_sched_init(void) {
@@ -104,7 +131,8 @@ int bringup_thread_create(const char *name, void (*entry)(void)) {
          * PXN|UXN -- a stack that is executable is a stack you can be made to
          * return into. */
         uint64_t top = P2V(base) + (uint64_t)STACK_PAGES * PAGE_SIZE;
-        kernel_ctx_prepare(&threads[i].ctx, entry, top);
+        threads[i].entry = entry;
+        kernel_ctx_prepare(&threads[i].ctx, bringup_entry, top);
 
         threads[i].used = true;
         kprintf("sched: thread %d '%s' stack %p..%p\n", i, name,

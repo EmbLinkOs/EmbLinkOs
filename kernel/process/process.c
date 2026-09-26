@@ -3237,6 +3237,26 @@ static void schedule_locked(void) {
 
     next->state = PROCESS_RUNNING;  // Mark the next thread as RUNNING
     next->running_cpu = (int)this_cpu()->cpu_index;
+
+    /* A CORE LEAVING IDLE MUST GET ITS QUANTUM BACK. The idle loop arms this
+     * core's timer for the next thing due -- up to SCHED_IDLE_CAP_MS, a whole
+     * second -- and halts. What wakes it early (a reschedule IPI, a device
+     * interrupt) runs schedule() from inside that interrupt and switches
+     * straight to real work, and the idle loop's own exit path does not run
+     * until much later. Without this, the thread dispatched here keeps the
+     * idle loop's long arm: it runs up to a second unpreempted, and when every
+     * core got there the same way -- four idle cores kicked awake to run a
+     * burst of new threads -- nothing ran schedule() anywhere, and a periodic
+     * thread missed its deadlines by 800-1600 ms. Found by the deadline test
+     * on `virt,gic-version=2` (docs/RPI4.md P3); on a desktop it is a stutter.
+     * Whether or not the core was idle is exactly what g_idle_cpus says. */
+    {
+        uint32_t bit = 1u << (this_cpu()->cpu_index & 31);
+        if (__atomic_load_n(&g_idle_cpus, __ATOMIC_RELAXED) & bit) {
+            sched_idle_exit();
+            timer_arm_this_cpu_ms(TIMER_QUANTUM_MS);
+        }
+    }
     next->ticks_since_scheduled = 0;  // it's getting CPU time now; aging clock resets
     /* And the band it was aged into is given back: the boost bought it this
      * turn, which is all it was for. Without this line every busy thread ended
