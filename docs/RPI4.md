@@ -260,6 +260,16 @@ scrolls, and you can copy from it. The screen is for when it isn't.
   guest time after bring-up, and an idle core sleeps up to 1 s between ticks.
   It gets its time back when P3 gives the userland tests something to run.
 
+* **Reboot and halt ✅ (QEMU, checked by hand).** The Pi has no PSCI, so
+  `power_arm.c` falls back to the BCM2835 power-management watchdog, the same
+  sequence as Linux's `bcm2835_wdt`. It sets the RSTS "partition" the firmware
+  should boot next (0 = normal; 63 = halt, the nearest a Pi gets to off), arms
+  the watchdog for ten ticks, and requests a full reset. Every write carries
+  the `0x5a` password, without which the block silently ignores it. Checked
+  on `raspi4b` by calling `arch_power_reboot()` at the end of boot, where
+  `-no-reboot` QEMU exited on the reset. It isn't automated yet: nothing on
+  a diskless Pi asks for a reboot.
+
 * **P3 ❌ — the SD card is the disk.** EMMC2 (`brcm,bcm2711-emmc2`, 0xFE34_0000)
   is an SDHCI, and `kernel/drivers/storage/sdhci.c` exists but binds over PCI.
   Split its core from its PCI attach and add a DT attach. Card layout:

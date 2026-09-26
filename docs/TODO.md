@@ -862,10 +862,12 @@ P0 boots on QEMU `raspi4b`; the rest is phased in docs/RPI4.md §3. Open, in ord
       raspi4b (docs/RPI4.md). Real-hardware risks they carry to Monday:
       interrupt groups (QEMU imitates the firmware's GIC set-up) and the
       cache cleaning before a spin-table release (QEMU models no caches).
-- [ ] **The Pi cannot reboot or power off.** `power_arm.c` knows only PSCI,
-      which the Pi's firmware doesn't provide, so both return -ENODEV. A Pi
-      reboots through its power-management watchdog (PM_RSTC/PM_WDOG with the
-      0x5a000000 password); QEMU raspi4b emulates it.
+- [x] ~~The Pi cannot reboot or power off.~~ -- `power_arm.c` falls back to the
+      BCM2835 power-management watchdog when there is no PSCI: reboot is
+      partition 0, "off" is the firmware's halt partition 63. Verified once on
+      QEMU raspi4b with a temporary trigger (QEMU -no-reboot exited on the
+      reset). Not in an automated test: aarch64 has no serial command channel
+      to ask for a reboot, and userland (which has the syscall) needs P3.
 - [ ] **The "every core is taking interrupts" self-test samples too early on
       a diskless Pi** (~50 ms after bring-up, when idle cores may sleep 1 s).
       It passes on `virt` because the userland tests take seconds. Resolves
