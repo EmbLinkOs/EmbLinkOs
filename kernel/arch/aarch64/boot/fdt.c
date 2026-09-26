@@ -513,6 +513,22 @@ bool fdt_dma_translate(fdt_node_t node, bool cpu_to_bus, uint64_t in, uint64_t *
     return false;
 }
 
+fdt_node_t fdt_find_gic(void) {
+    /* v3 first, then every GICv2 name a device tree uses -- the same list, in
+     * the same order, as irq/gicv2.c probes, so the two cannot disagree about
+     * which controller this machine has. */
+    static const char *const names[] = {
+        "arm,gic-v3", "arm,gic-400", "arm,cortex-a15-gic",
+        "arm,cortex-a9-gic", "arm,cortex-a7-gic",
+    };
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+        fdt_node_t n = fdt_find_compatible(names[i]);
+        if (n != FDT_NONE)
+            return n;
+    }
+    return FDT_NONE;
+}
+
 bool fdt_interrupt(fdt_node_t node, uint32_t index,
                    uint32_t *type, uint32_t *num, uint32_t *flags) {
     uint32_t len = 0;
@@ -526,9 +542,7 @@ bool fdt_interrupt(fdt_node_t node, uint32_t index,
      * device-tree framework, which docs/ARM64.md §5 rules out. If no GIC is
      * found, 3 is the ARM binding's value and the only one that could apply. */
     uint32_t cells = 3;
-    fdt_node_t gic = fdt_find_compatible("arm,gic-v3");
-    if (gic == FDT_NONE)
-        gic = fdt_find_compatible("arm,cortex-a15-gic");   /* GICv2 */
+    fdt_node_t gic = fdt_find_gic();
     if (gic != FDT_NONE)
         cells = fdt_prop_u32(gic, "#interrupt-cells", 3);
 

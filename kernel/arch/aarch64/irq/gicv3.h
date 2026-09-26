@@ -4,7 +4,14 @@
 #include <stdint.h>
 #include "include/types.h"
 
-/* GICv3 -- the aarch64 interrupt controller. docs/ARM64.md phase A3.
+/* The aarch64 interrupt controller API -- docs/ARM64.md phase A3, and
+ * docs/RPI4.md P1. The name is historical: behind it is EITHER a GICv3
+ * (irq/gicv3.c, QEMU `virt`) or a GICv2 (irq/gicv2.c, the Raspberry Pi 4's
+ * GIC-400), chosen at boot from the device tree -- see irq/gic_hw.h. What
+ * follows describes the v3; a v2 has the same INTID space and the same
+ * distributor, with an MMIO CPU interface and no redistributors or LPIs.
+ *
+ * GICv3 -- the aarch64 interrupt controller.
  *
  * Replaces three x86 devices at once: the 8259 PIC (masking), the IOAPIC
  * (routing device interrupts to CPUs) and part of the LAPIC (per-CPU delivery
@@ -75,6 +82,11 @@ uint32_t gic_redist_ctlr(void);
 uint64_t gic_percpu_irq_count(uint32_t cpu);
 int      gic_lpi_pending(uint32_t intid);
 void gic_unregister(uint32_t intid);
+
+/* Software-generated interrupts (INTID 0-15): to every core but this one, or
+ * to one core by dense cpu index. False when the target cannot be named. */
+bool gic_send_sgi_all_but_self(uint32_t sgi);
+bool gic_send_sgi(uint32_t cpu_index, uint32_t sgi);
 
 /* Enable/disable one INTID at the controller without touching its handler. */
 void gic_enable(uint32_t intid);

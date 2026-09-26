@@ -5,21 +5,24 @@ way docs/ARM64.md is: every phase is ❌ until it boots and ✅ only once its
 "done when" is machine-checked by a `make` target. A phase that has only been
 seen on QEMU says so. The real board is the only witness for "real hardware".*
 
-**Status: P0 and P0b ✅ on QEMU `raspi4b`: it boots, and the kernel log is on
-the screen. Not yet run on a physical Pi. First real-hardware run planned for
-Monday 2026-09-28, on a television over HDMI.**
+**Status: P0, P0b, P1 and P2 ✅ on QEMU `raspi4b`: it boots, the kernel log
+is on the screen, interrupts work, and all four cores run. Not yet run on a
+physical Pi. First real-hardware run planned for Monday 2026-09-28, on a
+television over HDMI.**
 
 ```
-make ARCH=aarch64 BOARD=rpi4 test-rpi4-boot   # P0 + P0b, asserted (serial AND screen)
+make ARCH=aarch64 BOARD=rpi4 test-rpi4-boot   # P0-P2, asserted (serial, screen, per-core ticks)
 make ARCH=aarch64 BOARD=rpi4 run-rpi4         # the same, on this terminal
 make ARCH=aarch64 BOARD=rpi4 rpi4-sdboot      # an SD card's boot partition
 ```
 
 The Pi kernel boots on QEMU's `raspi4b` with the **real** Pi 4 device tree.
 It gets from the firmware's EL2 entry to EL1 in the higher half, takes its
-memory map from that device tree, gets a framebuffer from the firmware over
-the mailbox, draws its log on it, and passes every self-test that runs before
-interrupts. It stops at the interrupt controller, which is P1:
+memory map from that device tree, and gets a framebuffer from the firmware
+over the mailbox and draws its log on it. It brings up the GIC-400, preempts
+on the generic timer, and releases cores 1–3 from the firmware's spin-table.
+Then it runs the whole boot self-test to the end. What fails there is what
+needs a disk (P3) or PCIe (P5):
 
 ```
   board       : rpi4
@@ -28,10 +31,15 @@ interrupts. It stops at the interrupt controller, which is P1:
 boot: dtb memory 0x0000000000000000 + 0x000000003c000000
 mbox: framebuffer 640x480, pitch 2560, RGB, at 0x000000003c100000 (bus 0x000000003c100000)
 rawcon: kernel log on the firmware framebuffer, 640x480, 79x30 cells
-  [ ok ] unaligned load on Device memory -> alignment fault
-         FAR_EL1 : 0xffffc000fe201019       <- the Pi's UART, through the MMIO window
 --- self-test done: 0 failure(s) ---
-gic: this machine has a GICv2 (the Pi 4's GIC-400). Its driver is docs/RPI4.md phase P1.
+gic: GICD 0x00000000ff841000, GICC 0x00000000ff842000 [GICv2, from the device tree]
+gic: initialised (GICv2, memory-mapped CPU interface)
+  [ ok ] timer fired: 40 ticks in 392 ms
+  [ ok ] worker 1 was scheduled 18 times
+smp: cpu1: released from its spin-table at 0x00000000000000e0
+smp: 4 of 4 core(s) online
+  [ ok ] IPI: 3 of 3 other core(s) took the interrupt
+--- all self-tests done: 10 failure(s) ...     <- all of them need the disk or PCIe
 ```
 
 ---
@@ -195,22 +203,62 @@ scrolls, and you can copy from it. The screen is for when it isn't.
   On `virt` every device is the root's child, so all this is a no-op there;
   the full `test-arm64-boot` confirms it.
 
-* **P1 ❌ — GIC-400 and the timer.** `irq/gicv2.c` behind the API `gicv3.c`
-  already exports (`gic_init`, `gic_register`, `gic_intid`, EOI, IPIs through
-  `GICD_SGIR`), with `gic_init` choosing by `compatible`. The GIC's `reg`
-  (0x40041000 in `/soc`'s space) now reaches the CPU address 0xFF84_1000
-  through `fdt_reg()`'s `ranges` walk, done in P0b. `fdt_interrupt()` must also
-  learn `arm,gic-400`, which today it doesn't recognise as a GIC. No ITS, so
-  no MSI through the GIC; the Pi's PCIe has its own MSI controller (P5). The timer's PPIs are 13/14/11/10, and the
-  existing driver already reads them from the tree.
+* **P1 ✅ (QEMU) — GIC-400 and the timer.** The GIC driver is now two
+  back-ends behind one interface (`irq/gic_hw.h`): `irq/gic.c` holds what
+  every GIC does (the handler table, the handler → EOI → scheduler order that
+  `gic_dispatch()` depends on, the counters), and `irq/gicv3.c` and the new
+  `irq/gicv2.c` hold what differs. `gic_init()` picks one from the device
+  tree at **runtime**. That is deliberate: it lets QEMU `virt` with
+  `gic-version=2` put the GICv2 driver through the *whole* `virt` suite (four
+  cores over PSCI, IPIs, virtio on INTx, the desktop, input), which the Pi's
+  boot alone could never do. SGI sending moved into the back-ends: v3 names
+  a core by MPIDR affinity (`ICC_SGI1R_EL1`), v2 by a CPU-interface bit that
+  each core reads from the banked `GICD_ITARGETSR0` (`GICD_SGIR`). `ipi.c` is
+  now version-neutral.
   **Done when:** the scheduler preempts on `raspi4b` and `selftest_preemption`
-  passes.
+  passes. ✅ Also: `test-arm64-boot` passes on `virt` GICv3 (HVF), and on
+  `virt,gic-version=2` (TCG; HVF can't emulate a GICv2) everything passes
+  except PAN, which TCG's Cortex-A72 doesn't have.
 
-* **P2 ❌ — four cores, over spin-table.** For each CPU, write the secondary
-  entry's physical address to its `cpu-release-addr`, `dc civac` it, then `sev`.
-  Secondaries arrive at EL2 in the firmware's loop, so they go through the
-  same EL drop. `vm_restore_identity_map()` already exists for exactly this.
-  **Done when:** 4 cores report in and tick on `raspi4b`.
+  Two things P1 turned up:
+  - **Interrupt groups.** A real Pi runs the kernel non-secure after firmware
+    has put every interrupt in Group 1; QEMU's `virt` GICv2 has a single
+    security state and everything is Group 0. Writing "Group 0" and control
+    bit 0 does the right thing in both: the non-secure view ignores the group
+    write, and there bit 0 *is* the Group 1 enable. **Real-hardware risk:**
+    QEMU `raspi4b` imitates the firmware's GIC set-up rather than running it,
+    so Monday is the first real test of this.
+  - **PCI's `interrupt-map` assumed a GICv3.** `pci_ecam.c` looked up the
+    interrupt controller as `arm,gic-v3` only. On a GICv2 it found nothing,
+    fell back to 0 parent address cells where the tree says 2, and read every
+    entry misaligned: "8 of 9 devices routed, on 1 distinct line of 4".
+    `fdt_find_gic()` now knows every GIC name, and both it and
+    `fdt_interrupt()` use it. Only `virt,gic-version=2` could have shown this.
+  - **The munmap self-test was miscounting.** It compares the whole machine's
+    free pages, which also sees the kernel heap growing to hold the VMA
+    record, and the heap keeps what it grows. On `virt` the disk had grown it
+    long before; on the diskless Pi it looked like "munmap leaked 17 pages".
+    The test now runs one unmeasured cycle first. A real leak still fails.
+
+* **P2 ✅ (QEMU) — four cores, over spin-table.** `cpus_probe()` records each
+  core's `enable-method` and `cpu-release-addr`; with no PSCI node,
+  `spin_table_release()` publishes whose turn it is (`smp_spin_index`) and
+  that core's stack. It then writes the physical entry point into the core's
+  slot (0xe0/0xe8/0xf0, through the direct map) and `sev`s.
+  `secondary_entry_spin` reads the index, because the firmware's loop doesn't
+  pass it in `x0` the way PSCI does, and joins the common path. That path
+  now clears `CPTR_EL2` too, since every Pi secondary arrives at EL2.
+  **Caches:** a released core runs with its MMU and caches off, so it reads
+  RAM directly and sees nothing still dirty in core 0's cache. Everything it
+  reads is cleaned to the point of coherency (`dc civac`) first. The PSCI
+  path had relied on a `dsb`, which orders but doesn't clean. QEMU models no
+  caches, so only the real board can prove this.
+  **Done when:** 4 cores report in and tick on `raspi4b`. ✅ `test-rpi4-boot`
+  measures the ticks itself: it reads every core's interrupt counter twice,
+  5 s apart, through QMP. The kernel's own "every core is taking interrupts"
+  check can't be the witness yet: on a diskless Pi it samples about 50 ms of
+  guest time after bring-up, and an idle core sleeps up to 1 s between ticks.
+  It gets its time back when P3 gives the userland tests something to run.
 
 * **P3 ❌ — the SD card is the disk.** EMMC2 (`brcm,bcm2711-emmc2`, 0xFE34_0000)
   is an SDHCI, and `kernel/drivers/storage/sdhci.c` exists but binds over PCI.
@@ -260,10 +308,15 @@ is optional (below).
    card.
 2. **The kernel log, white on dark blue-black**, with a **blue bar** marking
    the newest line. It starts with the boot banner (`board : rpi4`,
-   `CurrentEL : EL1`, …) and ends at
-   `gic: … Its driver is docs/RPI4.md phase P1.` / `gic: FATAL no interrupt
-   controller`. **That is success for P0.** The OS stops there on purpose
-   until P1.
+   `CurrentEL : EL1`, …).
+3. **A blink to black, then the log again in white on plain black.** That's
+   the kernel's real console taking the screen over; it's normal.
+4. It ends at `--- all self-tests done: N failure(s) ...` and
+   `A7 reached: ...`, then sits there. **That is success.** Expect around ten
+   failures, all about the missing disk or PCIe (`no EMBKFS volume`,
+   `could not launch /system/bin/...`). Things worth reading on the way:
+   `gic: initialised (GICv2`, `timer fired`, and `smp: 4 of 4 core(s)
+   online`.
 
 Take a photo of the screen either way. It carries everything needed.
 
@@ -278,8 +331,12 @@ Take a photo of the screen either way. It carries everything needed.
   which; see below.
 - **The log is there but the bar is orange, not blue:** red and blue are
   swapped. Harmless, and a one-line fix (P0b's note).
-- **The log stops somewhere before `gic:`:** the photo of the last lines is
-  the bug report.
+- **The log stops somewhere before the end:** the photo of the last lines is
+  the bug report. Three places are new on real silicon and the likeliest to
+  stop: right after `gic: initialised` (interrupt groups: the timer never
+  fires), at `smp: cpuN: released from its spin-table` (a core that never
+  reports in, which points at caches), and anything after `fb_init` (the
+  console taking the screen over).
 - **Edges cut off:** the TV is overscanning. Set its picture size to "Just
   Scan", "Screen Fit" or "1:1".
 

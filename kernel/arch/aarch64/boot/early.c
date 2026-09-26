@@ -1237,8 +1237,29 @@ void arch_early_main(uint64_t dtb_phys) {
     kprintf("\n--- mmap ---\n");
     {
         struct process *p = current_thread ? current_thread->proc : 0;
-        uint64_t free_before = pmm_free_pages();
         const uint64_t LEN = 16 * 4096;
+
+        /* ONE CYCLE FIRST, UNMEASURED. The count below is the whole machine's,
+         * so it also sees the kernel heap growing to hold the VMA record -- and
+         * the heap keeps what it grows. On `virt` the disk and filesystem have
+         * grown it long before this runs; on a Raspberry Pi with no disk yet it
+         * is still at its first page, and the grow alone read as "munmap leaked
+         * 17 pages" (docs/RPI4.md P1). After a warm-up cycle the heap has what
+         * it needs, and the measured cycle below must return EVERY page -- so a
+         * real munmap leak still fails, every time. */
+        if (p) {
+            int64_t w = vma_mmap(p, 0, LEN, PROT_READ | PROT_WRITE,
+                                 MAP_ANONYMOUS | MAP_PRIVATE);
+            if (w > 0) {
+                uaccess_hw_begin();
+                for (uint64_t i = 0; i < LEN / 8; i += 512)
+                    ((volatile uint64_t *)(uintptr_t)w)[i] = i;
+                uaccess_hw_end();
+                vma_munmap(p, (uint64_t)w, LEN);
+            }
+        }
+
+        uint64_t free_before = pmm_free_pages();
 
         int64_t a = p ? vma_mmap(p, 0, LEN, PROT_READ | PROT_WRITE,
                                  MAP_ANONYMOUS | MAP_PRIVATE)

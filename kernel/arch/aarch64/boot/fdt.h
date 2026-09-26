@@ -101,6 +101,11 @@ bool fdt_reg(fdt_node_t node, uint32_t index, uint64_t *addr, uint64_t *size);
  * False when there are none or the address is outside them. */
 bool fdt_dma_translate(fdt_node_t node, bool cpu_to_bus, uint64_t in, uint64_t *out);
 
+/* The interrupt controller node, GICv3 or GICv2. Its #address-cells and
+ * #interrupt-cells are what `interrupts` and `interrupt-map` entries are
+ * measured in -- looking for one version only misparses the other. */
+fdt_node_t fdt_find_gic(void);
+
 /* One entry of an `interrupts` property, decoded against the interrupt
  * controller's `#interrupt-cells`. For the ARM GIC that is three cells:
  *

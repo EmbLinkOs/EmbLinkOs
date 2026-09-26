@@ -13,7 +13,8 @@
 #include "process/process.h"
 #include "power/power.h"   /* idle residency accounting */
 
-/* Secondary CPU bring-up over PSCI -- docs/ARM64.md phase A9.
+/* Secondary CPU bring-up over PSCI -- docs/ARM64.md phase A9 -- or, on a
+ * Raspberry Pi, over a spin-table (docs/RPI4.md P2; see spin_table_release()).
  *
  * PSCI (the Power State Coordination Interface) is the ARM world's answer to
  * x86's INIT-SIPI-SIPI dance, and it is a great deal less ceremony: ONE call,
@@ -41,6 +42,10 @@ static uint32_t          g_cpu_on_id = PSCI_CPU_ON_64;
 /* Every core's MPIDR affinity value, indexed BY CPU INDEX. The device tree
  * lists them; nothing else does. */
 static uint64_t g_cpu_mpidr[MAX_CPUS];
+
+/* Each core's spin-table release address (its `cpu-release-addr`), by cpu
+ * index, or 0 when its enable-method is not "spin-table". */
+static uint64_t g_cpu_release[MAX_CPUS];
 
 /* A core's MPIDR affinity, by dense cpu index -- what a TARGETED SGI needs to
  * build its affinity fields. Exposed rather than duplicated: the device-tree
@@ -118,7 +123,7 @@ static bool psci_probe(void) {
     if (n == FDT_NONE) n = fdt_find_compatible("arm,psci-0.2");
     if (n == FDT_NONE) n = fdt_find_compatible("arm,psci");
     if (n == FDT_NONE) {
-        kprintf("smp: no PSCI node in the device tree -- cannot start a second core\n");
+        kprintf("smp: no PSCI node in the device tree\n");
         return false;
     }
 
@@ -195,6 +200,15 @@ static void cpus_probe(void) {
                          ((uint32_t)reg[c * 4 + 2] << 8) | (uint32_t)reg[c * 4 + 3];
             v = (v << 32) | w;
         }
+        /* A spin-table core (a Raspberry Pi's) is parked by firmware polling
+         * a 64-bit slot; the tree says where. A 32-bit value is legal too. */
+        uint64_t rel = 0;
+        if (fdt_prop_has_string(n, "enable-method", "spin-table")) {
+            const uint8_t *r = (const uint8_t *)fdt_prop(n, "cpu-release-addr", &len);
+            for (uint32_t b = 0; r && (len == 4 || len == 8) && b < len; b++)
+                rel = (rel << 8) | r[b];
+        }
+        g_cpu_release[g_cpu_listed] = rel;
         g_cpu_mpidr[g_cpu_listed++] = v & 0xFF00FFFFFFULL;
     }
 
@@ -202,6 +216,9 @@ static void cpus_probe(void) {
         if (g_cpu_mpidr[i] == self) {
             g_cpu_mpidr[i] = g_cpu_mpidr[0];
             g_cpu_mpidr[0] = self;
+            uint64_t r = g_cpu_release[i];
+            g_cpu_release[i] = g_cpu_release[0];
+            g_cpu_release[0] = r;
             break;
         }
     }
@@ -290,12 +307,56 @@ void smp_secondary_main(uint64_t index) {
 }
 
 extern void secondary_entry(void);      /* boot.S */
+extern void secondary_entry_spin(void); /* boot.S: reads smp_spin_index first */
+
+/* Which core a spin-table release is FOR. PSCI hands a secondary its index in
+ * x0; a spin-table does not -- the firmware's loop leaves x0 holding the jump
+ * address, or nothing useful. Cores are released one at a time and each is
+ * waited for, so one published "whose turn" is enough: boot.S's
+ * secondary_entry_spin reads it, with the MMU off, before anything else.
+ * Not static: boot.S names it. */
+uint64_t smp_spin_index;
+
+/* Push a line out of this core's caches to RAM. A core that has just been
+ * released runs with its MMU -- and so its caches -- OFF: its reads go
+ * straight to memory and see nothing still dirty in core 0's cache. QEMU
+ * models no caches, so this is invisible there and decisive on a real Pi. */
+static void clean_to_poc(const volatile void *p) {
+    __asm__ volatile("dc civac, %0" :: "r"((uint64_t)(uintptr_t)p) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* Start core `i` through its spin-table -- docs/RPI4.md P2.
+ *
+ * The Pi's firmware (armstub8, and QEMU raspi4b's imitation of it) parks cores
+ * 1-3 at EL2 in a loop: wfe, read the core's own 64-bit slot at
+ * cpu-release-addr (0xd8, 0xe0, 0xe8, 0xf0 -- page 0, which the device tree
+ * reserves), and jump there once it is nonzero. So: publish whose turn it is
+ * and that core's stack, write the PHYSICAL entry point into its slot, push
+ * all three to RAM, and `sev` to end the wfe. The slot is written through the
+ * direct map, which covers page 0 as ordinary RAM. */
+static bool spin_table_release(uint32_t i, uint64_t entry_phys) {
+    uint64_t rel = g_cpu_release[i];
+    if (!rel || rel >= 0x100000000ULL)
+        return false;
+
+    smp_spin_index = i;
+    clean_to_poc(&smp_spin_index);
+    clean_to_poc(&smp_stack_top[i]);
+
+    volatile uint64_t *slot = (volatile uint64_t *)(uintptr_t)P2V(rel);
+    *slot = entry_phys;
+    clean_to_poc(slot);
+    __asm__ volatile("sev" ::: "memory");
+    return true;
+}
 
 void smp_bringup(void) {
-    kprintf("\n=== SMP bring-up (PSCI) ===\n");
+    kprintf("\n=== SMP bring-up ===\n");
 
-    if (!fdt_ok() || !psci_probe())
+    if (!fdt_ok())
         return;
+    bool psci = psci_available();
 
     cpus_probe();
     kprintf("smp: %d cpu(s) in the device tree\n", (int)g_cpu_listed);
@@ -309,9 +370,10 @@ void smp_bringup(void) {
         return;
     }
 
-    /* PSCI wants a PHYSICAL entry address and secondary_entry's linked address
-     * is virtual -- the kernel runs in the higher half. */
-    uint64_t entry = KV2P((uint64_t)(uintptr_t)&secondary_entry);
+    /* Both methods want a PHYSICAL entry address and the linked addresses are
+     * virtual -- the kernel runs in the higher half. */
+    uint64_t entry      = KV2P((uint64_t)(uintptr_t)&secondary_entry);
+    uint64_t entry_spin = KV2P((uint64_t)(uintptr_t)&secondary_entry_spin);
 
     /* Reopen the identity map for the length of the bring-up. Each secondary
      * runs boot.S's enable_mmu, which installs boot_l0_ttbr0 and turns the MMU
@@ -328,13 +390,22 @@ void smp_bringup(void) {
         smp_stack_top[i] = (uint64_t)(uintptr_t)&g_smp_stacks[i][SMP_STACK_SIZE];
 
         /* Read by a core whose caches are not on yet, so the write has to be
-         * in memory and not just in ours. */
-        __asm__ volatile("dsb ish" ::: "memory");
+         * in memory and not just in ours -- a dsb orders it, only a clean to
+         * the point of coherency puts it there. */
+        clean_to_poc(&smp_stack_top[i]);
 
         uint32_t before = g_online;
-        int64_t rc = psci_call(g_cpu_on_id, g_cpu_mpidr[i], entry, i);
-        if (rc != PSCI_SUCCESS && rc != PSCI_ALREADY_ON) {
-            kprintf("smp: cpu%d: PSCI CPU_ON refused (%d)\n", (int)i, (int)rc);
+        if (psci) {
+            int64_t rc = psci_call(g_cpu_on_id, g_cpu_mpidr[i], entry, i);
+            if (rc != PSCI_SUCCESS && rc != PSCI_ALREADY_ON) {
+                kprintf("smp: cpu%d: PSCI CPU_ON refused (%d)\n", (int)i, (int)rc);
+                continue;
+            }
+        } else if (spin_table_release(i, entry_spin)) {
+            kprintf("smp: cpu%d: released from its spin-table at %p\n",
+                    (int)i, (void *)(uintptr_t)g_cpu_release[i]);
+        } else {
+            kprintf("smp: cpu%d: no way to start it -- no PSCI, no spin-table\n", (int)i);
             continue;
         }
 

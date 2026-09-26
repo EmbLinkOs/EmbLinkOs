@@ -1,12 +1,15 @@
 #include "arch/aarch64/irq/gicv3.h"
+#include "arch/aarch64/irq/gic_hw.h"
+#include "arch/aarch64/smp/smp.h"
 #include "arch/aarch64/cpu/percpu.h"
 #include "arch/aarch64/boot/fdt.h"
 #include "mm/pmm.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
 
-/* See gicv3.h. Arm Generic Interrupt Controller Architecture Specification,
- * GIC architecture version 3 and 4. */
+/* The GICv3 back-end -- see gic_hw.h for the split, gicv3.h for the API.
+ * Arm Generic Interrupt Controller Architecture Specification, GIC
+ * architecture version 3 and 4. */
 
 /* --- distributor ---------------------------------------------------------- */
 #define GICD_CTLR          0x0000
@@ -52,8 +55,7 @@
 #define GICR_IPRIORITYR    (GICR_SGI_BASE + 0x0400)
 #define GICR_ICFGR1        (GICR_SGI_BASE + 0x0C04)
 
-#define SPURIOUS 1023
-#define MAX_INTID 1020
+#define MAX_INTID GIC_MAX_INTID
 
 /* LPIs live at 8192 and up, far outside the SPI/PPI range, so they cannot
  * share the handlers[] array -- indexing it by INTID would need 8192 wasted
@@ -77,12 +79,7 @@ static gic_handler_t lpi_handlers[LPI_MAX];
 static const char   *lpi_names[LPI_MAX];
 static uint64_t      lpi_counts[LPI_MAX];
 
-/* Middle priority for everything. A single priority means no interrupt can
- * preempt another, which is what we want while the kernel runs with a single
- * IRQ stack: nesting needs a stack per level and there is exactly one.
- * NOTE the GIC only implements the HIGH bits of the priority field, so 0x80 is
- * chosen because it is representable on every implementation. */
-#define IRQ_PRIORITY 0x80
+#define IRQ_PRIORITY GIC_PRIORITY    /* one priority for everything: gic.c */
 
 static volatile uint8_t *gicd;
 static volatile uint8_t *gicr;      /* this CPU's redistributor */
@@ -94,15 +91,6 @@ static volatile uint8_t *gicr;      /* this CPU's redistributor */
 static volatile uint8_t *gicr_array;
 static uint64_t          gicr_array_size;
 static bool gic_ready;
-
-static struct {
-    gic_handler_t fn;
-    const char   *name;
-    uint64_t      count;
-} handlers[MAX_INTID];
-
-static uint64_t spurious;
-static void (*post_eoi)(void);
 
 static inline uint32_t d_read(uint32_t off)            { return *(volatile uint32_t *)(gicd + off); }
 static inline void     d_write(uint32_t off, uint32_t v){ *(volatile uint32_t *)(gicd + off) = v; }
@@ -176,32 +164,19 @@ static volatile uint8_t *find_redistributor(uint64_t base, uint64_t size) {
     return 0;
 }
 
-int gic_init(void) {
+static int v3_init_this_cpu(void);
+static const struct gic_hw gicv3_hw;
+
+int gicv3_probe(const struct gic_hw **out) {
     fdt_node_t node = fdt_find_compatible("arm,gic-v3");
-    if (node == FDT_NONE) {
-        kprintf("gic: no arm,gic-v3 node in the device tree.\n");
-
-        /* Say WHAT is there instead, because the overwhelmingly likely cause
-         * is a QEMU command line without gic-version=3 -- under TCG, `-M virt`
-         * still defaults to GICv2 -- and "not found" alone sends you looking
-         * in the wrong place entirely. */
-        if (fdt_find_compatible("arm,cortex-a15-gic") != FDT_NONE ||
-            fdt_find_compatible("arm,gic-400") != FDT_NONE)
-            kprintf(fdt_prop_has_string(fdt_root(), "compatible", "brcm,bcm2711")
-                    ? "gic: this machine has a GICv2 (the Pi 4's GIC-400). Its driver is docs/RPI4.md phase P1.\n"
-                    : "gic: this machine has a GICv2. Add gic-version=3 to -M virt.\n");
-
-        /* Deliberately no GICv2 fallback: docs/ARM64.md §6.2 chose v3, and a
-         * half-configured controller is worse than none -- interrupts would
-         * appear to be enabled and simply never arrive. */
-        return -1;
-    }
+    if (node == FDT_NONE)
+        return -1;              /* not a GICv3 machine: gic.c tries v2 */
 
     uint64_t d_base = 0, d_size = 0, r_base = 0, r_size = 0;
     if (!fdt_reg(node, 0, &d_base, &d_size) ||
         !fdt_reg(node, 1, &r_base, &r_size)) {
         kprintf("gic: device tree node has no distributor/redistributor reg\n");
-        return -1;
+        return -2;
     }
 
     /* Through the MMIO window, not the physical address: the identity map was
@@ -219,7 +194,7 @@ int gic_init(void) {
     gicr = find_redistributor((uint64_t)(uintptr_t)rbase, r_size);
     if (!gicr) {
         kprintf("gic: no redistributor frame matches this CPU's MPIDR\n");
-        return -1;
+        return -2;
     }
 
     uint32_t typer = d_read(GICD_TYPER);
@@ -255,11 +230,13 @@ int gic_init(void) {
     d_write(GICD_CTLR, GICD_CTLR_ARE | GICD_CTLR_ENGRP1 | GICD_CTLR_ENGRP0);
     gicd_wait_rwp();
 
-    if (gic_init_this_cpu() != 0)
-        return -1;
+    gic_ready = true;           /* before the per-core half: it enables lines */
+    if (v3_init_this_cpu() != 0) {
+        gic_ready = false;
+        return -2;
+    }
 
-    gic_ready = true;
-    kprintf("gic: initialised (GICv3, system register CPU interface)\n");
+    *out = &gicv3_hw;
     return 0;
 }
 
@@ -272,11 +249,9 @@ int gic_init(void) {
  * it touches is either in that core's own redistributor frame or is a banked
  * system register. A secondary that skips it has a GIC that looks initialised
  * from core 0's point of view and delivers it nothing. */
-int gic_init_this_cpu(void) {
-    if (!gicr_array) {
-        kprintf("gic: gic_init_this_cpu() before gic_init()\n");
+static int v3_init_this_cpu(void) {
+    if (!gicr_array)
         return -1;
-    }
 
     /* Find THIS core's frame -- find_redistributor() reads the caller's own
      * MPIDR, so calling it again here is the whole of "per core". */
@@ -413,7 +388,7 @@ uint64_t gic_lpi_count(uint32_t intid) {
     return lpi_counts[intid - LPI_BASE_INTID];
 }
 
-void gic_enable(uint32_t intid) {
+static void v3_enable(uint32_t intid) {
     if (!gic_ready || intid >= MAX_INTID)
         return;
 
@@ -426,7 +401,7 @@ void gic_enable(uint32_t intid) {
     }
 }
 
-void gic_disable(uint32_t intid) {
+static void v3_disable(uint32_t intid) {
     if (!gic_ready || intid >= MAX_INTID)
         return;
 
@@ -439,114 +414,79 @@ void gic_disable(uint32_t intid) {
     }
 }
 
-int gic_register(uint32_t intid, gic_handler_t handler, const char *name) {
-    if (intid >= MAX_INTID || !handler)
-        return -1;
+/* --- acknowledge / end: the ICC_* system registers ----------------------- */
 
-    handlers[intid].fn    = handler;
-    handlers[intid].name  = name ? name : "?";
-    handlers[intid].count = 0;
-    gic_enable(intid);
+static uint64_t v3_ack(void)               { return SYSREG_READ(ICC_IAR1_EL1); }
+static uint32_t v3_iar_intid(uint64_t iar) { return (uint32_t)(iar & 0xFFFFFF); }
+static void     v3_eoi(uint64_t iar)       { SYSREG_WRITE(ICC_EOIR1_EL1, iar); }
 
-    kprintf("gic: INTID %d -> %s\n", (int)intid, handlers[intid].name);
-    return 0;
-}
-
-void gic_unregister(uint32_t intid) {
-    if (intid >= MAX_INTID)
-        return;
-    gic_disable(intid);
-    handlers[intid].fn = 0;
-}
-
-void gic_set_post_eoi(void (*fn)(void)) {
-    post_eoi = fn;
-}
-
-/* Per-core interrupt tally, for diagnosing "does this core take interrupts at
- * all" -- a question that is otherwise invisible, because every count the GIC
- * driver keeps is shared. */
-static volatile uint64_t percpu_irqs[MAX_CPUS];
-uint64_t gic_percpu_irq_count(uint32_t cpu) {
-    return cpu < MAX_CPUS ? percpu_irqs[cpu] : 0;
-}
-
-void gic_dispatch(void) {
-    uint64_t iar = SYSREG_READ(ICC_IAR1_EL1);
-    percpu_irqs[this_cpu()->cpu_index & (MAX_CPUS - 1)]++;
-    uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
-
-    /* An LPI -- an MSI that the ITS translated and delivered. Handled before
-     * the spurious check, because 8192+ is far above MAX_INTID and would
-     * otherwise be counted as spurious and never acknowledged. */
-    if (intid >= LPI_BASE_INTID) {
-        uint32_t l = intid - LPI_BASE_INTID;
-        if (l < LPI_MAX) {
-            lpi_counts[l]++;
-            if (lpi_handlers[l])
-                lpi_handlers[l](intid);
-        }
-        /* EOI regardless: an LPI nobody claimed still has to be retired, or
-         * the CPU interface stays busy at that priority and every later
-         * interrupt is blocked behind it. */
-        SYSREG_WRITE(ICC_EOIR1_EL1, iar);
-        if (post_eoi)
-            post_eoi();
-        return;
+void gicv3_lpi_dispatch(uint32_t intid) {
+    uint32_t l = intid - LPI_BASE_INTID;
+    if (l < LPI_MAX) {
+        lpi_counts[l]++;
+        if (lpi_handlers[l])
+            lpi_handlers[l](intid);
     }
-
-    if (intid >= MAX_INTID) {          /* 1020-1023: spurious or special */
-        spurious++;
-        return;                        /* no EOI for a spurious ID       */
-    }
-
-    /* THE ORDER OF THE NEXT THREE STEPS IS THE WHOLE DESIGN, and getting it
-     * wrong produces two different bugs that look nothing like each other.
-     *
-     * 1. HANDLER FIRST, so the device stops asserting. A PPI like the generic
-     *    timer is LEVEL-triggered: the timer holds the line high until
-     *    CNTV_TVAL is reloaded. End the interrupt while the line is still
-     *    high and the GIC immediately latches another one -- the timer then
-     *    fires faster than it was programmed to (measured: 6.4 ms for a 10 ms
-     *    tick under HVF), and the extra interrupt arrives at a moment nothing
-     *    expects.
-     *
-     * 2. THEN EOI, retiring the interrupt completely.
-     *
-     * 3. THEN the post-EOI hook -- the scheduler. It must come after the EOI
-     *    because it CONTEXT-SWITCHES and does not return: with the EOI still
-     *    pending, the interrupt would stay active until this thread was
-     *    scheduled again, the GIC would refuse to deliver another at the same
-     *    priority meanwhile, and the other thread would never get a tick --
-     *    one preemption, then silence.
-     *
-     * Steps 1 and 3 pull in opposite directions, which is exactly why the
-     * scheduler is a separate hook here rather than something the timer
-     * handler calls. Switching inside the handler satisfies 3 only by
-     * breaking 1. */
-    handlers[intid].count++;
-    if (handlers[intid].fn)
-        handlers[intid].fn(intid);
-    else
-        kprintf("gic: unhandled INTID %d\n", (int)intid);
-
-    SYSREG_WRITE(ICC_EOIR1_EL1, iar);
-
-    if (post_eoi)
-        post_eoi();
 }
 
-uint64_t gic_count(uint32_t intid) {
-    return intid < MAX_INTID ? handlers[intid].count : 0;
+/* --- SGIs: ICC_SGI1R_EL1 ----------------------------------------------------
+ * Sending one is a system-register write with no memory-mapped controller
+ * involved at all, which is the same trade the rest of GICv3 makes. */
+
+/* IRM = 1 means "every core except this one" -- the same shorthand x86's ICR
+ * has, and for the same reason: it cannot miss a core that came up after a
+ * list was built. Affinity fields are ignored with IRM set. */
+#define SGI_IRM_ALL_BUT_SELF (1ULL << 40)
+#define ICC_SGI1R_EL1        "S3_0_C12_C11_5"
+
+static void sgi1r_write(uint64_t val) {
+    __asm__ volatile("dsb ishst" ::: "memory");
+    SYSREG_WRITE(ICC_SGI1R_EL1, val);
+    __asm__ volatile("isb" ::: "memory");
 }
 
-uint64_t gic_spurious_count(void) { return spurious; }
-
-void gic_dump(void) {
-    kprintf("gic: registered lines:\n");
-    for (uint32_t i = 0; i < MAX_INTID; i++)
-        if (handlers[i].fn)
-            kprintf("gic:   INTID %-4d %-16s %d deliveries\n",
-                    (int)i, handlers[i].name, (int)handlers[i].count);
-    kprintf("gic:   spurious: %d\n", (int)spurious);
+static bool v3_sgi_all_but_self(uint32_t sgi) {
+    sgi1r_write(SGI_IRM_ALL_BUT_SELF | ((uint64_t)sgi << 24));
+    return true;
 }
+
+/* ONE core. IRM=0 means "use the affinity fields", and the target is a 16-bit
+ * MASK of cores within one Aff1 cluster -- so this builds the mask from that
+ * core's own MPIDR rather than from its index.
+ *
+ * Refusing a target outside this cluster rather than silently sending to the
+ * wrong core: on `virt` every core shares Aff1..Aff3, so the case does not
+ * arise here, and a machine where it does would otherwise wake a stranger. */
+static bool v3_sgi_to_cpu(uint32_t cpu, uint32_t sgi) {
+    uint64_t self = 0;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(self));
+    uint64_t tgt = smp_cpu_mpidr(cpu);
+
+    uint64_t aff1 = (tgt >> 8)  & 0xFF;
+    uint64_t aff2 = (tgt >> 16) & 0xFF;
+    uint64_t aff3 = (tgt >> 32) & 0xFF;
+    if (aff1 != ((self >> 8) & 0xFF) || aff2 != ((self >> 16) & 0xFF) ||
+        aff3 != ((self >> 32) & 0xFF))
+        return false;                     /* another cluster: not ours to target */
+
+    uint64_t aff0 = tgt & 0xFF;
+    if (aff0 > 15)
+        return false;                     /* outside this target list's 16 bits */
+
+    sgi1r_write(((uint64_t)sgi << 24) |
+                (aff3 << 48) | (aff2 << 32) | (aff1 << 16) |
+                (1ULL << aff0));          /* IRM = 0: use the affinity fields */
+    return true;
+}
+
+static const struct gic_hw gicv3_hw = {
+    .name             = "GICv3, system register CPU interface",
+    .init_this_cpu    = v3_init_this_cpu,
+    .enable           = v3_enable,
+    .disable          = v3_disable,
+    .ack              = v3_ack,
+    .iar_intid        = v3_iar_intid,
+    .eoi              = v3_eoi,
+    .sgi_all_but_self = v3_sgi_all_but_self,
+    .sgi_to_cpu       = v3_sgi_to_cpu,
+};

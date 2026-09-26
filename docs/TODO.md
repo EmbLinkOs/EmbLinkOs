@@ -858,9 +858,18 @@ P0 boots on QEMU `raspi4b`; the rest is phased in docs/RPI4.md §3. Open, in ord
       triage are docs/RPI4.md §4. Check that the newest-line bar is BLUE.
 - [x] ~~`fdt_reg()` ignores parent `ranges`~~ -- it translates through every
       ancestor's `ranges` now, and reads the parent's cell counts (P0b).
-- [ ] **P1: `irq/gicv2.c`** for the GIC-400 behind the existing `gic_*` API, and
-      `fdt_interrupt()` recognising `arm,gic-400` as a GIC.
-- [ ] **P2: spin-table SMP** (`cpu-release-addr`), beside the PSCI path.
+- [x] ~~P1: `irq/gicv2.c`~~ and ~~P2: spin-table SMP~~ -- both pass on QEMU
+      raspi4b (docs/RPI4.md). Real-hardware risks they carry to Monday:
+      interrupt groups (QEMU imitates the firmware's GIC set-up) and the
+      cache cleaning before a spin-table release (QEMU models no caches).
+- [ ] **The Pi cannot reboot or power off.** `power_arm.c` knows only PSCI,
+      which the Pi's firmware doesn't provide, so both return -ENODEV. A Pi
+      reboots through its power-management watchdog (PM_RSTC/PM_WDOG with the
+      0x5a000000 password); QEMU raspi4b emulates it.
+- [ ] **The "every core is taking interrupts" self-test samples too early on
+      a diskless Pi** (~50 ms after bring-up, when idle cores may sleep 1 s).
+      It passes on `virt` because the userland tests take seconds. Resolves
+      itself at P3; test-rpi4-boot measures per-core ticks directly meanwhile.
 - [ ] **P3: EMMC2.** `drivers/storage/sdhci.c` binds over PCI only; split out
       a DT attach. Plus an `rpi4-sdcard` target: FAT32 boot partition and
       EMBKFS root.

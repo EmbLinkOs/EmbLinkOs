@@ -56,7 +56,9 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/boot/fdt.c \
                kernel/arch/aarch64/boot/boot_protocol_dtb.c \
                kernel/arch/aarch64/irq/exception.c \
+               kernel/arch/aarch64/irq/gic.c \
                kernel/arch/aarch64/irq/gicv3.c \
+               kernel/arch/aarch64/irq/gicv2.c \
                kernel/arch/aarch64/irq/its.c \
                kernel/arch/aarch64/irq/ipi.c \
                kernel/arch/aarch64/sched/bringup.c \
@@ -1093,7 +1095,7 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img bu
 	  chk 'translation fault, on a READ'   A2 'low addresses still resolve -- identity map not dropped'; \
 	  chk 'permission fault, on a WRITE'   A2 '.rodata is still writable -- section permissions are not real'; \
 	  chk 'wrote and read back via the direct map' A2 'the physical allocator or the direct map is broken'; \
-	  chk 'gic: initialised (GICv3'        A3 'the interrupt controller did not come up'; \
+	  chk 'gic: initialised (GICv'         A3 'the interrupt controller did not come up'; \
 	  chk 'generic timer'                  A3 'the timer never registered an interrupt line'; \
 	  chk '100 Hz tick'                    A3 'the generic timer was not programmed'; \
 	  chk 'worker 1 was scheduled'         A3 'no preemption report'; \
@@ -1163,11 +1165,11 @@ test-arm64-boot: $(ARM_IMG) $(ARM_ROOTFS) build/crash-seed.img build/swap.img bu
 	  chk 'virtio-snd: stream 0 ready'     A7 'virtio-snd did not accept its PCM parameters'; \
 	  chk 'frame(s) accepted at 44100 Hz'  A7 'audio buffers were not submitted or never retired'; \
 	  chk 'PSCI via'                       A9 'no PSCI conduit found in the device tree'; \
-	  if [ "$$acc" = tcg ]; then \
+	  if [ "$$acc" = tcg ] && echo '$(ARM_MACHINE)' | grep -q 'gic-version=3'; then \
 	    chk 'software-triggered MSI'       A7 'the ITS did not deliver a translated interrupt'; \
 	    chk 'MSI -> LPI .* delivered'      A7 'the MSI was mapped but never arrived'; \
 	  else \
-	    chk 'MSI unavailable, INTx still works' A7 'HVF has no ITS; the driver should have said so and fallen back'; \
+	    chk 'MSI unavailable, INTx still works' A7 'no ITS here (HVF, or a GICv2); the driver should have said so and fallen back'; \
 	  fi; \
 	  chk "$(ARM_SMP) of $(ARM_SMP) core(s) online" A9 'not every secondary core came up'; \
 	  chk 'other core(s) took the interrupt' A9 'an IPI reached nobody -- cross-core interrupts do not work'; \
@@ -1303,24 +1305,44 @@ rpi4-firmware: $(RPI4_STAMP)
 # test below checks that a memory range arrived rather than its size.
 RPI4_QEMU = qemu-system-aarch64 -M raspi4b -dtb $(RPI4_DTB)
 
-# What the current phase claims, one grep each. P0: the board header and the
-# first page tables got it to EL1 in the higher half with a memory map from
-# the Pi's own device tree, the MMIO window really is Device memory over the
-# Pi's peripherals (an unaligned read there FAULTS), and nothing that runs
-# before interrupts failed. P0b: the firmware gave the kernel a framebuffer
-# over the mailbox -- found through the device tree's `ranges`, handed back
-# through its `dma-ranges` -- and the kernel log is on it. The script also
-# screenshots the display and checks the pixels (tools/rpi4_boot_test.py).
-RPI4_P0_MARKS = 'board       : rpi4' \
-                'CurrentEL   : EL1' \
-                'higher half: YES' \
-                'boot: dtb memory 0x0000000000000000 + ' \
-                'fdt: firmware reservation 0x0000000000000000 + 1000' \
-                'mbox: framebuffer ' \
-                'rawcon: kernel log on the firmware framebuffer' \
-                '[ ok ] unaligned load on Device memory' \
-                '[ ok ] write to .rodata -> permission fault' \
-                'self-test done: 0 failure(s)'
+# What the phases so far claim, one grep each.
+#  P0:  the board header and the first page tables got it to EL1 in the higher
+#       half with a memory map from the Pi's own device tree, the MMIO window
+#       really is Device memory over the Pi's peripherals (an unaligned read
+#       there FAULTS), and nothing that runs before interrupts failed.
+#  P0b: the firmware gave the kernel a framebuffer over the mailbox and the
+#       kernel log is on it -- the script also screenshots the display and
+#       checks the pixels (tools/rpi4_boot_test.py).
+#  P1:  the GIC-400 came up through the GICv2 back-end, the generic timer
+#       ticks through it at the rate CNTVCT says it should, and the scheduler
+#       PREEMPTS -- every thread got slices it did not yield. The munmap line
+#       is here because P1 is what first ran it on the Pi, and it found the
+#       self-test miscounting a heap grow as a leak.
+#  P2:  cores 1-3 released from their spin-table slots, all four online,
+#       IPIs reach every other core through the GIC-400, and every core's own
+#       timer ticks (measured by the script, not claimed by a log line).
+# The disk- and PCIe-dependent self-tests still fail on raspi4b, and are not
+# claimed: those are P3 and P5.
+RPI4_MARKS = 'board       : rpi4' \
+             'CurrentEL   : EL1' \
+             'higher half: YES' \
+             'boot: dtb memory 0x0000000000000000 + ' \
+             'fdt: firmware reservation 0x0000000000000000 + 1000' \
+             'mbox: framebuffer ' \
+             'rawcon: kernel log on the firmware framebuffer' \
+             '[ ok ] unaligned load on Device memory' \
+             '[ ok ] write to .rodata -> permission fault' \
+             'self-test done: 0 failure(s)' \
+             'gic: initialised (GICv2' \
+             '[ ok ] timer fired' \
+             '[ ok ] CNTVCT and the tick count agree' \
+             '[ ok ] worker 1 was scheduled' \
+             '[ ok ] worker 2 was scheduled' \
+             '[ ok ] boot thread was scheduled back' \
+             '[ ok ] free pages' \
+             'released from its spin-table' \
+             'smp: 4 of 4 core(s) online' \
+             '[ ok ] IPI: 3 of 3 other core(s) took the interrupt'
 
 ifeq ($(BOARD),rpi4)
 .PHONY: rpi4-sdboot
@@ -1344,7 +1366,7 @@ run-rpi4: $(ARM_IMG) $(RPI4_STAMP)
 .PHONY: test-rpi4-boot
 test-rpi4-boot: $(ARM_IMG) $(RPI4_STAMP) tools/rpi4_boot_test.py
 	python3 tools/rpi4_boot_test.py $(ARM_IMG) $(RPI4_DTB) \
-	  $(ARM_KBUILD)/test-rpi4-boot.log $(RPI4_P0_MARKS)
+	  $(ARM_KBUILD)/test-rpi4-boot.log $(RPI4_MARKS)
 else
 .PHONY: rpi4-sdboot run-rpi4 test-rpi4-boot
 rpi4-sdboot run-rpi4 test-rpi4-boot:

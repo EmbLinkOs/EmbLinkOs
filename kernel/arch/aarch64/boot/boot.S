@@ -319,14 +319,23 @@ mmu_on:
  *     the only thing distinguishing one secondary from another this early,
  *     because MPIDR needs decoding and the index is what the C side wants.
  * ==========================================================================*/
+/* The spin-table way in (a Raspberry Pi's -- docs/RPI4.md P2). The firmware's
+ * loop does not pass the CPU index in x0 the way PSCI does, so fetch it from
+ * where core 0 published it, then join the common path. Physical, like the
+ * rest of this window: PHYS_OF, and core 0 cleaned the value out to RAM. */
+    .globl secondary_entry_spin
+secondary_entry_spin:
+    PHYS_OF x1, smp_spin_index
+    ldr     x0, [x1]
+    /* fall through */
+
     .globl secondary_entry
 secondary_entry:
     mov     x20, x0                     /* the CPU index, across all of this */
 
-    /* Same EL2 drop as the primary, and dead code for the same reason: QEMU's
-     * PSCI starts a secondary at the EL of the caller, and we call from EL1.
-     * It is here so `-M virt,virtualization=on` does not silently start every
-     * secondary in a state where system-register writes go to the EL2 alias. */
+    /* Same EL2 drop as the primary. Dead code under QEMU's PSCI, which starts
+     * a secondary at the EL of the caller (EL1) -- and the ONLY path on a
+     * Raspberry Pi, whose firmware parks every secondary at EL2. */
     mrs     x1, CurrentEL
     lsr     x1, x1, #2
     cmp     x1, #2
@@ -336,6 +345,8 @@ secondary_entry:
     msr     hcr_el2, x1
     ldr     x1, =0x30d00800
     msr     sctlr_el1, x1
+    mov     x1, #0x33ff                 /* CPTR_EL2: no FP trap -- see the primary */
+    msr     cptr_el2, x1
     mrs     x1, cnthctl_el2
     orr     x1, x1, #3
     msr     cnthctl_el2, x1

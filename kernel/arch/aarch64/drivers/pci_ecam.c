@@ -255,7 +255,11 @@ uint32_t arch_pci_irq_line(const struct pci_device *dev) {
 
     /* Every one of these comes from the tree. See the note above on why
      * assuming any of them is how a routing table walks off its own entries. */
-    fdt_node_t gic = fdt_find_compatible("arm,gic-v3");
+    /* EITHER GIC. Looking for "arm,gic-v3" alone found nothing on a GICv2
+     * machine, fell back to 0 parent address cells where the tree says 2, and
+     * read every entry misaligned: "8 of 9 devices routed, on 1 distinct
+     * line of 4" under `virt,gic-version=2` (docs/RPI4.md P1). */
+    fdt_node_t gic = fdt_find_gic();
     uint32_t child_ac  = fdt_prop_u32(n, "#address-cells", 3);
     uint32_t child_ic  = fdt_prop_u32(n, "#interrupt-cells", 1);
     uint32_t parent_ac = (gic != FDT_NONE) ? fdt_prop_u32(gic, "#address-cells", 0) : 0;
