@@ -15,4 +15,11 @@
  * .bss, so it needs no allocator and no runtime mapping. */
 void bcm_fb_probe(struct boot_protocol *proto);
 
+/* A clock's rate in Hz, from the firmware (which owns every clock on a Pi),
+ * or 0 if there is no mailbox or it would not say. Clock IDs are the
+ * firmware's: 12 is EMMC2, the Pi 4's SD slot; 1 the older EMMC controller. */
+#define BCM_CLOCK_EMMC  1
+#define BCM_CLOCK_EMMC2 12
+uint32_t bcm_mbox_clock_rate(uint32_t clock_id);
+
 #endif

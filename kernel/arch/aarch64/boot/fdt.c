@@ -315,19 +315,24 @@ bool fdt_prop_has_string(fdt_node_t node, const char *name, const char *value) {
     return false;
 }
 
-fdt_node_t fdt_find_compatible(const char *compat) {
+fdt_node_t fdt_find_compatible_after(const char *compat, fdt_node_t after) {
     fdt_node_t root = fdt_root();
     if (root == FDT_NONE)
         return FDT_NONE;
 
+    /* Tree order is offset order, so "after" is a plain comparison. */
     for (fdt_node_t n = fdt_first_child(root); n != FDT_NONE; n = fdt_next_sibling(n)) {
-        if (fdt_prop_has_string(n, "compatible", compat))
+        if (n > after && fdt_prop_has_string(n, "compatible", compat))
             return n;
         for (fdt_node_t c = fdt_first_child(n); c != FDT_NONE; c = fdt_next_sibling(c))
-            if (fdt_prop_has_string(c, "compatible", compat))
+            if (c > after && fdt_prop_has_string(c, "compatible", compat))
                 return c;
     }
     return FDT_NONE;
+}
+
+fdt_node_t fdt_find_compatible(const char *compat) {
+    return fdt_find_compatible_after(compat, FDT_NONE);
 }
 
 fdt_node_t fdt_find_device_type(const char *type, fdt_node_t after) {

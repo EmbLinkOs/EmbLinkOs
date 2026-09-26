@@ -65,6 +65,11 @@ const char *fdt_node_name(fdt_node_t node);
  * finds its device: "arm,pl011", "arm,gic-v3", "pci-host-ecam-generic". */
 fdt_node_t fdt_find_compatible(const char *compat);
 
+/* The next such node after `after` in tree order (FDT_NONE: from the start) --
+ * for a compatible that names several devices, e.g. a Raspberry Pi's two
+ * nodes for one SD controller address, one of them its Wi-Fi link. */
+fdt_node_t fdt_find_compatible_after(const char *compat, fdt_node_t after);
+
 /* Find the first node whose `device_type` property equals `type` -- "memory"
  * and "cpu" are the two that matter. */
 fdt_node_t fdt_find_device_type(const char *type, fdt_node_t after);

@@ -67,6 +67,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/drivers/pci_ecam.c \
                kernel/arch/aarch64/drivers/pl031.c \
                kernel/arch/aarch64/drivers/bcm_mbox.c \
+               kernel/arch/aarch64/drivers/sdhci_dt.c \
                kernel/arch/aarch64/drivers/absent.c \
                kernel/arch/aarch64/cpu/spinlock.c \
                kernel/arch/aarch64/cpu/arch_thread.c \
@@ -111,6 +112,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/bus/pci.c \
                   kernel/drivers/storage/virtio_blk.c \
                   kernel/drivers/storage/nvme.c \
+                  kernel/drivers/storage/sdhci.c \
                   kernel/drivers/storage/virtio_scsi.c \
                   kernel/drivers/storage/nvmetest.c \
                   kernel/block/block.c \
@@ -1288,6 +1290,7 @@ RPI4_FW     := $(BUILD)/rpi4-firmware
 RPI4_STAMP  := $(RPI4_FW)/.fetched
 RPI4_DTB    := $(RPI4_FW)/bcm2711-rpi-4-b.dtb
 RPI4_SDBOOT := $(ARM_BUILD)/rpi4/sdboot
+RPI4_SDCARD := $(ARM_BUILD)/rpi4/sdcard.img
 
 $(RPI4_STAMP): tools/rpi4_firmware.sh
 	sh tools/rpi4_firmware.sh $(RPI4_FW)
@@ -1303,7 +1306,24 @@ rpi4-firmware: $(RPI4_STAMP)
 # is the only witness for P5 onward. QEMU does not fill in /memory the way the
 # firmware does from the RAM it finds -- it sizes it itself -- which is why the
 # test below checks that a memory range arrived rather than its size.
-RPI4_QEMU = qemu-system-aarch64 -M raspi4b -dtb $(RPI4_DTB)
+RPI4_QEMU = qemu-system-aarch64 -M raspi4b -dtb $(RPI4_QEMU_DTB)
+
+# THE ONE WAY QEMU'S raspi4b IS NOT A PI 4 THAT P3 CANNOT IGNORE: it wires its
+# SD card to the older controller at 0x7e300000 -- where the real board has
+# its Wi-Fi -- and leaves EMMC2, the real SD slot, empty (its sd-bus is not
+# reachable from the command line either). So QEMU boots a COPY of the real
+# device tree with that controller's SD-card node switched from "disabled" to
+# "okay": the tree then describes the emulated machine as it is, and the
+# kernel is taught nothing about QEMU. The SD card is still found, partitioned
+# and mounted through the same driver, the same 32-bit-only register path and
+# the same code after it; what only the real board can test is EMMC2's own
+# two quirks (no card-detect, a firmware-owned clock). docs/RPI4.md P3.
+RPI4_QEMU_DTB := $(ARM_BUILD)/rpi4/qemu-bcm2711-rpi-4-b.dtb
+$(RPI4_QEMU_DTB): $(RPI4_STAMP)
+	@mkdir -p $(dir $@)
+	cp $(RPI4_DTB) $@.tmp
+	fdtput -t s $@.tmp /soc/mmc@7e300000 status okay
+	mv $@.tmp $@
 
 # What the phases so far claim, one grep each.
 #  P0:  the board header and the first page tables got it to EL1 in the higher
@@ -1321,8 +1341,13 @@ RPI4_QEMU = qemu-system-aarch64 -M raspi4b -dtb $(RPI4_DTB)
 #  P2:  cores 1-3 released from their spin-table slots, all four online,
 #       IPIs reach every other core through the GIC-400, and every core's own
 #       timer ticks (measured by the script, not claimed by a log line).
-# The disk- and PCIe-dependent self-tests still fail on raspi4b, and are not
-# claimed: those are P3 and P5.
+#  P3:  the SD card (sdcard.img) is found, switched to its fast bus, its MBR
+#       read, sda2 mounted as `/` -- and everything that needed a disk now
+#       runs from it: programs, the accounts, init, the desktop session.
+#       Through the older controller, because QEMU wires the card there
+#       (RPI4_QEMU_DTB above); EMMC2 itself is for the real board.
+# What still fails on raspi4b is PCIe (P5: nothing is routed) and swap (the
+# card carries no swap area); neither is claimed.
 RPI4_MARKS = 'board       : rpi4' \
              'CurrentEL   : EL1' \
              'higher half: YES' \
@@ -1342,7 +1367,17 @@ RPI4_MARKS = 'board       : rpi4' \
              '[ ok ] free pages' \
              'released from its spin-table' \
              'smp: 4 of 4 core(s) online' \
-             '[ ok ] IPI: 3 of 3 other core(s) took the interrupt'
+             '[ ok ] IPI: 3 of 3 other core(s) took the interrupt' \
+             'sdhci: sda = SD card' \
+             '4-bit bus at up to 25 MHz' \
+             'part: sda1 type 0xC' \
+             'part: sda2 type 0x83' \
+             'EMBKFS: sda2: mounted' \
+             'VFS: mounted fs at "/"' \
+             '[ ok ] /system/bin/hello.elf launched' \
+             'init: desktop session started' \
+             'home: desktop ready' \
+             '[ ok ] every core is taking interrupts on its own timer'
 
 ifeq ($(BOARD),rpi4)
 .PHONY: rpi4-sdboot
@@ -1359,16 +1394,28 @@ rpi4-sdboot: $(ARM_IMG) $(RPI4_STAMP) boot/rpi4/config.txt
 	@echo "connect a 3.3 V USB-serial adapter: GND -> pin 6, RX -> pin 8 (TXD),"
 	@echo "TX -> pin 10 (RXD), and open it at 115200 8N1. See docs/RPI4.md §4."
 
+# THE WHOLE CARD (P3): partition 1 the boot files above, partition 2 the
+# root filesystem -- tools/mkrpi4sd.py. This is the image to write to a real
+# card (Raspberry Pi Imager: "Use custom"; or dd), and the one QEMU boots with.
+.PHONY: rpi4-sdcard
+rpi4-sdcard: rpi4-sdboot $(ARM_ROOTFS) tools/mkrpi4sd.py
+	python3 tools/mkrpi4sd.py $(RPI4_SDCARD) $(RPI4_SDBOOT) $(ARM_ROOTFS)
+	@echo "Write $(RPI4_SDCARD) to the WHOLE card (not a partition) -- docs/RPI4.md §4."
+
+# The card is attached with snapshot=on: the kernel writes to its root
+# filesystem, and a test run must not change the image the next one boots.
+RPI4_SD_DRIVE = -drive if=sd,format=raw,snapshot=on,file=$(RPI4_SDCARD)
+
 .PHONY: run-rpi4
-run-rpi4: $(ARM_IMG) $(RPI4_STAMP)
-	$(RPI4_QEMU) -nographic -kernel $(ARM_IMG)
+run-rpi4: rpi4-sdcard $(RPI4_QEMU_DTB)
+	$(RPI4_QEMU) -nographic $(RPI4_SD_DRIVE) -kernel $(ARM_IMG)
 
 .PHONY: test-rpi4-boot
-test-rpi4-boot: $(ARM_IMG) $(RPI4_STAMP) tools/rpi4_boot_test.py
-	python3 tools/rpi4_boot_test.py $(ARM_IMG) $(RPI4_DTB) \
-	  $(ARM_KBUILD)/test-rpi4-boot.log $(RPI4_MARKS)
+test-rpi4-boot: rpi4-sdcard $(RPI4_QEMU_DTB) tools/rpi4_boot_test.py
+	python3 tools/rpi4_boot_test.py $(ARM_IMG) $(RPI4_QEMU_DTB) \
+	  $(ARM_KBUILD)/test-rpi4-boot.log --sd $(RPI4_SDCARD) $(RPI4_MARKS)
 else
-.PHONY: rpi4-sdboot run-rpi4 test-rpi4-boot
-rpi4-sdboot run-rpi4 test-rpi4-boot:
+.PHONY: rpi4-sdboot rpi4-sdcard run-rpi4 test-rpi4-boot
+rpi4-sdboot rpi4-sdcard run-rpi4 test-rpi4-boot:
 	@echo "$@ is about the Raspberry Pi kernel: make ARCH=aarch64 BOARD=rpi4 $@" >&2; exit 1
 endif

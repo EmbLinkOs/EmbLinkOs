@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Boot the Raspberry Pi 4 kernel on QEMU raspi4b and check what it claims.
 
-    tools/rpi4_boot_test.py <kernel.img> <bcm2711-rpi-4-b.dtb> <log> <marker>...
+    tools/rpi4_boot_test.py <kernel.img> <dtb> <log> [--sd <card.img>] <marker>...
+
+With --sd the card image is inserted (snapshot=on: the run cannot change it).
 
 Used by `make ARCH=aarch64 BOARD=rpi4 test-rpi4-boot` -- docs/RPI4.md.
 kernel.elf is expected beside kernel.img (for one symbol, below); set NM to
@@ -15,8 +17,11 @@ Two witnesses, because a Pi on a television has two outputs:
          rawcon's foreground colour, and rawcon's blue "newest line" bar. The
          bar is the byte-order check -- with red and blue swapped it comes out
          orange, and the serial log cannot tell you that;
-      2. at the end of the boot, after the real console took the screen over:
-         the log is STILL there, i.e. nothing between the two left the TV dark.
+      2. at the end of the boot. With a root filesystem (P3) the desktop has
+         come up by then, and the screen must BE a desktop -- many colours,
+         where a console has two. Without one the real console has taken the
+         screen over, and the log must still be on it: nothing between the
+         two screenshots may leave the TV dark.
 
 And one measurement, because a log line cannot make it: EVERY CORE'S OWN
 TIMER TICKS (P2). The kernel's per-core interrupt counters (percpu_irqs, in
@@ -50,7 +55,7 @@ FG = (0xD8, 0xDC, 0xE4)
 MARK = (0x5B, 0x8C, 0xFF)
 
 END_OF_BOOT = ("--- all self-tests done", "gic: FATAL", "FATAL no interrupt controller")
-TIMEOUT_S = 120
+TIMEOUT_S = 600          # the whole userland runs from the SD card since P3
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000
 TICK_WINDOW_S = 5
 HANDOVER = "fb_init"      # it clears the screen: rawcon's last moment
@@ -152,6 +157,10 @@ def count(px, rgb):
     return sum(1 for k in range(0, len(px), 3) if px[k:k + 3] == needle)
 
 
+def distinct_colours(px):
+    return len({px[k:k + 3] for k in range(0, len(px), 3)})
+
+
 def bright(px):
     """Pixels light enough to be text on any of this kernel's dark consoles."""
     return sum(1 for k in range(0, len(px), 3)
@@ -163,6 +172,10 @@ def main():
         sys.exit(__doc__)
     kernel, dtb, log = sys.argv[1:4]
     markers = sys.argv[4:]
+    sd = []
+    if markers[:1] == ["--sd"]:
+        sd = ["-drive", "if=sd,format=raw,snapshot=on,file=" + markers[1]]
+        markers = markers[2:]
     elf = os.path.join(os.path.dirname(kernel), "kernel.elf")
     handover = symbol(elf, HANDOVER)
     irqs_phys = symbol(elf, "percpu_irqs") - KERNEL_VIRT_BASE
@@ -176,7 +189,7 @@ def main():
          "-serial", "file:" + log,
          "-qmp", "tcp:127.0.0.1:%d,server,nowait" % qmp_port,
          "-gdb", "tcp:127.0.0.1:%d" % gdb_port, "-S",
-         "-kernel", kernel],
+         *sd, "-kernel", kernel],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     tmp = tempfile.mkdtemp()
@@ -258,9 +271,14 @@ def main():
               % (", ".join("cpu%d +%d" % (c, grew[c]) for c in cores), TICK_WINDOW_S))
     if reached_handover:
         _, _, px = read_ppm(shot_end)
-        n = bright(px)
-        check(n > 2000, "screen at the end of the boot: the log is still on it, "
-              "now from the console (%d text pixels)" % n)
+        if "home: desktop ready" in text:
+            n = distinct_colours(px)
+            check(n >= 32, "screen at the end of the boot: the DESKTOP is drawn "
+                  "(%d distinct colours; a console has 2)" % n)
+        else:
+            n = bright(px)
+            check(n > 2000, "screen at the end of the boot: the log is still on it, "
+                  "now from the console (%d text pixels)" % n)
 
     if fail:
         print("test-rpi4-boot: FAILED -- serial log in %s, screens in %s" % (log, tmp))

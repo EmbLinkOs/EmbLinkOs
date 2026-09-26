@@ -5,15 +5,16 @@ way docs/ARM64.md is: every phase is ❌ until it boots and ✅ only once its
 "done when" is machine-checked by a `make` target. A phase that has only been
 seen on QEMU says so. The real board is the only witness for "real hardware".*
 
-**Status: P0, P0b, P1 and P2 ✅ on QEMU `raspi4b`: it boots, the kernel log
-is on the screen, interrupts work, and all four cores run. Not yet run on a
-physical Pi. First real-hardware run planned for Monday 2026-09-28, on a
-television over HDMI.**
+**Status: P0–P4 ✅ on QEMU `raspi4b`: it boots, the kernel log is on the
+screen, interrupts work, all four cores run, and the SD card is the disk. The
+userland and the desktop session run from it. Not yet run on a physical Pi.
+First real-hardware run planned for Monday 2026-09-28, on a television over
+HDMI.**
 
 ```
-make ARCH=aarch64 BOARD=rpi4 test-rpi4-boot   # P0-P2, asserted (serial, screen, per-core ticks)
+make ARCH=aarch64 BOARD=rpi4 test-rpi4-boot   # P0-P3, asserted (serial, two screens, per-core ticks)
 make ARCH=aarch64 BOARD=rpi4 run-rpi4         # the same, on this terminal
-make ARCH=aarch64 BOARD=rpi4 rpi4-sdboot      # an SD card's boot partition
+make ARCH=aarch64 BOARD=rpi4 rpi4-sdcard      # the whole SD card image, to flash
 ```
 
 The Pi kernel boots on QEMU's `raspi4b` with the **real** Pi 4 device tree.
@@ -270,20 +271,106 @@ scrolls, and you can copy from it. The screen is for when it isn't.
   `-no-reboot` QEMU exited on the reset. It isn't automated yet: nothing on
   a diskless Pi asks for a reboot.
 
-* **P3 ❌ — the SD card is the disk.** EMMC2 (`brcm,bcm2711-emmc2`, 0xFE34_0000)
-  is an SDHCI, and `kernel/drivers/storage/sdhci.c` exists but binds over PCI.
-  Split its core from its PCI attach and add a DT attach. Card layout:
-  partition 1 FAT32 (the `rpi4-sdboot` files), partition 2 EMBKFS (the
-  rootfs). `embk_partition_scan_all()` already finds it. Build the whole card
-  image with `rpi4-sdcard`.
-  **Done when:** `/system/bin/init.elf` runs from the SD card on `raspi4b`
-  (`-drive if=sd`).
+* **P3 ✅ (QEMU, through the older controller) — the SD card is the disk.**
+  `make ARCH=aarch64 BOARD=rpi4 rpi4-sdcard` builds `sdcard.img`, the whole
+  card: an MBR, partition 1 FAT32 with the firmware and `kernel8.img`,
+  partition 2 the EMBKFS root. The kernel finds the card, partitions it, and
+  mounts `sda2` as `/`; `init`, the accounts, futexes and the rest of the
+  userland self-test run from it.
 
-* **P4 ❌ — the desktop on the screen.** The framebuffer exists from P0b, and
-  `fb_init()` already uses the boot protocol's. What's missing is everything
-  before it in the boot: P1–P3.
-  **Done when:** the desktop draws on `raspi4b`'s display. On the real board,
-  on the TV.
+  - **`tools/mkrpi4sd.py`** writes the card, including its own FAT32. The
+    firmware needs long names and a subdirectory (`bcm2711-rpi-4-b.dtb`,
+    `overlays/`), which `mkfat32.py` doesn't write. It also needs a volume
+    that is FAT32 by the specification's rule: the FAT type is decided by the
+    **cluster count**, and `mkfat32.py`'s ~8,000 clusters are FAT16 to any
+    reader that follows it. The card uses 128 MiB of 1 KiB clusters, about
+    130,000. Verified independently on macOS: `fsck_msdos` is clean, and
+    `hdiutil` mounts the image and every file is byte-identical to its source.
+  - **`sdhci.c` gained what a Pi's controllers need**, as flags on a new
+    `sdhci_attach_mmio()` (the PCI path is unchanged in behaviour):
+    - `SDHCI_32BIT_ONLY`: Broadcom's controllers implement only 32-bit
+      register accesses. Byte and halfword writes become read-modify-write,
+      except transfer mode and block size/count. Those are held in a shadow
+      and written with the command, because writing the command half is what
+      *issues* it. This is the same scheme as Linux's `sdhci-iproc`.
+    - `SDHCI_BROKEN_CD`: the Pi 4 device tree says `broken-cd` for the SD
+      slot, so the driver asks the card rather than trusting the
+      present-state bit.
+    - A real clock. The driver ran at its initialisation divider forever,
+      about 400 kHz on one data line, roughly 50 KB/s. That's invisible on
+      QEMU and minutes of boot on a real card. It now computes the divider
+      from the base clock (from the capabilities register, or from the
+      firmware over the mailbox), then switches to a 4-bit bus (ACMD6) and
+      25 MHz after selection.
+  - **`drivers/sdhci_dt.c`** attaches controllers from the device tree:
+    EMMC2 (`brcm,bcm2711-emmc2`, the Pi 4's slot) and the older
+    `brcm,bcm2835-sdhci`. Disabled nodes are skipped, and so is any
+    controller with an SDIO function under it (the Pi's Wi-Fi, `wifi@1`,
+    lives at the same address as that older controller).
+
+  **The disk found a deadlock in the shared scheduler, on every aarch64
+  machine.** With a root filesystem, the boot runs the userland tests, and
+  about one boot in six hung for good at the deadline-scheduler `jitter` run.
+  The hung VM was read over QMP: all four cores in `spin_lock` on
+  `g_sched_lock`, whose `holder_lr` named `schedule()`, and two backtraces
+  ending at a new thread's frame-chain reset. `kernel_ctx_prepare()` gave
+  every new thread `DAIF = 0`, interrupts on from its first instruction. But
+  a new thread is entered holding the scheduler lock, which its trampoline
+  releases as its first action. A timer interrupt pending at the switch fired
+  in between, called `schedule()`, and spun forever on the lock its own core
+  held. New contexts now start fully masked, as x86's do, and interrupts are
+  enabled by the entry code once the lock is gone (the trampolines already
+  did; `bringup.c`'s self-test threads got a wrapper). `virt` had the same
+  window, and one of its suite runs today hung on the same line.
+
+  **And a second one: the exception return was interruptible.** In the
+  20-boot confirmation of that fix, one boot killed a program right after
+  `home: desktop ready`, with an instruction abort *from user mode* at a
+  *kernel* address, `exc_common`'s `msr spsr_el1`. `exc_common` loaded
+  `ELR_EL1` and `SPSR_EL1` and ran `eret` with interrupts on whenever the
+  handler returned with them on, as every system call does. An IRQ between
+  the two `msr`s replaced ELR, and the `eret` went there in user mode. When
+  returning to kernel mode instead, the same race writes a register into SPSR
+  and takes an illegal-execution-state exception: the unexplained 2026-09-12
+  crash in docs/TODO.md. Both return paths (`exc_common` and
+  `aarch64_eret_to_el0`) now mask everything before touching ELR/SPSR. Both
+  of these bugs live in shared aarch64 code, so `virt` benefits too.
+
+  **And a third, older than all of this: a core woken from idle kept the
+  idle loop's timer.** Tickless idle arms a halted core's timer for the next
+  thing due, up to a whole second. When a reschedule IPI or a device
+  interrupt wakes it early, `schedule()` runs inside that interrupt and
+  switches straight to real work, so the new thread inherits the long arm
+  and runs up to a second unpreempted. On `virt,gic-version=2` under TCG,
+  two runs in five saw the deadline test's periodic thread starve for
+  800–1,600 ms. An A/B with today's two fixes reverted showed it wasn't them.
+  `schedule_locked()` now re-arms the quantum whenever it dispatches on a
+  core `g_idle_cpus` says was idle. This is shared code, so x86's tickless
+  idle had the same hole and gets the same fix. On a desktop it's the
+  difference between smooth and an occasional one-second stutter.
+
+  **QEMU is not the board here, and the test says so.** `raspi4b` wires its
+  SD card to the *older* controller at 0x7e300000, where the real Pi has its
+  Wi-Fi, and leaves EMMC2 empty. EMMC2's `sd-bus` can't be reached from the
+  command line either. So the QEMU runs boot a copy of the real device tree
+  with that controller's SD-card node enabled (`fdtput`, in `arch.mk`). The
+  kernel learns nothing about QEMU; the tree just describes the emulated
+  machine as it is wired. Everything from the register path to the mounted
+  root is exercised. **Only the real board tests EMMC2's own two quirks**:
+  no card-detect, and a clock only the firmware knows.
+
+* **P4 ✅ (QEMU) — the desktop on the screen.** Nothing new was needed once
+  P3 gave it a disk: `fb_init()` takes the mailbox framebuffer from the boot
+  protocol, `init` logs the development user in, and the compositor, top bar,
+  dock, file panel and notification daemon come up on it. The screenshot at
+  the end of `test-rpi4-boot` is the EmbLink desktop at `raspi4b`'s
+  640×480: the hummingbird wallpaper, the top bar's clock and CPU meter, the
+  dock, and the icon colours right (blue folder, purple globe). On a TV it
+  will be the TV's own resolution, capped at 1080p (P0b).
+  **Done when:** the desktop draws on `raspi4b`'s display. ✅ The test checks
+  it has more than 32 distinct colours, where a console has two.
+  **Not yet:** input (keyboard and mouse are USB, P5), and the clock, which
+  reads 1 January 1970 until NTP runs (P6; a Pi has no RTC).
 
 * **P5 ❌ (real hardware only) — USB keyboard and mouse.** The BCM2711 PCIe
   root complex (`brcm,bcm2711-pcie`, 0xFD50_0000) has to be brought up by the
@@ -302,14 +389,17 @@ scrolls, and you can copy from it. The screen is for when it isn't.
 
 ## 4. Running it on the real board
 
-**You need:** a Pi 4B, a microSD card, a 5 V/3 A USB-C supply, a
-**micro-HDMI to HDMI** cable and a TV or monitor. A 3.3 V USB-serial adapter
-is optional (below).
+**You need:** a Pi 4B, a microSD card (1 GB or more; whatever is on it will be
+erased), a 5 V/3 A USB-C supply, a **micro-HDMI to HDMI** cable, and a TV or
+monitor. A 3.3 V USB-serial adapter is optional (below).
 
-1. `make ARCH=aarch64 BOARD=rpi4 rpi4-sdboot`
-2. Format the card **FAT32** (MBR partition table) and copy everything in
-   `build/aarch64/rpi4/sdboot/` to its root. On a Mac: Disk Utility → Erase →
-   "MS-DOS (FAT)", scheme "Master Boot Record".
+1. `make ARCH=aarch64 BOARD=rpi4 rpi4-sdcard`. This builds
+   `build/aarch64/rpi4/sdcard.img`, the whole card: boot files and root
+   filesystem.
+2. Write it to the card with **Raspberry Pi Imager**: *Choose OS* → *Use
+   custom* → pick `sdcard.img` → *Choose storage* → the card → *Write*. Skip
+   any "OS customisation" it offers; that's for Raspberry Pi OS. (balenaEtcher
+   works too, and so does `dd` to the **whole** device, not a partition.)
 3. Plug the cable into **HDMI0**, the micro-HDMI port next to the USB-C power
    socket. Switch the TV to that input first, then power the Pi.
 
@@ -318,22 +408,23 @@ is optional (below).
    card.
 2. **The kernel log, white on dark blue-black**, with a **blue bar** marking
    the newest line. It starts with the boot banner (`board : rpi4`,
-   `CurrentEL : EL1`, …).
+   `CurrentEL : EL1`, …) and reaches `sdhci: sda = SD card`,
+   `EMBKFS: sda2: mounted` and `VFS: mounted fs at "/"`. That's the card
+   becoming the disk.
 3. **A blink to black, then the log again in white on plain black.** That's
    the kernel's real console taking the screen over; it's normal.
-4. It ends at `--- all self-tests done: N failure(s) ...` and
-   `A7 reached: ...`, then sits there. **That is success.** Expect around ten
-   failures, all about the missing disk or PCIe (`no EMBKFS volume`,
-   `could not launch /system/bin/...`). Things worth reading on the way:
-   `gic: initialised (GICv2`, `timer fired`, and `smp: 4 of 4 core(s)
-   online`.
+4. **The desktop**, with its top bar, logged in automatically as the
+   development user. The whole boot takes seconds on the real board (the
+   minute-plus figures in this file are QEMU emulating every instruction).
+   **That is success.** The keyboard and mouse won't work yet: the Pi's USB
+   sits behind PCIe, which is P5.
 
 Take a photo of the screen either way. It carries everything needed.
 
 **If it doesn't look like that:**
-- **No rainbow, TV says "no signal":** the firmware never started. Check the
-  card is FAT32 with the files at the top level (not in a folder), and that
-  the cable is in HDMI0. The Pi's green LED flashing a pattern is an error
+- **No rainbow, TV says "no signal":** the firmware never started. Re-write
+  the card (the whole image, to the whole card), and check the cable is in
+  HDMI0. The Pi's green LED flashing a pattern is an error
   code; count the long and short flashes.
 - **Rainbow, then black:** the firmware loaded the kernel but the kernel never
   drew. Either it died before the screen came up (in boot.S's page tables or
@@ -341,6 +432,10 @@ Take a photo of the screen either way. It carries everything needed.
   which; see below.
 - **The log is there but the bar is orange, not blue:** red and blue are
   swapped. Harmless, and a one-line fix (P0b's note).
+- **`sdhci: the SD slot (EMMC2): no card answered`:** the SD path, on the
+  one controller QEMU cannot test (P3). The lines just above it (the base
+  clock the firmware reported) are the evidence; a photo of them is the bug
+  report.
 - **The log stops somewhere before the end:** the photo of the last lines is
   the bug report. Three places are new on real silicon and the likeliest to
   stop: right after `gic: initialised` (interrupt groups: the timer never

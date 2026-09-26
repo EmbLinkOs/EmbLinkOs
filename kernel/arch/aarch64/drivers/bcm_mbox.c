@@ -37,6 +37,7 @@
 #define TAG_SET_PIXORDER  0x00048006u
 #define TAG_ALLOC_BUFFER  0x00040001u
 #define TAG_GET_PITCH     0x00040008u
+#define TAG_GET_CLOCK_RATE 0x00030002u
 
 /* PIXEL ORDER, as the firmware names it: 0 = BGR, 1 = RGB -- the order of the
  * bytes in memory, which is what FB_FORMAT_* describes too. We ASK for RGB and
@@ -210,4 +211,16 @@ void bcm_fb_probe(struct boot_protocol *proto) {
     kprintf("mbox: framebuffer %ux%u, pitch %u, %s, at %p (bus %p)\n",
             fw, fh, pitch, proto->fb_format == FB_FORMAT_BGR ? "BGR" : "RGB",
             (void *)(uintptr_t)fb, (void *)(uintptr_t)fb_bus);
+}
+
+uint32_t bcm_mbox_clock_rate(uint32_t clock_id) {
+    if (!mbox)
+        return 0;                       /* bcm_fb_probe found no mailbox */
+    uint32_t v[2] = { clock_id, 0 };
+    begin();
+    uint32_t at = tag(TAG_GET_CLOCK_RATE, 2, v);
+    end();
+    if (!mbox_call() || msg[at] != clock_id)
+        return 0;
+    return msg[at + 1];
 }

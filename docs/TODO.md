@@ -868,10 +868,23 @@ P0 boots on QEMU `raspi4b`; the rest is phased in docs/RPI4.md §3. Open, in ord
       QEMU raspi4b with a temporary trigger (QEMU -no-reboot exited on the
       reset). Not in an automated test: aarch64 has no serial command channel
       to ask for a reboot, and userland (which has the syscall) needs P3.
-- [ ] **The "every core is taking interrupts" self-test samples too early on
-      a diskless Pi** (~50 ms after bring-up, when idle cores may sleep 1 s).
-      It passes on `virt` because the userland tests take seconds. Resolves
-      itself at P3; test-rpi4-boot measures per-core ticks directly meanwhile.
+- [x] ~~The "every core is taking interrupts" self-test samples too early on
+      a diskless Pi~~ -- resolved at P3: with the userland running from the
+      SD card, the check passes on raspi4b and test-rpi4-boot claims it.
+- [ ] **EMMC2 is untested anywhere but the real board.** QEMU raspi4b wires
+      its SD card to the older 0x7e300000 controller, and EMMC2's sd-bus is
+      not reachable from the QEMU command line. Its two quirks -- no
+      card-detect, a firmware-owned base clock (QEMU answers the mailbox's
+      clock query with a placeholder 700 MHz) -- are first exercised on
+      Monday's Pi.
+- [ ] **The Pi's SD card has no swap area**, so the swap self-test fails on
+      raspi4b. tools/mkrpi4sd.py could add a third partition with the
+      EMBKSWAP header (tools/mkswap.py) once PIO SD throughput is measured on
+      the real card -- swapping at SD-over-PIO speed may not be worth having.
+- [ ] **x86 build: `$(wildcard build/*.embx)` makes every stale .embx a
+      prerequisite of embkfs.img**, and its rule needs EmbCC's embld -- so
+      while EmbCC is being rebuilt (embld absent), the whole x86 image build
+      fails even though the .embx is optional. Seen 2026-09-26.
 - [ ] **P3: EMMC2.** `drivers/storage/sdhci.c` binds over PCI only; split out
       a DT attach. Plus an `rpi4-sdcard` target: FAT32 boot partition and
       EMBKFS root.
@@ -2858,7 +2871,50 @@ Open:
       of the hung guest, so the next occurrence names the call site. That
       capture is what the two fixes above were found from: the holder read
       `schedule+0x20`, and the serial log ended at the thread-creation failure.
-- [ ] **A second aarch64 failure at the same point**, from a desktop run on
+
+      **AND A THIRD CAUSE, FOUND 2026-09-27** by the Raspberry Pi's boot, where
+      it hit about one boot in six (docs/RPI4.md P3). The line above -- "both
+      first-run trampolines already release the lock a new thread inherits" --
+      is true and was not enough: `kernel_ctx_prepare()` gave every new thread
+      `DAIF = 0`, so interrupts came on at CTX_LOAD's `msr daif`, SEVERAL
+      INSTRUCTIONS BEFORE the trampoline's release. A timer IRQ pending at the
+      switch fired in that window, its `schedule()` spun on the lock its own
+      core held, and the other three piled up. Caught with all four cores in
+      `spin_lock`, `holder_lr` = `schedule()`, and two backtraces ending at the
+      trampoline's `mov x29, xzr`. New contexts now start fully masked, as
+      x86's do; the trampolines enable interrupts after the release, and the
+      bring-up self-test threads got a wrapper that does. 0 hangs in 20 boots
+      after, against ~3 in 17 before.
+- [x] **A core woken from tickless idle kept the idle loop's timer -- FIXED
+      2026-09-27** (both architectures; shared code). The idle loop arms up to
+      SCHED_IDLE_CAP_MS (1 s) and halts; a reschedule IPI or device IRQ that
+      wakes it early switches to real work from inside the interrupt, and that
+      thread then ran up to a second unpreempted. Four cores kicked awake to
+      run a burst of new threads meant nothing ran schedule() at all: the
+      deadline test's periodic thread measured 807 and 1567 ms worst lateness
+      on `virt,gic-version=2` (TCG), 2 runs in 5. schedule_locked() now re-arms
+      TIMER_QUANTUM_MS when it dispatches on a core g_idle_cpus says was idle.
+- [x] **A second aarch64 failure at the same point -- EXPLAINED AND FIXED,
+      2026-09-27.** The exception RETURN path loaded ELR_EL1 and SPSR_EL1 and
+      ran `eret` with interrupts ENABLED whenever the handler returned with
+      them on, which every system call does. An IRQ between the two `msr`s
+      overwrote ELR with the address of `msr spsr_el1`; the nested return
+      restored that, and the outer `eret` then jumped back to `msr spsr_el1`
+      in the mode its SPSR named:
+        * returning to EL1, it re-ran the tail with the frame's registers
+          already reloaded, wrote a thread's x1 into SPSR, and took ILLEGAL
+          EXECUTION STATE at `msr spsr_el1` -- exactly the report below, packed
+          small integers and all;
+        * returning to EL0, it entered USER mode at a kernel address: an
+          instruction abort from EL0 at `exc_common`, and the program killed.
+          That is how the Raspberry Pi's boot caught it (docs/RPI4.md P3),
+          after `home: desktop ready`, with ELR = FAR = `msr spsr_el1`.
+      `exc_common` now masks everything (`msr daifset, #0xf`) before touching
+      ELR/SPSR, and so does `aarch64_eret_to_el0`, which a new thread reaches
+      straight from its trampoline's unlock. The `eret` restores the returning
+      context's own DAIF from SPSR. The original report, for the trail:
+
+      A second aarch64 failure at the same point, from a desktop run on
       2026-09-12: an ILLEGAL EXECUTION STATE exception (ESR EC 0x0E) taken at
       `exc_common+0x80`, which is exactly `msr spsr_el1, x1` in the exception
       RETURN path, on the static boot stack, with x30 = 0x5ca and a register

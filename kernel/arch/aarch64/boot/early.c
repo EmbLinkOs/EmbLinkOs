@@ -19,6 +19,7 @@
 #include "mm/swaptest.h"
 #include "loader/pietest.h"
 #include "drivers/storage/nvme.h"
+#include "arch/aarch64/drivers/sdhci_dt.h"
 #include "fs/epfs.h"      /* the swap witness, driven */
 #include "fs/vfs.h"
 #include "arch/aarch64/cpu/cpu_features.h"
@@ -605,6 +606,12 @@ void arch_early_main(uint64_t dtb_phys) {
             selftest_fails++;
         }
     }
+
+    /* An SD card: a Raspberry Pi's, in the slot it booted from (docs/RPI4.md
+     * P3). After virtio-blk and NVMe for the same reason NVMe is after
+     * virtio-blk -- `virt`'s disks keep their names -- and on a Pi, which has
+     * neither, it is sda. */
+    sdhci_dt_init();
 
     /* PARTITIONS. Every disk above is a whole device; a disk that carries a
      * partition table holds its filesystems INSIDE it, and until this ran the
