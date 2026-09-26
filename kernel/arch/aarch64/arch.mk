@@ -15,15 +15,36 @@ AARCH64_CC     := $(AARCH64_PREFIX)gcc
 AARCH64_OBJCOPY:= $(AARCH64_PREFIX)objcopy
 
 ARM_BUILD   := $(BUILD)/aarch64
-ARM_ELF     := $(ARM_BUILD)/kernel.elf
-ARM_IMG     := $(ARM_BUILD)/kernel.img
+
+# WHICH MACHINE -- docs/RPI4.md §2.1. `virt` (QEMU, the CI target) or `rpi4`
+# (a Raspberry Pi 4 Model B). Only the KERNEL differs: it is linked at a
+# board-specific physical address and boots with board-specific first page
+# tables (board.h). The userland and the root filesystem are the same bytes on
+# both, so they stay in $(ARM_BUILD) and are shared; the kernel of a non-virt
+# board goes in a subdirectory so switching BOARD never links one board's
+# kernel into the other's image.
+BOARD       ?= virt
+ifeq ($(BOARD),virt)
+ARM_KBUILD  := $(ARM_BUILD)
+ARM_BOARD_CFLAGS :=
+else ifeq ($(BOARD),rpi4)
+ARM_KBUILD  := $(ARM_BUILD)/rpi4
+ARM_BOARD_CFLAGS := -DBOARD_RPI4 -Wl,--defsym=BOARD_KERNEL_PHYS_BASE=0x80000
+else
+$(error unknown BOARD '$(BOARD)' for ARCH=aarch64. Known: virt, rpi4)
+endif
+
+ARM_ELF     := $(ARM_KBUILD)/kernel.elf
+ARM_IMG     := $(ARM_KBUILD)/kernel.img
 # Declared HERE, with the other output paths, and not beside the rule that
 # builds it further down: make expands a rule's prerequisites when it READS the
 # rule, so `arm64: ... $(ARM_ROOTFS)` below would expand to NOTHING if this line
 # came after it. It did, and `make ARCH=aarch64` on a clean tree built a kernel
 # with no userland and no disk for it to read -- which then failed only at run
 # time, as "no EMBKFS volume".
-ARM_ROOTFS  := $(ARM_BUILD)/embkfs-arm64.img
+# Per BOARD, because it carries /system/kernel.embdbg -- the symbol table of
+# THIS board's kernel, which mkfs_arm64.py picks up from beside the image.
+ARM_ROOTFS  := $(ARM_KBUILD)/embkfs-arm64.img
 ARM_LINKER  := kernel/arch/aarch64/boot/linker.ld
 
 ARM_ASM_SRC := kernel/arch/aarch64/boot/boot.S \
@@ -43,6 +64,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/drivers/timer_generic.c \
                kernel/arch/aarch64/drivers/pci_ecam.c \
                kernel/arch/aarch64/drivers/pl031.c \
+               kernel/arch/aarch64/drivers/bcm_mbox.c \
                kernel/arch/aarch64/drivers/absent.c \
                kernel/arch/aarch64/cpu/spinlock.c \
                kernel/arch/aarch64/cpu/arch_thread.c \
@@ -151,6 +173,7 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/video/framebuffer.c \
                   kernel/drivers/video/console.c \
                   kernel/drivers/video/font_8x16.c \
+                  kernel/drivers/video/rawcon.c \
                   kernel/drivers/video/gpu.c \
                   kernel/drivers/video/bootanim.c \
                   kernel/drivers/video/virtio_gpu.c \
@@ -214,6 +237,11 @@ ARM_CFLAGS  = -ffreestanding -nostdlib -nostartfiles \
 $(ARM_BUILD):
 	mkdir -p $(ARM_BUILD)
 
+ifneq ($(ARM_KBUILD),$(ARM_BUILD))
+$(ARM_KBUILD):
+	mkdir -p $(ARM_KBUILD)
+endif
+
 
 # One compile, like the x86 kernel: every header is a prerequisite because
 # there are no per-TU depfiles to consult. Same reasoning as $(KERNEL_HDRS).
@@ -221,8 +249,8 @@ $(ARM_BUILD):
 # kernel as compile-time defines, and a prerequisite list of source files alone
 # would rebuild nothing when they change -- so `make FB_W=1280` would silently
 # boot the OLD cap. The stamp's mtime moves only when the pair actually changes.
-$(ARM_ELF): $(FB_STAMP) $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_BUILD)
-	$(AARCH64_CC) $(ARM_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC)
+$(ARM_ELF): $(FB_STAMP) $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC) $(ARM_HDRS) $(ARM_LINKER) | $(ARM_KBUILD)
+	$(AARCH64_CC) $(ARM_CFLAGS) $(ARM_BOARD_CFLAGS) -T $(ARM_LINKER) -o $@ $(ARM_ASM_SRC) $(ARM_C_SRC) $(ARM_SHARED_SRC)
 
 # The flat Image. QEMU boots the ELF directly, so this is not on the run path
 # -- it exists because a real ARM board loads a headerless blob at a fixed
@@ -749,7 +777,7 @@ $(foreach p,$(ARM_EMLIBC_PROGS),$(eval $(call ARM_EMLIBC_PROG,$(p))))
 # binutils decode the DWARF, so it is architecture-neutral as long as it is
 # handed the readelf that matches the ELF.
 ARM_EMBDBG_READELF ?= aarch64-elf-readelf
-$(ARM_BUILD)/kernel.embdbg: $(ARM_ELF) | $(ARM_BUILD)
+$(ARM_KBUILD)/kernel.embdbg: $(ARM_ELF) | $(ARM_KBUILD)
 	@if [ -x "$(EMBDBG)" ]; then \
 	   echo "  EMBDBG   $@"; READELF=$(ARM_EMBDBG_READELF) $(EMBDBG) $< emit-kernel $@; \
 	 else echo "  (embdbg tool absent -> no kernel panic symbols on aarch64)"; : > $@; fi
@@ -757,7 +785,7 @@ $(ARM_BUILD)/kernel.embdbg: $(ARM_ELF) | $(ARM_BUILD)
 ARM_ROOTFS_INPUTS := tools/embkfs_mkfs/mkfs_arm64.py tools/embkfs_mkfs/mkfs_embkfs.py \
                      tools/embkfs_mkfs/layout.py \
                      $(wildcard user/*/*/*.ns) $(wildcard user/*/*/*.caps) $(wildcard user/*/*/*.app)
-$(ARM_ROOTFS): $(ARM_ROOTFS_INPUTS) $(ARM_USER_ELVES) $(ARM_LIBEMBK) $(ARM_BUILD)/kernel.embdbg | $(ARM_BUILD)
+$(ARM_ROOTFS): $(ARM_ROOTFS_INPUTS) $(ARM_USER_ELVES) $(ARM_LIBEMBK) $(ARM_KBUILD)/kernel.embdbg | $(ARM_KBUILD)
 	python3 tools/embkfs_mkfs/mkfs_arm64.py $@ $(ARM_USER)
 
 .PHONY: arm64-rootfs
@@ -1243,3 +1271,82 @@ check-tools-arm64:
 .PHONY: clean-arm64
 clean-arm64:
 	rm -rf $(ARM_BUILD)
+
+# --- Raspberry Pi 4 -- docs/RPI4.md ----------------------------------------
+# Everything below needs BOARD=rpi4, because it is about the Pi's kernel:
+#
+#   make ARCH=aarch64 BOARD=rpi4 rpi4-sdboot     the SD card's boot partition
+#   make ARCH=aarch64 BOARD=rpi4 run-rpi4        QEMU's raspi4b, on this terminal
+#   make ARCH=aarch64 BOARD=rpi4 test-rpi4-boot  the current phase, asserted
+#
+# The firmware is fetched once into $(RPI4_FW), outside any BOARD's kernel
+# directory so clean-arm64 does not throw away a download. The stamp exists
+# only if every file matched its pinned hash (tools/rpi4_firmware.sh).
+RPI4_FW     := $(BUILD)/rpi4-firmware
+RPI4_STAMP  := $(RPI4_FW)/.fetched
+RPI4_DTB    := $(RPI4_FW)/bcm2711-rpi-4-b.dtb
+RPI4_SDBOOT := $(ARM_BUILD)/rpi4/sdboot
+
+$(RPI4_STAMP): tools/rpi4_firmware.sh
+	sh tools/rpi4_firmware.sh $(RPI4_FW)
+	@touch $@
+
+.PHONY: rpi4-firmware
+rpi4-firmware: $(RPI4_STAMP)
+
+# QEMU's raspi4b is the Pi's CI target the way `virt` is the kernel's: the same
+# BCM2711 memory map, the same GIC-400 and PL011, booted with the SAME device
+# tree the real firmware hands over. It has no PCIe, no Ethernet and no USB,
+# so it can prove the early phases and nothing that needs those; the real board
+# is the only witness for P5 onward. QEMU does not fill in /memory the way the
+# firmware does from the RAM it finds -- it sizes it itself -- which is why the
+# test below checks that a memory range arrived rather than its size.
+RPI4_QEMU = qemu-system-aarch64 -M raspi4b -dtb $(RPI4_DTB)
+
+# What the current phase claims, one grep each. P0: the board header and the
+# first page tables got it to EL1 in the higher half with a memory map from
+# the Pi's own device tree, the MMIO window really is Device memory over the
+# Pi's peripherals (an unaligned read there FAULTS), and nothing that runs
+# before interrupts failed. P0b: the firmware gave the kernel a framebuffer
+# over the mailbox -- found through the device tree's `ranges`, handed back
+# through its `dma-ranges` -- and the kernel log is on it. The script also
+# screenshots the display and checks the pixels (tools/rpi4_boot_test.py).
+RPI4_P0_MARKS = 'board       : rpi4' \
+                'CurrentEL   : EL1' \
+                'higher half: YES' \
+                'boot: dtb memory 0x0000000000000000 + ' \
+                'fdt: firmware reservation 0x0000000000000000 + 1000' \
+                'mbox: framebuffer ' \
+                'rawcon: kernel log on the firmware framebuffer' \
+                '[ ok ] unaligned load on Device memory' \
+                '[ ok ] write to .rodata -> permission fault' \
+                'self-test done: 0 failure(s)'
+
+ifeq ($(BOARD),rpi4)
+.PHONY: rpi4-sdboot
+rpi4-sdboot: $(ARM_IMG) $(RPI4_STAMP) boot/rpi4/config.txt
+	rm -rf $(RPI4_SDBOOT)
+	mkdir -p $(RPI4_SDBOOT)/overlays
+	cp $(RPI4_FW)/start4.elf $(RPI4_FW)/fixup4.dat $(RPI4_DTB) $(RPI4_SDBOOT)/
+	cp $(RPI4_FW)/overlays/disable-bt.dtbo $(RPI4_SDBOOT)/overlays/
+	cp boot/rpi4/config.txt $(RPI4_SDBOOT)/
+	cp $(ARM_IMG) $(RPI4_SDBOOT)/kernel8.img
+	@echo
+	@echo "Pi 4 boot partition staged in $(RPI4_SDBOOT)/"
+	@echo "Copy EVERYTHING in it to the root of a FAT32-formatted SD card, then"
+	@echo "connect a 3.3 V USB-serial adapter: GND -> pin 6, RX -> pin 8 (TXD),"
+	@echo "TX -> pin 10 (RXD), and open it at 115200 8N1. See docs/RPI4.md §4."
+
+.PHONY: run-rpi4
+run-rpi4: $(ARM_IMG) $(RPI4_STAMP)
+	$(RPI4_QEMU) -nographic -kernel $(ARM_IMG)
+
+.PHONY: test-rpi4-boot
+test-rpi4-boot: $(ARM_IMG) $(RPI4_STAMP) tools/rpi4_boot_test.py
+	python3 tools/rpi4_boot_test.py $(ARM_IMG) $(RPI4_DTB) \
+	  $(ARM_KBUILD)/test-rpi4-boot.log $(RPI4_P0_MARKS)
+else
+.PHONY: rpi4-sdboot run-rpi4 test-rpi4-boot
+rpi4-sdboot run-rpi4 test-rpi4-boot:
+	@echo "$@ is about the Raspberry Pi kernel: make ARCH=aarch64 BOARD=rpi4 $@" >&2; exit 1
+endif

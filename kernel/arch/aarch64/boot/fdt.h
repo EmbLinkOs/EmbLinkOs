@@ -86,9 +86,20 @@ bool fdt_prop_has_string(fdt_node_t node, const char *name, const char *value);
  * or doubles every address, so it is never assumed. */
 void fdt_reg_cells(fdt_node_t node, uint32_t *addr_cells, uint32_t *size_cells);
 
-/* Decode entry `index` of a `reg` property into address/size. Returns false
- * when the index is past the end. */
+/* The node's parent, or FDT_NONE for the root. A walk from the root, so
+ * O(depth x siblings) -- fine for the handful of lookups boot makes. */
+fdt_node_t fdt_parent(fdt_node_t node);
+
+/* Decode entry `index` of a `reg` property into address/size, the address
+ * translated through every ancestor's `ranges` to a CPU physical address.
+ * Returns false when the index is past the end, or when some ancestor bus is
+ * not mapped into the CPU's address space (it has no `ranges`). */
 bool fdt_reg(fdt_node_t node, uint32_t index, uint64_t *addr, uint64_t *size);
+
+/* Translate between a CPU physical address and the address a DMA master on
+ * `node`'s bus uses for the same memory, through the bus's `dma-ranges`.
+ * False when there are none or the address is outside them. */
+bool fdt_dma_translate(fdt_node_t node, bool cpu_to_bus, uint64_t in, uint64_t *out);
 
 /* One entry of an `interrupts` property, decoded against the interrupt
  * controller's `#interrupt-cells`. For the ARM GIC that is three cells:

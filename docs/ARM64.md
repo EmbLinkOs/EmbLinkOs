@@ -5,7 +5,8 @@ without forking the kernel. Every phase below is marked ❌ until it boots and
 ✅ only once its "done when" is machine-checked; this file is the plan and the
 reasoning, and its status marks are claims that a `make` target will defend.*
 
-**Status: A0–A9 COMPLETE. The campaign is finished.**
+**Status: A0–A9 COMPLETE. The campaign is finished.** Its first real board,
+the Raspberry Pi 4, is docs/RPI4.md (`make ARCH=aarch64 BOARD=rpi4`).
 
 Four cores, the real `init` session, the full 52-program userland, and every
 device `virt` offers: virtio-blk, -gpu, -input, -snd, and MSI through the GIC

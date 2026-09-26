@@ -350,19 +350,49 @@ fdt_node_t fdt_find_device_type(const char *type, fdt_node_t after) {
     return FDT_NONE;
 }
 
+/* The parent of `node`. Nodes are offsets into the blob and carry no parent
+ * pointer, so walk down from the root -- cheaply, because a subtree occupies a
+ * contiguous span: at each level the node can only be inside the LAST child
+ * that starts before it, so exactly one child is descended into per level. */
+fdt_node_t fdt_parent(fdt_node_t node) {
+    fdt_node_t p = fdt_root();
+    if (p == FDT_NONE || node == FDT_NONE || node == p)
+        return FDT_NONE;
+
+    for (int depth = 0; depth < 32; depth++) {
+        fdt_node_t inside = FDT_NONE;
+        for (fdt_node_t c = fdt_first_child(p); c != FDT_NONE; c = fdt_next_sibling(c)) {
+            if (c == node)
+                return p;
+            if (c > node)
+                break;
+            inside = c;
+        }
+        if (inside == FDT_NONE)
+            return FDT_NONE;
+        p = inside;
+    }
+    return FDT_NONE;
+}
+
+/* A bus's own #address-cells / #size-cells: what its CHILDREN use. Spec
+ * defaults if absent: 2 and 1. */
+static void bus_cells(fdt_node_t bus, uint32_t *a, uint32_t *s) {
+    *a = bus == FDT_NONE ? 2 : fdt_prop_u32(bus, "#address-cells", 2);
+    *s = bus == FDT_NONE ? 1 : fdt_prop_u32(bus, "#size-cells", 1);
+}
+
 void fdt_reg_cells(fdt_node_t node, uint32_t *addr_cells, uint32_t *size_cells) {
     /* #address-cells and #size-cells for a node's `reg` are declared on its
-     * PARENT. We do not keep parent pointers, and every node this kernel reads
-     * `reg` from is a child of the root, so the root's values are the right
-     * ones. Anything deeper must pass its own parent explicitly -- and today
-     * nothing does. Spec defaults if absent: 2 address cells, 1 size cell. */
-    (void)node;
-    fdt_node_t root = fdt_root();
-    uint32_t a = 2, s = 1;
-    if (root != FDT_NONE) {
-        a = fdt_prop_u32(root, "#address-cells", 2);
-        s = fdt_prop_u32(root, "#size-cells", 1);
-    }
+     * PARENT -- not on the root. Until the Raspberry Pi this used the root's
+     * unconditionally, which was right only because every node read on `virt`
+     * is the root's child (or the ITS, whose parent happens to agree). A Pi
+     * puts its peripherals under /soc with ONE address cell, and the root's two
+     * would have read each `reg` as garbage. docs/RPI4.md P1. */
+    fdt_node_t parent = fdt_parent(node);
+    uint32_t a, s;
+    bus_cells(parent == FDT_NONE ? fdt_root() : parent, &a, &s);
+
     /* A cell count above 2 cannot fit in uint64_t; clamp and say so rather
      * than silently truncating an address. */
     if (a > 2 || s > 2) {
@@ -379,6 +409,54 @@ static uint64_t read_cells(const uint8_t *p, uint32_t cells) {
     return cells == 2 ? be64_at(p) : (uint64_t)be32_at(p);
 }
 
+/* Carry an address in `bus`'s child space up to a CPU physical address, one
+ * `ranges` at a time, until the root. `virt` never needed this -- its devices
+ * are the root's children, so the loop does not run -- but a Pi's /soc maps
+ * bus address 0x7e201000 to CPU 0xfe201000, and a driver that skipped this
+ * would program the VideoCore's view of the world into the ARM's MMU.
+ *
+ * `ranges;` (empty) is the identity. NO `ranges` means the bus is not mapped
+ * into the CPU's address space at all, and the address has no CPU meaning:
+ * that is a failure, not an identity. */
+static bool translate_to_cpu(fdt_node_t bus, uint64_t *addr) {
+    fdt_node_t root = fdt_root();
+    while (bus != FDT_NONE && bus != root) {
+        uint32_t len = 0;
+        const uint8_t *r = (const uint8_t *)fdt_prop(bus, "ranges", &len);
+        if (!r)
+            return false;
+
+        fdt_node_t up = fdt_parent(bus);
+        if (len == 0) {
+            bus = up;
+            continue;
+        }
+
+        uint32_t ca, cs, pa, ps;
+        bus_cells(bus, &ca, &cs);
+        bus_cells(up == FDT_NONE ? root : up, &pa, &ps);
+        if (ca > 2 || cs > 2 || pa > 2)
+            return false;       /* a PCI-style bus: its ranges are not MMIO reg */
+
+        uint32_t stride = (ca + pa + cs) * 4;
+        bool found = false;
+        for (uint32_t off = 0; off + stride <= len; off += stride) {
+            uint64_t child  = read_cells(r + off, ca);
+            uint64_t parent = read_cells(r + off + ca * 4, pa);
+            uint64_t size   = read_cells(r + off + (ca + pa) * 4, cs);
+            if (*addr >= child && *addr - child < size) {
+                *addr = parent + (*addr - child);
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return false;
+        bus = up;
+    }
+    return true;
+}
+
 bool fdt_reg(fdt_node_t node, uint32_t index, uint64_t *addr, uint64_t *size) {
     uint32_t ac = 2, sc = 1, len = 0;
     fdt_reg_cells(node, &ac, &sc);
@@ -392,9 +470,47 @@ bool fdt_reg(fdt_node_t node, uint32_t index, uint64_t *addr, uint64_t *size) {
         return false;
 
     const uint8_t *e = p + (uint64_t)index * stride;
-    if (addr) *addr = read_cells(e, ac);
+    uint64_t a = read_cells(e, ac);
+    if (!translate_to_cpu(fdt_parent(node), &a))
+        return false;
+    if (addr) *addr = a;
     if (size) *size = read_cells(e + ac * 4, sc);
     return true;
+}
+
+bool fdt_dma_translate(fdt_node_t node, bool cpu_to_bus, uint64_t in, uint64_t *out) {
+    /* One level: the device's parent bus's dma-ranges, entries of
+     * (bus address [bus #address-cells], CPU address [its parent's
+     * #address-cells], size [bus #size-cells]). Enough for the Pi, whose /soc
+     * maps VideoCore bus 0xC0000000 onto ARM 0 for 1 GiB; a machine that
+     * nests DMA translations would need the walk translate_to_cpu() does. */
+    fdt_node_t bus = fdt_parent(node);
+    if (bus == FDT_NONE)
+        return false;
+    uint32_t len = 0;
+    const uint8_t *r = (const uint8_t *)fdt_prop(bus, "dma-ranges", &len);
+    if (!r || len == 0)
+        return false;
+
+    fdt_node_t up = fdt_parent(bus);
+    uint32_t ca, cs, pa, ps;
+    bus_cells(bus, &ca, &cs);
+    bus_cells(up == FDT_NONE ? fdt_root() : up, &pa, &ps);
+    if (ca > 2 || cs > 2 || pa > 2)
+        return false;
+
+    uint32_t stride = (ca + pa + cs) * 4;
+    for (uint32_t off = 0; off + stride <= len; off += stride) {
+        uint64_t b    = read_cells(r + off, ca);
+        uint64_t c    = read_cells(r + off + ca * 4, pa);
+        uint64_t size = read_cells(r + off + (ca + pa) * 4, cs);
+        uint64_t from = cpu_to_bus ? c : b, to = cpu_to_bus ? b : c;
+        if (in >= from && in - from < size) {
+            *out = to + (in - from);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool fdt_interrupt(fdt_node_t node, uint32_t index,

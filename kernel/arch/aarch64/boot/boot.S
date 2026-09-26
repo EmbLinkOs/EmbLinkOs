@@ -11,6 +11,8 @@
  * physical addresses the linker script assigns. The higher half is A2.
  */
 
+#include "arch/aarch64/board.h"
+
 /* ---------------------------------------------------------------------------
  * Constants and macros for the physical-mode window.
  * ------------------------------------------------------------------------- */
@@ -70,7 +72,11 @@
  * ASCII codes rather than character literals: `#'X'` is not portable across
  * assembler syntaxes and this file cannot afford a surprise. */
 .macro PUTC code
-    mov     x9, #0x09000000
+    /* movz+movk rather than `mov #imm`: the Pi's 0xFE201000 is not a single
+     * encodable immediate, and a literal-pool load would be one more thing
+     * that has to be PC-relative to be right in this window. */
+    movz    x9, #(BOARD_UART_PHYS >> 16), lsl #16
+    movk    x9, #(BOARD_UART_PHYS & 0xffff)
 .Lputc_wait\@:
     ldr     w10, [x9, #0x18]            /* UARTFR */
     tbnz    w10, #5, .Lputc_wait\@      /* TXFF: transmit FIFO full */
@@ -107,16 +113,18 @@ _start:
                                          * is the same 0x80000, and the linker
                                          * script's 0x40080000 = virt's RAM
                                          * base + this.                     */
-    .quad   0x100000                    /* image_size: how much RAM the image
+    .quad   __kernel_image_size         /* image_size: how much RAM the image
                                          * needs INCLUDING .bss, so a loader
-                                         * knows what not to overwrite. A flat
-                                         * 1 MiB, not `kernel_end - _start`:
-                                         * that difference spans sections and
-                                         * is not guaranteed to be a link-time
-                                         * constant. Revisit when the kernel
-                                         * approaches it -- and it must, since
-                                         * a nonzero value here is what makes
-                                         * text_offset above be honoured.    */
+                                         * knows what not to overwrite -- and
+                                         * a nonzero value is what makes
+                                         * text_offset above be honoured.
+                                         * Computed by linker.ld. It was a flat
+                                         * 1 MiB until the kernel had grown to
+                                         * five; `virt` never noticed, because
+                                         * QEMU puts its DTB BELOW the kernel,
+                                         * but a loader that places the DTB
+                                         * just past image_size would have it
+                                         * zeroed with .bss (docs/RPI4.md P0). */
     .quad   0                           /* flags: little-endian, page size
                                          * unspecified, 2 MiB-aligned base   */
     .quad   0                           /* res2 */
@@ -157,6 +165,14 @@ header_end:
      * bring-up bug -- it is tolerated by some implementations and not others. */
     ldr     x1, =0x30d00800
     msr     sctlr_el1, x1
+
+    /* CPTR_EL2 = RES1 bits only, TFP = 0: do not trap FP/SIMD to EL2. Every
+     * kernel on a Raspberry Pi arrives HERE -- its firmware enters at EL2 --
+     * and CPTR_EL2 is whatever that firmware left it. With TFP set, the first
+     * FP instruction at EL0 traps to an EL2 that has no vector table, which is
+     * a hang with no message. docs/RPI4.md §3, P0. */
+    mov     x1, #0x33ff
+    msr     cptr_el2, x1
 
     /* Let EL1 see the physical counter/timer (A3 needs CNTVCT_EL0), and zero
      * the virtual offset so virtual and physical time agree. */
@@ -400,6 +416,75 @@ park:
 build_page_tables:
     stp     x29, x30, [sp, #-16]!
 
+#if defined(BOARD_RPI4)
+    /* THE RASPBERRY PI 4 IS THE OTHER WAY UP (docs/RPI4.md §2.2): RAM from 0,
+     * and the peripherals in the top 64 MiB of the 4th GiB, 0xFC000000 up. The
+     * kernel is at PA 0x80000, so it is GiB 0 that must be executable RAM.
+     *
+     * Device space is mapped in the identity map and the MMIO window and
+     * NOWHERE ELSE. In particular the direct map stops at 0xFC000000 in 2 MiB
+     * blocks rather than mapping GiB 3 whole: Normal memory may be accessed
+     * speculatively, and a speculative read of a peripheral register on this
+     * SoC is not harmless -- some of them have side effects on read, and the
+     * bus can hang on others. */
+
+    /* --- TTBR0: identity ------------------------------------------------- */
+    PHYS_OF x0, boot_l0_ttbr0
+    PHYS_OF x1, boot_l1_ident
+    orr     x2, x1, #PTE_TABLE_BITS
+    str     x2, [x0]                            /* l0[0] -> l1_ident */
+
+    ldr     x3, =BLOCK_RAM_EXEC
+    str     x3, [x1]                            /* PA 0..1G: RAM, the kernel */
+    ldr     x3, =BLOCK_DEVICE
+    ldr     x4, =0xC0000000
+    orr     x3, x3, x4
+    str     x3, [x1, #(3 * 8)]                  /* PA 3..4G: peripherals, for
+                                                 * pl011_init() before it moves
+                                                 * to the MMIO window */
+
+    /* --- TTBR1: kernel window, direct map, MMIO -------------------------- */
+    PHYS_OF x0, boot_l0_ttbr1
+
+    PHYS_OF x1, boot_l1_kern
+    orr     x2, x1, #PTE_TABLE_BITS
+    str     x2, [x0, #(L0_IDX_KERNEL * 8)]
+    ldr     x3, =BLOCK_RAM_EXEC
+    str     x3, [x1, #(510 * 8)]                /* VA base+0 -> PA 0..1G */
+
+    PHYS_OF x1, boot_l1_dmap
+    orr     x2, x1, #PTE_TABLE_BITS
+    str     x2, [x0, #(L0_IDX_DIRECT * 8)]
+    ldr     x4, =BLOCK_RAM_NOEXEC
+    mov     x5, #0
+5:  lsl     x6, x5, #30
+    orr     x6, x6, x4
+    str     x6, [x1, x5, lsl #3]                /* PA 0..3G: RAM (1, 2, 4 and
+                                                 * 8 GiB boards alike; pmm only
+                                                 * hands out what the DTB says) */
+    add     x5, x5, #1
+    cmp     x5, #3
+    b.lo    5b
+
+    PHYS_OF x2, boot_l2_dmap3                   /* PA 3..4G in 2 MiB blocks */
+    orr     x3, x2, #PTE_TABLE_BITS
+    str     x3, [x1, #(3 * 8)]
+    ldr     x5, =0xC0000000
+    ldr     x7, =0xFC000000
+6:  orr     x6, x5, x4
+    str     x6, [x2], #8
+    add     x5, x5, #0x200000
+    cmp     x5, x7
+    b.lo    6b                                  /* ...and stop at 0xFC000000 */
+
+    PHYS_OF x1, boot_l1_mmio
+    orr     x2, x1, #PTE_TABLE_BITS
+    str     x2, [x0, #(L0_IDX_MMIO * 8)]
+    ldr     x3, =BLOCK_DEVICE
+    ldr     x4, =0xC0000000
+    orr     x3, x3, x4
+    str     x3, [x1, #(3 * 8)]                  /* PA 3..4G as Device memory */
+#else
     /* --- TTBR0: identity ------------------------------------------------- */
     PHYS_OF x0, boot_l0_ttbr0
     PHYS_OF x1, boot_l1_ident
@@ -452,6 +537,7 @@ build_page_tables:
     str     x2, [x0, #(L0_IDX_MMIO * 8)]
     ldr     x3, =BLOCK_DEVICE
     str     x3, [x1]                            /* PA 0..1G as Device memory */
+#endif
 
     /* The tables were built with the MMU and caches OFF, so these stores went
      * straight to memory -- but the page-table walker is a separate observer
@@ -554,3 +640,6 @@ boot_l1_kern:   .space 4096
 boot_l1_dmap:   .space 4096
     .globl boot_l1_mmio
 boot_l1_mmio:   .space 4096
+#if defined(BOARD_RPI4)
+boot_l2_dmap3:  .space 4096
+#endif

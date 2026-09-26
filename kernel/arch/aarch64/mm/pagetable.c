@@ -920,7 +920,10 @@ void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {
  * is the same simplification vmm.h documents for the x86 side. Physical pages
  * ARE reclaimed; it is only the address space that is spent, and there is
  * 512 GiB of it per level-0 slot. */
-#define MMIO_DYN_BASE  (MMIO_BASE + 0x40000000ULL)   /* above boot.S's 1 GiB block */
+/* Above ALL FOUR GiB of boot.S's static window, not just virt's first: on a
+ * Raspberry Pi the static block is GiB 3 (the peripherals), and a bump
+ * allocator starting at +1 GiB would walk into it after 2 GiB of mappings. */
+#define MMIO_DYN_BASE  (MMIO_BASE + 0x100000000ULL)
 #define KMAP_VA_BASE   0xFFFFFD0000000000ULL         /* L0 slot 506, unused */
 
 static uint64_t mmio_va_next = MMIO_DYN_BASE;

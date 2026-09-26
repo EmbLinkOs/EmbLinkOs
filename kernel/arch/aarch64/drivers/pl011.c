@@ -1,15 +1,16 @@
 #include "arch/aarch64/drivers/pl011.h"
 #include "arch/aarch64/boot/fdt.h"
 #include "arch/aarch64/irq/gicv3.h"
+#include "arch/aarch64/board.h"
 #include "drivers/char/serial.h"
 
-/* PL011 on QEMU `-M virt`. Hardcoded, and honestly so: `virt`'s memory map is
- * a documented, stable contract (hw/arm/virt.c, VIRT_UART), and docs/ARM64.md
- * §5 rules out a general device-tree driver framework for exactly this reason
- * -- we read the few nodes we need and hardcode the rest of one board.
+/* The board's console PL011 (board.h): QEMU `virt`'s at 0x09000000, or UART0
+ * on a Raspberry Pi 4. Taken from the board header rather than the device tree
+ * because it has to work BEFORE the tree is read -- it is how a failure to
+ * read the tree gets reported at all.
  *
  * Register offsets: ARM PrimeCell UART (PL011) Technical Reference Manual. */
-#define PL011_PHYS      0x09000000UL
+#define PL011_PHYS      ((unsigned long)BOARD_UART_PHYS)
 
 /* Where the UART is REACHED from, which is not the same as where it is.
  *
@@ -69,19 +70,23 @@ void pl011_use_mmio_window(unsigned long base) {
 
 void pl011_init(void) {
     /* QEMU hands us a UART that already works, so none of this is strictly
-     * required under -M virt. It is here because the first time this code
+     * required under emulation. It is here because the first time this code
      * meets firmware that left the UART in some other state -- a different
      * baud, FIFOs off, RX disabled -- the symptom is a blank console with no
      * way to ask why. Programming it costs nine stores. */
 
     mmio_w32(UARTCR, 0);                        /* disable while reconfiguring */
 
-    /* 115200 baud from `virt`'s 24 MHz UART clock:
-     *   divisor = 24e6 / (16 * 115200) = 13.0208
-     *   IBRD    = 13
-     *   FBRD    = round(0.0208 * 64) = 1                                  */
-    mmio_w32(UARTIBRD, 13);
-    mmio_w32(UARTFBRD, 1);
+    /* 115200 baud from the board's UART clock. The divisor is clk / (16 *
+     * baud) in 6.6 fixed point, so compute it in 64ths, rounded:
+     *   virt 24 MHz: 13.0208 -> IBRD 13, FBRD 1
+     *   rpi4 48 MHz: 26.0417 -> IBRD 26, FBRD 3
+     * The Pi's firmware has usually programmed this already -- but for its own
+     * idea of the clock, and a wrong divisor is a console of garbage rather
+     * than an absent one, which costs an afternoon to recognise. */
+    uint32_t div64 = (uint32_t)((((uint64_t)BOARD_UART_CLK_HZ * 8u) / 115200u + 1u) / 2u);
+    mmio_w32(UARTIBRD, div64 >> 6);
+    mmio_w32(UARTFBRD, div64 & 63u);
 
     mmio_w32(UARTLCR_H, LCR_H_WLEN_8 | LCR_H_FEN);   /* 8N1, FIFOs on */
 

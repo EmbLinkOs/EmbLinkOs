@@ -849,6 +849,33 @@ The measurement immediately earned itself twice:
 
 ---
 
+## Raspberry Pi 4 (docs/RPI4.md)
+
+P0 boots on QEMU `raspi4b`; the rest is phased in docs/RPI4.md §3. Open, in order:
+
+- [ ] **P0 + P0b on the real board** (planned Monday 2026-09-28, on a TV). Only
+      QEMU has seen them. `rpi4-sdboot`, HDMI0; the expected screen and the
+      triage are docs/RPI4.md §4. Check that the newest-line bar is BLUE.
+- [x] ~~`fdt_reg()` ignores parent `ranges`~~ -- it translates through every
+      ancestor's `ranges` now, and reads the parent's cell counts (P0b).
+- [ ] **P1: `irq/gicv2.c`** for the GIC-400 behind the existing `gic_*` API, and
+      `fdt_interrupt()` recognising `arm,gic-400` as a GIC.
+- [ ] **P2: spin-table SMP** (`cpu-release-addr`), beside the PSCI path.
+- [ ] **P3: EMMC2.** `drivers/storage/sdhci.c` binds over PCI only; split out
+      a DT attach. Plus an `rpi4-sdcard` target: FAT32 boot partition and
+      EMBKFS root.
+- [ ] **P4: the desktop on the mailbox framebuffer** (the framebuffer itself is
+      P0b, done). P5: BCM2711 PCIe + VL805 xHCI
+      (`NOTIFY_XHCI_RESET`). P6: GENET v5 Ethernet.
+- [ ] **aarch64 RAM above 4 GiB is ignored.** boot.S's direct map covers 4 GiB,
+      so `boot_protocol_dtb.c` truncates memory there, loudly, rather than let
+      pmm hand out pages the kernel can't reach. That was a real bug before, not
+      a limit: an 8 GB Pi or `virt -m 5G` would fault. The fix is extending the
+      direct map from the DTB in C once pmm exists (docs/RPI4.md P7).
+- [ ] `fdt_find_compatible()` doesn't examine the root node, so a board's own
+      `compatible` can't be found through it. Worth fixing in the function
+      rather than working around at each caller the way `gicv3.c` does now.
+
 ## Storage
 
 ### The installer

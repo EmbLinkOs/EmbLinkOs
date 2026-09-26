@@ -187,7 +187,9 @@ int gic_init(void) {
          * in the wrong place entirely. */
         if (fdt_find_compatible("arm,cortex-a15-gic") != FDT_NONE ||
             fdt_find_compatible("arm,gic-400") != FDT_NONE)
-            kprintf("gic: this machine has a GICv2. Add gic-version=3 to -M virt.\n");
+            kprintf(fdt_prop_has_string(fdt_root(), "compatible", "brcm,bcm2711")
+                    ? "gic: this machine has a GICv2 (the Pi 4's GIC-400). Its driver is docs/RPI4.md phase P1.\n"
+                    : "gic: this machine has a GICv2. Add gic-version=3 to -M virt.\n");
 
         /* Deliberately no GICv2 fallback: docs/ARM64.md §6.2 chose v3, and a
          * half-configured controller is worse than none -- interrupts would

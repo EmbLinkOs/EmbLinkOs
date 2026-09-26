@@ -33,7 +33,11 @@
 ENTRY(_start)
 
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
-KERNEL_PHYS_BASE = 0x40080000;
+/* BOARD_KERNEL_PHYS_BASE comes from `--defsym` when a board other than `virt`
+ * is built (kernel/arch/aarch64/arch.mk): a Raspberry Pi 4 has RAM at 0, so
+ * its kernel8.img is at 0x80000. A plain assignment here would override the
+ * defsym, hence DEFINED. */
+KERNEL_PHYS_BASE = DEFINED(BOARD_KERNEL_PHYS_BASE) ? BOARD_KERNEL_PHYS_BASE : 0x40080000;
 
 SECTIONS {
     . = KERNEL_VIRT_BASE + KERNEL_PHYS_BASE;
@@ -103,6 +107,12 @@ SECTIONS {
     . = ALIGN(4096);
     kernel_end = .;
     __kernel_end = .;
+
+    /* The arm64 Image header's image_size (boot.S): the whole footprint in
+     * RAM, .bss included. An absolute symbol, so the header's .quad is
+     * resolved at link time rather than left as a difference of two
+     * relocations the assembler cannot fold. */
+    __kernel_image_size = __kernel_end - __kernel_start;
 
     /* Toolchain metadata that would otherwise land in an allocated segment and
      * be loaded into RAM for nothing. */

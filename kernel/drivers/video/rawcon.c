@@ -35,6 +35,7 @@
 #include "mm/vmm.h"
 #include "include/kprintf.h"
 #include "drivers/char/serial.h"
+#include "lib/klog.h"
 
 static uint32_t *g_px;               /* the mapping; 0 = no framebuffer */
 static uint32_t  g_w, g_h, g_stride; /* stride in PIXELS */
@@ -107,6 +108,16 @@ static void new_line(void) {
     mark_row(g_row, g_mark);
 }
 
+static void draw_char(char ch) {
+    unsigned char c = (unsigned char)ch;
+    if (c == '\n') { new_line(); return; }
+    if (c == '\r') { g_col = 0; return; }
+    if (c == '\t') { do rawcon_putc(' '); while (g_col % 8); return; }
+    if (c < 32 && c != 0) return;
+    if (g_col >= g_cols) new_line();
+    glyph(g_col++, g_row, c);
+}
+
 void rawcon_putc(char ch) {
     /* SERIAL FIRST, as console_putchar() does: a registered secondary sink
      * REPLACES kprintf's own serial write rather than adding to it, so a
@@ -115,13 +126,39 @@ void rawcon_putc(char ch) {
      * console -- ACPI, the TSC's frequency, PCI -- vanished from it. */
     if (g_active && !g_panicked) serial_write_char(ch);
     if (!g_px || (!g_active && !g_panicked) || g_screen_full) return;
-    unsigned char c = (unsigned char)ch;
-    if (c == '\n') { new_line(); return; }
-    if (c == '\r') { g_col = 0; return; }
-    if (c == '\t') { do rawcon_putc(' '); while (g_col % 8); return; }
-    if (c < 32 && c != 0) return;
-    if (g_col >= g_cols) new_line();
-    glyph(g_col++, g_row, c);
+    draw_char(ch);
+}
+
+/* WHAT WAS SAID BEFORE THERE WAS A SCREEN. rawcon_init runs once the VMM can
+ * map the framebuffer, which is after the banner, the memory map and the
+ * physical allocator have all printed -- exactly the stretch a machine with no
+ * serial port (a laptop; a Raspberry Pi on a television) is most likely to
+ * hang in on its first boot. kprintf has been keeping it in the klog ring all
+ * along, so draw the part that fits on one screen: the newest rows-2 lines,
+ * so the replay never wraps over itself. Drawn only -- serial already has it. */
+static char g_replay[8192];
+
+static void replay_early_log(void) {
+    uint32_t n = klog_tail(g_replay, sizeof g_replay);
+    if (!n || g_rows < 3) return;
+
+    /* Walk back a LINE at a time, charging each the screen ROWS it takes: a
+     * line longer than the screen is wide wraps, and counting newlines alone
+     * let the replay run past the bottom and over its own first lines. */
+    uint32_t budget = g_rows - 2, used = 0, start = n;
+    while (start > 0) {
+        uint32_t end = start, b = start;
+        while (b > 0 && g_replay[b - 1] != '\n') b--;
+        uint32_t len = end - b;
+        uint32_t rows = len ? (len + g_cols - 1) / g_cols : 1;
+        if (used + rows > budget) break;
+        used += rows;
+        start = b > 0 ? b - 1 : 0;          /* step over the newline before it */
+        if (b == 0) break;
+    }
+    /* `start` is on a newline (or 0); begin just after it. */
+    if (start > 0 || g_replay[0] == '\n') start++;
+    for (uint32_t i = start; i < n; i++) draw_char(g_replay[i]);
 }
 
 void rawcon_puts(const char *s) {
@@ -166,6 +203,7 @@ void rawcon_init(void) {
     for (uint32_t r = 0; r < g_rows; r++) fill_row(r, g_bg);
     g_row = 0; g_col = 0;
     mark_row(0, g_mark);
+    replay_early_log();
 
     g_active = true;
     kprintf_set_secondary(rawcon_ready, rawcon_putc);

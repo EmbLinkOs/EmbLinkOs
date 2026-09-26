@@ -1,5 +1,6 @@
 #include "boot/boot_protocol.h"
 #include "arch/aarch64/boot/fdt.h"
+#include "arch/aarch64/drivers/bcm_mbox.h"
 #include "mm/pmm.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
@@ -24,6 +25,9 @@
  * "unknown" meaning in the protocol. */
 
 #define MAX_MMAP 32
+
+/* The extent of boot.S's direct map: four level-1 blocks. */
+#define DMAP_BOOT_LIMIT 0x100000000ULL
 
 static struct boot_mmap_entry mmap[MAX_MMAP];
 static uint32_t mmap_count;
@@ -92,9 +96,26 @@ void boot_protocol_capture(uint64_t phys)
     while ((m = fdt_find_device_type("memory", m)) != FDT_NONE) {
         uint64_t a = 0, s = 0;
         for (uint32_t i = 0; fdt_reg(m, i, &a, &s); i++) {
-            add_range(a, s, E820_USABLE);
             kprintf("boot: dtb memory %p + %p\n",
                     (void *)(uintptr_t)a, (void *)(uintptr_t)s);
+
+            /* boot.S's direct map -- the only way the kernel reaches a
+             * physical page -- covers the first 4 GiB and no more. RAM above
+             * it is IGNORED, loudly, rather than handed to pmm: pmm would give
+             * those pages out, and the first kernel access to one would be a
+             * translation fault far from here. An 8 GiB Raspberry Pi 4 is the
+             * first machine to have any (docs/RPI4.md); `virt -m 4G+` the
+             * second. Extending the direct map is the fix, in docs/TODO.md. */
+            if (a >= DMAP_BOOT_LIMIT) {
+                kprintf("boot:   ...above the 4 GiB direct map -- ignored\n");
+                continue;
+            }
+            if (s > DMAP_BOOT_LIMIT - a) {
+                kprintf("boot:   ...truncated to the 4 GiB direct map (%d MiB ignored)\n",
+                        (int)((s - (DMAP_BOOT_LIMIT - a)) >> 20));
+                s = DMAP_BOOT_LIMIT - a;
+            }
+            add_range(a, s, E820_USABLE);
         }
     }
 
@@ -115,6 +136,10 @@ void boot_protocol_capture(uint64_t phys)
     proto.mmap_phys   = KV2P((uint64_t)(uintptr_t)mmap);
     proto.mmap_stride = sizeof(struct boot_mmap_entry);
     proto.boot_drive  = 0xFF;      /* protocol's "unknown" */
+
+    /* A Raspberry Pi's screen is the firmware's to hand out, over the
+     * mailbox; x86's loaders put the same fields here from VBE or GOP. */
+    bcm_fb_probe(&proto);
     captured = true;
 }
 

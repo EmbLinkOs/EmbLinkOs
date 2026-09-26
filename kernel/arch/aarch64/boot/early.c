@@ -1,5 +1,7 @@
 #include <stdint.h>
+#include "arch/aarch64/board.h"
 #include "arch/aarch64/drivers/pl011.h"
+#include "drivers/video/rawcon.h"
 #include "arch/aarch64/irq/exception.h"
 #include "arch/aarch64/boot/fdt.h"
 #include "arch/aarch64/mm/pagetable.h"
@@ -64,7 +66,7 @@
  * Called from boot.S AFTER the MMU is on and the kernel has jumped to the
  * higher half, with x0 = the PHYSICAL device tree address QEMU planted. */
 
-#define PL011_PHYS 0x09000000UL
+#define PL011_PHYS ((unsigned long)BOARD_UART_PHYS)
 
 /* How long the boot self-test waits for the desktop session to come up and for
  * injected input to arrive, at the 100 Hz tick. Generous on purpose: it is a
@@ -452,6 +454,7 @@ void arch_early_main(uint64_t dtb_phys) {
     kprintf("\nEmbLinkOS aarch64 -- phase A5 (EL0, svc, the neutral syscall path)\n");
     kprintf("  see docs/ARM64.md\n\n");
 
+    kprintf("  board       : %s\n",     BOARD_NAME);
     kprintf("  CurrentEL   : EL%d\n",   (int)read_sysreg_currentel());
     kprintf("  MIDR_EL1    : %p\n",     (void *)(uintptr_t)read_sysreg_midr());
     kprintf("  SCTLR_EL1   : %p   (M=1 => MMU ON)\n",
@@ -489,6 +492,14 @@ void arch_early_main(uint64_t dtb_phys) {
     }
     vm_drop_identity_map();
     kprintf("vm: identity map dropped -- low addresses now fault\n");
+
+    /* THE KERNEL LOG ON THE SCREEN, from here on -- a Raspberry Pi on a
+     * television has no other output unless someone has a serial adapter.
+     * As early as it can be: it maps the framebuffer, so it needs pmm and the
+     * final kernel tables, and nothing else. A machine with no firmware
+     * framebuffer (`virt`) gets nothing and hears nothing. docs/RPI4.md P0b. */
+    rawcon_init();
+
     vm_dump_kernel_mapping();
 
     selftest_pmm();
