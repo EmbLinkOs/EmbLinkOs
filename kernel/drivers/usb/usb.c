@@ -214,6 +214,7 @@ void usb_hotplug_poll(void) {
 // Called from the kernel main loop: services interrupt-IN endpoints on the
 // polled legacy controllers (UHCI/OHCI/EHCI). xHCI input is IRQ-driven.
 void usb_poll(void) {
+    xhci_poll();          /* only controllers no interrupt services */
     usb_core_poll();
     usb_hotplug_poll();
 }

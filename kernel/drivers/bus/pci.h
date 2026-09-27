@@ -31,6 +31,15 @@
  * beyond "a write that raises an interrupt", so the message is asked for
  * rather than computed. */
 uint32_t arch_pci_cfg_read32 (uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
+
+/* Memory addresses as a BAR holds them (bus addresses) versus as the CPU
+ * reaches them. The same on a PC and on QEMU `virt`; NOT on a Raspberry Pi 4,
+ * whose PCIe window is CPU 0x6_0000_0000 = bus 0xF8000000 (docs/RPI4.md P5).
+ * pci_read_bar() returns CPU addresses, so every driver maps the right thing;
+ * whatever PROGRAMS a BAR or a bridge window writes bus addresses. An address
+ * outside every window translates to itself -- bus address 0 stays 0. */
+uint64_t arch_pci_bus_to_cpu(uint64_t bus_addr);
+uint64_t arch_pci_cpu_to_bus(uint64_t cpu_addr);
 void     arch_pci_cfg_write32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset,
                               uint32_t value);
 

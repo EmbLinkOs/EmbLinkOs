@@ -16,7 +16,7 @@
 #include "include/kstring.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
-#include "drivers/timer/pit.h"
+#include "drivers/timer/timer.h"   /* timer_delay_ms: the portable delay (on x86, the same PIT/TSC wait) */
 
 // Capability registers.
 #define EHCI_CAPLENGTH  0x00
@@ -399,7 +399,7 @@ static void ehci_port_probe(struct ehci_hc *hc, bool ppc, uint32_t p) {
 
         if (ppc && !(sc & EHCI_PORT_PP)) {
             ehci_op_write(hc, reg, (sc & ~EHCI_PORT_W1C) | EHCI_PORT_PP);
-            pit_delay_ms(20);
+            timer_delay_ms(20);
             sc = ehci_op_read(hc, reg);
         }
 
@@ -418,14 +418,14 @@ static void ehci_port_probe(struct ehci_hc *hc, bool ppc, uint32_t p) {
         sc = ehci_op_read(hc, reg);
         ehci_op_write(hc, reg,
                       ((sc & ~EHCI_PORT_W1C) & ~EHCI_PORT_PED) | EHCI_PORT_PR);
-        pit_delay_ms(50);
+        timer_delay_ms(50);
         sc = ehci_op_read(hc, reg);
         ehci_op_write(hc, reg, (sc & ~EHCI_PORT_W1C) & ~EHCI_PORT_PR);
         for (int i = 0; i < 100; i++) {
             if (!(ehci_op_read(hc, reg) & EHCI_PORT_PR)) break;
-            pit_delay_ms(1);
+            timer_delay_ms(1);
         }
-        pit_delay_ms(10);
+        timer_delay_ms(10);
 
         sc = ehci_op_read(hc, reg);
         if (!(sc & EHCI_PORT_PED)) {
@@ -524,12 +524,12 @@ bool ehci_init_controller(struct usb_controller *ctrl) {
                   ehci_op_read(hc, EHCI_USBCMD) & ~(uint32_t)EHCI_CMD_RS);
     for (int i = 0; i < 200; i++) {
         if (ehci_op_read(hc, EHCI_USBSTS) & EHCI_STS_HCH) break;
-        pit_delay_ms(1);
+        timer_delay_ms(1);
     }
     ehci_op_write(hc, EHCI_USBCMD, EHCI_CMD_HCRESET);
     for (int i = 0; i < 500; i++) {
         if (!(ehci_op_read(hc, EHCI_USBCMD) & EHCI_CMD_HCRESET)) break;
-        pit_delay_ms(1);
+        timer_delay_ms(1);
     }
 
     // Async list: head QH pointing at itself, H=1, no work.
@@ -563,7 +563,7 @@ bool ehci_init_controller(struct usb_controller *ctrl) {
     ehci_op_write(hc, EHCI_USBCMD,
                   EHCI_CMD_RS | EHCI_CMD_ASE | EHCI_CMD_PSE | EHCI_CMD_ITC8);
     ehci_op_write(hc, EHCI_CONFIGFLAG, 1);   // claim all ports
-    pit_delay_ms(20);
+    timer_delay_ms(20);
 
     kprintf("EHCI: running, %u root ports%s\n",
             (unsigned int)hc->nports, ppc ? " (port power switching)" : "");

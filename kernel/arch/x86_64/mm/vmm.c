@@ -1,3 +1,4 @@
+#include "include/arch_dma.h"
 #include "mm/vmm.h"
 #include "arch/x86_64/cpu/cpu_features.h"
 #include "include/arch_ipi.h"
@@ -1121,3 +1122,8 @@ void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {
     // The VA range (including the guard page below it) is intentionally not
     // reclaimed — same bump-allocator trade-off vmm_map_mmio already makes.
 }
+
+/* include/arch_dma.h: DMA is cache-coherent on x86, so there is nothing to do.
+ * The Raspberry Pi 4 is why the interface exists (docs/RPI4.md P5). */
+void arch_dma_uncached(void *va, uint64_t len) { (void)va; (void)len; }
+void arch_dma_flush(const volatile void *va, uint64_t len) { (void)va; (void)len; }

@@ -47,3 +47,21 @@
 
 /* --- bochs VGA: virtio-gpu is the display path here ----------------------- */
 const struct gpu_driver *bochs_gpu_probe(void)         { return 0; }
+
+/* --- UHCI: the one USB host controller that is not memory-mapped ----------
+ * UHCI (Intel's USB 1.1 controller) is driven through x86 I/O ports -- `in`
+ * and `out`, which this architecture does not have. It exists only on PCs,
+ * and no ARM board has one, so the PCI scan never finds one here either;
+ * this answers "can you bring up this UHCI?" with the no that usb.c already
+ * handles ("controller did not initialise"). xHCI, EHCI and OHCI are
+ * MMIO and are the real drivers on aarch64 (docs/RPI4.md P5). */
+#include "drivers/usb/uhci.h"
+#include "include/kprintf.h"
+
+bool uhci_init_controller(struct usb_controller *ctrl) {
+    (void)ctrl;
+    kprintf("USB: UHCI needs x86 port I/O -- not on this architecture\n");
+    return false;
+}
+
+void uhci_rescan(void *hc) { (void)hc; }

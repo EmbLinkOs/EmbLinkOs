@@ -1,3 +1,4 @@
+#include "include/arch_dma.h"
 #include "arch/aarch64/mm/pagetable.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -998,4 +999,43 @@ uint64_t vmm_kmap_pages(const uint64_t *phys, uint32_t n) {
 void vmm_kunmap_pages(uint64_t virt_base, uint32_t n) {
     for (uint32_t i = 0; i < n; i++)
         vm_unmap_page(virt_base + (uint64_t)i * PAGE_SIZE);
+}
+
+/* --- DMA and the caches: include/arch_dma.h -------------------------------- */
+
+void arch_dma_flush(const volatile void *va, uint64_t len) {
+    uint64_t a = (uint64_t)(uintptr_t)va & ~63ull, end = (uint64_t)(uintptr_t)va + len;
+    for (; a < end; a += 64)
+        __asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+void arch_dma_uncached(void *va, uint64_t len) {
+    uint64_t start = (uint64_t)(uintptr_t)va;
+    if ((start | len) & (PAGE_SIZE - 1) || start < KERNEL_VIRTUAL_BASE) {
+        kprintf("dma: arch_dma_uncached(%p, %d): not whole pages of the kernel image\n",
+                va, (int)len);
+        return;
+    }
+    /* Everything the cache holds for the range goes to memory FIRST. After the
+     * remap the CPU no longer looks in the cache for it -- but a dirty line
+     * left there could still be evicted later and land on top of what the
+     * device wrote. */
+    arch_dma_flush(va, len);
+    uint32_t wrong = 0;
+    for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
+        vm_map_page(start + off, KV2P(start + off), PT_WRITE | PT_WC);
+        /* READ IT BACK. On a coherent machine a mapping that silently stayed
+         * cacheable works anyway, so no test would notice -- and on the Pi it
+         * is the whole difference. Checked here, where it can be said. */
+        int err = PT_OK;
+        uint64_t *pte = walk(start + off, false, &err);
+        if (!pte || (*pte & PTE_ATTR(7)) != PTE_ATTR(MAIR_NC))
+            wrong++;
+    }
+    arch_dma_flush(va, len);             /* anything speculatively refilled */
+    if (wrong)
+        kprintf("dma: %u of %u page(s) at %p did NOT become non-cacheable -- "
+                "device DMA there will be incoherent on a non-coherent bus\n",
+                wrong, (unsigned)(len / PAGE_SIZE), va);
 }

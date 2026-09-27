@@ -326,6 +326,9 @@ struct pci_bar pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, uint8
             result.size = size & 0xFFFFFFFF;
             result.valid = (result.size != 0);
         }
+        /* What the BAR holds is a BUS address; what a driver maps is a CPU
+         * one. The same thing on most machines -- see arch_pci_bus_to_cpu. */
+        result.address = arch_pci_bus_to_cpu(result.address);
     }
     return result;
 }
@@ -386,11 +389,14 @@ void pci_assign_resources(uint64_t window_base, uint64_t window_size) {
                 break;
             }
 
+            /* `addr` is where the CPU will reach it; the BAR takes where the
+             * BUS will (arch_pci_cpu_to_bus -- different on a Pi 4). */
+            uint64_t busaddr = arch_pci_cpu_to_bus(addr);
             pci_write32(d->bus, d->device, d->function,
-                        PCI_BAR0 + b * 4, (uint32_t)addr);
+                        PCI_BAR0 + b * 4, (uint32_t)busaddr);
             if (bar.is_64bit)
                 pci_write32(d->bus, d->device, d->function,
-                            PCI_BAR0 + (b + 1) * 4, (uint32_t)(addr >> 32));
+                            PCI_BAR0 + (b + 1) * 4, (uint32_t)(busaddr >> 32));
 
             /* Read it back. A BAR has read-only low bits (the type and
              * prefetch flags) and read-only ADDRESS bits below its size, so
@@ -545,6 +551,10 @@ void pci_bridge_configure(void) {
             if (pci_behind_bridge(sec, sub, &lo, &hi)) {
                 /* The window granularity is one megabyte and the register
                  * holds only the top sixteen bits of the address. */
+                /* The BARs were read as CPU addresses; a bridge window is in
+                 * BUS addresses (arch_pci_cpu_to_bus -- different on a Pi 4). */
+                lo = arch_pci_cpu_to_bus(lo);
+                hi = arch_pci_cpu_to_bus(hi - 1) + 1;
                 uint16_t nb = (uint16_t)((lo & 0xFFF00000ULL) >> 16);
                 uint16_t nl = (uint16_t)(((hi - 1) & 0xFFF00000ULL) >> 16);
                 pci_write16(d->bus, d->device, d->function, PCI_MEM_BASE, nb);

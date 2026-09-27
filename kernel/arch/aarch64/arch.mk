@@ -68,6 +68,7 @@ ARM_C_SRC   := kernel/arch/aarch64/boot/early.c \
                kernel/arch/aarch64/drivers/pl031.c \
                kernel/arch/aarch64/drivers/bcm_mbox.c \
                kernel/arch/aarch64/drivers/sdhci_dt.c \
+               kernel/arch/aarch64/drivers/pcie_brcmstb.c \
                kernel/arch/aarch64/drivers/absent.c \
                kernel/arch/aarch64/cpu/spinlock.c \
                kernel/arch/aarch64/cpu/arch_thread.c \
@@ -113,6 +114,13 @@ ARM_SHARED_SRC := kernel/mm/pmm.c \
                   kernel/drivers/storage/virtio_blk.c \
                   kernel/drivers/storage/nvme.c \
                   kernel/drivers/storage/sdhci.c \
+                  kernel/drivers/usb/usb.c \
+                  kernel/drivers/usb/usb_core.c \
+                  kernel/drivers/usb/usb_uas.c \
+                  kernel/drivers/usb/xhci.c \
+                  kernel/drivers/usb/ehci.c \
+                  kernel/drivers/usb/ohci.c \
+                  kernel/net/usb_net.c \
                   kernel/drivers/storage/virtio_scsi.c \
                   kernel/drivers/storage/nvmetest.c \
                   kernel/block/block.c \
@@ -1275,6 +1283,21 @@ check-tools-arm64:
 .PHONY: clean-arm64
 clean-arm64:
 	rm -rf $(ARM_BUILD)
+
+# --- USB input on aarch64 -- docs/RPI4.md P5 --------------------------------
+# A Pi 4's keyboard and mouse are USB behind PCIe. raspi4b has no PCIe, so the
+# USB half is proven here instead: `virt` with a qemu-xhci, a usb-kbd and a
+# usb-mouse and NO virtio input, keys and motion sent through QEMU's input
+# layer, and the driver's report counters and the cursor read back out of
+# guest memory. The same xHCI/HID code runs on the Pi.
+.PHONY: test-arm64-usb
+test-arm64-usb: $(ARM_IMG) $(ARM_ROOTFS) tools/arm64_usb_input_test.py
+	python3 tools/arm64_usb_input_test.py $(ARM_IMG) $(ARM_ELF) $(ARM_ROOTFS) \
+	  $(ARM_KBUILD)/test-arm64-usb.log
+	@# ...and again with both behind a hub: every Pi 4 keyboard is (its USB
+	@# 2.0 ports are a hub inside the VL805).
+	python3 tools/arm64_usb_input_test.py $(ARM_IMG) $(ARM_ELF) $(ARM_ROOTFS) \
+	  $(ARM_KBUILD)/test-arm64-usb-hub.log --hub
 
 # --- Raspberry Pi 4 -- docs/RPI4.md ----------------------------------------
 # Everything below needs BOARD=rpi4, because it is about the Pi's kernel:

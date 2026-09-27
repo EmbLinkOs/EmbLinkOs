@@ -153,6 +153,16 @@ void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
     if (wheel) g_wheel += wheel;
 }
 
+void mouse_move_relative(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel) {
+    int32_t nx = g_x + dx;
+    int32_t ny = g_y + dy;                     /* screen convention: +y is DOWN */
+    if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
+    if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
+    g_x = nx; g_y = ny;
+    buttons_set(buttons & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE));
+    if (wheel) g_wheel += wheel;
+}
+
 #if defined(__x86_64__)
 static void mouse_handler(void) {
     /* On IRQ12 the pending byte is mouse data; read it directly. (Some 8042

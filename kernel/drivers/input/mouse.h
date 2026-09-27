@@ -39,4 +39,10 @@ int mouse_take_press(uint32_t *when_ms);
 void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
                         uint32_t buttons, int32_t wheel);
 
+/* Move the cursor by a RELATIVE delta (a USB boot-protocol mouse), clamped to
+ * the screen. Screen convention -- +dy is DOWN, as USB HID reports it; the
+ * PS/2 path flips its own up-positive y before it gets here. buttons uses
+ * MOUSE_BTN_*; wheel is a delta to accumulate (+up). */
+void mouse_move_relative(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel);
+
 #endif /* _MOUSE_H_ */

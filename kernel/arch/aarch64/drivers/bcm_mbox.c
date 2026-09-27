@@ -38,6 +38,7 @@
 #define TAG_ALLOC_BUFFER  0x00040001u
 #define TAG_GET_PITCH     0x00040008u
 #define TAG_GET_CLOCK_RATE 0x00030002u
+#define TAG_NOTIFY_XHCI_RESET 0x00030058u
 
 /* PIXEL ORDER, as the firmware names it: 0 = BGR, 1 = RGB -- the order of the
  * bytes in memory, which is what FB_FORMAT_* describes too. We ASK for RGB and
@@ -223,4 +224,14 @@ uint32_t bcm_mbox_clock_rate(uint32_t clock_id) {
     if (!mbox_call() || msg[at] != clock_id)
         return 0;
     return msg[at + 1];
+}
+
+bool bcm_mbox_notify_xhci_reset(uint32_t pci_dev_addr) {
+    if (!mbox)
+        return false;
+    begin();
+    uint32_t at = tag(TAG_NOTIFY_XHCI_RESET, 1, &pci_dev_addr);
+    end();
+    (void)at;
+    return mbox_call();
 }

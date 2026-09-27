@@ -4,6 +4,7 @@
 #include "mm/vmm.h"
 #include "include/kprintf.h"
 #include "arch/aarch64/irq/gicv3.h"
+#include "arch/aarch64/drivers/pcie_brcmstb.h"
 
 /* PCIe configuration space on aarch64 -- ECAM. docs/ARM64.md phase A7.
  *
@@ -31,9 +32,15 @@ static void ecam_init(void) {
     if (ecam)
         return;
 
+    static bool said;
     fdt_node_t n = fdt_find_compatible("pci-host-ecam-generic");
     if (n == FDT_NONE) {
-        kprintf("pci: no ECAM host bridge in the device tree\n");
+        /* Once, not per config access: a machine with no ECAM (a Raspberry
+         * Pi, whose PCIe is pcie_brcmstb.c) asks this for every one of the
+         * 8192 addresses pci_init() scans. */
+        if (!said && !brcm_pcie_active())
+            kprintf("pci: no ECAM host bridge in the device tree\n");
+        said = true;
         return;
     }
 
@@ -72,8 +79,21 @@ static volatile uint32_t *cfg_word(uint8_t bus, uint8_t device, uint8_t function
     return (volatile uint32_t *)(ecam + off);
 }
 
+/* TWO KINDS OF HOST BRIDGE on aarch64: `virt`'s ECAM, and a Raspberry Pi 4's
+ * Broadcom controller (pcie_brcmstb.c), whose configuration space is reached
+ * a different way and whose memory window is at a different CPU address than
+ * bus address. A machine has one or the other; each hook asks which. */
+uint64_t arch_pci_bus_to_cpu(uint64_t a) {
+    return brcm_pcie_active() ? brcm_pcie_bus_to_cpu(a) : a;
+}
+uint64_t arch_pci_cpu_to_bus(uint64_t a) {
+    return brcm_pcie_active() ? brcm_pcie_cpu_to_bus(a) : a;
+}
+
 uint32_t arch_pci_cfg_read32(uint8_t bus, uint8_t device, uint8_t function,
                              uint8_t offset) {
+    if (brcm_pcie_active())
+        return brcm_pcie_cfg_read32(bus, device, function, offset);
     volatile uint32_t *p = cfg_word(bus, device, function, offset);
     /* All-ones is what a real bus returns for an absent device, so it is also
      * the right answer when there is no ECAM window at all -- enumeration
@@ -83,6 +103,10 @@ uint32_t arch_pci_cfg_read32(uint8_t bus, uint8_t device, uint8_t function,
 
 void arch_pci_cfg_write32(uint8_t bus, uint8_t device, uint8_t function,
                           uint8_t offset, uint32_t value) {
+    if (brcm_pcie_active()) {
+        brcm_pcie_cfg_write32(bus, device, function, offset, value);
+        return;
+    }
     volatile uint32_t *p = cfg_word(bus, device, function, offset);
     if (p)
         *p = value;
@@ -144,6 +168,10 @@ uint32_t arch_pci_msi_last_intid(void) { return g_last_msi_intid; }
  * not 64-bit-capable can only be placed below 4 GiB and every virtio device on
  * `virt` has one. */
 void pci_ecam_assign_resources(void) {
+    if (brcm_pcie_active()) {                /* a Pi 4: its own windows */
+        brcm_pcie_assign_resources();
+        return;
+    }
     ecam_init();
 
     fdt_node_t n = fdt_find_compatible("pci-host-ecam-generic");

@@ -462,6 +462,10 @@ static bool translate_to_cpu(fdt_node_t bus, uint64_t *addr) {
     return true;
 }
 
+bool fdt_translate(fdt_node_t bus, uint64_t *addr) {
+    return translate_to_cpu(bus, addr);
+}
+
 bool fdt_reg(fdt_node_t node, uint32_t index, uint64_t *addr, uint64_t *size) {
     uint32_t ac = 2, sc = 1, len = 0;
     fdt_reg_cells(node, &ac, &sc);

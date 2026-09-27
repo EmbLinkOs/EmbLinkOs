@@ -12,6 +12,12 @@ void xhci_enable_irq(void);
 // Interrupt handler: acknowledge + drain every controller's event ring. Wired to
 // the IRQ vector by xhci_enable_irq (exposed for the IRQ dispatch layer).
 void xhci_irq(void);
+// Drain the event ring of every controller not serviced by interrupt -- all
+// of them on aarch64. Called from usb_poll().
+void xhci_poll(void);
+// HID reports processed so far, keyboard and mouse. Evidence that input is
+// ARRIVING, not merely that a device was configured.
+void xhci_hid_stats(uint64_t *kbd, uint64_t *mouse);
 
 /* Devices addressed on xHCI controllers. Counted separately from
  * usb_device_count() because xHCI does not use usb_core's device table -- see

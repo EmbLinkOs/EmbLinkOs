@@ -5,7 +5,7 @@ way docs/ARM64.md is: every phase is ❌ until it boots and ✅ only once its
 "done when" is machine-checked by a `make` target. A phase that has only been
 seen on QEMU says so. The real board is the only witness for "real hardware".*
 
-**Status: P0–P4 ✅ on QEMU `raspi4b`: it boots, the kernel log is on the
+**Status: P0–P4 ✅ on QEMU `raspi4b`, P5's USB stack ✅ on QEMU `virt`: it boots, the kernel log is on the
 screen, interrupts work, all four cores run, and the SD card is the disk. The
 userland and the desktop session run from it. Not yet run on a physical Pi.
 First real-hardware run planned for Monday 2026-09-28, on a television over
@@ -372,13 +372,70 @@ scrolls, and you can copy from it. The screen is for when it isn't.
   **Not yet:** input (keyboard and mouse are USB, P5), and the clock, which
   reads 1 January 1970 until NTP runs (P6; a Pi has no RTC).
 
-* **P5 ❌ (real hardware only) — USB keyboard and mouse.** The BCM2711 PCIe
-  root complex (`brcm,bcm2711-pcie`, 0xFD50_0000) has to be brought up by the
-  kernel: link training, outbound window, its own MSI block. Behind it sits
-  the VL805, an **xHCI**, which `kernel/drivers/usb/xhci.c` already drives on
-  x86. After the PCIe reset the VL805 needs firmware reloaded, via mailbox tag
-  `NOTIFY_XHCI_RESET` (0x00030058).
-  **Done when:** typing on a USB keyboard reaches the shell (checklist, §4).
+* **P5 — USB keyboard and mouse. ✅ on QEMU for everything QEMU can model;
+  the PCIe half is real-hardware only.** A Pi 4's USB is a VIA VL805 xHCI
+  behind the SoC's PCIe, and its USB 2.0 ports are a hub inside the VL805, so
+  a keyboard is always PCIe → xHCI → hub → device. Each layer:
+
+  - **The USB stack on aarch64** (✅ `test-arm64-usb`). The x86 xHCI, EHCI,
+    OHCI and HID code now builds for aarch64: `timer_delay_ms()` instead of
+    the x86 PIT, UHCI (I/O ports) answered by `absent.c`, and the controller
+    **polled** from the boot loop (`xhci_poll()` via `usb_poll()`, next to
+    `virtio_input_poll()`), with x86's interrupt path unchanged. Proven on
+    `virt` with `qemu-xhci` and **no virtio input**: keys sent through QEMU's
+    input layer raise the driver's report counter, and a (+100, +50) motion
+    moves the kernel's cursor by exactly that.
+  - **Mouse support** (✅). The driver used to detect a boot mouse and never
+    configure it. Now keyboards and mice share the endpoint setup, and mouse
+    reports go to a new shared `mouse_move_relative()`.
+  - **Hubs** (✅, `test-arm64-usb` runs a second topology). Mandatory on a Pi.
+    It covers the hub descriptor, the slot marked as a hub (Configure
+    Endpoint), port power and reset, route strings, Transaction Translator
+    fields for low/full-speed devices behind a high-speed hub, recursive
+    enumeration up to five tiers, per-slot teardown (a hub takes its children
+    with it), and hub-port hotplug in `xhci_rescan()`. Hot-adding a keyboard
+    to a hub port over QMP enumerates it and it types. QEMU's hub is full
+    speed, so **the TT fields are the one part only the Pi's high-speed hub
+    exercises.**
+  - **Four real-hardware bugs QEMU hid, fixed while here:**
+    - `SET_PROTOCOL(boot)` was never sent. Devices start in report protocol;
+      keyboards happen to match, many real mice don't.
+    - EP0 used 64 bytes for **low**-speed devices, which must use 8.
+      **Full**-speed devices now get their EP0 size from the first 8 bytes of
+      the descriptor, then Evaluate Context. Before, a device with an 8-byte
+      EP0 returned an 8-byte descriptor padded with zeros.
+    - The raw `bInterval` went to xHCI, which wants an exponent: a
+      full-speed mouse polled every 128 ms instead of 10.
+    - The command ring's Link TRB never got its cycle bit updated, so the
+      controller would stop dead after 255 commands. One `xhci_cmd_advance()`
+      now serves all five enqueue sites.
+  - **DMA coherency** (✅ mechanism on QEMU; the need is real-hardware only).
+    A Pi 4's PCIe doesn't snoop the CPU caches. `include/arch_dma.h` adds
+    `arch_dma_uncached()` (remap page-aligned kernel memory non-cacheable)
+    and `arch_dma_flush()`. The xHCI's whole DMA bundle is remapped the
+    moment it's claimed; the kernel reads the page tables back and complains
+    if a page stayed cacheable, and the test requires it didn't. Scratchpad
+    pages are flushed after zeroing. No-ops on x86.
+  - **The Pi's PCIe host bridge** (`drivers/pcie_brcmstb.c`, **real hardware
+    only**: `raspi4b` has no PCIe). Linux's `pcie-brcmstb` bring-up for the
+    BCM2711, with the windows from the device tree:
+    1. Reset, SerDes out of IDDQ.
+    2. Unsupported config reads return all-ones, so the scan can't fault.
+    3. The inbound DMA window from `dma-ranges`.
+    4. Interrupts masked, PERST released, link awaited.
+    5. The outbound window (this firmware: CPU `0x6_0000_0000` = PCI
+       `0xC0000000`, 1 GiB) and the root port's bus numbers and window.
+
+    Then the VL805's firmware: if its version register (config `0x50`) reads
+    0, the VideoCore is asked to load it (`NOTIFY_XHCI_RESET`), and the BAR
+    and command register are restored afterwards. Every step prints; the
+    version is on screen.
+  - **PCI addresses ≠ CPU addresses.** `pci_read_bar()` now returns CPU
+    addresses via `arch_pci_bus_to_cpu()`, and BARs and bridge windows are
+    programmed with bus addresses. The identity on x86 and `virt`.
+
+  **Done when (on the Pi):** typing on a USB keyboard reaches the desktop,
+  and the mouse moves the cursor.
 
 * **P6 ❌ (real hardware only) — Ethernet.** GENET v5 (0xFD58_0000) and its
   BCM54213 PHY. Then the existing network stack and NTP set the clock (the Pi
@@ -416,8 +473,13 @@ monitor. A 3.3 V USB-serial adapter is optional (below).
 4. **The desktop**, with its top bar, logged in automatically as the
    development user. The whole boot takes seconds on the real board (the
    minute-plus figures in this file are QEMU emulating every instruction).
-   **That is success.** The keyboard and mouse won't work yet: the Pi's USB
-   sits behind PCIe, which is P5.
+   **That is success.**
+5. **With a USB keyboard and mouse plugged in** (any of the four ports), the
+   mouse should move the cursor and the keyboard should type. This is P5's
+   first real test. If they don't, the lines to photograph are the ones
+   starting `pcie:` and `xHCI` near the top of the log. The `pcie:` lines
+   show the link training and the USB controller's firmware version; the
+   `xHCI` lines show the hub and every device behind it.
 
 Take a photo of the screen either way. It carries everything needed.
 
@@ -436,6 +498,11 @@ Take a photo of the screen either way. It carries everything needed.
   one controller QEMU cannot test (P3). The lines just above it (the base
   clock the firmware reported) are the evidence; a photo of them is the bug
   report.
+- **Desktop fine, but no keyboard or mouse:** look for `pcie: LINK DOWN`
+  (PCIe never trained), `firmware version 0 ... STILL NO FIRMWARE` (the
+  VL805 has no firmware), or `xHCI hub slot1: ... port N` lines with no
+  `HID keyboard ready` after them (enumeration behind the hub failed;
+  usually the TT fields, which QEMU can't test).
 - **The log stops somewhere before the end:** the photo of the last lines is
   the bug report. Three places are new on real silicon and the likeliest to
   stop: right after `gic: initialised` (interrupt groups: the timer never

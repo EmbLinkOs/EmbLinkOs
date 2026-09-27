@@ -20,6 +20,8 @@
 #include "loader/pietest.h"
 #include "drivers/storage/nvme.h"
 #include "arch/aarch64/drivers/sdhci_dt.h"
+#include "arch/aarch64/drivers/pcie_brcmstb.h"
+#include "drivers/usb/usb.h"
 #include "fs/epfs.h"      /* the swap witness, driven */
 #include "fs/vfs.h"
 #include "arch/aarch64/cpu/cpu_features.h"
@@ -529,6 +531,10 @@ void arch_early_main(uint64_t dtb_phys) {
      * preemption output. The existing virtio-gpu and virtio-net drivers are
      * virtio-over-PCI, so this bus is what makes them reachable here at all. */
     kprintf("\n--- PCIe ---\n");
+    /* A Raspberry Pi 4's host bridge must be brought up by the kernel before
+     * anything behind it can be seen -- its USB is there (docs/RPI4.md P5).
+     * Silent on a machine without one. */
+    brcm_pcie_init();
     pci_init();
     { extern void pci_ecam_assign_resources(void); pci_ecam_assign_resources(); }
 
@@ -612,6 +618,13 @@ void arch_early_main(uint64_t dtb_phys) {
      * virtio-blk -- `virt`'s disks keep their names -- and on a Pi, which has
      * neither, it is sda. */
     sdhci_dt_init();
+
+    /* USB: xHCI (and EHCI/OHCI) over PCI -- a Raspberry Pi 4's keyboard and
+     * mouse, which sit behind its PCIe (docs/RPI4.md P5), and on `virt` a
+     * qemu-xhci. Before the partition scan, as kernel/main.c orders it, so a
+     * USB stick's partitions are found like any other disk's. Polled on this
+     * architecture: see usb_poll() in the boot loops below. */
+    usb_init();
 
     /* PARTITIONS. Every disk above is a whole device; a disk that carries a
      * partition table holds its filesystems INSIDE it, and until this ran the
@@ -1474,6 +1487,7 @@ void arch_early_main(uint64_t dtb_phys) {
                  * IRQ handler. main.c's boot loop drives usb_poll() from the
                  * identical place for the identical reason. */
                 virtio_input_poll();
+                usb_poll();
                 compositor_pointer_tick();
                 compositor_anim_tick();
 
@@ -1629,6 +1643,7 @@ void arch_early_main(uint64_t dtb_phys) {
      * cheaper than spinning. */
     for (;;) {
         virtio_input_poll();
+        usb_poll();       /* USB keyboard and mouse -- polled here, as on x86 */
         compositor_pointer_tick();
         /* The system key shortcuts, on this arch too -- GUI+Tab switching
          * windows only on x86 would be a shortcut nobody could rely on. The

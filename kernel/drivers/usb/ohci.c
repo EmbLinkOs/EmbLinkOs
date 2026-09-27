@@ -17,7 +17,6 @@
 #include "include/kstring.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
-#include "drivers/timer/pit.h"
 
 // Operational registers.
 #define OHCI_REVISION        0x00
@@ -526,10 +525,10 @@ static void ohci_port_probe(struct ohci_hc *hc, uint32_t p) {
         ohci_write(hc, reg, OHCI_PORT_PRS);
         for (int i = 0; i < 500; i++) {
             if (ohci_read(hc, reg) & OHCI_PORT_PRSC) break;
-            pit_delay_ms(1);
+            timer_delay_ms(1);
         }
         ohci_write(hc, reg, OHCI_PORT_PRSC | OHCI_PORT_CSC | OHCI_PORT_PESC);
-        pit_delay_ms(10);
+        timer_delay_ms(10);
 
         sc = ohci_read(hc, reg);
         if (!(sc & OHCI_PORT_PES)) {
@@ -615,7 +614,7 @@ bool ohci_init_controller(struct usb_controller *ctrl) {
     ohci_write(hc, OHCI_CMDSTATUS, OHCI_CS_HCR);
     for (int i = 0; i < 100; i++) {
         if (!(ohci_read(hc, OHCI_CMDSTATUS) & OHCI_CS_HCR)) break;
-        pit_delay_ms(1);
+        timer_delay_ms(1);
     }
 
     // Empty periodic table: interrupt ED chain filled in below.
@@ -642,7 +641,7 @@ bool ohci_init_controller(struct usb_controller *ctrl) {
     ohci_write(hc, OHCI_RHSTATUS, 1U << 16);       // SetGlobalPower
     uint32_t rhda = ohci_read(hc, OHCI_RHDESCRIPTORA);
     uint32_t potpgt = (rhda >> 24) & 0xFF;
-    pit_delay_ms(potpgt ? potpgt * 2 : 50);
+    timer_delay_ms(potpgt ? potpgt * 2 : 50);
 
     hc->nports = rhda & 0xFF;
     if (hc->nports > 15) hc->nports = 15;

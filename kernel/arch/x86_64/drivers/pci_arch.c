@@ -27,6 +27,11 @@ void arch_pci_cfg_write32(uint8_t bus, uint8_t device, uint8_t function,
     outl(PCI_CONFIG_DATA, value);
 }
 
+/* A PC's PCI memory space IS the CPU's: firmware places BARs at the addresses
+ * the CPU uses for them. */
+uint64_t arch_pci_bus_to_cpu(uint64_t bus_addr) { return bus_addr; }
+uint64_t arch_pci_cpu_to_bus(uint64_t cpu_addr) { return cpu_addr; }
+
 bool arch_pci_msi_message(uint8_t bus, uint8_t device, uint8_t function,
                           uint8_t vector, uint32_t cpu_id,
                           uint64_t *out_addr, uint32_t *out_data) {

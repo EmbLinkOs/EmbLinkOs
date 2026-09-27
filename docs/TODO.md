@@ -888,9 +888,22 @@ P0 boots on QEMU `raspi4b`; the rest is phased in docs/RPI4.md §3. Open, in ord
 - [ ] **P3: EMMC2.** `drivers/storage/sdhci.c` binds over PCI only; split out
       a DT attach. Plus an `rpi4-sdcard` target: FAT32 boot partition and
       EMBKFS root.
-- [ ] **P4: the desktop on the mailbox framebuffer** (the framebuffer itself is
-      P0b, done). P5: BCM2711 PCIe + VL805 xHCI
-      (`NOTIFY_XHCI_RESET`). P6: GENET v5 Ethernet.
+- [x] ~~P4: the desktop on the mailbox framebuffer~~ -- ✅ on QEMU raspi4b.
+- [ ] **P5 on the real board** -- the USB stack, mouse, hubs and DMA remap
+      pass on QEMU `virt` (test-arm64-usb); the BCM2711 PCIe bring-up and the
+      VL805 firmware load have never run (raspi4b has no PCIe), and a
+      high-speed hub's Transaction Translator fields are exercised only by
+      the Pi's own hub. docs/RPI4.md P5 and §4 say what to photograph.
+- [ ] **USB on aarch64 is polled** (~10 ms, from the boot loop). Fine for a
+      keyboard and a mouse; audio or bulk throughput would want the xHCI's
+      interrupt wired through the GIC (virt: INTx/MSI; Pi: the brcmstb
+      controller's own MSI block).
+- [ ] **One interrupt-IN endpoint per USB device.** A composite device -- a
+      wireless receiver that is a keyboard AND a mouse on two interfaces --
+      gets its first boot interface only. The Pi's usual wired keyboard and
+      mouse are two devices and unaffected.
+- [ ] **P6: Ethernet** (GENET v5 + its BCM54213 PHY) -- then NTP sets the
+      clock, which a Pi has no battery-backed RTC to keep.
 - [ ] **aarch64 RAM above 4 GiB is ignored.** boot.S's direct map covers 4 GiB,
       so `boot_protocol_dtb.c` truncates memory there, loudly, rather than let
       pmm hand out pages the kernel can't reach. That was a real bug before, not

@@ -8,7 +8,7 @@
 #include "block/block.h"
 #include "fs/automount.h"
 #include "net/usb_net.h"
-#include "drivers/timer/pit.h"
+#include "drivers/timer/timer.h"   /* timer_delay_ms: the portable delay (on x86, the same PIT/TSC wait) */
 
 // ---------------------------------------------------------------------------
 // Device table
@@ -418,7 +418,7 @@ static bool usb_msc_attach(struct usb_device *dev) {
         memset(cdb, 0, sizeof(cdb));
         cdb[0] = 0x03; cdb[4] = 18;             // REQUEST SENSE
         usb_msc_bot(m, cdb, 6, true, 18);
-        pit_delay_ms(10);
+        timer_delay_ms(10);
     }
 
     // READ CAPACITY(10)
@@ -636,14 +636,14 @@ static void usb_hub_clear_port_feature(struct usb_device *hub, uint8_t port, uin
 // instead of the HC's native port registers.
 static void usb_hub_port_attach(struct usb_device *hub, uint8_t port) {
     usb_hub_set_port_feature(hub, port, USB_PORT_FEAT_POWER);
-    pit_delay_ms(20);   // bPwrOn2PwrGood is in 2 ms units; 20 ms covers any real hub
+    timer_delay_ms(20);   // bPwrOn2PwrGood is in 2 ms units; 20 ms covers any real hub
 
     uint16_t status, change;
     if (!usb_hub_get_port_status(hub, port, &status, &change)) return;
     if (!(status & (1 << USB_PORT_FEAT_CONNECTION))) return;   // nothing plugged in
 
     usb_hub_set_port_feature(hub, port, USB_PORT_FEAT_RESET);
-    pit_delay_ms(50);
+    timer_delay_ms(50);
 
     if (!usb_hub_get_port_status(hub, port, &status, &change)) return;
 
@@ -714,7 +714,7 @@ int usb_enumerate(struct usb_device *dev) {
         return -1;
     }
     dev->addr = addr;
-    pit_delay_ms(5);   // address settle time (spec: 2 ms)
+    timer_delay_ms(5);   // address settle time (spec: 2 ms)
 
     // 3) Full device descriptor.
     rc = usb_get_descriptor(dev, USB_DESC_DEVICE, 0, buf, 18);

@@ -2,6 +2,7 @@
 #define ARCH_AARCH64_BCM_MBOX_H
 
 #include "boot/boot_protocol.h"
+#include "include/types.h"
 
 /* The Raspberry Pi's VideoCore mailbox -- docs/RPI4.md P0b.
  *
@@ -21,5 +22,12 @@ void bcm_fb_probe(struct boot_protocol *proto);
 #define BCM_CLOCK_EMMC  1
 #define BCM_CLOCK_EMMC2 12
 uint32_t bcm_mbox_clock_rate(uint32_t clock_id);
+
+/* Tell the firmware the PCIe link to the VL805 (the Pi 4's USB controller)
+ * has been reset, so it (re)loads the VL805's firmware -- which the newer
+ * boards keep nowhere else. `pci_dev_addr` is bus<<20 | device<<15 |
+ * function<<12, as Linux's rpi_firmware_init_vl805() sends it. True if the
+ * firmware accepted the request. docs/RPI4.md P5. */
+bool bcm_mbox_notify_xhci_reset(uint32_t pci_dev_addr);
 
 #endif

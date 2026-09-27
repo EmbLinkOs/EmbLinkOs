@@ -91,6 +91,13 @@ bool fdt_prop_has_string(fdt_node_t node, const char *name, const char *value);
  * or doubles every address, so it is never assumed. */
 void fdt_reg_cells(fdt_node_t node, uint32_t *addr_cells, uint32_t *size_cells);
 
+/* Carry an address in `bus`'s CHILD address space up to a CPU physical
+ * address through every `ranges` on the way -- what fdt_reg() does for a
+ * `reg`, for any other address a node publishes (a PCIe window's parent
+ * address in its host bridge's `ranges`, say). False if some ancestor is not
+ * mapped into the CPU's address space. */
+bool fdt_translate(fdt_node_t bus, uint64_t *addr);
+
 /* The node's parent, or FDT_NONE for the root. A walk from the root, so
  * O(depth x siblings) -- fine for the handful of lookups boot makes. */
 fdt_node_t fdt_parent(fdt_node_t node);
