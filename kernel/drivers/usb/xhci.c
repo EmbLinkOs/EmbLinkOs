@@ -54,6 +54,7 @@
 #define XHCI_IMAN_IE          (1U << 1)  // Interrupt Enable
 
 #define XHCI_PORTSC_CCS      (1U << 0)
+#define XHCI_PORTSC_PP       (1U << 9)   /* port power: OFF after reset when PPC */
 #define XHCI_PORTSC_PED      (1U << 1)
 #define XHCI_PORTSC_PR       (1U << 4)
 #define XHCI_PORTSC_SPEED_SHIFT 10
@@ -2701,6 +2702,61 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
      * because nothing had looked. */
     rt->max_ports = max_ports < XHCI_MAX_PORTS_TRACKED ? max_ports
                                                        : XHCI_MAX_PORTS_TRACKED;
+
+    /* TURN THE PORTS ON. A host controller reset leaves every port UNPOWERED
+     * on any controller that implements port power control (HCCPARAMS1 bit 3,
+     * PPC) -- and an unpowered port reports no device, forever, however many
+     * times it is scanned. QEMU's controller has PPC clear and its ports are
+     * always on, so this driver never needed the bit and never had it.
+     *
+     * An HP ProBook is where that showed: the firmware read the USB stick to
+     * load this kernel, and the kernel then reported "xHCI at 00:14.0 -- 18
+     * port(s), 0 device(s) present" and could not find its own root
+     * filesystem. The machine was looking at eighteen ports it had switched
+     * off itself.
+     *
+     * PP is set preserving the RW1C change bits (writing them back as read
+     * would clear status the port had raised), then the spec's power-good
+     * settling time before anything is believed. */
+    {
+        bool ppc = (hccparams1 & (1U << 3)) != 0;
+        uint32_t powered = 0;
+        for (uint32_t port = 1; port <= rt->max_ports; port++) {
+            uint32_t reg = XHCI_PORTSC_BASE + ((port - 1U) * XHCI_PORT_STRIDE);
+            uint32_t v = xhci_read32(op, reg);
+            if (!(v & XHCI_PORTSC_PP)) {
+                xhci_write32(op, reg, (v & ~XHCI_PORTSC_RW1C_MASK) | XHCI_PORTSC_PP);
+                powered++;
+            }
+        }
+        if (powered) {
+            timer_delay_ms(20);              /* power-good */
+            kprintf("xHCI: powered %u port(s) that came up dark (port power control %s)\n",
+                    (unsigned)powered, ppc ? "supported" : "not advertised");
+        }
+
+        /* AND THEN WAIT FOR SOMETHING TO ANNOUNCE ITSELF. A device does not
+         * appear the instant its port has power: USB 2 debounce alone is
+         * 100 ms, and a stick that was just reset with the controller has to
+         * re-attach. Scanning immediately -- which is what this did -- reads
+         * every port as empty and never looks again. Half a second, ended the
+         * moment anything connects, and only paid on a machine where nothing
+         * has yet. */
+        for (int waited = 0; waited < 500; waited += 25) {
+            bool any = false;
+            for (uint32_t port = 1; port <= rt->max_ports && !any; port++) {
+                uint32_t v = xhci_read32(op, XHCI_PORTSC_BASE +
+                                             ((port - 1U) * XHCI_PORT_STRIDE));
+                if (v & XHCI_PORTSC_CCS) any = true;
+            }
+            if (any) {
+                if (waited)
+                    kprintf("xHCI: a device announced itself after %d ms\n", waited);
+                break;
+            }
+            timer_delay_ms(25);
+        }
+    }
     for (uint32_t port = 1; port <= rt->max_ports; port++) {
         uint32_t portsc = xhci_read32(op, XHCI_PORTSC_BASE +
                                           ((port - 1U) * XHCI_PORT_STRIDE));
@@ -2719,6 +2775,22 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
     kprintf("xHCI: detected %u connected device(s) on %u port(s)\n",
             (unsigned int)ctrl->devices_present,
             (unsigned int)ctrl->max_ports);
+
+    /* NOTHING AT ALL is worth a raw dump: on a machine that booted off one of
+     * these ports, "no devices" is a claim that needs evidence, and PORTSC is
+     * the evidence -- power, connect, enable and speed, per port, as the
+     * hardware reports them. */
+    if (ctrl->devices_present == 0) {
+        kprintf("xHCI: every port as the controller reports it (PORTSC):\n");
+        for (uint32_t port = 1; port <= rt->max_ports; port++) {
+            uint32_t v = xhci_read32(op, XHCI_PORTSC_BASE +
+                                         ((port - 1U) * XHCI_PORT_STRIDE));
+            kprintf("xHCI:   port %2u: %08x%s%s%s\n", (unsigned)port, (unsigned)v,
+                    (v & XHCI_PORTSC_PP)  ? " powered"   : " DARK",
+                    (v & XHCI_PORTSC_CCS) ? " connected" : "",
+                    (v & XHCI_PORTSC_PED) ? " enabled"   : "");
+        }
+    }
 
     return true;
 }
