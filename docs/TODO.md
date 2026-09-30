@@ -7715,3 +7715,28 @@ a no.
       the cursor moves and the physical buttons click. Tap-to-click, two-finger
       scroll and edge scroll all live in the Synaptics/ELAN extended protocols
       (the `0xE8/0xE6` knock) and none of them are read here.
+
+**Two things the boot log could not say, and now does (2026-09-30)**
+
+The ProBook's I/O errors survived the bus lock, and its ESP held no
+`EMBLINK.LOG` at all -- the stick's reads were failing before the log's first
+write at four seconds. With no serial port, the log is the only witness, and
+it was missing the two facts that decide the remaining theories:
+
+- [x] **The firmware memory map went to the serial port only.** `pmm_print_map`
+      was `serial_write_*` throughout; it is `kprintf` now, one line per entry,
+      and the kernel states the verdict itself: whether any non-usable region
+      overlaps the image at `[0x100000, kernel_end)`, where every xHCI ring and
+      bounce buffer lives. A firmware that reserves low memory where OVMF does
+      not would corrupt those silently.
+- [x] **No ring may cross a 64 KB line (xHCI 1.2 §4.11.5.1; data buffers, §6.4.1).**
+      The rings were 64-byte aligned and placed by the linker; this build had one
+      slot's EP0 ring at `0x5afe80-0x5b0080`, across `0x5b0000`. QEMU does not
+      enforce the rule. Every DMA block is 4 KB-aligned now, which makes a
+      crossing structurally impossible, and `xhci_check_dma_layout()` verifies
+      it at init and writes `DMA layout ok` (or the offender) into the log.
+- [ ] **Neither is yet shown to be the ProBook's fault.** Both are real defects
+      by the specification; whether either is what the laptop trips on is what
+      the next `EMBLINK.LOG` -- or, if the stick still cannot be written, the
+      next photograph -- will say. A claim is measured or it is not made.
+

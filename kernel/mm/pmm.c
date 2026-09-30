@@ -45,45 +45,49 @@ static inline int bitmap_test(uint64_t page_index) {
 }
 
 
+/* THE MAP GOES INTO THE LOG, NOT JUST DOWN THE SERIAL LINE. This used to be
+ * serial_write_* throughout, which on a laptop -- no serial port -- is a
+ * report to nobody. It is the one thing the boot log on the stick most needs
+ * to carry: the kernel is loaded at a FIXED physical address and its DMA
+ * buffers (every xHCI ring and bounce buffer is a static array in .bss) sit
+ * wherever the image puts them, and whether the firmware still owns any of
+ * that range is a question only this map answers. So the kernel answers it
+ * itself, below, in one line a person can search for, rather than leaving
+ * 126 entries for someone to cross-check against a symbol table by hand. */
+#define KERNEL_LOAD_PHYS 0x100000ULL   /* both loaders; tools/kernel_fits.py guards it */
+
 void pmm_print_map(void) {
     uint32_t count = boot_mmap_count();
+    uint64_t kstart = KERNEL_LOAD_PHYS;
+    uint64_t kend   = KV2P((uint64_t)kernel_end);
 
-    serial_write_string("\n=== E820 Memory Map ===\n");
-    serial_write_string("entries: ");
-    serial_write_hex(count);
-    serial_write_string("\n");
-
+    kprintf("\n=== firmware memory map: %u entries ===\n", (unsigned)count);
     uint64_t total_usable = 0;
+    uint32_t overlaps = 0;
     for (uint32_t i = 0; i < count; i++) {
         const struct boot_mmap_entry *entry = boot_mmap_at(i);
+        uint64_t b = entry->base, e = entry->base + entry->length;
+        const char *tn = (entry->type >= 1 && entry->type <= 5) ? type_names[entry->type]
+                                                                 : "unknown";
+        kprintf("  [%3u] %016lx-%016lx %s\n", (unsigned)i, b, e, tn);
 
-        serial_write_string("[");
-        serial_write_hex(i);
-        serial_write_string("]  Base:");
-        serial_write_hex(entry->base);
-        serial_write_string(", Length:");
-        serial_write_hex(entry->length);
-        serial_write_string(", Type:");
-
-        if (entry->type >=1 && entry->type <=5) {
-           serial_write_string(type_names[entry->type]);
-        } else {
-           serial_write_string("unknown");
-        }
-        serial_write_string("\n");
-
-        if (entry->type == E820_USABLE)
+        if (entry->type == E820_USABLE) {
             total_usable += entry->length;
+        } else if (b < kend && e > kstart) {
+            /* A region the firmware did not give us, lying inside the range
+             * the kernel image occupies. Every byte of the image in that
+             * range -- code, data, DMA rings -- is shared with whatever the
+             * firmware still does there. This is the line to search for. */
+            overlaps++;
+            kprintf("  !!! entry %u (%s) OVERLAPS THE KERNEL IMAGE [%lx, %lx): "
+                    "%lx-%lx is not ours to use\n",
+                    (unsigned)i, tn, kstart, kend,
+                    (b > kstart ? b : kstart), (e < kend ? e : kend));
+        }
     }
-
-    /* The number the map is actually FOR. It was computed and then thrown
-     * away, which is also why -Wall (now on, via the aarch64 build) flagged
-     * it: a running total nobody prints is either a bug or dead weight, and
-     * here it was the former -- "entries: 1" tells you nothing about whether
-     * the machine has the memory you asked for. */
-    serial_write_string("usable total: ");
-    serial_write_hex(total_usable);
-    serial_write_string(" bytes\n");
+    kprintf("  usable total: %lu MiB; kernel image at [%lx, %lx) %s\n",
+            (unsigned long)(total_usable >> 20), kstart, kend,
+            overlaps ? "-- SHARED WITH FIRMWARE, see above" : "-- all of it usable RAM");
 }
 
 

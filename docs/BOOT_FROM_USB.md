@@ -131,7 +131,8 @@ Lines worth searching for:
 | Search for | What it tells you |
 |---|---|
 | `i8042:` | Whether the machine has a PS/2 controller and what answered on each port: `port 1 holds a MF2 keyboard`, `port 2 holds a standard PS/2 mouse or touchpad`, or `port 2 tested good but nothing answered a reset -- this laptop's touchpad is somewhere else (I2C, most likely)`. That last line is the one that decides whether an I²C-HID driver is the next job. |
-| `xHCI` | The USB controller's ports, what was found on them, and any `transfer failed, completion code` followed by `recovering the endpoint`. |
+| `xHCI` | The USB controller's ports, what was found on them, and any `transfer failed, completion code` followed by `recovering the endpoint`. Also `DMA layout ok` — or `CROSSES A 64 KB BOUNDARY`, which names a ring the controller may misread. |
+| `firmware memory map` | Every region the firmware reported, then one verdict line: the kernel image is either `all of it usable RAM` or `SHARED WITH FIRMWARE` — the latter means the firmware still owns memory the kernel (and its USB DMA buffers) sit in. |
 | `I/O error` | A read from the stick failed. Which one, and what happened just before it, is the diagnosis. |
 | `home: desktop ready` | The desktop finished starting. |
 | `EmbLinkOS stopped` | A kernel fault; the lines after it name the function. |

@@ -228,31 +228,48 @@ struct xhci_runtime_state {
     volatile uint8_t *op_regs;
     volatile uint8_t *runtime_regs;
     volatile uint8_t *doorbell_regs;
+    /* EVERY DMA BLOCK BELOW IS 4 KB-ALIGNED, AND THAT IS NOT FUSSINESS.
+     *
+     * xHCI 1.2 section 4.11.5.1: a TRB ring segment shall not cross a 64 KB
+     * boundary; section 6.4.1: neither shall a data buffer. These arrays used
+     * to be aligned to 64 bytes, which is what the individual TRBs and contexts
+     * need, and they sat wherever .bss put them -- which moves every time the
+     * kernel grows by a byte anywhere in front of them. A build of this kernel
+     * placed one slot's EP0 ring at 0x5afe80-0x5b0080, straddling 0x5b0000.
+     * QEMU does not enforce the rule; a laptop's controller may fetch the
+     * wrong TRB, and what the filesystem then sees is an I/O error on a stick
+     * that is fine.
+     *
+     * 4 KB alignment settles it structurally: every block here is either at
+     * most 4 KB or made of sub-objects of at most 4 KB that start on their own
+     * 4 KB-aligned page, and a 64 KB line is itself 4 KB-aligned, so nothing
+     * can cross one. xhci_check_dma_layout() verifies it at init all the same
+     * and writes the answer into the boot log, because the layout is decided
+     * at link time and this comment is not a proof. */
     // Scratch buffer used by GET_DESCRIPTOR to receive DMA'd descriptor data.
     uint8_t  xfr_buf[XHCI_MAX_SLOTS_TRACKED][64] __attribute__((aligned(64)));
 
-    uint64_t dcbaa[256] __attribute__((aligned(64)));
-    struct xhci_trb cmd_ring[XHCI_CMD_RING_TRBS] __attribute__((aligned(64)));
-    struct xhci_trb evt_ring[XHCI_EVENT_RING_TRBS] __attribute__((aligned(64)));
+    uint64_t dcbaa[256] __attribute__((aligned(4096)));
+    struct xhci_trb cmd_ring[XHCI_CMD_RING_TRBS] __attribute__((aligned(4096)));
+    struct xhci_trb evt_ring[XHCI_EVENT_RING_TRBS] __attribute__((aligned(4096)));
     struct xhci_erst_entry erst[1] __attribute__((aligned(64)));
 
     // One input/device context pair plus a small EP0 transfer ring per slot.
-    uint8_t input_ctx[XHCI_MAX_SLOTS_TRACKED][1024] __attribute__((aligned(64)));
-    uint8_t device_ctx[XHCI_MAX_SLOTS_TRACKED][1024] __attribute__((aligned(64)));
+    uint8_t input_ctx[XHCI_MAX_SLOTS_TRACKED][1024] __attribute__((aligned(4096)));
+    uint8_t device_ctx[XHCI_MAX_SLOTS_TRACKED][1024] __attribute__((aligned(4096)));
     struct xhci_trb ep0_ring[XHCI_MAX_SLOTS_TRACKED][XHCI_EP0_RING_TRBS]
-        __attribute__((aligned(64)));
+        __attribute__((aligned(4096)));
     // Interrupt-IN transfer ring for HID/interrupt endpoints.
     struct xhci_trb intin_ring[XHCI_MAX_SLOTS_TRACKED][XHCI_INT_IN_RING_TRBS]
-        __attribute__((aligned(64)));
+        __attribute__((aligned(4096)));
     // Per-slot ring of distinct 64-byte receive buffers for interrupt-IN reports.
     uint8_t  hid_buf[XHCI_MAX_SLOTS_TRACKED][XHCI_INTIN_NUM_BUFS][64]
         __attribute__((aligned(64)));
 
     // Bulk transfer rings (OUT, IN) plus BOT command/status wrappers and a
-    // 4 KB data bounce. The bounce is 4 KB-aligned so a single data-stage TRB
-    // never crosses a 64 KB boundary (an xHCI TRB buffer restriction).
+    // 4 KB data bounce.
     struct xhci_trb bulk_ring[XHCI_MAX_SLOTS_TRACKED][2][XHCI_BULK_RING_TRBS]
-        __attribute__((aligned(64)));
+        __attribute__((aligned(4096)));
     uint8_t  msc_cbw[XHCI_MAX_SLOTS_TRACKED][64] __attribute__((aligned(64)));  // 31-byte CBW
     uint8_t  msc_csw[XHCI_MAX_SLOTS_TRACKED][64] __attribute__((aligned(64)));  // 13-byte CSW
     uint8_t  msc_data[XHCI_MAX_SLOTS_TRACKED][MSC_XFER_BYTES]
@@ -297,6 +314,41 @@ static inline void xhci_write64(volatile uint8_t *base, uint32_t off, uint64_t v
 // the wrong physical memory and every command/transfer silently times out.
 static inline uint64_t xhci_dma(const volatile void *p) {
     return KV2P((uint64_t)(uintptr_t)p);
+}
+
+/* Does any DMA object of this controller cross a 64 KB line? One line per
+ * offender and one summary line, into the log, at init. See the note on the
+ * struct. `what` is named per sub-object (per slot, per direction) because
+ * the rule is per ring segment and per buffer, not per array. */
+static uint32_t xhci_check_range(const char *what, uint32_t slot, const volatile void *p,
+                                 uint64_t len) {
+    uint64_t a = xhci_dma(p), b = a + len - 1U;
+    if ((a >> 16) == (b >> 16)) return 0;
+    kprintf("xHCI: %s%s%u at %lx-%lx CROSSES A 64 KB BOUNDARY -- the controller may "
+            "fetch the wrong TRB\n", what, slot ? " slot " : "", (unsigned)slot, a, b + 1U);
+    return 1;
+}
+static void xhci_check_dma_layout(struct xhci_runtime_state *rt) {
+    uint32_t bad = 0;
+    bad += xhci_check_range("DCBAA", 0, rt->dcbaa, sizeof rt->dcbaa);
+    bad += xhci_check_range("command ring", 0, rt->cmd_ring, sizeof rt->cmd_ring);
+    bad += xhci_check_range("event ring", 0, rt->evt_ring, sizeof rt->evt_ring);
+    bad += xhci_check_range("ERST", 0, rt->erst, sizeof rt->erst);
+    for (uint32_t i = 0; i < XHCI_MAX_SLOTS_TRACKED; i++) {
+        bad += xhci_check_range("input context", i + 1U, rt->input_ctx[i], sizeof rt->input_ctx[i]);
+        bad += xhci_check_range("device context", i + 1U, rt->device_ctx[i], sizeof rt->device_ctx[i]);
+        bad += xhci_check_range("EP0 ring", i + 1U, rt->ep0_ring[i], sizeof rt->ep0_ring[i]);
+        bad += xhci_check_range("interrupt-IN ring", i + 1U, rt->intin_ring[i], sizeof rt->intin_ring[i]);
+        bad += xhci_check_range("bulk OUT ring", i + 1U, rt->bulk_ring[i][0], sizeof rt->bulk_ring[i][0]);
+        bad += xhci_check_range("bulk IN ring", i + 1U, rt->bulk_ring[i][1], sizeof rt->bulk_ring[i][1]);
+        bad += xhci_check_range("bounce buffer", i + 1U, rt->msc_data[i], sizeof rt->msc_data[i]);
+    }
+    if (bad)
+        kprintf("xHCI: DMA layout: %u object(s) cross a 64 KB line -- this is the "
+                "line to report\n", (unsigned)bad);
+    else
+        kprintf("xHCI: DMA layout ok -- no ring or buffer crosses a 64 KB line "
+                "(runtime state at %lx)\n", xhci_dma(rt));
 }
 
 // Pick or allocate per-controller runtime state by BDF.
@@ -2830,6 +2882,9 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
     }
 
     struct xhci_runtime_state *rt = xhci_get_runtime_state(ctrl);
+    /* Before the controller is touched: does the memory it will be handed obey
+     * the 64 KB rule? The answer goes into the boot log either way. */
+    if (rt) xhci_check_dma_layout(rt);
     if (!rt) {
         kprintf("xHCI: no runtime slots available\n");
         return false;
