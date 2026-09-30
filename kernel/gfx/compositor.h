@@ -182,6 +182,9 @@ int  compositor_desktop_front(int pid, int on);
  * the screen lock) is covering everything. The kernel's own key shortcuts stop
  * working then; see compositor.c. */
 int  compositor_shell_modal(void);
+/* Repaint the whole screen from the window stack -- after something outside
+ * the compositor (the kernel log view) has been drawing on it. */
+void compositor_repaint_all(void);
 /* Advance window open/park motion one frame; no-op when nothing is moving. */
 void compositor_anim_tick(void);
 /* Average luminance (0-255) of what is composed under a screen rect, or -1. */

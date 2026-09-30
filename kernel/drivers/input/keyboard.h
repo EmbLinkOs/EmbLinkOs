@@ -88,6 +88,7 @@ enum {
     SYSKEY_NEXT_WINDOW,      /* GUI+Tab */
     SYSKEY_CLOSE_WINDOW,     /* GUI+W   */
     SYSKEY_QUIT_APP,         /* GUI+Q   */
+    SYSKEY_KERNEL_LOG,       /* GUI+K: show/hide the kernel log on screen */
 };
 /* Take the pending system shortcut, if any, and clear it. */
 int keyboard_take_syskey(void);

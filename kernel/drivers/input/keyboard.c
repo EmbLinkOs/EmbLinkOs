@@ -420,6 +420,9 @@ void kbd_translate(uint8_t make, int pressed) {
         if (low == '\t') { g_syskey = SYSKEY_NEXT_WINDOW;  return; }
         if (low == 'w')   { g_syskey = SYSKEY_CLOSE_WINDOW; return; }
         if (low == 'q')   { g_syskey = SYSKEY_QUIT_APP;     return; }
+        /* GUI+K: THE KERNEL LOG, ON SCREEN. The one question a machine with no
+         * serial port and no working mouse can still be asked. */
+        if (low == 'k')   { g_syskey = SYSKEY_KERNEL_LOG;   return; }
         char cmd = 0;
         switch (low) {
             case 'a': cmd = (char)EK_SEL_ALL; break;

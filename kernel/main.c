@@ -10,6 +10,7 @@
 #include "drivers/video/gpu.h"
 #include "drivers/video/console.h"
 #include "drivers/video/rawcon.h"
+#include "lib/klog.h"
 #include "drivers/input/keyboard.h"
 #include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
@@ -2285,6 +2286,53 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                 kprintf("compositor: system shortcut %d ignored -- a full-screen "
                         "shell surface is up\n", sk);
                 sk = 0;
+            }
+            /* GUI+K: THE KERNEL LOG, ON SCREEN, AND BACK AGAIN. Handled
+             * before the modal check below on purpose -- the whole point of it
+             * is to work on a machine where nothing else does. */
+            if (sk == SYSKEY_KERNEL_LOG) {
+                sk = 0;
+                /* EACH PRESS GOES FURTHER BACK. One screenful is never the
+                 * screenful anyone wants -- USB enumeration happens hundreds
+                 * of lines before the desktop -- so the first press shows the
+                 * end of the log and every press after it shows the page
+                 * before it, until the log runs out and the desktop returns.
+                 *
+                 * Read straight out of the ring, backwards, with no copy: see
+                 * klog_peek_back(). */
+                static uint32_t page;
+                if (!rawcon_holding()) page = 0; else page++;
+
+                uint32_t live = klog_live();
+                uint32_t rows = rawcon_rows();
+                uint32_t per_page = rows > 3 ? rows - 3 : 1;
+
+                /* Walk back (page+1) pages of lines from the newest byte. */
+                uint32_t want = per_page * (page + 1), lines = 0, back = 0;
+                while (back < live && lines < want) {
+                    back++;
+                    if (klog_peek_back(back) == '\n') lines++;
+                }
+                bool nothing_left = (lines < want);
+
+                if (page > 0 && nothing_left) {
+                    rawcon_hold_end();
+                    compositor_repaint_all();       /* give the desktop back */
+                } else if (rawcon_hold_begin()) {
+                    char line[128];
+                    snprintf(line, sizeof line,
+                             "EmbLinkOS kernel log -- page %u back of %u bytes kept. "
+                             "GUI+K: older; again at the oldest: the desktop.\n\n",
+                             (unsigned)page, (unsigned)live);
+                    rawcon_puts(line);
+                    /* Forward from where the walk stopped, one page of lines. */
+                    uint32_t shown = 0;
+                    while (back > 0 && shown <= per_page) {
+                        char c = klog_peek_back(back--);
+                        if (c == '\n') { shown++; if (shown > per_page) break; }
+                        rawcon_putc(c);
+                    }
+                }
             }
             if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
             else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();

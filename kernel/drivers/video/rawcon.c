@@ -45,6 +45,7 @@ static uint32_t  g_cols, g_rows;
 static uint32_t  g_col, g_row;
 static bool      g_active;           /* carrying the kernel log */
 static volatile bool g_panicked;
+static volatile bool g_hold;      /* the log is on screen, by request */
 
 #define CELL_W (FONT_WIDTH * g_scale)
 #define CELL_H (FONT_HEIGHT * g_scale)
@@ -125,7 +126,7 @@ void rawcon_putc(char ch) {
      * port. The first version did, and every line from the heap to the real
      * console -- ACPI, the TSC's frequency, PCI -- vanished from it. */
     if (g_active && !g_panicked) serial_write_char(ch);
-    if (!g_px || (!g_active && !g_panicked) || g_screen_full) return;
+    if (!g_px || (!g_active && !g_panicked && !g_hold) || g_screen_full) return;
     draw_char(ch);
 }
 
@@ -236,7 +237,34 @@ void rawcon_adopt(uint8_t *front, uint32_t width, uint32_t height,
     g_col = 0;
 }
 
-bool rawcon_panicked(void) { return g_panicked; }
+bool rawcon_panicked(void) { return g_panicked || g_hold; }
+
+/* SHOW THE KERNEL LOG ON A MACHINE THAT HAS NOTHING ELSE TO SHOW IT ON.
+ *
+ * Once the desktop owns the framebuffer the kernel log is invisible, and a
+ * laptop has no serial port to ask a second question through -- so a machine
+ * whose mouse does not work becomes a machine that cannot be diagnosed at all.
+ * This paints the log straight onto the front buffer, exactly as the panic
+ * screen does, and refuses every compositor present for as long as it is up so
+ * the desktop cannot paint back over it. Releasing it hands the screen back.
+ *
+ * Returns false if there is no framebuffer to draw on. */
+bool rawcon_hold_begin(void) {
+    if (!g_px) return false;
+    g_hold = true;
+    g_screen_full = false;
+    g_bg = pack(0x0B, 0x0D, 0x12);
+    g_fg = pack(0xD8, 0xDC, 0xE4);
+    g_mark = g_bg;
+    for (uint32_t r = 0; r < g_rows; r++) fill_row(r, g_bg);
+    g_row = 0; g_col = 0;
+    return true;
+}
+
+void rawcon_hold_end(void) { g_hold = false; }
+bool rawcon_holding(void) { return g_hold; }
+
+uint32_t rawcon_rows(void) { return g_rows; }
 
 uint32_t rawcon_rows_left(void) {
     return (g_px && g_rows > g_row + 1) ? g_rows - g_row - 1 : 0;

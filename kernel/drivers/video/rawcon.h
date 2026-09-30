@@ -30,6 +30,13 @@ bool rawcon_panicked(void);
 /* How much room is left under the cursor, so a caller can choose how much of
  * a log to show rather than have the bottom of the screen cut it off. */
 uint32_t rawcon_rows_left(void);
+uint32_t rawcon_rows(void);
+
+/* Take the screen to show the kernel log (GUI+K), and give it back. While
+ * held, every compositor present is refused -- see rawcon.c. */
+bool rawcon_hold_begin(void);
+void rawcon_hold_end(void);
+bool rawcon_holding(void);
 uint32_t rawcon_cols(void);
 
 #endif

@@ -1582,6 +1582,17 @@ static int g_desktop_front;
 
 int compositor_shell_modal(void) { return g_desktop_front; }
 
+/* REDRAW EVERYTHING. The compositor paints what changed, so after something
+ * else has owned the screen -- the kernel log, held up by GUI+K -- there is no
+ * damage to redraw and the desktop would stay buried under it. */
+void compositor_repaint_all(void) {
+    const struct fb_info *fi = fb_get_info();
+    if (!fi) return;
+    spin_lock(&g_comp_lock);
+    paint_region(0, 0, (int)fi->width, (int)fi->height);
+    spin_unlock(&g_comp_lock);
+}
+
 int compositor_desktop_front(int pid, int on) {
     spin_lock(&g_comp_lock);
     int rc = -1;

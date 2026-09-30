@@ -26,7 +26,14 @@
 /* Eight kilobytes: roughly the last hundred lines, which is far enough back
  * to cover a driver's bring-up, and small enough to fit a crash record
  * alongside whatever else the platform's error store is holding. */
-#define KLOG_SIZE 8192
+/* SIXTY-FOUR KILOBYTES, because the interesting part of a boot is the
+ * BEGINNING. Eight kilobytes held the last few seconds, which is the right
+ * size for a crash record and the wrong one for the question a real machine
+ * asks: "what happened during USB enumeration", four hundred lines earlier.
+ * On a laptop, with no serial port, this ring IS the boot log -- GUI+K puts it
+ * back on the screen (kernel/main.c). The cost is .bss, and the kernel's fit
+ * against its load address is measured at every build. */
+#define KLOG_SIZE 65536
 
 static char g_ring[KLOG_SIZE];
 static uint32_t g_head;      /* where the next character goes */
@@ -58,3 +65,22 @@ uint32_t klog_tail(char *out, uint32_t cap) {
 }
 
 uint64_t klog_bytes(void) { return g_total; }
+
+/* ONE BYTE, COUNTED BACK FROM THE NEWEST: n == 1 is the last byte written,
+ * n == klog_live() the oldest still held. 0 outside that range.
+ *
+ * Exists so the on-screen log viewer (GUI+K, kernel/main.c) can walk backwards
+ * through a 64 KB ring looking for line breaks WITHOUT a second 64 KB buffer
+ * to copy it into -- the kernel image has to fit under the address the
+ * firmware loads it at, and a spare copy of the log is a sixteenth of the
+ * budget. */
+char klog_peek_back(uint32_t n) {
+    uint32_t have = g_total < KLOG_SIZE ? (uint32_t)g_total : KLOG_SIZE;
+    if (n == 0 || n > have) return 0;
+    uint32_t idx = (g_head + KLOG_SIZE - n) % KLOG_SIZE;
+    return g_ring[idx];
+}
+
+uint32_t klog_live(void) {
+    return g_total < KLOG_SIZE ? (uint32_t)g_total : KLOG_SIZE;
+}
