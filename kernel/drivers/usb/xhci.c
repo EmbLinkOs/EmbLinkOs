@@ -61,6 +61,22 @@
 #define XHCI_PORTSC_SPEED_MASK  (0xFU << XHCI_PORTSC_SPEED_SHIFT)
 #define XHCI_PORTSC_RW1C_MASK   0x00FE0000U
 
+/* WRITING PORTSC IS NOT WRITING BACK WHAT YOU READ. Bit 1, Port Enabled, is
+ * write-1-to-CLEAR: a read-modify-write that faithfully preserves it DISABLES
+ * the port it meant to leave alone. Every write to this register therefore
+ * goes through here, which drops PED and the change bits, and the caller ORs
+ * back exactly what it means to set.
+ *
+ * This is why a real machine enumerated nothing. After a successful reset the
+ * port comes up ENABLED; the very next line wrote the register back to
+ * acknowledge the change bits, PED among them, so the port was switched off a
+ * microsecond after it came up and the driver read PED as clear and reported
+ * that the port "would not enable". On QEMU the USB 3 path returns before
+ * that write ever happens, which is why every test passed. */
+static inline uint32_t xhci_portsc_keep(uint32_t v) {
+    return v & ~(XHCI_PORTSC_RW1C_MASK | XHCI_PORTSC_PED);
+}
+
 #define XHCI_TRB_TYPE_SHIFT 10
 #define XHCI_TRB_LINK            6U
 #define XHCI_TRB_ENABLE_SLOT     9U
@@ -2140,7 +2156,7 @@ static bool xhci_port_reset(volatile uint8_t *op, uint32_t port_index) {
 
     if (portsc & XHCI_PORTSC_PED) return true;      /* already enabled */
 
-    xhci_write32(op, reg, (portsc & ~XHCI_PORTSC_RW1C_MASK) | XHCI_PORTSC_PR);
+    xhci_write32(op, reg, xhci_portsc_keep(portsc) | XHCI_PORTSC_PR);
     for (int i = 0; i < 2000000; i++) {
         portsc = xhci_read32(op, reg);
         if (!(portsc & XHCI_PORTSC_PR)) break;
@@ -2149,7 +2165,7 @@ static bool xhci_port_reset(volatile uint8_t *op, uint32_t port_index) {
     /* Acknowledge every change bit the reset raised, or the next read of this
      * register reports a connection that already happened. */
     portsc = xhci_read32(op, reg);
-    xhci_write32(op, reg, portsc);
+    xhci_write32(op, reg, xhci_portsc_keep(portsc) | (portsc & XHCI_PORTSC_RW1C_MASK));
     return (xhci_read32(op, reg) & XHCI_PORTSC_PED) != 0;
 }
 
@@ -2517,7 +2533,8 @@ void xhci_rescan(void *hc) {
          * acknowledged is reported again on every pass, and on a controller
          * driven by its interrupt it never stops. */
         if (portsc & XHCI_PORTSC_RW1C_MASK)
-            xhci_write32(rt->op_regs, reg, portsc);
+            xhci_write32(rt->op_regs, reg,
+                         xhci_portsc_keep(portsc) | (portsc & XHCI_PORTSC_RW1C_MASK));
 
         if (now == was) continue;
         rt->port_connected[port - 1U] = now;
@@ -2725,7 +2742,7 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
             uint32_t reg = XHCI_PORTSC_BASE + ((port - 1U) * XHCI_PORT_STRIDE);
             uint32_t v = xhci_read32(op, reg);
             if (!(v & XHCI_PORTSC_PP)) {
-                xhci_write32(op, reg, (v & ~XHCI_PORTSC_RW1C_MASK) | XHCI_PORTSC_PP);
+                xhci_write32(op, reg, xhci_portsc_keep(v) | XHCI_PORTSC_PP);
                 powered++;
             }
         }
@@ -2793,6 +2810,47 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
     }
 
     return true;
+}
+
+/* EVERY PORT, AND WHAT HAPPENS WHEN WE TRY IT AGAIN -- printed where it can be
+ * read. A machine with no serial port shows the last fifty lines of its boot,
+ * and USB bring-up happens hundreds of lines earlier: on the ProBook the
+ * controller reported four connected ports and not one enumerated device, and
+ * every message explaining why had scrolled past. So the no-root path calls
+ * this, at the end, and it says PORTSC for every port and then tries each
+ * connected one again, out loud. */
+void xhci_report_ports(void) {
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
+        struct xhci_runtime_state *rt = &g_xhci_runtime[i];
+        if (!rt->used || !rt->op_regs) continue;
+        kprintf("xHCI %02x:%02x.%x: %u port(s)\n", (unsigned)rt->bus,
+                (unsigned)rt->device, (unsigned)rt->function, (unsigned)rt->max_ports);
+        for (uint32_t port = 1; port <= rt->max_ports; port++) {
+            uint32_t v = xhci_read32(rt->op_regs, XHCI_PORTSC_BASE +
+                                     ((port - 1U) * XHCI_PORT_STRIDE));
+            if (!(v & (XHCI_PORTSC_CCS | XHCI_PORTSC_PED)) && (v & XHCI_PORTSC_PP))
+                continue;                      /* powered and empty: nothing to say */
+            kprintf("xHCI:   port %2u PORTSC %08x  %s%s%s slot %u\n",
+                    (unsigned)port, (unsigned)v,
+                    (v & XHCI_PORTSC_PP)  ? "powered "   : "DARK ",
+                    (v & XHCI_PORTSC_CCS) ? "connected " : "",
+                    (v & XHCI_PORTSC_PED) ? "enabled "   : "",
+                    (unsigned)rt->port_slot[port - 1U]);
+        }
+        for (uint32_t port = 1; port <= rt->max_ports; port++) {
+            uint32_t v = xhci_read32(rt->op_regs, XHCI_PORTSC_BASE +
+                                     ((port - 1U) * XHCI_PORT_STRIDE));
+            if (!(v & XHCI_PORTSC_CCS) || rt->port_slot[port - 1U]) continue;
+            kprintf("xHCI: port %u is connected and has no slot -- trying it again\n",
+                    (unsigned)port);
+            bool ok = xhci_bring_up_port(rt, port);
+            kprintf("xHCI: port %u bring-up %s (PORTSC now %08x, slot %u)\n",
+                    (unsigned)port, ok ? "SUCCEEDED" : "failed",
+                    (unsigned)xhci_read32(rt->op_regs, XHCI_PORTSC_BASE +
+                                          ((port - 1U) * XHCI_PORT_STRIDE)),
+                    (unsigned)rt->port_slot[port - 1U]);
+        }
+    }
 }
 
 /* How many devices this driver currently has addressed, across every xHCI

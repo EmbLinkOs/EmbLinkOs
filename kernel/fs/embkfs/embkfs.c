@@ -4,6 +4,7 @@
 #include "block/block.h"
 #include "block/partition.h"
 #include "drivers/usb/usb_core.h"
+#include "drivers/usb/xhci.h"
 #include "drivers/usb/usb.h"   /* embk_partition_parent — reach a volume's disk MBR */
 #include "boot/boot_protocol.h"  /* bootinfo_boot_disk_sig — root-follows-boot */
 #include "include/kmalloc.h"   /* kmalloc / kfree — the Phase 8 heap */
@@ -7972,6 +7973,10 @@ static void embkfs_init_after_probe(void)
             if (nc == 0)
                 kprintf("EMBKFS:   no USB controller was found at all -- nothing on a "
                         "USB stick can be reached\n");
+            /* And the ports themselves, with a fresh attempt at any that has a
+             * device and no slot. This is the one place the output survives on
+             * a machine with no serial port. */
+            xhci_report_ports();
             /* And WHAT is attached. "A stick that never enumerated" and "a
              * stick that enumerated and whose mass-storage interface was not
              * claimed" are different faults with the same symptom. Class 08 is

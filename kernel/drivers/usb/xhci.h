@@ -24,4 +24,8 @@ void xhci_hid_stats(uint64_t *kbd, uint64_t *mouse);
  * the .c. */
 uint32_t xhci_device_count(void);
 
+/* Print every xHCI port's PORTSC and retry any connected port that has no
+ * slot, loudly. For the no-root diagnostic -- see xhci.c. */
+void xhci_report_ports(void);
+
 #endif /* __XHCI_H__ */
