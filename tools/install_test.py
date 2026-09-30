@@ -30,6 +30,7 @@ import socket
 import subprocess
 import sys
 import time
+import qemu_guard
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
@@ -46,8 +47,7 @@ TARGET_MB = int(os.environ.get("INSTALL_TARGET_MB", "320"))
 
 
 def qemu_busy():
-    return any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-               for e in ("qemu-system-x86_64", "qemu-system-aarch64"))
+    return qemu_guard.other_qemu_running()
 
 
 def vars_copy(tag):

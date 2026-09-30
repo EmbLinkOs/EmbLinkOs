@@ -23,6 +23,7 @@ into an exit.
 ONE QEMU AT A TIME, like console_test.py.
 """
 import os, sys, time, subprocess
+import qemu_guard
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -88,8 +89,7 @@ def main():
     # a real debugging session: every tool here refused to start, reporting
     # "another qemu-system is running", while nothing was running but the
     # waiters themselves. -x matches the program, which is the question.
-    if any(subprocess.run(["pgrep", "-x", exe], capture_output=True).returncode == 0
-           for exe in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("power_test: another qemu-system is running; refusing to start a second one")
         return 2
     machines = os.environ.get("MACHINES", "pc q35").split()

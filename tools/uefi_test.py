@@ -51,6 +51,7 @@ import re
 import subprocess
 import sys
 import time
+import qemu_guard
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
@@ -64,8 +65,7 @@ BOOT_SECONDS = int(os.environ.get("UEFI_BOOT_SECONDS", "75"))
 
 
 def qemu_busy():
-    return any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-               for e in ("qemu-system-x86_64", "qemu-system-aarch64"))
+    return qemu_guard.other_qemu_running()
 
 
 def boot(image, extra_drive, log_path):

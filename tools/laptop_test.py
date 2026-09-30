@@ -38,6 +38,7 @@ import hashlib, json, os, shutil, socket, subprocess, sys, tempfile, threading, 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import shell_shot as S
+import qemu_guard
 
 FW_DIRS = [os.path.join(os.path.dirname(shutil.which("qemu-system-x86_64") or "/"), "..", "share", "qemu"),
            "/usr/share/qemu", "/usr/share/OVMF"]
@@ -213,8 +214,7 @@ class Machine:
 
 
 def main():
-    if any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-           for e in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("laptop_test: another qemu-system is running; refusing to start a second one")
         return 2
     if not os.path.exists(os.path.join(ROOT, "uefi-usb.img")):

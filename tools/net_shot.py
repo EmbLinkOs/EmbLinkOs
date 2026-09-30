@@ -19,6 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import app_shot as A
 import shell_shot as S
+import qemu_guard
 
 # The status glyph, MEASURED off a screendump of the bar rather than guessed --
 # the first attempt was 40px right of it, on the CPU meter, which opens nothing
@@ -86,8 +87,7 @@ def ink_area(path, x0, y0, x1, y1):
 
 
 def main():
-    if any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-           for e in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("net_shot: another qemu-system is running; refusing to start a second one")
         return 2
 

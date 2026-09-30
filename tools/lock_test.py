@@ -41,6 +41,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import shell_shot as S
+import qemu_guard
 
 USER = "tester"
 PASSWORD = "correct horse 1"
@@ -81,8 +82,7 @@ def ink(path, band, thresh=110):
 
 
 def main():
-    if any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-           for e in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("lock_test: another qemu-system is running; refusing to start a second one",
               file=sys.stderr)
         return 2

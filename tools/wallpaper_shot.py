@@ -37,6 +37,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import app_shot as A
 import shell_shot as S
+import qemu_guard
 
 # Where the control sits, measured off a screenshot of this exact pane at
 # 1024x768. app_shot centres the window, so these are stable between runs --
@@ -57,8 +58,7 @@ SETTINGS_SLOT = 2
 
 
 def main():
-    if any(subprocess.run(["pgrep", "-x", e], capture_output=True).returncode == 0
-           for e in ("qemu-system-x86_64", "qemu-system-aarch64")):
+    if qemu_guard.other_qemu_running():
         print("wallpaper_shot: another qemu-system is running; refusing to start a second one")
         return 2
 
