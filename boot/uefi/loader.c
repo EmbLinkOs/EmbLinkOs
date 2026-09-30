@@ -139,7 +139,22 @@ static EFI_PHYSICAL_ADDRESS alloc_pages(EFI_ALLOCATE_TYPE how,
                                         const char *what) {
     EFI_PHYSICAL_ADDRESS m = at;
     EFI_STATUS s = ST->BootServices->AllocatePages(how, EfiLoaderData, pages, &m);
-    if (EFI_ERROR(s)) { con_print(what); con_die("AllocatePages failed"); }
+    if (EFI_ERROR(s)) {
+        /* SAY WHICH MEMORY AND WHY. This used to print the label and the
+         * words "AllocatePages failed", which on a machine that will not boot
+         * tells nobody anything. The kernel is placed at a FIXED physical
+         * address, so this failure means the firmware has something of its own
+         * there -- and the address and page count are what identify it. */
+        con_print("\n*** could not reserve memory for ");
+        con_print(what);
+        con_print("\n    pages   "); con_printhex(pages);
+        con_print("\n    address "); con_printhex(at);
+        con_print("\n    status  "); con_printhex(s);
+        con_print("\n    This memory is not free on this machine. The kernel is linked to\n"
+                  "    load at a fixed physical address; something the firmware owns is\n"
+                  "    already there. Photograph this screen.\n");
+        con_die("AllocatePages failed");
+    }
     return m;
 }
 

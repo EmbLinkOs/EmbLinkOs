@@ -7622,3 +7622,24 @@ for them to run against:
       a long sequential run; the rerun passed. The harness missed the verdict
       line rather than the program failing -- but that is an inference, not a
       measurement.
+
+**The kernel is not relocatable, and the ceiling is close**
+
+- [ ] **The per-core fault stacks live in .bss**: 16 KB for ring-3 entry plus
+      16 KB for #DF, per slot in `cpu_table`, so MAX_CPUS costs 32 KB each in
+      the kernel IMAGE. That is why MAX_CPUS is 16 and why the image has to be
+      watched (`tools/kernel_fits.py`, run at every link). Allocating those
+      stacks per core at bring-up would free a megabyte and let MAX_CPUS go
+      back up; a relocatable kernel would remove the ceiling altogether. Until
+      then the guard fails the build rather than a machine failing to boot.
+
+**A filesystem regression that predates the bare-metal work**
+
+- [ ] **`test posix`'s rename checks fail on a FRESHLY BUILT image**, with
+      "EMBKFS: sdb: block N checksum bad" during the run -- so it is the
+      filesystem writing bad checksums, not stale test state. Present at
+      0b2a598 with every bare-metal change stashed, so it arrived with the
+      Sep 19-27 work, not with it. The desktop boots and runs on EMBKFS
+      regardless (`make test-laptop` writes home directories and settings
+      three times over), but a stick could corrupt itself given enough
+      renames. NEXT THING TO FIX.

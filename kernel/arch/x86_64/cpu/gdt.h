@@ -9,7 +9,24 @@
  * `struct tss` from this header; this header's GDT_ENTRIES needs a CPU
  * count). Distinct from ACPI_MAX_CPUS (256, acpi.h), which is MADT-parsing
  * capacity, a different concern. */
-#define MAX_CPUS 32
+/* SIXTEEN, AND THE REASON IS THE SIZE OF THE KERNEL IMAGE. Each slot in
+ * cpu_table carries this core's two fault stacks -- 16 KB for ring-3->ring-0
+ * entry and 16 KB for #DF -- so the table costs 32 KB per slot, in .bss, in
+ * the kernel image. At 32 slots that is one megabyte of a seven-megabyte
+ * kernel, and the kernel must fit BELOW whatever the firmware has reserved in
+ * low memory: the loader places it at its linked physical address, 0x100000,
+ * and OVMF puts ACPI NVS at 0x800000. Measured, the day the stick was first
+ * booted laptop-shaped: the image reached 0x801000 -- one page over -- and the
+ * loader could not place it at all. The machine did not boot, and said
+ * nothing useful about why.
+ *
+ * Sixteen covers every laptop this is meant to run on and leaves half a
+ * megabyte of headroom. Raising it again means taking those stacks out of
+ * .bss and allocating them per core at bring-up (docs/TODO.md), which is the
+ * real fix and not one to make in a hurry. percpu_register_cpu() already
+ * clamps a machine with more cores than this to the first MAX_CPUS and says
+ * so out loud. */
+#define MAX_CPUS 16
 
 /* 5 shared entries (null, kernel code, kernel data, user data, user code)
  * plus one 16-byte (2-GDT-entry) TSS descriptor PER CORE -- was a single
