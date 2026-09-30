@@ -34,4 +34,9 @@ uint32_t automount_count(void);
 bool automount_at(uint32_t idx, const char **at, const char **dev,
                   const char **fs);
 
+/* The first FAT32 volume mounted, or NULL -- the boot log's way off a machine
+ * that has no other one. See automount.c. */
+struct fat32_volume;
+struct fat32_volume *automount_fat32_volume(void);
+
 #endif

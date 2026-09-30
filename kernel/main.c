@@ -11,6 +11,7 @@
 #include "drivers/video/console.h"
 #include "drivers/video/rawcon.h"
 #include "lib/klog.h"
+#include "lib/bootlog.h"
 #include "drivers/input/keyboard.h"
 #include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
@@ -2217,6 +2218,13 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // enumerated and the scheduler is live (net_init spawns an RX poll kthread).
     // Static config for now; `test net` pings the gateway. No ring-3 surface yet.
     net_init();
+
+    /* AND LEAVE THE LOG SOMEWHERE A PERSON CAN GET AT IT. The next line hands
+     * the screen to the desktop; from here on a machine with no serial port
+     * says nothing. If it has a FAT partition -- and a machine booted from our
+     * stick does -- the log goes there on a timer, and the stick can be read
+     * on any other computer. */
+    bootlog_init();
 
     // Enter userspace through INIT: the kernel spawns exactly ONE user process,
     // /system/bin/init.elf, the root of userspace authority (docs/USERSPACE_v2.md
