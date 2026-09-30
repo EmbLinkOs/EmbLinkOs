@@ -1007,6 +1007,27 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* test xhci stats -- DID THE CONTROLLER'S INTERRUPT EVER ARRIVE? The one
+     * number a dead USB keyboard on a laptop needs: interrupts counted, HID
+     * reports counted, and whether the poll has taken over. */
+    if (strcmp(cmd, "test xhci stats") == 0) {
+        uint64_t irqs = 0, kbd = 0, mouse = 0; bool polled = false;
+        xhci_irq_stats(&irqs, &polled);
+        xhci_hid_stats(&kbd, &mouse);
+        kprintf("\n[xhci] irqs=%lu kbd_reports=%lu mouse_reports=%lu polled_fallback=%u\n",
+                (unsigned long)irqs, (unsigned long)kbd, (unsigned long)mouse,
+                polled ? 1U : 0U);
+        kprintf("[cmd] test xhci stats: OK\n");
+        return 1;
+    }
+    /* test xhci nointr -- mask the interrupt on purpose, so the polled fallback
+     * can be proven on a machine whose interrupt works (tools/xhci_nointr_test.py). */
+    if (strcmp(cmd, "test xhci nointr") == 0) {
+        xhci_force_nointr();
+        kprintf("\n[cmd] test xhci nointr: OK\n");
+        return 1;
+    }
+
     /* ----------------------------------------------------------------------
      * test prt -- WHICH INTERRUPT DOES EACH PCI SLOT REALLY USE?
      *

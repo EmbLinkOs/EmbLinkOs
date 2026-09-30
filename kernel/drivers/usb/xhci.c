@@ -159,6 +159,23 @@ struct xhci_runtime_state {
      * by xhci_poll(). Exactly one of the two services a controller, never
      * both: they would race on the event ring's dequeue pointer. */
     bool irq_driven;
+    /* DOES THE INTERRUPT ARRIVE? HID input on this controller is delivered by
+     * its interrupt and by nothing else, and a laptop's routing (MSI-X on a
+     * chipset nobody has booted this on, or an INTx line the I/O APIC route
+     * got wrong) is exactly the kind of thing that is broken on a machine one
+     * has never seen. So the interrupts are COUNTED, and xhci_poll() watches
+     * for EVIDENCE of one that did not come: an event sitting unconsumed at
+     * the ring's dequeue pointer across two polls XHCI_NOINTR_EVIDENCE_MS
+     * apart. A working interrupt consumes it in microseconds; an idle
+     * keyboard never produces one, so silence proves nothing -- the first cut
+     * of this watched for silence, masked a working interrupt two seconds
+     * into every boot, and measured its own mistake. When the evidence is
+     * there the interrupt is masked for good and the main loop drains the
+     * ring instead, that first event included. For good, not shared: a ring
+     * drained from two contexts is a race on its dequeue pointer. */
+    uint64_t irq_count;
+    uint64_t pending_seen_us;   /* when the poll first saw an event waiting; 0 = none waiting */
+    bool     polled_fallback;   /* the interrupt was given up on; xhci_poll() services this one */
     /* SCRATCHPAD: pages the controller asked for (HCSPARAMS2) and owns. QEMU
      * asks for none, so a driver written against it never allocates them --
      * and a real Intel or AMD controller that asked and was given nothing is
@@ -1253,6 +1270,15 @@ static void xhci_dispatch_class(struct xhci_runtime_state *rt,
                                 iproto == USB_HID_PROTO_KBD ? "Keyboard" : "Mouse");
                         xhci_hid_set_boot_protocol(rt, runtime_ptr, doorbell_ptr,
                                                    slot_id, buf[off + 2U]);
+                        /* SET_IDLE(0): report on change only, as the legacy
+                         * core asks. A keyboard's default idle rate repeats
+                         * its last report every 500 ms otherwise. */
+                        {
+                            uint32_t i0 = 0x21U | (0x0AU << 8) | (0U << 16);
+                            (void)xhci_ep0_control_transfer(rt, runtime_ptr, doorbell_ptr,
+                                                            slot_id, i0, (uint32_t)buf[off + 2U],
+                                                            false, NULL, 0);
+                        }
                         // Find the interrupt-IN endpoint address from the blob.
                         uint8_t ep_addr = 0;
                         uint8_t ep_intv = 0;
@@ -1718,6 +1744,9 @@ static void xhci_service_events(struct xhci_runtime_state *rt) {
 // ring, so the handler can't consume the completion the busy-poll is waiting on.
 static void xhci_intr_enable(struct xhci_runtime_state *rt, bool on) {
     if (!rt->runtime_regs) { return; }
+    /* A controller the poll has taken over stays masked: the block path
+     * re-enables after every request, and "for good" has to mean it. */
+    if (on && rt->polled_fallback) { on = false; }
     volatile uint8_t *ir = rt->runtime_regs + XHCI_RT_IR0;
     xhci_write32(ir, XHCI_IR_IMAN, on ? XHCI_IMAN_IE : 0U);
 }
@@ -1742,7 +1771,8 @@ static void xhci_ack_interrupt(struct xhci_runtime_state *rt) {
 void xhci_irq(void) {
     for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
         struct xhci_runtime_state *rt = &g_xhci_runtime[i];
-        if (!rt->used) { continue; }
+        if (!rt->used || rt->polled_fallback) { continue; }   /* given up on: the poll owns it */
+        rt->irq_count++;
         xhci_ack_interrupt(rt);
         xhci_service_events(rt);
     }
@@ -1858,17 +1888,69 @@ static struct mutex g_xhci_bus_lock = MUTEX_INIT;
  * and an x86 controller that found no usable interrupt ("staying polled"),
  * whose HID reports nothing drained before this. Called from usb_poll(), in
  * schedulable context. */
+#define XHCI_NOINTR_EVIDENCE_MS 50ULL   /* an event waiting this long is one the interrupt missed */
+
 void xhci_poll(void) {
     /* Busy bus: a transfer is in flight and is polling for its own completion.
      * Draining the event ring under it would steal that completion. Next pass. */
     if (!mutex_trylock(&g_xhci_bus_lock)) { return; }
     for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
         struct xhci_runtime_state *rt = &g_xhci_runtime[i];
-        if (!rt->used || rt->irq_driven) { continue; }
+        if (!rt->used) { continue; }
+        if (rt->irq_driven && !rt->polled_fallback) {
+            /* Interrupt-driven and, so far, trusted. Is something waiting that
+             * the interrupt should have delivered? */
+            const struct xhci_trb *ev = &rt->evt_ring[rt->evt_dequeue];
+            bool waiting = ((ev->d3 & 1U) == rt->evt_cycle);
+            uint64_t now = time_get_us();
+            if (!waiting || !now) {
+                rt->pending_seen_us = 0;
+            } else if (!rt->pending_seen_us) {
+                rt->pending_seen_us = now;
+            } else if (now - rt->pending_seen_us >= XHCI_NOINTR_EVIDENCE_MS * 1000ULL) {
+                xhci_intr_enable(rt, false);          /* masked, for good */
+                rt->polled_fallback = true;
+                kprintf("xHCI %x:%x.%x: an event waited %lu ms and the interrupt never came -- "
+                        "servicing by polling; check the interrupt routing\n",
+                        (unsigned)rt->bus, (unsigned)rt->device, (unsigned)rt->function,
+                        (unsigned long)((now - rt->pending_seen_us) / 1000ULL));
+            }
+            if (!rt->polled_fallback) { continue; }
+        }
         xhci_ack_interrupt(rt);
         xhci_service_events(rt);
     }
     mutex_unlock(&g_xhci_bus_lock);
+}
+
+/* For `test xhci stats` and the boot log. */
+void xhci_irq_stats(uint64_t *irqs, bool *polled) {
+    uint64_t n = 0; bool p = false;
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
+        if (!g_xhci_runtime[i].used) { continue; }
+        n += g_xhci_runtime[i].irq_count;
+        if (g_xhci_runtime[i].polled_fallback) { p = true; }
+    }
+    if (irqs) *irqs = n;
+    if (polled) *polled = p;
+}
+
+/* `test xhci nointr`: put every controller in the state a laptop with broken
+ * interrupt routing is in -- interrupt masked, none counted -- so the fallback
+ * can be proven where the interrupt otherwise works (tools/xhci_nointr_test.py).
+ * The next keypress leaves an event waiting, which is the evidence it needs. */
+void xhci_force_nointr(void) {
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
+        struct xhci_runtime_state *rt = &g_xhci_runtime[i];
+        if (!rt->used || !rt->irq_driven) { continue; }
+        xhci_intr_enable(rt, false);
+        rt->irq_count = 0;
+        rt->polled_fallback = false;
+        rt->pending_seen_us = 0;
+        kprintf("xHCI %x:%x.%x: interrupt masked on request -- the next event must be "
+                "caught by the fallback\n",
+                (unsigned)rt->bus, (unsigned)rt->device, (unsigned)rt->function);
+    }
 }
 
 // ==========================================================================

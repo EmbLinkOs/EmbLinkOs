@@ -2874,6 +2874,14 @@ test-acpi: $(IMG) $(EMBKFS_MASTER)
 #
 # The empty controller matters: a device present at boot would prove only that
 # the boot-time scan still works, which was never the missing part.
+# DOES A USB KEYBOARD STILL TYPE WHEN THE CONTROLLER'S INTERRUPT NEVER COMES?
+# A laptop's interrupt routing is the kind of thing that is wrong on a machine
+# nobody has booted before; the kernel falls back to polling and says so.
+# Proven here by masking the interrupt on purpose and typing.
+.PHONY: test-xhci-nointr
+test-xhci-nointr: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/xhci_nointr_test.py || exit 1
+
 .PHONY: test-usb-hotplug
 test-usb-hotplug: $(IMG) $(EMBKFS_MASTER)
 	@echo "=== UHCI (the shared core) ==="

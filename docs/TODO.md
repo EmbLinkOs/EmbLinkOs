@@ -7800,3 +7800,30 @@ worn out there. (Slot 2, incidentally: the slot whose EP0 ring straddled the
       change makes that flash block writable. Another stick is the answer for
       this machine; a read-only root that still reaches the desktop would be
       the answer for a machine whose only stick is like this one.
+
+**USB keyboard and mouse on the ProBook: the interrupt is the suspect (2026-09-30, night)**
+
+They work in the firmware and stop the moment this kernel owns the
+controller. The full/low-speed pitfalls are already handled (EP0 packet size
+per speed, Evaluate Context after bMaxPacketSize0, the per-speed interval
+formula); what remained unknowable was whether the controller's interrupt --
+the only thing that delivers HID input here -- ever arrived. Nothing counted
+it.
+
+- [x] `xhci_irq` counts per controller, and `test xhci stats` prints
+      `[xhci] irqs= kbd_reports= mouse_reports= polled_fallback=`.
+- [x] **A polled fallback, on evidence.** An interrupt-driven controller with
+      an event left unconsumed at its dequeue pointer across two polls 50 ms
+      apart has its interrupt masked for good and is serviced from the main
+      loop; one line names the fault. The first cut watched for SILENCE --
+      two seconds with no interrupt while a keyboard was armed -- and masked a
+      working interrupt on every boot, because an idle keyboard raises none;
+      the harness caught it (`irqs=0 polled_fallback=1` at baseline). Silence
+      is not evidence. `tools/xhci_nointr_test.py` proves the real trigger by
+      masking the interrupt on purpose (`test xhci nointr`) and typing.
+- [ ] **Not yet measured on the ProBook.** If tomorrow's log says "servicing
+      by polling", the routing is the bug (MSI-X on this chipset, or the
+      INTx line), and the keyboard works meanwhile. If it says nothing and the
+      keyboard is still dead, enumeration is the suspect and the log's
+      `xHCI slotN:` lines say which step.
+
