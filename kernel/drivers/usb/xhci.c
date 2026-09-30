@@ -316,6 +316,43 @@ static inline uint64_t xhci_dma(const volatile void *p) {
     return KV2P((uint64_t)(uintptr_t)p);
 }
 
+/* HOW LONG TO WAIT FOR A DEVICE IS A TIME, NOT A LOOP COUNT.
+ *
+ * Every wait in this driver was "poll the event ring N million times", which
+ * is a different length of time on every machine and, on real silicon, a few
+ * hundred milliseconds. A USB stick with a flash page going marginal reads
+ * that page with internal retries that take SECONDS -- macOS reads it fine,
+ * slowly -- and a host that gives up in 300 ms turns a slow block into an
+ * I/O error on the one block a filesystem cannot do without. Every other
+ * host allows a mass-storage command up to 30 s (that is the SCSI disk
+ * timeout Linux uses). So: a budget in microseconds from the TSC, and the
+ * iteration count only as the fallback for a machine whose clock reads 0.
+ *
+ * The waits stay busy-polls: the bus lock is held, the interrupt is off, and
+ * the caller is a synchronous block read. That is the existing design; this
+ * changes only what "too long" means. */
+#define XHCI_BUDGET_CMD_US    5000000ULL   /* an xHCI command: milliseconds normally  */
+#define XHCI_BUDGET_CTRL_US   5000000ULL   /* a control transfer                       */
+#define XHCI_BUDGET_BULK_US  30000000ULL   /* a bulk stage: the SCSI disk timeout      */
+#define XHCI_SLOW_NOTE_US     1000000ULL   /* log a transfer that took longer than this */
+
+struct xhci_wait { uint64_t t0; uint64_t budget_us; uint32_t iters; uint32_t max_iters; };
+
+static inline void xhci_wait_begin(struct xhci_wait *w, uint64_t budget_us, uint32_t max_iters) {
+    w->t0 = time_get_us(); w->budget_us = budget_us; w->iters = 0; w->max_iters = max_iters;
+}
+/* True while the caller should keep polling. */
+static inline bool xhci_wait_more(struct xhci_wait *w) {
+    w->iters++;
+    if (w->t0 != 0) {                              /* a real clock: use the budget */
+        return (time_get_us() - w->t0) < w->budget_us;
+    }
+    return w->iters < w->max_iters;                /* no clock: the old count      */
+}
+static inline uint64_t xhci_wait_elapsed_ms(const struct xhci_wait *w) {
+    return w->t0 ? (time_get_us() - w->t0) / 1000ULL : 0;
+}
+
 /* Does any DMA object of this controller cross a 64 KB line? One line per
  * offender and one summary line, into the log, at init. See the note on the
  * struct. `what` is named per sub-object (per slot, per direction) because
@@ -701,7 +738,8 @@ static bool xhci_poll_cmd_completion(struct xhci_runtime_state *rt,
 
     volatile uint8_t *ir = runtime + XHCI_RT_IR0;
 
-    for (uint32_t i = 0; i < max_iters; i++) {
+    struct xhci_wait w; xhci_wait_begin(&w, XHCI_BUDGET_CMD_US, max_iters);
+    while (xhci_wait_more(&w)) {
         struct xhci_trb *ev = &rt->evt_ring[rt->evt_dequeue];
         uint32_t d3 = ev->d3;
         uint32_t cycle = d3 & 1U;
@@ -925,7 +963,8 @@ static bool xhci_ep0_control_transfer(struct xhci_runtime_state *rt,
 
     // Poll interrupter-0 event ring for our Transfer Event.
     volatile uint8_t *ir = runtime + XHCI_RT_IR0;
-    for (uint32_t i = 0; i < 8000000U; i++) {
+    struct xhci_wait w; xhci_wait_begin(&w, XHCI_BUDGET_CTRL_US, 8000000U);
+    while (xhci_wait_more(&w)) {
         struct xhci_trb *ev = &rt->evt_ring[rt->evt_dequeue];
         uint32_t d3 = ev->d3;
         if ((d3 & 1U) != rt->evt_cycle) { continue; }
@@ -1965,7 +2004,8 @@ static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
     xhci_ring_doorbell(m->doorbell, m->slot_id, rt->bulk_dci[idx][d]);
 
     volatile uint8_t *ir = m->runtime + XHCI_RT_IR0;
-    for (uint32_t i = 0; i < 30000000U; i++) {
+    struct xhci_wait w; xhci_wait_begin(&w, XHCI_BUDGET_BULK_US, 30000000U);
+    while (xhci_wait_more(&w)) {
         struct xhci_trb *ev = &rt->evt_ring[rt->evt_dequeue];
         if ((ev->d3 & 1U) != rt->evt_cycle) { continue; }
         uint32_t type    = (ev->d3 >> XHCI_TRB_TYPE_SHIFT) & 0x3FU;
@@ -1975,7 +2015,16 @@ static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
         if (rt->evt_dequeue >= XHCI_EVENT_RING_TRBS) { rt->evt_dequeue = 0; rt->evt_cycle ^= 1U; }
         xhci_write64(ir, XHCI_IR_ERDP, xhci_dma(&rt->evt_ring[rt->evt_dequeue]) | (1ULL << 3));
         if (type != XHCI_TRB_TRANSFER_EVENT || ev_slot != m->slot_id) { continue; }
-        if (cc == 1U || cc == 13U) return true;          /* Success / Short Packet */
+        if (cc == 1U || cc == 13U) {                     /* Success / Short Packet */
+            /* A transfer that succeeded but took its time is the evidence a
+             * dying stick leaves: say so, once per slow transfer. */
+            uint64_t ms = xhci_wait_elapsed_ms(&w);
+            if (ms * 1000ULL >= XHCI_SLOW_NOTE_US)
+                kprintf("xHCI slot%u: bulk-%s transfer of %u bytes took %lu ms -- "
+                        "the device is slow here, not broken\n", (unsigned)m->slot_id,
+                        dir_in ? "IN" : "OUT", (unsigned)len, (unsigned long)ms);
+            return true;
+        }
         /* Anything else is a failed transfer, and the ones a stick actually
          * produces (STALL, Babble, Transaction Error) leave the endpoint
          * HALTED: every later transfer on it fails until something un-halts it,
@@ -1990,6 +2039,9 @@ static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
         xhci_ep_recover(m, d);
         return false;
     }
+    kprintf("xHCI slot%u: bulk-%s transfer of %u bytes: no completion after %lu ms\n",
+            (unsigned)m->slot_id, dir_in ? "IN" : "OUT", (unsigned)len,
+            (unsigned long)xhci_wait_elapsed_ms(&w));
     return false;
 }
 

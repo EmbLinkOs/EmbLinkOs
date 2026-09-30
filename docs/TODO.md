@@ -7740,3 +7740,31 @@ it was missing the two facts that decide the remaining theories:
       the next `EMBLINK.LOG` -- or, if the stick still cannot be written, the
       next photograph -- will say. A claim is measured or it is not made.
 
+**The ProBook's I/O errors: one block, read slowly (2026-09-30, evening)**
+
+The photograph after the bus lock showed the failure is ONE block -- node
+block 17, LBA 136, the root of the metadata tree -- failing on every read
+that reaches the stick, while every other block reads and every lookup the
+node cache can serve succeeds. On the Mac, `dd` of those eight sectors
+returns bytes without error. The stick is not dead there; it is slow there.
+
+- [x] **Every xHCI wait was an iteration count.** "Poll the event ring
+      30,000,000 times" is a few hundred milliseconds on real silicon and a
+      different number everywhere else; a flash page being read with internal
+      retries takes seconds, and every other host allows a mass-storage
+      command 30 s. Waits are TSC budgets now (5 s command, 5 s control, 30 s
+      bulk), and a bulk transfer that succeeds after more than a second says
+      `took N ms -- the device is slow here, not broken` in the log.
+- [ ] **Not yet measured on the ProBook.** The theory predicts the next boot
+      reaches the desktop, slowly, with that line in `EMBLINK.LOG`. If the
+      boot still fails, the same log now carries the memory map verdict and
+      the DMA layout verdict, and the failing transfer says how long it waited.
+- [ ] **The hash of the stick's block 17 does not match the current image's.**
+      Expected if the stick still holds the previous image (the root node's
+      bytes change with every build); a corruption if it holds this one. Which
+      it is was not yet known when this was written.
+- [ ] **A single marginal page kills the volume.** The tree root is one block
+      with no replica; the superblock has a backup at the last block, the root
+      node does not. A second copy of the root, written at every commit, is the
+      obvious next step and is not done.
+

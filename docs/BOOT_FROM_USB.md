@@ -134,6 +134,7 @@ Lines worth searching for:
 | `xHCI` | The USB controller's ports, what was found on them, and any `transfer failed, completion code` followed by `recovering the endpoint`. Also `DMA layout ok` — or `CROSSES A 64 KB BOUNDARY`, which names a ring the controller may misread. |
 | `firmware memory map` | Every region the firmware reported, then one verdict line: the kernel image is either `all of it usable RAM` or `SHARED WITH FIRMWARE` — the latter means the firmware still owns memory the kernel (and its USB DMA buffers) sit in. |
 | `I/O error` | A read from the stick failed. Which one, and what happened just before it, is the diagnosis. |
+| `took` | `bulk-IN transfer of 4096 bytes took 2300 ms -- the device is slow here, not broken`: the stick has a flash page it can still read only with retries. The kernel waits for it (up to 30 s per transfer, like every other OS), but the stick is wearing out — copy what matters off it and use another. |
 | `home: desktop ready` | The desktop finished starting. |
 | `EmbLinkOS stopped` | A kernel fault; the lines after it name the function. |
 
