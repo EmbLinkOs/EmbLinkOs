@@ -84,6 +84,7 @@ static inline uint32_t xhci_portsc_keep(uint32_t v) {
 #define XHCI_TRB_ADDRESS_DEVICE 11U
 #define XHCI_TRB_CFG_ENDPOINT   12U  // Configure Endpoint command TRB type
 #define XHCI_TRB_DISABLE_SLOT   10U  // Disable Slot command TRB type
+#define XHCI_TRB_STOP_ENDPOINT  15U  // Stop Endpoint: abandon a TD that will never complete
 #define XHCI_TRB_RESET_ENDPOINT 14U  // Reset Endpoint: take it out of Halted
 #define XHCI_TRB_SET_TR_DEQUEUE 16U  // Set TR Dequeue Pointer: resynchronise the ring
 #define XHCI_TRB_EVAL_CONTEXT   13U  // Evaluate Context command TRB type
@@ -1882,6 +1883,7 @@ struct xhci_msc_dev {
     volatile uint8_t *runtime;
     volatile uint8_t *doorbell;
     uint8_t slot_id;
+    uint8_t iface;      /* bInterfaceNumber: the Bulk-Only Reset is addressed to it */
     bool used;
 };
 static struct xhci_msc_dev g_msc_devs[XHCI_MAX_CONTROLLERS * XHCI_MAX_SLOTS_TRACKED];
@@ -1990,6 +1992,97 @@ static bool xhci_ep_recover(struct xhci_msc_dev *m, uint32_t d)
     return true;
 }
 
+/* A TRANSFER THAT NEVER COMPLETES is a different failure from one the
+ * controller reports, and it needs a different recovery. There is no event,
+ * so the endpoint is not Halted: Reset Endpoint would answer Context State
+ * Error. The TD is still on the ring, owned by the controller, and the device
+ * is wherever it is -- on a worn USB stick, stuck in its own firmware after
+ * a write. What an HP ProBook showed: the data stage of a WRITE(10) accepted,
+ * the 13-byte status never sent, and then nothing on either pipe.
+ *
+ * The ladder the specifications give (xHCI 4.6.9; USB Mass Storage Bulk-Only
+ * 1.0 section 5.3.4), and the one Linux's usb-storage climbs:
+ *   1. Stop Endpoint on both bulk pipes, so the controller abandons the TD.
+ *   2. Set TR Dequeue Pointer on both, so ring and driver agree again.
+ *   3. Bulk-Only Mass Storage Reset: a class request on EP0 that tells the
+ *      device to drop its half of the transaction.
+ *   4. CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints.
+ * The caller then retries the command once. What this cannot do is a port
+ * reset (the next rung, when EP0 does not answer either); docs/TODO.md. */
+static bool xhci_ep_stop(struct xhci_msc_dev *m, uint32_t d)
+{
+    struct xhci_runtime_state *rt = m->rt;
+    uint32_t idx = (uint32_t)m->slot_id - 1U;
+    uint8_t dci = rt->bulk_dci[idx][d];
+    if (!dci || !rt->doorbell_regs) return false;
+    if (rt->cmd_enqueue >= (XHCI_CMD_RING_TRBS - 1U)) return false;
+    struct xhci_trb *trb = &rt->cmd_ring[rt->cmd_enqueue];
+    trb->d0 = 0; trb->d1 = 0; trb->d2 = 0;
+    trb->d3 = (XHCI_TRB_STOP_ENDPOINT << XHCI_TRB_TYPE_SHIFT) |
+              ((uint32_t)m->slot_id << 24) | ((uint32_t)dci << 16) |
+              (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+    xhci_cmd_advance(rt);
+    xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+    uint8_t cc = 0, got = 0;
+    if (!xhci_poll_cmd_completion(rt, rt->runtime_regs, 4000000, &cc, &got) || cc != 1U) {
+        kprintf("xHCI slot%u: Stop Endpoint (dci %u) returned %u\n",
+                (unsigned)m->slot_id, (unsigned)dci, (unsigned)cc);
+        return false;
+    }
+    return true;
+}
+
+static void xhci_msc_timeout_recover(struct xhci_msc_dev *m)
+{
+    struct xhci_runtime_state *rt = m->rt;
+    kprintf("xHCI slot%u: recovering the device after a timeout (Stop Endpoint, "
+            "Bulk-Only Reset, clear halts)\n", (unsigned)m->slot_id);
+    for (uint32_t d = 0; d < 2U; d++) {
+        if (!xhci_ep_stop(m, d)) continue;
+        /* Set TR Dequeue: the same step xhci_ep_recover takes after its Reset
+         * Endpoint, on an endpoint that is now Stopped rather than Halted. */
+        uint32_t idx = (uint32_t)m->slot_id - 1U;
+        uint8_t dci = rt->bulk_dci[idx][d];
+        if (rt->cmd_enqueue >= (XHCI_CMD_RING_TRBS - 1U)) continue;
+        uint64_t deq = xhci_dma(&rt->bulk_ring[idx][d][rt->bulk_enqueue[idx][d]]);
+        struct xhci_trb *trb = &rt->cmd_ring[rt->cmd_enqueue];
+        trb->d0 = (uint32_t)((deq | (rt->bulk_cycle[idx][d] ? 1ULL : 0ULL)) & 0xFFFFFFFFULL);
+        trb->d1 = (uint32_t)(deq >> 32);
+        trb->d2 = 0;
+        trb->d3 = (XHCI_TRB_SET_TR_DEQUEUE << XHCI_TRB_TYPE_SHIFT) |
+                  ((uint32_t)m->slot_id << 24) | ((uint32_t)dci << 16) |
+                  (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+        xhci_cmd_advance(rt);
+        xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+        uint8_t cc = 0, got = 0;
+        if (!xhci_poll_cmd_completion(rt, rt->runtime_regs, 4000000, &cc, &got) || cc != 1U)
+            kprintf("xHCI slot%u: Set TR Dequeue (dci %u) returned %u\n",
+                    (unsigned)m->slot_id, (unsigned)dci, (unsigned)cc);
+    }
+
+    /* 3. Bulk-Only Mass Storage Reset: bmRequestType 0x21 (host-to-device,
+     *    class, interface), bRequest 0xFF, wValue 0, wIndex the interface. */
+    uint32_t d0 = 0x21U | (0xFFU << 8) | (0U << 16);
+    uint32_t d1 = (uint32_t)m->iface;
+    bool reset_ok = xhci_ep0_control_transfer(rt, m->runtime, m->doorbell, m->slot_id,
+                                              d0, d1, false, NULL, 0);
+    if (!reset_ok)
+        kprintf("xHCI slot%u: the device did not answer the Bulk-Only Reset on EP0 -- "
+                "it needs a port reset, which this driver does not do yet\n",
+                (unsigned)m->slot_id);
+
+    /* 4. CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints. */
+    for (uint32_t d = 0; d < 2U; d++) {
+        uint32_t idx = (uint32_t)m->slot_id - 1U;
+        uint8_t dci = rt->bulk_dci[idx][d];
+        if (!dci) continue;
+        uint8_t ep_addr = (uint8_t)((dci >> 1) | (d ? 0x80U : 0U));
+        uint32_t c0 = 0x02U | ((uint32_t)USB_REQ_CLEAR_FEATURE << 8) | (0U << 16);
+        (void)xhci_ep0_control_transfer(rt, m->runtime, m->doorbell, m->slot_id,
+                                        c0, (uint32_t)ep_addr, false, NULL, 0);
+    }
+}
+
 static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
                            uint64_t phys, uint32_t len) {
     struct xhci_runtime_state *rt = m->rt;
@@ -2042,6 +2135,7 @@ static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
     kprintf("xHCI slot%u: bulk-%s transfer of %u bytes: no completion after %lu ms\n",
             (unsigned)m->slot_id, dir_in ? "IN" : "OUT", (unsigned)len,
             (unsigned long)xhci_wait_elapsed_ms(&w));
+    xhci_msc_timeout_recover(m);
     return false;
 }
 
@@ -2182,14 +2276,19 @@ static int usb_msc_block_write(struct embk_block_device *dev, uint64_t lba,
 // Find the first bulk IN and bulk OUT endpoints in the config-descriptor blob.
 static bool xhci_find_bulk_endpoints(struct xhci_runtime_state *rt, uint8_t slot_id,
                                      uint8_t *out_ep, uint8_t *in_ep,
-                                     uint16_t *out_mps, uint16_t *in_mps) {
+                                     uint16_t *out_mps, uint16_t *in_mps,
+                                     uint8_t *iface) {
     uint32_t idx = (uint32_t)slot_id - 1U;
     uint8_t *buf = rt->xfr_buf[idx];
     bool have_out = false, have_in = false;
     uint32_t off = 0;
+    if (iface) { *iface = 0; }
     while (off + 2U <= 64U) {
         uint8_t dlen = buf[off], dtype = buf[off + 1U];
         if (dlen == 0U) { break; }
+        if (dtype == USB_DESC_INTERFACE && off + 3U <= 64U && iface && !have_in && !have_out) {
+            *iface = buf[off + 2U];          /* the interface the bulk pipes belong to */
+        }
         if (dtype == USB_DESC_ENDPOINT && off + 7U <= 64U) {
             uint8_t ep_addr = buf[off + 2U];
             uint8_t attrs   = buf[off + 3U];
@@ -2290,8 +2389,9 @@ static bool xhci_configure_bulk_endpoints(struct xhci_runtime_state *rt,
 static bool xhci_msc_setup(struct xhci_runtime_state *rt, uint8_t slot_id,
                            volatile uint8_t *op, volatile uint8_t *runtime,
                            volatile uint8_t *doorbell) {
-    uint8_t out_ep = 0, in_ep = 0; uint16_t out_mps = 512, in_mps = 512;
-    if (!xhci_find_bulk_endpoints(rt, slot_id, &out_ep, &in_ep, &out_mps, &in_mps)) {
+    uint8_t out_ep = 0, in_ep = 0;
+    uint8_t iface = 0; uint16_t out_mps = 512, in_mps = 512;
+    if (!xhci_find_bulk_endpoints(rt, slot_id, &out_ep, &in_ep, &out_mps, &in_mps, &iface)) {
         kprintf("xHCI slot%u: MSC missing bulk IN/OUT endpoints\n", (unsigned int)slot_id);
         return false;
     }
@@ -2310,6 +2410,7 @@ static bool xhci_msc_setup(struct xhci_runtime_state *rt, uint8_t slot_id,
     if (!m) { kprintf("xHCI: MSC device table full\n"); return false; }
     m->used = true; m->rt = rt; m->runtime = runtime; m->doorbell = doorbell;
     m->slot_id = slot_id;
+    m->iface = iface;
     m->blk.block_size = 512; // provisional until READ CAPACITY (scsi_rw10 reads it)
     rt->msc_active[slot_id - 1U] = true;
 

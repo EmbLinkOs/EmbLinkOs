@@ -7768,3 +7768,35 @@ returns bytes without error. The stick is not dead there; it is slow there.
       node does not. A second copy of the root, written at every commit, is the
       obvious next step and is not done.
 
+**With the real timeout, the ProBook reads everything and dies on its first write (2026-09-30, late)**
+
+The next photograph: every read succeeds -- `ls /:` lists the root, init.elf
+loads, login runs -- and then `make "Trash"` commits, and:
+
+    xHCI slot2: bulk-IN transfer of 13 bytes: no completion after 30004 ms
+    xHCI slot2: bulk-OUT transfer of 31 bytes: no completion after 30000 ms
+
+The data stage of the WRITE(10) completed (the stick acknowledged it); the
+13-byte status wrapper never came; and the next command's 31-byte CBW was not
+accepted either. Silence on both pipes is a flash controller stuck in its own
+error handling, and the write went to block 16, the neighbour of the block it
+already reads slowly -- one flash page, read-modify-written. The Mac's `dd`
+of the whole image is sequential and never touches that path. The stick is
+worn out there. (Slot 2, incidentally: the slot whose EP0 ring straddled the
+64 KB line in the build before.)
+
+- [x] **Recovery after a timeout, three rungs of four.** The BOT spec (USB
+      Mass Storage Bulk-Only 1.0, section 5.3.4) defines it: Stop Endpoint and
+      Set TR Dequeue on both bulk rings so the controller abandons the TD,
+      Bulk-Only Mass Storage Reset on EP0, CLEAR_FEATURE(HALT) on both bulk
+      endpoints, then the command is retried once
+      (`xhci_msc_timeout_recover`). Linux's usb-storage does the same.
+- [ ] **The fourth rung, a port reset, is not built.** When the device does
+      not answer the Bulk-Only Reset on EP0 either, only a USB reset of the
+      port brings it back, and that means re-enumerating the slot while the
+      block device stays registered. The log says "needs a port reset, which
+      this driver does not do yet" at exactly that moment.
+- [ ] **A stick that wedges on a write cannot host a writable root.** No driver
+      change makes that flash block writable. Another stick is the answer for
+      this machine; a read-only root that still reaches the desktop would be
+      the answer for a machine whose only stick is like this one.
