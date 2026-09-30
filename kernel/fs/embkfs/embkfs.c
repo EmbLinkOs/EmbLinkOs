@@ -1634,6 +1634,15 @@ int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume 
         if (psb->magic == EMBKFS_MAGIC) {
             uint32_t pcalc = embk_crc32c(sb_primary, EMBKFS_SB_BODY_SIZE, 0);
             primary_valid = ((uint32_t)psb->checksum == pcalc);
+            /* A SUPERBLOCK THAT IS THERE AND IS REFUSED must say so. Silence
+             * here is what left an HP ProBook reporting only "no volume found"
+             * while its stick held a perfectly good filesystem -- the one case
+             * where the device, the offset and the magic are all right and the
+             * answer is still no. */
+            if (!primary_valid)
+                kprintf("EMBKFS: %s: superblock magic is right but its checksum is not "
+                        "(stored 0x%08X, calc 0x%08X) -- not mounting\n",
+                        dev->name, (unsigned int)psb->checksum, (unsigned int)pcalc);
         }
     }
 
