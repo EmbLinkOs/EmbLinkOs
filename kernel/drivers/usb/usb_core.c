@@ -6,6 +6,7 @@
 #include "include/kstring.h"
 #include "include/errno.h"
 #include "block/block.h"
+#include "process/ksync.h"   /* one synchronous transaction on the bus at a time */
 #include "fs/automount.h"
 #include "net/usb_net.h"
 #include "drivers/timer/timer.h"   /* timer_delay_ms: the portable delay (on x86, the same PIT/TSC wait) */
@@ -246,7 +247,16 @@ static bool usb_hid_attach(struct usb_device *dev, uint8_t kind) {
     return true;
 }
 
+/* See the note on usb_bus_lock in usb.h. */
+static struct mutex g_usb_bus_lock = MUTEX_INIT;
+void usb_bus_lock(void)   { mutex_lock(&g_usb_bus_lock); }
+void usb_bus_unlock(void) { mutex_unlock(&g_usb_bus_lock); }
+bool usb_bus_trylock(void){ return mutex_trylock(&g_usb_bus_lock) != 0; }
+
 void usb_core_poll(void) {
+    /* A transfer is in flight and is polling for its own completion. Draining
+     * an interrupt endpoint under it would take that completion. Next tick. */
+    if (!usb_bus_trylock()) { return; }
     for (uint32_t i = 0; i < USB_MAX_DEVICES; i++) {
         struct usb_device *dev = &g_usb_devices[i];
         if (!dev->in_use || !dev->hid_active) continue;
@@ -271,6 +281,7 @@ void usb_core_poll(void) {
             dev->ops->int_submit(dev, dev->hid_ep, dev->hid_mps);
         }
     }
+    usb_bus_unlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -365,15 +376,20 @@ static int usb_msc_block_read(struct embk_block_device *bdev, uint64_t lba,
     struct usb_msc *m = (struct usb_msc *)bdev->driver_data;
     uint8_t *dst = (uint8_t *)buffer;
     uint32_t per = MSC_CHUNK_BYTES / m->block_size;
+    usb_bus_lock();                      /* the bus is ours for this request */
     while (count) {
         uint32_t n = count > per ? per : count;
         size_t bytes = (size_t)n * (size_t)m->block_size;
-        if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)n)) return -EMBK_EIO;
+        if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)n)) {
+            usb_bus_unlock();
+            return -EMBK_EIO;
+        }
         memcpy(dst, m->data, bytes);
         dst += bytes;
         lba += n;
         count -= n;
     }
+    usb_bus_unlock();
     return EMBK_OK;
 }
 
@@ -382,14 +398,19 @@ static int usb_msc_block_write(struct embk_block_device *bdev, uint64_t lba,
     struct usb_msc *m = (struct usb_msc *)bdev->driver_data;
     const uint8_t *src = (const uint8_t *)buffer;
     uint32_t per = MSC_CHUNK_BYTES / m->block_size;
+    usb_bus_lock();                      /* see usb_msc_block_read */
     while (count) {
         uint32_t n = count > per ? per : count;
         memcpy(m->data, src, (size_t)n * (size_t)m->block_size);
-        if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)n)) return -EMBK_EIO;
+        if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)n)) {
+            usb_bus_unlock();
+            return -EMBK_EIO;
+        }
         src += n * m->block_size;
         lba += n;
         count -= n;
     }
+    usb_bus_unlock();
     return EMBK_OK;
 }
 

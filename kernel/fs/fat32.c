@@ -1406,6 +1406,16 @@ static int fat32_write_data_to_chain(struct fat32_volume *vol,
     return (int)bytes_written;
 }
 
+/* Is there a file (not a directory) at `path`? The path walk and nothing more:
+ * no cluster chain is followed and no data is read, which is what a caller
+ * asking "is this the volume I think it is?" actually wants. */
+bool fat32_exists(struct fat32_volume *vol, const char *path) {
+    if (!vol || !vol->mounted || !path) return false;
+    struct fat_dir_entry entry;
+    if (fat32_find_path(vol, path, &entry) != EMBK_OK) return false;
+    return (entry.attr & FAT32_ATTR_DIRECTORY) == 0;
+}
+
 int fat32_read(struct fat32_volume *vol, const char *name,
                uint8_t *buffer, uint32_t max_size) {
     if (!vol || !vol->mounted || !name || !buffer) return -EMBK_EINVAL;

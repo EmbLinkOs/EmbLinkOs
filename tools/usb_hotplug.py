@@ -202,6 +202,11 @@ def main():
         if MARKER not in text:
             fails.append("the guest never read %s off the stick -- mounted is "
                          "not the same as readable" % MARKER)
+            # A failing check that does not say what the guest ACTUALLY said
+            # sends the reader back to QEMU by hand. Print the answer.
+            print("usb-hotplug: what the guest answered instead:")
+            for line in text.splitlines()[-25:]:
+                print("    | %s" % line.rstrip())
         else:
             print("usb-hotplug: the guest read %s off the new volume" % MARKER)
         m = re.search(r"mount (\S+) <- (\S+) \((\w+)\)", text)

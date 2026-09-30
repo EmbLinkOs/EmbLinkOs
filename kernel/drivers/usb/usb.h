@@ -120,6 +120,28 @@ void usb_hotplug_poll(void);
 /* Force a rescan now, whatever the timer says. `test usbhotplug` uses it so
  * the test does not have to sleep for the poll interval. */
 void usb_hotplug_scan_now(void);
+
+/* ONE SYNCHRONOUS TRANSACTION ON THE LEGACY USB BUS AT A TIME.
+ *
+ * UHCI, OHCI and EHCI share usb_core's device table, its per-device bounce
+ * buffers and its transfer queues, and every transfer here WAITS for its own
+ * completion. Two threads in that at once do not get a slow bus, they get a
+ * wrong one: a filesystem read, the 500 ms hotplug enumeration and the HID
+ * poll each take the other's completion and then report a timeout. The lock
+ * SLEEPS (the holder is waiting on a device round trip, which a spinlock
+ * holder must never do), and the two tick-driven callers take it with trylock
+ * -- they run every pass of a loop and lose nothing by skipping one.
+ *
+ * LOCK ORDER: filesystem lock first, this one second -- which is the order a
+ * file read naturally takes them in. Nothing may hold this across an operation
+ * that mounts (the hotplug rescan does exactly that, which is why it runs
+ * unlocked; see usb_hotplug_scan_now).
+ *
+ * xHCI shares none of this code and has its own (xhci.c, g_xhci_bus_lock).
+ * Never taken from an interrupt handler: a handler cannot sleep. */
+void usb_bus_lock(void);
+void usb_bus_unlock(void);
+bool usb_bus_trylock(void);
 uint32_t usb_controller_count(void);
 const struct usb_controller *usb_get_controller(uint32_t index);
 

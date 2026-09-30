@@ -7651,3 +7651,40 @@ for them to run against:
       silent. All three are correct by the specification and none of them fixed
       the corruption that prompted them -- that was the unlocked rename. Worth
       keeping, worth being honest about.
+
+**USB: one transaction at a time, and the one place that still is not**
+
+The USB block drivers had no lock. Two threads doing I/O through one host
+controller share its command ring, its event ring and its bounce buffers, and
+each waits for its own completion by reading the event ring in a loop -- so
+whoever polls first consumes the other's completion and the other reports a
+transfer that "failed". Above that it is an I/O error on a stick that is
+working perfectly. It is the bug `ata.c` had (`g_ata_lock`), and the answer is
+the same: a sleeping lock around each request, in `xhci.c` (`g_xhci_bus_lock`)
+and in `usb_core.c` (`usb_bus_lock`, shared by UHCI/OHCI/EHCI).
+
+- [ ] **The 500 ms hotplug rescan runs unlocked, on purpose.** A rescan that
+      finds a stick enumerates AND MOUNTS it before returning, and the mount
+      reads blocks -- taking the filesystem lock first and the USB lock second,
+      which is the order a file read takes them in too. Holding the USB lock
+      across the rescan would take them in the opposite order, and two threads
+      doing that hangs the machine outright: strictly worse than the problem.
+      So the transfers under the rescan are serialised individually and the
+      scan itself is not, which leaves one window: plug something in at the
+      exact moment another thread is mid-transfer and a completion can still be
+      taken. The cost is a retry, not corruption. Closing it properly means
+      registering the new block device OUTSIDE the enumeration -- deferring the
+      `embk_block_register` call to after the scan drops the lock -- which is a
+      change to boot ordering on a machine that currently boots, so it waits
+      for a day when it can be measured on that machine rather than guessed at.
+
+**The boot log wrote itself onto whatever stick was plugged in**
+
+`automount_fat32_volume()` returned "the first mounted FAT32 volume", and the
+boot log wrote 64 KB there every five seconds. Plug a stick into a running
+EmbLinkOS and it is mounted within half a second -- and if it took the first
+slot, the log landed on someone else's stick, over the same USB pipe they were
+reading through. `tools/usb_hotplug.py` caught it as an OHCI bulk timeout and a
+volume that "is mounted but cannot be listed". The boot volume is now
+recognised rather than guessed: the one carrying `/EFI/BOOT/BOOTX64.EFI`, the
+loader that started this kernel, pinned once found.

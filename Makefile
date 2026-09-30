@@ -298,6 +298,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/lib/ksym.c \
              kernel/lib/klog.c \
              kernel/lib/crashlog.c \
+             kernel/lib/bootlog.c \
              kernel/lib/kprintf.c
 
 LINKER      = kernel/linker.ld

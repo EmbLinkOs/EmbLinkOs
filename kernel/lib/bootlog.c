@@ -31,10 +31,41 @@
 #define BOOTLOG_FIRST_MS   4000    /* soon: a machine that wedges at 15 s must still leave a log */
 #define BOOTLOG_EVERY_MS   5000
 
+/* WHICH VOLUME? THE ONE THIS KERNEL BOOTED FROM, AND NO OTHER.
+ *
+ * "The first mounted FAT32 volume" is not that. Plug a stick into a running
+ * EmbLinkOS and it is mounted within half a second, and if it happens to take
+ * the first slot the boot log lands on SOMEONE ELSE'S STICK -- 64 KB of kernel
+ * log written, unasked, onto whatever a person plugged in. It also breaks the
+ * stick for whoever was using it: the write goes out over the same USB pipe
+ * their read is using (tools/usb_hotplug.py caught exactly this, as an OHCI
+ * bulk timeout and a volume that "is mounted but cannot be listed").
+ *
+ * The boot volume is recognised, not guessed: it is the one carrying the
+ * loader that started this kernel. Nothing else on a person's desk has
+ * /EFI/BOOT/BOOTX64.EFI on it, and if something does, it is a boot stick and
+ * writing a log to it is what this file is for. Pinned once found, so a later
+ * plug cannot change the answer.
+ */
+static struct fat32_volume *bootlog_volume(void)
+{
+    static struct fat32_volume *pinned;
+    if (pinned) return pinned;
+    for (int i = 0; ; i++) {
+        struct fat32_volume *v = automount_fat32_volume(i);
+        if (!v) return NULL;
+        if (fat32_exists(v, "/EFI/BOOT/BOOTX64.EFI") ||
+            fat32_exists(v, "/EFI/BOOT/BOOTAA64.EFI")) {
+            pinned = v;
+            return v;
+        }
+    }
+}
+
 static void bootlog_write_once(void)
 {
-    struct fat32_volume *vol = automount_fat32_volume();
-    if (!vol) return;                    /* no FAT partition: nothing to do */
+    struct fat32_volume *vol = bootlog_volume();
+    if (!vol) return;                    /* not booted from a FAT volume: nothing to do */
 
     /* The heap, not .bss: the kernel image has to fit under the address the
      * firmware loads it at, and 64 KB of it for a copy of something already in

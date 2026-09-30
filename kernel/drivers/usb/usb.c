@@ -197,6 +197,12 @@ void usb_init(void) {
 
 static uint64_t g_next_hotplug_ms;
 
+/* NOT under usb_bus_lock, deliberately -- see the lock order note in usb.h.
+ * A rescan that finds a stick MOUNTS it before it returns, and a mount reads
+ * blocks through the filesystem, which takes the filesystem's own lock and
+ * then this one. Holding this one across that would be the two locks taken in
+ * opposite orders by two threads, which is the one way to hang a machine
+ * outright. The transfers underneath are individually serialised instead. */
 void usb_hotplug_scan_now(void) {
     for (uint32_t i = 0; i < g_usb_controller_count; i++) {
         struct usb_controller *c = &g_usb_controllers[i];

@@ -11,6 +11,7 @@
 #include "drivers/timer/timer.h"   /* timer_delay_ms: the portable delay (on x86, the same PIT/TSC wait) */
 #include "block/block.h"
 #include "fs/automount.h"       // block-device registration for USB mass storage
+#include "process/ksync.h"      // one synchronous transaction on the bus at a time
 #if defined(__x86_64__)
 #include "arch/x86_64/irq/irq.h"           // irq_register (interrupt-driven event servicing)
 #include "arch/x86_64/irq/ioapic.h"        // ioapic_route_level for the PCI interrupt
@@ -83,6 +84,8 @@ static inline uint32_t xhci_portsc_keep(uint32_t v) {
 #define XHCI_TRB_ADDRESS_DEVICE 11U
 #define XHCI_TRB_CFG_ENDPOINT   12U  // Configure Endpoint command TRB type
 #define XHCI_TRB_DISABLE_SLOT   10U  // Disable Slot command TRB type
+#define XHCI_TRB_RESET_ENDPOINT 14U  // Reset Endpoint: take it out of Halted
+#define XHCI_TRB_SET_TR_DEQUEUE 16U  // Set TR Dequeue Pointer: resynchronise the ring
 #define XHCI_TRB_EVAL_CONTEXT   13U  // Evaluate Context command TRB type
 
 /* How many root ports this driver remembers the state of. The controller
@@ -778,7 +781,7 @@ static bool xhci_prepare_address_device_context(struct xhci_runtime_state *rt,
 // USB SETUP request types / requests (standard device request subset).
 #define USB_BMRT_H2D_STD_DEV   0x00U  // host-to-device, standard, device
 #define USB_BMRT_D2H_STD_DEV   0x80U  // device-to-host, standard, device
-// USB_REQ_GET_DESCRIPTOR already defined in usb.h
+// USB_REQ_GET_DESCRIPTOR and USB_REQ_CLEAR_FEATURE already come from usb.h
 #define USB_REQ_SET_ADDRESS_CMD 0x05U // kept distinct from the usb.h constant name
 #define USB_DESC_DEVICE_TYPE   0x01U
 #define USB_DESC_CONFIG_TYPE   0x02U
@@ -1714,17 +1717,66 @@ void xhci_enable_irq(void) {
 #endif
 }
 
+/* ==========================================================================
+ * ONE SYNCHRONOUS TRANSACTION ON THE BUS AT A TIME.
+ *
+ * Three things drive this controller from ordinary thread context, and until
+ * now none of them knew about the others:
+ *
+ *   - a filesystem read or write (usb_msc_block_read/write), on whichever
+ *     thread asked for the file;
+ *   - the 500 ms hotplug tick (xhci_rescan), on the boot CPU's main loop,
+ *     which walks every root and hub port and, on a change, runs a WHOLE
+ *     enumeration -- control transfers, Address Device, SCSI INQUIRY;
+ *   - xhci_poll(), the event-ring drain for a controller with no usable
+ *     interrupt, also on the boot loop.
+ *
+ * They share one command ring, one event ring and one set of per-slot bounce
+ * buffers, and each of them WAITS for its own completion by reading the event
+ * ring in a loop. Two at once is not a slow bus, it is a wrong one: whoever
+ * polls first consumes the other's completion event, so the other waits for
+ * something that has already been taken and eventually reports a transfer that
+ * "failed". Above that, the filesystem sees an I/O error on a stick that is
+ * working perfectly -- and, because the block read it fails is a metadata read
+ * the mount needs, the failure does not stay small.
+ *
+ * It is the same bug ata.c had (see g_ata_lock there) and it gets the same
+ * answer: a SLEEPING lock, because the holder waits on a device round trip and
+ * a spinlock holder must never do that. The event-drain tick takes it with
+ * mutex_trylock -- it runs every pass of a loop and has nothing to gain by
+ * queueing behind a 4 KB read.
+ *
+ * WHAT IT DELIBERATELY DOES NOT COVER: the 500 ms hotplug rescan. A rescan
+ * that finds a stick ENUMERATES AND MOUNTS it before it returns, and the mount
+ * reads blocks -- taking the filesystem lock first and this one second. A
+ * filesystem read of a USB volume takes them in that same order. Holding this
+ * lock across the rescan would take them in the opposite order, and two
+ * threads doing that is a hung machine, which is worse than the problem. So
+ * the rescan runs unlocked and the transfers under it are serialised
+ * individually; a plug event arriving in the middle of a read can still lose a
+ * completion, which is a retry, not a corruption. docs/TODO.md records it.
+ *
+ * NOT taken by xhci_irq(): an interrupt handler cannot sleep. The block path
+ * silences the interrupt (xhci_intr_enable) for exactly that reason, which is
+ * the handler's half of this same arrangement.
+ * ========================================================================== */
+static struct mutex g_xhci_bus_lock = MUTEX_INIT;
+
 /* Service every controller that is NOT interrupt-driven: aarch64's always,
  * and an x86 controller that found no usable interrupt ("staying polled"),
  * whose HID reports nothing drained before this. Called from usb_poll(), in
  * schedulable context. */
 void xhci_poll(void) {
+    /* Busy bus: a transfer is in flight and is polling for its own completion.
+     * Draining the event ring under it would steal that completion. Next pass. */
+    if (!mutex_trylock(&g_xhci_bus_lock)) { return; }
     for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
         struct xhci_runtime_state *rt = &g_xhci_runtime[i];
         if (!rt->used || rt->irq_driven) { continue; }
         xhci_ack_interrupt(rt);
         xhci_service_events(rt);
     }
+    mutex_unlock(&g_xhci_bus_lock);
 }
 
 // ==========================================================================
@@ -1775,6 +1827,78 @@ static bool xhci_bulk_enqueue_trb(struct xhci_runtime_state *rt, uint32_t idx,
 // Synchronous single-TRB bulk transfer; busy-polls the shared event ring for
 // the completion. dir_in: true = bulk-IN, false = bulk-OUT. Returns true on a
 // Success (1) or Short Packet (13) completion code.
+/* A HALTED ENDPOINT STAYS HALTED UNTIL THE DRIVER SAYS OTHERWISE.
+ *
+ * Any transfer error -- a STALL from the device, a transaction error on the
+ * wire, a babble -- puts an xHCI endpoint in the Halted state, and every
+ * transfer submitted to it afterwards fails immediately. There was no recovery
+ * here at all, so the FIRST error a real USB stick produced made that stick
+ * permanently unreadable: an HP ProBook mounted its root filesystem, started
+ * init, and then filled its screen with "node block 17 read (LBA 136) failed:
+ * I/O error", forever, because nothing ever un-halted the bulk-IN endpoint.
+ * QEMU's storage device never stalls, so nothing here had met one.
+ *
+ * The sequence the spec asks for (xHCI 4.6.8 / 4.6.10): Reset Endpoint to take
+ * it out of Halted, then Set TR Dequeue Pointer so the controller and this
+ * driver agree about where the ring now is -- the failed TRB is left behind
+ * deliberately. Then, for mass storage, the class's own reset recovery
+ * (USB Bulk-Only Transport 5.3.4): clear the halt feature on the endpoint the
+ * device stalled, so IT stops refusing too. */
+static bool xhci_ep_recover(struct xhci_msc_dev *m, uint32_t d)
+{
+    struct xhci_runtime_state *rt = m->rt;
+    uint32_t idx = (uint32_t)m->slot_id - 1U;
+    uint8_t dci = rt->bulk_dci[idx][d];
+    if (!dci || !rt->doorbell_regs) return false;
+
+    /* 1. Reset Endpoint. */
+    if (rt->cmd_enqueue >= (XHCI_CMD_RING_TRBS - 1U)) return false;
+    struct xhci_trb *trb = &rt->cmd_ring[rt->cmd_enqueue];
+    trb->d0 = 0; trb->d1 = 0; trb->d2 = 0;
+    trb->d3 = (XHCI_TRB_RESET_ENDPOINT << XHCI_TRB_TYPE_SHIFT) |
+              ((uint32_t)m->slot_id << 24) | ((uint32_t)dci << 16) |
+              (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+    xhci_cmd_advance(rt);
+    xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+    uint8_t cc = 0, got = 0;
+    if (!xhci_poll_cmd_completion(rt, rt->runtime_regs, 4000000, &cc, &got) || cc != 1U) {
+        kprintf("xHCI slot%u: Reset Endpoint (dci %u) returned %u\n",
+                (unsigned)m->slot_id, (unsigned)dci, (unsigned)cc);
+        /* carry on: the dequeue pointer still has to be resynchronised */
+    }
+
+    /* 2. Set TR Dequeue Pointer, to where this driver will enqueue next. */
+    if (rt->cmd_enqueue >= (XHCI_CMD_RING_TRBS - 1U)) return false;
+    uint64_t deq = xhci_dma(&rt->bulk_ring[idx][d][rt->bulk_enqueue[idx][d]]);
+    trb = &rt->cmd_ring[rt->cmd_enqueue];
+    trb->d0 = (uint32_t)((deq | (rt->bulk_cycle[idx][d] ? 1ULL : 0ULL)) & 0xFFFFFFFFULL);
+    trb->d1 = (uint32_t)(deq >> 32);
+    trb->d2 = 0;
+    trb->d3 = (XHCI_TRB_SET_TR_DEQUEUE << XHCI_TRB_TYPE_SHIFT) |
+              ((uint32_t)m->slot_id << 24) | ((uint32_t)dci << 16) |
+              (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+    xhci_cmd_advance(rt);
+    xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+    cc = 0; got = 0;
+    if (!xhci_poll_cmd_completion(rt, rt->runtime_regs, 4000000, &cc, &got) || cc != 1U) {
+        kprintf("xHCI slot%u: Set TR Dequeue (dci %u) returned %u\n",
+                (unsigned)m->slot_id, (unsigned)dci, (unsigned)cc);
+        return false;
+    }
+
+    /* 3. And tell the DEVICE to stop refusing: CLEAR_FEATURE(ENDPOINT_HALT). */
+    /* The endpoint's USB address, back out of its xHCI device context index:
+     * DCI = endpoint number * 2 + (IN ? 1 : 0). */
+    uint8_t ep_addr = (uint8_t)((dci >> 1) | (d ? 0x80U : 0U));
+    uint32_t d0 = 0x02U                                   /* bmRequestType: endpoint */
+                | ((uint32_t)USB_REQ_CLEAR_FEATURE << 8)  /* bRequest              */
+                | (0U << 16);                             /* wValue: ENDPOINT_HALT */
+    uint32_t d1 = (uint32_t)ep_addr;                      /* wIndex: the endpoint  */
+    (void)xhci_ep0_control_transfer(rt, m->runtime, m->doorbell, m->slot_id,
+                                    d0, d1, false, NULL, 0);
+    return true;
+}
+
 static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
                            uint64_t phys, uint32_t len) {
     struct xhci_runtime_state *rt = m->rt;
@@ -1799,7 +1923,20 @@ static bool xhci_bulk_xfer(struct xhci_msc_dev *m, bool dir_in,
         if (rt->evt_dequeue >= XHCI_EVENT_RING_TRBS) { rt->evt_dequeue = 0; rt->evt_cycle ^= 1U; }
         xhci_write64(ir, XHCI_IR_ERDP, xhci_dma(&rt->evt_ring[rt->evt_dequeue]) | (1ULL << 3));
         if (type != XHCI_TRB_TRANSFER_EVENT || ev_slot != m->slot_id) { continue; }
-        return (cc == 1U || cc == 13U);
+        if (cc == 1U || cc == 13U) return true;          /* Success / Short Packet */
+        /* Anything else is a failed transfer, and the ones a stick actually
+         * produces (STALL, Babble, Transaction Error) leave the endpoint
+         * HALTED: every later transfer on it fails until something un-halts it,
+         * and until now nothing did, so one bad transfer was a device dead for
+         * the life of the boot. Recover unconditionally: on a code that did not
+         * halt, the Reset Endpoint answers Context State Error, which is logged
+         * and costs nothing, and that is cheaper than a table of which codes
+         * halt on which controller. */
+        kprintf("xHCI slot%u: bulk-%s transfer failed, completion code %u -- recovering "
+                "the endpoint\n", (unsigned)m->slot_id, dir_in ? "IN" : "OUT",
+                (unsigned)cc);
+        xhci_ep_recover(m, d);
+        return false;
     }
     return false;
 }
@@ -1892,16 +2029,27 @@ static int usb_msc_block_read(struct embk_block_device *dev, uint64_t lba,
     uint32_t bsize = dev->block_size;
     uint32_t max_sec = MSC_XFER_BYTES / bsize; if (max_sec == 0U) { max_sec = 1U; }
     int rc = 0;
+    // The bus is ours for this request: see g_xhci_bus_lock. Taken BEFORE the
+    // interrupt is silenced so a waiter sleeps with the controller in its
+    // normal state, not with its interrupt off.
+    mutex_lock(&g_xhci_bus_lock);
     // Silence the xHCI IRQ so its handler can't drain the bulk completions this
     // synchronous path busy-polls for; re-enable (draining any queued HID) after.
     xhci_intr_enable(m->rt, false);
     while (count > 0U) {
         uint32_t chunk = (count > max_sec) ? max_sec : count;
-        if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
+        /* ONE RETRY, BECAUSE THE FIRST FAILURE IS NOW RECOVERABLE. The bulk
+         * path un-halts the endpoint after an error (xhci_ep_recover), so the
+         * command that failed can simply be asked again -- and a stick that
+         * stalls once should not become a filesystem that reports I/O errors.
+         * A second failure is a real one and is reported. */
+        if (!scsi_rw10(m, false, (uint32_t)lba, (uint16_t)chunk) &&
+            !scsi_rw10(m, false, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
         memcpy(out, bounce, chunk * bsize);
         out += (size_t)chunk * (size_t)bsize; lba += chunk; count -= chunk;
     }
     xhci_intr_enable(m->rt, true);
+    mutex_unlock(&g_xhci_bus_lock);
     return rc;
 }
 static int usb_msc_block_write(struct embk_block_device *dev, uint64_t lba,
@@ -1913,14 +2061,17 @@ static int usb_msc_block_write(struct embk_block_device *dev, uint64_t lba,
     uint32_t bsize = dev->block_size;
     uint32_t max_sec = MSC_XFER_BYTES / bsize; if (max_sec == 0U) { max_sec = 1U; }
     int rc = 0;
+    mutex_lock(&g_xhci_bus_lock);    // see usb_msc_block_read
     xhci_intr_enable(m->rt, false);  // see usb_msc_block_read
     while (count > 0U) {
         uint32_t chunk = (count > max_sec) ? max_sec : count;
         memcpy(bounce, in, (size_t)chunk * (size_t)bsize);
-        if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
+        if (!scsi_rw10(m, true, (uint32_t)lba, (uint16_t)chunk) &&
+            !scsi_rw10(m, true, (uint32_t)lba, (uint16_t)chunk)) { rc = -EMBK_EIO; break; }
         in += (size_t)chunk * (size_t)bsize; lba += chunk; count -= chunk;
     }
     xhci_intr_enable(m->rt, true);
+    mutex_unlock(&g_xhci_bus_lock);
     return rc;
 }
 
@@ -2523,6 +2674,8 @@ static void xhci_teardown_port(struct xhci_runtime_state *rt, uint32_t root_port
 void xhci_rescan(void *hc) {
     struct xhci_runtime_state *rt = (struct xhci_runtime_state *)hc;
     if (!rt || !rt->used || !rt->op_regs) return;
+    /* NOT under g_xhci_bus_lock: this mounts what it finds, and a mount takes
+     * the filesystem lock and then this one. See the lock order note above. */
 
     for (uint32_t port = 1; port <= rt->max_ports; port++) {
         uint32_t reg = XHCI_PORTSC_BASE + ((port - 1U) * XHCI_PORT_STRIDE);
