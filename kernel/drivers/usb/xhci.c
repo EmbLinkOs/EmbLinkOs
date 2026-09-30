@@ -1001,32 +1001,6 @@ static bool xhci_run_ctx_command(struct xhci_runtime_state *rt, uint32_t type,
     return true;
 }
 
-// Send SET_ADDRESS.  In xHCI the host controller manages the USB address
-// internally after Address Device; we still issue the SET_ADDRESS request
-// so the device's own address register is programmed correctly.
-// `addr` is the new USB device address (1–127).
-static bool xhci_set_address(struct xhci_runtime_state *rt,
-                              volatile uint8_t *runtime,
-                              volatile uint8_t *doorbell,
-                              uint8_t slot_id, uint8_t addr) {
-    // bmRequestType=0x00 host-to-device, bRequest=SET_ADDRESS,
-    // wValue=addr, wIndex=0, wLength=0 — no DATA stage.
-    uint32_t d0 = (uint32_t)USB_BMRT_H2D_STD_DEV
-                | ((uint32_t)USB_REQ_SET_ADDRESS_CMD << 8)
-                | ((uint32_t)addr << 16); // wValue = new address
-    uint32_t d1 = 0;                      // wIndex=0, wLength=0
-    bool ok = xhci_ep0_control_transfer(rt, runtime, doorbell, slot_id,
-                                        d0, d1, false, NULL, 0);
-    if (!ok) {
-        kprintf("xHCI slot%u: SET_ADDRESS(%u) failed\n",
-                (unsigned int)slot_id, (unsigned int)addr);
-    } else {
-        kprintf("xHCI slot%u: SET_ADDRESS(%u) OK\n",
-                (unsigned int)slot_id, (unsigned int)addr);
-    }
-    return ok;
-}
-
 // Send SET_CONFIGURATION to move the device from the Address state into the
 // Configured state. Until this succeeds the device's interfaces/endpoints are
 // inactive and it produces no interrupt-IN data — so a HID keyboard sends no
@@ -2150,11 +2124,19 @@ static bool xhci_msc_setup(struct xhci_runtime_state *rt, uint8_t slot_id,
  * The change bits are write-1-to-clear and live in the same register as the
  * control bits, so every write has to preserve the ones it does not mean to
  * touch -- XHCI_PORTSC_RW1C_MASK is exactly that set. */
+static void xhci_teardown_slot(struct xhci_runtime_state *rt, uint8_t slot);
+
 static bool xhci_port_reset(volatile uint8_t *op, uint32_t port_index) {
     uint32_t reg = XHCI_PORTSC_BASE + (port_index * XHCI_PORT_STRIDE);
     uint32_t portsc = xhci_read32(op, reg);
 
-    if (portsc & XHCI_PORTSC_PED) return true;      /* already enabled */
+    /* NO EARLY RETURN ON "ALREADY ENABLED". A port that is enabled is not the
+     * same as a device that is in the Default state and ready to be addressed:
+     * after a failed attempt the device is still addressed from that attempt,
+     * ignores an Address Device aimed at the default address, and the command
+     * comes back a USB transaction error. A reset is what puts it back where
+     * enumeration starts. USB 3 ports train themselves to Enabled on connect
+     * and take a hot reset here perfectly well. */
 
     xhci_write32(op, reg, xhci_portsc_keep(portsc) | XHCI_PORTSC_PR);
     for (int i = 0; i < 2000000; i++) {
@@ -2276,9 +2258,29 @@ static uint8_t xhci_enumerate_device(struct xhci_runtime_state *rt, uint8_t root
     rt->ep0_enqueue[sidx] = 0;
     rt->ep0_cycle[sidx]   = 1;
 
-    if (!xhci_get_device_descriptor(rt, runtime, doorbell, slot)) { return 0; }
-    xhci_set_address(rt, runtime, doorbell, slot, slot);
-    if (!xhci_get_config_descriptor(rt, runtime, doorbell, slot)) { return 0; }
+    /* NO SET_ADDRESS. The Address Device command above IS the addressing: the
+     * controller issued it and holds the address in the slot context. Sending
+     * the standard request again is a protocol error against a device that is
+     * already in the Address state, and it is what an HP ProBook's own webcam
+     * refused -- "Address Device code=1", a device descriptor read perfectly,
+     * and then "SET_ADDRESS(5) failed" one line later, taking the whole
+     * bring-up with it. QEMU's devices tolerated it; a real one does not have
+     * to. (xHCI 4.6.5: the host controller manages device addresses.)
+     *
+     * AND A FAILURE MUST GIVE THE SLOT BACK. Every return below used to leave
+     * the slot allocated and the device sitting in the Address state, so the
+     * next attempt asked for a NEW slot and addressed a device that was no
+     * longer listening at the default address -- which is why the ProBook's
+     * other three ports all came back "Address Device code=4" with slot
+     * numbers climbing 5, 6, 7, 8. */
+    if (!xhci_get_device_descriptor(rt, runtime, doorbell, slot)) {
+        xhci_teardown_slot(rt, slot);
+        return 0;
+    }
+    if (!xhci_get_config_descriptor(rt, runtime, doorbell, slot)) {
+        xhci_teardown_slot(rt, slot);
+        return 0;
+    }
     uint8_t cfg_val = rt->xfr_buf[sidx][5];
     xhci_set_configuration(rt, runtime, doorbell, slot, cfg_val);
     rt->slot_to_port[sidx] = root_port;
