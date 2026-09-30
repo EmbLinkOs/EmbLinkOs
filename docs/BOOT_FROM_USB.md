@@ -111,6 +111,12 @@ stick.
 > laptop's exact model. If the machine does reach the desktop, that is worth a
 > photo too.
 
+### Booted on, so far
+
+| Machine | Result |
+|---|---|
+| **HP ProBook** (Intel, xHCI at 00:14.0 with 18 ports, 500 GB internal drive, no battery reported) | **Reaches the desktop from the stick.** It took seven fixes that no emulator could have shown: the kernel had grown past the physical address the firmware will load it at; the clock had to stop depending on the PIT and HPET, which recent laptops gate off or hide; kernel messages and the panic screen had to reach the framebuffer, since a laptop has no serial port; VT-d had to stay off on a machine with RAM above 4 GiB; and xHCI had to power its own ports, stop disabling every port it enabled, stop sending SET_ADDRESS after the controller had already addressed the device, and give a slot back when a bring-up failed. |
+
 ### Hardware reality on a laptop
 
 | Subsystem | On real hardware |
