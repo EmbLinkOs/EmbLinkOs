@@ -2535,6 +2535,16 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    if (strcmp(cmd, "test embkfs verify-writes") == 0) {
+        /* Not a test: a switch, for the run that follows it. Every metadata
+         * block written from here on is read straight back and compared with
+         * what was meant to be there. See docs/TODO.md's intermittent
+         * bad-checksum entry -- this is the instrument for it. */
+        embkfs_set_verify_writes(true);
+        kprintf("\n[cmd] test embkfs verify-writes: ON (every node write is read back)\n");
+        return 1;
+    }
+
     if (strcmp(cmd, "test embkfs alloc") == 0) {
         int rc = embkfs_run_allocator_selftests();
         kprintf("\n[cmd] test embkfs alloc: %s\n", rc == EMBK_OK ? "OK" : embk_strerror(rc));

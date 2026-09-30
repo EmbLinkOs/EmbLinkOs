@@ -7633,31 +7633,21 @@ for them to run against:
       back up; a relocatable kernel would remove the ceiling altogether. Until
       then the guard fails the build rather than a machine failing to boot.
 
-**An INTERMITTENT metadata corruption in EMBKFS**
+**Instruments left behind from the EMBKFS corruption hunt**
 
-- [ ] **`test posix`'s rename checks sometimes fail with "EMBKFS: sdb: block N
-      checksum bad"** -- the block on disk does not match its own CRC. Roughly
-      3 runs in 12 on 2026-09-30, on freshly built images, at both 4 cores and
-      1 core; it also appeared once on 2026-09-17. It is NOT a regression from
-      any particular commit: an earlier note here said it arrived with the
-      Sep 19-27 work, and that was wrong -- it was attributed by single runs of
-      a flaky test, which proves nothing. 6/6 clean runs afterwards prove
-      nothing either.
-
-      What is known:
-        * the bad block numbers are always low (4, 11, 13, 14), and blocks
-          1..15 -- the region before the superblock at block 16 -- are left
-          FREE in the allocator bitmap on purpose, so they are the first blocks
-          handed out and the most churned by copy-on-write;
-        * the block passes the magic check and fails its own checksum, which
-          means it holds a node whose bytes and CRC field disagree: a torn or
-          interleaved write, not a stale pointer (that would trip the Merkle
-          check instead) and not random garbage;
-        * the desktop boots and runs on EMBKFS regardless (`make test-laptop`
-          writes home directories and settings three times over).
-
-      Next step, and the only honest one for a bug this rare: make
-      embkfs_write_node() read the block back and verify it under a debug
-      switch, then run the loop until it trips. That says which of the two it
-      is -- one writer whose buffer changed under it, or two writers on one
-      block -- instead of another guess.
+- [ ] `test embkfs verify-writes` switches on two things that are off by
+      default: every metadata block is read back immediately after writing and
+      compared, and every allocation, free and write of the low blocks (1..15,
+      the ones before the superblock, which the allocator hands out first) is
+      traced. They cost I/O, which is why they are a switch -- but they are
+      what found the fault, so they stay. The re-read on a failed checksum, and
+      the line that prints which block and generation the bytes claim to be,
+      run always: they are failure paths and they turn one unusable symptom
+      into a diagnosis.
+- [ ] **The ATA DMA paths now wait for the CONTROLLER to report completion**
+      (bus-master Interrupt set, Active clear) rather than trusting the drive's
+      interrupt alone, acknowledge a pending drive interrupt before issuing,
+      and poison the destination so a transfer that moves nothing cannot be
+      silent. All three are correct by the specification and none of them fixed
+      the corruption that prompted them -- that was the unlocked rename. Worth
+      keeping, worth being honest about.

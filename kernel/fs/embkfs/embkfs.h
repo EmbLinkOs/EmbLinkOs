@@ -719,6 +719,12 @@ int embkfs_vfs_register(const char *path, struct embkfs_volume *vol);
 void embkfs_lock(void);
 void embkfs_unlock(void);
 
+/* Read every metadata block back immediately after writing it and report any
+ * difference. Off by default (it doubles metadata write I/O); switched on by
+ * `test embkfs verify-writes` to hunt the intermittent bad-checksum fault in
+ * docs/TODO.md. */
+void embkfs_set_verify_writes(bool on);
+
 /* How hard is that one lock actually being leaned on? Answering this is the
  * prerequisite for making it finer-grained: per-volume or per-object locking
  * means first un-sharing 34 static scratch buffers in embkfs.c, and that is

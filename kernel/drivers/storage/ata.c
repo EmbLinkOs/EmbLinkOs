@@ -410,6 +410,41 @@ int ata_write_sectors(uint32_t drive_index, uint64_t lba, uint8_t count, const v
     return 0;
 }
 
+/* A READ THAT TRANSFERS NOTHING AND REPORTS SUCCESS.
+ *
+ * The drive's completion interrupt was treated as "the transfer is done": the
+ * driver waited for the IRQ flag, then wrote 0 to the bus-master command
+ * register to stop the engine. If the flag was ALREADY set when the command
+ * was issued -- a late interrupt from the previous command, which is exactly
+ * what a busy host produces -- the wait returned instantly and the engine was
+ * stopped before it had moved a single byte. The caller got EMBK_OK and a
+ * buffer still holding whatever was in it before.
+ *
+ * Measured, and this is what made it unmistakable: EMBKFS read a tree node
+ * whose magic was right and whose checksum was wrong, about one run in four.
+ * Reading the same block again returned a block that checksummed perfectly,
+ * differing from the first read in ~1000 bytes spread over 409 separate runs
+ * across the whole 4096 -- not a truncated tail, but a DIFFERENT NODE: the
+ * previous contents of the same shared buffer.
+ *
+ * So completion is now the CONTROLLER's word, not the interrupt flag's: the
+ * bus-master Interrupt bit set (the engine finished the PRDT) and the Active
+ * bit clear (it is not still moving data). Bounded, so a controller that never
+ * reports either fails the request instead of hanging the machine. */
+#define ATA_DMA_COMPLETE_SPINS 4000000u
+static int ata_dma_wait_complete(uint16_t bmide) {
+    for (uint32_t spin = 0; spin < ATA_DMA_COMPLETE_SPINS; spin++) {
+        uint8_t bm = inb(bmide + BMIDE_STATUS);
+        if (bm & BMIDE_STATUS_ERROR) return -1;
+        if ((bm & BMIDE_STATUS_IRQ) && !(bm & BMIDE_STATUS_ACTIVE))
+            return 0;                       /* finished, and memory is complete */
+        __asm__ volatile ("pause" ::: "memory");
+    }
+    kprintf("ATA DMA: the controller never reported the transfer complete "
+            "(bmide status %x)\n", (unsigned int)inb(bmide + BMIDE_STATUS));
+    return -1;
+}
+
 int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer) {
     if (drive_index >= drive_count) return -1; 
     if (count == 0) return -1;
@@ -462,9 +497,25 @@ int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer
     if (ata_wait_not_busy(d->io_base) < 0) return -1;
     ata_setup_lba(d, lba, count);
 
-    // 6. Clear IRQ fired flag, issue READ DMA command to the drive (different from PIO command)
+    // 6. Acknowledge anything the drive still has pending (reading the status
+    //    register is what clears an IDE drive's interrupt), THEN clear our own
+    //    flag, so a leftover interrupt cannot satisfy this command's wait.
+    (void)inb(d->io_base + ATA_REG_STATUS);
     *ata_irq_flag(d->io_base) = false;
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_READ_DMA); // Send READ DMA command
+
+    /* POISON, so "this read transferred nothing" cannot be silent. A read that
+     * returns success with the caller's buffer untouched is indistinguishable
+     * from a correct read of whatever was in it before -- which is exactly the
+     * fault being hunted (docs/TODO.md). Sixteen bytes at each end, checked
+     * after completion. */
+    uint8_t poison_head[8], poison_tail[8];
+    for (int pi = 0; pi < 8; pi++) {
+        poison_head[pi] = (uint8_t)(0xA5 ^ pi);
+        poison_tail[pi] = (uint8_t)(0x5A ^ pi);
+    }
+    memcpy((uint8_t *)dma_buf, poison_head, 8);
+    memcpy((uint8_t *)dma_buf + byte_count - 8, poison_tail, 8);
 
     // 7. Start the bus master engine (set start bit, keep read direction)
     outb(bmide + BMIDE_COMMAND, BMIDE_CMD_READ | BMIDE_CMD_START); // Start the transfer
@@ -476,6 +527,13 @@ int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer
         return -1; // Wait for DRQ to set
     }
 
+    // 8b. And then for the CONTROLLER to say it finished -- see the comment
+    //     on ata_dma_wait_complete: the interrupt alone is not that word.
+    if (ata_dma_wait_complete(bmide) < 0) {
+        outb(bmide + BMIDE_COMMAND, 0);
+        return -1;
+    }
+
     // 9. Stop the bus master engine
     outb(bmide + BMIDE_COMMAND, 0); // Stop the transfer
 
@@ -484,6 +542,14 @@ int ata_read_dma(uint32_t drive_index, uint64_t lba, uint8_t count, void *buffer
     outb(bmide + BMIDE_STATUS, st | BMIDE_STATUS_IRQ | BMIDE_STATUS_ERROR); // Clear status bits
     if (st & BMIDE_STATUS_ERROR) {
         kprintf("ATA DMA read error: status %x\n", (unsigned int)st);
+        return -1;
+    }
+
+    if (memcmp(dma_buf, poison_head, 8) == 0 &&
+        memcmp((const uint8_t *)dma_buf + byte_count - 8, poison_tail, 8) == 0) {
+        kprintf("ATA DMA read: NOTHING WAS TRANSFERRED for lba %lu count %u "
+                "(bmide status %x) -- the buffer still holds the poison\n",
+                lba, (unsigned)count, (unsigned int)inb(bmide + BMIDE_STATUS));
         return -1;
     }
 
@@ -547,7 +613,11 @@ int ata_write_dma(uint32_t drive_index, uint64_t lba, uint8_t count, const void 
     if (ata_wait_not_busy(d->io_base) < 0) return -1;
     ata_setup_lba(d, lba, count);
 
-    // 6. Clear IRQ flag, issue WRITE DMA command
+    // 6. Acknowledge anything the drive still has pending (reading its status
+    //    register is what clears an IDE interrupt), THEN clear our own flag --
+    //    same reason as the read path: a leftover interrupt must not be able to
+    //    satisfy this command's wait before the engine has moved anything.
+    (void)inb(d->io_base + ATA_REG_STATUS);
     *ata_irq_flag(d->io_base) = false;
     outb(d->io_base + ATA_REG_COMMAND, ATA_CMD_WRITE_DMA);
 

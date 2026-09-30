@@ -362,6 +362,21 @@ static int embkfs_bitmap_build(struct embkfs_volume *vol);   /* defined below; o
 
 static inline void embk_bm_clear(uint8_t *bm, uint64_t b) { bm[b >> 3] &= (uint8_t)~(1u << (b & 7)); }
 
+/* THE LOW BLOCKS, IN ORDER. Blocks 1..15 live before the superblock and are
+ * left free on purpose, so they are the first blocks handed out and the most
+ * reused -- and they are where the intermittent bad-checksum fault lands every
+ * time. This prints every allocation, free and write that touches them, which
+ * is what turns "a block went bad" into "this freed it, that wrote it, and the
+ * tree still pointed at it". On only with `test embkfs verify-writes`. */
+static bool g_verify_writes;
+void embkfs_set_verify_writes(bool on) { g_verify_writes = on; }
+
+#define EMBKFS_TRACE_BELOW 32ULL
+static void embkfs_trace_block(const char *what, uint64_t start, uint64_t len) {
+    if (!g_verify_writes || start >= EMBKFS_TRACE_BELOW) return;
+    kprintf("EMBKFS TRACE: %s block %lu (len %lu)\n", what, start, len);
+}
+
 static void embkfs_free_index_clear(struct embkfs_volume *vol)
 {
     if (!vol) return;
@@ -441,6 +456,7 @@ static int embkfs_free_index_rebuild(struct embkfs_volume *vol)
 static int embkfs_free_run(struct embkfs_volume *vol, uint64_t start, uint64_t len)
 {
     if (len == 0) return EMBK_OK;
+    embkfs_trace_block("FREE ", start, len);
     if (start >= vol->total_blocks || len > vol->total_blocks - start) return -EMBK_EINVAL;
 
     for (uint64_t b = 0; b < len; b++) {
@@ -668,6 +684,7 @@ static int embkfs_alloc_run(struct embkfs_volume *vol, uint64_t want,
         if (vol->txn)
             embk_txn_push_run(&vol->txn->arun, &vol->txn->arun_n, &vol->txn->arun_cap,
                               &vol->txn->overflow, start, got);
+        embkfs_trace_block("ALLOC", start, got);
         *out_start = start;
         *out_got = got;
         return EMBK_OK;
@@ -1381,8 +1398,35 @@ static int embkfs_write_node(struct embkfs_volume *vol, uint64_t block,
     h->checksum   = csum;                                   /* first field, low 32 = CRC */
 
     uint64_t spb = vol->block_size / vol->dev->block_size;
+    embkfs_trace_block("NODE-WRITE", block, 1);
     int rc = embk_block_write(vol->dev, block * spb, spb, buf);
     if (rc != EMBK_OK) return rc;
+
+    /* DID THE BLOCK ACTUALLY LAND? Off by default; switched on by `test embkfs
+     * verify-writes` to catch a rare fault that has no other witness: a node
+     * that reads back with its magic intact and its own checksum wrong. That
+     * is either one writer whose buffer changed under it or two writers on one
+     * block, and the two look identical from the read side -- so this reads the
+     * block back at the moment it was written, while it is still known what was
+     * meant to be there, and says WHICH bytes differ. See docs/TODO.md. */
+    if (g_verify_writes) {
+        static uint8_t vbuf[4096];   /* the only block size this filesystem uses */
+        if (vol->block_size <= sizeof vbuf &&
+            embk_block_read(vol->dev, block * spb, spb, vbuf) == EMBK_OK) {
+            if (memcmp(vbuf, buf, vol->block_size) != 0) {
+                uint32_t off = 0;
+                while (off < vol->block_size && vbuf[off] == buf[off]) off++;
+                uint32_t back = embk_crc32c(vbuf + 8, vol->block_size - 8, 0);
+                kprintf("EMBKFS: WRITE VERIFY FAILED: block %lu gen %lu: read back "
+                        "differs from what was written, first at byte %u "
+                        "(wrote 0x%02X, read 0x%02X); csum meant 0x%08X, block "
+                        "now checksums to 0x%08X\n",
+                        block, generation, (unsigned)off,
+                        (unsigned)buf[off], (unsigned)vbuf[off],
+                        (unsigned int)csum, (unsigned int)back);
+            }
+        }
+    }
 
     out_ptr->block = block;  out_ptr->checksum = csum;
     out_ptr->generation = generation;  out_ptr->flags = 0;
@@ -1882,6 +1926,58 @@ int embkfs_read_node(struct embkfs_volume *vol,
     if ((uint32_t)h->checksum != calc) {
         kprintf("EMBKFS: %s: block %lu checksum bad (stored 0x%08X, calc 0x%08X)\n",
                 name, ptr->block, (unsigned int)h->checksum, (unsigned int)calc);
+        /* WHOSE BYTES ARE THESE? Every node records the block it was written
+         * to and the generation that wrote it, so the header answers the only
+         * question that matters here: did this read bring back the wrong
+         * NODE (h->block != the block asked for -- a stale buffer or a read
+         * of the wrong place), or the right node from an older commit
+         * (h->block matches, generation is behind)? */
+        kprintf("EMBKFS: %s: the bytes say they are block %lu generation %lu; "
+                "asked for block %lu generation %lu\n",
+                name, (unsigned long)h->block, (unsigned long)h->generation,
+                (unsigned long)ptr->block, (unsigned long)ptr->generation);
+
+        /* WERE THE BAD BYTES ON THE DISK, OR DID THE READ BRING THEM? Those
+         * are different bugs -- one is a filesystem that wrote a block wrong,
+         * the other a block layer that hands back a blend of two transfers --
+         * and from one read they look identical. So read it again, into a
+         * different buffer, and say whether the disk agrees with itself.
+         * Costs nothing: this path has already failed. */
+        {
+            static uint8_t again[4096];
+            if (vol->block_size <= sizeof again &&
+                embk_block_read(vol->dev, lba, spb, again) == EMBK_OK) {
+                const struct embk_node_header *h2 = (const struct embk_node_header *)again;
+                uint32_t calc2 = embk_crc32c(again + 8, vol->block_size - 8, 0);
+                uint32_t diff = 0, first_d = 0xFFFFFFFFu, last_d = 0, runs = 0;
+                bool in_run = false;
+                for (uint32_t i = 0; i < vol->block_size; i++) {
+                    if (again[i] != buf[i]) {
+                        diff++;
+                        if (first_d == 0xFFFFFFFFu) first_d = i;
+                        last_d = i;
+                        if (!in_run) { runs++; in_run = true; }
+                    } else {
+                        in_run = false;
+                    }
+                }
+                /* WHERE the bytes differ says WHICH bug this is. One run at the
+                 * tail = a transfer that stopped early. Many runs scattered
+                 * through the block = two different blocks blended, i.e. the
+                 * buffer was reused underneath the reader. */
+                kprintf("EMBKFS: %s: block %lu DIFF SHAPE: %u byte(s) in %u run(s), "
+                        "first at %u, last at %u (block %u bytes)\n",
+                        name, ptr->block, (unsigned)diff, (unsigned)runs,
+                        (unsigned)first_d, (unsigned)last_d, (unsigned)vol->block_size);
+                kprintf("EMBKFS: %s: block %lu RE-READ: stored 0x%08X calc 0x%08X, "
+                        "%u byte(s) differ from the first read -- %s\n",
+                        name, ptr->block,
+                        (unsigned int)h2->checksum, (unsigned int)calc2, (unsigned)diff,
+                        ((uint32_t)h2->checksum == calc2)
+                            ? "THE DISK IS FINE: the first read was wrong"
+                            : "the disk really holds a block that fails its own checksum");
+            }
+        }
         return -EMBK_EINVAL;
     }
 
@@ -2686,6 +2782,7 @@ static int embkfs_write_file(struct embkfs_volume *vol, uint64_t oid,
                 aes_xts_encrypt(embkfs_xts(vol), start + blk, datablk, datablk, vol->block_size);
                 csum_len = vol->block_size;
             }
+            embkfs_trace_block("DATA-WRITE", start + blk, 1);
             rc = embk_block_write(vol->dev, (start + blk) * spb, spb, datablk);
             if (rc == EMBK_OK) { csum = embk_crc32c(datablk, csum_len, csum); written += chunk; }
         }
@@ -7755,6 +7852,56 @@ void embkfs_init(void)
 
     if (g_embkfs_volume_count == 0) {
         kprintf("EMBKFS: no volume found on any block device\n");
+
+        /* AND WHY NOT, DEVICE BY DEVICE. Without this the machine says only
+         * that it found nothing, mounts an empty root, and hangs with no
+         * /system/bin/init.elf -- which is exactly what an HP ProBook did on
+         * the first real boot, with no serial port to ask a second question
+         * through. One line per device: is it even readable at the offset the
+         * superblock lives at, and what is actually there? That distinguishes
+         * "the stick was not read" from "it was read and holds something
+         * else" from "the superblock is there but was rejected", which are
+         * three different bugs. */
+        kprintf("EMBKFS: what each block device holds at byte %u "
+                "(want magic 45 4D 42 4B 46 53 31 37 = \"EMBKFS17\"):\n",
+                (unsigned)EMBKFS_SB_OFFSET);
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *d = embk_block_get(i);
+            if (!d) continue;
+            if (embk_block_is_partitioned(d)) {
+                kprintf("EMBKFS:   %s: %lu blocks x %u B -- a partition table; "
+                        "its filesystems live in its partitions\n",
+                        d->name, (unsigned long)d->block_count,
+                        (unsigned)d->block_size);
+                continue;
+            }
+            static uint8_t probe[4096];
+            uint32_t bs = d->block_size ? d->block_size : 512;
+            uint64_t lba = EMBKFS_SB_OFFSET / bs;
+            if (d->block_count <= lba) {
+                kprintf("EMBKFS:   %s: %lu blocks x %u B -- too small to hold a "
+                        "superblock at that offset\n",
+                        d->name, (unsigned long)d->block_count, (unsigned)bs);
+                continue;
+            }
+            int rc = embk_block_read(d, lba, 1, probe);
+            if (rc != EMBK_OK) {
+                kprintf("EMBKFS:   %s: %lu blocks x %u B -- READ FAILED at LBA %lu: %s\n",
+                        d->name, (unsigned long)d->block_count, (unsigned)bs,
+                        (unsigned long)lba, embk_strerror(rc));
+                continue;
+            }
+            kprintf("EMBKFS:   %s: %lu blocks x %u B -- LBA %lu holds "
+                    "%02X %02X %02X %02X %02X %02X %02X %02X%s\n",
+                    d->name, (unsigned long)d->block_count, (unsigned)bs,
+                    (unsigned long)lba,
+                    probe[0], probe[1], probe[2], probe[3],
+                    probe[4], probe[5], probe[6], probe[7],
+                    (*(uint64_t *)probe == EMBKFS_MAGIC)
+                        ? "  <-- the magic IS here; the superblock was rejected for "
+                          "another reason (checksum or version)"
+                        : "");
+        }
         return;
     }
 
