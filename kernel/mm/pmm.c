@@ -130,7 +130,54 @@ void pmm_init(void) {
     bitmap_size = (total_pages + 7) / 8; // Size of bitmap in bytes (round up to nearest byte)
 
     // step 3: We will place our bitmap at the end of the kernel in memory, which is defined by the linker script as 'kernel_end'. We need to ensure that the bitmap does not overlap with the kernel or any reserved areas.
-    pmm_bitmap = (uint8_t *)kernel_end; // Place bitmap right after the kernel in memory
+    /* WHERE THE BITMAP GOES IS NOT "WHEREVER THE KERNEL ENDS".
+     *
+     * This used to be exactly that -- pmm_bitmap = kernel_end -- with a comment
+     * saying the bitmap must not overlap the kernel or any reserved area, and
+     * nothing checking that it does not. The next thing that happens is 0xFF
+     * written across the whole bitmap: on an 8 GB machine, a quarter of a
+     * megabyte, straight after the kernel image, wherever that lands.
+     *
+     * Under OVMF it lands in free memory and nobody notices. On a real machine
+     * the firmware reserves low memory where it likes, and the bitmap's
+     * position moves every time the KERNEL changes size -- so a kernel that
+     * grew by 64 KB (a bigger log ring) can start scribbling over an area the
+     * firmware still owns, and the machine that booted yesterday hangs today
+     * with nothing to show for it.
+     *
+     * So the map is asked. The first usable region with room for the bitmap at
+     * or after the end of the kernel image wins, and it has to be below the
+     * gigabyte the higher-half window covers, because the bitmap is written
+     * through that window before paging is rebuilt. */
+    {
+        uint64_t kend = KV2P((uint64_t)kernel_end);
+        kend = (kend + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+        uint64_t chosen = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const struct boot_mmap_entry *e = boot_mmap_at(i);
+            if (e->type != E820_USABLE) continue;
+            uint64_t start = e->base > kend ? e->base : kend;
+            start = (start + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+            uint64_t end = e->base + e->length;
+            if (start >= end) continue;                 /* entirely below the kernel */
+            if (end - start < bitmap_size) continue;    /* not enough room here */
+            if (start + bitmap_size > 0x40000000ULL) continue;  /* past the mapped window */
+            chosen = start;
+            break;
+        }
+        if (!chosen) {
+            serial_write_string("\nPMM FATAL: no usable memory below 1 GiB can hold the "
+                                "page bitmap\n");
+            for (;;) { __asm__ volatile ("cli; hlt"); }
+        }
+        pmm_bitmap = (uint8_t *)KP2V(chosen);
+        if (chosen != kend) {
+            serial_write_string("PMM: the memory after the kernel is not usable; bitmap "
+                                "placed at ");
+            serial_write_hex(chosen);
+            serial_write_string(" instead\n");
+        }
+    }
 
     serial_write_string("\n=== PMM Layout ===\n");
     serial_write_string("Kernel End: ");
@@ -174,7 +221,17 @@ void pmm_init(void) {
 
     // step 6: Reserve kernel + bitmap region
     uint64_t bitmap_phys_end = KV2P(pmm_bitmap) + bitmap_size; // Calculate the physical end of the bitmap region
-    uint64_t reserve_end_page = (bitmap_phys_end + PAGE_SIZE - 1) / PAGE_SIZE ; // Reserve the entire bitmap region for now
+    uint64_t kernel_phys_end = KV2P((uint64_t)kernel_end);
+    /* Everything below the kernel's end is reserved as before; the bitmap is
+     * reserved too, wherever the map allowed it to go. */
+    uint64_t reserve_end_page = (kernel_phys_end + PAGE_SIZE - 1) / PAGE_SIZE;
+    {
+        uint64_t b0 = KV2P(pmm_bitmap) / PAGE_SIZE;
+        uint64_t b1 = (bitmap_phys_end + PAGE_SIZE - 1) / PAGE_SIZE;
+        for (uint64_t p = b0; p < b1 && p < total_pages; p++) {
+            if (!bitmap_test(p)) { bitmap_set(p); free_pages--; used_pages++; }
+        }
+    }
 
     for (uint64_t p = 0; p <= reserve_end_page && p < total_pages; p++) {
         if (!bitmap_test(p)) {

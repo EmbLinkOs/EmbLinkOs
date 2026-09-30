@@ -2235,15 +2235,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // and USB, and the serial/keyboard REPL stays available as a debug console.
     {
         char *iargv[] = { (char *)"/system/bin/init.elf", NULL };
-        /* The desktop is about to own the framebuffer -- disable the text
-         * console's on-screen half BEFORE userspace becomes schedulable.
-         * Ordering matters: process_create() makes init RUNNABLE, and userspace
-         * stdout/stderr (fd 1/2) now route through console_putchar. If the fb
-         * were still enabled here, a timer preemption in the gap between spawn
-         * and this call could let the desktop's first write() paint over the
-         * boot screen. Disabling first closes that window. All kernel logging +
-         * the serial debug console below stay on COM1 and never touch the fb. */
-        console_set_fb_enabled(false);
+        /* The framebuffer is NOT handed over here -- the compositor does it
+         * when the first window is actually created (compositor.c). A machine
+         * that never gets that far keeps its screen, which is the only way it
+         * can say why. */
+        kprintf("\ninit: loading /system/bin/init.elf ...\n");
         int ipid = process_create("/system/bin/init.elf", iargv, 1, NULL, 0);
         if (ipid < 0)
             kprintf("\ninit: failed to launch /system/bin/init.elf: %s\n", embk_strerror(ipid));

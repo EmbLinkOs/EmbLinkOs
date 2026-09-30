@@ -2,6 +2,7 @@
 
 #include "gfx/compositor.h"
 #include "drivers/video/framebuffer.h"
+#include "drivers/video/console.h"
 #include "drivers/input/mouse.h"
 #include "include/spinlock.h"
 #include "process/process.h"   /* struct process (shared_next_va, pml4_phys) for zero-copy */
@@ -1138,6 +1139,9 @@ static void win_free_backing(struct comp_window *w) {
 
 /* ---- public API --------------------------------------------------------- */
 
+/* True until the first window exists: see the handover comment below. */
+static bool g_console_owned_by_kernel = true;
+
 int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
                               int32_t x, int32_t y, const char *title) {
     const fb_info_t *fi = fb_get_info();
@@ -1258,6 +1262,22 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->used = 1; w->id = g_next_id++; w->pid = (int)client->pid;
     w->x = x; w->y = y; w->cw = cw; w->ch = ch; w->visible = 1;
     w->desktop = desktop;
+
+    /* THE SCREEN STAYS WITH THE KERNEL UNTIL SOMETHING ELSE ACTUALLY DRAWS.
+     *
+     * main.c used to switch the text console off just before spawning init,
+     * on the reasoning that the desktop was about to own the framebuffer. When
+     * the desktop does come up that is true. When it does NOT -- a machine
+     * that wedges loading init.elf off a USB stick, say -- the last thing the
+     * screen ever shows is the line before that call, and every message
+     * explaining the failure is written to a console nobody can see. An HP
+     * ProBook spent three boots saying exactly nothing for that reason.
+     *
+     * The first window created is the moment the handover is real. */
+    if (g_console_owned_by_kernel) {
+        g_console_owned_by_kernel = false;
+        console_set_fb_enabled(false);
+    }
     w->chromeless = chromeless;
     w->widget = widget;
     w->glass = glass && !desktop;

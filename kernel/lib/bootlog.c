@@ -28,8 +28,8 @@
 #include "drivers/timer/timer.h"
 
 #define BOOTLOG_PATH      "/EMBLINK.LOG"
-#define BOOTLOG_FIRST_MS  20000    /* let the desktop come up, or fail to */
-#define BOOTLOG_EVERY_MS  30000
+#define BOOTLOG_FIRST_MS   4000    /* soon: a machine that wedges at 15 s must still leave a log */
+#define BOOTLOG_EVERY_MS   5000
 
 static void bootlog_write_once(void)
 {
