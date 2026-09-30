@@ -7688,3 +7688,30 @@ reading through. `tools/usb_hotplug.py` caught it as an OHCI bulk timeout and a
 volume that "is mounted but cannot be listed". The boot volume is now
 recognised rather than guessed: the one carrying `/EFI/BOOT/BOOTX64.EFI`, the
 loader that started this kernel, pinned once found.
+
+**PS/2 has one owner now (`kernel/drivers/input/i8042.c`)**
+
+`keyboard.c` and `mouse.c` each did their own read-modify-write of the 8042
+config byte, touching "only their own bits" so the two inits would compose in
+either order. Sound reasoning, and it still loses a laptop its keyboard: it
+skips the step before the read. UEFI drives the keyboard until the moment it
+hands over, and a scancode left in the output buffer is what the read returns
+-- so the config byte written back is a keystroke. The controller now has one
+owner that quiets both ports, flushes, self-tests, tests each port and asks
+each device what it is, and the two drivers ask it for a port and get a yes or
+a no.
+
+- [ ] **Not yet on silicon.** The bring-up is right by the datasheet and passes
+      in QEMU, which has both ports and answers everything. What it is FOR is
+      an HP ProBook whose USB keyboard dies the moment this kernel owns the
+      controller. The boot log will now say what that machine actually has:
+      `i8042: port 1 holds a ...` / `port 2 holds a ...`, or `no second port`.
+- [ ] **If the touchpad is not on port 2, it is I2C-HID**, which is a real
+      piece of work: Intel LPSS I2C, the ACPI device (PNP0C50) and its HID
+      descriptor protocol. Nothing of that exists yet. Do not start it until
+      the log says it is needed.
+- [ ] **Touchpad gestures are not implemented.** A PS/2 touchpad in its default
+      mode is a three-byte relative mouse, which is what `mouse.c` parses, so
+      the cursor moves and the physical buttons click. Tap-to-click, two-finger
+      scroll and edge scroll all live in the Synaptics/ELAN extended protocols
+      (the `0xE8/0xE6` knock) and none of them are read here.

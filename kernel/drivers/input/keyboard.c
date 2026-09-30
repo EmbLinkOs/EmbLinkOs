@@ -9,6 +9,8 @@
  * places for a stuck-modifier bug to live. See keyboard_inject_event(). */
 #if defined(__x86_64__)
 #include "arch/x86_64/irq/irq.h"
+#include "drivers/input/i8042.h"
+#include "include/kprintf.h"
 #include "include/io.h"
 #endif
 #include "drivers/char/serial.h"
@@ -451,44 +453,29 @@ void kbd_translate(uint8_t make, int pressed) {
  * translation is on (which is what makes set 2 arrive here looking like the
  * set 1 our tables index). Nothing verified either.
  *
- * ⚠️ THIS MUST COMPOSE WITH mouse.c, WHICH TOUCHES THE SAME CONFIG BYTE.
- * mouse_init() does its own read-modify-write to set bit 1 (IRQ12) and clear
- * bit 5 (mouse clock). So:
- *   - we ONLY touch keyboard bits (0 = IRQ1, 4 = kbd clock, 6 = translation),
- *     read-modify-write, so the two inits compose in EITHER order;
- *   - we do NOT issue a controller self-test (0xAA) and do NOT disable ports
- *     (0xAD/0xA7). Every "proper 8042 init" writeup does; here they would reset
- *     state the mouse depends on. The mouse works today -- do not break it to
- *     be textbook-correct.
+ * THE CONFIG BYTE HAS ONE OWNER NOW: i8042.c. This file used to do its own
+ * read-modify-write of it and so did mouse.c, each touching "only its own
+ * bits" so the two would compose in either order. That reasoning was sound and
+ * still cost a laptop its keyboard, because it skipped the step before the
+ * read: emptying the output buffer. UEFI drives the keyboard until the moment
+ * it hands over, and a scancode left in the buffer is what the read returns --
+ * so the config byte written back is a keystroke. i8042_init() quiets both
+ * ports, flushes, self-tests and tests each port before anything believes a
+ * byte it read; this file asks it for the keyboard and gets a yes or a no.
+ *
+ * The old note said a self-test would "reset state the mouse depends on" and
+ * that the mouse worked, so leave it. On QEMU it did. The machine that matters
+ * is the one where it did not.
  *
  * 🪤 THE PAIRING TRAP: scancode set and translation are ONE decision, not two.
  * Set the device to set 1 while translation is on and the controller
  * translates set-1 bytes as if they were set-2 -- garbage, and a dead keyboard.
  * We pick the standard PC pairing (device in SET 2 + translation ON) and state
  * it, because it is what our set-1 tables require. */
-#define PS2_CFG_IRQ1        0x01   /* bit 0: keyboard IRQ1 enable       */
-#define PS2_CFG_KBD_CLKOFF  0x10   /* bit 4: 1 = keyboard clock DISABLED */
-#define PS2_CFG_XLATE       0x40   /* bit 6: set2 -> set1 translation    */
-
-static void ps2_wait_write(void) {          /* input buffer clear before we write */
-    for (int i = 0; i < 100000; i++) if (!(inb(KBD_STATUS_PORT) & 0x02)) return;
-}
-static void ps2_wait_read(void) {           /* output buffer full before we read */
-    for (int i = 0; i < 100000; i++) if (inb(KBD_STATUS_PORT) & 0x01) return;
-}
-
-/* Send a byte to the KEYBOARD (not the controller) and eat its ACK (0xFA).
- * Bounded: a device that never ACKs must not hang the boot. */
-static int kbd_cmd(uint8_t byte) {
-    for (int try = 0; try < 3; try++) {
-        ps2_wait_write(); outb(KBD_DATA_PORT, byte);
-        ps2_wait_read();
-        uint8_t r = inb(KBD_DATA_PORT);
-        if (r == 0xFA) return 1;            /* ACK */
-        if (r != 0xFE) return 0;            /* not a RESEND: give up, report it */
-    }
-    return 0;
-}
+/* Send a byte to the KEYBOARD (not the controller) and eat its ACK. The
+ * retry-on-RESEND and the bounded wait live in i8042.c now, with the rest of
+ * the controller: one owner, one config byte, one flush. */
+static int kbd_cmd(uint8_t byte) { return i8042_kbd_write(byte) ? 1 : 0; }
 
 /* The three lock LEDs. `0xED` then a bitmap: bit0 Scroll, bit1 Num, bit2 Caps.
  * Caps Lock without its LED is a latch the user cannot see -- the light IS the
@@ -503,17 +490,19 @@ static void kbd_set_leds(void) {
 
 void keyboard_init(void) {
     serial_write_string("\n=== Keyboard init ===\n");
+    g_mods = 0;                              /* locks start OFF, whatever feeds the keys */
+
+    /* The controller first, and only once: it tests its own ports and says
+     * what is on them. A machine with no 8042 -- which is a thing a laptop can
+     * be -- stops here rather than configuring a chip that is not there. */
+    if (!i8042_init() || !i8042_have_kbd()) {
+        kprintf("Keyboard: no PS/2 keyboard on this machine; USB and "
+                "virtio-input feed the same key handling\n");
+        return;
+    }
 
     irq_register(1, keyboard_handler);
-
-    /* Config byte: read-modify-write, keyboard bits only (see the warning above). */
-    ps2_wait_write(); outb(KBD_STATUS_PORT, 0x20);
-    ps2_wait_read();  uint8_t cfg = inb(KBD_DATA_PORT);
-    cfg |=  PS2_CFG_IRQ1;                    /* deliver IRQ1                     */
-    cfg &= ~PS2_CFG_KBD_CLKOFF;              /* clock ON (bit CLEAR enables it)  */
-    cfg |=  PS2_CFG_XLATE;                   /* set2 -> set1, what our tables want */
-    ps2_wait_write(); outb(KBD_STATUS_PORT, 0x60);
-    ps2_wait_write(); outb(KBD_DATA_PORT, cfg);
+    i8042_irq_enable(true, false);           /* IRQ1 on, handler now in place */
 
     /* Scancode set 2 EXPLICITLY -- the other half of the translation pairing.
      * Best-effort: QEMU and most real controllers ACK; one that does not is
@@ -527,8 +516,7 @@ void keyboard_init(void) {
 
     kbd_cmd(0xF4);                           /* enable scanning */
 
-    g_mods = 0;                              /* locks start OFF, and the LEDs agree */
-    kbd_set_leds();
+    kbd_set_leds();                          /* and the LEDs agree with g_mods */
 
     serial_write_string("Keyboard registered on IRQ 1\n");
 }

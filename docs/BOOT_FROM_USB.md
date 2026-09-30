@@ -104,12 +104,37 @@ stick.
 | The menu, then `EmbBoot FATAL: ...` | The loader stopped before the kernel. **Photograph it.** |
 | Kernel messages that stop and never move again | A hang. **Photograph the screen** — the last lines say which driver it was in. |
 | **A red bar reading "EmbLinkOS stopped: ..."** with numbers and log lines | A kernel fault. **Photograph the whole screen.** It names the function and source line that faulted. |
-| The desktop, but the mouse or keyboard does nothing | Try a USB mouse/keyboard in a different port. Note the laptop model. |
+| The desktop, but the mouse or keyboard does nothing | Try a USB mouse/keyboard in a different port. Then read the boot log off the stick (below): its `i8042:` lines say whether the built-in keyboard and touchpad are PS/2 devices this kernel can drive. |
 | Black screen right after choosing Boot | The firmware gave no usable framebuffer. Note the model. |
 
 > **The single most useful thing is a clear photo of the screen**, plus the
 > laptop's exact model. If the machine does reach the desktop, that is worth a
 > photo too.
+
+### The boot log on the stick: `EMBLINK.LOG`
+
+A laptop has no serial port, so the kernel leaves its log where any computer
+can read it: **a file called `EMBLINK.LOG` in the root of the stick's first
+partition** (the small FAT32 one the firmware boots from). The first copy is
+written about four seconds into the boot and it is rewritten every five
+seconds after, so it is always the newest 64 KB of the log — long enough to
+cover the desktop appearing, or failing to.
+
+To read it: power the laptop off, move the stick to another computer, open the
+first partition (macOS mounts it as `EFI` or `EMBLINK`) and open `EMBLINK.LOG`
+in any text editor. The kernel writes it only to the stick it booted from —
+the volume holding `/EFI/BOOT/BOOTX64.EFI` — never to another stick you plug
+in.
+
+Lines worth searching for:
+
+| Search for | What it tells you |
+|---|---|
+| `i8042:` | Whether the machine has a PS/2 controller and what answered on each port: `port 1 holds a MF2 keyboard`, `port 2 holds a standard PS/2 mouse or touchpad`, or `port 2 tested good but nothing answered a reset -- this laptop's touchpad is somewhere else (I2C, most likely)`. That last line is the one that decides whether an I²C-HID driver is the next job. |
+| `xHCI` | The USB controller's ports, what was found on them, and any `transfer failed, completion code` followed by `recovering the endpoint`. |
+| `I/O error` | A read from the stick failed. Which one, and what happened just before it, is the diagnosis. |
+| `home: desktop ready` | The desktop finished starting. |
+| `EmbLinkOS stopped` | A kernel fault; the lines after it name the function. |
 
 ### Booted on, so far
 
@@ -129,7 +154,8 @@ stick.
 | Sound | Intel HDA exists; whether the laptop's codec produces sound is unknown. |
 | Power | Shut Down and Restart work through ACPI. No sleep, no battery indicator yet. |
 
-**What the OS writes:** its own files on the stick. If the kernel faults, it may
+**What the OS writes:** its own files on the stick, including `EMBLINK.LOG` on
+the boot partition (above). If the kernel faults, it may
 also leave one small crash record (a few kilobytes) through the firmware's ACPI
 error-record store, if the laptop has one — the same mechanism other operating
 systems use for crash reports. It never writes the internal drive. **Do not run

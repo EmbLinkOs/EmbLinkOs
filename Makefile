@@ -209,6 +209,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/timer/rtc.c \
              kernel/drivers/input/keyboard.c \
              kernel/drivers/input/mouse.c \
+             kernel/drivers/input/i8042.c \
              kernel/drivers/input/virtio_input.c \
              kernel/drivers/bus/pci.c \
              kernel/drivers/bus/virtio_pci.c \
@@ -297,8 +298,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/loader/pietest.c \
              kernel/lib/ksym.c \
              kernel/lib/klog.c \
-             kernel/lib/crashlog.c \
              kernel/lib/bootlog.c \
+             kernel/lib/crashlog.c \
              kernel/lib/kprintf.c
 
 LINKER      = kernel/linker.ld
