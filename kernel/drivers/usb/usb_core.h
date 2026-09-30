@@ -132,6 +132,8 @@ void usb_device_gone(struct usb_device *dev);
 
 // How many devices are enumerated right now, for the hot-plug test.
 uint32_t usb_device_count(void);
+/* The Nth attached device, or NULL. For reporting what is on the bus. */
+const struct usb_device *usb_device_at(uint32_t index);
 
 // A port holding something that would not enumerate. Without this a rescan
 // retries the same failure every half second for the life of the machine --

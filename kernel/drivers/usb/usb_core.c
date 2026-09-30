@@ -86,6 +86,16 @@ struct usb_device *usb_device_on_port(void *hc, uint8_t port) {
     return NULL;
 }
 
+/* The Nth device in use, for a caller that wants to SAY what is attached --
+ * the no-root diagnostic in embkfs.c. NULL past the end. */
+const struct usb_device *usb_device_at(uint32_t index) {
+    for (uint32_t i = 0; i < USB_MAX_DEVICES; i++) {
+        if (!g_usb_devices[i].in_use) continue;
+        if (index-- == 0) return &g_usb_devices[i];
+    }
+    return NULL;
+}
+
 uint32_t usb_device_count(void) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < USB_MAX_DEVICES; i++)
@@ -411,15 +421,34 @@ static bool usb_msc_attach(struct usb_device *dev) {
     cdb[0] = 0x12; cdb[4] = 36;
     usb_msc_bot(m, cdb, 6, true, 36);
 
-    // TEST UNIT READY until it settles, clearing sense data in between.
-    for (int tries = 0; tries < 5; tries++) {
+    /* TEST UNIT READY until it settles, clearing sense data in between.
+     *
+     * FIVE TRIES AND FIFTY MILLISECONDS WAS AN EMULATOR'S IDEA OF PATIENCE.
+     * QEMU's stick is ready the instant it is asked; a real one answers NOT
+     * READY while its controller wakes up, and the ones that have been sitting
+     * in a drawer can take a second or more. A stick that is merely slow must
+     * not look like a stick that is absent -- which, on a machine whose ROOT
+     * FILESYSTEM is on it, is the difference between booting and not. Forty
+     * tries at 50 ms is two seconds of patience, paid only when a device is
+     * actually being brought up. */
+    bool ready = false;
+    for (int tries = 0; tries < 40; tries++) {
         memset(cdb, 0, sizeof(cdb));
-        if (usb_msc_bot(m, cdb, 6, false, 0)) break;
+        if (usb_msc_bot(m, cdb, 6, false, 0)) {
+            if (tries)
+                kprintf("USB MSC: ready after %d attempt(s) (%d ms)\n",
+                        tries + 1, tries * 50);
+            ready = true;
+            break;
+        }
         memset(cdb, 0, sizeof(cdb));
         cdb[0] = 0x03; cdb[4] = 18;             // REQUEST SENSE
         usb_msc_bot(m, cdb, 6, true, 18);
-        timer_delay_ms(10);
+        timer_delay_ms(50);
     }
+    if (!ready)
+        kprintf("USB MSC: never reported ready after 2 s -- asking for its "
+                "capacity anyway\n");
 
     // READ CAPACITY(10)
     memset(cdb, 0, sizeof(cdb));

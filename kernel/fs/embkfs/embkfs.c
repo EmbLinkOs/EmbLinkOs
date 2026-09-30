@@ -2,7 +2,9 @@
 #include "drivers/timer/timer.h"
 #include "fs/embkfs/crc32c.h"
 #include "block/block.h"
-#include "block/partition.h"   /* embk_partition_parent — reach a volume's disk MBR */
+#include "block/partition.h"
+#include "drivers/usb/usb_core.h"
+#include "drivers/usb/usb.h"   /* embk_partition_parent — reach a volume's disk MBR */
 #include "boot/boot_protocol.h"  /* bootinfo_boot_disk_sig — root-follows-boot */
 #include "include/kmalloc.h"   /* kmalloc / kfree — the Phase 8 heap */
 #include "include/kprintf.h"
@@ -7824,6 +7826,9 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
     return EMBK_OK;
 }
 
+static void embkfs_probe_all_devices(void);
+static void embkfs_init_after_probe(void);
+
 void embkfs_init(void)
 {
     kprintf("\n=== EMBKFS init ===\n");
@@ -7844,6 +7849,33 @@ void embkfs_init(void)
      * main.c) -- so index 0 (the primary, aliased by g_embkfs_live) is
      * deterministically "whichever EMBKFS volume was found earliest in
      * boot", normally the internal disk. */
+    embkfs_probe_all_devices();
+
+    /* NOT FOUND IS NOT THE SAME AS NOT THERE YET. The root filesystem of a
+     * machine booted from a USB stick is ON that stick, and a real stick is
+     * not necessarily enumerated by the time this runs: it answers NOT READY
+     * while it wakes, and some are still being addressed when the rest of the
+     * kernel has moved on. An HP ProBook reached this point with its own
+     * internal drive as the only block device in the machine and stopped
+     * there, with a perfectly good stick in the port.
+     *
+     * So: give USB a few more seconds and look again. Only on the failure path
+     * -- a machine that found its root pays nothing. */
+    for (int round = 0; g_embkfs_volume_count == 0 && round < 6; round++) {
+        kprintf("EMBKFS: nothing yet -- letting USB settle (%d/6)\n", round + 1);
+        for (int tick = 0; tick < 10; tick++) {
+            usb_poll();
+            timer_delay_ms(50);
+        }
+        embk_partition_scan_all();      /* a stick that arrived has partitions */
+        embkfs_probe_all_devices();
+    }
+
+    embkfs_init_after_probe();
+}
+
+static void embkfs_probe_all_devices(void)
+{
     for (uint32_t i = 0; i < embk_block_count() && g_embkfs_volume_count < EMBKFS_MAX_VOLUMES; i++) {
         struct embk_block_device *d = embk_block_get(i);
         /* Skip a whole disk that carries a partition table: its filesystems live
@@ -7858,7 +7890,11 @@ void embkfs_init(void)
             continue;
         g_embkfs_volume_count++;
     }
+}
 
+/* Everything below runs after the probe (and its retries) have had their say. */
+static void embkfs_init_after_probe(void)
+{
     if (g_embkfs_volume_count == 0) {
         kprintf("EMBKFS: no volume found on any block device\n");
 
@@ -7910,6 +7946,46 @@ void embkfs_init(void)
                         ? "  <-- the magic IS here; the superblock was rejected for "
                           "another reason (checksum or version)"
                         : "");
+        }
+        /* AND WHETHER USB EVEN CAME UP. The ProBook's answer to the dump
+         * above was that the only disk in the machine was its own 500 GB
+         * internal drive: the stick it had just booted from had no block
+         * device at all. The firmware read that stick to load the loader, so
+         * the hardware works -- it is this kernel's USB stack that did not
+         * bring it up, and the lines that would have said so had already
+         * scrolled off a screen that cannot be scrolled back. So they are
+         * repeated here, where the failure is. */
+        {
+            uint32_t nc = usb_controller_count();
+            kprintf("EMBKFS: USB at this point: %u controller(s), %u device(s)\n",
+                    (unsigned)nc, (unsigned)usb_device_count());
+            for (uint32_t i = 0; i < nc; i++) {
+                const struct usb_controller *c = usb_get_controller(i);
+                if (!c) continue;
+                static const char *kind[] = { "UHCI", "OHCI", "EHCI", "xHCI" };
+                kprintf("EMBKFS:   %s at %02x:%02x.%x -- %u port(s), %u device(s) present\n",
+                        (c->kind <= USB_HC_XHCI) ? kind[c->kind] : "unknown",
+                        (unsigned)c->pci.bus, (unsigned)c->pci.device,
+                        (unsigned)c->pci.function,
+                        (unsigned)c->max_ports, (unsigned)c->devices_present);
+            }
+            if (nc == 0)
+                kprintf("EMBKFS:   no USB controller was found at all -- nothing on a "
+                        "USB stick can be reached\n");
+            /* And WHAT is attached. "A stick that never enumerated" and "a
+             * stick that enumerated and whose mass-storage interface was not
+             * claimed" are different faults with the same symptom. Class 08 is
+             * mass storage; 08/06/50 is the SCSI/bulk-only kind every USB
+             * stick in the world reports. */
+            for (uint32_t i = 0; i < usb_device_count(); i++) {
+                const struct usb_device *u = usb_device_at(i);
+                if (!u) break;
+                kprintf("EMBKFS:   usb %04x:%04x on port %u, class %02x/%02x/%02x%s\n",
+                        (unsigned)u->vid, (unsigned)u->pid, (unsigned)u->port,
+                        (unsigned)u->if_class, (unsigned)u->if_subclass,
+                        (unsigned)u->if_protocol,
+                        (u->if_class == 0x08) ? "  <-- mass storage" : "");
+            }
         }
         return;
     }
