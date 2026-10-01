@@ -7843,5 +7843,10 @@ it.
       noticed because the root it damaged was no longer block 17. Every such
       target should copy the master to a scratch file first, as
       `tools/usb_hotplug.py` and `tools/root_mirror_test.py` do; until then,
-      `rm -f embkfs.img && make` before building a stick image.
+      `rm -f embkfs.img && make && make uefi-usb.img` before shipping a stick
+      image -- the default target regenerates the master but NOT
+      `uefi-usb.img`, and `test-laptop` rebuilds `uefi-usb.img` from whatever
+      master it finds, so a stick image can carry a drifted filesystem with a
+      clean master sitting right next to it (it did, once, on 2026-10-01;
+      caught by checking the image's embedded superblock before handing it over).
 
