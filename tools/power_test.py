@@ -22,17 +22,21 @@ into an exit.
 
 ONE QEMU AT A TIME, like console_test.py.
 """
-import os, sys, time, subprocess
+import os
+import shutil, sys, time, subprocess
 import qemu_guard
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def run(machine, action):
+    # A copy of the root filesystem, never the master (see tools/console_test.py).
+    root_img = os.path.join(ROOT, "build", "power-root.img")
+    shutil.copyfile(os.path.join(ROOT, "embkfs.img"), root_img)
     argv = ["qemu-system-x86_64", "-M", machine, "-cpu", "max", "-m", "2G", "-smp", "4",
             "-display", "none", "-serial", "stdio", "-no-reboot",
             "-drive", "format=raw,file=%s/myos.img,if=ide,index=0" % ROOT,
-            "-drive", "format=raw,file=%s/embkfs.img,if=ide,index=1" % ROOT]
+            "-drive", "format=raw,file=%s,if=ide,index=1" % root_img]
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT)
     os.set_blocking(p.stdout.fileno(), False)

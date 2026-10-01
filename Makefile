@@ -2157,10 +2157,11 @@ run-embkfs-tree: $(IMG) $(DISK) embkfs_tree.img
 
 
 run-embkfs: $(IMG) $(DISK) embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	qemu-system-x86_64 \
 	    -cpu $(QEMU_CPU) \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown $(NET)
 
 # --- run-ui: boot to a window, then the live EmbLink UI app ------------------
@@ -2173,10 +2174,11 @@ run-embkfs: $(IMG) $(DISK) embkfs.img
 # -vga std incurs (fb_front is vmm_map_mmio'd VMM_NOCACHE) -- ~2x FPS on the
 # toolkit demos. Use `make run-vga-std` for the plain uncached-LFB path.
 run-ui: $(IMG) embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	@echo "At the shell prompt, type:  run /uidemo.elf"
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
 	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4 $(NET)
@@ -2185,10 +2187,11 @@ run-ui: $(IMG) embkfs.img
 # hosting the EmUI toolkit, one drawn directly) over a desktop with title-bar
 # chrome + z-order. At the shell prompt, type:  run /wmdemo.elf   (ESC quits).
 run-wm: $(IMG) embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	@echo "At the shell prompt, type:  run /wmdemo.elf   (ESC quits)"
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -usb -device usb-tablet \
 	    $(VGA_VIRTIO) $(DISPLAY_1TO1) \
 	    -serial stdio -no-reboot -no-shutdown -m 512M -m 4G -smp 4 $(NET)
@@ -2341,9 +2344,10 @@ dirtree.img: tools/embkfs_mkfs/mkfs_embkfs.py
 # Boot the default volume at "/" (index 1) PLUS the nested fixture (index 2 ->
 # embkfs_volume_at(1)), so `test dirtree` can resolve nested paths on it.
 run-dirtree: $(IMG) $(DISK) embkfs.img dirtree.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -drive format=raw,file=dirtree.img,if=ide,index=2 \
 	    -serial stdio -no-reboot -no-shutdown
 
@@ -2523,12 +2527,13 @@ uefi.img: $(BOOTX64) tools/mkuefidisk.py
 # Boot under OVMF. VARS must be a writable per-run copy. The kernel's EMBKFS root
 # rides a second drive for the MVP (kernel probes every block device for it).
 run-uefi: uefi.img embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
 	qemu-system-x86_64 \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 	    -drive format=raw,file=uefi.img,if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -serial stdio -no-reboot -no-shutdown -m 512M $(NET)
 
 # SINGLE self-contained UEFI device: one GPT disk = [ESP: loader+kernel] +
@@ -2537,6 +2542,20 @@ run-uefi: uefi.img embkfs.img
 # second drive). `make run-uefi-usb` proves single-device boot under OVMF.
 uefi-usb.img: $(BOOTX64) embkfs.img tools/mkuefidisk.py
 	python3 tools/mkuefidisk.py $(BOOTX64) $@ embkfs.img
+
+# BUILD THE STICK -- the one command for the image that goes to a laptop.
+# The master root filesystem is regenerated from mkfs (several things can
+# have written it: see docs/TODO.md on master drift), the stick image is
+# rebuilt from it (the default target does not), and the result is CHECKED
+# before its checksum is printed: the embedded filesystem must be mkfs's
+# (generation 1), its root mirror intact, the loader on the ESP. A stick
+# image that fails the check is not one to hand over.
+.PHONY: stick
+stick:
+	rm -f embkfs.img
+	$(MAKE) embkfs.img
+	$(MAKE) uefi-usb.img
+	@python3 tools/stick_check.py uefi-usb.img
 
 run-uefi-usb: uefi-usb.img
 	cp -f $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
@@ -2570,9 +2589,10 @@ run-uefi-cow: uefi.img $(EMBKFS_MASTER)
 # both on plain IDE -- exercises embkfs_init()'s multi-volume mount table
 # without needing USB. Pair with `test embkfs multivol` at the shell.
 run-multivol: $(IMG) $(DISK) embkfs.img usbdisk_embkfs.img
+	cp -f $(EMBKFS_MASTER) $(EMBKFS_SCRATCH)    # the master is never the disk
 	qemu-system-x86_64 \
 	    -drive format=raw,file=$(IMG),if=ide,index=0 \
-	    -drive format=raw,file=embkfs.img,if=ide,index=1 \
+	    -drive format=raw,file=$(EMBKFS_SCRATCH),if=ide,index=1 \
 	    -drive format=raw,file=usbdisk_embkfs.img,if=ide,index=2 \
 	    -serial stdio -no-reboot -no-shutdown
 

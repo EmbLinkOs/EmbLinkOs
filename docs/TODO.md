@@ -7833,20 +7833,20 @@ it.
       keyboard is still dead, enumeration is the suspect and the log's
       `xHCI slotN:` lines say which step.
 
-**The master `embkfs.img` is booted writable by several targets (noticed 2026-10-01)**
+**The master `embkfs.img` was booted writable by several targets (noticed and fixed 2026-10-01)**
 
-- [ ] `run-embkfs-cow`, `run-embkfs-*` and the suites behind them attach
-      `embkfs.img` itself as the second IDE disk (Makefile around lines
-      2163-2531), so the kernel's boot-time commits land in the MASTER: after
-      one such run it sits at generation 2 with its root moved to block 6, and
-      the next `uefi-usb.img` packs that drifted image. `test-root-mirror`
-      noticed because the root it damaged was no longer block 17. Every such
-      target should copy the master to a scratch file first, as
-      `tools/usb_hotplug.py` and `tools/root_mirror_test.py` do; until then,
-      `rm -f embkfs.img && make && make uefi-usb.img` before shipping a stick
-      image -- the default target regenerates the master but NOT
-      `uefi-usb.img`, and `test-laptop` rebuilds `uefi-usb.img` from whatever
-      master it finds, so a stick image can carry a drifted filesystem with a
-      clean master sitting right next to it (it did, once, on 2026-10-01;
-      caught by checking the image's embedded superblock before handing it over).
+- [x] `tools/console_test.py` (behind most `test-*` targets), `tools/power_test.py`,
+      `tools/secureboot_test.py` and six interactive `run-*` targets attached
+      `embkfs.img` itself as the second disk, so the kernel's boot-time commits
+      landed in the MASTER -- the file the stick image is packed from. One run
+      left it at generation 2 with its root at block 6, and a stick image was
+      packed from that before anyone looked. Every one of them now copies the
+      master to a scratch image first (`build/console-root.img`,
+      `$(EMBKFS_SCRATCH)`, ...), as `run-embkfs-cow` and `tools/usb_hotplug.py`
+      always did.
+- [x] **`make stick`** regenerates the master, rebuilds `uefi-usb.img` (the
+      default target does not) and runs `tools/stick_check.py`, which refuses
+      an image whose embedded filesystem is not mkfs's, whose root mirror is
+      not intact, or whose ESP lacks the loader -- then prints the checksum
+      for the handover.
 

@@ -177,6 +177,20 @@ The image is `uefi-usb.img` in the repository (build it with `make uefi-usb.img`
 The stick must be at least 256 MB; everything on it is erased.
 
 ### On macOS
+### Build it first
+
+```
+make stick
+```
+
+That regenerates the root filesystem from mkfs, rebuilds `uefi-usb.img` from
+it, and **checks the result** before printing its checksum: the filesystem
+inside must be mkfs's own (generation 1, nothing has committed to it), its
+root mirror must be intact, and the loader must be on the EFI partition. A
+plain `make` does not rebuild the stick image, and some targets boot the
+master filesystem writable; `make stick` exists so neither can hand you a
+stale or drifted image without saying so.
+
 
 1. Plug the stick in and **find it** — look for the size that matches your stick:
 

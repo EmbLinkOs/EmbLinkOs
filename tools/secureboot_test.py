@@ -34,6 +34,7 @@ OS bootable on somebody else's laptop, where the enrolled keys are Microsoft's
 docs/TODO.md says so rather than this test implying otherwise.
 """
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -94,6 +95,9 @@ def boot(image, vars_file, log_path, want_desktop):
     run_vars = log_path + ".vars"
     sh("cp", "-f", vars_file, run_vars)
 
+    # A copy of the root filesystem, never the master (see tools/console_test.py).
+    root_copy = os.path.join(ROOT, "build", "secureboot-root.img")
+    shutil.copyfile(os.path.join(ROOT, "embkfs.img"), root_copy)
     argv = [
         "qemu-system-x86_64",
         "-machine", "q35,smm=on",
@@ -102,7 +106,7 @@ def boot(image, vars_file, log_path, want_desktop):
         "-drive", "if=pflash,format=raw,unit=0,readonly=on,file=%s" % SECURE_CODE,
         "-drive", "if=pflash,format=raw,unit=1,file=%s" % run_vars,
         "-drive", "format=raw,file=%s,if=ide,index=0" % image,
-        "-drive", "format=raw,file=%s,if=ide,index=1" % os.path.join(ROOT, "embkfs.img"),
+        "-drive", "format=raw,file=%s,if=ide,index=1" % root_copy,
         "-serial", "file:%s" % log_path,
         "-display", "none", "-no-reboot", "-no-shutdown", "-m", "512M",
     ]
