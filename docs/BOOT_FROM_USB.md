@@ -176,7 +176,6 @@ that erases a disk.
 The image is `uefi-usb.img` in the repository (build it with `make uefi-usb.img`).
 The stick must be at least 256 MB; everything on it is erased.
 
-### On macOS
 ### Build it first
 
 ```
@@ -192,6 +191,7 @@ master filesystem writable; `make stick` exists so neither can hand you a
 stale or drifted image without saying so.
 
 
+### On macOS
 1. Plug the stick in and **find it** — look for the size that matches your stick:
 
    ```bash
