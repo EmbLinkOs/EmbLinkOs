@@ -229,6 +229,26 @@ EMBKFS_CRYPTO_HEADER_MAGIC = struct.unpack("<Q", b"EMBKCRY1")[0]
 KEY_CHECK_PLAINTEXT = b"EMBKFS-KEY-CHECK"
 assert len(KEY_CHECK_PLAINTEXT) == 16
 
+# ---- Root mirror header (v2.3.1) -----------------------------------------
+# A second copy of the tree's root node, named here so a volume survives the
+# one block every lookup must pass through. Lives in the superblock block past
+# the crypto (200..252) and verify (260..308) headers, self-described by magic
+# and its own CRC32C over the 40 bytes before the checksum -- NOT covered by
+# the superblock's checksum, and ignorable by a kernel that predates it.
+# Mirrors struct embk_mirror_header exactly: magic(8) root_mirror(32) checksum(8)
+MIRROR_HEADER_OFFSET = 320
+MIRROR_HEADER_FMT = "<Q32sQ"
+MIRROR_HEADER_SIZE = struct.calcsize(MIRROR_HEADER_FMT)
+assert MIRROR_HEADER_SIZE == 48, MIRROR_HEADER_SIZE
+EMBKFS_MIRROR_HEADER_MAGIC = struct.unpack("<Q", b"EMBKMIR1")[0]
+
+def pack_mirror_header(mirror_ptr32):
+    """The 48-byte header naming the root's mirror block."""
+    assert len(mirror_ptr32) == 32
+    body = struct.pack("<Q32s", EMBKFS_MIRROR_HEADER_MAGIC, mirror_ptr32)
+    from crc32c import crc32c as _c
+    return body + struct.pack("<Q", _c(body))
+
 def pack_extent(disk_block, length_blocks, logical_size, data_checksum,
                 generation=0, flags=0):
     return struct.pack(EXTENT_FMT,

@@ -264,7 +264,7 @@ def build_extent_items(oid: int, blk: int, data: bytes, gen: int) -> list:
 
 def build_superblock(total_blocks: int, free_blocks: int, generation: int,
                      uuid16: bytes, root_block: int, root_csum: int,
-                     feat_incompat: int = 0) -> bytes:
+                     feat_incompat: int = 0, mirror_block=None) -> bytes:
     """
     Build the superblock block (4 KiB): body per spec §5.2 plus the trailing
     checksum over all preceding bytes. The rest of the block is reserved (zero).
@@ -290,6 +290,14 @@ def build_superblock(total_blocks: int, free_blocks: int, generation: int,
 
     block = bytearray(L.BLOCK_SIZE)
     block[0:len(sb)] = sb
+    if mirror_block is not None:
+        # v2.3.1: name a byte-identical copy of the root (spec section 6). The
+        # pointer carries the ROOT's checksum and generation -- the copy's own
+        # header says "block root_block", and that is what the kernel checks.
+        mptr = L.pack_block_ptr(block=mirror_block, checksum=root_csum,
+                                generation=generation, flags=0)
+        hdr = L.pack_mirror_header(mptr)
+        block[L.MIRROR_HEADER_OFFSET:L.MIRROR_HEADER_OFFSET + len(hdr)] = hdr
     return bytes(block)
 
 
@@ -347,14 +355,25 @@ def make_image(path: str, size_bytes: int = 128 * 1024 * 1024, objects=None):
     # reserves it) agrees with this hint. The registry is counted for exactly
     # the same reason: embkfs_bitmap_build() marks it, so if this hint did not,
     # every mount would print an allocator MISMATCH.
-    used = 4 + n_meta + sum(nblocks for (_n, _s, nblocks, _z, _c) in file_layouts)
+    # THE ROOT'S MIRROR (v2.3.1): a byte-identical copy of the root node at the
+    # far end of the volume, just inside the backup superblock -- a different
+    # flash page from block 17 on any real medium, which is the whole point: a
+    # USB stick with ONE marginal page under the root made a whole root
+    # filesystem unreadable, on a freshly written image, before any commit
+    # could have moved the root anywhere else. So the copy exists from mkfs.
+    MIRROR_BLOCK = total_blocks - 2
+    root_bytes = dict(meta_blocks)[root_block]
+    n_data = sum(nblocks for (_n, _s, nblocks, _z, _c) in file_layouts)
+    assert MIRROR_BLOCK > data_start + n_data, "the root mirror would land on file data"
+    used = 4 + n_meta + n_data + 1
     free_blocks = total_blocks - used
 
     superblock = build_superblock(total_blocks=total_blocks,
                                   free_blocks=free_blocks, generation=gen,
                                   uuid16=uuidlib.uuid4().bytes,
                                   root_block=root_block, root_csum=root_csum,
-                                  feat_incompat=L.EMBKFS_INCOMPAT_SNAPREG)
+                                  feat_incompat=L.EMBKFS_INCOMPAT_SNAPREG,
+                                  mirror_block=MIRROR_BLOCK)
 
     # --- assemble the full image ---
     img = bytearray(size_bytes)  # all zeros
@@ -369,6 +388,7 @@ def make_image(path: str, size_bytes: int = 128 * 1024 * 1024, objects=None):
         put(b, d)
     for b, d in data_blocks:
         put(b, d)
+    put(MIRROR_BLOCK, root_bytes)       # the root again, far from the root
     put(BACKUP_BLOCK, superblock)       # backup is an identical copy
 
     with open(path, "wb") as f:
@@ -399,6 +419,7 @@ def make_image(path: str, size_bytes: int = 128 * 1024 * 1024, objects=None):
               f" {nblocks} blocks, {n_ext} extent{'s' if n_ext != 1 else ''},"
               f" src fingerprint 0x{data_csum:08X})")
     print(f"  backup superblk : block {BACKUP_BLOCK} (last block)")
+    print(f"  root mirror     : block {MIRROR_BLOCK} (a copy of block {root_block}, named in the superblock at +320)")
     print(f"  free_blocks hint: {free_blocks}")
 
 

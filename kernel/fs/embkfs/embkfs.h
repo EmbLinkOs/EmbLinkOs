@@ -314,6 +314,27 @@ struct embk_verify_header {
 } __attribute__((packed));
 _Static_assert(sizeof(struct embk_verify_header) == 48, "verify header must be 48 bytes");
 
+/* ---- Root mirror header (v2.3.1, spec §6) -------------------------------
+ * A byte-identical copy of the tree's root node, kept at a second block and
+ * named here, so that the one block every lookup passes through is not the
+ * whole volume. Past the crypto (200..252) and verify (260..308) headers, in
+ * the same first sector of the superblock block; self-described by magic and
+ * its own CRC32C over the 40 bytes before the checksum, NOT covered by the
+ * superblock's checksum, announced by no feature bit: a kernel without this
+ * ignores the bytes, one with it treats absent-or-invalid as "no mirror".
+ *
+ * The pointer carries the ROOT's checksum and generation, because the bytes
+ * are the root's; the copy's own header says "block <root's block>", and that
+ * is what a reader checks it against. */
+#define EMBKFS_MIRROR_HEADER_OFFSET 320
+#define EMBKFS_MIRROR_HEADER_MAGIC  0x3152494D4B424D45ULL /* "EMBKMIR1" */
+struct embk_mirror_header {
+    uint64_t              magic;        /*  0  EMBKFS_MIRROR_HEADER_MAGIC          */
+    struct embk_block_ptr root_mirror;  /*  8  block = the copy; csum/gen = the root's */
+    uint64_t              checksum;     /* 40  CRC32C over bytes [0..40)            */
+} __attribute__((packed));
+_Static_assert(sizeof(struct embk_mirror_header) == 48, "mirror header must be 48 bytes");
+
 /* ---- Snapshots (v2.2 Phase 5b) --------------------------------------
  * A snapshot is nothing but a FROZEN root block_ptr: taking one is O(1)
  * (the tree it points at is already immutable, CoW guarantees no future
@@ -415,6 +436,10 @@ struct embkfs_volume {
                                       * once the commit is durable (NULL outside a transaction) */
 
     struct embk_block_ptr root;      /* pointer into the metadata tree */
+    struct embk_block_ptr root_mirror; /* a second copy of the root's bytes; block 0 = none (spec §6) */
+    bool     root_mirror_said;       /* the "using its mirror" line, once per mount */
+    uint64_t root_primary_bad;       /* root block whose primary failed: reads go straight to the
+                                        mirror until a commit moves the root (0 = none) */
     bool     read_only;              /* forced RO by an ro_compat bit  */
     bool     mounted;                /* true once the SB validated     */
     uint64_t feature_incompat;       /* mirrors the on-disk field; only ever

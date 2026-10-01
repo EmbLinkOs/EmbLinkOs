@@ -142,7 +142,89 @@ optimising it — one counter, one boot, every time.
   one 4 KiB leaf, and `build_btree` auto-splits to a level-1 root. The
   hash-collision fixtures were dropped from the default image when it overflowed.
 
+## 6. The root mirror (v2.3.1) — one block must not be the whole volume
+
+### 6.1 Why
+
+Every lookup passes through the tree's root node. The superblock has had a
+backup at the last block since v1; the root node had none, and an HP ProBook
+showed what that costs: a USB stick with one marginal flash page under block
+17 — the root of a freshly written image — failed every read of it with I/O
+error, and the whole root filesystem was unreadable before the first commit
+could have moved the root anywhere else.
+
+### 6.2 On disk
+
+A **byte-identical copy of the root node** is kept at a second block, named by
+a header in the superblock block at a fixed offset, past the crypto header
+(200..252, v2.2 Phase 4) and the verify header (260..308, v2.2 Phase 5d):
+
+```
+offset 320: struct embk_mirror_header  (48 bytes)
+    uint64_t              magic;         "EMBKMIR1" = 0x3152494D4B424D45
+    struct embk_block_ptr root_mirror;   block = the mirror's block; checksum and
+                                         generation = THE ROOT'S (the bytes are
+                                         the root's, so they carry its tag)
+    uint64_t              checksum;      CRC32C over the 40 bytes before it
+```
+
+Self-described by magic and its own checksum, **not** covered by the
+superblock's checksum (which ends at 152) and announced by no feature bit: a
+kernel that predates it ignores the bytes, a kernel that has it treats an
+absent or invalid header as "no mirror". The backup superblock carries the
+same header, because it is a copy of the whole block.
+
+The copy's node header says `block = <root's block>`, not its own. That is
+deliberate and is what a reader checks it against: the mirror is not a node of
+the tree, it is the root's bytes kept somewhere else.
+
+### 6.3 Who writes it
+
+- **mkfs** places the copy at `total_blocks − 2`, immediately inside the backup
+  superblock: the far end of the medium, a different flash page from the
+  tree's first blocks on any real device. It counts as a used block.
+- **Every commit** allocates a block **from the far end of the free space**
+  — the allocator otherwise hands out the next free block, which on a flash
+  medium is the same page as the root it is meant to survive — reads the
+  just-written new root back, writes it there, names it in the superblock it
+  is about to install, and — once that superblock is sealed — releases the
+  previous mirror's block. A failure anywhere in staging the mirror is logged
+  and the commit proceeds **without** one: the mirror is a safety net, never a
+  reason a write fails.
+- **Mount** marks the mirror's block used, next to the superblocks and the
+  snapshot registry, so the allocator cannot hand it out.
+
+### 6.4 Who reads it
+
+`embkfs_read_node()`, for the root only: if the primary read fails — I/O
+error, bad magic, bad self-checksum, Merkle or generation mismatch — and a
+mirror is named, the mirror's block is read and validated against the **root
+pointer** (self-checksum, `checksum == root.checksum`,
+`generation == root.generation`, `header.block == root.block`). Success is
+logged once per mount: `root node at block N could not be read (...); using
+its mirror at block M from now on -- the medium is failing there`, and **from
+then on the primary is not asked again** for that root block: every lookup
+reads the root, and on the medium this is for each failed primary read is a
+30-second timeout. A commit moves the root and the new block starts trusted.
+Nothing is written back to the failing block: on the device that motivated
+this, a write near that page hung the device's own firmware.
+
+### 6.5 What it does not do
+
+It saves the volume when the **root** dies. An interior node or a leaf with
+one copy is still one copy; the files under it are lost with it. Duplicating
+all metadata is the next step up and is not this.
+
 ## Validation status
+
+- **§6 root mirror** — `make test-root-mirror` (tools/root_mirror_test.py), three boots of the
+  same image: healthy (mirror line absent, root listed), root block overwritten with noise
+  (`bad node magic`, served from the mirror, root listed), and QEMU `blkdebug` injecting
+  errno 5 on every read touching the root's sectors (`read (LBA 136) failed: I/O error`,
+  served from the mirror, root listed). One primary failure logged per boot, then
+  `using its mirror at block 32766 from now on`. `verify_embkfs.py` checks the mirror is
+  byte-identical to the root. Passed 2026-10-01 alongside `test-crash`, `test-embkfs-crash`,
+  `test-usb-all` and `test-laptop`.
 
 Every claim above is covered by a live selftest in `kernel/selftests.c`:
 

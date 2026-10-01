@@ -648,6 +648,45 @@ static int embkfs_alloc_block(struct embkfs_volume *vol, uint64_t *out_block)
     return EMBK_OK;
 }
 
+/* ONE BLOCK FROM THE FAR END OF THE FREE SPACE -- for the root's mirror
+ * (spec §6). The allocator above hands out the first free block, which is
+ * where the tree's own nodes go; a mirror placed there sits in the same flash
+ * page as the root it is meant to survive, which the first run of
+ * tools/root_mirror_test.py showed: root at block 6, mirror at block 7. This
+ * takes the LAST block of the LAST free extent instead, the way mkfs puts the
+ * first mirror at total_blocks - 2. Same marking, same index upkeep, same
+ * transaction record as embkfs_alloc_run, so rollback and the free count see
+ * it the same way. */
+static int embkfs_alloc_block_far(struct embkfs_volume *vol, uint64_t *out_block)
+{
+    if (!out_block) return -EMBK_EINVAL;
+    for (uint32_t i = vol->free_ext_n; i-- > 0; ) {
+        if (vol->free_ext[i].len == 0) continue;
+        uint64_t blk = vol->free_ext[i].start + vol->free_ext[i].len - 1;
+        if (embk_bm_test(vol->block_bitmap, blk)) {
+            kprintf("EMBKFS: %s: free index mismatch at block %lu, rebuilding\n",
+                    vol->dev->name, blk);
+            int rrc = embkfs_free_index_rebuild(vol);
+            if (rrc != EMBK_OK) return rrc;
+            return embkfs_alloc_block(vol, out_block);     /* any block beats none */
+        }
+        embk_bm_set(vol->block_bitmap, blk);
+        vol->free_ext[i].len -= 1;                          /* taken from the tail: start stays */
+        if (vol->free_ext[i].len == 0) {
+            for (uint32_t k = i; k + 1 < vol->free_ext_n; k++)
+                vol->free_ext[k] = vol->free_ext[k + 1];
+            vol->free_ext_n--;
+        }
+        if (vol->txn)
+            embk_txn_push_run(&vol->txn->arun, &vol->txn->arun_n, &vol->txn->arun_cap,
+                              &vol->txn->overflow, blk, 1);
+        embkfs_trace_block("ALLOC", blk, 1);
+        *out_block = blk;
+        return EMBK_OK;
+    }
+    return -EMBK_ENOSPC;
+}
+
 /* Find a contiguous run of free blocks, up to `want`, mark it used, return its
  * start and the length actually found (1..want). Call repeatedly to cover a
  * file across a fragmented bitmap. Same O(n) linear scan as embkfs_alloc_block;
@@ -1464,7 +1503,8 @@ static void embkfs_verify_root_hmac(const struct embk_block_ptr *root, uint64_t 
  * the existing one, re-checksum the body, write primary then backup. THE COMMIT. */
 static int embkfs_write_superblock(struct embkfs_volume *vol,
                                    const struct embk_block_ptr *new_root,
-                                   uint64_t new_generation, uint64_t free_blocks)
+                                   uint64_t new_generation, uint64_t free_blocks,
+                                   const struct embk_block_ptr *new_mirror)
 {
     static uint8_t sbbuf[4096];
     uint64_t spb      = vol->block_size / vol->dev->block_size;
@@ -1488,6 +1528,20 @@ static int embkfs_write_superblock(struct embkfs_volume *vol,
             (struct embk_verify_header *)(sbbuf + EMBKFS_VERIFY_HEADER_OFFSET);
         vh->magic = EMBKFS_VERIFY_HEADER_MAGIC;
         embkfs_verify_root_hmac(new_root, new_generation, vh->hmac);
+    }
+
+    /* The root's mirror (spec §6): named, or the header zeroed when this
+     * commit could not stage one, so a stale header never names a block the
+     * allocator may since have reused. Outside the body checksum, by design. */
+    {
+        struct embk_mirror_header *mh =
+            (struct embk_mirror_header *)(sbbuf + EMBKFS_MIRROR_HEADER_OFFSET);
+        memset(mh, 0, sizeof *mh);
+        if (new_mirror && new_mirror->block) {
+            mh->magic = EMBKFS_MIRROR_HEADER_MAGIC;
+            mh->root_mirror = *new_mirror;
+            mh->checksum = embk_crc32c((const uint8_t *)mh, 40, 0);
+        }
     }
 
     sb->checksum = embk_crc32c(sbbuf, EMBKFS_SB_BODY_SIZE, 0);   /* body [0..152) */
@@ -1836,6 +1890,26 @@ int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume 
     vol->wcache_buf = NULL; vol->wcache_oid = 0; vol->wcache_gen = 0;
     vol->wcache_off = 0;    vol->wcache_len = 0;
     vol->root         = sb->root;
+    /* The root's mirror (spec §6), if this superblock names one. `sb` is the
+     * start of the sector that was read, so the header is in the same bytes. */
+    memset(&vol->root_mirror, 0, sizeof vol->root_mirror);
+    vol->root_mirror_said = false;
+    vol->root_primary_bad = 0;
+    {
+        const struct embk_mirror_header *mh =
+            (const struct embk_mirror_header *)((const uint8_t *)sb + EMBKFS_MIRROR_HEADER_OFFSET);
+        if (mh->magic == EMBKFS_MIRROR_HEADER_MAGIC &&
+            embk_crc32c((const uint8_t *)mh, 40, 0) == (uint32_t)mh->checksum &&
+            mh->root_mirror.block != 0 && mh->root_mirror.block < sb->total_blocks &&
+            mh->root_mirror.block != sb->root.block) {
+            vol->root_mirror = mh->root_mirror;
+            kprintf("EMBKFS: %s: root mirror at block %lu\n", dev->name,
+                    (unsigned long)vol->root_mirror.block);
+        } else {
+            kprintf("EMBKFS: %s: no root mirror (one bad block under the root loses the volume)\n",
+                    dev->name);
+        }
+    }
     vol->read_only    = read_only;
     vol->feature_incompat = sb->feature_incompat;
     vol->mounted      = true;
@@ -1896,9 +1970,9 @@ void embkfs_stat_get(struct embkfs_stat *out)
     *out = g_efs_stat;
 }
 
-int embkfs_read_node(struct embkfs_volume *vol,
-                     const struct embk_block_ptr *ptr,
-                     uint8_t *buf, size_t buf_size)
+static int embkfs_read_node_primary(struct embkfs_volume *vol,
+                                    const struct embk_block_ptr *ptr,
+                                    uint8_t *buf, size_t buf_size)
 {
     g_efs_stat.node_reads++;
     const char *name = vol->dev->name;
@@ -2020,6 +2094,69 @@ int embkfs_read_node(struct embkfs_volume *vol,
         return -EMBK_EINVAL;
     }
 
+    return EMBK_OK;
+}
+
+/* THE ROOT HAS A SECOND COPY (spec §6). Every lookup passes through the root,
+ * and on an HP ProBook one marginal flash block under it -- block 17 of a
+ * freshly written image -- made the whole root filesystem unreadable. So a
+ * read of the ROOT that fails, for any reason the primary reader rejects (I/O
+ * error, magic, self-checksum, Merkle link, generation), is served from the
+ * mirror, validated against the ROOT's pointer: the bytes are the root's, so
+ * they carry its checksum and generation and say they are its block. Nothing
+ * is written back to the failing block -- on the device that motivated this,
+ * a write near that page hung the device's own firmware -- and the next commit
+ * moves the root anyway. Any other node has one copy and gets no second chance. */
+int embkfs_read_node(struct embkfs_volume *vol,
+                     const struct embk_block_ptr *ptr,
+                     uint8_t *buf, size_t buf_size)
+{
+    /* ONCE THE PRIMARY HAS FAILED, STOP ASKING IT. The root is read on every
+     * lookup; a boot that served it from the mirror 273 times also logged the
+     * primary's failure 273 times -- and on the medium this is for, each of
+     * those failed reads is a 30-second timeout. A commit moves the root and
+     * clears this. */
+    bool skip_primary = (vol && ptr && vol->root_primary_bad &&
+                         ptr->block == vol->root_primary_bad &&
+                         ptr->block == vol->root.block && vol->root_mirror.block);
+    int rc = skip_primary ? -EMBK_EIO : embkfs_read_node_primary(vol, ptr, buf, buf_size);
+    if (rc == EMBK_OK) return rc;
+    if (!vol || !ptr || ptr->block != vol->root.block || vol->root_mirror.block == 0 ||
+        vol->root_mirror.block == ptr->block || vol->block_size > buf_size)
+        return rc;
+
+    const char *name = vol->dev->name;
+    uint64_t spb = vol->block_size / vol->dev->block_size;
+    uint64_t lba = vol->root_mirror.block * spb;
+    int mrc = embk_block_read(vol->dev, lba, spb, buf);
+    if (mrc != EMBK_OK) {
+        kprintf("EMBKFS: %s: root mirror at block %lu unreadable too: %s\n",
+                name, (unsigned long)vol->root_mirror.block, embk_strerror(mrc));
+        return rc;
+    }
+    const struct embk_node_header *h = (const struct embk_node_header *)buf;
+    uint32_t calc = embk_crc32c(buf + 8, vol->block_size - 8, 0);
+    if (h->magic != EMBKFS_NODE_MAGIC || (uint32_t)h->checksum != calc ||
+        (uint32_t)h->checksum != (uint32_t)ptr->checksum ||
+        h->generation != ptr->generation || h->block != ptr->block) {
+        kprintf("EMBKFS: %s: root mirror at block %lu does not match the root pointer "
+                "(magic %s, csum 0x%08X calc 0x%08X want 0x%08X, gen %lu want %lu, "
+                "says block %lu want %lu)\n",
+                name, (unsigned long)vol->root_mirror.block,
+                h->magic == EMBKFS_NODE_MAGIC ? "ok" : "BAD",
+                (unsigned)h->checksum, (unsigned)calc, (unsigned)ptr->checksum,
+                (unsigned long)h->generation, (unsigned long)ptr->generation,
+                (unsigned long)h->block, (unsigned long)ptr->block);
+        return rc;
+    }
+    if (!vol->root_mirror_said) {
+        vol->root_mirror_said = true;
+        kprintf("EMBKFS: %s: root node at block %lu could not be read (%s); using its "
+                "mirror at block %lu from now on -- the medium is failing there\n",
+                name, (unsigned long)ptr->block, embk_strerror(rc),
+                (unsigned long)vol->root_mirror.block);
+    }
+    vol->root_primary_bad = ptr->block;
     return EMBK_OK;
 }
 
@@ -2514,6 +2651,42 @@ static int embkfs_commit(struct embkfs_volume *vol,
 {
     const char *dev = vol->dev->name;
 
+    /* THE ROOT'S SECOND COPY (spec §6). Allocate a block, read the new root
+     * back (it was just written and is one block), write it there, and name
+     * it in the superblock below. A failure anywhere here is logged and the
+     * commit goes on WITHOUT a mirror: this is a safety net, never a reason a
+     * write fails. The block count is adjusted here because the callers
+     * computed new_free before this allocation existed; the previous mirror
+     * is released only once the new superblock is sealed, and directly --
+     * no snapshot ever references a mirror, so nothing holds it back. */
+    struct embk_block_ptr new_mirror; memset(&new_mirror, 0, sizeof new_mirror);
+    struct embk_block_ptr old_mirror = vol->root_mirror;
+    if (new_free > 0) {
+        uint64_t mb = 0;
+        if (embkfs_alloc_block_far(vol, &mb) == EMBK_OK) {
+            uint8_t *copy = kmalloc(vol->block_size);
+            uint64_t spb = vol->block_size / vol->dev->block_size;
+            int mrc = copy ? embk_block_read(vol->dev, new_root->block * spb, spb, copy)
+                           : -EMBK_ENOMEM;
+            if (mrc == EMBK_OK &&
+                (uint32_t)embk_crc32c(copy + 8, vol->block_size - 8, 0) != (uint32_t)new_root->checksum)
+                mrc = -EMBK_EINVAL;                /* the read-back is not the root we wrote */
+            if (mrc == EMBK_OK) mrc = embk_block_write(vol->dev, mb * spb, spb, copy);
+            if (copy) kfree(copy);
+            if (mrc == EMBK_OK) {
+                new_mirror.block = mb;
+                new_mirror.checksum = new_root->checksum;
+                new_mirror.generation = new_gen;
+                new_free -= 1;
+            } else {
+                kprintf("EMBKFS: %s: could not stage the root mirror at block %lu (%s) -- "
+                        "committing without one\n", dev, (unsigned long)mb, embk_strerror(mrc));
+                /* The block stays marked until the next mount rebuilds the
+                 * bitmap from the tree; one block, and only on this path. */
+            }
+        }
+    }
+
     /* BARRIER: force the whole new tree durable BEFORE the superblock that names
      * it. A drive's write-back cache can make writes durable out of issue order,
      * so issuing the superblock last is not enough; without this a power loss
@@ -2523,7 +2696,7 @@ static int embkfs_commit(struct embkfs_volume *vol,
 
     /* THE COMMIT: install a new superblock naming the new root, generation bumped.
      * Until this write lands, the old superblock still names the old tree. */
-    rc = embkfs_write_superblock(vol, new_root, new_gen, new_free);
+    rc = embkfs_write_superblock(vol, new_root, new_gen, new_free, &new_mirror);
     if (rc != EMBK_OK) { kprintf("EMBKFS: %s: commit failed: %s\n", dev, embk_strerror(rc)); return rc; }
 
     /* SEAL: flush again so the superblock itself is durable before we report
@@ -2534,6 +2707,15 @@ static int embkfs_commit(struct embkfs_volume *vol,
 
     vol->root        = *new_root;
     vol->generation  = new_gen;
+    vol->root_mirror = new_mirror;
+    vol->root_mirror_said = false;
+    vol->root_primary_bad = 0;       /* the root moved; the new block has not failed */
+    /* The previous mirror is now unreferenced by any superblock on disk. */
+    if (old_mirror.block && old_mirror.block != new_mirror.block &&
+        old_mirror.block < vol->total_blocks &&
+        embk_bm_test(vol->block_bitmap, old_mirror.block)) {
+        if (embkfs_free_run(vol, old_mirror.block, 1) == EMBK_OK) new_free += 1;
+    }
     vol->free_blocks = new_free;
     g_efs_stat.commits++;
     return EMBK_OK;
@@ -7707,6 +7889,10 @@ static int embkfs_bitmap_build(struct embkfs_volume *vol)
     vol->next_oid = 0;
     int rc = embkfs_mark_tree(vol, &vol->root);
     if (rc != EMBK_OK) return rc;
+    /* The root's mirror (spec §6) is not a node of the tree: mark it by hand,
+     * or the allocator hands it out and the copy is overwritten. */
+    if (vol->root_mirror.block && vol->root_mirror.block < vol->total_blocks)
+        embk_bm_set(vol->block_bitmap, vol->root_mirror.block);
 
     /* Also protect every retained snapshot's frozen tree (v2.2 Phase 5b) --
      * a block can be unreachable from the LIVE tree yet still be exactly

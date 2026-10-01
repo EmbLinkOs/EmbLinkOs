@@ -2878,6 +2878,15 @@ test-acpi: $(IMG) $(EMBKFS_MASTER)
 # A laptop's interrupt routing is the kind of thing that is wrong on a machine
 # nobody has booted before; the kernel falls back to polling and says so.
 # Proven here by masking the interrupt on purpose and typing.
+# DOES THE ROOT FILESYSTEM SURVIVE LOSING ITS ROOT NODE? One marginal flash
+# block under the tree's root made a ProBook's freshly written root volume
+# unreadable. The root has a mirror now (EMBKFS spec v2.3 section 6); three
+# boots prove it: healthy (mirror unused), root overwritten with garbage, and
+# an I/O error injected by blkdebug on the root's own sectors.
+.PHONY: test-root-mirror
+test-root-mirror: $(IMG) $(EMBKFS_MASTER)
+	@python3 tools/root_mirror_test.py || exit 1
+
 .PHONY: test-xhci-nointr
 test-xhci-nointr: $(IMG) $(EMBKFS_MASTER)
 	@python3 tools/xhci_nointr_test.py || exit 1

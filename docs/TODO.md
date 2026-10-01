@@ -7763,10 +7763,16 @@ returns bytes without error. The stick is not dead there; it is slow there.
       Expected if the stick still holds the previous image (the root node's
       bytes change with every build); a corruption if it holds this one. Which
       it is was not yet known when this was written.
-- [ ] **A single marginal page kills the volume.** The tree root is one block
-      with no replica; the superblock has a backup at the last block, the root
-      node does not. A second copy of the root, written at every commit, is the
-      obvious next step and is not done.
+- [x] **A single marginal page no longer kills the volume -- when it is under
+      the ROOT.** The root node has a byte-identical mirror (EMBKFS spec v2.3
+      section 6): mkfs writes it at `total_blocks - 2`, every commit writes the
+      new root twice and names the copy in the superblock at +320, mount marks
+      it used, and a root read that fails for any reason is served from it with
+      one line in the log. `make test-root-mirror` proves it three ways,
+      including blkdebug injecting an I/O error on the root's own sectors.
+- [ ] **An interior node or a leaf is still one copy.** The files under it go
+      with it. Duplicating all metadata (every node written twice, every
+      pointer carrying both) is the next step up and is not done.
 
 **With the real timeout, the ProBook reads everything and dies on its first write (2026-09-30, late)**
 
@@ -7826,4 +7832,16 @@ it.
       INTx line), and the keyboard works meanwhile. If it says nothing and the
       keyboard is still dead, enumeration is the suspect and the log's
       `xHCI slotN:` lines say which step.
+
+**The master `embkfs.img` is booted writable by several targets (noticed 2026-10-01)**
+
+- [ ] `run-embkfs-cow`, `run-embkfs-*` and the suites behind them attach
+      `embkfs.img` itself as the second IDE disk (Makefile around lines
+      2163-2531), so the kernel's boot-time commits land in the MASTER: after
+      one such run it sits at generation 2 with its root moved to block 6, and
+      the next `uefi-usb.img` packs that drifted image. `test-root-mirror`
+      noticed because the root it damaged was no longer block 17. Every such
+      target should copy the master to a scratch file first, as
+      `tools/usb_hotplug.py` and `tools/root_mirror_test.py` do; until then,
+      `rm -f embkfs.img && make` before building a stick image.
 

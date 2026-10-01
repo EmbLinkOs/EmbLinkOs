@@ -248,6 +248,35 @@ def parse_superblock_candidate(raw512):
     }
 
 
+def parse_mirror_header(raw512):
+    """The root-mirror header (v2.3.1, spec section 6) at +320, or None if absent/invalid."""
+    o = L.MIRROR_HEADER_OFFSET
+    if len(raw512) < o + L.MIRROR_HEADER_SIZE:
+        return None
+    magic, ptr32, csum = struct.unpack_from(L.MIRROR_HEADER_FMT, raw512, o)
+    if magic != L.EMBKFS_MIRROR_HEADER_MAGIC:
+        return None
+    if crc32c(raw512[o:o + 40]) != csum:
+        return None
+    block, bcsum, gen, _flags = struct.unpack(L.BLOCK_PTR_FMT, ptr32)
+    return {"block": block, "checksum": bcsum, "generation": gen}
+
+
+def check_root_mirror(img, raw512, root_block, total_blocks):
+    """The mirror must be byte-identical to the root node. Returns (ok, line)."""
+    mh = parse_mirror_header(raw512)
+    if mh is None:
+        return True, "root mirror     : none (pre-v2.3.1 image)"
+    b = mh["block"]
+    if not (0 < b < total_blocks) or b == root_block:
+        return False, f"root mirror     : FAIL -- header names block {b}"
+    bs = L.BLOCK_SIZE
+    same = img[root_block * bs:(root_block + 1) * bs] == img[b * bs:(b + 1) * bs]
+    if same:
+        return True, f"root mirror     : block {b} == block {root_block} byte for byte"
+    return False, f"root mirror     : block {b} DIFFERS from the root -- FAIL"
+
+
 def main(path, passphrase=None):
     with open(path, "rb") as f:
         img = f.read()
@@ -383,6 +412,10 @@ def main(path, passphrase=None):
 
     root_block, root_csum, root_gen, root_flags = struct.unpack(L.BLOCK_PTR_FMT, root_ptr)
     print(f"  root ptr -> block {root_block} (csum 0x{root_csum:08X}, gen {root_gen})")
+    mirror_ok, mirror_line = check_root_mirror(img, chosen["raw512"], root_block, total_blocks)
+    print("  " + mirror_line)
+    if not mirror_ok:
+        raise SystemExit("verify: the root mirror is wrong")
 
     # ---------------------------------------------------------------
     # 2. TREE — descend from the root, verifying every node + the routing
