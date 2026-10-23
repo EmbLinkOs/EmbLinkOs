@@ -110,13 +110,13 @@ NEWLIB_FLAGS = [
     a("user", "lib"), "-isystem", NEWLIB_INC,
 ] + TOOLCHAIN_INC
 
-# App LIBRARIES that live outside user/lib. user/bin/<app>.c is compiled with
+# App LIBRARIES that live outside user/lib. user/apps/<app>/<app>.c is compiled with
 # these roots by the Makefile, so clangd needs them too -- without them an app
 # that owns a subdirectory reads as a page of red in the editor while building
 # perfectly clean.
 APP_INC = [a("user", "note"), a("user", "web"), a("user", "web", "css")]
 
-USER_FLAGS = NEWLIB_FLAGS + UI_INC + APP_INC   # user/bin apps import the toolkit
+USER_FLAGS = NEWLIB_FLAGS + UI_INC + APP_INC   # user/apps programs import the toolkit
 UI_FLAGS = NEWLIB_FLAGS + UI_INC                # ui/ itself + its host tests
 SHELL_FLAGS = NEWLIB_FLAGS + [a("shell")]       # kernel-style: ONE root, qualified
 
@@ -134,16 +134,20 @@ def entries():
 
     add("kernel/**/*.c", KERNEL_FLAGS)
     add("shell/**/*.c", SHELL_FLAGS)
-    add("user/bin/*.c", USER_FLAGS)
+    # Every program directory, not just user/apps -- a test fixture and a tool
+    # are compiled with the same flags an app is, and clangd needs all of them.
+    for _d in ("apps", "system", "tools", "tests", "examples"):
+        add(f"user/{_d}/*/*.c", USER_FLAGS)
     add("user/lib/*.c", NEWLIB_FLAGS)
     add("user/note/*.c", NEWLIB_FLAGS + APP_INC)
     add("user/web/**/*.c", NEWLIB_FLAGS + UI_INC + APP_INC)
     add("ui/**/*.c", UI_FLAGS)
-    # C++ (user/bin/*.cc). Needs the C++ compiler as argv[0] so clangd infers
+    # C++ (a program directory's *.cc). Needs the C++ compiler as argv[0] so clangd infers
     # a C++ language mode and finds libstdc++'s headers -- with the C driver
     # it can't even resolve <string>.
     if os.path.isfile(CXX):
-        add("user/bin/*.cc", USER_FLAGS, cc=CXX)
+        for _d in ("apps", "system", "tools", "tests", "examples"):
+            add(f"user/{_d}/*/*.cc", USER_FLAGS, cc=CXX)
     return out
 
 

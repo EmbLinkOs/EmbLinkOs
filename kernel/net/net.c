@@ -18,6 +18,10 @@
  * so a caller does not depend on the background RX kthread being scheduled. */
 
 #include "net/net.h"
+#include "net/ntp.h"
+#if defined(__x86_64__)
+#include "net/usb_net.h"
+#endif
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"   /* process_create_kthread, schedule */
@@ -84,7 +88,7 @@ void net_lock(void) {
  * At the outermost hold (depth 1) this genuinely releases; a nested caller
  * (e.g. an ARP resolve inside a connect) stays held, which is brief and rare. */
 void net_yield(void) {
-    virtio_net_poll();     /* atomic drain under the held lock */
+    net_dev_poll();        /* atomic drain under the held lock */
     net_unlock();          /* release across the yield -- the anti-camping move */
     schedule();
     net_lock();            /* reacquire; the caller re-checks state next iteration */
@@ -192,7 +196,7 @@ void net_rx(const uint8_t *frame, uint32_t len) {
 static void net_rx_thread(void) {
     for (;;) {
         net_lock();
-        virtio_net_poll();          /* drain + deliver everything pending */
+        net_dev_poll();             /* drain + deliver everything pending */
         net_unlock();
         sched_lock();
         wait_queue_wake_all(&g_net_event_wq);   /* clients re-check their state */
@@ -200,12 +204,67 @@ static void net_rx_thread(void) {
     }
 }
 
+/* Every card this kernel can drive, in the order they are tried. */
+static const struct net_driver g_drivers[] = {
+    { "virtio-net", virtio_net_init, virtio_net_tx, virtio_net_poll, virtio_net_link },
+    /* igb BEFORE e1000: both match Intel ethernet parts, and the newer
+     * descriptor format is the specific case. e1000.c skips igb's device ids
+     * as well, so the ordering is a preference rather than the thing that
+     * keeps them apart. */
+    { "igb",        igb_init,        igb_tx,        igb_poll,        igb_link        },
+    { "e1000",      e1000_init,      e1000_tx,      e1000_poll,      e1000_link      },
+    { "i8255x",     i8255x_init,     i8255x_tx,     i8255x_poll,     i8255x_link     },
+    { "rtl8139",    rtl8139_init,    rtl8139_tx,    rtl8139_poll,    rtl8139_link    },
+    /* LAST ON PURPOSE. A USB adapter is the fallback, not the preference: a
+     * machine with a real NIC should use it, and the dongle is what you reach
+     * for when there is nothing else. It is also the only entry whose probe
+     * depends on something that happened EARLIER in boot -- usb_init has
+     * already enumerated by the time net_init runs, so `up` is a fact by then
+     * rather than a race. */
+#if defined(__x86_64__)
+    /* x86 ONLY, because the USB host controllers are. aarch64's machine has
+     * no UHCI/OHCI/EHCI/xHCI in this tree, so usb_core is not compiled there
+     * and neither is anything that calls into it -- the same per-architecture
+     * split audio.c's driver table makes, and for the same reason. */
+    { "usb-net",    usb_net_drv_init, usb_net_drv_tx, usb_net_drv_poll, usb_net_drv_link },
+#endif
+};
+static const struct net_driver *g_dev;
+
+int net_dev_tx(const void *frame, uint32_t len) {
+    return g_dev ? g_dev->tx(frame, len) : -1;
+}
+void net_dev_poll(void) {
+    if (g_dev) g_dev->poll();
+}
+const char *net_dev_name(void) { return g_dev ? g_dev->name : ""; }
+int net_dev_link(void) { return (g_dev && g_dev->link) ? g_dev->link() : -1; }
+
+/* The boot-time clock sync, off the boot path -- see the call site.
+ *
+ * It ENDS, unlike every other kthread in this system, and a kthread that ends
+ * has to say so: kthread_trampoline() does not handle a return, so falling off
+ * the end of this function jumps to whatever the poison pattern in a fresh
+ * kernel stack decodes as. Measured, the first time this was written without
+ * the line below: "RIP: 0xC5C5C5C5C5C5C5C5", a general protection fault
+ * moments after a perfectly successful sync. */
+static void net_ntp_boot_thread(void) {
+    if (!net_ntp_sync_default())
+        kprintf("ntp: no time server answered; keeping the hardware clock\n");
+    process_exit_self(0);
+}
+
 void net_init(void) {
     memset(&g_netif, 0, sizeof(g_netif));
-    if (!virtio_net_init(g_netif.mac)) {
+    g_dev = 0;
+    for (unsigned i = 0; i < sizeof g_drivers / sizeof g_drivers[0]; i++) {
+        if (g_drivers[i].init(g_netif.mac)) { g_dev = &g_drivers[i]; break; }
+    }
+    if (!g_dev) {
         kprintf("net: no NIC -- networking disabled\n");
         return;
     }
+    kprintf("net: using %s\n", g_dev->name);
     process_create_kthread(net_rx_thread, 0);   /* background RX poller */
     g_netif.up = true;
 
@@ -220,4 +279,20 @@ void net_init(void) {
         g_netif.gateway = IPV4(10, 0, 2, 2);
         kprintf("net: DHCP failed -- static 10.0.2.15/24 gw 10.0.2.2\n");
     }
+
+    /* AND ASK SOMETHING WHAT TIME IT IS. Every timestamp this system writes
+     * came from a CMOS chip with nothing to check itself against, and a clock
+     * that is years out cannot verify a certificate -- TLS refuses one that is
+     * not yet valid, so a wrong clock looks exactly like an attack.
+     *
+     * ON A THREAD, NOT HERE. Measured before it was: the gateway does not
+     * answer NTP under an emulator, so the first query waits out the stack's
+     * whole 3 s timeout, and resolving pool.ntp.org can spend another one --
+     * six seconds of a boot spent on an answer nothing is waiting for. The
+     * desktop does not need the date to come up, and a machine that boots
+     * slower to be right about the clock is not the trade anyone wants.
+     *
+     * Failure is not an error: a machine with no route to a time server keeps
+     * the clock it has, which is what it would have had anyway. */
+    process_create_kthread(net_ntp_boot_thread, 0);
 }

@@ -3,11 +3,15 @@
 #include "arch/x86_64/cpu/gdt.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/irq/lapic.h"
+#include "include/arch_ipi.h"
 #include "arch/x86_64/cpu/fpu.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "acpi/acpi.h"
 #include "process/process.h"
+#include "power/power.h"
+#include "arch/x86_64/cpu/cpu_features.h"   /* idle residency accounting */
+#include "drivers/timer/timer.h"
 #include "include/kprintf.h"
 #include "include/kstring.h"
 
@@ -60,6 +64,11 @@ void ap_main(void) {
      * bug, not a defensive measure -- reserved-bit double faults the first
      * time an AP ran a fresh kthread off its NX-mapped stack. */
     vmm_enable_nx_this_cpu();
+    /* SMEP/SMAP/UMIP are CR4, and CR4 is per core. An AP that skipped this
+     * would be the one soft spot in an otherwise hardened machine, with
+     * nothing to show for it -- the whole job of these bits is to be invisible
+     * while they are working. Same reasoning as EFER.NXE above. */
+    cpu_protection_init_this_cpu();
     vmm_pat_init_this_cpu();   // per-core, same reasoning as vmm_enable_nx_this_cpu()
                                // -- so a WC (vmm_map_mmio_wc) mapping resolves to
                                // Write-Combining on this AP too, not the reset WB.
@@ -69,8 +78,14 @@ void ap_main(void) {
                             // idle kthread's adoption below counts).
 
     gdt_init_this_cpu();
+    syscall_fast_init_this_cpu();   /* per core: the MSRs and this core's GS scratch */
     idt_load_this_cpu();
     lapic_init_this_cpu();
+
+    /* This core's IDT entries for the three IPI vectors. Done per core because
+     * a core that has not installed them takes an unhandled interrupt on the
+     * first shootdown -- and the sender has no way to notice. */
+    arch_ipi_init_this_cpu();
 
     struct cpu_data *me = this_cpu();
 
@@ -120,8 +135,77 @@ void ap_main(void) {
      * and back again later -- the same mechanism that already drives
      * preemption on the BSP, now running independently on every core. */
     for (;;) {
+        /* Bracketed for the idle accounting (kernel/power/power.h). This --
+         * NOT the per-core idle kthread -- is where an AP actually spends its
+         * time: the adopted boot thread is NORMAL priority and always
+         * runnable, so the PRIORITY_BACKGROUND idle kthread behind it is a
+         * liveness backstop that is never reached in practice. Instrumenting
+         * only the kthread reported 0% idle on a machine that was in fact
+         * halted on three of its four cores. */
+        /* Tickless, same as the idle kthread: nothing to preempt here, so
+         * arm for the next real deadline rather than the next quantum. */
+        sched_idle_enter();
+        timer_arm_this_cpu_ms(sched_idle_next_ms());
+
+        power_idle_enter();
         __asm__ volatile ("hlt");
+        power_idle_exit();
+
+        sched_idle_exit();
     }
+}
+
+/* Start ONE application processor: copy the trampoline, poke its three data
+ * slots, send the startup IPI, and wait for it to say it arrived.
+ *
+ * Factored out of smp_bringup because a CPU that is plugged in while the
+ * machine runs needs exactly this and nothing else -- and duplicating it
+ * would mean the hot-plug path drifting away from the boot path, which is
+ * the one place where two copies of a bring-up sequence would be worst. */
+static bool smp_start_one(struct cpu_data *ap) {
+    uint64_t trampoline_virt = P2V(AP_TRAMPOLINE_PHYS);
+
+    /* Fresh copy of the trampoline for every AP: the previous AP's own
+     * bring-up may have left the poked data slots pointing at ITS values.
+     * APs are started strictly one at a time, so reusing the one trampoline
+     * page between them is safe as long as each start re-copies first. */
+    memcpy((void *)trampoline_virt, ap_trampoline_blob_start, blob_size());
+    *AP_SLOT_PML4_PHYS(trampoline_virt)   = vmm_get_kernel_pml4();
+    *AP_SLOT_STACK_TOP(trampoline_virt)   = (uint64_t)(ap->rsp0_stack + sizeof(ap->rsp0_stack));
+    *AP_SLOT_ENTRY_POINT(trampoline_virt) = (uint64_t)(uintptr_t)ap_entry64;
+
+    lapic_start_ap(ap->apic_id, AP_TRAMPOLINE_PHYS);
+
+    /* Bounded wait, not indefinite: an AP that never reports in must not
+     * hang whoever started it. */
+    for (int spin = 0; spin < 2000000; spin++) {
+        if (ap->online) return true;
+        __asm__ volatile ("pause");
+    }
+    return false;
+}
+
+/* A CPU THAT WAS NOT IN THE MADT. Everything about starting it is the same;
+ * what is different is that it has no entry in the topology table, because
+ * that table was built from a list made before this processor existed. */
+bool smp_hotplug_cpu(uint8_t apic_id) {
+    struct cpu_data *existing = percpu_by_apic_id(apic_id);
+    if (existing) {
+        if (existing->online) return true;
+        return smp_start_one(existing);
+    }
+    struct cpu_data *ap = percpu_register_cpu(apic_id);
+    if (!ap) {
+        kprintf("smp: no room in the topology table for apic_id=%u\n",
+                (unsigned int)apic_id);
+        return false;
+    }
+    kprintf("smp: a processor appeared (apic_id=%u, index %u); starting it\n",
+            (unsigned int)apic_id, (unsigned int)ap->cpu_index);
+    bool ok = smp_start_one(ap);
+    if (!ok)
+        kprintf("smp: apic_id=%u did not come online\n", (unsigned int)apic_id);
+    return ok;
 }
 
 void smp_bringup(void) {
@@ -132,47 +216,26 @@ void smp_bringup(void) {
         return;
     }
 
-    uint64_t trampoline_virt = P2V(AP_TRAMPOLINE_PHYS);
-
     for (uint32_t i = 1; i < cpu_count; i++) {
         struct cpu_data *ap = &cpu_table[i];
 
-        /* Fresh copy of the trampoline for every AP: the previous AP's own
-         * bring-up may have left the poked data slots (and, in principle,
-         * self-modifying real-mode state) pointing at ITS values -- APs
-         * are started strictly one at a time (see the loop structure), so
-         * reusing the one trampoline page between them is safe as long as
-         * each iteration re-copies and re-pokes before its own SIPI. */
-        memcpy((void *)trampoline_virt, ap_trampoline_blob_start, blob_size());
-
-        *AP_SLOT_PML4_PHYS(trampoline_virt)   = vmm_get_kernel_pml4();
-        *AP_SLOT_STACK_TOP(trampoline_virt)   = (uint64_t)(ap->rsp0_stack + sizeof(ap->rsp0_stack));
-        *AP_SLOT_ENTRY_POINT(trampoline_virt) = (uint64_t)(uintptr_t)ap_entry64;
-
         kprintf("smp: starting AP apic_id=%u (index %u)...\n",
                 (unsigned int)ap->apic_id, (unsigned int)i);
-
-        lapic_start_ap(ap->apic_id, AP_TRAMPOLINE_PHYS);
-
-        /* Bounded wait, not indefinite: an AP that never reports in (wrong
-         * SIPI vector encoding, a bug in the trampoline, hardware that
-         * doesn't support MP bring-up the way this code assumes) must not
-         * hang the BSP's entire boot -- log it and move on to the next
-         * core rather than getting stuck forever. */
-        bool came_online = false;
-        for (int spin = 0; spin < 2000000; spin++) {
-            if (ap->online) {
-                came_online = true;
-                break;
-            }
-            __asm__ volatile ("pause");
-        }
-
-        if (!came_online) {
+        if (!smp_start_one(ap))
             kprintf("smp: AP apic_id=%u did NOT come online (timed out)\n",
                     (unsigned int)ap->apic_id);
-        }
     }
 
     kprintf("=== SMP bring-up done ===\n");
+}
+
+
+/* pmm.h's arch hook. The AP trampoline is already covered incidentally by
+ * pmm_init()'s blanket reservation of everything below kernel_end (which is
+ * always above 1 MB), but that is an accident of where that loop starts, not a
+ * deliberate low-memory carve-out. Reserving it explicitly means it stays
+ * reserved if that ever changes. */
+void arch_pmm_reserve_fixed(void)
+{
+    pmm_reserve_page(AP_TRAMPOLINE_PHYS);
 }

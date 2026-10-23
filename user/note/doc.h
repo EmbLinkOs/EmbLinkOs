@@ -25,6 +25,7 @@
 
 #include <stddef.h>
 #include "syntax.h"
+#include "edit.h"   /* struct ed_undo_state: the history lives with the document */
 
 #define DOC_MAX      8               /* documents open at once     */
 #define DOC_CAP      (256 * 1024)    /* bytes per document         */
@@ -38,6 +39,11 @@ struct doc {
     enum syn_lang lang;
     unsigned long saved_hash;          /* of the text as last read/written */
     int           truncated;           /* the file was larger than DOC_CAP */
+    /* THE UNDO HISTORY BELONGS HERE, not to the engine. The engine is re-bound
+     * on every tab switch and ed_init clears its arena, so a history kept only
+     * there did not survive a visit to another tab -- you came back and Ctrl+Z
+     * did nothing, with no sign that anything had been discarded. */
+    struct ed_undo_state undo;
 };
 
 void        doc_init(void);

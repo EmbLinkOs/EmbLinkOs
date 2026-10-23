@@ -75,7 +75,7 @@ MODULE_BUILDTYPE=static \
   CFLAGS="-mno-red-zone -fno-stack-protector -O2 -I$M/user/lib -isystem $NL/include \
           -DSSIZE_MAX=0x7fffffffffffffffL \
           -D_POSIX_TIMERS=200809L -D_POSIX_MONOTONIC_CLOCK=200809L" \
-  LDFLAGS="-static -nostartfiles -T $M/user/lib/newlib.ld -L$NL/lib $M/build/crt0.o $M/build/syscalls.o" \
+  LDFLAGS="-static -nostartfiles -T $M/user/lib/newlib.ld -L$M/user/lib -L$NL/lib $M/build/crt0.o $M/build/syscalls.o" \
   "$@" 2>&1 | tee cfg.log
 
 # --- POST-CONFIGURE: enable networking (the pip/git-over-HTTP foundation) -----

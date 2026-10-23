@@ -32,22 +32,21 @@ static const struct entry entries[MENU_ENTRY_COUNT] = {
  * OutputString calls when there is no real display). --- */
 static void ap(char *b, int *n, const char *s) { while (*s) b[(*n)++] = *s++; }
 
-static void ap_sgr(char *b, int *n, UINTN a) {
-    static const char fg[16][3] = {
-        "30","34","32","36","31","35","33","37",
-        "90","94","92","96","91","95","93","97" };
-    static const char bg[8][3] = { "40","44","42","46","41","45","43","47" };
-    b[(*n)++] = 0x1b; b[(*n)++] = '['; b[(*n)++] = '0'; b[(*n)++] = ';';
-    const char *f = fg[a & 0x0F];        b[(*n)++] = f[0]; b[(*n)++] = f[1]; b[(*n)++] = ';';
-    const char *g = bg[(a >> 4) & 0x07]; b[(*n)++] = g[0]; b[(*n)++] = g[1];
-    b[(*n)++] = 'm';
-}
+/* NO COLOUR, AND THAT IS A DECISION. This used to emit ANSI escapes, on the
+ * reasoning that OutputString passes ESC straight through to a terminal -- and
+ * under QEMU the terminal is a serial console that interprets them. A real
+ * machine's console is the firmware's GRAPHICS console, which does not: the
+ * first boot of the stick on a laptop-shaped machine drew "[0;36;40m" and
+ * "[2J[H" across the menu. The firmware's own SetAttribute/ClearScreen are not
+ * the fix either (console.c records why: OVMF's graphics console faults on
+ * them when there is no display). Plain text is correct on both. */
+static void ap_sgr(char *b, int *n, UINTN a) { (void)b; (void)n; (void)a; }
 
 static void draw(int sel, int countdown) {
     char b[1024];
     int n = 0;
 
-    ap(b, &n, "\x1b[2J\x1b[H");
+    ap(b, &n, "\n");
     ap_sgr(b, &n, EFI_CYAN);      ap(b, &n, "\n    EmbBoot\n");
     ap_sgr(b, &n, EFI_DARKGRAY);  ap(b, &n, "    -------\n\n");
 

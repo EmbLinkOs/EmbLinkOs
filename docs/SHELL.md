@@ -79,10 +79,195 @@ shell/
 ## 3. The grammar
 
 ```
-line     := "let" IDENT "=" expr | pipeline
+program  := sep* ( stmt ( sep+ stmt )* )? sep*
+sep      := NEWLINE | ";"
+stmt     := "let" IDENT "=" expr
+          | "if" expr block ( "else" ( block | if-stmt ) )?
+          | "while" expr block
+          | "for" IDENT "in" expr block
+          | "def" IDENT ( "(" IDENT ("," IDENT)* ")" )? block
+          | "break" | "continue" | "return" expr?
+          | pipeline
+block    := "{" program "}"
 pipeline := command ("|" command)*
-command  := IDENT expr*            (args end at '|', ')' or end of line)
+command  := IDENT expr*      (args end at '|', ')', '{', '}', ';', newline, EOF)
+expr     := ... | "$(" pipeline ")"      -- command substitution
 ```
+
+**A NEWLINE IS A TOKEN, not whitespace.** It separates statements everywhere
+except the three places a statement obviously continues: after a `|`, inside
+`$( )` and `( )`, and around a block's braces. `else` may also start the line
+after a closing `}`, because that is how people write it.
+
+**Why this exists at all.** The shell could always compose commands with `|`.
+It could not decide, repeat, or be extended — and with thirty builtins and
+fifty-odd programs and no way to branch, a user has eighty capabilities. With
+`if`, `while`, `for` and `def` they have as many as they are willing to write
+down, and can add one *without rebuilding the OS*. That is the difference
+between a launcher and a language.
+
+### Command substitution is `$(...)`, never `(...)`
+
+Plain parentheses group expressions. `(total)` would otherwise have to be a
+guess between "the bare word `total`" and "run the command `total`" — and a
+guess like that is wrong *silently*, in whichever direction it is made. `$` is
+already how this language says "a value from somewhere", so `$(ls /)` reads as
+what it is.
+
+```
+for row in $(ls /) { echo $row.name }
+let n = $(ls / | count)
+```
+
+### Defined commands are functions
+
+```
+def bigger-than(n) {
+    ls | where size > $n
+}
+
+bigger-than 1mb | count
+```
+
+- Arguments are **expressions, evaluated in the caller's scope**, bound to the
+  parameter names in a fresh child scope whose parent is the *top-level*
+  scope — not the caller's. A callee that forgot to declare something must not
+  be silently satisfied by a local of whoever called it.
+- Arity is checked. `one 1 2` where `one` takes one parameter is an error, not
+  a silently dropped argument.
+- The pipeline's input arrives as **`$in`**. A command that ignores it is a
+  source; one that uses it is a filter.
+- The result is the last statement's value, or whatever `return` carried — so
+  a definition composes into a pipeline like any other stage.
+- **A body's statements do not print.** A command is a function: its output is
+  its return value and the caller decides what happens to it. The cost is that
+  `def f { echo a; echo b }` yields only `b`; the benefit is that `f | count`
+  counts rows instead of printing them, which is the whole point of being able
+  to define one.
+
+### Name resolution
+
+```
+builtin  >  user command  >  external program
+```
+
+Builtins win because they are the language's own verbs — `where`, `select` and
+`sort-by` are as much a part of the grammar as `if` is, and a script that
+shadowed one would change the meaning of every pipeline that followed it,
+including ones its author never read. User commands beat programs on disk so
+that `def` genuinely extends the system.
+
+### Scripts
+
+```
+shell.elf path.esh        run a script file
+shell.elf -c "program"    run one program from the command line
+```
+
+A script is read and parsed **whole**, not line by line: a block spans lines
+and a line-at-a-time reader cannot see the end of one. A leading `#!` is
+skipped (and `#` already starts a comment, so it costs nothing).
+
+### File selection: `glob`
+
+```
+glob "*.c"                              -> a table, ls's shape
+glob "src/*.c" | where size > 1kb
+for f in $(glob "*.tmp") { rm $f.path }
+```
+
+A **table**, not a list of names, so every transform already written works on
+the result. Rows carry `path` as well as `name` — without it, every loop over a
+glob has to re-join the directory by hand and half of them get it wrong.
+
+`*` matches within one path component and `?` matches exactly one character.
+`*` deliberately does **not** cross `/`: a pattern that silently recursed would
+make `rm *.tmp` a very different command from the one it looks like. Recursive
+matching wants its own spelling and is not here yet. A wildcard is only allowed
+in the last component.
+
+A pattern that matches nothing yields an **empty table** — not an error, and
+not the pattern passed through as a literal filename, which is the single worst
+thing the Bourne shell does. `.` and `..` are never matched by a wildcard, only
+by naming them.
+
+### The vocabulary
+
+Control flow with nothing to compute is still not much. These are all *pure* —
+value in, value out, no OS — which is why they are covered by the host tests
+rather than only by a boot.
+
+| | |
+|---|---|
+| `sum` `avg` `min` `max` `[col]` | over a list, or a table column: `ls \| sum size` |
+| `range N` / `range A B` | half-open, so `range $n` has exactly n items |
+| `skip N` | `first`'s complement |
+| `uniq` | distinct list items, first occurrence wins |
+| `split SEP` / `join SEP` | text ↔ list |
+| `lines` | text → a list of lines |
+| `trim` `upper` `lower` | text maps |
+| `replace OLD NEW` | every occurrence, literal |
+
+The edge cases are the point, and each is pinned by a test:
+
+- **An empty aggregate is `null`, not zero.** `sum` of nothing being 0 is
+  defensible; `min` of nothing being 0 is a lie, and having the four agree is
+  worth more than the one convenient case.
+- **A null cell is skipped, not counted as zero** — a missing measurement is
+  not a measurement of zero, and averaging it as one drags the answer down.
+- **`split` keeps empty fields.** `"a,,b"` is three fields. A shell that
+  collapsed the middle one would corrupt every CSV it touched.
+- **`lines` produces no phantom last line** for the trailing newline every text
+  file ends with.
+- **A descending `range` is empty**, not reversed — a loop that should not run.
+- **`replace` scans forward** and does not re-scan what it wrote, so
+  `replace "aa" "b"` on `"aaa"` is `"ba"`.
+
+### Background jobs, and Ctrl-C
+
+```
+wget http://host/big.iso &      -> 1        (the job id)
+ls | where size > 1mb &         -> 2        (a BUILTIN pipeline, backgrounded)
+jobs                            -> a table: job, state, exit, cmd
+fg 1                            -> waits, and hands back { job, exit, cmd }
+```
+
+`&` backgrounds a statement by spawning **another shell** to run that
+statement's source text. Spawning the named program directly would only work
+for pipelines that are a single external command — builtins run *in this
+process*, and this process is busy being the shell. Re-parsing the source in a
+child costs a millisecond and makes backgrounding a property of any statement
+rather than a privilege external programs happen to have.
+
+`jobs` is a **table**, so it composes: `jobs | where state == "running" |
+count`. A finished job is shown once and then forgotten — keeping it forever
+fills the table, and dropping it the instant it exits would let a job finish
+between two prompts and leave no trace it ever ran.
+
+`fg N` waits for a job and returns its exit status. It is *not* "bring it to
+the foreground" in the terminal sense: there is no terminal ownership to
+transfer, because a background job here is a separate shell with its own
+stdio. It is named for what it gives.
+
+`$(cmd &)` is refused, and says why: a background job has no value yet.
+
+**Ctrl-C interrupts a running script.** While a program runs, ^C is aimed at
+the shell and *caught* rather than cancelling it; at the prompt it is handed
+back and arrives as the byte the line editor treats as "kill this line".
+
+This was impossible until the kernel grew a second channel. Cancellation is
+sticky and permanent — that is the property that makes it trustworthy, since a
+process cannot miss one by being between calls — so a shell that routed ^C at
+itself would take one keystroke and never read a line again. The kernel now
+has a **counted, clearable interrupt** alongside it (`embk_intr_catch`,
+`embk_intr_take`): opt in, and ^C increments a counter you take and clear, as
+many times as a human presses the key.
+
+Which is why `while` no longer has an iteration ceiling. It used to refuse
+after ten million passes, because `while true { }` could otherwise only be
+ended by resetting the machine, and the comment on it said *"remove this the
+day the shell can be interrupted, and not before"*. That day has come: a loop
+now runs exactly as long as it is asked to, and stops when someone asks it to.
 
 **Every command argument is an expression** — no command has a bespoke arg
 parser. `where`'s arg is the expr `size > 1mb`; `ls`'s arg is the bare word
@@ -278,7 +463,7 @@ The "Terminal" tile on home (or `run /term.elf`) opens an EmUI window
 hosting the shell. Live-verified: typing `ls` renders the table in the
 window.
 
-It is a deliberately **dumb byte terminal** (user/bin/term.c): it spawns
+It is a deliberately **dumb byte terminal** (user/apps/term/term.c): it spawns
 `/shell.elf` with fds 0/1/2 piped (INSTALL_OBJ both ways + fd_install_obj
 for its own ends), forwards keystrokes into the shell's stdin, and renders
 whatever comes back — the shell already does echo, backspace erase and the
@@ -351,6 +536,19 @@ Three gaps closed in one pass, all `test fd`-asserted live:
 
 - **Streaming stages** (`tail -f` shapes) — v1 materializes.
 - **Regex `=~`** — substring today.
+- **Stopping and resuming a job** (`^Z`, `bg`). `&`, `jobs`, `fg` and ^C into a
+  running script all work; what is missing is suspending something already
+  running and putting it back. That needs the kernel to be able to *stop* a
+  process rather than only interrupt or cancel it.
+- **Interrupting a background job.** ^C reaches the foreground only, and
+  `kill` takes a pid rather than a job id.
+- **Closures / commands as values.** `def` creates a name, not a value; a
+  command cannot yet be passed to another command.
+- **Early `return` from a script**, as distinct from from a command body —
+  today a top-level `return` sets the exit status and stops that block only.
 - **cwd / relative paths, env vars, Ctrl-C** — tracked in the libc/OS
-  roadmap (see the C++/Python/git plan), not shell-local.
-- **dup2-style fd aliasing** — named gap from Piece 0; nothing needs it yet.
+  roadmap, not shell-local.
+- ~~**dup2-style fd aliasing**~~ — the kernel has it now (`dup`, `dup2`,
+  `fcntl(F_DUPFD)` over a real shared open file description); the shell has
+  not yet grown the `<`/`>` syntax that would use it, because `save` and `cat`
+  already cover the cases and `>` is a comparison operator here.

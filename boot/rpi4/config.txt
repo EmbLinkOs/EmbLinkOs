@@ -1,0 +1,40 @@
+# EmbLinkOS on a Raspberry Pi 4 Model B -- docs/RPI4.md
+#
+# Read by the Pi's VideoCore firmware (start4.elf) from the FAT boot partition
+# before any ARM core runs. Every line here is a setting the kernel DEPENDS on;
+# none is a preference.
+
+# A 64-bit kernel, entered at EL2 on all four cores -- core 0 at the kernel,
+# cores 1-3 parked in the firmware's spin loop until the kernel releases them
+# (the device tree's spin-table enable-method; docs/RPI4.md P2).
+arm_64bit=1
+kernel=kernel8.img
+
+# Pinned, not defaulted: the kernel is LINKED at physical 0x80000
+# (kernel/arch/aarch64/board.h), and firmware releases have moved the default
+# load address for 64-bit kernels before.
+kernel_address=0x80000
+
+# The console. UART0 is the PL011, and by default the firmware gives it to the
+# Bluetooth module and puts the weaker mini-UART on GPIO 14/15. disable-bt
+# swaps it back, so pins 8 (TX) and 10 (RX) are the PL011 at 115200 8N1.
+enable_uart=1
+dtoverlay=disable-bt
+
+# The GIC-400 in place of the legacy BCM2836 interrupt controller. The default
+# on a Pi 4 today; stated because the kernel has no driver for the other one.
+enable_gic=1
+
+# The screen (docs/RPI4.md P0b): the kernel asks the firmware for a
+# framebuffer and draws its log on it, so a television is a debug console.
+# Use HDMI0, the micro-HDMI port next to the USB-C power socket.
+# hdmi_force_hotplug: drive HDMI even if the TV was off, or on another input,
+# when the Pi powered up -- otherwise the firmware decides there is no screen
+# and the kernel gets none. disable_overscan: the firmware's default black
+# border for old TVs would crop the first and last columns of the log.
+hdmi_force_hotplug=1
+disable_overscan=1
+
+# Uncomment to have the firmware log its own boot to the same UART -- the first
+# thing to turn on when kernel8.img prints nothing at all.
+#uart_2ndstage=1

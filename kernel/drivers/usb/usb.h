@@ -26,6 +26,16 @@ struct usb_controller {
     uint8_t max_ports;
     uint8_t devices_present;
     bool initialized;
+
+    /* HOT-PLUG. A controller that is only ever scanned once needs neither of
+     * these; a machine where somebody can push a stick into a socket needs a
+     * way back into the driver that owns that socket. `hc` is the driver's own
+     * instance (opaque here on purpose -- usb.c knows nothing about any
+     * controller's registers) and `rescan` is what compares the ports against
+     * what the device table remembers. NULL means this controller type has no
+     * hot-plug support yet, and it is skipped rather than guessed at. */
+    void *hc;
+    void (*rescan)(void *hc);
 };
 
 struct usb_setup_packet {
@@ -102,6 +112,14 @@ struct usb_endpoint_descriptor {
 
 void usb_init(void);
 void usb_poll(void);
+
+/* Look for ports that changed. Called from usb_poll() on a timer -- see usb.c
+ * on why polling and not the controllers' own change interrupts. */
+void usb_hotplug_poll(void);
+
+/* Force a rescan now, whatever the timer says. `test usbhotplug` uses it so
+ * the test does not have to sleep for the poll interval. */
+void usb_hotplug_scan_now(void);
 uint32_t usb_controller_count(void);
 const struct usb_controller *usb_get_controller(uint32_t index);
 

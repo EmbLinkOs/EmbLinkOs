@@ -56,6 +56,11 @@ struct embk_block_device {
 // The driver owns the struct's memory; the layer stores a pointer to it.
 int embk_block_register(struct embk_block_device *dev);
 
+/* Take a device back out: the medium is gone. Removes it from the table
+ * BEFORE anything else can look it up, and does not recycle its name. Returns
+ * -ENODEV if it was not registered. The driver still owns the struct. */
+int embk_block_unregister(struct embk_block_device *dev);
+
 // How many block devices are reistered?.
 uint32_t embk_block_count(void);
 

@@ -1,4 +1,5 @@
 #include "process/ksync.h"
+#include "include/arch_irq.h"
 #include "include/kprintf.h"
 #include "include/errno.h"   /* EMBK_ECANCELED for the interruptible acquires */
 
@@ -97,7 +98,7 @@ static int mutex_acquire(struct mutex *m, bool interruptible) {
     if (m->locked && m->owner == current_thread) {
         kprintf("KSYNC PANIC: mutex %p re-locked by its owner (self-deadlock)\n",
                 (void *)m);
-        for (;;) __asm__ volatile ("cli; hlt");   /* a hang here beats a hang nowhere */
+        arch_cpu_halt_forever();   /* a hang here beats a hang nowhere */
     }
 
     while (m->locked) {

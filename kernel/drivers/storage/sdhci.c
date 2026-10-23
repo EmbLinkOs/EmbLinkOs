@@ -1,0 +1,736 @@
+/* kernel/drivers/storage/sdhci.c -- the SD/eMMC host controller.
+ *
+ * This is the card reader in the side of a laptop, and on a great many ARM
+ * boards it is also where the machine BOOTS FROM. It is the first storage
+ * controller in this kernel that does not speak SCSI or ATA: an SD card is
+ * commanded with numbered commands and answers with a bit-packed register,
+ * and the host controller is a state machine you feed one command at a time.
+ *
+ * THE CARD IS NOT ADDRESSED THE SAME WAY DEPENDING ON ITS SIZE, and this is
+ * the single most common way to get an SD driver wrong. A standard-capacity
+ * card (<= 2 GB) takes a BYTE offset in the command argument. A high-capacity
+ * card (SDHC/SDXC, and every eMMC part) takes a BLOCK number. Sending a byte
+ * offset to an SDHC card reads block 0 of every request that fits in 512
+ * bytes, and sending a block number to an SDSC card reads 512 bytes from 512
+ * times too far in. Which one it is comes back in the OCR during
+ * initialisation and is recorded as `block_addressed`.
+ *
+ * Transfers here are PIO through the buffer data port, not DMA. That is slow
+ * -- 128 32-bit reads per block -- and it is deliberate: it removes the SDMA
+ * boundary rules and the ADMA descriptor table from the first version of a
+ * driver whose correctness is entirely in the command sequence. The DMA path
+ * is a later change to this file and to nothing else.
+ *
+ * eMMC differs from SD in exactly two places, both marked below: it is woken
+ * with CMD1 instead of ACMD41, and it is TOLD its relative address by CMD3
+ * instead of being asked for one. Everything after that is shared.
+ *
+ * TWO WAYS IN: over PCI (sdhci_init, a laptop's card reader) and at a fixed
+ * address found some other way (sdhci_attach_mmio -- a Raspberry Pi 4's SD
+ * slot, from the device tree: kernel/arch/aarch64/drivers/sdhci_dt.c). The
+ * second brings the two quirks that board needs, as flags; see sdhci.h.
+ */
+#include <stdint.h>
+#include <stddef.h>
+
+#include "include/types.h"
+#include "include/kprintf.h"
+#include "include/kstring.h"
+#include "include/errno.h"
+#include "drivers/bus/pci.h"
+#include "drivers/storage/sdhci.h"
+#include "block/block.h"
+#include "fs/automount.h"
+#include "mm/vmm.h"
+
+
+/* Register offsets, SD Host Controller Simplified Specification 3.00 §2.2. */
+#define SD_ARG2          0x00
+#define SD_BLOCK_SIZE    0x04   /* 16-bit; block count at +2                */
+#define SD_ARG1          0x08
+#define SD_XFER_MODE     0x0C   /* 16-bit; command at +2                    */
+#define SD_RESP0         0x10
+#define SD_BUFFER        0x20
+#define SD_PRESENT       0x24
+#define SD_HOST_CTL      0x28   /* 8-bit; power +1, block gap +2, wake +3   */
+#define SD_CLOCK_CTL     0x2C   /* 16-bit; timeout +2, soft reset +3        */
+#define SD_INT_STATUS    0x30   /* normal 16-bit; error status at +2        */
+#define SD_INT_ENABLE    0x34
+#define SD_SIGNAL_ENABLE 0x38
+#define SD_CAPS          0x40
+#define SD_VERSION       0xFE
+
+#define HOST_CTL_4BIT    (1u << 1)
+#define CMD_SET_BUS_WIDTH 6        /* ACMD6: SD only */
+
+#define PRESENT_CMD_INHIBIT   (1u << 0)
+#define PRESENT_DAT_INHIBIT   (1u << 1)
+#define PRESENT_BUF_WRITE_EN  (1u << 10)
+#define PRESENT_BUF_READ_EN   (1u << 11)
+#define PRESENT_CARD_INSERTED (1u << 16)
+
+#define INT_CMD_COMPLETE   (1u << 0)
+#define INT_XFER_COMPLETE  (1u << 1)
+#define INT_BUF_WRITE_RDY  (1u << 4)
+#define INT_BUF_READ_RDY   (1u << 5)
+#define INT_ERROR          (1u << 15)
+
+#define XFER_BLOCK_COUNT_EN (1u << 1)
+#define XFER_AUTO_CMD12     (1u << 2)
+#define XFER_DIR_READ       (1u << 4)
+#define XFER_MULTI_BLOCK    (1u << 5)
+
+/* Command register: index in bits 13:8, then the flags below. */
+#define CMD_RESP_NONE   0u
+#define CMD_RESP_136    1u
+#define CMD_RESP_48     2u
+#define CMD_RESP_48_BSY 3u
+#define CMD_CRC_CHECK   (1u << 3)
+#define CMD_INDEX_CHECK (1u << 4)
+#define CMD_DATA        (1u << 5)
+
+/* THE CHECK BITS BELONG TO THE RESPONSE TYPE, NOT TO ITS LENGTH.
+ *
+ * R1 and R3 are both 48 bits, and that is the only thing they have in common:
+ * R1 carries the command index and a CRC, and R3 -- which is how a card
+ * returns its OCR -- carries neither. A controller told to verify a CRC that
+ * was never sent reports a CRC error on a perfectly good answer, and the
+ * driver reads that as "no card". Likewise R2, which has a CRC but no index.
+ *
+ * So each response is named for what it IS and the bits travel with it. */
+#define RESP_NONE  (CMD_RESP_NONE)
+#define RESP_R1    (CMD_RESP_48     | CMD_CRC_CHECK | CMD_INDEX_CHECK)
+#define RESP_R1B   (CMD_RESP_48_BSY | CMD_CRC_CHECK | CMD_INDEX_CHECK)
+#define RESP_R2    (CMD_RESP_136    | CMD_CRC_CHECK)
+#define RESP_R3    (CMD_RESP_48)
+#define RESP_R6    RESP_R1
+#define RESP_R7    RESP_R1
+
+/* SD/MMC command indices, named. */
+#define CMD_GO_IDLE          0
+#define CMD_SEND_OP_COND     1    /* eMMC only */
+#define CMD_ALL_SEND_CID     2
+#define CMD_SEND_RELATIVE    3
+#define CMD_SELECT           7
+#define CMD_SEND_IF_COND     8
+#define CMD_SEND_CSD         9
+#define CMD_SET_BLOCKLEN    16
+#define CMD_READ_SINGLE     17
+#define CMD_READ_MULTI      18
+#define CMD_WRITE_SINGLE    24
+#define CMD_WRITE_MULTI     25
+#define CMD_SEND_EXT_CSD     8    /* eMMC: index 8 means something else here */
+#define CMD_APP_CMD         55
+#define ACMD_SD_SEND_OP_COND 41
+
+#define SDHCI_MAX_HOSTS 2
+#define SD_BLOCK_BYTES  512u
+
+struct sdhci_host {
+    bool used;
+    volatile uint8_t *regs;
+    uint32_t flags;             /* SDHCI_* from sdhci.h */
+    uint32_t base_khz;          /* the controller's base clock; 0 = unknown */
+    char     where[16];         /* a PCI host's bus:dev.fn, for the log */
+
+    /* SDHCI_32BIT_ONLY: the registers written together with the command,
+     * held until it is issued -- see w_sub(). */
+    uint32_t shadow_cmd, shadow_blk;
+    bool     cmd_shadowed, blk_shadowed;
+    uint16_t rca;               /* relative card address, in bits 31:16 of args */
+    bool block_addressed;       /* SDHC/SDXC/eMMC: the argument is a block number */
+    bool is_emmc;
+    uint64_t blocks;
+    struct embk_block_device blk;
+};
+static struct sdhci_host g_hosts[SDHCI_MAX_HOSTS];
+static uint32_t g_host_count;
+
+/* Set while the driver is asking a question it expects to be refused: "are
+ * you an SD card?" is answered by an eMMC part with a command timeout, and
+ * that is information, not a fault. Without this the log for a perfectly
+ * healthy eMMC opens with two error lines. */
+static bool g_probing; 
+
+static inline uint32_t r32(struct sdhci_host *h, uint32_t o) { return *(volatile uint32_t *)(h->regs + o); }
+static inline void w32(struct sdhci_host *h, uint32_t o, uint32_t v) { *(volatile uint32_t *)(h->regs + o) = v; }
+
+/* SDHCI_32BIT_ONLY -- a controller that implements only 32-bit register
+ * accesses (the Broadcom iProc core in a Raspberry Pi 4's SD slot). A byte or
+ * halfword write becomes read-modify-write of the aligned word, which is
+ * right for every register this driver touches EXCEPT two pairs:
+ *
+ *   * TRANSFER MODE (0x0C) and COMMAND (0x0E) share a word, and writing the
+ *     command half is what ISSUES the command. So a transfer-mode write cannot
+ *     go out alone -- by the time the command is written, the RMW would read
+ *     back a transfer mode the controller has already consumed or cleared. It
+ *     is held in a shadow and written in the same 32-bit store as the command.
+ *   * BLOCK SIZE and BLOCK COUNT (0x04) are held the same way and written just
+ *     before the command, as Linux's sdhci-iproc does.
+ *
+ * A command sent with no transfer-mode write since the last one goes out with
+ * transfer mode ZERO rather than a stale shadow: this driver, unlike Linux's
+ * core, only writes the mode before data commands. */
+static void w_sub(struct sdhci_host *h, uint32_t reg, uint32_t val, uint32_t width) {
+    uint32_t shift = (reg & 3u) * 8, word = reg & ~3u;
+    uint32_t mask  = (width == 1 ? 0xFFu : 0xFFFFu) << shift;
+    uint32_t old;
+
+    if (reg == SD_XFER_MODE + 2) {                 /* the command: flush both */
+        if (h->blk_shadowed) {
+            w32(h, SD_BLOCK_SIZE, h->shadow_blk);
+            h->blk_shadowed = false;
+        }
+        old = h->cmd_shadowed ? h->shadow_cmd : 0;
+        h->cmd_shadowed = false;
+    } else if (word == SD_BLOCK_SIZE && h->blk_shadowed) {
+        old = h->shadow_blk;
+    } else if (word == SD_XFER_MODE && h->cmd_shadowed) {
+        old = h->shadow_cmd;
+    } else {
+        old = r32(h, word);
+    }
+
+    uint32_t nv = (old & ~mask) | ((val << shift) & mask);
+    if (reg == SD_XFER_MODE)       { h->shadow_cmd = nv; h->cmd_shadowed = true; }
+    else if (word == SD_BLOCK_SIZE) { h->shadow_blk = nv; h->blk_shadowed = true; }
+    else                            w32(h, word, nv);
+}
+
+static inline uint8_t r8(struct sdhci_host *h, uint32_t o) {
+    if (h->flags & SDHCI_32BIT_ONLY)
+        return (uint8_t)(r32(h, o & ~3u) >> ((o & 3u) * 8));
+    return *(volatile uint8_t *)(h->regs + o);
+}
+static inline uint16_t r16(struct sdhci_host *h, uint32_t o) {
+    if (h->flags & SDHCI_32BIT_ONLY)
+        return (uint16_t)(r32(h, o & ~3u) >> ((o & 2u) * 8));
+    return *(volatile uint16_t *)(h->regs + o);
+}
+static inline void w8(struct sdhci_host *h, uint32_t o, uint8_t v) {
+    if (h->flags & SDHCI_32BIT_ONLY) { w_sub(h, o, v, 1); return; }
+    *(volatile uint8_t *)(h->regs + o) = v;
+}
+static inline void w16(struct sdhci_host *h, uint32_t o, uint16_t v) {
+    if (h->flags & SDHCI_32BIT_ONLY) { w_sub(h, o, v, 2); return; }
+    *(volatile uint16_t *)(h->regs + o) = v;
+}
+
+static void sd_complain_impl(struct sdhci_host *h, const char *what);
+#define sd_complain(h, what) sd_complain_impl((h), (what))
+
+static bool wait_bit_clear(struct sdhci_host *h, uint32_t reg, uint32_t mask) {
+    for (int i = 0; i < 1000000; i++) {
+        if (!(r32(h, reg) & mask)) return true;
+        __asm__ volatile("" ::: "memory");
+    }
+    return false;
+}
+
+/* Issue one command and wait for Command Complete. `resp_type` is one of the
+ * CMD_RESP_* values; `data` says whether a data transfer follows, which the
+ * controller needs told BEFORE the command goes out.
+ *
+ * BOTH INHIBIT BITS MUST BE CLEAR FIRST, and the second one is the one people
+ * forget: CMD inhibit says the command line is free, DAT inhibit says the
+ * previous transfer has finished with the data lines. Issuing a read while
+ * DAT is still busy is accepted by the controller and produces the previous
+ * block's data. */
+static bool sd_cmd(struct sdhci_host *h, uint8_t index, uint32_t arg,
+                   uint32_t resp, bool data) {
+    bool busy_resp = (resp & 3u) == CMD_RESP_48_BSY;
+    uint32_t inhibit = PRESENT_CMD_INHIBIT | ((busy_resp || data) ? PRESENT_DAT_INHIBIT : 0);
+    if (!wait_bit_clear(h, SD_PRESENT, inhibit)) {
+        kprintf("sdhci: controller stuck busy before CMD%u\n", index);
+        return false;
+    }
+
+    /* Clear the status bits we are about to wait on. A stale Command Complete
+     * from the previous command makes the next one appear to finish
+     * instantly, with whatever was in the response registers. */
+    w32(h, SD_INT_STATUS, 0xFFFFFFFFu);
+    w32(h, SD_ARG1, arg);
+
+    uint16_t cmd = (uint16_t)((uint32_t)index << 8) | (uint16_t)resp;
+    if (data) cmd |= CMD_DATA;
+    w16(h, SD_XFER_MODE + 2, cmd);
+
+    for (int i = 0; i < 1000000; i++) {
+        uint32_t st = r32(h, SD_INT_STATUS);
+        if (st & INT_ERROR) {
+            if (!g_probing)
+                kprintf("sdhci: CMD%u arg %08x -- error %04x, present %08x\n",
+                        index, (unsigned)arg, (unsigned)(st >> 16),
+                        (unsigned)r32(h, SD_PRESENT));
+            w32(h, SD_INT_STATUS, 0xFFFFFFFFu);
+            return false;
+        }
+        if (st & INT_CMD_COMPLETE) {
+            w32(h, SD_INT_STATUS, INT_CMD_COMPLETE);
+            return true;
+        }
+        __asm__ volatile("" ::: "memory");
+    }
+    return false;
+}
+
+/* PIO one block in or out. The controller raises Buffer Read/Write Ready per
+ * block, and the port is read 32 bits at a time regardless of bus width. */
+static void sd_complain_impl(struct sdhci_host *h, const char *what) {
+    /* WHAT THE CONTROLLER ACTUALLY SAID. A data path that fails silently is
+     * unfixable from outside; the two status words and the present-state
+     * register between them name every failure this driver can hit. */
+    kprintf("sdhci: %s -- status %04x error %04x present %08x\n", what,
+            (unsigned)(r32(h, SD_INT_STATUS) & 0xFFFFu),
+            (unsigned)(r32(h, SD_INT_STATUS) >> 16),
+            (unsigned)r32(h, SD_PRESENT));
+}
+
+static bool sd_pio_block(struct sdhci_host *h, uint8_t *buf, bool read) {
+    uint32_t want = read ? INT_BUF_READ_RDY : INT_BUF_WRITE_RDY;
+    for (int i = 0; i < 1000000; i++) {
+        uint32_t st = r32(h, SD_INT_STATUS);
+        if (st & INT_ERROR) { sd_complain(h, read ? "read block" : "write block"); return false; }
+        if (st & want) { w32(h, SD_INT_STATUS, want); goto ready; }
+        __asm__ volatile("" ::: "memory");
+    }
+    sd_complain(h, read ? "buffer never ready to read" : "buffer never ready to write");
+    return false;
+ready:
+    for (uint32_t i = 0; i < SD_BLOCK_BYTES / 4; i++) {
+        if (read) {
+            uint32_t v = r32(h, SD_BUFFER);
+            buf[i*4+0] = (uint8_t)v;       buf[i*4+1] = (uint8_t)(v >> 8);
+            buf[i*4+2] = (uint8_t)(v >> 16); buf[i*4+3] = (uint8_t)(v >> 24);
+        } else {
+            uint32_t v = (uint32_t)buf[i*4+0] | ((uint32_t)buf[i*4+1] << 8) |
+                         ((uint32_t)buf[i*4+2] << 16) | ((uint32_t)buf[i*4+3] << 24);
+            w32(h, SD_BUFFER, v);
+        }
+    }
+    return true;
+}
+
+static bool sd_transfer(struct sdhci_host *h, uint64_t lba, uint32_t count,
+                        void *buf, bool read) {
+    if (!count) return true;
+    uint8_t *p = buf;
+
+    w16(h, SD_BLOCK_SIZE, (uint16_t)SD_BLOCK_BYTES);
+    w16(h, SD_BLOCK_SIZE + 2, (uint16_t)count);
+
+    uint16_t mode = XFER_BLOCK_COUNT_EN;
+    if (read) mode |= XFER_DIR_READ;
+    /* A MULTI-BLOCK TRANSFER DOES NOT END BY ITSELF.
+     *
+     * CMD18 and CMD25 tell the card to keep streaming until it is STOPPED,
+     * with CMD12. The block-count register makes the controller stop moving
+     * bytes, which is not the same thing at all: the CARD is still in its
+     * sending-data state, waiting, and every command sent to it afterwards
+     * -- including the next read -- is answered with nothing. One four-block
+     * read wedges the card for the rest of the boot.
+     *
+     * Auto CMD12 is the controller issuing that stop for us, which is the
+     * whole reason the bit exists. This driver found out the hard way: single
+     * block reads worked perfectly, the first multi-block read succeeded, and
+     * then every subsequent command timed out with the card stuck mid-send.
+     * The QEMU trace naming the state was what found it -- the failure is
+     * entirely invisible from the controller's registers. */
+    if (count > 1) mode |= XFER_MULTI_BLOCK | XFER_AUTO_CMD12;
+    w16(h, SD_XFER_MODE, mode);
+
+    /* THE ARGUMENT'S UNIT depends on the card, not on the controller. */
+    uint32_t arg = h->block_addressed ? (uint32_t)lba
+                                      : (uint32_t)(lba * SD_BLOCK_BYTES);
+    uint8_t index = read ? (count > 1 ? CMD_READ_MULTI : CMD_READ_SINGLE)
+                         : (count > 1 ? CMD_WRITE_MULTI : CMD_WRITE_SINGLE);
+    if (!sd_cmd(h, index, arg, RESP_R1, true)) {
+        kprintf("sdhci: CMD%u (lba %llu, %u blocks) was refused\n",
+                index, (unsigned long long)lba, count);
+        return false;
+    }
+
+    for (uint32_t b = 0; b < count; b++)
+        if (!sd_pio_block(h, p + b * SD_BLOCK_BYTES, read)) return false;
+
+    for (int i = 0; i < 5000000; i++) {
+        uint32_t st = r32(h, SD_INT_STATUS);
+        if (st & INT_ERROR) { sd_complain(h, "transfer"); return false; }
+        if (st & INT_XFER_COMPLETE) { w32(h, SD_INT_STATUS, INT_XFER_COMPLETE); return true; }
+        __asm__ volatile("" ::: "memory");
+    }
+    sd_complain(h, "transfer never completed");
+    return false;
+}
+
+static int sd_blk_read(struct embk_block_device *d, uint64_t lba,
+                       uint32_t count, void *buf) {
+    struct sdhci_host *h = d->driver_data;
+    uint8_t *p = buf;
+    while (count) {
+        uint32_t n = count > 64 ? 64 : count;   /* bounded so one stall is bounded */
+        if (!sd_transfer(h, lba, n, p, true)) return -EMBK_EIO;
+        lba += n; count -= n; p += n * SD_BLOCK_BYTES;
+    }
+    return EMBK_OK;
+}
+static int sd_blk_write(struct embk_block_device *d, uint64_t lba,
+                        uint32_t count, const void *buf) {
+    struct sdhci_host *h = d->driver_data;
+    const uint8_t *p = buf;
+    while (count) {
+        uint32_t n = count > 64 ? 64 : count;
+        if (!sd_transfer(h, lba, n, (void *)(uintptr_t)p, false)) return -EMBK_EIO;
+        lba += n; count -= n; p += n * SD_BLOCK_BYTES;
+    }
+    return EMBK_OK;
+}
+
+/* The SD clock, at most `khz`.
+ *
+ * The divider's encoding depends on the controller's specification version:
+ * from 3.00 it is a 10-bit N (bits 15:8 low, 7:6 high) giving base / 2N; before
+ * that an 8-bit field that must be a power of two, giving base / 2x. With the
+ * base clock unknown the slowest setting is used -- right for initialisation
+ * (which must not exceed 400 kHz) and never raised, because "25 MHz" means
+ * nothing without knowing what is being divided. */
+static bool sd_set_clock(struct sdhci_host *h, uint32_t khz) {
+    bool v3 = (r16(h, SD_VERSION) & 0xFF) >= 2;
+    uint32_t n;
+    if (!h->base_khz)
+        n = v3 ? 1023 : 0x80;
+    else if (v3) {
+        n = (h->base_khz + 2 * khz - 1) / (2 * khz);
+        if (n > 1023) n = 1023;
+    } else {
+        n = 1;
+        while (n < 0x80 && h->base_khz / (2 * n) > khz) n <<= 1;
+    }
+
+    w16(h, SD_CLOCK_CTL, 0);                          /* off while it changes */
+    w16(h, SD_CLOCK_CTL, (uint16_t)(((n & 0xFFu) << 8) | (((n >> 8) & 3u) << 6) | 0x01u));
+    for (int i = 0; i < 1000000; i++) {
+        if (r16(h, SD_CLOCK_CTL) & 0x02) {            /* internal clock stable */
+            w16(h, SD_CLOCK_CTL, (uint16_t)(r16(h, SD_CLOCK_CTL) | 0x04u));  /* SD clock on */
+            return true;
+        }
+        __asm__ volatile("" ::: "memory");
+    }
+    kprintf("sdhci: internal clock never reported stable\n");
+    return false;
+}
+
+/* Reset, power and clock. The order is fixed by the specification and none of
+ * it is optional: a card clocked before it is powered never answers. */
+static bool sd_host_reset(struct sdhci_host *h) {
+    w8(h, SD_CLOCK_CTL + 3, 0x01);            /* software reset: all */
+    for (int i = 0; i < 1000000; i++) {
+        if (!(r8(h, SD_CLOCK_CTL + 3) & 0x01)) goto reset_done;
+        __asm__ volatile("" ::: "memory");
+    }
+    kprintf("sdhci: controller did not come out of reset\n");
+    return false;
+reset_done:;
+    h->cmd_shadowed = h->blk_shadowed = false;     /* reset cleared what they held */
+
+    /* Voltage: take the highest the controller says it supports. The bits are
+     * capabilities 26 (1.8V), 25 (3.0V), 24 (3.3V). */
+    uint32_t caps = r32(h, SD_CAPS);
+    /* Base clock, in MHz, in bits 15:8 (6 bits before spec 3.00). Zero means
+     * "ask the platform" -- the attach may already have been told. */
+    uint32_t mhz = (caps >> 8) & ((r16(h, SD_VERSION) & 0xFF) >= 2 ? 0xFFu : 0x3Fu);
+    if (mhz)
+        h->base_khz = mhz * 1000;
+    uint8_t power;
+    if (caps & (1u << 24))      power = (7u << 1);   /* 3.3V */
+    else if (caps & (1u << 25)) power = (6u << 1);   /* 3.0V */
+    else if (caps & (1u << 26)) power = (5u << 1);   /* 1.8V */
+    else { kprintf("sdhci: controller supports no voltage we can select\n"); return false; }
+    w8(h, SD_HOST_CTL + 1, (uint8_t)(power | 1u));   /* select, then bus power on */
+
+    /* Clock: initialisation must run at 400 kHz or less. Speed comes after
+     * the card is selected -- see sd_speed_up(). */
+    if (!sd_set_clock(h, 400))
+        return false;
+    w8(h, SD_CLOCK_CTL + 2, 0x0E);                                   /* timeout: max */
+
+    /* Enable every status bit. Not the SIGNAL enables -- this driver polls,
+     * and turning on signalling would route an interrupt nothing handles.
+     * The distinction between those two registers is exactly that. */
+    w32(h, SD_INT_ENABLE, 0xFFFFFFFFu);
+    w32(h, SD_SIGNAL_ENABLE, 0);
+    w32(h, SD_INT_STATUS, 0xFFFFFFFFu);
+    return true;
+}
+
+/* Wake the card and learn how it is addressed. Returns false if nothing
+ * answered. */
+static bool sd_card_init(struct sdhci_host *h) {
+    sd_cmd(h, CMD_GO_IDLE, 0, RESP_NONE, false);
+
+    /* Everything up to "which kind of card is this" is a question, and a `no`
+     * is an answer. */
+    g_probing = true;
+
+    /* CMD8 asks "do you understand 2.0 voltages?" with a check pattern that
+     * must come back unchanged. A card that ignores it is pre-2.0, which
+     * means standard capacity and byte addressing. */
+    bool v2 = sd_cmd(h, CMD_SEND_IF_COND, 0x000001AAu, RESP_R7, false)
+              && (r32(h, SD_RESP0) & 0xFFu) == 0xAAu;
+
+    uint32_t ocr = 0;
+    bool ready = false;
+    for (int attempt = 0; attempt < 2000 && !ready; attempt++) {
+        /* SD: CMD55 then ACMD41. eMMC: CMD1. The host does not know which it
+         * has until one of them answers, so SD is tried first and eMMC is the
+         * fallback -- an eMMC part does not implement CMD55 at all. */
+        if (!h->is_emmc) {
+            if (sd_cmd(h, CMD_APP_CMD, 0, RESP_R1, false) &&
+                sd_cmd(h, ACMD_SD_SEND_OP_COND,
+                       (v2 ? 0x40000000u : 0u) | 0x00FF8000u,
+                       RESP_R3, false)) {
+                ocr = r32(h, SD_RESP0);
+                if (ocr & 0x80000000u) ready = true;
+                continue;
+            }
+            if (attempt == 0) { h->is_emmc = true; continue; }   /* try eMMC */
+            g_probing = false;
+            return false;
+        }
+        if (!sd_cmd(h, CMD_SEND_OP_COND, 0x40FF8000u, RESP_R3, false)) {
+            g_probing = false;
+            return false;
+        }
+        ocr = r32(h, SD_RESP0);
+        if (ocr & 0x80000000u) ready = true;
+    }
+    g_probing = false;
+    if (!ready) { kprintf("sdhci: card never left the busy state\n"); return false; }
+
+    /* BIT 30 OF THE OCR IS THE WHOLE ADDRESSING QUESTION. Set means the card
+     * takes block numbers; clear means byte offsets. */
+    h->block_addressed = (ocr & 0x40000000u) != 0;
+
+    if (!sd_cmd(h, CMD_ALL_SEND_CID, 0, RESP_R2, false)) return false;
+
+    if (h->is_emmc) {
+        /* eMMC is TOLD its address; there is only ever one part on the bus. */
+        h->rca = 1;
+        if (!sd_cmd(h, CMD_SEND_RELATIVE, (uint32_t)h->rca << 16,
+                    RESP_R1, false)) return false;
+    } else {
+        if (!sd_cmd(h, CMD_SEND_RELATIVE, 0, RESP_R6, false)) return false;
+        h->rca = (uint16_t)(r32(h, SD_RESP0) >> 16);
+    }
+
+    if (!sd_cmd(h, CMD_SEND_CSD, (uint32_t)h->rca << 16, RESP_R2, false))
+        return false;
+
+    /* THE RESPONSE REGISTERS HOLD CSD[127:8], SHIFTED DOWN BY EIGHT -- the
+     * controller has already dropped the CRC byte. So CSD bit N is bit N-8 of
+     * the 120-bit value spread across RESP0..RESP3, and every field offset
+     * below is written in those terms rather than in the specification's. */
+    uint32_t r0 = r32(h, SD_RESP0), r1 = r32(h, SD_RESP0 + 4);
+    uint32_t r2 = r32(h, SD_RESP0 + 8), r3 = r32(h, SD_RESP0 + 12);
+    uint32_t csd_structure = (r3 >> 22) & 3u;          /* CSD[127:126] */
+
+    /* THE SAME TWO BITS MEAN DIFFERENT THINGS ON THE TWO KINDS OF CARD. On an
+     * SD card, 1 selects the version-2 capacity encoding. On eMMC it is the
+     * MMC specification version, and the capacity encoding is ALWAYS the
+     * classic three-field one -- reading an eMMC's CSD as if it were an SDHC
+     * card's produced a 64 MiB part that claimed to be a terabyte. */
+    if (h->is_emmc) csd_structure = 0;
+
+    if (csd_structure >= 1) {
+        /* Version 2: capacity is (C_SIZE + 1) * 512 KiB, flat. */
+        uint32_t c_size = (r1 >> 8) & 0x3FFFFFu;       /* CSD[69:48] */
+        h->blocks = ((uint64_t)c_size + 1) * 1024;
+    } else {
+        /* Version 1: the three-field product, and READ_BL_LEN can exceed 512
+         * on old cards -- which is why the block count is computed in bytes
+         * and divided, rather than assumed. */
+        uint32_t c_size = ((r2 & 0x3u) << 10) | ((r1 >> 22) & 0x3FFu);  /* CSD[73:62] */
+        uint32_t c_mult = ((r1 & 0x3u) << 1) | (r0 >> 31);              /* CSD[49:47] */
+        uint32_t read_bl_len = (r2 >> 8) & 0xFu;                        /* CSD[83:80] */
+        uint64_t bytes = ((uint64_t)c_size + 1) * (1ULL << (c_mult + 2))
+                         * (1ULL << read_bl_len);
+        h->blocks = bytes / SD_BLOCK_BYTES;
+    }
+
+    if (!sd_cmd(h, CMD_SELECT, (uint32_t)h->rca << 16, RESP_R1B, false))
+        return false;
+
+    /* eMMC: THE CSD SATURATES AND THE REAL SIZE IS SOMEWHERE ELSE.
+     *
+     * The classic capacity fields top out a little over 2 GiB, and every eMMC
+     * part larger than that reports the maximum C_SIZE (0xFFF) and puts its
+     * true sector count in the EXTENDED CSD -- a 512-byte register read like
+     * a data block, not like a response. A driver that trusts the CSD on a
+     * modern part gets exactly 2 GiB of a 64 GiB device, silently.
+     *
+     * The extended CSD also settles the addressing question: a part with a
+     * sector count in it is addressed by sector, whatever the OCR said. */
+    if (h->is_emmc) {
+        static uint8_t ext[SD_BLOCK_BYTES] __attribute__((aligned(64)));
+        w16(h, SD_BLOCK_SIZE, (uint16_t)SD_BLOCK_BYTES);
+        w16(h, SD_BLOCK_SIZE + 2, 1);
+        w16(h, SD_XFER_MODE, XFER_BLOCK_COUNT_EN | XFER_DIR_READ);
+        if (sd_cmd(h, CMD_SEND_EXT_CSD, 0, RESP_R1, true) &&
+            sd_pio_block(h, ext, true)) {
+            for (int i = 0; i < 5000000; i++) {
+                uint32_t st = r32(h, SD_INT_STATUS);
+                if (st & (INT_XFER_COMPLETE | INT_ERROR)) {
+                    w32(h, SD_INT_STATUS, INT_XFER_COMPLETE);
+                    break;
+                }
+                __asm__ volatile("" ::: "memory");
+            }
+            /* SEC_COUNT is a little-endian 32-bit count of 512-byte sectors
+             * at byte 212. */
+            uint32_t sec = (uint32_t)ext[212] | ((uint32_t)ext[213] << 8) |
+                           ((uint32_t)ext[214] << 16) | ((uint32_t)ext[215] << 24);
+            if (sec) {
+                h->blocks = sec;
+                h->block_addressed = true;
+            }
+        } else {
+            kprintf("sdhci: eMMC did not return its extended CSD; using the "
+                    "CSD's capacity, which saturates above 2 GiB\n");
+        }
+    }
+    /* A block-addressed card has a fixed 512-byte block and rejects CMD16;
+     * a byte-addressed one must be told. */
+    if (!h->block_addressed &&
+        !sd_cmd(h, CMD_SET_BLOCKLEN, SD_BLOCK_BYTES, RESP_R1, false))
+        return false;
+    return true;
+}
+
+/* After the card is selected: a 4-bit bus and default speed (25 MHz).
+ *
+ * THIS IS NOT AN OPTIMISATION ON REAL HARDWARE. Initialisation runs at
+ * 400 kHz on one data line -- about 50 KB/s -- and staying there makes a boot
+ * that reads a few megabytes of programs and fonts take minutes. QEMU does
+ * not model the clock at all, which is how a driver can pass every test at a
+ * speed no real card would tolerate. Each step is optional: a card that
+ * refuses the wide bus keeps the narrow one, and an unknown base clock keeps
+ * the slow clock, and both are said. */
+static void sd_speed_up(struct sdhci_host *h) {
+    bool wide = false;
+    if (!h->is_emmc &&
+        sd_cmd(h, CMD_APP_CMD, (uint32_t)h->rca << 16, RESP_R1, false) &&
+        sd_cmd(h, CMD_SET_BUS_WIDTH, 2, RESP_R1, false)) {        /* 2 = 4-bit */
+        w8(h, SD_HOST_CTL, (uint8_t)(r8(h, SD_HOST_CTL) | HOST_CTL_4BIT));
+        wide = true;
+    }
+    if (h->base_khz && sd_set_clock(h, 25000))
+        kprintf("sdhci: %s bus at up to 25 MHz (base clock %u MHz)\n",
+                wide ? "4-bit" : "1-bit", h->base_khz / 1000);
+    else
+        kprintf("sdhci: %s bus, base clock unknown -- staying at the "
+                "initialisation clock, which is SLOW\n", wide ? "4-bit" : "1-bit");
+}
+
+/* Bring up a controller whose registers are mapped at h->regs. */
+static bool sdhci_attach_regs(struct sdhci_host *h, const char *where) {
+    h->used = true;
+    if (!sd_host_reset(h)) { h->used = false; return false; }
+
+    /* THE CARD-DETECT LINE IS NOT WIRED ON EVERY BOARD. A Raspberry Pi 4's
+     * device tree says `broken-cd` for its SD slot -- the Pi boots from that
+     * card, so it is certainly there, and the present-state bit may still say
+     * otherwise. With SDHCI_BROKEN_CD the card is simply asked. */
+    if (!(h->flags & SDHCI_BROKEN_CD) &&
+        !(r32(h, SD_PRESENT) & PRESENT_CARD_INSERTED)) {
+        kprintf("sdhci: host controller v%u.%u at %s, no card\n",
+                (r16(h, SD_VERSION) & 0xFF) + 1, 0, where);
+        g_host_count++;
+        return true;                 /* the controller is up; the slot is empty */
+    }
+
+    if (!sd_card_init(h)) {
+        kprintf((h->flags & SDHCI_BROKEN_CD)
+                ? "sdhci: %s: no card answered (this slot has no card-detect line)\n"
+                : "sdhci: %s: card present but did not initialise\n", where);
+        h->used = false;
+        return false;
+    }
+    sd_speed_up(h);
+
+    h->blk.block_count = h->blocks;
+    h->blk.block_size  = SD_BLOCK_BYTES;
+    h->blk.read  = sd_blk_read;
+    h->blk.write = sd_blk_write;
+    h->blk.flush = NULL;
+    h->blk.driver_data = h;
+    h->blk.dma_max_phys = ~0ULL;      /* PIO: no controller DMA at all */
+    h->blk.needs_kernel_range = true;
+    if (embk_block_register(&h->blk) != EMBK_OK) { h->used = false; return false; }
+
+    kprintf("sdhci: %s = %s card at %s, %llu blocks x %u B (%llu MiB), %s addressing\n",
+            h->blk.name, h->is_emmc ? "eMMC" : "SD", where,
+            (unsigned long long)h->blocks, SD_BLOCK_BYTES,
+            (unsigned long long)((h->blocks * SD_BLOCK_BYTES) >> 20),
+            h->block_addressed ? "block" : "byte");
+    /* A card with a filesystem on it should be readable; automount handles
+     * the partition table, or its absence. */
+    automount_attach(&h->blk);
+    g_host_count++;
+    return true;
+}
+
+static bool sdhci_attach(const struct pci_device *pci) {
+    if (g_host_count >= SDHCI_MAX_HOSTS) return false;
+    struct sdhci_host *h = &g_hosts[g_host_count];
+    memset(h, 0, sizeof *h);
+
+    struct pci_bar bar = pci_read_bar(pci->bus, pci->device, pci->function, 0);
+    if (!bar.valid || !bar.is_mmio) {
+        kprintf("sdhci: %02x:%02x.%u has no MMIO BAR0\n",
+                pci->bus, pci->device, pci->function);
+        return false;
+    }
+    uint16_t cmdreg = pci_read16(pci->bus, pci->device, pci->function, PCI_COMMAND);
+    pci_write16(pci->bus, pci->device, pci->function, PCI_COMMAND,
+                (uint16_t)(cmdreg | 0x0006));   /* memory space + bus master */
+    h->regs = (volatile uint8_t *)(uintptr_t)vmm_map_mmio(bar.address, bar.size);
+    if (!h->regs) return false;
+
+    snprintf(h->where, sizeof h->where, "%02x:%02x.%u",
+             pci->bus, pci->device, pci->function);
+    return sdhci_attach_regs(h, h->where);
+}
+
+int sdhci_attach_mmio(uint64_t phys, uint64_t size, uint32_t flags,
+                      uint32_t base_khz, const char *where) {
+    if (g_host_count >= SDHCI_MAX_HOSTS) return -EMBK_ENOMEM;
+    struct sdhci_host *h = &g_hosts[g_host_count];
+    memset(h, 0, sizeof *h);
+    h->flags = flags;
+    h->base_khz = base_khz;          /* the capabilities register may override */
+    h->regs = (volatile uint8_t *)(uintptr_t)vmm_map_mmio(phys, size ? size : 0x100);
+    if (!h->regs) return -EMBK_ENOMEM;
+    return sdhci_attach_regs(h, where) ? EMBK_OK : -EMBK_EIO;
+}
+
+void sdhci_init(void) {
+    uint32_t n = pci_devices_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct pci_device *d = pci_get_device(i);
+        /* Class 08 subclass 05 is "SD Host controller". prog-if distinguishes
+         * the DMA variants and is not consulted: this driver is PIO either
+         * way, and refusing a DMA-capable controller for being DMA-capable
+         * would skip the only one QEMU has. */
+        if (!d || d->class_code != 0x08 || d->subclass != 0x05) continue;
+        sdhci_attach(d);
+    }
+}
+
+uint32_t sdhci_host_count(void) { return g_host_count; }
+bool sdhci_card_present(uint32_t idx) {
+    if (idx >= g_host_count) return false;
+    return (r32(&g_hosts[idx], SD_PRESENT) & PRESENT_CARD_INSERTED) != 0;
+}
+uint64_t sdhci_blocks(uint32_t idx) {
+    return idx < g_host_count ? g_hosts[idx].blocks : 0;
+}

@@ -26,6 +26,7 @@
 #include "sval/sval.h"
 #include "wire/wire.h"
 #include "embk.h"
+#include "exec.h"       /* jobs_adopt_stopped -- ^Z turns a command into a job */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -356,6 +357,37 @@ struct value extern_stage_run(const struct command *cmd, struct value input,
      * are the same event ("the child no longer owns the console"), after the
      * same reap -- which is why they sit together. */
     shell_tty_resume();
+
+    /* ^Z: IT STOPPED RATHER THAN FINISHED.
+     *
+     * The child is still there, frozen, holding its memory and its fds, and
+     * this handle is still the only name anyone has for it -- so it becomes a
+     * JOB, which is exactly what ^Z means. Dropping the handle here would
+     * strand a live process nothing could ever name again.
+     *
+     * Whatever it had already written is kept and returned: it is real output
+     * that really happened, and throwing it away because the command was
+     * paused afterwards would lose data on a keystroke. */
+    if (code == -EMBK_ESTOPPED) {
+        int id = jobs_adopt_stopped((int)child, cmd->name);
+        if (id < 0) {
+            /* The table is full and there is nowhere to remember it. Letting it
+             * run on unnamed would leak a process no one can reach, so it is
+             * resumed and left to finish on its own -- the honest recovery,
+             * and it is reported rather than hidden. */
+            (void)embk_resume((int)child);
+            (void)embk_wait((int)child);
+            value_free(&collected);
+            snprintf(msg, sizeof msg,
+                     "%s: stopped, but the job table is full -- resumed it",
+                     cmd->name);
+            return value_error(msg);
+        }
+        char note[96];
+        snprintf(note, sizeof note, "[%d] stopped  %s\n", id, cmd->name);
+        embk_puts(1, note);
+        return collected;
+    }
 
     if (rc < 0) {
         value_free(&collected);

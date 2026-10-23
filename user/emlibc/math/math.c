@@ -33,10 +33,28 @@ int __em_signbit(double x)  { di_t v; v.d = x; return (int)(v.u >> 63); }
 /* legacy finite() -- fdlibm's s_ldexp.c reaches for it. */
 int finite(double x)        { return __em_isfinite(x); }
 
-/* ---- hardware sqrt (exact); __ieee754_sqrt is what fdlibm's asin/acos/hypot call ---- */
+/* ---- hardware sqrt (exact); __ieee754_sqrt is what fdlibm's asin/acos/hypot call ----
+ *
+ * One instruction on both machines, and worth keeping as one: IEEE-754 defines
+ * sqrt as correctly rounded, so the hardware answer is THE answer and a
+ * software approximation would be strictly worse than what the CPU already
+ * does in a few cycles.
+ *
+ *   x86-64   sqrtsd / sqrtss, "x" constraint (an SSE register)
+ *   aarch64  fsqrt,           "w" constraint (an FP/SIMD register), with the
+ *            %d / %s modifiers naming the double and single VIEWS of it --
+ *            without them the operand prints as `v0` and the assembler
+ *            rejects it, because `fsqrt v0, v0` does not say what width. */
+#if defined(__x86_64__)
 double sqrt(double x)         { double r; __asm__ ("sqrtsd %1, %0" : "=x"(r) : "x"(x)); return r; }
-double __ieee754_sqrt(double x){ return sqrt(x); }
 float  sqrtf(float x)         { float  r; __asm__ ("sqrtss %1, %0" : "=x"(r) : "x"(x)); return r; }
+#elif defined(__aarch64__)
+double sqrt(double x)         { double r; __asm__ ("fsqrt %d0, %d1" : "=w"(r) : "w"(x)); return r; }
+float  sqrtf(float x)         { float  r; __asm__ ("fsqrt %s0, %s1" : "=w"(r) : "w"(x)); return r; }
+#else
+#error "emlibc math.c: no hardware sqrt for this architecture"
+#endif
+double __ieee754_sqrt(double x){ return sqrt(x); }
 
 /* ---- public wrappers over the fdlibm cores (no matherr) ---- */
 double exp(double x)             { return __ieee754_exp(x); }

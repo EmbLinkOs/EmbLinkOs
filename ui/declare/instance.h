@@ -38,6 +38,20 @@ struct instance {
     struct instance_handle self, parent, first_child, next_sibling;
 
     enum instance_kind kind;
+    /* WHICH WAY A CONTAINER STACKS, and part of its identity.
+     *
+     * Every container is INSTANCE_BOX, so before this a VStack and an HStack in
+     * the same slot MATCHED each other and the second reused the first's
+     * instance -- inheriting every box property the new one does not restate,
+     * because the shadow below only fires a mutation when a declared value
+     * DIFFERS. Files' empty-folder placeholder (a VStack with 32/24 padding)
+     * was reused as the first row of the grid (an HStack that sets none), and
+     * the listing drew 32 px down and 24 px right of where it belonged.
+     *
+     * 0 = a plain box or a leaf, 1 = column, 2 = row. Comparing it only ever
+     * makes matching STRICTER: the worst case is one extra destroy-and-create
+     * where two different containers really do trade places. */
+    uint8_t  box_axis;
     bool     has_explicit_key;
     uint64_t explicit_key;
 

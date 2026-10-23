@@ -6,8 +6,53 @@
 /* Install the timer IRQ handler (IRQ0 / PIT keeps running at BIOS default). */
 void timer_init(void);
 
+#if defined(__aarch64__)
+/* Bring THIS core's timer up: enable its PPI in its own redistributor and arm
+ * its comparator. The generic timer's control and compare registers are banked
+ * per core, so a secondary must do this for itself -- core 0 cannot do it on
+ * its behalf. Global setup (frequency, the device-tree interrupt, the handler)
+ * belongs to timer_init() and is done once. */
+void timer_init_this_cpu(void);
+void timer_arm_this_cpu(void);
+#endif
+
 /* Get the raw LAPIC 100-Hz tick count (used by the heartbeat loop). */
 uint64_t timer_get_ticks(void);
+
+/* Ticks of the timer that PREEMPTS -- the one the scheduler is driven by, and
+ * the clock every scheduling timestamp (born_tick, exit_tick) is measured in.
+ *
+ * Not the same thing as timer_get_ticks() and the difference is not cosmetic:
+ * on x86 those are two different devices. The legacy PIT drives IRQ0 and
+ * timer_get_ticks(); the LOCAL APIC timer drives preemption and is per-CPU. A
+ * scheduler timestamp taken from the wrong one is wrong by however much the
+ * two have drifted. On aarch64 there is one generic timer doing both jobs, so
+ * the two are equal -- which is exactly why this needed to be a named seam
+ * rather than an assumption that they always are. */
+uint64_t timer_sched_ticks(void);
+
+/* Arm THIS core's preemption timer to fire in `ms` milliseconds, one shot.
+ *
+ * The seam tickless idle is built on. A core with work to do arms the ordinary
+ * 10 ms quantum; a core about to halt arms for the next thing actually due --
+ * which is usually far away, and is why a machine doing nothing should not be
+ * woken a hundred times a second to confirm it.
+ *
+ * `ms` is clamped by the implementation to something the hardware counter can
+ * express. Both architectures already had a per-core one-shot underneath: the
+ * aarch64 generic timer is CNTV_CVAL, and the LAPIC is one-shot the moment the
+ * PERIODIC bit is cleared. */
+void timer_arm_this_cpu_ms(uint32_t ms);
+
+/* The scheduler quantum, in milliseconds -- what a core arms when it has work
+ * to run. One name for the number both the timer and the scheduler mean. */
+#define TIMER_QUANTUM_MS 10
+
+/* Busy-wait for `ms` milliseconds. For device bring-up sequences that have to
+ * observe a spec'd settle time before the scheduler exists (or while holding a
+ * lock that forbids sleeping). Was `pit_delay_ms` at every call site, which
+ * named an x86 device in code that only wanted a delay. */
+void timer_delay_ms(uint32_t ms);
 /* Monotonic milliseconds since boot (HPET where available, coarse ticks
  * otherwise). The clock both the ring-3 UI animator and the compositor's own
  * window motion run on. */

@@ -619,21 +619,65 @@ def build_btree(items, gen, first_block, forced_leaf_splits=None):
         leaf = build_leaf_block(gen, first_block, leaf_lists[0])
         return first_block, crc32c(leaf[8:]), [(first_block, leaf)], 1
 
-    if len(leaf_lists) > INTERNAL_SLOT_MAX:
-        raise ValueError(f"{len(leaf_lists)} leaves exceed one internal node "
-                         f"({INTERNAL_SLOT_MAX} slots); a level-2 tree is not "
-                         f"implemented -- add it here if an image ever needs it")
+    if len(leaf_lists) <= INTERNAL_SLOT_MAX:
+        meta_blocks, slots = [], []
+        leaf_block = first_block + 1                   # leaves live above the root
+        for il in leaf_lists:
+            leaf = build_leaf_block(gen, leaf_block, il)
+            leaf_csum = crc32c(leaf[8:])
+            meta_blocks.append((leaf_block, leaf))
+            # slot key = smallest key in that child's subtree = its first item's key
+            slots.append((il[0][0], L.pack_block_ptr(leaf_block, leaf_csum, gen)))
+            leaf_block += 1
+        root = build_internal_block(gen, first_block, level=1, slots=slots)
+        root_csum = crc32c(root[8:])
+        meta_blocks.insert(0, (first_block, root))
+        return first_block, root_csum, meta_blocks, len(meta_blocks)
 
-    meta_blocks, slots = [], []
-    leaf_block = first_block + 1                       # leaves live above the root
+    # --- more leaves than one internal node can route: grow a level ---------
+    #
+    # THE ROOT STAYS AT `first_block` WHATEVER THE HEIGHT. The superblock's
+    # root pointer is a fixed field written before this runs, so a taller tree
+    # may not move its root -- it grows DOWNWARD, with the level-1 nodes and
+    # then the leaves laid out after it.
+    #
+    # This used to be an explicit refusal ("a level-2 tree is not implemented
+    # -- add it here if an image ever needs it"). An image needed it: the
+    # master image passed 72 leaves as the build directory filled up, and
+    # every `make` failed with that message. The kernel's reader has always
+    # descended by the node's own level field and needed no change.
+    n_l1 = (len(leaf_lists) + INTERNAL_SLOT_MAX - 1) // INTERNAL_SLOT_MAX
+    if n_l1 > INTERNAL_SLOT_MAX:
+        raise ValueError(f"{len(leaf_lists)} leaves need {n_l1} level-1 nodes, "
+                         f"which exceeds one root ({INTERNAL_SLOT_MAX} slots); "
+                         f"a level-3 tree is not implemented -- add it here")
+
+    # Spread the leaves EVENLY rather than filling each node to the brim. A
+    # 72/1 split is legal and horrible: the second node exists to route one
+    # leaf, and the next leaf added rebalances the whole image.
+    per = (len(leaf_lists) + n_l1 - 1) // n_l1
+
+    meta_blocks = []
+    leaf_block = first_block + 1 + n_l1               # leaves after the L1 nodes
+    leaf_slots = []
     for il in leaf_lists:
         leaf = build_leaf_block(gen, leaf_block, il)
-        leaf_csum = crc32c(leaf[8:])
         meta_blocks.append((leaf_block, leaf))
-        # slot key = smallest key in that child's subtree = its first item's key
-        slots.append((il[0][0], L.pack_block_ptr(leaf_block, leaf_csum, gen)))
+        leaf_slots.append((il[0][0],
+                           L.pack_block_ptr(leaf_block, crc32c(leaf[8:]), gen)))
         leaf_block += 1
-    root = build_internal_block(gen, first_block, level=1, slots=slots)
+
+    l1_block = first_block + 1
+    root_slots = []
+    for i in range(0, len(leaf_slots), per):
+        group = leaf_slots[i:i + per]
+        node = build_internal_block(gen, l1_block, level=1, slots=group)
+        meta_blocks.append((l1_block, node))
+        root_slots.append((group[0][0],
+                           L.pack_block_ptr(l1_block, crc32c(node[8:]), gen)))
+        l1_block += 1
+
+    root = build_internal_block(gen, first_block, level=2, slots=root_slots)
     root_csum = crc32c(root[8:])
     meta_blocks.insert(0, (first_block, root))
     return first_block, root_csum, meta_blocks, len(meta_blocks)
@@ -659,6 +703,50 @@ def _read_file(path):
             return f.read()
     except FileNotFoundError:
         return None
+
+
+# Where DejaVu lives depends on the HOST, not on the OS we are building. The
+# Debian path was hard-coded here and returned None anywhere else -- and because
+# a missing font was skipped silently, the image built fine and then booted with
+# no text in any app ("home: FONT MISSING" on the serial console, nothing on
+# screen). That is the worst possible failure shape for a build asset, so this
+# searches the known locations and SAYS SO when it comes up empty.
+#
+#   Debian/Ubuntu  /usr/share/fonts/truetype/dejavu   (apt install fonts-dejavu)
+#   Arch/Fedora    /usr/share/fonts/{dejavu,TTF}
+#   macOS          ~/Library/Fonts, /Library/Fonts    (brew install --cask font-dejavu)
+#
+# Override with EMBK_FONT_DIR=/path/to/dir to use a font tree of your own.
+FONT_DIRS = [
+    os.environ.get("EMBK_FONT_DIR"),
+    "/usr/share/fonts/truetype/dejavu",     # Debian/Ubuntu
+    "/usr/share/fonts/dejavu",              # Fedora
+    "/usr/share/fonts/TTF",                 # Arch
+    os.path.expanduser("~/Library/Fonts"),  # macOS, per-user (brew cask)
+    "/Library/Fonts",                       # macOS, system-wide
+]
+
+_font_warned = set()
+
+
+def _read_font(name):
+    """Read a DejaVu face from wherever this host keeps it, or warn loudly."""
+    for d in FONT_DIRS:
+        if not d:
+            continue
+        blob = _read_file(os.path.join(d, name))
+        if blob is not None:
+            return blob
+    if name not in _font_warned:
+        _font_warned.add(name)
+        sys.stderr.write(
+            "\n*** mkfs_embkfs: %s NOT FOUND -- the image will have no text.\n"
+            "***   searched: %s\n"
+            "***   Debian/Ubuntu: sudo apt install fonts-dejavu\n"
+            "***   macOS:         brew install --cask font-dejavu\n"
+            "***   or set EMBK_FONT_DIR=/dir/containing/%s\n\n"
+            % (name, ", ".join(d for d in FONT_DIRS if d), name))
+    return None
 
 
 def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
@@ -700,7 +788,16 @@ def _tree_objects(host_dir: str, image_prefix: bytes, suffix: str = ""):
 # separately (fonts at root, fixtures at root -- they test the format, not the
 # layout).
 _SYSTEM_BIN = {"init.elf", "primtest.elf", "shell.elf", "home.elf",
-               "setup.elf", "login.elf"}   # -> /system/bin/
+               "setup.elf", "login.elf",
+               # A SERVICE, not an application: nothing launches filepanel from
+               # the dock, apps reach it through /run/emlink.files, and it is
+               # part of the system the way the desktop is. Sealed with them.
+               "filepanel.elf", "notifyd.elf",
+               # THE PASSWORD CHECKER for one session, started by init and
+               # never by a user: it is the only program in reach of a session
+               # that can read /etc/shadow, so it belongs with the system's
+               # own, not among the applications.
+               "authd.elf"}   # -> /system/bin/
 
 def _elf_dest(name: str) -> bytes:
     """Tree path (bytes, no leading slash) for a packed *.elf basename."""
@@ -709,11 +806,40 @@ def _elf_dest(name: str) -> bytes:
     return f"data/apps/{name[:-4]}/{name}".encode()          # every other app: /data/apps/<name>/
 
 
+
+# A program's metadata lives in the program's OWN directory now -- user/apps/,
+# user/system/, user/tools/, user/tests/ or user/examples/, one folder per
+# program -- rather than in one flat user/bin/. Only the NAME is known here (it
+# comes from the .elf), so the directory is searched rather than passed in. The
+# categories are deliberately not hardcoded anywhere else: moving a program
+# between them is moving its folder.
+_PROG_DIRS = ("user/apps", "user/system", "user/tools", "user/tests", "user/examples")
+
+def _prog_meta(base: str, ext: str) -> str:
+    """Path to <base>.<ext> beside the program's source, or a path that does not
+    exist (so the caller's _read_file returns None, as it always has).
+
+    A LAUNCHER ENTRY (.app) is only ever taken from user/apps/. The desktop
+    lists exactly the programs that ship one, and before the directories said
+    what a program is, the five toolkit reference demos shipped one too: a
+    third of the launcher of an OS meant to be used every day was "V4 Demo",
+    "Editor Demo", "Windows", "Menus" and "UI Demo". They are still built,
+    installed and runnable -- `run /data/apps/v4demo/v4demo.elf` -- and their
+    namespace and capability manifests are still packed so they run correctly
+    when started that way. They are just not presented as applications, because
+    they are not. Move one into user/apps/ and it is back on the desktop."""
+    dirs = ("user/apps",) if ext == "app" else _PROG_DIRS
+    for d in dirs:
+        p = f"{d}/{base}/{base}.{ext}"
+        if os.path.exists(p):
+            return p
+    return f"user/apps/{base}/{base}.{ext}"
+
 def discover_userland_objects(build_dir="build"):
     """Assemble the boot image's objects by DISCOVERING what's been built, placed
     into the docs/USERSPACE.md tree (see _elf_dest / the sealed-vs-mutable map
     above). Adding a new EmUI app still needs no mkfs edit -- drop
-    user/bin/foo.c in and foo.elf appears at the root; name it in _SYSTEM_BIN or
+    user/apps/foo/foo.c in and foo.elf appears at the root; name it in _SYSTEM_BIN or
     _APPS only if it belongs elsewhere. Returns a list of (name, dtype, mode,
     data); `name` may contain '/', and build_root_items creates the dirs.
       - system programs      -> /system/bin/
@@ -736,27 +862,34 @@ def discover_userland_objects(build_dir="build"):
             continue                                          # already added / staged elsewhere
         objects.append((_elf_dest(name), L.DT_REG, L.S_IFREG | 0o755, _read_file(elf)))
         # Per-app NAMESPACE MANIFEST (docs/USERSPACE_v2.md UP4): an app ships its
-        # declared namespace as user/bin/<name>.ns, packed beside its .elf as
+        # declared namespace as <progdir>/<name>.ns, packed beside its .elf as
         # /data/apps/<name>/<name>.ns. The session (home) reads it and grants
         # EXACTLY those bindings (absent => the app inherits the parent's view).
         base = name[:-4]                                      # strip ".elf"
-        nsm = _read_file(f"user/bin/{base}.ns")
-        if nsm is not None and _elf_dest(name).startswith(b"data/apps/"):
-            dest = f"data/apps/{base}/{base}.ns".encode()
+        #
+        # BESIDE THE BINARY, WHEREVER THAT IS. This used to pack manifests only
+        # for /data/apps, which silently dropped them for anything sealed under
+        # /system/bin -- and the first program that needed one there was the
+        # file panel, the single process whose authority matters most in the
+        # whole session. It spawned "full inherit (no manifest)".
+        elf_dir = _elf_dest(name).rsplit(b"/", 1)[0]
+        nsm = _read_file(_prog_meta(base, "ns"))
+        if nsm is not None:
+            dest = elf_dir + b"/" + base.encode() + b".ns"
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, nsm))
         # Per-app CAPABILITY MANIFEST: the other half of the same declaration
         # (user/lib/appauth.h). <name>.caps names the capability CLASSES the app
         # needs -- what it may DO, where the .ns says what it may NAME. The
         # session grants exactly that; the kernel refuses any mask that is not a
         # subset of the grantor's, so the file can only ever narrow.
-        capm = _read_file(f"user/bin/{base}.caps")
-        if capm is not None and _elf_dest(name).startswith(b"data/apps/"):
-            dest = f"data/apps/{base}/{base}.caps".encode()
+        capm = _read_file(_prog_meta(base, "caps"))
+        if capm is not None:
+            dest = elf_dir + b"/" + base.encode() + b".caps"
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, capm))
         # Per-app PRESENTATION MANIFEST: an app describes itself (display name +
-        # icon) in user/bin/<name>.app, packed as /data/apps/<name>/<name>.app.
+        # icon) in <progdir>/<name>.app, packed as /data/apps/<name>/<name>.app.
         # The desktop reads it instead of hard-coding each app's name and icon.
-        appm = _read_file(f"user/bin/{base}.app")
+        appm = _read_file(_prog_meta(base, "app"))
         if appm is not None and _elf_dest(name).startswith(b"data/apps/"):
             dest = f"data/apps/{base}/{base}.app".encode()
             objects.append((dest, L.DT_REG, L.S_IFREG | L.PERM_FILE, appm))
@@ -836,12 +969,12 @@ def discover_userland_objects(build_dir="build"):
     # UI fonts are part of the sealed OS, not root stragglers: they live under
     # /system/fonts (USERSPACE_v2 UP1 -- nothing at bare /). The EmUI runtime
     # (ui/dsl/em_app.c) and the explicit readers default to these paths.
-    font = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    font = _read_font("DejaVuSans.ttf")
     if font is not None:
         objects.append((b"system/fonts/font.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, font))
     # The terminal's MONOSPACE face (same DejaVu family, so the same
     # rasterizer tech) -- shell tables align only in fixed-pitch glyphs.
-    mono = _read_file("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+    mono = _read_font("DejaVuSansMono.ttf")
     if mono is not None:
         objects.append((b"system/fonts/mono.ttf", L.DT_REG, L.S_IFREG | L.PERM_FILE, mono))
     # Sealed visual assets used by full-screen system experiences (login/setup).
@@ -874,6 +1007,12 @@ def discover_userland_objects(build_dir="build"):
     # startup and a page never finishes loading without them -- which looks
     # exactly like a hung fetch, not a missing file.
     objects.extend(_tree_objects("system/netsurf", b"system/netsurf/", (".css", ".html")))
+    # LOADABLE KERNEL MODULES, under /system because they are part of the
+    # system and not the user's data -- and read-only to every session, which
+    # matters more here than anywhere else on the image: a writable path
+    # holding code the KERNEL will execute would undo every boundary the rest
+    # of this tree draws. Loading one is a kernel operation, not an app's.
+    objects.extend(_tree_objects("build/modules", b"system/modules/", (".ko",)))
     # THE ABI, sealed under /system/abi (docs/USERSPACE.md D2 §3.1): crt0.o
     # (_start), syscalls.o (the newlib retargeting layer) and libc.a ARE the
     # definition of "targeting EmbLinkOS". tcc READS them (read-only reach into
@@ -984,14 +1123,14 @@ def discover_userland_objects(build_dir="build"):
     # wall" coming down. The ui/ tree ships to /data/src/ui/ preserving its subdir
     # shape (the app's -I set mirrors it); clockw.c beside it.
     objects.extend(_tree_objects("ui", b"data/src/ui/", ".h"))
-    ck = _read_file("user/bin/clockw.c")
+    ck = _read_file("user/apps/clockw/clockw.c")
     if ck is not None:
         objects.append((b"data/src/ui/clockw.c", L.DT_REG, L.S_IFREG | L.PERM_FILE, ck))
     # ...and the MANIFEST that builds it: EmbBuild's first GUI target. Until
     # this shipped, "the OS rebuilds its userland" excluded the GUI -- first
     # because tcc could not link a libembk.so app at all, then, once it could,
     # because no manifest named one. `test embbuild gui` is the proof.
-    ckm = _read_file("user/bin/clockw.build.ebm")
+    ckm = _read_file("user/apps/clockw/clockw.build.ebm")
     if ckm is not None:
         objects.append((b"data/src/ui/build.ebm", L.DT_REG, L.S_IFREG | L.PERM_FILE, ckm))
 
@@ -1049,7 +1188,7 @@ def discover_userland_objects(build_dir="build"):
     # with embcc (against emlibc's headers + embcc's own freestanding stddef/
     # stdarg, NOT newlib), then link+emit with embld -- the whole artifact
     # produced by the owned toolchain on the metal. `test embcc embx` proves it.
-    app_c = _read_file("user/bin/emlibc_embxapp.c")
+    app_c = _read_file("user/tests/emlibc_embxapp/emlibc_embxapp.c")
     if app_c is not None:
         objects.append((b"data/src/emlibc/embxapp.c",
                         L.DT_REG, L.S_IFREG | L.PERM_FILE, app_c))
@@ -1069,7 +1208,7 @@ def discover_userland_objects(build_dir="build"):
                      ("user/emlibc/process/process.c",b"data/src/emlibc/process.c"),
                      ("user/lib/embk_syscall.h",      b"data/src/emlibc/include/embk_syscall.h"),
                      ("user/emlibc/math/math.c",      b"data/src/emlibc/math.c"),
-                     ("user/bin/mathself.c",          b"data/src/emlibc/mathself.c")):
+                     ("user/tests/mathself/mathself.c",          b"data/src/emlibc/mathself.c")):
         blob = _read_file(src)
         if blob is not None:
             objects.append((dst, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
@@ -1154,6 +1293,14 @@ def discover_userland_objects(build_dir="build"):
     # Empty user/scratch directories the layout commits to now (D4 §5, D3 §4.1),
     # so a session can chdir into a home and tcc has a scratch dir to write to.
     objects.append((b"data/tmp", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    # A MOUNT POINT HAS TO EXIST. /host is where a virtio-9p share from the
+    # development machine is mounted, and /media is where a USB stick lands.
+    # Mounting does not CREATE the name -- the VFS shadows a directory that is
+    # already there -- and anything that resolves a path component by
+    # component, ns_bind included, fails on a name the root filesystem has
+    # never heard of. An empty directory costs one inode.
+    objects.append((b"host",     L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"media",    L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"home",     L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     # ...and the dev user's home INSIDE it. init sets HOME=/home/<user> and the
     # terminal starts the shell there, so with only an empty /home the shell
@@ -1173,6 +1320,32 @@ def discover_userland_objects(build_dir="build"):
     objects.append((b"etc",      L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
     objects.append((b"etc/passwd", L.DT_REG, L.S_IFREG | 0o644, b""))
     objects.append((b"etc/shadow", L.DT_REG, L.S_IFREG | 0o600, b""))
+    # /etc/sessions: where a session's clamped namespace profile lives
+    # (user/system/init/init.c reads /etc/sessions/<user>.ns). The DIRECTORY has to be
+    # on the image even when it is empty, for the same reason .vellum above
+    # does: a namespace bind resolves its prefix in the parent at spawn time, so
+    # a directory that does not exist yet can never be granted and therefore can
+    # never be created by the process that needs it.
+    objects.append((b"etc/sessions", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+
+    # Per-user homes under /data/users. This is the multi-user boundary made
+    # real: a session is granted ITS OWN directory here and nothing else, so
+    # another user's home is not merely unreadable, it is UNNAMEABLE -- absence
+    # rather than a permission check.
+    #
+    # They must exist before anyone logs in, and for the bind reason above they
+    # cannot be created on demand by the session that wants one. Two of them,
+    # because one proves nothing: user/tests/primtest/primtest.c's mu_isolation_test runs
+    # as a confined `guest` and checks that it can write its own home AND that
+    # /data/users/teo does not resolve at all. With only one user on the image
+    # that second half is vacuous, and with neither it cannot spawn.
+    objects.append((b"data/users",       L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/guest", L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/teo",   L.DT_DIR, L.S_IFDIR | L.PERM_DIR, None))
+    objects.append((b"data/users/teo/user.ns", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+                    b"# teo's session profile -- the file a guest must not be able to name.\n"
+                    b"ro /system\n"
+                    b"rw /data/users/teo\n"))
     return objects
 
 
@@ -1425,6 +1598,16 @@ if __name__ == "__main__":
         out_path = sys.argv[2] if len(sys.argv) > 2 else "embkfs_encrypted.img"
         passphrase = (sys.argv[3] if len(sys.argv) > 3 else "correcthorsebattery").encode()
         make_encrypted_image(out_path, passphrase)
+    elif len(sys.argv) > 3 and sys.argv[1] == "--size-mib":
+        # A SMALL, REAL volume: mkfs_embkfs.py --size-mib <N> <path>. The
+        # standard image packs the whole userland (128 MB); the kernel's
+        # crash-consistency test wants a genuine fresh format it can copy into
+        # RAM a few hundred times, not a fixture and not 128 MB. One tiny file
+        # so the tree is not empty.
+        make_image(sys.argv[3], int(sys.argv[2]) << 20, objects=[
+            (b"readme.txt", L.DT_REG, L.S_IFREG | L.PERM_FILE,
+             b"a small real EMBKFS volume, made for the crash test\n"),
+        ])
     elif len(sys.argv) > 1:
         # Single-image mode: write one flat oracle image at the given path
         # (used by the Makefile to produce a second, independent EMBKFS

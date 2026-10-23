@@ -42,7 +42,13 @@ static void set_tss_descriptor(int index, struct tss *tss) {
 
 
 void tss_set_rsp0(uint64_t rsp0) {
-    this_cpu()->tss.rsp0 = rsp0;
+    struct cpu_data *me = this_cpu();
+    me->tss.rsp0 = rsp0;
+    /* The `syscall` entry switches stacks itself -- the instruction does not
+     * do it -- and reads the stack from gs:8. Same value, same moment: a
+     * scheduler switch that moved RSP0 and left this behind would land the
+     * next syscall on the PREVIOUS thread's kernel stack. */
+    me->sc.kstack_top = rsp0;
 }
 
 /* Shared by gdt_init_bsp() and gdt_init_this_cpu(): everything that must
@@ -78,6 +84,7 @@ static void gdt_load_and_set_tss(uint32_t cpu_index) {
 
     /* TSS: stacks grow DOWN, so RSP starts at the TOP of each buffer. */
     me->tss.rsp0 = (uint64_t)(me->rsp0_stack + sizeof(me->rsp0_stack));
+    me->sc.kstack_top = me->tss.rsp0;      /* the syscall stub's copy, see tss_set_rsp0 */
     me->tss.ist1 = (uint64_t)(me->df_stack + sizeof(me->df_stack));
     me->tss.iomap_base = sizeof(struct tss); // No I/O permission bitmap
 

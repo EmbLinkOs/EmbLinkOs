@@ -20,29 +20,172 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include "embk.h"
 
-#define OSCFG_PATH "/data/settings.conf"
+/* WHERE THE FILE LIVES, resolved once, from the environment.
+ *
+ * It used to be a fixed /data/settings.conf, and NO SESSION COULD REACH IT. A
+ * session's namespace is `ro /system, ro /data/apps, rw /home/<user>, rw /run`
+ * -- /data/settings.conf is in none of those -- so every oscfg_load() in the
+ * desktop opened it, got -ENOENT, and silently used defaults. Measured, in the
+ * shell, once per poll for the life of the machine:
+ *
+ *     home: cfg open=-2 wp=0 accent=0 dock=38
+ *
+ * The accent, the theme, the interface size, the dock size, the indicator
+ * dots, the keyboard layout the shell re-applies at login: none of them had
+ * ever been worn by the desktop. Settings wrote the file, and the only process
+ * that could read it back was one started from the kernel console, which has
+ * no namespace at all. That is why this looked like it worked.
+ *
+ * The user's own directory is where a per-user preference belongs, and
+ * /home/<user> is ALREADY writable by that user's session -- so this is a fix
+ * that needs no widening of the namespace policy, which is the kind of fix to
+ * prefer when the alternative is punching a hole for one filename.
+ *
+ * The old path remains as the fallback for a process with no HOME: the kernel
+ * console's `run`, and the image-build tools. */
+#define OSCFG_FALLBACK "/data/settings.conf"
+static inline const char *oscfg_path(void) {
+    static char p[192];
+    if (!p[0]) {
+        const char *h = getenv("HOME");
+        if (h && h[0]) snprintf(p, sizeof p, "%s/settings.conf", h);
+        else            snprintf(p, sizeof p, "%s", OSCFG_FALLBACK);
+    }
+    return p;
+}
 
 /* The accents are named rather than free RGB: a palette a designer chose beats
  * a colour wheel a user fights, and every one of these is checked against the
  * dark ground the shell actually uses. */
-#define OSCFG_ACCENTS 5
+#define OSCFG_ACCENTS 8
 struct oscfg_accent { const char *name; float r, g, b; };
+/* APPENDED TO, NEVER REORDERED. The file stores an INDEX, so moving an entry
+ * silently repaints somebody's desktop a different colour the next time they
+ * boot. New colours go on the end. */
 static const struct oscfg_accent oscfg_accents[OSCFG_ACCENTS] = {
     { "Indigo",  0.42f, 0.45f, 0.94f },
     { "Teal",    0.16f, 0.68f, 0.63f },
     { "Amber",   0.92f, 0.66f, 0.20f },
     { "Rose",    0.90f, 0.36f, 0.48f },
     { "Violet",  0.65f, 0.42f, 0.92f },
+    { "Blue",    0.20f, 0.55f, 0.96f },
+    { "Green",   0.24f, 0.72f, 0.39f },
+    { "Coral",   0.96f, 0.44f, 0.31f },
 };
+
+/* THE DESKTOP PICTURE. A path and a name, in one place, because the shell draws
+ * it and Settings offers it and they must agree on the list -- a picker that
+ * offers a file the desktop cannot find is a preference that silently does
+ * nothing. Appended to, never reordered, for the same reason as the accents. */
+#define OSCFG_WALLPAPERS 8
+#define OSCFG_WALLPAPER_PICTURES 4      /* the first N are files; the rest are drawn */
+struct oscfg_wallpaper {
+    const char *path;       /* NULL => a gradient the desktop DRAWS, see below */
+    const char *label;
+    float a[3], b[3], c[3]; /* three gradient stops, when path is NULL */
+    float angle;            /* degrees */
+};
+/* PICTURES AND COLOURS, in one list, because to the person choosing there is
+ * only one question. The colours are drawn rather than shipped: a 1600x1000
+ * PPM is 4.8 MB and a gradient is nine floats, so the choice costs nothing on
+ * an image that has to fit on a real machine. The renderer has had linear
+ * gradients all along; nothing here needed inventing, only using. */
+static const struct oscfg_wallpaper oscfg_wallpapers[OSCFG_WALLPAPERS] = {
+    { "/system/images/colibri-user.ppm",             "Graphite" },
+    { "/system/images/hummingbird-wallpaper.ppm",    "Night"    },
+    { "/system/images/hummingbird-wallpaper-v2.ppm", "Dusk"     },
+    { "/system/images/login-wallpaper.ppm",          "Aurora"   },
+    { 0, "Indigo", { .09f,.10f,.22f }, { .20f,.18f,.46f }, { .05f,.05f,.12f }, 160.f },
+    { 0, "Ember",  { .16f,.06f,.12f }, { .46f,.16f,.18f }, { .09f,.04f,.08f }, 150.f },
+    { 0, "Pine",   { .04f,.14f,.13f }, { .09f,.30f,.26f }, { .03f,.07f,.08f }, 155.f },
+    { 0, "Slate",  { .07f,.08f,.09f }, { .17f,.19f,.22f }, { .04f,.04f,.05f }, 165.f },
+};
+
+/* THE KEYBOARD LAYOUTS THE KERNEL KNOWS, by the names its driver answers to.
+ * An index rather than a string because this file's format is `key value` with
+ * integer values, and because a user picks from a list -- there is no useful
+ * layout you could type here that the driver would accept. */
+#define OSCFG_KEYMAPS 3
+struct oscfg_keymap { const char *name; const char *label; };
+static const struct oscfg_keymap oscfg_keymaps[OSCFG_KEYMAPS] = {
+    { "us",     "QWERTY (US)" },
+    { "azerty", "AZERTY (French)" },
+    { "dvorak", "Dvorak" },
+};
+
+/* WHAT TIME IT IS HERE, as opposed to what time it is.
+ *
+ * The kernel's clock is UTC and stays UTC -- every timestamp on disk, every
+ * inode, every log line. That is the right thing for a filesystem and the
+ * wrong thing for a person, who wants the menu bar to agree with the clock on
+ * their wall.
+ *
+ * A POSIX TZ STRING, NOT AN OLSON NAME. "Europe/Paris" is a lookup into a
+ * database of every rule change since 1970 -- megabytes of it, revised several
+ * times a year, needing a path in every namespace that wants a date. The TZ
+ * string carries the rule itself: the offset, the abbreviation, and when
+ * summer time starts and ends, in thirty characters that libc already knows
+ * how to read. What it cannot do is tell you what the rule was in 1974, which
+ * matters for a calendar application and does not matter for a clock.
+ *
+ * So the labels here name CITIES and the strings carry RULES, and the pair is
+ * what a person picks from. Appended to, never reordered: the file stores an
+ * index, and moving an entry moves somebody's clock. */
+#define OSCFG_TIMEZONES 20
+/* THE GROUP IS NOT DECORATION. Twenty entries do not fit in a dropdown that is
+ * clipped by the window it opens in -- measured, the list ended at Athens and
+ * the last eight zones could not be picked at all. So the picker asks two
+ * questions, and this is the first one. */
+#define OSCFG_TZ_GROUPS 3
+static const char *const oscfg_tz_group_names[OSCFG_TZ_GROUPS] = {
+    "Americas", "Europe & Africa", "Asia & Pacific"
+};
+struct oscfg_timezone { const char *label; const char *tz; int group; };
+static const struct oscfg_timezone oscfg_timezones[OSCFG_TIMEZONES] = {
+    /* Index 0 is UTC and is the default: a machine that has never been told
+     * where it is should say so rather than guess a continent. */
+    { "UTC",                     "UTC0", 1 },
+    { "Honolulu",                "HST10", 0 },
+    { "Los Angeles \xc2\xb7 Vancouver", "PST8PDT,M3.2.0,M11.1.0", 0 },
+    { "Denver \xc2\xb7 Phoenix",        "MST7MDT,M3.2.0,M11.1.0", 0 },
+    { "Chicago \xc2\xb7 Mexico City",   "CST6CDT,M3.2.0,M11.1.0", 0 },
+    { "New York \xc2\xb7 Toronto",      "EST5EDT,M3.2.0,M11.1.0", 0 },
+    { "S\xc3\xa3o Paulo",               "BRT3", 0 },
+    { "London \xc2\xb7 Dublin \xc2\xb7 Lisbon", "GMT0BST,M3.5.0/1,M10.5.0/2", 1 },
+    { "Lagos \xc2\xb7 Algiers",         "WAT-1", 1 },
+    { "Paris \xc2\xb7 Berlin \xc2\xb7 Madrid", "CET-1CEST,M3.5.0,M10.5.0/3", 1 },
+    { "Johannesburg \xc2\xb7 Cairo",    "SAST-2", 1 },
+    { "Athens \xc2\xb7 Helsinki",       "EET-2EEST,M3.5.0/3,M10.5.0/4", 1 },
+    { "Moscow \xc2\xb7 Istanbul",       "MSK-3", 1 },
+    { "Dubai",                   "GST-4", 2 },
+    { "Karachi",                 "PKT-5", 2 },
+    { "Mumbai \xc2\xb7 Delhi",          "IST-5:30", 2 },
+    { "Bangkok \xc2\xb7 Jakarta",       "WIB-7", 2 },
+    { "Beijing \xc2\xb7 Singapore",     "CST-8", 2 },
+    { "Tokyo \xc2\xb7 Seoul",           "JST-9", 2 },
+    { "Sydney \xc2\xb7 Melbourne",      "AEST-10AEDT,M10.1.0,M4.1.0/3", 2 },
+};
+
 
 struct oscfg {
     int accent;        /* index into oscfg_accents                       */
     int dark;          /* 1 dark, 0 light                                */
     int dock_size;     /* dock icon base size in px                      */
-    int dock_dots;     /* show a running indicator under live apps       */
+    int dock_dots;     /* light the socket behind a live app's icon      */
     int ui_scale;      /* interface size, PERCENT (80..130); 100 = default */
+    int keymap;        /* index into oscfg_keymaps                       */
+    int wallpaper;     /* index into oscfg_wallpapers                    */
+    int tz;            /* index into oscfg_timezones; 0 = UTC            */
+    /* The menu bar. Four small knobs rather than one "style": each of these is
+     * a separate question a person actually has an opinion about, and folding
+     * them into presets would mean inventing combinations nobody asked for. */
+    int bar_24h;       /* 1 = 24-hour clock, 0 = 12-hour with am/pm       */
+    int bar_seconds;   /* show seconds in the clock                       */
+    int bar_date;      /* show the date beside the time                   */
+    int bar_cpu;       /* show the CPU readout                            */
 };
 
 /* The screen band the DOCK owns, in pixels, for a given preference.
@@ -69,21 +212,126 @@ static inline int oscfg_dock_band(const struct oscfg *c) {
 }
 
 static inline void oscfg_defaults(struct oscfg *c) {
-    c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1;
-    c->ui_scale = 100;
+    c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1; c->keymap = 0;
+    c->ui_scale = 100; c->wallpaper = 0; c->tz = 0;
+    c->bar_24h = 1; c->bar_seconds = 0; c->bar_date = 1; c->bar_cpu = 1;
 }
 
-/* Read the file into `c`. Missing/unreadable => defaults, never a failure:
- * losing your preferences must not mean losing your desktop. */
+/* HOW THE SHELL'S NARROW COMPONENTS GET IT.
+ *
+ * The menu bar's namespace is `ro /system, rw /run`, and its manifest says so
+ * on purpose: "read /system, reach /run -- nothing else nameable". It has no
+ * business holding the user's home directory, and wanting to know whether the
+ * clock shows seconds is not a reason to give it one.
+ *
+ * A published FILE under /run was the obvious answer and is not available:
+ * /run is epfs, which holds endpoint nodes and nothing else, so creating a
+ * regular file there fails -- measured, `home: publish rc=-1`, before this
+ * comment replaced that design.
+ *
+ * So it goes over a CHANNEL, which is what /run is for. The desktop serves an
+ * endpoint whose entire meaning is "connect and I will hand you the
+ * preferences": no request payload, symmetric with the launcher endpoint next
+ * to it where the connect is itself the signal. The reader gets the same text
+ * the file holds, from the one serialiser, and needs no authority beyond the
+ * /run it already has. */
+#define OSCFG_ENDPOINT "/run/emlink.prefs"
+
+/* Every value the file can carry, forced back into range. A hand-edited file
+ * is a supported way to change these (Settings says so in About), so a typo
+ * must yield a working desktop and not a 4000-pixel dock. */
+static inline void oscfg_clamp(struct oscfg *c) {
+    if (c->accent < 0 || c->accent >= OSCFG_ACCENTS) c->accent = 0;
+    if (c->wallpaper < 0 || c->wallpaper >= OSCFG_WALLPAPERS) c->wallpaper = 0;
+    if (c->tz < 0 || c->tz >= OSCFG_TIMEZONES) c->tz = 0;
+    if (c->dock_size < 28) c->dock_size = 28;
+    if (c->dock_size > 60) c->dock_size = 60;
+    if (c->ui_scale < 80)  c->ui_scale = 80;
+    if (c->ui_scale > 130) c->ui_scale = 130;
+    c->dark = !!c->dark; c->dock_dots = !!c->dock_dots;
+    c->bar_24h = !!c->bar_24h; c->bar_seconds = !!c->bar_seconds;
+    c->bar_date = !!c->bar_date; c->bar_cpu = !!c->bar_cpu;
+}
+
+/* The rule for a preference, always valid -- an out-of-range index reads as
+ * UTC rather than off the end of the table. */
+static inline const char *oscfg_tz_string(const struct oscfg *c) {
+    int i = (c && c->tz >= 0 && c->tz < OSCFG_TIMEZONES) ? c->tz : 0;
+    return oscfg_timezones[i].tz;
+}
+static inline const char *oscfg_tz_label(const struct oscfg *c) {
+    int i = (c && c->tz >= 0 && c->tz < OSCFG_TIMEZONES) ? c->tz : 0;
+    return oscfg_timezones[i].label;
+}
+
+/* WEAR THE ZONE. TZ in the environment plus tzset() is the whole mechanism:
+ * libc reads that variable and nothing else, so this is what makes localtime()
+ * -- and therefore every clock, every file date, every `date` -- agree with
+ * the preference.
+ *
+ * Guarded by a comparison because it is called from a poll loop once a second
+ * for the life of the machine, and because setenv() frees and reallocates the
+ * old string: doing that under a thread that is inside getenv() is a real
+ * hazard, and not doing it at all unless the answer changed removes it for
+ * every second but the one where the user actually picked a new zone. */
+static inline void oscfg_apply_tz(const struct oscfg *c) {
+    const char *want = oscfg_tz_string(c);
+    const char *cur  = getenv("TZ");
+    if (cur && !strcmp(cur, want)) return;
+    setenv("TZ", want, 1);
+    tzset();
+}
+
+static inline void oscfg_parse(struct oscfg *c, char *buf);
+static inline int  oscfg_write_to(const struct oscfg *c, const char *path);
+
+/* Ask the desktop for the preferences over OSCFG_ENDPOINT. Silent on failure:
+ * a process that cannot reach the desktop keeps the defaults, exactly as one
+ * that cannot open the file does. */
+static inline void oscfg_ask_desktop(struct oscfg *c) {
+    int ch = (int)embk_chan_connect(OSCFG_ENDPOINT);
+    if (ch < 0) return;
+    char buf[640];
+    unsigned len = 0, nh = 0;
+    if (embk_chan_recv(ch, buf, sizeof buf - 1, &len, 0, &nh) == 0 && len) {
+        if (len > sizeof buf - 1) len = sizeof buf - 1;
+        buf[len] = 0;
+        oscfg_parse(c, buf);
+    }
+    embk_chan_close(ch);
+}
+
+/* Read one file into `c`, leaving it untouched if the file is unreadable.
+ * Returns 1 if anything was parsed. */
+static inline int oscfg_read_from(struct oscfg *c, const char *path) {
+    int fd = (int)embk_open(path, EMBK_O_RDONLY, 0);
+    if (fd < 0) return 0;
+    char b[1024];
+    int64_t n = embk_read(fd, b, sizeof b - 1);
+    embk_close(fd);
+    if (n <= 0) return 0;
+    b[n] = 0;
+    oscfg_parse(c, b);
+    return 1;
+}
+
+/* Read the preferences into `c`. The user's own file first, then the published
+ * copy for a process whose namespace cannot name it. Missing/unreadable =>
+ * defaults, never a failure: losing your preferences must not mean losing your
+ * desktop. */
 static inline void oscfg_load(struct oscfg *c) {
     oscfg_defaults(c);
-    int fd = (int)embk_open(OSCFG_PATH, EMBK_O_RDONLY, 0);
-    if (fd < 0) return;
-    char buf[1024];
-    int64_t n = embk_read(fd, buf, sizeof buf - 1);
-    embk_close(fd);
-    if (n <= 0) return;
-    buf[n] = 0;
+    if (!oscfg_read_from(c, oscfg_path()))
+        oscfg_ask_desktop(c);
+    oscfg_clamp(c);
+    /* LOADING THE PREFERENCES MEANS WEARING THEM, for the one preference that
+     * is invisible until something formats a date. An app that reads the
+     * config to find the accent colour also gets the right clock, and no app
+     * has to remember a second call it would only notice missing at 1am. */
+    oscfg_apply_tz(c);
+}
+
+static inline void oscfg_parse(struct oscfg *c, char *buf) {
     for (char *p = buf; *p; ) {
         char key[32]; int val = 0;
         char *line = p;
@@ -95,29 +343,52 @@ static inline void oscfg_load(struct oscfg *c) {
         else if (!strcmp(key, "dark"))      c->dark      = val;
         else if (!strcmp(key, "dock_size")) c->dock_size = val;
         else if (!strcmp(key, "dock_dots")) c->dock_dots = val;
+        else if (!strcmp(key, "keymap")) c->keymap = (val >= 0 && val < OSCFG_KEYMAPS) ? val : 0;
         else if (!strcmp(key, "ui_scale"))  c->ui_scale  = val;
+        else if (!strcmp(key, "wallpaper")) c->wallpaper = val;
+        else if (!strcmp(key, "timezone"))  c->tz        = val;
+        else if (!strcmp(key, "bar_24h"))     c->bar_24h     = val;
+        else if (!strcmp(key, "bar_seconds")) c->bar_seconds = val;
+        else if (!strcmp(key, "bar_date"))    c->bar_date    = val;
+        else if (!strcmp(key, "bar_cpu"))     c->bar_cpu     = val;
     }
-    if (c->accent < 0 || c->accent >= OSCFG_ACCENTS) c->accent = 0;
-    if (c->dock_size < 28) c->dock_size = 28;
-    if (c->dock_size > 60) c->dock_size = 60;
-    if (c->ui_scale < 80)  c->ui_scale = 80;
-    if (c->ui_scale > 130) c->ui_scale = 130;
 }
 
 /* Written whole rather than patched in place: the file is four lines, and a
  * rewrite cannot leave a half-updated one behind. */
-static inline int oscfg_save(const struct oscfg *c) {
-    char out[512];
-    int n = snprintf(out, sizeof out,
+/* The whole preference set as text. One serialiser, used by the file and by the
+ * channel below: two encodings of the same thing is how they drift apart. */
+static inline int oscfg_format(const struct oscfg *c, char *out, int cap) {
+    return snprintf(out, (size_t)cap,
                      "# EmbLink preferences -- written by Settings, editable by hand.\n"
                      "accent %d\n" "dark %d\n" "dock_size %d\n" "dock_dots %d\n"
-                     "ui_scale %d\n",
-                     c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale);
-    int fd = (int)embk_open(OSCFG_PATH, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
+                     "ui_scale %d\n" "keymap %d\n" "wallpaper %d\n" "timezone %d\n"
+                     "bar_24h %d\n" "bar_seconds %d\n" "bar_date %d\n" "bar_cpu %d\n",
+                     c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale,
+                     c->keymap, c->wallpaper, c->tz,
+                     c->bar_24h, c->bar_seconds, c->bar_date, c->bar_cpu);
+}
+
+static inline int oscfg_write_to(const struct oscfg *c, const char *path) {
+    char out[640];
+    int n = oscfg_format(c, out, (int)sizeof out);
+    int fd = (int)embk_open(path, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
     if (fd < 0) return -1;
     int64_t w = embk_write(fd, out, (size_t)n);
     embk_close(fd);
     return w == n ? 0 : -1;
+}
+
+static inline int oscfg_save(const struct oscfg *c) {
+    return oscfg_write_to(c, oscfg_path());
+}
+
+/* Hand one connected peer the preferences and be done. Called by the desktop's
+ * little server thread; see OSCFG_ENDPOINT above. */
+static inline int oscfg_serve_one(int ch, const struct oscfg *c) {
+    char out[640];
+    int n = oscfg_format(c, out, (int)sizeof out);
+    return embk_chan_send(ch, out, (unsigned)n, 0, 0, 0);
 }
 
 #endif /* _EMBLINK_OSCFG_H_ */

@@ -49,7 +49,7 @@ An EmbLinkOS app declares the authority it needs, and the kernel enforces it —
   checks it is a subset of the grantor's at load. (ELF apps inherit the spawner's
   caps.)
 - **Namespace** — the paths the app can name, declared in a per-app manifest
-  `user/bin/<name>.ns` (lines of `<ro|rw> <prefix>`), packed to
+  `<progdir>/<name>.ns` (lines of `<ro|rw> <prefix>`), packed to
   `/data/apps/<name>/<name>.ns`. The session grants exactly that (UP4). No manifest
   ⇒ the app inherits the parent's view.
 
@@ -59,7 +59,7 @@ authority — is designed in [PACKAGING_AND_SDK.md](PACKAGING_AND_SDK.md).
 
 ## Cross-built vs on-OS
 
-- **Cross-built (today's default):** drop `user/bin/foo.c` in and `make` compiles it
+- **Cross-built (today's default):** drop `user/apps/foo/foo.c` in and `make` compiles it
   to `build/foo.elf`; mkfs packs it to `/data/apps/foo/` (plus its `.ns` if present).
   See [BUILD.md](BUILD.md).
 - **On the OS itself:** `tcc` and `embcc` run *on the image* — you can compile and

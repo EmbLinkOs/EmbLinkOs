@@ -16,11 +16,28 @@
     .text
     .globl _start
 _start:
+    /* A BYTE ON COM1, BEFORE ANYTHING ELSE. The firmware's console is not ours
+     * yet and on a real machine may not exist at all; a machine that dies
+     * between "firmware started the loader" and the loader's first ConOut
+     * write otherwise leaves nothing behind at all. '1' means this instruction
+     * ran. The port is written raw -- no init, no line-status wait -- because
+     * anything more is code that can itself be the thing that fails. */
     /* Firmware entry (MS x64 ABI): RCX = ImageHandle, RDX = SystemTable.
-     * Stash them in callee-saved regs -- we never return to firmware, so we owe
-     * it nothing, and the relocation loop below is free to clobber the rest. */
+     * Stash them in callee-saved regs FIRST -- we never return to firmware, so
+     * we owe it nothing, and everything after this is free to clobber the rest.
+     *
+     * BEFORE THE MARKER BELOW, and that ordering is the whole point: `out dx,
+     * al` needs the port in DX, which IS the low half of RDX -- the system
+     * table pointer. Writing the marker first left r13 holding the table's
+     * address with 0x03F8 stamped into its low 16 bits, and every read through
+     * it returned freed-pool poison. An instrument that destroys the thing it
+     * was added to observe. */
     mov r12, rcx
     mov r13, rdx
+
+    mov dx, 0x3F8
+    mov al, '1'
+    out dx, al
 
     lea rdi, [rip + __image_base]   /* rdi = actual load base (RIP-relative) */
     lea rsi, [rip + __rela_start]
@@ -38,6 +55,10 @@ _start:
 3:  add rsi, 24                     /* sizeof(Elf64_Rela) */
     jmp 1b
 2:
+    mov dx, 0x3F8          /* '2': relocations applied, about to call efi_main */
+    mov al, '2'
+    out dx, al
+
     /* Call efi_main(ImageHandle, SystemTable) -- MS x64: RCX, RDX, plus a
      * 16-byte-aligned stack and 32 bytes of shadow space. */
     mov rcx, r12

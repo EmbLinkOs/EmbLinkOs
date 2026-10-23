@@ -72,6 +72,10 @@
                                                // (absent => inherit the parent's whole view). Reuses
                                                // `path`+`flags`; consumed at creation, skipped by the
                                                // file-action processor.
+#define SPAWN_ACTION_NEW_SESSION     8         // the child LEADS A NEW SESSION for user `path`
+                                                // (a username). Requires the spawner to hold
+                                                // EMBK_CAP_SESSION; the child never does. See
+                                                // struct process::session_id.
 #define SPAWN_ACTION_SET_CAPS        5         // attenuate the child's capability set: `flags`
                                                // carries the requested cap bitmask (capabilities.h
                                                // cap IDs). Enforced <= the spawning process's own

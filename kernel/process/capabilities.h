@@ -16,12 +16,31 @@
  * GPU at all"), a different and deliberately weaker thing than the OS's typed
  * object HANDLES ("holds an unforgeable reference to THIS surface"). Handles
  * stay the real enforcement; a capability is the coarse GATE that governs
- * which handles a parent will install into a child at spawn. Nothing in the
- * kernel checks a capability at a syscall yet -- there is no consumer until
- * EMBX or a subsystem opts in -- so v1 of this mechanism REPRESENTS, SEEDS and
- * ATTENUATES the set and proves the invariant below; it does not gate anything
- * at runtime. That layer is next, and it should gate handle-install, not
- * become a second ambient-authority system.
+ * which handles a process may obtain in the first place.
+ *
+ * THIS PARAGRAPH USED TO SAY "nothing in the kernel checks a capability at a
+ * syscall yet ... that layer is next, and it should gate handle-install, not
+ * become a second ambient-authority system." That layer landed, and it did
+ * gate handle-install. Gating now exists at the INSTALL POINTS and only there:
+ *
+ *   FILESYSTEM  sys_open           (not read/write -- an fd already granted
+ *                                   is handle-scoped and needs no re-check;
+ *                                   stdio 0/1/2 come from spawn, so a process
+ *                                   without it keeps its console)
+ *   NETWORK     the socket calls
+ *   GPU         surface and window creation
+ *   AUDIO       audio_open/write/close, via audio_permitted()
+ *   DEBUG       the debugger session, and spawning a child under one
+ *
+ * CAMERA, USB, SERIAL, RAWDISK and KERNEL_EXT have no gate for a reason worth
+ * stating so the absence does not read as an oversight: they have NO ring-3
+ * syscall at all. There is nothing to gate. Each becomes a gate on the day it
+ * becomes a syscall, and the class exists now so that the .caps file and the
+ * attenuation invariant are already right when it does.
+ *
+ * `test capgate` proves the live gates BOTH WAYS with witness programs, and
+ * capnet probes two classes at once precisely so the four-way test catches a
+ * gate that reads the wrong bit -- which every single-class test would pass.
  *
  * IDs match EMBX §5.6 (cap_id 1..9). The bitmask uses bit position == cap_id,
  * so bit 0 (cap_id 0 = invalid) is never set.
@@ -44,7 +63,30 @@
  * debug syscalls (69-75) refuse without it — which is the "coarse gate governs
  * which handles a parent installs" step the header note below anticipated. */
 #define EMBK_CAP_DEBUG      10
-#define EMBK_CAP_MAX_ID      10
+/* cap_id 11 -- the authority to OPEN A SESSION: to spawn a process that
+ * belongs to a user (SPAWN_ACTION_NEW_SESSION). Held by init, which
+ * authenticates people, and by the kernel. A process that enters a session
+ * loses it -- the kernel strips it from every session leader -- so nothing a
+ * user runs can ever mint a session for someone else, however it attenuates
+ * or does not. It also carries the authority to act ACROSS sessions (kill by
+ * pid, end another session), which is the same authority seen from the
+ * other side. */
+#define EMBK_CAP_SESSION    11
+/* TURN THE MACHINE OFF. A class of its own because it is unlike every other
+ * one here: the rest gate what a process may TOUCH, and this gates something
+ * that ends every other process on the machine at once. The desktop shell
+ * holds it; an application has no business with it. */
+#define EMBK_CAP_POWER      12
+/* READING THE COMPOSED SCREEN. Its own capability and not GPU's, because
+ * owning a window and reading everybody else's are opposite claims: the first
+ * says "give me a surface", the second says "show me what every other
+ * application is displaying". A screenshot tool needs it; nothing else on this
+ * machine does. */
+#define EMBK_CAP_SCREEN     13
+/* BUMP THIS WITH THE LAST ID. It stayed at 11 when POWER was added, which
+ * quietly dropped POWER out of EMBK_CAP_ALL and made every sys_power call
+ * return -EPERM with nothing to say why. */
+#define EMBK_CAP_MAX_ID      13
 
 #define EMBK_CAP_BIT(id)  (1ULL << (id))
 

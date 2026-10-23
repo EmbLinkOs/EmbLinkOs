@@ -8,8 +8,9 @@
 #include "include/kprintf.h"
 #include <stdint.h>
 #include "drivers/video/font_8x16.h"
-#include "arch/x86_64/cpu/spinlock.h"
-#include "arch/x86_64/boot/boot_protocol.h"
+#include "drivers/video/rawcon.h"
+#include "include/spinlock.h"
+#include "boot/boot_protocol.h"
 
 
 static fb_info_t fb;
@@ -184,6 +185,9 @@ void fb_init(void) {
             while (1) {}
         }
         fb_front = (uint8_t *)virt;
+        /* The panic screen draws here from now on -- the mode may not be the
+         * one the firmware left. */
+        rawcon_adopt(fb_front, fb.width, fb.height, fb.pitch, fb.bpp, fb.format);
         serial_write_string("Framebuffer mapped into virtual memory at: ");
         serial_write_hex(virt);
         serial_write_string("\n");
@@ -225,6 +229,11 @@ void fb_init(void) {
 // ---------------------------------------------------------------------------
 
 static void fb_push_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    /* THE KERNEL HAS FAULTED and the screen is showing why. On a multi-core
+     * machine the compositor on another core is still presenting frames, and
+     * one of them would paint the desktop straight back over the only message
+     * anyone is going to see. See drivers/video/rawcon.c. */
+    if (rawcon_panicked()) return;
     if (fb_back && fb_front) {
         uint64_t off = (uint64_t)y * fb.pitch + (uint64_t)x * fb_bypp;
         uint32_t bytes = w * fb_bypp;

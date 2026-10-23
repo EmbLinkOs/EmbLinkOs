@@ -17,6 +17,7 @@
  * dropped -- so a surface can't leak on a dropped handoff. */
 
 #include "ipc/channel.h"
+#include "include/arch_irq.h"
 #include "ipc/handle.h"
 #include "process/process.h"
 #include "gfx/surface.h"
@@ -33,12 +34,11 @@ uint32_t channel_live_count(void) { return (uint32_t)g_chan_live; }
 /* Snapshot/restore the caller's interrupt-enable bit around a block (the
  * resumed thread's IF isn't otherwise restored on this non-iretq path -- same
  * reason process_wait/thread_join do this). */
-static inline uint64_t save_if(void) {
-    uint64_t f; __asm__ volatile ("pushfq; pop %0" : "=r"(f) :: "memory"); return f;
-}
-static inline void restore_if(uint64_t f) {
-    if (f & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
-}
+/* Was: a local copy of the x86 pushfq/sti pair, in this file and in the other
+ * one next door. Both are now the shared primitive -- the duplication was the
+ * real problem, not the instruction. */
+static inline uint64_t save_if(void)          { return arch_irq_flags(); }
+static inline void     restore_if(uint64_t f) { arch_irq_restore(f); }
 
 /* ---- ancillary-object refcount dispatch (v1: surfaces) ------------------ */
 static void obj_ref_get(enum handle_kind k, void *obj) {
@@ -163,6 +163,12 @@ int64_t channel_send(struct process *caller, int handle,
     }
     /* Backpressure (A3): block until the peer inbox has room (or peer dies). */
     while (peer->inbox_count >= CHAN_QUEUE_MAX && !chan->peer_closed[side]) {
+        if (current_process && current_process->cancelled) {   /* cancelled, or killed */
+            sched_unlock();
+            if (msg->bytes) kfree(msg->bytes);
+            kfree(msg);
+            return -EMBK_ECANCELED;
+        }
         sched_block_current_locked(&peer->send_wait);   /* releases lock on resume */
         restore_if(fl);
         sched_lock();
@@ -236,6 +242,10 @@ int64_t channel_recv(struct process *caller, int handle,
         if (chan->peer_closed[side]) {              /* A4: peer hung up + empty */
             sched_unlock();
             return -EMBK_EPIPE;
+        }
+        if (current_process && current_process->cancelled) {   /* cancelled, or killed */
+            sched_unlock();
+            return -EMBK_ECANCELED;
         }
         sched_block_current_locked(&end->recv_wait); /* releases lock on resume (A2) */
         restore_if(fl);

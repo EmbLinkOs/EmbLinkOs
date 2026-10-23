@@ -1,0 +1,16 @@
+# It shows text in a corner, and that is all it may do -- no network, no audio,
+# no devices.
+#
+# `filesystem` is here for ONE reason and it is worth stating, because leaving
+# it out is the more obvious-looking choice and it is wrong: every EmUI program
+# reads /system/fonts/font.ttf at startup. Without this capability notifyd came
+# up, drew its banner frames, and rendered NOT ONE CHARACTER -- empty rounded
+# boxes in the corner, because the font open failed and there were no glyphs to
+# draw. The capability system worked exactly as designed; the declaration was
+# simply wrong.
+#
+# Narrowing this to a read-only /system/fonts binding in notifyd.ns is the
+# proper fix and is left as one.
+
+filesystem     # the font, and nothing else it actually opens
+gpu            # a window is a GPU resource

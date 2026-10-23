@@ -24,6 +24,7 @@ holding the loader (with the kernel embedded) at
   every built-in laptop keyboard, and firmware menus want a keyboard present at
   start-up (they enumerate USB keyboards once, at POST — hot-plugging later is
   often ignored).
+- **A USB mouse.** A laptop's touchpad will most likely not work yet.
 
 ---
 
@@ -73,70 +74,106 @@ stick.
 
 ---
 
-## 4. Using EmbLinkOS
+## 4. What you will see
 
-You should see a few lines of bootloader text → kernel start-up messages → a
-small **graphical desktop** (a launcher and a live clock). That is the OS running
-on real hardware.
+1. A plain-text **EmbBoot** menu. It boots on its own after 5 seconds.
+2. **Kernel messages in white on dark blue-black**, scrolling from the top of
+   the screen. These appear from the very first moments of the kernel, so if
+   the machine stops somewhere, the last line on the screen says where.
+3. The **desktop**: a menu bar, a dock at the bottom, and the wallpaper. The
+   session is a development auto-login (user `yves`, no password).
 
-- Use the **USB keyboard** to interact.
-- **No networking** — there is no driver for real network cards yet (only the
-  virtual `virtio-net` used under QEMU), so no Wi-Fi/internet. Everything else
-  runs locally.
-- **To leave:** reboot or power off and remove the stick. The normal system
-  returns untouched.
+- **Use a USB mouse.** Most laptop touchpads are I²C-HID, which has no driver
+  yet. The built-in keyboard usually works (it is PS/2 on most laptops); a USB
+  keyboard always does.
+- **On a high-resolution panel everything will look small** — the desktop has
+  no HiDPI scaling yet.
+- **The clock may be off by some hours** if the laptop also runs Windows,
+  which keeps the hardware clock in local time. With a network, NTP corrects it.
+- **To leave:** EmbLink menu (top left) → Shut Down or Restart, then remove the
+  stick.
 
 ---
 
-## 5. Troubleshooting
+## 5. If something goes wrong
 
-| Symptom | Fix |
+| What you see | What it means / what to do |
 |---|---|
-| Stick not in the boot menu | Confirm Secure Boot is **Disabled** and you **saved**; try another USB port; ensure UEFI boot is enabled (not Legacy-only). |
-| "Secure Boot Violation" / "failed to verify" | Secure Boot is still on — go back to §2 and disable it. |
-| Black screen after selecting it | The display adapter may be unsupported; note the machine model and report it. |
-| Boots, then an error / a page of registers | **This is the useful case.** Photograph the whole screen — the dump says exactly where it stopped. |
+| Stick not in the boot menu | Secure Boot still on, or not saved; try another USB port; make sure UEFI boot is enabled. |
+| "Secure Boot Violation" | Secure Boot is still on — §2. |
+| The menu, then `EmbBoot FATAL: ...` | The loader stopped before the kernel. **Photograph it.** |
+| Kernel messages that stop and never move again | A hang. **Photograph the screen** — the last lines say which driver it was in. |
+| **A red bar reading "EmbLinkOS stopped: ..."** with numbers and log lines | A kernel fault. **Photograph the whole screen.** It names the function and source line that faulted. |
+| The desktop, but the mouse or keyboard does nothing | Try a USB mouse/keyboard in a different port. Note the laptop model. |
+| Black screen right after choosing Boot | The firmware gave no usable framebuffer. Note the model. |
 
-> **The single most useful thing:** if it doesn't reach the desktop, a clear
-> **photo of the screen** (any text, error, or register dump) is the best clue
-> for fixing it.
+> **The single most useful thing is a clear photo of the screen**, plus the
+> laptop's exact model. If the machine does reach the desktop, that is worth a
+> photo too.
 
-### Hardware reality on bare metal
+### Hardware reality on a laptop
 
 | Subsystem | On real hardware |
 |---|---|
-| Display | Works via the firmware's UEFI GOP framebuffer (no GPU driver needed). |
-| Storage | SATA/AHCI + IDE only — **no NVMe driver**. (Irrelevant here: the OS boots off the USB and doesn't install.) |
-| Keyboard | USB HID + PS/2. A laptop's built-in keyboard may be I2C-HID (unsupported) — use a USB keyboard. |
-| Networking | None (real NIC drivers not written yet). |
+| Display | The firmware's UEFI framebuffer, at the resolution the firmware chose. No GPU driver. |
+| Storage | Boots and runs entirely from the stick. NVMe and SATA drivers exist, and **the internal drive is only read, never written** — checked by `make test-laptop`, which hashes an emulated internal disk before and after a boot. |
+| Keyboard / mouse | PS/2 and USB HID. I²C-HID touchpads: not yet. |
+| Network | No Wi-Fi. Built-in Ethernet: probably not (only some Intel and older Realtek chips have drivers). **USB tethering from an Android phone works** (RNDIS) — plug in the phone and turn on USB tethering. |
+| Timers | Does not need an HPET or the 8254 PIT, which recent laptops often lack or clock-gate: the processor's clock is measured against CPUID or the ACPI PM timer, and every wait on the PIT is bounded. Tested in emulation with both absent — not yet on silicon. |
+| Sound | Intel HDA exists; whether the laptop's codec produces sound is unknown. |
+| Power | Shut Down and Restart work through ACPI. No sleep, no battery indicator yet. |
+
+**What the OS writes:** its own files on the stick. If the kernel faults, it may
+also leave one small crash record (a few kilobytes) through the firmware's ACPI
+error-record store, if the laptop has one — the same mechanism other operating
+systems use for crash reports. It never writes the internal drive. **Do not run
+the `install` tool on a laptop you care about**: installing is the one thing
+that erases a disk.
 
 ---
 
-## Writing the stick yourself
+## Writing the stick
 
-Only needed if you must create the stick from `uefi-usb.img` rather than
-receiving one ready-made. Done on a Linux machine.
+> ⚠️ **Writing the image erases the entire target device.** Point it at the
+> wrong disk and you wipe that disk instead. Identify the stick carefully.
 
-> ⚠️ **`dd` erases the entire target device and does not ask twice.** Point it at
-> the wrong disk and you wipe it. Identify the USB device carefully first.
+The image is `uefi-usb.img` in the repository (build it with `make uefi-usb.img`).
+The stick must be at least 256 MB; everything on it is erased.
 
-1. **Find the USB device** — transport `usb`, size matching your stick:
+### On macOS
+
+1. Plug the stick in and **find it** — look for the size that matches your stick:
 
    ```bash
-   lsblk -o NAME,SIZE,TRAN,MODEL
+   diskutil list external physical
    ```
 
-2. **Write the image** — replace `sdX` with that device (e.g. `sdb`), and
-   double-check before pressing Enter:
+   It is shown as `/dev/diskN` (for example `/dev/disk4`). **Your Mac's own
+   disks are `disk0`/`disk1`/`disk3`-style internal entries and are not listed
+   under `external physical`.**
+
+2. **Unmount it and write** — replace `N` with that number. Note `rdisk`, which
+   is much faster than `disk`:
 
    ```bash
-   sudo umount /dev/sdX*        # ignore "not mounted"
-   sudo dd if=uefi-usb.img of=/dev/sdX bs=4M status=progress conv=fsync
+   diskutil unmountDisk /dev/diskN
+   sudo dd if=uefi-usb.img of=/dev/rdiskN bs=4m
    sync
+   diskutil eject /dev/diskN
    ```
 
-To rebuild `uefi-usb.img` from source: `make uefi-usb.img` (see the Makefile
-target; it packs the current kernel + EMBKFS via `tools/mkuefidisk.sh`).
+3. If macOS says **"The disk you inserted was not readable by this computer"**,
+   click **Ignore** — never *Initialize*. The second partition is EmbLinkOS's
+   own filesystem, which macOS does not know.
+
+### On Linux
+
+```bash
+lsblk -o NAME,SIZE,TRAN,MODEL           # transport "usb", size matching the stick
+sudo umount /dev/sdX*                   # ignore "not mounted"
+sudo dd if=uefi-usb.img of=/dev/sdX bs=4M status=progress conv=fsync
+sync
+```
 
 ---
 

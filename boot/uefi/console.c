@@ -34,35 +34,14 @@ void con_printhex(uint64_t v) {
  * graphics-console implementations of those fault on a serial-only console
  * (-display none), and ANSI is the more portable path for a boot menu anyway.
  * OutputString passes the ESC (0x1B) bytes straight through to the terminal. */
-void con_clear(void) { con_print("\x1b[2J\x1b[H"); }   /* clear + home */
+void con_clear(void) { con_print("\n"); }
 
-void con_attr(UINTN a) {
-    /* EFI colour index -> ANSI SGR. EFI order is B/G/R bits, not ANSI's.
-     * Tables are INLINE char arrays (not `const char *[]`) -- see menu.c: this
-     * app has no data relocations, so a pointer table would be wrong at runtime. */
-    static const char fg[16][3] = {
-        "30","34","32","36","31","35","33","37",
-        "90","94","92","96","91","95","93","97" };
-    static const char bg[8][3] = { "40","44","42","46","41","45","43","47" };
-    char s[16]; int i = 0;
-    s[i++] = 0x1b; s[i++] = '['; s[i++] = '0'; s[i++] = ';';
-    const char *f = fg[a & 0x0F];        s[i++] = f[0]; s[i++] = f[1]; s[i++] = ';';
-    const char *b = bg[(a >> 4) & 0x07]; s[i++] = b[0]; s[i++] = b[1];
-    s[i++] = 'm'; s[i] = 0;
-    con_print(s);
-}
+/* Colour and cursor positioning are no-ops, for the reason menu.c gives: the
+ * ANSI escapes these used to print are shown LITERALLY by a real machine's
+ * graphics console. */
+void con_attr(UINTN a) { (void)a; }
 
-void con_setpos(UINTN c, UINTN r) {
-    char s[16]; int i = 0;
-    s[i++] = 0x1b; s[i++] = '[';
-    if (r >= 10) s[i++] = (char)('0' + (r / 10) % 10);
-    s[i++] = (char)('0' + r % 10);
-    s[i++] = ';';
-    if (c >= 10) s[i++] = (char)('0' + (c / 10) % 10);
-    s[i++] = (char)('0' + c % 10);
-    s[i++] = 'H'; s[i] = 0;
-    con_print(s);
-}
+void con_setpos(UINTN c, UINTN r) { (void)c; (void)r; }
 
 int con_read_key(EFI_INPUT_KEY *key, long timeout_ms) {
     long waited = 0;

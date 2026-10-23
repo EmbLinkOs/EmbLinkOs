@@ -1,8 +1,8 @@
 /* kernel/drivers/audio/audio.h -- the PCM sink the syscalls sit on.
  *
  * Device-independent on purpose: everything here is about a stream and its
- * owner, and nothing about ports or descriptors. A second driver implements
- * ac97.h; this file does not change.
+ * owner, and nothing about ports or descriptors. Which sound card is
+ * underneath is decided by probing at boot -- see pcm.h.
  *
  * Format is fixed at the device's own: 16-bit signed, stereo, interleaved, at
  * audio_sample_rate(). Resampling and mixing are a level above a sink that
@@ -14,6 +14,14 @@
 
 #include <stdint.h>
 #include "include/types.h"
+
+/* Probe every compiled-in sound driver and keep the first that finds its
+ * hardware. Once, during device bring-up. False means this machine has no
+ * card this kernel knows, which is not a boot failure. */
+bool audio_init(void);
+
+/* Which driver won, or "none". */
+const char *audio_device_name(void);
 
 bool     audio_available(void);
 uint32_t audio_sample_rate(void);
@@ -31,7 +39,49 @@ int  audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
 /* Has the hardware played everything handed to it? */
 bool audio_drained(uint32_t pid);
 
+/* WHERE THE SPEAKER ACTUALLY IS, in frames since this stream started;
+ * monotonic, 0 before the device begins. The device itself reports only which
+ * descriptor it is on -- a number that wraps and answers nothing alone -- so
+ * the laps are counted for you.
+ *
+ * This is what a writer needs to hold a KNOWN distance ahead, and what A/V
+ * sync needs to line sound up with picture. Do not substitute the wall clock:
+ * the device does not start at t=0, it starts when the prefill is met, so a
+ * clock-based estimate is ahead of the truth by exactly the prefill.
+ *
+ * Resolution is one descriptor (~21 ms at 48 kHz) -- it is the position of the
+ * buffer being played, not of the sample. */
+uint64_t audio_position(uint32_t pid);
+
+/* Ask for a shallower start-up buffer: the device will begin once `ms` of
+ * audio is queued instead of the default ~170 ms. THAT NUMBER IS THE LATENCY
+ * of everything the stream does afterwards, so a writer that can be relied on
+ * to come back in time should lower it, and one that cannot should not --
+ * running dry is worse than being late, and a caller who lowers this without
+ * being able to keep up has chosen holes over delay.
+ *
+ * Only before the first sound comes out; -EBUSY afterwards. Returns the
+ * latency actually granted in ms, which is rounded UP to whole descriptors and
+ * floored at two of them. */
+int audio_set_latency(uint32_t pid, uint32_t ms);
+
 void audio_close(uint32_t pid);
 void audio_reap_pid(uint32_t pid);   /* a process died holding the device */
+
+/* WHAT THE STREAM ACTUALLY DID. `underruns` is how many times the speaker ran
+ * dry mid-sound -- the hardware's own count, not an inference -- and it is the
+ * only audio failure a person hears directly. `frames` is how much was handed
+ * over, `writes` how many calls it took. All three are since the current sound
+ * started. Any may be NULL. */
+void audio_stats(uint64_t *underruns, uint64_t *frames, uint64_t *writes);
+
+/* THE DEVICE UNDERNEATH, for `test audio` only: it plays a tone with no
+ * process owning the stream, which is what separates a broken driver from a
+ * broken stream layer when there is no sound. Nothing else should use these --
+ * they bypass ownership entirely. */
+uint32_t audio_dev_fill(int i, const int16_t *frames, uint32_t nframes);
+void     audio_dev_play(int last);
+bool     audio_dev_done(int last);
+void     audio_dev_stop(void);
 
 #endif

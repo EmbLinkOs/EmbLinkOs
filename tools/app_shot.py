@@ -37,7 +37,7 @@ def sock_path(name, kind):
     return os.path.join(BUILD, "shot-%s-%s.sock" % (name, kind))
 
 
-def boot(name, scratch, audio=None):
+def boot(name, scratch, audio=None, tablet=False, nic=None):
     ser, qmp = sock_path(name, "ser"), sock_path(name, "qmp")
     for p in (ser, qmp):
         if os.path.exists(p):
@@ -57,6 +57,32 @@ def boot(name, scratch, audio=None):
         "-no-reboot", "-no-shutdown", "-m", "1024m", "-smp", "2",
         "-accel", "tcg,thread=multi",
     ]
+    # A NETWORK, when the caller asks for one. Off by default because most of
+    # these tests do not care and a NIC is one more thing to go wrong -- but a
+    # test of the network indicator has to be able to produce BOTH answers, and
+    # "no device at all" is only one of them. QEMU's user-mode stack hands out
+    # 10.0.2.15 over DHCP with a router at 10.0.2.2.
+    if os.environ.get("NET") == "1":
+        argv += ["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]
+    # A NIC on QEMU's user-mode stack, with an id so QMP `set_link` can
+    # reach it -- which is how a test unplugs the cable.
+    if nic:
+        argv += ["-netdev", "user,id=net0",
+                 "-device", "%s,netdev=net0" % nic]
+    if tablet:
+        # AN ABSOLUTE POINTING DEVICE, for a test that has to put the cursor on
+        # a named pixel. QEMU gives a PC a PS/2 mouse, which is RELATIVE: a tool
+        # can only aim by shoving the pointer into a corner and counting deltas
+        # back out, and a dropped or coalesced packet silently lands it
+        # somewhere else -- measured, the same script hit a dock icon and then
+        # missed a 24px window button by 90px on the same boot.
+        #
+        # The kernel already drives QEMU's usb-tablet as an absolute device
+        # (usb_tablet_process_report -> mouse_set_absolute), so attaching one
+        # makes `input-send-event` with abs axes land on the pixel asked for.
+        # Off by default: it is extra hardware to enumerate, and a test that
+        # does not move the pointer should not pay for it.
+        argv += ["-device", "qemu-xhci,id=xhci", "-device", "usb-tablet,bus=xhci.0"]
     if audio:
         # The guest's audio written to a FILE on this machine. The same trick
         # `make test-audio` uses: what a speaker did is not observable from a
@@ -85,8 +111,11 @@ class Qmp:
         self.f.readline()                       # greeting
         self.cmd("qmp_capabilities")
 
-    def cmd(self, name, **args):
-        msg = {"execute": name}
+    def cmd(self, _command, **args):
+        """The parameter is underscored because QMP has commands whose OWN
+        argument is called `name` -- set_link is one -- and a plain `name` here
+        collides with it. Every caller passes the command positionally."""
+        msg = {"execute": _command}
         if args:
             msg["arguments"] = args
         self.f.write((json.dumps(msg) + "\n").encode())

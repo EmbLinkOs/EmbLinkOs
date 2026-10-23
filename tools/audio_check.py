@@ -39,10 +39,28 @@ def read_wav(path):
     if len(data) < 44 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise ValueError("not a RIFF/WAVE file")
 
+    # A WAV WRITTEN BY A PROCESS THAT WAS KILLED HAS A HEADER OF ZEROES, and
+    # believing it means reading a perfectly good recording as silence.
+    #
+    # QEMU's wav sink writes the RIFF and data lengths as placeholders and
+    # patches them when the file is CLOSED -- which never happens, because the
+    # harness ends the guest with SIGTERM. On this machine that produced a
+    # 88 KB file full of a clean 440 Hz square wave which every reader,
+    # including Python's own `wave`, reported as zero frames: the OS was
+    # emitting the tone correctly and the test said "mostly SILENCE".
+    #
+    # So a zero-length chunk means "to the end of the file" rather than
+    # "empty". Nothing legitimate is lost -- a genuinely empty data chunk at
+    # the end of a file is indistinguishable from a truncated one anyway, and
+    # the silence checks below are what catch a real failure.
+    truncated = False
     pos, fmt, frames = 12, None, None
     while pos + 8 <= len(data):
         cid = data[pos:pos + 4]
         size = struct.unpack_from("<I", data, pos + 4)[0]
+        if size == 0 and cid == b"data":
+            size = len(data) - (pos + 8)
+            truncated = True
         body = data[pos + 8: pos + 8 + size]
         if cid == b"fmt ":
             tag, ch, rate, _brate, _align, bits = struct.unpack_from("<HHIIHH", body, 0)
@@ -50,6 +68,10 @@ def read_wav(path):
         elif cid == b"data":
             frames = body
         pos += 8 + size + (size & 1)          # chunks are word-aligned
+
+    if truncated:
+        print("  (the writer was killed before it finalised the header -- "
+              "reading the data chunk to end of file)")
 
     if fmt is None or frames is None:
         raise ValueError("missing fmt or data chunk")
@@ -66,26 +88,50 @@ def analyse(fmt, raw):
     left = samples[0::ch]                     # one channel is enough to measure
 
     peak = max((abs(s) for s in left), default=0)
-    nonzero = sum(1 for s in left if abs(s) > 64)
+    rate = float(fmt["rate"]) if fmt["rate"] else 1.0
+    seconds = len(left) / rate
+
+    # WHERE THE SILENCE IS, not just how much. Silence before the first sample
+    # and after the last is the recording being longer than the sound -- the
+    # sink keeps running while the guest shuts the stream down, and it says
+    # nothing about the audio. Silence BETWEEN them is a hole somebody hears.
+    #
+    # Measuring them together is how a clean tone with a 20 ms tail reads as
+    # "96% non-silent, 422 Hz" and looks like a driver dropping samples. It is
+    # not, and the two numbers below are the difference.
+    loud = [i for i, v in enumerate(left) if abs(v) > 64]
+    if not loud:
+        return {"channels": ch, "rate": fmt["rate"], "frames": len(left),
+                "seconds": seconds, "peak": peak, "nonsilent": 0.0,
+                "hz": 0.0, "lead": seconds, "tail": 0.0, "gap": 0.0,
+                "sound": 0.0}
+    first, last = loud[0], loud[-1]
+    core = left[first:last + 1]
+    nonzero = sum(1 for v in core if abs(v) > 64)
 
     # Zero crossings, with a hysteresis band so a silent or noisy stretch does
-    # not manufacture a frequency out of dither.
+    # not manufacture a frequency out of dither. Over the SOUND, not over the
+    # file: a silent tail has no crossings and would drag the estimate down in
+    # exact proportion to its length.
     gate = max(200, peak // 4)
     crossings, state = 0, 0
-    for s in left:
-        if state <= 0 and s > gate:
+    for v in core:
+        if state <= 0 and v > gate:
             state = 1
             crossings += 1
-        elif state >= 0 and s < -gate:
+        elif state >= 0 and v < -gate:
             state = -1
             crossings += 1
-    seconds = len(left) / float(fmt["rate"]) if fmt["rate"] else 0.0
-    hz = (crossings / 2.0) / seconds if seconds > 0 else 0.0
+    sound = len(core) / rate
+    hz = (crossings / 2.0) / sound if sound > 0 else 0.0
     return {
         "channels": ch, "rate": fmt["rate"], "frames": len(left),
         "seconds": seconds, "peak": peak,
-        "nonsilent": nonzero / float(len(left)) if left else 0.0,
+        "nonsilent": nonzero / float(len(core)),
         "hz": hz,
+        "lead": first / rate,
+        "tail": (len(left) - 1 - last) / rate,
+        "sound": sound,
     }
 
 
@@ -109,9 +155,12 @@ def main():
         return 1
 
     a = analyse(fmt, raw)
-    print("  %s: %d ch, %d Hz, %.2f s, peak %d, %.0f%% non-silent, measured %.1f Hz"
-          % (path, a["channels"], a["rate"], a["seconds"], a["peak"],
-             a["nonsilent"] * 100, a["hz"]))
+    print("  %s: %d ch, %d Hz, %.2f s recorded, peak %d"
+          % (path, a["channels"], a["rate"], a["seconds"], a["peak"]))
+    print("  the sound itself: %.2f s, %.0f%% non-silent, measured %.1f Hz"
+          "  (silence: %.0f ms before, %.0f ms after)"
+          % (a["sound"], a["nonsilent"] * 100, a["hz"],
+             a["lead"] * 1000, a["tail"] * 1000))
 
     fails = []
     if a["seconds"] < min_sec:
@@ -119,8 +168,8 @@ def main():
                      "be right and the sound still be cut short"
                      % (a["seconds"], min_sec))
     if a["nonsilent"] < 0.5:
-        fails.append("mostly SILENCE (%.0f%% non-silent) -- muted codec, or the "
-                     "DMA never ran" % (a["nonsilent"] * 100))
+        fails.append("mostly SILENCE (%.0f%% of the sound) -- muted codec, or "
+                     "the DMA never ran" % (a["nonsilent"] * 100))
     if a["peak"] < 1000:
         fails.append("peak amplitude %d is inaudible" % a["peak"])
     if want_hz > 0:

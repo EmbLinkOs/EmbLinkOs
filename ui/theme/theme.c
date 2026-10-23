@@ -21,6 +21,7 @@ static struct ui_theme light_theme(void) {
     t.accent        = C(84, 87,229);   /* #5457E5 */
     t.accent_hover  = C(74, 76,209);
     t.accent_soft   = C(238,239,254);
+    t.selection     = (struct color){ 0.29f, 0.33f, 0.90f, 0.42f };
     t.on_accent     = C(255,255,255);
     t.success       = C(22,163, 74);
     t.warning       = C(217,119,  6);
@@ -44,6 +45,7 @@ static struct ui_theme dark_theme(void) {
     t.accent        = C(124,130,255);  /* #7C82FF */
     t.accent_hover  = C(144,152,255);
     t.accent_soft   = C(30, 33, 64);
+    t.selection     = (struct color){ 0.42f, 0.46f, 0.95f, 0.42f };
     t.on_accent     = C(255,255,255);
     t.success       = C(63,184,107);
     t.warning       = C(224,145, 58);
@@ -110,6 +112,7 @@ void ui_theme_set_accent(struct color c) {
                                              c.g + (1.f - c.g) * 0.18f,
                                              c.b + (1.f - c.b) * 0.18f, c.a };
     g_current.accent_soft  = (struct color){ c.r, c.g, c.b, 0.18f };
+    g_current.selection    = (struct color){ c.r, c.g, c.b, 0.42f };
     /* white on a dark accent, near-black on a light one -- luminance decides,
      * not taste */
     float l = c.r * 0.2126f + c.g * 0.7152f + c.b * 0.0722f;

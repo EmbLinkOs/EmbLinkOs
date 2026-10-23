@@ -1,0 +1,3 @@
+# fsloop: writes one file in the home directory, over and over.
+ro /system
+rw /home/yves

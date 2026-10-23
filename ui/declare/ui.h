@@ -104,6 +104,16 @@ bool ui_consume_click(struct instance_handle h);
  * are surface-local), then widgets query hover/press for the currently open
  * box. A click fires on the press edge and is read via ui_consume_click. */
 void ui_pointer(float x, float y, bool down);
+/* WHEN the state passed to ui_pointer() was made, in milliseconds, if the event
+ * loop knows -- 0 means "no better answer than now".
+ *
+ * It exists because a press can reach an application later than it happened:
+ * the compositor holds a click made while the app was mid-render and replays
+ * it, one per poll. Anything timing a double-click by ARRIVAL therefore
+ * measures the app's frame rate, not the person's hand, and a slow app can
+ * never be double-clicked. Feed this and multi-click works regardless. */
+void     ui_pointer_at_time(uint64_t ms);
+uint64_t ui_pointer_time(void);   /* 0 if the loop did not say */
 void ui_pointer_pos(float *x, float *y);   /* live pointer position (surface-local) */
 /* How many press EDGES have happened since this was last asked (and clears the
  * count). For a caller that needs to tell one click from three -- g_clicked
@@ -128,6 +138,7 @@ int  ui_input_take(char *dst, int max);           /* focused field drains queued
 void ui_request_focus(struct instance_handle h);
 bool ui_has_focus(struct instance_handle h);
 bool ui_any_focus(void);       /* is ANY text field focused? (app key hooks) */
+uint64_t ui_frame_serial(void); /* changes every frame; for per-frame widget state */
 
 /* --- scroll --- */
 void  ui_set_scroll_offset(float dy);             /* shift open box's children up by dy */

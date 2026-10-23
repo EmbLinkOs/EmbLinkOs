@@ -1,7 +1,21 @@
 #include "drivers/input/keyboard.h"
+/* PS/2 is an x86 device, and this file is now TWO things: the PS/2 controller
+ * driver, and the keyboard POLICY every input source shares -- the char ring,
+ * the key-event ring, modifier tracking, layouts, the Ctrl-C route and the
+ * grab. Only the first half is x86, and only the first half is behind the
+ * guards below. ARM64.md §2.6 said virtio-input "replaces" the PS/2 keyboard;
+ * it replaces the HARDWARE half, and duplicating the other 300 lines to say so
+ * would have been the real mistake -- two ring buffers, two grab rules, two
+ * places for a stuck-modifier bug to live. See keyboard_inject_event(). */
+#if defined(__x86_64__)
 #include "arch/x86_64/irq/irq.h"
 #include "include/io.h"
+#endif
 #include "drivers/char/serial.h"
+#include "include/arch_irq.h"   /* arch_cpu_idle() -- see keyboard_getchar() */
+#if !defined(__x86_64__)
+#include "drivers/input/virtio_input.h"   /* the LEDs live on its status queue */
+#endif
 #include "process/process.h"
 #include "include/errno.h"
 
@@ -21,7 +35,7 @@ static struct wait_queue kbd_wait_queue;   /* for keyboard_deliver() to wait on 
 // Indexed by scancode (0-0x7F for "pressed" code)
 // 0 = unmapped / special key
 
-static const char scan_to_ascii[128] = {
+static const uint32_t scan_to_cp_us[128] = {
     0,   0x1B, '1', '2', '3', '4', '5', '6', '7', '8',   // 0x00-0x09
     '9', '0', '-', '=', '\b','\t','q', 'w', 'e', 'r',    // 0x0A-0x13
     't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0,     // 0x14-0x1D (1D=LeftCtrl)
@@ -40,8 +54,8 @@ static const char scan_to_ascii[128] = {
 /* SHIFTED layer, US QWERTY. Existed as a gap until the pipeline shell made
  * it absurd: a shell whose core operator is '|' on an OS whose keyboard
  * could not TYPE '|' (shift produced the unshifted char -- no uppercase, no
- * !@#$, no quotes-vs-apostrophe either). Same indexing as scan_to_ascii. */
-static const char scan_to_ascii_shift[128] = {
+ * !@#$, no quotes-vs-apostrophe either). Same indexing as scan_to_cp_us. */
+static const uint32_t scan_to_cp_shift[128] = {
     0,   0x1B, '!', '@', '#', '$', '%', '^', '&', '*',   // 0x00-0x09
     '(', ')', '_', '+', '\b','\t','Q', 'W', 'E', 'R',    // 0x0A-0x13
     'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n', 0,     // 0x14-0x1D
@@ -64,13 +78,12 @@ static const char scan_to_ascii_shift[128] = {
  * policy -- so this is what "support keymaps" actually costs. Dvorak was chosen
  * to PROVE that, because it is pure ASCII.
  *
- * ⚠️ AZERTY IS NOT SHIPPABLE YET, and not for lack of a table: French needs
- * é è ç à ù, which are NOT ASCII. The char stream is `char` and carries 7-bit
- * ASCII, so an "AZERTY" here could only be QWERTY-with-letters-moved and silent
- * holes where the accents belong. That is a worse lie than saying no. Real
- * AZERTY needs the char stream to grow a wider encoding first -- a genuine,
- * stated gap (see docs/TODO.md), not an oversight. */
-static const char scan_to_ascii_dvorak[128] = {
+ * AZERTY USED TO BE REFUSED HERE, and the refusal was right at the time: French
+ * needs é è ç à ù, the char stream was 7-bit, and an "AZERTY" built on it could
+ * only have been QWERTY-with-letters-moved and silent holes where the accents
+ * belong -- a worse lie than saying no. The stream carries UTF-8 now and the
+ * tables carry codepoints, so the real layout ships: see scan_to_cp_azerty. */
+static const uint32_t scan_to_cp_dvorak[128] = {
     0,   0x1B, '1', '2', '3', '4', '5', '6', '7', '8',   // 0x00-0x09
     '9', '0', '[', ']', '\b','\t','\'',',', '.', 'p',    // 0x0A-0x13
     'y', 'f', 'g', 'c', 'r', 'l', '/', '=', '\n', 0,     // 0x14-0x1D
@@ -85,7 +98,7 @@ static const char scan_to_ascii_dvorak[128] = {
     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,      // 0x6E-0x77
     0,   0,   0,   0,   0,   0,   0,   0,                // 0x78-0x7F
 };
-static const char scan_to_ascii_dvorak_shift[128] = {
+static const uint32_t scan_to_cp_dvorak_shift[128] = {
     0,   0x1B, '!', '@', '#', '$', '%', '^', '&', '*',   // 0x00-0x09
     '(', ')', '{', '}', '\b','\t','"', '<', '>', 'P',    // 0x0A-0x13
     'Y', 'F', 'G', 'C', 'R', 'L', '?', '+', '\n', 0,     // 0x14-0x1D
@@ -162,6 +175,15 @@ static int buffer_pop(char *c) {
  * handler can reach it. */
 static void keyboard_deliver(char c);
 
+/* The pending system shortcut, decided in IRQ context and performed by the
+ * kernel's main loop -- see SYSKEY_* in keyboard.h. */
+static volatile int g_syskey;
+int keyboard_take_syskey(void) { int k = g_syskey; g_syskey = SYSKEY_NONE; return k; }
+void        kbd_translate(uint8_t make, int pressed);   /* the testable seam */
+static void keyboard_deliver_cp(uint32_t cp);   /* one codepoint, as UTF-8 */
+static uint32_t kbd_compose(uint32_t mark, uint32_t base);
+static uint32_t g_dead;                          /* pending dead-key mark, or 0 */
+
 
 /* The EK_* navigation codes now live in keyboard.h -- they are a contract
  * shared with the USB HID driver (usb/xhci.c) and userland (EMBK_KEY_*), not
@@ -200,6 +222,7 @@ static void lock_toggle(uint8_t ekm, uint16_t code, int pressed)
     kbd_event_push(code, pressed);
 }
 
+#if defined(__x86_64__)
 static void keyboard_handler(void) {
     uint8_t sc = inb(KBD_DATA_PORT);
     static int extended = 0;     /* the previous byte was the 0xE0 prefix */
@@ -226,15 +249,23 @@ static void keyboard_handler(void) {
             default: break;
         }
 
-        /* The real nav cluster (the keypad's twins are handled below). */
+        /* The real nav cluster (the keypad's twins are handled below).
+         *
+         * WITH SHIFT HELD these four deliver a SELECTION command instead of a
+         * movement. The decision belongs here because this is where the
+         * modifier state is known at the instant the key went down -- the char
+         * stream carries no modifiers, so Shift+Left and Left are otherwise
+         * literally the same byte and no reader downstream could ever tell
+         * them apart. See EK_SEL_* in keyboard.h. */
+        int sel = (g_mods & EKM_SHIFT) != 0;
         uint16_t kc = 0; char ch = 0;
         switch (make) {
-            case 0x4B: kc = EKC_LEFT;  ch = EK_LEFT;  break;
-            case 0x4D: kc = EKC_RIGHT; ch = EK_RIGHT; break;
+            case 0x4B: kc = EKC_LEFT;  ch = sel ? (char)EK_SEL_LEFT  : (char)EK_LEFT;  break;
+            case 0x4D: kc = EKC_RIGHT; ch = sel ? (char)EK_SEL_RIGHT : (char)EK_RIGHT; break;
             case 0x48: kc = EKC_UP;    ch = EK_UP;    break;
             case 0x50: kc = EKC_DOWN;  ch = EK_DOWN;  break;
-            case 0x47: kc = EKC_HOME;  ch = EK_HOME;  break;
-            case 0x4F: kc = EKC_END;   ch = EK_END;   break;
+            case 0x47: kc = EKC_HOME;  ch = sel ? (char)EK_SEL_HOME  : (char)EK_HOME;  break;
+            case 0x4F: kc = EKC_END;   ch = sel ? (char)EK_SEL_END   : (char)EK_END;   break;
             case 0x53: kc = EKC_DEL;   ch = EK_DEL;   break;
             case 0x49: kc = EKC_PGUP;  ch = EK_PGUP;  break;
             case 0x51: kc = EKC_PGDN;  ch = EK_PGDN;  break;
@@ -293,25 +324,74 @@ static void keyboard_handler(void) {
     }
 
     /* --- ordinary keys --- */
-    char base = g_layout->normal[make];
+    kbd_translate(make, pressed);
+}
+
+/* THE TRANSLATION, AS A FUNCTION YOU CAN CALL. Split out of the interrupt
+ * handler so a selftest can drive a layout with make codes and read what comes
+ * out of the char stream -- there is no other way to test a keymap without an
+ * 8042 and a pair of hands. Everything above this point is hardware decoding
+ * (prefixes, break codes, modifiers); everything below is policy. */
+void kbd_translate(uint8_t make, int pressed) {
+    uint32_t base = g_layout->normal[make];
     if (!base) { if (pressed) { } return; }   /* unmapped: no event, no char */
 
     /* The event carries the UNSHIFTED key -- "which key", not "what character".
      * The char stream below answers the character question, and duplicating it
-     * here would just be a second, worse answer. */
-    kbd_event_push((uint16_t)base, pressed);
+     * here would just be a second, worse answer. A dead key reports the mark it
+     * carries (´ is EKC-less, so its codepoint is the honest answer to "which
+     * key"), and a key above the BMP reports 0 rather than a truncated lie. */
+    uint32_t evcp = KEY_BARE(base);
+    kbd_event_push((uint16_t)(evcp <= 0xFFFF ? evcp : 0), pressed);
     if (!pressed) return;                     /* releases produce no text */
 
-    char ascii = (g_mods & EKM_SHIFT) ? g_layout->shift[make] : base;
-    if (!ascii) return;
+    /* THREE LEVELS. AltGr is the right Alt key specifically -- tracked as a
+     * SIDE, not as EKM_ALT, because Alt+f is a shortcut and AltGr+f is a
+     * character, and a layout that cannot tell them apart cannot type € or @
+     * on any European keyboard. */
+    uint32_t cp;
+    if ((g_side & SIDE_RALT) && g_layout->altgr) cp = g_layout->altgr[make];
+    else if (g_mods & EKM_SHIFT)                 cp = g_layout->shift[make];
+    else                                         cp = base;
+    if (!cp) return;
+
+    /* A DEAD KEY produces nothing yet: it waits for the next key and composes
+     * with it (^ then e -> ê). Pressing it twice, or following it with a key it
+     * cannot combine with, emits the mark itself and then the other character
+     * -- which is what every desktop does and what makes ^ still typeable. */
+    if (KEY_IS_DEAD(cp)) {
+        uint32_t mark = KEY_BARE(cp);
+        if (g_dead == mark) {                 /* the same mark twice: type it once */
+            keyboard_deliver_cp(mark);
+            g_dead = 0;
+        } else {
+            if (g_dead) keyboard_deliver_cp(g_dead);   /* a different one: flush it */
+            g_dead = mark;
+        }
+        return;
+    }
+    if (g_dead) {
+        uint32_t composed = kbd_compose(g_dead, cp);
+        uint32_t mark = g_dead;
+        g_dead = 0;
+        if (composed) { keyboard_deliver_cp(composed); return; }
+        keyboard_deliver_cp(mark);            /* no such pairing: mark, then key */
+    }
 
     /* Caps Lock: LETTERS ONLY, and it XORs with Shift rather than adding to it
      * (Caps+Shift+a is 'a', not 'A'). Applying it to the whole shift table --
      * the obvious implementation -- would make Caps Lock type '!' for '1',
-     * which no keyboard on earth does. */
+     * which no keyboard on earth does.
+     *
+     * Latin-1 letters case the same way, one block up: à<->À, é<->É, ù<->Ù. The
+     * rule is +/-0x20 across U+00C0..U+00FE, with the two multiplication and
+     * division signs punched out of the middle -- they sit inside a letter
+     * range and are not letters. */
     if (g_mods & EKM_CAPS) {
-        if      (ascii >= 'a' && ascii <= 'z') ascii = (char)(ascii - 'a' + 'A');
-        else if (ascii >= 'A' && ascii <= 'Z') ascii = (char)(ascii - 'A' + 'a');
+        if      (cp >= 'a'    && cp <= 'z')    cp = cp - 'a' + 'A';
+        else if (cp >= 'A'    && cp <= 'Z')    cp = cp - 'A' + 'a';
+        else if (cp >= 0x00E0 && cp <= 0x00FE && cp != 0x00F7) cp -= 0x20;
+        else if (cp >= 0x00C0 && cp <= 0x00DE && cp != 0x00D7) cp += 0x20;
     }
 
     /* Ctrl + letter -> the C0 control code (Ctrl-C = 0x03, Ctrl-D = 0x04, ...).
@@ -319,10 +399,45 @@ static void keyboard_handler(void) {
      * plain 'c' and keyboard_deliver()'s 0x03 branch could never fire. Gate on a
      * real letter so Ctrl+digit / Ctrl+symbol pass through unchanged rather than
      * becoming stray control bytes. */
-    if ((g_mods & EKM_CTRL) && ascii >= 'a' && ascii <= 'z') ascii = ascii & 0x1f;
-    else if ((g_mods & EKM_CTRL) && ascii >= 'A' && ascii <= 'Z') ascii = ascii & 0x1f;
+    if ((g_mods & EKM_CTRL) && cp >= 'a' && cp <= 'z') cp = cp & 0x1f;
+    else if ((g_mods & EKM_CTRL) && cp >= 'A' && cp <= 'Z') cp = cp & 0x1f;
 
-    keyboard_deliver(ascii);
+    /* GUI + letter -> an editing command. The interface's modifier, kept
+     * separate from the terminal's: Ctrl+C is an INTERRUPT in this OS and
+     * always will be, so the clipboard cannot live there. See EK_SEL_ALL and
+     * friends in keyboard.h for the whole argument.
+     *
+     * Delivered as a RAW BYTE, not through keyboard_deliver_cp: these are byte
+     * values, not codepoints, and encoding 0xFD as UTF-8 would turn one command
+     * into the two bytes of ý. Unclaimed GUI+letter combinations fall through
+     * and type their letter, so the key is not a hole. */
+    if (g_mods & EKM_GUI) {
+        uint32_t low = (cp >= 'A' && cp <= 'Z') ? cp + 0x20 : cp;
+        /* SYSTEM shortcuts first, and they are swallowed: see SYSKEY_* in
+         * keyboard.h for why an application must not be able to see -- and so
+         * decline -- the window switcher. Recorded, not performed: this is IRQ
+         * context and the compositor is not safe to call from one. */
+        if (low == '\t') { g_syskey = SYSKEY_NEXT_WINDOW;  return; }
+        if (low == 'w')   { g_syskey = SYSKEY_CLOSE_WINDOW; return; }
+        if (low == 'q')   { g_syskey = SYSKEY_QUIT_APP;     return; }
+        char cmd = 0;
+        switch (low) {
+            case 'a': cmd = (char)EK_SEL_ALL; break;
+            case 'c': cmd = (char)EK_COPY;    break;
+            case 'x': cmd = (char)EK_CUT;     break;
+            case 'v': cmd = (char)EK_PASTE;   break;
+            /* UNDO is GUI+Z and REDO is GUI+Shift+Z -- the shift is read here
+             * because the char stream cannot carry it, so a reader downstream
+             * could never tell the two apart. GUI+Y is the other spelling of
+             * redo and costs one line to honour. */
+            case 'z': cmd = (g_mods & EKM_SHIFT) ? (char)EK_REDO : (char)EK_UNDO; break;
+            case 'y': cmd = (char)EK_REDO;    break;
+            default: break;
+        }
+        if (cmd) { keyboard_deliver(cmd); return; }
+    }
+
+    keyboard_deliver_cp(cp);
 }
 
 
@@ -415,10 +530,303 @@ void keyboard_init(void) {
     serial_write_string("Keyboard registered on IRQ 1\n");
 }
 
+#else  /* !__x86_64__ ---------------------------------------------------------
+ * No PS/2 controller, so no scancode decode, no IRQ1 and no LED command. The
+ * POLICY above is untouched and fully live; it is fed by keyboard_inject_event()
+ * instead of by an interrupt.
+ *
+ * The LEDs go out over virtio-input's STATUS queue instead of a PS/2 0xED
+ * command -- same moment, same trigger, different wire. */
+static void kbd_set_leds(void) {
+    virtio_input_set_leds(g_mods);
+}
+
+void keyboard_init(void) {
+    g_mods = 0;
+}
+#endif /* __x86_64__ */
+
+/* The layout, the shift table, Caps Lock and Ctrl -- applied ONCE, here, so
+ * every input source composes characters the same way.
+ *
+ * `make` is an AT SET-1 make code, which is also, and not by coincidence, a
+ * Linux evdev keycode: evdev's numbering for the main key block was taken from
+ * set 1, so KEY_ESC is 1, KEY_Q is 16 and KEY_A is 30 exactly as the scancodes
+ * are. That is what lets virtio-input index the SAME layout tables instead of
+ * carrying a second copy of them -- and what makes `keyboard_set_layout
+ * dvorak` apply to a virtio keyboard without another line of code.
+ *
+ * Returns 0 for a key that produces no character in this layout.
+ */
+uint32_t keyboard_compose_cp(uint8_t make, uint8_t mods) {
+    if (make >= 128 || !g_layout)
+        return 0;
+
+    /* The same three levels the PS/2 path uses, so a virtio keyboard types
+     * exactly what a PS/2 one does on the same layout -- AltGr included. */
+    uint32_t ascii;
+    if ((g_side & SIDE_RALT) && g_layout->altgr) ascii = g_layout->altgr[make];
+    else if (mods & EKM_SHIFT)                   ascii = g_layout->shift[make];
+    else                                         ascii = g_layout->normal[make];
+    if (!ascii)
+        return 0;
+
+    /* A dead key composes with the NEXT key here exactly as it does on the
+     * PS/2 path -- same pending mark, because it is the same person typing on
+     * one keyboard and the state cannot live in two places. */
+    if (KEY_IS_DEAD(ascii)) {
+        uint32_t mark = KEY_BARE(ascii);
+        if (g_dead == mark) { g_dead = 0; return mark; }
+        if (g_dead) { uint32_t flush = g_dead; g_dead = mark; return flush; }
+        g_dead = mark;
+        return 0;
+    }
+    if (g_dead) {
+        uint32_t composed = kbd_compose(g_dead, ascii);
+        uint32_t mark = g_dead;
+        g_dead = 0;
+        if (composed) return composed;
+        keyboard_deliver_cp(mark);          /* no pairing: the mark, then the key */
+    }
+
+    /* Caps Lock: LETTERS ONLY, and it XORs with Shift rather than adding to it
+     * (Caps+Shift+a is 'a', not 'A'). Applying it to the whole shift table --
+     * the obvious implementation -- would make Caps Lock type '!' for '1',
+     * which no keyboard on earth does. */
+    if (mods & EKM_CAPS) {
+        if      (ascii >= 'a'    && ascii <= 'z')    ascii = ascii - 'a' + 'A';
+        else if (ascii >= 'A'    && ascii <= 'Z')    ascii = ascii - 'A' + 'a';
+        else if (ascii >= 0x00E0 && ascii <= 0x00FE && ascii != 0x00F7) ascii -= 0x20;
+        else if (ascii >= 0x00C0 && ascii <= 0x00DE && ascii != 0x00D7) ascii += 0x20;
+    }
+
+    /* Ctrl + letter -> the C0 control code. Gated on a real letter so
+     * Ctrl+digit / Ctrl+symbol pass through unchanged rather than becoming
+     * stray control bytes. */
+    if ((mods & EKM_CTRL) && ((ascii >= 'a' && ascii <= 'z') ||
+                              (ascii >= 'A' && ascii <= 'Z')))
+        ascii = ascii & 0x1f;
+
+    return ascii;
+}
+
+/* The unshifted key IDENTITY for an event code -- "which key", not "what
+ * character". Always the base layout, never the shift table, so an event says
+ * the same thing whether or not Shift was held. */
+uint16_t keyboard_keycode_of(uint8_t make) {
+    if (make >= 128 || !g_layout)
+        return 0;
+    /* The BARE codepoint: a dead key is still "which key", and its identity is
+     * the mark it carries. Above the BMP there is no 16-bit answer, so say 0
+     * rather than a truncated one -- the same choice kbd_translate makes. */
+    uint32_t cp = KEY_BARE(g_layout->normal[make]);
+    return (uint16_t)(cp <= 0xFFFF ? cp : 0);
+}
+
+/* ---- the injection seam --------------------------------------------------
+ * ONE decoded key, from whatever hardware decoded it, into the two streams.
+ *
+ * This is what makes a second keyboard driver a translation table rather than a
+ * second keyboard driver. virtio-input (arch/aarch64/drivers/virtio_input.c)
+ * turns Linux evdev codes into EKC_* / ASCII and calls this; the PS/2 handler
+ * above reaches the same rings by the same rules, and USB HID's
+ * keyboard_inject_char() is the char-only special case of it.
+ *
+ * `ascii` is 0 for a key with no character (F5, the arrows already carry their
+ * EK_* through it, a modifier). It is delivered only on the MAKE: a key
+ * RELEASE has never produced a character on any of these paths, and emitting
+ * one would double every keystroke. */
+void keyboard_inject_event(uint16_t code, int pressed, char ascii) {
+    switch (code) {
+    case EKC_LSHIFT: mod_update(SIDE_LSHIFT, SIDE_LSHIFT | SIDE_RSHIFT,
+                                EKM_SHIFT, code, pressed); return;
+    case EKC_RSHIFT: mod_update(SIDE_RSHIFT, SIDE_LSHIFT | SIDE_RSHIFT,
+                                EKM_SHIFT, code, pressed); return;
+    case EKC_LCTRL:  mod_update(SIDE_LCTRL,  SIDE_LCTRL  | SIDE_RCTRL,
+                                EKM_CTRL,  code, pressed); return;
+    case EKC_RCTRL:  mod_update(SIDE_RCTRL,  SIDE_LCTRL  | SIDE_RCTRL,
+                                EKM_CTRL,  code, pressed); return;
+    case EKC_LALT:   mod_update(SIDE_LALT,   SIDE_LALT   | SIDE_RALT,
+                                EKM_ALT,   code, pressed); return;
+    case EKC_RALT:   mod_update(SIDE_RALT,   SIDE_LALT   | SIDE_RALT,
+                                EKM_ALT,   code, pressed); return;
+    case EKC_LWIN:   mod_update(SIDE_LGUI,   SIDE_LGUI   | SIDE_RGUI,
+                                EKM_GUI,   code, pressed); return;
+    case EKC_RWIN:   mod_update(SIDE_RGUI,   SIDE_LGUI   | SIDE_RGUI,
+                                EKM_GUI,   code, pressed); return;
+    case EKC_CAPS:   lock_toggle(EKM_CAPS,   code, pressed); return;
+    case EKC_NUM:    lock_toggle(EKM_NUM,    code, pressed); return;
+    case EKC_SCROLL: lock_toggle(EKM_SCROLL, code, pressed); return;
+    default: break;
+    }
+
+    kbd_event_push(code, pressed);
+    if (pressed && ascii)
+        keyboard_deliver(ascii);
+}
+
+/* --- AZERTY (French) ------------------------------------------------------
+ *
+ * THE LAYOUT THIS DRIVER USED TO REFUSE TO SHIP. Its comment above the Dvorak
+ * table said, correctly, that an AZERTY in a 7-bit char stream "could only be
+ * QWERTY-with-letters-moved and silent holes where the accents belong -- a
+ * worse lie than saying no". The stream is UTF-8 now, so here is the real one.
+ *
+ * What makes it French rather than QWERTY rearranged:
+ *   * é è ç à ù are on the NUMBER ROW, unshifted, where a French keyboard puts
+ *     them -- they are not dead-key compositions and never were;
+ *   * the digits are the SHIFTED level of that row (French types 1 with Shift);
+ *   * ^ and ¨ live on one key as DEAD keys, which is how â ê î ô û and ë ï ü
+ *     are typed;
+ *   * AltGr is a real third level: @ # { } [ ] | \ € ~ are only reachable
+ *     there, and nothing else on the keyboard can produce them.
+ *
+ * Set-1 make codes, same indexing as every other table here. */
+static const uint32_t scan_to_cp_azerty[128] = {
+    /* THE NUMBER ROW IS THE LAYOUT. Set-1 make 0x02 is the key labelled 1 on a
+     * US board, and on a French one that key is '&' -- the accented letters sit
+     * along this row and the digits are its shifted level. Getting this row
+     * off by one make code (which the first draft did) puts é where & belongs
+     * and every test of it disagrees by exactly one key. */
+    0,   0x1B, 0x0026,0x00E9,0x0022,0x0027,0x0028,0x002D,0x00E8,0x005F,  // 0x00-0x09  & é " ' ( - è _
+    0x00E7,0x00E0,0x0029,0x003D,'\b','\t', 'a', 'z', 'e', 'r',            // 0x0A-0x13  ç à ) =
+    't', 'y', 'u', 'i', 'o', 'p', KEY_DEAD(0x005E), 0x0024, '\n', 0,     // 0x14-0x1D  ^dead $
+    'q', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm',                    // 0x1E-0x27
+    0x00F9,0x00B2, 0,  '*', 'w', 'x', 'c', 'v', 'b', 'n',                // 0x28-0x31  ù ²
+    0x002C,0x003B,0x003A,0x0021, 0, '*', 0,  ' ', 0,   0,                // 0x32-0x3B  , ; : !
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x3C-0x45
+    0,   0,   0,   '-', 0,   0,   0,   '+', 0,   0,                      // 0x46-0x4F
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x50-0x59
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x5A-0x63
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x64-0x6D
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x6E-0x77
+    0,   0,   0,   0,   0,   0,   0,   0,                                // 0x78-0x7F
+};
+static const uint32_t scan_to_cp_azerty_shift[128] = {
+    0,   0x1B, '1', '2', '3', '4', '5', '6', '7', '8',                   // 0x00-0x09  the DIGITS
+    '9', '0', 0x00B0,'+', '\b','\t', 'A', 'Z', 'E', 'R',                  // 0x0A-0x13  ° +
+    'T', 'Y', 'U', 'I', 'O', 'P', KEY_DEAD(0x00A8), 0x00A3, '\n', 0,     // 0x14-0x1D  ¨dead £
+    'Q', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'M',                    // 0x1E-0x27
+    '%', 0,   0,  0x00B5,'W', 'X', 'C', 'V', 'B', 'N',                   // 0x28-0x31  % µ
+    '?', '.', '/', 0x00A7, 0, '*', 0,  ' ', 0,   0,                      // 0x32-0x3B  ? . / §
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x3C-0x45
+    0,   0,   0,   '-', 0,   0,   0,   '+', 0,   0,                      // 0x46-0x4F
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x50-0x59
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x5A-0x63
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x64-0x6D
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x6E-0x77
+    0,   0,   0,   0,   0,   0,   0,   0,                                // 0x78-0x7F
+};
+/* The third level. Everything a programmer needs that the first two levels of a
+ * French keyboard do not have: without this row you cannot type @ in an email
+ * address, { } in C, [ ] in an array, | in a shell pipeline, or \\ anywhere. */
+static const uint32_t scan_to_cp_azerty_altgr[128] = {
+    0,   0,   0,   '~', '#', '{', '[', '|', 0x0060,'\\',                  // 0x00-0x09  ~ # { [ | ` and backslash
+    '^', '@', ']', '}', 0,   0,   0,   0,   0x20AC,0,                    // 0x0A-0x13  ^ @ ] }  € on E
+    0,   0,   0,   0,   0,   0,   0,   0x00A4,0,   0,                    // 0x14-0x1D  ¤
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x1E-0x27
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x28-0x31
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x32-0x3B
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x3C-0x45
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x46-0x4F
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x50-0x59
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x5A-0x63
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x64-0x6D
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,                      // 0x6E-0x77
+    0,   0,   0,   0,   0,   0,   0,   0,                                // 0x78-0x7F
+};
+
+/* --- Unicode: composition and UTF-8 ---------------------------------------
+ *
+ * WHAT THE CHAR STREAM CARRIES, AND WHY IT CHANGED. It used to be 7-bit ASCII,
+ * one byte per key, and that made French unshippable: this driver's own
+ * comment said so, and refused to offer AZERTY rather than ship a layout with
+ * silent holes where é è ç à ù belong. The stream is UTF-8 now. ASCII is
+ * byte-for-byte what it always was -- every existing reader (the tty, the
+ * shell, embk_key_poll, ui_input_char) keeps working unchanged -- and anything
+ * above 0x7F arrives as the 2-4 bytes the renderer already knows how to draw
+ * (ui/backend/font.c's font_utf8_decode has decoded UTF-8 all along; it was
+ * only the INPUT half of the OS that could not spell). */
+
+/* The pairings a dead key can make. Deliberately the Latin-1 set and no more:
+ * every one of these is a character the shipped font can draw and a French,
+ * Spanish or German keyboard can reach. An entry that cannot be rendered would
+ * be a hole of exactly the kind this whole change exists to remove. */
+static const struct { uint16_t mark, base, out; } g_compose[] = {
+    /* acute */
+    { 0x00B4, 'a', 0x00E1 }, { 0x00B4, 'e', 0x00E9 }, { 0x00B4, 'i', 0x00ED },
+    { 0x00B4, 'o', 0x00F3 }, { 0x00B4, 'u', 0x00FA }, { 0x00B4, 'y', 0x00FD },
+    { 0x00B4, 'A', 0x00C1 }, { 0x00B4, 'E', 0x00C9 }, { 0x00B4, 'I', 0x00CD },
+    { 0x00B4, 'O', 0x00D3 }, { 0x00B4, 'U', 0x00DA },
+    /* grave */
+    { 0x0060, 'a', 0x00E0 }, { 0x0060, 'e', 0x00E8 }, { 0x0060, 'i', 0x00EC },
+    { 0x0060, 'o', 0x00F2 }, { 0x0060, 'u', 0x00F9 },
+    { 0x0060, 'A', 0x00C0 }, { 0x0060, 'E', 0x00C8 }, { 0x0060, 'I', 0x00CC },
+    { 0x0060, 'O', 0x00D2 }, { 0x0060, 'U', 0x00D9 },
+    /* circumflex -- the one AZERTY puts on its own key */
+    { 0x005E, 'a', 0x00E2 }, { 0x005E, 'e', 0x00EA }, { 0x005E, 'i', 0x00EE },
+    { 0x005E, 'o', 0x00F4 }, { 0x005E, 'u', 0x00FB },
+    { 0x005E, 'A', 0x00C2 }, { 0x005E, 'E', 0x00CA }, { 0x005E, 'I', 0x00CE },
+    { 0x005E, 'O', 0x00D4 }, { 0x005E, 'U', 0x00DB },
+    /* diaeresis -- AZERTY's shifted circumflex */
+    { 0x00A8, 'a', 0x00E4 }, { 0x00A8, 'e', 0x00EB }, { 0x00A8, 'i', 0x00EF },
+    { 0x00A8, 'o', 0x00F6 }, { 0x00A8, 'u', 0x00FC }, { 0x00A8, 'y', 0x00FF },
+    { 0x00A8, 'A', 0x00C4 }, { 0x00A8, 'E', 0x00CB }, { 0x00A8, 'I', 0x00CF },
+    { 0x00A8, 'O', 0x00D6 }, { 0x00A8, 'U', 0x00DC },
+    /* tilde */
+    { 0x007E, 'n', 0x00F1 }, { 0x007E, 'a', 0x00E3 }, { 0x007E, 'o', 0x00F5 },
+    { 0x007E, 'N', 0x00D1 }, { 0x007E, 'A', 0x00C3 }, { 0x007E, 'O', 0x00D5 },
+    /* cedilla */
+    { 0x00B8, 'c', 0x00E7 }, { 0x00B8, 'C', 0x00C7 },
+};
+
+static uint32_t kbd_compose(uint32_t mark, uint32_t base) {
+    for (unsigned i = 0; i < sizeof g_compose / sizeof g_compose[0]; i++)
+        if (g_compose[i].mark == mark && g_compose[i].base == base)
+            return g_compose[i].out;
+    return 0;                                  /* no such pairing */
+}
+
+/* One codepoint -> UTF-8 -> the byte ring the whole system already reads. */
+static void keyboard_deliver_cp(uint32_t cp) {
+    if (cp < 0x80) { keyboard_deliver((char)cp); return; }
+    if (cp < 0x800) {
+        keyboard_deliver((char)(0xC0 | (cp >> 6)));
+        keyboard_deliver((char)(0x80 | (cp & 0x3F)));
+        return;
+    }
+    if (cp < 0x10000) {
+        keyboard_deliver((char)(0xE0 | (cp >> 12)));
+        keyboard_deliver((char)(0x80 | ((cp >> 6) & 0x3F)));
+        keyboard_deliver((char)(0x80 | (cp & 0x3F)));
+        return;
+    }
+    keyboard_deliver((char)(0xF0 | (cp >> 18)));
+    keyboard_deliver((char)(0x80 | ((cp >> 12) & 0x3F)));
+    keyboard_deliver((char)(0x80 | ((cp >> 6) & 0x3F)));
+    keyboard_deliver((char)(0x80 | (cp & 0x3F)));
+}
+
+/* Force modifier state, FOR THE KEYMAP SELFTEST ONLY. A test that cannot hold
+ * Shift or AltGr can only check a third of any layout -- and the third level is
+ * exactly where the characters a French keyboard needs for code live. */
+void kbd_mods_force(uint8_t mods)  { g_mods = mods; }
+void kbd_altgr_force(int on)       { if (on) g_side |= SIDE_RALT; else g_side &= (uint8_t)~SIDE_RALT; }
+
+/* A key from a keyboard that is not the PS/2 one. Same event ring, same char
+ * stream, same UTF-8 -- so a virtio keyboard and a PS/2 keyboard on the same
+ * layout produce identical bytes, which is the only way `keyboard_set_layout`
+ * can mean one thing on a machine that has both. */
+void keyboard_inject_cp(uint16_t code, int pressed, uint32_t cp) {
+    keyboard_inject_event(code, pressed, 0);      /* the event half */
+    if (pressed && cp) keyboard_deliver_cp(cp);   /* the text half, as UTF-8 */
+}
+
 /* --- layouts -------------------------------------------------------------- */
 static const struct keymap g_layouts[] = {
-    { "us",     scan_to_ascii,        scan_to_ascii_shift        },
-    { "dvorak", scan_to_ascii_dvorak, scan_to_ascii_dvorak_shift },
+    { "us",     scan_to_cp_us,        scan_to_cp_shift,        NULL },
+    { "dvorak", scan_to_cp_dvorak, scan_to_cp_dvorak_shift, NULL },
+    { "azerty", scan_to_cp_azerty,    scan_to_cp_azerty_shift,    scan_to_cp_azerty_altgr },
 };
 static const struct keymap *g_layout = &g_layouts[0];
 
@@ -446,7 +854,11 @@ char keyboard_getchar(void) {
     char c;
     // spin until a character is available in the buffer
     while (!buffer_pop(&c)) {
-        __asm__ volatile ("hlt"); // No character available, halt until next interrupt
+        /* Idle until the next interrupt. Through the HAL rather than a bare
+         * `hlt`: the instruction is x86's spelling (aarch64's is `wfi`), and
+         * this file is compiled for both now. docs/TODO.md asked for exactly
+         * this conversion, "as part of making its file build". */
+        arch_cpu_idle();
     }
     
     return c;
@@ -478,7 +890,20 @@ int keyboard_has_char(void) {
  * wins, the same class of concession as embk_proc_kill's ambient authority. */
 static volatile uint32_t g_console_int_target;   /* pid, or 0 for none */
 
+/* WHO DELEGATED, so ^Z has somewhere to report back to.
+ *
+ * ^C needs only a target: interrupt it, and the shell finds out because its
+ * wait returns when the child dies or gives up. ^Z is different -- the child
+ * does not die, it FREEZES, and a parent blocked waiting for it would wait
+ * forever for an exit that is never coming. So the router is remembered too,
+ * and suspending wakes it.
+ *
+ * Recorded at the same moment as the target and by the same call, so the two
+ * cannot disagree about who routed what. */
+static volatile uint32_t g_console_int_router;   /* pid that routed, or 0 */
+
 void keyboard_set_interrupt_target(uint32_t pid) { g_console_int_target = pid; }
+void keyboard_set_interrupt_router(uint32_t pid) { g_console_int_router = pid; }
 uint32_t keyboard_get_interrupt_target(void) { return g_console_int_target; }
 
 static void keyboard_deliver(char c) {
@@ -492,11 +917,53 @@ static void keyboard_deliver(char c) {
     if (c == 0x03) {
         uint32_t target = g_console_int_target;
         if (target) {
+            /* An interrupt FIRST, if the target asked to catch them. That is
+             * the difference between "stop what you are doing" and "stop
+             * permanently": a shell running a script wants the first and
+             * cannot survive the second, because cancellation is sticky by
+             * design. A target that has not opted in is cancelled exactly as
+             * before, so every routed child behaves as it always did. */
+            if (process_raise_interrupt(target) == 1)
+                return;
             process_cancel(target);
             return;         /* consumed: ^C is an interruption, not input */
         }
         /* Nobody routed: fall through and hand ^C over as an ordinary byte
          * rather than silently swallowing a keystroke. */
+    }
+
+    /* ^Z: STOP the routed target rather than delivering a byte.
+     *
+     * The other half of "stop what you are doing". ^C says do not finish this;
+     * ^Z says finish it later. It needs the kernel to be able to freeze a
+     * process rather than only interrupt or cancel one -- which it has always
+     * been able to do (process_suspend, built for the debugger) and has never
+     * had a way to ask for from a keyboard.
+     *
+     * WAKING THE ROUTER IS NOT A COURTESY, IT IS THE WHOLE MECHANISM. The
+     * child does not exit, so the shell's process_wait() would block forever
+     * on an exit that is not coming. process_wake_child_waiters() makes it
+     * re-check, and process_wait() now answers -EMBK_ESTOPPED, which is how a
+     * shell gets its prompt back and can say "Stopped".
+     *
+     * Same lock reasoning as ^C above: both calls take g_sched_lock
+     * themselves and this runs in IRQ context, so neither may be made with it
+     * already held -- and by the standing invariant it never is. */
+    if (c == 0x1A) {
+        uint32_t target = g_console_int_target;
+        uint32_t router = g_console_int_router;
+        /* Suspending the SHELL ITSELF is not a job control operation, it is a
+         * way to wedge the console with one keystroke. A session owner that
+         * routed ^C at its own prompt (handle 0) is refused here and ^Z falls
+         * through as an ordinary byte. */
+        if (target && target != router) {
+            if (process_suspend(target) > 0) {
+                if (router) process_wake_child_waiters(router);
+                return;     /* consumed */
+            }
+        }
+        /* Nobody routed, or the target could not be frozen (every thread of it
+         * is pinned): hand ^Z over as a byte rather than pretending. */
     }
 
     sched_lock();

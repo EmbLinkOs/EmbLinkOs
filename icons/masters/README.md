@@ -6,7 +6,7 @@ One **SVG** per icon, named after the icon. `make` turns each one into a
     icons/masters/files.svg     ->  /system/images/files.eic
     icons/masters/terminal.svg  ->  /system/images/terminal.eic
 
-Then point an app at it from its `user/bin/<name>.app` manifest:
+Then point an app at it from its `<progdir>/<name>.app` manifest:
 
     name Files
     icon /system/images/files.eic

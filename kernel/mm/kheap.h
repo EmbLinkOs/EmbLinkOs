@@ -65,5 +65,7 @@ void kheap_check(void);
 
 // Slab allocator stats (objects in use vs capacity per pool)
 void kheap_slab_stats(void);
+/* The same numbers for a test: objects carved, objects out, regions. */
+void kheap_slab_stats_get(uint64_t *total_objs, uint64_t *used_objs, int *ranges);
 
 #endif /* __KHEAP__H__ */

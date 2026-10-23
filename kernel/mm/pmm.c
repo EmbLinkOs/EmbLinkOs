@@ -1,8 +1,10 @@
 #include "mm/pmm.h"
+#include "mm/kheap.h"
+#include "include/kprintf.h"
+#include "include/kstring.h"
 #include "drivers/char/serial.h"
-#include "arch/x86_64/smp/smp.h"
-#include "arch/x86_64/cpu/spinlock.h"
-#include "arch/x86_64/boot/boot_protocol.h"
+#include "include/spinlock.h"
+#include "boot/boot_protocol.h"
 
 /* Guards pmm_bitmap/free_pages/used_pages -- unused until SMP (Phase 3,
  * docs/architecture/process-and-scheduling.md), same "add the lock, don't
@@ -70,10 +72,18 @@ void pmm_print_map(void) {
         }
         serial_write_string("\n");
 
-}
+        if (entry->type == E820_USABLE)
+            total_usable += entry->length;
+    }
 
-
-
+    /* The number the map is actually FOR. It was computed and then thrown
+     * away, which is also why -Wall (now on, via the aarch64 build) flagged
+     * it: a running total nobody prints is either a bug or dead weight, and
+     * here it was the former -- "entries: 1" tells you nothing about whether
+     * the machine has the memory you asked for. */
+    serial_write_string("usable total: ");
+    serial_write_hex(total_usable);
+    serial_write_string(" bytes\n");
 }
 
 
@@ -182,13 +192,12 @@ void pmm_init(void) {
 
     // step 7: explicitly reserve fixed-address pages that something OUTSIDE
     // this allocator's own bookkeeping needs to own at a known physical
-    // address. Today this is only the AP trampoline (kernel/cpu/smp.h) --
-    // already covered incidentally by step 6's blanket reservation of
-    // everything below kernel_end (which is always > 1MB), but that's an
-    // accident of where step 6's loop happens to start (page 0), not a
-    // deliberate low-memory carve-out. Reserving it explicitly here means
-    // it stays reserved even if step 6 is ever changed to start later.
-    pmm_reserve_page(AP_TRAMPOLINE_PHYS);
+    // address. WHICH pages those are is the one genuinely architecture-specific
+    // thing in this file, so it is asked rather than assumed: on x86 it is the
+    // AP trampoline (SMP bring-up pokes machine code into a fixed low page); on
+    // aarch64 it is nothing at all, because PSCI starts secondary CPUs at an
+    // address we choose. See arch_pmm_reserve_fixed() in pmm.h.
+    arch_pmm_reserve_fixed();
 
     pmm_print_stats();
 
@@ -200,6 +209,19 @@ void pmm_init(void) {
 // image plus its own bitmap. The bitmap lives at kernel_end and is written before
 // paging is rebuilt, so vmm_init must map at least this far in the kernel window
 // or the first bitmap access after the CR3 switch faults.
+uint64_t pmm_free_pages(void) {
+    return free_pages;
+}
+
+/* The other two numbers, because "free" alone answers nothing: free OUT OF WHAT
+ * is the only form of the question anybody actually asks. `total` counts every
+ * page the machine reports; `used` is what the allocator has handed out, so
+ * used + free falls short of total by exactly the pages that were never usable
+ * (firmware, MMIO holes, the bitmap itself). */
+uint64_t pmm_total_pages(void) { return total_pages; }
+uint64_t pmm_used_pages(void)  { return used_pages; }
+
+
 uint64_t pmm_reserved_phys_end(void) {
     uint64_t bitmap_phys_end = KV2P(pmm_bitmap) + bitmap_size;
     return (bitmap_phys_end + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
@@ -302,3 +324,62 @@ void pmm_reserve_page(uint64_t phys_addr) {
 }
 
 
+
+
+/* ---- memory that arrived after boot --------------------------------------
+ *
+ * The bitmap is sized once, at boot, from the highest address the firmware's
+ * memory map mentioned, and it lives immediately after the kernel image --
+ * which means it cannot simply be extended in place: what follows it is
+ * whatever the linker put there.
+ *
+ * So a region above the current coverage gets a NEW bitmap, allocated from
+ * the kernel heap, with the old one copied in. That is the only moving part,
+ * and it is why this cannot run before the heap exists.
+ *
+ * A region BELOW the current coverage needs none of that: the bits are
+ * already there and were marked used, so freeing them is the whole job. That
+ * is the common case -- firmware usually reports the hot-plug window's
+ * address range as reserved, so the bitmap already spans it. */
+bool pmm_add_region(uint64_t phys, uint64_t length) {
+    if (!length) return false;
+    uint64_t start_page = (phys + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t end_page = (phys + length) / PAGE_SIZE;
+    if (end_page <= start_page) return false;
+
+    if (end_page > total_pages) {
+        uint64_t new_total = end_page;
+        uint64_t new_size = (new_total + 7) / 8;
+        uint8_t *nb = (uint8_t *)kmalloc(new_size);
+        if (!nb) {
+            kprintf("pmm: cannot grow the bitmap to %llu bytes for %llu MiB "
+                    "of new memory\n", (unsigned long long)new_size,
+                    (unsigned long long)(length >> 20));
+            return false;
+        }
+        /* EVERYTHING NEW IS USED UNTIL SAID OTHERWISE. Copying the old bits
+         * and then setting the rest is the order that matters: the other way
+         * round would briefly present the new pages as free while the old
+         * ones were still being written. */
+        memcpy(nb, pmm_bitmap, bitmap_size);
+        for (uint64_t i = bitmap_size; i < new_size; i++) nb[i] = 0xFF;
+        used_pages += (new_total - total_pages);
+        pmm_bitmap = nb;
+        bitmap_size = new_size;
+        total_pages = new_total;
+    }
+
+    uint64_t added = 0;
+    for (uint64_t p = start_page; p < end_page; p++) {
+        if (bitmap_test(p)) {
+            bitmap_clear(p);
+            free_pages++;
+            used_pages--;
+            added++;
+        }
+    }
+    kprintf("pmm: +%llu MiB at %llx (%llu page(s) now free)\n",
+            (unsigned long long)((added * PAGE_SIZE) >> 20),
+            (unsigned long long)phys, (unsigned long long)free_pages);
+    return added > 0;
+}

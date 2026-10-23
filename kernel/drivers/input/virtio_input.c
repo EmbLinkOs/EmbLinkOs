@@ -1,0 +1,559 @@
+#include "drivers/input/virtio_input.h"
+#include "drivers/bus/virtio_pci.h"
+#include "drivers/input/keyboard.h"
+#include "drivers/input/mouse.h"
+#include "mm/pmm.h"
+#include "include/kprintf.h"
+#include "include/kstring.h"
+
+/* virtio-input -- the keyboard and the pointer on a machine with no PS/2
+ * controller. docs/ARM64.md phase A7; docs/TODO.md said "virtio-input is the
+ * one that matters first: without it the ARM machine has no keyboard".
+ *
+ * WHAT THIS FILE IS NOT: a second keyboard driver. The char ring, the key-event
+ * ring, modifier tracking, layouts, the Ctrl-C route and the grab all live in
+ * drivers/input/keyboard.c and are shared -- that file's PS/2 half is now
+ * behind an #if and its POLICY half is not. This file is a TRANSLATION TABLE
+ * plus a queue: Linux evdev codes in, keyboard_inject_event() out. The same
+ * goes for the pointer, which lands in mouse_set_absolute(), an entry point
+ * that already existed for USB tablets.
+ *
+ * TWO DEVICES, ONE DRIVER. QEMU exposes the keyboard and the tablet as separate
+ * PCI functions with the SAME device id (0x1052), distinguishable only by
+ * asking each what it is: select ID_DEVIDS/ID_NAME in the device config and
+ * read the answer. We probe by capability instead of by name -- a device that
+ * reports EV_KEY with keyboard keycodes IS a keyboard, whatever it calls
+ * itself -- because the names are QEMU's and could change.
+ *
+ * POLLED, like virtio-blk, and for the same reason plus one: there is no MSI on
+ * this machine (arch_pci_msi_message() returns false), so an interrupt-driven
+ * version would use a level-triggered INTx line shared with everything else on
+ * the bus, and the event queue is drained from the compositor tick anyway --
+ * which is exactly the cadence input needs.
+ */
+
+#define VIRTIO_INPUT_DEVID   0x1052
+#define VI_MAX_DEVS          4
+#define VI_QSIZE             64        /* eventq depth: a burst of keystrokes  */
+#define VI_SQSIZE            8         /* statusq: three LEDs, never a burst   */
+
+/* Device-config selects (virtio 1.1, 5.8.4). */
+#define VI_CFG_SELECT        0x00
+#define VI_CFG_SUBSEL        0x01
+#define VI_CFG_SIZE          0x02
+#define VI_CFG_PAYLOAD       0x08
+
+#define VI_SEL_ID_NAME       0x01
+#define VI_SEL_EV_BITS       0x11
+
+/* Linux evdev event types + the codes we translate. These are the ABI the
+ * device speaks; they are Linux's numbers, not ours. */
+#define EV_SYN  0x00
+#define EV_KEY  0x01
+#define EV_REL  0x02
+#define EV_ABS  0x03
+#define EV_LED  0x11
+
+/* Linux LED ids, sent on the STATUS queue (driver -> device). */
+#define LED_NUML   0x00
+#define LED_CAPSL  0x01
+#define LED_SCROLLL 0x02
+
+#define REL_WHEEL 0x08
+#define ABS_X     0x00
+#define ABS_Y     0x01
+
+/* MULTITOUCH, which is a protocol inside the event stream rather than a new
+ * event type. A touchscreen does not report "finger 2 moved": it reports
+ * ABS_MT_SLOT to say which contact it is talking about, and then that
+ * contact's fields, until the next SLOT changes the subject. A TRACKING_ID of
+ * -1 is how a contact says it has lifted -- there is no release event.
+ *
+ * That stateful framing is the whole difficulty. A driver that treats these
+ * as independent axes sees one finger at the average of all of them. */
+#define ABS_MT_SLOT        0x2F
+#define ABS_MT_POSITION_X  0x35
+#define ABS_MT_POSITION_Y  0x36
+#define ABS_MT_TRACKING_ID 0x39
+#define BTN_TOUCH          0x14A
+#define MT_MAX_SLOTS       10
+
+#define BTN_LEFT   0x110
+#define BTN_RIGHT  0x111
+#define BTN_MIDDLE 0x112
+
+struct virtio_input_event {
+    uint16_t type;
+    uint16_t code;
+    uint32_t value;
+} __attribute__((packed));
+
+struct vring_avail_q { uint16_t flags; uint16_t idx; uint16_t ring[VI_QSIZE]; }
+    __attribute__((packed));
+struct vring_used_q  { uint16_t flags; uint16_t idx; struct vring_used_elem ring[VI_QSIZE]; }
+    __attribute__((packed));
+struct vring_avail_s { uint16_t flags; uint16_t idx; uint16_t ring[VI_SQSIZE]; }
+    __attribute__((packed));
+struct vring_used_s  { uint16_t flags; uint16_t idx; struct vring_used_elem ring[VI_SQSIZE]; }
+    __attribute__((packed));
+
+/* One ring set per device. Static, not kmalloc'd: a descriptor addresses
+ * PHYSICAL memory and KV2P() only works on the kernel image window, not on the
+ * heap -- the same constraint virtio_blk.c records for its rings. */
+struct vi_dev {
+    struct virtio_pci_dev vd;
+    struct vring_desc     desc[VI_QSIZE]  __attribute__((aligned(16)));
+    struct vring_avail_q  avail           __attribute__((aligned(2)));
+    struct vring_used_q   used            __attribute__((aligned(4)));
+    struct virtio_input_event ev[VI_QSIZE];
+
+    /* The STATUS queue (queue 1, driver -> device): how the lock LEDs are
+     * driven. Its own small ring, because a queue is a one-way channel and the
+     * event queue's descriptors are all device-WRITABLE. */
+    struct vring_desc     sdesc[VI_SQSIZE]  __attribute__((aligned(16)));
+    struct vring_avail_s  savail            __attribute__((aligned(2)));
+    struct vring_used_s   sused             __attribute__((aligned(4)));
+    struct virtio_input_event sev[VI_SQSIZE];
+    uint16_t sqsize;
+    uint16_t snotify_off;
+    uint16_t snext;             /* next status slot to use, round-robin */
+
+    uint16_t qsize;
+    uint16_t notify_off;
+    uint16_t last_used;
+    bool     is_keyboard;
+    bool     up;
+};
+
+static struct vi_dev g_vi[VI_MAX_DEVS];
+static uint32_t      g_vi_count;
+
+/* The tablet reports ABS_X/ABS_Y in a device-defined range; QEMU uses 0..32767.
+ * We read the real maximum out of the config rather than assuming, because a
+ * wrong range does not fail -- it silently squashes the cursor into a corner. */
+static int32_t g_abs_max_x = 32767, g_abs_max_y = 32767;
+static int32_t g_last_x, g_last_y;
+static uint32_t g_buttons;
+
+/* The contacts currently on the glass. Reported state, not derived: a slot
+ * stays active until its tracking id goes to -1, whatever else arrives. */
+static struct { bool active; int32_t x, y; } g_mt[MT_MAX_SLOTS];
+static uint32_t g_mt_slot;        /* which contact the device is talking about */
+static uint32_t g_mt_events;
+static bool g_mt_present;
+
+uint32_t virtio_input_touch_count(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < MT_MAX_SLOTS; i++) if (g_mt[i].active) n++;
+    return n;
+}
+uint32_t virtio_input_touch_events(void) { return g_mt_events; }
+bool virtio_input_touch_present(void) { return g_mt_present; }
+bool virtio_input_touch_at(uint32_t slot, int32_t *x, int32_t *y) {
+    if (slot >= MT_MAX_SLOTS || !g_mt[slot].active) return false;
+    if (x) *x = g_mt[slot].x;
+    if (y) *y = g_mt[slot].y;
+    return true;
+}
+
+/* Counters, for the boot self-test. "The device came up" and "events actually
+ * arrive" are different claims, and only the second one is worth making --
+ * a queue that is armed but never filled looks identical to a working one
+ * until someone presses a key. */
+static uint32_t g_key_events, g_ptr_events;
+
+/* --- evdev keycode -> this OS's key code + unshifted ASCII ------------------
+ * Only the keys a keyboard actually has. Everything absent maps to 0 and is
+ * dropped, which is the honest answer for a key we cannot name -- injecting a
+ * wrong code would be worse than injecting none. */
+static uint16_t vi_translate(uint16_t code, uint32_t *ascii, int pressed) {
+    /* A Linux evdev keycode IS an AT set-1 make code for the main key block --
+     * evdev took its numbering from set 1 -- so the printable half of this
+     * table is not ours to own: keyboard_compose_cp() applies the CURRENT layout,
+     * its shift table, Caps Lock and Ctrl, and a virtio keyboard therefore
+     * honours `keyboard_set_layout dvorak` without another line here. The
+     * hand-rolled US shift table this replaced was a second, worse answer to a
+     * question keyboard.c had already answered.
+     *
+     * What is left is the keys with no character at all, plus the navigation
+     * block, which carries BOTH an event code and a private control byte
+     * (keyboard.h's three-way contract with the shell's history recall and the
+     * terminal's scrollback). */
+    *ascii = 0;
+
+    switch (code) {
+    case 29:  return EKC_LCTRL;
+    case 42:  return EKC_LSHIFT;
+    case 54:  return EKC_RSHIFT;
+    case 56:  return EKC_LALT;
+    case 58:  return EKC_CAPS;
+    case 97:  return EKC_RCTRL;
+    case 100: return EKC_RALT;
+    case 125: return EKC_LWIN;
+    case 126: return EKC_RWIN;
+    case 127: return EKC_MENU;
+
+    case 59: return EKC_F1;  case 60: return EKC_F2;  case 61: return EKC_F3;
+    case 62: return EKC_F4;  case 63: return EKC_F5;  case 64: return EKC_F6;
+    case 65: return EKC_F7;  case 66: return EKC_F8;  case 67: return EKC_F9;
+    case 68: return EKC_F10; case 87: return EKC_F11; case 88: return EKC_F12;
+
+    case 69: return EKC_NUM;
+    case 70: return EKC_SCROLL;
+
+    case 102: *ascii = EK_HOME;  return EKC_HOME;
+    case 103: *ascii = EK_UP;    return EKC_UP;
+    case 104: *ascii = EK_PGUP;  return EKC_PGUP;
+    case 105: *ascii = EK_LEFT;  return EKC_LEFT;
+    case 106: *ascii = EK_RIGHT; return EKC_RIGHT;
+    case 107: *ascii = EK_END;   return EKC_END;
+    case 108: *ascii = EK_DOWN;  return EKC_DOWN;
+    case 109: *ascii = EK_PGDN;  return EKC_PGDN;
+    case 110: return EKC_INS;
+    case 111: *ascii = EK_DEL;   return EKC_DEL;
+
+    default: break;
+    }
+
+    /* Everything else: ask the layout. The EVENT carries the unshifted key
+     * ("which key"), the char stream the composed character ("what text") --
+     * the same split the PS/2 path makes, because it is now the same code. */
+    if (code < 128) {
+        uint16_t base = keyboard_keycode_of((uint8_t)code);
+        if (base) {
+            /* A CODEPOINT, not a char: this layout can produce é, and a char
+             * cannot hold it -- truncation turned it into a lone 0xE9, which
+             * is not valid UTF-8 and drew as a replacement box.
+             *
+             * ON THE PRESS ONLY. Composing is not a pure lookup any more: a
+             * dead key sets pending state and the next key consumes it, so
+             * asking again on the RELEASE would advance that state a second
+             * time -- typing ^ then e would eat the mark on ^'s release and
+             * produce a bare e. Releases carry no text on any path. */
+            *ascii = pressed ? keyboard_compose_cp((uint8_t)code, keyboard_mods()) : 0;
+            return base;
+        }
+    }
+    return 0;
+}
+
+/* Read one device-config field. select/subsel latch, then size says how many
+ * payload bytes are valid. */
+static uint8_t vi_cfg(struct vi_dev *d, uint8_t sel, uint8_t subsel,
+                      uint8_t *out, uint8_t max)
+{
+    vp_w8(d->vd.devcfg, VI_CFG_SELECT, sel);
+    vp_w8(d->vd.devcfg, VI_CFG_SUBSEL, subsel);
+    uint8_t size = vp_r8(d->vd.devcfg, VI_CFG_SIZE);
+    if (size > max) size = max;
+    for (uint8_t i = 0; i < size; i++)
+        out[i] = vp_r8(d->vd.devcfg, VI_CFG_PAYLOAD + i);
+    return size;
+}
+
+/* Hand every buffer to the device. Each event is ONE device-writable
+ * descriptor -- virtio-input has no request/response shape, the device just
+ * fills buffers as things happen. */
+static void vi_arm_all(struct vi_dev *d) {
+    for (uint16_t i = 0; i < d->qsize; i++) {
+        d->desc[i].addr  = KV2P((uint64_t)(uintptr_t)&d->ev[i]);
+        d->desc[i].len   = sizeof(struct virtio_input_event);
+        d->desc[i].flags = VRING_DESC_F_WRITE;
+        d->desc[i].next  = 0;
+        d->avail.ring[i] = i;
+    }
+    __asm__ volatile("" ::: "memory");
+    d->avail.idx = d->qsize;
+    virtio_pci_notify(&d->vd, d->notify_off, 0);
+}
+
+static void vi_handle(const struct virtio_input_event *e) {
+    switch (e->type) {
+    case EV_KEY: {
+        if (e->code == BTN_LEFT || e->code == BTN_RIGHT || e->code == BTN_MIDDLE) {
+            uint32_t bit = (e->code == BTN_LEFT)  ? MOUSE_BTN_LEFT :
+                           (e->code == BTN_RIGHT) ? MOUSE_BTN_RIGHT
+                                                  : MOUSE_BTN_MIDDLE;
+            if (e->value) g_buttons |= bit; else g_buttons &= ~bit;
+            mouse_set_absolute(g_last_x, g_last_y, g_abs_max_x, g_buttons, 0);
+            return;
+        }
+        /* value 2 is auto-repeat; treat it as another press, which is what a
+         * held key should look like to a text reader. */
+        if (e->value > 2) return;
+        g_key_events++;
+        uint32_t ascii = 0;
+        uint16_t code = vi_translate(e->code, &ascii, e->value != 0);
+        if (!code) return;
+        keyboard_inject_cp(code, e->value != 0, ascii);
+        return;
+    }
+    case EV_ABS:
+        g_ptr_events++;
+        switch (e->code) {
+        case ABS_X: g_last_x = (int32_t)e->value; return;
+        case ABS_Y: g_last_y = (int32_t)e->value; return;
+
+        /* THE SLOT IS A MODE, NOT A VALUE. Everything after it belongs to
+         * that contact until another SLOT event changes the subject, so it
+         * has to be remembered across events -- which is the one thing a
+         * per-event switch statement naturally does not do. */
+        case ABS_MT_SLOT:
+            g_mt_slot = e->value < MT_MAX_SLOTS ? e->value : 0;
+            return;
+
+        /* AND -1 IS HOW A FINGER LIFTS. There is no release event: the
+         * tracking id going negative is the whole notification, and a driver
+         * that only watches positions leaves a contact on the screen
+         * forever. */
+        case ABS_MT_TRACKING_ID:
+            if ((int32_t)e->value < 0) {
+                g_mt[g_mt_slot].active = false;
+            } else if (!g_mt[g_mt_slot].active) {
+                g_mt[g_mt_slot].active = true;
+                g_mt_events++;
+            }
+            return;
+
+        /* POSITION DOES NOT MAKE A CONTACT EXIST. Only the tracking id does,
+         * in both directions -- that is the whole of protocol B's lifetime
+         * rule. Marking a slot active here as well reads as a harmless
+         * belt-and-braces line, and it makes a lifted finger impossible to
+         * remove on any device that sends one more position for the slot
+         * after the tracking id goes to -1. Nothing here has been seen doing
+         * that; the rule is followed because it is the rule, not because
+         * something broke. */
+        case ABS_MT_POSITION_X:
+            g_mt[g_mt_slot].x = (int32_t)e->value;
+            return;
+        case ABS_MT_POSITION_Y:
+            g_mt[g_mt_slot].y = (int32_t)e->value;
+            return;
+        default:
+            return;
+        }
+    case EV_REL:
+        if (e->code == REL_WHEEL)
+            mouse_set_absolute(g_last_x, g_last_y, g_abs_max_x, g_buttons,
+                               (int32_t)e->value);
+        return;
+    case EV_SYN:
+        /* The frame is complete: publish the accumulated position. Doing it
+         * here rather than per-axis is what stops the cursor from tracking
+         * through an intermediate (newX, oldY) point on every move.
+         *
+         * A TOUCHSCREEN DRIVES THE POINTER FROM ITS FIRST CONTACT, and the
+         * contact existing IS the button being down -- there is no separate
+         * press. Later contacts are counted and kept but do nothing on their
+         * own: a gesture recogniser is a different piece of software, and
+         * inventing one here would put guesses in the input path. */
+        if (g_mt_present) {
+            uint32_t buttons = g_buttons;
+            int32_t x = g_last_x, y = g_last_y;
+            if (g_mt[0].active) {
+                x = g_mt[0].x;
+                y = g_mt[0].y;
+                buttons |= MOUSE_BTN_LEFT;
+            } else {
+                buttons &= ~MOUSE_BTN_LEFT;
+            }
+            g_last_x = x;
+            g_last_y = y;
+            mouse_set_absolute(x, y, g_abs_max_x, buttons, 0);
+            return;
+        }
+        mouse_set_absolute(g_last_x, g_last_y, g_abs_max_x, g_buttons, 0);
+        return;
+    default:
+        return;
+    }
+}
+
+void virtio_input_poll(void) {
+    for (uint32_t i = 0; i < g_vi_count; i++) {
+        struct vi_dev *d = &g_vi[i];
+        if (!d->up) continue;
+
+        while (d->last_used != d->used.idx) {
+            __asm__ volatile("" ::: "memory");
+            uint16_t slot = (uint16_t)(d->last_used % d->qsize);
+            uint32_t id   = d->used.ring[slot].id;
+            if (id < d->qsize)
+                vi_handle(&d->ev[id]);
+
+            /* Recycle the buffer immediately: the queue is the only place
+             * events can land, and a buffer left un-armed is an event the
+             * device has nowhere to put. */
+            uint16_t a = (uint16_t)(d->avail.idx % d->qsize);
+            d->avail.ring[a] = (uint16_t)id;
+            __asm__ volatile("" ::: "memory");
+            d->avail.idx++;
+            d->last_used++;
+        }
+        virtio_pci_notify(&d->vd, d->notify_off, 0);
+    }
+}
+
+void virtio_input_init(void) {
+    kprintf("\n=== virtio-input ===\n");
+
+    for (uint32_t idx = 0; idx < VI_MAX_DEVS; idx++) {
+        const struct pci_device *pci = virtio_pci_find(VIRTIO_INPUT_DEVID, idx);
+        if (!pci)
+            break;
+
+        struct vi_dev *d = &g_vi[g_vi_count];
+        memset(d, 0, sizeof(*d));
+
+        if (!virtio_pci_attach(&d->vd, pci, "virtio-input", 0, 0))
+            continue;
+
+        /* virtio-input IS its device config: select/subsel/size is the only way
+         * to ask what the device is. Without that window there is nothing to
+         * probe and no way to tell a keyboard from a tablet. */
+        if (!d->vd.devcfg) {
+            kprintf("virtio-input: device %u exposes no config window\n", idx);
+            continue;
+        }
+
+        /* WHAT IS THIS DEVICE? Ask what event types it can produce. A device
+         * with EV_KEY bit 1 (KEY_ESC) set is a keyboard; one that reports
+         * EV_ABS is a tablet. Probing by capability rather than by the name
+         * string, which belongs to QEMU and is not part of any contract. */
+        uint8_t bits[128];
+        uint8_t n = vi_cfg(d, VI_SEL_EV_BITS, EV_KEY, bits, sizeof bits);
+        d->is_keyboard = (n > 0) && (bits[0] & 0x02);   /* KEY_ESC == 1 */
+
+        uint8_t nabs = vi_cfg(d, VI_SEL_EV_BITS, EV_ABS, bits, sizeof bits);
+        bool is_tablet = (nabs > 0) && (bits[0] & 0x03);  /* ABS_X | ABS_Y */
+
+        /* A TOUCHSCREEN IS NOT A TABLET WITH MORE AXES. It is recognised by
+         * the multitouch position axis being in its capability bitmap --
+         * ABS_MT_POSITION_X, code 0x35, which is byte 6 bit 5. Probing for
+         * the capability rather than the device's name string, for the same
+         * reason as everything else here: the name belongs to QEMU. */
+        bool is_touch = (nabs > 6) && (bits[6] & (1u << (ABS_MT_POSITION_X & 7)));
+        if (is_touch) {
+            is_tablet = true;                /* it reports ABS_X/Y as well */
+            g_mt_present = true;
+            /* The touch surface's own range, which is the one the contacts
+             * are reported in. */
+            uint8_t ai[24];
+            if (vi_cfg(d, 0x12, ABS_MT_POSITION_X, ai, sizeof ai) >= 8)
+                g_abs_max_x = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
+                                        ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
+            if (vi_cfg(d, 0x12, ABS_MT_POSITION_Y, ai, sizeof ai) >= 8)
+                g_abs_max_y = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
+                                        ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
+            if (g_abs_max_x <= 0) g_abs_max_x = 32767;
+            if (g_abs_max_y <= 0) g_abs_max_y = 32767;
+        }
+
+        /* The tablet's real coordinate range, read rather than assumed. */
+        if (is_tablet && !is_touch) {
+            uint8_t ai[24];
+            if (vi_cfg(d, 0x12 /* ID_ABS_INFO */, ABS_X, ai, sizeof ai) >= 8)
+                g_abs_max_x = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
+                                        ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
+            if (vi_cfg(d, 0x12, ABS_Y, ai, sizeof ai) >= 8)
+                g_abs_max_y = (int32_t)((uint32_t)ai[4] | ((uint32_t)ai[5] << 8) |
+                                        ((uint32_t)ai[6] << 16) | ((uint32_t)ai[7] << 24));
+            if (g_abs_max_x <= 0) g_abs_max_x = 32767;
+            if (g_abs_max_y <= 0) g_abs_max_y = 32767;
+        }
+
+        /* Queue 0 is the event queue (device -> driver). Queue 1 is status
+         * (LEDs, rumble) and is deliberately not set up: nothing drives it. */
+        d->qsize = virtio_pci_setup_queue(&d->vd, 0, VI_QSIZE, d->desc,
+                                          &d->avail, &d->used, &d->notify_off);
+        if (d->qsize == 0) {
+            kprintf("virtio-input: device %u has no event queue\n", idx);
+            continue;
+        }
+
+        /* The STATUS queue, on the keyboard only -- a tablet has no LEDs. Its
+         * absence is not an error: virtio-input devices are not required to
+         * offer one, and a keyboard without it simply has no lights. */
+        if (d->is_keyboard) {
+            d->sqsize = virtio_pci_setup_queue(&d->vd, 1, VI_SQSIZE, d->sdesc,
+                                               &d->savail, &d->sused,
+                                               &d->snotify_off);
+            d->savail.flags = VRING_AVAIL_F_NO_INTERRUPT;
+        }
+
+        /* Polled: tell the device not to raise its INTx line. Without this a
+         * level-triggered interrupt nothing acknowledges wedges the machine --
+         * the exact failure the PCI routing self-test caused once already
+         * (docs/TODO.md, "a diagnostic must not arm anything"). */
+        d->avail.flags = VRING_AVAIL_F_NO_INTERRUPT;
+
+        virtio_pci_driver_ok(&d->vd);
+        vi_arm_all(d);
+        d->up = true;
+        g_vi_count++;
+
+        kprintf("virtio-input: %u:%u.%u is a %s, queue %u, polled%s\n",
+                pci->bus, pci->device, pci->function,
+                d->is_keyboard ? "keyboard"
+                               : (is_touch ? "touchscreen"
+                                           : (is_tablet ? "tablet" : "device")),
+                d->qsize,
+                d->sqsize ? ", statusq (LEDs)" : "");
+    }
+
+    if (g_vi_count == 0)
+        kprintf("virtio-input: no device\n");
+}
+
+bool virtio_input_present(void) { return g_vi_count > 0; }
+
+/* Drive the three lock LEDs. Called from keyboard.c's kbd_set_leds() on the
+ * architectures with no PS/2 controller, which is the same place and the same
+ * moment the PS/2 path sends its 0xED command -- so Caps Lock lights up for
+ * the same reason on both machines.
+ *
+ * One EV_LED event per lamp, then a notify. The descriptors are DEVICE-READABLE
+ * (no VRING_DESC_F_WRITE): this queue runs the other way from the event queue,
+ * driver to device.
+ *
+ * Fire and forget, deliberately. There is nothing useful to do with a failure
+ * to light an LED, and blocking the key path on a virtqueue round trip to find
+ * out would be a far worse trade than a lamp that is briefly wrong. */
+void virtio_input_set_leds(uint8_t mods) {
+    for (uint32_t i = 0; i < g_vi_count; i++) {
+        struct vi_dev *d = &g_vi[i];
+        if (!d->up || !d->is_keyboard || d->sqsize == 0)
+            continue;
+
+        static const struct { uint16_t code; uint8_t bit; } lamps[] = {
+            { LED_NUML,    EKM_NUM    },
+            { LED_CAPSL,   EKM_CAPS   },
+            { LED_SCROLLL, EKM_SCROLL },
+        };
+
+        for (unsigned l = 0; l < sizeof lamps / sizeof lamps[0]; l++) {
+            uint16_t slot = (uint16_t)(d->snext % d->sqsize);
+            d->snext++;
+
+            d->sev[slot].type  = EV_LED;
+            d->sev[slot].code  = lamps[l].code;
+            d->sev[slot].value = (mods & lamps[l].bit) ? 1 : 0;
+
+            d->sdesc[slot].addr  = KV2P((uint64_t)(uintptr_t)&d->sev[slot]);
+            d->sdesc[slot].len   = sizeof(struct virtio_input_event);
+            d->sdesc[slot].flags = 0;          /* device READS this one */
+            d->sdesc[slot].next  = 0;
+
+            uint16_t a = (uint16_t)(d->savail.idx % d->sqsize);
+            d->savail.ring[a] = slot;
+            __asm__ volatile("" ::: "memory");
+            d->savail.idx++;
+        }
+        virtio_pci_notify(&d->vd, d->snotify_off, 1);
+    }
+}
+
+void virtio_input_stats(uint32_t *keys, uint32_t *pointer) {
+    if (keys)    *keys    = g_key_events;
+    if (pointer) *pointer = g_ptr_events;
+}

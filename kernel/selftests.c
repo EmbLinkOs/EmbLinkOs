@@ -4,9 +4,11 @@
 #include "include/kstring.h"
 #include "include/errno.h"
 #include "fs/embkfs/embkfs.h"
-#include "block/block.h"   /* blkstat request counters (test ioperf) */
+#include "block/block.h"
+#include "block/partition.h"   /* blkstat request counters (test ioperf) */
 #include "net/net.h"       /* g_netif, net_ping (test net) */
-#include "arch/x86_64/syscall/usercopy.h"   /* transient-EFAULT retry counters */
+#include "net/ntp.h"       /* net_ntp_sync_default (test ntp) */
+#include "include/usercopy.h"   /* transient-EFAULT retry counters */
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/timer.h"
 #include "drivers/char/serial.h"      /* serial_write_char: test tcc real heartbeat */
@@ -14,6 +16,7 @@
 #include "fs/vfs.h"
 #include "fs/fd.h"
 #include "arch/x86_64/cpu/rwlock.h"
+#include "arch/x86_64/cpu/percpu.h"      /* syscall_fast_enabled: test syscall */
 #include "drivers/timer/rtc.h"
 #include "arch/x86_64/syscall/usermode.h"
 #include "process/process.h"
@@ -24,11 +27,28 @@
 #include "lib/ksym.h"         /* test debugsym: the panic symbolizer */
 #include "tty/tty.h"
 #include "drivers/input/keyboard.h"
+#include "ipc/clipboard.h"                   /* test session: whose the clipboard is */
 #include "process/ksync.h"
 #include "mm/kheap.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"   /* MMIO_BASE for the test vmm range assertions */
+#include "mm/swap.h"                         /* test swap store */
+#include "mm/swaptest.h"                     /* test swap: the witness, driven */
+#include "kworker/kworker.h"                 /* test swap: wait for the deferred teardown */
+#include "arch/x86_64/cpu/cpu_features.h"  /* test hardening */
+#include "include/uaccess_guard.h"           /* test hardening */
+#include "lib/random.h"                      /* test random */
+#include "lib/canary.h"                      /* test canary */
+#include "loader/pietest.h"
+#include "drivers/storage/nvme.h"
+#include <stddef.h>                            /* offsetof: test aslr */
+#include "mm/vma.h"       /* test mmap: vma_mmap, vma_munmap, PROT_ and MAP_ */
+#include "mm/vm_object.h" /* test pagecache: vmo_stats/flush/reclaim */
+#include "power/power.h"  /* power / poweroff / reboot */
+#include "process/futex.h" /* test futex */
+#include "process/sched.h" /* test deadline: swapping the policy */
 #include "drivers/usb/usb.h"
+#include "drivers/usb/xhci.h"
 #include "drivers/video/framebuffer.h"
 #include "arch/x86_64/cpu/percpu.h"
 #include "crypto/sha256.h"
@@ -43,7 +63,90 @@
 #include "ipc/channel.h"
 #include "ipc/endpoint.h"
 #include "ipc/pipe.h"
-#include "drivers/audio/ac97.h"
+#include "boot/boot_protocol.h"
+#include "module/module.h"
+#include "drivers/char/virtio_rng.h"
+#include "drivers/char/platform_misc.h"
+#include "drivers/i2c/smbus.h"
+#include "lib/random.h"
+#include "fs/automount.h"
+#include "drivers/input/virtio_input.h"
+#include "drivers/storage/virtio_pmem.h"
+#include "drivers/storage/nvdimm.h"
+#include "drivers/crypto/virtio_crypto.h"
+#include "drivers/iommu/virtio_iommu.h"
+#include "drivers/iommu/intel_iommu.h"
+#include "drivers/iommu/amd_iommu.h"
+#include "acpi/hotplug.h"
+#include "acpi/erst.h"
+#include "lib/crashlog.h"
+#include "crypto/aes.h"
+#include "drivers/storage/atapi.h"
+#include "drivers/storage/sdhci.h"
+#include "fs/ninep.h"
+#include "drivers/storage/virtio_scsi.h"
+#include "drivers/usb/usb_core.h"
+#include "block/block.h"
+#include "acpi/acpi.h"
+#include "acpi/aml.h"
+#include "drivers/audio/pcm.h"
+
+/* `test aml`: run _STA on every device the firmware declared. _STA is a
+ * METHOD on most machines, so this is the check that the executor works --
+ * the loader alone would report the names and evaluate nothing. */
+/* `test usbdevs`: count what is on a removable volume and remember the first
+ * name, which is how the host harness tells a mount that WORKS from one that
+ * merely exists. */
+struct media_listing { int n; char first[64]; };
+static int media_count_cb(const char *name, uint8_t name_len, uint8_t type,
+                          uint64_t ino, void *ctx) {
+    (void)type; (void)ino;
+    struct media_listing *m = ctx;
+    if (m->n == 0 && name_len < sizeof m->first) {
+        memcpy(m->first, name, name_len);
+        m->first[name_len] = 0;
+    }
+    m->n++;
+    return EMBK_OK;
+}
+
+struct sta_count { int ok, bad; };
+static bool sta_visit(struct aml_node *n, void *ctx) {
+    struct sta_count *c = ctx;
+    if (n->value && n->value->kind == AML_DEVICE) {
+        struct aml_node *sta = aml_lookup(n, "_STA");
+        if (sta && sta->parent == n) {
+            struct aml_object *v = aml_evaluate(sta, NULL, 0);
+            if (v && v->kind == AML_INTEGER) c->ok++;
+            else                             c->bad++;
+            aml_put(v);
+        }
+    }
+    return true;
+}
+#include "drivers/audio/audio.h" /* test audiostress: underrun accounting */
+
+/* The other half of the ^Z test below: something has to stop the child WHILE
+ * its parent is inside wait(). A kthread, because the parent is blocked and
+ * cannot do it itself -- which is the whole point of the case. */
+static volatile uint32_t g_jobctl_victim;
+static volatile uint32_t g_jobctl_parent;
+
+
+static void jobctl_stopper(void) {
+    /* Long enough for the parent to be genuinely blocked rather than merely
+     * on its way there. A stop that lands before the wait would be answered by
+     * the check at the top of process_wait() and would prove less. */
+    sched_sleep_ms(250);
+    uint32_t vic = g_jobctl_victim, par = g_jobctl_parent;
+    if (vic) {
+        process_suspend(vic);
+        if (par) process_wake_child_waiters(par);   /* what ^Z does */
+    }
+    process_exit_self(0);
+}
+
+
 
 static struct fat32_volume *g_fat32 = NULL;
 static bool g_has_fat32 = false;
@@ -388,6 +491,23 @@ static void selftests_print_commands(void)
     kprintf("  test usercopy\n");
     kprintf("  test pmm\n");
     kprintf("  test audio\n");
+    kprintf("  test audiostress\n");
+    kprintf("  test policycost\n");
+    kprintf("  test jobctl\n");
+    kprintf("  test hardening\n");
+    kprintf("  test random\n");
+    kprintf("  test aslr\n");
+    kprintf("  test pie\n");
+    kprintf("  test nvme\n");
+    kprintf("  test canary\n");
+    kprintf("  test hardlink\n");
+    kprintf("  test embkfs crash   (needs sdc: make test-embkfs-crash)\n");
+    kprintf("  test swap store     (needs a swap disk: make test-swap-store)\n");
+    kprintf("  test swap           (anonymous memory > RAM survives: make test-swap)\n");
+    kprintf("  test kill io        (a process killed inside the filesystem leaves it usable)\n");
+    kprintf("  test session        (sessions: identity, inheritance, the gates, logout)\n");
+    kprintf("  test accounts       (the account store and the session-profile policy)\n");
+    kprintf("  test syscall        (int 0x80 vs syscall/sysret, timed)\n");
     kprintf("  test caps\n");
     kprintf("  test spawncaps\n");
     kprintf("  test embx\n");
@@ -440,6 +560,7 @@ static void selftests_print_commands(void)
     kprintf("  test tcc dyn\n");
     kprintf("  test tcc tally\n");
     kprintf("  test embcc\n");
+    kprintf("  test embcc cxx\n");
     kprintf("  test embcc self\n");
     kprintf("  test embcc selfhost\n");
     kprintf("  test embld\n");
@@ -560,6 +681,576 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* ----------------------------------------------------------------------
+     * test rng -- IS THE ENTROPY SOURCE ACTUALLY PRODUCING ENTROPY?
+     *
+     * A virtqueue that completes proves the DANCE worked. It does not prove
+     * the device returned anything: 64 zero bytes satisfy every structural
+     * check and contribute nothing to the pool, and a machine seeded from
+     * them generates keys anybody can guess.
+     *
+     * So this looks at the bytes. Not a statistical test -- 64 bytes cannot
+     * support one -- but the three degenerate cases that a broken or absent
+     * source actually produces: all zero, all identical, and unchanged between
+     * two reads.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test rng") == 0) {
+        int fails = 0;
+        kprintf("\n[rng] kernel pool quality: %d\n", (int)random_quality());
+
+        if (!virtio_rng_present()) {
+            kprintf("  no virtio-rng on this machine -- the pool is seeded "
+                    "from the CPU and clocks alone\n");
+            kprintf("\n[cmd] test rng: OK (nothing to test)\n");
+            return 1;
+        }
+
+        static uint8_t a[64], b[64];
+        uint32_t na = virtio_rng_read(a, sizeof a);
+        uint32_t nb = virtio_rng_read(b, sizeof b);
+        kprintf("  virtio-rng returned %u and %u byte(s); %llu total this boot\n",
+                na, nb, (unsigned long long)virtio_rng_bytes());
+        if (na == 0 || nb == 0) {
+            kprintf("  FAIL: the device returned nothing\n"); fails++;
+        } else {
+            int zero = 1, same = 1, identical = (na == nb);
+            for (uint32_t i = 0; i < na; i++) {
+                if (a[i] != 0)    zero = 0;
+                if (a[i] != a[0]) same = 0;
+                if (identical && i < nb && a[i] != b[i]) identical = 0;
+            }
+            if (zero)      { kprintf("  FAIL: 64 zero bytes\n"); fails++; }
+            if (same)      { kprintf("  FAIL: every byte is 0x%02x\n", a[0]); fails++; }
+            if (identical) { kprintf("  FAIL: two reads returned the SAME bytes -- "
+                                     "the buffer is not being refilled\n"); fails++; }
+            if (!fails)
+                kprintf("  two reads differ, neither is degenerate: %02x%02x%02x%02x... "
+                        "then %02x%02x%02x%02x...\n",
+                        a[0],a[1],a[2],a[3], b[0],b[1],b[2],b[3]);
+        }
+        kprintf("\n[cmd] test rng: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test modules -- CODE THE KERNEL DID NOT SHIP WITH.
+     *
+     * The whole round trip, because each step alone proves nothing: load an
+     * object the compiler produced and the kernel has never seen, watch it
+     * register a real block device, READ BACK SOMETHING IT WROTE through the
+     * block layer rather than through its own pointer, then unload it and
+     * require the device to be gone.
+     *
+     * The read-back is the part that separates a loader that works from one
+     * that merely returned success. A module whose relocations were applied
+     * wrongly still loads, still reports a registered device, and produces
+     * garbage the first time anything calls through it.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test modules") == 0) {
+        int fails = 0;
+        const char *path = "/system/modules/ramdisk.ko";
+
+        kprintf("\n[modules] the kernel exports %u symbol(s); %u module(s) loaded\n",
+                (unsigned)embk_export_count(), (unsigned)embk_module_count());
+        if (embk_export_count() == 0) {
+            kprintf("  FAIL: no export table -- the linker script did not "
+                    "gather .embk_exports\n");
+            fails++;
+        }
+
+        uint32_t blocks_before = embk_block_count();
+
+        int rc = embk_module_load(path);
+        if (rc != EMBK_OK) {
+            kprintf("  FAIL: loading %s returned %d\n", path, rc);
+            kprintf("\n[cmd] test modules: FAIL\n");
+            return 1;
+        }
+        if (embk_module_count() != 1) {
+            kprintf("  FAIL: the module is not in the table after loading\n");
+            fails++;
+        }
+
+        /* IT REGISTERED A REAL DEVICE. */
+        uint32_t blocks_after = embk_block_count();
+        kprintf("  block devices: %u before, %u after loading\n",
+                (unsigned)blocks_before, (unsigned)blocks_after);
+        if (blocks_after != blocks_before + 1) {
+            kprintf("  FAIL: the module did not register a block device\n");
+            fails++;
+        }
+
+        /* AND IT WORKS. Read block 0 back through the block layer -- a
+         * different path from the one the module wrote it by. */
+        struct embk_block_device *rd = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *d = embk_block_get(i);
+            if (d && d->block_count == 2048 && d->block_size == 512) rd = d;
+        }
+        if (!rd) {
+            kprintf("  FAIL: the new block device is not findable\n");
+            fails++;
+        } else {
+            static uint8_t buf[512];
+            memset(buf, 0, sizeof buf);
+            if (embk_block_read(rd, 0, 1, buf) != EMBK_OK) {
+                kprintf("  FAIL: reading block 0 of %s failed\n", rd->name);
+                fails++;
+            } else if (strcmp((const char *)buf, "EMBLINK-RAMDISK-MODULE") != 0) {
+                kprintf("  FAIL: block 0 reads %.32s -- the relocations are "
+                        "wrong, or the module wrote somewhere else\n", buf);
+                fails++;
+            } else {
+                kprintf("  %s block 0 reads \"%s\" -- written by module code, "
+                        "read through the block layer\n", rd->name, buf);
+            }
+
+            /* WRITE THROUGH IT TOO: a function pointer in the module's data
+             * section, called by the kernel, is a 64-bit absolute relocation
+             * and the one most likely to be silently wrong. */
+            static uint8_t wbuf[512];
+            memset(wbuf, 0xA5, sizeof wbuf);
+            if (embk_block_write(rd, 7, 1, wbuf) != EMBK_OK) {
+                kprintf("  FAIL: writing block 7 failed\n"); fails++;
+            } else {
+                memset(wbuf, 0, sizeof wbuf);
+                if (embk_block_read(rd, 7, 1, wbuf) != EMBK_OK || wbuf[0] != 0xA5 ||
+                    wbuf[511] != 0xA5) {
+                    kprintf("  FAIL: block 7 did not read back what was written\n");
+                    fails++;
+                } else {
+                    kprintf("  a write through the module's own op read back "
+                            "correctly\n");
+                }
+            }
+        }
+
+        /* W^X, CHECKED IN THE PAGE TABLES RATHER THAN ASSERTED.
+         *
+         * A module loader is the easiest thing in a kernel to get wrong this
+         * way: the simple implementation maps its memory writable AND
+         * executable and never thinks about it again, which makes the module
+         * region the one place in the system where an arbitrary write becomes
+         * arbitrary code. Reading the leaf entry is the only way to know it
+         * did not happen -- the module runs either way. */
+        const struct embk_module *mi = embk_module_at(0);
+        if (mi && mi->text_size) {
+            struct vmm_walk_result w;
+            vmm_walk(vmm_get_kernel_pml4(), mi->text_base, &w);
+            if (!w.mapped || w.levels_read < 4) {
+                kprintf("  FAIL: the module's code is not mapped\n"); fails++;
+            } else {
+                uint64_t pte = w.entry[3];
+                bool writable = (pte & (1ULL << 1)) != 0;
+                bool nx       = (pte & (1ULL << 63)) != 0;
+                kprintf("  module text PTE: %s, %s\n",
+                        writable ? "WRITABLE" : "read-only",
+                        nx ? "NO-EXECUTE" : "executable");
+                if (writable) {
+                    kprintf("  FAIL: module code is writable AND executable -- "
+                            "W^X is not being applied to the one region that "
+                            "most needs it\n");
+                    fails++;
+                }
+                if (nx) {
+                    kprintf("  FAIL: module code is marked no-execute, yet it "
+                            "ran -- the flip did not take\n");
+                    fails++;
+                }
+            }
+        }
+
+        /* AND IT LEAVES CLEANLY. */
+        if (embk_module_unload("ramdisk") != EMBK_OK) {
+            kprintf("  FAIL: unloading returned an error\n"); fails++;
+        }
+        if (embk_module_count() != 0) {
+            kprintf("  FAIL: the module is still in the table after unload\n");
+            fails++;
+        }
+        if (embk_block_count() != blocks_before) {
+            kprintf("  FAIL: the block device outlived the module (%u, "
+                    "expected %u)\n", (unsigned)embk_block_count(),
+                    (unsigned)blocks_before);
+            fails++;
+        }
+
+        kprintf("\n[cmd] test modules: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test secureboot -- WHAT, IF ANYTHING, WAS VERIFIED ON THE WAY IN?
+     *
+     * Two separate facts and the machine cannot work either one out for
+     * itself: by the time this runs, boot services are gone and the only
+     * record of what was checked is what the loader wrote into the boot
+     * protocol.
+     *
+     * THE HONEST ANSWER INCLUDES "NOBODY CHECKED", and it is the one worth
+     * printing loudly. A machine that booted unverified code and a machine
+     * that verified every stage look identical from userspace, and that is
+     * exactly the confusion this exists to end.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test secureboot") == 0) {
+        const struct boot_protocol *bp = boot_protocol_get();
+        if (!bp) {
+            kprintf("\n[cmd] test secureboot: no boot protocol record\n");
+            return 1;
+        }
+        int fails = 0;
+
+        kprintf("\n[secureboot] boot protocol v%u, %u bytes, firmware %s\n",
+                (unsigned)bp->version, (unsigned)bp->size,
+                bp->firmware == BOOT_FW_UEFI ? "UEFI"
+                : bp->firmware == BOOT_FW_BIOS ? "BIOS" : "device tree");
+
+        /* A v1 loader did not have these fields at all. Reporting their zero
+         * bytes as facts would be inventing them. */
+        if (bp->size < sizeof(struct boot_protocol)) {
+            kprintf("  this loader predates the verification fields -- nothing "
+                    "to report, which is itself the answer\n");
+            kprintf("\n[cmd] test secureboot: OK\n");
+            return 1;
+        }
+
+        const char *sb = bp->secure_boot == BOOT_SB_ON  ? "ENABLED"
+                       : bp->secure_boot == BOOT_SB_OFF ? "disabled"
+                                                        : "not reported";
+        kprintf("  firmware secure boot: %s%s\n", sb,
+                bp->setup_mode ? "  (setup mode: no platform key enrolled, so "
+                                 "nothing is enforced)" : "");
+        kprintf("  kernel image:         %s\n",
+                bp->kernel_verified == BOOT_KV_OK ? "verified against its build hash"
+              : bp->kernel_verified == BOOT_KV_FAILED ? "FAILED VERIFICATION"
+                                                      : "not verified (BIOS path)");
+
+        /* THE ONE THING THAT IS ALWAYS WRONG. Reaching here having failed
+         * verification means the loader jumped anyway, which it must never do. */
+        if (bp->kernel_verified == BOOT_KV_FAILED) {
+            kprintf("  FAIL: this kernel is RUNNING after failing its own "
+                    "verification -- the loader should have refused\n");
+            fails++;
+        }
+        /* Under UEFI the loader always checks, so "not verified" there means
+         * the check did not run and nobody noticed. */
+        if (bp->firmware == BOOT_FW_UEFI &&
+            bp->kernel_verified == BOOT_KV_UNKNOWN) {
+            kprintf("  FAIL: booted by UEFI but the kernel was never checked\n");
+            fails++;
+        }
+
+        if (bp->secure_boot != BOOT_SB_ON)
+            kprintf("  note: nothing outside this machine vouched for the "
+                    "loader itself. The kernel hash above is checked BY the "
+                    "loader, so it is only as trustworthy as the loader is.\n");
+
+        kprintf("\n[cmd] test secureboot: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test usbdevs -- WHAT IS PLUGGED IN RIGHT NOW?
+     *
+     * Deliberately a REPORT, not a pass/fail: what is attached to a machine is
+     * the machine's business, and a test that asserted "there is a stick" would
+     * fail on every machine without one. tools/usb_hotplug.py runs this before
+     * and after plugging something in over QMP, and the DIFFERENCE is the
+     * verdict. That keeps the assertion on the host, where it knows what it
+     * attached, instead of in the guest, where it would have to be told.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test usbdevs") == 0) {
+        usb_hotplug_scan_now();       /* do not make the harness wait a tick */
+
+        /* BOTH TABLES. usb_core's covers UHCI, OHCI and EHCI; xHCI keeps its
+         * own slots and appears in neither. Reporting only the first said "0
+         * devices" on a machine with a USB 3 stick plugged in and mounted --
+         * and this is the line a person reads to find out whether the machine
+         * saw what they plugged in. */
+        kprintf("\n[usb] %u device(s) enumerated, %u block device(s), "
+                "%u removable volume(s) mounted\n",
+                (unsigned)(usb_device_count() + xhci_device_count()),
+                (unsigned)embk_block_count(),
+                (unsigned)automount_count());
+
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *d = embk_block_get(i);
+            if (d) kprintf("  block %s: %llu x %u B\n", d->name,
+                           (unsigned long long)d->block_count,
+                           (unsigned)d->block_size);
+        }
+        for (uint32_t i = 0; ; i++) {
+            const char *at = 0, *dev = 0, *fs = 0;
+            if (!automount_at(i, &at, &dev, &fs)) break;
+            kprintf("  mount %s <- %s (%s)\n", at, dev, fs);
+        }
+
+        /* AND READ SOMETHING OFF IT. A mount that cannot be listed is not a
+         * mount; this is the difference between "the filesystem was
+         * recognised" and "the medium is readable". */
+        for (uint32_t i = 0; ; i++) {
+            const char *at = 0;
+            if (!automount_at(i, &at, 0, 0)) break;
+            struct media_listing ml = { 0, { 0 } };
+            int rc = vfs_readdir(at, media_count_cb, &ml);
+            if (rc != EMBK_OK && ml.n == 0) {
+                kprintf("  FAIL: %s is mounted but cannot be listed (%d)\n",
+                        at, rc);
+                continue;
+            }
+            kprintf("  %s lists %d entr%s%s%s\n", at, ml.n,
+                    ml.n == 1 ? "y" : "ies",
+                    ml.n > 0 ? ", first: " : "", ml.n > 0 ? ml.first : "");
+        }
+
+        kprintf("\n[cmd] test usbdevs: OK\n");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test prt -- WHICH INTERRUPT DOES EACH PCI SLOT REALLY USE?
+     *
+     * The answer is in a method, not a table, and on this machine that method
+     * is 1853 bytes that branch on whether the OS said it uses the APIC. So
+     * this is the end-to-end check of the interpreter: a package of packages
+     * built by running firmware code, with link devices followed through
+     * their _CRS resource templates where the machine uses them.
+     *
+     * WHAT IS ASSERTED is the shape, not the numbers -- the numbers are the
+     * board's and differ on every machine. A routing entry that names a GSI
+     * the I/O APIC does not have is wrong ANYWHERE, and that is checkable.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test prt") == 0) {
+        if (!aml_available()) {
+            kprintf("\n[cmd] test prt: NO NAMESPACE\n");
+            return 1;
+        }
+        uint32_t n = acpi_pci_route_count();
+        int fails = 0;
+
+        const struct acpi_info *ai = acpi_get_info();
+        uint32_t gsi_max = 0;
+        for (uint32_t i = 0; i < ai->io_apic_count; i++) {
+            uint32_t top = ai->io_apic_gsi_bases[i] + 24;  /* the usual size */
+            if (top > gsi_max) gsi_max = top;
+        }
+
+        kprintf("\n[prt] %u routing entr%s from ACPI\n", n, n == 1 ? "y" : "ies");
+        if (n == 0) {
+            kprintf("  FAIL: _PRT produced nothing -- the interpreter ran it "
+                    "and got no usable package\n");
+            fails++;
+        }
+
+        uint32_t shown = 0, distinct_gsi = 0;
+        uint32_t seen[32];
+        for (uint32_t i = 0; i < n; i++) {
+            uint8_t bus, dev, pin; uint32_t gsi; bool low, lvl;
+            if (!acpi_pci_route_at(i, &bus, &dev, &pin, &gsi, &low, &lvl)) continue;
+            if (shown < 16) {
+                kprintf("  %02x:%02x INT%c -> GSI %u  %s %s\n", bus, dev,
+                        'A' + (pin & 3), gsi, lvl ? "level" : "edge",
+                        low ? "active-low" : "active-high");
+                shown++;
+            }
+            if (gsi_max && gsi >= gsi_max) {
+                kprintf("  FAIL: %02x:%02x INT%c routes to GSI %u, past the "
+                        "last I/O APIC input (%u)\n",
+                        bus, dev, 'A' + (pin & 3), gsi, gsi_max - 1);
+                fails++;
+            }
+            bool dup = false;
+            for (uint32_t k = 0; k < distinct_gsi; k++) if (seen[k] == gsi) dup = true;
+            if (!dup && distinct_gsi < 32) seen[distinct_gsi++] = gsi;
+        }
+        if (shown < n) kprintf("  ... %u more\n", n - shown);
+        kprintf("  %u distinct interrupt line(s) in use\n", distinct_gsi);
+
+        /* A TABLE THAT ROUTES EVERYTHING TO ONE LINE is the classic wrong
+         * answer: it is what you get from a _PRT evaluated in the wrong mode,
+         * or from reading the package's fields in the wrong order. It also
+         * still "works" for a single device, which is why it needs saying. */
+        if (n >= 4 && distinct_gsi < 2) {
+            kprintf("  FAIL: every entry routes to the same line -- the "
+                    "package was misread, or _PIC did not take\n");
+            fails++;
+        }
+
+        /* AND NOW THE INDEPENDENT WITNESS.
+         *
+         * The firmware ALSO wrote each device's Interrupt Line register when
+         * it configured the machine. That byte and this table describe the
+         * same wiring by two completely different routes -- one is a value
+         * left in PCI configuration space, the other is the result of running
+         * the DSDT's own code and reading a chipset register through it. They
+         * have no common failure between them.
+         *
+         * BUT THEY MUST BE COMPARED IN THE SAME MODE, and that is the whole
+         * subtlety. A legacy BIOS writes the 8259 routing into those bytes,
+         * because at that point nothing has said otherwise. Once _PIC(1) is
+         * called the firmware hands back the I/O APIC routing instead -- GSI
+         * 16 and up on this chipset -- and the two SHOULD disagree. Asserting
+         * equality there would be asserting that _PIC did nothing.
+         *
+         * So on a machine with _PIC, the comparison is made in PIC mode --
+         * where the two really do describe the same thing -- and then the
+         * mode is switched back and the table is required to CHANGE. That
+         * difference is the proof the call took; there is no other. */
+        bool has_pic = acpi_pic_method_exists();
+        if (has_pic) {
+            kprintf("  this machine has \\_PIC: comparing in 8259 mode, where "
+                    "the firmware's byte and ACPI mean the same thing\n");
+            acpi_pci_routing_rebuild(0);
+        }
+
+        int agree = 0, differ = 0, unrouted = 0;
+        uint32_t pcin = pci_devices_count();
+        for (uint32_t i = 0; i < pcin; i++) {
+            const struct pci_device *d = pci_get_device(i);
+            if (!d) continue;
+            uint8_t pin = pci_read8(d->bus, d->device, d->function, PCI_INTERRUPT_PIN);
+            if (pin == 0 || pin > 4) continue;
+            uint8_t line = pci_read8(d->bus, d->device, d->function, PCI_INTERRUPT_LINE);
+            uint32_t gsi = 0;
+            if (!acpi_pci_route(d->bus, d->device, (uint8_t)(pin - 1), &gsi, 0, 0)) {
+                unrouted++;
+                continue;
+            }
+            if (line == 0xFF || line == 0) continue;   /* firmware had no opinion */
+            if ((uint32_t)line == gsi) {
+                agree++;
+            } else {
+                differ++;
+                kprintf("  FAIL: %02x:%02x.%u INT%c -- ACPI says GSI %u, the "
+                        "firmware wrote line %u\n", d->bus, d->device,
+                        d->function, 'A' + pin - 1, gsi, line);
+            }
+        }
+        kprintf("  cross-check against the firmware's Interrupt Line byte: "
+                "%d agree, %d differ, %d not described by ACPI\n",
+                agree, differ, unrouted);
+        if (differ) fails++;
+        if (agree == 0 && differ == 0)
+            kprintf("  note: no device had both a pin and a firmware line -- "
+                    "nothing to cross-check on this machine\n");
+
+        /* BACK TO APIC MODE, and the table must be different for it. */
+        if (has_pic) {
+            uint32_t pic_gsi = 0, apic_gsi = 0;
+            bool had = acpi_pci_route(0, 2, 0, &pic_gsi, 0, 0);
+            acpi_pci_routing_rebuild(1);
+            bool has = acpi_pci_route(0, 2, 0, &apic_gsi, 0, 0);
+            kprintf("  00:02 INTA is GSI %u in 8259 mode and GSI %u in I/O APIC "
+                    "mode\n", pic_gsi, apic_gsi);
+            if (!had || !has) {
+                kprintf("  FAIL: 00:02 INTA vanished from the table across a "
+                        "mode switch\n");
+                fails++;
+            } else if (pic_gsi == apic_gsi) {
+                kprintf("  FAIL: the routing did not change -- _PIC was called "
+                        "and the firmware ignored it, or we never called it\n");
+                fails++;
+            }
+        }
+
+        kprintf("\n[cmd] test prt: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test aml -- WHAT DID THE FIRMWARE ACTUALLY SAY?
+     *
+     * An AML interpreter cannot be checked by asserting a number, because the
+     * numbers come from the machine's own firmware and differ on every one.
+     * What CAN be checked is that the namespace has the shape ACPI requires,
+     * that the methods a machine must have can be RUN, and that running them
+     * produces the kinds the specification says they produce.
+     *
+     * The dump is the other half and is not decoration: on the machine this
+     * eventually runs on, it is the only way to see what the firmware
+     * declared without a disassembler.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test aml") == 0 || strcmp(cmd, "test amldump") == 0) {
+        if (!aml_available()) {
+            kprintf("\n[cmd] test aml: NO NAMESPACE (no DSDT, or it did not parse)\n");
+            return 1;
+        }
+        const struct aml_stats *st = aml_get_stats();
+        int fails = 0;
+
+        if (strcmp(cmd, "test amldump") == 0) { aml_dump(); return 1; }
+
+        kprintf("\n[aml] %u table(s): %u names, %u methods, %u devices, "
+                "%u regions, %u fields, %u refusal(s)\n",
+                st->tables, st->nodes, st->methods, st->devices,
+                st->regions, st->fields, st->load_errors);
+
+        /* THE ROOT SCOPES. Every DSDT assumes \_SB_ exists and puts its
+         * devices under it; a namespace without it did not parse. */
+        if (!aml_lookup(NULL, "\\_SB_")) { kprintf("  FAIL: no \\_SB_ scope\n"); fails++; }
+
+        /* _OSI IS OURS, not the firmware's, and it is the single call every
+         * DSDT makes. Answering it wrongly changes which branch of the
+         * firmware's code the whole machine takes. */
+        struct aml_node *osi = aml_lookup(NULL, "\\_OSI");
+        if (!osi) { kprintf("  FAIL: \\_OSI is not defined\n"); fails++; }
+        else {
+            struct aml_object *yes_s = aml_string("Windows 2009");
+            struct aml_object *no_s  = aml_string("Plan 9");
+            struct aml_object *a1[1], *a2[1];
+            a1[0] = yes_s; a2[0] = no_s;
+            struct aml_object *r1 = aml_evaluate(osi, a1, 1);
+            struct aml_object *r2 = aml_evaluate(osi, a2, 1);
+            uint64_t v1 = (r1 && r1->kind == AML_INTEGER) ? r1->u.integer : 0;
+            uint64_t v2 = (r2 && r2->kind == AML_INTEGER) ? r2->u.integer : 1;
+            kprintf("  _OSI(\"Windows 2009\") = 0x%llx, _OSI(\"Plan 9\") = 0x%llx\n",
+                    (unsigned long long)v1, (unsigned long long)v2);
+            if (!v1) { kprintf("  FAIL: _OSI refused a string we support\n"); fails++; }
+            if (v2)  { kprintf("  FAIL: _OSI claimed one we do not\n"); fails++; }
+            aml_put(r1); aml_put(r2); aml_put(yes_s); aml_put(no_s);
+        }
+
+        /* THE COUNTS THEMSELVES. A DSDT with no methods did not parse -- the
+         * shortest real one on any machine has dozens. */
+        if (st->methods == 0) { kprintf("  FAIL: no methods loaded\n"); fails++; }
+        if (st->devices == 0) { kprintf("  FAIL: no devices loaded\n"); fails++; }
+
+        /* \_S5_, the thing acpi.c had to pattern-match for. Evaluated
+         * properly now: a package whose first two elements are the SLP_TYP
+         * values written to the PM1 registers to switch the machine off. */
+        struct aml_node *s5 = aml_lookup(NULL, "\\_S5_");
+        if (!s5) {
+            kprintf("  note: no \\_S5_ on this machine (power-off uses its fallback)\n");
+        } else {
+            struct aml_object *v = aml_evaluate(s5, NULL, 0);
+            if (!v || v->kind != AML_PACKAGE || v->u.pkg.count < 1) {
+                kprintf("  FAIL: \\_S5_ did not evaluate to a package\n"); fails++;
+            } else {
+                struct aml_object *e0 = v->u.pkg.elem[0];
+                struct aml_object *e1 = v->u.pkg.count > 1 ? v->u.pkg.elem[1] : NULL;
+                kprintf("  \\_S5_ = Package(%u) { SLP_TYPa=%llu, SLP_TYPb=%llu }\n",
+                        v->u.pkg.count,
+                        (unsigned long long)(e0 && e0->kind == AML_INTEGER ? e0->u.integer : 0),
+                        (unsigned long long)(e1 && e1->kind == AML_INTEGER ? e1->u.integer : 0));
+                if (!e0 || e0->kind != AML_INTEGER) {
+                    kprintf("  FAIL: \\_S5_[0] is not an integer\n"); fails++;
+                }
+            }
+            aml_put(v);
+        }
+
+        /* A DEVICE WALK that RUNS code: _STA is a method on most devices and
+         * returns a bitfield. This is the check that the executor works at
+         * all, as opposed to the loader. */
+        struct sta_count sta = { 0, 0 };
+        aml_walk(NULL, sta_visit, &sta);
+        kprintf("  _STA evaluated on %d device(s), %d refused\n", sta.ok, sta.bad);
+        if (sta.ok == 0) { kprintf("  FAIL: not one _STA method ran\n"); fails++; }
+
+        kprintf("\n[cmd] test aml: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
     /* AUDIO: play a tone the HOST can measure.
      *
      * The point of this test is that it does not ask anyone to listen. QEMU is
@@ -573,13 +1264,15 @@ int selftests_handle_command(const char *cmd)
      * a description of what they heard. Half a second: long enough to measure,
      * short enough that the test is not a wait. */
     if (strcmp(cmd, "test audio") == 0) {
-        if (!ac97_present()) {
-            kprintf("\n[cmd] test audio: NO DEVICE (add -device AC97 to the QEMU line)\n");
+        if (!audio_available()) {
+            kprintf("\n[cmd] test audio: NO DEVICE (add -device AC97 or "
+                    "-device intel-hda -device hda-duplex to the QEMU line)\n");
             return 1;
         }
+        kprintf("audio: the %s driver answered\n", audio_device_name());
 
-        const uint32_t rate  = ac97_sample_rate();
-        const uint32_t percb = ac97_frames_per_buffer();
+        const uint32_t rate  = audio_sample_rate();
+        const uint32_t percb = audio_frames_per_buffer();
         const uint32_t want  = rate / 2;            /* half a second */
         const int      tone  = 440;
 
@@ -607,7 +1300,7 @@ int selftests_handle_command(const char *cmd)
                 chunk[f * 2 + 0] = v;               /* left  */
                 chunk[f * 2 + 1] = v;               /* right */
             }
-            uint32_t took = ac97_fill(i, chunk, n);
+            uint32_t took = audio_dev_fill(i, chunk, n);
             if (took == 0) break;
             done += took;
             last = i;
@@ -620,18 +1313,1219 @@ int selftests_handle_command(const char *cmd)
 
         kprintf("audio: playing %u frames of %d Hz across %d buffers\n",
                 done, tone, last + 1);
-        ac97_play(last);
+        audio_dev_play(last);
 
         /* Wait for the device to walk the list, bounded -- a driver that never
          * starts must fail rather than hang the console. */
         int spins = 0;
-        while (!ac97_done(last) && spins < 2000) { for (volatile int d = 0; d < 200000; d++) {} spins++; }
-        ac97_stop();
+        while (!audio_dev_done(last) && spins < 2000) { for (volatile int d = 0; d < 200000; d++) {} spins++; }
+        audio_dev_stop();
 
         kprintf("\n[cmd] test audio: %s (%u frames, %d Hz; check the WAV with "
                 "tools/audio_check.py)\n",
                 spins < 2000 ? "PLAYED" : "TIMED OUT waiting for the device",
                 done, tone);
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test audiostress -- HOW SHALLOW CAN THE AUDIO BUFFER BE?
+     *
+     * The first version of this asked whether a busy machine makes the speaker
+     * run dry, and the answer was no: zero underruns under round-robin against
+     * six threads that never sleep. The driver keeps roughly 320 ms of audio
+     * queued ahead of the device, and nothing a scheduler does on a 10 ms tick
+     * reaches through 320 ms of runway. That test measured the ring size.
+     *
+     * The cost of a deep buffer is LATENCY -- every millisecond queued ahead
+     * is a millisecond between deciding to make a sound and the sound
+     * existing, which is what a synth, a game, or anything syncing to picture
+     * actually pays. So the question is how LITTLE runway can be held without
+     * a hole appearing, because that number is the achievable latency, and it
+     * is a number a scheduler can move.
+     *
+     * tonestress paces itself by the clock rather than filling the ring, so
+     * the depth is an argument. This sweeps it downward under both policies
+     * and reports the shallowest each survived.
+     *
+     * THE UNDERRUN COUNT IS THE HARDWARE'S. When the device reaches the end of
+     * what it was given, AC'97 latches the fact and halts and HDA plays
+     * silence past the end; each driver counts its own, from what its
+     * hardware shows. Nothing here is inferred from timings.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test audiostress") == 0) {
+        if (!audio_available()) {
+            kprintf("\n[cmd] test audiostress: NO DEVICE (add -device AC97 to "
+                    "the QEMU line)\n");
+            return 1;
+        }
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test audiostress: VFS not registered\n");
+            return 1;
+        }
+        const char *tp = "/data/apps/tonestress/tonestress.elf";
+        struct vfs_stat tst;
+        if (vfs_stat(tp, &tst) != EMBK_OK) {
+            kprintf("\n[cmd] test audiostress: %s not on image\n", tp);
+            return 1;
+        }
+
+        const struct sched_policy *saved = sched_policy_get();
+        const struct sched_policy *rr    = sched_policy_by_name("round-robin");
+        const struct sched_policy *dl    = sched_policy_by_name("deadline");
+        if (!rr || !dl) {
+            kprintf("\n[cmd] test audiostress: a policy is missing\n");
+            return 1;
+        }
+
+        /* Down to 15 ms. Nothing in the hardware stops it going lower -- a
+         * descriptor holds whatever is put in it -- but a buffer shallower
+         * than a timer tick has to be refilled inside one scheduling round on
+         * a busy machine, and no scheduler can promise that. audio.c refuses
+         * below 10 ms for the same reason. */
+        static const char *DEPTH[] = { "160", "80", "40", "20", "15" };
+        const int NDEPTH = (int)(sizeof(DEPTH) / sizeof(DEPTH[0]));
+
+        kprintf("\n[audiostress] 400 ms of 440 Hz against 8 threads that never\n");
+        kprintf("              sleep, holding progressively less audio queued\n");
+        kprintf("              ahead of the speaker. An underrun is a hole you\n");
+        kprintf("              hear; the runway that avoids one IS the latency.\n");
+
+        int best_rr = -1, best_dl = -1;   /* shallowest clean depth, ms */
+        int ok = 1;
+
+        for (int pass = 0; pass < 2; pass++) {
+            const int  deadline = (pass == 1);
+            const char *decl    = deadline ? "1" : "0";
+            sched_policy_set(deadline ? dl : rr);
+            kprintf("\n--- %s ---\n",
+                    deadline ? "deadline, declaring 10 ms / 3 ms"
+                             : "round-robin, no declaration");
+
+            for (int d = 0; d < NDEPTH; d++) {
+                char *a[] = { (char *)tp, "8", "400", (char *)decl,
+                              (char *)DEPTH[d], NULL };
+                int pid = process_create(tp, a, 5, NULL, 0);
+                int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+
+                uint64_t un = 0, fr = 0;
+                audio_stats(&un, &fr, 0);
+
+                kprintf("  %4s ms runway: %llu underrun(s), %llu frames%s\n",
+                        DEPTH[d], (unsigned long long)un,
+                        (unsigned long long)fr,
+                        rc == 0 ? "" : " (writer did not finish)");
+
+                if (rc != 0) { ok = 0; continue; }
+                if (un == 0) {
+                    int ms = 0;
+                    for (const char *c = DEPTH[d]; *c; c++) ms = ms * 10 + (*c - '0');
+                    if (deadline) { if (best_dl < 0 || ms < best_dl) best_dl = ms; }
+                    else          { if (best_rr < 0 || ms < best_rr) best_rr = ms; }
+                }
+            }
+        }
+
+        sched_policy_set(saved);
+
+        kprintf("\n[audiostress] shallowest clean runway: round-robin %d ms, "
+                "deadline %d ms\n", best_rr, best_dl);
+
+        /* The assertion is the comparison, and only the comparison. An
+         * absolute latency figure would be a claim about QEMU's audio timing. */
+        kprintf("  [%s] declaring a period does not need MORE runway "
+                "(%d <= %d)\n",
+                (best_dl >= 0 && best_rr >= 0 && best_dl <= best_rr)
+                    ? "ok" : "FAIL", best_dl, best_rr);
+        if (best_dl < 0 || best_rr < 0 || best_dl > best_rr) ok = 0;
+
+        if (best_rr >= 0 && best_rr <= 15)
+            kprintf("  (round-robin was clean at the SHALLOWEST depth tested, so\n"
+                    "   the hardware's two-descriptor floor is the limit here and\n"
+                    "   not the scheduler -- this run says the policy is not\n"
+                    "   needed for audio on this host, which is a result.)\n");
+
+        kprintf("[cmd] test audiostress: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test policycost -- what the deadline policy costs when nobody uses it.
+     *
+     * The deadline policy is only worth making the DEFAULT if it is free on a
+     * machine where nothing has declared a period, which is every machine most
+     * of the time. It scans all MAX_THREADS slots looking for a live deadline
+     * and then falls through to round-robin, which does the scan again -- so
+     * the question is not rhetorical and "it is only a loop" is not an answer
+     * this kernel accepts from itself.
+     *
+     * One kthread re-entering the scheduler as fast as it can, timed, under
+     * each policy. Every iteration is exactly one pick(). The absolute figure
+     * is a statement about the host; the RATIO is the result.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test policycost") == 0) {
+        const struct sched_policy *saved = sched_policy_get();
+        const struct sched_policy *rr    = sched_policy_by_name("round-robin");
+        const struct sched_policy *dl    = sched_policy_by_name("deadline");
+        if (!rr || !dl) {
+            kprintf("\n[cmd] test policycost: a policy is missing\n");
+            return 1;
+        }
+
+        kprintf("\n[policycost] 200000 scheduling decisions, taken on this\n");
+        kprintf("             thread with nothing else runnable, so each one is\n");
+        kprintf("             a pick() and nothing else. Nothing has declared a\n");
+        kprintf("             period, so this is what the deadline policy costs\n");
+        kprintf("             when it has no work of its own to do.\n");
+        kprintf("             (%u permille reserved right now)\n",
+                sched_reserved_permille());
+
+        /* A warm-up under each, discarded: the first run of either pays for
+         * cold caches and would flatter whichever went second. */
+        sched_policy_set(rr); (void)sched_pick_cost_ns(20000);
+        sched_policy_set(dl); (void)sched_pick_cost_ns(20000);
+
+        sched_policy_set(rr);
+        uint64_t c_rr = sched_pick_cost_ns(200000);
+        sched_policy_set(dl);
+        uint64_t c_dl = sched_pick_cost_ns(200000);
+        sched_policy_set(saved);
+
+        uint64_t k_ms = 0, k_ns = 0;
+        sched_clock_cost_ns(20000, &k_ms, &k_ns);
+
+        kprintf("\n  round-robin: %llu ns per decision\n", (unsigned long long)c_rr);
+        kprintf("  deadline:    %llu ns per decision\n", (unsigned long long)c_dl);
+
+        int ok = 1;
+        if (!c_rr || !c_dl) {
+            kprintf("  [FAIL] a benchmark thread could not run\n");
+            ok = 0;
+        } else {
+            /* A FIFTH is the bar. It was a third when the empty scan really
+             * ran; with sched_declared_count() short-circuiting it the
+             * difference is inside the noise of the round-robin measurement
+             * itself (82.8 to 91.8 ns across runs of identical code on this
+             * host), so the bar is set at roughly twice that spread. What is
+             * being ruled out is a policy that costs enough when idle that it
+             * cannot be the default -- if this fails it means the
+             * short-circuit stopped working, which is the thing worth
+             * catching. */
+            uint64_t bar = c_rr + c_rr / 5;
+            kprintf("  [%s] the unused policy costs under a fifth more "
+                    "(%llu vs %llu ns, bar %llu)\n",
+                    c_dl <= bar ? "ok" : "FAIL",
+                    (unsigned long long)c_dl, (unsigned long long)c_rr,
+                    (unsigned long long)bar);
+            if (c_dl > bar) ok = 0;
+
+            if (c_dl > c_rr)
+                kprintf("  (%llu ns of that is the empty deadline scan, which is\n"
+                        "   the price of the policy being available at all)\n",
+                        (unsigned long long)(c_dl - c_rr));
+        }
+
+        /* WHERE THE TIME ACTUALLY GOES. A scheduling decision costing tens of
+         * microseconds is not a table scan, and printing the two clocks says
+         * what it is instead: timer_uptime_ms() reads the HPET over MMIO,
+         * which is a device trap under emulation, while time_get_ns() is
+         * rdtsc. Both are on the hot path. */
+        kprintf("\n  the clocks, per call: timer_uptime_ms (HPET, MMIO) %llu ns,\n"
+                "                        time_get_ns (rdtsc) %llu ns\n",
+                (unsigned long long)k_ms, (unsigned long long)k_ns);
+        if (k_ns && k_ms > k_ns * 4)
+            kprintf("  (the ms clock is %llux the ns clock -- a scheduling\n"
+                    "   decision is mostly clock reads, not scheduling)\n",
+                    (unsigned long long)(k_ms / (k_ns ? k_ns : 1)));
+
+        kprintf("[cmd] test policycost: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test jobctl -- can a job be STOPPED, and does everything still work
+     * while it is?
+     *
+     * ^C says "do not finish this". ^Z says "finish it later", and it needs
+     * something ^C never did: the kernel has to freeze a process rather than
+     * only interrupt or cancel one. It could always do that -- process_suspend
+     * was built for the debugger -- and there was simply no way for a shell to
+     * ask.
+     *
+     * THE PART THAT IS EASY TO GET WRONG is not the freezing, it is the
+     * waiting. A stopped process never exits, so a parent blocked in wait()
+     * for its exit code waits for something that is not coming, and the shell
+     * that suspended its own foreground job hangs holding the console. That is
+     * why process_wait() answers -EMBK_ESTOPPED, and it is what this asserts:
+     * not "suspend returns success" but "the parent gets its prompt back".
+     * ------------------------------------------------------------------- */
+    if (strcmp(cmd, "test jobctl") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test jobctl: VFS not registered\n");
+            return 1;
+        }
+        const char *sp = "/system/bin/shell.elf";
+        struct vfs_stat sst;
+        if (vfs_stat(sp, &sst) != EMBK_OK) {
+            kprintf("\n[cmd] test jobctl: %s not on image\n", sp);
+            return 1;
+        }
+
+        kprintf("\n[jobctl] a shell backgrounds a job, stops it, sees it stopped,\n");
+        kprintf("         resumes it and collects its exit code -- all of which\n");
+        kprintf("         happens INSIDE the child shell, so what is under test\n");
+        kprintf("         is the whole path and not a kernel call in isolation.\n");
+
+        /* TWO THINGS THE SHELL'S OWN GRAMMAR DECIDES, and both were got wrong
+         * before being read:
+         *
+         * `&` is a STATEMENT, not an expression -- `$(cmd &)` is refused,
+         * because a job that has just started has no value yet. And `first` /
+         * `last` return a TABLE of one row, not a record, so `.job` on one is
+         * an error. A `for` over the table is how a person gets at a row, and
+         * it is what these do.
+         *
+         * Every case cleans up after itself: a stopped job left behind when
+         * the child shell exits is a frozen process nothing will ever name. */
+        struct { const char *what; const char *src; int want; } cases[] = {
+            /* The shape of the thing: start, stop, look, resume, collect. The
+             * sleep is what makes the stop meaningful -- a job that has already
+             * finished cannot be frozen, and a test that stopped one would be
+             * asserting nothing. */
+            { "a job can be stopped and reports itself stopped",
+              "sleep 1200 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "stop $id\n"
+              "let st = \"\"\n"
+              "for row in $(jobs) { let st = $row.state }\n"
+              "bg $id\n"
+              "let r = $(fg $id)\n"
+              "if $st == \"stopped\" { return 0 } else { return 1 }", 0 },
+
+            /* THE ASSERTION THAT MATTERS. Without -EMBK_ESTOPPED the fg below
+             * never returns and the case times out rather than failing. */
+            { "bg lets it go again and fg collects its exit code",
+              "sleep 600 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "stop $id\n"
+              "bg $id\n"
+              "let r = $(fg $id)\n"
+              "if $r.exit == 0 { return 0 } else { return 1 }", 0 },
+
+            /* fg on a STOPPED job must resume it first. Waiting for a frozen
+             * process to exit is waiting for something that is not coming, and
+             * this is the case where a shell would hang forever. */
+            { "fg resumes a stopped job rather than waiting forever",
+              "sleep 600 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "stop $id\n"
+              "let r = $(fg $id)\n"
+              "if $r.exit == 0 { return 0 } else { return 1 }", 0 },
+
+            /* A stopped job is ALIVE, and the poll that `jobs` does first must
+             * not mistake it for a corpse and try to reap it -- a wait on a
+             * stopped process answers ESTOPPED, and that is not an exit code.
+             * If it did, the job would vanish from the table between the two
+             * counts. */
+            { "polling jobs does not reap a stopped one",
+              "sleep 1200 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "stop $id\n"
+              "let a = $(jobs | count)\n"
+              "let b = $(jobs | count)\n"
+              "bg $id\n"
+              "let r = $(fg $id)\n"
+              "if $a == $b { return 0 } else { return 1 }", 0 },
+
+            /* A job that has been collected is GONE -- `fg` frees the slot
+             * once it has reported an exit code. Stopping it afterwards names
+             * nothing, and saying so beats a silent no-op that reads as
+             * success. */
+            { "stopping an already-collected job is refused",
+              "sleep 50 &\n"
+              "let id = 0\n"
+              "for row in $(jobs) { let id = $row.job }\n"
+              "let r = $(fg $id)\n"
+              "stop $id", 1 },
+
+            { "stop needs a job id",  "stop",   1 },
+            { "bg needs a job that exists", "bg 999", 1 },
+        };
+
+        int ok = 1;
+        for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char *a[] = { (char *)sp, "-c", (char *)cases[i].src, NULL };
+            int pid = process_create(sp, a, 3, NULL, 0);
+            int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+            int good = (rc == cases[i].want);
+            if (!good) ok = 0;
+            kprintf("  [%s] %s (exit %d, want %d)\n",
+                    good ? "ok" : "FAIL", cases[i].what, rc, cases[i].want);
+        }
+
+        /* ------------------------------------------------------------------
+         * AND THE PART THE SHELL CASES ABOVE CANNOT REACH: a parent that is
+         * ALREADY BLOCKED in wait() when its child is stopped.
+         *
+         * That is the ^Z path, and it is the one that hangs a shell if it is
+         * wrong. `stop N` above always runs while the shell is at its prompt;
+         * ^Z arrives while it is waiting for a foreground command, and unless
+         * the wait is released and answers ESTOPPED, the console is gone for
+         * good.
+         *
+         * The KEYSTROKE is not covered here -- keyboard_deliver() is reachable
+         * only from a real keyboard, not from the serial console these tests
+         * drive, which is the same limitation `test interrupt` has and says
+         * so. What is covered is everything that keystroke does: suspend the
+         * target, wake the router, and see what the router's wait() answers.
+         * ---------------------------------------------------------------- */
+        {
+            char *a[] = { (char *)sp, "-c", "sleep 5000", NULL };
+            int vic = process_create(sp, a, 3, NULL, 0);
+            if (vic < 0) {
+                kprintf("  [FAIL] could not spawn the victim shell\n");
+                ok = 0;
+            } else {
+                /* Let it get past startup, so the stop lands on a process that
+                 * is genuinely running rather than one still being linked. */
+                timer_delay_ms(500);
+
+                g_jobctl_victim = (uint32_t)vic;
+                g_jobctl_parent = current_process ? current_process->pid : 0;
+                struct thread *kt = process_create_kthread(jobctl_stopper, NULL);
+
+                /* Blocks. The kthread above suspends the child and wakes us --
+                 * without that, this line never returns and the test hangs,
+                 * which is exactly what a shell would do. */
+                int rc = kt ? process_wait((uint32_t)vic) : 0;
+
+                kprintf("  [%s] a wait already in progress is released when the\n"
+                        "       child stops, and says so (rc %d, want %d)\n",
+                        rc == -EMBK_ESTOPPED ? "ok" : "FAIL",
+                        rc, -EMBK_ESTOPPED);
+                if (rc != -EMBK_ESTOPPED) ok = 0;
+
+                /* Clean up: a frozen process that nothing will ever name again
+                 * is exactly the leak this feature must not create. */
+                process_resume((uint32_t)vic);
+                process_kill((uint32_t)vic);
+                (void)process_wait((uint32_t)vic);
+                g_jobctl_victim = 0;
+            }
+        }
+
+        kprintf("[cmd] test jobctl: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test hardening -- is the processor actually ENFORCING it?
+     *
+     * "We set CR4.SMAP" and "a kernel read of a user page faults" are two
+     * different claims, and only the second one is worth anything. A bit that
+     * was set on the boot core and missed on an AP, or set before something
+     * else rewrote CR4 wholesale, looks exactly like a hardened machine right
+     * up until it matters.
+     *
+     * So this reads CR4 back, and then DELIBERATELY COMMITS THE VIOLATION: it
+     * maps a page user-accessible, arms the recovery guard, and reads it
+     * WITHOUT taking the hardware permission. Under SMAP that is a fault the
+     * guard catches. Without SMAP the read succeeds and this test says so,
+     * which is the honest outcome on a processor that cannot do it rather than
+     * a failure.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test hardening") == 0) {
+        const struct cpu_features *cf = cpu_features();
+        uint64_t cr4 = cpu_read_cr4();
+        int ok = 1;
+
+        kprintf("\n[hardening] %s\n", cf->brand[0] ? cf->brand : cf->vendor);
+        kprintf("  available: SMEP %s  SMAP %s  UMIP %s  NX %s\n",
+                cf->smep ? "yes" : "NO", cf->smap ? "yes" : "NO",
+                cf->umip ? "yes" : "NO", cf->nx   ? "yes" : "NO");
+        kprintf("  CR4 = 0x%llx  -> SMEP %s  SMAP %s  UMIP %s\n",
+                (unsigned long long)cr4,
+                (cr4 & (1ULL << 20)) ? "ON" : "off",
+                (cr4 & (1ULL << 21)) ? "ON" : "off",
+                (cr4 & (1ULL << 11)) ? "ON" : "off");
+
+        /* Available but not enabled is a BUG -- it means the enable path did
+         * not run on this core. Unavailable and not enabled is a fact about
+         * the processor and not a failure. */
+        if (cf->smep) {
+            kprintf("  [%s] SMEP is enabled where the processor has it\n",
+                    (cr4 & (1ULL << 20)) ? "ok" : "FAIL");
+            if (!(cr4 & (1ULL << 20))) ok = 0;
+        }
+        if (cf->smap) {
+            kprintf("  [%s] SMAP is enabled where the processor has it\n",
+                    (cr4 & (1ULL << 21)) ? "ok" : "FAIL");
+            if (!(cr4 & (1ULL << 21))) ok = 0;
+        }
+
+        /* --- and now the part that is evidence rather than bookkeeping --- */
+        uint64_t page = pmm_alloc_page();
+        if (!page) {
+            kprintf("  [FAIL] no page to test with\n");
+            ok = 0;
+        } else {
+            /* A low, canonical, otherwise-unused address, mapped USER so the
+             * processor treats a kernel touch of it as the thing SMAP exists
+             * to refuse. Writable through the direct map first, so the value
+             * read back is known and a "success" cannot be a coincidence. */
+            const uint64_t probe_va = 0x0000600000000000ULL;
+            *(volatile uint64_t *)P2V(page) = 0x5EC0DEULL;
+
+            if (vmm_map(probe_va, page, VMM_PRESENT | VMM_WRITABLE | VMM_USER) != 0) {
+                kprintf("  [FAIL] could not map the probe page\n");
+                ok = 0;
+            } else {
+                uint64_t before = uaccess_recoveries();
+                volatile uint64_t got = 0;
+                int faulted = 0;
+
+                /* Armed, but NOT permitted -- no uaccess_hw_begin(). This is
+                 * the violation, on purpose. */
+                if (uaccess_arm()) {
+                    got = *(volatile uint64_t *)probe_va;
+                    uaccess_disarm();
+                } else {
+                    faulted = 1;      /* the fault handler resumed us here */
+                }
+
+                uint64_t caught = uaccess_recoveries() - before;
+
+                if (cf->smap) {
+                    kprintf("  [%s] a kernel read of a USER page without "
+                            "permission FAULTS (faulted %d, guard caught %llu)\n",
+                            (faulted && caught == 1) ? "ok" : "FAIL",
+                            faulted, (unsigned long long)caught);
+                    if (!faulted || caught != 1) ok = 0;
+
+                    /* And the same read WITH permission must still work, or
+                     * the kernel could not do its job. */
+                    volatile uint64_t got2 = 0;
+                    if (uaccess_arm()) {
+                        uaccess_hw_begin();
+                        got2 = *(volatile uint64_t *)probe_va;
+                        uaccess_hw_end();
+                        uaccess_disarm();
+                    }
+                    kprintf("  [%s] the same read WITH permission succeeds "
+                            "(0x%llx)\n",
+                            got2 == 0x5EC0DEULL ? "ok" : "FAIL",
+                            (unsigned long long)got2);
+                    if (got2 != 0x5EC0DEULL) ok = 0;
+                } else {
+                    kprintf("  (no SMAP on this processor: the unguarded read "
+                            "returned 0x%llx and did not fault, which is "
+                            "correct for hardware that cannot refuse it)\n",
+                            (unsigned long long)got);
+                }
+
+                vmm_unmap(probe_va);
+            }
+            pmm_free_page(page);
+        }
+
+        kprintf("[cmd] test hardening: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test random -- the kernel's CSPRNG.
+     *
+     * The KNOWN-ANSWER TEST comes first: NIST CAVP vectors through the same
+     * primitives the live generator uses. Everything after it is structural
+     * and says less: consecutive outputs differ, a reseed changes the
+     * stream, the bits are not grossly lopsided, and the uniform-range helper
+     * is unbiased on a bound that a modulus would get wrong. Plus the thing
+     * that matters most operationally: WHERE the seed came from, because a
+     * generator seeded only from clocks under an emulator is a different
+     * claim from one seeded from RDSEED on metal, and the difference should be
+     * printed rather than assumed.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test random") == 0) {
+        int ok = 1;
+        uint64_t b0, r0, h0;
+        random_stats(&b0, &r0, &h0);
+        enum random_quality q = random_quality();
+
+        kprintf("\n[random] seed quality: %s (%llu hardware words so far, "
+                "%llu reseeds, %llu bytes drawn)\n",
+                q == RANDOM_HARDWARE ? "HARDWARE + clocks"
+              : q == RANDOM_JITTER   ? "clocks and jitter ONLY (no hardware RNG)"
+                                     : "UNSEEDED",
+                (unsigned long long)h0, (unsigned long long)r0,
+                (unsigned long long)b0);
+        if (q == RANDOM_UNSEEDED) { kprintf("  [FAIL] never seeded\n"); ok = 0; }
+
+        /* 0. THE KNOWN-ANSWER TEST, which is the only line here that says the
+         *    DRBG is HMAC_DRBG rather than something that merely looks random.
+         *    NIST CAVP vectors, run on a private state through the same
+         *    primitives the live generator uses. */
+        for (unsigned v = 0; v < random_kat_count(); v++) {
+            int which = -1;
+            int rc = random_kat(v, &which);
+            kprintf("  [%s] CAVP HMAC_DRBG/SHA-256 vector %u: %s\n",
+                    rc == 0 ? "ok" : "FAIL", v,
+                    which == 2 ? "second generate matches ReturnedBits"
+                  : which == 1 ? "only the FIRST generate matches -- the procedure is off by one generate"
+                               : "NEITHER generate matches -- the DRBG is wrong");
+            if (rc != 0) ok = 0;
+        }
+
+        /* 1. Two draws are not the same, and neither is zero. */
+        uint64_t a = random_u64(), b = random_u64();
+        kprintf("  [%s] consecutive draws differ (0x%llx, 0x%llx)\n",
+                (a != b && a && b) ? "ok" : "FAIL",
+                (unsigned long long)a, (unsigned long long)b);
+        if (a == b || !a || !b) ok = 0;
+
+        /* 2. Monobit: over 64 KiB, ones within 49-51% -- a generous bound that
+         *    a stuck or structurally broken generator still cannot meet. */
+        static uint8_t buf[65536];
+        random_bytes(buf, sizeof buf);
+        uint64_t ones = 0;
+        for (size_t i = 0; i < sizeof buf; i++)
+            /* A plain loop, not __builtin_popcount: the builtin lowers to a
+             * libgcc call (__popcountdi2) on this target and the freestanding
+             * kernel does not link libgcc. It cost a link failure that a
+             * targeted build masked, and a test run on a stale kernel. */
+            for (uint8_t v = buf[i]; v; v &= v - 1) ones++;
+        uint64_t bits = (uint64_t)sizeof buf * 8;
+        uint64_t pct100 = ones * 10000 / bits;   /* percent x100 */
+        kprintf("  [%s] monobit over 64 KiB: %llu.%02llu%% ones\n",
+                (pct100 >= 4900 && pct100 <= 5100) ? "ok" : "FAIL",
+                (unsigned long long)(pct100 / 100), (unsigned long long)(pct100 % 100));
+        if (pct100 < 4900 || pct100 > 5100) ok = 0;
+
+        /* 3. No 8-byte value repeats across 8192 draws. The birthday bound for
+         *    64-bit values at this count is ~2e-12, so a single repeat is a
+         *    broken generator, not bad luck. O(n^2) on 8192 is fine here. */
+        uint64_t *w = (uint64_t *)buf;
+        size_t nw = sizeof buf / sizeof(uint64_t);
+        int repeats = 0;
+        for (size_t i = 0; i < nw && repeats == 0; i++)
+            for (size_t j = i + 1; j < nw; j++)
+                if (w[i] == w[j]) { repeats++; break; }
+        kprintf("  [%s] no repeated 64-bit value among %u draws\n",
+                repeats == 0 ? "ok" : "FAIL", (unsigned)nw);
+        if (repeats) ok = 0;
+
+        /* 4. random_below is unbiased on a bound a modulus would skew. With
+         *    bound 3 and 30000 draws, each bucket should hold ~10000; a modulo
+         *    bias on a 64-bit draw is invisible at this size, so this checks
+         *    the rejection path runs, not that it matters -- the bound
+         *    3 * 2^62 + 1 below is where it would. */
+        uint64_t bucket[3] = {0,0,0};
+        for (int i = 0; i < 30000; i++) bucket[random_below(3)]++;
+        int fair = 1;
+        for (int i = 0; i < 3; i++)
+            if (bucket[i] < 9600 || bucket[i] > 10400) fair = 0;
+        kprintf("  [%s] random_below(3) over 30000 draws: %llu / %llu / %llu\n",
+                fair ? "ok" : "FAIL",
+                (unsigned long long)bucket[0], (unsigned long long)bucket[1],
+                (unsigned long long)bucket[2]);
+        if (!fair) ok = 0;
+        uint64_t big = random_below(3ull * (1ull << 62) + 1);
+        kprintf("  [%s] random_below on a bound with a large modulus remainder "
+                "returns inside it (0x%llx)\n",
+                big < 3ull * (1ull << 62) + 1 ? "ok" : "FAIL",
+                (unsigned long long)big);
+        if (big >= 3ull * (1ull << 62) + 1) ok = 0;
+
+        /* 5. Mixing entropy changes the stream: the same call after an
+         *    add_entropy cannot continue the sequence it would have. Checked
+         *    the only way it can be -- by drawing, mixing, drawing, and
+         *    requiring the second draw not to equal what a plain third draw
+         *    from the untouched state would produce... which is unobservable.
+         *    So the weaker, honest version: the state advances and does not
+         *    crash, and the draw after mixing is still a fresh value. */
+        uint64_t before = random_u64();
+        const char salt[] = "test random salt";
+        random_add_entropy(salt, sizeof salt);
+        uint64_t after = random_u64();
+        kprintf("  [%s] add_entropy then draw: 0x%llx -> 0x%llx\n",
+                (before != after) ? "ok" : "FAIL",
+                (unsigned long long)before, (unsigned long long)after);
+        if (before == after) ok = 0;
+
+        uint64_t b1, r1, h1;
+        random_stats(&b1, &r1, &h1);
+        kprintf("  drew %llu bytes in this test\n",
+                (unsigned long long)(b1 - b0));
+
+        kprintf("[cmd] test random: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test aslr -- does every process get its own addresses?
+     *
+     * Six processes, seven layouts read straight out of the process table. Each
+     * of the seven windows must be page-aligned, inside its window, and DISTINCT
+     * across all six: at 22 bits of entropy per window the chance of any
+     * collision among six is about 1 in 300,000, so a repeat is a broken
+     * generator, not bad luck. The children sleep so they exist long enough to
+     * be read, and are killed and collected afterwards -- a frozen or leaked
+     * child is exactly what a test of process creation must not leave behind.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test aslr") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test aslr: VFS not registered\n"); return 1; }
+        const char *sp = "/system/bin/shell.elf";
+        struct vfs_stat sst;
+        if (vfs_stat(sp, &sst) != EMBK_OK) { kprintf("\n[cmd] test aslr: %s not on image\n", sp); return 1; }
+
+        enum { N = 6 };
+        struct user_layout L[N];
+        int pids[N];
+        int ok = 1, got = 0;
+
+        kprintf("\n[aslr] %d processes, seven kernel-chosen windows each\n", N);
+        for (int i = 0; i < N; i++) {
+            char *a[] = { (char *)sp, "-c", "sleep 3000", NULL };
+            pids[i] = process_create(sp, a, 3, NULL, 0);
+            if (pids[i] < 0 || process_layout_of((uint32_t)pids[i], &L[i]) != 0) {
+                kprintf("  [FAIL] could not spawn/read process %d\n", i);
+                ok = 0; pids[i] = -1; continue;
+            }
+            got++;
+            kprintf("  pid %3d: exec %llx  dylib %llx  shared %llx  mmap %llx  heap %llx  stack %llx  tstack %llx\n",
+                    pids[i], (unsigned long long)L[i].exec_base,
+                    (unsigned long long)L[i].dylib_base, (unsigned long long)L[i].shared_base,
+                    (unsigned long long)L[i].mmap_base,  (unsigned long long)L[i].heap_base,
+                    (unsigned long long)L[i].stack_top_page, (unsigned long long)L[i].thread_stack_base);
+        }
+
+        /* Each field: aligned, in-window, and unique across the set. */
+        struct { const char *name; size_t off; uint64_t lo, hi; } F[] = {
+            { "exec",   offsetof(struct user_layout, exec_base),          0x0000100000000000ULL, 0x0000100000000000ULL + (64ull<<30) },
+            { "dylib",  offsetof(struct user_layout, dylib_base),        0x0000200000000000ULL, 0x0000200000000000ULL + (16ull<<30) },
+            { "shared", offsetof(struct user_layout, shared_base),       0x0000400000000000ULL, 0x0000400000000000ULL + (64ull<<30) },
+            { "mmap",   offsetof(struct user_layout, mmap_base),         0x0000500000000000ULL, 0x0000500000000000ULL + (64ull<<30) },
+            { "heap",   offsetof(struct user_layout, heap_base),         0x0000600000000000ULL, 0x0000600000000000ULL + (16ull<<30) },
+            { "stack",  offsetof(struct user_layout, stack_top_page),    0x0000700000000000ULL - (16ull<<30), 0x0000700000000000ULL + 1 },
+            { "tstack", offsetof(struct user_layout, thread_stack_base), 0x0000700010000000ULL, 0x0000700010000000ULL + (16ull<<30) },
+        };
+        for (unsigned f = 0; f < sizeof F / sizeof F[0]; f++) {
+            int aligned = 1, inwin = 1, distinct = 1;
+            for (int i = 0; i < N; i++) {
+                if (pids[i] < 0) continue;
+                uint64_t v = *(uint64_t *)((char *)&L[i] + F[f].off);
+                if (v & 0xFFF) aligned = 0;
+                if (v < F[f].lo || v >= F[f].hi) inwin = 0;
+                for (int j = i + 1; j < N; j++) {
+                    if (pids[j] < 0) continue;
+                    if (v == *(uint64_t *)((char *)&L[j] + F[f].off)) distinct = 0;
+                }
+            }
+            kprintf("  [%s] %-6s: page-aligned %s, inside its window %s, all %d distinct %s\n",
+                    (aligned && inwin && distinct) ? "ok" : "FAIL", F[f].name,
+                    aligned ? "yes" : "NO", inwin ? "yes" : "NO", got, distinct ? "yes" : "NO");
+            if (!(aligned && inwin && distinct)) ok = 0;
+        }
+
+        /* The windows must not overlap WITHIN one process either: the largest
+         * (mmap, 256 GiB from a base up to 64 GiB in) tops out at
+         * 0x5050_0000_0000, below the heap base. Checked, not assumed. */
+        int disjoint = 1;
+        for (int i = 0; i < N; i++) {
+            if (pids[i] < 0) continue;
+            if (L[i].mmap_max > L[i].heap_base) disjoint = 0;
+            if (L[i].heap_max > L[i].stack_top_page - (128ull << 12)) disjoint = 0;   /* main stack pages */
+            if (L[i].shared_base + (64ull << 30) > L[i].mmap_base) disjoint = 0;
+            if (L[i].exec_base + (64ull << 30) > L[i].dylib_base) disjoint = 0;
+        }
+        kprintf("  [%s] the seven windows do not overlap inside any process\n", disjoint ? "ok" : "FAIL");
+        if (!disjoint) ok = 0;
+
+        /* And the processes actually RAN with those layouts: they are alive,
+         * which means main() was reached on a randomised stack with argv
+         * pointers that resolved -- the one site that was missed in the first
+         * pass would have faulted every one of them before this line. */
+        int alive = 0;
+        for (int i = 0; i < N; i++) if (pids[i] >= 0 && process_alive((uint32_t)pids[i])) alive++;
+        kprintf("  [%s] %d of %d children are alive on their randomised stacks\n",
+                alive == got ? "ok" : "FAIL", alive, got);
+        if (alive != got) ok = 0;
+
+        for (int i = 0; i < N; i++) {
+            if (pids[i] < 0) continue;
+            process_kill((uint32_t)pids[i]);
+            (void)process_wait((uint32_t)pids[i]);
+        }
+        kprintf("[cmd] test aslr: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test pie -- does a position-independent executable actually MOVE?
+     *
+     * `test aslr` above proves the kernel CHOOSES a different executable base
+     * for every process. That is only half the claim, and the cheaper half: a
+     * base nothing is loaded at randomises nothing. This spawns a real ET_DYN
+     * binary twice and asks it where it ended up.
+     *
+     * pieprobe.c checks its own relocated pointers, its constructor and its
+     * __thread variable before answering, and exits with the PAGE INDEX of its
+     * own text inside the kernel's executable window -- so one small integer
+     * carries "I am position-independent, I was relocated correctly, and here
+     * is where". Two runs, two different answers, both inside the window.
+     *
+     * Sequential, not concurrent. Two processes alive at once would also prove
+     * it, but a serial spawn-and-wait proves the addresses differ ACROSS TIME
+     * rather than merely across two live layouts, which is the property an
+     * attacker cares about: knowing where yesterday's process put its text must
+     * tell you nothing about today's.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test nvme -- the NVMe driver, against a disk it is allowed to destroy.
+     *
+     * Reads every NVMe namespace's first block (safe, and itself a check),
+     * then writes, reads back and verifies only the one carrying the scratch
+     * marker: every PRP shape, a transfer split across commands, the last
+     * blocks of the namespace, that the LBA is honoured, that the end is
+     * enforced, and flush. Attach the scratch image with
+     *   NVME_DISK=build/nvme-scratch.img python3 tools/console_test.py "test nvme"
+     * (`make test-nvme` does that, at 512- and 4096-byte block sizes).
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test nvme") == 0) {
+        kprintf("\n[nvme] %d namespace(s)\n", nvme_namespace_count());
+        int rc = nvme_selftest_run();
+        if (rc == -EMBK_ENOENT) { kprintf("[cmd] test nvme: SKIP\n"); return 1; }
+        kprintf("[cmd] test nvme: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test pie") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test pie: VFS not registered\n"); return 1; }
+        const char *pp = "/data/apps/pieprobe/pieprobe.elf";
+        kprintf("\n[pie] %s, twice\n", pp);
+        int rc = pie_selftest_run(pp);
+        if (rc == -EMBK_ENOENT) { kprintf("[cmd] test pie: SKIP\n"); return 1; }
+        kprintf("[cmd] test pie: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test canary -- does the stack protector actually fire?
+     *
+     * A canary that has never been seen to trip is a compiler flag, not a
+     * protection. This overflows a local on purpose, in a function the
+     * compiler is not allowed to inline or optimise the overflow out of, and
+     * requires __stack_chk_fail to run -- which it proves by landing back
+     * here through the recovery point instead of halting the machine.
+     *
+     * It also checks the guard is not the static initialiser: that is the
+     * only evidence the entry stub seeded it, and a canary that is the same
+     * on every boot is a canary an attacker can read from the binary.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test canary") == 0) {
+        int ok = 1;
+        uintptr_t g = canary_value();
+        kprintf("\n[canary] guard 0x%lx\n", (unsigned long)g);
+        kprintf("  [%s] the guard is non-zero and is not the compile-time initialiser\n",
+                (g && g != 0x5A6B7C8D9EAFB0C1ULL) ? "ok" : "FAIL");
+        if (!g || g == 0x5A6B7C8D9EAFB0C1ULL) ok = 0;
+
+        uint64_t before = canary_fires();
+        int landed = 0;
+        if (canary_test_arm()) {
+            canary_smash_a_frame(24);      /* 16-byte buffer, 24 bytes written */
+            /* Not reached: the smashed frame's epilogue calls __stack_chk_fail,
+             * which longjmps to the arm above. If we ARE here, the protector
+             * did not fire and the overwritten return address was taken --
+             * which means it happened to land somewhere survivable, which is
+             * luck, not protection. */
+            canary_test_disarm();
+            kprintf("  [FAIL] the smashed frame RETURNED -- the protector did not fire\n");
+            ok = 0;
+        } else {
+            landed = 1;
+        }
+        uint64_t fired = canary_fires() - before;
+        kprintf("  [%s] a deliberate 8-byte overrun of a 16-byte local was caught "
+                "(fired %llu, recovered %d)\n",
+                (landed && fired == 1) ? "ok" : "FAIL",
+                (unsigned long long)fired, landed);
+        if (!landed || fired != 1) ok = 0;
+
+        kprintf("[cmd] test canary: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test hardlink -- the VFS half of hard links, in the kernel. The
+     * filesystem's own namespace test already proves embkfs_link_name; this
+     * proves the path from a NAME to it, which is what a syscall uses. */
+    if (strcmp(cmd, "test hardlink") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test hardlink: VFS not registered\n"); return 1; }
+        int ok = 1;
+        struct vfs_stat st;
+        const char *a = "/khl_a", *b = "/khl_b", *d = "/khl_dir";
+        vfs_unlink_path(b); vfs_unlink_path(a); vfs_rmdir_path(d);
+
+        int fd = vfs_open(a, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) { kprintf("\n[cmd] test hardlink: cannot create %s\n", a); return 1; }
+        size_t wr = 0; (void)vfs_fd_write(fd, "kernel", 6, &wr); vfs_close(fd);
+
+        kprintf("\n[hardlink]\n");
+        int rc = vfs_link_path(a, b);
+        kprintf("  [%s] vfs_link_path creates a second name (rc %d)\n", rc == EMBK_OK ? "ok" : "FAIL", rc);
+        if (rc != EMBK_OK) ok = 0;
+
+        rc = vfs_stat(a, &st);
+        kprintf("  [%s] nlink is 2 through the original (%llu)\n",
+                (rc == EMBK_OK && st.nlink == 2) ? "ok" : "FAIL", (unsigned long long)st.nlink);
+        if (rc != EMBK_OK || st.nlink != 2) ok = 0;
+
+        rc = vfs_unlink_path(a);
+        rc = vfs_stat(b, &st);
+        kprintf("  [%s] after unlinking the original: the other name resolves, nlink %llu, size %llu\n",
+                (rc == EMBK_OK && st.nlink == 1 && st.size == 6) ? "ok" : "FAIL",
+                (unsigned long long)st.nlink, (unsigned long long)st.size);
+        if (rc != EMBK_OK || st.nlink != 1 || st.size != 6) ok = 0;
+
+        rc = vfs_mkdir_path(d);
+        rc = vfs_link_path(d, "/khl_dir2");
+        kprintf("  [%s] a directory target is refused (rc %d, want %d)\n",
+                rc == -EMBK_EPERM ? "ok" : "FAIL", rc, -EMBK_EPERM);
+        if (rc != -EMBK_EPERM) ok = 0;
+
+        rc = vfs_link_path("/khl_does_not_exist", "/khl_c");
+        kprintf("  [%s] a missing target is ENOENT (rc %d)\n", rc == -EMBK_ENOENT ? "ok" : "FAIL", rc);
+        if (rc != -EMBK_ENOENT) ok = 0;
+
+        vfs_rmdir_path(d); vfs_unlink_path(b);
+        kprintf("[cmd] test hardlink: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test embkfs crash -- power loss at every write. Needs the small tree
+     * image attached as a THIRD disk (sdc): `make test-embkfs-crash`. */
+    if (strcmp(cmd, "test embkfs crash") == 0) {
+        struct embk_block_device *seed = embk_block_get_by_name("sdc");
+        if (!seed) {
+            kprintf("\n[cmd] test embkfs crash: no third disk (sdc) -- run `make test-embkfs-crash`\n");
+            return 1;
+        }
+        int rc = embkfs_run_crash_selftests(seed);
+        kprintf("[cmd] test embkfs crash: %s\n", rc == EMBK_OK ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test session -- whose a process is, and what that decides.
+     *
+     * The witness (user/tests/sessprobe/sessprobe.c) is spawned into sessions this test
+     * names -- the console holds EMBK_CAP_SESSION, as init does -- and each
+     * mode is one claim: identity and inheritance, no minting, the kill-by-pid
+     * gate, clipboard isolation, logout from inside and from outside, a
+     * session that ends with its leader, the console's ^C slot. */
+    if (strcmp(cmd, "test session") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test session: VFS not registered\n"); return 1; }
+        const char *wp = "/data/apps/sessprobe/sessprobe.elf";
+        struct vfs_stat wst;
+        if (vfs_stat(wp, &wst) != EMBK_OK) { kprintf("\n[cmd] test session: %s not on image\n", wp); return 1; }
+        kprintf("\n[session] the witness runs in sessions this test opens\n");
+        int ok = 1;
+
+        /* Spawn the witness in a NEW session for `user` (or in ours if NULL). */
+        #define SP_SPAWN(user, ...) ({                                              \
+            char *a_[] = { (char *)wp, __VA_ARGS__, NULL };                          \
+            int n_ = 0; while (a_[n_]) n_++;                                         \
+            struct spawn_file_action act_; memset(&act_, 0, sizeof act_);            \
+            int na_ = 0;                                                              \
+            if (user) { act_.kind = SPAWN_ACTION_NEW_SESSION;                        \
+                        strncpy(act_.path, (user), sizeof act_.path - 1); na_ = 1; } \
+            process_create(wp, a_, n_, na_ ? &act_ : NULL, na_); })
+        #define SP_RUN(user, ...) ({ int p_ = SP_SPAWN(user, __VA_ARGS__);          \
+            p_ < 0 ? p_ : process_wait((uint32_t)p_); })
+        #define SP_CHECK(cond, ...) do { kprintf("  [%s] ", (cond) ? "ok" : "FAIL"); \
+            kprintf(__VA_ARGS__); kprintf("\n"); if (!(cond)) ok = 0; } while (0)
+
+        /* How many processes a session still has, waiting for the stragglers
+         * of an ended session to reach their exits (a kill is deferred to the
+         * victim's next safe point). */
+        #define SP_LIVE(sid) ({ uint32_t c_ = 0;                                     \
+            for (int w_ = 0; w_ < 400; w_++) {                                        \
+                struct session_row r_[16]; int n_ = session_list(r_, 16); c_ = 0;     \
+                for (int i_ = 0; i_ < n_; i_++) if (r_[i_].id == (sid)) c_ = r_[i_].procs; \
+                if (!c_ && !kworker_pending()) break;                                 \
+                sched_sleep_ms(5);                                                    \
+            } c_; })
+
+        int rc = SP_RUN("alice", "info", "alice");
+        SP_CHECK(rc == 0, "identity: a session for alice, not the system's, no power to open sessions, and the child is in it (exit %d)", rc);
+
+        rc = SP_RUN("alice", "mint");
+        SP_CHECK(rc == 0, "a session cannot open another: NEW_SESSION and CAP_SESSION both refused (exit %d)", rc);
+
+        struct spawn_file_action bad; memset(&bad, 0, sizeof bad);
+        bad.kind = SPAWN_ACTION_NEW_SESSION; strcpy(bad.path, "Bad/Name");
+        { char *a[] = { (char *)wp, "sleep", NULL };
+          rc = process_create(wp, a, 2, &bad, 1); }
+        if (rc > 0) { process_kill((uint32_t)rc); process_wait((uint32_t)rc); }
+        SP_CHECK(rc == -EMBK_EINVAL, "a session name that is not a username is refused (rc %d)", rc);
+
+        /* A system-session process and a kernel thread for the kill gate. */
+        int sys0 = SP_SPAWN(NULL, "sleep");
+        uint32_t kth = 0;
+        { struct process_info rows[MAX_PROCESSES]; int n = process_list(rows, MAX_PROCESSES);
+          for (int i = 0; i < n && !kth; i++) if (rows[i].is_kthread) kth = rows[i].pid; }
+        char s0[16], sk[16];
+        snprintf(s0, sizeof s0, "%d", sys0); snprintf(sk, sizeof sk, "%u", kth);
+        rc = SP_RUN("bob", "kill", s0, sk);
+        SP_CHECK(rc == 0 && process_alive((uint32_t)sys0),
+                 "kill by pid: another session's and a kernel thread's refused, one's own child killed (exit %d, pid %d still alive %d)",
+                 rc, sys0, (int)process_alive((uint32_t)sys0));
+
+        /* The console's ^C slot, taken by the system session. */
+        keyboard_set_interrupt_target((uint32_t)sys0);
+        rc = SP_RUN("erin", "route");
+        keyboard_set_interrupt_target(0);
+        SP_CHECK(rc == 0, "the console's ^C cannot be taken from another session (exit %d)", rc);
+        process_kill((uint32_t)sys0); (void)process_wait((uint32_t)sys0);
+
+        /* Clipboard: alice copies and stays; bob looks. */
+        int a = SP_SPAWN("alice", "clipset", "s3cret-password");
+        uint32_t sid_a = 0;
+        (void)process_session_of((uint32_t)a, &sid_a);
+        for (int w = 0; w < 400 && clipboard_owner_session() != sid_a; w++) sched_sleep_ms(5);
+        SP_CHECK(sid_a && clipboard_owner_session() == sid_a, "alice's clipboard holds her copy (session %u)", sid_a);
+        { struct process_info rows[MAX_PROCESSES]; int n = process_list(rows, MAX_PROCESSES), seen = 0;
+          for (int i = 0; i < n; i++) if (rows[i].pid == (uint32_t)a && rows[i].session_id == sid_a) seen = 1;
+          SP_CHECK(seen, "ps shows alice's process in her session"); }
+        rc = SP_RUN("bob", "clipget");
+        SP_CHECK(rc == 0, "bob, in another session, sees an empty clipboard (%d bytes)", rc);
+
+        /* Logout from outside -- what init does -- ends her session. */
+        int nk = session_end(sid_a, true);
+        rc = process_wait((uint32_t)a);
+        uint32_t left = SP_LIVE(sid_a);
+        SP_CHECK(rc == EMBK_EXIT_LOGOUT && left == 0 && clipboard_owner_session() == 0,
+                 "ending alice's session: %d stopped, leader exit 0x%x (want 0x%x), %u left, clipboard wiped %d",
+                 nk, (unsigned)rc, (unsigned)EMBK_EXIT_LOGOUT, left, (int)(clipboard_owner_session() == 0));
+
+        /* A leader that exits without logging out: the session ends anyway. */
+        int c = SP_SPAWN("carol", "linger");
+        uint32_t sid_c = 0; (void)process_session_of((uint32_t)c, &sid_c);
+        rc = process_wait((uint32_t)c);
+        left = SP_LIVE(sid_c);
+        SP_CHECK(rc == 0 && sid_c && left == 0,
+                 "a leader that exits takes its session with it: the child it left running is stopped (%u left)", left);
+
+        /* Logout from inside: the session, the caller included. */
+        int d = SP_SPAWN("dave", "logout");
+        uint32_t sid_d = 0; (void)process_session_of((uint32_t)d, &sid_d);
+        rc = process_wait((uint32_t)d);
+        left = SP_LIVE(sid_d);
+        SP_CHECK(rc == EMBK_EXIT_LOGOUT && left == 0,
+                 "logging out from inside: leader exit 0x%x (want 0x%x), %u left", (unsigned)rc, (unsigned)EMBK_EXIT_LOGOUT, left);
+
+        #undef SP_SPAWN
+        #undef SP_RUN
+        #undef SP_CHECK
+        #undef SP_LIVE
+        kprintf("[cmd] test session: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test plant profile <user> -- a TEST FIXTURE, not a feature: write a
+     * HOSTILE session profile for <user> into /etc/sessions -- one that asks
+     * for the account store and every home on the machine -- so that
+     * tools/login_test.py can sign in and watch init refuse those lines. What
+     * a profile may grant is decided by user/lib/session_policy.h, never by
+     * the profile. */
+    if (strncmp(cmd, "test plant profile ", 19) == 0) {
+        const char *u = cmd + 19;
+        char path[96], text[256];
+        snprintf(path, sizeof path, "/etc/sessions/%s.ns", u);
+        snprintf(text, sizeof text,
+                 "# planted by the test: asks for far more than any session may have\n"
+                 "rw /etc\nrw /home\nro /system\nro /data/apps\nrw /home/%s\nrw /run\n", u);
+        (void)vfs_mkdir_path("/etc/sessions");
+        int fd = vfs_open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        size_t w = 0;
+        int rc = fd >= 0 ? vfs_fd_write(fd, text, strlen(text), &w) : fd;
+        if (fd >= 0) { (void)vfs_fd_fsync(fd); vfs_close(fd); }
+        kprintf("\n[cmd] test plant profile: %s (%s, %d)\n", rc == EMBK_OK ? "OK" : "FAIL", path, rc);
+        return 1;
+    }
+
+    /* test syscall -- the two ways into the kernel, timed against each other
+     * by user/tests/syscallbench/syscallbench.c: `int 0x80` (an interrupt: IDT walk, TSS
+     * stack switch, pushed frame) and `syscall` (selectors from an MSR, RIP
+     * in RCX, jump). Both must return the same pid before either is timed. */
+    if (strcmp(cmd, "test syscall") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test syscall: VFS not registered\n"); return 1; }
+        const char *bp = "/data/apps/syscallbench/syscallbench.elf";
+        char *a[] = { (char *)bp, NULL };
+        kprintf("\n[syscall] fast path armed: %s\n", syscall_fast_enabled() ? "yes" : "NO");
+        int pid = process_create(bp, a, 1, NULL, 0);
+        int rc = pid >= 0 ? process_wait((uint32_t)pid) : pid;
+        kprintf("[cmd] test syscall: %s (exit %d)\n",
+                (rc == 0 && syscall_fast_enabled()) ? "OK" : "FAIL", rc);
+        return 1;
+    }
+
+    /* test accounts -- the account store and the session policy
+     * (user/tests/authtest/authtest.c against a scratch store: create, verify, change,
+     * reset, remove, the last-administrator rule, the upgrade of a standard
+     * PBKDF2 record made elsewhere, atomic rewrites, the throttle, and the
+     * clamp on session profiles). Exit code = claims that did not hold. */
+    if (strcmp(cmd, "test accounts") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test accounts: VFS not registered\n"); return 1; }
+        const char *tp = "/data/apps/authtest/authtest.elf";
+        char *a[] = { (char *)tp, NULL };
+        int pid = process_create(tp, a, 1, NULL, 0);
+        int rc = pid >= 0 ? process_wait((uint32_t)pid) : pid;
+        kprintf("[cmd] test accounts: %s (exit %d)\n", rc == 0 ? "OK" : "FAIL", rc);
+        return 1;
+    }
+
+    /* test kill io -- kill a process while it is inside the filesystem, eight
+     * times at eight different moments, and the filesystem is still usable.
+     *
+     * The witness (user/tests/fsloop/fsloop.c) creates, writes, fsyncs and unlinks a
+     * file in a loop; fsync commits a transaction under the filesystem's lock
+     * in the PROCESS's own context, so a kill that lands there lands on a
+     * thread holding that lock -- asleep on the disk, or preempted. What a
+     * kill must never do is take that lock with the thread. */
+    if (strcmp(cmd, "test kill io") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test kill io: VFS not registered\n"); return 1; }
+        const char *wp = "/data/apps/fsloop/fsloop.elf";
+        struct vfs_stat wst;
+        if (vfs_stat(wp, &wst) != EMBK_OK) { kprintf("\n[cmd] test kill io: %s not on image\n", wp); return 1; }
+
+        kprintf("\n[kill io] eight kills, each at a different moment in the witness's loop\n");
+        int ok = 1;
+        for (int i = 0; i < 8; i++) {
+            char *a[] = { (char *)wp, NULL };
+            int pid = process_create(wp, a, 1, NULL, 0);
+            if (pid < 0) { kprintf("  [FAIL] spawn %d\n", pid); ok = 0; break; }
+            sched_sleep_ms(23 + 11 * i);
+            uint64_t t0 = timer_uptime_ms();
+            process_kill((uint32_t)pid);
+            int rc = process_wait((uint32_t)pid);
+            kprintf("  [ok] kill %d after %d ms: reaped in %llu ms, exit %d\n",
+                    i, 23 + 11 * i, (unsigned long long)(timer_uptime_ms() - t0), rc);
+        }
+
+        sched_sleep_ms(50);
+        bool held = embkfs_lock_is_held();
+        kprintf("  [%s] the filesystem lock is free after the kills\n", held ? "FAIL" : "ok");
+        if (held) ok = 0;
+
+        /* And it WORKS -- create, write, sync, remove -- which is the claim;
+         * the lock state above is the diagnosis when it does not. */
+        const char *path = "/home/yves/killio.txt";
+        int fd = vfs_open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        size_t w = 0;
+        int rw = fd >= 0 ? vfs_fd_write(fd, "alive", 5, &w) : -1;
+        int rf = fd >= 0 ? vfs_fd_fsync(fd) : -1;
+        if (fd >= 0) vfs_close(fd);
+        int ru = vfs_unlink_path(path);
+        bool works = fd >= 0 && rw == EMBK_OK && w == 5 && rf == EMBK_OK && ru == EMBK_OK;
+        kprintf("  [%s] a file can still be created, written, synced and removed (open %d, write %d, fsync %d, unlink %d)\n",
+                works ? "ok" : "FAIL", fd, rw, rf, ru);
+        if (!works) ok = 0;
+
+        kprintf("[cmd] test kill io: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test swap -- anonymous memory larger than RAM, and the program survives.
+     *
+     * The witness (user/tests/swapper/swapper.c) maps N MiB anonymous, writes a pattern
+     * through every page and reads every page back; its exit code is the
+     * number of pages that came back wrong. N is chosen HERE from what the
+     * machine actually has free, so the run forces paging at any -m: more
+     * than is free, less than free plus half the store. Then the kernel's
+     * counters have to agree that pages went out and came back, and that
+     * everything the process held -- frames and slots -- was returned when
+     * it exited. Needs the swap image: make test-swap. */
+    if (strcmp(cmd, "test swap") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test swap: VFS not registered\n"); return 1; }
+        kprintf("\n");
+        int rc = swap_selftest_run("/data/apps/swapper/swapper.elf", false);   /* mm/swaptest.c: shared with the aarch64 boot */
+        kprintf("[cmd] test swap: %s\n", rc == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* test swap store -- the page store, before anything is swapped.
+     * Slots are handed out and taken back; a page written out comes back
+     * byte for byte; two pages out do not come back as each other; a slot
+     * nobody holds is refused. Needs the swap image: make test-swap-store. */
+    if (strcmp(cmd, "test swap store") == 0) {
+        if (!swap_available()) {
+            kprintf("\n[cmd] test swap store: no swap store (attach build/swap.img: make test-swap-store)\n");
+            return 1;
+        }
+        int ok = 1;
+        struct swap_stats st0, st1;
+        swap_stats_get(&st0);
+        kprintf("\n[swap store] %s: %llu slots, %llu in use\n", st0.dev,
+                (unsigned long long)st0.nslots, (unsigned long long)st0.used);
+
+        uint64_t pa = pmm_alloc_page(), pb = pmm_alloc_page(), pc = pmm_alloc_page();
+        if (!pa || !pb || !pc) { kprintf("  [FAIL] no pages\n"); return 1; }
+        uint8_t *a = (uint8_t *)P2V(pa), *b = (uint8_t *)P2V(pb), *c = (uint8_t *)P2V(pc);
+        for (int i = 0; i < 4096; i++) { a[i] = (uint8_t)(i * 7 + 1); b[i] = (uint8_t)(0xA5 ^ i); }
+
+        uint64_t sa = swap_out(pa), sb = swap_out(pb);
+        kprintf("  [%s] two pages went out to distinct slots (%llu, %llu)\n",
+                (sa && sb && sa != sb) ? "ok" : "FAIL", (unsigned long long)sa, (unsigned long long)sb);
+        if (!(sa && sb && sa != sb)) ok = 0;
+
+        memset(a, 0, 4096); memset(b, 0, 4096);
+        int ra = swap_in(sa, pc);
+        int match_a = 1; for (int i = 0; i < 4096; i++) if (c[i] != (uint8_t)(i * 7 + 1)) { match_a = 0; break; }
+        kprintf("  [%s] page A came back byte for byte (rc %d)\n", (ra == EMBK_OK && match_a) ? "ok" : "FAIL", ra);
+        if (ra != EMBK_OK || !match_a) ok = 0;
+
+        int rb = swap_in(sb, pc);
+        int match_b = 1; for (int i = 0; i < 4096; i++) if (c[i] != (uint8_t)(0xA5 ^ i)) { match_b = 0; break; }
+        kprintf("  [%s] page B came back byte for byte, not as A (rc %d)\n", (rb == EMBK_OK && match_b) ? "ok" : "FAIL", rb);
+        if (rb != EMBK_OK || !match_b) ok = 0;
+
+        int rz = swap_in(sa + 1000 < st0.nslots ? sa + 1000 : 1, pc);
+        kprintf("  [%s] reading a slot nobody holds is refused (rc %d)\n", rz == -EMBK_EINVAL ? "ok" : "FAIL", rz);
+        if (rz != -EMBK_EINVAL) ok = 0;
+
+        /* HOW FAST IS THE STORE, per page? Printed, not asserted -- it is a
+         * fact about the device and the host, not about the code -- but every
+         * paging decision above this layer is a bet on this number, so the
+         * test that proves the store works also says what it costs. 512 pages
+         * out to fresh slots, then the same 512 back. */
+        {
+            enum { NT = 512 };
+            static uint64_t slots[NT];
+            int n = 0;
+            uint64_t t0 = timer_uptime_ms();
+            for (; n < NT; n++) { slots[n] = swap_out(pa); if (!slots[n]) break; }
+            uint64_t t1 = timer_uptime_ms();
+            for (int i = 0; i < n; i++) (void)swap_in(slots[i], pc);
+            uint64_t t2 = timer_uptime_ms();
+            for (int i = 0; i < n; i++) swap_free(slots[i]);
+            kprintf("  [info] %d pages out in %llu ms (%llu us/page), the same %d back in %llu ms (%llu us/page)\n",
+                    n, (unsigned long long)(t1 - t0), (unsigned long long)(n ? (t1 - t0) * 1000 / n : 0),
+                    n, (unsigned long long)(t2 - t1), (unsigned long long)(n ? (t2 - t1) * 1000 / n : 0));
+        }
+
+        swap_free(sa); swap_free(sb);
+        swap_stats_get(&st1);
+        kprintf("  [%s] slots returned: %llu in use before, %llu after; %llu outs, %llu ins\n",
+                st1.used == st0.used ? "ok" : "FAIL",
+                (unsigned long long)st0.used, (unsigned long long)st1.used,
+                (unsigned long long)(st1.outs - st0.outs), (unsigned long long)(st1.ins - st0.ins));
+        if (st1.used != st0.used) ok = 0;
+
+        pmm_free_page(pa); pmm_free_page(pb); pmm_free_page(pc);
+        kprintf("[cmd] test swap store: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
@@ -945,6 +2839,1020 @@ int selftests_handle_command(const char *cmd)
         return ok ? 0 : 1;
     }
 
+    /* ----------------------------------------------------------------------
+     * test scsi -- DOES THE CONTROLLER MOVE DATA, not just enumerate?
+     *
+     * A controller that finds its targets and reports their geometry has
+     * proved the command path for INQUIRY and READ CAPACITY and nothing else.
+     * Reads and writes go through a different descriptor layout -- a data
+     * buffer in the chain, in one direction or the other -- and that is the
+     * part that is wrong when a disk is silently garbage.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test cdrom -- the optical path, from the ATAPI transport to a file.
+     *
+     * Three separate things have to be right and only the last one is
+     * visible: the PACKET envelope carries a SCSI command, READ(10) returns
+     * 2048-byte blocks, and ISO 9660 turns those into names. A test that
+     * only checked "a drive was found" would pass with every one of them
+     * broken.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test cdrom") == 0) {
+        /* WHICH TRANSPORT CARRIED THE DISC IS NOT THE SUBJECT. The same SCSI
+         * commands reach an optical drive over an IDE cable and over
+         * virtio-scsi, and the filesystem on top cannot tell the difference.
+         * So the ATAPI-specific half runs only when there is an ATAPI drive,
+         * and the ISO 9660 half runs whenever a disc is mounted -- otherwise
+         * running this against `scsi-cd` would report SKIP while quietly
+         * testing nothing. */
+        bool have_iso = false;
+        for (uint32_t i = 0; i < automount_count(); i++) {
+            const char *at = NULL, *dev = NULL, *fs = NULL;
+            if (automount_at(i, &at, &dev, &fs) && fs && strcmp(fs, "iso9660") == 0)
+                have_iso = true;
+        }
+        if (atapi_drive_count() == 0 && !have_iso) {
+            kprintf("\n[cdrom] no optical drive and no mounted disc\n");
+            kprintf("\n[cmd] test cdrom: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        kprintf("\n[cdrom] %u ATAPI drive(s), disc mounted: %s\n",
+                (unsigned)atapi_drive_count(), have_iso ? "yes" : "no");
+
+        const char *name = atapi_drive_count() ? atapi_drive_name(0) : NULL;
+        if (atapi_drive_count() && !name) {
+            kprintf("  FAIL: the drive registered no block device (empty?)\n");
+            fails++;
+        } else if (name) {
+            kprintf("  %s: %llu blocks\n", name,
+                    (unsigned long long)atapi_drive_blocks(0));
+            /* THE BLOCK SIZE IS THE TEST. A driver that reports 512 has
+             * defaulted rather than asked, and every LBA after that is off
+             * by a factor of four. */
+            struct embk_block_device *d = NULL;
+            for (uint32_t i = 0; i < embk_block_count(); i++) {
+                struct embk_block_device *c = embk_block_get(i);
+                if (c && strcmp(c->name, name) == 0) d = c;
+            }
+            if (!d) { kprintf("  FAIL: %s is not in the block table\n", name); fails++; }
+            else if (d->block_size != 2048) {
+                kprintf("  FAIL: %s has a %u-byte block, not 2048\n",
+                        d->name, d->block_size);
+                fails++;
+            } else {
+                kprintf("  %s block size is 2048\n", d->name);
+            }
+        }
+
+        /* And the filesystem on it. The disc the harness attaches carries
+         * HELLO.TXT; reading its contents proves the whole stack. The mount
+         * point is whatever automount chose, so it is looked up rather than
+         * assumed -- an ISO on a USB stick would land somewhere else and the
+         * test should still find it.
+         *
+         * The stored name is "HELLO.TXT;1" and the name asked for here is
+         * lower case with no version. Both of those are the filesystem's job
+         * and both are part of what is being tested. */
+        char path[96];
+        path[0] = 0;
+        for (uint32_t i = 0; i < automount_count(); i++) {
+            const char *at = NULL, *dev = NULL, *fs = NULL;
+            if (!automount_at(i, &at, &dev, &fs) || !at) continue;
+            if (!fs || strcmp(fs, "iso9660") != 0) continue;
+            uint32_t n = 0;
+            while (at[n] && n < sizeof path - 12) { path[n] = at[n]; n++; }
+            const char *tail = "/hello.txt";
+            while (*tail && n < sizeof path - 1) path[n++] = *tail++;
+            path[n] = 0;
+            break;
+        }
+        if (!path[0]) {
+            kprintf("  FAIL: no ISO 9660 volume is mounted\n");
+            fails++;
+        } else {
+            struct vfs_stat st;
+            int rc = vfs_stat(path, &st);
+            if (rc != EMBK_OK) {
+                kprintf("  FAIL: %s does not stat (rc=%d)\n", path, rc);
+                fails++;
+            } else {
+                static char text[64];
+                size_t got = 0;
+                memset(text, 0, sizeof text);
+                rc = vfs_read(path, 0, text, sizeof text - 1, &got);
+                if (rc != EMBK_OK || got == 0) {
+                    kprintf("  FAIL: %s read no bytes (rc=%d)\n", path, rc);
+                    fails++;
+                } else if (text[0] != 'H' || text[1] != 'e') {
+                    kprintf("  FAIL: %s reads \"%s\"\n", path, text);
+                    fails++;
+                } else {
+                    /* Trim the trailing newline so the line reads cleanly. */
+                    for (size_t i = 0; i < got && i < sizeof text; i++)
+                        if (text[i] == '\n') { text[i] = 0; break; }
+                    kprintf("  %s: stat %llu bytes, read %llu, \"%s\"\n",
+                            path, (unsigned long long)st.size,
+                            (unsigned long long)got, text);
+                }
+            }
+        }
+        kprintf("\n[cmd] test cdrom: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test sdcard -- the SD/eMMC host controller moves data both ways.
+     *
+     * The interesting failure is not "no card": it is a card whose ADDRESSING
+     * MODE was guessed. A high-capacity card given a byte offset reads block
+     * zero for every request that fits in 512 bytes, so a test that only read
+     * block 0 would pass. This writes a pattern to a block a long way in and
+     * reads it back, which that bug cannot survive.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test sdcard") == 0) {
+        if (sdhci_host_count() == 0) {
+            kprintf("\n[sdcard] no SD host controller on this machine\n");
+            kprintf("\n[cmd] test sdcard: SKIP\n");
+            return 1;
+        }
+        if (!sdhci_card_present(0) || sdhci_blocks(0) == 0) {
+            kprintf("\n[sdcard] controller present, slot empty\n");
+            kprintf("\n[cmd] test sdcard: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        uint64_t blocks = sdhci_blocks(0);
+        kprintf("\n[sdcard] card of %llu blocks\n", (unsigned long long)blocks);
+
+        struct embk_block_device *d = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *c = embk_block_get(i);
+            if (c && c->block_count == blocks && c->block_size == 512) d = c;
+        }
+        if (!d) {
+            kprintf("  FAIL: the card is not in the block table\n");
+            kprintf("\n[cmd] test sdcard: FAIL\n");
+            return 1;
+        }
+
+        static uint8_t buf[512], back[512];
+        /* READ BEFORE WRITE, so a broken read is not reported as a broken
+         * write. They are different commands and different directions
+         * through the buffer port. */
+        if (embk_block_read(d, 0, 1, back) != EMBK_OK) {
+            kprintf("  FAIL: reading block 0 failed\n");
+            fails++;
+        } else {
+            kprintf("  block 0 read %02x %02x %02x %02x\n",
+                    back[0], back[1], back[2], back[3]);
+        }
+
+        /* A block FAR from zero: 0x2000 is 8 MiB in, which a byte-addressed
+         * argument cannot reach on a card this size without wrapping. */
+        uint64_t far = blocks > 0x2000 ? 0x2000 : blocks / 2;
+        for (int i = 0; i < 512; i++) buf[i] = (uint8_t)(i ^ 0xA5);
+        if (embk_block_write(d, far, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: writing block %llu failed\n",
+                    (unsigned long long)far);
+            fails++;
+        } else {
+            memset(back, 0, sizeof back);
+            if (embk_block_read(d, far, 1, back) != EMBK_OK) {
+                kprintf("  FAIL: reading block %llu back failed\n",
+                        (unsigned long long)far);
+                fails++;
+            } else {
+                for (int i = 0; i < 512; i++)
+                    if (back[i] != (uint8_t)(i ^ 0xA5)) {
+                        kprintf("  FAIL: block %llu byte %d is %02x, want %02x\n",
+                                (unsigned long long)far, i, back[i],
+                                (uint8_t)(i ^ 0xA5));
+                        fails++;
+                        break;
+                    }
+                if (!fails) kprintf("  block %llu wrote and read back "
+                                    "512 matching bytes\n",
+                                    (unsigned long long)far);
+            }
+        }
+
+        /* Multi-block, which uses a different command (READ/WRITE MULTIPLE)
+         * and the block-count register rather than a single transfer. */
+        static uint8_t big[2048];
+        for (int i = 0; i < 2048; i++) big[i] = (uint8_t)(i * 7 + 1);
+        if (embk_block_write(d, far + 8, 4, big) != EMBK_OK) {
+            kprintf("  FAIL: a 4-block write failed\n"); fails++;
+        } else {
+            static uint8_t bigback[2048];
+            memset(bigback, 0, sizeof bigback);
+            if (embk_block_read(d, far + 8, 4, bigback) != EMBK_OK) {
+                kprintf("  FAIL: a 4-block read failed\n"); fails++;
+            } else {
+                for (int i = 0; i < 2048; i++)
+                    if (bigback[i] != (uint8_t)(i * 7 + 1)) {
+                        kprintf("  FAIL: multi-block byte %d differs\n", i);
+                        fails++; break;
+                    }
+                if (!fails) kprintf("  a 4-block transfer round-tripped\n");
+            }
+        }
+        kprintf("\n[cmd] test sdcard: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test hba -- ONE TEST FOR EVERY SCSI CONTROLLER.
+     *
+     * MegaRAID, PVSCSI, Fusion-MPT, ESP, the 53c895a and virtio-scsi are six
+     * completely different ways of handing a command to a device, and every
+     * one of them ends at the same place: kernel/block/scsi.c builds the CDB
+     * and the block layer reads and writes 512-byte blocks. If that claim is
+     * true then a single test proves all six, and if it is not true then this
+     * test is where it shows.
+     *
+     * The disk the harness attaches is 32 MB with a signature at block 0, and
+     * which controller carries it is not this test's business -- it looks for
+     * the geometry, not for a driver.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test touch -- a touchscreen's contacts, reported rather than asserted.
+     *
+     * The guest cannot claim "a finger is on the glass"; only the host that
+     * put it there can. So this REPORTS -- whether a multitouch device was
+     * found, how many contacts have ever begun, and how many are down right
+     * now -- and tools/touch_test.py, which did the touching, checks the
+     * numbers against what it sent. Same division of labour as the USB
+     * hot-plug test, for the same reason.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test pmem -- does persistent memory actually persist?
+     *
+     * The only claim worth making about this device is the one that cannot be
+     * checked in a single boot: that a write which was flushed is still there
+     * after the power went away. So this reads what a PREVIOUS run left,
+     * reports the generation number it found, writes the next one, and
+     * flushes. tools/pmem_test.py runs it twice over the same backing file
+     * and kills the machine in between -- no clean shutdown, because a clean
+     * shutdown would let a write survive that had never been made durable,
+     * which is the exact bug this is looking for.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test crypto -- does the device's AES agree with ours?
+     *
+     * An offload engine is only useful if it computes the same function the
+     * software path does. That is not a thing to assume: a wrong key length,
+     * a byte-swapped IV or a mode that is nearly CBC all produce output that
+     * looks exactly as random as the right answer.
+     *
+     * kernel/crypto/aes.c is already here and already has known-answer tests
+     * against FIPS-197, so it is the reference. The device encrypts; we
+     * decrypt its output with our own code and check we get the plaintext
+     * back. Then the device decrypts and we compare against the plaintext
+     * directly. Two directions, because a driver can have one right.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test iommu -- is DMA still working now that it is being translated?
+     *
+     * THE MACHINE BOOTING IS MOST OF THE ANSWER. Every attached endpoint's
+     * transfers go through the domain's table from the moment it is attached,
+     * so a wrong mapping does not produce a wrong answer -- it produces a
+     * disk controller that cannot reach its own descriptors, and nothing
+     * mounts. What this adds is a READ ISSUED NOW, after everything is up, so
+     * the claim is about the running system rather than about the boot.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test hotplug -- a processor or a memory stick that arrived after boot.
+     *
+     * Reported, not asserted, for the same reason as the USB stick: the guest
+     * cannot claim somebody plugged something in. tools/hotplug_test.py does
+     * the plugging and checks the numbers move.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test erst -- a record written before the machine stopped existing.
+     *
+     * Same shape as `test pmem`, and for the same reason: the claim is about
+     * what survives, and nothing observable in one boot distinguishes a
+     * record that reached persistent storage from one that did not.
+     * tools/erst_test.py runs this twice and kills the machine in between.
+     *
+     * The record is a real UEFI Common Platform Error Record, because the
+     * firmware reads its header: the record's own IDENTIFIER lives at offset
+     * 96 of it and is what the platform indexes by. A blob with a marker in
+     * it would be stored and then impossible to find again.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test crashlog -- everything the last crash left behind.
+     *
+     * The boot message shows the registers and the last few lines. This is
+     * the rest of the log, which is the part that usually says WHY: a
+     * register dump says where the machine stopped and almost never what it
+     * was doing.
+     * -------------------------------------------------------------------- */
+    /* ----------------------------------------------------------------------
+     * test parts -- the partition table, and whether it addresses anything.
+     *
+     * "A partition was registered" and "the partition addresses the sectors
+     * the table named" are different claims, and only the second is worth
+     * having: a parser that reads the entry array with the wrong stride
+     * registers plausible partitions at wrong offsets and looks entirely
+     * healthy. So this reads the FIRST BLOCK of every partition and reports
+     * what is there -- tools/mkgpt.py puts a signature in each.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test parts") == 0) {
+        int fails = 0;
+        uint32_t parts = 0;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *d = embk_block_get(i);
+            if (!d) continue;
+            struct embk_block_device *parent = embk_partition_parent(d);
+            if (!parent || parent == d) continue;     /* a whole disk, not a partition */
+            parts++;
+
+            static uint8_t buf[4096];
+            memset(buf, 0, sizeof buf);
+            const char *mark = "(unreadable)";
+            if (embk_block_read(d, 0, 1, buf) == EMBK_OK) {
+                buf[63] = '\0';
+                mark = (const char *)buf;
+                if (buf[0] == '\0') mark = "(empty)";
+            } else {
+                fails++;
+            }
+            kprintf("[parts] %s on %s: %llu x %u B, first block says \"%s\"\n",
+                    d->name, parent->name,
+                    (unsigned long long)d->block_count, d->block_size, mark);
+        }
+        kprintf("\n[parts] %u partition(s) registered\n", (unsigned)parts);
+        kprintf("\n[cmd] test parts: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test crashlog") == 0) {
+        if (!crashlog_have_previous() && !crashlog_load_previous()) {
+            kprintf("\n[crashlog] no crash record from a previous boot\n");
+            kprintf("\n[cmd] test crashlog: OK (nothing to report)\n");
+            return 1;
+        }
+        const char *sym = crashlog_previous_symbol();
+        const char *log = crashlog_previous_log();
+        kprintf("\n[crashlog] vector %u at %s\n",
+                (unsigned)crashlog_previous_vector(),
+                (sym && sym[0]) ? sym : "(not symbolised)");
+        kprintf("[crashlog] %u byte(s) of kernel log:\n%s\n",
+                (unsigned)(log ? strlen(log) : 0), log ? log : "");
+        kprintf("\n[cmd] test crashlog: OK\n");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test erst") == 0) {
+        if (!erst_present()) {
+            kprintf("\n[erst] no error record storage on this machine\n");
+            kprintf("\n[cmd] test erst: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        uint64_t count = erst_record_count();
+        kprintf("\n[erst] %llu record(s) stored, %llu-byte buffer\n",
+                (unsigned long long)count, (unsigned long long)erst_buffer_size());
+
+        static uint8_t rec[256];
+        uint32_t found = 0;
+        if (count) {
+            uint64_t id = erst_first_record();
+            memset(rec, 0, sizeof rec);
+            int n = erst_read(id, rec, sizeof rec);
+            if (n < 128) {
+                kprintf("  FAIL: record %llu did not read back (%d)\n",
+                        (unsigned long long)id, n);
+                fails++;
+            } else if (memcmp(rec + 128, "EMBLINK-ERST", 12) != 0) {
+                kprintf("  FAIL: record %llu holds \"%s\", not ours\n",
+                        (unsigned long long)id, rec + 128);
+                fails++;
+            } else {
+                found = (uint32_t)rec[140] | ((uint32_t)rec[141] << 8) |
+                        ((uint32_t)rec[142] << 16) | ((uint32_t)rec[143] << 24);
+                kprintf("[erst] generation found: %u (record id %llu)\n",
+                        (unsigned)found, (unsigned long long)id);
+            }
+        } else {
+            kprintf("[erst] generation found: 0\n");
+        }
+
+        /* Build the next one. A CPER header is 128 bytes and three of its
+         * fields are not decoration: the signature, the total length, and
+         * the record identifier the platform indexes by. */
+        uint32_t next = found + 1;
+        memset(rec, 0, sizeof rec);
+        memcpy(rec + 0, "CPER", 4);
+        rec[4] = 0x00; rec[5] = 0x01;                 /* revision 1.0 */
+        rec[6] = 0xFF; rec[7] = 0xFF; rec[8] = 0xFF; rec[9] = 0xFF;
+        rec[10] = 0; rec[11] = 0;                     /* no sections   */
+        rec[12] = 1;                                  /* severity: fatal */
+        uint32_t total = 160;
+        rec[20] = (uint8_t)total;        rec[21] = (uint8_t)(total >> 8);
+        rec[22] = (uint8_t)(total >> 16); rec[23] = (uint8_t)(total >> 24);
+        uint64_t id = 0x454D424B00000000ULL | next;   /* "EMBK" and a counter */
+        for (int i = 0; i < 8; i++) rec[96 + i] = (uint8_t)(id >> (i * 8));
+        memcpy(rec + 128, "EMBLINK-ERST", 12);
+        rec[140] = (uint8_t)next;        rec[141] = (uint8_t)(next >> 8);
+        rec[142] = (uint8_t)(next >> 16); rec[143] = (uint8_t)(next >> 24);
+
+        int rc = erst_write(id, rec, total);
+        if (rc != EMBK_OK) {
+            kprintf("  FAIL: writing the record returned %d\n", rc);
+            fails++;
+        } else {
+            kprintf("[erst] generation written: %u (now %llu record(s))\n",
+                    (unsigned)next, (unsigned long long)erst_record_count());
+        }
+        kprintf("\n[cmd] test erst: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test hotplug") == 0) {
+        if (!acpi_hotplug_available()) {
+            kprintf("\n[hotplug] this machine has no ACPI hot-plug registers\n");
+            kprintf("\n[cmd] test hotplug: SKIP\n");
+            return 1;
+        }
+        uint32_t online = 0;
+        for (uint32_t i = 0; i < cpu_count; i++)
+            if (cpu_table[i].online) online++;
+        kprintf("\n[hotplug] %u cpu(s) online, %llu free page(s); "
+                "added since boot: %u cpu(s), %u region(s)\n",
+                (unsigned)online, (unsigned long long)pmm_free_pages(),
+                (unsigned)acpi_hotplug_cpus_added(),
+                (unsigned)acpi_hotplug_memory_added());
+        kprintf("\n[cmd] test hotplug: OK\n");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test iommu") == 0) {
+        /* THREE DIFFERENT IOMMUs, ONE TEST. VT-d, AMD-Vi and virtio-iommu are
+         * three unrelated ways of describing the same restriction, and what
+         * has to be true afterwards is identical: the devices are in a
+         * domain, and DMA still works. */
+        const char *which = NULL;
+        uint32_t endpoints = 0;
+        if (virtio_iommu_present()) {
+            which = "virtio-iommu"; endpoints = virtio_iommu_endpoints();
+        } else if (intel_iommu_present()) {
+            which = "intel VT-d";   endpoints = intel_iommu_devices();
+        } else if (amd_iommu_present()) {
+            which = "AMD-Vi";       endpoints = amd_iommu_devices();
+        }
+        if (!which) {
+            kprintf("\n[iommu] no IOMMU on this machine\n");
+            kprintf("\n[cmd] test iommu: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        kprintf("\n[iommu] %s: %u device(s) translated\n", which,
+                (unsigned)endpoints);
+        if (endpoints == 0) {
+            kprintf("  FAIL: the IOMMU is up and translating nothing\n");
+            fails++;
+        }
+
+        /* A real transfer, through a real controller, right now. */
+        struct embk_block_device *d = embk_block_get(0);
+        static uint8_t buf[512];
+        if (!d) {
+            kprintf("  FAIL: no block device to read from\n"); fails++;
+        } else if (embk_block_read(d, 0, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: reading %s through the IOMMU failed\n", d->name);
+            fails++;
+        } else {
+            kprintf("  read block 0 of %s through translated DMA\n", d->name);
+        }
+        kprintf("\n[cmd] test iommu: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test crypto") == 0) {
+        if (!virtio_crypto_present()) {
+            kprintf("\n[crypto] no virtio-crypto device on this machine\n");
+            kprintf("\n[cmd] test crypto: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        static const uint8_t key[32] = {
+            0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,
+            0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4
+        };
+        static const uint8_t iv[16] = {
+            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+        };
+        static uint8_t plain[64], cipher[64], back[64];
+        for (int i = 0; i < 64; i++) plain[i] = (uint8_t)(i * 13 + 5);
+
+        int rc = virtio_crypto_aes_cbc(true, key, 32, iv, plain, cipher, 64);
+        if (rc != EMBK_OK) {
+            kprintf("  FAIL: the device would not encrypt (rc=%d)\n", rc);
+            fails++;
+        } else {
+            /* DECRYPT IT WITH OUR OWN AES. CBC is ECB-decrypt then XOR with
+             * the previous ciphertext block -- the previous block, not the
+             * previous plaintext, which is the classic way to get a CBC
+             * implementation that decrypts its own output and nothing
+             * else's. */
+            struct aes256_ctx ctx;
+            aes256_init(&ctx, key);
+            uint8_t prev[16];
+            memcpy(prev, iv, 16);
+            for (int b = 0; b < 64; b += 16) {
+                uint8_t tmp[16];
+                aes256_decrypt_block(&ctx, cipher + b, tmp);
+                for (int i = 0; i < 16; i++) back[b + i] = tmp[i] ^ prev[i];
+                memcpy(prev, cipher + b, 16);
+            }
+            if (memcmp(back, plain, 64) != 0) {
+                kprintf("  FAIL: our AES does not agree with the device's\n");
+                fails++;
+            } else {
+                kprintf("\n[crypto] the device's ciphertext decrypts to the "
+                        "plaintext under our own AES-256\n");
+            }
+        }
+
+        /* And the other direction. */
+        memset(back, 0, sizeof back);
+        rc = virtio_crypto_aes_cbc(false, key, 32, iv, cipher, back, 64);
+        if (rc != EMBK_OK) {
+            kprintf("  FAIL: the device would not decrypt (rc=%d)\n", rc);
+            fails++;
+        } else if (memcmp(back, plain, 64) != 0) {
+            kprintf("  FAIL: the device's decryption is not the plaintext\n");
+            fails++;
+        } else {
+            kprintf("[crypto] and its own decryption round-trips (%u op(s))\n",
+                    (unsigned)virtio_crypto_ops());
+        }
+        kprintf("\n[cmd] test crypto: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test pmem") == 0) {
+        /* TWO WAYS TO HAVE PERSISTENT MEMORY and the test is about neither of
+         * them: virtio-pmem is a device that says where its region is, an
+         * NVDIMM is memory in a slot with an ACPI table saying it is special.
+         * What has to be true afterwards is identical. */
+        uint64_t bytes = 0;
+        const char *kind = NULL;
+        if (virtio_pmem_present()) { bytes = virtio_pmem_size(); kind = "virtio-pmem"; }
+        else if (nvdimm_count())   { bytes = nvdimm_bytes(0);    kind = "nvdimm"; }
+        if (!bytes) {
+            kprintf("\n[pmem] no persistent memory on this machine\n");
+            kprintf("\n[cmd] test pmem: SKIP\n");
+            return 1;
+        }
+        struct embk_block_device *d = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *c = embk_block_get(i);
+            if (c && c->block_count == bytes / 512) d = c;
+        }
+        if (!d) {
+            kprintf("  FAIL: the region is not in the block table\n");
+            kprintf("\n[cmd] test pmem: FAIL\n");
+            return 1;
+        }
+
+        static uint8_t buf[512];
+        int fails = 0;
+        uint32_t found = 0;
+        memset(buf, 0, sizeof buf);
+        if (embk_block_read(d, 0, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: reading block 0 failed\n"); fails++;
+        } else if (memcmp(buf, "EMBLINK-PMEM", 12) == 0) {
+            found = (uint32_t)buf[12] | ((uint32_t)buf[13] << 8) |
+                    ((uint32_t)buf[14] << 16) | ((uint32_t)buf[15] << 24);
+        }
+        kprintf("\n[pmem] %s, %llu MiB, generation found: %u\n", kind,
+                (unsigned long long)(bytes >> 20), (unsigned)found);
+
+        uint32_t next = found + 1;
+        memset(buf, 0, sizeof buf);
+        memcpy(buf, "EMBLINK-PMEM", 12);
+        buf[12] = (uint8_t)next;        buf[13] = (uint8_t)(next >> 8);
+        buf[14] = (uint8_t)(next >> 16); buf[15] = (uint8_t)(next >> 24);
+        if (embk_block_write(d, 0, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: writing block 0 failed\n"); fails++;
+        } else {
+            kprintf("[pmem] generation written: %u (%llu flush(es) so far)\n",
+                    (unsigned)next, (unsigned long long)virtio_pmem_flushes());
+        }
+        kprintf("\n[cmd] test pmem: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test touch") == 0) {
+        if (!virtio_input_touch_present()) {
+            kprintf("\n[touch] no multitouch device on this machine\n");
+            kprintf("\n[cmd] test touch: SKIP\n");
+            return 1;
+        }
+        uint32_t down = virtio_input_touch_count();
+        kprintf("\n[touch] %u contact(s) began, %u down now\n",
+                (unsigned)virtio_input_touch_events(), (unsigned)down);
+        for (uint32_t i = 0; i < 10; i++) {
+            int32_t x = 0, y = 0;
+            if (virtio_input_touch_at(i, &x, &y))
+                kprintf("  slot %u at %d,%d\n", (unsigned)i, (int)x, (int)y);
+        }
+        kprintf("\n[cmd] test touch: OK\n");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test hba") == 0) {
+        /* THIRTY-TWO MEGABYTES, HOWEVER THEY ARE DIVIDED UP. Matching on a
+         * block COUNT would have quietly skipped UFS, whose logical units use
+         * 4096-byte blocks -- and skipping is the one outcome a test must not
+         * produce when the thing it tests is present. */
+        struct embk_block_device *d = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *c = embk_block_get(i);
+            if (c && c->block_count * (uint64_t)c->block_size == 32u * 1024 * 1024)
+                d = c;
+        }
+        if (!d) {
+            kprintf("\n[hba] no 32 MB target on this machine\n");
+            kprintf("\n[cmd] test hba: SKIP\n");
+            return 1;
+        }
+        int fails = 0;
+        uint32_t bs = d->block_size;
+        kprintf("\n[hba] %s: %llu blocks x %u B\n", d->name,
+                (unsigned long long)d->block_count, bs);
+
+        #define HBA_MAX_BS 4096u
+        static uint8_t buf[HBA_MAX_BS], back[HBA_MAX_BS];
+        if (bs > HBA_MAX_BS) {
+            kprintf("  FAIL: a %u-byte block is larger than this test's buffer\n", bs);
+            kprintf("\n[cmd] test hba: FAIL\n");
+            return 1;
+        }
+
+        memset(buf, 0, sizeof buf);
+        if (embk_block_read(d, 0, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: reading block 0 failed\n"); fails++;
+        } else if (buf[0] != 'E' || buf[1] != 'M' || buf[2] != 'B') {
+            kprintf("  FAIL: block 0 reads \"%s\", not the host's signature\n", buf);
+            fails++;
+        } else {
+            kprintf("  block 0 = \"%s\" (written by the host)\n", buf);
+        }
+
+        /* The other direction is a different descriptor layout on every one
+         * of these controllers, and a driver can easily have one right. */
+        memset(buf, 0x5A, bs);
+        if (embk_block_write(d, 100, 1, buf) != EMBK_OK) {
+            kprintf("  FAIL: writing block 100 failed\n"); fails++;
+        } else {
+            memset(back, 0, sizeof back);
+            if (embk_block_read(d, 100, 1, back) != EMBK_OK ||
+                back[0] != 0x5A || back[bs - 1] != 0x5A) {
+                kprintf("  FAIL: block 100 did not read back what was written\n");
+                fails++;
+            } else {
+                kprintf("  a write to block 100 read back correctly\n");
+            }
+        }
+
+        /* AND A TRANSFER BIGGER THAN ONE BLOCK, which is where a
+         * scatter-gather list that was only ever exercised with one element
+         * stops working. */
+        #define HBA_MULTI 8u
+        static uint8_t big[HBA_MAX_BS * HBA_MULTI], bigback[HBA_MAX_BS * HBA_MULTI];
+        uint32_t span = bs * HBA_MULTI;
+        for (uint32_t i = 0; i < span; i++) big[i] = (uint8_t)(i * 31 + 7);
+        if (embk_block_write(d, 200, HBA_MULTI, big) != EMBK_OK) {
+            kprintf("  FAIL: an 8-block write failed\n"); fails++;
+        } else {
+            memset(bigback, 0, span);
+            if (embk_block_read(d, 200, HBA_MULTI, bigback) != EMBK_OK) {
+                kprintf("  FAIL: an 8-block read failed\n"); fails++;
+            } else {
+                for (uint32_t i = 0; i < span; i++)
+                    if (bigback[i] != (uint8_t)(i * 31 + 7)) {
+                        kprintf("  FAIL: multi-block byte %u differs\n", i);
+                        fails++; break;
+                    }
+                if (!fails) kprintf("  an 8-block transfer round-tripped\n");
+            }
+        }
+        kprintf("\n[cmd] test hba: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test scsi") == 0) {
+        if (!virtio_scsi_present()) {
+            kprintf("\n[scsi] no virtio-scsi controller\n");
+            kprintf("\n[cmd] test scsi: OK (nothing to test)\n");
+            return 1;
+        }
+        int fails = 0;
+        kprintf("\n[scsi] controller up, %u target(s) registered\n",
+                (unsigned)virtio_scsi_target_count());
+        if (virtio_scsi_target_count() == 0) {
+            kprintf("  FAIL: the controller found no targets\n");
+            kprintf("\n[cmd] test scsi: FAIL\n");
+            return 1;
+        }
+
+        /* The LAST block device is the one virtio-scsi just registered: the
+         * root and its partitions came first. */
+        struct embk_block_device *d = NULL;
+        for (uint32_t i = 0; i < embk_block_count(); i++) {
+            struct embk_block_device *c = embk_block_get(i);
+            if (c && c->block_count == 65536 && c->block_size == 512) d = c;
+        }
+        if (!d) {
+            kprintf("  FAIL: the 32 MB target is not in the block table\n");
+            fails++;
+        } else {
+            static uint8_t buf[512], back[512];
+            /* THE HOST WROTE A SIGNATURE AT BLOCK 0. Reading it back proves
+             * the read path carries real bytes rather than zeroes. */
+            memset(buf, 0, sizeof buf);
+            if (embk_block_read(d, 0, 1, buf) != EMBK_OK) {
+                kprintf("  FAIL: reading block 0 of %s failed\n", d->name);
+                fails++;
+            } else if (strcmp((const char *)buf, "EMBLINK-VSCSI") != 0) {
+                kprintf("  FAIL: block 0 reads \"%.20s\", not the host's "
+                        "signature\n", buf);
+                fails++;
+            } else {
+                kprintf("  %s block 0 = \"%s\" (written by the host)\n",
+                        d->name, buf);
+            }
+
+            /* AND THE OTHER DIRECTION, which is a different descriptor
+             * layout: the data buffer moves from the out-group to the
+             * in-group and a driver can easily have only one of them right. */
+            memset(buf, 0x5A, sizeof buf);
+            if (embk_block_write(d, 100, 1, buf) != EMBK_OK) {
+                kprintf("  FAIL: writing block 100 failed\n"); fails++;
+            } else {
+                memset(back, 0, sizeof back);
+                if (embk_block_read(d, 100, 1, back) != EMBK_OK ||
+                    back[0] != 0x5A || back[511] != 0x5A) {
+                    kprintf("  FAIL: block 100 did not read back what was "
+                            "written\n");
+                    fails++;
+                } else {
+                    kprintf("  a write to block 100 read back correctly\n");
+                }
+            }
+        }
+        kprintf("\n[cmd] test scsi: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test ninep -- THE HOST'S FILESYSTEM, READ FROM THE GUEST.
+     *
+     * The point of the driver is development turnaround: change a file on the
+     * host, read it in the guest, with no image rebuild in between. So the
+     * test reads a file the HOST wrote and compares the bytes -- a mount that
+     * lists a directory proves the protocol walked, and only a read proves
+     * anything came back.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test ninep") == 0) {
+        if (!ninep_present()) {
+            kprintf("\n[9p] no virtio-9p share attached\n");
+            kprintf("\n[cmd] test ninep: OK (nothing to test)\n");
+            return 1;
+        }
+        int fails = 0;
+        kprintf("\n[9p] share \"%s\" at /host\n", ninep_tag());
+
+        struct media_listing ml = { 0, { 0 } };
+        int rc = vfs_readdir("/host", media_count_cb, &ml);
+        kprintf("  /host lists %d entr%s (rc %d)%s%s\n", ml.n,
+                ml.n == 1 ? "y" : "ies", rc,
+                ml.n ? ", first: " : "", ml.n ? ml.first : "");
+        if (ml.n == 0) { kprintf("  FAIL: the share listed nothing\n"); fails++; }
+
+        /* A SUBDIRECTORY, because a walk of depth one can be right by
+         * accident -- the root fid needs no walk at all. */
+        struct media_listing sub = { 0, { 0 } };
+        if (vfs_readdir("/host/sub", media_count_cb, &sub) == EMBK_OK)
+            kprintf("  /host/sub lists %d entr%s%s%s\n", sub.n,
+                    sub.n == 1 ? "y" : "ies",
+                    sub.n ? ", first: " : "", sub.n ? sub.first : "");
+
+        /* AND THE BYTES. stat first, so a size that disagrees with what comes
+         * back is visible rather than silently truncated. */
+        struct vfs_stat st;
+        if (vfs_stat("/host/HELLO.txt", &st) != EMBK_OK) {
+            kprintf("  FAIL: /host/HELLO.txt does not stat\n"); fails++;
+        } else {
+            static char buf[256];
+            size_t got = 0;
+            memset(buf, 0, sizeof buf);
+            rc = vfs_read("/host/HELLO.txt", 0, buf, sizeof buf - 1, &got);
+            kprintf("  HELLO.txt: stat says %llu bytes, read returned %llu\n",
+                    (unsigned long long)st.size, (unsigned long long)got);
+            if (rc != EMBK_OK || got == 0) {
+                kprintf("  FAIL: reading it returned %d\n", rc); fails++;
+            } else {
+                /* Trim the newline so the comparison is about the content. */
+                for (size_t i = 0; i < got; i++) if (buf[i] == '\n') buf[i] = 0;
+                kprintf("  it says: \"%s\"\n", buf);
+                if (strcmp(buf, "the host wrote this") != 0) {
+                    kprintf("  FAIL: that is not what the host wrote\n");
+                    fails++;
+                }
+                if (got != st.size) {
+                    kprintf("  FAIL: read %llu bytes but stat said %llu\n",
+                            (unsigned long long)got, (unsigned long long)st.size);
+                    fails++;
+                }
+            }
+        }
+
+        /* IT IS READ-ONLY AND SAYS SO. A write that silently did nothing
+         * would look like a successful save of work that was never stored. */
+        size_t wrote = 0;
+        rc = vfs_write("/host/HELLO.txt", 0, "x", 1, &wrote);
+        if (rc == EMBK_OK) {
+            kprintf("  FAIL: a write to the read-only share SUCCEEDED\n");
+            fails++;
+        } else {
+            kprintf("  a write is refused (%d), as it should be\n", rc);
+        }
+
+        kprintf("\n[cmd] test ninep: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test i2c -- WHAT IS ON THE TWO-WIRE BUS?
+     *
+     * The bus itself cannot be asserted about: what is attached is the
+     * machine's business and an empty bus is not a failure. What CAN be
+     * asserted is that a device which IS attached answers correctly, and EDID
+     * is the ideal case -- 128 bytes with a fixed header and a checksum, so a
+     * bus that answered with whatever was floating is distinguishable from a
+     * monitor that answered.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test i2c") == 0) {
+        int fails = 0;
+        if (!smbus_present()) {
+            kprintf("\n[i2c] no SMBus host on this machine\n");
+            kprintf("\n[cmd] test i2c: OK (nothing to test)\n");
+            return 1;
+        }
+        kprintf("\n[i2c] %s host\n", smbus_host_name());
+
+        /* WHO IS THERE. A quick-write to every address, which is the probe
+         * with no side effects -- addresses 0x03..0x77 are the usable range. */
+        int found = 0;
+        for (uint8_t a = 0x03; a <= 0x77; a++) {
+            if (!smbus_probe(a)) continue;
+            kprintf("  device at 0x%02x%s\n", a,
+                    a == EDID_I2C_ADDR ? "  (a monitor's EDID, or memory SPD)"
+                  : a == SMART_BATTERY_ADDR ? "  (a Smart Battery)" : "");
+            found++;
+        }
+        kprintf("  %d device(s) answered\n", found);
+
+        /* AND DOES THE ONE WE CAN CHECK ANSWER CORRECTLY? */
+        /* LOOK FOR A MONITOR AT EVERY ADDRESS THAT ANSWERED, not only at
+         * 0x50. On a PC the DDC address collides with the first memory
+         * module's SPD, so a display attached for testing has to sit
+         * elsewhere -- and on a real machine with several outputs there is
+         * more than one of them anyway. */
+        static uint8_t edid[128];
+        uint8_t edid_at = 0;
+        for (uint8_t a = 0x03; a <= 0x77 && !edid_at; a++)
+            if (smbus_probe(a) && smbus_read_edid_at(a, edid)) edid_at = a;
+
+        if (edid_at) {
+            kprintf("  a display answered at 0x%02x\n", edid_at);
+            char vendor[4]; uint16_t product; uint32_t serial;
+            smbus_edid_identity(edid, vendor, &product, &serial);
+            uint32_t w = 0, h = 0;
+            bool mode = smbus_edid_preferred_mode(edid, &w, &h);
+            kprintf("  EDID: %s product 0x%04x serial 0x%08x, EDID %u.%u\n",
+                    vendor, (unsigned)product, (unsigned)serial,
+                    (unsigned)edid[18], (unsigned)edid[19]);
+            if (mode)
+                kprintf("  the display's preferred mode is %ux%u\n",
+                        (unsigned)w, (unsigned)h);
+            else
+                kprintf("  no preferred timing in the first descriptor\n");
+
+            /* The header and checksum already passed inside read_edid; this
+             * checks the decode produced something usable rather than three
+             * control characters. */
+            for (int i = 0; i < 3; i++)
+                if (vendor[i] < 'A' || vendor[i] > 'Z') {
+                    kprintf("  FAIL: the manufacturer code decoded to garbage\n");
+                    fails++;
+                    break;
+                }
+        } else if (found) {
+            /* NOT A MONITOR, THEN. On a PC the addresses 0x50..0x57 are the
+             * memory modules' SPD EEPROMs, which live at the same address as
+             * a monitor's EDID but on a different bus segment. Decoding what
+             * is actually there is more useful than reporting that it was not
+             * the thing we guessed first. */
+            uint8_t spd[16];
+            bool ok = true;
+            for (int i = 0; i < 16 && ok; i++)
+                ok = smbus_read_byte_data(0x50, (uint8_t)i, &spd[i]);
+            if (!ok) {
+                kprintf("  FAIL: 0x50 answered a probe but not a read\n");
+                fails++;
+            } else {
+                static const char *ddr[] = {
+                    "reserved","FPM","EDO","pipelined nibble","SDRAM","ROM",
+                    "DDR SGRAM","DDR","DDR2","FB-DIMM","FB-DIMM probe",
+                    "DDR3","DDR4" };
+                unsigned type = spd[2];
+                kprintf("  0x50 is memory SPD: type %u (%s), %u bytes used of "
+                        "%u\n", type,
+                        type < sizeof ddr / sizeof ddr[0] ? ddr[type] : "unknown",
+                        (unsigned)(spd[0] & 0x0F) ? 1u << ((spd[0] & 0x0F) + 4) : 0u,
+                        (unsigned)(spd[0] >> 4) ? 1u << ((spd[0] >> 4) + 4) : 0u);
+                kprintf("  first 16 bytes: %02x%02x%02x%02x %02x%02x%02x%02x "
+                        "%02x%02x%02x%02x %02x%02x%02x%02x\n",
+                        spd[0],spd[1],spd[2],spd[3],spd[4],spd[5],spd[6],spd[7],
+                        spd[8],spd[9],spd[10],spd[11],spd[12],spd[13],spd[14],spd[15]);
+                /* THE BUS IS REALLY WORKING if the bytes are not all the same.
+                 * A host that returns the last value latched, or 0xFF for
+                 * everything, passes every structural check above. */
+                /* ALL-ZERO IS A LEGITIMATE STATE, not a failure: QEMU creates
+                 * its eight SPD EEPROMs empty unless the machine was given
+                 * real DIMM geometry, and a laptop with soldered memory has
+                 * no SPD at all. Reported, not asserted -- the EDID path
+                 * above is where content is actually checked. */
+                int distinct = 0;
+                for (int i = 1; i < 16; i++) if (spd[i] != spd[0]) { distinct = 1; break; }
+                if (!distinct)
+                    kprintf("  (every byte is 0x%02x -- an empty EEPROM, which "
+                            "is what an emulator without DIMM geometry has)\n",
+                            spd[0]);
+            }
+        }
+
+        kprintf("\n[cmd] test i2c: %s\n", fails ? "FAIL" : "OK");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * qemu-exit pass|fail -- END THE EMULATOR WITH A VERDICT.
+     *
+     * Seven harnesses in tools/ each boot a machine, wait, and scrape the
+     * serial log for a sentence -- each with its own timeout, its own idea of
+     * what "no verdict" means, and its own way of being wrong about it. An
+     * exit status is a different KIND of thing: it cannot be garbled by a log
+     * line that happened to contain the word OK, and "the guest never
+     * answered" stops being indistinguishable from "the guest said no".
+     *
+     * Does nothing on a machine without the device, so it is safe to leave in
+     * a path that also runs for real.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "qemu-exit pass") == 0 || strcmp(cmd, "qemu-exit fail") == 0) {
+        bool pass = (cmd[10] == 'p');
+        kprintf("\n[qemu-exit] %s -- ending the emulator with status %d\n",
+                pass ? "PASS" : "FAIL",
+                pass ? ((PLATFORM_EXIT_PASS << 1) | 1) : ((PLATFORM_EXIT_FAIL << 1) | 1));
+        platform_debug_exit(pass ? PLATFORM_EXIT_PASS : PLATFORM_EXIT_FAIL);
+        kprintf("[qemu-exit] still here -- there is no debug-exit device\n");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------------
+     * test panicnow -- DELIBERATELY FAULT IN THE KERNEL.
+     *
+     * This halts the machine. That is the point: it is the only way to reach
+     * the kernel-mode fault path, and therefore the only way to check that
+     * pvpanic tells the host about it rather than leaving a harness to guess
+     * from a timeout.
+     *
+     * Named so nobody runs it by accident, and it prints what it is about to
+     * do first -- a machine that dies with no explanation is the failure mode
+     * this whole path exists to prevent.
+     * -------------------------------------------------------------------- */
+    if (strcmp(cmd, "test panicnow") == 0) {
+        kprintf("\n[panicnow] faulting the kernel ON PURPOSE. The machine will "
+                "halt.\n");
+        kprintf("[panicnow] pvpanic is %s -- the host %s be told\n",
+                platform_pvpanic_present() ? "present" : "absent",
+                platform_pvpanic_present() ? "will" : "will NOT");
+        /* A write through a pointer into the non-canonical hole: a #GP that
+         * cannot be confused with a page fault on real memory, and cannot be
+         * recovered by demand paging. */
+        volatile uint64_t *bad = (volatile uint64_t *)0x0000800000000000ULL;
+        *bad = 0xDEAD;
+        kprintf("[panicnow] still running -- the fault did not happen\n");
+        return 1;
+    }
+
     if (strcmp(cmd, "test faultkill") == 0) {
         /* CRASH RESILIENCE: a ring-3 fault must terminate only the faulting
          * process, not halt the machine (isr_handler's §6.6 non-debugged arm).
@@ -1065,6 +3973,53 @@ int selftests_handle_command(const char *cmd)
         }
         if (!ok) kprintf("[dns] no resolution (needs outbound DNS via SLIRP/host)\n");
         kprintf("[cmd] test dns: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "test ntp") == 0) {
+        /* TIME. The question is not "did a packet come back" -- it is "is the
+         * clock right afterwards", and the only way to ask that is to break it
+         * first. So this puts the clock four hundred days in the past, syncs,
+         * and measures what is left over against the hardware clock, which
+         * under QEMU is the host's and is therefore a reference this kernel
+         * did not itself produce.
+         *
+         * A test that only checked the answer parsed would pass with the
+         * epoch off by seventy years, which is exactly the bug NTP code has. */
+        if (!g_netif.up) { kprintf("\n[cmd] test ntp: NIC not up\n"); return 1; }
+
+        uint64_t reference = rtc_hardware_unix();
+        const uint64_t skew = 400ULL * 86400ULL;   /* four hundred days back */
+        rtc_set_unix(reference - skew);
+        kprintf("[ntp] clock broken on purpose: now reads %llu, should read %llu\n",
+                (unsigned long long)rtc_now_unix(), (unsigned long long)reference);
+
+        if (!net_ntp_sync_default()) {
+            rtc_set_unix(rtc_hardware_unix());     /* put it back, then fail */
+            kprintf("[ntp] no server answered (needs outbound UDP/123 via SLIRP/host)\n");
+            kprintf("[cmd] test ntp: FAIL\n");
+            return 1;
+        }
+
+        uint64_t adopted = rtc_now_unix();
+        int64_t  step    = net_ntp_last_step();
+        int64_t  residual = (int64_t)adopted - (int64_t)rtc_hardware_unix();
+        if (residual < 0) residual = -residual;
+
+        kprintf("[ntp] server %u.%u.%u.%u  adopted %llu  step %lld s  residual %lld s\n",
+                IP_OCTETS(net_ntp_server()), (unsigned long long)adopted,
+                (long long)step, (long long)residual);
+
+        /* The step must be the skew we introduced, near enough, and what is
+         * left must be small. Five seconds is the round trip plus the one
+         * second of resolution a CMOS chip has. */
+        int64_t step_err = step - (int64_t)skew;
+        if (step_err < 0) step_err = -step_err;
+        int ok = (step_err <= 5) && (residual <= 5) && net_ntp_synced();
+        if (!ok)
+            kprintf("[ntp] expected a step of %llu s and a residual of 0\n",
+                    (unsigned long long)skew);
+        kprintf("[cmd] test ntp: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
     }
 
@@ -2362,9 +5317,41 @@ int selftests_handle_command(const char *cmd)
             kprintf("[capgate] (FS case skipped: capfs.elf not on image)\n");
         }
 
+        /* (5..8) NETWORK and AUDIO -- gated in the kernel since sockets and the
+         * mixer existed, and until now proven by nothing.
+         *
+         * capnet probes BOTH in one run and returns the answers as BITS
+         * (1 = network, 2 = audio), which is what lets four spawns cover every
+         * combination -- including the case a single-class witness cannot see:
+         * that holding ONE class does not accidentally grant the OTHER. A gate
+         * that read the wrong bit would pass every one-class test ever
+         * written. */
+        const char *np = "/data/apps/capnet/capnet.elf";
+        if (vfs_stat(np, &st) == 0) {
+            char *na[] = { (char *)np, NULL };
+            const uint64_t NET = EMBK_CAP_BIT(EMBK_CAP_NETWORK);
+            const uint64_t AUD = EMBK_CAP_BIT(EMBK_CAP_AUDIO);
+            struct { const char *what; uint64_t caps; int want; } ncases[] = {
+                { "neither",      0,         0 },
+                { "network only", NET,       1 },
+                { "audio only",   AUD,       2 },
+                { "both",         NET | AUD, 3 },
+            };
+            for (unsigned i = 0; i < 4; i++) {
+                int pid = process_create_caps(np, na, 1, env, NULL, 0, ncases[i].caps);
+                int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+                int good = (rc == ncases[i].want);
+                kprintf("[capgate] capnet %-13s exit=%d (want %d: bit0=net bit1=audio)%s\n",
+                        ncases[i].what, rc, ncases[i].want, good ? "" : "  <- FAIL");
+                if (!good) ok = 0;
+            }
+        } else {
+            kprintf("[capgate] (capnet.elf not on image: NETWORK/AUDIO gates untested)\n");
+        }
+
         kprintf("\n[cmd] test capgate: %s\n",
-                ok ? "OK -- GPU surface AND filesystem open gated on their caps, both ways "
-                     "(win_create/desktop share the proven GPU gate)"
+                ok ? "OK -- GPU, FILESYSTEM, NETWORK and AUDIO each gated on their own "
+                     "cap, both ways, and holding one grants no other"
                    : "FAIL");
         return 1;
     }
@@ -3014,7 +6001,7 @@ int selftests_handle_command(const char *cmd)
         // /system/bin/primtest.elf runs the full EmbLink native-primitive suite -- a second
         // thread (create/join + shared-memory proof), a spawn() with argv +
         // file-actions, and an sbrk() heap exercise -- and exits 16 iff ALL
-        // of them passed (see user/bin/primtest.c, built on the EmbLink SDK
+        // of them passed (see user/tests/primtest/primtest.c, built on the EmbLink SDK
         // user/embk.h). 16 is a fixed success sentinel, not a computed value.
         // Needs a real filesystem with /system/bin/primtest.elf on it (e.g. `make
         // run-embkfs`) -- unlike "test ring3", there's no embedded fallback
@@ -3252,8 +6239,10 @@ int selftests_handle_command(const char *cmd)
          * must reach the same `environ` it passes to the commands it spawns.
          * Spawned WITH an environment here, so the rendered table proves the
          * whole chain: process_create_env -> RDX -> crt0 -> environ -> builtin. */
-        /* `|`, not `;` -- the lexer has no statement separator. Builtins run
-         * IN-PROCESS, so the set and the listing share one `environ`. */
+        /* `|` rather than `;` here on purpose, even though the shell now HAS a
+         * statement separator: piping keeps both halves in ONE process, and
+         * builtins run in-process, so the set and the listing share one
+         * `environ` -- which is the thing being tested. */
         char *aenv[] = { "/system/bin/shell.elf", "-c", "env set EMBK_SET fromshell | env", NULL };
         char *senv[] = { "EMBK_ENV_TEST=shell-ok", "HOME=/", NULL };
         int pe = process_create_env("/system/bin/shell.elf", aenv, 3, senv, NULL, 0);
@@ -3292,6 +6281,221 @@ int selftests_handle_command(const char *cmd)
         kprintf("\n[cmd] test shell: expr rc=%d; ls-pipeline rc=%d; error-path rc=%d; "
                 "cmd-batch rc=%d -> %s\n",
                 c1, c2, c3, c4, ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* INTERRUPTION -- ^C that a process SURVIVES.
+     *
+     * The claim is specific and was untrue until now: a runaway script can be
+     * STOPPED. `while true { }` used to be unkillable -- the shell could not
+     * route ^C at itself, because ^C set the sticky cancellation flag and one
+     * keystroke would end the shell for good, so the loop carried an iteration
+     * ceiling instead and a genuinely infinite loop meant resetting the
+     * machine.
+     *
+     * This drives the interrupt from the kernel side (there is no keyboard in
+     * a scripted test) but through EXACTLY the path a ^C takes:
+     * process_raise_interrupt(), the same call keyboard_deliver() makes. */
+    if (strcmp(cmd, "test interrupt") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test interrupt: VFS not registered\n");
+            return 1;
+        }
+        int ok = 1;
+        kprintf("\n[interrupt]\n");
+
+        /* 1. A LOOP THAT NEVER ENDS ON ITS OWN. */
+        char *a[] = { "/system/bin/shell.elf", "-c", "while true { }", NULL };
+        int pid = process_create("/system/bin/shell.elf", a, 3, NULL, 0);
+        if (pid < 0) {
+            kprintf("  [FAIL] could not spawn the shell\n");
+            return 1;
+        }
+
+        /* Let it get past startup and into the loop. Busy-wait rather than
+         * sleep: this runs in the kernel's own REPL context, and the point is
+         * to give the CHILD cpu time, which any of the other three cores can
+         * provide. */
+        timer_delay_ms(400);
+
+        int alive_before = process_alive((uint32_t)pid);
+        int raised = process_raise_interrupt((uint32_t)pid);
+        int rc = process_wait((uint32_t)pid);
+
+        kprintf("  [%s] the loop was still running before the interrupt\n",
+                alive_before ? "ok" : "FAIL");
+        kprintf("  [%s] the shell had opted IN to catching interrupts (raise -> %d)\n",
+                raised == 1 ? "ok" : "FAIL", raised);
+        kprintf("  [%s] `while true { }` stopped and exited %d (want 1)\n",
+                rc == 1 ? "ok" : "FAIL", rc);
+        if (!alive_before || raised != 1 || rc != 1) ok = 0;
+
+        /* 2. THE OTHER HALF STILL WORKS. A process that has NOT opted in is
+         *    cancelled exactly as before -- the new channel must not have
+         *    quietly changed what ^C does to a routed child. */
+        char *b[] = { "/data/apps/posixdemo/posixdemo.elf", NULL };
+        int p2 = process_create("/data/apps/posixdemo/posixdemo.elf", b, 1, NULL, 0);
+        if (p2 >= 0) {
+            int r2 = process_raise_interrupt((uint32_t)p2);
+            kprintf("  [%s] a process that does NOT catch interrupts declines them "
+                    "(raise -> %d, want 0 so the caller cancels)\n",
+                    r2 == 0 ? "ok" : "FAIL", r2);
+            if (r2 != 0) ok = 0;
+            (void)process_wait((uint32_t)p2);
+        }
+
+        kprintf("[cmd] test interrupt: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* THE SHELL AS A LANGUAGE.
+     *
+     * `test shell` above covers pipelines -- one line, one statement. This
+     * covers the part that turns a launcher into something a user can extend:
+     * statements, branching, loops, definitions, and a SCRIPT FILE.
+     *
+     * Every case asserts an EXIT CODE, because that is the only thing a
+     * spawned shell can tell this process without a pipe. `return 0` / `return
+     * 1` from a script is the shell's own exit status, so each script below
+     * ends by deciding whether it passed -- the test cannot be fooled by a
+     * script that runs and does nothing. */
+    if (strcmp(cmd, "test shellscript") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test shellscript: VFS not registered\n");
+            return 1;
+        }
+
+        struct { const char *what; const char *src; int want; } cases[] = {
+            { "';' separates statements",
+              "echo one; echo two", 0 },
+            { "if takes the true branch",
+              "if 2 > 1 { echo yes } else { rm /definitely-not-here }", 0 },
+            { "if takes the false branch",
+              "if 1 > 2 { rm /definitely-not-here } else { echo no }", 0 },
+            { "else-if chains",
+              "if 1 > 2 { echo a } else if 2 > 1 { echo b } else { echo c }", 0 },
+            { "a condition that is not a boolean is refused",
+              "if 5 { echo nope }", 1 },
+            { "while counts and break leaves",
+              "let i = 0\n"
+              "while true {\n"
+              "  let i = $i + 1\n"
+              "  if $i > 4 { break }\n"
+              "}\n"
+              "echo $i", 0 },
+            { "for walks a table's rows",
+              "for row in $(ls /) { echo $row.name }", 0 },
+            { "def defines a command and it runs",
+              "def twice(x) { echo $x + $x }\ntwice 21", 0 },
+            { "a defined command's arity is checked",
+              "def one(x) { echo $x }\none 1 2", 1 },
+            { "a defined command composes into a pipeline",
+              "def rows { ls / }\nrows | count", 0 },
+            { "command substitution feeds an expression",
+              "let n = $(ls / | count)\nif $n > 0 { echo many } else { echo none }", 0 },
+            { "break outside a loop is an error",
+              "break", 1 },
+            { "a pipeline continues after a trailing '|'",
+              "ls / |\n  count", 0 },
+            /* Background jobs. The value of `cmd &` is its JOB ID, and `jobs`
+             * is a table like everything else -- so the whole thing composes
+             * rather than being a special-cased listing. */
+            { "'&' starts a background job that `jobs` can see",
+              "echo hi &\nlet n = $(jobs | count)\n"
+              "if $n > 0 { echo have } else { echo none }", 0 },
+            { "a background job inside $( ) is refused, and says why",
+              "let j = $(echo hi &)", 1 },
+            { "jobs is a table and fg waits for one",
+              "echo hi &\nlet r = $(fg 1)\nif $r.exit == 0 { echo done } else { echo bad }", 0 },
+            { "fg on a job that does not exist is an error",
+              "fg 99", 1 },
+            /* glob + the vocabulary. These are what turn "the shell can loop"
+             * into "the shell can do something in the loop". */
+            { "glob finds files and composes with the transforms",
+              "let n = $(glob \"/system/bin/*.elf\" | count)\n"
+              "if $n > 0 { echo found } else { echo none }", 0 },
+            { "a glob that matches nothing is EMPTY, not an error",
+              "let n = $(glob \"/system/bin/*.nonesuch\" | count)\n"
+              "if $n == 0 { echo empty } else { echo wrong }", 0 },
+            { "a wildcard in a directory component is refused",
+              "glob \"/sys*/bin/x\"", 1 },
+            { "glob rows carry a usable path, and a for loop can walk them",
+              "let c = 0\n"
+              "for f in $(glob \"/system/bin/*.elf\") { let c = $c + 1 }\n"
+              "if $c > 0 { echo walked } else { echo none }", 0 },
+            { "aggregates work on a real table column",
+              "let t = $(ls /system/bin | where size > 0 | sum size)\n"
+              "if $t > 0 { echo summed } else { echo zero }", 0 },
+            { "ln makes a link the shell can read back",
+              "ln /system/bin/shell.elf /shln.tmp\n"
+              "let t = $(readlink /shln.tmp)\n"
+              "rm /shln.tmp\n"
+              "if $t == \"/system/bin/shell.elf\" { echo ok } else { echo bad }", 0 },
+            { "a link the shell made resolves like the real thing",
+              "ln /system/bin /shlndir.tmp\n"
+              "let n = $(ls /shlndir.tmp | count)\n"
+              "rm /shlndir.tmp\n"
+              "if $n > 0 { echo through } else { echo empty }", 0 },
+            /* The point is that CPU time is an ORDINARY COLUMN: it sorts and
+             * filters like every other field, rather than being a special
+             * pretty-printed listing. `last 1` yields a one-row TABLE, not a
+             * record, so this counts rather than reaching for a field. */
+            { "ps carries CPU time and it sorts and filters like any column",
+              "let n = $(ps | sort-by cpu | where cpu >= 0 | count)\n"
+              "if $n > 0 { echo ok } else { echo bad }", 0 },
+            { "readlink of a non-link is an error",
+              "readlink /system/bin/shell.elf", 1 },
+            { "range/join/split round-trip",
+              "let s = $(range 3 | join \",\")\n"
+              "let n = $(echo $s | split \",\" | count)\n"
+              "if $n == 3 { echo ok } else { echo bad }", 0 },
+        };
+
+        int ok = 1;
+        for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char *a[] = { "/system/bin/shell.elf", "-c", (char *)cases[i].src, NULL };
+            int pid = process_create("/system/bin/shell.elf", a, 3, NULL, 0);
+            int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+            int good = (rc == cases[i].want);
+            if (!good) ok = 0;
+            kprintf("  [%s] %s (exit %d, want %d)\n",
+                    good ? "ok" : "FAIL", cases[i].what, rc, cases[i].want);
+        }
+
+        /* A REAL SCRIPT FILE, written here and run by path. This is the case
+         * that could not exist before: every capability the shell had needed a
+         * human to type it. */
+        const char *path = "/scripttest.esh";
+        const char *script =
+            "#!/system/bin/shell.elf\n"
+            "# count the entries in / two ways and agree\n"
+            "let n = 0\n"
+            "for row in $(ls /) {\n"
+            "  let n = $n + 1\n"
+            "}\n"
+            "def total { ls / | count }\n"
+            "let m = $(total)\n"
+            "if $n == $m { return 0 } else { return 1 }\n";
+
+        vfs_unlink_path(path);
+        int fd = vfs_open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int script_rc = -1;
+        if (fd >= 0) {
+            size_t w = 0;
+            (void)vfs_fd_write(fd, script, strlen(script), &w);
+            (void)vfs_fd_fsync(fd);       /* the child reads it through its own open */
+            vfs_close(fd);
+
+            char *a[] = { "/system/bin/shell.elf", (char *)path, NULL };
+            int pid = process_create("/system/bin/shell.elf", a, 2, NULL, 0);
+            script_rc = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        }
+        vfs_unlink_path(path);
+        if (script_rc != 0) ok = 0;
+        kprintf("  [%s] a script FILE runs by path (exit %d, want 0)\n",
+                script_rc == 0 ? "ok" : "FAIL", script_rc);
+
+        kprintf("[cmd] test shellscript: %s\n", ok ? "OK" : "FAIL");
         return 1;
     }
 
@@ -3445,6 +6649,30 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* THE TIME ZONE, down the path the desktop actually uses. The kernel keeps
+     * UTC; turning it into the time on somebody's wall is libc's job, driven
+     * by a TZ the PARENT hands over -- nothing is inherited in this system, so
+     * the desktop puts the user's chosen zone into every app it launches.
+     *
+     * This is that spawn, with a zone whose answer is known: Sydney in
+     * November is on summer time, eleven hours ahead, and the date rolls over.
+     * A child that ignored its environment would report UTC and pass a weaker
+     * test; posixdemo compares against the conversion it did before it touched
+     * the environment at all. */
+    if (strcmp(cmd, "test tz") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test tz: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/data/apps/posixdemo/posixdemo.elf", NULL };
+        char *env[] = { "TZ=AEST-10AEDT,M10.1.0,M4.1.0/3", "HOME=/", NULL };
+        int pid = process_create_env("/data/apps/posixdemo/posixdemo.elf", a, 1, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test tz: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
     /* Console ^C routing, END TO END (docs/INTERRUPTION.md Phase 2). Spawns a
      * userspace parent that routes ^C to a child blocked reading the console,
      * then BLOCKS waiting for the harness to inject a real Ctrl+C through QMP
@@ -3521,6 +6749,39 @@ int selftests_handle_command(const char *cmd)
         if (r) for (int i = 0; i < 16; i++) if (r[i] != (uint8_t)(0x40 + i)) rok = 0;
         HCHK("krealloc slab->general keeps data", rok);
         if (r) kfree(r);
+        kheap_check();
+        /* 5. PAST THE OLD CAP, AND STILL O(1). 20,000 objects of 96 bytes is
+         *    2.5 MiB in the 128-byte class -- beyond the 1 MiB the slab used
+         *    to stop at, after which every one of these walked the general
+         *    first-fit list (measured: 224 us each, with the list fifty
+         *    thousand blocks long). Every object must come from the slab,
+         *    and the time per allocation is printed so the claim is a
+         *    number. */
+        {
+            enum { NBIG = 20000 };
+            static void *big_set[NBIG];
+            uint64_t t0 = 0, u0 = 0, t1 = 0, u1 = 0; int r0 = 0, r1 = 0;
+            kheap_slab_stats_get(&t0, &u0, &r0);
+            uint64_t ns0 = time_get_ns();
+            int bgot = 0;
+            for (int i = 0; i < NBIG; i++) { big_set[i] = kmalloc(96); if (big_set[i]) bgot++; }
+            uint64_t ns1 = time_get_ns();
+            kheap_slab_stats_get(&t1, &u1, &r1);
+            for (int i = 0; i < bgot; i++) *(int *)big_set[i] = i;
+            int balias = 0;
+            for (int i = 0; i < bgot; i++) if (*(int *)big_set[i] != i) balias++;
+            for (int i = 0; i < bgot; i++) kfree(big_set[i]);
+            uint64_t ns2 = time_get_ns();
+            kprintf("  %d x kmalloc(96): %llu us total (%llu ns each), free %llu ns each; "
+                    "slab objects out %llu -> %llu, regions %d -> %d\n",
+                    bgot, (unsigned long long)((ns1 - ns0) / 1000),
+                    (unsigned long long)(bgot ? (ns1 - ns0) / bgot : 0),
+                    (unsigned long long)(bgot ? (ns2 - ns1) / bgot : 0),
+                    (unsigned long long)u0, (unsigned long long)u1, r0, r1);
+            HCHK("20000 objects past the old 1 MiB cap all came from the slab",
+                 bgot == NBIG && u1 - u0 == (uint64_t)NBIG);
+            HCHK("no two of them alias", balias == 0);
+        }
         kheap_check();
 
         kheap_slab_stats();
@@ -3661,6 +6922,88 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* THE KEYMAP, AND WHETHER FRENCH ACTUALLY TYPES.
+     *
+     * This OS shipped for a long time with a keyboard that could not produce
+     * é è ç à ù, and the driver said so out loud rather than ship an AZERTY
+     * full of holes. The tables carry codepoints now and the char stream
+     * carries UTF-8, so the claim to check is simply: press the keys a French
+     * keyboard has, read the stream, and compare against the exact bytes.
+     *
+     * Byte-level, deliberately. "It looked right on screen" is how an encoding
+     * bug survives -- a half-written é and a correct é differ by one byte and
+     * the renderer draws both as something. */
+    if (strcmp(cmd, "test keymap") == 0) {
+        int pass = 0, fail = 0;
+        #define MCHK(name, cond) do { if (cond) { pass++; } else { fail++; \
+            kprintf("  FAIL %s\n", name); } } while (0)
+
+        const char *saved = keyboard_layout();
+        { struct key_event e; while (keyboard_event_pop(&e)) {} }
+        while (keyboard_has_char()) (void)keyboard_getchar();
+
+        /* Press a key (make code), then read every byte it produced. */
+        char got[8];
+        int  ngot;
+        #define TYPE(mk) do { ngot = 0; kbd_translate((mk), 1); kbd_translate((mk), 0); \
+            while (keyboard_has_char() && ngot < (int)sizeof got) \
+                got[ngot++] = (char)keyboard_getchar(); } while (0)
+        #define IS2(a, b) (ngot == 2 && (unsigned char)got[0] == (a) && (unsigned char)got[1] == (b))
+        #define IS1(a)    (ngot == 1 && (unsigned char)got[0] == (a))
+
+        MCHK("the azerty layout exists", keyboard_set_layout("azerty") == 0);
+
+        /* The number row, unshifted: & é " ' ( - è _ ç à -- the five accented
+         * ones are the whole point. é is U+00E9 = C3 A9 in UTF-8. */
+        TYPE(0x03); MCHK("é on the 2 key   (C3 A9)", IS2(0xC3, 0xA9));
+        TYPE(0x08); MCHK("è on the 7 key   (C3 A8)", IS2(0xC3, 0xA8));
+        TYPE(0x0A); MCHK("ç on the 9 key   (C3 A7)", IS2(0xC3, 0xA7));
+        TYPE(0x0B); MCHK("à on the 0 key   (C3 A0)", IS2(0xC3, 0xA0));
+        TYPE(0x28); MCHK("ù on the ' key   (C3 B9)", IS2(0xC3, 0xB9));
+
+        /* Letters still work, and A is where AZERTY puts it (the Q key). */
+        TYPE(0x10); MCHK("a is on the Q position", IS1('a'));
+        TYPE(0x1E); MCHK("q is on the A position", IS1('q'));
+
+        /* A DEAD KEY: ^ then e is ê (U+00EA = C3 AA), and ^ produces nothing
+         * on its own. This is how â ê î ô û are typed on a real keyboard. */
+        TYPE(0x1A); MCHK("^ alone types nothing (it is dead)", ngot == 0);
+        TYPE(0x12); MCHK("^ then e is ê     (C3 AA)", IS2(0xC3, 0xAA));
+
+        /* Two dead keys in a row type the first one: the escape hatch that
+         * keeps ^ itself reachable. */
+        TYPE(0x1A); TYPE(0x1A); MCHK("^^ types one ^", IS1('^'));
+
+        /* Shift gives the DIGITS on this layout -- French types 1 with Shift. */
+        kbd_mods_force(EKM_SHIFT);
+        TYPE(0x02); MCHK("Shift+2 key is '1'", IS1('1'));
+        kbd_mods_force(0);
+
+        /* And the third level: without AltGr a French keyboard cannot type @,
+         * which means it cannot type an email address. */
+        kbd_altgr_force(1);
+        TYPE(0x0B); MCHK("AltGr+0 key is '@'", IS1('@'));
+        TYPE(0x06); MCHK("AltGr+5 key is '['", IS1('['));
+        TYPE(0x12); MCHK("AltGr+e is € (E2 82 AC)",
+                         ngot == 3 && (unsigned char)got[0] == 0xE2 &&
+                         (unsigned char)got[1] == 0x82 && (unsigned char)got[2] == 0xAC);
+        kbd_altgr_force(0);
+
+        /* US is untouched by any of it -- the tables changed type, not content. */
+        MCHK("the us layout is still there", keyboard_set_layout("us") == 0);
+        TYPE(0x1E); MCHK("us: the A key is 'a'", IS1('a'));
+        TYPE(0x03); MCHK("us: the 2 key is '2'", IS1('2'));
+
+        keyboard_set_layout(saved);
+        #undef TYPE
+        #undef IS1
+        #undef IS2
+        kprintf("\n[cmd] test keymap: %s (%d/%d)\n",
+                fail == 0 ? "OK" : "FAIL", pass, pass + fail);
+        #undef MCHK
+        return 1;
+    }
+
     if (strcmp(cmd, "test keyboard") == 0) {
         int pass = 0, fail = 0;
         #define KCHK(name, cond) do { if (cond) { pass++; } else { fail++; \
@@ -3688,7 +7031,11 @@ int selftests_handle_command(const char *cmd)
         kprintf("[keyboard] mods now 0x%02x (0=nothing held)\n", keyboard_mods());
         KCHK("no modifier stuck down at rest", keyboard_mods() == 0);
 
-        kprintf("\n[cmd] test keyboard: %d/%d checks\n", pass, pass + fail);
+        /* NOT the `[cmd] <name>:` form -- that shape IS the verdict a scripted
+         * run reads, and printing it here made the harness judge the test
+         * before the live capture had even started. One verdict per command,
+         * at the end. */
+        kprintf("\n[keyboard] %d/%d automated checks\n", pass, pass + fail);
         kprintf("[keyboard] NOW TYPE -- 8s live capture (events: code/mods/up-down)\n");
 
         /* 3. LIVE: whatever arrives in the next 8s, report it. This is where a
@@ -3706,7 +7053,142 @@ int selftests_handle_command(const char *cmd)
         }
         kprintf("[keyboard] captured %d events; mods at end=0x%02x\n",
                 nev, keyboard_mods());
+
+        /* A VERDICT LINE, and an honest one. The automated half above is the
+         * part a machine can judge; the live capture needs a person to type,
+         * and an unattended run captures nothing through no fault of the
+         * keyboard. Reported as a SKIP, so a scripted sweep stops recording a
+         * permanent red light for a test nobody could have passed -- the same
+         * correction `test layout` needed, and for the same reason: a light
+         * that is always red is a light people stop reading.
+         *
+         * The keymap itself IS machine-checkable, and is checked without a
+         * human anywhere near it: `test keymap`. */
+        if (fail == 0 && nev == 0)
+            kprintf("\n[cmd] test keyboard: SKIP (%d/%d automated; nobody typed "
+                    "during the live capture)\n", pass, pass + fail);
+        else
+            kprintf("\n[cmd] test keyboard: %s (%d/%d automated, %d live event(s))\n",
+                    fail == 0 ? "OK" : "FAIL", pass, pass + fail, nev);
         #undef KCHK
+        return 1;
+    }
+
+    /* The keyboard layout over the SYSCALL. `test keymap` beside this one
+     * calls keyboard_set_layout() directly and so never touched sys_kbd_layout,
+     * which rejected every non-empty name with -EFAULT for want of a `< 0`. */
+    /* PRINT THE USER'S PREFERENCES FILE. The console's `run` takes a path and
+     * not an argument vector, so there is no way from here to ask a program to
+     * open a named file -- and without one, a test of Settings can see that the
+     * screen changed and never that the preference was STORED. Those are
+     * different claims, and the difference is exactly where this repo's last
+     * two preference bugs lived. */
+    if (strcmp(cmd, "test cfgdump") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test cfgdump: VFS not registered\n");
+            return 1;
+        }
+        /* The SESSION's file, which is the one that matters: preferences live
+         * in the user's own directory now (user/lib/oscfg.h), and the DEV
+         * auto-login user is 'yves'. If that ever changes this fails loudly,
+         * which is the right way for a hard-coded path in a test to break. */
+        char *a[] = { "/system/bin/primtest.elf", "catfile",
+                      "/home/yves/settings.conf", NULL };
+        int pid = process_create("/system/bin/primtest.elf", a, 3, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test cfgdump: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* TWO THREADS IN THE ALLOCATOR. newlib's __malloc_lock is a do-nothing
+     * stub in libc.a; user/lib/syscalls.c replaces it with a real recursive
+     * lock, and this is the program that fails without one. */
+    if (strcmp(cmd, "test mtmalloc") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test mtmalloc: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/data/apps/mtmalloc/mtmalloc.elf", NULL };
+        int pid = process_create("/data/apps/mtmalloc/mtmalloc.elf", a, 1, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test mtmalloc: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* WHICH CARD, AND IS THE CABLE IN. Printed rather than asserted: the answer
+     * depends on what the machine has and on whether somebody has unplugged it,
+     * and both are things a test wants to READ. tools/netlink_shot.py drives
+     * QEMU's `set_link` around this and checks the reading follows. */
+    if (strcmp(cmd, "test netlink") == 0) {
+        int l = net_dev_link();
+        kprintf("\n[cmd] test netlink: card=%s link=%s\n",
+                net_dev_name()[0] ? net_dev_name() : "none",
+                l > 0 ? "up" : l == 0 ? "down" : "unknown");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test meminfo") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test meminfo: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/system/bin/primtest.elf", "meminfo", NULL };
+        int pid = process_create("/system/bin/primtest.elf", a, 2, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test meminfo: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test kbdlayout") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test kbdlayout: VFS not registered\n");
+            return 1;
+        }
+        char *a[] = { "/system/bin/primtest.elf", "kbdlayout", NULL };
+        int pid = process_create("/system/bin/primtest.elf", a, 2, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("\n[cmd] test kbdlayout: exit=%d -> %s\n", code,
+                (pid >= 0 && code == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* HOW CLOSE IS ANY THREAD TO RUNNING OFF ITS KERNEL STACK.
+     *
+     * The guard page below every stack turns an overflow into a fault, which
+     * is the right answer to one that has already happened and no answer at
+     * all to one that is coming. This reads the HIGH WATER mark of each
+     * thread -- how deep it has ever been, not where its SP is now -- and
+     * FAILS if anything has used more than three quarters of its 32 KiB,
+     * because a thread at 75% is one unlucky interrupt from the guard page and
+     * the machine it takes down will not be this one.
+     *
+     * Written while chasing exactly that on aarch64 with networking on. */
+    if (strcmp(cmd, "test stacks") == 0) {
+        static struct thread_info ti[MAX_THREADS];
+        int n = thread_list(ti, MAX_THREADS);
+        uint64_t worst = 0; int worst_tid = -1, worst_pid = 0;
+        int over = 0;
+        kprintf("\n");
+        for (int i = 0; i < n; i++) {
+            if (!ti[i].kstack_used) continue;       /* static boot stack */
+            unsigned pct = (unsigned)(ti[i].kstack_used * 100 / KSTACK_SIZE);
+            if (pct >= 50 || ti[i].kstack_used > worst)
+                kprintf("  tid %-3u pid %-3u %s%-6llu bytes (%u%% of %u)\n",
+                        ti[i].tid, ti[i].pid, ti[i].is_kthread ? "k " : "  ",
+                        (unsigned long long)ti[i].kstack_used, pct,
+                        (unsigned)KSTACK_SIZE);
+            if (ti[i].kstack_used > worst) {
+                worst = ti[i].kstack_used; worst_tid = (int)ti[i].tid;
+                worst_pid = (int)ti[i].pid;
+            }
+            if (ti[i].kstack_used * 4 > (uint64_t)KSTACK_SIZE * 3) over++;
+        }
+        kprintf("[cmd] test stacks: %d threads, deepest tid %d (pid %d) at %llu/%u bytes -> %s\n",
+                n, worst_tid, worst_pid, (unsigned long long)worst,
+                (unsigned)KSTACK_SIZE, over ? "FAIL" : "OK");
         return 1;
     }
 
@@ -4089,6 +7571,157 @@ int selftests_handle_command(const char *cmd)
         int ok = (pid >= 0 && code == 0 && is_elf && is_64 && is_rel &&
                   is_exec && rcode == 42);
         kprintf("\n[cmd] test embcc: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+/* C++ ON THE METAL (EmbCC CX9). The same shape as `test embcc` one step up:
+ * the on-image embcc -- itself built by EmbCC -- compiles a C++ program HERE,
+ * EmbLD links it against the sealed ABI (crt0 + syscalls + libc), and the
+ * result runs -- compiler and linker both EmbCC's, on the metal. The program is deliberately self-contained: it defines the
+ * few runtime entry points a plain C++ program needs (operator new/delete, a
+ * local static's guard, __cxa_pure_virtual) so nothing but the C ABI has to
+ * be on the image -- what is being judged is the COMPILER, not a C++ library.
+ * It exercises what a C++ port breaks on: a global constructor, virtual
+ * dispatch through a base, templates over two types, new/delete and
+ * new[]/delete[], a guarded function-local static, and recursion. Exit 42. */
+    if (strcmp(cmd, "test embcc cxx") == 0) {
+        if (!g_vfs_ready) { kprintf("\n[cmd] test embcc cxx: VFS not registered\n"); return 1; }
+        struct vfs_stat est;
+        if (vfs_stat("/data/apps/embcc/embcc.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc cxx: /data/apps/embcc/embcc.elf not on image\n");
+            return 1; }
+        if (vfs_stat("/data/apps/embld/embld.elf", &est) != 0) {
+            kprintf("\n[cmd] test embcc cxx: embld.elf not on image (the linker)\n");
+            return 1; }
+
+        static const char src[] =
+            "/* Compiled BY EmbCC, ON EmbLinkOS. Self-contained: the runtime\n"
+            "   entry points a plain C++ program needs are defined here, so it\n"
+            "   links against the C ABI alone. */\n"
+            "#include <stdlib.h>\n"
+            "#include <string.h>\n"
+            "void *operator new(unsigned long n) { return malloc(n); }\n"
+            "void *operator new[](unsigned long n) { return malloc(n); }\n"
+            "void operator delete(void *p) noexcept { free(p); }\n"
+            "void operator delete[](void *p) noexcept { free(p); }\n"
+            "void operator delete(void *p, unsigned long) noexcept { free(p); }\n"
+            "void operator delete[](void *p, unsigned long) noexcept { free(p); }\n"
+            "extern \"C\" int __cxa_guard_acquire(long long *g) { return !*(char *)g; }\n"
+            "extern \"C\" void __cxa_guard_release(long long *g) { *(char *)g = 1; }\n"
+            "extern \"C\" void __cxa_guard_abort(long long *) {}\n"
+            "extern \"C\" int __cxa_atexit(void (*)(void *), void *, void *) { return 0; }\n"
+            "extern \"C\" void __cxa_pure_virtual(void) { abort(); }\n"
+            "struct Shape {\n"
+            "    virtual ~Shape() {}\n"
+            "    virtual int sides() const = 0;\n"
+            "    int twice() const { return sides() * 2; }\n"
+            "};\n"
+            "struct Tri : Shape { int sides() const override { return 3; } };\n"
+            "struct Quad : Shape { int sides() const override { return 4; } };\n"
+            "template <class T> struct Box {\n"
+            "    T v;\n"
+            "    explicit Box(T x) : v(x) {}\n"
+            "    T twice() const { return v + v; }\n"
+            "};\n"
+            "static int ctors;\n"
+            "struct Counted { Counted() { ctors++; } ~Counted() { ctors--; } };\n"
+            "static Counted g_one;\n"
+            "static int fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }\n"
+            "int main(void)\n"
+            "{\n"
+            "    int fails = 0;\n"
+            "    if (ctors != 1) fails |= 1;\n"
+            "    Shape *s[2] = { new Tri(), new Quad() };\n"
+            "    if (s[0]->twice() != 6 || s[1]->twice() != 8) fails |= 2;\n"
+            "    delete s[0];\n"
+            "    delete s[1];\n"
+            "    Box<int> bi(21);\n"
+            "    Box<double> bd(1.5);\n"
+            "    if (bi.twice() != 42 || bd.twice() != 3.0) fails |= 4;\n"
+            "    for (int i = 0; i < 3; i++) {\n"
+            "        static Box<int> lazy(7);\n"
+            "        if (lazy.v != 7) fails |= 8;\n"
+            "    }\n"
+            "    Shape **arr = new Shape *[2];\n"
+            "    arr[0] = new Tri(); arr[1] = new Quad();\n"
+            "    int sum = arr[0]->sides() + arr[1]->sides();\n"
+            "    delete arr[0]; delete arr[1]; delete[] arr;\n"
+            "    if (sum != 7) fails |= 16;\n"
+            "    char *p = (char *)malloc(64);\n"
+            "    strcpy(p, \"EmbCC\");\n"
+            "    if (strlen(p) != 5) fails |= 32;\n"
+            "    free(p);\n"
+            "    if (fib(12) != 144) fails |= 64;\n"
+            "    return fails ? fails : 42;\n"
+            "}\n";
+        {
+            int fd = vfs_open("/data/tmp/cxx.cc", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { kprintf("test embcc cxx: cannot write /data/tmp/cxx.cc\n"); return 1; }
+            size_t w = 0;
+            vfs_fd_write(fd, src, sizeof src - 1, &w);
+            vfs_close(fd);
+        }
+        (void)vfs_unlink_path("/data/tmp/cxx.o");
+        (void)vfs_unlink_path("/data/tmp/cxx.elf");
+
+        /* 1. EmbCC compiles the C++ on the OS. -fno-rtti/-fno-exceptions keep
+         *    it free of libsupc++ (typeinfo, the personality routine). */
+        char *a[] = { "/data/apps/embcc/embcc.elf", "-c", "/data/tmp/cxx.cc",
+                      "-fno-rtti", "-fno-exceptions",
+                      "-I", "/data/apps/embcc/include",
+                      "-I", "/system/abi/include",
+                      "-o", "/data/tmp/cxx.o" };
+        char *env[] = { "HOME=/", NULL };
+        kprintf("[embcc c++] -c /data/tmp/cxx.cc -fno-rtti -fno-exceptions -o /data/tmp/cxx.o\n");
+        int pid = process_create_env("/data/apps/embcc/embcc.elf", a, 11, env, NULL, 0);
+        int code = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        kprintf("[embcc c++] exit=%d\n", code);
+
+        unsigned char hdr[20] = {0};
+        struct vfs_stat st;
+        int have = (vfs_stat("/data/tmp/cxx.o", &st) == 0);
+        if (have) {
+            int fd = vfs_open("/data/tmp/cxx.o", O_RDONLY, 0);
+            if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, hdr, sizeof hdr, &r); vfs_close(fd); }
+        }
+        int is_elf = have && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
+        int is_64  = is_elf && hdr[4] == 2;
+        int is_rel = is_elf && hdr[16] == 1;
+        kprintf("[embcc c++] /data/tmp/cxx.o: %s, %llu bytes; ELF=%d 64-bit=%d ET_REL=%d\n",
+                have ? "written" : "MISSING",
+                have ? (unsigned long long)st.size : 0ULL, is_elf, is_64, is_rel);
+
+        /* 2. EmbLD links it against the sealed ABI -- EmbCC's own linker, so
+         *    the whole toolchain in this test is EmbCC's. */
+        int rcode = -1, is_exec = 0;
+        if (is_elf && is_64 && is_rel) {
+            char *b[] = { "/data/apps/embld/embld.elf", "-o",
+                          "/data/tmp/cxx.elf", "/system/abi/crt0.o",
+                          "/system/abi/syscalls.o", "/data/tmp/cxx.o",
+                          "/system/abi/libc.a" };
+            int lp = process_create_env("/data/apps/embld/embld.elf", b, 7, env, NULL, 0);
+            int lcode = lp >= 0 ? process_wait((uint32_t)lp) : -1;
+            struct vfs_stat lst;
+            unsigned char lhdr[20] = {0};
+            if (vfs_stat("/data/tmp/cxx.elf", &lst) == 0) {
+                int fd = vfs_open("/data/tmp/cxx.elf", O_RDONLY, 0);
+                if (fd >= 0) { size_t r = 0; vfs_fd_read(fd, lhdr, sizeof lhdr, &r); vfs_close(fd); }
+                is_exec = lhdr[0] == 0x7f && lhdr[16] == 2;
+            }
+            kprintf("[embcc c++] embld link: exit=%d, ET_EXEC=%d\n", lcode, is_exec);
+
+            /* 3. Run it. Exit 42 is the whole claim. */
+            if (is_exec) {
+                char *c[] = { "/data/tmp/cxx.elf", NULL };
+                int p2 = process_create_env("/data/tmp/cxx.elf", c, 1, env, NULL, 0);
+                rcode = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+                kprintf("[embcc c++] /data/tmp/cxx.elf ran: exit=%d (want 42)\n", rcode);
+            }
+        }
+
+        int okc = (pid >= 0 && code == 0 && is_elf && is_64 && is_rel &&
+                   is_exec && rcode == 42);
+        kprintf("\n[cmd] test embcc cxx: %s\n", okc ? "OK" : "FAIL");
         return 1;
     }
 
@@ -5820,6 +9453,927 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* mmap/munmap, measured against the PHYSICAL allocator.
+     *
+     * posixdemo already exercises the syscall from ring 3 and checks that the
+     * memory works and that the refusals refuse. What it cannot see from there
+     * is whether munmap actually GAVE THE PAGES BACK -- reading unmapped
+     * memory is a fault, so a userland test can only prove the mapping is
+     * gone, not that the frames returned to the allocator. pmm_free_pages() is
+     * the one number the thing under test cannot fake.
+     *
+     * The exact round trip is the point. It used to be inexact: munmap gave
+     * back the DATA pages and kept the three page tables that described them
+     * (docs/TODO.md carried that as "vm_unmap_page() does not free page tables
+     * that become empty"), so this would have read 19 out and 16 back. */
+    if (strcmp(cmd, "test mmap") == 0) {
+        struct process *p = current_thread ? current_thread->proc : 0;
+        if (!p) {
+            kprintf("\n[cmd] test mmap: no process context\n");
+            return 1;
+        }
+
+        int fails = 0;
+        const uint64_t LEN = 16 * 4096;
+        uint64_t free_before = pmm_free_pages();
+
+        int64_t a = vma_mmap(p, 0, LEN, PROT_READ | PROT_WRITE,
+                             MAP_ANONYMOUS | MAP_PRIVATE);
+        bool ok = a > 0;
+
+        /* DEMAND PAGING: the mapping exists and costs NOTHING yet. Asserted
+         * before a single byte is touched, because "mmap is cheap" is a claim
+         * about this exact moment. */
+        uint64_t free_mapped_only = pmm_free_pages();
+        bool lazy = (free_mapped_only >= free_before - 4);   /* page tables only */
+        kprintf("      %d KiB mapped: %llu pages consumed before first touch "
+                "(demand paging: want ~0)\n",
+                (int)(LEN / 1024),
+                (unsigned long long)(free_before - free_mapped_only));
+        if (!lazy) { kprintf("      FAIL: mmap allocated eagerly\n"); fails++; }
+
+        if (ok) {
+            /* Zeroed FIRST, then written, then read back -- in that order. A
+             * mapping that returns what you wrote but arrived carrying the
+             * last owner's data is a disclosure a write-then-read test cannot
+             * see.
+             *
+             * BRACKETED: this is ring 0 touching a USER mapping, which SMAP
+             * refuses unless asked. It hung here the first time SMAP was on --
+             * the first touch of each page is a not-present fault that
+             * vm_fault() resolves, the access retries, and the retry is then a
+             * perfectly present user page read with AC clear. The aarch64
+             * mmap test failed the same way under PAN for the same reason. */
+            uaccess_hw_begin();
+            volatile uint64_t *m = (volatile uint64_t *)(uintptr_t)a;
+            for (uint64_t i = 0; i < LEN / 8; i += 512)
+                if (m[i] != 0) ok = false;
+            for (uint64_t i = 0; i < LEN / 8; i += 512)
+                m[i] = 0xC0FFEE00ULL + i;
+            for (uint64_t i = 0; i < LEN / 8; i += 512)
+                if (m[i] != 0xC0FFEE00ULL + i) ok = false;
+            uaccess_hw_end();
+        }
+
+        /* THE ACCESSED BIT, which reclaim reads to spare a page that is in
+         * use: set by the touches above, clear once read, set again by one
+         * more touch. The TLB entry is flushed between, because the CPU sets
+         * the bit on a TLB fill and not on a hit -- the imprecision the
+         * reclaimer accepts, made exact here so the claim is exact. */
+        bool acc1 = false, acc2 = false;
+        if (ok) {
+            acc1 = vmm_test_and_clear_accessed_in(p->pml4_phys, (uint64_t)a);
+            vmm_flush_tlb((uint64_t)a);
+            uaccess_hw_begin();
+            (void)*(volatile uint64_t *)(uintptr_t)a;
+            uaccess_hw_end();
+            acc2 = vmm_test_and_clear_accessed_in(p->pml4_phys, (uint64_t)a);
+            kprintf("      [%s] the accessed bit: set after the touches, clear once read, set again by one touch\n",
+                    (acc1 && acc2) ? " ok " : "FAIL");
+            if (!(acc1 && acc2)) fails++;
+        }
+
+        uint64_t free_mapped = pmm_free_pages();
+        bool took = ok && free_mapped <= free_before - LEN / 4096;
+
+        /* And having touched it, the pages ARE there -- so laziness is not a
+         * synonym for "never allocated". */
+        struct vm_fault_stats fs;
+        vm_fault_stats(&fs);
+        kprintf("      after touching every page: %llu resolved faults total\n",
+                (unsigned long long)fs.handled);
+
+        int rc = ok ? vma_munmap(p, (uint64_t)a, LEN) : -1;
+        uint64_t free_after = pmm_free_pages();
+        bool gave_back = (rc == EMBK_OK) && (free_after == free_before);
+
+        kprintf("\n[cmd] test mmap: %d KiB at %p, zeroed, written, read back: %s\n",
+                (int)(LEN / 1024), (void *)(uintptr_t)a, ok ? "OK" : "FAIL");
+        kprintf("      free pages %d -> %d -> %d (page tables included): %s\n",
+                (int)free_before, (int)free_mapped, (int)free_after,
+                (took && gave_back) ? "OK" : "FAIL");
+
+        /* THE HEADLINE. A gigabyte of address space, three pages touched.
+         * Eagerly allocated this would need 262144 pages and would simply fail
+         * on a smaller machine -- which is the difference between address
+         * space and memory being one resource and being two. */
+        {
+            const uint64_t BIG = 1024ull * 1024 * 1024;
+            uint64_t f0 = pmm_free_pages();
+            int64_t big = vma_mmap(p, 0, BIG, PROT_READ | PROT_WRITE,
+                                   MAP_ANONYMOUS | MAP_PRIVATE);
+            if (big <= 0) {
+                kprintf("      FAIL: could not reserve 1 GiB of address space\n");
+                fails++;
+            } else {
+                uint64_t f1 = pmm_free_pages();
+                volatile char *m = (volatile char *)(uintptr_t)big;
+                uaccess_hw_begin();           /* ring 0 into a user mapping */
+                m[0] = 1;
+                m[BIG / 2] = 2;
+                m[BIG - 1] = 3;
+                bool good = (m[0] == 1 && m[BIG / 2] == 2 && m[BIG - 1] == 3);
+                uaccess_hw_end();
+                uint64_t f2 = pmm_free_pages();
+                kprintf("      [%s] 1 GiB reserved for %llu pages, then 3 touched "
+                        "for %llu more (eager would be %llu)\n",
+                        good ? " ok " : "FAIL",
+                        (unsigned long long)(f0 - f1),
+                        (unsigned long long)(f1 - f2),
+                        (unsigned long long)(BIG / 4096));
+                if (!good || (f0 - f1) > 8) fails++;
+                (void)vma_munmap(p, (uint64_t)big, BIG);
+            }
+        }
+
+        /* A fault OUTSIDE any mapping must still be fatal. Not tested by
+         * touching one -- that would kill this context -- but by asking
+         * vm_fault directly, which is the same call the fault handler makes. */
+        {
+            bool declined = !vm_fault(p, p->layout.mmap_base + 0x3000000000ull, true, false);
+            kprintf("      [%s] a fault outside every mapping is DECLINED "
+                    "(a wild pointer must still crash)\n", declined ? " ok " : "FAIL");
+            if (!declined) fails++;
+        }
+
+        int64_t wx = vma_mmap(p, 0, 4096, PROT_WRITE | PROT_EXEC,
+                              MAP_ANONYMOUS | MAP_PRIVATE);
+        kprintf("      writable+executable refused: %s\n", wx < 0 ? "OK" : "FAIL");
+        if (wx > 0) vma_munmap(p, (uint64_t)wx, 4096);
+
+        kprintf("[cmd] test mmap: %s\n",
+                (ok && took && gave_back && wx < 0 && fails == 0) ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* THE PAGE CACHE -- and the number that says whether it is real.
+     *
+     * The claim is not "reads got faster". It is that a write() no longer
+     * commits a filesystem transaction. EMBKFS is copy-on-write: every write
+     * that reaches it rebuilds the object and commits a new generation, so a
+     * program appending a line at a time used to cost one transaction PER
+     * LINE. That is the thing being measured here -- 512 small appends, and
+     * how many times the device was written during them.
+     *
+     * Everything else in this test exists because a cache that is fast and
+     * wrong is worse than no cache: coherence between two independent opens,
+     * fsync actually reaching the device, and the pages coming back under
+     * pressure. */
+    /* METADATA. The page cache made a file's CONTENTS nearly free to re-read;
+     * its NAME and its SIZE were not, and `test pagecache` says so out loud by
+     * keeping the seek outside its measured window rather than hiding it.
+     *
+     * This measures the part that was left: how many device reads it costs to
+     * ask about a file you have already asked about. A stat is a B-tree
+     * descent for the inode; an open is TWO descents per path component (the
+     * directory's inode, then the entry). Nothing about that changes between
+     * two identical calls, so anything above zero is work being redone. */
+    /* HOW CONTENDED IS THE SCHEDULER LOCK, really?
+     *
+     * One global lock guards every scheduling decision, and the standard
+     * answer to that is per-core run queues -- a large change to the most
+     * dangerous code in this kernel, in a function where two separate real
+     * bugs have already been found. Worth making against a number, not a
+     * hunch, which is what this produces.
+     *
+     * MEASURED UNDER LOAD, not at idle: an idle machine barely touches the
+     * lock, so an idle measurement would say "not contended" about a system
+     * that was not doing anything. The work below is deliberately the most
+     * scheduler-intensive thing available -- four ring-3 threads hammering one
+     * mutex, which drives block, wake and switch on every core at once. */
+    if (strcmp(cmd, "test schedlock") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test schedlock: VFS not registered\n");
+            return 1;
+        }
+        const char *lp = "/data/apps/lockdemo/lockdemo.elf";
+        struct vfs_stat st;
+        if (vfs_stat(lp, &st) != EMBK_OK) {
+            kprintf("\n[cmd] test schedlock: %s not on image\n", lp);
+            return 1;
+        }
+
+        uint64_t a0, c0, s0, a1, c1, s1;
+
+        /* (1) IDLE baseline: whatever the desktop does on its own. */
+        sched_lock_stats(&a0, &c0, &s0);
+        timer_delay_ms(2000);
+        sched_lock_stats(&a1, &c1, &s1);
+        kprintf("\n[schedlock] 2s idle:   %llu acquires, %llu contended (%llu%%), "
+                "%llu spins\n",
+                (unsigned long long)(a1 - a0), (unsigned long long)(c1 - c0),
+                (unsigned long long)((a1 - a0) ? (c1 - c0) * 100 / (a1 - a0) : 0),
+                (unsigned long long)(s1 - s0));
+
+        /* (2) UNDER LOAD: four threads, one mutex, a bounded queue. */
+        sched_lock_stats(&a0, &c0, &s0);
+        char *a[] = { (char *)lp, NULL };
+        int pid = process_create(lp, a, 1, NULL, 0);
+        int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+        sched_lock_stats(&a1, &c1, &s1);
+
+        uint64_t acq = a1 - a0, con = c1 - c0, spn = s1 - s0;
+        kprintf("[schedlock] under load: %llu acquires, %llu contended (%llu%%), "
+                "%llu spins (exit %d)\n",
+                (unsigned long long)acq, (unsigned long long)con,
+                (unsigned long long)(acq ? con * 100 / acq : 0),
+                (unsigned long long)spn, rc);
+        kprintf("            %llu spin iterations per contended acquire\n",
+                (unsigned long long)(con ? spn / con : 0));
+
+        /* THE PERCENTAGE IS THE WRONG NUMBER ON ITS OWN, and that is the whole
+         * lesson of this test. A lock can be 20% contended and cost nothing,
+         * if it is only taken a few hundred times a second. What matters is
+         * the TIME spent spinning, so that is what this converts to.
+         *
+         * A spin iteration is one `pause` (x86) or one `wfe` wake (aarch64) --
+         * call it ~35 cycles. The absolute figure is what decides whether
+         * per-core run queues are worth the riskiest refactor in this kernel,
+         * and it is printed rather than asserted because there is no correct
+         * answer to fail against. */
+        {
+            uint64_t spins_per_sec = spn;      /* the load window is ~1s */
+            uint64_t cycles = spins_per_sec * 35;
+            kprintf("            ~%llu spin-cycles/s across all cores; on a 1 GHz\n"
+                    "            core that is ~%llu.%02llu%% of ONE core\n",
+                    (unsigned long long)cycles,
+                    (unsigned long long)(cycles / 10000000),
+                    (unsigned long long)((cycles / 100000) % 100));
+        }
+        kprintf("[cmd] test schedlock: measured (see docs/KERNEL_ROADMAP.md)\n");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test metacache") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test metacache: VFS not registered\n");
+            return 1;
+        }
+
+        const char *paths[4] = {
+            "/system/bin/shell.elf",
+            "/system/bin/init.elf",
+            "/system/bin/hello.elf",
+            "/system/bin/sysinfo.elf",
+        };
+        struct vfs_stat st;
+        int npaths = 0;
+        for (int i = 0; i < 4; i++)
+            if (vfs_stat(paths[i], &st) == EMBK_OK) paths[npaths++] = paths[i];
+        if (npaths == 0) {
+            kprintf("\n[cmd] test metacache: no fixture files on the image\n");
+            return 1;
+        }
+
+        struct embk_blkstat b0, b1;
+        int fails = 0;
+
+        /* SETTLE FIRST. Both caches are keyed on the volume generation, so any
+         * COMMIT retires every entry -- and the writeback thread commits
+         * whenever there are dirty pages, on another core, in the middle of
+         * this measurement. Pushing them out now means the numbers below are
+         * about the cache rather than about whatever the machine happened to
+         * be writing. This is not the test being made easy: on a system that
+         * is genuinely writing, metadata genuinely does cost more, and that is
+         * the documented price of the generation key. */
+        uint64_t flushed = vmo_writeback_all();
+
+        kprintf("\n[metacache] (%d fixture file(s), %llu dirty page(s) flushed first)\n",
+                npaths, (unsigned long long)flushed);
+
+        /* (1) THE SAME file, over and over. The answer cannot change, so a
+         *     second call should cost nothing. */
+        (void)vfs_stat(paths[0], &st);              /* warm it */
+        struct embkfs_stat es0, es1;
+        embkfs_stat_get(&es0);
+        embk_blkstat_reset(); embk_blkstat_get(&b0);
+        for (int i = 0; i < 50; i++) (void)vfs_stat(paths[0], &st);
+        embk_blkstat_get(&b1);
+        embkfs_stat_get(&es1);
+        uint64_t same = b1.reads - b0.reads;
+        uint64_t commits_during = es1.commits - es0.commits;
+        kprintf("  50 stats of ONE warm file:        %llu device reads"
+                "  (%llu commit(s) landed during it)\n",
+                (unsigned long long)same, (unsigned long long)commits_during);
+        /* WHERE THE READS COME FROM, when there are any. A device read that
+         * no cache accounts for is a read none of them covers, and the
+         * breakdown is what says which. */
+        if (same) {
+            kprintf("    breakdown over the window: node_reads %llu  "
+                    "icache %llu/%llu  ncache %llu/%llu  ecache %llu/%llu  "
+                    "rcache %llu/%llu\n",
+                    (unsigned long long)(es1.node_reads   - es0.node_reads),
+                    (unsigned long long)(es1.icache_hit   - es0.icache_hit),
+                    (unsigned long long)(es1.icache_miss  - es0.icache_miss),
+                    (unsigned long long)(es1.ncache_hit   - es0.ncache_hit),
+                    (unsigned long long)(es1.ncache_miss  - es0.ncache_miss),
+                    (unsigned long long)(es1.ecache_hit   - es0.ecache_hit),
+                    (unsigned long long)(es1.ecache_miss  - es0.ecache_miss),
+                    (unsigned long long)(es1.rcache_hit   - es0.rcache_hit),
+                    (unsigned long long)(es1.rcache_miss  - es0.rcache_miss));
+        }
+        /* A SMALL BOUND rather than exactly zero. It reads 0 in practice, and
+         * did so immediately after a run of posixdemo that created and deleted
+         * nine hundred objects -- but both caches are keyed on the volume
+         * generation, so a commit landing mid-measurement (the writeback
+         * thread, on another core) legitimately costs a few descents. The
+         * bound is there so that ordinary background writing cannot make this
+         * test flaky, not to excuse a cache that misses. Cold was 22 reads per
+         * stat: 1100 for this loop. */
+        if (same > 20) fails++;          /* cold was 1100 */
+
+        /* (2) ROUND-ROBIN over several files. This is what a one-entry cache
+         *     cannot do: each call evicts the answer the next one wants, so a
+         *     single slot scores exactly zero hits however warm it is. */
+        for (int i = 0; i < npaths; i++) (void)vfs_stat(paths[i], &st);
+        embk_blkstat_reset(); embk_blkstat_get(&b0);
+        for (int r = 0; r < 20; r++)
+            for (int i = 0; i < npaths; i++) (void)vfs_stat(paths[i], &st);
+        embk_blkstat_get(&b1);
+        uint64_t rr = b1.reads - b0.reads;
+        kprintf("  %d stats round-robin over %d files: %llu device reads\n",
+                20 * npaths, npaths, (unsigned long long)rr);
+        if (rr > 20) fails++;
+
+        /* (3) OPEN, which is the path walk: two descents per component. */
+        int fd = vfs_open(paths[0], O_RDONLY, 0);
+        if (fd >= 0) vfs_close(fd);
+        embk_blkstat_reset(); embk_blkstat_get(&b0);
+        for (int i = 0; i < 20; i++) {
+            fd = vfs_open(paths[0], O_RDONLY, 0);
+            if (fd >= 0) vfs_close(fd);
+        }
+        embk_blkstat_get(&b1);
+        uint64_t opens = b1.reads - b0.reads;
+        kprintf("  20 opens of ONE warm path:        %llu device reads\n",
+                (unsigned long long)opens);
+        if (opens > 20) fails++;         /* cold was 480 */
+
+        /* (4) THE PART THAT MATTERS MORE THAN THE SPEED: a cache that serves a
+         *     stale answer is worse than no cache. Every case below changes
+         *     something the caches hold and then asks again through the
+         *     ordinary path -- if any of them returns the old answer, the
+         *     numbers above are worthless. */
+        const char *tp = "/metacache.tmp";
+        vfs_unlink_path(tp);
+
+        /* a) a name that did not exist must not stay non-existent. Negative
+         *    answers are deliberately never cached, and create-then-open is
+         *    the most common sequence in the system. */
+        struct vfs_stat s0;
+        bool absent_first = (vfs_stat(tp, &s0) != EMBK_OK);
+        int nfd = vfs_open(tp, O_RDWR | O_CREAT, 0644);
+        bool found_after = (nfd >= 0) && (vfs_stat(tp, &s0) == EMBK_OK);
+        kprintf("  [%s] a file created after a failed lookup is found\n",
+                (absent_first && found_after) ? "ok" : "FAIL");
+        if (!absent_first || !found_after) fails++;
+
+        /* b) the SIZE now comes from the cached inode. A write must move it. */
+        if (nfd >= 0) {
+            size_t w = 0;
+            (void)vfs_fd_write(nfd, "0123456789", 10, &w);
+            (void)vfs_fd_fsync(nfd);
+            vfs_close(nfd);
+        }
+        struct vfs_stat s1;
+        bool grew = (vfs_stat(tp, &s1) == EMBK_OK) && (s1.size == 10);
+        kprintf("  [%s] stat reports the new size after a write (%llu, want 10)\n",
+                grew ? "ok" : "FAIL", (unsigned long long)s1.size);
+        if (!grew) fails++;
+
+        /* c) an unlinked name must stop resolving. This is the one a
+         *    generation-keyed cache gets right and a naive one does not. */
+        (void)vfs_unlink_path(tp);
+        bool gone = (vfs_stat(tp, &s1) != EMBK_OK);
+        kprintf("  [%s] an unlinked file stops resolving\n", gone ? "ok" : "FAIL");
+        if (!gone) fails++;
+
+        struct embkfs_stat es;
+        embkfs_stat_get(&es);
+        kprintf("  inode cache: %llu hits / %llu misses;  name cache: %llu / %llu\n",
+                (unsigned long long)es.icache_hit,
+                (unsigned long long)es.icache_miss,
+                (unsigned long long)es.ncache_hit,
+                (unsigned long long)es.ncache_miss);
+
+        kprintf("[cmd] test metacache: %s\n", fails == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* SEQUENTIAL READS. The page cache made a RE-read free; the FIRST read of a
+     * file still faults one page at a time, and each of those is a separate
+     * trip through the filesystem -- a B-tree descent and an extent walk to
+     * fetch 4 KiB. Reading a 256 KiB file that way is 64 of them.
+     *
+     * Measured cold every time: closing the file releases the last reference
+     * to its page object, which frees its pages, so the reopen below starts
+     * from nothing without needing a "drop caches" lever that would exist only
+     * for this test. */
+    /* THE FUTEX, and the userland mutex built on it.
+     *
+     * Two assertions, and the second matters as much as the first:
+     *
+     *   THE ANSWER IS EXACT. Four threads add to one shared counter under the
+     *   lock. A broken mutex does not crash -- it LOSES UPDATES -- so the only
+     *   meaningful check is that the total is exactly right.
+     *
+     *   THE SLOW PATH WAS TAKEN. A mutex that never blocked would pass the
+     *   first check by luck, and blocking is the entire point of a futex. The
+     *   kernel's own wait/wake counters say whether any thread actually slept.
+     *   A run reporting zero waits proves nothing, however green it looks. */
+    /* ----------------------------------------------------------------------
+     * test deadline -- does declaring a rate actually make a thread punctual?
+     *
+     * THE A/B IS THE TEST. A single run of jitter.elf reports a number with
+     * nothing to compare it to, and "12 ms of jitter" is neither good nor bad
+     * on its own. So the SAME binary is run twice against the SAME load, once
+     * under each policy, and the assertion is that the deadline policy is
+     * better -- which is the only claim being made for it.
+     *
+     * Swapping the policy between runs is safe HERE and is not safe in
+     * general. sched.h says there is deliberately no supported way to change
+     * policy under load, because a policy holding queue state would strand it.
+     * Both of these hold none -- each is a scan of thread_table with all its
+     * state in struct thread -- and the swap happens between two runs with no
+     * deadline thread alive in between. That is a property of these two
+     * policies, not a general permission, and a third one with a run queue
+     * would have to reinstate the restriction.
+     * -------------------------------------------------------------------- */
+    /* `sched` alone reports the installed policy and how much of the machine
+     * is promised away; `sched <name>` installs another one. See the note in
+     * `test deadline` about when swapping is safe -- it is a property of the
+     * two policies that exist today, not a general guarantee. */
+    if (strcmp(cmd, "sched") == 0) {
+        kprintf("\npolicy: %s   reserved: %u permille (ceiling %u)\n",
+                sched_policy_get()->name, sched_reserved_permille(),
+                (unsigned)SCHED_MAX_RESERVED_PERMILLE);
+        kprintf("available: round-robin, deadline\n");
+        kprintf("[cmd] sched\n");
+        return 1;
+    }
+    if (strncmp(cmd, "sched ", 6) == 0) {
+        const struct sched_policy *p = sched_policy_by_name(cmd + 6);
+        if (!p) {
+            kprintf("\nsched: no policy named \"%s\"\n", cmd + 6);
+        } else {
+            sched_policy_set(p);
+            kprintf("\npolicy: %s\n", sched_policy_get()->name);
+        }
+        kprintf("[cmd] %s\n", cmd);
+        return 1;
+    }
+
+    if (strcmp(cmd, "test deadline") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test deadline: VFS not registered\n");
+            return 1;
+        }
+        const char *jp = "/data/apps/jitter/jitter.elf";
+        struct vfs_stat jst;
+        if (vfs_stat(jp, &jst) != EMBK_OK) {
+            kprintf("\n[cmd] test deadline: %s not on image\n", jp);
+            return 1;
+        }
+
+        const struct sched_policy *saved = sched_policy_get();
+        const struct sched_policy *rr    = sched_policy_by_name("round-robin");
+        const struct sched_policy *dl    = sched_policy_by_name("deadline");
+        if (!rr || !dl) {
+            kprintf("\n[cmd] test deadline: a policy is missing from the table\n");
+            return 1;
+        }
+
+        /* 6 hogs on a 4-core machine: more runnable work than cores, which is
+         * the only condition under which the question means anything. */
+        char *a[] = { (char *)jp, "6", "16", "150", "2", NULL };
+
+        kprintf("\n[deadline] one 16 ms periodic thread, 150 periods, 6 threads\n");
+        kprintf("           that never sleep. Exit code is the WORST lateness\n");
+        kprintf("           in ms (capped at 250).\n");
+
+        kprintf("\n--- policy: round-robin ---\n");
+        sched_policy_set(rr);
+        int pid_rr   = process_create(jp, a, 5, NULL, 0);
+        int worst_rr = pid_rr >= 0 ? process_wait((uint32_t)pid_rr) : -1;
+
+        kprintf("\n--- policy: deadline ---\n");
+        sched_policy_set(dl);
+        int pid_dl   = process_create(jp, a, 5, NULL, 0);
+        int worst_dl = pid_dl >= 0 ? process_wait((uint32_t)pid_dl) : -1;
+
+        /* AND THE SAME QUESTION THROUGH THE REAL TOOLKIT. jitter is a bare
+         * thread with a hand-written sleep loop; framepace is an actual EmApp
+         * with a real window rendering into a real compositor surface, and it
+         * declares nothing itself -- em_app_run declares for it, because it is
+         * animating. So this run is what verifies that the declaration
+         * actually happens on the path every app on this desktop uses, which a
+         * quiet desktop never reaches.
+         *
+         * Not asserted, printed. It renders real frames through a real
+         * compositor, so its absolute numbers depend on the host's graphics
+         * speed in a way jitter's do not, and turning that into a pass/fail
+         * would be asserting something about QEMU. */
+        const char *fp = "/data/apps/framepace/framepace.elf";
+        struct vfs_stat fst;
+        if (vfs_stat(fp, &fst) == EMBK_OK) {
+            char *fa[] = { (char *)fp, "60", "6", NULL };
+
+            kprintf("\n--- the same question through the real UI toolkit ---\n");
+            sched_policy_set(rr);
+            int p1 = process_create(fp, fa, 3, NULL, 0);
+            int w1 = p1 >= 0 ? process_wait((uint32_t)p1) : -1;
+
+            sched_policy_set(dl);
+            int p2 = process_create(fp, fa, 3, NULL, 0);
+            int w2 = p2 >= 0 ? process_wait((uint32_t)p2) : -1;
+
+            /* SPREAD, not lateness: this app renders in software and cannot
+             * hit 16 ms on an emulated machine, so drift from an ideal clock
+             * would be a renderer benchmark. How much worse the worst frame
+             * was than the best is stutter, and stutter survives a slow
+             * renderer -- 15 fps evenly looks fine, 15 fps unevenly does
+             * not. */
+            kprintf("  a real EmApp at 60 Hz, frame-interval spread: "
+                    "round-robin %d ms, deadline %d ms\n", w1, w2);
+        } else {
+            kprintf("\n  (framepace.elf is not on this image -- the toolkit "
+                    "half of this test did not run)\n");
+        }
+
+        sched_policy_set(saved);
+
+        int ok = 1;
+        if (worst_rr < 0 || worst_dl < 0) {
+            kprintf("  [FAIL] a run did not complete (rr=%d dl=%d)\n",
+                    worst_rr, worst_dl);
+            kprintf("[cmd] test deadline: FAIL\n");
+            return 1;
+        }
+
+        kprintf("\n[deadline] worst lateness: round-robin %d ms, deadline %d ms\n",
+                worst_rr, worst_dl);
+
+        /* The comparison, and it is the ONLY assertion worth making. An
+         * absolute bound would be a claim about QEMU's timing rather than
+         * about this kernel; "better than the policy it replaces, on the same
+         * load, in the same boot" is a claim about the change.
+         *
+         * FOUR TIMES BETTER, not merely "no worse". `worst_dl <= worst_rr` was
+         * the assertion and it let the real failure through: when the policy
+         * silently stopped applying (the declared-count reap race, fixed in
+         * process/process.c), a deadline run measured 44 ms against
+         * round-robin's 44 ms and PASSED. Working, this policy is 4 ms against
+         * 115 here and 0-1 against 42-52 on aarch64 -- so a quarter is a wide
+         * margin that still fails the instant the policy is not in effect. */
+        bool dl_better = worst_dl * 4 <= worst_rr;
+        kprintf("  [%s] the deadline policy is 4x better, not merely no worse "
+                "(%d <= %d/4 ms)\n", dl_better ? "ok" : "FAIL", worst_dl, worst_rr);
+        if (!dl_better) ok = 0;
+
+        /* Sanity on the load itself. If round-robin already delivered every
+         * period inside one tick, the machine was not actually contended and
+         * the run above proves nothing either way -- so say so rather than
+         * quietly banking a green tick. */
+        if (worst_rr < 10) {
+            kprintf("  (round-robin's worst was only %d ms -- the load did not\n"
+                    "   contend, so this comparison is not evidence)\n", worst_rr);
+        }
+
+        kprintf("  reserved after both runs: %u permille (0 expected: the\n"
+                "  declaration dies with the thread)\n",
+                sched_reserved_permille());
+        if (sched_reserved_permille() != 0) {
+            kprintf("  [FAIL] a reservation outlived its thread\n");
+            ok = 0;
+        }
+
+        kprintf("[cmd] test deadline: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test futex") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test futex: VFS not registered\n");
+            return 1;
+        }
+        const char *lp = "/data/apps/lockdemo/lockdemo.elf";
+        struct vfs_stat st;
+        if (vfs_stat(lp, &st) != EMBK_OK) {
+            kprintf("\n[cmd] test futex: %s not on image\n", lp);
+            return 1;
+        }
+
+        uint64_t w0, k0, e0, w1, k1, e1;
+        futex_stats(&w0, &k0, &e0);
+
+        char *a[] = { (char *)lp, NULL };
+        int pid = process_create(lp, a, 1, NULL, 0);
+        int rc  = pid >= 0 ? process_wait((uint32_t)pid) : -1;
+
+        futex_stats(&w1, &k1, &e1);
+        uint64_t waits = w1 - w0, wakes = k1 - k0, again = e1 - e0;
+
+        int ok = 1;
+        kprintf("\n[futex] phase 1: 4 threads x 2000 increments of one counter\n");
+        kprintf("        phase 2: a bounded queue, 2 producers + 2 consumers\n");
+        /* The exit code says WHICH phase failed, because "the concurrency test
+         * failed" is not a useful thing to be told:
+         *   1 = the mutex lost updates      3 = items were lost or duplicated
+         *   2 = a thread could not start    4 = the checksums disagree      */
+        kprintf("  [%s] both phases exact (exit %d; 1=mutex 3=count 4=checksum)\n",
+                rc == 0 ? "ok" : "FAIL", rc);
+        if (rc != 0) ok = 0;
+
+        kprintf("  [%s] the slow path was actually taken: %llu waits, %llu wakes\n",
+                waits > 0 ? "ok" : "FAIL",
+                (unsigned long long)waits, (unsigned long long)wakes);
+        if (waits == 0) ok = 0;
+
+        /* EAGAIN is the race the in-kernel compare exists to catch: the holder
+         * released between the caller's check and the syscall. Its count is
+         * not asserted -- it depends on timing -- but it is printed, because a
+         * permanent zero would mean that window is never being exercised and
+         * the protection is untested rather than unneeded. */
+        kprintf("  (%llu EAGAIN: the lock changed between the check and the "
+                "syscall -- the window the kernel compare closes)\n",
+                (unsigned long long)again);
+
+        /* Nothing may still be asleep on a futex once the process is reaped. */
+        kprintf("  [%s] no waiter was left behind (%llu waits, %llu wakes)\n",
+                wakes <= waits ? "ok" : "FAIL",
+                (unsigned long long)waits, (unsigned long long)wakes);
+        if (wakes > waits) ok = 0;
+
+        kprintf("[cmd] test futex: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test readahead") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test readahead: VFS not registered\n");
+            return 1;
+        }
+
+        const char *cands[] = {
+            "/data/apps/posixdemo/posixdemo.elf",
+            "/system/bin/shell.elf",
+            "/system/bin/init.elf",
+        };
+        const char *path = NULL;
+        struct vfs_stat st;
+        uint64_t size = 0;
+        for (unsigned i = 0; i < sizeof cands / sizeof cands[0]; i++) {
+            if (vfs_stat(cands[i], &st) == EMBK_OK && st.size >= 64 * 1024) {
+                path = cands[i]; size = st.size; break;
+            }
+        }
+        if (!path) {
+            kprintf("\n[cmd] test readahead: no file >= 64 KiB on the image\n");
+            return 1;
+        }
+
+        static char chunk[4096];
+        struct embk_blkstat b0, b1;
+        struct embkfs_stat e0, e1;
+
+        int fd = vfs_open(path, O_RDONLY, 0);
+        if (fd < 0) { kprintf("\n[cmd] test readahead: cannot open %s\n", path); return 1; }
+
+        embk_blkstat_reset(); embkfs_stat_reset();
+        embk_blkstat_get(&b0); embkfs_stat_get(&e0);
+
+        uint64_t total = 0;
+        for (;;) {
+            size_t got = 0;
+            if (vfs_fd_read(fd, chunk, sizeof chunk, &got) != EMBK_OK || got == 0)
+                break;
+            total += got;
+        }
+        embk_blkstat_get(&b1); embkfs_stat_get(&e1);
+        vfs_close(fd);          /* releases the object: the next read is cold */
+
+        uint64_t pages = (total + 4095) / 4096;
+        uint64_t reads = b1.reads - b0.reads;
+        uint64_t nodes = e1.node_reads - e0.node_reads;
+
+        kprintf("\n[readahead] %s, %llu KiB read cold in 4 KiB chunks\n",
+                path, (unsigned long long)(total / 1024));
+        kprintf("  %llu pages  ->  %llu device reads, %llu B-tree node reads\n",
+                (unsigned long long)pages, (unsigned long long)reads,
+                (unsigned long long)nodes);
+        uint64_t blocks = b1.read_blocks - b0.read_blocks;
+        kprintf("  %llu blocks moved (%llu KiB), avg %llu blocks/request, %llu us\n",
+                (unsigned long long)blocks, (unsigned long long)(blocks / 2),
+                (unsigned long long)(reads ? blocks / reads : 0),
+                (unsigned long long)(b1.read_us - b0.read_us));
+        kprintf("  rcache %llu hit / %llu miss / %llu bypass; ecache %llu / %llu\n",
+                (unsigned long long)(e1.rcache_hit - e0.rcache_hit),
+                (unsigned long long)(e1.rcache_miss - e0.rcache_miss),
+                (unsigned long long)(e1.rcache_bypass - e0.rcache_bypass),
+                (unsigned long long)(e1.ecache_hit - e0.ecache_hit),
+                (unsigned long long)(e1.ecache_miss - e0.ecache_miss));
+
+        bool ok = (total == size);
+        kprintf("  [%s] read the whole file (%llu of %llu bytes)\n",
+                ok ? "ok" : "FAIL", (unsigned long long)total,
+                (unsigned long long)size);
+        kprintf("[cmd] test readahead: %s\n", ok ? "OK" : "FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test pagecache") == 0) {
+        if (!g_vfs_ready) {
+            kprintf("\n[cmd] test pagecache: VFS not registered\n");
+            return 1;
+        }
+
+        const char *path = "/pcachetest.bin";
+        const int N = 512, CHUNK = 64;
+        char buf[64];
+        for (int i = 0; i < CHUNK; i++) buf[i] = (char)('A' + (i % 26));
+
+        int fails = 0;
+        struct embk_blkstat b0, b1;
+        struct vmo_stats v0, v1;
+
+        vfs_unlink_path(path);   /* a stale file from a previous run is not a fixture */
+
+        int fd = vfs_open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            kprintf("\n[cmd] test pagecache: cannot create %s (%d)\n", path, fd);
+            return 1;
+        }
+
+        /* --- 1. the append storm ------------------------------------- */
+        embk_blkstat_reset();
+        embk_blkstat_get(&b0);
+        vmo_stats_get(&v0);
+
+        for (int i = 0; i < N; i++) {
+            size_t w = 0;
+            if (vfs_fd_write(fd, buf, CHUNK, &w) != EMBK_OK || w != (size_t)CHUNK) {
+                fails++; break;
+            }
+        }
+        vmo_stats_get(&v1);
+        uint64_t wb_during = v1.writebacks - v0.writebacks;
+
+        kprintf("\n[pagecache] the write-back cache, measured:\n");
+        kprintf("      %d writes of %d bytes -> %llu page writebacks during the loop\n",
+                N, CHUNK, (unsigned long long)wb_during);
+        /* 512 * 64 = 32 KiB = 8 pages. Write-through would have been 512
+         * transactions; anything near N means the cache is not absorbing. */
+        if (wb_during > 16) { kprintf("      FAIL: writes reached the device one at a time\n"); fails++; }
+
+        /* --- 2. fsync is a real flush --------------------------------- */
+        vmo_stats_get(&v0);
+        int rc = vfs_fd_fsync(fd);
+        vmo_stats_get(&v1);
+        kprintf("      fsync: rc=%d, %llu pages pushed, %llu still dirty\n",
+                rc, (unsigned long long)(v1.writebacks - v0.writebacks),
+                (unsigned long long)v1.dirty_pages);
+        if (rc != EMBK_OK) { kprintf("      FAIL: fsync failed\n"); fails++; }
+        if (v1.writebacks == v0.writebacks) { kprintf("      FAIL: fsync wrote nothing\n"); fails++; }
+
+        /* --- 3. coherence between two independent opens ---------------- */
+        /* Not two descriptors from dup -- a SEPARATE open(), which is the case
+         * that fails if each open caches its own copy of the file. */
+        int fd2 = vfs_open(path, O_RDONLY, 0);
+        if (fd2 < 0) { kprintf("      FAIL: second open\n"); fails++; }
+        else {
+            size_t w = 0;
+            (void)vfs_fd_seek(fd, 0, 2, &(uint64_t){0});
+            const char *tag = "COHERENT";
+            if (vfs_fd_write(fd, tag, 8, &w) != EMBK_OK) fails++;
+
+            char rb[8] = {0};
+            uint64_t at = (uint64_t)N * CHUNK;
+            (void)vfs_fd_seek(fd2, (int64_t)at, 0, &(uint64_t){0});
+            size_t got = 0;
+            int r2 = vfs_fd_read(fd2, rb, 8, &got);
+            bool same = (r2 == EMBK_OK && got == 8 && rb[0] == 'C' && rb[7] == 'T');
+            kprintf("      a write through one open is visible to another, unflushed: %s\n",
+                    same ? "OK" : "FAIL");
+            if (!same) fails++;
+            vfs_close(fd2);
+        }
+
+        /* --- 4. the second read of a file costs the device nothing ----- */
+        /* The SEEK stays outside the measured window on purpose. A seek asks
+         * the filesystem for the file's size, and that is a B-tree walk that
+         * legitimately reads the device -- metadata caching is a separate
+         * problem from page caching, and folding them together here would
+         * measure the wrong thing and hide both. */
+        char big[512];
+        size_t got = 0;
+        (void)vfs_fd_seek(fd, 0, 0, &(uint64_t){0});
+        for (int i = 0; i < 8; i++) (void)vfs_fd_read(fd, big, sizeof big, &got);
+        (void)vfs_fd_seek(fd, 0, 0, &(uint64_t){0});
+
+        embk_blkstat_get(&b0);
+        vmo_stats_get(&v0);
+        for (int i = 0; i < 8; i++) (void)vfs_fd_read(fd, big, sizeof big, &got);
+        embk_blkstat_get(&b1);
+        vmo_stats_get(&v1);
+        kprintf("      re-reading 4 KiB already cached: %llu device reads, %llu cache hits\n",
+                (unsigned long long)(b1.reads - b0.reads),
+                (unsigned long long)(v1.hits - v0.hits));
+        if (b1.reads != b0.reads) { kprintf("      FAIL: a cached read still touched the device\n"); fails++; }
+
+        /* --- 5. the pages come back under pressure --------------------- */
+        /* While the file is still OPEN -- closing it releases the object and
+         * its pages anyway, which would make this measure nothing. The point
+         * is that a LIVE cache yields memory the moment something else wants
+         * it. */
+        vmo_stats_get(&v0);
+        uint64_t free_before = pmm_free_pages();
+        uint64_t got_back = vmo_reclaim(4);
+        uint64_t free_after = pmm_free_pages();
+        kprintf("      %llu pages resident; reclaim asked for 4, freed %llu, "
+                "pmm %llu -> %llu\n",
+                (unsigned long long)v0.resident_pages, (unsigned long long)got_back,
+                (unsigned long long)free_before, (unsigned long long)free_after);
+        if (v0.resident_pages >= 4 && got_back != 4) {
+            kprintf("      FAIL: reclaim did not free what it could\n"); fails++;
+        }
+        if (free_after != free_before + got_back) {
+            kprintf("      FAIL: reclaim reported pages it did not return\n"); fails++;
+        }
+
+        /* And the file still reads correctly through the hole it just made:
+         * eviction is not data loss, it is a re-read. */
+        (void)vfs_fd_seek(fd, 0, 0, &(uint64_t){0});
+        got = 0;
+        int rr = vfs_fd_read(fd, big, sizeof big, &got);
+        bool intact = (rr == EMBK_OK && got == sizeof big && big[0] == 'A' && big[25] == 'Z');
+        kprintf("      the file reads correctly after eviction: %s\n", intact ? "OK" : "FAIL");
+        if (!intact) fails++;
+
+        vfs_close(fd);
+        vfs_unlink_path(path);
+
+        vmo_stats_get(&v1);
+        kprintf("      cache now: %llu objects, %llu resident, %llu dirty, "
+                "%llu hits / %llu misses, %llu evictions\n",
+                (unsigned long long)v1.objects, (unsigned long long)v1.resident_pages,
+                (unsigned long long)v1.dirty_pages, (unsigned long long)v1.hits,
+                (unsigned long long)v1.misses, (unsigned long long)v1.evictions);
+        kprintf("[cmd] test pagecache: %s\n", fails == 0 ? "OK" : "FAIL");
+        return 1;
+    }
+
+    /* What this machine is running on and what it is spending.
+     *
+     * The idle percentage is the number worth watching: it should be high on a
+     * machine with nothing to do, and if it falls without the workload
+     * changing, something started polling. That is a regression this command
+     * can catch and nothing else in the tree can. */
+    if (strcmp(cmd, "power") == 0) {
+        kprintf("\n[power]\n");
+        for (uint32_t c = 0; c < 64; c++) {
+            struct power_cpu_stats st;
+            if (!power_cpu_stats(c, &st))
+                continue;
+            kprintf("  cpu%u: idle %llu of %llu ms (%llu%%), %llu halts, "
+                    "%llu timer irqs (%llu/s)\n",
+                    (unsigned)c,
+                    (unsigned long long)st.idle_ms,
+                    (unsigned long long)st.uptime_ms,
+                    (unsigned long long)(st.uptime_ms ? st.idle_ms * 100 / st.uptime_ms : 0),
+                    (unsigned long long)st.idle_entries,
+                    (unsigned long long)st.timer_irqs,
+                    (unsigned long long)(st.uptime_ms ? st.timer_irqs * 1000 / st.uptime_ms : 0));
+        }
+        kprintf("  system idle: %u%%\n", (unsigned)power_idle_percent());
+
+        struct power_supply_state ps;
+        if (power_supply_get(&ps)) {
+            kprintf("  supply: %s, battery %s",
+                    ps.source == POWER_SOURCE_BATTERY ? "battery" : "AC",
+                    ps.battery_present ? "present" : "absent");
+            if (ps.battery_present)
+                kprintf(", %u%%%s", (unsigned)ps.percent, ps.charging ? " (charging)" : "");
+            kprintf("\n");
+        } else {
+            /* Not a stub and not a failure: this machine has no battery, and
+             * saying so is the accurate answer. */
+            kprintf("  supply: no power-supply driver -- this machine has no battery\n");
+        }
+        return 1;
+    }
+
+    if (strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "shutdown") == 0) {
+        int rc = power_transition(POWER_OFF);
+        kprintf("\n[cmd] poweroff: FAILED (%d) -- %s\n", rc, power_last_error());
+        return 1;
+    }
+
+    if (strcmp(cmd, "reboot") == 0) {
+        int rc = power_transition(POWER_REBOOT);
+        kprintf("\n[cmd] reboot: FAILED (%d) -- %s\n", rc, power_last_error());
+        return 1;
+    }
+
     if (strcmp(cmd, "test fpu") == 0) {
         int rc = process_test_fpu();
         kprintf("\n[cmd] test fpu: %s\n", rc == 0 ? "OK" : "FAIL");
@@ -5960,18 +10514,30 @@ int selftests_handle_command(const char *cmd)
              IS_THERE("/system/abi/crt0.o") && IS_THERE("/system/abi/syscalls.o") &&
              IS_THERE("/system/abi/libc.a"));
 
-        /* /data -- mutable state: installed apps + user/scratch dirs. */
-        LCHK("/data/apps/{tcc,git}", IS_THERE("/data/apps/tcc/tcc.elf") &&
-             IS_THERE("/data/apps/git/git.elf"));
+        /* /data -- mutable state: installed apps + user/scratch dirs.
+         *
+         * tcc is OPTIONAL -- the Makefile only stages it when a host copy was
+         * found (HAVE_TCC) -- so a build without it must SKIP this line, not
+         * fail it. A test that reports a red light for a component nobody asked
+         * to build is a test people learn to ignore. */
+        if (IS_THERE("/data/apps/tcc/tcc.elf"))
+            LCHK("/data/apps/{tcc,git}", IS_THERE("/data/apps/git/git.elf"));
+        else
+            kprintf("  SKIP /data/apps/tcc (not built: HAVE_TCC was off)\n");
         LCHK("/data/tmp and /data/users/teo exist",
              IS_THERE("/data/tmp") && IS_THERE("/data/users/teo"));
 
-        /* THE SCOPE DECISION, asserted so a future reader knows it was deliberate:
-         * demos and fonts stayed at ROOT and did NOT move under /system. */
+        /* WHERE THE SEALED ASSETS LIVE. This pair used to assert the opposite
+         * -- "demos and fonts stayed at ROOT" -- and it had been failing since
+         * 2026-07-28, when f743bd3 ("userspace v2: init as the root of
+         * authority (UP1) + fonts to /system") moved the fonts and did not
+         * come back here. Six weeks of a red light on a test whose subject had
+         * simply moved, which is worse than having no test: it teaches the
+         * reader that this one is always red. */
         LCHK("a demo moved to /data/apps (/data/apps/uidemo/uidemo.elf, not /uidemo.elf)",
              IS_THERE("/data/apps/uidemo/uidemo.elf") && !IS_THERE("/uidemo.elf"));
-        LCHK("fonts stayed at root (/font.ttf, not /system/lib/font.ttf)",
-             IS_THERE("/font.ttf") && !IS_THERE("/system/lib/font.ttf"));
+        LCHK("fonts are sealed under /system/fonts (not root stragglers)",
+             IS_THERE("/system/fonts/font.ttf") && !IS_THERE("/font.ttf"));
 
         /* The OLD flat paths must be GONE -- a lingering /system/bin/shell.elf would mean the
          * migration half-happened (dangerous: two truths for one program). */

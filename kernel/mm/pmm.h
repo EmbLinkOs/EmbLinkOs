@@ -3,10 +3,11 @@
 
 
 #include <stdint.h>
+#include "include/types.h"
 
 
 // The memory map now arrives via the boot protocol (struct boot_mmap_entry in
-// arch/x86_64/boot/boot_protocol.h), not a fixed buffer stage2 writes. The old
+// boot/boot_protocol.h), not a fixed buffer stage2 writes. The old
 // `struct e820_entry` and the E820_*_ADDR buffer pointers below are retired --
 // only the TYPE constants survive, because boot_mmap_entry.type reuses them.
 
@@ -53,6 +54,13 @@ uint64_t pmm_alloc_page(void);
  * See the rotating hint in pmm_alloc_page. */
 void pmm_scan_stats(uint64_t *out_bits, uint64_t *out_allocs);
 
+/* How many physical pages are currently free. Exists so that "this was freed"
+ * can be CHECKED rather than announced: take it before and after a teardown
+ * and the difference is the truth about whether anything leaked. */
+uint64_t pmm_free_pages(void);
+uint64_t pmm_total_pages(void);
+uint64_t pmm_used_pages(void);
+
 // takes a physical address and frees the corresponding virtual page
 void pmm_free_page(uint64_t phys_addr);
 
@@ -64,6 +72,31 @@ void pmm_free_page(uint64_t phys_addr);
 // pmm_alloc_page() happens to return. Idempotent: reserving an
 // already-reserved page is a harmless no-op.
 void pmm_reserve_page(uint64_t phys_addr);
+
+/* Reserve the fixed physical pages THIS ARCHITECTURE cannot allocate normally,
+ * called near the end of pmm_init() once the bitmap exists.
+ *
+ * Implemented once per architecture, because the answer genuinely differs and
+ * there is no sensible portable default:
+ *   x86_64   -- the AP trampoline at AP_TRAMPOLINE_PHYS: SMP bring-up copies
+ *               real-mode startup code to a fixed low page that INIT-SIPI-SIPI
+ *               jumps to, so the allocator must never hand it out.
+ *   aarch64  -- nothing. PSCI CPU_ON takes the entry point as an argument, so
+ *               secondary CPUs start wherever we already are. An empty
+ *               implementation here is a FACT about the architecture, not a
+ *               stub waiting to be filled in.
+ *
+ * A new architecture must provide this; leaving it out is a link error, which
+ * is the correct outcome -- silently reserving nothing would be a bug that only
+ * appears when a second CPU starts. */
+void arch_pmm_reserve_fixed(void);
+
+/* MEMORY THAT ARRIVED AFTER BOOT. The bitmap is sized once from the firmware's
+ * memory map and sits immediately after the kernel image, so it cannot be
+ * extended in place -- a region above its coverage gets a new bitmap from the
+ * kernel heap with the old one copied in. Needs the heap, so it cannot run
+ * during early boot. Returns true if any page actually became available. */
+bool pmm_add_region(uint64_t phys, uint64_t length);
 
 
 

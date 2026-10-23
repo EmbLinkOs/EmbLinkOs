@@ -33,6 +33,54 @@ EmbLinkOS today is a 64-bit x86 kernel with:
 - Track open issues in `TODO.md`; record completed work here.
 - SMP-aware and portability-minded from the start (arch-specific code kept
   identifiable so an ARM64 port later is a contained campaign, not a rewrite).
+  **Now audited and planned in `docs/ARM64.md`** — the claim measured true
+  (`arch/x86_64/` is 11% of 58k kernel lines; the asm that leaked out collapses
+  into seven repeated primitives), with the syscall argument-passing seam as the
+  one genuine exception. **Phases A0-A9 are built and the campaign is
+  finished: the REAL DESKTOP SESSION RUNS ON ARM, on four cores.**
+  `make ARCH=aarch64` produces
+  a kernel that boots at EL1 on QEMU `virt`, decodes and survives its own
+  faults, runs in the higher half with the MMU on -- reading its memory map
+  from the device tree and driving the SAME `kernel/mm/pmm.c` the x86 build
+  uses, unmodified -- and preemptively switches between kernel threads on a
+  GICv3-delivered generic-timer tick. Checked by
+  `make ARCH=aarch64 test-arm64-boot`. On the x86 side, A4 took the 95 syscall
+  handlers out of `arch/x86_64/` -- they read `struct sysargs` now, not machine
+  registers, so `arch/x86_64/syscall/syscall.c` is 88 lines instead of 2,019.
+  A5 then ran an aarch64 program at EL0 through those same neutral handlers.
+  With the first HAL piece extracted (`kernel/include/arch_irq.h`), **61 of the
+  76 shared kernel files -- 31,465 lines -- compile for aarch64**; eleven of the
+  fourteen that do not are x86 drivers for hardware ARM does not have. **The
+  whole shared kernel links and runs on aarch64**, mounting a real EMBKFS image
+  over virtio-blk and reading files out of it. The
+  shared kernel heap (`kernel/mm/kheap.c`, slabs and canaries and all) runs
+  unchanged on aarch64, and all 3,700 lines of `kernel/process/process.c` --
+  the scheduler -- compile for it with zero inline assembly left in them.
+  Per-process address spaces work there too, with isolation and leak-free
+  teardown both machine-checked. **All 64 shared files LINK against the aarch64
+  tree**; the 37 symbols still undefined are device drivers for hardware QEMU
+  `virt` does not have -- which A7 then supplied. **A6 gave aarch64 a
+  userland:** newlib built for the target by the same script and the same
+  options x86 uses (`tools/newlib/build-newlib-emblink.sh`), one `user/lib`
+  with an `svc #0` branch beside the `int $0x80` one, and THIRTY programs built
+  from a list DERIVED from the x86 app discovery rather than retyped. **A7 gave
+  it devices:** virtio-gpu at 1280x800, virtio-blk, and virtio-input as a
+  translation layer into the SHARED keyboard and mouse drivers (whose PS/2
+  halves are now behind `#if defined(__x86_64__)` and whose policy halves are
+  not). **`init.elf` is pid 1 there, the same one x86 runs** -- it
+  authenticates, builds a confined namespace and spawns `home.elf`, so the
+  desktop is init's child. Machine-checked end to end by
+  `make ARCH=aarch64 test-arm64-boot`, which asserts every phase's "done when"
+  under BOTH accelerators and injects real keyboard and pointer events over QMP
+  to prove input ARRIVES rather than merely enumerating. **A9 brought up the
+  other cores over PSCI** -- four by default, each configuring its own GIC
+  redistributor, timer and per-CPU pointer -- and the machine now has every
+  device `virt` offers: virtio-blk, -gpu, -input, -snd, and MSI through the GIC
+  ITS (with a correct INTx fallback on HVF, which exposes no ITS). The userland
+  is at PARITY: all 52 programs x86 builds, plus two more.
+  The x86 build is untouched by all of it (`ARCH` defaults to `x86_64`, the
+  aarch64 rules are in a fragment the default build never parses, and
+  `make -n all` is byte-identical to before the campaign).
 - See `ARCHITECTURE.md` §1 for the full governing principle ("bless the clean
   native primitive; provide the compatible one as an opt-in layer") and §3 for
   the settled architectural decisions (`spawn()` over `fork()`, message ports
@@ -646,7 +694,7 @@ newlib-based libc port.*
   icons, and borders; and the toolkit got its first **drag-and-drop** — a
   `Dock` container whose chips you drag to reorder or pull out to remove
   (`em_dock`) — which powers a **dynamic Apple-modern menu bar**
-  (`user/bin/topbar.c`, auto-spawned by home): a chromeless glass strip with a
+  (`user/apps/topbar/topbar.c`, auto-spawned by home): a chromeless glass strip with a
   leading logo, a `File`/`Edit`/`View` menu bar, a `DragHandle` middle that
   moves the whole bar, and a right-side dock of status chips + clock + a pin
   control that snaps the bar to a screen anchor (`em_window_move_to`). The
@@ -694,13 +742,18 @@ newlib-based libc port.*
   rounding, is 26px, bolds the owning app's name, and carries bare status
   glyphs in equal-width slots rather than boxed chips. It paints NOTHING at all
   -- no fill, no frost: the menu bar is its text and glyphs sitting directly on
-  the wallpaper. The dock names the app under the pointer in a floating glass
-  label, and its band is the pill plus a gap so it reads as floating rather
-  than as a taskbar welded to the screen edge; window controls are
-  **traffic lights** (red close, green minimize) whose symbol appears only on
-  hover, drawn as a small dot inside a deliberately larger invisible hit area.
-  The three essential applications share one
-  house style (`AppBar`): traffic lights leading, a centred title, the app's
+  the wallpaper -- and it reports a MEASURED number (the session's CPU use,
+  per core, from `embk_proc_list`) where four decorative glyphs used to sit.
+  The dock names the app under the pointer in a floating glass label, and its
+  band is the rack plus a gap so it reads as floating rather than as a taskbar
+  welded to the screen edge; a RUNNING app sits in a lit socket rather than
+  over a dot, and nothing magnifies under the pointer. Window controls are
+  **three lights** -- round, but close in the danger tone, zoom in the accent,
+  minimize a quiet slate, and every glyph drawn at rest rather than revealed on
+  hover. Resting on the zoom light opens a **board of placements**: Left,
+  Right, Top, Bottom, Fill (the work area, bar and dock still reachable) and
+  Full (the whole display). The three essential applications share one
+  house style (`AppBar`): the three lights leading, a centred title, the app's
   own controls trailing. **Files** is a real file manager (places sidebar,
   back/forward/up, live search that FILTERS rather than navigates, grid/list
   views, human sizes and named kinds, New Folder); **Settings** is built to the
@@ -728,7 +781,7 @@ newlib-based libc port.*
   broadly, not just a message-passing feature on its own.
 - **`epfs`** (`kernel/fs/epfs.c`): an additional lightweight filesystem
   backend alongside EMBKFS/FAT32 in the VFS mount registry.
-- **The home launcher** (`user/bin/home.c`) replaces the interactive kernel
+- **The home launcher** (`user/apps/home/home.c`) replaces the interactive kernel
   shell as the default boot target: a full-screen chromeless desktop window
   hosting an app-tile grid (click to `spawn()`), spawning the clock desktop
   widget (`clockw.elf`) automatically. It hand-rolls its own event loop
@@ -744,7 +797,7 @@ newlib-based libc port.*
   split view, every V4/V5 component), `v6demo.elf` (the V6 menu system — the
   "Menus" home tile), `v7demo.elf` (the V7 text editor — the "Editor" home
   tile), `clockw.elf` (the minimal `EM_WIDGET` reference, an uptime clock
-  ticking on the desktop). New EmUI apps under `user/bin/*.c` are
+  ticking on the desktop). New EmUI apps under `user/apps/*/*.c` are
   auto-discovered by the Makefile and packed into the EMBKFS image — no
   per-app build rule or mkfs entry to add by hand.
 
@@ -754,7 +807,7 @@ newlib-based libc port.*
 
 A whole network stack, hand-written in `kernel/net/` (split per-protocol, one
 
-And something now STANDS on it: `httpd` (`user/httpd/` + `user/bin/httpd.c`) is a real HTTP/1.1 server that serves the OS's own filesystem -- request parsing, percent-decoded paths, directory listings, content types by extension, 403/404/405, and files streamed in 32KB bites. Point a browser on the host at a SLIRP-forwarded port and you are reading EMBKFS through our own virtio-net, IPv4, TCP and socket layer (`test httpserve`).
+And something now STANDS on it: `httpd` (`user/httpd/` + `user/tools/httpd/httpd.c`) is a real HTTP/1.1 server that serves the OS's own filesystem -- request parsing, percent-decoded paths, directory listings, content types by extension, 403/404/405, and files streamed in 32KB bites. Point a browser on the host at a SLIRP-forwarded port and you are reading EMBKFS through our own virtio-net, IPv4, TCP and socket layer (`test httpserve`).
 concern per file). virtio-net driver (mirrors the virtio-gpu transport, split
 virtqueues, KV2P DMA, MSI-X RX interrupt) under Ethernet/ARP/IPv4/ICMP, then
 UDP + a DHCP client (real DORA lease at boot) + a minimal DNS resolver, then
@@ -808,6 +861,17 @@ The OS now owns and rebuilds its whole toolchain, on itself:
   fdlibm tree + app) on the metal and passes real math at 1e-12. **The loop is
   closed: compiler + the libc it built + linker + format + loader, one owned
   system.** (`SPAWN_ARGV_MAX` 32→64 to fit a 39-object link in one argv.)
+- **C++ on the metal** (`test embcc cxx`): the on-image `embcc.elf` compiles a
+  C++ program *here* — a global constructor, virtual dispatch through a base,
+  templates, `new`/`delete` and `new[]`/`delete[]`, a guarded function-local
+  static — `embld.elf` links it against the sealed ABI (`/system/abi`: crt0.o,
+  syscalls.o, libc.a), and it runs and exits 42. No host compiler and no TCC in
+  that loop. The program defines the handful of runtime entry points a plain
+  C++ program needs (`operator new`/`delete`, `__cxa_guard_*`,
+  `__cxa_pure_virtual`), so only the C ABI has to be on the image: what is
+  judged is the compiler, not a C++ library. `test cxx` is its companion at the
+  other end — `cxxdemo.elf`, with `<iostream>`, compiled by EmbCC on the host
+  against the libstdc++ EmbCC itself built from GCC's sources.
 
 ---
 
@@ -921,7 +985,7 @@ verified on the metal.
   `test nbsock`). With those, **stock `pip install` works**: `urllib3` → our
   `ssl.py` → `_embtls` → an authenticated PyPI fetch, `pip install six` succeeds.
 - **T7 — `git clone` over our TLS.** git can't fork/exec its HTTPS transport here,
-  so `gitclone` (`user/git/` + `user/bin/gitclone.c`) drives git's **smart-HTTP
+  so `gitclone` (`user/git/` + `user/tools/gitclone/gitclone.c`) drives git's **smart-HTTP
   protocol** directly over libtls: ref discovery, `git-upload-pack` fetch, an own
   **packfile unpacker** (own zlib-streaming inflate + delta resolution) named by an
   **own SHA-1**, then writes a real `.git` + checks out the working tree.
@@ -981,7 +1045,7 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
   build_id/caps/namespace/provides`) that *mirrors* an app's declared authority
   (its EMBX cap table + its UP4 `.ns`). It is a **view, not a second source of
   truth**: `pkg` cross-checks it against the real binary so it cannot drift.
-- **`pkg`** (`user/bin/pkg.c` + `user/pkg/`): `verify` recomputes the EMBX
+- **`pkg`** (`user/tools/pkg/pkg.c` + `user/pkg/`): `verify` recomputes the EMBX
   `build_id` (SHA-256 with `build_id`+`header_checksum` zeroed, EMBX §3.4 — the
   kernel loader checks CRCs but not this) and matches it to the header *and* the
   manifest, cross-checks the manifest `caps:` against the cap table + `abi`.
@@ -1013,7 +1077,7 @@ exceed the grant. Full design in `docs/PACKAGING_AND_SDK.md`; PK1 shipped.
   or namespace** unless `--allow-widen` (a new version cannot silently widen its
   reach); `pkg rollback/remove/info` complete the set. `test pkg` runs 8 checks
   green on the metal.
-- **PK2b — on-device package generation.** `pkgbuild` (`user/bin/pkgbuild.c` +
+- **PK2b — on-device package generation.** `pkgbuild` (`user/tools/pkgbuild/pkgbuild.c` +
   `user/pkg/embxgen.c`, a C EMBX writer byte-identical to mkembx) turns one
   `.pkgspec` + a linked ELF into the three views ON THE OS ITSELF; `pkg install
   --local` adopts the unsigned dev build. `test pkgbuild` proves generate →
@@ -1040,7 +1104,7 @@ hostile page needs a bounded appetite), `style.c` computes a `struct vstyle`
 from a user-agent stylesheet, `render.c` maps the CSS box model onto EmUI --
 blocks become columns, an inline run becomes a wrapping row holding ONE TEXT
 NODE PER WORD, list items become [marker][column] so wrapped text hangs under
-itself, `<pre>` neither collapses nor wraps. `user/bin/vellum.c` is the app:
+itself, `<pre>` neither collapses nor wraps. `user/apps/vellum/vellum.c` is the app:
 URL bar, back/forward, clickable links, a status line. The renderer reads only
 `struct vstyle` and never a tag name, so real CSS changes how that struct is
 FILLED and nothing else.
@@ -1055,7 +1119,7 @@ window. Clicks and timers reach the page too: `addEventListener('click')`,
 clickable so a page's links keep working.
 
 **The engine half.** QuickJS 2024-01-13 cross-compiled
-against newlib and hosted by ~100 lines of our own (`user/bin/js.c`) -- one
+against newlib and hosted by ~100 lines of our own (`user/apps/js/js.c`) -- one
 patch of two hunks for the whole 58k-line engine, both hunks merely widening
 existing `#ifdef`s. `js hello.js` runs closures, regexps, Array.sort and
 JSON from the OS's shell. The DOM bindings, which are the point, are next.
@@ -1910,7 +1974,7 @@ order check over a space the copier does not emit.
 
 ### Phase 38 — Note++: the OS's own code editor ✅
 
-`user/bin/edit.c` is the one-file editor: a buffer, a Save button, the path
+`user/apps/edit/edit.c` is the one-file editor: a buffer, a Save button, the path
 Files handed it. Note++ is the other thing — eight documents at once, a caret
 you drive from the keyboard, selection, undo/redo, find and replace, and code
 coloured by the same keyword tables the OS's own compiler reads.
@@ -1924,7 +1988,7 @@ tests: `make edit-test` and `make syntax-test` run on the build machine in
 under a second. An editor is mostly edge cases (a selection dragged backwards,
 an undo that restores the cursor as well as the characters, a replace-all whose
 replacement contains the search term) and none of them are worth discovering on
-a screen. `user/bin/notepp.c` is the part that cannot be tested that way:
+a screen. `user/apps/notepp/notepp.c` is the part that cannot be tested that way:
 pixels, keys and files.
 
 It draws its own text rather than using the toolkit's TextEditor, which cannot
@@ -2053,7 +2117,7 @@ Full list, kept current: `TODO.md`. Summary of the ones most likely to bite:
   On the metal: 27.3 s of continuous audio, zero dropouts in 55 half-second
   windows. MPEG-2/2.5 not done (says so rather than guessing).
   `make test-mp3`, `make test-mp3-pcm`, `make test-resample`.
-- Photos: the picture viewer (`user/bin/photos.c` + `user/photos/`) reads
+- Photos: the picture viewer (`user/apps/photos/photos.c` + `user/photos/`) reads
   PNG and JPEG through the browser's own decoders and resamples by AREA
   AVERAGE rather than leaving it to the compositor's bilinear blitter —
   which is right for magnifying and aliases badly when shrinking. On the

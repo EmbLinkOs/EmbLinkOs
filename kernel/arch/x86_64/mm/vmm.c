@@ -1,0 +1,1129 @@
+#include "include/arch_dma.h"
+#include "mm/vmm.h"
+#include "arch/x86_64/cpu/cpu_features.h"
+#include "include/arch_ipi.h"
+#include "mm/pmm.h"
+#include "include/kstring.h"
+#include "boot/boot_protocol.h"   /* memory map now arrives via the boot protocol */
+#include "drivers/char/serial.h"
+#include "include/spinlock.h"
+#include <stdint.h>
+#include <stdbool.h>
+
+
+static uint64_t kernel_pml4_phys = 0;     // physical address of the kernel PML4
+static int vmm_direct_map_active = 0;     // 0 during early init, 1 after the CR3 switch
+extern uint8_t kernel_end[];
+
+/* Guards every page-table STRUCTURE mutation (vmm_map_in/vmm_unmap/
+ * vmm_create_address_space/vmm_destroy_address_space, all of which walk or
+ * rewrite shared PML4/PDPT/PD/PT pages via get_or_create_table()/
+ * vmm_destroy_table()) plus the kstack/MMIO bump-pointer VA reservations
+ * below. Unlike pmm_lock/heap_lock (added alongside this one, same reason),
+ * this one was missing when Phase 3's SMP scheduler integration first
+ * landed: process_create_kthread() calls vmm_alloc_kernel_stack() ->
+ * vmm_map() with NO g_sched_lock held (proc_alloc() already released it),
+ * while process_reap_slot() calls vmm_free_kernel_stack()/
+ * vmm_destroy_address_space() -> vmm_unmap() WITH g_sched_lock held -- two
+ * DIFFERENT locks (one of them nonexistent), so a kthread creation on one
+ * core and a reap on another could walk/rewrite the exact same shared
+ * page-table page at the same time. Observed directly: a double fault
+ * inside vmm_flush_tlb() (a bare invlpg) with a live, non-zero RBP --
+ * config consistent with corrupted page-table structure, not a fresh/
+ * never-run context (which is the OTHER class of bug already fixed
+ * elsewhere in this file's callers). */
+static spinlock_t vmm_lock = SPINLOCK_INIT;
+
+
+// Map a physical page-table page to a usable virtual pointer.
+//
+// Page-table pages are handed out by the PMM from anywhere in usable RAM, so
+// they routinely live past the kernel image. Before the CR3 switch the only
+// active mapping that spans arbitrary low RAM is the stage2 kernel window
+// (KP2V covers the low 1GB). After the switch that window only covers the
+// kernel image (up to ~2MB), so we must reach page-table pages through the
+// direct map (P2V), which spans all usable RAM. Using KP2V post-switch is the
+// bug that faulted once the kernel grew enough to push allocations past 2MB.
+static inline uint64_t *vmm_table(uint64_t phys) {
+    return (uint64_t *)(vmm_direct_map_active ? P2V(phys) : KP2V(phys));
+}
+static inline uint64_t *vmm_pml4(void) { return vmm_table(kernel_pml4_phys); }
+
+
+
+
+
+// helper functions
+static inline uint64_t pml4_index(uint64_t v) { return (v >> 39) & 0x1ff; }
+static inline uint64_t pdpt_index(uint64_t v) { return (v >> 30) & 0x1ff; }
+static inline uint64_t pd_index(uint64_t v) { return (v >> 21) & 0x1ff; }
+static inline uint64_t pt_index(uint64_t v) { return (v >> 12) & 0x1ff; }
+
+// Allocation and zero a new table
+static uint64_t *alloc_table(void) {
+
+    uint64_t pyhs_addr = pmm_alloc_page();
+    if (!pyhs_addr){
+        return 0;
+    }
+    uint64_t *table = (uint64_t *)vmm_table(pyhs_addr);
+    for (int i = 0; i < 512; i++) {
+        table[i] = 0;
+    }
+    return table;
+}
+
+/* Create a fresh address space: a new PML4 whose USER half(slots 0-255) is empty 
+ and the KERNEL half (slots 256-511) is identity-mapped. returns the physical address of the new PML4. */
+uint64_t vmm_create_address_space(void) {
+    uint64_t pml4_phys = pmm_alloc_page();
+    if (!pml4_phys) {
+        return 0;
+    }
+
+    spin_lock(&vmm_lock);
+
+    uint64_t *pml4 = (uint64_t *)vmm_table(pml4_phys);    // virtual pointer to the new PML4
+    uint64_t *kernel_pml4 = vmm_pml4(); // virtual pointer to the kernel's PML4
+
+    for (int i = 0; i < 512; i++) {
+        pml4[i] = 0;                    // empty user half + identity-map kernel half
+    }
+
+    for (int i = 256; i < 512; i++) {
+        pml4[i] = kernel_pml4[i];      // copy kernel half from the current PML4
+    }
+
+    spin_unlock(&vmm_lock);
+    return pml4_phys;
+}
+
+static void vmm_destroy_table(uint64_t table_phys, int level) {
+    uint64_t *table = vmm_table(table_phys);
+
+    for (int i = 0; i < 512; i++) {
+        uint64_t entry = table[i];
+        if (!(entry & VMM_PRESENT)) {
+            continue;
+        }
+
+        uint64_t child_phys = entry & VMM_ADDR_MASK;
+
+        if (level == 1) {
+            pmm_free_page(child_phys);
+            continue;
+        }
+
+        if (entry & VMM_HUGE) {
+            serial_write_string("vmm_destroy_address_space: huge user mapping unsupported\n");
+            continue;
+        }
+
+        vmm_destroy_table(child_phys, level - 1);
+    }
+
+    pmm_free_page(table_phys);
+}
+
+void vmm_destroy_address_space(uint64_t pml4_phys) {
+    if (!pml4_phys || pml4_phys == kernel_pml4_phys) {
+        return;
+    }
+
+    spin_lock(&vmm_lock);
+
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    for (int i = 0; i < 256; i++) {
+        uint64_t entry = pml4[i];
+        if (!(entry & VMM_PRESENT)) {
+            continue;
+        }
+
+        vmm_destroy_table(entry & VMM_ADDR_MASK, 3);
+        pml4[i] = 0;
+    }
+
+    spin_unlock(&vmm_lock);
+    pmm_free_page(pml4_phys);
+}
+
+
+/* Switch the active address space by loading CR3 with a new PML4 physical address */
+void vmm_switch_address_space(uint64_t pml4_phys) {
+    __asm__ volatile("mov %0, %%cr3" : : "r"(pml4_phys) : "memory");
+}
+/* PTE bit 7 is the PAT index bit on a 4KB LEAF entry, but the PS (page-size)
+ * bit on a PDPTE/PDE. We use it as the PAT bit to select Write-Combining for
+ * leaf mappings (vmm_map_mmio_wc / vmm_pat_init_this_cpu). It must therefore
+ * NEVER reach an intermediate table entry, where it would wrongly declare a
+ * huge page -- vmm_map_in() masks it out of the flags it hands to
+ * get_or_create_table(). (Real huge pages are made by a separate direct PD
+ * write, not through this path, so nothing legitimately propagates bit 7 up.) */
+#define VMM_PTE_PAT (1ULL << 7)
+
+/* The permissions an INTERMEDIATE entry may carry.
+ *
+ * An x86 page walk ANDs the permission bits down the levels: the effective
+ * right is the intersection of PML4E, PDPTE, PDE and PTE. So an intermediate
+ * that is missing a bit VETOES it for every page beneath -- including pages
+ * mapped later, by someone else, for another purpose entirely.
+ *
+ * That is why intermediates are kept PERMISSIVE and the leaf is made
+ * authoritative. Writable is already forced below for the same reason. NX is
+ * the one that bit: a table first created for a data page came out NX, and
+ * every executable mapping made under it afterwards was silently
+ * non-executable. mprotect(W -> X) then "succeeded" and the first instruction
+ * fetch took a #PF with error 0x15 -- present, user, instruction fetch,
+ * protection violation -- at an address whose own PTE said execute was fine.
+ *
+ * Nothing is lost by this: the LEAF still carries NX and U/S, and it is the
+ * leaf that decides. What is gained is that two mappings sharing a 2 MiB
+ * region can have different permissions, which is the entire point of having
+ * them per-page. */
+static inline uint64_t table_perms(uint64_t flags) {
+    return VMM_PRESENT | VMM_WRITABLE | (flags & VMM_USER);
+}
+
+// Get or Create the next-level table from entry
+static uint64_t *get_or_create_table(uint64_t *parent, uint64_t index, uint64_t flags) {
+
+    if (parent[index] & VMM_PRESENT) {
+        /* WIDEN an existing table's entry if this mapping needs more than the
+         * mapping that created it did. Only ever widen -- narrowing here would
+         * revoke a right from a neighbouring mapping that is still using it. */
+        uint64_t want = table_perms(flags);
+        if ((parent[index] & want) != want || (parent[index] & VMM_NX))
+            parent[index] = (parent[index] | want) & ~VMM_NX;
+
+        // Table already exists, return its vitual address
+        uint64_t phys_addr = parent[index] & VMM_ADDR_MASK;
+        return (uint64_t *)vmm_table(phys_addr);
+    }
+    // Allocate a new table and set its flags
+    uint64_t phys_addr = pmm_alloc_page();
+    if (!phys_addr) {
+        return 0;
+    }
+
+    uint64_t *table = (uint64_t *)vmm_table(phys_addr);
+    for (int i = 0; i < 512; i++) {
+        table[i] = 0;
+    }
+
+    // install in parent table -- permissive; the leaf decides (see table_perms)
+    parent[index] = phys_addr | table_perms(flags);
+    return table;
+}
+
+
+/* --- Refactor: walkers operate on a GIVEN pml4 physical address --- */
+/* The core mapper, now parameterized by the target address space's PML4.
+ `pml4_phys` is the physical address of the PML4 to map into the table;
+ vmm_table() turns a physical address into a virtual pointer regardless of 
+ which address space it belongs to (page-table pages are reachable via the
+ direct map no matter whose tree they're in). */
+ int vmm_map_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags){
+    spin_lock(&vmm_lock);
+
+    uint64_t *pml4 = vmm_table(pml4_phys);
+
+    /* get_or_create_table() reduces this to table_perms() -- present, writable,
+     * and user only if the leaf is. That drops the leaf's PAT bit (bit 7 is PS
+     * at an intermediate level, where it would wrongly declare a huge page --
+     * see VMM_PTE_PAT) and, just as importantly, the leaf's NX. The full flags
+     * go on the leaf below. */
+    uint64_t table_flags = flags;
+
+    uint64_t *pdpt = get_or_create_table(pml4, pml4_index(virt_addr),  table_flags);
+    if (!pdpt) {
+        spin_unlock(&vmm_lock);
+        return -1;
+    }
+
+    uint64_t *pd = get_or_create_table(pdpt, pdpt_index(virt_addr), table_flags);
+    if (!pd) {
+        spin_unlock(&vmm_lock);
+        return -1;
+    }
+
+    uint64_t *pt = get_or_create_table(pd, pd_index(virt_addr), table_flags);
+    if (!pt) {
+        spin_unlock(&vmm_lock);
+        return -1;
+    }
+
+    // set the page table entry
+    uint64_t page_index = pt_index(virt_addr); // 12 bits for 4K pages
+    pt[page_index] = (phys_addr & VMM_ADDR_MASK )| VMM_PRESENT | flags;
+    vmm_flush_tlb(virt_addr);// flush TLB to update mapping /* harmless if the target address space isn't active */
+
+    spin_unlock(&vmm_lock);
+    return 0;
+ }
+
+
+ // Public API
+int vmm_map(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
+    return vmm_map_in(kernel_pml4_phys, virt_addr, phys_addr, flags);
+}
+
+
+uint64_t vmm_get_kernel_pml4(void) {
+    return kernel_pml4_phys;
+}
+
+
+void vmm_unmap(uint64_t virt_addr){
+    spin_lock(&vmm_lock);
+
+    uint64_t *pml4 = vmm_pml4();
+    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) {
+        spin_unlock(&vmm_lock);
+        return;
+    }
+    uint64_t *pdpt = (uint64_t *)vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+
+    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) {
+        spin_unlock(&vmm_lock);
+        return;
+    }
+    uint64_t *pd = (uint64_t *)vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+
+    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) {
+        spin_unlock(&vmm_lock);
+        return;
+    }
+    uint64_t *pt = (uint64_t *)vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+
+    uint64_t page_index = pt_index(virt_addr); // represents 12 bits for 4K pages
+    pt[page_index] = 0; // clear the page table entry
+    vmm_flush_tlb(virt_addr); // flush TLB to update mapping
+
+    spin_unlock(&vmm_lock);
+}
+
+/* Clear the PTE for `virt_addr` in a SPECIFIC address space, WITHOUT freeing
+ * the physical frame it pointed at. Mirrors vmm_unmap() but walks `pml4_phys`
+ * instead of the current CR3 -- needed to detach SHARED memory (surface
+ * buffers, kernel/gfx/surface.c) from a process before its address space is
+ * torn down: the frame is owned by the surface's refcount, not the process,
+ * so vmm_destroy_address_space() must NOT free it. Unmapping it here first
+ * makes that frame invisible to the destroy walk (which frees every present
+ * user-half frame it finds). No-op if the mapping isn't present. */
+/* Change the PERMISSIONS of an existing mapping, keeping the frame.
+ *
+ * mprotect could be written as unmap-then-map, and it would be wrong twice
+ * over: the frame would be freed and a different one handed back (its contents
+ * are the whole reason anyone calls mprotect), and the page tables underneath
+ * would be reclaimed and immediately rebuilt. The translation is not changing
+ * -- only what may be done through it -- so the PTE is rewritten in place with
+ * its frame bits untouched.
+ *
+ * The INTERMEDIATE entries are widened, never narrowed. An x86 page walk ANDs
+ * the permissions down the levels, so a PDE without VMM_WRITABLE makes every
+ * page under it read-only however the PTEs are set; get_or_create_table()
+ * already installs intermediates as user+writable for exactly this reason, and
+ * the leaf is where the real answer lives. Nothing here may clear a bit in a
+ * table a NEIGHBOURING mapping shares. */
+int vmm_protect_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t flags) {
+    spin_lock(&vmm_lock);
+
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return -1; }
+    uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return -1; }
+    uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return -1; }
+    if (pd[pd_index(virt_addr)] & VMM_HUGE) { spin_unlock(&vmm_lock); return -1; }
+    uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+
+    uint64_t *pte = &pt[pt_index(virt_addr)];
+    if (!(*pte & VMM_PRESENT)) { spin_unlock(&vmm_lock); return -1; }
+
+    /* Widen the intermediates first, for the reason table_perms() explains: a
+     * table created for a data page carries NX, and NX at any level vetoes
+     * execution for everything beneath it. Without this, mprotect(W -> X)
+     * returns 0 and the first instruction fetch still faults. */
+    uint64_t want = table_perms(flags);
+    uint64_t *chain[3] = { &pml4[pml4_index(virt_addr)],
+                           &pdpt[pdpt_index(virt_addr)],
+                           &pd[pd_index(virt_addr)] };
+    for (int i = 0; i < 3; i++)
+        if ((*chain[i] & want) != want || (*chain[i] & VMM_NX))
+            *chain[i] = (*chain[i] | want) & ~VMM_NX;
+
+    *pte = (*pte & VMM_ADDR_MASK) | VMM_PRESENT | flags;
+    vmm_flush_tlb(virt_addr);
+
+    spin_unlock(&vmm_lock);
+    return 0;
+}
+
+/* The leaf PTE for `virt` in `pml4_phys`, or NULL. Caller holds vmm_lock. */
+static uint64_t *pte_slot_locked(uint64_t pml4_phys, uint64_t virt_addr) {
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    if (!(pml4[pml4_index(virt_addr)] & VMM_PRESENT)) return NULL;
+    uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pdpt[pdpt_index(virt_addr)] & VMM_PRESENT)) return NULL;
+    uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+    if (!(pd[pd_index(virt_addr)] & VMM_PRESENT) || (pd[pd_index(virt_addr)] & VMM_HUGE)) return NULL;
+    uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+    uint64_t *pte = &pt[pt_index(virt_addr)];
+    return (*pte & VMM_PRESENT) ? pte : NULL;
+}
+
+bool vmm_test_and_clear_accessed_in(uint64_t pml4_phys, uint64_t virt_addr) {
+    spin_lock(&vmm_lock);
+    uint64_t *pte = pte_slot_locked(pml4_phys, virt_addr);
+    bool was = pte && (*pte & VMM_ACCESSED);
+    if (was)
+        *pte &= ~VMM_ACCESSED;      /* no flush: see mm/vmm.h */
+    spin_unlock(&vmm_lock);
+    return was;
+}
+
+bool vmm_set_accessed_in(uint64_t pml4_phys, uint64_t virt_addr) {
+    spin_lock(&vmm_lock);
+    uint64_t *pte = pte_slot_locked(pml4_phys, virt_addr);
+    if (pte) *pte |= VMM_ACCESSED;
+    spin_unlock(&vmm_lock);
+    return pte != NULL;
+}
+
+static bool vmm_table_is_empty(uint64_t table_phys) {
+    const uint64_t *t = vmm_table(table_phys);
+    for (int i = 0; i < 512; i++)
+        if (t[i] & VMM_PRESENT)
+            return false;
+    return true;
+}
+
+void vmm_unmap_in(uint64_t pml4_phys, uint64_t virt_addr) {
+    spin_lock(&vmm_lock);
+
+    /* Remember each level's table on the way down, so the walk back up can
+     * free the ones this unmap just emptied. tables[0]=PDPT, [1]=PD, [2]=PT;
+     * slots[n] is the entry in the level ABOVE that points at tables[n]. */
+    uint64_t *slots[3];
+    uint64_t  tables[3];
+
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    slots[0] = &pml4[pml4_index(virt_addr)];
+    if (!(*slots[0] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    tables[0] = *slots[0] & VMM_ADDR_MASK;
+
+    uint64_t *pdpt = vmm_table(tables[0]);
+    slots[1] = &pdpt[pdpt_index(virt_addr)];
+    if (!(*slots[1] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    if (*slots[1] & VMM_HUGE)      { spin_unlock(&vmm_lock); return; }  /* 1G leaf */
+    tables[1] = *slots[1] & VMM_ADDR_MASK;
+
+    uint64_t *pd = vmm_table(tables[1]);
+    slots[2] = &pd[pd_index(virt_addr)];
+    if (!(*slots[2] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    if (*slots[2] & VMM_HUGE)      { spin_unlock(&vmm_lock); return; }  /* 2M leaf */
+    tables[2] = *slots[2] & VMM_ADDR_MASK;
+
+    uint64_t *pt = vmm_table(tables[2]);
+    if (!(pt[pt_index(virt_addr)] & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+
+    pt[pt_index(virt_addr)] = 0;
+    vmm_flush_tlb(virt_addr);   /* harmless if this address space isn't active */
+
+    /* RECLAIM THE TABLES THIS EMPTIED, deepest first.
+     *
+     * Without this, unmapping gives back the DATA pages and keeps every page
+     * table that described them -- three per region on a 4-level walk. A
+     * process that maps and unmaps repeatedly at fresh addresses leaks them
+     * forever, and the leak is invisible from userspace because the address
+     * space looks free. It showed up on ARM first, as munmap() returning 16 of
+     * the 19 pages an mmap() had taken; x86 walks the same four levels and had
+     * exactly the same hole.
+     *
+     * ONLY IN THE USER HALF. Slots 256-511 of every PML4 are COPIES of the
+     * kernel's own entries (vmm_create_address_space), so the tables under
+     * them are shared by every address space in the system. Freeing one
+     * because this process stopped using it would pull the kernel mapping out
+     * from under all the others. Every caller today passes a user address;
+     * this makes that a rule rather than a coincidence.
+     *
+     * A table is freed only when EVERY entry in it is clear, so a mapping that
+     * shares a table with a live neighbour keeps it. Stop at the first level
+     * still in use: if the leaf's table survives, so does everything above.
+     *
+     * CLEAR, THEN FLUSH, THEN FREE -- in that order, and the order is the
+     * whole safety argument. A page-table page handed back to the PMM can be
+     * reallocated and rewritten immediately; any core still holding a cached
+     * WALK of it would be translating through somebody else's data. `invlpg`
+     * on the one VA is not enough either: the entry being removed describes a
+     * 2 MiB or 1 GiB span and the paging-structure caches hold it for that
+     * whole span. vmm_flush_tlb's shootdown IPI makes every core reload CR3,
+     * which is exactly the blunt instrument this case needs. */
+    if (pml4_index(virt_addr) < 256) {
+        int freed = 0;
+        for (int level = 2; level >= 0; level--) {
+            if (!vmm_table_is_empty(tables[level]))
+                break;
+            *slots[level] = 0;
+            freed++;
+        }
+        if (freed) {
+            vmm_flush_tlb(virt_addr);
+            for (int level = 2; level > 2 - freed; level--)
+                pmm_free_page(tables[level]);
+        }
+    }
+
+    spin_unlock(&vmm_lock);
+}
+
+/* Look up the physical address a VA maps to IN A GIVEN address space.
+   Mirrors vmm_get_phys but walks `pml4_phys` instead of the kernel PML4 —
+   needed so elf_load can find the frame it just mapped into the process
+   space and reach it via the direct map. */
+uint64_t vmm_get_phys_in(uint64_t pml4_phys, uint64_t virt_addr) {
+    /* MUST hold vmm_lock: every table mutator (vmm_map_in, vmm_unmap_in,
+     * vmm_destroy_address_space) does, and this is a MULTI-LEVEL walk. Reading
+     * it locklessly raced the writer -- e.g. the compositor mapping shared
+     * window pages into a client's PML4 on core A while the client's own
+     * copy_to_user/access_ok walked that PML4 on core B saw a half-installed
+     * intermediate table and reported an already-mapped heap page as absent
+     * (-EMBK_EFAULT on a valid read -> the "font.ttf open failed -14" / random
+     * app failures under -smp 4). An SMP data race, invisible on 1 core. */
+    spin_lock(&vmm_lock);
+    uint64_t result = 0;
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    if (pml4[pml4_index(virt_addr)] & VMM_PRESENT) {
+        uint64_t *pdpt = vmm_table(pml4[pml4_index(virt_addr)] & VMM_ADDR_MASK);
+        if (pdpt[pdpt_index(virt_addr)] & VMM_PRESENT) {
+            uint64_t *pd = vmm_table(pdpt[pdpt_index(virt_addr)] & VMM_ADDR_MASK);
+            if (pd[pd_index(virt_addr)] & VMM_PRESENT) {
+                uint64_t *pt = vmm_table(pd[pd_index(virt_addr)] & VMM_ADDR_MASK);
+                if (pt[pt_index(virt_addr)] & VMM_PRESENT)
+                    result = (pt[pt_index(virt_addr)] & VMM_ADDR_MASK) | (virt_addr & 0xfff);
+            }
+        }
+    }
+    spin_unlock(&vmm_lock);
+    return result;
+}
+
+/* ---- EmbDBG v2 page-table introspection ---------------------------------
+ * Physical-frame masks for the two huge-page sizes (the frame field is wider
+ * than a 4K PTE's because the low address bits are the in-page offset). */
+#define VMM_HUGE_1G_MASK 0x000fffffc0000000ULL   /* PDPTE (1 GiB) frame bits */
+#define VMM_HUGE_2M_MASK 0x000fffffffe00000ULL   /* PDE   (2 MiB) frame bits */
+
+void vmm_walk(uint64_t pml4_phys, uint64_t virt, struct vmm_walk_result *out) {
+    out->mapped = false;
+    out->phys = 0;
+    out->levels_read = 0;
+    out->huge = false;
+    out->huge_level = -1;
+    for (int i = 0; i < 4; i++) { out->entry[i] = 0; out->index[i] = 0; }
+    out->index[0] = (int)pml4_index(virt);
+    out->index[1] = (int)pdpt_index(virt);
+    out->index[2] = (int)pd_index(virt);
+    out->index[3] = (int)pt_index(virt);
+
+    spin_lock(&vmm_lock);
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    uint64_t e = pml4[out->index[0]];
+    out->entry[0] = e; out->levels_read = 1;
+    if (!(e & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+
+    uint64_t *pdpt = vmm_table(e & VMM_ADDR_MASK);
+    e = pdpt[out->index[1]];
+    out->entry[1] = e; out->levels_read = 2;
+    if (!(e & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    if (e & VMM_HUGE) {   /* 1 GiB page terminates here */
+        out->huge = true; out->huge_level = 1; out->mapped = true;
+        out->phys = (e & VMM_HUGE_1G_MASK) | (virt & 0x3fffffffULL);
+        spin_unlock(&vmm_lock); return;
+    }
+
+    uint64_t *pd = vmm_table(e & VMM_ADDR_MASK);
+    e = pd[out->index[2]];
+    out->entry[2] = e; out->levels_read = 3;
+    if (!(e & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    if (e & VMM_HUGE) {   /* 2 MiB page terminates here */
+        out->huge = true; out->huge_level = 2; out->mapped = true;
+        out->phys = (e & VMM_HUGE_2M_MASK) | (virt & 0x1fffffULL);
+        spin_unlock(&vmm_lock); return;
+    }
+
+    uint64_t *pt = vmm_table(e & VMM_ADDR_MASK);
+    e = pt[out->index[3]];
+    out->entry[3] = e; out->levels_read = 4;
+    if (!(e & VMM_PRESENT)) { spin_unlock(&vmm_lock); return; }
+    out->mapped = true;
+    out->phys = (e & VMM_ADDR_MASK) | (virt & 0xfffULL);
+    spin_unlock(&vmm_lock);
+}
+
+/* Permission/identity bits that define a "region": pages differing only in
+ * Accessed/Dirty/PAT still belong to the same run. */
+#define VMM_REGION_ID (VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NX)
+
+int vmm_enum_user_regions(uint64_t pml4_phys, struct vmm_region *out, int max) {
+    if (max <= 0) return 0;
+    int n = 0;
+    bool have_cur = false;
+    struct vmm_region cur = {0};
+
+    spin_lock(&vmm_lock);
+    uint64_t *pml4 = vmm_table(pml4_phys);
+    /* User half only: PML4 indices 0..255 (VAs below the canonical hole). */
+    for (int i4 = 0; i4 < 256 && n < max; i4++) {
+        uint64_t e4 = pml4[i4];
+        if (!(e4 & VMM_PRESENT)) continue;
+        uint64_t *pdpt = vmm_table(e4 & VMM_ADDR_MASK);
+        for (int i3 = 0; i3 < 512 && n < max; i3++) {
+            uint64_t e3 = pdpt[i3];
+            if (!(e3 & VMM_PRESENT)) continue;
+            uint64_t base3 = ((uint64_t)i4 << 39) | ((uint64_t)i3 << 30);
+            if (e3 & VMM_HUGE) {                         /* 1 GiB leaf */
+                uint64_t sz = 1ULL << 30;
+                if (have_cur && cur.huge && cur.end == base3 &&
+                    (cur.flags & VMM_REGION_ID) == (e3 & VMM_REGION_ID)) {
+                    cur.end += sz;
+                } else {
+                    if (have_cur) out[n++] = cur;
+                    cur = (struct vmm_region){ base3, base3 + sz, e3, true };
+                    have_cur = true;
+                }
+                continue;
+            }
+            uint64_t *pd = vmm_table(e3 & VMM_ADDR_MASK);
+            for (int i2 = 0; i2 < 512 && n < max; i2++) {
+                uint64_t e2 = pd[i2];
+                if (!(e2 & VMM_PRESENT)) continue;
+                uint64_t base2 = base3 | ((uint64_t)i2 << 21);
+                if (e2 & VMM_HUGE) {                     /* 2 MiB leaf */
+                    uint64_t sz = 1ULL << 21;
+                    if (have_cur && cur.huge && cur.end == base2 &&
+                        (cur.flags & VMM_REGION_ID) == (e2 & VMM_REGION_ID)) {
+                        cur.end += sz;
+                    } else {
+                        if (have_cur) out[n++] = cur;
+                        cur = (struct vmm_region){ base2, base2 + sz, e2, true };
+                        have_cur = true;
+                    }
+                    continue;
+                }
+                uint64_t *pt = vmm_table(e2 & VMM_ADDR_MASK);
+                for (int i1 = 0; i1 < 512 && n < max; i1++) {
+                    uint64_t e1 = pt[i1];
+                    if (!(e1 & VMM_PRESENT)) continue;
+                    uint64_t va = base2 | ((uint64_t)i1 << 12);
+                    uint64_t sz = 1ULL << 12;
+                    if (have_cur && !cur.huge && cur.end == va &&
+                        (cur.flags & VMM_REGION_ID) == (e1 & VMM_REGION_ID)) {
+                        cur.end += sz;
+                    } else {
+                        if (have_cur) out[n++] = cur;
+                        cur = (struct vmm_region){ va, va + sz, e1, false };
+                        have_cur = true;
+                    }
+                }
+            }
+        }
+    }
+    if (have_cur && n < max) out[n++] = cur;
+    spin_unlock(&vmm_lock);
+    return n;
+}
+
+/* Existing public one becomes the kernel-space wrapper. */
+uint64_t vmm_get_phys(uint64_t virt_addr) {
+    return vmm_get_phys_in(kernel_pml4_phys, virt_addr);
+}
+
+
+void vmm_flush_tlb(uint64_t virt_addr) {
+    __asm__ volatile("invlpg (%0)" : : "r" (virt_addr) : "memory");
+
+    /* AND TELL THE OTHER CORES. `invlpg` invalidates THIS core's TLB and says
+     * nothing to the rest, so without this a page unmapped here stays mapped
+     * on every other core until something happens to evict it -- a
+     * use-after-free the hardware will happily perform, on memory the
+     * allocator has already handed to somebody else.
+     *
+     * That was a real hole from the day x86 gained a second core, hidden only
+     * by how rarely a mapping is torn down while another core is touching it.
+     *
+     * A blunt instrument on purpose: the receiving core reloads CR3 and throws
+     * away every non-global entry, because the IPI carries no payload to say
+     * WHICH page (see include/arch_ipi.h). A mailbox and a handshake would
+     * narrow it, and would be the right change once a shootdown is frequent
+     * enough to measure. It is not.
+     *
+     * aarch64 needs none of this: `tlbi ... is` broadcasts across the
+     * inner-shareable domain in hardware. */
+    arch_ipi_broadcast(IPI_TLB_SHOOTDOWN);
+}
+
+
+
+/* EFER.NXE (bit 11) is a PER-CORE MSR, not a paging-structure-wide setting:
+ * every core that ever walks a page table with VMM_NX (bit 63) set in any
+ * entry needs its OWN EFER.NXE=1, or that core treats bit 63 as a plain
+ * reserved bit and takes a reserved-bit page fault the moment it touches
+ * that mapping -- regardless of what any other core's EFER says. The BSP
+ * gets this from vmm_init() below; every AP must call this too (ap_main(),
+ * kernel/cpu/smp.c) before it can safely touch ANY VMM_NX-mapped memory,
+ * which in practice means immediately (kernel stacks are mapped
+ * VMM_WRITABLE | VMM_NX). Missing this on the APs was a real bug: it
+ * surfaced as a double fault (escalated from an unhandled reserved-bit
+ * #PF) the first time an AP's schedule_locked() switched into a fresh
+ * kthread's stack. */
+void vmm_enable_nx_this_cpu(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080));
+    lo |= (1 << 11);                        /* NXE */
+    __asm__ volatile("wrmsr" : : "c"(0xC0000080), "a"(lo), "d"(hi));
+}
+
+/* Program IA32_PAT (MSR 0x277) so PAT entry 4 selects Write-Combining. A 4KB
+ * leaf PTE with the PAT bit set (VMM_PTE_PAT, bit 7) and PCD=PWT=0 indexes
+ * entry 4 -- that is what vmm_map_mmio_wc() emits. Entries 0-3 keep their
+ * power-on memory types, so EVERY existing mapping is unaffected: normal RAM
+ * (index 0 = WB) and UC MMIO (VMM_NOCACHE -> PCD -> index 2 = UC-) resolve
+ * exactly as before. This is PER-CORE state, like EFER.NXE: called from
+ * vmm_init() (BSP) and each AP's ap_main(). Set BEFORE any WC mapping is
+ * created/touched, so no cached line ever needs its type changed (the SDM's
+ * heavyweight PAT-change flush dance is unnecessary).
+ *
+ *   idx: 0=WB(06) 1=WT(04) 2=UC-(07) 3=UC(00) 4=WC(01) 5=WT(04) 6=UC-(07) 7=UC(00) */
+void vmm_pat_init_this_cpu(void) {
+    const uint64_t pat = 0x0007040100070406ULL;
+    __asm__ volatile("wrmsr" : : "c"(0x277u),
+                     "a"((uint32_t)pat), "d"((uint32_t)(pat >> 32)));
+}
+
+// Initialize the virtual memory manager
+void vmm_init(void) {
+    serial_write_string("\n=== VMM init ===\n");
+
+    vmm_enable_nx_this_cpu();
+    vmm_pat_init_this_cpu();   /* WC PAT slot -- before any vmm_map_mmio_wc() */
+
+    /* Ask the processor what it can enforce, then turn all of it on. Here
+     * because it is the same "per core, before anything depends on it" rule as
+     * the two calls above -- and because SMEP and SMAP are nothing but the
+     * hardware honouring page-table permission bits, which is this file's
+     * whole subject. */
+    cpu_features_detect();
+    cpu_protection_init_this_cpu();
+
+    // step 1:Allocate a new page for the kernel PML4
+    // alloc_table() runs in the early phase (vmm_direct_map_active == 0), so it
+    // hands back a KP2V pointer; recover the physical address with KV2P.
+    uint64_t *pml4 = alloc_table();
+    if (!pml4) {
+        serial_write_string("FATAL: Could not allocate PML4\n");
+        while (1) {}
+    }
+    kernel_pml4_phys = KV2P(pml4);
+
+    serial_write_string("PML4 Allocated at phys: ");
+    serial_write_hex(kernel_pml4_phys);
+    serial_write_string("\n");
+
+
+    // step 2: Map 0 to 1GB physical memory to higher half virtual memory
+    // Map all usable physical RAM E820 using 2 MB pages
+    // for simplicity, we map from 0 to the highest usable address
+    // ... etc 1GB
+    // Read the memory map through the boot protocol (same source pmm_init uses),
+    // NOT the retired fixed 0x7000 e820 buffer -- stage2 no longer writes there.
+    // Safe here: this whole scan finishes before the get_or_create_table calls
+    // below allocate any page, so the entries at mmap_phys can't be reused
+    // mid-read (the ordering constraint documented in boot_protocol.h).
+    uint32_t mmap_count = boot_mmap_count();
+
+    uint64_t highest_phys = 0;
+    for (uint32_t i = 0; i < mmap_count; i++) {
+        const struct boot_mmap_entry *e = boot_mmap_at(i);
+        if (e->type != E820_USABLE) {
+            continue;
+        }
+        uint64_t end = e->base + e->length;
+        if (end > highest_phys) {
+            highest_phys = end;
+        }
+    }
+
+    // Rounded up to nearest 2MB boundary
+    highest_phys = (highest_phys + 0x1fffff) & ~0x1fffffULL; // 2MB pages
+
+    serial_write_string("Building direct map from 0 to phys: ");
+    serial_write_hex(highest_phys);
+    serial_write_string("(2MB pages)\n");
+
+    for (uint64_t phys = 0; phys < highest_phys; phys += 0x200000) {
+        uint64_t virt = phys + DIRECT_MAP_BASE;
+        
+        uint64_t *pdpt = get_or_create_table(vmm_pml4(), pml4_index(virt),  VMM_WRITABLE);
+        if (!pdpt) {
+            serial_write_string("FATAL: Could not allocate PDPT\n");
+            while (1) {}
+        }
+
+        uint64_t *pd = get_or_create_table(pdpt, pdpt_index(virt), VMM_WRITABLE);
+        if (!pd) {
+            serial_write_string("FATAL: Could not allocate PD\n");
+            while (1) {}
+        }
+
+        uint64_t page_index = pd_index(virt); // 21 bits for 2MB pages
+        pd[page_index] = (phys & ~0x1fffffULL) | VMM_PRESENT | VMM_WRITABLE | VMM_HUGE;
+    }
+       
+    
+    serial_write_string("Mapping complete\n");
+
+    // step 3: build the kernel mapping at KERNEL_VIRTUAL_BASE
+    // Map [0 .. kernel image + PMM bitmap) so the kernel can grow past 2 MB
+    // without faulting after the CR3 switch. The boot stack now lives in the
+    // kernel's own .bss (see kernel/cpu/kentry.asm), so it is below kernel_end
+    // and covered automatically. The PMM bitmap sits *at* kernel_end and is
+    // written before this remap, so extend the mapping to pmm_reserved_phys_end()
+    // — otherwise the first bitmap access after the CR3 switch page-faults.
+    uint64_t kernel_end_phys = (KV2P(kernel_end) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1);
+    uint64_t kernel_map_end = pmm_reserved_phys_end();
+    if (kernel_map_end < kernel_end_phys)
+        kernel_map_end = kernel_end_phys;
+
+    serial_write_string("Mapping Kernel at 0xFFFFFFFF80000000 up to phys: ");
+    serial_write_hex(kernel_map_end);
+    serial_write_string("\n");
+    for (uint64_t phys = 0; phys < kernel_map_end; phys += PAGE_SIZE) {
+        uint64_t virt = KERNEL_VIRTUAL_BASE + phys;
+        if (vmm_map(virt, phys, VMM_WRITABLE) < 0) {
+            serial_write_string("FATAL: vmm_map kernel failed at\n");
+            serial_write_hex(phys);
+            serial_write_string("\n");
+            while (1) {}
+    
+        }
+
+    }
+    serial_write_string("Kernel mapping complete\n");
+
+
+    // step 4: switch CR3 to point to the kernel PML4 (new page tables)
+
+    serial_write_string("switching CR3 ...\n");
+    uint64_t new_cr3 = kernel_pml4_phys;
+    __asm__ volatile("mov %0, %%cr3" : : "r" (new_cr3): "memory");
+    // The new tables carry the full direct map, so from here on page-table
+    // pages must be reached through it (P2V) rather than the now-2MB kernel
+    // window (KP2V).
+    vmm_direct_map_active = 1;
+    serial_write_string("CR3 set to ");
+    serial_write_hex(new_cr3);
+    serial_write_string("\n");
+}
+
+// ---- MMIO / kmap virtual-address allocator -------------------------------
+//
+// A bump pointer within [MMIO_BASE, MMIO_END), PLUS a small free list so
+// vmm_unmap_mmio() can return a released VA range for reuse instead of leaking
+// it forever. MMIO_END is the hard ceiling: this region must not grow into the
+// kernel-stack region 256 GiB above MMIO_BASE (KSTACK_REGION_BASE == MMIO_END).
+#define MMIO_END (MMIO_BASE + (1ULL << 38))
+static uint64_t mmio_next_virt = MMIO_BASE;
+
+// Freed VA ranges awaiting reuse (page-aligned base + byte size). Bounded: on
+// overflow a freed range simply isn't recorded and its VA leaks -- the same
+// spirit as the bump pointer never shrinking, just an upper bound on how much
+// churn we can recycle. All of mmio_next_virt / mmio_free[] is under vmm_lock.
+#define MMIO_FREE_MAX 32
+static struct { uint64_t base; uint64_t size; } mmio_free[MMIO_FREE_MAX];
+static uint32_t mmio_free_count = 0;
+
+// Reserve `total_size` (page-aligned) bytes of MMIO VA. Prefers a freed range
+// that fits (first-fit, splitting any remainder back onto the list); otherwise
+// bumps mmio_next_virt with a hard MMIO_END check (which also catches wrap).
+// Returns 0 when the region is exhausted. Caller holds vmm_lock.
+static uint64_t mmio_reserve_va_locked(uint64_t total_size) {
+    for (uint32_t i = 0; i < mmio_free_count; i++) {
+        if (mmio_free[i].size >= total_size) {
+            uint64_t base = mmio_free[i].base;
+            if (mmio_free[i].size == total_size) {
+                mmio_free[i] = mmio_free[--mmio_free_count];   // consume whole slot
+            } else {
+                mmio_free[i].base += total_size;                // keep the remainder
+                mmio_free[i].size -= total_size;
+            }
+            return base;
+        }
+    }
+    if (total_size > MMIO_END - mmio_next_virt) return 0;        // ceiling / wrap guard
+    uint64_t base = mmio_next_virt;
+    mmio_next_virt += total_size;
+    return base;
+}
+
+// Shared body for vmm_map_mmio / vmm_map_mmio_wc: reserve VA + map the pages
+// with `cache_flags` (VMM_NOCACHE for strict UC, VMM_PTE_PAT for WC).
+static uint64_t mmio_map(uint64_t phys_addr, uint64_t size, uint64_t cache_flags) {
+    uint64_t phys_aligned = phys_addr & ~0xFFFULL;
+    uint64_t offset       = phys_addr - phys_aligned;
+    uint64_t total_size   = (size + offset + PAGE_SIZE - 1) & ~0xFFFULL;
+    uint64_t pages        = total_size / PAGE_SIZE;
+
+    spin_lock(&vmm_lock);
+    uint64_t virt_base = mmio_reserve_va_locked(total_size);
+    spin_unlock(&vmm_lock);
+    if (!virt_base) {
+        serial_write_string("vmm_map_mmio: MMIO VA region exhausted\n");
+        return 0;
+    }
+
+    for (uint64_t i = 0; i < pages; i++) {
+        if (vmm_map(virt_base + i * PAGE_SIZE, phys_aligned + i * PAGE_SIZE,
+                    VMM_WRITABLE | cache_flags) < 0) {
+            serial_write_string("FATAL: vmm_map mmio failed\n");
+            return 0;
+        }
+    }
+    return virt_base + offset;
+}
+
+// Map device memory strictly UNCACHEABLE (device registers, most MMIO).
+uint64_t vmm_map_mmio(uint64_t phys_addr, uint64_t size) {
+    return mmio_map(phys_addr, size, VMM_NOCACHE);
+}
+
+// Map device memory WRITE-COMBINING (PAT entry 4 via VMM_PTE_PAT): the CPU
+// coalesces bursts of writes, a big win for a linear framebuffer or other large
+// write-mostly aperture. NOT for device registers -- WC's weak ordering breaks
+// their required UC semantics. Needs vmm_pat_init_this_cpu() to have programmed
+// this core's IA32_PAT (done in vmm_init + every AP).
+uint64_t vmm_map_mmio_wc(uint64_t phys_addr, uint64_t size) {
+    return mmio_map(phys_addr, size, VMM_PTE_PAT);
+}
+
+// Unmap and RELEASE a range previously returned by vmm_map_mmio[_wc]. Clears
+// the PTEs (flushing the TLB) and hands the page-aligned VA range back to the
+// free list for reuse. `virt`/`size` are the values passed to / returned from
+// the mapping call. (Contrast vmm_kunmap_pages, which unmaps but does not
+// reclaim the VA.)
+void vmm_unmap_mmio(uint64_t virt, uint64_t size) {
+    if (!virt || !size) return;
+    uint64_t virt_aligned = virt & ~0xFFFULL;
+    uint64_t offset       = virt - virt_aligned;
+    uint64_t total_size   = (size + offset + PAGE_SIZE - 1) & ~0xFFFULL;
+    uint64_t pages        = total_size / PAGE_SIZE;
+
+    // vmm_unmap() takes vmm_lock itself, so unmap BEFORE grabbing it here.
+    for (uint64_t i = 0; i < pages; i++)
+        vmm_unmap(virt_aligned + i * PAGE_SIZE);
+
+    spin_lock(&vmm_lock);
+    if (mmio_free_count < MMIO_FREE_MAX) {
+        mmio_free[mmio_free_count].base = virt_aligned;
+        mmio_free[mmio_free_count].size = total_size;
+        mmio_free_count++;
+    }   // table full -> VA leaks (bounded, documented above)
+    spin_unlock(&vmm_lock);
+}
+
+/* Map `n` (possibly non-contiguous) physical pages into a fresh, CONTIGUOUS,
+ * CACHED kernel VA window -- a flat kernel view of scattered pages (e.g. a
+ * window's shared pixel buffer the compositor samples with fb_blit). Returns
+ * the base VA, or 0 on failure. Reuses the MMIO bump region deliberately: that
+ * PML4 slot is already populated before the first process address space is
+ * snapshotted, so the mapping is visible in every address space's kernel half
+ * -- the compositor reads it from a client's syscall context. Unlike MMIO this
+ * maps WRITE-BACK cached (no VMM_NOCACHE) for fast pixel access. */
+uint64_t vmm_kmap_pages(const uint64_t *phys, uint32_t n) {
+    if (!phys || n == 0) return 0;
+    spin_lock(&vmm_lock);
+    uint64_t virt_base = mmio_reserve_va_locked((uint64_t)n * PAGE_SIZE);
+    spin_unlock(&vmm_lock);
+    if (!virt_base) return 0;   // MMIO/kmap VA region exhausted
+    for (uint32_t i = 0; i < n; i++) {
+        if (vmm_map(virt_base + (uint64_t)i * PAGE_SIZE, phys[i] & ~0xFFFULL,
+                    VMM_WRITABLE | VMM_NX) < 0) {
+            return 0;
+        }
+    }
+    return virt_base;
+}
+
+/* Unmap a window returned by vmm_kmap_pages. The VA itself is not reclaimed
+ * (bump allocator -- same simplification as MMIO/kernel-stack regions). */
+void vmm_kunmap_pages(uint64_t virt_base, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        vmm_unmap(virt_base + (uint64_t)i * PAGE_SIZE);
+}
+
+// Bump pointer for kernel-stack VA allocation.
+//
+// This MUST land in a PML4 slot that's already populated in the kernel's own
+// page tables before the *first* process address space is ever created:
+// vmm_create_address_space() shares the kernel half by copying PML4 entries
+// *by value* at creation time (kernel_pml4.c: `pml4[i] = kernel_pml4[i]` for
+// i in [256,512)) — a one-time snapshot, not a live reference. A PML4 slot
+// that's still empty (not-present) at that moment copies as not-present
+// forever, even after the kernel's own table later fills it in; a region
+// carved out of genuinely fresh address space (tried first: a dedicated
+// 0xFFFFB0... base) hits exactly this — the first process's own stack
+// mapping, created moments after its address space snapshot, is invisible
+// in its own page tables. #PF on first touch, which then can't even push
+// its own fault frame (same unmapped region backs TSS.RSP0) -> #DF.
+//
+// Fix: reuse MMIO_BASE's PML4 slot instead of a new one. HPET/LAPIC/IOAPIC/
+// the framebuffer all call vmm_map_mmio() during early boot, long before any
+// process exists, which guarantees that slot is already present by the time
+// the first vmm_create_address_space() runs. Offset well clear (256 GiB in,
+// out of the 512 GiB one PML4 entry spans) of where the actual MMIO bump
+// allocator grows (a few hundred KB at most).
+#define KSTACK_REGION_BASE MMIO_END   /* == MMIO_BASE + (1<<38); the MMIO bump stops here */
+static uint64_t kstack_next_virt = KSTACK_REGION_BASE;
+
+uint64_t vmm_alloc_kernel_stack(uint64_t size) {
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // Reserve a guard page, then the stack pages right above it. The guard
+    // page is deliberately left unmapped: a stack that overflows downward
+    // walks straight into it and takes a #PF at the overflow site instead of
+    // silently corrupting whatever memory used to sit there.
+    spin_lock(&vmm_lock);
+    uint64_t guard_virt = kstack_next_virt;
+    uint64_t stack_base_virt = guard_virt + PAGE_SIZE;
+    kstack_next_virt = stack_base_virt + (pages * PAGE_SIZE);
+    spin_unlock(&vmm_lock);
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) {
+            serial_write_string("FATAL: vmm_alloc_kernel_stack: out of physical memory\n");
+            return 0;
+        }
+        uint64_t virt = stack_base_virt + (i * PAGE_SIZE);
+        if (vmm_map(virt, phys, VMM_WRITABLE | VMM_NX) < 0) {
+            serial_write_string("FATAL: vmm_alloc_kernel_stack: vmm_map failed\n");
+            pmm_free_page(phys);
+            return 0;
+        }
+    }
+
+    return stack_base_virt + (pages * PAGE_SIZE);  // top of stack (RSP seed)
+}
+
+/* ---- memory a loadable module runs from ---------------------------------
+ *
+ * A module needs memory the kernel can WRITE (to copy sections in and apply
+ * relocations) and then EXECUTE. It cannot have both at once: this kernel
+ * enforces W^X, and a region that is writable and executable at the same time
+ * is the thing W^X exists to prevent -- it would be the one place in the
+ * system where an arbitrary write becomes arbitrary code, which is exactly
+ * the position a module loader must not create.
+ *
+ * So it is two steps. vmm_alloc_module() hands back writable, non-executable
+ * pages; vmm_module_make_exec() flips a range to read-only and executable once
+ * the loader has finished writing it. Data sections simply stay as they are.
+ *
+ * Its own region, rather than the kernel heap: heap allocations share pages,
+ * and flipping a page to executable because a module landed on it would take
+ * whatever else was on that page with it.
+ *
+ * WHERE THAT REGION IS, is not free choice. Kernel code is built
+ * -mcmodel=kernel, which promises every address is within 2 GiB of every
+ * other, so a call compiles to a 32-bit PC-relative displacement. Put module
+ * memory in the MMIO or stack windows -- which is where it went first -- and
+ * the very first call from a module into kprintf is seventy TERABYTES away
+ * and cannot be encoded at all. The loader says so and refuses, which is the
+ * right failure, but the fix is to put modules where the model says they are:
+ * in the kernel's own 2 GiB window, 1 GiB above the image.
+ *
+ * 512 MiB of it. The kernel image occupies a few megabytes at the bottom of
+ * the window and nothing else is mapped between them. */
+#define MODULE_REGION_BASE 0xFFFFFFFFC0000000ULL
+#define MODULE_REGION_END  0xFFFFFFFFE0000000ULL
+static uint64_t module_next_virt = MODULE_REGION_BASE;
+
+uint64_t vmm_alloc_module(uint64_t size) {
+    if (!size) return 0;
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    spin_lock(&vmm_lock);
+    uint64_t base = module_next_virt;
+    /* A guard page between modules, for the same reason the stacks have one:
+     * a relocation computed slightly wrong runs off the end of one module and
+     * into the next, and a fault there is a bug report rather than a mystery. */
+    uint64_t next = base + (pages + 1) * PAGE_SIZE;
+    if (next > MODULE_REGION_END || next < base) { spin_unlock(&vmm_lock); return 0; }
+    module_next_virt = next;
+    spin_unlock(&vmm_lock);
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) return 0;
+        if (vmm_map(base + i * PAGE_SIZE, phys, VMM_WRITABLE | VMM_NX) < 0) {
+            pmm_free_page(phys);
+            return 0;
+        }
+        memset((void *)(base + i * PAGE_SIZE), 0, PAGE_SIZE);
+    }
+    return base;
+}
+
+int vmm_module_make_exec(uint64_t virt, uint64_t size) {
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = 0; i < pages; i++) {
+        /* READ-ONLY AND EXECUTABLE. Both stated: VMM_EXEC is the positive ask
+         * and the absence of VMM_WRITABLE is what makes it W^X rather than a
+         * region that merely happens not to be written just now. */
+        if (vmm_protect_in(kernel_pml4_phys, virt + i * PAGE_SIZE,
+                           VMM_PRESENT | VMM_EXEC) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+void vmm_free_module(uint64_t virt, uint64_t size) {
+    if (!virt) return;
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t v = virt + i * PAGE_SIZE;
+        uint64_t phys = vmm_get_phys(v);
+        if (phys) pmm_free_page(phys);
+        vmm_unmap(v);
+    }
+    /* VA is not reclaimed -- the same bump-allocator trade-off as the stacks
+     * and the MMIO window. A machine that loads and unloads modules for long
+     * enough to exhaust 256 GiB of address space has a different problem. */
+}
+
+void vmm_free_kernel_stack(uint64_t stack_top, uint64_t size) {
+    /* An adopted thread (the boot context, each secondary's) records
+     * kstack_top = 0: it runs on a static stack it did not allocate. Freeing
+     * that would wrap to the top of the address space -- see the aarch64 copy
+     * of this function, where the same guard is spelled out. */
+    if (!stack_top)
+        return;
+
+    uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t stack_base_virt = stack_top - (pages * PAGE_SIZE);
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t virt = stack_base_virt + (i * PAGE_SIZE);
+        uint64_t phys = vmm_get_phys(virt);
+        if (phys) {
+            pmm_free_page(phys);
+        }
+        vmm_unmap(virt);
+    }
+    // The VA range (including the guard page below it) is intentionally not
+    // reclaimed — same bump-allocator trade-off vmm_map_mmio already makes.
+}
+
+/* include/arch_dma.h: DMA is cache-coherent on x86, so there is nothing to do.
+ * The Raspberry Pi 4 is why the interface exists (docs/RPI4.md P5). */
+void arch_dma_uncached(void *va, uint64_t len) { (void)va; (void)len; }
+void arch_dma_flush(const volatile void *va, uint64_t len) { (void)va; (void)len; }

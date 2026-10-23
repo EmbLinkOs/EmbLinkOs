@@ -1,10 +1,19 @@
 #include <stdint.h>
 #include "drivers/char/serial.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/uaccess_guard.h"
+#include "mm/vma.h"            /* vm_fault: demand paging */
+#include "include/arch_irq.h"   /* arch_irq_enable/disable around vm_fault */
+#include "process/process.h"
+#include "include/spinlock.h"
 #include "process/process.h"   /* current_thread, struct process/thread */
 #include "process/debug.h"     /* debug_on_exception (§6.6 exception routing) */
 #include "lib/ksym.h"          /* the panic symbolizer (§7) */
-#include "arch/x86_64/syscall/usercopy.h"   /* access_ok, for the ring-3 walk */
+#include "drivers/char/platform_misc.h"
+#include "lib/crashlog.h"
+#include "lib/klog.h"
+#include "drivers/video/rawcon.h"
+#include "drivers/timer/timer.h"
+#include "include/usercopy.h"   /* access_ok, for the ring-3 walk */
 
 /* Serializes the exception dump so two faulting cores don't interleave their
  * reports byte-by-byte over the lockless UART (observed directly as two
@@ -106,7 +115,6 @@ static void dump_fault(struct registers *regs) {
     serial_write_string("RBP: ");
     serial_write_hex(regs->rbp);
     serial_write_string("\n");
-
     // Page Fault (vector 14): CR2 holds the faulting address, and the
     // error code's low bits explain the cause.
     if (regs->vector == 14) {
@@ -162,40 +170,141 @@ static void dump_fault(struct registers *regs) {
      * The kernel walk above stops at the kernel's own .text, which is exactly
      * no help when the faulting code is an application -- and "RIP=0" says a
      * call or return went through a null pointer without saying whose. The
-     * user stack is mapped right now (same CR3), so the rbp chain is readable;
-     * every read goes through access_ok so a corrupt frame ends the walk
-     * instead of faulting the fault handler.
+     * user stack is mapped right now (same CR3), so the rbp chain is readable.
+     *
+     * TWO THINGS ARE NEEDED TO READ IT, and this had only one of them.
+     *
+     * access_ok() proves a page is mapped. It does NOT make the processor
+     * willing to touch it: SMAP turns any kernel-mode read of a user page into
+     * a fault unless the access is declared deliberate, which is what
+     * uaccess_hw_begin() does. Without it the first dereference here faulted --
+     * inside the fault handler, in kernel mode, with no recovery point armed --
+     * and the machine went into a fault loop printing nothing. The line
+     * "ret@rsp" with no value after it was the whole of the evidence.
+     *
+     * That was reachable by ANY ring-3 fault, which is to say by any program
+     * that crashes, which is the one situation this code exists for. It
+     * survived because the crash path's own witness reads the kernel's verdict
+     * line rather than this block, so a handler that hung before printing it
+     * looked like a slow test.
+     *
+     * So: permission from the hardware, and a recovery point, because
+     * access_ok is a check and a check is not a guarantee -- the page can go
+     * away between the proof and the read. A fault inside the walk now ends the
+     * walk instead of the machine.
      *
      * Addresses, not symbols: the kernel has its own .embdbg and knows nothing
-     * about an application's. `nm build/<app>.elf` turns these into names, and
-     * an ET_EXEC app is loaded at bias 0 so they match directly. */
+     * about an application's. `nm build/<app>.elf` turns these into names --
+     * directly for an ET_EXEC app, which is loaded at bias 0, and offset by the
+     * load bias for a PIE (whose text is in the executable window, 0x1000_...;
+     * subtract the window-relative page from `rip` to recover the link-time
+     * address). */
     if ((regs->cs & 0x3) == 0x3) {
         serial_write_string("\n--- ring-3 backtrace (addresses; nm the app) ---\n");
         serial_write_string("  rip  "); serial_write_hex(regs->rip); serial_write_string("\n");
-        /* The return address the faulting frame would use, if rsp still points
-         * at it -- the usual shape when a CALL through a null pointer faults
-         * on the very first instruction fetch. */
-        if (access_ok((const void *)(uintptr_t)regs->rsp, 8)) {
-            serial_write_string("  ret@rsp  ");
-            serial_write_hex(*(volatile uint64_t *)(uintptr_t)regs->rsp);
-            serial_write_string("\n");
+        uaccess_hw_begin();
+        if (uaccess_arm()) {
+            /* The return address the faulting frame would use, if rsp still
+             * points at it -- the usual shape when a CALL through a null
+             * pointer faults on the very first instruction fetch. */
+            if (access_ok((const void *)(uintptr_t)regs->rsp, 8)) {
+                serial_write_string("  ret@rsp  ");
+                serial_write_hex(*(volatile uint64_t *)(uintptr_t)regs->rsp);
+                serial_write_string("\n");
+            }
+            uint64_t rbp = regs->rbp;
+            for (int i = 0; i < 24; i++) {
+                if ((rbp & 0x7) || !access_ok((const void *)(uintptr_t)rbp, 16)) break;
+                uint64_t next = *(volatile uint64_t *)(uintptr_t)(rbp);
+                uint64_t ret  = *(volatile uint64_t *)(uintptr_t)(rbp + 8);
+                if (!ret) break;
+                serial_write_string("  frame "); serial_write_hex(ret); serial_write_string("\n");
+                if (next <= rbp) break;                /* chain must climb */
+                rbp = next;
+            }
+            uaccess_disarm();
+        } else {
+            serial_write_string("  (stack unreadable -- walk abandoned)\n");
         }
-        uint64_t rbp = regs->rbp;
-        for (int i = 0; i < 24; i++) {
-            if ((rbp & 0x7) || !access_ok((const void *)(uintptr_t)rbp, 16)) break;
-            uint64_t next = *(volatile uint64_t *)(uintptr_t)(rbp);
-            uint64_t ret  = *(volatile uint64_t *)(uintptr_t)(rbp + 8);
-            if (!ret) break;
-            serial_write_string("  frame "); serial_write_hex(ret); serial_write_string("\n");
-            if (next <= rbp) break;                    /* chain must climb */
-            rbp = next;
-        }
+        uaccess_hw_end();
         serial_write_string("--- end ring-3 backtrace ---\n");
     }
 }
 
 
 void isr_handler(struct registers *regs) {
+    /* --- RESOLVE the fault, if it is resolvable -----------------------------
+     *
+     * Before any of the reporting below, ask the VM whether this address is
+     * legitimately the process's and simply has no page yet. That is what
+     * demand paging IS: mmap reserves address space, and the page appears
+     * here, on first touch.
+     *
+     * A fault that vm_fault() handles is NOT an error and must produce no
+     * output -- it is the ordinary way memory comes into existence, and a
+     * kernel that logged one per page would spend its life printing. Returning
+     * retries the faulting instruction, which now succeeds.
+     *
+     * ANY RING, but only for a USER address. A kernel-mode fault on a user
+     * address is not a bug -- it is the kernel touching a process's memory on
+     * its behalf, which is what copy_to_user does, and a page it has not
+     * faulted in yet is exactly as legitimate there as it is at EL0. What
+     * stays fatal is a kernel-mode fault on a KERNEL address, which has no VMA
+     * and is always a real bug.
+     *
+     * Ordered BEFORE the guarded-copy recovery on purpose: an unfaulted page
+     * inside a valid mapping should be MADE to work, not reported as EFAULT.
+     * The guard still catches the case vm_fault declines. */
+    if (regs->vector == 14 && current_thread) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        if (cr2 < USER_VA_LIMIT) {
+            bool w = (regs->error_code & 0x2) != 0;
+            bool x = (regs->error_code & 0x10) != 0;
+
+            /* WITH INTERRUPTS ON, if the faulting context had them on. #PF is
+             * an interrupt gate, so we arrive with IF clear -- and resolving a
+             * fault can mean reading the file the page comes from, or reading
+             * it back from the swap store, and waiting for the disk with
+             * interrupts off is waiting for an IRQ that cannot arrive. The ATA
+             * driver's wait loop has a canary for exactly that, and the first
+             * paging run tripped it 24,985 times. The interrupted context's
+             * own RFLAGS says whether enabling is legitimate: user mode always
+             * had them on; a kernel copy_to_user that faulted did too; a
+             * kernel path that genuinely had them off keeps them off. This is
+             * x86-specific code, so testing IF here is not the coupling
+             * arch_irq.h warns about. */
+            bool irqs_on = (regs->rflags & (1ULL << 9)) != 0;
+            bool from_user = (regs->cs & 0x3) == 0x3;
+            if (from_user) current_thread->in_kernel++;   /* a kill waits for this to finish */
+            if (irqs_on) arch_irq_enable();
+            bool handled = vm_fault(current_thread->proc, cr2, w, x);
+            if (irqs_on) arch_irq_disable();
+            if (from_user) {
+                current_thread->in_kernel--;
+                if (handled && current_thread->killed)
+                    thread_die_killed();     /* never returns */
+            }
+            if (handled)
+                return;                  /* retry the instruction */
+        }
+    }
+
+    /* A GUARDED user copy that faulted -- the kernel touched user memory that
+     * access_ok() had just proved was mapped, and another core unmapped it in
+     * between (include/uaccess_guard.h). This does not return: it longjmps
+     * back into copy_from_user()/copy_to_user(), which reports -EFAULT.
+     *
+     * Vector 14 (#PF) and KERNEL mode only -- error_code bit 2 clear. A user
+     * -mode fault is the program's own and belongs to the handling below.
+     * Checked before the panic printing, because it is the only fault here
+     * that can legitimately happen. */
+    if (regs->vector == 14 && !(regs->error_code & 0x4) &&
+        uaccess_fault_recover()) {
+        /* not reached */
+    }
+
+
     /* EMBDBG_Specification.md §6.6 — the debug pre-dispatch, BEFORE either final
      * path below. For the debug-relevant vectors, a fault from a thread whose
      * process has a debug session is delivered to the debugger as a STOP EVENT:
@@ -235,6 +344,106 @@ void isr_handler(struct registers *regs) {
     }
 
     serial_write_string("kernel-mode fault -- system halted.\n");
+
+    /* AND LEAVE A RECORD SOMEWHERE THAT SURVIVES THE POWER GOING OFF.
+     *
+     * Everything above this line goes to a serial port. On a developer's desk
+     * that is enough; on the target machine there is no cable, the screen
+     * holds whatever was on it, and the next thing that happens is somebody
+     * pressing the power button. docs/PILLARS.md phase 3 names the gap: "a
+     * problem on the real machine cannot be diagnosed after the fact."
+     *
+     * FIRST, AND BEFORE TELLING THE HOST. pvpanic is a request to the
+     * hypervisor, and a host configured to act on it may stop this machine
+     * between the two statements -- which would lose exactly the record that
+     * is being written. The order is not stylistic.
+     *
+     * crashlog_capture allocates nothing, takes no lock (this core already
+     * holds panic_lock, which is what keeps two faulting cores apart), and
+     * touches no page tables. See kernel/lib/crashlog.c for why each of those
+     * is a requirement rather than a preference. */
+    {
+        uint64_t cr2 = 0, cr3 = 0;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        struct crash_state st = {
+            .vector = regs->vector,
+            .error_code = regs->error_code,
+            .rip = regs->rip, .rsp = regs->rsp, .rbp = regs->rbp,
+            .rflags = regs->rflags, .cr2 = cr2, .cr3 = cr3,
+            .cs = regs->cs, .ss = regs->ss,
+            .cpu = this_cpu() ? this_cpu()->cpu_index : 0,
+            .pid = (current_thread && current_thread->proc)
+                       ? current_thread->proc->pid : 0,
+            .uptime_ms = timer_uptime_ms(),
+        };
+        crashlog_capture(&st);
+    }
+
+    /* AND ON THE SCREEN. A laptop has no serial port: until this block, a
+     * kernel fault on one froze the display on whatever the desktop had last
+     * drawn and said nothing at all. Everything here writes pixels straight
+     * into the firmware's framebuffer -- no lock, no allocation, no graphics
+     * stack -- and from its first line every other core's attempt to present
+     * a frame is refused, so the desktop cannot paint back over it. */
+    {
+        rawcon_panic_begin(regs->vector < 32 ? exception_messages[regs->vector]
+                                             : "unknown exception");
+        uint64_t cr2 = 0;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        rawcon_puts("  vector "); rawcon_hex(regs->vector);
+        rawcon_puts("   error "); rawcon_hex(regs->error_code);
+        rawcon_puts("   cpu "); rawcon_hex(this_cpu() ? this_cpu()->cpu_index : 0);
+        rawcon_puts("   uptime ms "); rawcon_hex(timer_uptime_ms());
+        rawcon_putc('\n');
+        rawcon_puts("  RIP "); rawcon_hex(regs->rip); rawcon_puts("  ");
+        if (ksym_ready()) {
+            static char sym[128];
+            ksym_symbolize(regs->rip, sym, sizeof sym);
+            rawcon_puts(sym);
+        } else {
+            rawcon_puts("(no symbols loaded yet)");
+        }
+        rawcon_putc('\n');
+        rawcon_puts("  RSP "); rawcon_hex(regs->rsp);
+        rawcon_puts("  RBP "); rawcon_hex(regs->rbp);
+        rawcon_puts("  CR2 "); rawcon_hex(cr2);
+        rawcon_putc('\n');
+        if (current_thread && current_thread->proc) {
+            rawcon_puts("  pid "); rawcon_hex(current_thread->proc->pid);
+            rawcon_putc('\n');
+        }
+        rawcon_puts("\n  Photograph this whole screen. The last of the kernel log:\n\n");
+
+        /* As much of the log as FITS, counted in screen rows from the end,
+         * because the lines nearest the fault are the ones that say what it
+         * was doing -- and a log that runs off the bottom loses exactly those. */
+        static char tail[6000];
+        uint32_t n = klog_tail(tail, sizeof tail);
+        uint32_t rows = rawcon_rows_left(), cols = rawcon_cols();
+        if (rows > 1) rows -= 1;
+        uint32_t used = 0, start = n, linelen = 0;
+        while (start > 0 && used < rows) {
+            char c = tail[start - 1];
+            if (c == '\n') {
+                used += cols ? (linelen / cols) + 1 : 1;
+                if (used > rows) break;
+                linelen = 0;
+            } else {
+                linelen++;
+            }
+            start--;
+        }
+        while (start < n && tail[start] == '\n') start++;
+        rawcon_puts(tail + start);
+    }
+
+    /* TELL THE HOST, if there is one. A halted guest and a slow one look
+     * identical from outside -- both are a test harness waiting for a line
+     * that never comes, and both time out the same way. pvpanic makes the
+     * difference a reported event instead of an inference. Silent no-op on
+     * real hardware. */
+    platform_pvpanic_notify();
     while (1) {
         __asm__ volatile ("cli; hlt");
     }

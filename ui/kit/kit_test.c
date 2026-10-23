@@ -1,0 +1,702 @@
+/* ui/kit/kit_test.c -- the text field's keyboard behaviour, on the host.
+ * make kit-test  -> exits 0 iff every claim holds.
+ *
+ * What a login form needs from a field and did not have: to open ready to
+ * type (autofocus), Tab to the next field with the keys typed after the Tab
+ * following it there, wrap from the last field to the first, Return reported
+ * by the field that saw it -- and focus let go when the focused field is no
+ * longer on screen, so the next page can take it. */
+#include "ui.h"
+#include "scene.h"
+#include "layout.h"
+#include "kit.h"
+#include "font.h"
+#include "testfont.h"
+#include <stdio.h>
+#include <string.h>
+
+static int g_fail;
+#define CHECK(cond, msg) do { if (!(cond)) { printf("  FAIL: %s\n", (msg)); g_fail++; } \
+                              else { printf("  ok:   %s\n", (msg)); } } while (0)
+
+static struct scene_arena  SA;
+static struct layout_arena LA;
+
+/* A CLIPBOARD OF OUR OWN. The kit takes one as two function pointers precisely
+ * so it never has to know about the kernel -- which is what lets copy and cut
+ * be tested here, on the host, in a millisecond, instead of only in QEMU. */
+static char g_clip[256];
+static unsigned g_clip_n;
+static int clip_set(const char *b, unsigned n) {
+    if (n > sizeof g_clip) n = sizeof g_clip;
+    memcpy(g_clip, b, n); g_clip_n = n; return 0;
+}
+static int clip_get(char *b, unsigned cap) {
+    unsigned n = g_clip_n < cap ? g_clip_n : cap;
+    memcpy(b, g_clip, n); return (int)n;
+}
+/* A CLOCK WE WIND BY HAND. Real time in a test means a test that is
+ * occasionally wrong on a loaded machine; this one is exact, and it can put
+ * two presses 10 ms or 10 s apart without waiting for either. */
+static uint64_t g_ms = 1000;
+static uint64_t fake_clock(void) { return g_ms; }
+
+/* Modifier keys the test holds down by hand. A click carries no byte saying
+ * whether shift was held, so the kit asks -- and here the answer is ours. */
+static unsigned g_mods;
+static unsigned fake_mods(void) { return g_mods; }
+
+static const char *clip_text(void) {
+    static char out[257];
+    memcpy(out, g_clip, g_clip_n); out[g_clip_n] = 0; return out;
+}
+static char A[32], B[32], C[32];
+static bool subA, subB, subC;
+static bool show_b = true, autofocus = true;
+static uint64_t page = 0x1111;            /* a keyed container: a new key is a new page */
+
+static void form(void) {
+    ui_begin_vstack(page);
+      if (autofocus) ui_text_field_autofocus();
+      ui_text_field(A, sizeof A, "a");  subA = ui_text_field_submitted();
+      if (show_b) { ui_text_field(B, sizeof B, "b");  subB = ui_text_field_submitted(); }
+      ui_password_field(C, sizeof C, "c"); subC = ui_text_field_submitted();
+    ui_end_stack();
+}
+static void frame(const char *keys) {
+    for (const char *k = keys; k && *k; k++) ui_input_char(*k);
+    ui_frame_begin(); form(); ui_frame_end();
+    ui_run_layout(400, 300);
+}
+
+/* One press-and-release at a point, with no movement -- a click.
+ *
+ * press_at ADVANCES THE CLOCK first, so consecutive gestures in this file are
+ * separate ones; press_fast does not, and is how a real double-click is
+ * driven. Getting this wrong is quiet and confusing: every press falls inside
+ * the previous one's double-click window, the run climbs, and drags stop
+ * working because a drag deliberately leaves a multi-click's selection alone. */
+static void press_fast(float x, float y) {
+    ui_pointer(x, y, true);
+    frame(NULL);
+    ui_pointer(x, y, false);
+    frame(NULL);
+}
+static void press_at(float x, float y) { g_ms += 900; press_fast(x, y); }
+
+/* Press at one x, drag to another, release -- the way nearly everyone
+ * actually selects text. */
+static void drag(float x0, float x1, float y) {
+    g_ms += 900;
+    ui_pointer(x0, y, true);
+    frame(NULL);
+    ui_pointer(x1, y, true);
+    frame(NULL);
+    ui_pointer(x1, y, false);
+    frame(NULL);
+}
+
+/* A ScrollView containing `rows` boxes of `row_h`, laid out twice so the
+ * extents the bar is sized from (which lag a frame by design) are settled. */
+static void scroll_view(float *sc, float view_h, int rows, float row_h) {
+    for (int pass = 0; pass < 2; pass++) {
+        ui_frame_begin();
+        ui_scroll_begin(0x5C401, view_h, sc);
+        for (int i = 0; i < rows; i++) {
+            ui_box_begin((uint64_t)(i + 1));
+            ui_set_size((struct layout_size){ .mode = SIZE_FLEX, .flex_grow = 1 },
+                        (struct layout_size){ .mode = SIZE_FIXED, .fixed_value = row_h });
+            ui_box_end();
+        }
+        ui_scroll_end();
+        ui_frame_end();
+        ui_run_layout(400, 300);
+    }
+}
+
+
+/* --- the segmented control ----------------------------------------------
+ *
+ * This exists because a live desktop could not switch the keyboard layout
+ * through Settings, and the instrumentation said something that should not be
+ * possible: inside ui_segmented the pointer IS in the segment's rect,
+ * ui_is_hovered() is 1 and ui_is_pressed() is 1 -- and ui_consume_click(seg)
+ * still returns false, so the selection never moves. Either the harness was
+ * mis-driving the pane or the control is not clickable, and a control that is
+ * not clickable breaks the theme, the text size, the layout AND Files'
+ * Grid/List. Guessing between the two is what a host test is for.
+ *
+ * It SWEEPS the pointer across the control rather than pressing where I think
+ * a segment is: a guessed coordinate that misses turns "the control is broken"
+ * into "my arithmetic was wrong" and reports the same red either way. */
+static const char *const SEG3[3] = { "One", "Two", "Three" };
+static int seg_pick;
+static void seg_frame(void) {
+    ui_frame_begin();
+    ui_begin_vstack(0x5E60);
+      ui_set_padding(0, 0, 0, 0);
+      seg_pick = ui_segmented(SEG3, 3, seg_pick);
+    ui_end_stack();
+    ui_frame_end();
+    ui_run_layout(400, 300);
+}
+/* A press-and-release on the control, driven the way a hand drives one:
+ * a frame with the button down, then a frame with it up. */
+static void seg_press(float x, float y) {
+    g_ms += 900;
+    ui_pointer(x, y, true);  seg_frame();
+    ui_pointer(x, y, false); seg_frame();
+}
+/* The first x that selects `want`, or -1 if no x on the control does. */
+static float seg_x_for(int want) {
+    for (float x = 1; x < 300; x += 1) {
+        seg_pick = 0; seg_frame(); seg_frame();
+        seg_press(x, 12);
+        if (seg_pick == want) return x;
+    }
+    return -1;
+}
+
+int main(void) {
+    printf("=== kit-test: the text field and the keyboard ===\n");
+    scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
+
+    /* A REAL FONT, or every width this test measures is zero -- and a zero
+     * width does not fail loudly, it agrees with whatever you expected. See
+     * ui/testfont.h: every character is exactly half the text size wide, so a
+     * test can SAY where the caret should land. */
+    static struct testfont TF;
+    uint32_t fh = font_load(TF.data, testfont_build(&TF));
+    if (!fh) { printf("  FAIL: could not build the test font\n"); return 1; }
+    ui_theme_set_fonts(fh, fh);
+
+    ui_clipboard_provider(clip_set, clip_get);
+    ui_clock_provider(fake_clock);
+    ui_mods_provider(fake_mods);
+
+    frame(NULL);
+    CHECK(ui_any_focus(), "a form with autofocus opens with a field focused");
+    frame("tester");
+    CHECK(!strcmp(A, "tester"), "the keys go to the FIRST field");
+
+    frame("\t");
+    frame("pass");
+    CHECK(!strcmp(B, "pass") && !strcmp(A, "tester"), "Tab moves to the next field; typing lands there");
+
+    frame("\tword\n");
+    CHECK(!strcmp(C, "word"), "Tab then keys in ONE frame: the keys after the Tab follow it");
+    CHECK(subC && !subA && !subB, "Return is reported by the field that saw it, and only by it");
+    frame(NULL);
+    CHECK(!subA && !subB && !subC, "and only once: a submit is an edge");
+
+    frame("\t");
+    frame("x");
+    CHECK(!strcmp(A, "testerx"), "Tab in the LAST field wraps to the first");
+
+    /* Hiding one field is NOT a new page: identity is positional, so the
+     * field after it inherits its instance -- and its focus. */
+    frame("\t");                          /* focus to B */
+    show_b = false;
+    frame(NULL);
+    CHECK(ui_any_focus(), "a field that disappears mid-form hands its place (and focus) to the next");
+    show_b = true;
+
+    /* A NEW PAGE -- a differently keyed container, every widget new: the
+     * focused one is gone for good. */
+    autofocus = false;
+    page = 0x2222;
+    frame(NULL);
+    frame(NULL);
+    CHECK(!ui_any_focus(), "focus is let go when the focused field is no longer on screen");
+    autofocus = true;
+    A[0] = 0;
+    frame(NULL);
+    CHECK(ui_any_focus(), "so the next page's autofocus takes it");
+    frame("z");
+    CHECK(!strcmp(A, "z"), "and typing goes to that page's first field");
+
+    /* ---- UTF-8: the field has to hold a language, not just ASCII --------
+     *
+     * The key stream carries UTF-8 now (the keyboard driver encodes codepoints
+     * rather than truncating them to 7 bits), so é arrives as two bytes and €
+     * as three. This field used to reject every byte outside 32..126 -- which
+     * silently dropped every accented character between the keyboard and the
+     * screen -- and its backspace deleted ONE BYTE, which cuts a two-byte
+     * character in half and leaves something the renderer draws as a
+     * replacement box.
+     *
+     * Typed here as the exact bytes the driver produces, because that is what
+     * the field actually receives. */
+    page = 0x3333; autofocus = true; A[0] = 0;
+    frame(NULL); frame(NULL);
+    frame("caf\xC3\xA9");                 /* c a f + U+00E9 */
+    CHECK(!strcmp(A, "caf\xC3\xA9"), "an accented character survives into the field (café)");
+
+    frame("\b");
+    CHECK(!strcmp(A, "caf"), "one backspace removes the WHOLE é, not half of it");
+
+    A[0] = 0; frame(NULL);
+    frame("\xE2\x82\xAC");               /* U+20AC EURO SIGN, three bytes */
+    CHECK(!strcmp(A, "\xE2\x82\xAC"), "a three-byte character (€) survives too");
+    frame("\b");
+    CHECK(A[0] == 0, "and one backspace removes all three of its bytes");
+
+    /* ---- THE CARET: editing somewhere other than the end ----------------
+     *
+     * Until it existed, this field could only be appended to and backspaced
+     * from the end -- so fixing a typo three characters back meant deleting
+     * everything after it, in every filename box and search box in the system.
+     * The navigation keys arrive as bytes in this same stream (UI_KEY_*), which
+     * is why they can be typed here exactly as the driver sends them. */
+    #define LEFT  "\x11"
+    #define RIGHT "\x12"
+    #define HOME  "\x02"
+    #define END   "\x05"
+    #define DEL   "\x7F"
+
+    page = 0x4444; autofocus = true; A[0] = 0;
+    frame(NULL); frame(NULL);
+    frame("world");
+    frame(HOME "hello ");
+    CHECK(!strcmp(A, "hello world"), "Home puts the caret at the front and typing INSERTS there");
+
+    frame(END "!");
+    CHECK(!strcmp(A, "hello world!"), "End goes back to the end");
+
+    /* "hello world!" -- three lefts put the caret before the l of "world",
+     * so backspace takes the r. */
+    frame(LEFT LEFT LEFT "\b");
+    CHECK(!strcmp(A, "hello wold!"), "backspace takes the character BEFORE the caret, mid-string");
+
+    frame(DEL);
+    CHECK(!strcmp(A, "hello wod!"), "Delete takes the one after it -- a key that used to do nothing");
+
+    frame(HOME DEL DEL DEL DEL DEL DEL);
+    CHECK(!strcmp(A, "wod!"), "Delete at the front eats forwards");
+
+    /* A caret is a CHARACTER position, not a byte position: the stream is
+     * UTF-8, and an arrow key that moved one byte would step into the middle
+     * of an é and let a backspace cut it in half. */
+    A[0] = 0; frame(NULL);
+    frame("caf\xC3\xA9s");                /* c a f é s */
+    frame(LEFT LEFT);                      /* over the s, then over the whole é */
+    frame("X");
+    CHECK(!strcmp(A, "cafX\xC3\xA9s"), "Left steps over a whole é, not one of its bytes");
+
+    frame(RIGHT);                          /* past the é, in one press */
+    frame("Y");
+    CHECK(!strcmp(A, "cafX\xC3\xA9Ys"), "and Right steps over all of it too");
+
+    /* One left puts the caret between the é and the Y, so backspace takes the
+     * whole é -- both its bytes, in one press. */
+    frame(LEFT "\b");
+    CHECK(!strcmp(A, "cafXYs"), "backspace over a multi-byte character removes all of it");
+
+    /* FOCUSING A FIELD PUTS THE CARET AT THE END OF ITS TEXT, and that is the
+     * documented behaviour rather than a limitation worked around: there is one
+     * caret because exactly one field is focused, and arriving at the end is
+     * what someone Tabbing into a field to add to it expects. Pointing at a
+     * spot is how you get anywhere else, and a click does exactly that. */
+    A[0] = 0; B[0] = 0; frame(NULL);
+    frame("abc");
+    frame(HOME);                           /* caret to the front of A */
+    frame("\t");                           /* to B */
+    frame("zz");
+    frame("\t\t");                         /* wrap back round to A */
+    frame("Q");
+    CHECK(!strcmp(A, "abcQ"), "coming back to a field puts the caret at the end of its text");
+    CHECK(!strcmp(B, "zz"), "and the other field kept its own text");
+
+    /* ---- SELECTION, AND THE CLIPBOARD ----------------------------------
+     *
+     * These commands ride the SAME byte stream as the text, at 0xF8..0xFF --
+     * byte values that can never occur in valid UTF-8, which is what makes it
+     * safe to put them there and what keeps them in ORDER with typed
+     * characters. They come from the GUI key rather than Ctrl because Ctrl+C is
+     * this OS's console interrupt and is consumed before any app sees it. */
+    #define SLEFT  "\xF8"
+    #define SRIGHT "\xF9"
+    #define SHOME  "\xFA"
+    #define SEND   "\xFB"
+    #define SALL   "\xFC"
+    #define COPY   "\xFD"
+    #define CUT    "\xFE"
+
+    page = 0x5555; autofocus = true; A[0] = 0;
+    frame(NULL); frame(NULL);
+    frame("hello world");
+    frame(SLEFT SLEFT SLEFT SLEFT SLEFT);   /* select "world" backwards */
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "world"), "Shift+Left selects, and copy puts it on the clipboard");
+    CHECK(!strcmp(A, "hello world"), "copying does not change the text");
+
+    frame("W");
+    CHECK(!strcmp(A, "hello W"), "typing REPLACES the selection");
+
+    /* Step off the end first, so this tests that Shift+Home extends from where
+     * the CARET is rather than simply selecting everything. */
+    frame(LEFT);                            /* caret between "hello " and "W" */
+    frame(SHOME);                           /* select back to the start */
+    frame(CUT);
+    CHECK(!strcmp(clip_text(), "hello ") && A[0] == 'W' && A[1] == 0,
+          "Shift+Home selects to the front from the caret, and cut removes exactly that");
+
+    /* Select-all, then one keystroke: the "clear this field" everyone does. */
+    A[0] = 0; frame(NULL);
+    frame("something long");
+    frame(SALL "x");
+    CHECK(!strcmp(A, "x"), "select-all then a key replaces the whole field");
+
+    /* An arrow with a selection COLLAPSES it to the edge it moves toward,
+     * rather than moving the caret from wherever it happened to be. */
+    A[0] = 0; frame(NULL);
+    frame("abcdef");
+    frame(SHOME);                           /* all of it selected, caret at 0 */
+    frame(RIGHT);                           /* collapse to the RIGHT edge */
+    frame("Z");
+    CHECK(!strcmp(A, "abcdefZ"), "a plain arrow collapses the selection to the edge it moves toward");
+
+    frame(SALL);
+    frame(LEFT);                            /* collapse to the LEFT edge */
+    frame("Q");
+    CHECK(!strcmp(A, "QabcdefZ"), "and Left collapses it to the other one");
+
+    /* Backspace with a selection deletes the selection, not one character. */
+    A[0] = 0; frame(NULL);
+    frame("keep this");
+    frame(SLEFT SLEFT SLEFT SLEFT);
+    frame("\b");
+    CHECK(!strcmp(A, "keep "), "backspace over a selection removes the whole selection");
+
+    /* A selection spanning a multi-byte character travels in whole characters,
+     * so what reaches the clipboard is text and not a broken fragment. */
+    A[0] = 0; frame(NULL);
+    frame("caf\xC3\xA9");
+    frame(SLEFT SLEFT);                     /* the é and the f */
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "f\xC3\xA9"), "a selection over é copies BOTH its bytes");
+
+    /* A password field keeps its secret: the caret and the selection work, but
+     * the text never leaves it. */
+    g_clip_n = 0;
+    C[0] = 0; page = 0x6666; autofocus = false; frame(NULL); frame(NULL);
+    frame("\t\t");                          /* into the password field */
+    frame("secret");
+    frame(SALL COPY);
+    CHECK(g_clip_n == 0, "a masked field refuses to copy its text");
+
+    /* ---- THE MOUSE -----------------------------------------------------
+     *
+     * Keyboard selection is not how people select text; dragging is. Pointer
+     * capture (ui_is_active) keeps the drag alive after the pointer has left
+     * the field, so dragging off the end extends to the end rather than
+     * stopping dead at the edge -- which is the difference between this and
+     * simply asking whether the field is pressed. */
+    page = 0x7777; autofocus = true; A[0] = 0; g_clip_n = 0;
+    frame(NULL); frame(NULL);
+    frame("hello world");
+
+    /* The first field sits at the top of the form; well past its right edge
+     * and back to the far left selects everything in between. */
+    /* THE PRESS HAS TO START INSIDE THE FIELD -- that is what captures the
+     * pointer, and a drag beginning outside is somebody else's drag. The
+     * RELEASE is far outside on purpose: capture is what keeps the selection
+     * extending after the pointer has gone, and without it this would stop at
+     * the field's edge. */
+    {
+        /* A PRECISE drag: from the very start of the text to the middle of the
+         * 5th character, which is the boundary after "hello". This is the test
+         * that needs a real font -- with everything measuring zero it would
+         * pass for any expectation at all. */
+        const struct ui_theme *th = ui_theme();
+        float adv = testfont_advance(th->text_body);
+        drag(th->sp3 + 0.5f, th->sp3 + adv * 4.0f + adv * 0.5f, 20);
+        frame(COPY);
+        CHECK(!strcmp(clip_text(), "hello"), "a drag selects exactly what it crossed");
+    }
+
+    /* And one that leaves the field entirely: pointer capture keeps it
+     * extending instead of stopping at the edge. */
+    g_clip_n = 0;
+    drag(5, 1000, 20);
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "hello world"),
+          "a drag that starts in the field and leaves it selects to the end");
+
+    frame("x");
+    CHECK(!strcmp(A, "x"), "and typing replaces what the drag selected");
+
+    /* ---- DOUBLE AND TRIPLE CLICK ---------------------------------------
+     *
+     * The threshold is a real elapsed time, so the test drives a clock it
+     * controls rather than sleeping. Frame counting could not do this job at
+     * all: a retained loop skips frames when nothing moves, so the PAUSE
+     * between two deliberate clicks can be fewer frames than a fast
+     * double-click. */
+    page = 0x8888; autofocus = true; A[0] = 0; g_clip_n = 0; g_ms = 1000;
+    frame(NULL); frame(NULL);
+    frame("hello big_world here");
+
+    /* Land in "big_world": one press, then a second 50 ms later at the same
+     * spot. The underscore is part of the word; the spaces bound it. */
+    /* WHERE TO AIM, computed rather than guessed. The text starts one left
+     * padding (sp3) into the field, and every character of the test font is
+     * exactly half the text size wide. "hello " is six characters, so the
+     * middle of "big_world" is nine and a half in. */
+    const struct ui_theme *th = ui_theme();
+    float adv = testfont_advance(th->text_body);
+    float text_x = th->sp3;
+    #define CHAR_X(n) (text_x + adv * (float)(n) + adv * 0.5f)
+
+    g_ms += 900;  press_fast(CHAR_X(9), 20);
+    g_ms += 50;   press_fast(CHAR_X(9), 20);
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "big_world"),
+          "a double-click selects the whole word, underscore included");
+
+    g_ms += 50;   press_fast(CHAR_X(9), 20); /* the third of the run */
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "hello big_world here"),
+          "a third click takes the whole field");
+
+    /* TOO SLOW IS TWO CLICKS. Past the threshold the run restarts, so this
+     * places a caret and selects nothing. */
+    g_clip_n = 0;
+    g_ms += 900;  press_fast(CHAR_X(9), 20);
+    g_ms += 5000; press_fast(CHAR_X(9), 20);
+    frame(COPY);
+    CHECK(g_clip_n == 0, "two clicks far apart in TIME are not a double-click");
+
+    /* TOO FAR IS TWO CLICKS. Fast, but a different place. */
+    g_clip_n = 0;
+    g_ms += 900;  press_fast(CHAR_X(2), 20);
+    g_ms += 30;   press_fast(CHAR_X(16), 20);
+    frame(COPY);
+    CHECK(g_clip_n == 0, "two clicks far apart on SCREEN are not a double-click");
+
+    /* A word made of multi-byte characters is one word. */
+    A[0] = 0; g_clip_n = 0; frame(NULL);
+    frame("caf\xC3\xA9 noir");
+    g_ms += 900;  press_fast(CHAR_X(1), 20);
+    g_ms += 40;   press_fast(CHAR_X(1), 20);
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), "caf\xC3\xA9"), "an accented word is not cut in two");
+    #undef CHAR_X
+
+    /* ---- UNDO ----------------------------------------------------------
+     *
+     * Every text field could be typed into and none could be undone: one stray
+     * keystroke over a selection and the text was gone. The log records by
+     * DIFFING the buffer across a frame, so every way the field mutates text is
+     * covered without the log having to be told about each one. */
+    #define UNDO "\xF6"
+    #define REDO "\xF7"
+
+    page = 0x9999; autofocus = true; A[0] = 0; g_ms += 5000;
+    frame(NULL); frame(NULL);
+    frame("hello");
+    g_ms += 5000;                          /* end the typing run */
+    frame(" world");
+    frame(UNDO);
+    CHECK(!strcmp(A, "hello"), "undo takes back the last run of typing");
+    frame(UNDO);
+    CHECK(A[0] == 0, "and the one before it");
+    frame(REDO);
+    CHECK(!strcmp(A, "hello"), "redo puts it back");
+    frame(REDO);
+    CHECK(!strcmp(A, "hello world"), "and again");
+    frame(REDO);
+    CHECK(!strcmp(A, "hello world"), "redo past the end does nothing");
+
+    /* A RUN OF TYPING IS ONE THING THE PERSON DID. Five undos to remove
+     * "hello" is five times as many as anyone wants. */
+    /* ONE KEY PER FRAME, which is how a person types and the only way this
+     * tests the coalescing at all -- six characters fed in a single frame are
+     * one diff and would collapse into one record whether runs are merged or
+     * not. (They were, and this test passed without exercising the feature
+     * until a mutation showed it could not fail.) */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    for (const char *k = "abcdef"; *k; k++) {
+        char one[2] = { *k, 0 };
+        g_ms += 60;                         /* fast typing, inside the run window */
+        frame(one);
+    }
+    CHECK(!strcmp(A, "abcdef"), "typed one key per frame");
+    frame(UNDO);
+    CHECK(A[0] == 0, "a whole run of typing undoes at once, not letter by letter");
+
+    /* Backspacing is a run too, and undoes as one. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("abcdef");
+    for (int i = 0; i < 3; i++) { g_ms += 60; frame("\b"); }
+    CHECK(!strcmp(A, "abc"), "three backspaces, one per frame");
+    frame(UNDO);
+    CHECK(!strcmp(A, "abcdef"), "and one undo brings all three back");
+
+    /* A PAUSE ENDS THE RUN. Coming back to a field minutes later and typing
+     * should not let one undo swallow what you wrote before the break. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("first");
+    g_ms += 5000;                           /* well past UI_UNDO_RUN_MS */
+    frame("second");
+    frame(UNDO);
+    CHECK(!strcmp(A, "first"), "a pause ends the run, so undo stops at it");
+
+    /* THE CASE THAT MOTIVATED THIS: typing over a selection destroys it, and
+     * without undo the text is simply gone. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("important text");
+    g_ms += 5000;
+    frame(SALL "x");
+    CHECK(!strcmp(A, "x"), "select-all then a key replaces everything");
+    frame(UNDO);
+    CHECK(!strcmp(A, "important text"), "undo brings back what a selection replaced");
+
+    /* A new edit after an undo drops the redo tail -- you cannot redo a future
+     * that no longer follows from the present. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("one");
+    g_ms += 5000;
+    frame("two");
+    frame(UNDO);
+    CHECK(!strcmp(A, "one"), "undone");
+    g_ms += 5000;
+    frame("three");
+    frame(REDO);
+    CHECK(!strcmp(A, "onethree"), "a new edit drops what could have been redone");
+
+    /* Each field has its own past. */
+    A[0] = 0; B[0] = 0; g_ms += 5000; frame(NULL);
+    frame("aaa");
+    frame("\t");                            /* to B */
+    frame("bbb");
+    frame(UNDO);
+    CHECK(!strcmp(B, "") && !strcmp(A, "aaa"),
+          "undo in one field does not reach into another");
+
+    /* ---- THE SCROLLBAR -------------------------------------------------
+     *
+     * A ScrollView scrolled with the wheel and showed NOTHING: no way to tell
+     * how long a list was or where you were in it. The bar is sized from the
+     * same content/viewport extents the scroll clamp uses, so it cannot
+     * disagree with the thing it describes.
+     *
+     * Checked by geometry rather than by eye: the view is the only thing in the
+     * frame, so its outer box is the root's first child, the track is that
+     * box's second child, and the thumb is the track's first. */
+    {
+        static float sc;
+        const float VIEW = 100.0f, ROW = 20.0f;
+        const int ROWS = 20;                     /* 400px of content in 100px */
+
+        struct instance_handle outer, track, thumb;
+        float tx, ty, tw, th;
+
+        sc = 0;
+        scroll_view(&sc, VIEW, ROWS, ROW);
+        outer = ui_first_child(ui_root());
+        track = ui_next_sibling(ui_first_child(outer));
+        CHECK(!instance_handle_is_null(track), "the scroll view has a bar beside its content");
+        thumb = ui_first_child(track);
+        CHECK(!instance_handle_is_null(thumb), "and a thumb in it when the content overflows");
+
+        if (!instance_handle_is_null(thumb) && ui_rect_of(thumb, &tx, &ty, &tw, &th)) {
+            /* content = 20 rows of 20 = 400 (plus the stack's own spacing);
+             * the thumb is viewport/content of the track, floored at 28. */
+            CHECK(th > 20.0f && th < VIEW * 0.6f,
+                  "the thumb is a fraction of the track, not the whole of it");
+            float top = ty;
+            sc = 1e6f;                            /* scrolled to the very bottom */
+            scroll_view(&sc, VIEW, ROWS, ROW);
+            thumb = ui_first_child(ui_next_sibling(ui_first_child(ui_first_child(ui_root()))));
+            float bx, by, bw, bh;
+            if (!instance_handle_is_null(thumb) && ui_rect_of(thumb, &bx, &by, &bw, &bh)) {
+                CHECK(by > top, "and it moves DOWN as the view scrolls down");
+                CHECK(by + bh <= ty + VIEW + 1.0f, "without running off the end of the track");
+            } else {
+                CHECK(0, "and it moves DOWN as the view scrolls down");
+            }
+        }
+
+        /* Content that FITS gets no thumb -- a full-length bar that cannot move
+         * is a lie about the content. */
+        sc = 0;
+        scroll_view(&sc, VIEW, 1, ROW);
+        track = ui_next_sibling(ui_first_child(ui_first_child(ui_root())));
+        CHECK(instance_handle_is_null(ui_first_child(track)),
+              "content that fits shows no thumb at all");
+    }
+
+    /* ---- SHIFT-CLICK ----------------------------------------------------
+     *
+     * Click once to place the caret, then shift-click elsewhere to take
+     * everything between -- the way you select a long run without dragging
+     * across it. The anchor stays put and only the caret moves, the same rule
+     * the drag follows. */
+    page = 0xAAAA; autofocus = true; A[0] = 0; g_clip_n = 0; g_mods = 0;
+    frame(NULL); frame(NULL);
+    frame("hello big world");
+
+    const struct ui_theme *th2 = ui_theme();
+    float adv2 = testfont_advance(th2->text_body);
+    #define CX(n) (th2->sp3 + adv2 * (float)(n) + adv2 * 0.5f)
+
+    press_at(CX(4), 20);                  /* caret after "hello", boundary 5 */
+    g_mods = UI_MOD_SHIFT;
+    press_at(CX(8), 20);                  /* ...extend to boundary 9, taking " big" */
+    g_mods = 0;
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), " big"), "shift-click extends the selection to it");
+
+    /* And it extends AGAIN from the same anchor rather than starting over. */
+    g_mods = UI_MOD_SHIFT;
+    press_at(CX(14), 20);                 /* boundary 15: the end */
+    g_mods = 0;
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), " big world"),
+          "a second shift-click extends further from the SAME anchor");
+
+    /* A plain click after it starts fresh. */
+    press_at(CX(2), 20);
+    g_clip_n = 0;
+    frame(COPY);
+    CHECK(g_clip_n == 0, "a plain click afterwards starts a new, empty selection");
+
+    /* Two shift-clicks in the same spot are not a double-click: that would turn
+     * a deliberate extend into a word-select. */
+    A[0] = 0; g_ms += 5000; frame(NULL);
+    frame("hello big world");
+    press_at(CX(4), 20);
+    g_mods = UI_MOD_SHIFT;
+    g_ms += 900; press_fast(CX(8), 20);
+    g_ms += 50;  press_fast(CX(8), 20);
+    g_mods = 0;
+    frame(COPY);
+    CHECK(!strcmp(clip_text(), " big"), "two fast shift-clicks extend, they do not select a word");
+    #undef CX
+
+    /* --- the segmented control is clickable, or nothing that uses one works --- */
+    seg_pick = 0;
+    float x1 = seg_x_for(1), x2 = seg_x_for(2);
+    CHECK(x1 >= 0, "a press somewhere on a segmented control selects segment 1");
+    CHECK(x2 >= 0, "...and somewhere else selects segment 2");
+    CHECK(x1 < 0 || x2 < 0 || x1 < x2, "the segments are in the order they are written");
+
+    /* Selecting one and pressing it again LEAVES IT SELECTED. The selected
+     * segment is painted differently -- if being selected changed its identity
+     * or its hit rect, the second press would fall through and reset it. */
+    if (x2 >= 0) {
+        seg_press(x2, 12);
+        CHECK(seg_pick == 2, "pressing the segment that is already selected keeps it");
+    }
+
+    /* And a press OFF the control selects nothing: a control that answers
+     * clicks it never received would swallow every click on the page. */
+    if (x2 >= 0) {
+        seg_press(380, 12);
+        CHECK(seg_pick == 2, "a press outside the control changes nothing");
+    }
+
+    printf("=== kit-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);
+    return g_fail ? 1 : 0;
+}

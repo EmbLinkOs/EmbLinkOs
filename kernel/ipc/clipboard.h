@@ -26,4 +26,14 @@ int64_t clipboard_set_user(const void *ubuf, size_t len);
  * buffer learns the real size), or -EMBK_EFAULT. Empty clipboard returns 0. */
 int64_t clipboard_get_user(void *ubuf, size_t cap);
 
+/* THE CLIPBOARD BELONGS TO A SESSION. It was one machine-global buffer, so a
+ * password user A copied was pasteable by user B after A logged out. Now a
+ * set records the setter's session; a get from any other session sees an
+ * empty clipboard; and when a session ends its clipboard is wiped -- zeroed,
+ * not just forgotten. */
+void clipboard_session_ended(uint32_t sid);
+
+/* Whose content the clipboard holds right now (0 = nobody's). For tests. */
+uint32_t clipboard_owner_session(void);
+
 #endif

@@ -9,23 +9,53 @@
 #include "drivers/video/framebuffer.h"
 #include "drivers/video/gpu.h"
 #include "drivers/video/console.h"
+#include "drivers/video/rawcon.h"
 #include "drivers/input/keyboard.h"
+#include "drivers/input/virtio_input.h"
 #include "drivers/input/mouse.h"
 #include "gfx/compositor.h"   /* compositor_pointer_tick() -- cursor/focus/drag */
 #include "drivers/timer/timer.h"
 #include "drivers/timer/hpet.h"
 #include "drivers/timer/rtc.h"
 #include "drivers/bus/pci.h"
-#include "drivers/audio/ac97.h"
+#include "drivers/audio/audio.h"
+#include "acpi/aml.h"
+#include "drivers/char/virtio_rng.h"
+#include "drivers/char/platform_misc.h"
+#include "drivers/storage/sdhci.h"
+#include "drivers/storage/atapi.h"
+#include "drivers/storage/megasas.h"
+#include "drivers/storage/pvscsi.h"
+#include "drivers/storage/mptsas.h"
+#include "drivers/storage/esp.h"
+#include "drivers/storage/lsi53c895a.h"
+#include "drivers/storage/ufs.h"
+#include "drivers/storage/virtio_pmem.h"
+#include "drivers/storage/nvdimm.h"
+#include "drivers/crypto/virtio_crypto.h"
+#include "drivers/iommu/virtio_iommu.h"
+#include "drivers/iommu/intel_iommu.h"
+#include "drivers/iommu/amd_iommu.h"
+#include "drivers/tpm/tpm.h"
+#include "acpi/hotplug.h"
+#include "acpi/erst.h"
+#include "lib/crashlog.h"
+#include "drivers/misc/virtio_mem.h"
+#include "drivers/char/virtio_console.h"
+#include "drivers/misc/virtio_balloon.h"
+#include "drivers/i2c/smbus.h"
+#include "fs/ninep.h"
+#include "drivers/storage/virtio_scsi.h"
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
+#include "drivers/storage/nvme.h"
 #include "drivers/video/bootanim.h"
 
 #include "arch/x86_64/cpu/gdt.h"
 #include "arch/x86_64/cpu/percpu.h"
 #include "arch/x86_64/smp/smp.h"
-#include "arch/x86_64/boot/boot_protocol.h"
+#include "boot/boot_protocol.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/syscall/syscall.h"
 #include "arch/x86_64/irq/pic.h"
@@ -36,12 +66,14 @@
 
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "include/arch_ipi.h"
 #include "mm/kheap.h"
 
 #include "acpi/acpi.h"
 #include "net/net.h"
 #include "block/block.h"
 #include "block/partition.h"
+#include "fs/automount.h"
 #include "fs/fat32.h"
 #include "fs/embkfs/embkfs.h"
 #include "fs/vfs.h"
@@ -56,6 +88,10 @@
 #include "selftests.h"
 
 #include "kworker/kworker.h"
+#include "mm/vm_object.h"   /* the page cache writeback thread */
+#include "power/power.h"     /* idle residency, shutdown, reboot */
+#include "lib/random.h"      /* random_init: the kernel CSPRNG */
+#include "mm/swap.h"         /* swap_init: the swap store */
 
 #include "process/process.h"
 #include "tty/tty.h"
@@ -724,11 +760,29 @@ static bool shell_handle_process_command(const char *cmd)
 
     if ((arg = shell_match_prefix(cmd, "run")) != NULL) {
         if (!arg[0]) {
-            kprintf("\n[run] usage: run <path>\n");
+            kprintf("\n[run] usage: run <path> [args...]\n");
             return true;
         }
-        char *argv[] = { (char *)arg, NULL };
-        int pid = process_create(arg, argv, 1, NULL, 0);
+        /* ARGUMENTS, because a program that takes them could not be started
+         * from here at all: the path and everything after it went to
+         * process_create as ONE string, which is a file that does not exist.
+         * Split in place on spaces -- `cmd` is the console's own line buffer
+         * and is finished with. No quoting: a path with a space in it is a
+         * thing this console does not do, and pretending otherwise would mean
+         * a parser nobody has tested. */
+        static char *argv[16];
+        int argc = 0;
+        char *p = (char *)arg;
+        while (*p && argc < (int)(sizeof argv / sizeof argv[0]) - 1) {
+            while (*p == ' ') *p++ = '\0';
+            if (!*p) break;
+            argv[argc++] = p;
+            while (*p && *p != ' ') p++;
+        }
+        argv[argc] = NULL;
+        if (argc == 0) { kprintf("\n[run] usage: run <path> [args...]\n"); return true; }
+        arg = argv[0];
+        int pid = process_create(arg, argv, argc, NULL, 0);
         if (pid < 0) {
             kprintf("\n[run] failed to start %s: %s\n", arg, embk_strerror(pid));
         } else {
@@ -740,15 +794,32 @@ static bool shell_handle_process_command(const char *cmd)
     if (strcmp(cmd, "ps") == 0) {
         struct process_info procs[MAX_PROCESSES];
         int n = process_list(procs, MAX_PROCESSES);
-        kprintf("\nPID  PPID STATE   PRI KIND    EXIT\n");
+        /* CPU in MILLISECONDS, from nanoseconds. A process that has used less
+         * than a millisecond shows 0 rather than a spuriously precise figure:
+         * this is a "what is the machine busy with" column, and to answer that
+         * the interesting rows are the ones with big numbers. */
+        kprintf("\nPID  PPID STATE   PRI KIND     CPU(ms) EXIT NAME\n");
+        uint64_t total_ns = 0;
         for (int i = 0; i < n; i++) {
-            kprintf("%-4u %-4u %-7s %-3u %-7s %d\n",
+            total_ns += procs[i].cpu_ns;
+            kprintf("%-4u %-4u %-7s %-3u %-7s %-8llu %-4d %s\n",
                     (unsigned int)procs[i].pid, (unsigned int)procs[i].parent_pid,
                     process_state_name(procs[i].state),
                     (unsigned int)procs[i].priority,
                     procs[i].is_kthread ? "kthread" : "process",
-                    procs[i].exit_code);
+                    (unsigned long long)(procs[i].cpu_ns / 1000000ULL),
+                    procs[i].exit_code,
+                    procs[i].name[0] ? procs[i].name : "-");
         }
+        /* The total against uptime is the sanity check that makes the column
+         * trustworthy: on a 4-core machine idling at 97%, the sum of every
+         * process's CPU should be a small fraction of 4 x uptime. A total that
+         * exceeded it would mean the accounting is double-charging. */
+        kprintf("total %llu ms of CPU used; uptime %llu ms x %u cores"
+                "  [ns-clock says %llu ms]\n",
+                (unsigned long long)(total_ns / 1000000ULL),
+                (unsigned long long)timer_uptime_ms(), (unsigned)cpu_count,
+                (unsigned long long)(time_get_ns() / 1000000ULL));
         return true;
     }
 
@@ -1523,6 +1594,27 @@ static bool shell_handle_process_command(const char *cmd)
         return true;
     }
 
+    /* sessions: every live session -- id, user, leader, processes. And
+     * `session end <id>`, which is init's logout: every process in it is
+     * stopped, the leader last. The console holds EMBK_CAP_SESSION. */
+    if (strcmp(cmd, "sessions") == 0) {
+        struct session_row rows[16];
+        int n = session_list(rows, 16);
+        kprintf("\n[sessions] %d live\n", n);
+        for (int i = 0; i < n; i++)
+            kprintf("  session %u  user %-12s  leader pid %u  %u process(es)\n",
+                    (unsigned)rows[i].id, rows[i].user, (unsigned)rows[i].leader_pid,
+                    (unsigned)rows[i].procs);
+        return true;
+    }
+    if ((arg = shell_match_prefix(cmd, "session end")) != NULL) {
+        uint32_t sid = shell_parse_uint(arg);
+        int n = session_end(sid, true);
+        kprintf("\n[session] end %u: %d process(es) stopped%s\n", (unsigned)sid, n,
+                n < 0 ? " (refused)" : "");
+        return true;
+    }
+
     if ((arg = shell_match_prefix(cmd, "kill")) != NULL) {
         if (!arg[0]) {
             kprintf("\n[kill] usage: kill <pid>\n");
@@ -1684,6 +1776,18 @@ static void kernel_handle_line_command(const char *cmd)
         kprintf("\n[cmd] unknown command: %s\n", cmd);
 }
 
+/* COM1's receive interrupt: drain the FIFO into the driver's ring. It lives
+ * here rather than in serial.c because irq_handler_t and the IRQ layer belong
+ * to x86, and serial.c is shared with nothing that has them. */
+/* How often the debug REPL wakes to pump the compositor: ~60 Hz. Named because
+ * it is a FRAME rate, not a scheduler quantum, and the two had been the same
+ * number by accident. */
+#define COMPOSITOR_PUMP_MS 16
+
+static void serial_irq_handler(void) {
+    serial_irq_drain();
+}
+
 void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                                         * pointer the loader left in RDI, relayed
                                         * by kentry.asm as the first argument. */
@@ -1699,6 +1803,9 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                       // (the BSP) directly, see gdt_init_bsp()'s comment.
     idt_init();
     syscall_init();   // install int 0x80 (DPL3) + #DF on IST1; needs idt_init first
+    syscall_fast_init_this_cpu();   // and `syscall`/`sysret`: MSRs + this core's
+                                    // GS scratch. After gdt_init_bsp (a GS selector
+                                    // reload would clear GS.base) -- see syscall_fast.c
     pic_init();
     irq_install();
     fpu_init_this_cpu();   // CR0/CR4 are per-core -- every AP repeats this in
@@ -1710,11 +1817,38 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     pmm_init();
     vmm_init();
     kheap_init();
+    /* THE KERNEL LOG ON THE SCREEN FROM HERE, not from console_init() -- which
+     * is two hundred lines and every driver on the machine further on. On a
+     * laptop, with no serial port, a hang anywhere in between used to leave the
+     * loader's last line on the screen and nothing else. */
+    rawcon_init();
     ap_bootstrap_map();   // permanent low-1MB identity map, needed before
                           // any AP can be started (see smp.h's comment)
 
     // --- Interrupt controllers (ACPI -> LAPIC -> IO-APIC) ---
     acpi_init();
+    /* The firmware's bytecode. After acpi_init (it needs the RSDP) and after
+     * kheap_init (the namespace is allocated), and before anything that would
+     * want to ask the firmware a question. A machine whose DSDT does not parse
+     * carries on with the table-only facts it had. */
+    aml_init();
+    /* \_S5_ again, EVALUATED this time. acpi.c decoded it by recognising the
+     * encoding of a named package, which is all that was possible before the
+     * interpreter existed and which cannot read a machine whose _S5 is a
+     * method. This corrects it where they differ and fills it in where the
+     * decoder found nothing. */
+    acpi_power_adopt_aml_s5();
+    /* THE TSC'S FREQUENCY, BEFORE ANYTHING TIMES ANYTHING. Every busy-wait in
+     * the USB, storage and SMP code goes through pit_delay_ms(), which becomes
+     * an exact TSC wait the moment this is known -- and every other core
+     * calibrates its scheduler tick against it as soon as smp_bringup() below
+     * starts it. Measured with the PIT and HPET switched off, which is what a
+     * recent laptop looks like: called later, after the cores were up, the
+     * three secondaries timed their ticks against a PIT that was not counting
+     * and ran five times fast. It needs only the ACPI tables (the PM timer's
+     * port, parsed in acpi_init just above); the HPET is not mapped yet and is
+     * simply not one of the references it can use this early. */
+    tsc_calibrate();
     lapic_init();
     // this_cpu() becomes usable core-wide from here on: needs both ACPI's
     // MADT CPU list (acpi_init, just above) and a working lapic_get_id()
@@ -1739,6 +1873,10 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
                           // smp.c) as a real, adopted scheduler
                           // participant with its own LAPIC timer
     ioapic_init();
+    /* AFTER the I/O APIC, because the first thing this does is tell the
+     * firmware we are using it -- and on most machines, QEMU included, that
+     * changes which routing table _PRT hands back. */
+    acpi_pci_routing_init();
 
     // --- HPET: must come after acpi_init + vmm (for MMIO map) ---
     hpet_init();
@@ -1754,13 +1892,63 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // --- Devices ---
     
     pci_init();
-    ac97_init();   // sound out; harmless when no AC97 device is attached
+    /* And the bridges, which the scan above walks THROUGH without ever
+     * looking AT. Before the IOMMU and before any driver: a device behind a
+     * bridge with mastering off cannot complete a transfer. */
+    pci_bridge_configure();
+
+    /* THE IOMMU BEFORE ANY DEVICE THAT DMAs. Attaching an endpoint to a
+     * domain redirects everything it does through that domain's table, so
+     * this has to happen while nothing is in flight -- which is here, between
+     * the bus scan and the first driver that touches memory on a device's
+     * behalf. */
+    virtio_iommu_init();
+    intel_iommu_init();
+    amd_iommu_init();
+    tpm_init();           /* the chip that remembers what booted, if there is one */
+    acpi_hotplug_init();  /* and watch for a CPU or a DIMM arriving later   */
+    erst_init();          /* somewhere to leave a crash record              */
+    /* AND READ THE LAST ONE BACK. If the previous boot ended in a fault,
+     * this is where it says so -- registers, the symbolised address, and
+     * the kernel log leading up to it. */
+    crashlog_report();
+    /* AFTER the heap exists: growing the page bitmap allocates. */
+    virtio_mem_init();    /* memory offered a block at a time               */
+
+    audio_init();  // sound out; harmless when the machine has no card
+    /* The chipset's two-wire bus: the battery, the memory SPD, a monitor's
+     * EDID. After pci_init, which is where the host controller is found. */
+    smbus_init();
+
+    /* pvpanic, the watchdog and the debug-exit port. After pci_init, which is
+     * where the watchdog is found. */
+    platform_misc_init();
+
+    /* ENTROPY FROM THE HOST, if this is a guest. Folded into the pool rather
+     * than replacing it, so a hypervisor feeding predictable bytes cannot
+     * make the CSPRNG worse than it already was. After pci_init, which is
+     * where the device is found. */
+    if (virtio_rng_init()) {
+        uint32_t got = virtio_rng_harvest(64);
+        kprintf("virtio-rng: seeded the pool with %u byte(s)\n", (unsigned)got);
+    }
+
+    /* A console that is not a 16550 and memory the host can ask back for.
+     * Both are no-ops on a machine that does not have them. */
+    virtio_console_init();
+    virtio_balloon_init();
+
     usb_init();
     ata_init();    // registers ATA drives as block devices internally
     ahci_init();   // runs IDENTIFY per port, stores sector counts
 
     // Register AHCI drives as block devices (after ahci_init filled sector counts)
     ahci_register_block_devices();
+
+    // NVMe AFTER ATA and AHCI, so a machine that has both keeps its SATA boot
+    // disk as sda -- the name everything below and the test harness expect.
+    // Before the partition scan, which is what gives an NVMe disk its sdX1..
+    nvme_init();
 
 
 
@@ -1769,6 +1957,15 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     fb_init();
     console_init();
     keyboard_init();
+    /* A KEYBOARD, TABLET OR TOUCHSCREEN THAT IS NOT A PS/2 PART.
+     *
+     * aarch64 has driven virtio-input since it had no i8042 to fall back on.
+     * x86 has one, so this was never built here -- and that made a whole class
+     * of device unreachable on the architecture most people run: a virtio
+     * touchscreen is not a PS/2 device and never will be, and a machine with
+     * no PS/2 controller at all is now the normal kind. The driver attaches
+     * only to devices that exist, so a machine with both keeps both. */
+    virtio_input_init();
     ioapic_route_isa(1, 33, 0);   // keyboard: ISA IRQ 1 -> vector 33 -> CPU 0 (override-aware)
     // Clamp the cursor to the ACTUAL screen size (varies by GPU: virtio-gpu is
     // 1280x800, stdvga 1024x768) so it can reach every corner of the desktop.
@@ -1784,7 +1981,19 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // here. Only depends on HPET/PIT (both up by now), not on the LAPIC timer.
     tsc_calibrate();
 
+    /* THE KERNEL'S ENTROPY, seeded here and not earlier for a reason that is
+     * easy to get wrong: the seed mixes the TSC across a jitter loop, and
+     * time_get_ns() returns 0 until the line above has calibrated it. Seeding
+     * before that point would mix in a clock that does not move -- which is
+     * exactly the kind of quietly-wrong seed this file's own comments warn
+     * about elsewhere. The HPET (above) and RTC are readable by now too.
+     * Before any process exists, because process layout is chosen from it. */
+    random_init();
+
     // --- Timer (LAPIC) + retire PIC ---
+    /* The boot core's IPI vectors, before any AP exists to send it one. */
+    arch_ipi_init_this_cpu();
+
     lapic_timer_init(48);
     outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);
@@ -1803,7 +2012,20 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // IRQ-driven and would hang waiting on an interrupt that can't fire yet.
     // Done before enumeration/mount so partitions appear in the listing and the
     // mount probe below sees them alongside whole disks.
+    virtio_scsi_init();   /* before the partition scan: its targets are disks */
+    sdhci_init();         /* likewise: an SD card is a disk like any other  */
+    atapi_init();         /* and an optical drive, which answers SCSI       */
+    megasas_init();       /* a RAID controller's logical drives             */
+    pvscsi_init();        /* and VMware's paravirtual one                   */
+    mptsas_init();        /* and Fusion-MPT, which passes messages          */
+    esp_init();           /* and the 53C9x, which walks the bus by hand     */
+    lsi53c895a_init();    /* and the 53c895a, which runs a program          */
+    ufs_init();           /* and UFS, which a phone would have              */
+    virtio_pmem_init();   /* and memory that survives a reboot              */
+    nvdimm_init();        /* and the kind that is just memory in a slot     */
+    virtio_crypto_init(); /* and a cipher engine, if the host lends one     */
     embk_partition_scan_all();
+
 
     kprintf("\n=== Block devices ===\n");
     for (uint32_t i = 0; i < embk_block_count(); i++) {
@@ -1818,6 +2040,11 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     //  Mount FAT32 (probe every disk, mount the first valid one)
     // ============================================================
     embkfs_init();
+
+    /* The swap store, if a block device carries the header. After the block
+     * layer and beside the filesystem, because it is found the same way the
+     * filesystem is: by reading block 0 of every device and recognising it. */
+    swap_init();
     static struct fat32_volume vol;
     bool found = false;
     for (uint32_t i = 0; i < embk_block_count(); i++) {
@@ -1833,6 +2060,22 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     }
 
     vfs_init();
+
+    /* THE HOST'S FILESYSTEM, if one was shared. Mounted read-only at /host so
+     * a build directory on the development machine is readable in the guest
+     * without rebuilding a disk image -- which is the whole reason this
+     * driver exists. Absent on a real machine, and absent is normal.
+     *
+     * AFTER vfs_init(), which ZEROES the mount table. Mounting before it
+     * leaves a share that was mounted, reported itself mounted, resolved
+     * correctly once -- and was then silently erased before anything could
+     * use it. */
+    ninep_init("/host");
+
+    /* AND EVERYTHING THAT WAS PLUGGED IN BEFORE THE VFS EXISTED. An optical
+     * drive or an SD card found during device bring-up has been waiting in
+     * automount's queue since; this is where those become paths. */
+    automount_start();
 
     // EmbLink UI Piece 1, Layer B: the RAM-backed endpoint filesystem, mounted
     // at /run independent of whatever real storage was found above -- IPC
@@ -1957,6 +2200,18 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
 
     kworker_init();
 
+    /* The page cache's writeback thread. AFTER the scheduler (it is a kthread
+     * and takes a sleeping lock) and after the filesystem is mounted -- from
+     * this point a write() lands in memory and this thread is what bounds how
+     * long it stays there. See mm/vm_object.h. */
+    vmo_writeback_init();
+
+    /* Power: idle residency starts being counted the moment the idle threads
+     * exist, and shutdown/reboot become available. After the page cache
+     * deliberately -- a power-off flushes it, so the thing it flushes has to
+     * be there first. */
+    power_init();
+
     // --- Networking (M1): virtio-net + Ethernet/ARP/IPv4/ICMP. After PCI is
     // enumerated and the scheduler is live (net_init spawns an RX poll kthread).
     // Static config for now; `test net` pings the gateway. No ring-3 surface yet.
@@ -1999,11 +2254,45 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // Legacy USB HCs (UHCI/OHCI/EHCI) are polled: drain any completed
         // interrupt-IN transfers and re-arm them. xHCI input is IRQ-driven.
         usb_poll();
+        virtio_input_poll();
+        acpi_hotplug_poll();
         // Drive the window compositor's pointer: cursor, click-to-focus, and
         // title-bar drag. Runs here (schedulable shell-process context) so the
         // compositor spinlock is never taken from an IRQ handler. No-op until a
         // window exists.
         compositor_pointer_tick();
+        /* SYSTEM KEY SHORTCUTS, performed here rather than where they were
+         * pressed: the keyboard decides them in IRQ context and the compositor
+         * takes a spinlock and repaints, which an IRQ handler must not do. Same
+         * arrangement as the pointer tick above. */
+        {
+            int sk = keyboard_take_syskey();
+            /* A window asked to close that has not gone. Killed HERE, outside
+             * the compositor lock, because process_kill reaps and reaping
+             * re-enters the compositor. */
+            { int overdue[8];
+              int n = compositor_close_overdue(overdue, 8);
+              for (int i = 0; i < n; i++) process_kill((uint32_t)overdue[i]); }
+            /* NOT WHILE A FULL-SCREEN SHELL SURFACE IS UP. With the screen
+             * locked, GUI+Tab would raise an application window over the lock
+             * -- which is the session, handed to whoever is standing there --
+             * and GUI+W/GUI+Q would close and quit the absent user's work. */
+            if (sk && compositor_shell_modal()) {
+                /* Said out loud, because "the shortcut did nothing" and "the
+                 * keystroke never arrived" look identical from outside the
+                 * machine -- and one of them is a screen lock that can be
+                 * walked around. */
+                kprintf("compositor: system shortcut %d ignored -- a full-screen "
+                        "shell surface is up\n", sk);
+                sk = 0;
+            }
+            if (sk == SYSKEY_NEXT_WINDOW) compositor_cycle_window();
+            else if (sk == SYSKEY_QUIT_APP) compositor_quit_front();
+            else if (sk == SYSKEY_CLOSE_WINDOW) {
+                int pid = compositor_close_front();
+                if (pid) process_kill((uint32_t)pid);
+            }
+        }
         // Advance any window open/minimize motion. Same reasoning as above: it
         // repaints, so it must run in schedulable context, not an IRQ.
         compositor_anim_tick();
@@ -2032,6 +2321,25 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
             }
         }
 
-        __asm__ volatile ("hlt");   // wake on any IRQ (timer, PS/2, or xHCI)
+        /* TICKLESS, at the compositor's rate rather than the scheduler's.
+         *
+         * This loop is not idle in the scheduler's sense -- it pumps the
+         * compositor's pointer and window animation every pass, so it must run
+         * at something like a frame rate. But it has no reason to run at the
+         * 10 ms preemption quantum, which is what a plain `hlt` gave it: any
+         * interrupt woke it, and the timer was the one that always did.
+         *
+         * Arming for the pump period instead cuts core 0's timer interrupts by
+         * about a third. Console input no longer depends on this rate at all,
+         * because COM1's receive interrupt wakes the halt directly -- which is
+         * what makes lengthening it safe rather than a latency regression. */
+        sched_idle_enter();
+        timer_arm_this_cpu_ms(COMPOSITOR_PUMP_MS);
+
+        power_idle_enter();
+        __asm__ volatile ("hlt");   // wake on any IRQ (timer, COM1, PS/2, xHCI)
+        power_idle_exit();
+
+        sched_idle_exit();
     }
 }

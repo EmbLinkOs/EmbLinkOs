@@ -3,7 +3,7 @@
 #include "gfx/compositor.h"
 #include "drivers/video/framebuffer.h"
 #include "drivers/input/mouse.h"
-#include "arch/x86_64/cpu/spinlock.h"
+#include "include/spinlock.h"
 #include "process/process.h"   /* struct process (shared_next_va, pml4_phys) for zero-copy */
 #include "mm/pmm.h"            /* pmm_alloc_page / pmm_free_page / PAGE_SIZE */
 #include "mm/vmm.h"            /* vmm_kmap_pages / vmm_map_in for shared windows */
@@ -34,6 +34,15 @@ struct comp_window {
                              * pixels; the compositor BLURS the backdrop behind it
                              * and composites the window over it (frosted acrylic).
                              * Implies chromeless (the app owns its own chrome). */
+    /* 1 = this window COVERS THE DISPLAY, so the work-area clamp in
+     * compositor_win_move does not apply to it. Derived, never declared: a
+     * window whose content is exactly the size of the screen IS full screen,
+     * and deriving it means an app cannot forget to clear the flag when it
+     * shrinks again. See the shell's zoom board (ui/dsl/em.c): "Fill" takes
+     * the work area and leaves the bar and dock reachable, "Full" takes the
+     * display, and the difference is only real if the kernel lets the second
+     * one happen. */
+    int       fullscreen;
     int       translucent;  /* 1 = per-pixel translucent, NO blur (like the desktop
                              * but a raisable floating window): starts transparent
                              * and composites over the SHARP backdrop. Lets a thin
@@ -55,13 +64,45 @@ struct comp_window {
                              * needs to keep showing the app as running while it
                              * sits there with no pixels on screen. */
     int       pending_action; /* one-shot request delivered to the app runtime */
+    /* CLOSING ASKS FIRST. `asked_close_ms` is when the window was told to go;
+     * the main loop kills it if it has not gone by COMP_CLOSE_GRACE_MS.
+     *
+     * Killing outright is what this used to do, from the close light and from
+     * GUI+W alike, and it threw away unsaved work with no warning -- an editor
+     * with an hour in it simply vanished. Asking is what lets an application
+     * write its file out; the kill is still there, as the backstop for one that
+     * will not go, because a window you cannot close is worse than an app that
+     * loses a second of state. */
+    uint64_t  asked_close_ms;
     /* Latched click replay: a press EDGE on this window's content is remembered
      * here so an app that was busy (e.g. mid first-frame render, seconds long
      * under TCG) still receives the click on its next win_input polls instead
      * of the click being silently eaten (win_input is a state poll, not an
-     * event queue). 0 = none, 1 = replay press, 2 = replay release. */
-    int       pend_click;
-    int       pend_lx, pend_ly;   /* content-local coords of the latched press */
+     * event queue).
+     *
+     * A QUEUE, NOT ONE SLOT, and that is what makes DOUBLE-CLICK possible at
+     * all. The single slot this replaced was overwritten by the next press, so
+     * two rapid clicks arrived at the application as ONE -- the toolkit's
+     * double-click logic was correct and host-tested, and on a real machine it
+     * simply never saw a second click to count. Measured before the fix: a
+     * deliberate double-click 130 ms apart reached the app as a single press.
+     *
+     * Four deep because the question is only ever "how many clicks in one
+     * gesture", and a triple-click is three. A press arriving with the queue
+     * full is dropped rather than evicting an older one: the clicks already
+     * queued are the ones the person made first, and dropping those would turn
+     * a triple-click into a single. */
+#define COMP_CLICK_Q 4
+    struct comp_click { int16_t x, y; uint32_t t; } pend_q[COMP_CLICK_Q];
+    uint8_t   pend_head;          /* ring read index */
+    uint8_t   pend_count;         /* how many presses are waiting */
+    uint8_t   pend_phase;         /* 0 = the press replays next, 1 = the release */
+
+    /* A DROP LANDED HERE. Set when the button comes up over this window while
+     * a drag is in flight, and taken once by the owning process. The position
+     * is content-local, like every other pointer coordinate an app sees. */
+    uint8_t   pend_drop;
+    int16_t   drop_lx, drop_ly;
     char      title[COMP_TITLE_MAX + 1];
     uint32_t *content;      /* cw*ch, 0xAARRGGBB premultiplied. For a copy      */
                             /* window this is a kmalloc'd kernel buffer the      */
@@ -330,32 +371,39 @@ uint32_t compositor_focused_pid(void) {
     return pid;
 }
 
-/* Screen rect of a window's title-bar CLOSE button (right side). The chromeless
- * desktop window has no title bar, so no close button (returns 0). */
-#define COMP_CLOSE_SZ 16
-static int win_close_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
+/* ---- the three window lights -------------------------------------------- *
+ *
+ * Close, minimize, zoom -- leading, round, 13px in a 24px hit case, exactly
+ * the geometry and order the toolkit uses (ui/dsl/em.c, where the reasoning
+ * is written out). A window that gets its chrome from the kernel and a window
+ * that draws its own must not be two different operating systems, and every
+ * app this OS ships draws its own -- so this path is what everything ELSE
+ * gets, which is precisely who cannot be relied on to match the house style.
+ *
+ * The colours are the toolkit's theme, resolved here as constants because the
+ * kernel has no theme: danger, a quiet slate, and the accent. NOT red / amber
+ * / green -- see em.c. */
+#define COMP_HIT      24
+#define COMP_DOT      13
+#define COMP_CLOSE_SZ COMP_DOT        /* kept: other code measures against it */
+
+static int win_light_rect(const struct comp_window *w, int seg,
+                          int *x0, int *y0, int *x1, int *y1) {
     if (w->desktop || w->chromeless) return 0;
-    *x0 = w->x + (int)w->cw - COMP_CLOSE_SZ - 6;
-    *y0 = w->y + (COMP_TITLEBAR_H - COMP_CLOSE_SZ) / 2;
-    *x1 = *x0 + COMP_CLOSE_SZ;
-    *y1 = *y0 + COMP_CLOSE_SZ;
+    *x0 = w->x + 6 + seg * COMP_HIT;
+    *y0 = w->y + (COMP_TITLEBAR_H - COMP_HIT) / 2;
+    *x1 = *x0 + COMP_HIT;
+    *y1 = *y0 + COMP_HIT;
     return 1;
 }
-
-static int win_max_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
-    int cx0, cy0, cx1, cy1;
-    if (!win_close_rect(w, &cx0, &cy0, &cx1, &cy1)) return 0;
-    *x0 = cx0 - 22; *x1 = cx1 - 22; *y0 = cy0; *y1 = cy1;
-    return 1;
+static int win_close_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
+    return win_light_rect(w, 0, x0, y0, x1, y1);
 }
-
-/* The minimize button was painted from the start but had no hit rect at all --
- * it was decoration you could click forever with nothing happening. */
 static int win_min_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
-    int cx0, cy0, cx1, cy1;
-    if (!win_close_rect(w, &cx0, &cy0, &cx1, &cy1)) return 0;
-    *x0 = cx0 - 44; *x1 = cx1 - 44; *y0 = cy0; *y1 = cy1;
-    return 1;
+    return win_light_rect(w, 1, x0, y0, x1, y1);
+}
+static int win_max_rect(const struct comp_window *w, int *x0, int *y0, int *x1, int *y1) {
+    return win_light_rect(w, 2, x0, y0, x1, y1);
 }
 
 /* ---- rounded corners ---------------------------------------------------- *
@@ -739,33 +787,50 @@ static void paint_window(struct comp_window *w, int focused,
         if (!(tbx1 <= rx0 || tbx0 >= rx1 || tby1 <= ry0 || tby0 >= ry1)) {
             fb_color_t bar = focused ? FB_RGB(0x24, 0x24, 0x24) : FB_RGB(0x20, 0x20, 0x20);
             fill_clip(tbx0, tby0, (int)w->cw, COMP_TITLEBAR_H, bar, rx0, ry0, rx1, ry1);
-            int tr = focused ? 0xf2 : 0xa8, tg = focused ? 0xf2 : 0xa8, tb = focused ? 0xf2 : 0xa8;
-            int br = 0x24, bg = 0x24, bb = 0x24;
-            fb_draw_string(w->title, tbx0 + 12, tby0 + (COMP_TITLEBAR_H - 16) / 2,
-                           tr, tg, tb, br, bg, bb);
 
-            /* Linux-style window controls: minimize, maximize and close.
-             * Close is connected to process teardown below. The first two are
-             * deliberately rendered as disabled chrome until the compositor
-             * exposes minimize/maximize lifecycle operations. */
-            int cbx0, cby0, cbx1, cby1;
-            win_close_rect(w, &cbx0, &cby0, &cbx1, &cby1);
-            int cy = (cby0 + cby1) / 2;
-            int cx = (cbx0 + cbx1) / 2;
-            fb_color_t ctl = focused ? FB_RGB(0x43, 0x43, 0x43) : FB_RGB(0x35, 0x35, 0x35);
-            fb_color_t glyph = focused ? FB_RGB(0xe5, 0xe5, 0xe5) : FB_RGB(0x8f, 0x8f, 0x8f);
-            fb_fill_circle(cx - 44, cy, COMP_CLOSE_SZ / 2, ctl);
-            fb_draw_line(cx - 48, cy + 2, cx - 40, cy + 2, glyph);
-            fb_fill_circle(cx - 22, cy, COMP_CLOSE_SZ / 2, ctl);
-            fb_draw_line(cx - 26, cy - 3, cx - 19, cy - 3, glyph);
-            fb_draw_line(cx - 26, cy - 3, cx - 26, cy + 4, glyph);
-            fb_draw_line(cx - 19, cy - 3, cx - 19, cy + 4, glyph);
-            fb_draw_line(cx - 26, cy + 4, cx - 19, cy + 4, glyph);
-            fb_fill_circle((cbx0 + cbx1) / 2, (cby0 + cby1) / 2, COMP_CLOSE_SZ / 2,
-                           ctl);
-            fb_color_t xc = glyph;
-            fb_draw_line(cbx0 + 5, cby0 + 5, cbx1 - 5, cby1 - 5, xc);
-            fb_draw_line(cbx1 - 5, cby0 + 5, cbx0 + 5, cby1 - 5, xc);
+            /* The lights. Dimmed as a set when the window is not focused --
+             * one lit corner on screen at a time says which window the
+             * keyboard belongs to, which is most of what an unfocused title
+             * bar is for. */
+            static const struct { uint8_t r, g, b; } LIT[3] = {
+                { 0xF2, 0x55, 0x5A },   /* close    -- theme danger        */
+                { 0x6A, 0x71, 0x80 },   /* minimize -- theme text_tertiary */
+                { 0x7C, 0x82, 0xFF },   /* zoom     -- theme accent        */
+            };
+            for (int i = 0; i < 3; i++) {
+                int lx0, ly0, lx1, ly1;
+                if (!win_light_rect(w, i, &lx0, &ly0, &lx1, &ly1)) break;
+                int cx = (lx0 + lx1) / 2, cy = (ly0 + ly1) / 2;
+                int rr = focused ? LIT[i].r : (LIT[i].r * 45) / 100;
+                int gg = focused ? LIT[i].g : (LIT[i].g * 45) / 100;
+                int bb = focused ? LIT[i].b : (LIT[i].b * 45) / 100;
+                fb_fill_circle(cx, cy, COMP_DOT / 2, FB_RGB(rr, gg, bb));
+
+                /* The glyph, ALWAYS -- the toolkit's rule, for the same
+                 * reason: nobody has learned this OS's window controls yet. */
+                fb_color_t ink = FB_RGB(0x1a, 0x1a, 0x1e);
+                if (i == 0) {                       /* close: a cross */
+                    fb_draw_line(cx - 3, cy - 3, cx + 3, cy + 3, ink);
+                    fb_draw_line(cx + 3, cy - 3, cx - 3, cy + 3, ink);
+                } else if (i == 1) {                /* minimize: a rule */
+                    fb_draw_line(cx - 3, cy, cx + 3, cy, ink);
+                } else {                            /* zoom: a square */
+                    fb_draw_line(cx - 3, cy - 3, cx + 3, cy - 3, ink);
+                    fb_draw_line(cx - 3, cy + 3, cx + 3, cy + 3, ink);
+                    fb_draw_line(cx - 3, cy - 3, cx - 3, cy + 3, ink);
+                    fb_draw_line(cx + 3, cy - 3, cx + 3, cy + 3, ink);
+                }
+            }
+
+            /* The title sits after the lights, not at the window's edge: one
+             * region of chrome instead of two. */
+            {
+                int lx0, ly0, lx1, ly1;
+                int tx = win_light_rect(w, 2, &lx0, &ly0, &lx1, &ly1) ? lx1 + 8 : tbx0 + 12;
+                int tr = focused ? 0xf2 : 0xa8;
+                fb_draw_string(w->title, tx, tby0 + (COMP_TITLEBAR_H - 16) / 2,
+                               tr, tr, tr, 0x24, 0x24, 0x24);
+            }
         }
     }
 
@@ -1104,7 +1169,9 @@ int64_t compositor_win_create(int pid, uint32_t cw, uint32_t ch,
     w->widget = 0;
     w->glass = 0;
     w->translucent = 0;
-    w->pend_click = 0;
+    w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->pend_drop = 0;
+    w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->content = buf;
     int n = 0;
     if (title) { while (n < COMP_TITLE_MAX && title[n]) { w->title[n] = title[n]; n++; } }
@@ -1195,7 +1262,9 @@ static int64_t win_create_shared_impl(struct process *client, uint32_t cw, uint3
     w->widget = widget;
     w->glass = glass && !desktop;
     w->translucent = translucent && !desktop;
-    w->pend_click = 0;
+    w->pend_head = w->pend_count = w->pend_phase = 0;
+    w->pend_drop = 0;
+    w->asked_close_ms = 0;   /* a reused slot must not inherit a close request */
     w->z = desktop ? 0 : widget ? g_widget_z++ : g_next_z++;   /* z band per kind */
     w->content = (uint32_t *)kview;
     w->shared = 1; w->phys = phys; w->npages = npages;
@@ -1293,6 +1362,7 @@ int64_t compositor_win_resize(struct process *client, uint32_t id,
     win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);   /* old footprint */
     ophys = w->phys; onpages = w->npages; okview = w->kview; ocva = w->client_va; opml4 = w->client_pml4;
     w->cw = nw; w->ch = nh;
+    w->fullscreen = (nw >= fi->width && nh >= fi->height);
     w->content = (uint32_t *)kview;
     w->phys = phys; w->npages = npages; w->kview = kview;
     w->client_va = cva; w->client_pml4 = client->pml4_phys;
@@ -1403,8 +1473,16 @@ int64_t compositor_win_move(int pid, uint32_t id, int32_t x, int32_t y) {
     int ox0, oy0, ox1, oy1; win_repaint_rect(w, &ox0, &oy0, &ox1, &oy1);
     const fb_info_t *fi = fb_get_info();
     /* A translucent bar IS the top-strip chrome, so it may sit above WORK_TOP
-     * (a menu bar at y=6). Ordinary app windows still stay in the work area. */
-    if (!w->desktop && !w->widget && !w->translucent && fi) {
+     * (a menu bar at y=6). Ordinary app windows still stay in the work area --
+     * and so a window can never be dragged under the bar or the dock, which is
+     * what keeps the shell reachable.
+     *
+     * A FULL-SCREEN window is the exception, and it has to be: covering the
+     * display is the whole difference between the zoom board's "Full" and its
+     * "Fill", and without this the two did the same thing. Measured before the
+     * exemption: asking for the display and y=0 left the bar untouched,
+     * because this clamp put the window back under it. */
+    if (!w->desktop && !w->widget && !w->translucent && !w->fullscreen && fi) {
         int maxx = (int)fi->width - (int)w->cw;
         int maxy = (int)fi->height - WORK_BOTTOM - win_titlebar_h(w) - (int)w->ch;
         if (maxx < 0) maxx = 0;
@@ -1492,6 +1570,18 @@ int compositor_win_minimize(int pid, uint32_t id) {
  * everything the user has open, which is not a thing one app may do to another.
  * A MODE, not a raise: clearing it restores z=0 exactly, so the ground does not
  * end up parked somewhere in the middle of the stack. */
+/* IS A FULL-SCREEN SHELL SURFACE UP? -- the launcher, or the screen lock.
+ *
+ * Read by the system key shortcuts, which are performed by the kernel and
+ * therefore cannot be declined by whatever is on screen. GUI+Tab raising an
+ * application window OVER a locked screen is not a cosmetic problem: the lock
+ * is the desktop layer in front, and a window above it is the session, open,
+ * to whoever pressed the key. So the kernel stops honouring the shortcuts for
+ * as long as the layer is up. */
+static int g_desktop_front;
+
+int compositor_shell_modal(void) { return g_desktop_front; }
+
 int compositor_desktop_front(int pid, int on) {
     spin_lock(&g_comp_lock);
     int rc = -1;
@@ -1501,6 +1591,7 @@ int compositor_desktop_front(int pid, int on) {
         if (w->pid != pid) break;                  /* not yours to move */
         int want = on ? DESKTOP_FRONT_Z : 0;
         rc = 0;
+        g_desktop_front = on ? 1 : 0;
         if (w->z != want) {
             w->z = want;
             /* THE MENU BAR IS NOT LIFTED WITH IT, and the attempt is worth
@@ -1532,6 +1623,194 @@ int compositor_desktop_front(int pid, int on) {
  * and raise its windows to the front. Both halves are what "click the dock
  * icon of a running app" has to mean -- a parked window comes back, and an app
  * that is merely buried comes forward. Returns 1 if anything changed. */
+/* Front-most first, because that is the order a switcher wants to show and the
+ * order "the one before this one" means. z is the compositor's own ordering,
+ * so this sorts by it rather than by slot index -- the table is a pool and its
+ * order means nothing to a person. */
+int compositor_win_list(struct comp_win_info *out, int max) {
+    if (!out || max <= 0) return 0;
+    spin_lock(&g_comp_lock);
+
+    uint32_t front = 0;
+    { struct comp_window *f = front_window(); if (f) front = (uint32_t)f->pid; }
+
+    int n = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS && n < max; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used) continue;
+        /* Not switchable: the wallpaper, the widget band, the translucent
+         * strips (menu bar, notifier), and anything that never named itself. */
+        if (w->desktop || w->widget || w->translucent) continue;
+        if (!w->title[0]) continue;
+
+        out[n].pid   = (uint32_t)w->pid;
+        out[n].id    = w->id;
+        out[n].flags = (w->minimized ? COMP_WIN_MINIMIZED : 0u) |
+                       ((uint32_t)w->pid == front && !w->minimized ? COMP_WIN_FOCUSED : 0u);
+        int k = 0;
+        while (k < COMP_TITLE_MAX && w->title[k]) { out[n].title[k] = w->title[k]; k++; }
+        out[n].title[k] = 0;
+        out[n].app[0] = 0;         /* the syscall layer's to fill -- see the struct */
+        n++;
+    }
+
+    /* insertion sort by z, descending -- n is at most a handful of windows */
+    for (int i = 1; i < n; i++) {
+        struct comp_win_info key = out[i];
+        int kz = -1, j;
+        for (j = 0; j < COMP_MAX_WINDOWS; j++)
+            if (g_wins[j].used && g_wins[j].id == key.id) { kz = g_wins[j].z; break; }
+        for (j = i - 1; j >= 0; j--) {
+            int jz = -1;
+            for (int q = 0; q < COMP_MAX_WINDOWS; q++)
+                if (g_wins[q].used && g_wins[q].id == out[j].id) { jz = g_wins[q].z; break; }
+            if (jz >= kz) break;
+            out[j + 1] = out[j];
+        }
+        out[j + 1] = key;
+    }
+
+    spin_unlock(&g_comp_lock);
+    return n;
+}
+
+/* CYCLE TO THE NEXT WINDOW -- what GUI+Tab does.
+ *
+ * "Next" is the one BEHIND the front one, and raising it sends the old front to
+ * the back of the switchable set rather than swapping the top two. Swapping is
+ * what you get from the naive implementation and it is a trap: pressing the
+ * shortcut repeatedly then flips between the same pair forever and the third
+ * window can never be reached.
+ *
+ * The same windows the switcher lists are the ones cycled -- the wallpaper,
+ * widgets, translucent strips and anything unnamed are furniture, not
+ * destinations. A minimized window IS a destination: it comes back.
+ *
+ * Called from the kernel's main loop, never from the keyboard IRQ: this takes
+ * the compositor lock and repaints. */
+int compositor_cycle_window(void) {
+    spin_lock(&g_comp_lock);
+
+    struct comp_window *front = 0, *next = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w->desktop || w->widget || w->translucent || !w->title[0]) continue;
+        if (!front || w->z > front->z) front = w;
+    }
+    if (!front) { spin_unlock(&g_comp_lock); return 0; }
+
+    /* The highest z BELOW the front one; with nothing below, the front stays. */
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w == front) continue;
+        if (w->desktop || w->widget || w->translucent || !w->title[0]) continue;
+        if (w->z < front->z && (!next || w->z > next->z)) next = w;
+    }
+    if (!next) { spin_unlock(&g_comp_lock); return 0; }
+
+    if (next->minimized) {
+        next->minimized = 0;
+        next->z = g_next_z++;
+        anim_start(next, ANIM_UNPARK);
+    } else {
+        next->z = g_next_z++;
+        int x0, y0, x1, y1;
+        win_repaint_rect(next, &x0, &y0, &x1, &y1);
+        paint_region(x0, y0, x1, y1);
+    }
+    enforce_focus();
+    spin_unlock(&g_comp_lock);
+    return 1;
+}
+
+/* Close the front window, exactly as its close light does -- the process is
+ * killed and its windows reclaimed. Returns the pid to kill, or 0. */
+/* Ask a window to close, and remember when we asked. */
+static void win_ask_close(struct comp_window *w) {
+    w->pending_action = 2;                     /* EMBK_WIN_ACTION_CLOSE */
+    if (!w->asked_close_ms) w->asked_close_ms = timer_uptime_ms();
+}
+
+/* Windows that were asked to close and have not gone. Returns how many pids it
+ * wrote to `out` -- the caller kills them OUTSIDE the compositor lock, because
+ * process_kill reaps, which re-enters here. */
+int compositor_close_overdue(int *out, int max) {
+    uint64_t now = timer_uptime_ms();
+    int n = 0;
+    spin_lock(&g_comp_lock);
+    for (int i = 0; i < COMP_MAX_WINDOWS && n < max; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || !w->asked_close_ms) continue;
+        if (now - w->asked_close_ms < COMP_CLOSE_GRACE_MS) continue;
+        w->asked_close_ms = 0;                 /* asked once, killed once */
+
+        /* TAKE THE WINDOW OFF THE SCREEN OURSELVES. A killed process does not
+         * run its own teardown, and the reap path frees memory without
+         * repainting -- so without this the window's last pixels simply stay
+         * there, a frozen picture of an application that no longer exists.
+         * That is exactly what the old close path did at click time and what
+         * was lost when closing became a request. */
+        w->visible = 0;
+        if (w->id == g_top_id) g_top_id = 0;
+        int x0, y0, x1, y1;
+        win_repaint_rect(w, &x0, &y0, &x1, &y1);
+        paint_region(x0, y0, x1, y1);
+        enforce_focus();
+
+        out[n++] = w->pid;
+    }
+    spin_unlock(&g_comp_lock);
+    return n;
+}
+
+int compositor_close_front(void) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *w = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *c = &g_wins[i];
+        if (!c->used || c->desktop || c->widget || c->translucent || !c->title[0]) continue;
+        if (!c->visible) continue;
+        if (!w || c->z > w->z) w = c;
+    }
+    if (w) win_ask_close(w);                   /* ask; the grace timer kills */
+    spin_unlock(&g_comp_lock);
+    return 0;
+}
+
+/* GUI+Q: quit the whole APPLICATION, not the window in front of it.
+ *
+ * The distinction is the point. GUI+W asks ONE window to go; an application
+ * with three open loses one of them and keeps running. GUI+Q asks every window
+ * the same process owns, so the program itself ends. On a machine whose apps
+ * mostly have one window the two look identical, which is exactly why it is
+ * worth being right about now rather than when they diverge.
+ *
+ * Asks, like everything else that closes a window here -- the app takes itself
+ * down and the grace timer kills it if it will not. */
+int compositor_quit_front(void) {
+    spin_lock(&g_comp_lock);
+    struct comp_window *front = 0;
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *c = &g_wins[i];
+        if (!c->used || c->desktop || c->widget || c->translucent || !c->title[0]) continue;
+        if (!c->visible) continue;
+        if (!front || c->z > front->z) front = c;
+    }
+    int n = 0;
+    if (front) {
+        int pid = front->pid;
+        for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+            struct comp_window *c = &g_wins[i];
+            if (!c->used || c->pid != pid) continue;
+            if (c->desktop || c->widget) continue;   /* not a window of its own */
+            win_ask_close(c);
+            n++;
+        }
+    }
+    spin_unlock(&g_comp_lock);
+    return n;
+}
+
 int compositor_restore_pid(int pid) {
     spin_lock(&g_comp_lock);
     int changed = 0;
@@ -1583,6 +1862,38 @@ int compositor_backdrop_luma(int x, int y, int w, int h) {
     }
     spin_unlock(&g_comp_lock);
     return n ? (int)(sum / n) : -1;
+}
+
+/* THE COMPOSED SCREEN, AS PIXELS. What backdrop_luma reads, but all of it and
+ * without averaging -- one 0x00RRGGBB word per pixel, row-major, into a buffer
+ * the caller sized.
+ *
+ * It reads the FRAMEBUFFER, which is to say the finished composite: every
+ * window, the cursor's ground, the wallpaper. That is the whole point of a
+ * screenshot and also exactly why the syscall above it is gated -- this is the
+ * one call on the machine that shows one application what every other
+ * application is displaying.
+ *
+ * Under the compositor lock, so a recompose cannot land halfway through and
+ * hand back a screen that never existed: half of one frame and half of the
+ * next is not a picture of anything.
+ *
+ * Returns the number of pixels written, or -1. */
+int compositor_screen_read(int x, int y, int w, int h, uint32_t *out, uint32_t cap) {
+    const fb_info_t *fi = fb_get_info();
+    if (!fi || !out || w <= 0 || h <= 0) return -1;
+    int x0 = imax(x, 0), y0 = imax(y, 0);
+    int x1 = imin(x + w, (int)fi->width), y1 = imin(y + h, (int)fi->height);
+    if (x1 <= x0 || y1 <= y0) return -1;
+    uint32_t need = (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0);
+    if (need > cap) return -1;
+    uint32_t n = 0;
+    spin_lock(&g_comp_lock);
+    for (int yy = y0; yy < y1; yy++)
+        for (int xx = x0; xx < x1; xx++)
+            out[n++] = fb_get_pixel((uint32_t)xx, (uint32_t)yy) & 0x00FFFFFFu;
+    spin_unlock(&g_comp_lock);
+    return (int)n;
 }
 
 /* Declare (or clear, w<=0) the window-local sub-rect whose backdrop should be
@@ -1638,6 +1949,47 @@ void compositor_anim_tick(void) {
     spin_unlock(&g_comp_lock);
 }
 
+/* IS SOMETHING BEING DRAGGED, and by whom.
+ *
+ * The compositor does not know or care WHAT -- the payload lives in the
+ * session's drag buffer, the same way the clipboard does, and the compositor
+ * deals in windows and pixels. All it needs is "a drag is in flight", so that
+ * when the button comes up it can work out which window the pointer was over
+ * and leave that window's process a note.
+ *
+ * This exists because POINTER CAPTURE would otherwise make a cross-application
+ * drop impossible: a press routes every later motion to the window it landed
+ * on, which is exactly right for a slider or a text selection and exactly
+ * wrong for carrying something to another program. The capture stays -- the
+ * source needs the motion to draw whatever it is holding -- and the DROP is
+ * resolved separately, here, at the release edge. */
+static int      g_drag_on;
+static uint32_t g_drag_pid;
+void compositor_drag_set(int on, uint32_t pid) {
+    spin_lock(&g_comp_lock);
+    g_drag_on = on ? 1 : 0;
+    g_drag_pid = on ? pid : 0;
+    spin_unlock(&g_comp_lock);
+}
+
+/* Take the drop pending for `pid`, if any. 1 and the details, or 0. */
+int compositor_drop_take(int pid, uint32_t *win, int32_t *lx, int32_t *ly) {
+    int got = 0;
+    spin_lock(&g_comp_lock);
+    for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
+        struct comp_window *w = &g_wins[i];
+        if (!w->used || w->pid != pid || !w->pend_drop) continue;
+        if (win) *win = w->id;
+        if (lx) *lx = w->drop_lx;
+        if (ly) *ly = w->drop_ly;
+        w->pend_drop = 0;
+        got = 1;
+        break;
+    }
+    spin_unlock(&g_comp_lock);
+    return got;
+}
+
 void compositor_pointer_tick(void) {
     if (!g_active) return;               /* no desktop yet -> nothing to route */
     int32_t x, y; uint32_t b;
@@ -1645,6 +1997,18 @@ void compositor_pointer_tick(void) {
 
     spin_lock(&g_comp_lock);
     int left = (b & MOUSE_BTN_LEFT) != 0, prev = (g_prev_buttons & MOUSE_BTN_LEFT) != 0;
+    /* HOW MANY presses actually happened, which the level cannot say: a whole
+     * down-up-down-up between two ticks leaves `left` equal to `prev` and the
+     * gesture would otherwise vanish here. The driver counts them as the
+     * packets arrive (mouse_take_presses), so a burst is preserved even when
+     * this tick is slower than the hand. */
+    struct { uint32_t t; } press_ev[COMP_CLICK_Q];
+    uint32_t presses = 0, ptime = 0;
+    while (presses < COMP_CLICK_Q && mouse_take_press(&ptime))
+        press_ev[presses++].t = ptime;
+    /* Belt: if the level moved but the driver reported nothing (a device that
+     * only ever sets absolute state), still treat it as one press, timed now. */
+    if (presses == 0 && left && !prev) press_ev[presses++].t = (uint32_t)timer_uptime_ms();
 
     /* one accumulated dirty bbox for the whole tick -> a single paint_region */
     int have = 0, bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
@@ -1661,22 +2025,47 @@ void compositor_pointer_tick(void) {
     }
 
     int raised = 0;
-    int close_pid = 0;   /* set when a close button is clicked */
+    int close_pid = 0;   /* unused since closing became a request, kept so the
+                          * unlock-then-act shape below stays obvious */
     /* press edge: raise the window under the pointer; title-bar press = drag,
      * close-button press = close. The desktop (home) layer is never raised or
      * dragged -- it stays pinned at the back; its clicks flow through to the app
      * as content input below. */
-    if (left && !prev) {
-        struct comp_window *w = topmost_at(x, y);
-        /* latch a content-area press for the owner (desktop included): if the
-         * app is busy rendering when this press+release happens, win_input
-         * replays it (press then release) so the click is never eaten. */
-        if (w) {
-            int clx = x - w->x, cly = y - (w->y + win_titlebar_h(w));
-            if (clx >= 0 && clx < (int)w->cw && cly >= 0 && cly < (int)w->ch) {
-                w->pend_click = 1; w->pend_lx = clx; w->pend_ly = cly;
+    /* LATCH EVERY PRESS, however many happened since the last tick. An app is
+     * handed them one per poll (see compositor_win_input), so a burst the user
+     * made faster than this loop runs still arrives as a burst.
+     *
+     * Separate from the window-management block below, which stays on the LEVEL
+     * edge: raising a window, starting a title drag or hitting the close button
+     * are things to do ONCE for a gesture, not once per click in it. */
+    if (presses) {
+        struct comp_window *wp = topmost_at(x, y);
+        if (wp) {
+            int clx = x - wp->x, cly = y - (wp->y + win_titlebar_h(wp));
+            if (clx >= 0 && clx < (int)wp->cw && cly >= 0 && cly < (int)wp->ch) {
+                /* WHEN THE FINGER WENT DOWN, not when the app gets around to
+                 * noticing. A replayed click is delivered one per poll, so two
+                 * clicks 130 ms apart reach an app rendering at 4 fps half a
+                 * second apart, and anything timing them by arrival decides
+                 * they were two separate clicks. Measured: exactly that.
+                 *
+                 * Each press carries the time the DRIVER recorded when the
+                 * button actually went down -- not this tick's time, which
+                 * would make two presses noticed on different ticks look as far
+                 * apart as the ticks are. */
+                for (uint32_t k = 0; k < presses && wp->pend_count < COMP_CLICK_Q; k++) {
+                    uint8_t slot = (uint8_t)((wp->pend_head + wp->pend_count) % COMP_CLICK_Q);
+                    wp->pend_q[slot].x = (int16_t)clx;
+                    wp->pend_q[slot].y = (int16_t)cly;
+                    wp->pend_q[slot].t = press_ev[k].t;   /* ITS OWN time, from the driver */
+                    wp->pend_count++;
+                }
             }
         }
+    }
+
+    if (left && !prev) {
+        struct comp_window *w = topmost_at(x, y);
         if (w && !w->desktop) {
             int title_control = 0;
             int cbx0, cby0, cbx1, cby1;
@@ -1687,11 +2076,13 @@ void compositor_pointer_tick(void) {
                  * killed process is reaped asynchronously; don't wait on it),
                  * repaint what's behind, then kill its process below. Its shared
                  * pixel backing is freed later by compositor_reap_pid. */
-                close_pid = w->pid;
+                /* ASK, do not kill. The window stays on screen until the app
+                 * takes itself down -- hiding it here and killing the process
+                 * later is what made an unsaved document disappear with no
+                 * chance to object. A window that ignores the request is killed
+                 * by the grace timer instead. */
+                win_ask_close(w);
                 title_control = 1;
-                if (w->id == g_top_id) g_top_id = 0;
-                anim_start(w, ANIM_CLOSE);   /* hides it; the ghost collapses */
-                w->visible = 0;              /* (and stays hidden if it declined) */
                 int fx0, fy0, fx1, fy1; win_repaint_rect(w, &fx0, &fy0, &fx1, &fy1);
                 DIRTY(fx0, fy0, fx1, fy1);
                 raised = 1;   /* re-run enforce_focus() to promote the new front */
@@ -1780,6 +2171,29 @@ void compositor_pointer_tick(void) {
     /* Record the content-local pointer for the topmost window under the cursor
      * (skipping its title bar) so its owning app can read it via sys_win_input.
      * A drag in progress keeps routing to no app (the compositor owns it). */
+    /* THE DROP, resolved at the release edge and before capture is dropped.
+     * The window under the pointer is the target, whoever owns it -- including
+     * the source itself, which is a drag that went nowhere and is the source's
+     * own business to ignore. */
+    if (g_drag_on && !(b & MOUSE_BTN_LEFT) && (g_prev_buttons & MOUSE_BTN_LEFT)) {
+        struct comp_window *t = topmost_at(x, y);
+        if (t && !t->widget) {
+            int lx = x - t->x, ly = y - (t->y + win_titlebar_h(t));
+            if (lx >= 0 && lx < (int)t->cw && ly >= 0 && ly < (int)t->ch) {
+                t->pend_drop = 1;
+                t->drop_lx = (int16_t)lx;
+                t->drop_ly = (int16_t)ly;
+                /* AND WAKE IT. An application that is idle does not build a
+                 * frame, and an application that does not build a frame never
+                 * polls for a drop -- so the note sat in the window unread and
+                 * the drag looked like it had done nothing. The action channel
+                 * is already an input edge the runtime reacts to. */
+                t->pending_action = 3;          /* EMBK_WIN_ACTION_DROP */
+            }
+        }
+        g_drag_on = 0; g_drag_pid = 0;
+    }
+
     g_ptr_pid = 0;
     if (!g_dragging) {
         if (!(b & MOUSE_BTN_LEFT)) g_cap_pid = 0;      /* release ends capture */
@@ -1818,7 +2232,7 @@ void compositor_pointer_tick(void) {
      * process_kill -> process_reap_slot -> compositor_reap_pid re-takes
      * g_comp_lock, so holding it here would deadlock. The window was already
      * hidden + repainted above, so it's gone regardless of when the reap runs. */
-    if (close_pid) process_kill((uint32_t)close_pid);
+    (void)close_pid;
 }
 
 /* Deliver the content-local pointer to the calling process IF it owns the window
@@ -1827,9 +2241,13 @@ void compositor_pointer_tick(void) {
  * inside a compositor window reads its mouse -- the home/desktop app gets every
  * click that falls through the floating windows onto it. */
 int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
-                         uint32_t *buttons, uint32_t *win, int32_t *wheel) {
+                         uint32_t *buttons, uint32_t *win, int32_t *wheel,
+                         uint32_t *when) {
     spin_lock(&g_comp_lock);
     int focused = (g_ptr_pid != 0 && g_ptr_pid == pid);
+    /* Live input is happening NOW; a replayed press overwrites this below with
+     * the moment it was actually made. */
+    if (when) *when = (uint32_t)timer_uptime_ms();
     if (focused) {
         if (lx) *lx = g_ptr_lx;
         if (ly) *ly = g_ptr_ly;
@@ -1847,25 +2265,36 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
      * fire), which also keeps slider drags on real button state. */
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || w->pid != pid || !w->pend_click) continue;
-        if (w->pend_click == 1) {
-            if (focused && w->id == g_ptr_win && (g_ptr_buttons & MOUSE_BTN_LEFT)) {
-                w->pend_click = 0;              /* live path saw the press */
+        if (!w->used || w->pid != pid || !w->pend_count) continue;
+        struct comp_click *q = &w->pend_q[w->pend_head];
+        if (w->pend_phase == 0) {
+            /* The live path is already delivering this one if the button is
+             * STILL DOWN on this window and there is nothing queued behind it
+             * -- replaying would double-fire, and would also break slider drags
+             * by feeding them a synthetic release. With more than one waiting,
+             * the extras are by definition presses the app has not seen. */
+            if (w->pend_count == 1 && focused && w->id == g_ptr_win &&
+                (g_ptr_buttons & MOUSE_BTN_LEFT)) {
+                w->pend_count = 0;
             } else {
-                if (lx) *lx = w->pend_lx;
-                if (ly) *ly = w->pend_ly;
+                if (lx) *lx = q->x;
+                if (ly) *ly = q->y;
                 if (buttons) *buttons = MOUSE_BTN_LEFT;
                 if (win) *win = w->id;
+                if (when) *when = q->t;         /* when the press really happened */
                 focused = 1;
-                w->pend_click = 2;              /* release replays next poll */
+                w->pend_phase = 1;              /* release replays next poll */
             }
-        } else {                                 /* == 2 */
-            if (lx) *lx = w->pend_lx;
-            if (ly) *ly = w->pend_ly;
+        } else {
+            if (lx) *lx = q->x;
+            if (ly) *ly = q->y;
             if (buttons) *buttons = 0;
             if (win) *win = w->id;
+            if (when) *when = q->t;
             focused = 1;
-            w->pend_click = 0;
+            w->pend_head = (uint8_t)((w->pend_head + 1) % COMP_CLICK_Q);
+            w->pend_count--;
+            w->pend_phase = 0;
         }
         break;
     }

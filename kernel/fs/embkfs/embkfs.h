@@ -499,11 +499,92 @@ struct embkfs_volume {
      * read_object_at's size probe plus read_object_range's own lookup. Measured:
      * ~3 device reads per 8 KB chunk when only ONE is the actual data block.
      * A single 128-byte struct, so it costs nothing next to rcache's megabytes. */
-    uint64_t  icache_oid;
-    uint64_t  icache_gen;
-    bool      icache_valid;
+    /* THE INODE CACHE. Finding an inode is a B-tree descent that reads blocks,
+     * and the answer cannot change between two calls that see the same
+     * `generation` -- so every read after the first is work being redone.
+     *
+     * DIRECT-MAPPED, 32 ways, because ONE slot is not a cache. A single entry
+     * scores exactly zero hits the moment two files are used alternately --
+     * each call evicts the answer the next one wants -- and that is not a
+     * corner case, it is what a path walk does (a directory's inode, then the
+     * child's, then the next directory's). Measured before changing it: 50
+     * stats of one file cost 1100 device reads and the cache reported 0 hits
+     * and 15 misses.
+     *
+     * DIRECT-MAPPED ON A MIXED INDEX, not on oid % N. Object ids are handed
+     * out sequentially, so `oid % 32` looked like it would spread them -- and
+     * it does, for ids that arrive in a run. It does not for the four inodes a
+     * path walk actually touches: root, "/system", "/system/bin" and the file
+     * itself are ids from wildly different eras of the volume's life, and if
+     * two of them land in one slot they evict each other on EVERY lookup. That
+     * showed up as a warm stat costing exactly 4 device reads -- one per path
+     * component -- while the cache reported plenty of hits overall.
+     *
+     * Multiplying by a large odd constant before taking the index spreads the
+     * high bits down, which is what makes ids that are far apart stop
+     * colliding. 128 slots rather than 32 for headroom: an inode is 128 bytes,
+     * so the whole cache is 18 KiB per volume.
+     *
+     * Keyed on `generation` as well as oid: any commit bumps it, so a stale
+     * inode can never be served -- blunt, but correct, and far cheaper now
+     * that the page cache batches writes instead of committing per write.
+     *
+     * AND THEN SET-ASSOCIATIVE, because the mixed index above was a fix for a
+     * symptom. Mixing moves WHICH ids collide; it cannot make a direct-mapped
+     * cache stop having collisions. A stat consults about seven inodes, and
+     * the odds that two of seven land in the same one of 128 slots are
+     * 1 - e^(-21/128), about 15% -- so roughly one volume layout in seven
+     * produced the exact failure described above, and which layouts did
+     * depended on the order objects were allocated in, i.e. on the size of
+     * everything else on the image. It came back after the mixing fix the
+     * moment an unrelated change shifted the object ids, and was diagnosed
+     * the second time by instrumenting it: zero commits during the window,
+     * two inodes missing on every single stat, evicting each other.
+     *
+     * 32 sets of 4 ways, LRU within a set. Seven inodes would have to put five
+     * into one set of four to conflict, which is not a thing that happens by
+     * luck. Same 128 entries, same 18 KiB -- the cost is a four-way compare on
+     * lookup, against a B-tree descent on every conflict. */
+#define EMBKFS_ICACHE_WAYS 4
+#define EMBKFS_ICACHE_SETS 32
+    struct {
+        uint64_t oid;
+        uint64_t gen;
+        uint32_t lru;           /* icache_clock at last use; smaller = older */
+        bool     valid;
+        struct embk_inode_item ino;
+    } icache[EMBKFS_ICACHE_WAYS * EMBKFS_ICACHE_SETS];
+    uint32_t  icache_clock;
     uint64_t  icache_hits, icache_misses;
-    struct embk_inode_item icache_ino;
+
+    /* THE NAME CACHE: (directory, name) -> object id.
+     *
+     * The other half of a path walk. With the inode cache in place, resolving
+     * "/system/bin/shell.elf" still cost one B-tree descent PER COMPONENT to
+     * turn a name into an object id -- and a path walk asks the same questions
+     * every time, because directories change far less often than they are
+     * read. Measured: after fixing the inode cache, 50 stats of one file were
+     * still 700 device reads.
+     *
+     * ONLY POSITIVE ANSWERS ARE CACHED. A miss is not remembered, because
+     * "this name does not exist" stops being true the moment somebody creates
+     * it -- and create-then-open is the single most common sequence in the
+     * system. Caching absence would need the create path to invalidate, which
+     * is a second thing to get wrong for no measured gain.
+     *
+     * Keyed on `generation` like the inode cache, so any commit -- including
+     * the unlink or rename that would change an answer -- retires every entry
+     * at once. Blunt and correct. */
+    struct {
+        uint64_t dir_oid;
+        uint32_t hash;          /* crc32c of the name */
+        uint8_t  name_len;
+        char     name[56];      /* the authoritative compare; a hash can collide */
+        uint64_t oid;
+        uint64_t gen;
+        bool     valid;
+    } ncache[64];
+    uint64_t  ncache_hits, ncache_misses;
 
     /* Windowed read-ahead cache. rcache is all-or-nothing: it caches the WHOLE
      * object, so `total <= EMBKFS_RCACHE_MAX` is a cliff -- a file one byte over
@@ -551,6 +632,13 @@ struct embkfs_stat {
      * when rcache MISSES, so it may well be cold in practice. (ecache already
      * had hit/miss counters above.) */
     uint64_t icache_hit, icache_miss;
+    /* The name cache: (dir, name) -> oid, the other half of a path walk. */
+    uint64_t ncache_hit, ncache_miss;
+    /* COMMITS: superblock generation bumps. Every one of them invalidates
+     * every generation-keyed cache above in a single stroke, so this is the
+     * number that says whether a cache that "stopped working" was actually
+     * being flushed underneath a measurement. */
+    uint64_t commits;
 };
 void embkfs_stat_reset(void);
 void embkfs_stat_get(struct embkfs_stat *out);
@@ -642,12 +730,20 @@ struct embkfs_lockstat {
     uint64_t wait_us;    /* wall microseconds spent blocked              */
 };
 void embkfs_lockstat_get(struct embkfs_lockstat *out);
+bool embkfs_lock_is_held(void);   /* test kill io */
 void embkfs_lockstat_reset(void);
 
 /* Probe one block device: read + verify the superblock at byte 65536, and on
  * success fill *vol. Returns EMBK_OK, or -EMBK_EINVAL if the device isn't an
  * EMBKFS volume (or its superblock is corrupt). */
+/* Mount `dev` into `vol`: superblock, root node, allocator, orphan sweep --
+ * ONE call, and the volume is usable. EIO if the superblock is fine and the
+ * volume behind it is not. */
 int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol);
+/* The superblock half only: verify it and fill `vol` from it. NOT a usable
+ * volume -- for tests that probe superblock acceptance on a live device
+ * through a scratch descriptor and must not allocate or sweep on its behalf. */
+int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume *vol);
 
 /* Read the block `ptr` targets and verify it as a tree node, against `ptr`
  * itself. On success `buf` holds the whole block_size-byte block. Used for
@@ -669,6 +765,9 @@ int embkfs_run_object_selftests(void);
 int embkfs_run_shrink_selftests(void);
 int embkfs_run_timestamp_selftests(void);
 int embkfs_run_multivol_selftests(void);
+/* Power loss simulated at every write against a RAM copy of `seed` (a small
+ * EMBKFS image; the third disk). See the definition. */
+int embkfs_run_crash_selftests(struct embk_block_device *seed);
 int embkfs_run_compress_selftests(void);
 int embkfs_run_selfheal_selftests(void);
 int embkfs_run_snapshot_selftests(void);
@@ -695,6 +794,20 @@ int embkfs_mkdir_name(struct embkfs_volume *vol, uint64_t dir_oid,
                       const char *name, uint64_t *out_oid);
 int embkfs_mkdir_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
                       const char *path, uint64_t *out_oid);
+
+/* Symbolic links. The on-disk format already had everything needed --
+ * EMBKFS_S_IFLNK, EMBKFS_DT_LNK, and embkfs_make_object() already maps the
+ * mode to the right directory-entry type -- so a link is an ordinary object
+ * whose CONTENT is the target path text. Nothing about the B-tree, the extent
+ * map or the commit protocol changes.
+ *
+ * The target is stored verbatim and is never validated: a symlink may name
+ * something that does not exist, and creating one before its target is the
+ * normal case in every build system that uses them. */
+int embkfs_symlink(struct embkfs_volume *vol, uint64_t dir_oid,
+                   const char *name, const char *target);
+int embkfs_readlink(struct embkfs_volume *vol, uint64_t oid,
+                    char *buf, uint64_t cap, uint64_t *out_len);
 int embkfs_write_object(struct embkfs_volume *vol, uint64_t oid,
                         const uint8_t *data, uint64_t len);
 /* `stat`-style metadata lookup: copies oid's raw inode item (size, mode,

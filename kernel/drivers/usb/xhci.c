@@ -1,20 +1,27 @@
 #include "drivers/usb/xhci.h"
 #include "drivers/input/keyboard.h"
+#include "drivers/input/mouse.h"
 
 #include "include/kprintf.h"
 #include "include/kstring.h"   // memcpy
 #include "include/errno.h"     // EMBK_* error codes
 #include "mm/vmm.h"
 #include "mm/pmm.h"   // KV2P: kernel-image virtual -> physical for DMA
-#include "block/block.h"       // block-device registration for USB mass storage
+#include "include/arch_dma.h"   // non-coherent DMA (a Raspberry Pi 4's PCIe)
+#include "drivers/timer/timer.h"   /* timer_delay_ms: the portable delay (on x86, the same PIT/TSC wait) */
+#include "block/block.h"
+#include "fs/automount.h"       // block-device registration for USB mass storage
+#if defined(__x86_64__)
 #include "arch/x86_64/irq/irq.h"           // irq_register (interrupt-driven event servicing)
 #include "arch/x86_64/irq/ioapic.h"        // ioapic_route_level for the PCI interrupt
+#endif
 
 #include <stdint.h>
 
 #define XHCI_CAPLENGTH   0x00
 #define XHCI_HCIVERSION  0x02
 #define XHCI_HCSPARAMS1  0x04
+#define XHCI_HCSPARAMS2  0x08
 #define XHCI_HCCPARAMS1  0x10
 #define XHCI_DBOFF       0x14
 #define XHCI_RTSOFF      0x18
@@ -58,6 +65,14 @@
 #define XHCI_TRB_ENABLE_SLOT     9U
 #define XHCI_TRB_ADDRESS_DEVICE 11U
 #define XHCI_TRB_CFG_ENDPOINT   12U  // Configure Endpoint command TRB type
+#define XHCI_TRB_DISABLE_SLOT   10U  // Disable Slot command TRB type
+#define XHCI_TRB_EVAL_CONTEXT   13U  // Evaluate Context command TRB type
+
+/* How many root ports this driver remembers the state of. The controller
+ * reports its own count; this is the cap on what can be tracked for hot-plug,
+ * and a port beyond it is enumerated at boot like before and simply not
+ * watched. Real controllers have well under this; QEMU's has eight. */
+#define XHCI_MAX_PORTS_TRACKED 24
 #define XHCI_TRB_CMD_COMPLETION 33U
 
 #define XHCI_TRB_CYCLE_BIT  (1U << 0)
@@ -119,6 +134,17 @@ struct xhci_erst_entry {
 // into command/event structures from very early boot without allocator coupling.
 struct xhci_runtime_state {
     bool used;
+    /* Events arrive by interrupt (x86: xhci_enable_irq succeeded) rather than
+     * by xhci_poll(). Exactly one of the two services a controller, never
+     * both: they would race on the event ring's dequeue pointer. */
+    bool irq_driven;
+    /* SCRATCHPAD: pages the controller asked for (HCSPARAMS2) and owns. QEMU
+     * asks for none, so a driver written against it never allocates them --
+     * and a real Intel or AMD controller that asked and was given nothing is
+     * entitled to fail the first time it needs one. */
+    uint16_t scratchpad_n;
+    uint64_t scratchpad_array_phys;
+    bool     ac64;                /* controller can address above 4 GiB */
     uint8_t bus;
     uint8_t device;
     uint8_t function;
@@ -129,9 +155,30 @@ struct xhci_runtime_state {
     uint8_t context_size;
     uint8_t tracked_slots;
 
+    /* WHICH PORT HAS WHAT, so a rescan can tell "still there" from "new".
+     * A controller that is only ever enumerated once needs none of this --
+     * which is exactly why it was not here. */
+    uint32_t max_ports;
+    uint8_t  port_slot[XHCI_MAX_PORTS_TRACKED];      /* slot serving it, 0 = none */
+    bool     port_connected[XHCI_MAX_PORTS_TRACKED]; /* what we last saw           */
+
     uint8_t slot_to_port[XHCI_MAX_SLOTS_TRACKED];
     uint8_t slot_speed[XHCI_MAX_SLOTS_TRACKED];
     uint8_t slot_active[XHCI_MAX_SLOTS_TRACKED];
+    /* WHERE A DEVICE SITS IN THE TREE, for devices behind a hub (xHCI 4.3.3,
+     * 6.2.2): its route string and tier, the hub it hangs off, and -- for a
+     * low/full-speed device behind a high-speed hub -- the hub slot and port
+     * whose Transaction Translator speaks for it. All zero on a root port.
+     * A Raspberry Pi 4 needs every field: its keyboard and mouse are always
+     * behind the USB 2.0 hub inside the VL805 (docs/RPI4.md P5). */
+    uint32_t slot_route[XHCI_MAX_SLOTS_TRACKED];
+    uint8_t  slot_depth[XHCI_MAX_SLOTS_TRACKED];
+    uint8_t  slot_tt_slot[XHCI_MAX_SLOTS_TRACKED];
+    uint8_t  slot_tt_port[XHCI_MAX_SLOTS_TRACKED];
+    uint8_t  slot_parent[XHCI_MAX_SLOTS_TRACKED];      /* hub slot above, 0 = root */
+    /* Hubs: how many ports, and the slot enumerated on each (0 = none). */
+    uint8_t  hub_nports[XHCI_MAX_SLOTS_TRACKED];       /* 0 = not a hub */
+    uint8_t  hub_child[XHCI_MAX_SLOTS_TRACKED][15];
     // Per-slot EP0 transfer ring enqueue pointer and cycle bit.
     uint16_t ep0_enqueue[XHCI_MAX_SLOTS_TRACKED];
     uint8_t  ep0_cycle[XHCI_MAX_SLOTS_TRACKED];
@@ -142,6 +189,7 @@ struct xhci_runtime_state {
     uint8_t  intin_interval[XHCI_MAX_SLOTS_TRACKED]; // bInterval from descriptor
     uint16_t intin_mps[XHCI_MAX_SLOTS_TRACKED];      // max packet size (report length)
     bool     intin_active[XHCI_MAX_SLOTS_TRACKED];   // true after Configure Endpoint
+    uint8_t  intin_kind[XHCI_MAX_SLOTS_TRACKED];     // USB_HID_PROTO_KBD / _MOUSE
     uint8_t  prev_keys[XHCI_MAX_SLOTS_TRACKED][6];   // last report's keycodes (edge detect)
     // Distinct receive buffers cycled across the interrupt-IN ring. head = next
     // buffer to arm, tail = next completed buffer to read (both mod NUM_BUFS).
@@ -244,6 +292,16 @@ static struct xhci_runtime_state *xhci_get_runtime_state(struct usb_controller *
     for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
         struct xhci_runtime_state *s = &g_xhci_runtime[i];
         if (!s->used) {
+            /* NON-CACHEABLE, before the controller ever sees an address in it:
+             * the rings, contexts and buffers are all here, and a Raspberry
+             * Pi 4's PCIe does not snoop the CPU's caches (include/arch_dma.h).
+             * A no-op where DMA is coherent. The struct is page-aligned and a
+             * whole number of pages (msc_data's alignment sees to both), and
+             * holds no lock or atomic -- both requirements of the remap. */
+            _Static_assert(sizeof(*s) % 4096 == 0, "xhci runtime state must be whole pages");
+            arch_dma_uncached(s, sizeof(*s));
+            kprintf("xHCI: DMA state %p (%u KiB) mapped for device access\n",
+                    (void *)s, (unsigned int)(sizeof(*s) / 1024U));
             xhci_bzero(s, sizeof(*s));
             s->used = true;
             s->bus = ctrl->pci.bus;
@@ -282,11 +340,19 @@ static uint8_t xhci_port_speed(volatile uint8_t *op, uint32_t port_index) {
 }
 
 static uint32_t xhci_ep0_max_packet(uint8_t speed) {
-    // Conservative defaults for pre-descriptor setup stage.
+    // The EP0 max packet size before the device descriptor says otherwise.
+    // xHCI speed IDs: 1 full, 2 LOW, 3 high, 4+ super.
     if (speed >= 4U) {
-        return 512U; // SuperSpeed default EP0 MPS
+        return 512U; // SuperSpeed: fixed
     }
-    return 64U; // HS/FS default and common fallback for early setup
+    if (speed == 2U) {
+        return 8U;   // LOW speed: always 8 -- and many cheap keyboards and
+                     // mice are low speed. 64 here was a request the device
+                     // cannot honour.
+    }
+    return 64U; // high speed: fixed 64. FULL speed: 8, 16, 32 or 64, learned
+                // from the first 8 bytes of the device descriptor and put
+                // right with Evaluate Context (xhci_get_device_descriptor).
 }
 
 static uint32_t xhci_find_first_connected_port(volatile uint8_t *op, uint32_t max_ports) {
@@ -302,7 +368,7 @@ static uint32_t xhci_find_first_connected_port(volatile uint8_t *op, uint32_t ma
 }
 
 // Minimal xHCI startup sequence: stop -> reset -> wait ready -> run.
-static bool xhci_controller_reset_and_run(volatile uint8_t *op) {
+static bool xhci_controller_reset(volatile uint8_t *op) {
     uint32_t cmd = xhci_read32(op, XHCI_OP_USBCMD);
     cmd &= ~XHCI_USBCMD_RUN_STOP;
     xhci_write32(op, XHCI_OP_USBCMD, cmd);
@@ -325,8 +391,18 @@ static bool xhci_controller_reset_and_run(volatile uint8_t *op) {
         kprintf("xHCI: timeout waiting CNR clear\n");
         return false;
     }
+    return true;
+}
 
-    cmd = xhci_read32(op, XHCI_OP_USBCMD);
+/* RUN, LAST. xHCI 4.2 is an ordered list -- reset, MaxSlotsEn, DCBAAP, the
+ * command ring, the interrupter, and only then Run/Stop -- and several of
+ * those registers are defined as "shall not be modified while running". This
+ * used to set Run straight after the reset and program everything else into
+ * a running controller. QEMU accepts that. A real controller is entitled not
+ * to, and a machine whose USB stick is its root filesystem is not where to
+ * find out. */
+static bool xhci_controller_run(volatile uint8_t *op) {
+    uint32_t cmd = xhci_read32(op, XHCI_OP_USBCMD);
     cmd |= (XHCI_USBCMD_RUN_STOP | XHCI_USBCMD_INTE);
     xhci_write32(op, XHCI_OP_USBCMD, cmd);
 
@@ -336,6 +412,54 @@ static bool xhci_controller_reset_and_run(volatile uint8_t *op) {
     }
 
     return true;
+}
+
+/* TAKE THE CONTROLLER FROM THE FIRMWARE. On a real machine the firmware has
+ * been driving this controller -- it is how the keyboard worked in the setup
+ * screen and how the loader was read off the stick -- and its System
+ * Management Mode code keeps a claim on it: USB Legacy Support, the first
+ * extended capability. Until the OS asks for ownership and switches the SMIs
+ * off, that code may still reach into the controller while this driver is
+ * using it. QEMU's xHCI has no such capability, so this is the other half of
+ * the code a QEMU-only driver never needed. xHCI 7.1. */
+static void xhci_bios_handoff(volatile uint8_t *mmio, uint32_t hccparams1, uint64_t map_size) {
+    uint32_t off = (hccparams1 >> 16) & 0xFFFFU;         /* in 32-bit words */
+    for (int guard = 0; off && guard < 64; guard++) {
+        uint64_t base = (uint64_t)off * 4U;
+        if (base + 8U > map_size) return;
+        uint32_t cap = xhci_read32(mmio, (uint32_t)base);
+        if ((cap & 0xFFU) == 1U) {                        /* USB Legacy Support */
+            if (cap & (1U << 16)) {                       /* BIOS owns it */
+                xhci_write32(mmio, (uint32_t)base, cap | (1U << 24));
+                int waited = 0;
+                while ((xhci_read32(mmio, (uint32_t)base) & (1U << 16)) && waited < 1000) {
+                    timer_delay_ms(1);
+                    waited++;
+                }
+                if (xhci_read32(mmio, (uint32_t)base) & (1U << 16)) {
+                    /* What Linux does too: a firmware that will not let go is
+                     * a firmware bug, and the controller is taken anyway. */
+                    kprintf("xHCI: firmware did not release the controller in 1 s -- taking it\n");
+                    xhci_write32(mmio, (uint32_t)base,
+                                 (xhci_read32(mmio, (uint32_t)base) & ~(1U << 16)) | (1U << 24));
+                } else {
+                    kprintf("xHCI: firmware handed the controller over (%d ms)\n", waited);
+                }
+            } else {
+                xhci_write32(mmio, (uint32_t)base, cap | (1U << 24));
+            }
+            /* SMIs off, pending SMI events acknowledged: keep the reserved bits,
+             * clear the enables, write 1 to the three RW1C status bits. */
+            uint32_t ctl = xhci_read32(mmio, (uint32_t)base + 4U);
+            ctl &= ((0x7U << 1) | (0xFFU << 5) | (0x7U << 17));
+            ctl |= (0x7U << 29);
+            xhci_write32(mmio, (uint32_t)base + 4U, ctl);
+            return;
+        }
+        uint32_t next = (cap >> 8) & 0xFFU;
+        if (!next) return;
+        off += next;
+    }
 }
 
 static void xhci_ring_doorbell(volatile uint8_t *db, uint32_t target, uint32_t val) {
@@ -351,6 +475,44 @@ static bool xhci_setup_rings(struct xhci_runtime_state *rt,
     }
 
     xhci_bzero(rt->dcbaa, sizeof(rt->dcbaa));
+
+    /* THE SCRATCHPAD ARRAY GOES IN DCBAA[0], and it has to be there before the
+     * controller runs. One page of pointers holds 512; no controller asks for
+     * more than a few dozen, and one that did is refused out loud rather than
+     * given half. Pages above 4 GiB are refused on a controller that cannot
+     * address them. */
+    if (rt->scratchpad_n) {
+        if (!rt->scratchpad_array_phys) {
+            if (rt->scratchpad_n > 512) {
+                kprintf("xHCI: asks for %u scratchpad pages; this driver provides at most 512\n",
+                        (unsigned)rt->scratchpad_n);
+                return false;
+            }
+            uint64_t arr = pmm_alloc_page();
+            if (!arr || (!rt->ac64 && arr >= 0x100000000ULL)) {
+                kprintf("xHCI: no addressable page for the scratchpad array\n");
+                return false;
+            }
+            uint64_t *slots = (uint64_t *)(uintptr_t)P2V(arr);
+            xhci_bzero(slots, 4096);
+            for (uint32_t i = 0; i < rt->scratchpad_n; i++) {
+                uint64_t pg = pmm_alloc_page();
+                if (!pg || (!rt->ac64 && pg >= 0x100000000ULL)) {
+                    kprintf("xHCI: scratchpad page %u unavailable\n", (unsigned)i);
+                    return false;
+                }
+                xhci_bzero((void *)(uintptr_t)P2V(pg), 4096);
+                arch_dma_flush((void *)(uintptr_t)P2V(pg), 4096);  /* see arch_dma.h */
+                slots[i] = pg;
+            }
+            arch_dma_flush(slots, 4096);   /* the array too: the controller reads it */
+            rt->scratchpad_array_phys = arr;
+            kprintf("xHCI: %u scratchpad page(s) given to the controller\n",
+                    (unsigned)rt->scratchpad_n);
+        }
+        rt->dcbaa[0] = rt->scratchpad_array_phys;
+    }
+
     xhci_bzero(rt->cmd_ring, sizeof(rt->cmd_ring));
     xhci_bzero(rt->evt_ring, sizeof(rt->evt_ring));
     xhci_bzero(rt->erst, sizeof(rt->erst));
@@ -386,6 +548,26 @@ static bool xhci_setup_rings(struct xhci_runtime_state *rt,
 }
 
 // Queue an Enable Slot command and ring Doorbell 0 (command ring).
+/* Step the command ring's producer past the TRB just written.
+ *
+ * AT THE WRAP, THE LINK TRB GETS THIS PASS'S CYCLE BIT FIRST. The controller
+ * follows the Link TRB in the last slot only if its cycle bit matches the pass
+ * it is consuming; it was written once at init and never again, so the first
+ * wrap -- 255 commands in, which enough plugging and unplugging reaches -- left
+ * the controller stopped in front of a link it would not take, and every
+ * command after it timed out. (Five call sites had the same copy of the wrap;
+ * this is it once.) */
+static void xhci_cmd_advance(struct xhci_runtime_state *rt) {
+    rt->cmd_enqueue++;
+    if (rt->cmd_enqueue == (XHCI_CMD_RING_TRBS - 1U)) {
+        struct xhci_trb *link = &rt->cmd_ring[XHCI_CMD_RING_TRBS - 1U];
+        link->d3 = (link->d3 & ~XHCI_TRB_CYCLE_BIT) |
+                   (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+        rt->cmd_enqueue = 0;
+        rt->cmd_cycle ^= 1U;
+    }
+}
+
 static bool xhci_submit_enable_slot(struct xhci_runtime_state *rt,
                                     volatile uint8_t *doorbell) {
     if (!rt || !doorbell) {
@@ -403,11 +585,7 @@ static bool xhci_submit_enable_slot(struct xhci_runtime_state *rt,
     trb->d3 = (XHCI_TRB_ENABLE_SLOT << XHCI_TRB_TYPE_SHIFT) |
               (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
 
-    rt->cmd_enqueue++;
-    if (rt->cmd_enqueue == (XHCI_CMD_RING_TRBS - 1U)) {
-        rt->cmd_enqueue = 0;
-        rt->cmd_cycle ^= 1U;
-    }
+    xhci_cmd_advance(rt);
 
     xhci_ring_doorbell(doorbell, 0, 0);
     return true;
@@ -433,11 +611,7 @@ static bool xhci_submit_address_device(struct xhci_runtime_state *rt,
               ((uint32_t)slot_id << 24) |
               (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
 
-    rt->cmd_enqueue++;
-    if (rt->cmd_enqueue == (XHCI_CMD_RING_TRBS - 1U)) {
-        rt->cmd_enqueue = 0;
-        rt->cmd_cycle ^= 1U;
-    }
+    xhci_cmd_advance(rt);
 
     xhci_ring_doorbell(doorbell, 0, 0);
     return true;
@@ -496,7 +670,10 @@ static bool xhci_poll_cmd_completion(struct xhci_runtime_state *rt,
 static bool xhci_prepare_address_device_context(struct xhci_runtime_state *rt,
                                                 uint8_t slot_id,
                                                 uint8_t root_port,
-                                                uint8_t port_speed) {
+                                                uint8_t port_speed,
+                                                uint32_t route,
+                                                uint8_t tt_slot,
+                                                uint8_t tt_port) {
     if (!rt || slot_id == 0) {
         return false;
     }
@@ -534,8 +711,10 @@ static bool xhci_prepare_address_device_context(struct xhci_runtime_state *rt,
 
     // Slot Context in input context index 1.
     uint32_t *slot_ctx = (uint32_t *)(ictx + csz * 1U);
-    slot_ctx[0] = ((uint32_t)port_speed << 20) | (1U << 27); // speed + context entries
+    slot_ctx[0] = (route & 0xFFFFFU) |                        // route string (hubs)
+                  ((uint32_t)port_speed << 20) | (1U << 27); // speed + context entries
     slot_ctx[1] = ((uint32_t)root_port << 16);               // root hub port number
+    slot_ctx[2] = (uint32_t)tt_slot | ((uint32_t)tt_port << 8); // TT hub slot / port
 
     // EP0 Context in input context index 2.
     uint32_t *ep0_ctx = (uint32_t *)(ictx + csz * 2U);
@@ -701,6 +880,11 @@ static bool xhci_ep0_control_transfer(struct xhci_runtime_state *rt,
 // Issue a GET_DESCRIPTOR(Device, index 0) on EP0 of the addressed slot.
 // Descriptor bytes land in rt->xfr_buf[slot_id-1].  Returns false on any
 // submission or timeout failure; completion code is logged regardless.
+static bool xhci_run_ctx_command(struct xhci_runtime_state *rt, uint32_t type,
+                                 uint8_t slot_id, const void *ictx,
+                                 const char *what);
+static void xhci_hub_setup(struct xhci_runtime_state *rt, uint8_t hub_slot);
+
 static bool xhci_get_device_descriptor(struct xhci_runtime_state *rt,
                                         volatile uint8_t *runtime,
                                         volatile uint8_t *doorbell,
@@ -710,6 +894,40 @@ static bool xhci_get_device_descriptor(struct xhci_runtime_state *rt,
 
     uint8_t *buf = rt->xfr_buf[idx];
     xhci_bzero(buf, 64);
+
+    /* FULL SPEED: LEARN EP0'S PACKET SIZE FIRST. A full-speed device's EP0
+     * takes 8, 16, 32 or 64 bytes a packet and only its device descriptor says
+     * which; the slot was addressed assuming 64. Asked for 18 bytes, a device
+     * whose EP0 is 8 sends one 8-byte packet -- SHORT, against 64 -- and the
+     * transfer ends there: the rest of the "descriptor" is zeros. QEMU does not
+     * care; a real full-speed mouse does. So: 8 bytes, byte 7, Evaluate Context
+     * if it differs, THEN the whole descriptor. */
+    if (rt->slot_speed[idx] == 1U) {
+        uint32_t d0_8 = (uint32_t)USB_BMRT_D2H_STD_DEV
+                      | ((uint32_t)USB_REQ_GET_DESCRIPTOR << 8)
+                      | ((uint32_t)USB_DESC_DEVICE_TYPE   << 24);
+        if (xhci_ep0_control_transfer(rt, runtime, doorbell, slot_id,
+                                      d0_8, (8U << 16), true, buf, 8U)) {
+            uint32_t mps0 = buf[7];
+            if ((mps0 == 8U || mps0 == 16U || mps0 == 32U) ) {
+                uint32_t csz = rt->context_size;
+                uint8_t *ictx = rt->input_ctx[idx];
+                xhci_bzero(ictx, 1024);
+                uint32_t *icc = (uint32_t *)ictx;
+                icc[1] = (1U << 1);                          /* A1: EP0 only */
+                uint32_t *ep0_in  = (uint32_t *)(ictx + csz * 2U);
+                const uint32_t *ep0_out = (const uint32_t *)(rt->device_ctx[idx] + csz);
+                for (uint32_t w = 0; w < csz / 4U; w++) { ep0_in[w] = ep0_out[w]; }
+                ep0_in[1] = (ep0_in[1] & 0x0000FFFFU) | (mps0 << 16);
+                if (xhci_run_ctx_command(rt, XHCI_TRB_EVAL_CONTEXT, slot_id, ictx,
+                                         "Evaluate Context (EP0 packet size)")) {
+                    kprintf("xHCI slot%u: full-speed EP0 is %u bytes a packet\n",
+                            (unsigned int)slot_id, (unsigned int)mps0);
+                }
+            }
+        }
+        xhci_bzero(buf, 64);
+    }
 
     // SETUP packet: bmRequestType=0x80, bRequest=GET_DESCRIPTOR,
     // wValue=(DEVICE<<8|0), wIndex=0, wLength=18.
@@ -734,6 +952,35 @@ static bool xhci_get_device_descriptor(struct xhci_runtime_state *rt,
             (unsigned int)buf[4],
             (unsigned int)(buf[8]  | ((uint32_t)buf[9]  << 8)),
             (unsigned int)(buf[10] | ((uint32_t)buf[11] << 8)));
+    return true;
+}
+
+/* Run one command that takes an input context -- Configure Endpoint or
+ * Evaluate Context -- and wait for its completion. True on Success (code 1). */
+static bool xhci_run_ctx_command(struct xhci_runtime_state *rt, uint32_t type,
+                                 uint8_t slot_id, const void *ictx,
+                                 const char *what) {
+    if (!rt || !rt->doorbell_regs || !rt->runtime_regs) { return false; }
+    if (rt->cmd_enqueue >= (XHCI_CMD_RING_TRBS - 1U)) { return false; }
+    uint64_t ptr = xhci_dma(ictx);
+    struct xhci_trb *cmd = &rt->cmd_ring[rt->cmd_enqueue];
+    cmd->d0 = (uint32_t)(ptr & 0xFFFFFFFFULL);
+    cmd->d1 = (uint32_t)(ptr >> 32);
+    cmd->d2 = 0;
+    cmd->d3 = (type << XHCI_TRB_TYPE_SHIFT) | ((uint32_t)slot_id << 24) |
+              (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+    xhci_cmd_advance(rt);
+    xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+    uint8_t cc = 0xFF, got = 0;
+    if (!xhci_poll_cmd_completion(rt, rt->runtime_regs, 4000000, &cc, &got)) {
+        kprintf("xHCI slot%u: %s timed out\n", (unsigned int)slot_id, what);
+        return false;
+    }
+    if (cc != 1U) {
+        kprintf("xHCI slot%u: %s failed, code %u\n", (unsigned int)slot_id, what,
+                (unsigned int)cc);
+        return false;
+    }
     return true;
 }
 
@@ -781,6 +1028,31 @@ static bool xhci_set_configuration(struct xhci_runtime_state *rt,
                                         d0, d1, false, NULL, 0);
     kprintf("xHCI slot%u: SET_CONFIGURATION(%u) %s\n",
             (unsigned int)slot_id, (unsigned int)cfg, ok ? "OK" : "failed");
+    return ok;
+}
+
+// HID SET_PROTOCOL(Boot) on interface `ifnum`.
+//
+// A HID device comes out of reset in REPORT protocol, whatever its interface
+// descriptor's boot subclass says. A keyboard's report-protocol report is
+// usually byte-for-byte its boot report, which is why the keyboard path got
+// away without this; a MOUSE's usually is not -- a report ID in front, 12- or
+// 16-bit deltas -- and parsed as a boot report it moves the cursor in
+// nonsense. QEMU's emulated devices do not care, which is how a driver can
+// pass every test here and misbehave on the first real mouse. Failure is
+// reported and not fatal: a device that refuses has no other protocol to offer.
+static bool xhci_hid_set_boot_protocol(struct xhci_runtime_state *rt,
+                                       volatile uint8_t *runtime,
+                                       volatile uint8_t *doorbell,
+                                       uint8_t slot_id, uint8_t ifnum) {
+    // bmRequestType=0x21 host-to-device | class | interface,
+    // bRequest=SET_PROTOCOL (0x0B), wValue=0 (Boot), wIndex=interface, wLength=0.
+    uint32_t d0 = 0x21U | (0x0BU << 8) | (0U << 16);
+    uint32_t d1 = (uint32_t)ifnum;
+    bool ok = xhci_ep0_control_transfer(rt, runtime, doorbell, slot_id,
+                                        d0, d1, false, NULL, 0);
+    kprintf("xHCI slot%u: SET_PROTOCOL(boot) on interface %u %s\n",
+            (unsigned int)slot_id, (unsigned int)ifnum, ok ? "OK" : "refused");
     return ok;
 }
 
@@ -888,9 +1160,13 @@ static void xhci_dispatch_class(struct xhci_runtime_state *rt,
                 // HID class — boot subclass with keyboard or mouse protocol.
                 if (iclass == USB_CLASS_HID &&
                     isubclass == USB_HID_SUBCLASS_BOOT) {
-                    if (iproto == USB_HID_PROTO_KBD) {
-                        kprintf("xHCI slot%u: HID Boot Keyboard — configuring endpoint\n",
-                                (unsigned int)slot_id);
+                    if (iproto == USB_HID_PROTO_KBD || iproto == USB_HID_PROTO_MOUSE) {
+                        const char *what = iproto == USB_HID_PROTO_KBD ? "keyboard" : "mouse";
+                        kprintf("xHCI slot%u: HID Boot %s — configuring endpoint\n",
+                                (unsigned int)slot_id,
+                                iproto == USB_HID_PROTO_KBD ? "Keyboard" : "Mouse");
+                        xhci_hid_set_boot_protocol(rt, runtime_ptr, doorbell_ptr,
+                                                   slot_id, buf[off + 2U]);
                         // Find the interrupt-IN endpoint address from the blob.
                         uint8_t ep_addr = 0;
                         uint8_t ep_intv = 0;
@@ -907,6 +1183,7 @@ static void xhci_dispatch_class(struct xhci_runtime_state *rt,
                             rt->intin_ep_addr[si] = ep_addr;
                             rt->intin_interval[si] = ep_intv;
                             rt->intin_mps[si] = ep_mps;
+                            rt->intin_kind[si] = iproto;
                             rt->intin_active[si] = false;
                             // Issue Configure Endpoint to activate the IN ring.
                             if (xhci_configure_intin_endpoint(rt, op_ptr, runtime_ptr,
@@ -914,20 +1191,18 @@ static void xhci_dispatch_class(struct xhci_runtime_state *rt,
                                                                ep_addr, ep_mps, ep_intv)) {
                                 rt->intin_active[si] = true;
                                 // Prime the ring with several receive buffers; from
-                                // now on xhci_poll() (main loop) drains reports and
-                                // re-arms buffers without blocking.
+                                // now on the event servicing (interrupt, or
+                                // xhci_poll() from the main loop) drains reports
+                                // and re-arms buffers without blocking.
                                 xhci_intin_post_buffers(rt, doorbell_ptr, slot_id,
                                                         ep_mps, XHCI_INTIN_NUM_BUFS);
-                                kprintf("xHCI slot%u: HID keyboard ready — polling via main loop\n",
-                                        (unsigned int)slot_id);
+                                kprintf("xHCI slot%u: HID %s ready\n",
+                                        (unsigned int)slot_id, what);
                             }
                         } else {
                             kprintf("xHCI slot%u: no interrupt-IN endpoint found\n",
                                     (unsigned int)slot_id);
                         }
-                    } else if (iproto == USB_HID_PROTO_MOUSE) {
-                        kprintf("xHCI slot%u: HID Boot Mouse detected\n",
-                                (unsigned int)slot_id);
                     }
                 } else if (iclass == USB_CLASS_MSC) {
                     kprintf("xHCI slot%u: Mass Storage device detected\n",
@@ -937,6 +1212,11 @@ static void xhci_dispatch_class(struct xhci_runtime_state *rt,
                 } else if (iclass == USB_CLASS_HUB) {
                     kprintf("xHCI slot%u: USB Hub detected\n",
                             (unsigned int)slot_id);
+                    /* Returns straight after: the hub's setup reads its own
+                     * descriptors into this slot's xfr_buf, which is the very
+                     * blob this loop is walking. */
+                    xhci_hub_setup(rt, slot_id);
+                    return;
                 }
             }
         }
@@ -1122,8 +1402,24 @@ static bool xhci_configure_intin_endpoint(struct xhci_runtime_state *rt,
     // Link cycle starts CLEAR — see the EP0 ring note; the wrap XORs it.
     link->d3 = (XHCI_TRB_LINK << XHCI_TRB_TYPE_SHIFT) | XHCI_TRB_TC_BIT;
 
+    /* INTERVAL: xHCI wants an EXPONENT -- the endpoint is serviced every
+     * 2^n x 125 us -- and bInterval is not one at every speed. High and super
+     * speed: bInterval is already an exponent, off by one. Full and low
+     * speed: bInterval is a count of 1 ms FRAMES. Passed through raw, a
+     * full-speed mouse's 10 ms became 2^10 x 125 us = 128 ms between reports. */
+    uint32_t iv;
+    uint8_t spd = rt->slot_speed[idx];
+    if (spd >= 3U) {
+        iv = interval ? (uint32_t)interval - 1U : 0U;
+        if (iv > 15U) iv = 15U;
+    } else {
+        uint32_t frames = interval ? interval : 1U;
+        iv = 31U - (uint32_t)__builtin_clz(frames * 8U);   /* floor(log2(frames x 8)) */
+        if (iv < 3U) iv = 3U;
+        if (iv > 10U) iv = 10U;
+    }
     uint32_t *ep_ctx = (uint32_t *)(ictx + csz * (ep_id + 1U));
-    ep_ctx[0] = (uint32_t)interval << 16; // Interval
+    ep_ctx[0] = iv << 16; // Interval (exponent)
     ep_ctx[1] = (7U << 3) | (3U << 1) | (mps << 16); // EP type=interrupt-IN, CErr=3
     ep_ctx[2] = (uint32_t)(ring_base & 0xFFFFFFFFULL) | 1U; // DCS=1
     ep_ctx[3] = (uint32_t)(ring_base >> 32);
@@ -1139,11 +1435,7 @@ static bool xhci_configure_intin_endpoint(struct xhci_runtime_state *rt,
     cmd->d3 = (XHCI_TRB_CFG_ENDPOINT << XHCI_TRB_TYPE_SHIFT)
             | ((uint32_t)slot_id << 24)
             | (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
-    rt->cmd_enqueue++;
-    if (rt->cmd_enqueue == (XHCI_CMD_RING_TRBS - 1U)) {
-        rt->cmd_enqueue = 0;
-        rt->cmd_cycle ^= 1U;
-    }
+    xhci_cmd_advance(rt);
     xhci_ring_doorbell(doorbell, 0, 0); // ring command ring doorbell
 
     uint8_t cc = 0xFF, out_slot = 0;
@@ -1202,8 +1494,32 @@ static void xhci_intin_post_buffers(struct xhci_runtime_state *rt,
 // only on its press edge, not repeatedly while held. `rep_buf` is the specific
 // receive buffer the completed TRB DMA'd into.
 // --------------------------------------------------------------------------
+/* HID reports taken, by kind: "the device is configured" and "reports are
+ * ARRIVING" are different claims, and only the second is evidence. Read by
+ * the aarch64 USB input test (tools/arm64_usb_input_test.py) out of guest
+ * memory, and printed by xhci_hid_stats(). */
+static volatile uint64_t g_hid_kbd_reports, g_hid_mouse_reports;
+
+void xhci_hid_stats(uint64_t *kbd, uint64_t *mouse) {
+    if (kbd) *kbd = g_hid_kbd_reports;
+    if (mouse) *mouse = g_hid_mouse_reports;
+}
+
 static void xhci_process_hid_report(struct xhci_runtime_state *rt, uint32_t idx,
                                     const uint8_t *rep_buf) {
+    /* A BOOT MOUSE: [buttons, dx, dy, (wheel)] -- signed 8-bit deltas, +y down,
+     * +wheel away from the user (scroll up), exactly the conventions
+     * mouse_move_relative() takes. The wheel byte exists only if the endpoint
+     * sends at least four. */
+    if (rt->intin_kind[idx] == USB_HID_PROTO_MOUSE) {
+        g_hid_mouse_reports++;
+        int32_t wheel = rt->intin_mps[idx] >= 4U ? (int32_t)(int8_t)rep_buf[3] : 0;
+        mouse_move_relative((int32_t)(int8_t)rep_buf[1], (int32_t)(int8_t)rep_buf[2],
+                            (uint32_t)rep_buf[0] & 0x07U, wheel);
+        return;
+    }
+
+    g_hid_kbd_reports++;
     bool shift = (rep_buf[0] & 0x22U) != 0; // LeftShift(0x02)|RightShift(0x20)
 
     for (uint32_t k = 2; k < 8; k++) {
@@ -1350,6 +1666,21 @@ void xhci_irq(void) {
 // vector and register the shared handler. Call once after enumeration so the
 // synchronous busy-poll enumeration path isn't disturbed.
 void xhci_enable_irq(void) {
+#if !defined(__x86_64__)
+    /* aarch64: POLLED, from the boot CPU's loop via usb_poll() -> xhci_poll(),
+     * next to virtio_input_poll() and for the same reason. A keyboard and a
+     * mouse need a 10 ms cadence, which the loop already runs at; wiring the
+     * controller's INTx or MSI through the GIC is worth doing when something
+     * needs better than that, and a Raspberry Pi's PCIe routes both its own
+     * way (docs/RPI4.md P5). */
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++)
+        if (g_xhci_runtime[i].used)
+            kprintf("xHCI %x:%x.%x: polled (no interrupt wiring on this architecture)\n",
+                    (unsigned int)g_xhci_runtime[i].bus,
+                    (unsigned int)g_xhci_runtime[i].device,
+                    (unsigned int)g_xhci_runtime[i].function);
+    return;
+#else
     for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
         struct xhci_runtime_state *rt = &g_xhci_runtime[i];
         if (!rt->used) { continue; }
@@ -1384,9 +1715,24 @@ void xhci_enable_irq(void) {
             mode = "INTx";
         }
         xhci_intr_enable(rt, true);
+        rt->irq_driven = true;
         kprintf("xHCI %x:%x.%x: interrupt-driven via %s (vector %u)\n",
                 (unsigned int)rt->bus, (unsigned int)rt->device,
                 (unsigned int)rt->function, mode, (unsigned int)vector);
+    }
+#endif
+}
+
+/* Service every controller that is NOT interrupt-driven: aarch64's always,
+ * and an x86 controller that found no usable interrupt ("staying polled"),
+ * whose HID reports nothing drained before this. Called from usb_poll(), in
+ * schedulable context. */
+void xhci_poll(void) {
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
+        struct xhci_runtime_state *rt = &g_xhci_runtime[i];
+        if (!rt->used || rt->irq_driven) { continue; }
+        xhci_ack_interrupt(rt);
+        xhci_service_events(rt);
     }
 }
 
@@ -1679,8 +2025,7 @@ static bool xhci_configure_bulk_endpoints(struct xhci_runtime_state *rt,
     cmd->d3 = (XHCI_TRB_CFG_ENDPOINT << XHCI_TRB_TYPE_SHIFT)
             | ((uint32_t)slot_id << 24)
             | (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
-    rt->cmd_enqueue++;
-    if (rt->cmd_enqueue == (XHCI_CMD_RING_TRBS - 1U)) { rt->cmd_enqueue = 0; rt->cmd_cycle ^= 1U; }
+    xhci_cmd_advance(rt);
     xhci_ring_doorbell(doorbell, 0, 0);
 
     uint8_t cc = 0xFF, os = 0;
@@ -1748,8 +2093,472 @@ static bool xhci_msc_setup(struct xhci_runtime_state *rt, uint8_t slot_id,
     m->blk.driver_data = m;
     m->blk.dma_max_phys = 0xFFFFFFFFFFFFFFFFULL; // DMA goes through kernel-BSS bounce
     m->blk.needs_kernel_range = true;
-    embk_block_register(&m->blk);
+    if (embk_block_register(&m->blk) != EMBK_OK) {
+        kprintf("xHCI slot%u: block registration failed\n", (unsigned int)slot_id);
+        m->used = false;
+        return false;
+    }
+    /* AND MAKE IT REACHABLE. Registering a block device is where this stopped,
+     * which is correct for a disk the boot code knows how to find and useless
+     * for one somebody just pushed into a socket -- the point of plugging a
+     * stick in is to read what is on it. The other three controllers have done
+     * this since automount was written; xHCI never did. */
+    automount_attach(&m->blk);
     return true;
+}
+
+/* ==========================================================================
+ * HOT-PLUG: bringing a port up, taking it down, and noticing the difference.
+ *
+ * The other three controllers share kernel/drivers/usb/usb_core.c, whose
+ * rescan compares the ports against a device table every 500 ms. xHCI never
+ * joined that path -- it has its own enumeration, its own slot model and its
+ * own transfer rings -- so its ports were scanned once at boot and never
+ * again. docs/PILLARS.md says it plainly: "modern machines put USB 3 ports on
+ * xHCI, so this is the half that a recent laptop actually needs."
+ *
+ * What follows is that same idea expressed in this driver's own terms: the
+ * shared core's `rescan` hook, implemented over xHCI's PORTSC registers and
+ * slot commands rather than over usb_core's device table.
+ * ========================================================================== */
+
+/* A NEWLY CONNECTED PORT IS NOT AN ENABLED ONE. At boot the firmware has
+ * already reset every port it found something on, which is why enumeration
+ * worked without this and why a hot-plugged device does not: a USB 2 device
+ * arrives in the Disabled state and reaches Enabled only through a port
+ * reset. (USB 3 ports train themselves and come up Enabled, which is why a
+ * USB 3 stick would have appeared to work and a USB 2 one in the same socket
+ * would not.)
+ *
+ * The change bits are write-1-to-clear and live in the same register as the
+ * control bits, so every write has to preserve the ones it does not mean to
+ * touch -- XHCI_PORTSC_RW1C_MASK is exactly that set. */
+static bool xhci_port_reset(volatile uint8_t *op, uint32_t port_index) {
+    uint32_t reg = XHCI_PORTSC_BASE + (port_index * XHCI_PORT_STRIDE);
+    uint32_t portsc = xhci_read32(op, reg);
+
+    if (portsc & XHCI_PORTSC_PED) return true;      /* already enabled */
+
+    xhci_write32(op, reg, (portsc & ~XHCI_PORTSC_RW1C_MASK) | XHCI_PORTSC_PR);
+    for (int i = 0; i < 2000000; i++) {
+        portsc = xhci_read32(op, reg);
+        if (!(portsc & XHCI_PORTSC_PR)) break;
+        __asm__ volatile("" ::: "memory");
+    }
+    /* Acknowledge every change bit the reset raised, or the next read of this
+     * register reports a connection that already happened. */
+    portsc = xhci_read32(op, reg);
+    xhci_write32(op, reg, portsc);
+    return (xhci_read32(op, reg) & XHCI_PORTSC_PED) != 0;
+}
+
+/* Enumerate whatever is on `root_port`: a slot, an address, the descriptors,
+ * and the class dispatch. This is the sequence that used to sit inline at the
+ * end of xhci_init_controller, lifted out unchanged in substance -- because a
+ * device plugged in while the machine runs needs exactly it, and a second
+ * copy would drift from the boot path. */
+static uint8_t xhci_enumerate_device(struct xhci_runtime_state *rt, uint8_t root_port,
+                                     uint32_t route, uint8_t speed, uint8_t depth,
+                                     uint8_t tt_slot, uint8_t tt_port, uint8_t parent);
+
+static bool xhci_bring_up_port(struct xhci_runtime_state *rt, uint32_t root_port) {
+    volatile uint8_t *op = rt->op_regs;
+    volatile uint8_t *runtime = rt->runtime_regs;
+    volatile uint8_t *doorbell = rt->doorbell_regs;
+    if (!op || !runtime || !doorbell) return false;
+    if (root_port == 0 || root_port > XHCI_MAX_PORTS_TRACKED) return false;
+
+    /* SILENCE THE INTERRUPTER FIRST. Everything below busy-polls the event
+     * ring for its own completions, and by the time a device can be plugged
+     * in the interrupt handler is live and draining that same ring. The
+     * handler wins the race, the poll times out, and the device does not
+     * enumerate -- which is exactly what happened the first time this ran:
+     * "Enable Slot completion timeout on port 1", on a controller that had
+     * enumerated the identical device perfectly at boot, when the interrupt
+     * was not yet armed. The MSC block path has masked it for this reason
+     * since it was written; this needs it for the same one. */
+    xhci_intr_enable(rt, false);
+
+    if (!xhci_port_reset(op, root_port - 1U)) {
+        kprintf("xHCI: port %u would not enable after a reset\n",
+                (unsigned int)root_port);
+        { xhci_intr_enable(rt, true); return false; }
+    }
+
+    uint8_t speed = xhci_port_speed(op, root_port - 1U);
+    uint8_t slot = xhci_enumerate_device(rt, (uint8_t)root_port, 0U, speed, 0U, 0U, 0U, 0U);
+    if (slot) {
+        rt->port_slot[root_port - 1U] = slot;
+    }
+    xhci_intr_enable(rt, true);
+    return slot != 0;
+}
+
+/* Give a device on an already-reset port a slot, an address and a
+ * configuration, and hand it to its class driver. A device on a root port has
+ * route 0 and no parent; one behind a hub carries the route string, tier,
+ * parent hub and (low/full speed behind a high-speed hub) Transaction
+ * Translator its hub setup worked out. The caller has silenced the
+ * interrupter. Returns the slot, or 0. */
+static uint8_t xhci_enumerate_device(struct xhci_runtime_state *rt, uint8_t root_port,
+                                     uint32_t route, uint8_t speed, uint8_t depth,
+                                     uint8_t tt_slot, uint8_t tt_port, uint8_t parent) {
+    volatile uint8_t *op = rt->op_regs;
+    volatile uint8_t *runtime = rt->runtime_regs;
+    volatile uint8_t *doorbell = rt->doorbell_regs;
+
+    if (!xhci_submit_enable_slot(rt, doorbell)) {
+        kprintf("xHCI: failed to submit Enable Slot (root port %u, route %x)\n",
+                (unsigned int)root_port, (unsigned int)route);
+        return 0;
+    }
+    uint8_t cc = 0xFF, slot = 0;
+    if (!xhci_poll_cmd_completion(rt, runtime, 4000000, &cc, &slot)) {
+        kprintf("xHCI: Enable Slot completion timeout (root port %u, route %x)\n",
+                (unsigned int)root_port, (unsigned int)route);
+        return 0;
+    }
+    if (cc != 1U || slot == 0U || slot > rt->tracked_slots) {
+        kprintf("xHCI: Enable Slot (root port %u, route %x) gave code=%u slot=%u\n",
+                (unsigned int)root_port, (unsigned int)route,
+                (unsigned int)cc, (unsigned int)slot);
+        return 0;
+    }
+
+    if (!xhci_prepare_address_device_context(rt, slot, root_port, speed,
+                                             route, tt_slot, tt_port)) {
+        kprintf("xHCI: failed to prepare input context for slot %u\n",
+                (unsigned int)slot);
+        return 0;
+    }
+    uint32_t sidx = (uint32_t)slot - 1U;
+    rt->slot_route[sidx]   = route;
+    rt->slot_depth[sidx]   = depth;
+    rt->slot_tt_slot[sidx] = tt_slot;
+    rt->slot_tt_port[sidx] = tt_port;
+    rt->slot_parent[sidx]  = parent;
+    rt->hub_nports[sidx]   = 0;
+
+    uint64_t ictx = xhci_dma(rt->input_ctx[sidx]);
+    if (!xhci_submit_address_device(rt, doorbell, slot, ictx)) {
+        kprintf("xHCI: failed to submit Address Device for slot %u\n",
+                (unsigned int)slot);
+        return 0;
+    }
+    uint8_t cc2 = 0xFF, slot2 = 0;
+    if (!xhci_poll_cmd_completion(rt, runtime, 4000000, &cc2, &slot2)) {
+        kprintf("xHCI: Address Device completion timeout\n");
+        return 0;
+    }
+    kprintf("xHCI: Address Device code=%u slot=%u port=%u speed=%u route=%x%s\n",
+            (unsigned int)cc2, (unsigned int)slot2,
+            (unsigned int)root_port, (unsigned int)speed, (unsigned int)route,
+            tt_slot ? " (via a hub's transaction translator)" : "");
+    if (cc2 != 1U) { return 0; }
+
+    rt->ep0_enqueue[sidx] = 0;
+    rt->ep0_cycle[sidx]   = 1;
+
+    if (!xhci_get_device_descriptor(rt, runtime, doorbell, slot)) { return 0; }
+    xhci_set_address(rt, runtime, doorbell, slot, slot);
+    if (!xhci_get_config_descriptor(rt, runtime, doorbell, slot)) { return 0; }
+    uint8_t cfg_val = rt->xfr_buf[sidx][5];
+    xhci_set_configuration(rt, runtime, doorbell, slot, cfg_val);
+    rt->slot_to_port[sidx] = root_port;
+    xhci_dispatch_class(rt, slot, op, runtime, doorbell);
+    return slot;
+}
+
+/* ---- hubs ------------------------------------------------------------------
+ *
+ * WHY THIS EXISTS: a Raspberry Pi 4 has none of its USB ports on the VL805's
+ * root ports directly. Its USB 2.0 side goes through a hub inside the VL805
+ * (VIA Labs 2109:3431), so a keyboard and a mouse are ALWAYS behind a hub
+ * there. Without this the Pi finds the hub and never sees what is on it.
+ *
+ * What a hub needs from an xHCI driver (USB 2.0 chapter 11, xHCI 4.3.3/6.2.2):
+ *   - the controller told the slot IS a hub, with its port count and -- for a
+ *     high-speed hub -- its Transaction Translator think time;
+ *   - its ports powered, then each connected one reset;
+ *   - every device found enumerated with its ROUTE STRING (one nibble per tier:
+ *     which hub port, from the top) and, if it is low/full speed behind a
+ *     high-speed hub, that hub's slot and port as its TT.
+ * The hub's own status-change endpoint is not used: ports are polled with
+ * GET_PORT_STATUS by xhci_rescan(), every 500 ms like the root ports. The
+ * hub runs single-TT (its default configuration); MTT would need the
+ * alternate interface selected first. USB 3 hubs are recognised and left
+ * alone -- a keyboard behind one appears on its USB 2.0 half, which is an
+ * ordinary hub. */
+
+#define USB_HUB_PORT_CONNECTION   (1U << 0)
+#define USB_HUB_PORT_ENABLE       (1U << 1)
+#define USB_HUB_PORT_RESET        (1U << 4)
+#define USB_HUB_PORT_LOW_SPEED    (1U << 9)
+#define USB_HUB_PORT_HIGH_SPEED   (1U << 10)
+#define USB_HUB_C_PORT_CONNECTION (1U << 0)   /* in wPortChange */
+#define USB_HUB_C_PORT_RESET      (1U << 4)
+#define USB_HUB_FEAT_PORT_RESET   4U
+#define USB_HUB_FEAT_PORT_POWER   8U
+#define USB_HUB_FEAT_C_CONNECTION 16U
+#define USB_HUB_FEAT_C_RESET      20U
+
+/* SET_FEATURE / CLEAR_FEATURE on hub port `port`: class, other (0x23). */
+static bool xhci_hub_port_feature(struct xhci_runtime_state *rt, uint8_t hub_slot,
+                                  uint8_t port, uint32_t feature, bool set) {
+    uint32_t d0 = 0x23U | ((set ? 3U : 1U) << 8) | (feature << 16);
+    return xhci_ep0_control_transfer(rt, rt->runtime_regs, rt->doorbell_regs,
+                                     hub_slot, d0, (uint32_t)port, false, NULL, 0);
+}
+
+/* GET_STATUS on hub port `port`: wPortStatus and wPortChange. */
+static bool xhci_hub_port_status(struct xhci_runtime_state *rt, uint8_t hub_slot,
+                                 uint8_t port, uint16_t *status, uint16_t *change) {
+    uint8_t *buf = rt->xfr_buf[(uint32_t)hub_slot - 1U];
+    xhci_bzero(buf, 8);
+    uint32_t d0 = 0xA3U | (0U << 8);                /* class, other, GET_STATUS */
+    if (!xhci_ep0_control_transfer(rt, rt->runtime_regs, rt->doorbell_regs, hub_slot,
+                                   d0, (uint32_t)port | (4U << 16), true, buf, 4U)) {
+        return false;
+    }
+    *status = (uint16_t)(buf[0] | ((uint16_t)buf[1] << 8));
+    *change = (uint16_t)(buf[2] | ((uint16_t)buf[3] << 8));
+    return true;
+}
+
+/* Something is connected to hub port `port`: reset it and enumerate it. */
+static void xhci_hub_port_attach(struct xhci_runtime_state *rt, uint8_t hub_slot,
+                                 uint8_t port) {
+    uint32_t hidx = (uint32_t)hub_slot - 1U;
+    uint16_t st = 0, ch = 0;
+
+    xhci_hub_port_feature(rt, hub_slot, port, USB_HUB_FEAT_PORT_RESET, true);
+    bool done = false;
+    for (uint32_t t = 0; t < 50U && !done; t++) {          /* up to 500 ms */
+        timer_delay_ms(10);
+        if (xhci_hub_port_status(rt, hub_slot, port, &st, &ch) &&
+            ((ch & USB_HUB_C_PORT_RESET) || !(st & USB_HUB_PORT_RESET))) {
+            done = true;
+        }
+    }
+    xhci_hub_port_feature(rt, hub_slot, port, USB_HUB_FEAT_C_RESET, false);
+    xhci_hub_port_feature(rt, hub_slot, port, USB_HUB_FEAT_C_CONNECTION, false);
+    if (!done || !(st & USB_HUB_PORT_ENABLE)) {
+        kprintf("xHCI hub slot%u: port %u did not enable after a reset (status %x)\n",
+                (unsigned int)hub_slot, (unsigned int)port, (unsigned int)st);
+        return;
+    }
+    timer_delay_ms(10);                                     /* reset recovery */
+
+    uint8_t speed = (st & USB_HUB_PORT_LOW_SPEED)  ? 2U :   /* xHCI speed IDs */
+                    (st & USB_HUB_PORT_HIGH_SPEED) ? 3U : 1U;
+    uint8_t depth = rt->slot_depth[hidx];
+    uint32_t route = rt->slot_route[hidx] |
+                     ((uint32_t)(port > 15U ? 15U : port) << (4U * depth));
+    /* A low/full-speed device talks through the Transaction Translator of the
+     * NEAREST high-speed hub above it. This hub if it is one; else whatever
+     * this hub itself was using. */
+    uint8_t tt_slot = rt->slot_tt_slot[hidx], tt_port = rt->slot_tt_port[hidx];
+    if (rt->slot_speed[hidx] == 3U && speed < 3U) {
+        tt_slot = hub_slot;
+        tt_port = port;
+    }
+    kprintf("xHCI hub slot%u: port %u: %s-speed device\n", (unsigned int)hub_slot,
+            (unsigned int)port, speed == 2U ? "low" : speed == 3U ? "high" : "full");
+    uint8_t child = xhci_enumerate_device(rt, rt->slot_to_port[hidx], route, speed,
+                                          (uint8_t)(depth + 1U), tt_slot, tt_port,
+                                          hub_slot);
+    rt->hub_child[hidx][port - 1U] = child;
+}
+
+static void xhci_hub_setup(struct xhci_runtime_state *rt, uint8_t hub_slot) {
+    uint32_t hidx = (uint32_t)hub_slot - 1U;
+    if (rt->slot_speed[hidx] >= 4U) {
+        kprintf("xHCI hub slot%u: a USB 3 hub -- left alone; what is plugged into it "
+                "appears on its USB 2.0 half\n", (unsigned int)hub_slot);
+        return;
+    }
+    if (rt->slot_depth[hidx] >= 5U) {
+        kprintf("xHCI hub slot%u: deeper than USB allows -- not enumerated\n",
+                (unsigned int)hub_slot);
+        return;
+    }
+
+    /* The hub descriptor: port count, characteristics, power-on time. */
+    uint8_t *buf = rt->xfr_buf[hidx];
+    xhci_bzero(buf, 64);
+    uint32_t d0 = 0xA0U | (6U << 8) | (0x29U << 24);        /* class, device, GET_DESCRIPTOR(hub) */
+    if (!xhci_ep0_control_transfer(rt, rt->runtime_regs, rt->doorbell_regs, hub_slot,
+                                   d0, (16U << 16), true, buf, 16U)) {
+        kprintf("xHCI hub slot%u: GET_DESCRIPTOR(hub) failed\n", (unsigned int)hub_slot);
+        return;
+    }
+    uint8_t nports = buf[2] > 15U ? 15U : buf[2];
+    uint16_t chars = (uint16_t)(buf[3] | ((uint16_t)buf[4] << 8));
+    uint32_t pgood_ms = (uint32_t)buf[5] * 2U;
+    uint32_t tt_think = (chars >> 5) & 3U;
+
+    /* Tell the controller this slot is a hub (Configure Endpoint, slot context
+     * only): Hub, Number of Ports, and TT Think Time for a high-speed hub. */
+    uint32_t csz = rt->context_size;
+    uint8_t *ictx = rt->input_ctx[hidx];
+    xhci_bzero(ictx, 1024);
+    ((uint32_t *)ictx)[1] = 1U;                              /* A0: slot context */
+    uint32_t *slot_in = (uint32_t *)(ictx + csz);
+    const uint32_t *slot_out = (const uint32_t *)rt->device_ctx[hidx];
+    for (uint32_t w = 0; w < csz / 4U; w++) { slot_in[w] = slot_out[w]; }
+    slot_in[0] |= (1U << 26);                                /* Hub */
+    slot_in[1] = (slot_in[1] & 0x00FFFFFFU) | ((uint32_t)nports << 24);
+    if (rt->slot_speed[hidx] == 3U) {
+        slot_in[2] = (slot_in[2] & ~(3U << 16)) | (tt_think << 16);
+    }
+    if (!xhci_run_ctx_command(rt, XHCI_TRB_CFG_ENDPOINT, hub_slot, ictx,
+                              "Configure Endpoint (hub)")) {
+        return;
+    }
+    rt->hub_nports[hidx] = nports;
+    kprintf("xHCI hub slot%u: %u port(s), %s-speed, route %x\n",
+            (unsigned int)hub_slot, (unsigned int)nports,
+            rt->slot_speed[hidx] == 3U ? "high" : "full",
+            (unsigned int)rt->slot_route[hidx]);
+
+    /* Power every port, wait what the hub says it needs (at least 100 ms),
+     * then attach whatever is there. */
+    for (uint8_t p = 1; p <= nports; p++) {
+        xhci_hub_port_feature(rt, hub_slot, p, USB_HUB_FEAT_PORT_POWER, true);
+    }
+    timer_delay_ms(pgood_ms > 100U ? pgood_ms + 20U : 120U);
+    for (uint8_t p = 1; p <= nports; p++) {
+        uint16_t st = 0, ch = 0;
+        if (!xhci_hub_port_status(rt, hub_slot, p, &st, &ch)) { continue; }
+        if (st & USB_HUB_PORT_CONNECTION) {
+            xhci_hub_port_attach(rt, hub_slot, p);
+        } else if (ch & USB_HUB_C_PORT_CONNECTION) {
+            xhci_hub_port_feature(rt, hub_slot, p, USB_HUB_FEAT_C_CONNECTION, false);
+        }
+    }
+}
+
+/* The device on `root_port` has gone. Release everything that named it.
+ *
+ * ORDER, AS EVERYWHERE ELSE A MEDIUM CAN LEAVE: unmount before the block
+ * device is unregistered, unregister before the slot is disabled. Doing it
+ * the other way means an in-flight path walk going through a registration
+ * whose transfer ring has already been handed back. */
+/* Release one slot and everything that named it -- and, for a hub, every
+ * device behind it first (they cannot outlive the hub they hang off). The
+ * caller has silenced the interrupter. */
+static void xhci_teardown_slot(struct xhci_runtime_state *rt, uint8_t slot) {
+    if (!slot || slot > rt->tracked_slots) return;
+    uint32_t sidx = (uint32_t)slot - 1U;
+
+    for (uint32_t p = 0; p < rt->hub_nports[sidx]; p++) {
+        uint8_t child = rt->hub_child[sidx][p];
+        rt->hub_child[sidx][p] = 0;
+        if (child) xhci_teardown_slot(rt, child);
+    }
+    rt->hub_nports[sidx] = 0;
+
+    for (uint32_t i = 0; i < (uint32_t)(XHCI_MAX_CONTROLLERS * XHCI_MAX_SLOTS_TRACKED); i++) {
+        struct xhci_msc_dev *m = &g_msc_devs[i];
+        if (!m->used || m->rt != rt || m->slot_id != slot) continue;
+        automount_detach(&m->blk);
+        embk_block_unregister(&m->blk);
+        kprintf("xHCI: %s removed (slot %u)\n", m->blk.name, (unsigned int)slot);
+        m->used = false;
+    }
+
+    /* NOTHING MAY BE ARMED ON A RING WHOSE DEVICE IS GONE. The interrupt-IN
+     * poll walks every slot marked active; one left set is a poll that reads
+     * a buffer the controller will never fill again. */
+    rt->intin_active[sidx] = false;
+    rt->msc_active[sidx] = false;
+    rt->slot_active[sidx] = 0;
+    rt->slot_to_port[sidx] = 0;
+
+    /* Give the slot back to the controller. The completion is busy-polled,
+     * which is why the caller silenced the interrupt handler. */
+    if (rt->doorbell_regs && rt->cmd_enqueue < (XHCI_CMD_RING_TRBS - 1U)) {
+        struct xhci_trb *trb = &rt->cmd_ring[rt->cmd_enqueue];
+        trb->d0 = 0; trb->d1 = 0; trb->d2 = 0;
+        trb->d3 = (XHCI_TRB_DISABLE_SLOT << XHCI_TRB_TYPE_SHIFT) |
+                  ((uint32_t)slot << 24) |
+                  (rt->cmd_cycle ? XHCI_TRB_CYCLE_BIT : 0U);
+        xhci_cmd_advance(rt);
+        xhci_ring_doorbell(rt->doorbell_regs, 0, 0);
+        uint8_t cc = 0, got = 0;
+        xhci_poll_cmd_completion(rt, rt->runtime_regs, 2000000, &cc, &got);
+    }
+    rt->dcbaa[slot] = 0;
+}
+
+static void xhci_teardown_port(struct xhci_runtime_state *rt, uint32_t root_port) {
+    if (root_port == 0 || root_port > XHCI_MAX_PORTS_TRACKED) return;
+    uint8_t slot = rt->port_slot[root_port - 1U];
+    rt->port_slot[root_port - 1U] = 0;
+    xhci_intr_enable(rt, false);
+    xhci_teardown_slot(rt, slot);
+    xhci_intr_enable(rt, true);
+}
+
+/* The shared core's hot-plug hook, called every 500 ms from usb_poll(). */
+void xhci_rescan(void *hc) {
+    struct xhci_runtime_state *rt = (struct xhci_runtime_state *)hc;
+    if (!rt || !rt->used || !rt->op_regs) return;
+
+    for (uint32_t port = 1; port <= rt->max_ports; port++) {
+        uint32_t reg = XHCI_PORTSC_BASE + ((port - 1U) * XHCI_PORT_STRIDE);
+        uint32_t portsc = xhci_read32(rt->op_regs, reg);
+        bool now = (portsc & XHCI_PORTSC_CCS) != 0;
+        bool was = rt->port_connected[port - 1U];
+
+        /* ACKNOWLEDGE THE CHANGE BITS WHATEVER HAPPENED. They are
+         * write-1-to-clear and they latch: a connect that is noticed but not
+         * acknowledged is reported again on every pass, and on a controller
+         * driven by its interrupt it never stops. */
+        if (portsc & XHCI_PORTSC_RW1C_MASK)
+            xhci_write32(rt->op_regs, reg, portsc);
+
+        if (now == was) continue;
+        rt->port_connected[port - 1U] = now;
+
+        if (now) {
+            kprintf("xHCI: something was plugged into port %u\n",
+                    (unsigned int)port);
+            xhci_bring_up_port(rt, port);
+        } else {
+            kprintf("xHCI: port %u went empty\n", (unsigned int)port);
+            xhci_teardown_port(rt, port);
+        }
+    }
+
+    /* HUB PORTS, the same way: a keyboard plugged into a Raspberry Pi 4 after
+     * boot lands on a port of the hub inside its VL805, which the loop above
+     * never sees. GET_PORT_STATUS on each; a connection change is acted on
+     * and acknowledged. */
+    for (uint32_t hs = 1; hs <= rt->tracked_slots; hs++) {
+        uint32_t hidx = hs - 1U;
+        if (!rt->slot_active[hidx] || !rt->hub_nports[hidx]) continue;
+        for (uint8_t p = 1; p <= rt->hub_nports[hidx]; p++) {
+            uint16_t st = 0, ch = 0;
+            xhci_intr_enable(rt, false);
+            bool ok = xhci_hub_port_status(rt, (uint8_t)hs, p, &st, &ch);
+            if (ok && (ch & USB_HUB_C_PORT_CONNECTION)) {
+                xhci_hub_port_feature(rt, (uint8_t)hs, p, USB_HUB_FEAT_C_CONNECTION, false);
+                uint8_t child = rt->hub_child[hidx][p - 1U];
+                if ((st & USB_HUB_PORT_CONNECTION) && !child) {
+                    kprintf("xHCI hub slot%u: something was plugged into port %u\n",
+                            (unsigned int)hs, (unsigned int)p);
+                    xhci_hub_port_attach(rt, (uint8_t)hs, p);
+                } else if (!(st & USB_HUB_PORT_CONNECTION) && child) {
+                    kprintf("xHCI hub slot%u: port %u went empty\n",
+                            (unsigned int)hs, (unsigned int)p);
+                    rt->hub_child[hidx][p - 1U] = 0;
+                    xhci_teardown_slot(rt, child);
+                }
+            }
+            xhci_intr_enable(rt, true);
+        }
+    }
 }
 
 // Count connected root ports for diagnostics. This MUST be read-only: issuing a
@@ -1841,7 +2650,9 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
         return false;
     }
 
-    if (!xhci_controller_reset_and_run(op)) {
+    xhci_bios_handoff(mmio, hccparams1, map_size);
+
+    if (!xhci_controller_reset(op)) {
         return false;
     }
 
@@ -1849,6 +2660,11 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
     if (!rt) {
         kprintf("xHCI: no runtime slots available\n");
         return false;
+    }
+    {
+        uint32_t hcs2 = xhci_read32(mmio, XHCI_HCSPARAMS2);
+        rt->scratchpad_n = (uint16_t)((((hcs2 >> 21) & 0x1FU) << 5) | ((hcs2 >> 27) & 0x1FU));
+        rt->ac64 = (hccparams1 & 1U) != 0;
     }
 
     // Remember the register blocks so the IRQ handler and runtime poll can reach
@@ -1861,105 +2677,68 @@ bool xhci_init_controller(struct usb_controller *ctrl) {
     rt->tracked_slots = (uint8_t)((max_slots < XHCI_MAX_SLOTS_TRACKED) ?
                                   max_slots : XHCI_MAX_SLOTS_TRACKED);
 
-    if (!xhci_setup_rings(rt, op, runtime)) {
-        kprintf("xHCI: ring setup failed\n");
-        return false;
-    }
-
-    // Program Max Device Slots Enabled (CONFIG[7:0]).
+    // Program Max Device Slots Enabled (CONFIG[7:0]) -- while halted.
     uint32_t cfg = xhci_read32(op, XHCI_OP_CONFIG);
     cfg &= ~0xFFU;
     cfg |= (max_slots > 8U) ? 8U : (max_slots ? max_slots : 1U);
     xhci_write32(op, XHCI_OP_CONFIG, cfg);
 
-    // First real command path: Enable Slot. This validates command/event rings.
-    if (xhci_submit_enable_slot(rt, doorbell)) {
-        uint8_t cc = 0xFF;
-        uint8_t slot = 0;
-        if (xhci_poll_cmd_completion(rt, runtime, 4000000, &cc, &slot)) {
-            kprintf("xHCI: Enable Slot completion code=%u slot=%u\n",
-                    (unsigned int)cc, (unsigned int)slot);
+    if (!xhci_setup_rings(rt, op, runtime)) {
+        kprintf("xHCI: ring setup failed\n");
+        return false;
+    }
 
-            // Address the first connected root port as the first real device flow.
-            uint32_t root_port = xhci_find_first_connected_port(op, max_ports);
-            if (cc == 1U && slot != 0U && root_port != 0U) {
-                uint8_t speed = xhci_port_speed(op, root_port - 1U);
-                if (!xhci_prepare_address_device_context(rt, slot,
-                                                         (uint8_t)root_port,
-                                                         speed)) {
-                    kprintf("xHCI: failed to prepare input context for slot %u\n",
-                            (unsigned int)slot);
-                } else {
-                    uint64_t ictx = xhci_dma(rt->input_ctx[(uint32_t)slot - 1U]);
-                    if (xhci_submit_address_device(rt, doorbell, slot, ictx)) {
-                        uint8_t cc2 = 0xFF;
-                        uint8_t slot2 = 0;
-                        if (xhci_poll_cmd_completion(rt, runtime, 4000000,
-                                                     &cc2, &slot2)) {
-                            kprintf("xHCI: Address Device completion code=%u slot=%u port=%u speed=%u\n",
-                                    (unsigned int)cc2,
-                                    (unsigned int)slot2,
-                                    (unsigned int)root_port,
-                                    (unsigned int)speed);
+    if (!xhci_controller_run(op)) {
+        return false;
+    }
 
-                            // Address Device succeeded (cc2==1) — the slot now
-                            // has a real USB address and EP0 is live.  Fetch the
-                            // standard 18-byte Device Descriptor as the first
-                            // real data transfer to confirm end-to-end function.
-                            if (cc2 == 1U) {
-                                uint32_t sidx = (uint32_t)slot - 1U;
-                                // Initialise the EP0 enqueue/cycle for this slot.
-                                rt->ep0_enqueue[sidx] = 0;
-                                rt->ep0_cycle[sidx]   = 1;
-
-                                // Step 1: GET_DESCRIPTOR(Device) — confirm EP0 works.
-                                if (xhci_get_device_descriptor(rt, runtime,
-                                                               doorbell, slot)) {
-                                    // Step 2: SET_ADDRESS — assign a stable device addr.
-                                    // Use slot_id as the USB address (legal range 1-127).
-                                    xhci_set_address(rt, runtime, doorbell,
-                                                     slot, slot);
-
-                                    // Step 3: GET_DESCRIPTOR(Configuration) — fetch the
-                                    // full config blob so we can identify the class.
-                                    if (xhci_get_config_descriptor(rt, runtime,
-                                                                   doorbell, slot)) {
-                                        // Step 4: SET_CONFIGURATION — activate the
-                                        // interfaces/endpoints (bConfigurationValue is
-                                        // byte 5 of the configuration descriptor). The
-                                        // device only produces HID reports once this
-                                        // moves it into the Configured state.
-                                        uint8_t cfg_val =
-                                            rt->xfr_buf[(uint32_t)slot - 1U][5];
-                                        xhci_set_configuration(rt, runtime, doorbell,
-                                                               slot, cfg_val);
-
-                                        // Step 5: Walk descriptors and dispatch by class.
-                                        xhci_dispatch_class(rt, slot, op,
-                                                            runtime, doorbell);
-                                    }
-                                }
-                            }
-                        } else {
-                            kprintf("xHCI: Address Device completion timeout\n");
-                        }
-                    } else {
-                        kprintf("xHCI: failed to submit Address Device command\n");
-                    }
-                }
-            }
-        } else {
-            kprintf("xHCI: Enable Slot completion timeout\n");
-        }
-    } else {
-        kprintf("xHCI: failed to submit Enable Slot command\n");
+    /* EVERY CONNECTED PORT, NOT THE FIRST ONE.
+     *
+     * This used to enumerate exactly one device: it found the first port with
+     * something on it and stopped. A machine with a keyboard and a stick on
+     * the same controller got whichever the firmware happened to put first,
+     * and the other was invisible -- with nothing in the log to say so,
+     * because nothing had looked. */
+    rt->max_ports = max_ports < XHCI_MAX_PORTS_TRACKED ? max_ports
+                                                       : XHCI_MAX_PORTS_TRACKED;
+    for (uint32_t port = 1; port <= rt->max_ports; port++) {
+        uint32_t portsc = xhci_read32(op, XHCI_PORTSC_BASE +
+                                          ((port - 1U) * XHCI_PORT_STRIDE));
+        if (!(portsc & XHCI_PORTSC_CCS)) continue;
+        rt->port_connected[port - 1U] = true;
+        xhci_bring_up_port(rt, port);
     }
 
     ctrl->max_ports = (uint8_t)max_ports;
+    /* AND THE WAY BACK IN. usb.c polls every controller that offers a rescan
+     * hook; xHCI has left it NULL since the hot-plug path was written, which
+     * is why a stick pushed into a USB 3 socket did nothing at all. */
+    ctrl->hc = rt;
+    ctrl->rescan = xhci_rescan;
     ctrl->devices_present = (uint8_t)xhci_probe_ports(op, max_ports);
     kprintf("xHCI: detected %u connected device(s) on %u port(s)\n",
             (unsigned int)ctrl->devices_present,
             (unsigned int)ctrl->max_ports);
 
     return true;
+}
+
+/* How many devices this driver currently has addressed, across every xHCI
+ * controller.
+ *
+ * usb_device_count() counts kernel/drivers/usb/usb_core.c's table, which xHCI
+ * does not use -- it has its own slots, its own rings and its own enumeration.
+ * So a report built only from that table said "0 devices" on a machine with a
+ * USB 3 stick plugged in and mounted, which is not a small thing to be wrong
+ * about: it is the report a person reads to find out whether the machine saw
+ * what they plugged in. */
+uint32_t xhci_device_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < XHCI_MAX_CONTROLLERS; i++) {
+        struct xhci_runtime_state *rt = &g_xhci_runtime[i];
+        if (!rt->used) continue;
+        for (uint32_t p = 0; p < XHCI_MAX_PORTS_TRACKED; p++)
+            if (rt->port_slot[p]) n++;
+    }
+    return n;
 }

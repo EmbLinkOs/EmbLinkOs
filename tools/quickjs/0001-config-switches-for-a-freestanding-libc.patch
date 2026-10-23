@@ -1,5 +1,14 @@
 --- /tmp/qjs_orig.c	2026-08-07 14:12:26.695903574 +0200
 +++ quickjs.c	2026-08-07 14:12:26.722525048 +0200
+@@ -35,7 +35,7 @@
+ 
+ #if defined(__APPLE__)
+ #include <malloc/malloc.h>
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(CONFIG_MALLOC_H)
+ #include <malloc.h>
+ #elif defined(__FreeBSD__)
+ #include <malloc_np.h>
 @@ -67,7 +67,7 @@
  
  /* define to include Atomics.* operations which depend on the OS
