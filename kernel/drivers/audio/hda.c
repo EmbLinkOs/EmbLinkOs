@@ -1,742 +1,309 @@
-/* kernel/drivers/audio/hda.c -- Intel High Definition Audio.
- *
- * The sound card real machines actually have. AC'97 left the market around
- * 2008; every x86 laptop and desktop since carries an HDA controller (Intel
- * calls it Azalia, AMD and NVIDIA ship register-compatible ones), and until
- * this file existed a machine booting EmbLinkOS had no sound at all.
- *
- * ac97.c's header says HDA is "three or four times the work" and that was not
- * an excuse -- it is the measurement. Three things here have no AC'97
- * equivalent at all, and each is a way to produce perfect silence:
- *
- *   1. THE CODEC IS A SEPARATE CHIP ON A SERIAL LINK. The controller does not
- *      make sound; it DMAs samples onto a link where one or more codecs live,
- *      and it is reached only by posting verbs through a command ring (CORB)
- *      and reading answers out of a response ring (RIRB). Nothing about the
- *      audio path is a register write.
- *
- *   2. THE CODEC IS A GRAPH, not a device. Converters, mixers, selectors and
- *      pin complexes, wired differently on every machine, and the driver has
- *      to WALK it to find a route from a DAC to a jack that has something
- *      plugged into it. There is no fixed answer to "where does sound come
- *      out" -- that is what a pin's configuration default is for, and it is
- *      written by the board's firmware.
- *
- *   3. THE DMA ENGINE IS CYCLIC. AC'97 walks descriptors 0..LVI and HALTS;
- *      HDA walks a buffer of fixed total length (CBL) round and round forever
- *      and has no "stop here" mark. CBL cannot be rewritten while the engine
- *      runs. So the stream contract's `set_last`/`done` are RECONSTRUCTED
- *      below from the link position, and an underrun is silence played rather
- *      than a halt latched.
- *
- * WHAT THAT LAST ONE COSTS, said plainly rather than buried: a descriptor here
- * is a fixed page -- 1024 stereo frames, 21 ms at 48 kHz -- because the total
- * has to stay constant while the engine runs. AC'97 gained variable-length
- * descriptors and with them a sub-descriptor latency floor; this cannot have
- * them. audio_set_latency() below about 21 ms is therefore granted in name
- * only on this device. That is a property of HDA's engine, not of this
- * driver, and it is the same choice ALSA makes (a period size fixed for the
- * life of the stream). Recorded in docs/TODO.md.
- *
- * Fixed at 48 kHz, 16-bit, stereo -- the same format AC'97 is fixed at, so
- * every caller above this file sees one device and not two.
- */
-#include <stdint.h>
-#include <stddef.h>
-
-#include "include/types.h"
-#include "include/kprintf.h"
-#include "include/kstring.h"
-#include "drivers/bus/pci.h"
+/* Intel High Definition Audio 1.0a, PCI class 04/03. One analog stereo route,
+ * CORB/RIRB verbs and a 32-page output BDL at 48 kHz/S16. HDMI, DSP firmware,
+ * input and codec-specific laptop amplifier quirks need separate support.
+ * MSI has a dedicated vector; no legacy IRQ handler is overwritten. */
+#include "drivers/audio/hda.h"
 #include "drivers/audio/pcm.h"
+#include "drivers/bus/pci.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
-
-/* ---- controller registers (BAR0, MMIO) ---------------------------------- */
-#define HDA_GCAP        0x00   /* 16: how many streams this controller has  */
-#define HDA_GCTL        0x08   /* 32: bit 0 CRST -- 0 is reset, 1 is run    */
-#define HDA_WAKEEN      0x0C
-#define HDA_STATESTS    0x0E   /* 16: one bit per codec that answered       */
-#define HDA_INTCTL      0x20
-#define HDA_INTSTS      0x24
-#define HDA_CORBLBASE   0x40
-#define HDA_CORBUBASE   0x44
-#define HDA_CORBWP      0x48   /* 16 */
-#define HDA_CORBRP      0x4A   /* 16 */
-#define HDA_CORBCTL     0x4C   /* 8  */
-#define HDA_CORBSIZE    0x4E   /* 8  */
-#define HDA_RIRBLBASE   0x50
-#define HDA_RIRBUBASE   0x54
-#define HDA_RIRBWP      0x58   /* 16 */
-#define HDA_RINTCNT     0x5A   /* 16 */
-#define HDA_RIRBCTL     0x5C   /* 8  */
-#define HDA_RIRBSTS     0x5D   /* 8  */
-#define HDA_RIRBSIZE    0x5E   /* 8  */
-
-#define GCTL_CRST       (1u << 0)
-#define CORBCTL_RUN     (1u << 1)
-#define CORBRP_RST      (1u << 15)
-#define RIRBCTL_RINTCTL (1u << 0)
-#define RIRBCTL_DMAEN   (1u << 1)
-#define RIRBSTS_INTFL   (1u << 0)
-#define RIRBSTS_OVERRUN (1u << 2)
-#define RIRBWP_RST      (1u << 15)
-
-/* ---- one stream descriptor ---------------------------------------------- */
-#define SD_CTL          0x00   /* 24 bits, read as 32 with SDSTS on top     */
-#define SD_STS          0x03   /* 8                                          */
-#define SD_LPIB         0x04   /* 32: byte position inside the cyclic buffer */
-#define SD_CBL          0x08   /* 32: cyclic buffer length, in bytes         */
-#define SD_LVI          0x0C   /* 16: last valid BDL index                   */
-#define SD_FIFOS        0x10   /* 16                                         */
-#define SD_FMT          0x12   /* 16                                         */
-#define SD_BDPL         0x18   /* 32                                         */
-#define SD_BDPU         0x1C   /* 32                                         */
-
-#define SDCTL_SRST      (1u << 0)
-#define SDCTL_RUN       (1u << 1)
-#define SDCTL_IOCE      (1u << 2)
-#define SDCTL_STRM_SH   20     /* stream tag lives in bits 23:20            */
-
-#define SDSTS_BCIS      (1u << 2)
-#define SDSTS_FIFOE     (1u << 3)
-#define SDSTS_DESE      (1u << 4)
-
-/* 48 kHz, 16-bit, two channels. base=0 (48k), mult=1, div=1, bits=001,
- * chan=1 (it is channels-MINUS-ONE, which is the field most often shipped
- * one too high). */
-#define HDA_FORMAT      0x0011
-#define HDA_RATE        48000
-#define HDA_STREAM_TAG  1
-
-/* ---- verbs --------------------------------------------------------------
- * A command is (codec << 28) | (node << 20) | payload, where the 20-bit
- * payload is either a 12-bit verb with 8 bits of data or a 4-bit verb with
- * 16. Two encodings, one field -- which is why they get their own macros
- * instead of being written out at each call site. */
-#define V12(v, d)   ((((uint32_t)(v)) << 8)  | ((uint32_t)(d) & 0xFF))
-#define V4(v, d)    ((((uint32_t)(v)) << 16) | ((uint32_t)(d) & 0xFFFF))
-
-#define GET_PARAM(p)            V12(0xF00, (p))
-#define GET_CONN_ENTRY(o)       V12(0xF02, (o))
-#define GET_CONFIG_DEFAULT      V12(0xF1C, 0)
-#define SET_CONN_SELECT(i)      V12(0x701, (i))
-#define SET_POWER_STATE(s)      V12(0x705, (s))
-#define SET_STREAM_CHANNEL(v)   V12(0x706, (v))
-#define SET_PIN_CTL(v)          V12(0x707, (v))
-#define SET_EAPD_BTL(v)         V12(0x70C, (v))
-#define SET_FORMAT(v)           V4 (0x2,   (v))
-#define SET_AMP(v)              V4 (0x3,   (v))
-
-#define PAR_VENDOR_ID       0x00
-#define PAR_SUBNODE_COUNT   0x04
-#define PAR_FUNCTION_TYPE   0x05
-#define PAR_WIDGET_CAP      0x09
-#define PAR_PIN_CAP         0x0C
-#define PAR_CONN_LIST_LEN   0x0E
-#define PAR_OUT_AMP_CAP     0x12
-
-#define FUNC_TYPE_AUDIO     0x01
-
-#define WIDGET_TYPE(cap)    (((cap) >> 20) & 0xF)
-#define WID_DAC             0x0
-#define WID_ADC             0x1
-#define WID_MIXER           0x2
-#define WID_SELECTOR        0x3
-#define WID_PIN             0x4
-
-#define WCAP_OUT_AMP        (1u << 2)
-#define WCAP_IN_AMP         (1u << 1)
-#define WCAP_CONN_LIST      (1u << 8)
-#define WCAP_DIGITAL        (1u << 9)
-#define WCAP_POWER          (1u << 10)
-
-#define PINCAP_OUT          (1u << 4)
-#define PINCTL_OUT_EN       (1u << 6)
-#define PINCTL_HP_EN        (1u << 7)
-
-/* Configuration default: the board's firmware describing the jack. */
-#define CFG_CONNECTIVITY(c) (((c) >> 30) & 0x3)
-#define CFG_DEVICE(c)       (((c) >> 20) & 0xF)
-#define CONN_NONE           0x1     /* nothing is wired to this pin at all  */
-#define DEV_LINE_OUT        0x0
-#define DEV_SPEAKER         0x1
-#define DEV_HP_OUT          0x2
-
-/* ---- the ring, and why it is shaped like AC'97's ------------------------ */
-#define HDA_BUFS        PCM_DESCRIPTORS          /* 32                       */
-#define HDA_BUF_BYTES   4096                     /* one page per descriptor  */
-#define HDA_BUF_FRAMES  (HDA_BUF_BYTES / 4)      /* stereo S16 -- 1024       */
-#define HDA_CBL         ((uint32_t)HDA_BUFS * HDA_BUF_BYTES)
-
-/* A buffer descriptor: 64-bit physical address, byte length, and a flag word
- * whose only bit anybody uses is "interrupt on completion". */
-struct hda_bdl {
-    uint64_t addr;
-    uint32_t len;
-    uint32_t flags;
-} __attribute__((packed));
-
-#define CORB_ENTRIES 256
-#define RIRB_ENTRIES 256
-
-static struct {
-    bool     present;
-    volatile uint8_t *mmio;
-    uint32_t sd;                       /* offset of output stream 0          */
-
-    uint32_t *corb;   uint64_t corb_phys;   uint16_t corb_wp;
-    uint64_t *rirb;   uint64_t rirb_phys;   uint16_t rirb_rp;
-
-    struct hda_bdl *bdl;  uint64_t bdl_phys;
-    int16_t *buf[HDA_BUFS];
-    uint64_t buf_phys[HDA_BUFS];
-
-    uint32_t codec;                    /* the codec address that answered    */
-    uint32_t dac, pin;
-
-    /* THE RECONSTRUCTION. LPIB is a byte offset inside a buffer that wraps,
-     * so on its own it answers nothing; `played` is it unwrapped, and it is
-     * what every question above this file is really asking. */
-    uint32_t lpib;
-    uint64_t played;                   /* bytes the link has taken, monotonic */
-    uint64_t fills;                    /* descriptors filled since play()     */
-    uint64_t seq[HDA_BUFS];            /* which fill each descriptor holds    */
-    uint64_t last_seq;                 /* the fill the writer last declared   */
-    bool     running;
+#include "drivers/timer/timer.h"
+#include "include/spinlock.h"
+#include "arch/x86_64/irq/idt.h"
+#include "arch/x86_64/irq/lapic.h"
+#include "include/kstring.h"
+#include "include/kprintf.h"
+#define HDA_VECTOR 0x53
+#define HDA_RING 32
+#define HDA_PAGE 4096
+struct hda_bd {uint64_t address;uint32_t length,flags;};
+struct widget {uint32_t caps;uint8_t links[32],count;};
+struct hda_device {
+    uint32_t corb[256] __attribute__((aligned(4096)));
+    volatile uint64_t rirb[256] __attribute__((aligned(4096)));
+    struct hda_bd bdl[HDA_RING] __attribute__((aligned(4096)));
+    int16_t pcm[HDA_RING][2048] __attribute__((aligned(4096)));
+    struct widget widgets[256];
+    uint8_t path[16],choices[16],visited[256],valid[HDA_RING];
+    volatile uint8_t *regs;
+    unsigned corb_size,rirb_size,wp,rp,sd,stream,retired,base,codec,fg,depth,pin,dac;
+    uint32_t fg_pcm,fg_format,fg_inamp,fg_outamp;
+    uint64_t physical;
+    struct pci_device pci;
     uint64_t underruns;
-} g;
-
-static inline uint8_t  r8 (uint32_t o)             { return *(volatile uint8_t  *)(g.mmio + o); }
-static inline uint16_t r16(uint32_t o)             { return *(volatile uint16_t *)(g.mmio + o); }
-static inline uint32_t r32(uint32_t o)             { return *(volatile uint32_t *)(g.mmio + o); }
-static inline void     w8 (uint32_t o, uint8_t v)  { *(volatile uint8_t  *)(g.mmio + o) = v; }
-static inline void     w16(uint32_t o, uint16_t v) { *(volatile uint16_t *)(g.mmio + o) = v; }
-static inline void     w32(uint32_t o, uint32_t v) { *(volatile uint32_t *)(g.mmio + o) = v; }
-
-/* Bring-up only. There is no scheduler to yield to this early, and the codec
- * link needs real microseconds after a reset before it will answer. */
-static void hda_delay(void) { for (volatile int i = 0; i < 200000; i++) { } }
-
-/* ---- the command ring ---------------------------------------------------
- *
- * One verb at a time, and the answer waited for. A driver that pipelines
- * verbs has to match responses to commands by position, and every one of the
- * calls below needs its answer before it can decide what to ask next -- so
- * the pipeline would be depth one anyway. */
-#define HDA_NO_ANSWER 0xFFFFFFFFu
-
-static uint32_t codec_cmd(uint32_t cad, uint32_t nid, uint32_t payload)
-{
-    uint32_t verb = (cad << 28) | (nid << 20) | (payload & 0xFFFFF);
-
-    g.corb_wp = (uint16_t)((g.corb_wp + 1) % CORB_ENTRIES);
-    g.corb[g.corb_wp] = verb;
-    __sync_synchronize();
-    w16(HDA_CORBWP, g.corb_wp);
-
-    /* Wait for the response ring's write pointer to move past ours. Bounded:
-     * a codec that does not answer must leave a message, not a hung boot. */
-    for (int spin = 0; spin < 2000000; spin++) {
-        uint16_t wp = (uint16_t)(r16(HDA_RIRBWP) & 0xFF);
-        if (wp != g.rirb_rp) {
-            g.rirb_rp = (uint16_t)((g.rirb_rp + 1) % RIRB_ENTRIES);
-            __sync_synchronize();
-            uint64_t resp = g.rirb[g.rirb_rp];
-            /* ACKNOWLEDGE THE RESPONSE, and it is not bookkeeping. The
-             * controller counts responses against RINTCNT and stops FETCHING
-             * COMMANDS once it reaches it -- this write is what resets the
-             * count. Skip it and exactly one verb ever executes, which reads
-             * as "the codec does not answer" and is the controller never
-             * having asked it. */
-            w8(HDA_RIRBSTS, RIRBSTS_INTFL | RIRBSTS_OVERRUN);
-            return (uint32_t)resp;
+    int present,running,fault,exhausted;
+};
+static struct hda_device *h;
+static spinlock_t lock=SPINLOCK_INIT;
+extern void hda_irq_stub(void);
+#ifndef HDA_MMIO_READ
+#define HDA_MMIO_READ(base,o,width) (*(volatile uint##width##_t *)((base)+(o)))
+#define HDA_MMIO_WRITE(base,o,width,v) (*(volatile uint##width##_t *)((base)+(o))=(v))
+#endif
+static uint8_t r8(unsigned o) {return HDA_MMIO_READ(h->regs,o,8);}
+static uint16_t r16(unsigned o) {return HDA_MMIO_READ(h->regs,o,16);}
+static uint32_t r32(unsigned o) {return HDA_MMIO_READ(h->regs,o,32);}
+static void w8(unsigned o,uint8_t v) {HDA_MMIO_WRITE(h->regs,o,8,v);}
+static void w16(unsigned o,uint16_t v) {HDA_MMIO_WRITE(h->regs,o,16,v);}
+static void w32(unsigned o,uint32_t v) {HDA_MMIO_WRITE(h->regs,o,32,v);}
+static void delay(unsigned us) {uint64_t start=time_get_us();while(time_get_us()-start<us) __asm__ volatile("pause");}
+static int wait32(unsigned o,uint32_t mask,uint32_t value) {
+    uint64_t start=time_get_us();
+    while((r32(o)&mask)!=value) {if(time_get_us()-start>20000) return -1;__asm__ volatile("pause");}
+    return 0;
+}
+static int wait16(unsigned o,uint16_t mask,uint16_t value) {
+    uint64_t start=time_get_us();
+    while((r16(o)&mask)!=value) {if(time_get_us()-start>20000) return -1;__asm__ volatile("pause");}
+    return 0;
+}
+static uint64_t phys(const void *p) {return h->physical+(uintptr_t)p-(uintptr_t)h;}
+static void address(unsigned o,const void *p) {uint64_t a=phys(p);w32(o,a);w32(o+4,a>>32);}
+static int command(unsigned nid,unsigned verb,unsigned data,uint32_t *out) {
+    if(h->fault || nid>255 || data>65535) return -1;
+    unsigned next=(h->wp+1)%h->corb_size;
+    uint64_t start=time_get_us();
+    while((r16(0x4a)&255)==next) if(time_get_us()-start>20000) goto fail;
+    h->corb[next]=(h->codec<<28)|(nid<<20)|(verb<<8)|data;
+    __atomic_thread_fence(__ATOMIC_RELEASE);h->wp=next;w16(0x48,next);
+    start=time_get_us();
+    for(;;) {
+        if(r8(0x5d)&4) goto fail; /* RIRB overflow loses response ownership. */
+        unsigned wp=r16(0x58)&255;
+        while(h->rp!=wp) {
+            h->rp=(h->rp+1)%h->rirb_size;__atomic_thread_fence(__ATOMIC_ACQUIRE);
+            uint64_t reply=h->rirb[h->rp];unsigned ext=reply>>32;
+            if(ext&16) continue; /* unsolicited responses are not command replies */
+            if((ext&15)!=h->codec) goto fail;
+            if(out) *out=(uint32_t)reply;
+            /* Acknowledge each solicited completion even while controller
+             * interrupts are masked. QEMU also uses this to re-arm CORB. */
+            w8(0x5d,1);
+            return 0;
         }
-        __asm__ volatile("" ::: "memory");
+        if(time_get_us()-start>20000) goto fail;
+        __asm__ volatile("pause");
     }
-    return HDA_NO_ANSWER;
+fail:kprintf("hda: verb timeout nid %u verb %x CORBRP %x RIRBWP %x status %x\n",nid,verb,r16(0x4a),r16(0x58),r8(0x5d));h->fault=1;return -1;
 }
-
-/* ---- walking the codec graph -------------------------------------------
- *
- * From a pin the board says is wired to something, find the converter that
- * can feed it, unmuting and selecting along the way. Depth-limited because a
- * codec graph is a graph: a mixer can list a widget that lists it back, and a
- * driver that follows that faithfully never finishes booting. */
-static void unmute_output(uint32_t nid, uint32_t cap)
-{
-    if (!(cap & WCAP_OUT_AMP)) return;
-    uint32_t amp = codec_cmd(g.codec, nid, GET_PARAM(PAR_OUT_AMP_CAP));
-    uint32_t steps = (amp == HDA_NO_ANSWER) ? 0x7F : ((amp >> 8) & 0x7F);
-    /* bit 15 output amp, 13 left, 12 right, bit 7 mute (clear), gain in 6:0.
-     * An HDA codec powers up with its output amps MUTED, exactly as AC'97
-     * does -- a driver that never writes this is correct and inaudible. */
-    codec_cmd(g.codec, nid, SET_AMP(0xB000 | (steps & 0x7F)));
+static int parameter(unsigned nid,unsigned id,uint32_t *v) {return command(nid,0xf00,id,v);}
+static int power(unsigned nid) {
+    if(command(nid,0x705,0,NULL)) return -1;
+    uint64_t start=time_get_us();uint32_t v;
+    do {if(command(nid,0xf05,0,&v)) return -1;if(!(v&0xff)) return 0;delay(100);} while(time_get_us()-start<20000);
+    return -1;
 }
-
-static void unmute_input(uint32_t nid, uint32_t cap, uint32_t index)
-{
-    if (!(cap & WCAP_IN_AMP)) return;
-    /* bit 14 input amp, 13 left, 12 right, index in 11:8, mute clear, full
-     * gain. A mixer that is unmuted on the wrong INDEX passes silence from
-     * the input nobody is using. */
-    codec_cmd(g.codec, nid, SET_AMP(0x7000 | ((index & 0xF) << 8) | 0x00));
-}
-
-/* Read connection `i` of `nid`, or -1. Entries are packed four to a response
- * in the short form and two in the long one, and the form is a bit in the
- * length parameter rather than anything visible in the answer. */
-static int conn_entry(uint32_t nid, uint32_t len_param, uint32_t i)
-{
-    bool longform = (len_param & 0x80) != 0;
-    uint32_t per = longform ? 2u : 4u;
-    uint32_t resp = codec_cmd(g.codec, nid, GET_CONN_ENTRY((i / per) * per));
-    if (resp == HDA_NO_ANSWER) return -1;
-    if (longform) return (int)((resp >> ((i % per) * 16)) & 0x7FFF);
-    return (int)((resp >> ((i % per) * 8)) & 0x7F);
-}
-
-static int find_dac(uint32_t nid, int depth)
-{
-    if (depth > 4) return -1;
-
-    uint32_t cap = codec_cmd(g.codec, nid, GET_PARAM(PAR_WIDGET_CAP));
-    if (cap == HDA_NO_ANSWER) return -1;
-    if (WIDGET_TYPE(cap) == WID_DAC && !(cap & WCAP_DIGITAL)) return (int)nid;
-    if (!(cap & WCAP_CONN_LIST)) return -1;
-
-    uint32_t lp = codec_cmd(g.codec, nid, GET_PARAM(PAR_CONN_LIST_LEN));
-    if (lp == HDA_NO_ANSWER) return -1;
-    uint32_t n = lp & 0x7F;
-
-    for (uint32_t i = 0; i < n; i++) {
-        int child = conn_entry(nid, lp, i);
-        if (child <= 0) continue;
-        int dac = find_dac((uint32_t)child, depth + 1);
-        if (dac < 0) continue;
-
-        /* This path works. Commit to it on the way back out: a selector has
-         * to be POINTED at the branch, and a mixer's input for that branch
-         * has to be unmuted, or the route exists on paper only. */
-        if (WIDGET_TYPE(cap) == WID_SELECTOR || WIDGET_TYPE(cap) == WID_PIN) {
-            if (n > 1) codec_cmd(g.codec, nid, SET_CONN_SELECT(i));
+static int links(unsigned nid) {
+    struct widget *w=&h->widgets[nid];uint32_t length;
+    if(!(w->caps&(1u<<8))) return 0;
+    if(parameter(nid,0x0e,&length)) return -1;
+    unsigned n=length&127,wide=length&128,previous=0;int have=0;
+    for(unsigned i=0;i<n;) {
+        uint32_t packed;if(command(nid,0xf02,i,&packed)) return -1;
+        unsigned per=wide?2:4;
+        for(unsigned k=0;k<per && i<n;k++,i++) {
+            unsigned raw=(packed>>(k*(wide?16:8)))&(wide?65535:255);
+            unsigned range=raw&(wide?32768:128),node=raw&(wide?32767:127);
+            if(!node || node>255 || (range && (!have || node<=previous))) return -1;
+            unsigned first=range?previous+1:node;
+            for(unsigned j=first;j<=node;j++) {if(w->count==32) return -1;w->links[w->count++]=j;}
+            previous=node;have=1;
         }
-        unmute_input(nid, cap, i);
-        unmute_output(nid, cap);
-        if (cap & WCAP_POWER) codec_cmd(g.codec, nid, SET_POWER_STATE(0));
-        return dac;
+    }
+    return 0;
+}
+static int route(unsigned nid,unsigned depth) {
+    if(!nid || depth==16 || h->visited[nid]) return 0;
+    struct widget *w=&h->widgets[nid];unsigned type=(w->caps>>20)&15;
+    if(w->caps&(1u<<9)) return 0; /* digital converters/pins are not analog */
+    h->visited[nid]=1;h->path[depth]=nid;
+    if(type==0 && (w->caps&1)) {
+        uint32_t pcm=h->fg_pcm,format=h->fg_format;
+        if((w->caps&(1u<<4)) && (parameter(nid,0x0a,&pcm)||parameter(nid,0x0b,&format))) return 0;
+        if((pcm&(1u<<6)) && (pcm&(1u<<17)) && (format&1)) {h->dac=nid;h->depth=depth+1;return 1;}
+    }
+    if(type==2 || type==3 || type==4) for(unsigned i=0;i<w->count;i++) {
+        if(route(w->links[i],depth+1)) {h->choices[depth]=i;return 1;}
+    }
+    return 0;
+}
+static int amplifier(unsigned nid,int input,unsigned index,int mute) {
+    struct widget *w=&h->widgets[nid];uint32_t cap=input?h->fg_inamp:h->fg_outamp;
+    if(!(w->caps&(input?2u:4u))) return 0;
+    if((w->caps&8) && parameter(nid,input?0x0d:0x12,&cap)) return -1;
+    unsigned gain=cap&127,steps=(cap>>8)&127;if(gain>steps) gain=steps;
+    if(index>15) return -1;
+    return command(nid,0x300,(input?0x4000:0x8000)|0x3000|(index<<8)|(mute?128:gain),NULL);
+}
+static int codec_route(unsigned codec) {
+    h->codec=codec;uint32_t roots;
+    if(parameter(0,4,&roots)) return -1;
+    unsigned start=(roots>>16)&255,count=roots&255;
+    kprintf("hda: codec %u function groups %u + %u\n",codec,start,count);
+    if(!start || start+count>256) return -1;
+    for(unsigned f=start;f<start+count;f++) {
+        uint32_t type,nodes;
+        if(parameter(f,5,&type)) return -1;
+        if((type&255)!=1) continue;
+        h->fg=f;
+        if(power(f) || parameter(f,4,&nodes) || parameter(f,0x0a,&h->fg_pcm) ||
+           parameter(f,0x0b,&h->fg_format) || parameter(f,0x0d,&h->fg_inamp) || parameter(f,0x12,&h->fg_outamp)) return -1;
+        unsigned first=(nodes>>16)&255,n=nodes&255;
+        kprintf("hda: group %u nodes %u + %u PCM %x formats %x\n",f,first,n,h->fg_pcm,h->fg_format);
+        if(!first || first+n>256) return -1;
+        memset(h->widgets,0,sizeof h->widgets);
+        for(unsigned i=first;i<first+n;i++) {
+            if(parameter(i,9,&h->widgets[i].caps) || links(i)) return -1;
+        }
+        /* Prefer the built-in speaker, then headphones, then line out. */
+        static const unsigned devices[]={1,2,0};
+        for(unsigned d=0;d<3;d++) for(unsigned i=first;i<first+n;i++) {
+            if(((h->widgets[i].caps>>20)&15)!=4) continue;
+            uint32_t cfg,pincap;
+            if(command(i,0xf1c,0,&cfg) || parameter(i,0x0c,&pincap)) return -1;
+            if((cfg>>30)==1 || ((cfg>>20)&15)!=devices[d] || !(pincap&16)) continue;
+            memset(h->visited,0,sizeof h->visited);
+            if(!route(i,0)) continue;
+            h->pin=i;
+            for(unsigned j=0;j<h->depth;j++) {
+                unsigned node=h->path[j];struct widget *w=&h->widgets[node];
+                if((w->caps&(1u<<10)) && power(node)) return -1;
+                if(w->count && command(node,0x701,h->choices[j],NULL)) return -1;
+                if(amplifier(node,0,0,0)) return -1;
+                if(w->caps&2) for(unsigned k=0;k<(w->count?w->count:1);k++)
+                    if(amplifier(node,1,k,w->count && k!=h->choices[j])) return -1;
+            }
+            if(command(i,0x707,0x40|((pincap&8)?0x80:0),NULL)) return -1;
+            if((pincap&(1u<<16)) && command(i,0x70c,2,NULL)) return -1;
+            if(command(h->dac,0x200,0x11,NULL) || command(h->dac,0x706,0x10,NULL)) return -1;
+            return 0;
+        }
     }
     return -1;
 }
-
-/* How much we want a given pin, higher is better. The board's own firmware
- * fills in the configuration default; this reads it rather than guessing from
- * node numbers, which is the difference between working on one machine and
- * working on the next one. */
-static int pin_rank(uint32_t cfg)
-{
-    if (CFG_CONNECTIVITY(cfg) == CONN_NONE) return -1;   /* not wired at all */
-    switch (CFG_DEVICE(cfg)) {
-    case DEV_SPEAKER:  return 3;
-    case DEV_LINE_OUT: return 2;
-    case DEV_HP_OUT:   return 1;
-    default:           return 0;
-    }
+static int ring_size(unsigned reg,unsigned *size) {
+    uint8_t v=r8(reg);unsigned sel;
+    if(v&0x40) {*size=256;sel=2;} else if(v&0x20) {*size=16;sel=1;} else if(v&0x10) {*size=2;sel=0;} else return -1;
+    w8(reg,sel);return 0;
 }
-
-static bool codec_setup(uint32_t cad)
-{
-    uint32_t vid = codec_cmd(cad, 0, GET_PARAM(PAR_VENDOR_ID));
-    if (vid == HDA_NO_ANSWER || vid == 0) {
-        kprintf("hda: codec %u is on the link but did not answer\n", (unsigned)cad);
-        return false;
+static int program(unsigned first);
+static unsigned current_buffer(void) {return h->running?(h->base+r32(h->sd+4)/HDA_PAGE)%HDA_RING:h->retired;}
+static void stop_dma(void) {w8(h->sd,r8(h->sd)&~2u);h->running=0;}
+static void retire(void) {
+    if(!h || !h->present || !h->running) return;
+    unsigned status=r8(h->sd+3);unsigned current=current_buffer();
+    w8(h->sd+3,status&0x1c);
+    if(status&0x18) {h->fault=1;stop_dma();return;}
+    while(h->retired!=current) {
+        h->valid[h->retired]=0;memset(h->pcm[h->retired],0,HDA_PAGE);
+        h->retired=(h->retired+1)%HDA_RING;
     }
-    g.codec = cad;
-
-    uint32_t sub = codec_cmd(cad, 0, GET_PARAM(PAR_SUBNODE_COUNT));
-    if (sub == HDA_NO_ANSWER) return false;
-    uint32_t fg_start = (sub >> 16) & 0xFF, fg_count = sub & 0xFF;
-
-    for (uint32_t f = 0; f < fg_count; f++) {
-        uint32_t afg = fg_start + f;
-        uint32_t type = codec_cmd(cad, afg, GET_PARAM(PAR_FUNCTION_TYPE));
-        if (type == HDA_NO_ANSWER || (type & 0xFF) != FUNC_TYPE_AUDIO) continue;
-
-        codec_cmd(cad, afg, SET_POWER_STATE(0));
-        hda_delay();
-
-        uint32_t ws = codec_cmd(cad, afg, GET_PARAM(PAR_SUBNODE_COUNT));
-        if (ws == HDA_NO_ANSWER) continue;
-        uint32_t w_start = (ws >> 16) & 0xFF, w_count = ws & 0xFF;
-
-        int best_pin = -1, best_rank = -1, pins = 0;
-        for (uint32_t i = 0; i < w_count; i++) {
-            uint32_t nid = w_start + i;
-            uint32_t cap = codec_cmd(cad, nid, GET_PARAM(PAR_WIDGET_CAP));
-            if (cap == HDA_NO_ANSWER) continue;
-            if (WIDGET_TYPE(cap) != WID_PIN || (cap & WCAP_DIGITAL)) continue;
-
-            uint32_t pc = codec_cmd(cad, nid, GET_PARAM(PAR_PIN_CAP));
-            if (pc == HDA_NO_ANSWER || !(pc & PINCAP_OUT)) continue;
-
-            pins++;
-            uint32_t cfg = codec_cmd(cad, nid, GET_CONFIG_DEFAULT);
-            int rank = (cfg == HDA_NO_ANSWER) ? 0 : pin_rank(cfg);
-            if (rank > best_rank) { best_rank = rank; best_pin = (int)nid; }
+    if(!h->valid[current]) {h->exhausted=1;stop_dma();}
+}
+void hda_irq_handler(void) {
+    spin_lock(&lock);retire();spin_unlock(&lock);lapic_send_eoi();
+}
+void hda_init(void) {
+    for(unsigned i=0;i<pci_devices_count();i++) {
+        const struct pci_device *p=pci_get_device(i);
+        if(!p || p->class_code!=4 || p->subclass!=3) continue;
+        struct pci_bar bar=pci_read_bar(p->bus,p->device,p->function,0);
+        if(!bar.valid || !bar.is_mmio || bar.size<0x400) continue;
+        if(!h) {
+            unsigned pages=(sizeof(*h)+4095)/4096;uint64_t base=pmm_alloc_contiguous(pages,1);
+            if(!base) return;
+            h=(struct hda_device *)P2V(base);memset(h,0,pages*4096);h->physical=base;
         }
-        if (best_pin < 0) {
-            kprintf("hda: codec %u function %u has %d output pin(s), none usable\n",
-                    (unsigned)cad, (unsigned)afg, pins);
-            continue;
-        }
-
-        int dac = find_dac((uint32_t)best_pin, 0);
-        if (dac < 0) {
-            kprintf("hda: pin %d is wired to nothing this driver can drive\n", best_pin);
-            continue;
-        }
-
-        g.pin = (uint32_t)best_pin;
-        g.dac = (uint32_t)dac;
-
-        /* Turn the jack on. OUT_ENABLE is the one that matters; HP_ENABLE
-         * drives the headphone amplifier and is harmless on a pin that has
-         * none. EAPD is the external amplifier on laptops -- clearing it is
-         * how a correct driver ends up audible on a desktop and silent on a
-         * notebook. */
-        codec_cmd(cad, g.pin, SET_PIN_CTL(PINCTL_OUT_EN | PINCTL_HP_EN));
-        codec_cmd(cad, g.pin, SET_EAPD_BTL(0x02));
-        codec_cmd(cad, g.pin, SET_POWER_STATE(0));
-
-        uint32_t dcap = codec_cmd(cad, g.dac, GET_PARAM(PAR_WIDGET_CAP));
-        if (dcap != HDA_NO_ANSWER) unmute_output(g.dac, dcap);
-        codec_cmd(cad, g.dac, SET_POWER_STATE(0));
-        codec_cmd(cad, g.dac, SET_FORMAT(HDA_FORMAT));
-        codec_cmd(cad, g.dac, SET_STREAM_CHANNEL((HDA_STREAM_TAG << 4) | 0));
-
-        kprintf("hda: codec %u vendor 0x%x -- dac node %u -> pin node %u\n",
-                (unsigned)cad, (unsigned)vid, (unsigned)g.dac, (unsigned)g.pin);
-        return true;
+        uint64_t base=h->physical;memset(h,0,sizeof *h);h->physical=base;h->pci=*p;
+        h->regs=(volatile uint8_t *)vmm_map_mmio(bar.address,bar.size);if(!h->regs) continue;
+        uint16_t pc=pci_read16(p->bus,p->device,p->function,PCI_COMMAND);
+        pci_write16(p->bus,p->device,p->function,PCI_COMMAND,pc|6|0x400);
+        unsigned stage=1;
+        unsigned cap=r16(0),inputs=(cap>>8)&15,outputs=(cap>>12)&15;
+        if(!outputs || (!(cap&1) && h->physical+sizeof *h>UINT32_MAX)) goto fail;
+        h->stream=inputs;h->sd=0x80+inputs*0x20;
+        if(h->sd+0x20>bar.size) goto fail;
+        w32(0x20,0);w8(0x4c,0);w8(0x5c,0);
+        w32(8,r32(8)&~1u);if(wait32(8,1,0)) goto fail;delay(100);
+        w32(8,r32(8)|1u);if(wait32(8,1,1)) goto fail;delay(1000);
+        stage=2;uint16_t codecs=r16(0x0e);w16(0x0c,0);
+        if(!codecs || ring_size(0x4e,&h->corb_size) || ring_size(0x5e,&h->rirb_size)) goto fail;
+        address(0x40,h->corb);address(0x50,(const void *)h->rirb);
+        w16(0x48,0);w16(0x4a,0x8000);
+        if(wait16(0x4a,0x8000,0x8000)) goto fail;
+        w16(0x4a,0);if(wait16(0x4a,0x8000,0)) goto fail;
+        w16(0x58,0x8000);h->rp=r16(0x58)&255;w16(0x5a,1);w8(0x5d,5);
+        w8(0x5c,3);w8(0x4c,2);
+        stage=3;int found=0;
+        for(unsigned c=0;c<15;c++) if(codecs&(1u<<c)) {if(!codec_route(c)) {found=1;break;}if(h->fault) break;}
+        if(!found) goto fail;
+        stage=4;idt_set_entry(HDA_VECTOR,(uint64_t)hda_irq_stub,0x8e);
+        if(!pci_enable_msi(p->bus,p->device,p->function,HDA_VECTOR,(uint8_t)lapic_get_id())) goto fail;
+        for(unsigned b=0;b<HDA_RING;b++) h->bdl[b]=(struct hda_bd){phys(h->pcm[b]),HDA_PAGE,1};
+        h->present=1;hda_stop();
+        w32(0x20,0x80000000u|(1u<<h->stream));
+        kprintf("hda: analog output codec %u pin %u DAC %u, 48000 Hz stereo, MSI\n",h->codec,h->pin,h->dac);return;
+fail:
+        w32(0x20,0);w8(0x4c,0);w8(0x5c,0);if(h->sd) w8(h->sd,0);
+        pci_write16(p->bus,p->device,p->function,PCI_COMMAND,(pc|0x400)&~4u);
+        kprintf("hda: controller %x:%x.%x setup failed at stage %u (GCAP %x, CORBRP %x)\n",p->bus,p->device,p->function,stage,cap,r16(0x4a));
     }
-    return false;
+}
+bool hda_present(void) {return h && h->present && !h->fault;}
+const char *hda_output_name(void) {return "High Definition Audio";}
+uint32_t hda_fill(int index,const int16_t *frames,uint32_t n) {
+    if(!hda_present() || index<0 || index>=HDA_RING || !frames) return 0;
+    spin_lock(&lock);retire();
+    if(h->fault || h->valid[index] || (h->running && current_buffer()==(unsigned)index)) {spin_unlock(&lock);return 0;}
+    if(n>1024) n=1024;
+    memcpy(h->pcm[index],frames,n*4);memset((uint8_t *)h->pcm[index]+n*4,0,HDA_PAGE-n*4);
+    __atomic_thread_fence(__ATOMIC_RELEASE);h->valid[index]=1;spin_unlock(&lock);return n;
+}
+uint8_t hda_civ(void) {
+    if(!hda_present()) return 0;
+    spin_lock(&lock);retire();unsigned index=current_buffer();spin_unlock(&lock);return index;
+}
+static void start(void) {
+    if(h->fault || h->running || !h->valid[h->retired]) return;
+    if(h->exhausted){h->underruns++;h->exhausted=0;}
+    if(program(h->retired)) {h->fault=1;return;}
+    __atomic_thread_fence(__ATOMIC_RELEASE);w8(h->sd,0x1e);h->running=1;
+}
+void hda_play(int last) {(void)last;if(!hda_present()) return;spin_lock(&lock);h->exhausted=0;h->underruns=0;start();spin_unlock(&lock);}
+void hda_set_last(int last) {(void)last;if(!hda_present()) return;spin_lock(&lock);retire();if(!h->running) start();spin_unlock(&lock);}
+bool hda_done(int last) {
+    (void)last;if(!hda_present()) return true;
+    spin_lock(&lock);retire();int any=0;for(unsigned i=0;i<HDA_RING;i++) any|=h->valid[i];spin_unlock(&lock);return !any;
+}
+/* Restart at the next logical page using a rotated BDL. Both real HDA and
+ * QEMU start from offset zero after this explicit stream reset; an underrun
+ * therefore cannot replay old pages or depend on a controller's RUN semantics. */
+static int program(unsigned first) {
+    if(wait32(h->sd,2,0)) return -1;
+    w8(h->sd,1);if(wait32(h->sd,1,1)) return -1;
+    w8(h->sd,0);if(wait32(h->sd,1,0)) return -1;
+    h->base=first;
+    for(unsigned i=0;i<HDA_RING;i++) h->bdl[i]=(struct hda_bd){phys(h->pcm[(first+i)%HDA_RING]),HDA_PAGE,1};
+    address(h->sd+0x18,h->bdl);w32(h->sd+8,HDA_RING*HDA_PAGE);w16(h->sd+0x0c,HDA_RING-1);
+    w16(h->sd+0x12,0x11);w8(h->sd+2,0x10);w8(h->sd+3,0x1c);return 0;
+}
+void hda_stop(void) {
+    if(!h || !h->present) return;
+    spin_lock(&lock);stop_dma();
+    if(wait32(h->sd,2,0)) h->fault=1;
+    h->exhausted=0;h->retired=0;memset(h->valid,0,sizeof h->valid);memset(h->pcm,0,sizeof h->pcm);
+    spin_unlock(&lock);
 }
 
-/* ---- the stream engine -------------------------------------------------- */
-
-/* Unwrap LPIB. Called by everything that asks a question about position, and
- * often enough that a full lap cannot pass between two calls -- which at
- * 170 ms a lap means a writer that has stopped writing, and that shows up as
- * an underrun rather than as a lost wrap. */
-static void hda_sync(void)
-{
-    if (!g.running) return;
-    uint32_t lpib = r32(g.sd + SD_LPIB);
-    if (lpib >= HDA_CBL) lpib %= HDA_CBL;
-    g.played += (lpib >= g.lpib) ? (lpib - g.lpib) : (HDA_CBL - g.lpib + lpib);
-    g.lpib = lpib;
-
-}
-
-static bool hda_probe(const struct pci_device **out)
-{
-    uint32_t n = pci_devices_count();
-    for (uint32_t i = 0; i < n; i++) {
-        const struct pci_device *d = pci_get_device(i);
-        /* BY CLASS, not by a device-id table. Intel alone has shipped dozens
-         * of HDA controller ids and AMD, NVIDIA and VIA ship their own; they
-         * are all register-compatible and all declare class 04 subclass 03,
-         * which is the only identification that keeps working on a machine
-         * built after this was written. */
-        if (d && d->class_code == 0x04 && d->subclass == 0x03) { *out = d; return true; }
-    }
-    return false;
-}
-
-static bool rings_init(void)
-{
-    uint64_t p = pmm_alloc_page();
-    if (!p) return false;
-    g.corb_phys = p;
-    g.corb = (uint32_t *)P2V(p);
-    memset(g.corb, 0, PAGE_SIZE);
-
-    p = pmm_alloc_page();
-    if (!p) return false;
-    g.rirb_phys = p;
-    g.rirb = (uint64_t *)P2V(p);
-    memset(g.rirb, 0, PAGE_SIZE);
-
-    /* Stop both engines before moving their bases. A controller that is still
-     * fetching from the old address will happily execute whatever is there. */
-    w8(HDA_CORBCTL, 0);
-    w8(HDA_RIRBCTL, 0);
-
-    w8(HDA_CORBSIZE, 0x02);                 /* 256 entries                   */
-    w32(HDA_CORBLBASE, (uint32_t)g.corb_phys);
-    w32(HDA_CORBUBASE, (uint32_t)(g.corb_phys >> 32));
-
-    /* Reset the read pointer, and CONFIRM IT. The bit is write-1, hardware
-     * clears it, and a controller that never acknowledges is one whose ring
-     * would start at an unknown index -- every verb off by one forever. */
-    w16(HDA_CORBRP, CORBRP_RST);
-    for (int i = 0; i < 1000 && !(r16(HDA_CORBRP) & CORBRP_RST); i++) hda_delay();
-    w16(HDA_CORBRP, 0);
-    for (int i = 0; i < 1000 && (r16(HDA_CORBRP) & CORBRP_RST); i++) hda_delay();
-    w16(HDA_CORBWP, 0);
-    g.corb_wp = 0;
-
-    w8(HDA_RIRBSIZE, 0x02);
-    w32(HDA_RIRBLBASE, (uint32_t)g.rirb_phys);
-    w32(HDA_RIRBUBASE, (uint32_t)(g.rirb_phys >> 32));
-    w16(HDA_RIRBWP, RIRBWP_RST);
-    w16(HDA_RINTCNT, 1);
-    g.rirb_rp = 0;
-
-    w8(HDA_CORBCTL, CORBCTL_RUN);
-    /* RINTCTL is on even though nothing here takes an interrupt: it is what
-     * makes the controller RAISE the response flag, and the flag is what
-     * codec_cmd() clears to let the next command through. INTCTL's global
-     * enable is off, so no interrupt is delivered to the CPU -- the flag is
-     * used as a flag, which is all a polled driver needs from it. */
-    w8(HDA_RIRBCTL, RIRBCTL_DMAEN | RIRBCTL_RINTCTL);
-    return true;
-}
-
-static bool hda_init(void)
-{
-    const struct pci_device *d = NULL;
-    if (!hda_probe(&d)) return false;
-
-    struct pci_bar bar = pci_read_bar(d->bus, d->device, d->function, 0);
-    if (!bar.valid || !bar.is_mmio) {
-        kprintf("hda: BAR0 is not memory -- refusing to guess\n");
-        return false;
-    }
-    g.mmio = (volatile uint8_t *)(uintptr_t)vmm_map_mmio(bar.address,
-                                                         bar.size ? bar.size : 0x4000);
-    if (!g.mmio) { kprintf("hda: could not map BAR0\n"); return false; }
-
-    pci_enable_bus_mastering(d->bus, d->device, d->function);
-
-    /* Intel's controllers default to a traffic class the chipset may not
-     * snoop, and the symptom is audio that plays from stale cache lines --
-     * intermittent, machine-dependent noise that looks like a driver bug.
-     * Linux clears the same register for the same reason. */
-    if (d->vendor_id == 0x8086)
-        pci_write32(d->bus, d->device, d->function, 0x44,
-                    pci_read32(d->bus, d->device, d->function, 0x44) & ~0xFFu);
-
-    /* Out of reset. CRST is LOW-true: the controller is held in reset while
-     * the bit is 0, and it must be taken there deliberately first, because
-     * firmware may have left it running. */
-    w32(HDA_GCTL, r32(HDA_GCTL) & ~GCTL_CRST);
-    for (int i = 0; i < 1000 && (r32(HDA_GCTL) & GCTL_CRST); i++) hda_delay();
-    w32(HDA_GCTL, r32(HDA_GCTL) | GCTL_CRST);
-    for (int i = 0; i < 1000 && !(r32(HDA_GCTL) & GCTL_CRST); i++) hda_delay();
-    if (!(r32(HDA_GCTL) & GCTL_CRST)) {
-        kprintf("hda: controller never came out of reset\n");
-        return false;
-    }
-    /* The codecs need real time on the link before STATESTS means anything.
-     * Reading it too early finds no codecs on hardware that has several. */
-    hda_delay(); hda_delay(); hda_delay();
-
-    uint16_t gcap = r16(HDA_GCAP);
-    uint32_t iss = (gcap >> 8) & 0xF, oss = (gcap >> 12) & 0xF;
-    if (oss == 0) { kprintf("hda: controller has no output stream\n"); return false; }
-    /* Stream descriptors are laid out inputs first, then outputs, then
-     * bidirectional -- so where the first OUTPUT one lives depends on how many
-     * inputs this particular controller has. */
-    g.sd = 0x80 + iss * 0x20;
-
-    w32(HDA_INTCTL, 0);                 /* polled, like every driver here    */
-    w16(HDA_WAKEEN, 0);
-
-    if (!rings_init()) { kprintf("hda: no memory for the command rings\n"); return false; }
-
-    uint16_t statests = r16(HDA_STATESTS);
-    w16(HDA_STATESTS, statests);        /* write-1-to-clear the latch        */
-    if (statests == 0) { kprintf("hda: no codec answered\n"); return false; }
-
-    bool found = false;
-    for (uint32_t cad = 0; cad < 15 && !found; cad++)
-        if (statests & (1u << cad)) found = codec_setup(cad);
-    if (!found) { kprintf("hda: no codec with an output path\n"); return false; }
-
-    /* The descriptor list and one page of PCM behind each entry. The list is
-     * 128-byte aligned by being page-aligned, which the spec requires and a
-     * page allocator gives for free. */
-    uint64_t bp = pmm_alloc_page();
-    if (!bp) { kprintf("hda: no page for the descriptor list\n"); return false; }
-    g.bdl_phys = bp;
-    g.bdl = (struct hda_bdl *)P2V(bp);
-    memset(g.bdl, 0, PAGE_SIZE);
-
-    for (int i = 0; i < HDA_BUFS; i++) {
-        uint64_t q = pmm_alloc_page();
-        if (!q) { kprintf("hda: only %d buffers\n", i); return false; }
-        g.buf_phys[i] = q;
-        g.buf[i] = (int16_t *)P2V(q);
-        memset(g.buf[i], 0, PAGE_SIZE);
-        g.bdl[i].addr  = q;
-        g.bdl[i].len   = HDA_BUF_BYTES;
-        g.bdl[i].flags = 0;
-    }
-
-    g.present = true;
-    kprintf("hda: %u out / %u in streams, stream regs at 0x%x, %u Hz, "
-            "%u frames/buffer\n",
-            (unsigned)oss, (unsigned)iss, (unsigned)g.sd,
-            (unsigned)HDA_RATE, (unsigned)HDA_BUF_FRAMES);
-    return true;
-}
-
-static uint32_t hda_sample_rate(void)       { return g.present ? HDA_RATE : 0; }
-static uint32_t hda_frames_per_buffer(void) { return HDA_BUF_FRAMES; }
-
-/* EVERY DESCRIPTOR PLAYS A FULL PAGE, whatever was put in it -- that is what
- * a cyclic engine with a fixed CBL means, and it is why this op exists. The
- * stream layer uses it for the playback position, which would otherwise lose
- * the padding on every short write and drift. */
-static uint32_t hda_desc_frames(int i) { (void)i; return HDA_BUF_FRAMES; }
-
-static uint32_t hda_fill(int i, const int16_t *frames, uint32_t nframes)
-{
-    if (!g.present || i < 0 || i >= HDA_BUFS || !frames) return 0;
-
-    uint32_t take = nframes < HDA_BUF_FRAMES ? nframes : HDA_BUF_FRAMES;
-    if (take == 0) return 0;
-
-    memcpy(g.buf[i], frames, (size_t)take * 4);
-    if (take < HDA_BUF_FRAMES)
-        memset(g.buf[i] + take * 2, 0, (size_t)(HDA_BUF_FRAMES - take) * 4);
-
-    g.seq[i] = ++g.fills;
-
-    /* SILENCE ONE STEP AHEAD. The engine never stops, so when the writer
-     * falls behind it walks straight into the next descriptor and plays
-     * whatever is there -- which, a lap later, is audio from 680 ms ago. A
-     * repeat is far worse than a gap, and clearing the descriptor the engine
-     * will reach next turns one into the other. Safe to clear here because
-     * the stream layer never fills further ahead than this. */
-    int nxt = (i + 1) % HDA_BUFS;
-    memset(g.buf[nxt], 0, HDA_BUF_BYTES);
-    g.seq[nxt] = 0;
-
-    return take;
-}
-
-static uint8_t hda_civ(void)
-{
-    if (!g.present || !g.running) return 0;
-    hda_sync();
-    return (uint8_t)((g.lpib / HDA_BUF_BYTES) % HDA_BUFS);
-}
-
-/* "The valid range now reaches `last`."
- *
- * There is nothing to write: the engine is cyclic and already walking. What
- * this call is good for is DETECTING that it walked past the end of what it
- * had been given before the extension arrived -- which is an underrun, and on
- * this device it is silence played rather than AC'97's latched halt. Same
- * hole in the sound, same number, counted where the hardware shows it. */
-static void hda_set_last(int last)
-{
-    if (!g.present || last < 0 || last >= HDA_BUFS) return;
-    hda_sync();
-    /* MORE AUDIO ARRIVING AFTER THE ENGINE PASSED THE END OF THE LAST LOT is
-     * the underrun, and it is the only way this device has of showing one:
-     * AC'97 halts and latches a bit, this walks into the silence beyond and
-     * keeps going. Counting it HERE rather than in the position poll is what
-     * separates it from simply reaching the end of a sound -- nothing follows
-     * that, so nothing is counted, which is correct and was not the first
-     * version's behaviour. */
-    if (g.running && g.played > g.last_seq * (uint64_t)HDA_BUF_BYTES)
-        g.underruns++;
-    g.last_seq = g.seq[last];
-}
-
-static void hda_play(int last)
-{
-    if (!g.present || last < 0 || last >= HDA_BUFS) return;
-
-    /* Stop and reset the stream engine before touching anything it reads.
-     * SRST is also low-true and also has to be confirmed both ways -- a
-     * controller half out of reset accepts register writes and ignores them. */
-    w32(g.sd + SD_CTL, 0);
-    for (int i = 0; i < 1000 && (r32(g.sd + SD_CTL) & SDCTL_RUN); i++) hda_delay();
-    w32(g.sd + SD_CTL, SDCTL_SRST);
-    for (int i = 0; i < 1000 && !(r32(g.sd + SD_CTL) & SDCTL_SRST); i++) hda_delay();
-    w32(g.sd + SD_CTL, 0);
-    for (int i = 0; i < 1000 && (r32(g.sd + SD_CTL) & SDCTL_SRST); i++) hda_delay();
-
-    w8(g.sd + SD_STS, SDSTS_BCIS | SDSTS_FIFOE | SDSTS_DESE);
-
-    w32(g.sd + SD_CBL, HDA_CBL);
-    w16(g.sd + SD_LVI, (uint16_t)(HDA_BUFS - 1));
-    w32(g.sd + SD_BDPL, (uint32_t)g.bdl_phys);
-    w32(g.sd + SD_BDPU, (uint32_t)(g.bdl_phys >> 32));
-    w16(g.sd + SD_FMT, HDA_FORMAT);
-
-    /* The stream TAG is what ties this engine to the converter that was told
-     * the same number during codec setup. Get it wrong and the DMA runs
-     * perfectly into a link nothing is listening on. */
-    w32(g.sd + SD_CTL, ((uint32_t)HDA_STREAM_TAG << SDCTL_STRM_SH));
-
-    /* Descriptors 0..last hold this sound; the engine starts at 0 and byte 0,
-     * so the fill sequence is exactly the index plus one. Recomputing it here
-     * rather than trusting whatever fill() left makes a restart correct even
-     * if the previous stream ended mid-ring. */
-    g.fills = (uint64_t)last + 1;
-    for (int i = 0; i < HDA_BUFS; i++) g.seq[i] = (i <= last) ? (uint64_t)(i + 1) : 0;
-    g.last_seq = (uint64_t)last + 1;
-    g.lpib = 0;
-    g.played = 0;
-    g.underruns = 0;          /* this sound's count, not the last one's */
-    g.running = true;
-
-    __sync_synchronize();
-    w32(g.sd + SD_CTL, ((uint32_t)HDA_STREAM_TAG << SDCTL_STRM_SH) | SDCTL_RUN);
-}
-
-static bool hda_done(int last)
-{
-    if (!g.present || !g.running || last < 0 || last >= HDA_BUFS) return true;
-    hda_sync();
-    uint64_t end = g.seq[last] * (uint64_t)HDA_BUF_BYTES;
-    return end == 0 || g.played >= end;
-}
-
-static void hda_stop(void)
-{
-    if (!g.present) return;
-    w32(g.sd + SD_CTL, 0);
-    for (int i = 0; i < 1000 && (r32(g.sd + SD_CTL) & SDCTL_RUN); i++) hda_delay();
-    g.running = false;
-    /* Leave the ring silent. The next sound fills from descriptor 0 and the
-     * engine starts there, but anything it has not reached yet would be the
-     * tail of this one. */
-    for (int i = 0; i < HDA_BUFS; i++) {
-        if (g.buf[i]) memset(g.buf[i], 0, HDA_BUF_BYTES);
-        g.seq[i] = 0;
-    }
-    g.fills = 0;
-    g.last_seq = 0;
-}
-
-static uint64_t hda_underruns(void) { return g.underruns; }
-
-const struct pcm_driver hda_driver = {
-    .name              = "hda",
-    .init              = hda_init,
-    .sample_rate       = hda_sample_rate,
-    .frames_per_buffer = hda_frames_per_buffer,
-    .fill              = hda_fill,
-    .desc_frames       = hda_desc_frames,
-    .civ               = hda_civ,
-    .set_last          = hda_set_last,
-    .play              = hda_play,
-    .done              = hda_done,
-    .stop              = hda_stop,
-    .underruns         = hda_underruns,
-};
+/* Retain bounded CORB/RIRB transactions and interrupt-backed page retirement
+ * behind the upstream PCM interface. HDA always plays the padded whole page. */
+static bool hda_pcm_init(void) {hda_init();return hda_present();}
+static uint32_t hda_pcm_rate(void) {return hda_present()?48000:0;}
+static uint32_t hda_pcm_frames(void) {return 1024;}
+static uint32_t hda_pcm_desc_frames(int i) {(void)i;return 1024;}
+static uint64_t hda_pcm_underruns(void) {return h?h->underruns:0;}
+const struct pcm_driver hda_driver={.name="hda",.init=hda_pcm_init,
+    .sample_rate=hda_pcm_rate,.frames_per_buffer=hda_pcm_frames,
+    .fill=hda_fill,.desc_frames=hda_pcm_desc_frames,.civ=hda_civ,
+    .set_last=hda_set_last,.play=hda_play,.done=hda_done,.stop=hda_stop,
+    .underruns=hda_pcm_underruns};

@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include "block/block.h"
 #include "include/errno.h"
+#include "process/ksync.h"
+#include "drivers/timer/timer.h"
 
 static struct embk_block_device ahci_block_devs[AHCI_MAX_PORTS];
 
@@ -15,6 +17,9 @@ static uint32_t ahci_cap = 0;
 static uint32_t ahci_pi = 0;
 static struct ahci_port_info ports[AHCI_MAX_PORTS];
 static uint32_t port_count = 0;
+/* A barrier must not race another caller filling/issuing the same command
+ * slot. Zero initialization is MUTEX_INIT; uncontended use is boot-safe. */
+static struct mutex port_io_lock[AHCI_MAX_PORTS];
 
 // Per-port memory : Command list + received FIS + Command tables. Each port has its own memory area, which is page-aligned (4096 bytes). The command list is 1024 bytes, the received FIS area is 256 bytes, and the command tables are 12288 bytes (32 command tables * 384 bytes each). Total per-port memory = 1024 + 256 + 12288 = 13568 bytes. We round up to the next page boundary (16384 bytes) for alignment.
 static struct ahci_port_mem port_mem[AHCI_MAX_PORTS] __attribute__((aligned(4096)));  // Per-port memory (BSS, page-aligned)
@@ -131,9 +136,17 @@ static int find_free_command_slot(uint8_t port) {
     return -1;
 }
 
-bool ahci_identify_device(uint8_t port_num, void *buffer) {
+static bool ahci_port_ready(uint8_t port_num) {
+    if (!ahci_abar || port_num >= AHCI_MAX_PORTS || !(ahci_pi & (1U << port_num)))
+        return false;
+    for (uint32_t i = 0; i < port_count; i++)
+        if (ports[i].port_num == port_num) return ports[i].present;
+    return false;
+}
+
+static bool ahci_identify_device_unlocked(uint8_t port_num, void *buffer) {
     // This function will send an IDENTIFY DEVICE command to the specified port and fill the provided buffer with the 512-byte IDENTIFY DEVICE data. It returns true if successful, false otherwise.
-    if (port_num >= port_count) {
+    if (!ahci_port_ready(port_num)) {
         return false;
     }
 
@@ -266,8 +279,8 @@ static const char *sig_string(uint32_t sig) {
 
 // Read `count` sectors starting at LBA from an AHCI port into buffer.
 // LBA48 READ DMA EXT. Buffer must be kernel-static (KV2P) and contiguous.
-bool ahci_read_sectors(uint8_t port_num, uint64_t lba, uint16_t count, void *buffer) {
-    if (port_num >= port_count) return false;
+static bool ahci_read_sectors_unlocked(uint8_t port_num, uint64_t lba, uint16_t count, void *buffer) {
+    if (!ahci_port_ready(port_num)) return false;
     if (count == 0) return false;
 
     uint32_t bytes = (uint32_t)count * 512;
@@ -341,8 +354,8 @@ bool ahci_read_sectors(uint8_t port_num, uint64_t lba, uint16_t count, void *buf
     return false;
 }
 
-bool ahci_write_sectors(uint8_t port_num, uint64_t lba, uint16_t count, const void *buffer) {
-    if (port_num >= port_count) return false;
+static bool ahci_write_sectors_unlocked(uint8_t port_num, uint64_t lba, uint16_t count, const void *buffer) {
+    if (!ahci_port_ready(port_num)) return false;
     if (count == 0) return false;
 
     uint32_t bytes = (uint32_t)count * 512;
@@ -417,6 +430,78 @@ bool ahci_write_sectors(uint8_t port_num, uint64_t lba, uint16_t count, const vo
 }
 
 
+bool ahci_identify_device(uint8_t port, void *buffer) {
+    if (port >= AHCI_MAX_PORTS || !buffer) return false;
+    mutex_lock(&port_io_lock[port]);
+    bool ok = ahci_identify_device_unlocked(port, buffer);
+    mutex_unlock(&port_io_lock[port]);
+    return ok;
+}
+
+bool ahci_read_sectors(uint8_t port, uint64_t lba, uint16_t count, void *buffer) {
+    if (port >= AHCI_MAX_PORTS || !buffer) return false;
+    mutex_lock(&port_io_lock[port]);
+    bool ok = ahci_read_sectors_unlocked(port, lba, count, buffer);
+    mutex_unlock(&port_io_lock[port]);
+    return ok;
+}
+
+bool ahci_write_sectors(uint8_t port, uint64_t lba, uint16_t count, const void *buffer) {
+    if (port >= AHCI_MAX_PORTS || !buffer) return false;
+    mutex_lock(&port_io_lock[port]);
+    bool ok = ahci_write_sectors_unlocked(port, lba, count, buffer);
+    mutex_unlock(&port_io_lock[port]);
+    return ok;
+}
+
+/* AHCI non-data command completion: PxCI clears when the device's D2H FIS
+ * completes the command. Keep the port locked from draining older commands
+ * through FLUSH CACHE (ATA 0xE7, also used by our IDE driver). PRDTL is zero:
+ * no host buffer is transferred, and W must be clear. QEMU's AHCI/IDE model
+ * provides the command-level referee in the SATA POSIX smoke test. */
+static bool ahci_wait_flush(uint8_t port, bool completing) {
+    bool timed = tsc_get_freq_hz() != 0;
+    uint64_t start = time_get_us();
+    for (uint32_t spins = 0; ; spins++) {
+        uint32_t tfd = ahci_port_read(port, AHCI_PORT_TFD);
+        uint32_t pending = ahci_port_read(port, AHCI_PORT_CI)
+                         | ahci_port_read(port, AHCI_PORT_SACT);
+        if (completing && ((tfd & 0x21)
+            || (ahci_port_read(port, AHCI_PORT_IS) & (1U << 30)))) return false;
+        if (!pending && !(tfd & 0x88)) return true;
+        if ((timed && time_get_us() - start >= 30000000ULL)
+            || (!timed && spins >= 9999999)) return false;
+        __asm__ volatile("pause");
+    }
+}
+
+static int ahci_block_flush(struct embk_block_device *dev) {
+    if (!dev) return -EMBK_EINVAL;
+    uintptr_t port_id = (uintptr_t)dev->driver_data;
+    if (port_id >= AHCI_MAX_PORTS) return -EMBK_ENODEV;
+    uint8_t port = (uint8_t)port_id;
+    mutex_lock(&port_io_lock[port]);
+    int rc = -EMBK_EIO;
+    if (!ahci_port_ready(port) || !ahci_wait_flush(port, false)) goto done;
+    struct ahci_cmd_header *hdr = &port_mem[port].cmd_list[0];
+    struct ahci_cmd_table *table = &port_mem[port].cmd_tables[0];
+    for (uint32_t i = 0; i < sizeof(*table) / sizeof(uint32_t); i++)
+        ((uint32_t *)table)[i] = 0;
+    hdr->flags = 5;    /* CFL=5 DWORDs; no write or ATAPI flags */
+    hdr->prdtl = 0;
+    hdr->prdbc = 0;
+    table->cfis.fis_type = AHCI_FIS_TYPE_REG_H2D;
+    table->cfis.pmport_c = 1U << 7;
+    table->cfis.command = 0xE7;
+    ahci_port_write(port, AHCI_PORT_IS, 1U << 30);  /* clear prior TFES (W1C) */
+    __asm__ volatile("" ::: "memory");
+    ahci_port_write(port, AHCI_PORT_CI, 1);
+    if (ahci_wait_flush(port, true)) rc = EMBK_OK;
+done:
+    mutex_unlock(&port_io_lock[port]);
+    return rc;
+}
+
 static int ahci_block_read(struct embk_block_device *dev,
                            uint64_t lba, uint32_t count, void *buf) {
     if (!dev || !buf) return -EMBK_EINVAL;
@@ -461,10 +546,12 @@ void ahci_register_block_devices(void) {
         ahci_block_devs[i].block_size  = 512;
         ahci_block_devs[i].read        = ahci_block_read;
         ahci_block_devs[i].write       = ahci_block_write;
+        ahci_block_devs[i].flush       = ahci_block_flush;
         ahci_block_devs[i].driver_data = (void *)(uintptr_t)port;
         ahci_block_devs[i].dma_max_phys      = 0xFFFFFFFFFFFFFFFFULL;  // 64-bit (S64A=1)
         ahci_block_devs[i].needs_kernel_range = true;  // still need KV2P validity
-        embk_block_register(&ahci_block_devs[i]);
+        if(!embk_block_register(&ahci_block_devs[i]))
+            embk_block_set_identity(&ahci_block_devs[i],"SATA",ports[i].model,ports[i].serial);
     }
 }
 
@@ -576,6 +663,9 @@ void ahci_init(void) {
                                | ((uint64_t)id_buf[103] << 48);
                 uint32_t lba28 = id_buf[60] | ((uint32_t)id_buf[61] << 16);
                 ports[i].sectors = lba48 ? lba48 : lba28;
+                for(unsigned j=0;j<20;j++) {ports[i].model[2*j]=id_buf[27+j]>>8;ports[i].model[2*j+1]=id_buf[27+j];}
+                for(unsigned j=0;j<10;j++) {ports[i].serial[2*j]=id_buf[10+j]>>8;ports[i].serial[2*j+1]=id_buf[10+j];}
+                ports[i].model[40]=0;ports[i].serial[20]=0;
             } else {
                 ports[i].sectors = 0;
             }

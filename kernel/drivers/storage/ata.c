@@ -689,6 +689,7 @@ void ata_register_block_devices(void) {
         ata_block_devices[i].dma_max_phys      = 0xFFFFFFFF;   // 32-bit DMA
         ata_block_devices[i].needs_kernel_range = true;
         embk_block_register(&ata_block_devices[i]);
+        embk_block_set_identity(&ata_block_devices[i],"ATA",drives[i].model,drives[i].serial);
     }
 }
 

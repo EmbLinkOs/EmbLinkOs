@@ -51,6 +51,7 @@ struct ata_drive {
     bool     is_slave;  // Slave drive
     uint32_t total_sectors;  // Total number of sectors
     char     model[41];  // 40 char + null name
+    char     serial[21];
 };
 
 // Initialize: detect drive via Identify

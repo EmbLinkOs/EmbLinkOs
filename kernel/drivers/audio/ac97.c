@@ -33,6 +33,7 @@
 #include "drivers/bus/pci.h"
 #include "mm/pmm.h"
 #include "drivers/audio/pcm.h"
+#include "drivers/timer/timer.h"
 
 #define AC97_VENDOR_INTEL   0x8086
 #define AC97_DEVICE_82801AA 0x2415
@@ -57,6 +58,9 @@
 #define AC97_SR_BCIS        0x08   /* buffer completion interrupt status     */
 #define AC97_SR_LVBCI       0x04   /* last valid buffer completed            */
 
+#define AC97_SR_DCH 0x01
+#define AC97_SR_FIFOE 0x10
+
 #define AC97_BDL_ENTRIES    32
 #define AC97_SAMPLE_RATE    48000
 
@@ -72,6 +76,7 @@ struct ac97_bd {
 
 static struct {
     bool     present;
+    struct pci_device pci;
     uint16_t mixer;                /* BAR0 I/O base */
     uint16_t bus;                  /* BAR1 I/O base */
     struct ac97_bd *bdl;           /* virtual pointer into the direct map   */
@@ -80,6 +85,13 @@ static struct {
     int16_t *buf[AC97_BDL_ENTRIES]; /* one page each, as samples            */
     uint32_t buf_samples;          /* samples per buffer (both channels)    */
 } g_ac97;
+static void disable_bus_mastering(void) {
+    const struct pci_device *p=&g_ac97.pci;
+    uint16_t command=pci_read16(p->bus,p->device,p->function,PCI_COMMAND);
+    pci_write16(p->bus,p->device,p->function,PCI_COMMAND,command&~4u);
+    g_ac97.present=false;
+}
+
 
 /* HOW MANY TIMES THE SPEAKER RAN DRY.
  *
@@ -109,7 +121,7 @@ static uint16_t mixer_read(uint8_t reg)
     return inw((uint16_t)(g_ac97.mixer + reg));
 }
 
-static uint32_t ac97_sample_rate(void) { return AC97_SAMPLE_RATE; }
+static uint32_t ac97_sample_rate(void) { return g_ac97.present ? AC97_SAMPLE_RATE : 0; }
 
 /* How many stereo FRAMES one descriptor's buffer holds. */
 static uint32_t ac97_frames_per_buffer(void)
@@ -173,8 +185,6 @@ static void ac97_set_last(int last)
      * this -- it fills every descriptor before starting -- so the bug lives
      * exactly where a program streams, which is what `beep` found: 0.03s of
      * audio out of half a second, and the checker called it silence. */
-    uint16_t sr = inw((uint16_t)(g_ac97.bus + AC97_PO_SR));
-    bool halted = (sr & AC97_SR_LVBCI) != 0;
 
     /* MOVE THE GOALPOST FIRST, and only touch anything else if the device has
      * actually stopped. Rewriting CR on every extend is what kept a stream at
@@ -184,16 +194,19 @@ static void ac97_set_last(int last)
      * speaker only ever heard the first burst. A one-shot never showed it --
      * it writes CR once. */
     outb((uint16_t)(g_ac97.bus + AC97_PO_LVI), (uint8_t)last);
+    uint16_t sr=inw((uint16_t)(g_ac97.bus+AC97_PO_SR));
+    if(sr&AC97_SR_FIFOE) {disable_bus_mastering();return;}
+    /* It may have completed the NEW end between the LVI write and SR read.
+     * Preserve that latch for drained(), rather than acknowledging it as an
+     * underrun at the old end and waiting for a completion that already came. */
+    if((sr&AC97_SR_LVBCI) && inb((uint16_t)(g_ac97.bus+AC97_PO_CIV))==(uint8_t)last) return;
+    bool halted=(sr&(AC97_SR_DCH|AC97_SR_LVBCI))!=0;
 
     if (halted) {
+        g_underruns++;
         /* It DID reach the old end and stop. Clear the latch -- while it is
          * set, a new LVI does not restart anything -- and run again. An
-         * underrun costs a gap, not the rest of the sound.
-         *
-         * And it IS an underrun: the writer had more to give and the device
-         * had already finished. Counted here rather than guessed at from
-         * timings above, because this branch is the hardware saying it. */
-        g_underruns++;
+         * underrun costs a gap, not the rest of the sound. */
         outw((uint16_t)(g_ac97.bus + AC97_PO_SR), (uint16_t)(sr & (AC97_SR_BCIS | AC97_SR_LVBCI)));
         outb((uint16_t)(g_ac97.bus + AC97_PO_CR), AC97_CR_IOCE | AC97_CR_RPBM);
     } else if (sr & AC97_SR_BCIS) {
@@ -231,7 +244,10 @@ static bool ac97_done(int last)
     uint16_t sr = inw((uint16_t)(g_ac97.bus + AC97_PO_SR));
     if (sr & (AC97_SR_BCIS | AC97_SR_LVBCI))
         outw((uint16_t)(g_ac97.bus + AC97_PO_SR), sr);  /* write-1-to-clear */
-    bool done = civ > (uint8_t)last || (sr & AC97_SR_LVBCI) != 0;
+    /* CIV is modulo 32. Numeric CIV > LVI can describe an EARLIER lap,
+     * so only the hardware's last-valid completion latch proves drainage. */
+    if(sr&AC97_SR_FIFOE) {disable_bus_mastering();return true;}
+    bool done = (sr & AC97_SR_LVBCI) != 0;
     if (done) kprintf("ac97: done civ=%u last=%d sr=0x%x\n",
                       (unsigned)civ, last, (unsigned)sr);
     return done;
@@ -241,6 +257,14 @@ static void ac97_stop(void)
 {
     if (!g_ac97.present) return;
     outb((uint16_t)(g_ac97.bus + AC97_PO_CR), 0);
+    /* Every new stream starts at descriptor zero. RUN=0 alone retains CIV,
+     * which otherwise makes a second sound skip its first pages. */
+    outb((uint16_t)(g_ac97.bus+AC97_PO_CR),AC97_CR_RR);
+    uint64_t start=time_get_us();
+    while(inb((uint16_t)(g_ac97.bus+AC97_PO_CR))&AC97_CR_RR) {
+        if(time_get_us()-start>=20000) {disable_bus_mastering();return;}
+        __asm__ volatile("pause");
+    }
 }
 
 static bool ac97_init(void)
@@ -265,6 +289,7 @@ static bool ac97_init(void)
                 (int)b0.is_mmio, (int)b1.is_mmio);
         return false;
     }
+    g_ac97.pci = *dev;
     g_ac97.mixer = (uint16_t)b0.address;
     g_ac97.bus   = (uint16_t)b1.address;
 
@@ -286,7 +311,7 @@ static bool ac97_init(void)
      * addresses, because the device walks this itself and knows nothing about
      * our page tables. */
     uint64_t bdl_page = pmm_alloc_page();
-    if (!bdl_page) { kprintf("ac97: no page for the descriptor list\n"); return false; }
+    if (!bdl_page || bdl_page > UINT32_MAX-PAGE_SIZE) { kprintf("ac97: no 32-bit descriptor list\n"); disable_bus_mastering(); return false; }
     g_ac97.bdl_phys = bdl_page;
     g_ac97.bdl = (struct ac97_bd *)P2V(bdl_page);
     memset(g_ac97.bdl, 0, PAGE_SIZE);
@@ -294,13 +319,15 @@ static bool ac97_init(void)
     g_ac97.buf_samples = PAGE_SIZE / sizeof(int16_t);   /* 2048 samples/page */
     for (int i = 0; i < AC97_BDL_ENTRIES; i++) {
         uint64_t p = pmm_alloc_page();
-        if (!p) { kprintf("ac97: only %d buffers\n", i); break; }
+        if (!p || p > UINT32_MAX-PAGE_SIZE) { kprintf("ac97: only %d usable buffers\n", i); disable_bus_mastering(); return false; }
         g_ac97.buf_phys[i] = p;
         g_ac97.buf[i] = (int16_t *)P2V(p);
         memset(g_ac97.buf[i], 0, PAGE_SIZE);
     }
 
     g_ac97.present = true;
+    ac97_stop();
+    if (!g_ac97.present) return false;
     kprintf("ac97: 82801AA at mixer 0x%x bus 0x%x, %u Hz, %u frames/buffer\n",
             g_ac97.mixer, g_ac97.bus, AC97_SAMPLE_RATE,
             ac97_frames_per_buffer());

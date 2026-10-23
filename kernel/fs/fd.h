@@ -186,7 +186,8 @@ int vfs_fd_get_flags(int fd);                 /* O_ACCMODE | O_NONBLOCK, or -err
 int vfs_fd_set_nonblock(int fd, bool on);     /* set/clear O_NONBLOCK; 0 or -errno */
 int vfs_unlink_path(const char *path);   /* rm: split parent + per-fs unlink op */
 int vfs_mkdir_path(const char *path);    /* mkdir: split parent + per-fs mkdir op */
-int vfs_rename_path(const char *old_path, const char *new_path); /* strict: dest must not exist (POSIX replace = libc veneer) */
+int vfs_rename_noreplace(const char *,const char *);
+int vfs_rename_path(const char *old_path, const char *new_path); /* atomic replacement */
 int vfs_chmod_path(const char *path, uint32_t mode);  /* permission bits; fs preserves the type bits */
 int vfs_fd_truncate(int fd, uint64_t size);  /* ftruncate over the existing per-fs truncate op */
 int vfs_fd_fsync(int fd);    /* push this file's dirty pages to the device NOW */

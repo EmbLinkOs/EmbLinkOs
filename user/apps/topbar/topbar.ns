@@ -6,3 +6,5 @@
 # dragged into the dock). So: read /system, reach /run -- nothing else nameable.
 ro /system
 rw /run
+
+ro /data/apps/notifications

@@ -694,6 +694,7 @@ struct embk_txn {
 #define EMBKFS_MAX_VOLUMES 4
 
 void embkfs_init(void);
+int embkfs_check(struct embkfs_volume *);
 /* The PRIMARY volume: the first one embkfs_init() found and mounted,
  * always registered at "/" by main.c. Every existing internal caller
  * (the selftests, in particular) operates on this one implicitly and is

@@ -38,6 +38,7 @@ struct emnote_rep {
 };
 
 static inline int embk_notify_level(int level, const char *title, const char *body) {
+    (void)embk_notify_send((unsigned)level,title,body);
     struct emnote_req q;
     for (unsigned i = 0; i < sizeof q; i++) ((unsigned char *)&q)[i] = 0;
     q.level = (uint32_t)level;

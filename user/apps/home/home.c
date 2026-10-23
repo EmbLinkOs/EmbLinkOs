@@ -315,6 +315,8 @@ static void lock_verify_thread(long arg) {
 
 static void lock_set(int on) {
     if (on == g_locked) return;
+    int gate=embk_session(on?EMBK_SESSION_LOCK:EMBK_SESSION_UNLOCK,0);
+    if(gate<0){embk_puts(1,"home: lock ownership request failed\n");return;}
     g_locked = on;
     if (on) {
         g_apps_open = 0;                      /* one modal surface at a time */
@@ -341,9 +343,16 @@ static void lock_set(int on) {
  * never heard of, and putting a password prompt in front of that would lock
  * the machine until it is rebooted. */
 static void poll_lock_request(void) {
+    int state=embk_session(EMBK_SESSION_STATUS,0);
+    if(state>=0 && (state&EMBK_SESSION_LOCKED) && !g_locked)g_lock_req=1;
     if (!g_lock_req) return;
     g_lock_req = 0;
     if (g_locked) return;
+    if(state>=0 && (state&EMBK_SESSION_LOCKED)) {
+        struct embk_session_info si;
+        if(!embk_session_info(&si))snprintf(g_lock_user,sizeof g_lock_user,"%s",si.user);
+        lock_set(1);return;
+    }
 
     struct emauth_rep rep;
     int st = emauth_status(&rep);
@@ -515,6 +524,13 @@ static void cfg_poll(void) {
     g_cfg_next = now + 1000;
     struct oscfg was = g_cfg;
     oscfg_load(&g_cfg);
+    if(g_cfg.volume!=was.volume || g_cfg.muted!=was.muted)embk_audio_volume(g_cfg.volume,g_cfg.muted);
+    if(g_cfg.idle_dim_seconds!=was.idle_dim_seconds || g_cfg.idle_lock_seconds!=was.idle_lock_seconds ||
+       g_cfg.lid_lock!=was.lid_lock || g_cfg.power_profile!=was.power_profile) {
+        struct embk_policy policy={.version=EMBK_POLICY_VERSION,.flags=g_cfg.lid_lock?EMBK_POLICY_LID_LOCK:0,
+            .idle_dim_seconds=g_cfg.idle_dim_seconds,.idle_lock_seconds=g_cfg.idle_lock_seconds,.profile=g_cfg.power_profile};
+        embk_policy_set(&policy);
+    }
 
     /* The pieces of the shell that cannot name the user's home ask us for the
      * preferences over /run/emlink.prefs; g_cfg is what we answer with, and the
@@ -1715,6 +1731,7 @@ int main(int argc, char **argv, char **envp) {
     dock_prune_missing();                   /* offer only what can actually run */
     embk_thread_create(apps_listener, 0);   /* the top bar's Apps signal listener */
     embk_thread_create(prefs_listener, 0);  /* ...and what it wears while it draws */
+    embk_session(EMBK_SESSION_BEGIN,0);
     embk_thread_create(lock_listener, 0);   /* ...and the menu bar's Lock Screen */
     /* apps describe their own icon/name (docs presentation manifest) */
     load_app_meta("files", g_dock[0].icon, sizeof g_dock[0].icon, g_dock[0].label, sizeof g_dock[0].label);

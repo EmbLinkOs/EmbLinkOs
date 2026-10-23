@@ -49,7 +49,7 @@ int64_t compositor_win_create_shared(struct process *client, uint32_t cw, uint32
 
 /* Full-screen chromeless HOME/desktop window for `client`: sized to the
  * framebuffer, pinned at the back (z=0), no title bar or border, zero-copy. The
- * screen dimensions are returned via *out_w/*out_h so the app needn't hardcode
+ * screen dimensions are returned via *out_w and *out_h so the app needn't hardcode
  * them. Returns a window id (>0) or -EMBK_*. */
 int64_t compositor_win_create_desktop(struct process *client, uint64_t *out_client_va,
                                       uint32_t *out_w, uint32_t *out_h);
@@ -225,5 +225,7 @@ void    compositor_reap_pid(int pid);
  * iteration of the kernel's main shell loop (thread context, so the plain
  * compositor spinlock is safe -- never call this from an IRQ handler). */
 void    compositor_pointer_tick(void);
+
+void compositor_session_changed(void);
 
 #endif /* __GFX_COMPOSITOR_H__ */

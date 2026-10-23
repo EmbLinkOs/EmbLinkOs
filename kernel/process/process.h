@@ -565,7 +565,8 @@ struct process {
      * threads. session_user is "" there. */
     uint32_t session_id;
     char     session_user[32];
-    bool     session_leader;     /* spawned with NEW_SESSION: its death ends the session */
+    bool     session_leader;
+    bool session_live;     /* spawned with NEW_SESSION: its death ends the session */
 
     /* THE BASENAME OF THE BINARY THIS PROCESS WAS CREATED FROM, and nothing
      * more: no argv, no working directory, no full path.

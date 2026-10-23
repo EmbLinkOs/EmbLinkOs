@@ -174,7 +174,7 @@ struct nvme_ctrl {
     uint32_t          max_xfer;         /* bytes per command (MDTS, bounce) */
     bool              vwc;              /* has a volatile write cache       */
     bool              up;
-    char              model[41];
+    char              model[41],serial[21];
     struct nvme_queue admin, io;
     struct mutex      lock;
     int               nns;
@@ -487,6 +487,7 @@ static void attach_namespace(struct nvme_ctrl *c, uint32_t nsid)
         kprintf("nvme: block layer refused namespace %u\n", (unsigned)nsid);
         return;
     }
+    embk_block_set_identity(&ns->blkdev,"NVMe",c->model,c->serial);
     c->nns++;
     g_nns_total++;
     kprintf("nvme: %s = %s, namespace %u: %llu blocks of %u bytes (%llu MiB)%s\n",
@@ -623,6 +624,7 @@ static bool nvme_attach(struct nvme_ctrl *c, const struct pci_device *d)
     }
     memcpy(c->model, c->ident + 24, 40);
     c->model[40] = 0;
+    memcpy(c->serial,c->ident+4,20);c->serial[20]=0;
     for (int i = 39; i >= 0 && (c->model[i] == ' ' || c->model[i] == 0); i--)
         c->model[i] = 0;
     uint8_t  mdts = c->ident[77];

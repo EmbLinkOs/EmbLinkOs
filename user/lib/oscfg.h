@@ -171,6 +171,8 @@ static const struct oscfg_timezone oscfg_timezones[OSCFG_TIMEZONES] = {
 
 
 struct oscfg {
+    int volume,muted;
+    int idle_dim_seconds,idle_lock_seconds,lid_lock,power_profile;
     int accent;        /* index into oscfg_accents                       */
     int dark;          /* 1 dark, 0 light                                */
     int dock_size;     /* dock icon base size in px                      */
@@ -212,6 +214,8 @@ static inline int oscfg_dock_band(const struct oscfg *c) {
 }
 
 static inline void oscfg_defaults(struct oscfg *c) {
+    c->volume=100;c->muted=0;
+    c->idle_dim_seconds=120;c->idle_lock_seconds=300;c->lid_lock=1;c->power_profile=0;
     c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1; c->keymap = 0;
     c->ui_scale = 100; c->wallpaper = 0; c->tz = 0;
     c->bar_24h = 1; c->bar_seconds = 0; c->bar_date = 1; c->bar_cpu = 1;
@@ -241,6 +245,12 @@ static inline void oscfg_defaults(struct oscfg *c) {
  * is a supported way to change these (Settings says so in About), so a typo
  * must yield a working desktop and not a 4000-pixel dock. */
 static inline void oscfg_clamp(struct oscfg *c) {
+    if(c->volume<0)c->volume=0;
+    if(c->volume>100)c->volume=100;
+    c->muted=!!c->muted;c->lid_lock=!!c->lid_lock;
+    if(c->power_profile<0 || c->power_profile>2)c->power_profile=0;
+    if(c->idle_dim_seconds<0 || c->idle_dim_seconds>86400 || (c->idle_dim_seconds && c->idle_dim_seconds<10))c->idle_dim_seconds=120;
+    if(c->idle_lock_seconds<0 || c->idle_lock_seconds>86400 || (c->idle_lock_seconds && c->idle_lock_seconds<10))c->idle_lock_seconds=300;
     if (c->accent < 0 || c->accent >= OSCFG_ACCENTS) c->accent = 0;
     if (c->wallpaper < 0 || c->wallpaper >= OSCFG_WALLPAPERS) c->wallpaper = 0;
     if (c->tz < 0 || c->tz >= OSCFG_TIMEZONES) c->tz = 0;
@@ -339,7 +349,13 @@ static inline void oscfg_parse(struct oscfg *c, char *buf) {
         if (*p) *p++ = 0;
         if (line[0] == '#' || !line[0]) continue;
         if (sscanf(line, "%31s %d", key, &val) != 2) continue;
-        if      (!strcmp(key, "accent"))    c->accent    = val;
+        if(!strcmp(key,"idle_dim_seconds"))c->idle_dim_seconds=val;
+        else if(!strcmp(key,"idle_lock_seconds"))c->idle_lock_seconds=val;
+        else if(!strcmp(key,"lid_lock"))c->lid_lock=val;
+        else if(!strcmp(key,"power_profile"))c->power_profile=val;
+        else if(!strcmp(key,"volume"))c->volume=val;
+        else if(!strcmp(key,"muted"))c->muted=val;
+        else if (!strcmp(key, "accent"))    c->accent    = val;
         else if (!strcmp(key, "dark"))      c->dark      = val;
         else if (!strcmp(key, "dock_size")) c->dock_size = val;
         else if (!strcmp(key, "dock_dots")) c->dock_dots = val;
@@ -363,20 +379,29 @@ static inline int oscfg_format(const struct oscfg *c, char *out, int cap) {
                      "# EmbLink preferences -- written by Settings, editable by hand.\n"
                      "accent %d\n" "dark %d\n" "dock_size %d\n" "dock_dots %d\n"
                      "ui_scale %d\n" "keymap %d\n" "wallpaper %d\n" "timezone %d\n"
-                     "bar_24h %d\n" "bar_seconds %d\n" "bar_date %d\n" "bar_cpu %d\n",
+                     "bar_24h %d\n" "bar_seconds %d\n" "bar_date %d\n" "bar_cpu %d\n" "volume %d\n" "muted %d\n" "idle_dim_seconds %d\n" "idle_lock_seconds %d\n" "lid_lock %d\n" "power_profile %d\n",
                      c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale,
                      c->keymap, c->wallpaper, c->tz,
-                     c->bar_24h, c->bar_seconds, c->bar_date, c->bar_cpu);
+                     c->bar_24h, c->bar_seconds, c->bar_date, c->bar_cpu,c->volume,c->muted,c->idle_dim_seconds,c->idle_lock_seconds,c->lid_lock,c->power_profile);
 }
 
 static inline int oscfg_write_to(const struct oscfg *c, const char *path) {
-    char out[640];
-    int n = oscfg_format(c, out, (int)sizeof out);
-    int fd = (int)embk_open(path, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    int64_t w = embk_write(fd, out, (size_t)n);
-    embk_close(fd);
-    return w == n ? 0 : -1;
+    char out[640],temporary[240];static unsigned sequence;
+    int n=oscfg_format(c,out,sizeof out);
+    if(n<0 || n>=(int)sizeof out)return -1;
+    snprintf(temporary,sizeof temporary,"%s.pending-%u-%u",path,(unsigned)embk_getpid(),++sequence);
+    int fd=(int)embk_open(temporary,EMBK_O_WRONLY|EMBK_O_CREAT|EMBK_O_EXCL,0600);
+    if(fd<0)return -1;
+    int done=0,rc=0;
+    while(done<n) {
+        int64_t wrote=embk_write(fd,out+done,(size_t)(n-done));
+        if(wrote<=0){rc=-1;break;}done+=(int)wrote;
+    }
+    if(!rc && embk_fsync(fd))rc=-1;
+    if(embk_close(fd))rc=-1;
+    if(!rc)rc=(int)embk_syscall2(EMBK_SYS_rename,(int64_t)(uintptr_t)temporary,(int64_t)(uintptr_t)path);
+    if(rc)embk_unlink(temporary);
+    return rc? -1:0;
 }
 
 static inline int oscfg_save(const struct oscfg *c) {

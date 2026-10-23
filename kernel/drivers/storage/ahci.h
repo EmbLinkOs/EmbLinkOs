@@ -54,6 +54,7 @@ struct ahci_port_info {
     uint8_t  det;  // Device detection status (SSTS det)
     bool present;  // Port is present
     uint64_t sectors;
+    char model[41],serial[21];
 };
 
 // === AHCI Packed structures ===

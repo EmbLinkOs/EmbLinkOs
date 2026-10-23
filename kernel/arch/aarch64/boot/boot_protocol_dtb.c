@@ -189,3 +189,5 @@ void boot_protocol_dump(void)
             (int)proto.version, (int)proto.mmap_count, (int)proto.mmap_stride);
     fdt_dump_summary();
 }
+
+bool boot_recovery_mode(void) {return false;}

@@ -26,11 +26,15 @@
  * and check `size` before reading anything new. Never reorder. */
 
 #define BOOT_PROTOCOL_MAGIC    0x4F52504B4E494C45ULL  /* "ELINKPRO" */
-#define BOOT_PROTOCOL_VERSION  2
+#define BOOT_PROTOCOL_VERSION  3
 
 /* Which firmware built this record. The kernel should need this for almost
  * nothing -- if a subsystem starts branching on it, that is a sign the
  * difference leaked out of the loader where it belongs. */
+#define BOOT_MODE_NORMAL 0
+#define BOOT_MODE_RECOVERY 1
+#define BOOT_MODE_DIAGNOSTICS 2
+#define BOOT_MODE_LIVE 3
 #define BOOT_FW_BIOS  1
 #define BOOT_FW_UEFI  2
 #define BOOT_FW_DTB   3   /* aarch64: a flattened device tree, from x0 */
@@ -93,7 +97,12 @@ struct boot_protocol {
      * compiler adds the same four bytes silently and the next person to add a
      * field puts it at an offset the assertions below do not describe. */
     uint32_t _reserved3;     /* +0x54                                        */
-};                           /*  size  0x58                                  */
+    /* v3 appends source identity and explicit recovery/live selection. The
+     * v2 Secure Boot fields above retain their original offsets. */
+    uint8_t boot_partition_guid[16]; /* +0x58 */
+    uint8_t boot_mode;               /* +0x68 BOOT_MODE_* */
+    uint8_t _reserved4[7];
+};                           /*  size  0x70                                  */
 
 /* What the firmware's SecureBoot variable said. UNKNOWN is not "off": a BIOS
  * machine has no such variable and neither does a UEFI one whose firmware
@@ -126,7 +135,9 @@ _Static_assert(sizeof(struct boot_mmap_entry) == 24, "mmap entry is 24 bytes");
  * record is allowed to be. v1 ended at acpi_rsdp. */
 #define BOOT_PROTOCOL_SIZE_V1  0x50
 
-_Static_assert(sizeof(struct boot_protocol)   == 0x58, "boot_protocol is 0x58");
+_Static_assert(sizeof(struct boot_protocol)   == 0x70, "boot_protocol is 0x70");
+_Static_assert(offsetof(struct boot_protocol, boot_partition_guid) == 0x58, "off");
+_Static_assert(offsetof(struct boot_protocol, boot_mode) == 0x68, "off");
 _Static_assert(offsetof(struct boot_protocol, secure_boot)   == 0x50, "off");
 _Static_assert(offsetof(struct boot_protocol, magic)         == 0x00, "off");
 _Static_assert(offsetof(struct boot_protocol, version)       == 0x08, "off");
@@ -153,6 +164,7 @@ void boot_protocol_capture(uint64_t phys);
 
 const struct boot_protocol *boot_protocol_get(void);
 void boot_protocol_dump(void);
+bool boot_recovery_mode(void);
 
 /* Memory map access.
  *

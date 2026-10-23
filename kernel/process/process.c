@@ -1,3 +1,4 @@
+#include "boot/boot_protocol.h"
 #include "process/process.h"
 #include "power/power.h"   /* idle residency accounting */
 #include "process/sched.h"    /* the policy seam: WHICH thread runs next */
@@ -5,6 +6,7 @@
 #include "include/arch_irq.h"
 #include "drivers/input/keyboard.h"   /* keyboard_release_grab_pid() on reap */
 #include "gfx/surface.h"   /* surface_transfer_to() for SPAWN_ACTION_INHERIT_SURFACE */
+#include "drivers/audio/audio.h"
 #include "gfx/compositor.h"   /* compositor_reap_pid() on process teardown */
 #include "ipc/channel.h"   /* channel_transfer_end_to() for SPAWN_ACTION_INHERIT_CHANNEL */
 #include "ipc/pipe.h"      /* struct pipe_end + fd_install_pipe target for SPAWN_ACTION_INSTALL_OBJ */
@@ -218,6 +220,7 @@ static struct process *process_alloc(void) {
             process_table[i].session_id = 0;
             process_table[i].session_user[0] = 0;
             process_table[i].session_leader = false;
+            process_table[i].session_live = false;
             /* Same hazard as the session fields: a reused slot showing the
              * PREVIOUS occupant's program name is worse than showing none --
              * the dock would light a tile for an app that has exited. */
@@ -800,6 +803,9 @@ static struct process *thread_zombie_locked(struct thread *t) {
         if (proc->live_thread_count == 0 && proc->session_leader && proc->session_id)
             kworker_defer_session_end_locked(proc->session_id);
         if (proc->live_thread_count == 0) {
+            /* Release the sink at death, before proc_alive can report false;
+             * parent-owned zombies may remain until wait, possibly forever. */
+            audio_reap_pid(proc->pid);
             /* Snapshot NOW, before the switch-away (schedule_locked()'s
              * own prev-demotion section) clears the thread's own
              * running_cpu -- see process.h's comment on this field for
@@ -2435,6 +2441,7 @@ int process_create_caps(const char *path, char *const argv[], int argc,
     {
         if (current_thread) {
             proc->session_id = current_process->session_id;
+            proc->session_live = current_process->session_live;
             memcpy(proc->session_user, current_process->session_user, sizeof proc->session_user);
         }
         for (int i = 0; i < n_count; i++) {
@@ -2463,6 +2470,10 @@ int process_create_caps(const char *path, char *const argv[], int argc,
             proc->session_id = __atomic_fetch_add(&g_next_session_id, 1, __ATOMIC_RELAXED);
             memset(proc->session_user, 0, sizeof proc->session_user);
             memcpy(proc->session_user, u, ul);
+            if(actions[i].flags&~SPAWN_SESSION_LIVE || (actions[i].flags && boot_protocol_get()->boot_mode!=BOOT_MODE_LIVE)) {
+                proc->pid=0;return -EMBK_EINVAL;
+            }
+            proc->session_live=(actions[i].flags&SPAWN_SESSION_LIVE)!=0;
             proc->session_leader = true;
             proc->cap_set &= ~EMBK_CAP_BIT(EMBK_CAP_SESSION);
             break;

@@ -1,3 +1,5 @@
+#include "power/policy.h"
+#include "drivers/i2c/hid_i2c.h"
 #include "arch/x86_64/irq/lapic.h"
 #include "drivers/char/serial.h"
 #include "drivers/timer/hpet.h"
@@ -407,6 +409,7 @@ void lapic_timer_handler(void){
 
     lapic_timer_arm_ms(arm);
 
+    if (real_tick)cpu_power_poll();
     if (real_tick)
         power_timer_tick();   /* count it: see power.h */
 
@@ -420,6 +423,7 @@ void lapic_timer_handler(void){
      * calls schedule() below on its OWN tick -- that part doesn't change. */
     if (real_tick && this_cpu_is_bsp()) {
         lapic_ticks++; // Increment the LAPIC timer tick count
+        i2c_hid_tick();
         net_tick();    // 10 ms net clock: drive event-driven RX + client timeouts
                        // (a no-op with empty queues before the net stack is up)
     }

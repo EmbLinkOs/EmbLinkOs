@@ -7,7 +7,7 @@
 /* EMBX §5.6 capability ids. Index = cap_id; NULL for the invalid id 0. */
 static const char *const CAP_NAMES[] = {
     NULL, "filesystem", "network", "gpu", "audio", "camera",
-    "usb", "serial", "rawdisk", "kernel-ext", "debug",
+    "usb", "serial", "rawdisk", "kernel-ext", "debug", "session", "power", "screen", "network_admin",
 };
 #define CAP_COUNT ((int)(sizeof CAP_NAMES / sizeof CAP_NAMES[0]))
 

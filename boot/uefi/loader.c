@@ -16,6 +16,7 @@
 #include "crypto/sha256.h"
 #include "console.h"
 #include "menu.h"
+#include "display_mode.h"
 
 /* A BYTE ON COM1. See crt0.S: the firmware's console may not be ours yet, and
  * on real hardware may not exist, so the loader marks its own progress on the
@@ -139,7 +140,28 @@ static EFI_PHYSICAL_ADDRESS alloc_pages(EFI_ALLOCATE_TYPE how,
                                         const char *what) {
     EFI_PHYSICAL_ADDRESS m = at;
     EFI_STATUS s = ST->BootServices->AllocatePages(how, EfiLoaderData, pages, &m);
-    if (EFI_ERROR(s)) { con_print(what); con_die("AllocatePages failed"); }
+    if (EFI_ERROR(s)) {
+        con_print(what);
+        con_print("AllocatePages status="); con_printhex(s);
+        con_print(" address="); con_printhex(at);
+        con_print(" pages="); con_printhex(pages); con_print("\n");
+        UINTN bytes = 0, key = 0, stride = 0;
+        uint32_t version = 0;
+        EFI_MEMORY_DESCRIPTOR *map = 0;
+        ST->BootServices->GetMemoryMap(&bytes, 0, &key, &stride, &version);
+        bytes += 8 * sizeof(EFI_MEMORY_DESCRIPTOR);
+        if (!EFI_ERROR(ST->BootServices->AllocatePool(EfiLoaderData, bytes, (void **)&map)) &&
+            !EFI_ERROR(ST->BootServices->GetMemoryMap(&bytes, map, &key, &stride, &version))) {
+            for (UINTN offset = 0; stride >= sizeof(*map) && offset + sizeof(*map) <= bytes; offset += stride) {
+                EFI_MEMORY_DESCRIPTOR *d = (void *)((uint8_t *)map + offset);
+                if (d->PhysicalStart >= 0x1000000) continue;
+                con_print("  memory "); con_printhex(d->PhysicalStart);
+                con_print(" pages="); con_printhex(d->NumberOfPages);
+                con_print(" type="); con_printhex(d->Type); con_print("\n");
+            }
+        }
+        con_die("AllocatePages failed");
+    }
     return m;
 }
 
@@ -238,13 +260,62 @@ static uint64_t find_acpi_rsdp(void) {
     return v10;   /* 2.0 not found: 1.0 if present, else 0 */
 }
 
+static void fill_boot_device(EFI_HANDLE image, struct boot_protocol *bp) {
+    EFI_GUID image_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+    EFI_GUID path_guid = EFI_DEVICE_PATH_PROTOCOL_GUID;
+    EFI_LOADED_IMAGE_PREFIX *loaded = 0;
+    uint8_t *path = 0;
+    if (EFI_ERROR(ST->BootServices->HandleProtocol(image, &image_guid, (void **)&loaded)) || !loaded)
+        return;
+    if (EFI_ERROR(ST->BootServices->HandleProtocol(loaded->DeviceHandle, &path_guid, (void **)&path)) || !path)
+        return;
+    /* Device paths are variable length. Bound the walk and validate every node. */
+    for (unsigned off = 0; off + 4 <= 4096;) {
+        const uint8_t *n = path + off;
+        unsigned len = n[2] | ((unsigned)n[3] << 8);
+        if (len < 4 || len > 4096 - off || n[0] == 0x7f) return;
+        if (n[0] == 4 && n[1] == 1 && len == 42) {
+            if (n[41] == 2) mini_memcpy(bp->boot_partition_guid, n + 24, 16);
+            else if (n[41] == 1) mini_memcpy(&bp->boot_disk_sig, n + 24, 4);
+            return;
+        }
+        off += len;
+    }
+}
+
 static void fill_framebuffer(struct boot_protocol *bp) {
     EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
     EFI_STATUS s = ST->BootServices->LocateProtocol(&gop_guid, 0, (void **)&gop);
     if (EFI_ERROR(s) || !gop) { con_print("  (no GOP; fb left 0)\n"); return; }
 
+    unsigned preferred_w=0,preferred_h=0;
+    EFI_GUID edid_guid={0xbd8c1056,0x9f36,0x44ec,{0x92,0xa8,0xa6,0x33,0x7f,0x81,0x79,0x86}};
+    struct {uint32_t size;uint8_t *bytes;} *edid=0;
+    if(!EFI_ERROR(ST->BootServices->LocateProtocol(&edid_guid,0,(void **)&edid)) && edid)
+        edid_preferred(edid->bytes,edid->size,&preferred_w,&preferred_h);
+    if(!gop->Mode || !gop->Mode->Info)con_die("GOP has no active mode");
     EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi = gop->Mode->Info;
+    uint32_t selected=gop->Mode->Mode;
+    int current_ok=efi_mode_usable(mi->HorizontalResolution,mi->VerticalResolution,mi->PixelsPerScanLine,mi->PixelFormat);
+    uint64_t best=current_ok?(uint64_t)mi->HorizontalResolution*mi->VerticalResolution:0;
+    if(!current_ok || (preferred_w && (mi->HorizontalResolution!=preferred_w || mi->VerticalResolution!=preferred_h))) {
+        for(unsigned i=0;i<gop->Mode->MaxMode && i<256;i++) {
+            EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info=0;UINTN size=0;
+            if(EFI_ERROR(gop->QueryMode(gop,i,&size,&info)) || !info)continue;
+            int usable=size>=sizeof *info && efi_mode_usable(info->HorizontalResolution,info->VerticalResolution,info->PixelsPerScanLine,info->PixelFormat);
+            int preferred=usable && info->HorizontalResolution==preferred_w && info->VerticalResolution==preferred_h;
+            uint64_t area=(uint64_t)info->HorizontalResolution*info->VerticalResolution;
+            if(preferred || (!current_ok && usable && area>best)) {selected=i;best=area;}
+            ST->BootServices->FreePool(info);
+            if(preferred)break;
+        }
+    }
+    if(selected!=gop->Mode->Mode && EFI_ERROR(gop->SetMode(gop,selected)))con_die("GOP rejected selected mode");
+    mi=gop->Mode->Info;
+    if(!efi_mode_usable(mi->HorizontalResolution,mi->VerticalResolution,mi->PixelsPerScanLine,mi->PixelFormat) ||
+       !gop->Mode->FrameBufferBase || (uint64_t)mi->PixelsPerScanLine*mi->VerticalResolution*4>gop->Mode->FrameBufferSize)
+        con_die("no usable linear RGB framebuffer");
     bp->fb_addr   = gop->Mode->FrameBufferBase;
     bp->fb_width  = mi->HorizontalResolution;
     bp->fb_height = mi->VerticalResolution;
@@ -404,7 +475,7 @@ static uint8_t verify_kernel(void) {
  * builds the boot_protocol + page tables, ExitBootServices, and jumps. Never
  * returns. This is the machinery the "Boot EmbLinkOS" and (later) "Recovery"
  * menu entries invoke; the menu itself lives in menu.c. */
-void boot_emblinkos(EFI_HANDLE image) {
+static void boot_emblinkos(EFI_HANDLE image,unsigned mode) {
     mark('B');                 /* B: booting -- the last marker before the kernel */
     con_print("\nBooting EmbLinkOS...\n");
 
@@ -426,6 +497,7 @@ void boot_emblinkos(EFI_HANDLE image) {
     bp->boot_disk_sig = 0;      /* not resolved yet (kernel probes all disks) */
     bp->boot_drive    = 0xFF;   /* n/a under UEFI */
     bp->acpi_rsdp     = find_acpi_rsdp();
+    bp->boot_mode=mode;fill_boot_device(image,bp);
 
     /* WHAT WAS TRUSTED, recorded before boot services go away and the
      * question becomes unanswerable. */
@@ -476,7 +548,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         int choice = menu_run();          /* draws the menu, returns an entry id */
         switch (choice) {
         case MENU_BOOT_EMBLINKOS:
-            boot_emblinkos(image);        /* never returns */
+        case MENU_RECOVERY:
+        case MENU_DIAGNOSTICS:
+        case MENU_LIVE_DESKTOP:
+            boot_emblinkos(image,choice==MENU_RECOVERY?BOOT_MODE_RECOVERY:
+                choice==MENU_DIAGNOSTICS?BOOT_MODE_DIAGNOSTICS:
+                choice==MENU_LIVE_DESKTOP?BOOT_MODE_LIVE:BOOT_MODE_NORMAL);        /* never returns */
             break;
         default:
             /* Recovery / Diagnostics / Firmware Update / Boot Manager / Secure

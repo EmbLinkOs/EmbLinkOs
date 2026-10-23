@@ -651,7 +651,7 @@ ARM_LIBEMBK_SRC := ui/scene/scene.c ui/backend/cpu_backend.c ui/backend/font.c \
                    ui/backend/scene_render.c ui/layout/layout.c \
                    ui/reactive/reactive.c ui/declare/declare.c \
                    ui/theme/theme.c ui/kit/kit.c ui/dsl/em.c ui/dsl/em_app.c \
-                   user/lib/auth.c
+                   user/lib/auth.c user/lib/fileops.c
 
 # build/aarch64/user/pic_ui_scene_scene.o -- the source path flattened, so two
 # files with the same basename in different directories cannot collide.

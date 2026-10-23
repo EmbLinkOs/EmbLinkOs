@@ -153,6 +153,8 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/cpu/rwlock.c \
              kernel/arch/x86_64/smp/smp.c \
              kernel/arch/x86_64/boot/boot_protocol.c \
+             kernel/arch/x86_64/boot/fw_cfg.c \
+             kernel/block/install.c kernel/block/install_protocol.c kernel/fs/embkfs/check.c \
              kernel/arch/x86_64/syscall/syscall.c \
              kernel/arch/x86_64/syscall/syscall_fast.c \
              kernel/syscall/syscalls.c \
@@ -194,6 +196,11 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/i2c/smbus.c \
              kernel/drivers/video/framebuffer.c \
              kernel/drivers/video/gpu.c \
+             kernel/drivers/video/intel_display.c \
+             kernel/acpi/display.c kernel/acpi/power.c \
+             kernel/process/session.c kernel/ipc/notify.c kernel/power/policy.c kernel/power/cpu.c \
+             kernel/drivers/i2c/designware.c kernel/drivers/i2c/designware_protocol.c \
+             kernel/drivers/i2c/hid_i2c.c kernel/drivers/i2c/hid_protocol.c kernel/drivers/input/hid_report.c \
              kernel/drivers/video/bochs_vbe.c \
              kernel/drivers/video/virtio_gpu.c \
              kernel/drivers/audio/ac97.c \
@@ -213,6 +220,17 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/bus/pci.c \
              kernel/drivers/bus/virtio_pci.c \
              kernel/net/net.c \
+             kernel/crypto/sha1.c \
+             kernel/crypto/hw_random.c \
+             kernel/net/wifi/wpa2_crypto.c \
+             kernel/net/wifi/wpa2.c \
+             kernel/net/wifi/ccmp.c \
+             kernel/net/wifi/station.c \
+             kernel/net/wifi/ax200_protocol.c \
+             kernel/net/wifi/ax200.c \
+             kernel/net/wifi/profile.c \
+             kernel/net/wifi/control.c \
+             kernel/net/wifi/wifi.c \
              kernel/net/virtio_net.c \
              kernel/net/e1000.c \
              kernel/net/igb.c \
@@ -317,7 +335,7 @@ KERNEL_ELF  = kernel/kernel.elf
 # identically. Keep kernel.elf (with symbols) for gdb + the .embdbg producer.
 STRIP       = x86_64-elf-strip
 # The UEFI loader is an x86_64 PE whatever ARCH the rest of the build targets.
-UEFI_OBJCOPY = x86_64-elf-objcopy
+UEFI_OBJCOPY ?= $(shell python3 tools/find_efi_objcopy.py)
 KERNEL_BIN  = kernel/kernel.strip.elf
 
 # The kernel's own .embdbg panic-symbol sidecar (EMBDBG_Specification.md §7),
@@ -412,12 +430,10 @@ USER_INC     = -Iuser/lib
 
 # The real pid-1 init: kernel spawns it first; it brings up the desktop session
 # and supervises. Freestanding (no libc) -- init stays minimal (USERSPACE_v2 UP1).
-# AUTOLOGIN=0 builds a production init: no session without a password. The
-# default (unset) keeps the development auto-login -- see DEV_AUTOLOGIN in
-# init.c for exactly what it does and does not do. make does not track a
-# variable's value: after changing it, `touch user/system/init/init.c`.
+# Authentication is the default. UI tests select explicit live mode through
+# EmbBoot or QEMU's opt/emblink/live file, without changing the init binary.
 build/init.o: user/system/init/init.c user/lib/session_policy.h | $(BUILD)
-	$(USER_CC) $(USER_CFLAGS) $(if $(AUTOLOGIN),-DDEV_AUTOLOGIN=$(AUTOLOGIN)) -c $< -o $@
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 build/init.elf: build/init.o user/lib/user.ld
 	$(USER_LD) -T user/lib/user.ld build/init.o -o $@
@@ -1564,7 +1580,9 @@ $(BUILD)/picobj_dsl_em_app.o: ui/dsl/em_app.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_auth.o: user/lib/auth.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
-LIBEMBK_OBJS = $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
+$(BUILD)/picobj_fileops.o: user/lib/fileops.c user/lib/fileops.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+LIBEMBK_OBJS = $(BUILD)/picobj_fileops.o  $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
                $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
                $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
                $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
@@ -2452,49 +2470,22 @@ build/uefi_sha256.o: kernel/crypto/sha256.c kernel/crypto/sha256.h | $(BUILD)
 UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
             build/uefi_menu.o build/uefi_sha256.o build/uefi_kernel_blob.o
 
-# -pie, NOT -shared, and that one word is the difference between an EFI
-# application that runs and one that cannot.
-#
-# With this binutils, `-shared` plus an external `-T` script produces an image
-# whose cross-file global accesses are ABSOLUTE -- the linker relaxes the
-# compiler's GOT reference into `mov $0xef030,%rax`, the symbol's LINK-TIME
-# address -- and emits no relocation to correct it. UEFI loads an application
-# wherever it likes, so every such global then reads from low memory that is
-# not the image: the system table pointer came back as ffffffffffffffff and the
-# first console write jumped into nowhere (#UD at 0xB0000). crt0's relocation
-# loop could not save it, because there were no relocations to apply.
-#
-# `-pie` makes the same linker, the same script and the same objects produce
-# RIP-relative accesses (`lea 0xed03d(%rip),%rax`) -- position-independent by
-# construction, nothing to relocate. Checked instruction by instruction, not
-# assumed.
-# -pie, NOT -shared, and the difference is the whole loader.
-#
-# With `-shared` this linker relaxes a cross-file global read into an ABSOLUTE
-# address -- `mov $0xef030,%rax`, the link-time address -- and emits NO
-# relocation to correct it. crt0's fixup loop then has nothing to apply, so
-# every global is read from low memory that is not the image, and the loader
-# dies on its first console call with the firmware's screen still blank. `-pie`
-# makes the same linker, script and objects emit `lea 0x...(%rip)`.
-#
-# THIS RULE DEPENDS ON THE MAKEFILE because that flag lives here: without it,
-# changing it rebuilds nothing and the image on disk is from the old one. That
-# is not hypothetical -- it happened while writing tools/uefi_test.py, and for
-# one run the test reported OK on a binary it had not built.
+# Forward link options explicitly: bare-metal GCC does not pass its -shared
+# driver flag through like a hosted GCC. Bind local globals and retain separate
+# dynamic metadata sections so the self-relocator sees every required fixup.
 build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds Makefile
-	$(CC) -nostdlib -pie -Bsymbolic -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
+	$(CC) -nostdlib -Wl,-shared,-Bsymbolic,--no-undefined -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
+
 
 # ELF -> PE32+ EFI application. The efi-app-x86_64 pseudo-target sets the EFI
 # subsystem and PE layout correctly.
 #
-# THE CROSS objcopy, not the host's. The note here used to say the cross one
-# lacked PE support, and the host's was used instead -- which is a build that
-# cannot work on a host whose objcopy is not GNU's (macOS ships none at all).
-# `x86_64-elf-objcopy --info` lists pei-x86-64, so the toolchain this tree
-# already requires can do it, and the build stops depending on what else the
-# machine happens to have.
-$(BOOTX64): build/uefi_loader.so
-	$(UEFI_OBJCOPY) -O efi-app-x86_64 -j .text -j .data -j .reloc $< $@
+# Prefer the cross objcopy when it supports EFI PE output, otherwise select a
+# compatible GNU host tool. Bare-metal binutils builds may enable only ELF;
+# tools/find_efi_objcopy.py checks actual targets rather than assuming support.
+$(BOOTX64): build/uefi_loader.so tools/check_uefi_elf.py
+	python3 tools/check_uefi_elf.py $<
+	$(UEFI_OBJCOPY) -O efi-app-x86_64 -j .text -j .rodata -j .data -j .bss -j .got -j .rela -j .reloc $< $@
 
 # DOES IT BOOT THE WAY MACHINES BOOT NOW? Both images, under the real firmware.
 #

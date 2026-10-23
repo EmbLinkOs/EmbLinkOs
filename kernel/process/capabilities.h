@@ -83,10 +83,11 @@
  * application is displaying". A screenshot tool needs it; nothing else on this
  * machine does. */
 #define EMBK_CAP_SCREEN     13
+#define EMBK_CAP_NETWORK_ADMIN 14
 /* BUMP THIS WITH THE LAST ID. It stayed at 11 when POWER was added, which
  * quietly dropped POWER out of EMBK_CAP_ALL and made every sys_power call
  * return -EPERM with nothing to say why. */
-#define EMBK_CAP_MAX_ID      13
+#define EMBK_CAP_MAX_ID      14
 
 #define EMBK_CAP_BIT(id)  (1ULL << (id))
 

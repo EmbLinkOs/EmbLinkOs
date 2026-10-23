@@ -21,6 +21,7 @@
  * HVF), 1.7 s under full x86 emulation, which is where most of the test suite
  * runs. */
 #define AUTH_ITERATIONS 210000u
+#define AUTH_ITERATIONS_MAX 1000000u
 #define SHA256_BLOCK 64
 #define SHA256_SIZE 32
 
@@ -31,7 +32,7 @@ void embk_auth_set_dir(const char *dir) {
     snprintf(g_dir, sizeof g_dir, "%s", dir && *dir ? dir : "/etc");
 }
 uint32_t embk_auth_iterations(void) { return g_iterations; }
-void embk_auth_set_iterations(uint32_t n) { g_iterations = n < 1000u ? 1000u : n; }
+void embk_auth_set_iterations(uint32_t n) { g_iterations = n < 1000u ? 1000u : n > AUTH_ITERATIONS_MAX ? AUTH_ITERATIONS_MAX : n; }
 
 static void store_path(char *out, size_t cap, const char *leaf) {
     snprintf(out, cap, "%s/%s", g_dir, leaf);
@@ -272,16 +273,24 @@ static int make_shadow_line(const char *u, const char *password, uint32_t iterat
 /* Check `password` against the shadow line at `rec` (starting at the name).
  * Returns 1/0, and the stored iteration count in *iters. */
 static int check_record(const char *rec, const char *u, const char *password, uint32_t *iters) {
-    const char *p = rec + strlen(u) + 1, *prefix = "$pbkdf2-sha256$";
-    if (memcmp(p, prefix, 15) != 0) return 0;
-    p += 15;
-    char *end; uint32_t iterations = (uint32_t)strtoul(p, &end, 10);
-    if (!iterations || *end != '$') return 0;
-    p = end + 1;
-    uint8_t salt[16], expected[32], got[32];
-    if (strlen(p) < 33 || p[32] != '$' || from_hex(p, 16, salt) < 0) return 0;
-    p += 33;
-    if (strlen(p) < 64 || from_hex(p, 32, expected) < 0) return 0;
+    const char *end_line=strchr(rec,'\n');
+    if(!end_line)end_line=rec+strlen(rec);
+    size_t name_len=strlen(u);
+    const char *prefix="$pbkdf2-sha256$";
+    if((size_t)(end_line-rec)<name_len+1+15+1+1+32+1+64)return 0;
+    const char *p=rec+name_len+1;
+    if(memcmp(p,prefix,15))return 0;
+    p+=15;uint32_t iterations=0;unsigned digits=0;
+    while(p<end_line && *p>='0' && *p<='9') {
+        unsigned digit=(unsigned)(*p++-'0');
+        if(iterations>(AUTH_ITERATIONS_MAX-digit)/10)return 0;
+        iterations=iterations*10+digit;digits++;
+    }
+    if(!digits || !iterations || p>=end_line || *p++!='$')return 0;
+    uint8_t salt[16],expected[32],got[32];
+    if(end_line-p<32+1+64 || p[32]!='$' || from_hex(p,16,salt)<0)return 0;
+    p+=33;
+    if((end_line-p>64 && p[64]!=':') || from_hex(p,32,expected)<0)return 0;
     derive(password, salt, iterations, got);
     uint8_t diff = 0;
     for (int i = 0; i < 32; i++) diff |= got[i] ^ expected[i];     /* constant time */

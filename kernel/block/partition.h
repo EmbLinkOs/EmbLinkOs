@@ -37,4 +37,6 @@ struct embk_block_device *embk_partition_parent(struct embk_block_device *dev);
 // self-heal WRITE over the MBR / boot code. Call after embk_partition_scan_all().
 bool embk_block_is_partitioned(struct embk_block_device *disk);
 
+struct embk_block_device *embk_partition_boot_disk(void);
+
 #endif /* _PARTITION_H_ */

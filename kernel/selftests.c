@@ -9022,6 +9022,33 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    /* Laptop control-plane acceptance runs in ring 3 and waits for the full
+     * child result, including its confined preferences/file-operation probes. */
+    const char *device_mode=NULL;
+    if(!strcmp(cmd,"test devices fixture"))device_mode="--fixture";
+    else if(!strcmp(cmd,"test devices audio"))device_mode="--audio";
+    else if(!strcmp(cmd,"test devices preferences"))device_mode="--preferences";
+    else if(!strcmp(cmd,"test devices files"))device_mode="--files";
+    else if(!strcmp(cmd,"test devices policy"))device_mode="--policy";
+    if(device_mode || !strcmp(cmd,"test devices")) {
+        const char *path="/data/apps/devicecheck/devicecheck.elf";
+        char *args[]={(char *)path,(char *)device_mode,NULL};
+        int pid=process_create(path,args,device_mode?2:1,NULL,0);
+        int code=pid<0?pid:process_wait(pid);
+        kprintf("[cmd] %s: exit=%d -> %s\n",cmd,code,code?"FAIL":"OK");
+        return code?1:0;
+    }
+    if(!strcmp(cmd,"test ipc cancel")) {
+        char *args[]={"/system/bin/primtest.elf","ipc-cancel",NULL};
+        unsigned before=channel_live_count();
+        int pid=process_create(args[0],args,2,NULL,0);
+        int code=pid<0?pid:process_wait(pid);
+        unsigned after=channel_live_count();
+        int ok=!code && before==after;
+        kprintf("[cmd] test ipc cancel: exit=%d, IPC counts restored=%u -> %s\n",code,before==after,ok?"OK":"FAIL");
+        return ok?0:1;
+    }
+
     if (strcmp(cmd, "test posix") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test posix: VFS not registered\n");

@@ -209,3 +209,15 @@ buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable ker
 - **Verification:** oracle-first — Python formatter/verifier is ground truth; the C reader is validated against it.
 - **Git hygiene:** PR-based workflow, `Teo` branch; after a GitHub-side PR merge, fetch → check log → merge master into `Teo` (not blind force-push). Non-fast-forward rejections from PR merges / CodeQL auto-fix commits are expected.
 - **Hardware:** consult the Intel SDM before coding any hardware-level component.
+
+## Laptop integration boundaries (2026-10-23)
+
+Incoming syscall IDs 1–128 are retained; laptop APIs occupy 129–143. The x86
+screen controller layers on native session IDs and safe process teardown; it
+does not replace the scheduler. Home owns the lock surface and authd supplies
+password proof. Native AML is the sole active interpreter; battery/backlight
+methods run on a worker and UI reads cached snapshots. The old uACPI adapter
+is unlinked reference code. GPT partition identity chooses the actual boot root;
+Recovery mounts it read-only and installs only through an explicit disk plan.
+ARM shared code still cross-links; laptop screen/policy services report ENOTSUP
+there. See DAILY_USE.md and LAPTOP_VALIDATION.md for behavior and evidence.

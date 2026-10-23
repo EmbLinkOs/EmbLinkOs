@@ -48,6 +48,7 @@ def boot(name, scratch, audio=None, tablet=False, nic=None):
                    check=True, cwd=ROOT)
     argv = [
         "qemu-system-x86_64", "-cpu", "max",
+        "-fw_cfg", "name=opt/emblink/live,string=1",
         "-drive", "format=raw,file=myos.img,if=ide,index=0",
         "-drive", "format=raw,file=%s,if=ide,index=1" % scratch,
         "-vga", "none", "-device", "virtio-vga,xres=1024,yres=768",

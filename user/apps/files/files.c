@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 
 #include "embk.h"
+#include "fileops.h"
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
@@ -401,19 +402,8 @@ static void do_paste(void) {
     if (!g_clip_path[0]) return;
     char dest[600];
     join(dest, sizeof dest, g_clip_name);
-    int in = (int)embk_open(g_clip_path, EMBK_O_RDONLY, 0);
-    if (in < 0) { snprintf(g_status, sizeof g_status, "Cannot read %s", g_clip_name); return; }
-    int out = (int)embk_open(dest, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
-    if (out < 0) { embk_close(in);
-        snprintf(g_status, sizeof g_status, "Cannot write here"); return; }
-    static char buf[8192];
-    int64_t n, total = 0; int ok = 1;
-    while ((n = embk_read(in, buf, sizeof buf)) > 0) {
-        if (embk_write(out, buf, (size_t)n) != n) { ok = 0; break; }
-        total += n;
-    }
-    embk_close(in); embk_close(out);
-    snprintf(g_status, sizeof g_status, ok ? "Copied %s" : "Copy of %s failed", g_clip_name);
+    int ok=embk_file_copy(g_clip_path,dest)==0;
+    snprintf(g_status,sizeof g_status,ok?"Copied %s":"Copy of %s failed (destination may already exist)",g_clip_name);
     g_dirty = true;
 }
 

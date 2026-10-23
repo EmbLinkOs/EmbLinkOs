@@ -8,6 +8,20 @@ first (the intended design and the decisions behind it), then this file
 history are ground truth; this file is reconstructed for the design record —
 if it disagrees with the code, the code wins.*
 
+## Laptop integration, 2026-10-23
+
+The `laptop-daily-use` branch incorporates master through `a281865` (210 incoming
+commits), retaining portable syscalls, ARM64/RPi4, VM/page-cache work, native
+AML and the newer desktop. Laptop APIs are appended after syscall 128 and
+capabilities 1–12 retain the incoming meanings. See
+[LAPTOP_VALIDATION.md](LAPTOP_VALIDATION.md) for current build/native evidence,
+[DAILY_USE.md](DAILY_USE.md) for behavior and limits, and the
+[progress gallery](media/laptop-progress/README.md) for actual captures.
+
+Physical Wi-Fi, laptop input/audio/panel/firmware and suspend/resume remain open.
+The older sections below are a design/handoff record; current test claims are
+recorded separately in LAPTOP_VALIDATION.md.
+
 ## Project Overview
 
 Building a complete x86_64 operating system from absolute zero — custom

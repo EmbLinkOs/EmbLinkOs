@@ -1,3 +1,10 @@
+#if defined(__x86_64__)
+#include "power/policy.h"
+#define INPUT_ACTIVITY() power_activity()
+#else
+#define INPUT_ACTIVITY() ((void)0)
+#endif
+#include "include/spinlock.h"
 #include "drivers/input/keyboard.h"
 /* PS/2 is an x86 device, and this file is now TWO things: the PS/2 controller
  * driver, and the keyboard POLICY every input source shares -- the char ring,
@@ -120,6 +127,7 @@ static volatile uint8_t g_mods;
 
 /* Defined below (they need the tables above and the 8042 helpers below); the
  * IRQ handler sits between the two and has to reach both. */
+static spinlock_t input_state_lock=SPINLOCK_INIT;
 static void kbd_set_leds(void);
 static const struct keymap *g_layout;
 
@@ -132,6 +140,7 @@ static struct key_event ev_ring[KBD_EVENT_RING];
 static volatile uint32_t ev_head, ev_tail;
 
 static void kbd_event_push(uint16_t code, int pressed) {
+    INPUT_ACTIVITY();
     uint32_t nh = (ev_head + 1) % KBD_EVENT_RING;
     if (nh == ev_tail) return;             /* full: drop the newest (see above) */
     ev_ring[ev_head].code    = code;
@@ -216,25 +225,24 @@ static void mod_update(uint8_t side_bit, uint8_t pair_mask, uint8_t ekm,
 /* The locks. A latch, not a level: it flips on the MAKE and ignores the break
  * entirely (holding Caps Lock down does not "hold" anything), which is exactly
  * how it differs from Shift. The LED is the only feedback the user gets. */
-static void lock_toggle(uint8_t ekm, uint16_t code, int pressed)
+static void lock_toggle(uint8_t ekm, uint16_t code, int pressed,int leds)
 {
-    if (pressed) { g_mods ^= ekm; kbd_set_leds(); }
+    if (pressed) { g_mods ^= ekm; if(leds)kbd_set_leds(); }
     kbd_event_push(code, pressed);
 }
 
 #if defined(__x86_64__)
-static void keyboard_handler(void) {
-    uint8_t sc = inb(KBD_DATA_PORT);
-    static int extended = 0;     /* the previous byte was the 0xE0 prefix */
+static void keyboard_scancode(uint8_t sc,int *prefix,int leds) {
+    int extended = *prefix;     /* the previous byte was the 0xE0 prefix */
 
-    if (sc == 0xE0) { extended = 1; return; }   /* prefix: next byte is extended */
+    if (sc == 0xE0) { *prefix = 1; return; }   /* prefix: next byte is extended */
     if (sc == 0xE1) { return; }                 /* Pause/Break's 6-byte burst: not decoded */
 
     int     pressed = !(sc & 0x80);             /* break codes are make | 0x80 */
     uint8_t make    = sc & 0x7F;
 
     if (extended) {
-        extended = 0;
+        *prefix = 0;
         /* An 0xE0-prefixed 0x2A/0xAA is a FAKE shift: set 1 pads it around the
          * nav keys so a shift-unaware BIOS still sees sane codes. It must never
          * touch real shift state, and it is not a key -- drop it silently. */
@@ -285,9 +293,9 @@ static void keyboard_handler(void) {
         case 0x36: mod_update(SIDE_RSHIFT, SIDE_LSHIFT|SIDE_RSHIFT, EKM_SHIFT, EKC_RSHIFT, pressed); return;
         case 0x1D: mod_update(SIDE_LCTRL,  SIDE_LCTRL|SIDE_RCTRL,   EKM_CTRL,  EKC_LCTRL,  pressed); return;
         case 0x38: mod_update(SIDE_LALT,   SIDE_LALT|SIDE_RALT,     EKM_ALT,   EKC_LALT,   pressed); return;
-        case 0x3A: lock_toggle(EKM_CAPS,   EKC_CAPS,   pressed); return;
-        case 0x45: lock_toggle(EKM_NUM,    EKC_NUM,    pressed); return;
-        case 0x46: lock_toggle(EKM_SCROLL, EKC_SCROLL, pressed); return;
+        case 0x3A: lock_toggle(EKM_CAPS,   EKC_CAPS,   pressed,leds); return;
+        case 0x45: lock_toggle(EKM_NUM,    EKC_NUM,    pressed,leds); return;
+        case 0x46: lock_toggle(EKM_SCROLL, EKC_SCROLL, pressed,leds); return;
         default: break;
     }
 
@@ -325,6 +333,41 @@ static void keyboard_handler(void) {
 
     /* --- ordinary keys --- */
     kbd_translate(make, pressed);
+}
+static void keyboard_handler(void) {
+    static int prefix;
+    uint8_t sc=inb(KBD_DATA_PORT);
+    spin_lock(&input_state_lock);keyboard_scancode(sc,&prefix,1);spin_unlock(&input_state_lock);
+}
+static uint16_t hid_scancode(uint16_t usage) {
+    static const uint16_t scans[128] = {
+        [4]=0x1e,[5]=0x30,[6]=0x2e,[7]=0x20,[8]=0x12,[9]=0x21,[10]=0x22,
+        [11]=0x23,[12]=0x17,[13]=0x24,[14]=0x25,[15]=0x26,[16]=0x32,
+        [17]=0x31,[18]=0x18,[19]=0x19,[20]=0x10,[21]=0x13,[22]=0x1f,
+        [23]=0x14,[24]=0x16,[25]=0x2f,[26]=0x11,[27]=0x2d,[28]=0x15,[29]=0x2c,
+        [30]=2,[31]=3,[32]=4,[33]=5,[34]=6,[35]=7,[36]=8,[37]=9,[38]=10,[39]=11,
+        [40]=0x1c,[41]=1,[42]=0x0e,[43]=0x0f,[44]=0x39,[45]=0x0c,[46]=0x0d,
+        [47]=0x1a,[48]=0x1b,[49]=0x2b,[50]=0x2b,[51]=0x27,[52]=0x28,
+        [53]=0x29,[54]=0x33,[55]=0x34,[56]=0x35,[57]=0x3a,
+        [58]=0x3b,[59]=0x3c,[60]=0x3d,[61]=0x3e,[62]=0x3f,[63]=0x40,
+        [64]=0x41,[65]=0x42,[66]=0x43,[67]=0x44,[68]=0x57,[69]=0x58,
+        [71]=0x46,[73]=0xe052,[74]=0xe047,[75]=0xe049,[76]=0xe053,
+        [77]=0xe04f,[78]=0xe051,[79]=0xe04d,[80]=0xe04b,[81]=0xe050,[82]=0xe048,
+        [83]=0x45,[84]=0xe035,[85]=0x37,[86]=0x4a,[87]=0x4e,[88]=0xe01c,
+        [89]=0x4f,[90]=0x50,[91]=0x51,[92]=0x4b,[93]=0x4c,[94]=0x4d,
+        [95]=0x47,[96]=0x48,[97]=0x49,[98]=0x52,[99]=0x53,[100]=0x56,[101]=0xe05d
+    };
+    static const uint16_t mods[8]={0x1d,0x2a,0x38,0xe05b,0xe01d,0x36,0xe038,0xe05c};
+    uint16_t sc=usage>=0xe0 && usage<=0xe7?mods[usage-0xe0]:(usage<128?scans[usage]:0);
+    return sc;
+}
+
+void keyboard_inject_hid_usage(uint16_t usage,int down) {
+    uint16_t scan=hid_scancode(usage);if(!scan)return;
+    int prefix=0;spin_lock(&input_state_lock);
+    if(scan&0xff00)keyboard_scancode(0xe0,&prefix,0);
+    keyboard_scancode((scan&127)|(down?0:128),&prefix,0);
+    spin_unlock(&input_state_lock);
 }
 
 /* THE TRANSLATION, AS A FUNCTION YOU CAN CALL. Split out of the interrupt
@@ -636,7 +679,7 @@ uint16_t keyboard_keycode_of(uint8_t make) {
  * EK_* through it, a modifier). It is delivered only on the MAKE: a key
  * RELEASE has never produced a character on any of these paths, and emitting
  * one would double every keystroke. */
-void keyboard_inject_event(uint16_t code, int pressed, char ascii) {
+static void inject_event_inner(uint16_t code, int pressed, char ascii) {
     switch (code) {
     case EKC_LSHIFT: mod_update(SIDE_LSHIFT, SIDE_LSHIFT | SIDE_RSHIFT,
                                 EKM_SHIFT, code, pressed); return;
@@ -654,15 +697,18 @@ void keyboard_inject_event(uint16_t code, int pressed, char ascii) {
                                 EKM_GUI,   code, pressed); return;
     case EKC_RWIN:   mod_update(SIDE_RGUI,   SIDE_LGUI   | SIDE_RGUI,
                                 EKM_GUI,   code, pressed); return;
-    case EKC_CAPS:   lock_toggle(EKM_CAPS,   code, pressed); return;
-    case EKC_NUM:    lock_toggle(EKM_NUM,    code, pressed); return;
-    case EKC_SCROLL: lock_toggle(EKM_SCROLL, code, pressed); return;
+    case EKC_CAPS:   lock_toggle(EKM_CAPS,   code, pressed,0); return;
+    case EKC_NUM:    lock_toggle(EKM_NUM,    code, pressed,0); return;
+    case EKC_SCROLL: lock_toggle(EKM_SCROLL, code, pressed,0); return;
     default: break;
     }
 
     kbd_event_push(code, pressed);
     if (pressed && ascii)
         keyboard_deliver(ascii);
+}
+void keyboard_inject_event(uint16_t code,int pressed,char ascii) {
+    spin_lock(&input_state_lock);inject_event_inner(code,pressed,ascii);spin_unlock(&input_state_lock);
 }
 
 /* --- AZERTY (French) ------------------------------------------------------
@@ -818,8 +864,10 @@ void kbd_altgr_force(int on)       { if (on) g_side |= SIDE_RALT; else g_side &=
  * layout produce identical bytes, which is the only way `keyboard_set_layout`
  * can mean one thing on a machine that has both. */
 void keyboard_inject_cp(uint16_t code, int pressed, uint32_t cp) {
-    keyboard_inject_event(code, pressed, 0);      /* the event half */
+    spin_lock(&input_state_lock);
+    inject_event_inner(code, pressed, 0);      /* the event half */
     if (pressed && cp) keyboard_deliver_cp(cp);   /* the text half, as UTF-8 */
+    spin_unlock(&input_state_lock);
 }
 
 /* --- layouts -------------------------------------------------------------- */
@@ -907,6 +955,7 @@ void keyboard_set_interrupt_router(uint32_t pid) { g_console_int_router = pid; }
 uint32_t keyboard_get_interrupt_target(void) { return g_console_int_target; }
 
 static void keyboard_deliver(char c) {
+    INPUT_ACTIVITY();
     /* ^C: cancel the routed target instead of delivering a byte.
      *
      * DELIBERATELY BEFORE sched_lock(): process_cancel() takes g_sched_lock
@@ -1031,5 +1080,10 @@ int keyboard_getchar_blocking_cancelable(char *out) {
 // Inject a character as if it came from a keyboard press.
 // Called by the USB HID driver for keys received over xHCI.
 void keyboard_inject_char(char c) {
-    keyboard_deliver(c);
+    spin_lock(&input_state_lock);keyboard_deliver(c);spin_unlock(&input_state_lock);
+}
+void keyboard_flush_input(void) {
+    spin_lock(&input_state_lock);sched_lock();
+    buf_head=buf_tail=ev_head=ev_tail=0;
+    sched_unlock();spin_unlock(&input_state_lock);
 }

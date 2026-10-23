@@ -1,3 +1,4 @@
+#include "process/session.h"
 /* kernel/gfx/compositor.c -- the window compositor (see compositor.h). */
 
 #include "gfx/compositor.h"
@@ -326,7 +327,7 @@ static int top_z(void) {
 static struct comp_window *front_window(void) {
     struct comp_window *top = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-        if (!g_wins[i].used || !g_wins[i].visible) continue;
+        if (!g_wins[i].used || !g_wins[i].visible || !session_ui_allowed(g_wins[i].pid)) continue;
         if (!top || g_wins[i].z > top->z) top = &g_wins[i];
     }
     return top;
@@ -336,7 +337,7 @@ static struct comp_window *front_window(void) {
 static struct comp_window *topmost_at(int x, int y) {
     struct comp_window *best = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-        if (!g_wins[i].used || !g_wins[i].visible) continue;
+        if (!g_wins[i].used || !g_wins[i].visible || !session_ui_allowed(g_wins[i].pid)) continue;
         int fx0, fy0, fx1, fy1; win_frame_rect(&g_wins[i], &fx0, &fy0, &fx1, &fy1);
         if (x >= fx0 && x < fx1 && y >= fy0 && y < fy1)
             if (!best || g_wins[i].z > best->z) best = &g_wins[i];
@@ -349,12 +350,13 @@ static struct comp_window *topmost_at(int x, int y) {
  * drains it and they race; the front window is the one the user is looking at,
  * so it gets them. 0 = no window at all (then nobody is filtered). */
 uint32_t compositor_focused_pid(void) {
+    if(session_input_owner())return session_input_owner();
     uint32_t pid = 0;
     spin_lock(&g_comp_lock);
     struct comp_window *best = 0, *desk = 0;
     for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
         struct comp_window *w = &g_wins[i];
-        if (!w->used || !w->visible) continue;
+        if (!w->used || !w->visible || !session_ui_allowed(w->pid)) continue;
         if (w->desktop) { desk = w; continue; }     /* the fallback owner */
         /* CHROME NEVER TAKES THE KEYBOARD. A menu bar or an ambient widget has
          * nothing to type into, so letting one hold focus could only ever steal
@@ -761,7 +763,7 @@ static void paint_window(struct comp_window *w, int focused,
      * ugliest moment in launching anything. Now that the open animation waits
      * for the first real frame anyway, simply don't draw the window until it
      * has one: the desktop stays whole, and then the window grows in. */
-    if (!w->presented) return;
+    if (!w->presented || !session_ui_allowed(w->pid)) return;
 
     /* the drop shadow: drawn first (outside the frame) so the window content
      * lands on top of it, offset downward, and deeper while focused. */
@@ -1047,7 +1049,7 @@ static void paint_region(int rx0, int ry0, int rx1, int ry1) {
     while (drawn < COMP_MAX_WINDOWS) {
         int best = -1;
         for (int i = 0; i < COMP_MAX_WINDOWS; i++) {
-            if (!g_wins[i].used || !g_wins[i].visible) continue;
+            if (!g_wins[i].used || !g_wins[i].visible || !session_ui_allowed(g_wins[i].pid)) continue;
             if (g_wins[i].z <= last_z) continue;
             if (best < 0 || g_wins[i].z < g_wins[best].z) best = i;
         }
@@ -2309,4 +2311,16 @@ int compositor_win_input(int pid, int32_t *lx, int32_t *ly,
     }
     spin_unlock(&g_comp_lock);
     return focused;
+}
+
+void compositor_session_changed(void) {
+    spin_lock(&g_comp_lock);
+    g_drag_id=0;g_dragging=0;g_cap_win=0;g_cap_pid=0;g_ptr_pid=0;g_ptr_win=0;g_ptr_buttons=0;
+    uint32_t owner=session_input_owner();
+    g_anim.kind=ANIM_NONE;
+    if(owner)for(unsigned i=0;i<COMP_MAX_WINDOWS;i++)
+        if(g_wins[i].used && g_wins[i].pid==owner)g_wins[i].presented=false;
+    const fb_info_t *fi=fb_get_info();
+    if(fi)paint_region(0,0,fi->width,fi->height);
+    spin_unlock(&g_comp_lock);
 }

@@ -30,13 +30,27 @@
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
+#include "system_status.h"
 
-enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_KEYBOARD, PANE_TIME, PANE_SYSTEM, PANE_ABOUT, PANE_N };
+enum { PANE_APPEARANCE = 0, PANE_DESKTOP, PANE_WIFI, PANE_SOUND, PANE_DISPLAY, PANE_POWER, PANE_KEYBOARD, PANE_TIME, PANE_SYSTEM, PANE_ABOUT, PANE_N };
 
-static const char *g_pane_name[PANE_N] = { "Appearance", "Desktop & Dock", "Keyboard", "Date & Time", "System", "About" };
-static const int   g_pane_icon[PANE_N] = { IconStar, IconGrid, IconList, IconClock, IconBolt, IconInfo };
+static const char *g_pane_name[PANE_N] = { "Appearance", "Desktop & Dock", "Wi-Fi", "Sound", "Displays", "Battery & Power", "Keyboard", "Date & Time", "System", "About" };
+static const int   g_pane_icon[PANE_N] = { IconStar, IconGrid, IconCloud, IconBell, IconGrid, IconBolt, IconList, IconClock, IconBolt, IconInfo };
 
 static int   g_pane = PANE_APPEARANCE;
+static struct embk_audio_info g_audio;
+static struct embk_display_info g_display;
+static struct embk_gpu_info g_graphics;
+static struct embk_power_info g_power;
+static struct embk_policy g_policy;
+static int g_audio_rc,g_display_rc,g_power_rc;
+static struct embk_wifi_info g_wifi;
+static int g_wifi_rc=-19,g_wifi_pending;
+static unsigned g_wifi_action;
+static char g_wifi_message[160],g_ssid[33],g_password[65];
+static uint8_t g_selected[32];
+static unsigned g_selected_len;
+static uint64_t g_sample_next;
 static float g_scroll = 0;
 static struct oscfg g_cfg;
 static bool  g_loaded = false;
@@ -67,6 +81,25 @@ static void commit(void) {
 
 static void sample_system(void) {
     uint64_t ms = embk_uptime_ms();
+    if(ms>=g_sample_next) {
+        g_sample_next=ms+1000;
+        g_wifi_rc=embk_wifi_get(&g_wifi);
+        g_audio_rc=embk_audio_get(&g_audio);g_display_rc=embk_display_get(&g_display);
+        g_power_rc=embk_power_get(&g_power);embk_gpu_get(&g_graphics);embk_policy_get(&g_policy);
+        if(!g_wifi_rc && g_wifi_pending && g_wifi.completed_id &&
+           ((g_wifi.completed_id-(unsigned)g_wifi_pending)&0x7fffffffu)<0x40000000u) {
+            const char *message="Connection preferences changed.";
+            if(g_wifi.completed_id==(unsigned)g_wifi_pending) {
+                if(g_wifi.request_error) message=system_request_error(g_wifi.request_error);
+                else if(g_wifi_action==EMBK_WIFI_SCAN) message="";
+                else if(g_wifi_action==EMBK_WIFI_DISCONNECT) message="Disconnected.";
+                else if(g_wifi_action==EMBK_WIFI_FORGET) message="Network forgotten.";
+                else message="Network saved. Connecting…";
+            }
+            snprintf(g_wifi_message,sizeof g_wifi_message,"%s",message);
+            g_wifi_pending=0;
+        }
+    }
     unsigned long s = (unsigned long)(ms / 1000);
     if (s >= 3600) snprintf(g_uptime, sizeof g_uptime, "%lu h %lu min", s / 3600, (s % 3600) / 60);
     else           snprintf(g_uptime, sizeof g_uptime, "%lu min %lu s", s / 60, s % 60);
@@ -306,6 +339,207 @@ static void pane_desktop(void) {
  * Applied through the KERNEL (embk_kbd_layout) as well as saved, because the
  * layout is the driver's policy -- writing the file alone would change what
  * the machine remembers and not what it types. */
+static void wifi_action(unsigned action,const uint8_t *ssid,unsigned n) {
+    struct embk_wifi_request r={.version=EMBK_WIFI_VERSION,.action=action,.ssid_len=n};
+    if(n) memcpy(r.ssid,ssid,n);
+    if(action==EMBK_WIFI_CONNECT) {r.secret_len=strlen(g_password);memcpy(r.secret,g_password,r.secret_len);}
+    int rc=embk_wifi_change(&r);
+    volatile unsigned char *p=(unsigned char *)&r;for(unsigned i=0;i<sizeof r;i++) p[i]=0;
+    p=(unsigned char *)g_password;for(unsigned i=0;i<sizeof g_password;i++) p[i]=0;
+    if(rc>0) {g_wifi_pending=rc;g_wifi_action=action;snprintf(g_wifi_message,sizeof g_wifi_message,"Updating connection preferences…");}
+    else snprintf(g_wifi_message,sizeof g_wifi_message,"%s",system_request_error(rc));
+    g_sample_next=0;
+}
+static void ipv4_text(char out[20],uint32_t ip) {
+    snprintf(out,20,"%u.%u.%u.%u",ip>>24,(ip>>16)&255,(ip>>8)&255,ip&255);
+}
+static void pane_wifi(void) {
+    Section("Connection",.key="wifi-connection") {
+        Text(g_wifi_rc?"Network status is unavailable.":system_wifi_status(&g_wifi)).body();
+        if(g_wifi.ssid_len) {
+            char name[129];system_ssid(name,g_wifi.ssid,g_wifi.ssid_len);
+            ListRow(IconCloud,"Network",name);
+            em_flush();
+        }
+        if(g_wifi.flags&EMBK_WIFI_ADDRESS) {
+            char ip[20],dns[20];ipv4_text(ip,g_wifi.ip);ipv4_text(dns,g_wifi.dns);
+            ListRow(IconInfo,"IP address",ip);ListRow(IconInfo,"DNS",dns);em_flush();
+        }
+        if(g_wifi_message[0]) Text(g_wifi_message).caption().secondary();
+        if(!g_wifi_rc && (g_wifi.flags&EMBK_WIFI_READY) && !g_wifi_pending && !(g_wifi.flags&EMBK_WIFI_BUSY)) {
+            if(g_wifi.state || (g_wifi.flags&EMBK_WIFI_AUTOCONNECT)) {
+                if(Button("Disconnect").ghost().clicked()) wifi_action(EMBK_WIFI_DISCONNECT,NULL,0);
+            } else if(g_wifi.saved_count && Button("Reconnect").clicked()) wifi_action(EMBK_WIFI_RECONNECT,NULL,0);
+        }
+    }
+    if(g_wifi_rc || !(g_wifi.flags&EMBK_WIFI_READY) || (g_wifi.flags&EMBK_WIFI_BLOCKED)) return;
+    if(g_wifi_pending || (g_wifi.flags&EMBK_WIFI_BUSY)) return;
+    Section("Nearby networks",.key="wifi-nearby") {
+        Text("WPA2 Personal networks are supported.").caption().secondary();
+        if(!g_wifi.network_count) Text((g_wifi.flags&EMBK_WIFI_SCANNING)?"Scanning…":"No networks from a recent scan.").caption().secondary();
+        for(unsigned i=0;i<g_wifi.network_count && i<EMBK_WIFI_NETWORKS;i++) {
+            const struct embk_wifi_network *net=&g_wifi.networks[i];char name[129],id[16];
+            system_ssid(name,net->ssid,net->ssid_len);snprintf(id,sizeof id,"near%u",i);
+            HStack(.spacing=12,.grow=1,.align=Center) {
+                if(net->security==EMBK_WIFI_SEC_WPA2) {
+                    if(Button(name).id(id).ghost().grow().leading().clicked()) {
+                        memcpy(g_selected,net->ssid,net->ssid_len);g_selected_len=net->ssid_len;
+                        g_password[0]=0;g_wifi_message[0]=0;
+                    }
+                } else {Text(name).caption();Spacer();Text("Unsupported security").caption().tertiary();}
+            }
+        }
+        if(!(g_wifi.flags&EMBK_WIFI_SCANNING) && (g_wifi.state==0 || g_wifi.state==6)) {
+            if(Button("Scan again").clicked()) wifi_action(EMBK_WIFI_SCAN,NULL,0);
+        } else if(g_wifi.state>=2 && g_wifi.state<=5) {
+            Text("Disconnect before scanning other channels.").caption().tertiary();
+        }
+    }
+    Section("Join a network",.key="wifi-join") {
+        if(g_selected_len) {
+            char name[129];system_ssid(name,g_selected,g_selected_len);
+            ListRow(IconCloud,"Selected network",name);
+            if(Button("Enter another name").ghost().clicked()) {g_selected_len=0;g_password[0]=0;}
+        } else TextField(g_ssid,sizeof g_ssid,"Network name").id("wifi-name");
+        PasswordField(g_password,sizeof g_password,"Password").id("wifi-password");
+        Text("Remember this network and connect automatically after restart.").caption().secondary();
+        if(Button("Connect & save").primary().clicked()) {
+            unsigned n=g_selected_len?g_selected_len:(unsigned)strlen(g_ssid);
+            unsigned pn=strlen(g_password);
+            if(!n || pn<8) snprintf(g_wifi_message,sizeof g_wifi_message,"Enter a network name and a password of at least 8 characters.");
+            else wifi_action(EMBK_WIFI_CONNECT,g_selected_len?g_selected:(const uint8_t *)g_ssid,n);
+        }
+    }
+    if(g_wifi.saved_count) Section("Saved networks",.key="wifi-saved") {
+        for(unsigned i=0;i<g_wifi.saved_count && i<EMBK_WIFI_SAVED;i++) {
+            const struct embk_wifi_network *net=&g_wifi.saved[i];char name[129],join[20],forget[20];
+            system_ssid(name,net->ssid,net->ssid_len);snprintf(join,sizeof join,"join%u",i);snprintf(forget,sizeof forget,"forget%u",i);
+            HStack(.spacing=12,.align=Center,.grow=1) {
+                Text(name).caption();Spacer();
+                if(Button("Join").id(join).clicked()) wifi_action(EMBK_WIFI_RECONNECT,net->ssid,net->ssid_len);
+                if(Button("Forget").id(forget).ghost().clicked()) wifi_action(EMBK_WIFI_FORGET,net->ssid,net->ssid_len);
+            }
+        }
+    }
+}
+static void pane_sound(void) {
+    Section("Output") {
+        if(g_audio_rc || !(g_audio.flags&EMBK_AUDIO_AVAILABLE)) {Text("No supported audio output.").body().secondary();}
+        else {
+            ListRow(IconBell,"Device",g_audio.output);
+            static float level=-1;static int dragging;
+            if(level<0 || !dragging) level=g_audio.percent/100.f;
+            char pct[16];snprintf(pct,sizeof pct,"%u%%",g_audio.percent);
+            setting_label("Output volume",pct);
+            float previous=level;Slider(&level);em_flush();
+            if(level!=previous) {
+                unsigned volume=(unsigned)(level*100+0.5f);
+                int rc=embk_audio_volume(volume,(g_audio.flags&EMBK_AUDIO_MUTED)!=0);
+                if(rc) snprintf(g_saved,sizeof g_saved,"Volume change failed (%d)",rc);
+                else {g_audio.percent=volume;g_cfg.volume=volume;dragging=1;}
+            } else if(dragging && !ui_pointer_down()) {dragging=0;commit();}
+            bool muted=(g_audio.flags&EMBK_AUDIO_MUTED)!=0,was=muted;
+            Toggle("Mute",&muted);
+            em_flush();
+            if(muted!=was) {
+                int rc=embk_audio_volume(g_audio.percent,muted);
+                if(rc) snprintf(g_saved,sizeof g_saved,"Mute change failed (%d)",rc);
+                else {g_cfg.muted=muted;g_cfg.volume=g_audio.percent;commit();g_sample_next=0;}
+            }
+        }
+    }
+    Section("Input") {Text("Microphone recording is not available yet.").caption().secondary();}
+}
+static void pane_display(void) {
+    Section("Display") {
+        ListRow(IconGrid,"Resolution",g_res);
+        ListRow(IconInfo,"Graphics",g_graphics.driver);
+        ListRow(IconInfo,"Rendering","Software");
+    }
+    Section("Brightness") {
+        if(g_display.flags&EMBK_DISPLAY_NATIVE)Text("Native panel brightness").caption().secondary();
+        if(g_display_rc || !(g_display.flags&EMBK_DISPLAY_BACKLIGHT)) Text("Brightness control is unavailable on this display.").body().secondary();
+        else {
+            static float level=-1;static int dragging;
+            if(level<0 || !dragging) level=g_display.percent/100.f;
+            if(g_display.flags&EMBK_DISPLAY_KNOWN) {char pct[16];snprintf(pct,sizeof pct,"%u%%",g_display.percent);Text(pct).caption();em_flush();}
+            else Text("Current brightness is unavailable.").caption().secondary();
+            if(g_display.flags&EMBK_DISPLAY_BUSY) Text("Adjusting brightness…").caption();
+            else {
+                float was=level;Slider(&level);em_flush();
+                if(was!=level) dragging=1;
+                else if(dragging && !ui_pointer_down()) {
+                    dragging=0;int rc=embk_display_brightness((unsigned)(level*100+0.5f));
+                    if(rc) snprintf(g_saved,sizeof g_saved,"Brightness failed (%d)",rc);
+                    g_sample_next=0;
+                }
+            }
+            if(g_display.last_error) Text("The display could not apply the brightness change.").caption();
+        }
+    }
+}
+static void save_policy(void) {
+    struct embk_policy p={.version=EMBK_POLICY_VERSION,.flags=g_cfg.lid_lock?EMBK_POLICY_LID_LOCK:0,
+        .idle_dim_seconds=g_cfg.idle_dim_seconds,.idle_lock_seconds=g_cfg.idle_lock_seconds,.profile=g_cfg.power_profile};
+    int rc=embk_policy_set(&p);
+    if(rc)snprintf(g_saved,sizeof g_saved,"Power preference failed (%d)",rc);
+    else commit();
+}
+static void pane_power(void) {
+    Section("Battery") {
+        if(g_power_rc) Text("Power information is unavailable.").body().secondary();
+        else if(!(g_power.flags&EMBK_POWER_BATTERY)) Text("No battery reported.").body().secondary();
+        else {
+            char pct[24];
+            if(g_power.percent==EMBK_POWER_UNKNOWN || embk_uptime_ms()>g_power.sampled_ms+10000) snprintf(pct,sizeof pct,"Unavailable");
+            else snprintf(pct,sizeof pct,"%u%%",g_power.percent);
+            ListRow(IconBolt,"Charge",pct);
+            const char *state="Unavailable";
+            if((g_power.flags&(EMBK_POWER_CHARGING|EMBK_POWER_DISCHARGING))==(EMBK_POWER_CHARGING|EMBK_POWER_DISCHARGING)) state="Mixed battery states";
+            else if(g_power.flags&EMBK_POWER_CHARGING) state="Charging";
+            else if(g_power.flags&EMBK_POWER_DISCHARGING) state="On battery";
+            else if((g_power.flags&(EMBK_POWER_AC_KNOWN|EMBK_POWER_AC_ONLINE))==(EMBK_POWER_AC_KNOWN|EMBK_POWER_AC_ONLINE)) state="Connected to power";
+            if(embk_uptime_ms()>g_power.sampled_ms+10000) state="Unavailable";
+            ListRow(IconInfo,"Status",state);
+            if((g_power.flags&EMBK_POWER_CRITICAL) || (g_power.percent<=10 && (g_power.flags&EMBK_POWER_DISCHARGING)))
+                Text("Battery is low. Connect your charger and save your work.").body();
+        }
+    }
+    Section("Automatic locking") {
+        static const char *times[]={"Never","5 min","15 min"};
+        static const int seconds[]={0,300,900};
+        int selected=g_cfg.idle_lock_seconds==0?0:g_cfg.idle_lock_seconds<=300?1:2,previous=selected;
+        Segmented(times,3,&selected);em_flush();
+        if(selected!=previous) {g_cfg.idle_lock_seconds=seconds[selected];save_policy();}
+        bool lid=g_cfg.lid_lock!=0,old=lid;
+        Toggle("Lock when the lid closes",&lid);em_flush();
+        if(lid!=old){g_cfg.lid_lock=lid;save_policy();}
+        bool dim=g_cfg.idle_dim_seconds!=0,was=dim;
+        Toggle("Dim brightness after two minutes idle",&dim);em_flush();
+        if(dim!=was){g_cfg.idle_dim_seconds=dim?120:0;save_policy();}
+        int session_status=embk_session(EMBK_SESSION_STATUS,0);
+        if(session_status>=0 && (session_status&EMBK_SESSION_LIVE))
+            Text("Live sessions have no password lock.").caption().secondary();
+    }
+    Section("Processor energy") {
+        if(g_policy.flags&EMBK_POLICY_HWP) {
+            static const char *profiles[]={"Balanced","Save energy","Performance"};
+            int profile=g_cfg.power_profile,old=profile;Segmented(profiles,3,&profile);em_flush();
+            if(profile!=old){g_cfg.power_profile=profile;save_policy();}
+        } else Text("Processor energy profiles are unavailable on this CPU.").caption().secondary();
+    }
+    Section("Power") {
+        if(g_power.flags&EMBK_POWER_LID_KNOWN) ListRow(IconInfo,"Lid",(g_power.flags&EMBK_POWER_LID_CLOSED)?"Closed":"Open");
+        Text("Sleep and automatic sleep when closing the lid are not available yet.").caption().secondary();
+        Text("Save your work before restarting or shutting down.").caption().secondary();
+        if(g_power.flags&EMBK_POWER_BUSY) Text("Preparing to shut down…").body();
+        else HStack(.spacing=12) {
+            if(Button("Restart").clicked()) {int rc=embk_power_request(EMBK_POWER_REBOOT);if(rc) snprintf(g_saved,sizeof g_saved,"Restart failed (%d)",rc);}
+            if(Button("Shut down").clicked()) {int rc=embk_power_request(EMBK_POWER_OFF);if(rc) snprintf(g_saved,sizeof g_saved,"Shutdown failed (%d)",rc);}
+        }
+        if(g_power.last_error) Text("The last power request failed. Your session is still running.").caption();
+    }
+}
 static void pane_keyboard(void) {
     Section("Layout") {
         const char *names[OSCFG_KEYMAPS];
@@ -476,6 +710,10 @@ static void app(void) {
                         switch (g_pane) {
                             case PANE_APPEARANCE: pane_appearance(); break;
                             case PANE_DESKTOP:    pane_desktop();    break;
+                            case PANE_SOUND:      pane_sound();      break;
+                            case PANE_DISPLAY:    pane_display();    break;
+                            case PANE_POWER:      pane_power();      break;
+                            case PANE_WIFI:       pane_wifi();       break;
                             case PANE_KEYBOARD:   pane_keyboard();   break;
                             case PANE_TIME:       pane_time();       break;
                             case PANE_SYSTEM:     pane_system();     break;

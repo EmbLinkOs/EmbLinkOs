@@ -383,3 +383,26 @@ bool pmm_add_region(uint64_t phys, uint64_t length) {
             (unsigned long long)phys, (unsigned long long)free_pages);
     return added > 0;
 }
+
+uint64_t pmm_alloc_contiguous(uint64_t pages,uint64_t alignment) {
+    if(!pages || !alignment || (alignment&(alignment-1))) return 0;
+    spin_lock(&pmm_lock);
+    if(pages>total_pages || alignment>total_pages || pages>free_pages) {
+        spin_unlock(&pmm_lock);return 0;
+    }
+    uint64_t limit=total_pages-pages,first=alignment;
+    while(first<=limit) {
+        uint64_t i=0;
+        while(i<pages) {pmm_scan_bits++;if(bitmap_test(first+i)) break;i++;}
+        if(i==pages) {
+            for(i=0;i<pages;i++) bitmap_set(first+i);
+            free_pages-=pages;used_pages+=pages;pmm_scan_allocs+=pages;
+            pmm_hint=first+pages;if(pmm_hint>=total_pages) pmm_hint=0;
+            spin_unlock(&pmm_lock);return first*PAGE_SIZE;
+        }
+        /* Skip the used page and align the next possible start. This cannot
+         * overflow: first+i is bounded by total_pages (physical pages). */
+        first=(first+i+alignment)&~(alignment-1);
+    }
+    spin_unlock(&pmm_lock);return 0;
+}

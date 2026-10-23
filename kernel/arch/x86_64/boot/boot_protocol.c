@@ -1,4 +1,5 @@
 #include "boot/boot_protocol.h"
+#include "arch/x86_64/boot/fw_cfg.h"
 #include "include/kstring.h"
 #include "mm/pmm.h"                  /* KP2V */
 #include "drivers/char/serial.h"
@@ -58,6 +59,7 @@ void boot_protocol_capture(uint64_t phys)
     memset(&g_bp, 0, sizeof g_bp);
     memcpy(&g_bp, src, take);
     g_bp.size = take;          /* what we actually HAVE, not what was offered */
+    if(!g_bp.boot_mode && boot_qemu_live())g_bp.boot_mode=BOOT_MODE_LIVE;
     g_valid = true;
 }
 
@@ -119,3 +121,4 @@ void boot_protocol_dump(void)
             (unsigned)g_bp.boot_drive, (unsigned)g_bp.boot_disk_sig,
             (unsigned long)g_bp.acpi_rsdp);
 }
+bool boot_recovery_mode(void) {return g_valid && (g_bp.boot_mode==BOOT_MODE_RECOVERY || g_bp.boot_mode==BOOT_MODE_DIAGNOSTICS);}

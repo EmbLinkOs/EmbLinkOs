@@ -41,6 +41,7 @@ Block map (4 KiB blocks):
 """
 
 import sys
+from pathlib import Path
 import os
 import glob
 import struct
@@ -1042,6 +1043,15 @@ def discover_userland_objects(build_dir="build"):
         blob = _read_file(host)
         if blob is not None:
             objects.append((name, L.DT_REG, L.S_IFREG | L.PERM_FILE, blob))
+
+    # Device firmware is data; never compile it into the kernel image.
+    for prefix in ("system/firmware", "system/licenses"):
+        directory=Path(prefix)
+        if directory.is_dir():
+            for host in sorted(directory.rglob("*")):
+                if host.is_file():
+                    objects.append((host.as_posix().encode(), L.DT_REG,
+                                    L.S_IFREG | L.PERM_FILE, host.read_bytes()))
 
     # THE HEADERS (the other half of "targeting EmbLinkOS"): newlib's include
     # tree under /system/abi/include (declaring the libc is part of the sealed

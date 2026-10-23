@@ -248,7 +248,9 @@ uint32_t keyboard_get_interrupt_target(void);
 int keyboard_getchar_blocking_cancelable(char *out);
 
 // Inject a character into the keyboard buffer (used by USB HID driver).
+void keyboard_flush_input(void);
 void keyboard_inject_char(char c);
+void keyboard_inject_hid_usage(uint16_t usage,int down);
 
 /* Deliver one DECODED key from any hardware -- the seam every input driver that
  * is not PS/2 comes in through (virtio-input today, and where USB HID belongs).

@@ -25,6 +25,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include "embk_syscall.h"
 
 /* ==================================================================== */
@@ -72,6 +73,7 @@
 #define EMBK_SPAWN_ACTION_INSTALL_OBJ 4   /* 2/3 are surface/channel inherits */
 #define EMBK_SPAWN_ACTION_SET_CAPS    5   /* attenuate child caps; `flags` = mask */
 #define EMBK_SPAWN_ACTION_NS_BIND     7   /* narrow child namespace; `path`=prefix, `flags`=mode */
+#define EMBK_SPAWN_SESSION_LIVE 1u
 #define EMBK_SPAWN_ACTION_NEW_SESSION 8   /* child leads a new session for user `path` */
 
 /* Coarse resource-class capabilities (kernel capabilities.h, EMBX spec §5.6).
@@ -94,6 +96,7 @@
  * holds it; an application has no business with it. */
 #define EMBK_CAP_POWER      12
 #define EMBK_CAP_SCREEN     13
+#define EMBK_CAP_NETWORK_ADMIN 14
 #define EMBK_CAP_BIT(id)     (1u << (id))
 struct embk_spawn_file_action {
     unsigned char kind;         /* EMBK_SPAWN_ACTION_* */
@@ -1380,6 +1383,80 @@ static inline int embk_audio_drained(void) {
 static inline int embk_audio_close(void) {
     return (int)embk_syscall1(EMBK_SYS_audio_close, 0);
 }
+
+/* WPA2 station status contains no passwords or saved keys. Changes require
+ * NETWORK_ADMIN; NETWORK alone only permits reading connection state. */
+#include "embk_wifi.h"
+static inline int embk_wifi_get(struct embk_wifi_info *info) {
+    return (int)embk_syscall2(EMBK_SYS_wifi_info, (int64_t)(intptr_t)info, sizeof *info);
+}
+static inline int embk_wifi_change(const struct embk_wifi_request *request) {
+    return (int)embk_syscall2(EMBK_SYS_wifi_request, (int64_t)(intptr_t)request, sizeof *request);
+}
+
+#include "embk_power.h"
+#include "embk_display.h"
+#include "embk_audio.h"
+#include "embk_gpu.h"
+static inline int embk_power_get(struct embk_power_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_power_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_display_get(struct embk_display_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_display_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_audio_get(struct embk_audio_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_audio_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_gpu_get(struct embk_gpu_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_gpu_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_display_brightness(unsigned percent) {
+    return (int)embk_syscall1(EMBK_SYS_display_set,percent);
+}
+static inline int embk_audio_volume(unsigned percent,unsigned mute) {
+    return (int)embk_syscall2(EMBK_SYS_audio_control,percent,mute);
+}
+static inline int embk_power_request(unsigned action) {
+    if(action!=EMBK_POWER_OFF && action!=EMBK_POWER_REBOOT)return -22;
+    return (int)embk_syscall1(EMBK_SYS_power,action==EMBK_POWER_OFF?0:1);
+}
+
+#include "embk_session.h"
+static inline int embk_session(unsigned command,int arg) {
+    return (int)embk_syscall2(EMBK_SYS_session_control,command,arg);
+}
+
+#include "embk_notify.h"
+#include "embk_policy.h"
+static inline void embk_notice_copy(char *out,unsigned cap,const char *source) {
+    unsigned at=0;
+    while(source && source[at]) {
+        unsigned char c=(unsigned char)source[at];
+        unsigned n=c<128?1:c>=0xc2 && c<=0xdf?2:c>=0xe0 && c<=0xef?3:c>=0xf0 && c<=0xf4?4:0;
+        if(!n || at+n>=cap)break;
+        unsigned valid=1;
+        for(unsigned j=1;j<n;j++)if(((unsigned char)source[at+j]&0xc0)!=0x80){valid=0;break;}
+        if(!valid)break;
+        for(unsigned j=0;j<n;j++)out[at+j]=source[at+j];
+        at+=n;
+    }
+    out[at]=0;
+}
+static inline int embk_notify_send(unsigned severity,const char *title,const char *body) {
+    struct embk_notice_request r={.version=EMBK_NOTIFY_VERSION,.severity=severity};
+    embk_notice_copy(r.title,sizeof r.title,title);embk_notice_copy(r.body,sizeof r.body,body);
+    return (int)embk_syscall2(EMBK_SYS_notice_post,(int64_t)(uintptr_t)&r,sizeof r);
+}
+static inline int embk_notify_get(struct embk_notice_info *out,int clear) {
+    return (int)embk_syscall3(EMBK_SYS_notice_get,(int64_t)(uintptr_t)out,sizeof *out,clear);
+}
+static inline int embk_policy_get(struct embk_policy *out) {
+    return (int)embk_syscall2(EMBK_SYS_policy_get,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_policy_set(const struct embk_policy *p) {
+    return (int)embk_syscall2(EMBK_SYS_policy_set,(int64_t)(uintptr_t)p,sizeof *p);
+}
+
 
 /* ---------------------------------------------------------------------------
  * WHERE THE SPEAKER ACTUALLY IS, in frames since this stream started.

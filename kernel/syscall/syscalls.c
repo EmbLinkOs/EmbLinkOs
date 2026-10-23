@@ -25,6 +25,15 @@
 #include "drivers/char/serial.h"
 #include "include/kprintf.h"   /* sys_read's copy_to_user fault-path diagnostic */
 #include "block/block.h"
+#include "boot/boot_protocol.h"
+#include "net/wifi/wifi.h"
+#include "acpi/power.h"
+#include "power/policy.h"
+#include "process/session.h"
+#include "ipc/notify.h"
+#include "acpi/display.h"
+#include "drivers/video/gpu.h"
+#include "../../user/lib/embk_gpu.h"
 #include "block/partition.h"
 #define EMBK_DISK_IS_PARTITION 1u
 #include "ipc/pipe.h"          /* sys_pipe: pipe_create */
@@ -35,6 +44,7 @@
 #include "include/types.h"
 #include "include/kstring.h"
 #include "process/process.h"
+#include "process/ksync.h"
 #include "power/power.h"   /* power_transition: the shell's Shut Down */
 #include "lib/random.h"          /* sys_getrandom */
 #include "process/futex.h"
@@ -410,10 +420,8 @@ static int64_t sys_unlink(const struct sysargs *a) {
 }
 
 /* mkdir(path) -> 0 or -errno. The shell's `mkdir`. */
-/* rename(old, new). STRICT kernel semantics: the destination must not exist
- * (EMBKFS refuses with -EEXIST) -- the POSIX replace-atomically veneer lives in
- * the LIBC (unlink dest, then rename), same split as path_abs. Two path copies,
- * one syscall: git's lockfile commit is the customer. */
+/* rename(old,new): atomic replacement. rename_noreplace is the file-manager
+ * variant and refuses an existing destination under the same filesystem lock. */
 static int64_t sys_rename(const struct sysargs *a) {
     char oldp[SYSCALL_PATH_MAX], newp[SYSCALL_PATH_MAX];
     int len = copy_string_from_user(oldp, (const char *)a->arg[0], sizeof(oldp));
@@ -1550,6 +1558,16 @@ static int64_t sys_thread_self(const struct sysargs *a) {
  * of the whole address space: one call moves at most 64 blocks, and the
  * userspace side loops. */
 #define RAWDISK_MAX_BLOCKS 64u
+#define RAWDISK_BOUNCE_BYTES (RAWDISK_MAX_BLOCKS * 4096u)
+/* Allocate on first use: two static 256 KiB buffers pushed the kernel into
+ * firmware-reserved low memory. One mutex also prevents concurrent raw I/O
+ * from overwriting a transfer while it is being copied to/from userspace. */
+static struct mutex rawdisk_lock = MUTEX_INIT;
+static uint8_t *rawdisk_bounce;
+static uint8_t *rawdisk_buffer(void) {
+    if (!rawdisk_bounce) rawdisk_bounce = kmalloc(RAWDISK_BOUNCE_BYTES);
+    return rawdisk_bounce;
+}
 
 static bool rawdisk_permitted(void)
 {
@@ -1601,19 +1619,15 @@ static int64_t sys_disk_read(const struct sysargs *a) {
     uint32_t count = (uint32_t)a->arg[2];
     if (count == 0 || count > RAWDISK_MAX_BLOCKS) return -EMBK_EINVAL;
 
-    static uint8_t bounce[RAWDISK_MAX_BLOCKS * 4096];
-    if ((uint64_t)count * d->block_size > sizeof bounce) return -EMBK_EINVAL;
-
-    /* THROUGH A KERNEL BOUNCE BUFFER, not straight into the user's pages. The
-     * block drivers require a KV2P-able address and a DMA-reachable one; a
-     * user pointer is neither, and handing one to a controller is a write to
-     * whatever physical page happened to be there. */
-    int rc = embk_block_read(d, a->arg[1], count, bounce);
-    if (rc != EMBK_OK) return rc;
-    if (copy_to_user((void *)(uintptr_t)a->arg[3], bounce,
-                     (uint64_t)count * d->block_size) != 0)
-        return -EMBK_EFAULT;
-    return EMBK_OK;
+    uint64_t bytes = (uint64_t)count * d->block_size;
+    if (!bytes || bytes > RAWDISK_BOUNCE_BYTES) return -EMBK_EINVAL;
+    mutex_lock(&rawdisk_lock);
+    uint8_t *bounce = rawdisk_buffer();
+    int rc = bounce ? embk_block_read(d, a->arg[1], count, bounce) : -EMBK_ENOMEM;
+    if (!rc && copy_to_user((void *)(uintptr_t)a->arg[3], bounce, bytes) != 0)
+        rc = -EMBK_EFAULT;
+    mutex_unlock(&rawdisk_lock);
+    return rc;
 }
 
 static int64_t sys_disk_write(const struct sysargs *a) {
@@ -1622,14 +1636,16 @@ static int64_t sys_disk_write(const struct sysargs *a) {
     if (!d) return -EMBK_ENODEV;
     uint32_t count = (uint32_t)a->arg[2];
     if (count == 0 || count > RAWDISK_MAX_BLOCKS) return -EMBK_EINVAL;
-
-    static uint8_t bounce[RAWDISK_MAX_BLOCKS * 4096];
-    if ((uint64_t)count * d->block_size > sizeof bounce) return -EMBK_EINVAL;
-
-    if (copy_from_user(bounce, (const void *)(uintptr_t)a->arg[3],
-                       (uint64_t)count * d->block_size) != 0)
-        return -EMBK_EFAULT;
-    return embk_block_write(d, a->arg[1], count, bounce);
+    uint64_t bytes = (uint64_t)count * d->block_size;
+    if (!bytes || bytes > RAWDISK_BOUNCE_BYTES) return -EMBK_EINVAL;
+    mutex_lock(&rawdisk_lock);
+    uint8_t *bounce = rawdisk_buffer();
+    int rc = bounce ? 0 : -EMBK_ENOMEM;
+    if (!rc && copy_from_user(bounce, (const void *)(uintptr_t)a->arg[3], bytes) != 0)
+        rc = -EMBK_EFAULT;
+    if (!rc) rc = embk_block_write(d, a->arg[1], count, bounce);
+    mutex_unlock(&rawdisk_lock);
+    return rc;
 }
 
 static int64_t sys_thread_cpu_ns(const struct sysargs *a) {
@@ -2096,7 +2112,7 @@ static int64_t sys_audio_write(const struct sysargs *a) {
      * page can be unmapped or reused between the write and the moment the
      * hardware reaches it. One buffer's worth at a time, which is also the
      * most audio_write can accept per call. */
-    static int16_t stage[8192];
+    int16_t stage[2048]; /* per-call: simultaneous writers cannot corrupt PCM */
     uint32_t cap_frames = (uint32_t)(sizeof stage / sizeof stage[0]) / 2;
     if (nframes > cap_frames) nframes = cap_frames;
 
@@ -2586,6 +2602,134 @@ static int64_t sys_win_raise(const struct sysargs *a) {
     return (int64_t)compositor_restore_pid((int)pid);
 }
 
+
+
+static int64_t sys_power_info(const struct sysargs *a) {
+    if(a->arg[1]!=sizeof(struct embk_power_info))return -EMBK_EINVAL;
+#if defined(__x86_64__)
+    struct embk_power_info info;int rc=acpi_power_snapshot(&info);if(rc)return rc;
+    return copy_to_user((void *)(uintptr_t)a->arg[0],&info,sizeof info);
+#else
+    return -EMBK_ENOTSUP;
+#endif
+}
+
+static int64_t sys_display_info(const struct sysargs *a) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_GPU)))return -EMBK_EPERM;
+    if(a->arg[1]!=sizeof(struct embk_display_info))return -EMBK_EINVAL;
+#if defined(__x86_64__)
+    struct embk_display_info info;acpi_display_snapshot(&info);
+    return copy_to_user((void *)(uintptr_t)a->arg[0],&info,sizeof info);
+#else
+    return -EMBK_ENOTSUP;
+#endif
+}
+
+static int64_t sys_audio_info(const struct sysargs *a) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_AUDIO)))return -EMBK_EPERM;
+    if(a->arg[1]!=sizeof(struct embk_audio_info))return -EMBK_EINVAL;
+    struct embk_audio_info info;audio_snapshot(&info);
+    return copy_to_user((void *)(uintptr_t)a->arg[0],&info,sizeof info);
+}
+
+static int64_t sys_gpu_info(const struct sysargs *a) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_GPU)))return -EMBK_EPERM;
+    if(a->arg[1]!=sizeof(struct embk_gpu_info))return -EMBK_EINVAL;
+    struct embk_gpu_info info;memset(&info,0,sizeof info);info.version=EMBK_GPU_VERSION;
+    info.flags=EMBK_GPU_SOFTWARE_RENDERING;
+    const fb_info_t *fb=fb_get_info();const struct gpu_driver *gpu=gpu_active();
+    if(fb){info.width=fb->width;info.height=fb->height;info.pitch=fb->pitch;info.bpp=fb->bpp;}
+    snprintf(info.driver,sizeof info.driver,"%s",gpu?gpu->name:"Firmware framebuffer");
+    return copy_to_user((void *)(uintptr_t)a->arg[0],&info,sizeof info);
+}
+
+static int64_t sys_display_set(const struct sysargs *a) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_POWER)))return -EMBK_EPERM;
+    if(a->arg[0]>100)return -EMBK_EINVAL;
+#if defined(__x86_64__)
+    return acpi_display_request(a->arg[0]);
+#else
+    return -EMBK_ENOTSUP;
+#endif
+}
+static int64_t sys_audio_control(const struct sysargs *a) {
+    if(!audio_permitted())return -EMBK_EPERM;
+    if(a->arg[0]>100 || a->arg[1]>1)return -EMBK_EINVAL;
+    return audio_control(a->arg[0],a->arg[1]);
+}
+static int64_t sys_rename_noreplace(const struct sysargs *a) {
+    char oldp[SYSCALL_PATH_MAX],newp[SYSCALL_PATH_MAX];
+    int rc=copy_string_from_user(oldp,(void *)(uintptr_t)a->arg[0],sizeof oldp);
+    if(rc<0)return rc;
+    rc=copy_string_from_user(newp,(void *)(uintptr_t)a->arg[1],sizeof newp);
+    if(rc<0)return rc;
+    return vfs_rename_noreplace(oldp,newp);
+}
+static int64_t sys_boot_mode(const struct sysargs *a) {
+    (void)a;const struct boot_protocol *bp=boot_protocol_get();return bp?bp->boot_mode:0;
+}
+#if defined(__x86_64__)
+static int64_t sys_session_control(const struct sysargs *a) {
+    if(a->arg[0]>UINT32_MAX || a->arg[1]>INT32_MAX) return -EMBK_EINVAL;
+    return session_control(current_process_atomic(),(unsigned)a->arg[0],(int)a->arg[1]);
+}
+static int64_t sys_notice_post(const struct sysargs *a) {
+    if(a->arg[1]!=sizeof(struct embk_notice_request))return -EMBK_EINVAL;
+    struct embk_notice_request req;
+    if(copy_from_user(&req,(void *)a->arg[0],sizeof req)!=EMBK_OK)return -EMBK_EFAULT;
+    return notify_post(current_process_atomic(),&req);
+}
+static int64_t sys_notice_get(const struct sysargs *a) {
+    if(a->arg[1]!=sizeof(struct embk_notice_info) || a->arg[2]>1)return -EMBK_EINVAL;
+    struct embk_notice_info info;int rc=notify_snapshot(current_process_atomic(),&info,(int)a->arg[2]);
+    if(rc)return rc;
+    return copy_to_user((void *)a->arg[0],&info,sizeof info)==EMBK_OK?0:-EMBK_EFAULT;
+}
+static int64_t sys_policy_get(const struct sysargs *a) {
+    if(a->arg[1]!=sizeof(struct embk_policy))return -EMBK_EINVAL;
+    struct embk_policy p;power_policy_get(&p);
+    return copy_to_user((void *)a->arg[0],&p,sizeof p)==EMBK_OK?0:-EMBK_EFAULT;
+}
+static int64_t sys_policy_set(const struct sysargs *a) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_POWER)))return -EMBK_EPERM;
+    if(a->arg[1]!=sizeof(struct embk_policy))return -EMBK_EINVAL;
+    struct embk_policy p;if(copy_from_user(&p,(void *)a->arg[0],sizeof p)!=EMBK_OK)return -EMBK_EFAULT;
+    return power_policy_set(&p);
+}
+#else
+static int64_t sys_session_control(const struct sysargs *a) {(void)a;return -EMBK_ENOTSUP;}
+static int64_t sys_notice_post(const struct sysargs *a) {(void)a;return -EMBK_ENOTSUP;}
+static int64_t sys_notice_get(const struct sysargs *a) {(void)a;return -EMBK_ENOTSUP;}
+static int64_t sys_policy_get(const struct sysargs *a) {(void)a;return -EMBK_ENOTSUP;}
+static int64_t sys_policy_set(const struct sysargs *a) {(void)a;return -EMBK_ENOTSUP;}
+#endif
+static int64_t sys_wifi_info(const struct sysargs *a) {
+    if (!(process_current_caps() & EMBK_CAP_BIT(EMBK_CAP_NETWORK))) return -EMBK_EPERM;
+    if (a->arg[1] != sizeof(struct embk_wifi_info)) return -EMBK_EINVAL;
+#if defined(__x86_64__)
+    struct embk_wifi_info info;
+    int rc = wifi_snapshot(&info);
+    if (rc) return rc;
+    return copy_to_user((void *)(uintptr_t)a->arg[0], &info, sizeof info);
+#else
+    return -EMBK_ENOTSUP;
+#endif
+}
+static int64_t sys_wifi_request(const struct sysargs *a) {
+    if (!(process_current_caps() & EMBK_CAP_BIT(EMBK_CAP_NETWORK_ADMIN))) return -EMBK_EPERM;
+    if (a->arg[1] != sizeof(struct embk_wifi_request)) return -EMBK_EINVAL;
+#if defined(__x86_64__)
+    struct embk_wifi_request request={0};
+    int rc=copy_from_user(&request,(void *)(uintptr_t)a->arg[0],sizeof request);
+    rc=rc?-EMBK_EFAULT:wifi_request(&request);
+    volatile uint8_t *p = (volatile uint8_t *)&request;
+    for (unsigned i = 0; i < sizeof request; i++) p[i] = 0;
+    return rc;
+#else
+    return -EMBK_ENOTSUP;
+#endif
+}
+
 static syscall_handler_t syscall_table[] = {
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
@@ -2627,6 +2771,21 @@ static syscall_handler_t syscall_table[] = {
     [SYS_sched_period] = sys_sched_period,
     [SYS_thread_cpu_ns] = sys_thread_cpu_ns,
     [SYS_thread_self]   = sys_thread_self,
+    [SYS_power_info] = sys_power_info,
+    [SYS_display_info] = sys_display_info,
+    [SYS_display_set] = sys_display_set,
+    [SYS_audio_info] = sys_audio_info,
+    [SYS_audio_control] = sys_audio_control,
+    [SYS_gpu_info] = sys_gpu_info,
+    [SYS_rename_noreplace] = sys_rename_noreplace,
+    [SYS_boot_mode] = sys_boot_mode,
+    [SYS_session_control] = sys_session_control,
+    [SYS_notice_post] = sys_notice_post,
+    [SYS_notice_get] = sys_notice_get,
+    [SYS_policy_get] = sys_policy_get,
+    [SYS_policy_set] = sys_policy_set,
+    [SYS_wifi_info]     = sys_wifi_info,
+    [SYS_wifi_request]  = sys_wifi_request,
     [SYS_disk_count]    = sys_disk_count,
     [SYS_disk_info]     = sys_disk_info,
     [SYS_disk_read]     = sys_disk_read,
@@ -2722,6 +2881,19 @@ static syscall_handler_t syscall_table[] = {
 /* The dispatch itself. Each architecture's trap entry fills in `a` and calls
  * this; nothing below the entry point knows how the arguments arrived. */
 int64_t syscall_invoke(const struct sysargs *a) {
+#if defined(__x86_64__)
+    struct process *caller=current_process_atomic();
+    if(caller && !session_ui_allowed(caller->pid)) {
+        switch(a->nr) {
+        case SYS_ui_present:case SYS_ui_present_rect:case SYS_ui_input:
+        case SYS_key_poll:case SYS_key_event_poll:case SYS_key_grab:
+        case SYS_win_input:case SYS_screen_read:case SYS_clip_set:case SYS_clip_get:
+            return -EMBK_EPERM;
+        case SYS_read:if(a->arg[0]==0)return -EMBK_EPERM;break;
+        default:break;
+        }
+    }
+#endif
     if (a->nr < SYSCALL_TABLE_SIZE && syscall_table[a->nr])
         return syscall_table[a->nr](a);
     return -EMBK_EINVAL;

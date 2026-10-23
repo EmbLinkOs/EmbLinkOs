@@ -7,6 +7,7 @@
 
 #define ARP_CACHE_N 16
 static struct { uint32_t ip; uint8_t mac[ETH_ALEN]; bool valid; } arp_cache[ARP_CACHE_N];
+void arp_reset(void) {memset(arp_cache,0,sizeof arp_cache);}
 
 static void arp_cache_put(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
     int slot = -1;
@@ -18,6 +19,20 @@ static void arp_cache_put(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
     arp_cache[slot].ip = ip;
     memcpy(arp_cache[slot].mac, mac, ETH_ALEN);
     arp_cache[slot].valid = true;
+}
+
+/* Learn the immediate sender of a validated IPv4 unicast frame. Replies
+ * from the receive worker must not block waiting for that same worker to
+ * consume an ARP response. Off-subnet traffic arrived through our gateway.
+ * Like ordinary ARP, this does not authenticate a neighbor's MAC address. */
+void arp_learn_ipv4_neighbor(uint32_t src, const uint8_t mac[ETH_ALEN]) {
+    if (!src || src == 0xffffffffU || (src >> 28) == 0xe || (mac[0] & 1)) return;
+    uint8_t any = 0;
+    for (unsigned i = 0; i < ETH_ALEN; i++) any |= mac[i];
+    if (!any || !g_netif.ip || !g_netif.netmask || src == g_netif.ip) return;
+    uint32_t hop = ((src & g_netif.netmask) == (g_netif.ip & g_netif.netmask))
+        ? src : g_netif.gateway;
+    if (hop) arp_cache_put(hop, mac);
 }
 
 static bool arp_cache_get(uint32_t ip, uint8_t mac[ETH_ALEN]) {

@@ -133,6 +133,10 @@ and:
   fail. This is the async-wake that signals were carrying, without the injection:
   the program learns at a point it *already* checks — a syscall return.
 - **`embk_cancelled()`** — a compute loop with no syscalls can poll it.
+- Channel receive, accept, queue-space waits in send, and thread join also
+  check cancellation before blocking. Queued messages/connections, available
+  queue space, and a completed thread still win. A cancelled pending send
+  releases its staging allocation without consuming ancillary handles.
 - The flag is **sticky**: once cancelled, subsequent blocking calls keep failing.
   A program cannot accidentally "miss" it by being between calls, and cleanup
   code that itself blocks would deadlock if the flag auto-cleared.
@@ -221,7 +225,9 @@ Stated so nobody reads the gaps as oversights:
    `process_cancel(pid)` (wakes each blocked thread via its OWN wait_queue --
    siblings may be blocked on different objects), `sys_cancel` 59 (handle-scoped,
    like sys_kill) + `sys_cancelled` 60, `embk_cancel()`/`embk_cancelled()`, and
-   `-EMBK_ECANCELED` from `process_wait` and pipe read/write.
+   `-EMBK_ECANCELED` from `process_wait`, pipe read/write, channel send/receive,
+   endpoint accept and thread join. `test ipc cancel` checks native blocked
+   IPC/join cancellation, pending MOVE preservation and IPC resource counts.
    **Ordering rule, in every check:** a completed operation WINS -- EOF and EPIPE
    are real, permanent answers and are tested BEFORE the cancel check. Cancelling
    must never turn a finished operation into a failure. The check sits just

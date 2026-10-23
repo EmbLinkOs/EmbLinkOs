@@ -44,6 +44,7 @@ def main():
     shutil.copyfile(os.path.join(ROOT, "embkfs.img"), disk)
     qmp_port = 4900 + random.randint(0, 400)
     argv = ["qemu-system-x86_64", "-cpu", "max",
+            "-fw_cfg", "name=opt/emblink/live,string=1",
             "-drive", "format=raw,file=%s/myos.img,if=ide,index=0" % ROOT,
             "-drive", "format=raw,file=%s,if=ide,index=1" % disk,
             "-serial", "stdio", "-no-reboot", "-no-shutdown", "-m", "2G", "-smp", "4",

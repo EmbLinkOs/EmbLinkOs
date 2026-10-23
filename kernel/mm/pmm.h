@@ -62,6 +62,8 @@ uint64_t pmm_total_pages(void);
 uint64_t pmm_used_pages(void);
 
 // takes a physical address and frees the corresponding virtual page
+uint64_t pmm_alloc_contiguous(uint64_t pages,uint64_t alignment_pages);
+
 void pmm_free_page(uint64_t phys_addr);
 
 // Explicitly mark one specific page as used, without allocating it via the

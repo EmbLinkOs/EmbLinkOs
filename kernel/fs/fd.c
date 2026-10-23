@@ -333,7 +333,7 @@ int vfs_lstat_path(const char *path, struct vfs_stat *out)
     return vn.mnt->ops->stat(&vn, out);
 }
 
-int vfs_rename_path(const char *old_path, const char *new_path)
+static int rename_path(const char *old_path, const char *new_path,int noreplace)
 {
     struct vnode old_parent, new_parent;
     const char *old_leaf = NULL, *new_leaf = NULL;
@@ -363,9 +363,17 @@ int vfs_rename_path(const char *old_path, const char *new_path)
     if (!old_parent.mnt || !old_parent.mnt->ops || !old_parent.mnt->ops->rename)
         return -EMBK_ENOSYS;
 
+    if(noreplace) {
+        if(!old_parent.mnt->ops->rename_noreplace)return -EMBK_ENOTSUP;
+        return old_parent.mnt->ops->rename_noreplace(&old_parent,old_leaf,old_len,
+                                                    &new_parent,new_leaf,new_len);
+    }
     return old_parent.mnt->ops->rename(&old_parent, old_leaf, old_len,
                                        &new_parent, new_leaf, new_len);
 }
+
+int vfs_rename_path(const char *old_path,const char *new_path) {return rename_path(old_path,new_path,0);}
+int vfs_rename_noreplace(const char *old_path,const char *new_path) {return rename_path(old_path,new_path,1);}
 
 /* ftruncate: fd -> vnode -> the per-fs truncate op that already exists (EMBKFS
  * wires it). Only a VNODE-backed fd can be truncated -- truncating a pipe or

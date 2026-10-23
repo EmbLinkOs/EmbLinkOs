@@ -1,3 +1,21 @@
+## Laptop integration follow-up (2026-10-23)
+
+- [x] Preserve master ABI/ARM architecture and integrate laptop services into the current desktop.
+- [x] Native UEFI/NVMe regression batch, standalone recovery installation,
+  account/preferences across reboot, lock/password gates and recorded HDA/AC97 output.
+- [ ] Physical AX200 WPA2/DHCP/DNS/page fetch and broader radio transports.
+- [ ] Physical built-in I2C input, panel, HDA routing and native AML/EC firmware acceptance.
+- [ ] Power transition writer freeze/drain, complete page-writeback failure reporting
+  and physical power-loss tests; current upstream shutdown writes back and flushes.
+- [ ] ARM runtime revalidation and port of x86 screen/policy/history services.
+- [ ] Reconcile incoming PCI configuration accesses with the older serialized,
+  exact-width access path; avoid address/data races and status write-one-to-clear hazards.
+- [ ] Suspend/resume, GPU modesetting/acceleration, multi-monitor management,
+  touchpad gestures, audio capture/mixing and OS-image updates/rollback.
+
+Current evidence: [LAPTOP_VALIDATION.md](LAPTOP_VALIDATION.md).
+Older sections below remain the broader roadmap.
+
 ## malloc in userspace: the lock exists now (2026-09-13)
 
 - [x] ~~newlib is linked with no `__malloc_lock`, so two threads in one process

@@ -39,6 +39,7 @@
 #include "include/io.h"
 #include "acpi/acpi.h"
 #include "acpi/aml.h"
+#include "process/ksync.h"
 #include "drivers/bus/pci.h"
 #include "mm/vmm.h"
 
@@ -239,13 +240,16 @@ static struct aml_object *obj_package(uint32_t n) {
     return o;
 }
 
+struct aml_object *aml_buffer(const uint8_t *data,uint32_t size) {return obj_buffer(data,size);}
+struct aml_object *aml_package(uint32_t count) {return obj_package(count);}
+
 struct aml_object *aml_get(struct aml_object *o) {
-    if (o) o->refs++;
+    if (o) __atomic_add_fetch(&o->refs,1,__ATOMIC_RELAXED);
     return o;
 }
 
 void aml_put(struct aml_object *o) {
-    if (!o || --o->refs > 0) return;
+    if (!o || __atomic_sub_fetch(&o->refs,1,__ATOMIC_ACQ_REL) > 0) return;
     switch (o->kind) {
     case AML_STRING:
     case AML_BUFFER:
@@ -1642,7 +1646,7 @@ static struct aml_object *invoke(struct aml_node *n, struct aml_object **args,
         return NULL;
     }
 
-    static uint32_t steps_root;
+    uint32_t steps_root;
     struct aml_ctx c;
     memset(&c, 0, sizeof c);
     c.p     = m->u.method.body;
@@ -1669,12 +1673,20 @@ static struct aml_object *invoke(struct aml_node *n, struct aml_object **args,
     return ret;
 }
 
+static struct mutex aml_execution_lock = MUTEX_INIT;
 struct aml_object *aml_evaluate(struct aml_node *node,
                                 struct aml_object **args, int argc) {
     if (!node || !g_ready) return NULL;
-    if (node->value && node->value->kind == AML_METHOD)
-        return invoke(node, args, argc, NULL);
-    return node_value(node, NULL);
+    /* PCI operation regions evaluate _ADR/_BBN while a method is already
+     * running. Only the owning thread may recurse into the same namespace. */
+    sched_lock();
+    bool nested=aml_execution_lock.locked && aml_execution_lock.owner==current_thread;
+    sched_unlock();
+    if(!nested)mutex_lock(&aml_execution_lock);
+    struct aml_object *result = node->value && node->value->kind == AML_METHOD
+        ? invoke(node, args, argc, NULL) : node_value(node, NULL);
+    if(!nested)mutex_unlock(&aml_execution_lock);
+    return result;
 }
 
 bool aml_eval_integer(struct aml_node *from, const char *path, uint64_t *out) {

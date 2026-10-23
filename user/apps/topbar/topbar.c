@@ -326,6 +326,15 @@ static const char *bar_clock(void) {
  * again the whole message. The bar cannot draw the lock itself -- it is an
  * ordinary window and an ordinary window can be lowered -- so it asks the
  * desktop, which owns the layer that goes in front of everything. */
+static void open_notifications(void) {
+    static int child=-1;
+    if(child>=0 && embk_proc_alive(child)){embk_win_restore(child);return;}
+    if(child>=0)embk_wait(child);
+    struct embk_spawn_file_action action;
+    embk_action_set_caps(&action,EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM)|EMBK_CAP_BIT(EMBK_CAP_GPU));
+    char *args[]={"/data/apps/notifications/notifications.elf",NULL};
+    child=embk_spawn(args[0],args,&action,1);
+}
 static void request_lock(void) {
     embk_puts(1, "TopBar: lock screen requested\n");
     int ch = (int)embk_chan_connect("/run/emlink.lock");
@@ -459,6 +468,7 @@ static void bar(void) {
                      * open to answer the door. */
                     if (MenuItem("Lock Screen")) request_lock();
                     if (MenuItem(logout_label)) embk_session_end(0);
+                    if (MenuItem("Notifications")) open_notifications();
                     MenuSeparator();
                     /* RESTART AND SHUT DOWN. Until these existed the only way
                      * to stop an EmbLink machine was to cut its power -- the

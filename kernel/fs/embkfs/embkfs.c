@@ -1662,7 +1662,7 @@ int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume 
             ((const struct embk_superblock *)sb_backup)->generation == sb->generation;
         bool other_ok = sb_is_primary ? backup_matches : primary_matches;
 
-        if (!other_ok && good_spb > 0 && good_spb <= 128) {
+        if (!boot_recovery_mode() && !other_ok && good_spb > 0 && good_spb <= 128) {
             uint8_t *goodblk = kmalloc(good_spb * dev->block_size);
             if (goodblk && embk_block_read(dev, good_lba, good_spb, goodblk) == EMBK_OK) {
                 int wrc = embk_block_write(dev, bad_lba, good_spb, goodblk);
@@ -1686,7 +1686,7 @@ int embkfs_probe_superblock(struct embk_block_device *dev, struct embkfs_volume 
                 dev->name, sb->feature_incompat);
         return -EMBK_EINVAL;
     }
-    bool read_only = (sb->feature_ro_compat & ~EMBKFS_KNOWN_RO_COMPAT) != 0;
+    bool read_only = boot_recovery_mode() || (sb->feature_ro_compat & ~EMBKFS_KNOWN_RO_COMPAT) != 0;
 
     /* Version backstop: a newer major could mean anything. */
     if (sb->version_major > EMBKFS_MAX_KNOWN_MAJOR) {
@@ -7722,6 +7722,7 @@ void embkfs_init(void)
 {
     kprintf("\n=== EMBKFS init ===\n");
 
+    struct embk_block_device *boot_disk=embk_partition_boot_disk();
     g_embkfs_live = NULL;
     g_embkfs_volume_count = 0;
 
@@ -7747,6 +7748,7 @@ void embkfs_init(void)
          * bogus "primary superblock" by WRITING over the MBR / boot code. */
         if (embk_block_is_partitioned(d))
             continue;
+        if(boot_recovery_mode() && ((boot_disk && embk_partition_parent(d)!=boot_disk) || g_embkfs_volume_count))continue;
         struct embkfs_volume *slot = &g_embkfs_volumes[g_embkfs_volume_count];
         if (embkfs_mount(d, slot) != EMBK_OK)
             continue;
@@ -7769,18 +7771,18 @@ void embkfs_init(void)
      * rather than repointing, so main.c's per-volume /sdX registration (which
      * treats index 0 as embk_live) needs no change. */
     uint32_t boot_sig;
-    if (g_embkfs_volume_count > 1 && bootinfo_boot_disk_sig(&boot_sig)) {
+    if (g_embkfs_volume_count > 1 && (boot_disk || bootinfo_boot_disk_sig(&boot_sig))) {
         for (uint32_t i = 1; i < g_embkfs_volume_count; i++) {
             struct embk_block_device *disk =
                 embk_partition_parent(g_embkfs_volumes[i].dev);
-            uint8_t mbr[512];
+            uint8_t mbr[4096];
             if (!disk || embk_block_read(disk, 0, 1, mbr) != EMBK_OK)
                 continue;
             uint32_t sig =  (uint32_t)mbr[0x1B8]
                          | ((uint32_t)mbr[0x1B9] << 8)
                          | ((uint32_t)mbr[0x1BA] << 16)
                          | ((uint32_t)mbr[0x1BB] << 24);
-            if (sig != boot_sig)
+            if (boot_disk?disk!=boot_disk:sig!=boot_sig)
                 continue;
             /* Every pointer in the struct targets the heap (bitmap / free_ext /
              * rcache bufs), never the struct itself, so a byte move keeps them
