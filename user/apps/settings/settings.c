@@ -117,7 +117,7 @@ static void sample_system(void) {
  * is not optional decoration: a switch labelled only "Running indicator" makes
  * the reader guess, and guessing is what settings windows are infamous for. */
 static void setting_label(const char *title, const char *why) {
-    VStack(.spacing = 0, .grow = 1, .align = Leading) {
+    VStack(.spacing = 0, .grow = 1, .align = Fill) {
         Text(title).caption();
         if (why && why[0]) Text(why).caption().tertiary();
     }

@@ -167,6 +167,18 @@ static void control_frame(const char *keys) {
     ui_text_field(B,sizeof B,"next");ui_end_stack();ui_frame_end();ui_run_layout(400,300);
 }
 
+static struct instance_handle wrapped_last;
+static void scroll_wrapped(float *sc) {
+    ui_frame_begin();ui_scroll_begin(0x5C402,60,sc);
+    ui_begin_vstack(1);ui_set_size((struct layout_size){.mode=SIZE_FLEX,.flex_grow=1},(struct layout_size){.mode=SIZE_INTRINSIC});ui_set_align(ALIGN_STRETCH);
+    ui_set_font(ui_theme()->font_regular);ui_set_text_size(ui_theme()->text_body);
+    ui_text("Wrapped text must contribute its actual height to the scroll range, so the last control remains reachable.");
+    ui_text("Last control");
+    struct instance_handle content=ui_open();
+    wrapped_last=ui_next_sibling(ui_first_child(content));
+    ui_end_stack();ui_scroll_end();ui_frame_end();ui_run_layout(140,80);
+}
+
 int main(void) {
     printf("=== kit-test: the text field and the keyboard ===\n");
     scene_arena_init(&SA); layout_arena_init(&LA); ui_init(&SA, &LA);
@@ -635,6 +647,14 @@ int main(void) {
         track = ui_next_sibling(ui_first_child(ui_first_child(ui_root())));
         CHECK(instance_handle_is_null(ui_first_child(track)),
               "content that fits shows no thumb at all");
+    }
+
+    {
+        float sc=0,x,y,w,h;
+        scroll_wrapped(&sc);scroll_wrapped(&sc);
+        sc=100000;scroll_wrapped(&sc);scroll_wrapped(&sc);
+        CHECK(ui_rect_of(wrapped_last,&x,&y,&w,&h) && y>=-1 && y+h<=61,
+              "scrolling reaches the final control after nested text wraps");
     }
 
     /* ---- SHIFT-CLICK ----------------------------------------------------

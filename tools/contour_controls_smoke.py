@@ -23,6 +23,11 @@ print('RESULT '+json.dumps({k:int(s[k]) for k in ['top','bottom','left','right',
         while not check():
             if time.monotonic()>end:raise AssertionError(message)
             d.g.pump(.5)
+    def dock_ready(side):
+        import struct
+        owner=d.debug("import gdb,json\nw=gdb.parse_and_eval(\"'kernel/gfx/compositor.c'::g_wins\")\nprint('RESULT '+json.dumps(next(int(w[i]['pid']) for i in range(w.type.range()[1]+1) if int(w[i]['used']) and int(w[i]['desktop']))))")
+        x0,y0,x1,y1=struct.unpack('<4f',d.read('home',owner,'g_dockr',16))
+        return x1-x0<100 and (x0<100 if side=='left' else x0>1000)
     def cfg(w,name):
         # The declaration order comes from the single schema, including old fields.
         text=(ROOT/'user/lib/oscfg.h').read_text();import re
@@ -35,8 +40,8 @@ print('RESULT '+json.dumps({k:int(s[k]) for k in ['top','bottom','left','right',
         w=d.launch('Settings','Settings');ui=NativeUI(d)
         ui.click_text(w,'Paper');d.g.pump(2)
         ui.click_text(w,'Desktop & Dock');ui.select(w,'Placement','Left')
-        eventually(lambda:state()['left']>0,'left dock insets');d.snap('left-dock')
-        ui.select(w,'Placement','Right');eventually(lambda:state()['right']>0,'right dock insets');d.snap('right-dock')
+        eventually(lambda:state()['left']>0 and dock_ready('left'),'left dock geometry');d.g.pump(2);d.snap('left-dock')
+        ui.select(w,'Placement','Right');eventually(lambda:state()['right']>0 and dock_ready('right'),'right dock geometry');d.g.pump(2);d.snap('right-dock')
         ui.select(w,'Placement','Bottom');eventually(lambda:state()['right']==0 and state()['bottom']>0,'bottom dock insets')
         ui.toggle(w,'Auto-hide');eventually(lambda:cfg(w,'dock_autohide')==1,'dock auto-hide preference')
         d.g.pump(2);d.snap('dock-hidden');ui.move(640,790);d.g.pump(2);d.snap('dock-revealed')

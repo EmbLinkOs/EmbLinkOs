@@ -678,7 +678,7 @@ void ui_set_scroll_offset(float dy) {
 }
 /* Open box's content height (sum of children, unclamped) and viewport height
  * (resolved) from the last layout -- a scroll view uses these to clamp its
- * offset. We sum children rather than read intrinsic_h because a scroll viewport
+ * offset. We sum arranged children rather than read intrinsic_h because a scroll viewport
  * has a FIXED height, so its own intrinsic_h is that fixed size, not the content. */
 bool ui_open_content_extent(float *content_h, float *viewport_h) {
     struct instance *b = cur_box(); if (!b) return false;
@@ -688,7 +688,12 @@ bool ui_open_content_extent(float *content_h, float *viewport_h) {
     for (struct layout_handle c = ln->first_child; !layout_handle_is_null(c); ) {
         struct layout_node *cn = layout_resolve(g_la, c);
         if (!cn) break;
-        sum += cn->intrinsic_h; cnt++;
+        /* Intrinsic heights precede width-dependent wrapping. Use the last
+         * arranged height, as the thumb and clamp describe what was laid out,
+         * or a long nested paragraph makes the final controls unreachable. */
+        if(!cn->is_overlay) {
+            sum += cn->resolved_h>0?cn->resolved_h:cn->intrinsic_h;cnt++;
+        }
         c = cn->next_sibling;
     }
     if (cnt > 1) sum += ln->spacing * (cnt - 1);

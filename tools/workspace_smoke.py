@@ -125,6 +125,8 @@ def main():
             if time.monotonic()>deadline:raise AssertionError(f'{app} text: {actual!r}, expected {expected!r}')
             d.g.pump(.5)
     def integer(app,w,symbol):return int.from_bytes(d.read(app,w['pid'],symbol,4),'little',signed=True)
+    def threads(pid):
+        return d.debug(f"import gdb,json\np=gdb.parse_and_eval(\"'kernel/process/process.c'::process_table\")\nprint('RESULT '+json.dumps(next(int(p[i]['live_thread_count']) for i in range(p.type.range()[1]+1) if int(p[i]['pid'])=={pid})))")
     def save_as(name,documents=True):
         panel=d.wait_window('Save');d.g.pump(1)
         ui=NativeUI(d)
@@ -140,12 +142,14 @@ def main():
         expect_text('edit',w,original)
         d.key('up');d.g.pump(1)
         assert all(v['title']!='Save' for v in d.state()['windows']), 'Up was mistaken for Ctrl+S'
-        d.key('ctrl-s');d.wait_window('Save');d.snap('shared-save')
+        d.key('ctrl-s');panel=d.wait_window('Save');d.snap('shared-save')
+        panel_threads=threads(panel['pid'])
         save_as('Milestone.txt')
         assert text('edit',w,'g_path')=='/home/tester/Documents/Milestone.txt'
         assert text('edit',w,'g_status').startswith('Saved ')
         d.snap('document-saved')
         NativeUI(d).click_text(w,'Save As');panel=d.wait_window('Save')
+        assert threads(panel['pid'])==panel_threads,'repeated picker windows leaked appearance workers'
         NativeUI(d).click_text(panel,'Save',rightmost=True);d.g.pump(1)
         assert integer('filepanel',panel,'g_replace')==1,'existing Save As skipped replacement confirmation'
         d.snap('replace-confirmation');d.key('esc');d.key('esc');d.g.pump(1)
