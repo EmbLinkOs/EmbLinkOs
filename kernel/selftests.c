@@ -671,6 +671,62 @@ static int vfs_files_identical(const char *a, const char *b)
     return eq;
 }
 
+/* A private mount/fd fixture: no global filesystem operation table is changed.
+ * Short backend writes must stay dirty; even a clean file/directory needs its
+ * sync callback, and the error must reach fsync's caller. */
+static int sync_test_calls, sync_test_error, sync_test_short;
+static int sync_test_read(struct vnode *vn,uint64_t off,void *buf,size_t n,size_t *done) {
+    (void)vn;(void)off;(void)buf;(void)n;*done=0;return EMBK_OK;
+}
+static int sync_test_stat(struct vnode *vn,struct vfs_stat *st) {
+    (void)vn;memset(st,0,sizeof *st);return EMBK_OK;
+}
+static int sync_test_write(struct vnode *vn,uint64_t off,const void *buf,size_t n,size_t *done) {
+    (void)vn;(void)off;(void)buf;*done=sync_test_short && n?n-1:n;return EMBK_OK;
+}
+static int sync_test_barrier(struct vnode *vn) {
+    (void)vn;sync_test_calls++;return sync_test_error;
+}
+static int document_sync_test(void) {
+    static const struct vfs_ops ops={.read=sync_test_read,.write=sync_test_write,
+                                    .stat=sync_test_stat,.sync=sync_test_barrier};
+    static struct vfs_mount mount={.ops=&ops};
+    struct vnode vn={.mnt=&mount,.ino=1,.type=VFS_DT_REG};
+    struct vm_object *obj=vmo_get(vn);int fails=0;
+    if(!obj)return 1;
+    size_t done=0;sync_test_short=1;
+    if(vmo_write(obj,0,"payload",7,&done)!=EMBK_OK || done!=7)fails++;
+    uint64_t dirty=obj->dirty_pages;
+    int rc=vmo_flush(obj);
+    if(rc!=-EMBK_EIO || obj->dirty_pages!=dirty)fails++;
+    sync_test_short=0;
+    if(vmo_flush(obj)!=EMBK_OK)fails++;
+    if(obj->dirty_pages!=0 || dirty!=1)fails++;
+    vmo_put(obj);
+
+    /* Install only in this monitor thread's own unused descriptor slot. The
+     * automatic fixture objects outlive the call and are removed before return. */
+    struct fd_entry *table=current_process?current_process->fds:NULL;
+    int fd=-1;
+    if(table) {
+        mutex_lock(&current_process->fd_lock);
+        for(int i=3;i<FD_MAX_OPEN;i++)if(!table[i].used){fd=i;break;}
+    }
+    if(fd<0) {
+        if(table)mutex_unlock(&current_process->fd_lock);
+        kprintf("[cmd] test document sync: fixture fd unavailable -> FAIL\n");return fails+1;
+    }
+    struct open_file file={.vn=vn,.refs=1,.obj=NULL};
+    table[fd]=(struct fd_entry){.used=true,.backing=FD_BACKING_VNODE};
+    table[fd].u.file.of=&file;sync_test_calls=0;sync_test_error=0;
+    if(vfs_fd_fsync(fd)!=EMBK_OK || sync_test_calls!=1)fails++;
+    file.vn.type=VFS_DT_DIR;sync_test_error=-EMBK_EIO;
+    if(vfs_fd_fsync(fd)!=-EMBK_EIO || sync_test_calls!=2)fails++;
+    memset(&table[fd],0,sizeof table[fd]);mutex_unlock(&current_process->fd_lock);
+    kprintf("[cmd] test document sync: short writes remain dirty; clean-file and directory barriers/errors: %s\n",fails?"FAIL":"OK");
+    return fails;
+}
+
 int selftests_handle_command(const char *cmd)
 {
     if (!cmd || !cmd[0])
@@ -9024,6 +9080,7 @@ int selftests_handle_command(const char *cmd)
 
     /* Laptop control-plane acceptance runs in ring 3 and waits for the full
      * child result, including its confined preferences/file-operation probes. */
+    if(!strcmp(cmd,"test document sync")) {document_sync_test();return 1;}
     const char *device_mode=NULL;
     if(!strcmp(cmd,"test devices fixture"))device_mode="--fixture";
     else if(!strcmp(cmd,"test devices audio"))device_mode="--audio";

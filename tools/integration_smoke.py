@@ -16,7 +16,7 @@ results=[]
 try:
     guest.wait(b'TopBar: first frame presented')
     guest.qmp.screendump(str(out/'desktop.ppm'))
-    for command in ['test devices','test devices preferences','test devices files',
+    for command in ['test devices','test devices preferences','test devices files','test document sync','test pagecache',
                     'test ipc cancel','test channel','test compositor','test session',
                     'test kill io','test posix']:
         start=len(guest.seen);guest.serial.sendall((command+'\n').encode())
@@ -28,7 +28,11 @@ try:
             if match:
                 line=match.group().decode(errors='replace');print(line,flush=True)
                 if not line.endswith('OK'):raise RuntimeError(line)
-                results.append(line);break
+                results.append(line)
+                # Let deferred reaping and session-service handshakes settle
+                # before the next test snapshots global IPC object counts.
+                guest.pump(1)
+                break
             if b'PANIC' in output:raise RuntimeError('kernel panic during '+command)
             if time.monotonic()>deadline:raise TimeoutError(command)
     guest.qmp.screendump(str(out/'desktop-tested.ppm'))

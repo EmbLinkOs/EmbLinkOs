@@ -445,8 +445,8 @@ static uint32_t flush_run(struct vm_object *o, uint64_t first) {
 
     size_t wrote = 0;
     int rc = o->vn.mnt->ops->write(&o->vn, off, g_flush_buf, (size_t)len, &wrote);
-    if (rc != EMBK_OK)
-        return 0;
+    if (rc != EMBK_OK || wrote != len)
+        return 0; /* keep every dirty page retryable after a short write */
 
     for (uint32_t i = 0; i < n; i++) {
         if (run[i]->dirty) {

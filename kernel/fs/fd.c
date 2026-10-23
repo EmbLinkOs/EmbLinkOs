@@ -429,9 +429,15 @@ int vfs_fd_fsync(int fd)
     if (e->backing != FD_BACKING_VNODE)
         return EMBK_OK;
     struct open_file *of = e->u.file.of;
-    if (!of || !of->obj)
-        return EMBK_OK;
-    return vmo_flush(of->obj);
+    if (!of) return -EMBK_EBADF;
+    int rc=of->obj?vmo_flush(of->obj):EMBK_OK;
+    if(rc!=EMBK_OK)return rc;
+    /* A clean page cache does not imply a durable device. In particular,
+     * directories have no cached data: fsync(parent) must still issue the
+     * filesystem's barrier after an atomic rename. */
+    if(of->vn.mnt && of->vn.mnt->ops && of->vn.mnt->ops->sync)
+        return of->vn.mnt->ops->sync(&of->vn);
+    return EMBK_OK;
 }
 
 int vfs_chmod_path(const char *path, uint32_t mode)
