@@ -82,10 +82,7 @@ static void cpu_sample(void) {
     g_cpu_last_ms = now;
 }
 
-/* LABELLED, and that is not decoration. A bare percentage in the corner of a
- * menu bar is read as a battery by everyone who has ever used a computer --
- * and this OS has no battery driver at all yet, so the one number it can
- * honestly show there had better say what it is. */
+/* Keep the unit visible: CPU utilization must not read as battery charge. */
 static const char *cpu_text(void) {
     static char buf[24];
     snprintf(buf, sizeof buf, "CPU %d%%", g_cpu_pct);
@@ -380,10 +377,16 @@ static void status_network(void) {
     }
 }
 static void status_power(void) {
-    Menu("Power",.icon=IconBattery,.height=g_bar_cfg.bar_size-4,.menu_above=g_bar_cfg.bar_edge?g_bar_cfg.bar_size:0,.width=224) {
+    int present=!!(g_power.flags&EMBK_POWER_BATTERY);
+    int battery=present && g_power.percent<=100;
+    static char label[32];
+    if(battery)snprintf(label,sizeof label,"Battery %u%%",g_power.percent);
+    else snprintf(label,sizeof label,present?"Battery unknown":"Power");
+    /* An unavailable battery must not look like a permanently full one. */
+    Menu(label,.icon=present?0:IconBolt,.height=g_bar_cfg.bar_size-4,.menu_above=g_bar_cfg.bar_edge?g_bar_cfg.bar_size:0,.width=224) {
         char status[64];
         if((g_power.flags&EMBK_POWER_BATTERY) && g_power.percent<=100)snprintf(status,sizeof status,"Battery  %u%%",g_power.percent);
-        else snprintf(status,sizeof status,"No battery reported");
+        else snprintf(status,sizeof status,present?"Battery charge unavailable":"No battery reported");
         MenuItem(status);MenuSeparator();
         if(MenuItem("Lock Screen"))request_lock();
     }

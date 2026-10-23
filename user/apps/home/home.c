@@ -445,6 +445,32 @@ static struct app_item grid_to_item(int i) {
  * Renders the icon
  * (with hover styling) and tracks a press as either a click or a drag; the drop
  * is resolved after the frame in dock_resolve_drop(). */
+/* Colour tiles have opaque backgrounds, so alpha-tinting the whole tile
+ * erases its glyph. Monochrome uses the matching original line silhouette. */
+static const char *monochrome_icon(const char *path) {
+    static const struct {const char *file,*symbol;} family[]={
+        {"files.eic","/system/images/ui-folder.eic"},
+        {"terminal.eic","/system/images/ui-terminal.eic"},
+        {"setting.eic","/system/images/ui-gear.eic"},
+        {"editor.eic","/system/images/ui-edit.eic"},
+        {"notepp.eic","/system/images/ui-document.eic"},
+        {"photos.eic","/system/images/ui-photo.eic"},
+        {"music.eic","/system/images/ui-music.eic"},
+        {"monitor.eic","/system/images/ui-monitor.eic"},
+        {"calc.eic","/system/images/ui-calculator.eic"},
+        {"vellum.eic","/system/images/ui-window.eic"},
+        {"netsurf.eic","/system/images/ui-network.eic"},
+        {"file.eic","/system/images/ui-document.eic"},
+        {"notifications.eic","/system/images/ui-bell.eic"},
+        {"launcher.eic","/system/images/ui-launcher.eic"},
+        {"app_launcher.eic","/system/images/ui-grid.eic"}
+    };
+    const char *file=strrchr(path,'/');file=file?file+1:path;
+    for(unsigned i=0;i<sizeof family/sizeof family[0];i++)
+        if(!strcmp(file,family[i].file))return family[i].symbol;
+    return "/system/images/ui-grid.eic";
+}
+
 static void drag_icon(struct app_item it, int size, int kind, int idx) {
     /* Key by the app's IDENTITY (its unique path), NOT its slot index. When the
      * list shifts (remove/reorder), an index-keyed instance gets reused for a
@@ -457,7 +483,7 @@ static void drag_icon(struct app_item it, int size, int kind, int idx) {
     ui_set_align(ALIGN_CENTER);
     /* ALWAYS set opacity, so an instance never stays dimmed after its drag ends */
     ui_set_opacity((g_drag == kind && g_drag_i == idx && g_drag_moved) ? 0.3f : 1.0f);
-    if(ui_theme()->icon_theme)ImageButtonTinted(it.icon,size,ui_theme()->text);
+    if(ui_theme()->icon_theme)ImageButtonTinted(monochrome_icon(it.icon),size,ui_theme()->text);
     else ImageButton(it.icon, size);         /* styling only; click/drag handled below */
     if (ui_is_active()) {
         g_any_active = 1;
@@ -833,7 +859,7 @@ static void drag_ghost(void) {
     ui_begin_vstack(1);
     ui_set_offset(g_drag_x - 22.0f, g_drag_y - 22.0f);
     ui_set_opacity(0.85f);
-    if(ui_theme()->icon_theme)ImageButtonTinted(g_drag_item.icon,44,ui_theme()->text);
+    if(ui_theme()->icon_theme)ImageButtonTinted(monochrome_icon(g_drag_item.icon),44,ui_theme()->text);
     else ImageButton(g_drag_item.icon,44);
     ui_end_stack();
     ui_end_stack();
