@@ -4,6 +4,8 @@ Current laptop implementation and validation: [DAILY_USE.md](DAILY_USE.md),
 [LAPTOP_DESKTOP.md](LAPTOP_DESKTOP.md),
 [LAPTOP_ALPHA.md](LAPTOP_ALPHA.md) and [WIFI.md](WIFI.md). These supersede the older
 driver/UI limitations in the historical phase log below.
+Validation: [LAPTOP_VALIDATION.md](LAPTOP_VALIDATION.md).
+Screenshots: [laptop progress gallery](media/laptop-progress/README.md).
 
 *Last updated: 2026-10-23. Living document — reconciled from two previously
 diverging copies (root `PROJECT_STATUS.md` and this file) into one canonical

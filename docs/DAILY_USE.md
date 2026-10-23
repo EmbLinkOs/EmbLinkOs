@@ -214,3 +214,6 @@ acceptance, broader hardware drivers, native GPU modesetting/acceleration,
 suspend/resume, and OS-image update/recovery beyond the initial installer.
 See [LAPTOP_ALPHA.md](LAPTOP_ALPHA.md), [HARDWARE_DRIVERS.md](HARDWARE_DRIVERS.md)
 and [WIFI.md](WIFI.md). Browser development remains separate.
+
+Validation results: [LAPTOP_VALIDATION.md](LAPTOP_VALIDATION.md).
+Screen captures and website assets: [progress gallery](media/laptop-progress/README.md).
