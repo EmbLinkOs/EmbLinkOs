@@ -831,37 +831,14 @@ static void drag_ghost(void) {
     ui_begin_vstack(1);
     ui_set_offset(g_drag_x - 22.0f, g_drag_y - 22.0f);
     ui_set_opacity(0.85f);
-    ImageButton(g_drag_item.icon, 44);
+    if(ui_theme()->icon_theme)ImageButtonTinted(g_drag_item.icon,44,ui_theme()->text);
+    else ImageButton(g_drag_item.icon,44);
     ui_end_stack();
     ui_end_stack();
 }
 
-/* THE APPLICATIONS LAUNCHER -- Launchpad, not a dialog.
- *
- * It used to be a 480px card floating over the desktop, and that was wrong in
- * two ways at once. It read as a file-picker rather than as the place all your
- * applications live; and at 480x430 it did not FIT a 640x480 display, so its
- * header slid up under the menu bar and the app names printed over the clock.
- * A modal card has to be sized against a screen it cannot know.
- *
- * Full-bleed instead: the launcher IS the screen while it is up. The wallpaper
- * home already painted stays visible through a frosted sheet, the grid is
- * centred in the work area, and everything is sized from the live viewport, so
- * there is no resolution at which it can overflow. This is also why the layer
- * comes to the front (see apps_set_open): a full-screen surface behind the
- * windows is just an invisible one. */
-/* The tint the launcher's glass carries, and why it carries one at all.
- *
- * "Blur the desktop and dim it" is the whole of this effect on a Mac, and it
- * works there because the wallpaper has colour in it to blur. This OS ships a
- * near-black one, so frosting it lands on black and stays black -- the launcher
- * came out looking like the screen had been switched off, which is a fair
- * description of a dark rectangle with small icons on it.
- *
- * So the glass is tinted rather than merely dimmed: a cool indigo at low alpha,
- * bright enough to give the surface somewhere to catch light and read as a
- * material over a dark room, faint enough that it is still the wallpaper you
- * are looking through. */
+/* The application library uses a bounded search/grid surface. Its dimensions
+ * follow the work area, including side docks and either command-strip edge. */
 /* The lock's wash is DARKER and far more opaque than the launcher's: the point
  * of the launcher is that you can still see your desktop behind it, and the
  * point of this is that you cannot. What is on your screen is as much yours as

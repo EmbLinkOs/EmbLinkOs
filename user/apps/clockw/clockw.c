@@ -1,8 +1,5 @@
-/* user/apps/clockw/clockw.c -- the EmbLink CLOCK desktop widget (EmUI V5).
- *
- * A tiny always-on-desktop tile: big uptime clock + a live activity spark.
- * Sits in the widget z-band (above the wallpaper, below every app window);
- * home spawns it at boot. The whole program is a view + one EM_WIDGET. */
+/* Clock widget example: real local wall time, date and system uptime.
+ * The widget runtime supplies the same live appearance as native apps. */
 
 #include <stdio.h>
 #include <time.h>

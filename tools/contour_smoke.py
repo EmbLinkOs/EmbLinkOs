@@ -89,6 +89,6 @@ print('RESULT '+json.dumps({k:int(s[k]) for k in ['workspace','workspace_count',
         d.snap('paper-after-reboot')
         d.g.command('recovery check',b'integrity OK',240)
     finally:d.g.close()
-    print('PASS: authenticated Contour shell, keyboard launch, real workspaces, hidden-input isolation, live Paper preset, all native app surfaces and cold preference persistence',flush=True)
+    print('PASS: authenticated Contour shell, keyboard launch, real workspaces, hidden-input isolation, live Paper preset, application surfaces and cold preference persistence',flush=True)
 
 if __name__=='__main__':main()

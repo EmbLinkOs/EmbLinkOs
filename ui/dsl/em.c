@@ -775,8 +775,9 @@ static void em_icon_impl(int cp, EmProps p) {
     const uint32_t *px=path?em_image_at(path,(uint32_t)extent,&w,&h):0;
     if(px) {
         Color ink=p.color.a>0?p.color:TH->text_secondary;
-        uint64_t key=(uint64_t)(uintptr_t)px ^ ((uint64_t)(ink.r*255)<<16) ^ ((uint64_t)(ink.g*255)<<8) ^ (uint64_t)(ink.b*255);
-        ui_image_sized_tinted(key,px,w,h,extent,extent,ink);
+        /* Identity follows the leaf's position, like text. Tint and mip level
+         * are content: changing either must retain an in-flight pointer capture. */
+        ui_image_sized_tinted(0,px,w,h,extent,extent,ink);
     } else {
         char g[5];utf8_enc(cp,g);if(!p.font)p.font=Body;
         em_text_impl(g,p);
@@ -2970,13 +2971,9 @@ bool em_image_button_tinted(const char *path, float size, Color tint) {
     ui_set_corner_radius(10);
     ui_set_paint(hov ? solid(shade(TH->surface_alt, pressed ? 0.86f : 1.12f))
                      : solid((Color){0, 0, 0, 0}));
-    /* key on the tint too: the same pixels drawn in a new colour must not be
-     * mistaken for an unchanged node and skipped by the dirty tracker */
-    uint64_t k = (uint64_t)(uintptr_t)px
-               ^ ((uint64_t)(uint32_t)(tint.r * 255.0f) << 16)
-               ^ ((uint64_t)(uint32_t)(tint.g * 255.0f) << 8)
-               ^ ((uint64_t)(uint32_t)(tint.b * 255.0f));
-    ui_image_sized_tinted(k, px, w, h, inner, inner, tint);
+    /* The leaf retains its identity across live tint and mip changes. The
+     * scene setter already marks changed stencil colour as damaged content. */
+    ui_image_sized_tinted(0x1CA7, px, w, h, inner, inner, tint);
     bool activated=ui_control_interact(self);
     ui_end_stack();
     return activated;

@@ -17,7 +17,7 @@ class NativeUI:
         self.offsets=json.loads(subprocess.check_output([str(probe)]))
         nm=subprocess.check_output(['x86_64-elf-nm','-S','--defined-only',str(ROOT/'build/libembk.so')],text=True)
         symbols={a[3]:int(a[0],16) for line in nm.splitlines() if len(a:=line.split())==4}
-        self.symbols={k:symbols[k] for k in ['g_inst','g_inst_hw','g_sa','g_hovered','g_clicked','g_active','g_focused','g_ptr_down','g_zoom_open','g_tip_visible']}
+        self.symbols={k:symbols[k] for k in ['g_inst','g_inst_hw','g_sa','g_hovered','g_clicked','g_active','g_focused','g_ptr_down','g_zoom_open','g_tip_visible','g_zoom_overlay','g_menu_scrim']}
     def labels(self,window,diagnostic=False):
         current=next(r for r in self.d.state()["windows"] if r["id"]==window["id"])
         window.update(current)
@@ -93,10 +93,11 @@ if {diagnostic!r}:
         index=uint(read(bias+symbols[key],8),0);chain=[]
         while 0<index<count and len(chain)<20:
             a=instance(index);n=uint(a,offsets['i_scene'])
-            chain.append({{'index':index,'text':a[offsets['i_text']:offsets['i_text']+256].split(b'\\0',1)[0].decode('utf-8','replace'),'rect':bounds(n)}})
+            chain.append({{'index':index,'text':a[offsets['i_text']:offsets['i_text']+256].split(b'\\0',1)[0].decode('utf-8','replace'),'rect':bounds(n),'key':int.from_bytes(a[offsets['i_key']:offsets['i_key']+8],'little'),'layer':node(n)[offsets['n_layer']],'passthrough':bool(node(n)[offsets['n_pass']])}})
             index=uint(a,offsets['i_parent'])
         states[key]=chain
     for key in ['g_ptr_down','g_tip_visible','g_zoom_open']:states[key]=int.from_bytes(read(bias+symbols[key],1 if key=='g_ptr_down' else 4),'little')
+    for key in ['g_zoom_overlay','g_menu_scrim']:states[key]=list(struct.unpack('<II',read(bias+symbols[key],8)))
     states['kernel_ptr_pid']=int(gdb.parse_and_eval("'kernel/gfx/compositor.c'::g_ptr_pid"))
     states['kernel_buttons']=int(gdb.parse_and_eval("'kernel/gfx/compositor.c'::g_ptr_buttons"))
     rows=states

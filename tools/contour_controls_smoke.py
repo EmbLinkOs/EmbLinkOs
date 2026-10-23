@@ -64,7 +64,7 @@ print('RESULT '+json.dumps(int(gdb.parse_and_eval("'kernel/gfx/compositor.c'::g_
         ui.click_text(w,'Appearance');ui.select(w,'Interface font','Serif');eventually(lambda:cfg(w,'font')==2,'font preference');d.snap('serif-appearance')
         ui.scroll(w,4);d.snap('type-controls')
         ui.select(w,'Interface scale','115%');eventually(lambda:cfg(w,'ui_scale')==115,'interface scale')
-        ui.select(w,'Density','Compact');eventually(lambda:cfg(w,'density')==0,'density');d.snap('compact-scaled')
+        ui.scroll(w,2);ui.select(w,'Density','Compact');eventually(lambda:cfg(w,'density')==0,'density');d.snap('compact-scaled')
         ui.scroll(w,20);ui.click_text(w,'Reset appearance…');d.snap('reset-confirmation')
         ui.click_text(w,'Cancel');assert cfg(w,'ui_scale')==115,'reset cancellation changed preferences'
         ui.click_text(w,'Reset appearance…');ui.click_text(w,'Reset')

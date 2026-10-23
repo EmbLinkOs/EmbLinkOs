@@ -24,6 +24,7 @@
 #include "testfont.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 static int g_fail;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("  FAIL: %s\n", (msg)); g_fail++; } \
@@ -176,6 +177,16 @@ static void under_frame(void) {
     ui_end_stack();ui_frame_end();ui_run_layout(400,100);
 }
 
+/* Exercise the shipped EIC path as well as the font fallback: a hover can
+ * change stencil tint on the very frame that captures the image leaf. */
+static uint8_t *icon_asset(const char *path,size_t *len) {
+    if(strncmp(path,"/system/images/",15))return NULL;
+    FILE *f=fopen(path+1,"rb");if(!f)return NULL;
+    fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);
+    uint8_t *p=malloc(n>0?(size_t)n:1);
+    if(n<=0 || !p || fread(p,1,(size_t)n,f)!=(size_t)n){free(p);fclose(f);return NULL;}
+    fclose(f);*len=(size_t)n;return p;
+}
 static bool chrome_closed;
 static void chrome_frame(void) {
     ui_frame_begin();em_new_frame();
@@ -453,6 +464,17 @@ int main(void) {
     em_feed_pointer(84,18,0,0,0,1);chrome_frame();g_ms+=700;chrome_frame();chrome_frame();
     em_feed_pointer(20,18,1,0,0,1);chrome_frame();
     CHECK(chrome_closed,"leaving the layout board for Close does not swallow the close press");
+    em_feed_pointer(20,18,0,0,0,1);chrome_frame();
+
+    em_res_set_loader(icon_asset);
+    uint32_t iw=0,ih=0;
+    CHECK(em_image_at("/system/images/ui-close.eic",16,&iw,&ih)!=NULL,
+          "window control regression uses the shipped EIC icon");
+    em_feed_pointer(300,200,0,0,0,1);chrome_frame();chrome_frame();
+    /* No intermediate hovered frame: pointer movement and press arrive in one
+     * compositor sample. The old tint-derived key destroyed the capture. */
+    em_feed_pointer(20,18,1,0,0,1);chrome_frame();
+    CHECK(chrome_closed,"a close press survives the icon's simultaneous hover tint change");
     em_feed_pointer(20,18,0,0,0,1);chrome_frame();
 
     printf("=== em-test: %s (%d failures) ===\n", g_fail ? "FAIL" : "OK", g_fail);

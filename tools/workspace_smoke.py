@@ -99,7 +99,7 @@ print('RESULT '+json.dumps(data.hex()))'''))
         self.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 1'});self.g.pump(.8)
         self.g.qmp.cmd('human-monitor-command',**{'command-line':'mouse_button 0'});self.g.pump(1)
     def snap(self,name):
-        self.g.pump(1);p=self.out.parent/(name+'.ppm');self.g.qmp.screendump(str(p));return p
+        self.g.pump(1);p=self.out.parent/(name+'.ppm');self.g.qmp.screendump(str(p));print('Capture: '+name,flush=True);return p
     def launch(self,name,title):
         self.key('meta_l-spc');self.g.pump(2)
         start=len(self.g.seen);self.type(name+'\n');w=self.wait_window(title)

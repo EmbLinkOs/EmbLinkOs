@@ -8,7 +8,7 @@
  * differently in three places.
  *
  * The format is deliberately the dullest thing that works -- "key value" lines
- * in /data/settings.conf. It is editable with the text editor we ship, it
+ * in ~/settings.conf (with /data/settings.conf as the no-HOME fallback). It is editable with the text editor we ship, it
  * diffs, and a corrupt or missing file simply yields defaults rather than an
  * unusable desktop. Unknown keys are ignored while reading. Settings writes the complete
  * schema it understands; it does not preserve future or third-party keys.
@@ -56,9 +56,8 @@ static inline const char *oscfg_path(void) {
     return p;
 }
 
-/* The accents are named rather than free RGB: a palette a designer chose beats
- * a colour wheel a user fights, and every one of these is checked against the
- * dark ground the shell actually uses. */
+/* Curated accents retain stable indices. Custom RGB accents use a separate
+ * key and are normalized by the shared theme for readable contrast. */
 #define OSCFG_ACCENTS 8
 struct oscfg_accent { const char *name; float r, g, b; };
 /* APPENDED TO, NEVER REORDERED. The file stores an INDEX, so moving an entry
@@ -214,7 +213,7 @@ struct oscfg {
     int accent;        /* index into oscfg_accents                       */
     int dark;          /* 1 dark, 0 light                                */
     int dock_size;     /* dock icon base size in px                      */
-    int dock_dots;     /* light the socket behind a live app's icon      */
+    int dock_dots;     /* show the accent rail under a live app          */
     int ui_scale;      /* interface size, PERCENT (80..130); 100 = default */
     int keymap;        /* index into oscfg_keymaps                       */
     int wallpaper;     /* index into oscfg_wallpapers                    */
