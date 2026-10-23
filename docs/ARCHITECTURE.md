@@ -1,5 +1,9 @@
 # EmbLinkOS — Architecture
 
+## Document workspace platform (2026-10-23)
+
+Document saving, shared file dialogs, acknowledged close requests and per-process recovery drafts now share a platform contract. See [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md) for ordering, failure semantics, authority and remaining races.
+
 *Living document — last updated 2026-07-13.*
 
 **Status legend:**

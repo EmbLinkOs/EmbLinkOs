@@ -567,3 +567,24 @@ launcher entry; move one there and it appears.
 - [`user/apps/clockw/clockw.c`](../user/apps/clockw/clockw.c) — the minimal widget reference.
 - [`ui/dsl/showcase_v2.c`](../ui/dsl/showcase_v2.c) — every component
   exercised for the host-render test loop.
+
+## Document applications: save and close
+
+Use `embk_file_panel` for Open and Save As. A return of 1 is a complete chosen
+absolute path, 0 is cancellation, and a negative result is a service/protocol
+error. The path still requires namespace authority. Use `emdoc_read` to refuse
+oversized/binary text without replacing the old buffer, and `emdoc_save` for
+synced temporary-file replacement and advisory external-edit detection.
+
+Install `em_set_close_hook` for an app with unsaved state. Return 0 to show a
+Save/Discard/Cancel dialog. Once the user answers, call `em_app_request_exit`
+again and let the hook return 1. This covers Escape, toolkit controls and GUI+W.
+The runtime acknowledges compositor close requests while the dialog is pending;
+a user deciding where to save is not subject to the unresponsive-app timeout.
+See [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md) and the two editor apps for
+recovery, multi-document quit handling and save-failure behavior.
+
+Key hooks that interpret Ctrl/Shift chords should use `em_key_modifiers()`,
+which describes the current queued character, rather than `embk_key_mods()`,
+which describes what is physically held now. This keeps delayed Ctrl+S distinct
+from the legacy Up byte after the modifier has been released.

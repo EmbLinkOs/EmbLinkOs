@@ -26,6 +26,9 @@
 
 #include "embk.h"
 #include "emnotify.h"
+#include "emfiles.h"
+#include "workspace.h"
+#include <errno.h>
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
@@ -110,8 +113,13 @@ static char  g_goto_buf[16];
  * frame it appears: the press that OPENED it is still being delivered, and a
  * sheet that opens and shuts in the same gesture reads as a button that does
  * nothing. The launcher learned this; these three inherited the bug instead. */
-static int   g_goto_frames, g_pick_frames, g_confirm_frames;
+static int   g_goto_frames, g_confirm_frames;
 #define SHEET_SETTLED 3
+static struct emdoc_workspace g_workspace;
+static struct emdoc_stamp g_read_stamp;
+static uint64_t g_checkpoint_ms;
+static int g_quitting;
+static unsigned g_quit_discard_mask;
 static int   g_confirm_close = -1;/* a modified document asking before it goes */
 static uint64_t g_last_click_ms;  /* for double / triple click                 */
 static int   g_click_streak;
@@ -129,12 +137,8 @@ static void move_visual(int dir, int extend);
 /* ---- files --------------------------------------------------------------- */
 
 static long file_read(const char *path, char *buf, size_t cap) {
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    size_t n = fread(buf, 1, cap - 1, f);
-    fclose(f);
-    buf[n] = 0;
-    return (long)n;
+    if(emdoc_read(path,buf,cap,&g_read_stamp))return -1;
+    return (long)strlen(buf);
 }
 
 /* Point the engine at whichever document is current. The engine holds a
@@ -166,23 +170,43 @@ static void sync_out(void) {
 
 static void session_save(void);   /* defined below; save records the session */
 
-static void save_current(void) {
-    struct doc *d = doc_cur();
-    if (!d) return;
-    if (!d->path[0]) { snprintf(g_msg, sizeof g_msg, "No name -- type a path above"); return; }
-    if (d->truncated) {
-        snprintf(g_msg, sizeof g_msg, "REFUSED: opened truncated at %d KB", DOC_CAP / 1024);
-        return;
+static const char *document_parent(const char *path) {
+    static char dir[256];
+    if(!path[0]) {const char *h=getenv("HOME");return h&&h[0]?h:"/home";}
+    snprintf(dir,sizeof dir,"%s",path);char *slash=strrchr(dir,'/');
+    if(slash==dir)slash[1]=0;else if(slash)*slash=0;return dir;
+}
+static int save_document(int save_as) {
+    struct doc *d=doc_cur();if(!d)return 0;
+    if(d->truncated){snprintf(g_msg,sizeof g_msg,"Refused: incomplete document");return 0;}
+    char path[DOC_PATH_MAX];snprintf(path,sizeof path,"%s",d->path);
+    struct emdoc_stamp expected=d->original;
+    if(save_as || !path[0]) {
+        const char *base=strrchr(d->path,'/');base=base?base+1:(d->path[0]?d->path:"Untitled.txt");
+        int r=embk_file_panel(EMFILE_SAVE,"Save document",document_parent(d->path),base,path,sizeof path);
+        if(r<=0){if(r<0)snprintf(g_msg,sizeof g_msg,"Save dialog unavailable (%d)",r);return 0;}
+        if(emdoc_probe(path,&expected)){snprintf(g_msg,sizeof g_msg,"Cannot inspect destination");return 0;}
+        /* Don't create two divergent tabs over the same file through Save As. */
+        for(int i=0;i<DOC_MAX;i++)if(i!=doc_current() && doc_at(i) && !strcmp(doc_at(i)->path,path)) {
+            snprintf(g_msg,sizeof g_msg,"That file is open in another tab");return 0;
+        }
     }
-    FILE *f = fopen(d->path, "w");
-    if (!f) { snprintf(g_msg, sizeof g_msg, "Cannot write %.60s", d->path); return; }
-    size_t len = strlen(d->text), w = fwrite(d->text, 1, len, f);
-    fclose(f);
-    if (w == len) { doc_mark_saved(doc_current());
-                    snprintf(g_msg, sizeof g_msg, "Saved %lu bytes", (unsigned long)w);
-                    session_save(); }
-    else snprintf(g_msg, sizeof g_msg, "PARTIAL WRITE %lu of %lu",
-                  (unsigned long)w, (unsigned long)len);
+    struct emdoc_stamp saved;
+    if(emdoc_save(path,d->text,strlen(d->text),&expected,&saved)) {
+        snprintf(g_msg,sizeof g_msg,"%s",errno==EAGAIN?"File changed on disk. Use Save As.":"Save failed; changes remain open");return 0;
+    }
+    snprintf(d->path,sizeof d->path,"%s",path);d->original=saved;d->lang=syn_lang_of(path);
+    snprintf(g_path_field,sizeof g_path_field,"%s",path);doc_mark_saved(doc_current());
+    emws_forget(&g_workspace,doc_current());session_save();
+    snprintf(g_msg,sizeof g_msg,"Saved and synced %lu bytes",(unsigned long)strlen(d->text));
+    embk_puts(1,"Note++: document saved and synced\n");return 1;
+}
+static int save_current(void) {return save_document(0);}
+static void pick_begin(void) {
+    struct doc *d=doc_cur();char path[DOC_PATH_MAX];
+    int r=embk_file_panel(EMFILE_OPEN,"Open document",document_parent(d?d->path:""),0,path,sizeof path);
+    if(r==1){snprintf(g_path_field,sizeof g_path_field,"%s",path);g_want_open=1;}
+    else if(r<0)snprintf(g_msg,sizeof g_msg,"Open dialog unavailable (%d)",r);
 }
 
 /* The token that starts a line comment, per language. Markdown and plain text
@@ -198,67 +222,6 @@ static const char *comment_tok(enum syn_lang l) {
 static enum syn_lang d_lang(void) {
     struct doc *d = doc_cur();
     return d ? d->lang : SYN_PLAIN;
-}
-
-/* ---- the file picker -----------------------------------------------------
- * A path field alone means the only way to find out where you may write is to
- * type somewhere and read the error. This app can name exactly two subtrees --
- * $HOME to read and write, /system to read (notepp.ns) -- and a list is a far
- * better way to say that than a refusal after the fact. */
-#define PICK_MAX 64
-static int  g_pick_open;
-static char g_pick_dir[DOC_PATH_MAX];
-static struct embk_dirent g_pick[PICK_MAX];
-static int  g_pick_n;
-static float g_pick_scroll;
-static int  g_pick_writable;      /* is the listed directory writable BY US? */
-static char g_pick_new[96];       /* a name to create in the listed directory */
-
-/* CAN WE WRITE HERE? Asked by trying, not by consulting a copy of the manifest.
- * The app's authority is declared in notepp.ns, which the app cannot read (its
- * namespace does not include /data/apps), and a second list of the same fact
- * kept here would be a list that drifts. Creating a file and removing it again
- * asks the kernel the real question and gets the real answer, including for a
- * directory that is writable for a reason nobody wrote down.
- *
- * Once per directory listed, not once per entry: the point is which PLACES
- * accept a save, and every entry in one directory shares that answer. */
-static int dir_writable(const char *dir) {
-    char probe[DOC_PATH_MAX + 24];
-    snprintf(probe, sizeof probe, "%s%s.notepp-probe", dir,
-             strcmp(dir, "/") ? "/" : "");
-    FILE *f = fopen(probe, "w");
-    if (!f) return 0;
-    fclose(f);
-    embk_unlink(probe);
-    return 1;
-}
-
-static void pick_scan(const char *dir) {
-    /* A rescan of the CURRENT directory passes g_pick_dir back in -- copying a
-     * buffer onto itself is undefined, and the compiler is right to say so. */
-    if (dir != g_pick_dir) snprintf(g_pick_dir, sizeof g_pick_dir, "%s", dir);
-    int64_t n = embk_readdir(g_pick_dir, g_pick, PICK_MAX);
-    g_pick_n = n < 0 ? 0 : (int)n;
-    g_pick_writable = dir_writable(g_pick_dir);
-    g_pick_scroll = 0;
-}
-
-static void pick_begin(void) {
-    const char *h = getenv("HOME");
-    /* Start where the caret's file lives, else at home -- the two places a
-     * person is most likely to mean. */
-    struct doc *d = doc_cur();
-    char start[DOC_PATH_MAX];
-    if (d && d->path[0]) {
-        snprintf(start, sizeof start, "%s", d->path);
-        char *slash = start;
-        for (char *q = start; *q; q++) if (*q == '/') slash = q;
-        if (slash != start) *slash = 0; else start[1] = 0;
-    } else snprintf(start, sizeof start, "%s", (h && h[0]) ? h : "/");
-    pick_scan(start);
-    g_pick_new[0] = 0;
-    g_pick_open = 1;     g_pick_frames = 0;
 }
 
 /* ---- the session ---------------------------------------------------------
@@ -278,14 +241,14 @@ static void session_path(char *out, size_t cap) {
 
 static void session_save(void) {
     char sp[256]; session_path(sp, sizeof sp);
-    FILE *f = fopen(sp, "w");
-    if (!f) return;
-    for (int i = 0; i < DOC_MAX; i++) {
-        struct doc *d = doc_at(i);
-        if (!d || !d->path[0]) continue;        /* an unnamed buffer has nowhere to come back from */
-        fprintf(f, "%d %d %s\n", i == doc_current(), d->cursor, d->path);
+    char data[DOC_MAX*(DOC_PATH_MAX+48)];size_t at=0;
+    for(int i=0;i<DOC_MAX;i++) {
+        struct doc *d=doc_at(i);if(!d || !d->path[0])continue;
+        int n=snprintf(data+at,sizeof data-at,"%d %d %s\n",i==doc_current(),d->cursor,d->path);
+        if(n<0 || (size_t)n>=sizeof data-at)return;
+        at+=(size_t)n;
     }
-    fclose(f);
+    if(emdoc_save(sp,data,at,0,0))snprintf(g_msg,sizeof g_msg,"Could not save workspace history");
 }
 
 static void session_load(void) {
@@ -301,6 +264,7 @@ static void session_load(void) {
         int i = doc_open(path, file_read);
         if (i < 0) continue;                    /* out of slots: keep what loaded */
         struct doc *d = doc_at(i);
+        if(d)d->original=g_read_stamp;
         /* The file may have changed since -- shorter, or gone. Clamp rather
          * than restore a caret past the end of it. */
         if (d && off >= 0 && off <= (int)strlen(d->text)) d->cursor = off;
@@ -308,6 +272,53 @@ static void session_load(void) {
     }
     fclose(f);
     if (want >= 0) doc_select(want);
+}
+
+static void checkpoint(void) {
+    sync_out();
+    for(int i=0;i<DOC_MAX;i++) {
+        struct doc *d=doc_at(i);
+        if(!d){if(g_workspace.present[i])emws_forget(&g_workspace,i);continue;}
+        struct emdoc_draft meta={.cursor=(uint32_t)d->cursor,.original=d->original};
+        snprintf(meta.path,sizeof meta.path,"%s",d->path);
+        if(emws_checkpoint(&g_workspace,i,&meta,d->text,doc_dirty(i)))
+            snprintf(g_msg,sizeof g_msg,"Draft recovery unavailable; save your work");
+    }
+}
+static void idle(void) {
+    uint64_t now=embk_uptime_ms();if(now-g_checkpoint_ms<2000)return;
+    g_checkpoint_ms=now;checkpoint();
+}
+static int restore_draft(const struct emdoc_draft *meta,const char *text) {
+    struct doc *d=doc_cur();int i=doc_current();
+    if(!d || d->path[0] || d->text[0])i=doc_new();
+    if(i<0)return -1;
+    d=doc_at(i);
+    snprintf(d->path,sizeof d->path,"%s",meta->path);strcpy(d->text,text);d->cursor=(int)meta->cursor;
+    d->original=meta->original;d->saved_hash=doc_hash(text)^1;d->lang=syn_lang_of(d->path);
+    g_bound=-1;return i;
+}
+static int close_window(void) {
+    sync_out();
+    for(int i=0;i<DOC_MAX;i++)if(doc_dirty(i) && !(g_quitting && (g_quit_discard_mask&(1u<<i)))) {
+        g_quitting=1;g_confirm_close=i;g_confirm_frames=0;checkpoint();em_request_frame();return 0;
+    }
+    session_save();
+    for(int i=0;i<DOC_MAX;i++)emws_forget(&g_workspace,i);
+    return 1;
+}
+static void confirmed_close(int save) {
+    int index=g_confirm_close;
+    if(save) {
+        sync_out();doc_select(index);g_bound=-1;bind_current();
+        if(!save_current())return;
+    }
+    if(g_quitting) {
+        /* Saving/discarding one tab advances to the next dirty document. Do
+         * not close tabs: the workspace should reopen them after a clean quit. */
+        if(!save)g_quit_discard_mask|=1u<<index;
+        g_confirm_close=-1;em_app_request_exit(0);
+    } else {emws_forget(&g_workspace,index);doc_close(index);g_confirm_close=-1;g_bound=-1;session_save();}
 }
 
 /* ---- scrolling ----------------------------------------------------------- */
@@ -341,7 +352,11 @@ static void scroll_to_caret(void) {
  * means "handled" and stops the toolkit seeing it -- which is how Ctrl+A can
  * mean select-all in the document and still type an 'a' into the find field. */
 static int on_key(int ch) {
-    int mods  = embk_key_mods();
+    if(g_confirm_close>=0) {
+        if(ch==27){g_confirm_close=-1;g_quitting=0;g_quit_discard_mask=0;}
+        return 1;
+    }
+    int mods  = em_key_modifiers();
     int ctrl  = (mods & 0x02) != 0;
     int shift = (mods & 0x01) != 0;
 
@@ -414,7 +429,7 @@ static int on_key(int ch) {
         switch (key) {
             case 's': save_current(); return 1;
             case 'n': g_want_new = 1; return 1;
-            case 'o': g_want_open = 1; return 1;
+            case 'o': pick_begin(); return 1;
             case 'w': g_close = doc_current(); return 1;
             case 'a': ed_select_all(&ED); return 1;
             case 'z': if (shift) ed_redo(&ED); else ed_undo(&ED); scroll_to_caret(); return 1;
@@ -927,9 +942,14 @@ static void app(void) {
     static int wired = 0;
     if (!wired) {
         wired = 1;
-        em_set_key_hook(on_key);
-        doc_init();
-        session_load();          /* before the first bind, so it opens onto a real file */
+        em_set_key_hook(on_key);em_set_close_hook(close_window);em_set_idle_hook(idle);
+        doc_init();emws_init(&g_workspace,"notepp");
+        int recovered=emws_restore(&g_workspace,"notepp",DOC_CAP,restore_draft);
+        if(recovered>0) {
+            snprintf(g_msg,sizeof g_msg,"Recovered %d unsaved document%s",recovered,recovered==1?"":"s");
+            embk_puts(1,"Note++: recovered unsaved workspace\n");
+        }
+        if(recovered<=0)session_load();          /* before the first bind, so it opens onto a real file */
         g_bound = -1;
     }
     doc_init();
@@ -948,8 +968,8 @@ static void app(void) {
             !strcmp(d.type, "path") && d.len) {
             unsigned n = d.len < sizeof dropped - 1 ? d.len : (unsigned)sizeof dropped - 1;
             dropped[n] = 0;
-            snprintf(g_path_field, sizeof g_path_field, "%s", dropped);
-            g_want_open = 1;
+            if(n>=sizeof g_path_field)snprintf(g_msg,sizeof g_msg,"Dropped path is too long");
+            else {memcpy(g_path_field,dropped,n+1);g_want_open=1;}
             /* SAY SO. A file dropped on a window that is behind another one
              * opens where nobody can see it, and a drag that appears to do
              * nothing is a drag people stop trying. The notifier is how any
@@ -960,12 +980,16 @@ static void app(void) {
         }
     }
 
-    if (g_want_new)  { g_want_new = 0; doc_new(); g_path_field[0] = 0; g_bound = -1; session_save(); }
+    if (g_want_new)  { sync_out();g_want_new = 0; doc_new(); g_path_field[0] = 0; g_bound = -1; session_save(); }
     if (g_want_open) {
         g_want_open = 0;
+        int existing=0;
+        for(int k=0;k<DOC_MAX;k++)if(doc_at(k) && !strcmp(doc_at(k)->path,g_path_field))existing=1;
+        sync_out();
         int i = doc_open(g_path_field, file_read);
-        if (i < 0) snprintf(g_msg, sizeof g_msg, "No room for another file");
+        if (i < 0) snprintf(g_msg, sizeof g_msg, "%s",i==-2?"Cannot open this text file":"No room for another file");
         else { struct doc *dd = doc_at(i);
+               if(!existing)dd->original=g_read_stamp;
                snprintf(g_msg, sizeof g_msg, "%s%s", dd->text[0] ? "Opened" : "New file",
                         dd->truncated ? " (TRUNCATED -- will not save)" : "");
                g_bound = -1; session_save(); }
@@ -975,6 +999,7 @@ static void app(void) {
         /* ASK BEFORE LOSING EDITS. Closing a modified document used to just
          * take it, and that is the only item on this app's list that costs
          * something you cannot get back. */
+        g_quitting=0;g_quit_discard_mask=0;
         if (doc_dirty(g_close)) { g_confirm_close = g_close; g_close = -1; g_confirm_frames = 0; }
         else { doc_close(g_close); g_close = -1; g_bound = -1; session_save(); }
     }
@@ -1020,17 +1045,12 @@ static void app(void) {
 
         /* ROW 2 -- the path and what can be done with it. */
         HStack(.spacing = 6, .align = Center, .px = 8, .py = 5, .key = "pathrow") {
-            if (TextField(g_path_field, sizeof g_path_field, "Path to open or save as").submitted())
-                g_want_open = 1;
-            if (Button("Open").ghost().font(Caption).py(2).clicked()) g_want_open = 1;
-            if (Button("Browse").ghost().font(Caption).py(2).clicked()) pick_begin();
-            if (Button("Save").primary().font(Caption).py(2).clicked()) {
-                if (d && strcmp(d->path, g_path_field)) {
-                    snprintf(d->path, sizeof d->path, "%s", g_path_field);
-                    d->lang = syn_lang_of(d->path);
-                }
-                save_current();
-            }
+            Text(d && d->path[0]?d->path:"Untitled document").caption().secondary();
+            Spacer();
+            if(Button("New").ghost().font(Caption).py(2).clicked())g_want_new=1;
+            if(Button("Open").ghost().font(Caption).py(2).clicked())pick_begin();
+            if(Button("Save As").ghost().font(Caption).py(2).clicked())save_document(1);
+            if(Button("Save").primary().font(Caption).py(2).clicked())save_current();
         }
 
         /* THE FIND BAR, only when it is open -- an editor that always shows one
@@ -1118,123 +1138,6 @@ static void app(void) {
             if (g_goto_frames >= SHEET_SETTLED && OverlayDismissed()) g_goto_open = 0;
         }
 
-        if (g_pick_open) {
-            g_pick_frames++;
-            Overlay() {
-                Dialog(.width = 460, .spacing = 10, .padding = 18) {
-                    HStack(.align = Center, .spacing = 8) {
-                        Text(g_pick_dir).caption().secondary(); em_flush();
-                        /* Say it here, once, rather than letting a save find out
-                         * later: this is the question the picker exists to
-                         * answer. */
-                        Text(g_pick_writable ? "writable" : "read-only")
-                            .caption().color(g_pick_writable ? rgb(0xFF7FC98A) : rgb(0xFFD08A6A));
-                        em_flush();
-                        Spacer();
-                        if (Button("Close").ghost().font(Caption).py(2).clicked())
-                            g_pick_open = 0;
-                    }
-                    /* CREATE HERE. Naming a new file used to mean typing its
-                     * whole path into the field, which is the one thing the
-                     * picker exists to spare you -- and you had to already know
-                     * a writable directory to type. Only offered where a write
-                     * would actually succeed; nothing touches the disk until
-                     * Save, so an accidental name costs nothing. */
-                    if (g_pick_writable) {
-                        HStack(.spacing = 6, .align = Center) {
-                            int mk = TextField(g_pick_new, sizeof g_pick_new,
-                                               "new file, or name/ for a folder").submitted();
-                            if (Button("Create").ghost().font(Caption).py(2).clicked()) mk = 1;
-                            /* A NAME ENDING IN '/' IS A FOLDER. One field, and
-                             * the shape of the name says which -- rather than a
-                             * second field and a second button for a thing you
-                             * do once a session. It is made immediately, unlike
-                             * a file: an empty directory is the whole object,
-                             * so there is no later Save to create it at. */
-                            if (mk && g_pick_new[0] &&
-                                g_pick_new[strlen(g_pick_new) - 1] == '/') {
-                                char dir[DOC_PATH_MAX];
-                                int dn = snprintf(dir, sizeof dir, "%s%s%.*s", g_pick_dir,
-                                                  strcmp(g_pick_dir, "/") ? "/" : "",
-                                                  (int)strlen(g_pick_new) - 1, g_pick_new);
-                                if (dn > 0 && dn < (int)sizeof dir) {
-                                    if (embk_mkdir(dir) == 0) {
-                                        snprintf(g_msg, sizeof g_msg, "Created %.60s", dir);
-                                        g_pick_new[0] = 0;
-                                        pick_scan(g_pick_dir);   /* show it */
-                                    } else {
-                                        snprintf(g_msg, sizeof g_msg, "Cannot create %.55s", dir);
-                                    }
-                                }
-                                mk = 0;                       /* handled */
-                            }
-                            if (mk && g_pick_new[0]) {
-                                char full[DOC_PATH_MAX];
-                                int fn = snprintf(full, sizeof full, "%s%s%s", g_pick_dir,
-                                                  strcmp(g_pick_dir, "/") ? "/" : "",
-                                                  g_pick_new);
-                                if (fn > 0 && fn < (int)sizeof full) {
-                                    snprintf(g_path_field, sizeof g_path_field, "%s", full);
-                                    g_want_open = 1;      /* absent = a new buffer at that path */
-                                    g_pick_open = 0;
-                                    snprintf(g_msg, sizeof g_msg, "New file -- Save to create it");
-                                }
-                            }
-                        }
-                    }
-                    ScrollView(&g_pick_scroll, 268, .key = "picklist") {
-                        VStack(.spacing = 2, .align = Fill) {
-                            /* Up first, always -- a picker you cannot leave is a
-                             * trap, and the root has no parent to offer. */
-                            if (strcmp(g_pick_dir, "/") != 0 &&
-                                Button("..").ghost().font(Caption).py(3).leading()
-                                    .id("pkup").clicked()) {
-                                char up[DOC_PATH_MAX];
-                                snprintf(up, sizeof up, "%s", g_pick_dir);
-                                char *slash = up;
-                                for (char *q = up; *q; q++) if (*q == '/') slash = q;
-                                if (slash == up) up[1] = 0; else *slash = 0;
-                                pick_scan(up[0] ? up : "/");
-                            }
-                            static const char *PK[PICK_MAX];
-                            for (int i = 0; i < g_pick_n; i++) {
-                                if (g_pick[i].name[0] == '.') continue;
-                                int isdir = (g_pick[i].type == EMBK_DT_DIR);
-                                char lbl[160];
-                                snprintf(lbl, sizeof lbl, "%.150s%s", g_pick[i].name, isdir ? "/" : "");
-                                PK[i] = g_pick[i].name;
-                                if (Button(lbl).ghost().font(Caption).py(3).leading()
-                                        .color(isdir ? TAB_TEXT_ON : TAB_TEXT_OFF)
-                                        .id(PK[i]).clicked()) {
-                                    /* Bounded on BOTH parts. A path assembled from
-                                     * a directory that is already near the cap plus
-                                     * a long name would otherwise be silently cut,
-                                     * and a truncated path is a different file. */
-                                    char full[DOC_PATH_MAX];
-                                    int fn = snprintf(full, sizeof full, "%s%s%s", g_pick_dir,
-                                                      strcmp(g_pick_dir, "/") ? "/" : "",
-                                                      g_pick[i].name);
-                                    if (fn < 0 || fn >= (int)sizeof full) {
-                                        snprintf(g_msg, sizeof g_msg, "Path too long");
-                                        g_pick_open = 0;
-                                        break;
-                                    }
-                                    if (isdir) pick_scan(full);
-                                    else {
-                                        snprintf(g_path_field, sizeof g_path_field, "%s", full);
-                                        g_want_open = 1;
-                                        g_pick_open = 0;
-                                    }
-                                    break;      /* the list just changed under us */
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if (g_pick_frames >= SHEET_SETTLED && OverlayDismissed()) g_pick_open = 0;
-        }
-
         /* The one question this app asks: a modified document is not closed out
          * from under the person who modified it. */
         if (g_confirm_close >= 0) {
@@ -1247,17 +1150,9 @@ static void app(void) {
                     Text("It has unsaved changes.").caption().secondary();
                     HStack(.spacing = 8, .align = Center) {
                         Spacer();
-                        if (Button("Cancel").ghost().clicked()) g_confirm_close = -1;
-                        if (Button("Save").clicked()) {
-                            doc_select(g_confirm_close); g_bound = -1; bind_current();
-                            save_current();
-                            if (!doc_dirty(g_confirm_close)) doc_close(g_confirm_close);
-                            g_confirm_close = -1; g_bound = -1;
-                        }
-                        if (Button("Discard").destructive().clicked()) {
-                            doc_close(g_confirm_close);
-                            g_confirm_close = -1; g_bound = -1;
-                        }
+                        if(Button("Cancel").ghost().clicked()){g_confirm_close=-1;g_quitting=0;g_quit_discard_mask=0;}
+                        if(Button("Save").primary().clicked())confirmed_close(1);
+                        if(Button("Discard").destructive().clicked())confirmed_close(0);
                     }
                 }
             }
@@ -1275,7 +1170,7 @@ static void app(void) {
             Text(meta).caption().tertiary();
             if (hi > lo) { char s[32]; snprintf(s, sizeof s, "%d selected", hi - lo);
                            Text(s).caption().tertiary(); }
-            Text(syn_lang_name(d ? d->lang : SYN_PLAIN)).caption().tertiary();
+            Text(syn_lang_name(doc_cur() ? doc_cur()->lang : SYN_PLAIN)).caption().tertiary();
             Text(ED.use_tabs ? "Tabs" : "Spaces").caption().tertiary();
             if (Button(g_wrap ? "Wrap" : "No wrap").ghost().font(Caption).py(2)
                     .id("wraptog").clicked()) {

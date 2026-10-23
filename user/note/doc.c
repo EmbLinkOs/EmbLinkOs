@@ -50,6 +50,8 @@ int doc_new(void) {
     int i = free_slot();
     if (i < 0) return -1;
     struct doc *d = &g_doc[i];
+    memset(&d->original,0,sizeof d->original);
+    memset(&d->undo,0,sizeof d->undo);
     d->path[0] = 0;
     d->text[0] = 0;
     d->cursor = 0;
@@ -62,31 +64,25 @@ int doc_new(void) {
 }
 
 int doc_open(const char *path, long (*read)(const char *, char *, size_t)) {
-    if (!path || !path[0]) return -1;
+    if (!path || !path[0] || strlen(path)>=DOC_PATH_MAX) return -2;
     /* Already open? Hand back the same tab. Two buffers over one file diverge,
      * and whichever was saved last would silently win. */
     for (int i = 0; i < DOC_MAX; i++)
         if (g_doc[i].open && !strcmp(g_doc[i].path, path)) { g_cur = i; return i; }
 
     int i = free_slot();
+    for(int k=0;k<DOC_MAX;k++)if(g_doc[k].open && !g_doc[k].path[0] && !g_doc[k].text[0] && !doc_dirty(k)){i=k;break;}
     if (i < 0) return -1;
     struct doc *d = &g_doc[i];
     snprintf(d->path, sizeof d->path, "%s", path);
     d->text[0] = 0;
     d->truncated = 0;
     long n = read ? read(path, d->text, DOC_CAP) : -1;
-    if (n < 0) {
-        /* Not there: an editor opens a NEW file at that path rather than
-         * refusing, which is what every editor does and what makes "open a
-         * name that does not exist yet" the ordinary way to create one. */
-        d->text[0] = 0;
-        n = 0;
-    } else if (n >= (long)DOC_CAP - 1) {
-        /* Say so. A silently truncated file that is then SAVED destroys the
-         * part that did not fit, which is the worst thing an editor can do. */
-        d->truncated = 1;
-    }
-    d->text[n < 0 ? 0 : (size_t)n] = 0;
+    if(n<0) { d->path[0]=0; return -2; }
+    if(n>=(long)DOC_CAP) { d->path[0]=0; return -2; }
+    d->text[(size_t)n]=0;
+    memset(&d->undo,0,sizeof d->undo);
+    memset(&d->original,0,sizeof d->original);
     d->cursor = 0;
     d->open = 1;
     d->lang = syn_lang_of(path);
@@ -136,7 +132,7 @@ const char *doc_label(int i) {
     if (!d) return "";
     const char *b = d->path, *s;
     for (s = d->path; *s; s++) if (*s == '/') b = s + 1;
-    snprintf(lbl[i], sizeof lbl[0], "%s%s",
+    snprintf(lbl[i], sizeof lbl[0], "%.42s%s",
              *b ? b : "Untitled", doc_dirty(i) ? " \xe2\x80\xa2" : "");
     return lbl[i];
 }

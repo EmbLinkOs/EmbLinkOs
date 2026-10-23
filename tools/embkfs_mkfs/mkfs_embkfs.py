@@ -1277,6 +1277,10 @@ def discover_userland_objects(build_dir="build"):
                         # embk.h + embk_syscall.h: the ABI's userspace surface
                         # -- sysinfo.c and embbuild.c #include them, so
                         # declaring the ABI joins the ABI (BUILD.md's rule).
+                        ("user/lib/document.h",            b"system/abi/include/document.h"),
+                        ("user/lib/workspace.h",           b"system/abi/include/workspace.h"),
+                        ("user/lib/emfiles.h",             b"system/abi/include/emfiles.h"),
+                        ("user/lib/emsvc.h",               b"system/abi/include/emsvc.h"),
                         ("user/lib/embk.h",                b"system/abi/include/embk.h"),
                         ("user/lib/embk_syscall.h",        b"system/abi/include/embk_syscall.h")):
         blob = _read_file(host)

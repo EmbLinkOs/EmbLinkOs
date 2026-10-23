@@ -36,6 +36,8 @@
 #include "embk.h"
 #include "emsvc.h"
 #include "emfiles.h"
+#include "fileops.h"
+#include <errno.h>
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
@@ -53,12 +55,15 @@ static char         g_title[48];
 static int          g_mode;
 static int          g_done;             /* 1 chose, -1 cancelled */
 static char         g_result[256];
+static char g_error[112], g_home[256], g_folder[96];
+static int g_replace, g_new_folder;
+static float g_scroll;
 
 /* ---- the filesystem ---------------------------------------------------- */
 
 static void join(char *out, size_t cap, const char *leaf) {
-    if (!strcmp(g_cwd, "/")) snprintf(out, cap, "/%s", leaf);
-    else                     snprintf(out, cap, "%s/%s", g_cwd, leaf);
+    int n=snprintf(out,cap,"%s%s%s",g_cwd,!strcmp(g_cwd,"/")?"":"/",leaf);
+    if(n<0 || n>=(int)cap) out[0]=0;
 }
 
 static int cmp_entry(const void *a, const void *b) {
@@ -70,11 +75,12 @@ static int cmp_entry(const void *a, const void *b) {
 static void read_dir(void) {
     g_count = 0; g_sel = -1;
     DIR *d = opendir(g_cwd);
-    if (!d) return;
+    if (!d) { snprintf(g_error,sizeof g_error,"Cannot read this folder"); return; }
     struct dirent *de;
     while ((de = readdir(d)) != NULL && g_count < MAX_ENTRIES) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         struct entry *e = &g_entries[g_count];
+        if(strlen(de->d_name)>=sizeof e->name)continue;
         snprintf(e->name, sizeof e->name, "%s", de->d_name);
         char full[400];
         join(full, sizeof full, de->d_name);
@@ -87,8 +93,12 @@ static void read_dir(void) {
 }
 
 static void go_to(const char *path) {
-    snprintf(g_cwd, sizeof g_cwd, "%s", path && path[0] ? path : "/");
-    read_dir();
+    struct stat st;
+    if(!path || strlen(path)>=sizeof g_cwd || stat(path,&st) || !S_ISDIR(st.st_mode)) {
+        snprintf(g_error,sizeof g_error,"Folder is unavailable");return;
+    }
+    snprintf(g_cwd,sizeof g_cwd,"%s",path);g_error[0]=0;g_name[0]=0;g_scroll=0;
+    read_dir();em_request_frame();
 }
 
 static void go_up(void) {
@@ -97,31 +107,44 @@ static void go_up(void) {
     if (!slash) return;
     if (slash == g_cwd) g_cwd[1] = 0;       /* "/x" -> "/" */
     else                *slash = 0;
-    read_dir();
+    if(g_mode==EMFILE_OPEN)g_name[0]=0;
+    g_scroll=0;read_dir();em_request_frame();
 }
 
-/* Finish: the chosen path, or nothing. */
+/* An existing destination requires an explicit Replace answer. A name is a
+ * leaf, never a path: slashes and dot segments cannot escape the chosen folder. */
+static void finish(void) {
+    g_done=1;em_app_request_exit(0);
+}
 static void choose(const char *leaf) {
-    char full[256];
-    if (!strcmp(g_cwd, "/")) snprintf(full, sizeof full, "/%s", leaf);
-    else                     snprintf(full, sizeof full, "%s/%s", g_cwd, leaf);
-    snprintf(g_result, sizeof g_result, "%s", full);
-    g_done = 1;
-    em_app_request_exit(0);
+    if(!embk_file_valid_name(leaf)) {
+        snprintf(g_error,sizeof g_error,"Enter a filename without / or control characters");return;
+    }
+    join(g_result,sizeof g_result,leaf);
+    if(!g_result[0]) {snprintf(g_error,sizeof g_error,"Path is too long");return;}
+    struct stat st;int rc=stat(g_result,&st);
+    if(!rc && !S_ISREG(st.st_mode)) {snprintf(g_error,sizeof g_error,"Select a regular file");return;}
+    if(rc && (g_mode==EMFILE_OPEN || errno!=ENOENT)) {
+        snprintf(g_error,sizeof g_error,"File is unavailable");return;
+    }
+    if(g_mode==EMFILE_SAVE && !rc) {g_replace=1;return;}
+    finish();
 }
-
-/* ---- the panel --------------------------------------------------------- */
-
-/* The places every panel offers. Not a user preference yet -- these are the
- * directories this OS's layout guarantees exist (docs/USERSPACE_v2.md), so a
- * panel that offers them cannot offer a dead link. */
-static const struct { const char *label; const char *path; } g_places[] = {
-    { "Home",      "/home" },
-    { "Documents", "/home" },
-    { "Data",      "/data" },
-    { "System",    "/system" },
-    { "Root",      "/" },
-};
+static int on_key(int ch) {
+    if(ch==27 && (g_replace || g_new_folder)) {
+        g_replace=g_new_folder=0;return 1;
+    }
+    if(ch=='\n' && !ui_any_focus() && !g_replace && !g_new_folder) {
+        if(g_name[0])choose(g_name);
+        return 1;
+    }
+    return 0;
+}
+static const char *place_path(unsigned index) {
+    static char path[320];
+    static const char *sub[]={"","Documents","Downloads","Desktop"};
+    snprintf(path,sizeof path,"%s%s%s",g_home,index?"/":"",sub[index]);return path;
+}
 
 static void panel(void) {
     const struct ui_theme *t = ui_theme();
@@ -134,9 +157,9 @@ static void panel(void) {
             VStack(.width = 150, .align = Fill, .spacing = 2, .padding = 8,
                    .background = t->surface_alt) {
                 Text("Places").caption().secondary();
-                for (unsigned i = 0; i < sizeof g_places / sizeof g_places[0]; i++) {
-                    if (Button(g_places[i].label).ghost().id(g_places[i].label).clicked())
-                        go_to(g_places[i].path);
+                static const char *places[]={"Home","Documents","Downloads","Desktop"};
+                for(unsigned i=0;i<4;i++) {
+                    if(Button(places[i]).ghost().id(places[i]).clicked())go_to(place_path(i));
                 }
             }
 
@@ -145,32 +168,37 @@ static void panel(void) {
                 HStack(.spacing = 8, .align = Center, .padding = 8) {
                     if (Button("Up").ghost().id("up").clicked()) go_up();
                     Text(g_cwd).caption().secondary();
+                    Spacer();
+                    if(Button("New folder").ghost().clicked()) {g_new_folder=1;g_folder[0]=0;}
                 }
                 Divider();
 
                 /* the listing */
-                static float scroll;
-                ScrollView(&scroll, 0, .grow = 1) {
+                ScrollView(&g_scroll, 260) {
                     VStack(.align = Fill, .spacing = 1, .padding = 6) {
                         static const char *KEY[MAX_ENTRIES];
                         for (int i = 0; i < g_count; i++) {
                             KEY[i] = g_entries[i].name;
                             bool sel = (i == g_sel);
+                            struct instance_handle row={0};
                             HStack(.spacing = 8, .align = Center, .px = 8, .py = 5,
                                    .corner = t->radius_sm, .key = KEY[i],
                                    .background = sel ? t->accent_soft : (struct color){0,0,0,0}) {
+                                row=ui_open();
                                 Icon(g_entries[i].is_dir ? IconFolder : IconDoc)
                                     .color(g_entries[i].is_dir ? t->accent : t->text_secondary);
                                 Text(g_entries[i].name);
                             }
-                            if (Clicked(KEY[i])) {
+                            /* Container keys preserve identity; they do not
+                             * register the leaf-only Clicked(id) result. */
+                            if (ui_consume_click(row)) {
                                 if (g_entries[i].is_dir) {
                                     char full[256];
                                     join(full, sizeof full, g_entries[i].name);
-                                    go_to(full);
+                                    go_to(full);break;
                                 } else {
                                     g_sel = i;
-                                    snprintf(g_name, sizeof g_name, "%s", g_entries[i].name);
+                                    memcpy(g_name,g_entries[i].name,sizeof g_name);
                                 }
                             }
                         }
@@ -178,12 +206,13 @@ static void panel(void) {
                     }
                 }
 
+                if(g_error[0]) {Text(g_error).caption().secondary();em_flush();}
                 Divider();
                 /* the answer, and the two buttons that end this */
                 HStack(.spacing = 8, .align = Center, .padding = 10) {
                     if (g_mode == EMFILE_SAVE) {
                         Text("Save as").caption().secondary();
-                        TextField(g_name, sizeof g_name, "Filename");
+                        if(TextField(g_name, sizeof g_name, "Filename").submitted() && g_name[0])choose(g_name);
                     } else {
                         Text(g_name[0] ? g_name : "Select a file").caption().secondary();
                     }
@@ -194,6 +223,39 @@ static void panel(void) {
                     if (Button(g_mode == EMFILE_SAVE ? "Save" : "Open")
                             .primary().id("ok").clicked()) {
                         if (g_name[0]) choose(g_name);
+                    }
+                }
+            }
+        }
+        if(g_replace) {
+            Overlay() {
+                Dialog(.width=420,.spacing=14,.padding=20) {
+                    Text("Replace this file?").heading();
+                    Text(g_name).caption();
+                    Text("The saved contents will replace the existing file.").caption().secondary();
+                    HStack(.spacing=12) {
+                        if(Button("Keep existing").ghost().clicked())g_replace=0;
+                        Spacer();
+                        if(Button("Replace").destructive().clicked())finish();
+                    }
+                }
+            }
+        }
+        if(g_new_folder) {
+            Overlay() {
+                Dialog(.width=380,.spacing=14,.padding=20) {
+                    Text("New folder").heading();
+                    TextField(g_folder,sizeof g_folder,"Folder name");
+                    HStack(.spacing=12) {
+                        if(Button("Cancel folder").ghost().clicked())g_new_folder=0;
+                        Spacer();
+                        if(Button("Create").primary().clicked()) {
+                            char full[256];join(full,sizeof full,g_folder);
+                            if(!embk_file_valid_name(g_folder) || !full[0])
+                                snprintf(g_error,sizeof g_error,"Enter a valid folder name");
+                            else if(mkdir(full,0700))snprintf(g_error,sizeof g_error,"Cannot create this folder");
+                            else {g_new_folder=0;g_error[0]=0;read_dir();}
+                        }
                     }
                 }
             }
@@ -230,7 +292,9 @@ int main(void) {
         unsigned len  = 0;
         int ch = emsvc_accept(lh, &type, &q, sizeof q, &len);
         if (ch < 0) continue;
-        if (type != EMSVC_T_FILE_PANEL || len < sizeof q) {
+        if (type != EMSVC_T_FILE_PANEL || len != sizeof q || q.mode>EMFILE_SAVE ||
+            !memchr(q.title,0,sizeof q.title) || !memchr(q.start,0,sizeof q.start) ||
+            !memchr(q.suggest,0,sizeof q.suggest)) {
             struct emfile_rep bad = { 0, -1, { 0 } };
             emsvc_reply(ch, type, &bad, sizeof bad);
             continue;
@@ -238,8 +302,12 @@ int main(void) {
 
         g_mode = (int)q.mode;
         snprintf(g_title, sizeof g_title, "%s", q.title);
-        snprintf(g_name,  sizeof g_name,  "%s", q.suggest);
-        go_to(q.start[0] ? q.start : "/home");
+        const char *home=getenv("HOME");snprintf(g_home,sizeof g_home,"%s",home&&home[0]?home:"/home");
+        g_error[0]=0;g_cwd[0]=0;g_replace=g_new_folder=0;
+        go_to(g_home);
+        if(q.start[0])go_to(q.start);
+        snprintf(g_name,sizeof g_name,"%s",q.suggest);
+        em_set_key_hook(on_key);
         g_done = 0;
         g_result[0] = 0;
         g_spec.title = g_mode == EMFILE_SAVE ? "Save" : "Open";

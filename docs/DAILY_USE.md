@@ -1,5 +1,9 @@
 # Installation, recovery and daily sessions
 
+## Working with documents
+
+Use Files → New Document, or launch Editor / Note++. Open and Save use the shared picker. Changes are guarded on ordinary close and checkpointed into separate recovery drafts. See [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md) for recovery and remaining data-loss boundaries.
+
 This milestone connects boot recovery, installation, authenticated sessions,
 file operations, notifications, display handoff and power preferences. Browser
 sources are unchanged. It is still a laptop alpha: physical compatibility,

@@ -5,12 +5,14 @@
 #include "embk.h"
 #include "oscfg.h"
 #include "fileops.h"
+#include "document.h"
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <unistd.h>
 #define CHECK(x) do {if(!(x)) {printf("devicecheck: line %d failed: %s\n",__LINE__,#x);return __LINE__%200+1;}} while(0)
 static int restricted(int parent_menu) {
-    if(parent_menu>0)CHECK(embk_win_menu((uint32_t)parent_menu,1)==-22);
+    if(parent_menu>0){CHECK(embk_win_menu((uint32_t)parent_menu,1)==-22);CHECK(embk_win_close_ack((uint32_t)parent_menu)==-22);}
     struct embk_wifi_info wifi;
     CHECK(embk_wifi_get(&wifi)==0);
     CHECK(embk_wifi_change((const void *)(uintptr_t)-1)==-1);
@@ -65,6 +67,25 @@ static int files_child(void) {
     snprintf(copied,sizeof copied,"%s/file",clone);
     CHECK(!embk_unlink(nested));CHECK(!embk_rmdir(folder));CHECK(!embk_unlink(copied));CHECK(!embk_rmdir(clone));
     CHECK(!embk_unlink(copy));CHECK(!embk_rmdir(trash));
+    struct emdoc_stamp absent,original,latest;
+    CHECK(!emdoc_probe(src,&absent) && !absent.exists);
+    CHECK(!emdoc_save(src,"original",8,&absent,&original));
+    char text[128]="preserved";
+    CHECK(!emdoc_read(src,text,sizeof text,&latest) && !strcmp(text,"original"));
+    CHECK(emdoc_save(src,"stale",5,&absent,0)<0 && errno==EAGAIN);
+    CHECK(!emdoc_save(src,"external",8,&original,&latest));
+    CHECK(emdoc_save(src,"lost",4,&original,0)<0 && errno==EAGAIN);
+    CHECK(!emdoc_read(src,text,sizeof text,0) && !strcmp(text,"external"));
+    CHECK(!emdoc_save(src,"binary\0tail",11,&latest,&original));
+    strcpy(text,"preserved");CHECK(emdoc_read(src,text,sizeof text,0)<0 && errno==EILSEQ && !strcmp(text,"preserved"));
+    CHECK(!embk_unlink(src));
+    struct emdoc_draft meta={.cursor=3,.original=original},loaded;
+    snprintf(meta.path,sizeof meta.path,"%s",src);
+    CHECK(!emdoc_draft_save(copy,&meta,"unsaved draft"));
+    CHECK(!emdoc_draft_load(copy,&loaded,text,sizeof text));
+    CHECK(!strcmp(text,"unsaved draft") && !strcmp(loaded.path,src) && loaded.cursor==3);
+    CHECK(!embk_unlink(copy));
+    puts("devicecheck: durable replacement, external edit conflict, binary refusal and draft recovery OK");
     puts("devicecheck: confined file copy, overwrite refusal, directory copy, move, Trash and restore OK");return 0;
 }
 static int policy_fixture(void) {
@@ -105,7 +126,7 @@ int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"--files-child")) return files_child();
     if(argc>1 && !strcmp(argv[1],"--policy")) return policy_fixture();
     if(argc>1 && !strcmp(argv[1],"--restricted")) return restricted(argc>2?atoi(argv[2]):0);
-    if(argc>1 && !strcmp(argv[1],"--menu-no-gpu")) {CHECK(embk_win_menu(0,1)==-1);return 0;}
+    if(argc>1 && !strcmp(argv[1],"--menu-no-gpu")) {CHECK(embk_win_menu(0,1)==-1);CHECK(embk_win_close_ack(0)==-1);return 0;}
     struct embk_wifi_info wifi;struct embk_audio_info audio;struct embk_display_info display;
     CHECK(embk_wifi_get(&wifi)==0 && wifi.version==1 && wifi.saved_count<=8 && wifi.network_count<=24);
     CHECK(embk_syscall2(EMBK_SYS_wifi_info,(uintptr_t)&wifi,sizeof wifi-1)==-22);
@@ -126,6 +147,9 @@ int main(int argc,char **argv) {
     CHECK(menu>0 && menu_pixels);
     CHECK(embk_win_resize(menu,200,26,&menu_pixels)>=0 && menu_pixels);
     CHECK(embk_win_resize(menu,200,80,&menu_pixels)>=0 && menu_pixels);
+    CHECK(!embk_win_close_ack((uint32_t)menu));
+    CHECK(embk_win_close_ack(0)==-22);
+    CHECK(embk_syscall1(EMBK_SYS_win_close_ack,((uint64_t)1<<32)|(uint32_t)menu)==-22);
     CHECK(!embk_win_menu((uint32_t)menu,1));
     CHECK(embk_syscall2(EMBK_SYS_win_menu,((uint64_t)1<<32)|(uint32_t)menu,1)==-22);
     char menu_id[16];snprintf(menu_id,sizeof menu_id,"%u",(unsigned)menu);
@@ -133,7 +157,7 @@ int main(int argc,char **argv) {
     struct embk_spawn_file_action action;embk_action_set_caps(&action,EMBK_CAP_BIT(EMBK_CAP_NETWORK)|EMBK_CAP_BIT(EMBK_CAP_GPU));
     int handle=embk_spawn(child[0],child,&action,1);CHECK(handle>=0);CHECK(embk_wait(handle)==0);
     CHECK(!embk_win_menu((uint32_t)menu,0));CHECK(!embk_win_destroy(menu));
-    CHECK(embk_win_menu((uint32_t)menu,1)==-22);
+    CHECK(embk_win_menu((uint32_t)menu,1)==-22);CHECK(embk_win_close_ack((uint32_t)menu)==-22);
     child[1]="--menu-no-gpu";child[2]=NULL;
     embk_action_set_caps(&action,EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM));
     handle=embk_spawn(child[0],child,&action,1);CHECK(handle>=0);CHECK(embk_wait(handle)==0);

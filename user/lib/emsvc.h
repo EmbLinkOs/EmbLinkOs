@@ -81,7 +81,7 @@ static inline int emsvc_call(const char *name, uint32_t type,
     /* Header and payload in ONE message: two sends would let a service see a
      * header with no body if the caller died between them. */
     unsigned char buf[512];
-    if (sizeof(struct emsvc_head) + reqlen > sizeof buf) { embk_chan_close(ch); return -EMBK_E2BIG; }
+    if (reqlen > sizeof buf - sizeof(struct emsvc_head)) { embk_chan_close(ch); return -EMBK_E2BIG; }
     struct emsvc_head h = { type, reqlen };
     for (unsigned k = 0; k < sizeof h; k++) buf[k] = ((const unsigned char *)&h)[k];
     for (unsigned k = 0; k < reqlen; k++)   buf[sizeof h + k] = ((const unsigned char *)req)[k];
@@ -97,6 +97,7 @@ static inline int emsvc_call(const char *name, uint32_t type,
 
     struct emsvc_head rh;
     for (unsigned k = 0; k < sizeof rh; k++) ((unsigned char *)&rh)[k] = buf[k];
+    if (rh.len != got - sizeof rh || rh.len > repcap) return -EMBK_EINVAL;
     if (rh.type != type) return -EMBK_EINVAL;      /* answered by the wrong thing */
 
     unsigned n = rh.len < repcap ? rh.len : repcap;
@@ -119,6 +120,7 @@ static inline int emsvc_accept(int listen_handle, uint32_t *out_type,
 
     struct emsvc_head h;
     for (unsigned k = 0; k < sizeof h; k++) ((unsigned char *)&h)[k] = buf[k];
+    if (h.len != got - sizeof h || h.len > reqcap) { embk_chan_close(ch); return -EMBK_EINVAL; }
     if (out_type) *out_type = h.type;
 
     unsigned n = h.len < reqcap ? h.len : reqcap;
@@ -130,7 +132,7 @@ static inline int emsvc_accept(int listen_handle, uint32_t *out_type,
 /* Reply and hang up. */
 static inline int emsvc_reply(int ch, uint32_t type, const void *rep, unsigned replen) {
     unsigned char buf[512];
-    if (sizeof(struct emsvc_head) + replen > sizeof buf) { embk_chan_close(ch); return -EMBK_E2BIG; }
+    if (replen > sizeof buf - sizeof(struct emsvc_head)) { embk_chan_close(ch); return -EMBK_E2BIG; }
     struct emsvc_head h = { type, replen };
     for (unsigned k = 0; k < sizeof h; k++) buf[k] = ((const unsigned char *)&h)[k];
     for (unsigned k = 0; k < replen; k++)   buf[sizeof h + k] = ((const unsigned char *)rep)[k];

@@ -1,5 +1,17 @@
 ## Desktop menu follow-up (2026-10-23)
 
+## Document workspace follow-up (2026-10-23)
+
+- [x] Shared session Open/Save with actual user places and replacement confirmation.
+- [x] Safe replacement, external-edit detection, whole-window dirty guards and separate recovery drafts.
+- [x] Files document creation and home-scoped Editor launch.
+- [ ] Desktop-wide quit/logout/power negotiation for unsaved documents.
+- [ ] Filesystem compare-and-swap for concurrent-writer conflicts.
+- [ ] Transferable open-file capabilities from the picker.
+- [ ] Large/binary document tools, recovery management UI, persistent undo and PID-reuse-independent recovery leases.
+
+Design and limits: [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md).
+
 - [x] Live system-menu palette, stable label anchors, one panel surface,
   Escape dismissal, full-display outside clicks and restored thin bar/input.
 - [ ] Arrow-key menu navigation, type-to-select, keyboard menu activation,
@@ -7648,3 +7660,7 @@ for them to run against:
       a long sequential run; the rerun passed. The harness missed the verdict
       line rather than the program failing -- but that is an inference, not a
       measurement.
+
+- [ ] Give the parallel raw key-event stream explicit event-time process/session
+  ownership, including queued-event handling across login/lock transitions;
+  the new character/modifier poll retains the existing focused-reader gate.

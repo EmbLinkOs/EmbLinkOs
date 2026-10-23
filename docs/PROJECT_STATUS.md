@@ -1,5 +1,9 @@
 # EmbLinkOS — Project Status & Handoff
 
+## Document workspace milestone (2026-10-23)
+
+Editor and Note++ now share guarded close, Open/Save, conflict detection, synced replacement and recoverable drafts. Files creates documents and passes the authenticated home to Editor. The native ABI now has 146 unique calls; queued keyboard modifier snapshots distinguish document shortcuts from navigation. Details and test commands: [DOCUMENT_WORKSPACE.md](DOCUMENT_WORKSPACE.md).
+
 *Last updated: 2026-07-19. Living document — reconciled from two previously
 diverging copies (root `PROJECT_STATUS.md` and this file) into one canonical
 version. If you're returning to this after time away, read `ARCHITECTURE.md`
