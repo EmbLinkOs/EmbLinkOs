@@ -1,8 +1,8 @@
 /* kernel/drivers/audio/audio.h -- the PCM sink the syscalls sit on.
  *
  * Device-independent on purpose: everything here is about a stream and its
- * owner, and nothing about ports or descriptors. A second driver implements
- * ac97.h; this file does not change.
+ * owner, and nothing about ports or descriptors. The sink selects an HDA or
+ * AC'97 adapter; applications keep the same PCM contract.
  *
  * Format is fixed at the device's own: 16-bit signed, stereo, interleaved, at
  * audio_sample_rate(). Resampling and mixing are a level above a sink that
@@ -14,6 +14,10 @@
 
 #include <stdint.h>
 #include "include/types.h"
+#include "../../../user/lib/embk_audio.h"
+void audio_init(void);
+void audio_snapshot(struct embk_audio_info *);
+int audio_control(unsigned percent,unsigned mute);
 
 bool     audio_available(void);
 uint32_t audio_sample_rate(void);

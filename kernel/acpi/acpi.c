@@ -297,3 +297,7 @@ void acpi_resolve_isa_irq(uint8_t isa_irq, uint32_t *out_gsi,
     if (out_active_low) *out_active_low = active_low;
     if (out_level)      *out_level = level;
 }
+uint64_t acpi_rsdp_address(void) {
+    struct rsdp *r = find_rsdp();
+    return r ? V2P(r) : 0;
+}

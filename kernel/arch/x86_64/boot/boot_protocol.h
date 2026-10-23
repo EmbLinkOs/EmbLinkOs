@@ -29,6 +29,9 @@
  * difference leaked out of the loader where it belongs. */
 #define BOOT_FW_BIOS  1
 #define BOOT_FW_UEFI  2
+#define BOOT_MODE_NORMAL 0
+#define BOOT_MODE_RECOVERY 1
+#define BOOT_MODE_DIAGNOSTICS 2
 
 /* One memory-map entry. Deliberately the same shape and the same TYPE
  * NUMBERING as the old struct e820_entry (E820_USABLE and friends in pmm.h
@@ -62,12 +65,14 @@ struct boot_protocol {
     uint32_t fb_format;      /* +0x40  FB_FORMAT_RGB / FB_FORMAT_BGR         */
 
     uint8_t  boot_drive;     /* +0x44  BIOS DL, 0xFF = unknown               */
-    uint8_t  _reserved[3];   /* +0x45                                        */
+    uint8_t  boot_mode;      /* +0x45 BOOT_MODE_*; legacy loaders write zero */
+    uint8_t  _reserved[2];
 
     uint64_t acpi_rsdp;      /* +0x48  ACPI RSDP phys, 0 = unknown (BIOS: the
                               *        kernel falls back to the legacy scan;
                               *        UEFI: from the EFI configuration table) */
-};                           /*  size  0x50                                  */
+    uint8_t boot_partition_guid[16]; /* optional extension, GPT device path */
+};
 
 /* Why mmap_stride exists when the loader normalizes every entry to
  * sizeof(struct boot_mmap_entry) anyway: it lets the ENTRY grow later
@@ -79,7 +84,7 @@ struct boot_protocol {
 #define BOOT_MMAP_STRIDE_MIN  24
 
 _Static_assert(sizeof(struct boot_mmap_entry) == 24, "mmap entry is 24 bytes");
-_Static_assert(sizeof(struct boot_protocol)   == 0x50, "boot_protocol is 0x50");
+_Static_assert(sizeof(struct boot_protocol)   == 0x60, "boot_protocol is 0x60");
 _Static_assert(offsetof(struct boot_protocol, magic)         == 0x00, "off");
 _Static_assert(offsetof(struct boot_protocol, version)       == 0x08, "off");
 _Static_assert(offsetof(struct boot_protocol, size)          == 0x0C, "off");
@@ -124,5 +129,6 @@ uint8_t bootinfo_boot_drive(void);
  * legacy BIOS memory areas instead). Set under UEFI, where that scan finds
  * nothing because the RSDP is in the EFI configuration table. */
 uint64_t boot_acpi_rsdp(void);
+bool boot_recovery_mode(void);
 
 #endif /* _ARCH_X86_64_BOOT_PROTOCOL_H_ */

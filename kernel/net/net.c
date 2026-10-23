@@ -21,6 +21,8 @@
 #include "include/kprintf.h"
 #include "include/kstring.h"
 #include "process/process.h"   /* process_create_kthread, schedule */
+#include "net/wifi/wifi.h"
+#include "process/ksync.h"
 
 struct netif g_netif;
 
@@ -48,6 +50,13 @@ static struct thread    *g_net_owner = 0;
 static int               g_net_depth = 0;
 static struct wait_queue g_net_wq;         /* threads waiting to ACQUIRE net_lock */
 static struct net_lockstat g_net_stat;
+static struct mutex g_net_service=MUTEX_INIT;
+
+/* DHCP and DNS share the legacy kernel UDP capture. Keep one service request
+ * active across net_wait(), which releases the stack monitor so RX can run.
+ * Try/wait avoids sleeping on a mutex while retaining an outer net_lock depth. */
+void net_service_lock(void) {while(!mutex_trylock(&g_net_service)) net_wait();}
+void net_service_unlock(void) {mutex_unlock(&g_net_service);}
 
 /* Event-driven RX (replaces busy-polling). The RX kthread sleeps on g_net_rx_wq
  * until the NIC interrupt (or the 10 ms timer tick) wakes it, then delivers and
@@ -84,7 +93,7 @@ void net_lock(void) {
  * At the outermost hold (depth 1) this genuinely releases; a nested caller
  * (e.g. an ARP resolve inside a connect) stays held, which is brief and rare. */
 void net_yield(void) {
-    virtio_net_poll();     /* atomic drain under the held lock */
+    net_poll();     /* atomic drain under the held lock */
     net_unlock();          /* release across the yield -- the anti-camping move */
     schedule();
     net_lock();            /* reacquire; the caller re-checks state next iteration */
@@ -179,7 +188,19 @@ void net_rx(const uint8_t *frame, uint32_t len) {
     uint32_t plen = len - ETH_HLEN;
     net_lock();                          /* protects arp cache / tcbs / capture */
     if (et == ETH_P_ARP)     arp_input(payload, plen);
-    else if (et == ETH_P_IP) ip_input(payload, plen);
+    else if (et == ETH_P_IP) {
+        if (plen >= sizeof(struct ip_hdr)) {
+            const struct ip_hdr *ip = (const struct ip_hdr *)payload;
+            uint32_t ihl = (ip->ver_ihl & 15) * 4;
+            uint32_t total = ntohs(ip->total_len);
+            if ((ip->ver_ihl >> 4) == 4 && ihl >= sizeof(*ip) && ihl <= plen
+                && total >= ihl && total <= plen && ntohl(ip->dst) == g_netif.ip
+                && !(ntohs(ip->flags_frag) & 0x3fff) && net_checksum(ip, ihl) == 0
+                && memcmp(e->dst, g_netif.mac, ETH_ALEN) == 0)
+                arp_learn_ipv4_neighbor(ntohl(ip->src), e->src);
+        }
+        ip_input(payload, plen);
+    }
     net_unlock();
 }
 
@@ -192,7 +213,7 @@ void net_rx(const uint8_t *frame, uint32_t len) {
 static void net_rx_thread(void) {
     for (;;) {
         net_lock();
-        virtio_net_poll();          /* drain + deliver everything pending */
+        net_poll();          /* drain + deliver everything pending */
         net_unlock();
         sched_lock();
         wait_queue_wake_all(&g_net_event_wq);   /* clients re-check their state */
@@ -200,9 +221,25 @@ static void net_rx_thread(void) {
     }
 }
 
+static bool using_virtio;
+static bool using_wifi;
+int net_send_frame(const void *frame, uint32_t len) {
+    if(using_wifi) return wifi_tx(frame,len);
+    return using_virtio ? virtio_net_tx(frame, len) : pci_net_tx(frame, len);
+}
+void net_poll(void) {
+    if(using_wifi) {wifi_poll();return;}
+    if (using_virtio) virtio_net_poll(); else pci_net_poll();
+}
 void net_init(void) {
     memset(&g_netif, 0, sizeof(g_netif));
-    if (!virtio_net_init(g_netif.mac)) {
+    using_wifi=wifi_init(g_netif.mac);
+    if(using_wifi) {
+        process_create_kthread(net_rx_thread,0);
+        wifi_start_worker();return;
+    }
+    using_virtio = virtio_net_init(g_netif.mac);
+    if (!using_virtio && !pci_net_init(g_netif.mac)) {
         kprintf("net: no NIC -- networking disabled\n");
         return;
     }

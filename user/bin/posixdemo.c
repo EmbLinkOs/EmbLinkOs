@@ -24,6 +24,8 @@
  * through a test that only checks the happy path.
  */
 #include <stdio.h>
+#include "embk_syscall.h"
+#include "embk_power.h"
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -626,16 +628,58 @@ static void test_fcntl(void) {
     ck("F_SETFD(0) accepted too (no exec => unobservable either way)",
        fcntl(fd, F_SETFD, 0) == 0);
 
-    /* Still refused: a false success here would make a caller believe it had
-     * non-blocking I/O and then hang in a blocking read. */
-    CK_FAILS("F_GETFL still refused (O_NONBLOCK is unimplementable)",
-             fcntl(fd, F_GETFL), ENOSYS);
+    flags = fcntl(fd, F_GETFL);
+    ck("F_GETFL preserves the read-only access mode", flags >= 0 && (flags & O_ACCMODE) == O_RDONLY);
+    ck("F_GETFL initially reports blocking mode", flags >= 0 && !(flags & O_NONBLOCK));
+    ck("F_SETFL enables O_NONBLOCK", fcntl(fd, F_SETFL, O_NONBLOCK) == 0);
+    flags = fcntl(fd, F_GETFL);
+    ck("F_GETFL reports O_NONBLOCK without changing access mode",
+       flags >= 0 && (flags & O_NONBLOCK) && (flags & O_ACCMODE) == O_RDONLY);
+    ck("F_SETFL restores blocking mode", fcntl(fd, F_SETFL, 0) == 0);
+    flags = fcntl(fd, F_GETFL);
+    ck("F_GETFL reports restored flags", flags >= 0 && !(flags & O_NONBLOCK)
+       && (flags & O_ACCMODE) == O_RDONLY);
 
     close(fd);
 
     /* A closed/bogus fd must be EBADF, not a cheerful answer. */
     CK_FAILS("F_GETFD on a closed fd -> EBADF", fcntl(fd, F_GETFD), EBADF);
+    CK_FAILS("F_GETFL on a closed fd -> EBADF", fcntl(fd, F_GETFL), EBADF);
     CK_FAILS("F_GETFD on a bogus fd -> EBADF", fcntl(9999, F_GETFD), EBADF);
+    fd = open("/fcntl_flags.txt", O_CREAT | O_WRONLY | O_APPEND | O_NONBLOCK, 0644);
+    ck("open with write-only, append and nonblocking flags", fd >= 0);
+    if (fd >= 0) {
+        flags = fcntl(fd, F_GETFL);
+        ck("F_GETFL translates open status flags without creation flags",
+           flags >= 0 && (flags & O_ACCMODE) == O_WRONLY
+           && (flags & O_APPEND) && (flags & O_NONBLOCK) && !(flags & O_CREAT));
+        close(fd);
+    }
+    unlink("/fcntl_flags.txt");
+}
+
+static void test_sync(void) {
+    printf("file synchronization:\n");
+    CK_FAILS("fsync invalid fd -> EBADF", fsync(9999), EBADF);
+    CK_FAILS("fdatasync invalid fd -> EBADF", fdatasync(-1), EBADF);
+    CK_FAILS("fsync console -> EINVAL", fsync(1), EINVAL);
+    int fd = open("/sync_test.txt", O_CREAT | O_TRUNC | O_RDWR, 0644);
+    ck("open a file for sync", fd >= 0);
+    if (fd < 0) return;
+    ck("write sync fixture", write(fd, "durable", 7) == 7);
+    ck("fsync file succeeds", fsync(fd) == 0);
+    ck("fdatasync file succeeds", fdatasync(fd) == 0);
+    close(fd);
+    CK_FAILS("fsync closed fd -> EBADF", fsync(fd), EBADF);
+    CK_FAILS("fdatasync closed fd -> EBADF", fdatasync(fd), EBADF);
+    fd = open("/sync_test.txt", O_RDONLY);
+    char bytes[8] = {0};
+    ck("reopen synced file", fd >= 0);
+    if (fd >= 0) {
+        ck("synced bytes read back", read(fd, bytes, 7) == 7 && memcmp(bytes, "durable", 7) == 0);
+        close(fd);
+    }
+    unlink("/sync_test.txt");
 }
 
 /* Every one of these is supposed to fail. A stub that returned 0 would pass a
@@ -644,8 +688,6 @@ static void test_honest_refusals(void) {
     printf("honest refusals (must NOT pretend):\n");
     struct utimbuf ub = { 0, 0 };
     CK_FAILS("utime -> ENOSYS", utime("/init.elf", &ub), ENOSYS);
-    CK_FAILS("fsync -> ENOSYS (never fake durability)", fsync(1), ENOSYS);
-    CK_FAILS("fdatasync -> ENOSYS", fdatasync(1), ENOSYS);
     CK_FAILS("dup -> ENOSYS", dup(1), ENOSYS);
     CK_FAILS("symlink -> ENOSYS", symlink("/init.elf", "/l"), ENOSYS);
     CK_FAILS("chroot -> ENOSYS", chroot("/"), ENOSYS);
@@ -913,7 +955,23 @@ static void test_signals(void) {
        prev != SIG_ERR);
 }
 
-int main(void) {
+static void test_power_abi(void) {
+    struct embk_power_info p;
+    int64_t rc=embk_syscall2(EMBK_SYS_power_info,(int64_t)(uintptr_t)&p,sizeof p);
+    ck("power snapshot has a versioned ABI or no firmware",rc==-19 || (rc==0 && p.version==1));
+    ck("power snapshot rejects wrong ABI size",embk_syscall2(EMBK_SYS_power_info,(int64_t)(uintptr_t)&p,1)==-22);
+    if(!rc) ck("power snapshot rejects invalid pointer",embk_syscall2(EMBK_SYS_power_info,0,sizeof p)==-14);
+    int64_t invalid=embk_syscall1(EMBK_SYS_power_request,99);
+    ck("power rejects invalid action or absent capability",invalid==-22 || invalid==-1);
+}
+int main(int argc,char **argv) {
+    if(argc==2 && strcmp(argv[1],"--power-denied")==0) {
+        struct embk_power_info p;
+        int64_t rc=embk_syscall2(EMBK_SYS_power_info,(int64_t)(uintptr_t)&p,sizeof p);
+        int ok=(rc==0 || rc==-19) && embk_syscall1(EMBK_SYS_power_request,EMBK_POWER_OFF)==-1;
+        printf("power capability: read allowed, shutdown denied: %s\n",ok?"OK":"FAIL");
+        return ok?0:1;
+    }
     printf("posixdemo: EmbLink POSIX layer self-check\n\n");
 
     test_tls();
@@ -927,6 +985,7 @@ int main(void) {
     test_large_file();
     test_widechar();
     test_fcntl();
+    test_sync();
     test_stat_access();
     test_sysparams();
     test_env();
@@ -935,6 +994,7 @@ int main(void) {
     test_rename();
     test_signals();
     test_honest_refusals();
+    test_power_abi();
 
     printf("\nposixdemo: %s (%d failure%s)\n",
            failures == 0 ? "ALL PASS" : "FAILURES", failures,

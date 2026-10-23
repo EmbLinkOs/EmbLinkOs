@@ -404,7 +404,10 @@ static bool vgpu_init_transport(const struct pci_device *dev) {
 }
 
 // ---- gpu_driver hooks ----------------------------------------------------------
+static struct gpu_mode cached_mode;
+static unsigned mode_ready;
 static bool vgpu_get_mode(struct gpu_mode *out) {
+    if(__atomic_load_n(&mode_ready,__ATOMIC_ACQUIRE)) {*out=cached_mode;return true;}
     struct virtio_gpu_state *s = &g_vgpu;
 
     // Ask the host for the preferred scanout geometry.
@@ -454,6 +457,7 @@ static bool vgpu_get_mode(struct gpu_mode *out) {
     out->pitch  = s->width * 4;
     out->bpp    = 32;
     out->format = FB_FORMAT_BGR;
+    cached_mode=*out;__atomic_store_n(&mode_ready,1,__ATOMIC_RELEASE);
     return true;
 }
 

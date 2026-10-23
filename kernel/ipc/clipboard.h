@@ -25,5 +25,6 @@ int64_t clipboard_set_user(const void *ubuf, size_t len);
  * Returns the number of bytes the clipboard HOLDS (so a caller with a small
  * buffer learns the real size), or -EMBK_EFAULT. Empty clipboard returns 0. */
 int64_t clipboard_get_user(void *ubuf, size_t cap);
+void clipboard_clear(void);
 
 #endif

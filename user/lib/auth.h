@@ -5,8 +5,12 @@
 
 #define EMBK_AUTH_USERNAME_MAX 31
 #define EMBK_AUTH_PASSWORD_MAX 127
+#ifndef EMBK_AUTH_PASSWD
 #define EMBK_AUTH_PASSWD "/etc/passwd"
+#endif
+#ifndef EMBK_AUTH_SHADOW
 #define EMBK_AUTH_SHADOW "/etc/shadow"
+#endif
 
 int embk_auth_valid_username(const char *username);
 int embk_auth_has_accounts(void);

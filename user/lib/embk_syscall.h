@@ -109,7 +109,7 @@
 #define EMBK_SYS_net_accept     81
 #define EMBK_SYS_net_sendto     82
 #define EMBK_SYS_net_recvfrom   83
-#define EMBK_SYS_fcntl          84   /* cmd 1 = get O_NONBLOCK, 2 = set it */
+#define EMBK_SYS_fcntl          84   /* 1=get nonblock, 2=set nonblock, 3=get kernel status flags */
 #define EMBK_SYS_fd_poll        85   /* (fd, events) -> ready POLL* bits */
 #define EMBK_SYS_clip_set       86   /* (buf, len) -> 0 | -err : fill the system clipboard */
 #define EMBK_SYS_clip_get       87   /* (buf, cap) -> held-len | -err : read it back */
@@ -120,6 +120,22 @@
 #define EMBK_SYS_win_desktop_front 92
 #define EMBK_SYS_audio_open     93
 #define EMBK_SYS_audio_write    94
+#define EMBK_SYS_power_info     97
+#define EMBK_SYS_power_request  98
+#define EMBK_SYS_wifi_info      99
+#define EMBK_SYS_wifi_request  100
+#define EMBK_SYS_display_info  101
+#define EMBK_SYS_display_set   102
+#define EMBK_SYS_audio_info    103
+#define EMBK_SYS_audio_control 104
+#define EMBK_SYS_session_control 105
+#define EMBK_SYS_rename_noreplace 106
+#define EMBK_SYS_notice_post 107
+#define EMBK_SYS_notice_get 108
+#define EMBK_SYS_policy_get 109
+#define EMBK_SYS_policy_set 110
+#define EMBK_SYS_gpu_info 111
+#define EMBK_SYS_fsync          96   /* fd -> 0 or -errno; filesystem/device durability barrier */
 #define EMBK_SYS_audio_close    95 /* (on) -> lift the DESKTOP layer above the
                                        * app windows while a full-screen shell
                                        * surface (the launcher) is up, and drop

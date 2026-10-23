@@ -148,13 +148,15 @@ int vfs_fd_read(int fd, void *buf, size_t len, size_t *out_read);
 int vfs_fd_write(int fd, const void *buf, size_t len, size_t *out_written);
 int vfs_fd_seek(int fd, int64_t delta, int whence, uint64_t *out_offset);
 int vfs_fd_fstat(int fd, struct vfs_stat *out);
+int vfs_fd_sync(int fd);   /* validate fd and propagate filesystem/device errors */
 int64_t vfs_fd_avail(int fd);   /* bytes readable without blocking; see fd_ops.avail */
 int vfs_fd_poll(int fd, int events);          /* ready POLL* bits for one fd */
 int vfs_fd_get_flags(int fd);                 /* O_ACCMODE | O_NONBLOCK, or -errno */
 int vfs_fd_set_nonblock(int fd, bool on);     /* set/clear O_NONBLOCK; 0 or -errno */
 int vfs_unlink_path(const char *path);   /* rm: split parent + per-fs unlink op */
 int vfs_mkdir_path(const char *path);    /* mkdir: split parent + per-fs mkdir op */
-int vfs_rename_path(const char *old_path, const char *new_path); /* strict: dest must not exist (POSIX replace = libc veneer) */
+int vfs_rename_path(const char *old_path, const char *new_path);
+int vfs_rename_noreplace(const char *old_path, const char *new_path);
 int vfs_chmod_path(const char *path, uint32_t mode);  /* permission bits; fs preserves the type bits */
 int vfs_fd_truncate(int fd, uint64_t size);  /* ftruncate over the existing per-fs truncate op */
 int vfs_rmdir_path(const char *path);    /* rmdir: EMPTY dirs only (fs enforces) */

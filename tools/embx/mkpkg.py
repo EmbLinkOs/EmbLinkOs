@@ -10,7 +10,7 @@ the caller (in PK2 they will come from build.ebm; here, from --ns flags).
 import sys, struct
 
 CAP_NAMES = {1:"filesystem",2:"network",3:"gpu",4:"audio",5:"camera",
-             6:"usb",7:"serial",8:"rawdisk",9:"kernel-ext",10:"debug"}
+             6:"usb",7:"serial",8:"rawdisk",9:"kernel-ext",10:"debug",11:"power",12:"network_admin"}
 
 def main():
     inp, outp = sys.argv[1], sys.argv[2]

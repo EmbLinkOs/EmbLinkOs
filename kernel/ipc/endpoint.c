@@ -114,6 +114,13 @@ int endpoint_accept(struct process *caller, int listen_handle) {
             restore_if(fl);
             return -EMBK_EINVAL;
         }
+        /* A cancellation wake must not immediately enqueue the waiter again.
+         * A pending connection still wins above, as with pipe reads. */
+        if (caller->cancelled) {
+            sched_unlock();
+            restore_if(fl);
+            return -EMBK_ECANCELED;
+        }
         sched_block_current_locked(&ep->accept_wait);   /* releases lock on resume */
         restore_if(fl);
     }

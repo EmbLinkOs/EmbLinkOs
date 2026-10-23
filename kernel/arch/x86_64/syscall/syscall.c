@@ -1,3 +1,13 @@
+#include "ipc/notify.h"
+#include "power/policy.h"
+#include "drivers/video/gpu.h"
+#include "../../../../user/lib/embk_gpu.h"
+#include "process/session.h"
+#include "acpi/power.h"
+#include "acpi/display.h"
+#include "drivers/audio/audio.h"
+#include "net/wifi/wifi.h"
+#include "net/wifi/control.h"
 #include "arch/x86_64/syscall/syscall.h"
 #include "arch/x86_64/irq/idt.h"
 #include "arch/x86_64/cpu/fsbase.h"    /* fsbase_set() -- sys_set_fs_base */
@@ -323,7 +333,8 @@ static int64_t sys_fd_avail(struct regs *r) {
 
 /* fcntl(fd, cmd, arg) -- the sliver of POSIX fcntl the kernel actually owns:
  * the O_NONBLOCK fd flag. cmd 1 = get (returns 1 if non-blocking, else 0);
- * cmd 2 = set non-blocking to `arg`. Everything else about fcntl (F_GETFD,
+ * cmd 2 = set non-blocking to `arg`; cmd 3 = all stored status flags.
+ * Everything else about fcntl (F_GETFD,
  * F_DUPFD, ...) stays a libc concern. */
 static int64_t sys_fcntl(struct regs *r) {
     int fd  = (int)r->rdi;
@@ -337,9 +348,15 @@ static int64_t sys_fcntl(struct regs *r) {
     }
     case 2:
         return vfs_fd_set_nonblock(fd, arg != 0);
+    case 3:
+        return vfs_fd_get_flags(fd);
     default:
         return -EMBK_EINVAL;
     }
+}
+
+static int64_t sys_fsync(struct regs *r) {
+    return vfs_fd_sync((int)r->rdi);
 }
 
 /* fd_poll(fd, events) -> ready POLL* bits (or POLLNVAL for a bad fd). One fd at
@@ -360,10 +377,8 @@ static int64_t sys_unlink(struct regs *r) {
 }
 
 /* mkdir(path) -> 0 or -errno. The shell's `mkdir`. */
-/* rename(old, new). STRICT kernel semantics: the destination must not exist
- * (EMBKFS refuses with -EEXIST) -- the POSIX replace-atomically veneer lives in
- * the LIBC (unlink dest, then rename), same split as path_abs. Two path copies,
- * one syscall: git's lockfile commit is the customer. */
+/* rename(old, new): the filesystem replaces the destination in the same
+ * transaction that moves the source. No unlink-before-rename window. */
 static int64_t sys_rename(struct regs *r) {
     char oldp[SYSCALL_PATH_MAX], newp[SYSCALL_PATH_MAX];
     int len = copy_string_from_user(oldp, (const char *)r->rdi, sizeof(oldp));
@@ -371,6 +386,14 @@ static int64_t sys_rename(struct regs *r) {
     len = copy_string_from_user(newp, (const char *)r->rsi, sizeof(newp));
     if (len < 0) return len;
     return vfs_rename_path(oldp, newp);
+}
+static int64_t sys_rename_noreplace(struct regs *r) {
+    char oldp[SYSCALL_PATH_MAX],newp[SYSCALL_PATH_MAX];
+    int rc=copy_string_from_user(oldp,(const char *)r->rdi,sizeof oldp);
+    if(rc<0) return rc;
+    rc=copy_string_from_user(newp,(const char *)r->rsi,sizeof newp);
+    if(rc<0) return rc;
+    return vfs_rename_noreplace(oldp,newp);
 }
 
 /* chmod(path, mode) -- REAL: EMBKFS inodes have always carried a mode, there
@@ -481,6 +504,8 @@ static int64_t sys_proc_list(struct regs *r) {
  * shows. If multi-user ever happens, this is the syscall to gate. */
 static int64_t sys_proc_kill(struct regs *r) {
     uint32_t pid = (uint32_t)r->rdi;
+    if (!session_may_signal(current_process_atomic(),pid) &&
+        !(process_current_caps() & EMBK_CAP_BIT(EMBK_CAP_DEBUG))) return -EMBK_EPERM;
     if (!process_alive(pid)) {
         return -EMBK_ENOENT;
     }
@@ -620,6 +645,7 @@ static int64_t sys_readdir(struct regs *r) {
  * could guess). If the handle table is full, the orphaned child is killed
  * immediately rather than leaked unreferenced. */
 static int64_t sys_spawn(struct regs *r) {
+    if (!session_may_spawn(current_process_atomic())) return -EMBK_ECANCELED;
     const char *user_path = (const char *)r->rdi;
     const uint64_t *user_argv = (const uint64_t *)r->rsi;
     int argc = (int)r->rdx;
@@ -1277,6 +1303,8 @@ static int64_t sys_key_poll(struct regs *r) {
  * Non-blocking on purpose: the callers are frame loops and games, which already
  * have a clock and must not park a thread on a keypress. */
 static int64_t sys_key_event_poll(struct regs *r) {
+    uint32_t focus=compositor_focused_pid();
+    if (focus && current_process->pid!=focus) return 0;
     struct key_event ev;
     if (!keyboard_event_pop(&ev)) return 0;
     if (copy_to_user((void *)r->rdi, &ev, sizeof ev) != EMBK_OK) return -EMBK_EFAULT;
@@ -1299,17 +1327,7 @@ static int64_t sys_key_grab(struct regs *r) {
 
 /* Monotonic milliseconds since boot, from the HPET counter -- the clock the
  * ring-3 UI animator ticks on. Falls back to the coarse timer tick count. */
-static uint64_t uptime_ms_now(void) {
-    if (hpet_available()) {
-        uint64_t pf = hpet_period_fs();                 /* femtoseconds per tick */
-        if (pf) {
-            uint64_t tpms = 1000000000000ULL / pf;      /* ticks per millisecond */
-            if (tpms == 0) tpms = 1;
-            return hpet_read_counter() / tpms;
-        }
-    }
-    return timer_get_ticks();
-}
+static uint64_t uptime_ms_now(void) {return timer_uptime_ms();}
 
 static int64_t sys_uptime_ms(struct regs *r) {
     (void)r;
@@ -1325,7 +1343,10 @@ static int64_t sys_uptime_ms(struct regs *r) {
  * scheduler surgery), but it removes ~all of the idle CPU theft. */
 static int64_t sys_sleep_ms(struct regs *r) {
     uint64_t end = uptime_ms_now() + r->rdi;
-    do { sys_yield(); } while (uptime_ms_now() < end);
+    do {
+        if(current_process && current_process->cancelled)return -EMBK_ECANCELED;
+        sys_yield();
+    } while (uptime_ms_now() < end);
     return 0;
 }
 
@@ -1795,6 +1816,15 @@ typedef int64_t (*syscall_handler_t)(struct regs *);
 #define SYS_audio_open     93
 #define SYS_audio_write    94
 #define SYS_audio_close    95
+#define SYS_fsync          96
+#define SYS_power_info     97
+#define SYS_power_request  98
+#define SYS_wifi_info      99
+#define SYS_wifi_request  100
+#define SYS_display_info  101
+#define SYS_display_set   102
+#define SYS_audio_info    103
+#define SYS_audio_control 104
 
 
 /* --- sound -----------------------------------------------------------------
@@ -1866,7 +1896,104 @@ static int64_t sys_audio_close(struct regs *r) {
     return 0;
 }
 
+static int64_t sys_power_info(struct regs *r) {
+    if(r->rsi!=sizeof(struct embk_power_info)) return -EMBK_EINVAL;
+    struct embk_power_info info;
+    int rc=acpi_power_snapshot(&info);
+    if(rc) return rc;
+    return copy_to_user((void *)r->rdi,&info,sizeof info)==EMBK_OK?0:-EMBK_EFAULT;
+}
+static int64_t sys_power_request(struct regs *r) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_POWER))) return -EMBK_EPERM;
+    if(r->rdi!=EMBK_POWER_OFF && r->rdi!=EMBK_POWER_REBOOT) return -EMBK_EINVAL;
+    return acpi_power_request(r->rdi);
+}
+
+static int64_t sys_wifi_info(struct regs *r) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_NETWORK))) return -EMBK_EPERM;
+    if(r->rsi!=sizeof(struct embk_wifi_info)) return -EMBK_EINVAL;
+    struct embk_wifi_info info;
+    int rc=wifi_snapshot(&info);
+    if(rc) return rc;
+    return copy_to_user((void *)r->rdi,&info,sizeof info)==EMBK_OK?0:-EMBK_EFAULT;
+}
+static int64_t sys_wifi_request(struct regs *r) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_NETWORK_ADMIN))) return -EMBK_EPERM;
+    if(r->rsi!=sizeof(struct embk_wifi_request)) return -EMBK_EINVAL;
+    struct embk_wifi_request request;
+    if(copy_from_user(&request,(void *)r->rdi,sizeof request)!=EMBK_OK) return -EMBK_EFAULT;
+    int rc=wifi_request(&request);
+    volatile uint8_t *p=(uint8_t *)&request;for(unsigned i=0;i<sizeof request;i++) p[i]=0;
+    return rc;
+}
+static int64_t sys_display_info(struct regs *r) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_GPU))) return -EMBK_EPERM;
+    if(r->rsi!=sizeof(struct embk_display_info)) return -EMBK_EINVAL;
+    struct embk_display_info info;acpi_display_snapshot(&info);
+    return copy_to_user((void *)r->rdi,&info,sizeof info)==EMBK_OK?0:-EMBK_EFAULT;
+}
+static int64_t sys_display_set(struct regs *r) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_POWER))) return -EMBK_EPERM;
+    if(r->rdi>100) return -EMBK_EINVAL;
+    return acpi_display_request(r->rdi);
+}
+static int64_t sys_audio_info(struct regs *r) {
+    if(!audio_permitted()) return -EMBK_EPERM;
+    if(r->rsi!=sizeof(struct embk_audio_info)) return -EMBK_EINVAL;
+    struct embk_audio_info info;audio_snapshot(&info);
+    return copy_to_user((void *)r->rdi,&info,sizeof info)==EMBK_OK?0:-EMBK_EFAULT;
+}
+static int64_t sys_audio_control(struct regs *r) {
+    if(!audio_permitted()) return -EMBK_EPERM;
+    if(r->rdi>100 || r->rsi>1) return -EMBK_EINVAL;
+    return audio_control(r->rdi,r->rsi);
+}
+static int64_t sys_session_control(struct regs *r) {
+    if(r->rdi>UINT32_MAX || r->rsi>INT32_MAX) return -EMBK_EINVAL;
+    return session_control(current_process_atomic(),(unsigned)r->rdi,(int)r->rsi);
+}
+static int64_t sys_notice_post(struct regs *r) {
+    if(r->rsi!=sizeof(struct embk_notice_request))return -EMBK_EINVAL;
+    struct embk_notice_request req;
+    if(copy_from_user(&req,(void *)r->rdi,sizeof req)!=EMBK_OK)return -EMBK_EFAULT;
+    return notify_post(current_process_atomic(),&req);
+}
+static int64_t sys_notice_get(struct regs *r) {
+    if(r->rsi!=sizeof(struct embk_notice_info) || r->rdx>1)return -EMBK_EINVAL;
+    struct embk_notice_info info;int rc=notify_snapshot(current_process_atomic(),&info,(int)r->rdx);
+    if(rc)return rc;
+    return copy_to_user((void *)r->rdi,&info,sizeof info)==EMBK_OK?0:-EMBK_EFAULT;
+}
+static int64_t sys_policy_get(struct regs *r) {
+    if(r->rsi!=sizeof(struct embk_policy))return -EMBK_EINVAL;
+    struct embk_policy p;power_policy_get(&p);
+    return copy_to_user((void *)r->rdi,&p,sizeof p)==EMBK_OK?0:-EMBK_EFAULT;
+}
+static int64_t sys_policy_set(struct regs *r) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_POWER)))return -EMBK_EPERM;
+    if(r->rsi!=sizeof(struct embk_policy))return -EMBK_EINVAL;
+    struct embk_policy p;if(copy_from_user(&p,(void *)r->rdi,sizeof p)!=EMBK_OK)return -EMBK_EFAULT;
+    return power_policy_set(&p);
+}
+static int64_t sys_gpu_info(struct regs *r) {
+    if(!(process_current_caps()&EMBK_CAP_BIT(EMBK_CAP_GPU)))return -EMBK_EPERM;
+    if(r->rsi!=sizeof(struct embk_gpu_info))return -EMBK_EINVAL;
+    struct embk_gpu_info info={.version=EMBK_GPU_VERSION,.flags=EMBK_GPU_SOFTWARE_RENDERING};
+    const struct gpu_driver *driver=gpu_active();
+    snprintf(info.driver,sizeof info.driver,"%s",driver?driver->name:"Firmware framebuffer");
+    if(driver && driver->set_mode)info.flags|=EMBK_GPU_DRIVER_MODESET;
+    const fb_info_t *mode=fb_get_info();
+    if(mode){info.width=mode->width;info.height=mode->height;info.pitch=mode->pitch;info.bpp=mode->bpp;}
+    return copy_to_user((void *)r->rdi,&info,sizeof info)==EMBK_OK?0:-EMBK_EFAULT;
+}
 static syscall_handler_t syscall_table[] = {
+    [105] = sys_session_control,
+    [106] = sys_rename_noreplace,
+    [107] = sys_notice_post,
+    [108] = sys_notice_get,
+    [109] = sys_policy_get,
+    [110] = sys_policy_set,
+    [111] = sys_gpu_info,
     [SYS_write]   = sys_write,
     [SYS_exit]    = sys_exit,
     [SYS_yield]   = sys_yield_syscall,
@@ -1944,6 +2071,15 @@ static syscall_handler_t syscall_table[] = {
     [SYS_net_sendto]     = sys_net_sendto,
     [SYS_net_recvfrom]   = sys_net_recvfrom,
     [SYS_fcntl]          = sys_fcntl,
+    [SYS_fsync]          = sys_fsync,
+    [SYS_power_info]     = sys_power_info,
+    [SYS_power_request]  = sys_power_request,
+    [SYS_wifi_info]      = sys_wifi_info,
+    [SYS_wifi_request]   = sys_wifi_request,
+    [SYS_display_info]   = sys_display_info,
+    [SYS_display_set]    = sys_display_set,
+    [SYS_audio_info]     = sys_audio_info,
+    [SYS_audio_control]  = sys_audio_control,
     [SYS_fd_poll]        = sys_fd_poll,
     [SYS_clip_set]       = sys_clip_set,
     [SYS_clip_get]       = sys_clip_get,
@@ -1971,6 +2107,15 @@ static syscall_handler_t syscall_table[] = {
  * `extern syscall_dispatch` resolves — a `static` here would not link.
  * Number in rax; result written back into rax (the stub pops it to the user).*/
 void syscall_dispatch(struct regs *r) {
+    /* Mark the exact entering thread before enabling IRQs. Session teardown
+     * checks this under the same scheduler lock; it cannot abandon a syscall
+     * while that thread owns filesystem/device locks. */
+    struct thread *entered=current_thread;
+    sched_lock();
+    int stopping=entered && (entered->state==PROCESS_ZOMBIE || !session_may_spawn(entered->proc));
+    if(entered && !stopping)entered->syscall_depth++;
+    sched_unlock();
+    if(stopping)thread_exit_self(-EMBK_ECANCELED);
     /* int 0x80 is an INTERRUPT gate (IDT_GATE_USER = 0xEE, type 0xE), which
      * auto-clears IF on entry -- so without this, every syscall handler
      * below runs with interrupts disabled for its entire duration. That's
@@ -1986,11 +2131,31 @@ void syscall_dispatch(struct regs *r) {
     __asm__ volatile("sti");
 
     uint64_t syscall_number = r->rax;
+    struct process *caller=current_process_atomic();
+    /* Raw framebuffer writes bypass window composition and cannot coexist with
+     * a protected login/lock screen. Managed sessions use window presentation. */
+    if(session_managed() && (syscall_number==SYS_ui_present || syscall_number==SYS_ui_present_rect)) {
+        r->rax=(uint64_t)-EMBK_EPERM;goto syscall_done;
+    }
+    if(caller && !session_ui_allowed(caller->pid) &&
+       (syscall_number==SYS_ui_input || syscall_number==SYS_win_input ||
+        syscall_number==SYS_win_blur_rect || syscall_number==SYS_key_grab || syscall_number==SYS_key_poll ||
+        syscall_number==SYS_key_event_poll || syscall_number==SYS_key_mods ||
+        syscall_number==SYS_clip_get || syscall_number==SYS_clip_set ||
+        syscall_number==SYS_screen_luma || (syscall_number==SYS_read && r->rdi==0))) {
+        r->rax=(uint64_t)-EMBK_EPERM;goto syscall_done;
+    }
     if (syscall_number < SYSCALL_TABLE_SIZE && syscall_table[syscall_number]) {
         r->rax = (uint64_t)syscall_table[syscall_number](r);
     } else {
         r->rax = (uint64_t)(-EMBK_EINVAL); // Invalid syscall number
     }
+syscall_done:
+    sched_lock();
+    if(entered && entered->syscall_depth)entered->syscall_depth--;
+    stopping=entered && (entered->state==PROCESS_ZOMBIE || !session_may_spawn(entered->proc));
+    sched_unlock();
+    if(stopping)thread_exit_self(-EMBK_ECANCELED);
 }
 
 

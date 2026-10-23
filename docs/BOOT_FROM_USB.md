@@ -80,9 +80,9 @@ small **graphical desktop** (a launcher and a live clock). That is the OS runnin
 on real hardware.
 
 - Use the **USB keyboard** to interact.
-- **No networking** — there is no driver for real network cards yet (only the
-  virtual `virtio-net` used under QEMU), so no Wi-Fi/internet. Everything else
-  runs locally.
+- **Wired networking:** initial Intel 8254x/82574 and Realtek RTL8139 drivers
+  are available; physical hardware remains untested. Other Ethernet models and
+  Wi-Fi are unsupported. See the hardware coverage document below.
 - **To leave:** reboot or power off and remove the stick. The normal system
   returns untouched.
 
@@ -106,8 +106,8 @@ on real hardware.
 | Subsystem | On real hardware |
 |---|---|
 | Display | Works via the firmware's UEFI GOP framebuffer (no GPU driver needed). |
-| Storage | SATA/AHCI + IDE only — **no NVMe driver**. (Irrelevant here: the OS boots off the USB and doesn't install.) |
-| Keyboard | USB HID + PS/2. A laptop's built-in keyboard may be I2C-HID (unsupported) — use a USB keyboard. |
+| Storage | SATA/AHCI, IDE and initial NVMe support (physical hardware untested). (Irrelevant here: the OS boots off the USB and doesn't install.) |
+| Keyboard | USB HID + PS/2. Initial Intel LPSS I2C-HID support is available but untested on physical laptops; keep a USB keyboard available. |
 | Networking | None (real NIC drivers not written yet). |
 
 ---
@@ -150,3 +150,9 @@ keyboards must be present at power-on; some firmware only feeds the built-in
 keyboard there). If neither the internal keyboard nor a USB keyboard can navigate
 MokManager, that machine can't run an unsigned OS until the BIOS password is
 cleared. Use a machine where Secure Boot is turn-off-able instead.
+
+See [HARDWARE_DRIVERS.md](HARDWARE_DRIVERS.md) for current Ethernet, NVMe and ACPI support and remaining laptop limitations.
+
+The Recovery menu now includes a read-only integrity check and a reviewed
+whole-disk installer. See [DAILY_USE.md](DAILY_USE.md) for target selection,
+expanded root capacity, normal login/live boot and current recovery limits.

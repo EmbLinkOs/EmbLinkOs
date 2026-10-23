@@ -1,5 +1,7 @@
 #include "drivers/bus/pci.h"
 #include "include/io.h"
+#include "arch/x86_64/cpu/spinlock.h"
+static spinlock_t config_lock = SPINLOCK_INIT;
 #include "include/kprintf.h"
 #include "drivers/char/serial.h"
 #include "mm/vmm.h"   // vmm_map_mmio for the MSI-X table (lives in a BAR)
@@ -24,8 +26,11 @@ uint32_t pci_read32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offse
     uint32_t address = pci_config_address(bus, device, function, offset);
     // We need outl/inl (32 bits port I/O). 
 
+    spin_lock(&config_lock);
     outl(PCI_CONFIG_ADDRESS, address);
-    return inl(PCI_CONFIG_DATA);
+    uint32_t value = inl(PCI_CONFIG_DATA);
+    spin_unlock(&config_lock);
+    return value;
 }
 
 
@@ -44,16 +49,24 @@ uint8_t pci_read8(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset)
 
 void pci_write32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value){
     uint32_t address = pci_config_address(bus, device, function, offset);
+    spin_lock(&config_lock);
     outl(PCI_CONFIG_ADDRESS, address);
     outl(PCI_CONFIG_DATA, value);
+    spin_unlock(&config_lock);
 }
 
-// 16-bit config write via read-modify-write of the containing dword.
-void pci_write16(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value){
-    uint32_t dword = pci_read32(bus, device, function, offset & 0xFC);
-    uint32_t shift = (offset & 2) * 8;
-    dword = (dword & ~(0xFFFFu << shift)) | ((uint32_t)value << shift);
-    pci_write32(bus, device, function, offset & 0xFC, dword);
+// Exact-width writes avoid clearing adjacent write-one-to-clear status bits.
+void pci_write16(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value) {
+    spin_lock(&config_lock);
+    outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, device, function, offset));
+    outw(PCI_CONFIG_DATA + (offset & 2), value);
+    spin_unlock(&config_lock);
+}
+void pci_write8(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint8_t value) {
+    spin_lock(&config_lock);
+    outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, device, function, offset));
+    outb(PCI_CONFIG_DATA + (offset & 3), value);
+    spin_unlock(&config_lock);
 }
 
 // Find the device's MSI capability and program it to deliver `vector` to the

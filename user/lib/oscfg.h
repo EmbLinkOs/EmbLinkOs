@@ -8,7 +8,8 @@
  * differently in three places.
  *
  * The format is deliberately the dullest thing that works -- "key value" lines
- * in /data/settings.conf. It is editable with the text editor we ship, it
+ * in $HOME/.settings.conf (the legacy /data/settings.conf for non-session
+ * tools). It is editable with the text editor we ship, it
  * diffs, and a corrupt or missing file simply yields defaults rather than an
  * unusable desktop. Unknown keys are preserved-by-ignoring: an older build
  * reading a newer file does not lose the keys it did not understand, it just
@@ -20,9 +21,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include "embk.h"
 
-#define OSCFG_PATH "/data/settings.conf"
+static inline void oscfg_path(char out[256]) {
+    const char *home=getenv("HOME");
+    if(home && home[0]=='/' && strlen(home)<200) snprintf(out,256,"%s/.settings.conf",home);
+    else snprintf(out,256,"/data/settings.conf"); /* non-session tools */
+}
 
 /* The accents are named rather than free RGB: a palette a designer chose beats
  * a colour wheel a user fights, and every one of these is checked against the
@@ -43,6 +49,8 @@ struct oscfg {
     int dock_size;     /* dock icon base size in px                      */
     int dock_dots;     /* show a running indicator under live apps       */
     int ui_scale;      /* interface size, PERCENT (80..130); 100 = default */
+    int volume,muted;
+    int idle_dim_seconds,idle_lock_seconds,lid_lock,power_profile;
 };
 
 /* The screen band the DOCK owns, in pixels, for a given preference.
@@ -69,6 +77,8 @@ static inline int oscfg_dock_band(const struct oscfg *c) {
 }
 
 static inline void oscfg_defaults(struct oscfg *c) {
+    c->volume=100;c->muted=0;
+    c->idle_dim_seconds=120;c->idle_lock_seconds=300;c->lid_lock=1;c->power_profile=0;
     c->accent = 0; c->dark = 1; c->dock_size = 38; c->dock_dots = 1;
     c->ui_scale = 100;
 }
@@ -77,7 +87,8 @@ static inline void oscfg_defaults(struct oscfg *c) {
  * losing your preferences must not mean losing your desktop. */
 static inline void oscfg_load(struct oscfg *c) {
     oscfg_defaults(c);
-    int fd = (int)embk_open(OSCFG_PATH, EMBK_O_RDONLY, 0);
+    char path[256];oscfg_path(path);
+    int fd = (int)embk_open(path, EMBK_O_RDONLY, 0);
     if (fd < 0) return;
     char buf[1024];
     int64_t n = embk_read(fd, buf, sizeof buf - 1);
@@ -96,28 +107,47 @@ static inline void oscfg_load(struct oscfg *c) {
         else if (!strcmp(key, "dock_size")) c->dock_size = val;
         else if (!strcmp(key, "dock_dots")) c->dock_dots = val;
         else if (!strcmp(key, "ui_scale"))  c->ui_scale  = val;
+        else if (!strcmp(key, "volume"))    c->volume    = val;
+        else if (!strcmp(key, "muted"))     c->muted     = val!=0;
+        else if (!strcmp(key,"idle_dim_seconds"))c->idle_dim_seconds=val;
+        else if (!strcmp(key,"idle_lock_seconds"))c->idle_lock_seconds=val;
+        else if (!strcmp(key,"lid_lock"))c->lid_lock=val!=0;
+        else if (!strcmp(key,"power_profile"))c->power_profile=val;
     }
     if (c->accent < 0 || c->accent >= OSCFG_ACCENTS) c->accent = 0;
     if (c->dock_size < 28) c->dock_size = 28;
     if (c->dock_size > 60) c->dock_size = 60;
     if (c->ui_scale < 80)  c->ui_scale = 80;
     if (c->ui_scale > 130) c->ui_scale = 130;
+    if(c->idle_dim_seconds<0 || c->idle_dim_seconds>86400 || (c->idle_dim_seconds && c->idle_dim_seconds<10))c->idle_dim_seconds=120;
+    if(c->idle_lock_seconds<0 || c->idle_lock_seconds>86400 || (c->idle_lock_seconds && c->idle_lock_seconds<10))c->idle_lock_seconds=300;
+    if(c->power_profile<0 || c->power_profile>2)c->power_profile=0;
+    if(c->volume<0) c->volume=0;
+    if(c->volume>100) c->volume=100;
 }
 
-/* Written whole rather than patched in place: the file is four lines, and a
- * rewrite cannot leave a half-updated one behind. */
+/* Readers see a complete old or new configuration, including when the desktop
+ * persists a sound-menu change while Settings is open. Flush before and after
+ * atomic replacement; an I/O failure is reported to the caller. */
 static inline int oscfg_save(const struct oscfg *c) {
     char out[512];
     int n = snprintf(out, sizeof out,
                      "# EmbLink preferences -- written by Settings, editable by hand.\n"
                      "accent %d\n" "dark %d\n" "dock_size %d\n" "dock_dots %d\n"
-                     "ui_scale %d\n",
-                     c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale);
-    int fd = (int)embk_open(OSCFG_PATH, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
+                     "ui_scale %d\nvolume %d\nmuted %d\nidle_dim_seconds %d\nidle_lock_seconds %d\nlid_lock %d\npower_profile %d\n",
+                     c->accent, c->dark, c->dock_size, c->dock_dots, c->ui_scale,c->volume,c->muted,c->idle_dim_seconds,c->idle_lock_seconds,c->lid_lock,c->power_profile);
+    char path[256],temp[288];oscfg_path(path);
+    snprintf(temp,sizeof temp,"%s.%lu.tmp",path,(unsigned long)embk_getpid());
+    int fd = (int)embk_open(temp, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0600);
     if (fd < 0) return -1;
-    int64_t w = embk_write(fd, out, (size_t)n);
+    size_t done=0;int rc=0;
+    while(done<(size_t)n) {int64_t w=embk_write(fd,out+done,(size_t)n-done);if(w<=0) {rc=-1;break;}done+=w;}
+    if(!rc && fsync(fd)) rc=-1;
+    if(!rc && rename(temp,path)) rc=-1;
+    if(!rc && fsync(fd)) rc=-1;
     embk_close(fd);
-    return w == n ? 0 : -1;
+    if(rc) unlink(temp);
+    return rc;
 }
 
 #endif /* _EMBLINK_OSCFG_H_ */

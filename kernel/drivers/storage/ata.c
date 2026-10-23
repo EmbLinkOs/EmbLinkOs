@@ -297,6 +297,8 @@ static bool ata_detect(uint16_t io_base, uint16_t ctrl_base, bool is_slave, stru
         out->model[2*i + 1] = (char) (w & 0xFF); 
     }
     out->model[40] = '\0'; // Null-terminate the string
+    for(unsigned i=0;i<10;i++) {out->serial[2*i]=identify_data[10+i]>>8;out->serial[2*i+1]=identify_data[10+i];}
+    out->serial[20]=0;
 
     out->present = true;
     out->io_base = io_base;
@@ -662,7 +664,8 @@ void ata_register_block_devices(void) {
         ata_block_devices[i].driver_data = (void *)(uintptr_t)i; // Store the drive index
         ata_block_devices[i].dma_max_phys      = 0xFFFFFFFF;   // 32-bit DMA
         ata_block_devices[i].needs_kernel_range = true;
-        embk_block_register(&ata_block_devices[i]);
+        if(!embk_block_register(&ata_block_devices[i]))
+            embk_block_set_identity(&ata_block_devices[i],"ATA",drives[i].model,drives[i].serial);
     }
 }
 

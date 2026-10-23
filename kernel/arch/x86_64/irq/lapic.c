@@ -1,3 +1,7 @@
+#include "power/policy.h"
+#include "drivers/input/keyboard.h"
+#include "acpi/power.h"
+#include "drivers/i2c/hid_i2c.h"
 #include "arch/x86_64/irq/lapic.h"
 #include "drivers/char/serial.h"
 #include "drivers/timer/hpet.h"
@@ -272,6 +276,7 @@ void lapic_timer_init(uint8_t vector) {
 }
 
 void lapic_timer_handler(void){
+    cpu_power_poll();
     /* Once every core has its own LAPIC timer firing independently (SMP),
      * incrementing this SHARED counter from every core's handler would
      * silently change its meaning from "wall-clock ticks" to "sum of every
@@ -282,8 +287,10 @@ void lapic_timer_handler(void){
      * calls schedule() below on its OWN tick -- that part doesn't change. */
     if (this_cpu_is_bsp()) {
         lapic_ticks++; // Increment the LAPIC timer tick count
-        net_tick();    // 10 ms net clock: drive event-driven RX + client timeouts
-                       // (a no-op with empty queues before the net stack is up)
+        net_tick();        // network RX and client timeout wakeups
+        keyboard_repeat_tick();
+        acpi_power_tick();
+        i2c_hid_tick();    // polling laptop input; no-op before discovery
     }
     lapic_send_eoi(); // Acknowledge the timer interrupt BEFORE any reschedule
                       // below, so the LAPIC can keep delivering interrupts to

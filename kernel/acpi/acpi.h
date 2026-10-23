@@ -141,6 +141,7 @@ struct acpi_info{
 
 // Discover and parse ACPI tables, fill the acpi_info struct with relevant data for APIC initialization and interrupt routing
 const struct acpi_info *acpi_init(void);
+uint64_t acpi_rsdp_address(void);
 
 // Get the parsed info after acpi_init. Returns NULL if ACPI tables were not found or failed to parse.
 const struct acpi_info *acpi_get_info(void);

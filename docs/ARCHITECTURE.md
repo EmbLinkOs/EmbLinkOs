@@ -1,6 +1,6 @@
 # EmbLinkOS — Architecture
 
-*Living document — last updated 2026-07-13.*
+*Living document — last updated 2026-10-23.*
 
 **Status legend:**
 `✅ Built` — implemented and verified · `🎯 Designed` — decided, not yet implemented · `🔓 Open` — undecided fork · `⏳ Later` — decided direction, off the near-term critical path
@@ -50,9 +50,12 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 | | | Pipes | 🎯 Designed |
 | 4 | Driver model | ACPI enumeration | ✅ Built |
 | | | PCI/PCIe enumeration (legacy CAM) | ✅ Built *(ECAM/MCFG still 🎯)* |
-| | | AHCI storage (LBA48 r/w) | ✅ Built |
+| | | AHCI storage (LBA48 r/w + flush), NVMe namespace r/w + flush | ✅ Built *(NVMe: QEMU validated; physical hardware untested)* |
+| | | Intel 8254x/82574 + RTL8139 Ethernet | ✅ Built *(polling; QEMU validated)* |
+| | | Intel LPSS I2C + HID keyboard/touchpad input | ✅ Built *(protocol models and native input tested; physical testing pending)* |
+| | | AML runtime + battery/AC reporting | ✅ Built *(EC transport and firmware integration implemented; physical testing pending)* |
 | | | USB (xHCI/EHCI/UHCI/OHCI: HID keyboard, mass storage, hub support on legacy HCs) | ✅ Built *(xHCI hub support, isochronous transfers still 🎯)* |
-| | | NVMe, PS/2 controller init, RTC | ⏳ Later / as needed |
+| | | PS/2 controller init, RTC | ⏳ Later / as needed |
 | | | VBE framebuffer (+ Bochs DISPI / VirtIO-GPU accelerated path, EDID + mode enumeration) | ✅ Built |
 | 5 | Block & filesystem | Block layer + DMA bounce buffers | ✅ Built |
 | | | VFS (mount registry, `vfs_resolve`, `vget`, `ls`) | ✅ Built |
@@ -148,6 +151,33 @@ This is why several decisions here **keep** Unix (files as descriptors, uid/gid/
 - **Process & scheduling:** preemptive SMP scheduler (priority-band round-robin + aging), ring-3 processes and threads, `spawn()`/`wait()`/`kill()` via capability handles, uncatchable kernel-level kill. See [`architecture/process-and-scheduling.md`](architecture/process-and-scheduling.md).
 - **Storage:** ATA + AHCI drivers (LBA48 read/write), block layer with DMA bounce buffers, MBR partitioning, USB mass storage as an alternate block-device backend.
 - **Filesystems:** VFS (filesystem-neutral mount registry, `vfs_resolve` with `.`/`..` breadcrumb stack, `vget` op, `ls`). FAT32 (file write, `mkdir`, LFN, FSInfo). **EMBKFS** — the primary filesystem: CoW B-tree on-disk format, checksums, AES-256-XTS encryption, compression, snapshots, self-heal, provenance, verified boot, **atomic rename** (git's lockfile protocol depends on it), chmod/ftruncate; a Python reference implementation (`tools/embkfs_mkfs/`) builds and independently verifies images. Spec: [`v2.3`](EMBKFS_spec_v2.3.md) (latest additions) layered on [`v2.2`](EMBKFS_spec_v2.2.md) (the v2 format).
+
+  Rename holds EMBKFS's recursive filesystem lock at both public entry points,
+  through path resolution and the complete transaction. Protecting only the
+  commit would leave shared probe buffers and the old root exposed to a reader
+  scheduled during disk I/O; protecting only the VFS bridge would leave direct
+  kernel callers exposed. `test fsrename` holds the lock in one thread and
+  checks that a second thread's real rename blocks, then moves the original
+  object after unlock, for both the name and path APIs.
+
+  `fsync` (syscall 96) validates a descriptor and dispatches through the mounted
+  filesystem's `sync` operation. EMBKFS holds its filesystem lock and flushes
+  the backing device; its transactions have already written file data and
+  metadata synchronously. A filesystem without this operation, or a disk driver
+  without a flush callback, returns `ENOTSUP`, including through partitions.
+  Console/pipe/socket descriptors return `EINVAL`; invalid descriptors return
+  `EBADF`. `fdatasync` uses the same, stronger metadata-and-data barrier.
+  `test sync` injects device failures into the real EMBKFS adapter and checks
+  that they reach its caller. The POSIX suite covers descriptor validation,
+  regular-file synchronization, and the access/nonblocking flags from `fcntl`.
+
+  AHCI disks implement the block flush callback with ATA `FLUSH CACHE` (0xE7),
+  a non-data command with no PRDT entries. A per-port sleeping mutex covers
+  identify, read, write and flush: a flush drains older commands before issuing
+  its own, and waits for completion or a device error, with a bounded timeout.
+  This also supplies the barriers used by EMBKFS's two-flush commit protocol.
+  The SATA QEMU run exercises the full POSIX suite and records 0xE7 commands at
+  the device model; it does not substitute for power-loss testing on hardware.
 - **File layer:** fd table (base 3, stdio reserved), create-on-open, `kcontext` setjmp/longjmp so `sys_exit` unwinds to kernel. Unlink-while-open safety via `g_open_refs` + deferred-free. *Known limit: no on-disk orphan list; mount-time sweep planned.*
 - **USB:** all four host-controller generations (xHCI, EHCI, UHCI, OHCI) — keyboard, mouse, mass storage.
 - **Display:** GPU driver (virtio-gpu → Bochs DISPI → VBE fallback), a framebuffer console, and an in-kernel **window compositor** (z-order, kernel or app-owned chrome, zero-copy shared-memory windows, resizable windows, desktop widgets in a dedicated z-band, pointer capture).
@@ -195,7 +225,7 @@ Smaller open items: pipe file-action API shape (at ABI design), init/PID 1 model
 
 ## 7. Deferred / Later (off the near-term critical path)
 
-buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · NVMe · USB isochronous transfers / xHCI hub support · lazy PLT binding for the dynamic linker (relocations are currently eager-only) · ARM64 portability · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib) · a real scrollback/line-editing TTY.
+buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable kernel modules (in-kernel ELF relocator + symbol table) · page/buffer cache · USB isochronous transfers / xHCI hub support · lazy PLT binding for the dynamic linker (relocations are currently eager-only) · ARM64 portability · on-disk orphan list + mount-time sweep · POSIX-capabilities (split root) · multi-user policy (login, `/etc/passwd`) · musl (replacing newlib) · a real scrollback/line-editing TTY.
 
 *(GUI stack and SMP have shipped — see §2 rows 2 and 10 — and are removed from this list.)*
 
@@ -209,3 +239,34 @@ buddy allocator · COW pages + NX (arrive with `fork()`) · runtime-loadable ker
 - **Verification:** oracle-first — Python formatter/verifier is ground truth; the C reader is validated against it.
 - **Git hygiene:** PR-based workflow, `Teo` branch; after a GitHub-side PR merge, fetch → check log → merge master into `Teo` (not blind force-push). Non-fast-forward rejections from PR merges / CodeQL auto-fix commits are expected.
 - **Hardware:** consult the Intel SDM before coding any hardware-level component.
+
+Hardware driver coverage and reproducible checks: [HARDWARE_DRIVERS.md](HARDWARE_DRIVERS.md).
+
+Laptop acceptance goals and power/boot validation: [LAPTOP_ALPHA.md](LAPTOP_ALPHA.md).
+
+## 9. Installation and session lifetime
+
+The UEFI loaded-image partition identity selects the boot root, independently
+of disk enumeration order. Recovery mounts that root read-only before repair
+or orphan cleanup and starts no userspace desktop/network service. Its installer
+validates the standard ESP + EMBKFS GPT layout, flushes and reads back payload
+writes, then publishes new boot metadata and grows the target root. This is a
+reviewed whole-disk installation path; image rollback and partition-preserving
+installation remain separate work.
+
+Init is the kernel-designated authentication controller. It validates bounded
+namespace profiles and accepts a private-pipe proof from the setup/login/unlock
+program. A kernel session epoch follows every descendant, including orphans.
+Locking gates composition, input and clipboard access to the greeter; managed
+sessions cannot use raw framebuffer presentation to bypass composition.
+
+Logout freezes old-epoch spawning and cancels blocking work. Active syscalls
+remain runnable until they release filesystem/device locks and reach a dispatch
+boundary; pure userspace threads can stop immediately. Init waits for all epoch
+members before returning to login. IPC accept/receive/send and thread join test
+sticky cancellation before sleeping again, preserving completed operations and
+uncommitted ancillary handles. The privileged serial development console remains
+outside the desktop's namespace/capability boundary.
+
+Implementation, acceptance commands and remaining display/power limitations:
+[DAILY_USE.md](DAILY_USE.md).

@@ -84,6 +84,7 @@ struct usb_device {
     uint8_t hid_ep;
     uint16_t hid_mps;
     uint8_t prev_keys[6];
+    uint8_t prev_modifiers;
 };
 
 #define USB_HID_KEYBOARD 0

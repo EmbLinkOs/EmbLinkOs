@@ -35,6 +35,8 @@ const char *em_cap_name(enum em_cap c)
     case EM_CAP_RAWDISK:    return "rawdisk";
     case EM_CAP_KERNEL_EXT: return "kernel-ext";
     case EM_CAP_DEBUG:      return "debug";
+    case EM_CAP_POWER:      return "power";
+    case EM_CAP_NETWORK_ADMIN: return "network_admin";
     default:                return "?";
     }
 }

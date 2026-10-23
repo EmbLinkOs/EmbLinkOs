@@ -46,9 +46,12 @@ def boot(name, scratch, audio=None):
     # the tree it was given is a test you can only run once.
     subprocess.run(["cp", "-f", os.path.join(ROOT, "embkfs.img"), scratch],
                    check=True, cwd=ROOT)
+    boot_copy=os.path.join(BUILD,"shot-%s-boot.img" % name)
+    subprocess.run(["cp","-f",os.path.join(ROOT,"myos.img"),boot_copy],check=True,cwd=ROOT)
     argv = [
         "qemu-system-x86_64", "-cpu", "max",
-        "-drive", "format=raw,file=myos.img,if=ide,index=0",
+        "-fw_cfg", "name=opt/emblink/live,string=1",
+        "-drive", "format=raw,file=%s,if=ide,index=0" % boot_copy,
         "-drive", "format=raw,file=%s,if=ide,index=1" % scratch,
         "-vga", "none", "-device", "virtio-vga,xres=1024,yres=768",
         "-display", "none",
@@ -63,6 +66,8 @@ def boot(name, scratch, audio=None):
         # test, but what the device was handed is.
         argv += ["-device", "AC97,audiodev=snd0",
                  "-audiodev", "wav,id=snd0,path=%s" % audio]
+    if os.environ.get("EMBLINK_ACPI_TABLE"):
+        argv += ["-acpitable","file=" + os.environ["EMBLINK_ACPI_TABLE"]]
     log = open(os.path.join(BUILD, "shot-%s-qemu.log" % name), "wb")
     return subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=log), ser, qmp
 
@@ -165,11 +170,13 @@ def main():
     ap.add_argument("--keys", default="", help="comma-separated chars to type after launch")
     ap.add_argument("--audio", action="store_true",
                     help="attach an AC97 and capture what it plays to a WAV")
+    ap.add_argument("--attach-audio",action="store_true",
+                    help="attach AC97 for device-control UI without requiring playback")
     args = ap.parse_args()
 
     scratch = os.path.join(BUILD, "shot-%s.img" % args.name)
     print("=== app-shot: booting for %s" % args.app)
-    wav = os.path.join(BUILD, "shot-%s.wav" % args.name) if args.audio else None
+    wav = os.path.join(BUILD, "shot-%s.wav" % args.name) if args.audio or args.attach_audio else None
     if wav and os.path.exists(wav):
         os.remove(wav)
     q, ser_path, qmp_path = boot(args.name, scratch, wav)
@@ -253,7 +260,7 @@ def main():
             print("     FAIL: %s" % f)
         print("=== app-shot: FAIL (%d)" % len(fails))
         return 1
-    if wav:
+    if wav and args.audio:
         # Measure it here rather than asserting a tone: a player's output is
         # music, so what matters is that it is LONG enough (no starvation) and
         # not silent (the decode reached the device).

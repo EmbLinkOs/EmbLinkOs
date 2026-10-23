@@ -1,4 +1,6 @@
+#include "acpi/power.h"
 #include "selftests.h"
+#include "acpi/runtime.h"
 
 #include "include/kprintf.h"
 #include "include/kstring.h"
@@ -48,6 +50,90 @@
 static struct fat32_volume *g_fat32 = NULL;
 static bool g_has_fat32 = false;
 static bool g_vfs_ready = false;
+
+/* A rename must wait behind an existing filesystem owner, even when called
+ * directly rather than through the VFS. The parent never waits for completion
+ * while holding the lock: it only checks that the worker really parked. */
+static struct embkfs_volume *s_rename_vol;
+static volatile int s_rename_started, s_rename_result;
+static struct {int busy,owner,finished,failed;} service_test;
+static void service_lock_worker(unsigned id,unsigned depth) {
+    for(unsigned round=0;round<3;round++) {
+        net_lock();if(depth==2) net_lock();net_service_lock();
+        if(service_test.owner) service_test.failed=1;
+        service_test.owner=id;
+        uint64_t until=net_ticks()+3;
+        while(net_ticks()<until) net_wait(); /* RX/timer/other contender must run */
+        if(service_test.owner!=(int)id) service_test.failed=1;
+        service_test.owner=0;net_service_unlock();
+        if(depth==2) net_unlock();net_unlock();
+    }
+    net_lock();service_test.finished++;net_unlock();process_exit_self(0);
+}
+static void service_lock_worker_a(void) {service_lock_worker(1,2);}
+static void service_lock_worker_b(void) {service_lock_worker(2,1);}
+static int s_rename_by_path;
+static void rename_lock_worker(void)
+{
+    s_rename_started = 1;
+    s_rename_result = s_rename_by_path
+        ? embkfs_rename_path(s_rename_vol, EMBKFS_ROOT_OBJECT_ID,
+                             "/.__rename_lock_a", "/.__rename_lock_b")
+        : embkfs_rename_name(s_rename_vol, EMBKFS_ROOT_OBJECT_ID, ".__rename_lock_a",
+                             EMBKFS_ROOT_OBJECT_ID, ".__rename_lock_b");
+    process_exit_self(0);
+}
+
+static void test_rename_lock(void)
+{
+    struct embkfs_volume *vol = embkfs_live_volume();
+    int ok = vol && !vol->read_only;
+    for (int by_path = 0; ok && by_path < 2; by_path++) {
+        uint64_t oid = 0, found = 0;
+        embkfs_lock();
+        /* Never overwrite a file left by the user or an interrupted test. */
+        int clean = embkfs_lookup_name(vol, EMBKFS_ROOT_OBJECT_ID,
+                                       ".__rename_lock_a", &found) == -EMBK_ENOENT
+                 && embkfs_lookup_name(vol, EMBKFS_ROOT_OBJECT_ID,
+                                       ".__rename_lock_b", &found) == -EMBK_ENOENT;
+        if (!clean || embkfs_create_file(vol, EMBKFS_ROOT_OBJECT_ID,
+                                         ".__rename_lock_a", &oid) != EMBK_OK) {
+            embkfs_unlock();
+            ok = 0;
+            break;
+        }
+        s_rename_vol = vol;
+        s_rename_by_path = by_path;
+        s_rename_started = 0;
+        s_rename_result = 999;
+        struct thread *worker = process_create_kthread(rename_lock_worker, current_process);
+        uint32_t pid = worker ? worker->proc->pid : 0;
+        int blocked = 0;
+        for (int y = 0; worker && y < 300; y++) {
+            schedule();
+            sched_lock();
+            blocked = s_rename_started && s_rename_result == 999
+                   && worker->state == PROCESS_BLOCKED;
+            sched_unlock();
+            if (blocked || s_rename_result != 999) break;
+        }
+        embkfs_unlock();
+        if (pid) process_wait(pid);
+        embkfs_lock();
+        int moved = worker && s_rename_result == EMBK_OK
+            && embkfs_lookup_name(vol, EMBKFS_ROOT_OBJECT_ID,
+                                  ".__rename_lock_b", &found) == EMBK_OK && found == oid
+            && embkfs_lookup_name(vol, EMBKFS_ROOT_OBJECT_ID,
+                                  ".__rename_lock_a", &found) == -EMBK_ENOENT;
+        (void)embkfs_unlink_name(vol, EMBKFS_ROOT_OBJECT_ID, ".__rename_lock_a");
+        (void)embkfs_unlink_name(vol, EMBKFS_ROOT_OBJECT_ID, ".__rename_lock_b");
+        embkfs_unlock();
+        kprintf("[fsrename] %s: waited for owner=%s, moved after unlock=%s\n",
+                by_path ? "path" : "name", blocked ? "yes" : "NO", moved ? "yes" : "NO");
+        if (!blocked || !moved) ok = 0;
+    }
+    kprintf("\n[cmd] test fsrename: %s\n", ok ? "OK" : "FAIL");
+}
 
 /* --- `test pipe` helper: a kthread that does ONE blocking 1-byte pipe read.
  * The EOF test's central assertion is "a reader BLOCKS while any write end
@@ -462,6 +548,8 @@ static void selftests_print_commands(void)
     kprintf("  test embbuild gui\n");
     kprintf("  test keyboard\n");
     kprintf("  test ksync\n");
+    kprintf("  test fsrename\n");
+    kprintf("  test sync\n");
     kprintf("  test kheap\n");
     kprintf("  test shell cwd\n");
     kprintf("  test python\n");
@@ -550,10 +638,94 @@ static int vfs_files_identical(const char *a, const char *b)
     return eq;
 }
 
+static int power_test_flush_result;
+static int power_test_write(struct embk_block_device *d,uint64_t lba,uint32_t count,const void *p) {
+    (void)d;(void)lba;(void)count;(void)p;return 0;
+}
+static int power_test_read(struct embk_block_device *d,uint64_t lba,uint32_t count,void *p) {
+    (void)d;(void)lba;memset(p,0,count*512);return 0;
+}
+static int power_test_flush(struct embk_block_device *d) {(void)d;return power_test_flush_result;}
+static struct embk_block_device power_test_disk;
+
 int selftests_handle_command(const char *cmd)
 {
     if (!cmd || !cmd[0])
         return 0;
+
+    if(strcmp(cmd,"test powerbarrier")==0 || strcmp(cmd,"test powerfailure")==0) {
+        static int registered;
+        if(!registered) {
+            power_test_disk=(struct embk_block_device){.block_count=1,.block_size=512,
+                .read=power_test_read,.write=power_test_write,.flush=power_test_flush,.dma_max_phys=UINT64_MAX};
+            registered=embk_block_register(&power_test_disk)==0;
+        }
+        uint8_t block[512]={0};int ok=registered;
+        ok=ok && embk_block_write(&power_test_disk,UINT64_MAX,2,block)==-EMBK_ERANGE
+            && !power_test_disk.durability_pending;
+        ok=ok && embk_block_write(&power_test_disk,0,1,block)==0 && power_test_disk.durability_pending;
+        if(strcmp(cmd,"test powerfailure")==0) {
+            power_test_flush_result=-EMBK_EIO;
+            ok=ok && acpi_power_request(EMBK_POWER_OFF)==0;
+            struct embk_power_info p={0};uint64_t start=time_get_us();
+            do {
+                schedule();
+                if(acpi_power_snapshot(&p)) {ok=0;break;}
+            } while((p.flags&EMBK_POWER_BUSY) && time_get_us()-start<3000000);
+            ok=ok && !(p.flags&EMBK_POWER_BUSY) && p.last_error==-EMBK_EIO;
+            power_test_flush_result=0;
+            ok=ok && embk_block_write(&power_test_disk,0,1,block)==0;
+            (void)embk_block_flush(&power_test_disk);
+            kprintf("[cmd] test powerfailure: %s\n",ok?"OK":"FAIL");return 1;
+        }
+        embkfs_lock();embk_block_freeze_writes();
+        ok=ok && embk_block_write(&power_test_disk,0,1,block)==-EMBK_EROFS;
+        power_test_flush_result=-EMBK_EIO;
+        ok=ok && embk_block_sync_dirty()==-EMBK_EIO && power_test_disk.durability_pending;
+        power_test_flush_result=0;
+        ok=ok && embk_block_sync_dirty()==0 && !power_test_disk.durability_pending;
+        embk_block_thaw_writes();embkfs_unlock();
+        ok=ok && embk_block_write(&power_test_disk,0,1,block)==0;
+        (void)embk_block_flush(&power_test_disk);
+        kprintf("[cmd] test powerbarrier: %s\n",ok?"OK":"FAIL");return 1;
+    }
+    if(strcmp(cmd,"poweroff")==0 || strcmp(cmd,"reboot")==0) {
+        int rc=acpi_power_request(strcmp(cmd,"reboot")==0?EMBK_POWER_REBOOT:EMBK_POWER_OFF);
+        if(rc) kprintf("[cmd] %s: failed (%d)\n",cmd,rc);
+        return 1;
+    }
+    if(strcmp(cmd,"test powercaps")==0) {
+        char *argv[]={"/data/apps/posixdemo/posixdemo.elf","--power-denied",NULL};
+        int pid=process_create_caps(argv[0],argv,2,NULL,NULL,0,0);
+        int ok=pid>=0 && process_wait(pid)==0;
+        kprintf("[cmd] test powercaps: %s\n",ok?"OK":"FAIL");return 1;
+    }
+    if(strcmp(cmd,"test powercache")==0) {
+        struct embk_power_info p;
+        int rc=acpi_power_snapshot(&p);
+        if(!rc) kprintf("power-cache: batteries=%u percent=%u flags=%u\n",p.batteries,p.percent,p.flags);
+        int ok=!rc && p.version==EMBK_POWER_VERSION && (p.percent<=100 || p.percent==EMBK_POWER_UNKNOWN);
+        kprintf("[cmd] test powercache: %s\n",ok?"OK":"FAIL");return 1;
+    }
+    if(strcmp(cmd,"test persist write")==0 || strcmp(cmd,"test persist verify")==0) {
+        int writing=strcmp(cmd,"test persist write")==0;
+        const char *path="/milestone-persist.bin";
+        int fd=vfs_open(path,writing?(O_CREAT|O_TRUNC|O_WRONLY):O_RDONLY,0644);
+        int ok=fd>=0;uint8_t data[1024];
+        for(unsigned chunk=0;chunk<64 && ok;chunk++) {
+            for(unsigned i=0;i<sizeof data;i++) data[i]=(uint8_t)((chunk*1024+i)*17+0x6d);
+            size_t done=0;
+            if(writing) ok=vfs_fd_write(fd,data,sizeof data,&done)==0 && done==sizeof data;
+            else {
+                uint8_t saved[1024];
+                ok=vfs_fd_read(fd,saved,sizeof saved,&done)==0 && done==sizeof saved
+                    && memcmp(saved,data,sizeof data)==0;
+            }
+        }
+        if(ok && writing) ok=vfs_fd_sync(fd)==0;
+        if(fd>=0 && vfs_close(fd)) ok=0;
+        kprintf("[cmd] %s: %s\n",cmd,ok?"OK":"FAIL");return 1;
+    }
 
     if (strcmp(cmd, "test list") == 0) {
         selftests_print_commands();
@@ -572,6 +744,21 @@ int selftests_handle_command(const char *cmd)
      * 440 Hz because it is unambiguous in a spectrum and nobody has to trust
      * a description of what they heard. Half a second: long enough to measure,
      * short enough that the test is not a wait. */
+    if(!strcmp(cmd,"test session drain")) {
+        int code=process_test_session_drain();
+        kprintf("\n[cmd] test session drain: exit=%d -> %s\n",code,code==0?"OK":"FAIL");return 1;
+    }
+    if (!strcmp(cmd,"test devices") || !strcmp(cmd,"test devices fixture") || !strcmp(cmd,"test devices audio") || !strcmp(cmd,"test devices preferences") || !strcmp(cmd,"test devices files") || !strcmp(cmd,"test devices policy")) {
+        char *args[]={"/data/apps/devicecheck/devicecheck.elf","--fixture",NULL};
+        int fixture=strcmp(cmd,"test devices")!=0;
+        if(!strcmp(cmd,"test devices audio")) args[1]="--audio";
+        if(!strcmp(cmd,"test devices preferences")) args[1]="--preferences";
+        if(!strcmp(cmd,"test devices files")) args[1]="--files";
+        if(!strcmp(cmd,"test devices policy")) args[1]="--policy";
+        int pid=process_create(args[0],args,fixture?2:1,NULL,0);
+        int code=pid<0?pid:process_wait(pid);
+        kprintf("\n[cmd] test devices: exit=%d -> %s\n",code,code==0?"OK":"FAIL");return 1;
+    }
     if (strcmp(cmd, "test audio") == 0) {
         if (!ac97_present()) {
             kprintf("\n[cmd] test audio: NO DEVICE (add -device AC97 to the QEMU line)\n");
@@ -1001,6 +1188,72 @@ int selftests_handle_command(const char *cmd)
             else kprintf("[net] attempt %d: no reply\n", i + 1);
         kprintf("[cmd] test net: %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
+    }
+
+    if(strcmp(cmd,"test hidrepeat")==0) {
+        int ok=keyboard_test_hid_repeat()==0;
+        kprintf("[cmd] test hidrepeat: %s\n",ok?"OK":"FAIL");return 1;
+    }
+    if(!strcmp(cmd,"test netservices")) {
+        net_lock();
+        if(service_test.busy) {net_unlock();kprintf("[cmd] test netservices: busy\n");return 1;}
+        memset(&service_test,0,sizeof service_test);service_test.busy=1;
+        unsigned workers=0;
+        if(process_create_kthread(service_lock_worker_a,NULL)) workers++;
+        if(process_create_kthread(service_lock_worker_b,NULL)) workers++;
+        uint64_t until=net_ticks()+300;
+        while(service_test.finished<(int)workers && net_ticks()<until) net_wait();
+        int ok=workers==2 && service_test.finished==2 && !service_test.failed && !service_test.owner;
+        if(service_test.finished==(int)workers) service_test.busy=0;
+        net_unlock();kprintf("[cmd] test netservices: %s\n",ok?"OK":"FAIL");return 1;
+    }
+    if(strcmp(cmd,"test dma") == 0) {
+        uint64_t a=pmm_alloc_contiguous(8,16),b=pmm_alloc_contiguous(3,1),c=pmm_alloc_page();
+        int ok=a && b && c && !(a%65536) && (b+3*PAGE_SIZE<=a || a+8*PAGE_SIZE<=b) &&
+            (c<a || c>=a+8*PAGE_SIZE) && (c<b || c>=b+3*PAGE_SIZE);
+        if(a && b && c) {
+            volatile uint8_t *ap=(void *)P2V(a),*bp=(void *)P2V(b),*cp=(void *)P2V(c);
+            for(unsigned i=0;i<8*PAGE_SIZE;i++) ap[i]=(uint8_t)(i*17+5);
+            for(unsigned i=0;i<3*PAGE_SIZE;i++) bp[i]=(uint8_t)(i*31+9);
+            for(unsigned i=0;i<PAGE_SIZE;i++) cp[i]=0xa7;
+            for(unsigned i=0;i<8*PAGE_SIZE;i++) if(ap[i]!=(uint8_t)(i*17+5)) ok=0;
+            for(unsigned i=0;i<3*PAGE_SIZE;i++) if(bp[i]!=(uint8_t)(i*31+9)) ok=0;
+            for(unsigned i=0;i<PAGE_SIZE;i++) if(cp[i]!=0xa7) ok=0;
+        }
+        if(a) for(unsigned i=0;i<8;i++) pmm_free_page(a+i*PAGE_SIZE);
+        if(b) for(unsigned i=0;i<3;i++) pmm_free_page(b+i*PAGE_SIZE);
+        if(c) pmm_free_page(c);
+        if(pmm_alloc_contiguous(0,1) || pmm_alloc_contiguous(1,3) || pmm_alloc_contiguous(UINT64_MAX,1)) ok=0;
+        kprintf("[cmd] test dma: %s\n",ok?"OK":"FAIL");return 1;
+    }
+    if (strcmp(cmd, "test hidkeys") == 0) {
+        struct key_event e;
+        while (keyboard_event_pop(&e)) {}
+        while (keyboard_has_char()) (void)keyboard_getchar();
+        keyboard_inject_hid_usage(0xe1, 1); /* left shift */
+        keyboard_inject_hid_usage(4, 1);    /* physical A */
+        keyboard_inject_hid_usage(4, 0);
+        keyboard_inject_hid_usage(0xe1, 0);
+        keyboard_inject_hid_usage(0x50, 1); /* left arrow */
+        keyboard_inject_hid_usage(0x50, 0);
+        uint16_t codes[]={EKC_LSHIFT,'a','a',EKC_LSHIFT,EKC_LEFT,EKC_LEFT};
+        uint8_t pressed[]={1,1,0,0,1,0};
+        int ok=1;
+        for (unsigned i=0;i<6;i++) {
+            if (!keyboard_event_pop(&e) || e.code!=codes[i] || e.pressed!=pressed[i]) ok=0;
+            if (i==1 && !(e.mods&EKM_SHIFT)) ok=0;
+        }
+        if (!keyboard_has_char() || keyboard_getchar()!='A') ok=0;
+        if (!keyboard_has_char() || keyboard_getchar()!=EK_LEFT) ok=0;
+        if (keyboard_mods()&EKM_SHIFT) ok=0;
+        kprintf("[cmd] test hidkeys: %s\n", ok?"OK":"FAIL");
+        return 1;
+    }
+
+    if (strcmp(cmd, "test power") == 0) {
+        int rc = acpi_power_report();
+        kprintf("[cmd] test power: %s\n", rc ? "FAIL" : "OK");
+        return 1;
     }
 
     if (strcmp(cmd, "test netlock") == 0) {
@@ -5389,6 +5642,17 @@ int selftests_handle_command(const char *cmd)
         return 1;
     }
 
+    if (strcmp(cmd, "test fsrename") == 0) {
+        test_rename_lock();
+        return 1;
+    }
+
+    if (strcmp(cmd, "test sync") == 0) {
+        int rc = embkfs_vfs_run_sync_selftests();
+        kprintf("\n[cmd] test sync: %s\n", rc == EMBK_OK ? "OK" : "FAIL");
+        return 1;
+    }
+
     if (strcmp(cmd, "test posix") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test posix: VFS not registered\n");
@@ -5662,6 +5926,15 @@ int selftests_handle_command(const char *cmd)
      * all pass. Then checks BOTH live counts returned to baseline: channels
      * (no channel leaked on close/exit) and surfaces (the undelivered handle's
      * in-transit ref was released -- A6, no leak). */
+    if (!strcmp(cmd, "test ipc cancel")) {
+        uint32_t channels = channel_live_count(), endpoints = endpoint_live_count();
+        char *args[] = {"/system/bin/primtest.elf", "ipc-cancel", NULL};
+        int pid = process_create(args[0], args, 2, NULL, 0);
+        int code = pid < 0 ? pid : process_wait((uint32_t)pid);
+        bool ok = !code && channels == channel_live_count() && endpoints == endpoint_live_count();
+        kprintf("\n[cmd] test ipc cancel: exit=%d, IPC counts restored=%d -> %s\n",code,ok,ok?"OK":"FAIL");
+        return 1;
+    }
     if (strcmp(cmd, "test channel") == 0) {
         if (!g_vfs_ready) {
             kprintf("\n[cmd] test channel: VFS not registered (need /system/bin/primtest.elf on disk)\n");

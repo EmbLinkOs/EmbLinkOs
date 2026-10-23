@@ -1,5 +1,6 @@
 #include "fs/fd.h"
 #include "fs/vfs.h"
+#include "fs/embkfs/embkfs.h"
 #include "fs/namespace.h"   /* ns_check_writable -- read-only binding gate (UP2) */
 #include "include/errno.h"
 #include "include/kprintf.h"
@@ -187,6 +188,20 @@ int vfs_mkdir_path(const char *path)
     return parent.mnt->ops->mkdir(&parent, leaf, leaf_len, &made);
 }
 
+int vfs_rename_noreplace(const char *old_path,const char *new_path) {
+    /* Serialize the existence check with every EMBKFS mutation. The ordinary
+     * rename keeps its POSIX replacement behavior for editors and databases. */
+    int rc=ns_check_writable(old_path);
+    if(!rc) rc=ns_check_writable(new_path);
+    if(rc) return rc;
+    embkfs_lock();
+    struct vnode found;
+    rc=vfs_resolve(new_path,&found);
+    if(!rc) rc=-EMBK_EEXIST;
+    else if(rc==-EMBK_ENOENT) rc=vfs_rename_path(old_path,new_path);
+    embkfs_unlock();return rc;
+}
+
 int vfs_rename_path(const char *old_path, const char *new_path)
 {
     struct vnode old_parent, new_parent;
@@ -343,7 +358,7 @@ int vfs_open(const char *path, int flags, uint32_t mode)
         return -EMBK_EINVAL;
     if (acc != O_RDONLY && acc != O_WRONLY && acc != O_RDWR)
         return -EMBK_EINVAL;
-    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND))
+    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_NONBLOCK))
         return -EMBK_EINVAL;
 
     /* /dev/null: the one special name (see nulldev_fd_ops above). Checked
@@ -601,6 +616,23 @@ int vfs_fd_set_nonblock(int fd, bool on) {
     return EMBK_OK;
 }
 
+int vfs_fd_sync(int fd)
+{
+    struct process *p = current_thread ? current_process : NULL;
+    struct vnode vn;
+    fdlock(p);
+    struct fd_entry *e = fd_lookup(fd);
+    int rc = !e ? -EMBK_EBADF
+           : e->backing != FD_BACKING_VNODE ? -EMBK_EINVAL : EMBK_OK;
+    if (rc == EMBK_OK) vn = e->u.file.vn;
+    fdunlock(p);
+    if (rc != EMBK_OK) return rc;
+    /* Mounts outlive descriptors. Snapshot before blocking so close/reuse of
+     * this fd cannot redirect a flush to a different filesystem. */
+    if (!vn.mnt || !vn.mnt->ops || !vn.mnt->ops->sync) return -EMBK_ENOTSUP;
+    return vn.mnt->ops->sync(&vn);
+}
+
 int vfs_fd_fstat(int fd, struct vfs_stat *out)
 {
     struct fd_entry *e = fd_lookup(fd);
@@ -632,7 +664,7 @@ int vfs_fd_fstat(int fd, struct vfs_stat *out)
     int acc = flags & O_ACCMODE;
     if (acc != O_RDONLY && acc != O_WRONLY && acc != O_RDWR)
         return -EMBK_EINVAL;
-    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND))
+    if (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_NONBLOCK))
         return -EMBK_EINVAL;
 
     struct vnode vn;

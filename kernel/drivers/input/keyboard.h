@@ -126,6 +126,8 @@ char keyboard_getchar(void);
 
 // Non-blocking read: returns 1 if the next ASCII character is available, otherwise returns 0
 int keyboard_has_char(void);
+void keyboard_flush_input(void);
+void keyboard_desktop_actions(void);
 
 /* Ctrl-C routing — docs/INTERRUPTION.md.
  *
@@ -146,6 +148,11 @@ int keyboard_getchar_blocking_cancelable(char *out);
 
 // Inject a character into the keyboard buffer (used by USB HID driver).
 void keyboard_inject_char(char c);
+void keyboard_inject_hid_usage(uint16_t usage, int pressed);
+void keyboard_repeat_tick(void);
+int keyboard_test_hid_repeat(void);
+void keyboard_hid_boot_report(uint8_t previous[6], uint8_t *previous_modifiers,
+    const uint8_t *report, unsigned length);
 
 // Keyboard grab: while grabbed, the kernel shell stops draining the buffer so a
 // ring-3 UI app has exclusive keystrokes. Auto-released when the grabber exits.

@@ -1,4 +1,7 @@
+#include "fs/embkfs/embkfs.h"
+#include "process/session.h"
 #include "process/process.h"
+#include "drivers/audio/audio.h"
 #include "drivers/input/keyboard.h"   /* keyboard_release_grab_pid() on reap */
 #include "gfx/surface.h"   /* surface_transfer_to() for SPAWN_ACTION_INHERIT_SURFACE */
 #include "gfx/compositor.h"   /* compositor_reap_pid() on process teardown */
@@ -135,6 +138,7 @@ static struct process *process_alloc(void) {
              * from the previous occupant would make this process born cancelled
              * -- every blocking syscall failing -ECANCELED before it ran a line. */
             process_table[i].cancelled = false;
+            process_table[i].session_id = 0;process_table[i].constructing=false;
             /* Default to kernel authority. Overwritten by process_create_caps
              * for user processes (attenuated from the parent); left as-is for
              * kernel threads, which ARE the kernel and hold the full set. */
@@ -218,6 +222,7 @@ static bool thread_init_for(struct thread *t, struct process *proc, uint64_t ctx
         return false;
     }
 
+    t->syscall_depth=0;
     t->kstack_top = kstack_top;
     t->entry_point = entry_point;
     t->user_rsp = user_rsp;
@@ -564,6 +569,9 @@ static struct process *thread_zombie_locked(struct thread *t) {
     if (was_linked) {
         proc->live_thread_count--;
         if (proc->live_thread_count == 0) {
+            /* The speaker is released at exit, before the parent waits. The
+             * sink uses a bounded, non-sleeping lock on this scheduler path. */
+            audio_reap_pid(proc->pid);
             /* Snapshot NOW, before the switch-away (schedule_locked()'s
              * own prev-demotion section) clears the thread's own
              * running_cpu -- see process.h's comment on this field for
@@ -770,8 +778,7 @@ int process_is_cancelled(uint32_t pid) {
  * not gated on the (much larger, not-yet-built) message-port IPC model).
  * -------------------------------------------------------------------- */
 
-void process_kill(uint32_t pid) {
-    spin_lock(&g_sched_lock);
+static void process_kill_locked(uint32_t pid,bool drain_syscalls) {
 
     struct process *proc = process_find(pid);
     if (!proc) {
@@ -780,6 +787,7 @@ void process_kill(uint32_t pid) {
         return;
     }
 
+    if(drain_syscalls && proc->constructing) {spin_unlock(&g_sched_lock);return;}
     if (proc->live_thread_count == 0) {
         spin_unlock(&g_sched_lock);
         return;   // already fully exited; nothing left to force
@@ -805,6 +813,10 @@ void process_kill(uint32_t pid) {
     int was_current_idx = -1;
     for (int i = 0; i < n; i++) {
         struct thread *t = threads[i];
+        /* Session teardown lets in-flight kernel work release its locks and
+         * finish the current transaction before exiting at dispatch return. */
+        if(drain_syscalls && (t->syscall_depth ||
+           (t->state==PROCESS_BLOCKED && !t->wait_queue)))continue;
         if (t == current_thread) {
             was_current_idx = i;
             continue;
@@ -1511,8 +1523,10 @@ int process_create_caps(const char *path, char *const argv[], int argc,
      * fallible steps below, so the parent link is always correct even if
      * process_create() fails partway through (the failure paths just reset
      * pid to 0; they don't need to touch parent/parent_pid). */
+    proc->constructing=true;
     proc->parent = current_thread ? current_process : NULL;
     proc->parent_pid = current_thread ? current_process->pid : 0;
+    proc->session_id = proc->parent ? proc->parent->session_id : 0;
 
     /* Attenuate from the parent (EMBX §6 step 9, kernel side). The grantor is
      * the spawning process; with no current process this is the kernel creating
@@ -1892,9 +1906,10 @@ int process_create_caps(const char *path, char *const argv[], int argc,
         }
         proc->debug_session = s;
         /* t->state was left BLOCKED by debug_session_spawn's wait_queue_block. */
-    } else {
-        t->state = PROCESS_READY;
     }
+    sched_lock();proc->constructing=false;
+    if(!want_debug)t->state=PROCESS_READY;
+    sched_unlock();
     return (int)proc->pid;
 }
 
@@ -1922,6 +1937,8 @@ static void process_trampoline(void) {
      * kthread_trampoline() below for the exact same fix on the kthread
      * side. */
     spin_unlock(&g_sched_lock);
+    if (!session_may_spawn(current_process)) thread_exit_self(-EMBK_ECANCELED);
+
 
     uint64_t entry = current_thread->entry_point;
     uint64_t user_rsp = current_thread->user_rsp;
@@ -2680,6 +2697,10 @@ retry:
             return code;
         }
 
+        if (proc->cancelled) {
+            spin_unlock(&g_sched_lock);
+            return -EMBK_ECANCELED;
+        }
         wait_queue_block(&proc->join_wait, current_thread);
         schedule_locked();
         if (entry_flags & (1ULL << 9)) {
@@ -2700,10 +2721,12 @@ retry:
  * thread's code always wins") because nothing yet needs that. */
 __attribute__((noreturn))
 void thread_exit_self(int code) {
-    current_process->exit_code = code;
-    current_thread->exit_code = code;
-    current_thread->state = PROCESS_ZOMBIE;
-    schedule();
+    /* Keep this thread's final state and handoff in one scheduler critical
+     * section, including when returning from a drained syscall. */
+    sched_lock();
+    struct thread *self=current_thread;
+    self->proc->exit_code=code;self->exit_code=code;self->state=PROCESS_ZOMBIE;
+    schedule_locked();
 
     __asm__ volatile("sti");
     for (;;) {
@@ -3706,4 +3729,58 @@ int process_test_thread_exit(void) {
 
     selftest_release_self(self, did_adopt);
     return ok ? 0 : -1;
+}
+
+void process_kill(uint32_t pid) {
+    spin_lock(&g_sched_lock);process_kill_locked(pid,false);
+}
+int process_end_session(uint32_t epoch,uint32_t controller) {
+    for(unsigned i=0;i<MAX_PROCESSES;i++) {
+        uint32_t pid=0;
+        sched_lock();
+        if(process_table[i].pid && process_table[i].pid!=controller && process_table[i].session_id==epoch)
+            pid=process_table[i].pid;
+        sched_unlock();if(pid) {
+            process_cancel(pid);
+            sched_lock();process_kill_locked(pid,true);
+        }
+    }
+    int live=0;sched_lock();
+    for(unsigned i=0;i<MAX_PROCESSES;i++)
+        if(process_table[i].pid && process_table[i].pid!=controller &&
+           process_table[i].session_id==epoch && (process_table[i].live_thread_count || process_table[i].constructing)) live++;
+    sched_unlock();return live;
+}
+
+/* Native teardown regression: a victim owns the real filesystem lock while
+ * marked inside a syscall. END must leave it runnable until it releases it. */
+#define DRAIN_TEST_EPOCH 0xfffffff0u
+static unsigned drain_entered,drain_release,drain_done;
+static volatile unsigned drain_cycles;
+static void session_drain_victim(void) {
+    sched_lock();current_process->session_id=DRAIN_TEST_EPOCH;current_thread->syscall_depth=1;sched_unlock();
+    embkfs_lock();__atomic_store_n(&drain_entered,1,__ATOMIC_RELEASE);
+    while(!__atomic_load_n(&drain_release,__ATOMIC_ACQUIRE)) {drain_cycles++;sys_yield();}
+    embkfs_unlock();
+    sched_lock();current_thread->syscall_depth=0;sched_unlock();
+    __atomic_store_n(&drain_done,1,__ATOMIC_RELEASE);process_exit_self(0);
+}
+int process_test_session_drain(void) {
+    if(!embkfs_live_volume())return -EMBK_ENODEV;
+    drain_entered=drain_release=drain_done=drain_cycles=0;
+    struct thread *t=process_create_kthread(session_drain_victim,NULL);
+    if(!t)return -EMBK_ENOMEM;
+    uint32_t pid=t->proc->pid;
+    for(unsigned i=0;i<500 && !__atomic_load_n(&drain_entered,__ATOMIC_ACQUIRE);i++)selftest_wait_ticks(1);
+    if(!drain_entered) {drain_release=1;return -EMBK_EIO;}
+    int pending=process_end_session(DRAIN_TEST_EPOCH,0);
+    unsigned before=drain_cycles;selftest_wait_ticks(2);
+    int continued=drain_cycles!=before && process_alive(pid);
+    __atomic_store_n(&drain_release,1,__ATOMIC_RELEASE);
+    for(unsigned i=0;i<500 && !__atomic_load_n(&drain_done,__ATOMIC_ACQUIRE);i++)selftest_wait_ticks(1);
+    for(unsigned i=0;i<50 && process_alive(pid);i++)selftest_wait_ticks(1);
+    int rc=pending>0 && continued && drain_done && !process_end_session(DRAIN_TEST_EPOCH,0)?0:-EMBK_EIO;
+    if(!rc) {embkfs_lock();embkfs_unlock();}
+    kprintf("session drain: pending=%d, owner continued=%d, lock released=%u\n",pending,continued,drain_done);
+    return rc;
 }

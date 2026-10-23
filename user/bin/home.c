@@ -188,6 +188,16 @@ static int   g_pin_n = 0;
  * blocks, so it can't live in the render loop) and just raises a flag; the top
  * bar CONNECTS to signal. The render loop consumes the flag non-blockingly. */
 static volatile int g_apps_requested = 0;
+static unsigned g_settings_requested;
+static void settings_listener(long arg) {
+    (void)arg;int lh=(int)embk_chan_listen("/run/emlink.settings");
+    if(lh<0) embk_thread_exit(1);
+    for(;;) {
+        int ch=(int)embk_chan_accept(lh);
+        if(ch<0) {embk_sleep_ms(100);continue;}
+        __atomic_store_n(&g_settings_requested,1,__ATOMIC_RELEASE);embk_chan_close(ch);
+    }
+}
 static void apps_listener(long arg) {
     (void)arg;
     int lh = (int)embk_chan_listen("/run/emlink.desktop");
@@ -343,6 +353,24 @@ static void cfg_poll(void) {
     g_cfg_next = now + 1000;
     struct oscfg was = g_cfg;
     oscfg_load(&g_cfg);
+    static int policy_loaded;
+    if(!policy_loaded || g_cfg.idle_dim_seconds!=was.idle_dim_seconds || g_cfg.idle_lock_seconds!=was.idle_lock_seconds ||
+       g_cfg.lid_lock!=was.lid_lock || g_cfg.power_profile!=was.power_profile) {
+        struct embk_policy p={.version=EMBK_POLICY_VERSION,.flags=g_cfg.lid_lock?EMBK_POLICY_LID_LOCK:0,
+            .idle_dim_seconds=g_cfg.idle_dim_seconds,.idle_lock_seconds=g_cfg.idle_lock_seconds,.profile=g_cfg.power_profile};
+        if(embk_policy_set(&p)==-95) {p.profile=0;embk_policy_set(&p);}
+        policy_loaded=1;
+    }
+    static int audio_loaded;
+    if(!audio_loaded || g_cfg.volume!=was.volume || g_cfg.muted!=was.muted) {
+        embk_audio_volume(g_cfg.volume,g_cfg.muted);audio_loaded=1;
+    } else {
+        struct embk_audio_info info;
+        if(!embk_audio_get(&info) && (info.flags&EMBK_AUDIO_AVAILABLE) &&
+           (g_cfg.volume!=(int)info.percent || g_cfg.muted!=((info.flags&EMBK_AUDIO_MUTED)!=0))) {
+            g_cfg.volume=info.percent;g_cfg.muted=(info.flags&EMBK_AUDIO_MUTED)!=0;oscfg_save(&g_cfg);
+        }
+    }
     /* The shell wears the preference too, and live. em_app_run applies it once
      * at launch for ordinary applications; the desktop never exits, so if it
      * only read the file at startup then changing the accent would recolour
@@ -1042,6 +1070,7 @@ int main(int argc, char **argv, char **envp) {
     (void)argc; (void)argv;
     g_session_env = envp;
     embk_thread_create(apps_listener, 0);   /* the top bar's Apps signal listener */
+    embk_thread_create(settings_listener,0);
     /* apps describe their own icon/name (docs presentation manifest) */
     load_app_meta("files", g_dock[0].icon, sizeof g_dock[0].icon, g_dock[0].label, sizeof g_dock[0].label);
     load_app_meta("term",  g_dock[1].icon, sizeof g_dock[1].icon, g_dock[1].label, sizeof g_dock[1].label);
@@ -1087,11 +1116,17 @@ int main(int argc, char **argv, char **envp) {
      * handle, draggable dock chips, and pin/snap. The desktop no longer draws
      * its own top status bar; this floating bar takes the top strip. */
     spawn_app("/data/apps/topbar/topbar.elf", NULL);
+    uint64_t topbar_next=embk_uptime_ms()+5000;
     embk_puts(1, "home: desktop ready\n");
 
     for (;;) {
         cfg_poll();            /* dock size / indicator, as Settings left them */
         poll_apps_request();   /* the top bar's Apps button opens our launcher */
+        if(embk_uptime_ms()>=topbar_next) {
+            topbar_next=embk_uptime_ms()+5000;
+            if(!dock_running("/data/apps/topbar/topbar.elf")) spawn_app("/data/apps/topbar/topbar.elf",NULL);
+        }
+        if(__atomic_exchange_n(&g_settings_requested,0,__ATOMIC_ACQ_REL)) spawn_app("/data/apps/settings/settings.elf",NULL);
 
         /* Esc closes the launcher. Only worth reading while it is up: the
          * desktop layer is in FRONT then, so the compositor gives it the

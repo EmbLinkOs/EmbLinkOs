@@ -11,11 +11,16 @@
 static char username[EMBK_AUTH_USERNAME_MAX + 1];
 static char password[EMBK_AUTH_PASSWORD_MAX + 1];
 static char status[96] = "Enter your account details.";
+static int unlocking;
+static uint64_t retry_at;
 
 static void sign_in(void) {
+    em_flush();
+    if(embk_uptime_ms()<retry_at) return;
     if (!embk_auth_verify(username, password)) {
         memset(password, 0, sizeof password);
-        snprintf(status, sizeof status, "Incorrect username or password.");
+        retry_at=embk_uptime_ms()+3000;
+        snprintf(status, sizeof status, "Incorrect username or password. Wait a moment, then retry.");
         return;
     }
     size_t len = strlen(username);
@@ -42,9 +47,10 @@ static void view(void) {
                   .background = { .r = 0.045f, .g = 0.055f, .b = 0.09f, .a = 0.92f },
                   .corner = 20, .border = 1, .shadow = 1) {
                 Text("EmbLink OS").title();
-                Text("Sign in").heading();
+                Text(unlocking?"Unlock your session":"Sign in").heading();
                 Text(status).body().secondary();
-                TextField(username, sizeof username, "username");
+                if(unlocking) Text(username).body();
+                else TextField(username, sizeof username, "username");
                 PasswordField(password, sizeof password, "password");
                 if (Button("Open session").primary().clicked()) sign_in();
             }
@@ -53,7 +59,14 @@ static void view(void) {
     }
 }
 
-EM_APPLICATION {
+static EmApp login_app;
+int main(int argc,char **argv) {
+    if(argc==3 && !strcmp(argv[1],"--unlock") && embk_auth_valid_username(argv[2])) {
+        unlocking=1;snprintf(username,sizeof username,"%s",argv[2]);
+    }
+    return em_app_run(&login_app);
+}
+static EmApp login_app={
     .title = "EmbLink OS Login",
     .size = { 680, 460 },
     .theme = Dark,

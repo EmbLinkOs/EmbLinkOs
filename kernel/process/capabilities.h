@@ -44,7 +44,9 @@
  * debug syscalls (69-75) refuse without it — which is the "coarse gate governs
  * which handles a parent installs" step the header note below anticipated. */
 #define EMBK_CAP_DEBUG      10
-#define EMBK_CAP_MAX_ID      10
+#define EMBK_CAP_POWER       11
+#define EMBK_CAP_NETWORK_ADMIN 12
+#define EMBK_CAP_MAX_ID      12
 
 #define EMBK_CAP_BIT(id)  (1ULL << (id))
 

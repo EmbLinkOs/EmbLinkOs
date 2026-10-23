@@ -103,6 +103,7 @@ struct embk_vfs_dirent {
 #define EMBK_O_EXCL    0x0080
 #define EMBK_O_TRUNC   0x0200
 #define EMBK_O_APPEND  0x0400
+#define EMBK_O_NONBLOCK 0x0800
 
 /* The environment. newlib requires `environ`; getenv() walks it.
  *
@@ -372,6 +373,7 @@ int open(const char *name, int flags, ...) {
     if (flags & O_EXCL)   kflags |= EMBK_O_EXCL;
     if (flags & O_TRUNC)  kflags |= EMBK_O_TRUNC;
     if (flags & O_APPEND) kflags |= EMBK_O_APPEND;
+    if (flags & O_NONBLOCK) kflags |= EMBK_O_NONBLOCK;
 
     char abs[EMBK_PATH_MAX];
     if (path_abs(name, abs, sizeof abs) != 0) return -1;   /* errno set */
@@ -785,30 +787,19 @@ mode_t umask(mode_t mask) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Genuinely absent -- fail rather than pretend                        */
+/* Synchronization and remaining unsupported calls                    */
 /* ------------------------------------------------------------------ */
 
-/* fsync/fdatasync succeed as a NO-OP -- and that is honest here, not a lie.
- * fsync's contract is "flush this fd's buffered writes to the device". EmbLinkOS
- * has NO write-back path to flush: the block layer keeps no dirty-page cache and
- * issues every write() straight to the device synchronously (grep block.c/ata.c
- * -- there is no cache/writeback/flush machinery). So by the time write()
- * returned, the data was already handed down; there is nothing left for fsync to
- * do, and "your writes are committed" is a TRUE statement about this OS. This is
- * the [[FD_CLOEXEC]] case from the port notes: a capability that is vacuously
- * SATISFIED, not missing -- refusing it (the old ENOSYS) broke callers with every
- * right to expect success (pip's adjacent_tmp_file does flush()+os.fsync() before
- * an atomic replace). If a write-back cache is ever added, THIS must become a
- * real device flush the same day, or it turns into the lie the old comment
- * feared. */
+/* A synchronous write can still sit in a device's volatile cache. Let the
+ * kernel validate the fd and flush its filesystem; never invent success. */
 int fsync(int fd) {
-    (void)fd;
-    return 0;
+    int64_t rc = embk_syscall3(EMBK_SYS_fsync, fd, 0, 0);
+    return embk_is_err(rc) ? embk_fail(rc) : 0;
 }
 
 int fdatasync(int fd) {
-    (void)fd;
-    return 0;
+    /* Flushing metadata too is a valid, stronger data-sync guarantee. */
+    return fsync(fd);
 }
 
 /* No dup: the fd table has no duplicate-into-lowest-free operation, and faking
@@ -840,12 +831,9 @@ int dup(int fd) {
  * convenient stub. (Should exec ever exist -- it will not, by design -- this
  * must become real state.)
  *
- * F_GETFL reports the TRUE state: O_RDWR, blocking (no O_NONBLOCK) -- every fd
- * here is blocking, so this is a fact, not a stub. F_SETFL accepts a request to
- * (re)assert blocking mode (a no-op: already so) but REFUSES O_NONBLOCK, because
- * a false "non-blocking is set" is the real trap -- the caller would then hang
- * forever in a blocking read. This lets blocking-socket code (CPython's _socket,
- * which reads/sets the flags) work while never lying about non-blocking.
+ * F_GETFL translates the kernel's actual access mode, append and nonblocking
+ * bits into newlib's bit layout. F_SETFL changes the nonblocking flag without
+ * changing how the descriptor was opened; socket operations honor it.
  * F_DUPFD likewise refused, since dup() itself is ENOSYS (see above).
  */
 #include <fcntl.h>
@@ -881,11 +869,13 @@ int fcntl(int fd, int cmd, ...) {
          * there is nothing to store and nothing that could later disagree. */
         return 0;
     case F_GETFL: {
-        /* Access mode is always read/write here; report O_NONBLOCK truthfully
-         * from the kernel fd flag (sockets can now be non-blocking). sys_fcntl
-         * cmd 1 = get non-blocking. */
-        int nb = (int)embk_syscall3(EMBK_SYS_fcntl, fd, 1, 0);
-        return O_RDWR | ((nb > 0) ? O_NONBLOCK : 0);
+        int64_t flags = embk_syscall3(EMBK_SYS_fcntl, fd, 3, 0);
+        if (embk_is_err(flags)) return embk_fail(flags);
+        int mode = (int)flags & 3;
+        int result = mode == 0 ? O_RDONLY : mode == 1 ? O_WRONLY : O_RDWR;
+        if (flags & EMBK_O_NONBLOCK) result |= O_NONBLOCK;
+        if (flags & EMBK_O_APPEND) result |= O_APPEND;
+        return result;
     }
     case F_SETFL: {
         va_list ap; va_start(ap, cmd);

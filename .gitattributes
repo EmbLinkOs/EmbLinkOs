@@ -1,0 +1,4 @@
+# Preserve these upstream files byte for byte, including their whitespace.
+third_party/iwx/if_iwxreg.h whitespace=-blank-at-eol
+third_party/iwx/LICENSE whitespace=-blank-at-eof
+system/licenses/iwx.txt whitespace=-blank-at-eof

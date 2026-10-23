@@ -46,6 +46,10 @@ uint64_t pmm_reserved_phys_end(void);
 
 // Returns Physical address of the given virtual address (or NULL if not found)
 uint64_t pmm_alloc_page(void);
+/* Atomically reserve a physically contiguous run for DMA. Alignment is a
+ * power-of-two number of pages. Returns physical base or zero on failure;
+ * each page may later be released with pmm_free_page. */
+uint64_t pmm_alloc_contiguous(uint64_t pages,uint64_t alignment_pages);
 
 /* Allocator scan cost: total bit/byte tests performed across all allocations,
  * and how many allocations that was. bits/allocs is the number that matters --

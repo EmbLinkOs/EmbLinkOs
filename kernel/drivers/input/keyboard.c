@@ -1,6 +1,15 @@
+#include "power/policy.h"
+#include "process/session.h"
+#include "gfx/compositor.h"
 #include "drivers/input/keyboard.h"
 #include "arch/x86_64/irq/irq.h"
 #include "include/io.h"
+#include "drivers/timer/timer.h"
+#include "arch/x86_64/cpu/spinlock.h"
+static spinlock_t input_state_lock = SPINLOCK_INIT;
+static uint16_t hid_repeat_usage;
+static uint64_t hid_repeat_at;
+static unsigned desktop_action;
 #include "drivers/char/serial.h"
 #include "process/process.h"
 #include "include/errno.h"
@@ -119,6 +128,7 @@ static struct key_event ev_ring[KBD_EVENT_RING];
 static volatile uint32_t ev_head, ev_tail;
 
 static void kbd_event_push(uint16_t code, int pressed) {
+    power_activity();
     uint32_t nh = (ev_head + 1) % KBD_EVENT_RING;
     if (nh == ev_tail) return;             /* full: drop the newest (see above) */
     ev_ring[ev_head].code    = code;
@@ -194,17 +204,18 @@ static void mod_update(uint8_t side_bit, uint8_t pair_mask, uint8_t ekm,
 /* The locks. A latch, not a level: it flips on the MAKE and ignores the break
  * entirely (holding Caps Lock down does not "hold" anything), which is exactly
  * how it differs from Shift. The LED is the only feedback the user gets. */
-static void lock_toggle(uint8_t ekm, uint16_t code, int pressed)
+static void lock_toggle(uint8_t ekm, uint16_t code, int pressed, int leds)
 {
-    if (pressed) { g_mods ^= ekm; kbd_set_leds(); }
+    if (pressed) { g_mods ^= ekm; if (leds) kbd_set_leds(); }
     kbd_event_push(code, pressed);
 }
 
-static void keyboard_handler(void) {
-    uint8_t sc = inb(KBD_DATA_PORT);
-    static int extended = 0;     /* the previous byte was the 0xE0 prefix */
+static void keyboard_scancode(uint8_t sc, int *prefix, int leds) {
+    int extended = *prefix;
+    *prefix = 0;
+    /* Separate prefix state for PS/2 and injected HID sequences. */
 
-    if (sc == 0xE0) { extended = 1; return; }   /* prefix: next byte is extended */
+    if (sc == 0xE0) { *prefix = 1; return; }   /* prefix: next byte is extended */
     if (sc == 0xE1) { return; }                 /* Pause/Break's 6-byte burst: not decoded */
 
     int     pressed = !(sc & 0x80);             /* break codes are make | 0x80 */
@@ -254,9 +265,9 @@ static void keyboard_handler(void) {
         case 0x36: mod_update(SIDE_RSHIFT, SIDE_LSHIFT|SIDE_RSHIFT, EKM_SHIFT, EKC_RSHIFT, pressed); return;
         case 0x1D: mod_update(SIDE_LCTRL,  SIDE_LCTRL|SIDE_RCTRL,   EKM_CTRL,  EKC_LCTRL,  pressed); return;
         case 0x38: mod_update(SIDE_LALT,   SIDE_LALT|SIDE_RALT,     EKM_ALT,   EKC_LALT,   pressed); return;
-        case 0x3A: lock_toggle(EKM_CAPS,   EKC_CAPS,   pressed); return;
-        case 0x45: lock_toggle(EKM_NUM,    EKC_NUM,    pressed); return;
-        case 0x46: lock_toggle(EKM_SCROLL, EKC_SCROLL, pressed); return;
+        case 0x3A: lock_toggle(EKM_CAPS,   EKC_CAPS,   pressed, leds); return;
+        case 0x45: lock_toggle(EKM_NUM,    EKC_NUM,    pressed, leds); return;
+        case 0x46: lock_toggle(EKM_SCROLL, EKC_SCROLL, pressed, leds); return;
         default: break;
     }
 
@@ -299,6 +310,11 @@ static void keyboard_handler(void) {
     /* The event carries the UNSHIFTED key -- "which key", not "what character".
      * The char stream below answers the character question, and duplicating it
      * here would just be a second, worse answer. */
+    if ((base=='\t' && (g_mods & EKM_ALT)) ||
+        (base=='l' && ((g_mods & EKM_GUI) || ((g_mods & (EKM_CTRL|EKM_ALT))==(EKM_CTRL|EKM_ALT))))) {
+        if(pressed) __atomic_store_n(&desktop_action,base=='l'?1:(g_mods&EKM_SHIFT)?3:2,__ATOMIC_RELEASE);
+        return;
+    }
     kbd_event_push((uint16_t)base, pressed);
     if (!pressed) return;                     /* releases produce no text */
 
@@ -324,6 +340,56 @@ static void keyboard_handler(void) {
 
     keyboard_deliver(ascii);
 }
+
+static void keyboard_handler(void) {
+    static int prefix;
+    uint8_t sc = inb(KBD_DATA_PORT);
+    spin_lock(&input_state_lock);
+    keyboard_scancode(sc, &prefix, 1);
+    spin_unlock(&input_state_lock);
+}
+
+/* HID keyboard usages -> set-1 physical keys, then the common layout/modifier
+ * decoder. This supplies releases and Ctrl/navigation events as well as text.
+ * No 8042 LED commands are sent for an I2C keyboard. */
+static uint16_t hid_scancode(uint16_t usage) {
+    static const uint16_t scans[128] = {
+        [4]=0x1e,[5]=0x30,[6]=0x2e,[7]=0x20,[8]=0x12,[9]=0x21,[10]=0x22,
+        [11]=0x23,[12]=0x17,[13]=0x24,[14]=0x25,[15]=0x26,[16]=0x32,
+        [17]=0x31,[18]=0x18,[19]=0x19,[20]=0x10,[21]=0x13,[22]=0x1f,
+        [23]=0x14,[24]=0x16,[25]=0x2f,[26]=0x11,[27]=0x2d,[28]=0x15,[29]=0x2c,
+        [30]=2,[31]=3,[32]=4,[33]=5,[34]=6,[35]=7,[36]=8,[37]=9,[38]=10,[39]=11,
+        [40]=0x1c,[41]=1,[42]=0x0e,[43]=0x0f,[44]=0x39,[45]=0x0c,[46]=0x0d,
+        [47]=0x1a,[48]=0x1b,[49]=0x2b,[50]=0x2b,[51]=0x27,[52]=0x28,
+        [53]=0x29,[54]=0x33,[55]=0x34,[56]=0x35,[57]=0x3a,
+        [58]=0x3b,[59]=0x3c,[60]=0x3d,[61]=0x3e,[62]=0x3f,[63]=0x40,
+        [64]=0x41,[65]=0x42,[66]=0x43,[67]=0x44,[68]=0x57,[69]=0x58,
+        [71]=0x46,[73]=0xe052,[74]=0xe047,[75]=0xe049,[76]=0xe053,
+        [77]=0xe04f,[78]=0xe051,[79]=0xe04d,[80]=0xe04b,[81]=0xe050,[82]=0xe048,
+        [83]=0x45,[84]=0xe035,[85]=0x37,[86]=0x4a,[87]=0x4e,[88]=0xe01c,
+        [89]=0x4f,[90]=0x50,[91]=0x51,[92]=0x4b,[93]=0x4c,[94]=0x4d,
+        [95]=0x47,[96]=0x48,[97]=0x49,[98]=0x52,[99]=0x53,[100]=0x56,[101]=0xe05d
+    };
+    static const uint16_t mods[8]={0x1d,0x2a,0x38,0xe05b,0xe01d,0x36,0xe038,0xe05c};
+    uint16_t sc=usage>=0xe0 && usage<=0xe7?mods[usage-0xe0]:(usage<128?scans[usage]:0);
+    return sc;
+}
+
+void keyboard_inject_hid_usage(uint16_t usage, int pressed) {
+    uint16_t sc=hid_scancode(usage);
+    if(!sc) return;
+    int prefix=0;
+    spin_lock(&input_state_lock);
+    if(!pressed && hid_repeat_usage==usage) hid_repeat_usage=0;
+    if(pressed && ((usage>=4 && usage<=0x38) || (usage>=0x4a && usage<=0x52)
+        || (usage>=0x54 && usage<=0x63))) {
+        hid_repeat_usage=usage;hid_repeat_at=time_get_us()+450000;
+    }
+    if (sc>255) keyboard_scancode(0xe0,&prefix,0);
+    keyboard_scancode((sc&255)|(pressed?0:0x80),&prefix,0);
+    spin_unlock(&input_state_lock);
+}
+
 
 
 
@@ -435,9 +501,11 @@ const char *keyboard_layout(void) { return g_layout->name; }
 uint8_t keyboard_mods(void) { return g_mods; }
 
 int keyboard_event_pop(struct key_event *ev) {
-    if (ev_head == ev_tail) return 0;
+    spin_lock(&input_state_lock);
+    if (ev_head == ev_tail) { spin_unlock(&input_state_lock); return 0; }
     *ev = ev_ring[ev_tail];
     ev_tail = (ev_tail + 1) % KBD_EVENT_RING;
+    spin_unlock(&input_state_lock);
     return 1;
 }
 
@@ -482,6 +550,7 @@ void keyboard_set_interrupt_target(uint32_t pid) { g_console_int_target = pid; }
 uint32_t keyboard_get_interrupt_target(void) { return g_console_int_target; }
 
 static void keyboard_deliver(char c) {
+    power_activity();
     /* ^C: cancel the routed target instead of delivering a byte.
      *
      * DELIBERATELY BEFORE sched_lock(): process_cancel() takes g_sched_lock
@@ -489,7 +558,7 @@ static void keyboard_deliver(char c) {
      * deadlock. Safe to take it here at all only because of the standing
      * invariant (see below): g_sched_lock is never held with interrupts on, so
      * an IRQ cannot land while some thread holds it, and it is free right now. */
-    if (c == 0x03) {
+    if (c == 0x03 && session_ui_allowed(0)) {
         uint32_t target = g_console_int_target;
         if (target) {
             process_cancel(target);
@@ -556,6 +625,9 @@ int keyboard_getchar_blocking_cancelable(char *out) {
         sched_block_current_locked(&kbd_wait_queue);
         sched_lock();
     }
+    if(session_managed() && current_process && !session_ui_allowed(current_process->pid)) {
+        sched_unlock();return -EMBK_EPERM;
+    }
     buffer_pop(out);
     sched_unlock();
     return EMBK_OK;
@@ -565,4 +637,74 @@ int keyboard_getchar_blocking_cancelable(char *out) {
 // Called by the USB HID driver for keys received over xHCI.
 void keyboard_inject_char(char c) {
     keyboard_deliver(c);
+}
+
+void keyboard_repeat_tick(void) {
+    spin_lock(&input_state_lock);
+    uint16_t usage=hid_repeat_usage;
+    uint64_t now=time_get_us();
+    if(usage && now>=hid_repeat_at) {
+        uint16_t sc=hid_scancode(usage);int prefix=0;
+        if(sc>255) keyboard_scancode(0xe0,&prefix,0);
+        if(sc) keyboard_scancode(sc&255,&prefix,0);
+        hid_repeat_at=now+33000;
+    }
+    spin_unlock(&input_state_lock);
+}
+void keyboard_hid_boot_report(uint8_t previous[6],uint8_t *previous_modifiers,
+    const uint8_t *report,unsigned length) {
+    if(length<8) return;
+    for(unsigned i=2;i<8;i++) if(report[i]>=1 && report[i]<=3) return;
+    for(unsigned i=0;i<8;i++) if((report[0]^*previous_modifiers)&(1U<<i))
+        keyboard_inject_hid_usage(0xe0+i,!!(report[0]&(1U<<i)));
+    for(unsigned i=0;i<6;i++) {
+        unsigned old=previous[i];int held=0;
+        for(unsigned j=2;j<8;j++) if(report[j]==old) held=1;
+        if(old && !held) keyboard_inject_hid_usage(old,0);
+    }
+    for(unsigned j=2;j<8;j++) {
+        unsigned key=report[j];int held=0;
+        for(unsigned i=0;i<6;i++) if(previous[i]==key) held=1;
+        if(key && !held) keyboard_inject_hid_usage(key,1);
+    }
+    for(unsigned i=0;i<6;i++) previous[i]=report[i+2];
+    *previous_modifiers=report[0];
+}
+
+/* Native integration regression: exercise the timer path without a 450ms wait
+ * that would let a focused user application consume the test's characters. */
+int keyboard_test_hid_repeat(void) {
+    if(keyboard_mods()) return -1;
+    struct key_event e;
+    while(keyboard_event_pop(&e)) {}
+    while(keyboard_has_char()) (void)keyboard_getchar();
+    keyboard_inject_hid_usage(4,1);
+    spin_lock(&input_state_lock);
+    uint64_t now=time_get_us();
+    int ok=hid_repeat_usage==4 && hid_repeat_at>now && hid_repeat_at-now<=450000;
+    hid_repeat_at=now;spin_unlock(&input_state_lock);
+    keyboard_repeat_tick();
+    keyboard_inject_hid_usage(4,0);
+    keyboard_repeat_tick();
+    unsigned count=0;
+    while(keyboard_has_char()) {if(keyboard_getchar()!='a') ok=0;count++;}
+    ok=ok && count==2;
+    unsigned events=0;
+    while(keyboard_event_pop(&e)) {
+        if(e.code!='a' || e.pressed!=(events<2)) ok=0;
+        events++;
+    }
+    return ok && events==3?0:-1;
+}
+
+void keyboard_flush_input(void) {
+    spin_lock(&input_state_lock);
+    buf_tail=buf_head;ev_tail=ev_head;hid_repeat_usage=0;
+    spin_unlock(&input_state_lock);
+}
+
+void keyboard_desktop_actions(void) {
+    unsigned action=__atomic_exchange_n(&desktop_action,0,__ATOMIC_ACQ_REL);
+    if(action==1) session_request_lock();
+    else if(action) compositor_cycle_window(action==3);
 }

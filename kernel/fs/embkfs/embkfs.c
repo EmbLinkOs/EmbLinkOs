@@ -1604,7 +1604,7 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
             ((const struct embk_superblock *)sb_backup)->generation == sb->generation;
         bool other_ok = sb_is_primary ? backup_matches : primary_matches;
 
-        if (!other_ok && good_spb > 0 && good_spb <= 128) {
+        if (!boot_recovery_mode() && !other_ok && good_spb > 0 && good_spb <= 128) {
             uint8_t *goodblk = kmalloc(good_spb * dev->block_size);
             if (goodblk && embk_block_read(dev, good_lba, good_spb, goodblk) == EMBK_OK) {
                 int wrc = embk_block_write(dev, bad_lba, good_spb, goodblk);
@@ -1628,7 +1628,8 @@ int embkfs_mount(struct embk_block_device *dev, struct embkfs_volume *vol)
                 dev->name, sb->feature_incompat);
         return -EMBK_EINVAL;
     }
-    bool read_only = (sb->feature_ro_compat & ~EMBKFS_KNOWN_RO_COMPAT) != 0;
+    bool read_only = boot_recovery_mode() ||
+        (sb->feature_ro_compat & ~EMBKFS_KNOWN_RO_COMPAT) != 0;
 
     /* Version backstop: a newer major could mean anything. */
     if (sb->version_major > EMBKFS_MAX_KNOWN_MAJOR) {
@@ -5128,14 +5129,14 @@ int embkfs_rmdir_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
     return embkfs_rmdir(vol, parent, leaf);
 }
 
-int embkfs_rename_name(struct embkfs_volume *vol,
+static int embkfs_rename_name_impl(struct embkfs_volume *vol,
                        uint64_t old_dir_oid, const char *old_name,
                        uint64_t new_dir_oid, const char *new_name)
 {
     return embkfs_rename(vol, old_dir_oid, old_name, new_dir_oid, new_name);
 }
 
-int embkfs_rename_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
+static int embkfs_rename_path_impl(struct embkfs_volume *vol, uint64_t start_dir_oid,
                        const char *old_path, const char *new_path)
 {
     char old_leaf[256], new_leaf[256];
@@ -7316,10 +7317,14 @@ static int embkfs_run_namespace_selftests_impl(void)
         if (rc != EMBK_OK || l != 9 || memcmp(linkbuf, "/tstns/f2", 9) != 0) ok = false;
     }
 
-    /* Rename into an existing destination must fail. */
+    /* Replacement keeps the source object and bytes, removes its old name,
+     * and discards the destination in the same transaction. */
+    uint64_t rename_source = 0;
     if (ok) {
-        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &oid);
-        if (rc != EMBK_OK && rc != -EMBK_EEXIST) ok = false;
+        rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &rename_source);
+        if (rc == EMBK_OK)
+            rc = embkfs_write_object(vol, rename_source, payload, sizeof payload);
+        if (rc != EMBK_OK) ok = false;
     }
     if (ok) {
         rc = embkfs_create_file_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &oid);
@@ -7327,7 +7332,20 @@ static int embkfs_run_namespace_selftests_impl(void)
     }
     if (ok) {
         rc = embkfs_rename_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", "/tstns/y");
-        if (rc != -EMBK_EEXIST) ok = false;
+        if (rc != EMBK_OK) ok = false;
+    }
+    if (ok) {
+        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/x", &oid);
+        if (rc != -EMBK_ENOENT) ok = false;
+        rc = embkfs_lookup_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/y", &oid);
+        if (rc != EMBK_OK || oid != rename_source) ok = false;
+    }
+    if (ok) {
+        memset(rbuf, 0, sizeof rbuf);
+        nread = 0;
+        rc = embkfs_read_object(vol, oid, rbuf, sizeof rbuf, &nread);
+        if (rc != EMBK_OK || nread != sizeof payload || memcmp(rbuf, payload, sizeof payload) != 0)
+            ok = false;
     }
 
     embkfs_unlink_path(vol, EMBKFS_ROOT_OBJECT_ID, "/tstns/f");
@@ -7473,7 +7491,7 @@ static bool embkfs_finish_mount(struct embkfs_volume *vol)
             vol->dev->name, (unsigned int)h->level,
             h->level == 0 ? "LEAF" : "internal", (unsigned int)h->nritems);
 
-    embkfs_alloc_init(vol);
+    if (embkfs_alloc_init(vol) != EMBK_OK) return false;
 
     int sweep_rc = embkfs_mount_orphan_sweep(vol);
     if (sweep_rc != EMBK_OK) {
@@ -7504,6 +7522,7 @@ void embkfs_init(void)
      * main.c) -- so index 0 (the primary, aliased by g_embkfs_live) is
      * deterministically "whichever EMBKFS volume was found earliest in
      * boot", normally the internal disk. */
+    struct embk_block_device *boot_disk = embk_partition_boot_disk();
     for (uint32_t i = 0; i < embk_block_count() && g_embkfs_volume_count < EMBKFS_MAX_VOLUMES; i++) {
         struct embk_block_device *d = embk_block_get(i);
         /* Skip a whole disk that carries a partition table: its filesystems live
@@ -7512,6 +7531,9 @@ void embkfs_init(void)
          * tail backup superblock at the wrong offset and -- worse -- self-heals a
          * bogus "primary superblock" by WRITING over the MBR / boot code. */
         if (embk_block_is_partitioned(d))
+            continue;
+        if (boot_recovery_mode() &&
+            ((boot_disk && embk_partition_parent(d) != boot_disk) || g_embkfs_volume_count))
             continue;
         struct embkfs_volume *slot = &g_embkfs_volumes[g_embkfs_volume_count];
         if (embkfs_mount(d, slot) != EMBK_OK)
@@ -7536,20 +7558,11 @@ void embkfs_init(void)
      * unchanged. Preserves the "slot 0 == primary" invariant below by SWAPPING
      * rather than repointing, so main.c's per-volume /sdX registration (which
      * treats index 0 as embk_live) needs no change. */
-    uint32_t boot_sig;
-    if (g_embkfs_volume_count > 1 && bootinfo_boot_disk_sig(&boot_sig)) {
+    if (g_embkfs_volume_count > 1 && boot_disk) {
         for (uint32_t i = 1; i < g_embkfs_volume_count; i++) {
             struct embk_block_device *disk =
                 embk_partition_parent(g_embkfs_volumes[i].dev);
-            uint8_t mbr[512];
-            if (!disk || embk_block_read(disk, 0, 1, mbr) != EMBK_OK)
-                continue;
-            uint32_t sig =  (uint32_t)mbr[0x1B8]
-                         | ((uint32_t)mbr[0x1B9] << 8)
-                         | ((uint32_t)mbr[0x1BA] << 16)
-                         | ((uint32_t)mbr[0x1BB] << 24);
-            if (sig != boot_sig)
-                continue;
+            if (disk != boot_disk) continue;
             /* Every pointer in the struct targets the heap (bitmap / free_ext /
              * rcache bufs), never the struct itself, so a byte move keeps them
              * valid; nothing outside holds a &volume yet (vfs registration runs
@@ -8030,6 +8043,28 @@ int embkfs_run_namespace_selftests(void)
 {
     embkfs_lock();
     int rc = embkfs_run_namespace_selftests_impl();
+    embkfs_unlock();
+    return rc;
+}
+
+/* Rename uses shared probe buffers and commits a new tree root. Protect the
+ * whole operation, including both path resolutions, against readers as well
+ * as writers. The VFS bridge delegates here without taking its own lock. */
+int embkfs_rename_name(struct embkfs_volume *vol,
+                       uint64_t old_dir_oid, const char *old_name,
+                       uint64_t new_dir_oid, const char *new_name)
+{
+    embkfs_lock();
+    int rc = embkfs_rename_name_impl(vol, old_dir_oid, old_name, new_dir_oid, new_name);
+    embkfs_unlock();
+    return rc;
+}
+
+int embkfs_rename_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
+                       const char *old_path, const char *new_path)
+{
+    embkfs_lock();
+    int rc = embkfs_rename_path_impl(vol, start_dir_oid, old_path, new_path);
     embkfs_unlock();
     return rc;
 }

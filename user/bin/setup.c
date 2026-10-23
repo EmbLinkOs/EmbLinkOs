@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +13,9 @@ static char confirm[EMBK_AUTH_PASSWORD_MAX + 1];
 static char status[128] = "Choose the account used to open your desktop.";
 
 static int write_all(const char *path, const char *data) {
-    int fd = (int)embk_open(path, EMBK_O_CREAT | EMBK_O_TRUNC | EMBK_O_WRONLY, 0600);
+    char temp[128];
+    if(snprintf(temp,sizeof temp,"%s.pending",path)>=(int)sizeof temp) return -1;
+    int fd = (int)embk_open(temp, EMBK_O_CREAT | EMBK_O_TRUNC | EMBK_O_WRONLY, 0600);
     if (fd < 0) return -1;
     size_t len = strlen(data), off = 0;
     while (off < len) {
@@ -20,8 +23,13 @@ static int write_all(const char *path, const char *data) {
         if (n <= 0) { embk_close(fd); return -1; }
         off += (size_t)n;
     }
+    int rc=fsync(fd);
     embk_close(fd);
-    return 0;
+    if(rc<0 || rename(temp,path)<0) {embk_unlink(temp);return -1;}
+    fd=(int)embk_open(path,EMBK_O_RDONLY,0);
+    if(fd<0) return -1;
+    rc=fsync(fd);embk_close(fd);
+    return rc<0?-1:0;
 }
 
 static void create_home_folders(const char *home) {
@@ -37,6 +45,7 @@ static void create_home_folders(const char *home) {
 }
 
 static void create_account(void) {
+    em_flush();
     if (!embk_auth_valid_username(username)) {
         snprintf(status, sizeof status, "Use lowercase letters, numbers, - or _.");
         return;

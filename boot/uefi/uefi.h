@@ -30,6 +30,17 @@ typedef uint64_t  EFI_VIRTUAL_ADDRESS;
 #define EFI_ERROR(s)         (((EFI_STATUS)(s)) & EFI_ERROR_BIT)
 
 typedef struct { uint32_t a; uint16_t b, c; uint8_t d[8]; } EFI_GUID;
+#define EFI_LOADED_IMAGE_PROTOCOL_GUID \
+    { 0x5b1b31a1, 0x9562, 0x11d2, {0x8e,0x3f,0x00,0xa0,0xc9,0x69,0x72,0x3b} }
+#define EFI_DEVICE_PATH_PROTOCOL_GUID \
+    { 0x09576e91, 0x6d3f, 0x11d2, {0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b} }
+typedef struct {
+    uint32_t Revision;
+    EFI_HANDLE ParentHandle;
+    void *SystemTable;
+    EFI_HANDLE DeviceHandle;
+} EFI_LOADED_IMAGE_PREFIX;
+typedef EFI_STATUS (EFIAPI *EFI_HANDLE_PROTOCOL)(EFI_HANDLE, EFI_GUID *, void **);
 
 /* Graphics Output Protocol GUID {9042A9DE-23DC-4A38-96FB-7ADED080516A} */
 #define EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID \
@@ -153,8 +164,8 @@ typedef struct {
 } EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
 
 typedef struct _EFI_GRAPHICS_OUTPUT_PROTOCOL {
-    void                              *QueryMode;
-    void                              *SetMode;
+    EFI_STATUS (EFIAPI *QueryMode)(struct _EFI_GRAPHICS_OUTPUT_PROTOCOL *,uint32_t,UINTN *,EFI_GRAPHICS_OUTPUT_MODE_INFORMATION **);
+    EFI_STATUS (EFIAPI *SetMode)(struct _EFI_GRAPHICS_OUTPUT_PROTOCOL *,uint32_t);
     void                              *Blt;
     EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL;
@@ -183,7 +194,7 @@ typedef struct {
     void              *FreePages;
     EFI_GET_MEMORY_MAP GetMemoryMap;
     EFI_ALLOCATE_POOL  AllocatePool;
-    void              *FreePool;
+    EFI_STATUS (EFIAPI *FreePool)(void *);
     void              *CreateEvent;
     void              *SetTimer;
     void              *WaitForEvent;
@@ -193,7 +204,7 @@ typedef struct {
     void              *InstallProtocolInterface;
     void              *ReinstallProtocolInterface;
     void              *UninstallProtocolInterface;
-    void              *HandleProtocol;
+    EFI_HANDLE_PROTOCOL HandleProtocol;
     void              *Reserved;
     void              *RegisterProtocolNotify;
     void              *LocateHandle;

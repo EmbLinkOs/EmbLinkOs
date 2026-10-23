@@ -142,6 +142,7 @@ struct xhci_runtime_state {
     uint8_t  intin_interval[XHCI_MAX_SLOTS_TRACKED]; // bInterval from descriptor
     uint16_t intin_mps[XHCI_MAX_SLOTS_TRACKED];      // max packet size (report length)
     bool     intin_active[XHCI_MAX_SLOTS_TRACKED];   // true after Configure Endpoint
+    uint8_t prev_modifiers[XHCI_MAX_SLOTS_TRACKED];
     uint8_t  prev_keys[XHCI_MAX_SLOTS_TRACKED][6];   // last report's keycodes (edge detect)
     // Distinct receive buffers cycled across the interrupt-IN ring. head = next
     // buffer to arm, tail = next completed buffer to read (both mod NUM_BUFS).
@@ -1204,61 +1205,7 @@ static void xhci_intin_post_buffers(struct xhci_runtime_state *rt,
 // --------------------------------------------------------------------------
 static void xhci_process_hid_report(struct xhci_runtime_state *rt, uint32_t idx,
                                     const uint8_t *rep_buf) {
-    bool shift = (rep_buf[0] & 0x22U) != 0; // LeftShift(0x02)|RightShift(0x20)
-
-    for (uint32_t k = 2; k < 8; k++) {
-        uint8_t usage = rep_buf[k];
-        if (usage == 0) { continue; }
-
-        // Skip keycodes already held in the previous report (no auto-repeat).
-        bool already = false;
-        for (uint32_t p = 0; p < 6; p++) {
-            if (rt->prev_keys[idx][p] == usage) { already = true; break; }
-        }
-        if (already) { continue; }
-
-        /* Navigation cluster FIRST: never shift-mapped (see hid_nav_key). */
-        char nav = hid_nav_key(usage);
-        if (nav != 0) { keyboard_inject_char(nav); continue; }
-
-        char ch = g_hid_usage_to_ascii[usage];
-        if (ch == 0) { continue; }
-
-        // Apply shift: uppercase letters, shifted symbols.
-        if (shift) {
-            if (ch >= 'a' && ch <= 'z') {
-                ch = (char)(ch - 32); // to uppercase
-            } else {
-                // Common shifted symbols on US QWERTY.
-                const char shifted[] = ")!@#$%^&*(";
-                if (ch >= '0' && ch <= '9') {
-                    ch = shifted[ch - '0'];
-                } else {
-                    switch (ch) {
-                    case '-': ch = '_'; break;
-                    case '=': ch = '+'; break;
-                    case '[': ch = '{'; break;
-                    case ']': ch = '}'; break;
-                    case '\\': ch = '|'; break;
-                    case ';': ch = ':'; break;
-                    case '\'': ch = '"'; break;
-                    case '`': ch = '~'; break;
-                    case ',': ch = '<'; break;
-                    case '.': ch = '>'; break;
-                    case '/': ch = '?'; break;
-                    default:  break;
-                    }
-                }
-            }
-        }
-
-        keyboard_inject_char(ch);
-    }
-
-    // Remember this report's keycodes for next-report edge detection.
-    for (uint32_t k = 0; k < 6; k++) {
-        rt->prev_keys[idx][k] = rep_buf[k + 2U];
-    }
+    keyboard_hid_boot_report(rt->prev_keys[idx],&rt->prev_modifiers[idx],rep_buf,8);
 }
 
 // --------------------------------------------------------------------------

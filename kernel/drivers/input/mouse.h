@@ -25,4 +25,6 @@ int32_t mouse_take_wheel(void);   /* consume accumulated scroll delta (+up/-down
 void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
                         uint32_t buttons, int32_t wheel);
 
+void mouse_inject_relative(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel);
+
 #endif /* _MOUSE_H_ */

@@ -35,6 +35,10 @@ struct usb_device *usb_alloc_device(const struct usb_hcd_ops *ops,
 }
 
 void usb_free_device(struct usb_device *dev) {
+    if(dev && dev->hid_active && dev->hid_kind==USB_HID_KEYBOARD) {
+        uint8_t released[8]={0};
+        keyboard_hid_boot_report(dev->prev_keys,&dev->prev_modifiers,released,sizeof released);
+    }
     if (dev) dev->in_use = false;
 }
 
@@ -127,27 +131,7 @@ static void usb_tablet_process_report(const uint8_t *report, int len) {
 static void usb_hid_process_report(struct usb_device *dev,
                                    const uint8_t *report, int len) {
     if (dev->hid_kind == USB_HID_TABLET) { usb_tablet_process_report(report, len); return; }
-    if (len < 3) return;
-    uint8_t modifiers = report[0];
-    bool shift = (modifiers & 0x22) != 0;   // L/R shift
-
-    // Edge-detect: inject only keys not present in the previous report.
-    for (int i = 2; i < 8 && i < len; i++) {
-        uint8_t usage = report[i];
-        if (usage == 0 || usage >= 128) continue;
-        bool was_down = false;
-        for (int j = 0; j < 6; j++) {
-            if (dev->prev_keys[j] == usage) { was_down = true; break; }
-        }
-        if (was_down) continue;
-        char ch = shift ? g_usb_hid_ascii_shift[usage] : g_usb_hid_ascii[usage];
-        if (!ch) ch = g_usb_hid_ascii[usage];
-        if (ch) keyboard_inject_char(ch);
-    }
-
-    for (int j = 0; j < 6; j++) {
-        dev->prev_keys[j] = (2 + j < len) ? report[2 + j] : 0;
-    }
+    keyboard_hid_boot_report(dev->prev_keys,&dev->prev_modifiers,report,len);
 }
 
 static bool usb_hid_attach(struct usb_device *dev, uint8_t kind) {

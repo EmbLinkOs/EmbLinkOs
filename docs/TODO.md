@@ -6,6 +6,31 @@ left to do.
 
 ---
 
+## Laptop daily-use acceptance
+
+Implemented behavior and reproduction commands are in [DAILY_USE.md](DAILY_USE.md),
+[LAPTOP_ALPHA.md](LAPTOP_ALPHA.md) and [HARDWARE_DRIVERS.md](HARDWARE_DRIVERS.md).
+The remaining acceptance gates are:
+
+- [ ] Validate actual laptop UEFI/NVMe persistence, held keys/clicks, I2C-HID,
+      Wi-Fi RF/WPA2/DHCP/DNS, HDA routing, brightness, battery and power-off/reset.
+      QEMU and protocol models do not establish physical compatibility.
+- [ ] Broaden wireless support beyond the experimental AX200 path; implement
+      pairwise rekey, WPA3/required PMF, roaming and power-saving modes.
+- [ ] Native GPU modesetting, connector/hotplug management and rendering
+      acceleration. Intel Gen9 currently preserves the firmware mode and offers
+      validated PCH PWM; other physical GPU families remain unsupported.
+- [ ] S3/S0ix, coordinated device quiesce/resume and reliable wake restoration.
+      Idle dimming and idle/lid locking do not put the system to sleep.
+- [ ] OS-image updating/rollback, firmware boot-entry management and partition
+      preservation for dual boot. The recovery installer overwrites a whole disk.
+- [ ] Extend integrity checking to snapshot roots, complete allocation-overlap
+      auditing and repair; add retained panic reports and staging-file recovery.
+- [ ] Rich clipboard formats, notification actions/persistence, touchpad gestures,
+      audio mixing/capture and broader service supervision.
+
+---
+
 ## The Applications launcher
 
 - [x] Opens every time, in FRONT of app windows, full-screen and searchable
@@ -283,7 +308,9 @@ web asks for them and how much they change a page:
   hand the kernel the same `boot_protocol`. `make run-uefi` / `run-uefi-cow`.
 - [ ] **EmbBoot** (UEFI boot manager, [EMBBOOT_Design.md](EMBBOOT_Design.md)):
   M1 (menu) done. Open: M2 `.embfw` payload format + kernel-on-ESP; M3 verify
-  (HMAC v1 → Ed25519 v2); M4 Recovery + Diagnostics; M5 Boot Manager + self-update.
+  (HMAC v1 → Ed25519 v2); M5 Boot Manager + self-update. Initial M4 read-only
+  Recovery/Diagnostics and a verified whole-disk installer are built; filesystem
+  repair and image rollback remain open ([DAILY_USE.md](DAILY_USE.md)).
 - [ ] Hardcoded kernel LBA start (sector 9) still stands for the BIOS path — a
   real filesystem-aware BIOS backend is EmbBoot §11 (stage1.5 / 64-bit core).
 

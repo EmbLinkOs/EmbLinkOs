@@ -30,7 +30,7 @@ FB_H ?= 600
 CFLAGS = -ffreestanding -nostdlib -nostartfiles \
          -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
          -mcmodel=kernel \
-         -Ikernel \
+         -Ikernel -Ithird_party/uacpi/include -DUACPI_USE_BUILTIN_STRING \
          -Iuser/lib/tls/crypto \
          -DEMBK_VGPU_CAP_W=$(FB_W) -DEMBK_VGPU_CAP_H=$(FB_H) \
          -g -O0
@@ -67,6 +67,14 @@ AP_TRAMPOLINE_BLOB_ASM = kernel/arch/x86_64/smp/ap_trampoline_blob.asm
 AP_TRAMPOLINE_BLOB_OBJ = $(BUILD)/ap_trampoline_blob.o
 
 KERNEL_SRC = kernel/main.c \
+             kernel/ipc/notify.c \
+             kernel/power/policy.c \
+             kernel/power/cpu.c \
+             kernel/drivers/video/intel_display.c \
+             kernel/process/session.c \
+             kernel/block/install.c \
+             kernel/block/install_protocol.c \
+             kernel/fs/embkfs/check.c \
              kernel/selftests.c \
              kernel/arch/x86_64/irq/isr.c \
              kernel/arch/x86_64/irq/pic.c \
@@ -81,6 +89,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/arch/x86_64/cpu/rwlock.c \
              kernel/arch/x86_64/smp/smp.c \
              kernel/arch/x86_64/boot/boot_protocol.c \
+             kernel/arch/x86_64/boot/fw_cfg.c \
              kernel/arch/x86_64/syscall/syscall.c \
              kernel/arch/x86_64/syscall/usercopy.c \
              kernel/arch/x86_64/syscall/usermode.c \
@@ -91,12 +100,24 @@ KERNEL_SRC = kernel/main.c \
              kernel/process/debug.c \
 			 kernel/tty/tty.c \
              kernel/acpi/acpi.c \
+             kernel/acpi/host.c \
+             kernel/acpi/ec.c \
+             kernel/drivers/platform/ec_protocol.c \
+             kernel/drivers/i2c/designware.c \
+             kernel/drivers/i2c/designware_protocol.c \
+             kernel/drivers/i2c/hid_protocol.c \
+             kernel/drivers/i2c/hid_i2c.c \
+             kernel/drivers/input/hid_report.c \
+             kernel/acpi/runtime.c \
+             kernel/acpi/power.c \
+             $(wildcard third_party/uacpi/source/*.c) \
              kernel/drivers/char/serial.c \
              kernel/drivers/video/framebuffer.c \
              kernel/drivers/video/gpu.c \
              kernel/drivers/video/bochs_vbe.c \
              kernel/drivers/video/virtio_gpu.c \
              kernel/drivers/audio/ac97.c \
+             kernel/drivers/audio/hda.c \
              kernel/drivers/audio/audio.c \
              kernel/drivers/video/font_8x16.c \
              kernel/drivers/video/console.c \
@@ -110,6 +131,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/bus/pci.c \
              kernel/net/net.c \
              kernel/net/virtio_net.c \
+             kernel/net/pci_net.c \
              kernel/net/ethernet/eth.c \
              kernel/net/ethernet/arp.c \
              kernel/net/ip/ipv4.c \
@@ -126,6 +148,7 @@ KERNEL_SRC = kernel/main.c \
              kernel/drivers/usb/ohci.c \
              kernel/drivers/storage/ata.c \
              kernel/drivers/storage/ahci.c \
+             kernel/drivers/storage/nvme.c \
              kernel/block/block.c \
              kernel/block/partition.c \
              kernel/mm/pmm.c \
@@ -133,6 +156,18 @@ KERNEL_SRC = kernel/main.c \
              kernel/mm/kheap.c \
              kernel/mm/kmalloc.c \
              kernel/crypto/sha256.c \
+             kernel/crypto/sha1.c \
+             kernel/net/wifi/wpa2_crypto.c \
+             kernel/net/wifi/wpa2.c \
+             kernel/net/wifi/ccmp.c \
+             kernel/net/wifi/station.c \
+             kernel/net/wifi/ax200_protocol.c \
+             kernel/net/wifi/ax200.c \
+             kernel/net/wifi/profile.c \
+             kernel/net/wifi/control.c \
+             kernel/acpi/display.c \
+             kernel/net/wifi/wifi.c \
+             kernel/crypto/hw_random.c \
              kernel/crypto/hmac.c \
              kernel/crypto/pbkdf2.c \
              kernel/crypto/aes.c \
@@ -1179,13 +1214,15 @@ $(BUILD)/picobj_dsl_em.o: ui/dsl/em.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_dsl_em_app.o: ui/dsl/em_app.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
+$(BUILD)/picobj_fileops.o: user/lib/fileops.c user/lib/fileops.h | $(BUILD)
+	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 $(BUILD)/picobj_auth.o: user/lib/auth.c | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) -fPIC $(UIDEMO_INC) -c $< -o $@
 LIBEMBK_OBJS = $(BUILD)/picobj_scene_scene.o $(BUILD)/picobj_backend_cpu_backend.o \
                $(BUILD)/picobj_backend_font.o $(BUILD)/picobj_backend_scene_render.o \
                $(BUILD)/picobj_layout_layout.o $(BUILD)/picobj_reactive_reactive.o \
                $(BUILD)/picobj_declare_declare.o $(BUILD)/picobj_theme_theme.o $(BUILD)/picobj_kit_kit.o \
-               $(BUILD)/picobj_dsl_em.o $(BUILD)/picobj_dsl_em_app.o $(BUILD)/picobj_auth.o
+               $(BUILD)/picobj_dsl_em.o $(BUILD)/picobj_dsl_em_app.o $(BUILD)/picobj_auth.o $(BUILD)/picobj_fileops.o
 
 build/libembk.so: $(LIBEMBK_OBJS)
 	$(USER_LD) -shared -soname libembk.so --hash-style=sysv $(LIBEMBK_OBJS) -o $@
@@ -1209,7 +1246,7 @@ EMUI_APPS     := $(patsubst user/bin/%.c,build/%.elf,$(EMUI_APP_SRCS))
 
 # One compile rule for any EmUI app object (newlib CFLAGS + the toolkit
 # include paths).
-build/%.o: user/bin/%.c user/lib/embk.h | $(BUILD)
+build/%.o: user/bin/%.c user/lib/embk.h $(wildcard user/lib/embk_*.h) | $(BUILD)
 	$(USER_CC) $(NEWLIB_CFLAGS) $(UIDEMO_INC) -c $< -o $@
 
 # One DYNAMIC link rule for any EmUI app: it imports the toolkit from
@@ -1488,7 +1525,7 @@ $(AP_TRAMPOLINE_BLOB_OBJ): $(AP_TRAMPOLINE_BLOB_ASM) $(AP_TRAMPOLINE_BIN) | $(BU
 # 35-minute boots during EmbBuild v2. A wildcard over every .h under kernel/ is
 # coarse (any header touch rebuilds the whole kernel) but the kernel is one
 # compile anyway, so the granularity is already all-or-nothing; correctness wins.
-KERNEL_HDRS := $(shell find kernel -name '*.h')
+KERNEL_HDRS := $(shell find kernel -name '*.h') third_party/iwx/if_iwxreg.h $(wildcard user/lib/embk_*.h)
 $(KERNEL_ELF): $(KERNEL_SRC) $(KERNEL_HDRS) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ) $(LINKER)
 	$(CC) $(CFLAGS) -T $(LINKER) -o $@ $(KERNEL_SRC) $(ISR_OBJ) $(SYSCALL_OBJ) $(KCONTEXT_OBJ) $(KENTRY_OBJ) $(AP_ENTRY_OBJ) $(AP_TRAMPOLINE_BLOB_OBJ)
 
@@ -1993,7 +2030,7 @@ OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
 build/uefi_crt0.o: boot/uefi/crt0.S | $(BUILD)
 	$(CC) -c $< -o $@
 
-build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h boot/uefi/console.h boot/uefi/menu.h | $(BUILD)
+build/uefi_loader.o: boot/uefi/loader.c boot/uefi/uefi.h boot/uefi/console.h boot/uefi/menu.h boot/uefi/display_mode.h | $(BUILD)
 	$(CC) $(UEFI_CFLAGS) $< -o $@
 
 build/uefi_console.o: boot/uefi/console.c boot/uefi/console.h boot/uefi/uefi.h | $(BUILD)
@@ -2009,13 +2046,14 @@ build/uefi_kernel_blob.o: boot/uefi/kernel_blob.S $(KERNEL_BIN) | $(BUILD)
 UEFI_OBJS = build/uefi_crt0.o build/uefi_loader.o build/uefi_console.o \
             build/uefi_menu.o build/uefi_kernel_blob.o
 
-build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds
-	$(CC) -nostdlib -shared -Bsymbolic -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
+build/uefi_loader.so: $(UEFI_OBJS) boot/uefi/efi.lds Makefile
+	$(CC) -nostdlib -Wl,-shared,-Bsymbolic,--no-undefined -T boot/uefi/efi.lds $(UEFI_OBJS) -o $@
 
 # ELF -> PE32+ EFI application. The efi-app-x86_64 pseudo-target sets the EFI
 # subsystem and PE layout correctly. Host objcopy: the cross one lacks pei.
-$(BOOTX64): build/uefi_loader.so
-	objcopy -O efi-app-x86_64 -j .text -j .data -j .reloc $< $@
+$(BOOTX64): build/uefi_loader.so tools/check_uefi_elf.py
+	python3 tools/check_uefi_elf.py $<
+	objcopy -O efi-app-x86_64 -j .text -j .rodata -j .data -j .bss -j .got -j .rela -j .reloc $< $@
 
 # GPT + ESP disk carrying /EFI/BOOT/BOOTX64.EFI.
 uefi.img: $(BOOTX64) tools/mkuefidisk.sh

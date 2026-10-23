@@ -85,6 +85,9 @@
 #define EMBK_CAP_SERIAL      7
 #define EMBK_CAP_RAWDISK     8
 #define EMBK_CAP_KERNEL_EXT  9
+#define EMBK_CAP_DEBUG       10
+#define EMBK_CAP_POWER       11
+#define EMBK_CAP_NETWORK_ADMIN 12
 #define EMBK_CAP_BIT(id)     (1u << (id))
 struct embk_spawn_file_action {
     unsigned char kind;         /* EMBK_SPAWN_ACTION_* */
@@ -262,6 +265,35 @@ static inline int64_t embk_spawn_env(const char *path, char *const argv[],
 /* embk_spawn_env() with NO environment for the child. This is the plain spawn:
  * every existing caller keeps its exact behaviour, because "no environment" is
  * what they always got. */
+#include "embk_power.h"
+#include "embk_wifi.h"
+#include "embk_display.h"
+#include "embk_audio.h"
+static inline int embk_audio_get(struct embk_audio_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_audio_info,(int64_t)(uintptr_t)out,sizeof(*out));
+}
+static inline int embk_audio_volume(unsigned percent,unsigned mute) {
+    return (int)embk_syscall2(EMBK_SYS_audio_control,percent,mute);
+}
+static inline int embk_display_get(struct embk_display_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_display_info,(int64_t)(uintptr_t)out,sizeof(*out));
+}
+static inline int embk_display_brightness(unsigned percent) {
+    return (int)embk_syscall1(EMBK_SYS_display_set,percent);
+}
+static inline int embk_wifi_get(struct embk_wifi_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_wifi_info,(int64_t)(uintptr_t)out,sizeof(*out));
+}
+static inline int embk_wifi_change(const struct embk_wifi_request *request) {
+    return (int)embk_syscall2(EMBK_SYS_wifi_request,(int64_t)(uintptr_t)request,sizeof(*request));
+}
+static inline int embk_power_get(struct embk_power_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_power_info,(int64_t)(uintptr_t)out,sizeof(*out));
+}
+static inline int embk_power_request(unsigned action) {
+    return (int)embk_syscall1(EMBK_SYS_power_request,action);
+}
+
 /* This process's own capability set (a bitmask of EMBK_CAP_BIT(id)). */
 static inline unsigned long embk_getcaps(void) {
     return (unsigned long)embk_syscall0(EMBK_SYS_getcaps);
@@ -840,6 +872,8 @@ static inline int embk_chan_pair(int out_handles[2]) {
 /* Send one message: `len` payload bytes plus `n_hnd` ancillary handles
  * (`hnds[]`) with per-handle COPY/MOVE (`flags[]`, or NULL for all-COPY).
  * Blocks if the peer's inbox is full; -EMBK_EPIPE if the peer has closed.
+ * Cancellation of a blocking send returns -EMBK_ECANCELED without transferring
+ * handles or enqueueing the message. Available capacity wins over cancellation.
  * Returns 0 or -EMBK_*. */
 static inline int embk_chan_send(int handle, const void *bytes, unsigned len,
                                  const int *hnds, const int *flags, unsigned n_hnd) {
@@ -850,7 +884,8 @@ static inline int embk_chan_send(int handle, const void *bytes, unsigned len,
 /* Receive one message. Blocks until one arrives or the peer closes
  * (-EMBK_EPIPE). Fills up to `buflen` payload bytes (-EMBK_EMSGSIZE, message
  * left queued, if it's bigger); *out_len gets the real length. Ancillary
- * handles are installed in this process's table, their ints written to
+ * An empty receive returns -EMBK_ECANCELED when cancelled; queued data wins.
+ * Ancillary handles are installed in this process's table, their ints written to
  * out_hnds[], count to *out_nhnd. Returns 0 or -EMBK_*. */
 static inline int embk_chan_recv(int handle, void *buf, unsigned buflen,
                                  unsigned *out_len, int *out_hnds, unsigned *out_nhnd) {
@@ -879,7 +914,8 @@ static inline int embk_chan_listen(const char *path) {
 }
 
 /* Block until a client connects; returns a new CHANNEL handle for that
- * connection, or -EMBK_*. */
+ * connection, or -EMBK_*. Cancellation refuses a blocking wait with
+ * -EMBK_ECANCELED; an already queued connection is accepted. */
 static inline int embk_chan_accept(int listen_handle) {
     return (int)embk_syscall1(EMBK_SYS_chan_accept, listen_handle);
 }
@@ -998,6 +1034,33 @@ static inline int64_t embk_clip_get(void *buf, size_t cap) {
 
 static inline int embk_tty_mode(int mode) {
     return (int)embk_syscall1(EMBK_SYS_tty_mode, mode);
+}
+
+#include "embk_session.h"
+static inline int embk_session(unsigned command,int arg) {
+    return (int)embk_syscall2(EMBK_SYS_session_control,command,arg);
+}
+
+#include "embk_notify.h"
+#include "embk_gpu.h"
+#include "embk_policy.h"
+static inline int embk_notify_send(unsigned severity,const char *title,const char *body) {
+    struct embk_notice_request r={.version=EMBK_NOTIFY_VERSION,.severity=severity};
+    unsigned i=0;while(title[i] && i<sizeof r.title-1){r.title[i]=title[i];i++;}
+    i=0;while(body[i] && i<sizeof r.body-1){r.body[i]=body[i];i++;}
+    return (int)embk_syscall2(EMBK_SYS_notice_post,(int64_t)(uintptr_t)&r,sizeof r);
+}
+static inline int embk_notify_get(struct embk_notice_info *out,int clear) {
+    return (int)embk_syscall3(EMBK_SYS_notice_get,(int64_t)(uintptr_t)out,sizeof *out,clear);
+}
+static inline int embk_policy_get(struct embk_policy *out) {
+    return (int)embk_syscall2(EMBK_SYS_policy_get,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_gpu_get(struct embk_gpu_info *out) {
+    return (int)embk_syscall2(EMBK_SYS_gpu_info,(int64_t)(uintptr_t)out,sizeof *out);
+}
+static inline int embk_policy_set(const struct embk_policy *p) {
+    return (int)embk_syscall2(EMBK_SYS_policy_set,(int64_t)(uintptr_t)p,sizeof *p);
 }
 
 #endif /* __EMBK_H__ */

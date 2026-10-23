@@ -30,7 +30,8 @@ HDR_SIZE, SEG_SIZE, CAP_SIZE = 128, 64, 16
 
 # Capability IDs -- must match kernel capabilities.h / EMBX §5.6.
 CAPS = {"FILESYSTEM":1,"NETWORK":2,"GPU":3,"AUDIO":4,"CAMERA":5,
-        "USB":6,"SERIAL":7,"RAWDISK":8,"KERNEL_EXT":9}
+        "USB":6,"SERIAL":7,"RAWDISK":8,"KERNEL_EXT":9,"DEBUG":10,
+        "POWER":11,"NETWORK_ADMIN":12}
 
 PT_LOAD = 1
 PF_X, PF_W, PF_R = 1, 2, 4

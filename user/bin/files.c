@@ -29,12 +29,14 @@
 #include <sys/stat.h>
 
 #include "embk.h"
+#include "fileops.h"
+#include <errno.h>
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
 
 #define MAX_ENTRIES 512
-#define NAME_LEN    112
+#define NAME_LEN    256
 
 struct entry { char name[NAME_LEN]; bool is_dir; long size; };
 
@@ -70,14 +72,18 @@ static int   g_menu_i = -1;          /* entry the menu was opened on */
 static bool  g_confirm_del = false;  /* the delete sheet             */
 static bool  g_renaming = false;     /* the rename sheet             */
 static char  g_rename_to[NAME_LEN] = "";
-static char  g_clip_path[600] = "";  /* the "copied" file            */
+static char  g_clip_path[1024] = "";  /* the "copied" file            */
 static char  g_clip_name[NAME_LEN] = "";
+static int g_clip_cut;
+static char g_undo_trash[1024];
+static int g_editors[32];
 
 /* ---- model ------------------------------------------------------------- */
 
-static void join(char *out, size_t cap, const char *name) {
-    if (strcmp(g_cwd, "/") == 0) snprintf(out, cap, "/%s", name);
-    else                         snprintf(out, cap, "%s/%s", g_cwd, name);
+static bool join(char *out,size_t cap,const char *name) {
+    size_t dir=strlen(g_cwd),n=strlen(name);int slash=strcmp(g_cwd,"/")!=0;
+    if(dir+(size_t)slash+n+1>cap) {snprintf(g_status,sizeof g_status,"This path is too long.");out[0]=0;return false;}
+    memcpy(out,g_cwd,dir);if(slash)out[dir++]='/';memcpy(out+dir,name,n+1);return true;
 }
 
 static int cmp_entry(const void *a, const void *b) {
@@ -95,8 +101,8 @@ static void read_dir(void) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         struct entry *e = &g_entries[g_count];
         snprintf(e->name, sizeof e->name, "%s", de->d_name);
-        char full[600];
-        join(full, sizeof full, de->d_name);
+        char full[1024];
+        if(!join(full, sizeof full, de->d_name))continue;
         struct stat st;
         if (stat(full, &st) == 0) { e->is_dir = S_ISDIR(st.st_mode); e->size = (long)st.st_size; }
         else                      { e->is_dir = false; e->size = 0; }
@@ -104,7 +110,6 @@ static void read_dir(void) {
     }
     closedir(d);
     qsort(g_entries, g_count, sizeof g_entries[0], cmp_entry);
-    g_status[0] = 0;
 }
 
 /* case-insensitive substring -- search should not care about Shift */
@@ -166,23 +171,27 @@ static void go_up(void) {
 }
 
 static void enter_dir(const char *name) {
-    char nc[512]; join(nc, sizeof nc, name); navigate_to(nc);
+    char nc[512]; if(join(nc, sizeof nc, name))navigate_to(nc);
 }
 
 static void open_file(const char *name) {
-    char full[600], envbuf[640];
-    join(full, sizeof full, name);
-    snprintf(envbuf, sizeof envbuf, "EDIT_FILE=%s", full);
-    char *argv[] = { "edit", NULL };
-    char *env[]  = { envbuf, NULL };
-    int64_t h = embk_spawn_env("/data/apps/edit/edit.elf", argv, env, NULL, 0);
-    snprintf(g_status, sizeof g_status, h >= 0 ? "Opened %s" : "Could not open %s", name);
+    int slot=-1;
+    for(unsigned i=0;i<32;i++) if(!g_editors[i]) {slot=(int)i;break;}
+    if(slot<0) {snprintf(g_status,sizeof g_status,"Close an editor window before opening another.");return;}
+    char full[1024],envbuf[1080],homebuf[1024];
+    if(!join(full,sizeof full,name))return;snprintf(envbuf,sizeof envbuf,"EDIT_FILE=%s",full);
+    const char *home=getenv("HOME");snprintf(homebuf,sizeof homebuf,"HOME=%s",home?home:"/");
+    char *argv[]={"edit",NULL},*env[]={envbuf,homebuf,NULL};
+    int h=(int)embk_spawn_env("/data/apps/edit/edit.elf",argv,env,NULL,0);
+    if(h>=0)g_editors[slot]=h;
+    snprintf(g_status,sizeof g_status,h>=0?"Opened %.90s":"Could not open %.90s",name);
 }
 
 static void create_folder(void) {
-    if (!g_newname[0]) { g_naming = false; return; }
-    char full[600];
-    join(full, sizeof full, g_newname);
+    em_flush();
+    if (!embk_file_valid_name(g_newname)) {snprintf(g_status,sizeof g_status,"Enter a name without / or control characters.");return;}
+    char full[1024];
+    if(!join(full, sizeof full, g_newname))return;
     if (embk_mkdir(full) >= 0) snprintf(g_status, sizeof g_status, "Created %s", g_newname);
     else                       snprintf(g_status, sizeof g_status, "Could not create %s here", g_newname);
     g_newname[0] = 0; g_naming = false; g_dirty = true;
@@ -194,8 +203,8 @@ static void create_folder(void) {
 static void do_delete(int i) {
     if (i < 0 || i >= g_count) return;
     struct entry *e = &g_entries[i];
-    char full[600];
-    join(full, sizeof full, e->name);
+    char full[1024];
+    if(!join(full, sizeof full, e->name))return;
     int rc = e->is_dir ? embk_rmdir(full) : embk_unlink(full);
     if (rc >= 0) snprintf(g_status, sizeof g_status, "Deleted %s", e->name);
     else if (e->is_dir)
@@ -205,11 +214,12 @@ static void do_delete(int i) {
 }
 
 static void do_rename(int i) {
-    if (i < 0 || i >= g_count || !g_rename_to[0]) return;
-    char from[600], to[600];
-    join(from, sizeof from, g_entries[i].name);
-    join(to,   sizeof to,   g_rename_to);
-    if (rename(from, to) == 0) snprintf(g_status, sizeof g_status, "Renamed to %s", g_rename_to);
+    em_flush();
+    if (i < 0 || i >= g_count || !embk_file_valid_name(g_rename_to)) return;
+    char from[1024], to[1024];
+    if(!join(from, sizeof from, g_entries[i].name))return;
+    if(!join(to,   sizeof to,   g_rename_to))return;
+    if (embk_file_move(from, to) == 0) snprintf(g_status, sizeof g_status, "Renamed to %s", g_rename_to);
     else snprintf(g_status, sizeof g_status, "Could not rename (does %s exist?)", g_rename_to);
     g_dirty = true;
 }
@@ -217,24 +227,51 @@ static void do_rename(int i) {
 /* Copy is two verbs: remembering a source, then writing it somewhere. Only
  * files -- copying a directory means walking it, and a half-copied tree is a
  * worse outcome than a refusal. */
-static void do_paste(void) {
-    if (!g_clip_path[0]) return;
-    char dest[600];
-    join(dest, sizeof dest, g_clip_name);
-    int in = (int)embk_open(g_clip_path, EMBK_O_RDONLY, 0);
-    if (in < 0) { snprintf(g_status, sizeof g_status, "Cannot read %s", g_clip_name); return; }
-    int out = (int)embk_open(dest, EMBK_O_WRONLY | EMBK_O_CREAT | EMBK_O_TRUNC, 0644);
-    if (out < 0) { embk_close(in);
-        snprintf(g_status, sizeof g_status, "Cannot write here"); return; }
-    static char buf[8192];
-    int64_t n, total = 0; int ok = 1;
-    while ((n = embk_read(in, buf, sizeof buf)) > 0) {
-        if (embk_write(out, buf, (size_t)n) != n) { ok = 0; break; }
-        total += n;
+static void clipboard_refresh(void) {
+    char payload[1024];int64_t n=embk_clip_get(payload,sizeof payload-1);
+    if(n<0)return;
+    g_clip_path[0]=g_clip_name[0]=0;
+    const char *prefix="EMBLINK_FILES_V1\n";size_t len=strlen(prefix);
+    if(n<=(int64_t)(len+2) || n>=(int64_t)sizeof payload)return;
+    payload[n]=0;
+    if(memcmp(payload,prefix,len) || (payload[len]!='C' && payload[len]!='M') || payload[len+1]!='\n')return;
+    const char *path=payload+len+2,*base=strrchr(path,'/');
+    if(path[0]!='/' || !base || !embk_file_valid_name(base+1) || strlen(path)>=sizeof g_clip_path)return;
+    snprintf(g_clip_path,sizeof g_clip_path,"%s",path);snprintf(g_clip_name,sizeof g_clip_name,"%s",base+1);
+    g_clip_cut=payload[len]=='M';
+}
+static void copy_selection(int i,int cut) {
+    if(i<0 || i>=g_count)return;
+    char path[1024],payload[1100];if(!join(path,sizeof path,g_entries[i].name))return;
+    snprintf(payload,sizeof payload,"EMBLINK_FILES_V1\n%c\n%s",cut?'M':'C',path);
+    if(!embk_clip_set(payload,strlen(payload))) {
+        clipboard_refresh();snprintf(g_status,sizeof g_status,cut?"Ready to move %.85s":"Copied %.85s",g_entries[i].name);
     }
-    embk_close(in); embk_close(out);
-    snprintf(g_status, sizeof g_status, ok ? "Copied %s" : "Copy of %s failed", g_clip_name);
-    g_dirty = true;
+}
+static void do_paste(void) {
+    if(!g_clip_path[0])return;
+    char dest[1024];if(!join(dest,sizeof dest,g_clip_name))return;
+    int rc=g_clip_cut?embk_file_move(g_clip_path,dest):embk_file_copy(g_clip_path,dest);
+    if(!rc) {
+        snprintf(g_status,sizeof g_status,g_clip_cut?"Moved %.85s":"Copied %.85s",g_clip_name);
+        if(g_clip_cut) {embk_clip_set(NULL,0);clipboard_refresh();}
+    } else snprintf(g_status,sizeof g_status,"Could not paste: %.95s",strerror(errno));
+    if(!rc)embk_notify_send(0,"Files",g_status);
+    g_dirty=true;
+}
+static void trash_selection(int i) {
+    if(i<0 || i>=g_count)return;
+    const char *home=getenv("HOME");char path[1024];if(!join(path,sizeof path,g_entries[i].name))return;
+    if(home && !embk_file_trash(path,home,g_undo_trash,sizeof g_undo_trash))
+        snprintf(g_status,sizeof g_status,"Moved %.85s to Trash",g_entries[i].name);
+    else snprintf(g_status,sizeof g_status,"Could not move to Trash: %.80s",strerror(errno));
+    g_dirty=true;
+}
+static void restore_record(const char *path) {
+    const char *home=getenv("HOME");
+    if(home && !embk_file_restore(path,home)) {snprintf(g_status,sizeof g_status,"Restored to its original folder");g_undo_trash[0]=0;}
+    else snprintf(g_status,sizeof g_status,"Could not restore: %.95s",strerror(errno));
+    g_dirty=true;
 }
 
 /* ---- naming things ----------------------------------------------------- */
@@ -386,6 +423,8 @@ static void app(void) {
         if (start && start[0] == '/') snprintf(g_cwd, sizeof g_cwd, "%s", start);
         g_initialized = true;
     }
+    for(unsigned i=0;i<32;i++)if(g_editors[i] && embk_proc_alive(g_editors[i])<=0) {embk_wait(g_editors[i]);g_editors[i]=0;}
+    clipboard_refresh();
     if (g_dirty) { read_dir(); g_dirty = false; }
     build_visible();
     rc_begin();
@@ -450,6 +489,7 @@ static void app(void) {
                                 .color(ui_theme()->text).clicked()) {
                             g_naming = true; g_newname[0] = 0;
                         }
+                        if(g_undo_trash[0] && Button("Undo Trash").ghost().clicked()) restore_record(g_undo_trash);
                         /* Paste acts on the FOLDER you are in, so it belongs on
                          * the toolbar; the per-item verbs live in the context
                          * menu. It only appears when there is something to
@@ -544,15 +584,11 @@ static void app(void) {
                             if (e->is_dir) enter_dir(e->name); else open_file(e->name);
                         }
                         MenuSeparator();
-                        if (MenuItem("Copy")) {
-                            if (e->is_dir) snprintf(g_status, sizeof g_status,
-                                                    "Copying folders is not supported yet");
-                            else {
-                                join(g_clip_path, sizeof g_clip_path, e->name);
-                                snprintf(g_clip_name, sizeof g_clip_name, "%s", e->name);
-                                snprintf(g_status, sizeof g_status, "Copied %s", e->name);
-                            }
-                        }
+                        if (MenuItem("Copy")) copy_selection(g_menu_i,0);
+                        if (MenuItem("Cut")) copy_selection(g_menu_i,1);
+                        if(!strcmp(g_cwd,trash)) {
+                            if(MenuItem("Restore")) {char path[1024];if(join(path,sizeof path,e->name))restore_record(path);}
+                        } else if(MenuItem("Move to Trash")) trash_selection(g_menu_i);
                         if (MenuItem("Rename...")) {
                             snprintf(g_rename_to, sizeof g_rename_to, "%s", e->name);
                             g_renaming = true;

@@ -11,6 +11,9 @@
 static uint8_t    g_clip[CLIPBOARD_MAX];
 static size_t     g_clip_len;
 static spinlock_t g_clip_lock;
+void clipboard_clear(void) {
+    spin_lock(&g_clip_lock);memset(g_clip,0,sizeof g_clip);g_clip_len=0;spin_unlock(&g_clip_lock);
+}
 
 int64_t clipboard_set_user(const void *ubuf, size_t len) {
     if (len > CLIPBOARD_MAX) return -EMBK_EINVAL;

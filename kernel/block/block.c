@@ -1,4 +1,5 @@
 #include "block/block.h"
+#include "block/partition.h"
 #include "process/ksync.h"      /* the bounce buffer needs a SLEEPING lock: a mutex */
 #include "include/kprintf.h"
 #include "include/errno.h"
@@ -14,6 +15,24 @@
 // The registry: pointers to all registered block devices.
 static struct embk_block_device *devices[BLOCK_MAX_DEVICES];
 static uint32_t device_count = 0;
+static struct embk_block_identity identities[BLOCK_MAX_DEVICES];
+static void identity_string(char *out,unsigned cap,const char *in) {
+    unsigned n=0;
+    while(in && in[n] && n+1<cap) {unsigned char c=in[n];out[n]=c>=32 && c<127?(char)c:'?';n++;}
+    while(n && out[n-1]==' ')n--;
+    out[n]=0;
+}
+void embk_block_set_identity(struct embk_block_device *dev,const char *transport,const char *model,const char *serial) {
+    for(unsigned i=0;i<device_count;i++)if(devices[i]==dev) {
+        identity_string(identities[i].transport,sizeof identities[i].transport,transport);
+        identity_string(identities[i].model,sizeof identities[i].model,model);
+        identity_string(identities[i].serial,sizeof identities[i].serial,serial);return;
+    }
+}
+const struct embk_block_identity *embk_block_identity(const struct embk_block_device *dev) {
+    for(unsigned i=0;i<device_count;i++)if(devices[i]==dev)return &identities[i];
+    return NULL;
+}
 
 // Whole-disk letter counter. Only auto-named disks consume a letter (sda, sdb,
 // ...). Partitions name themselves (sda1, sda2, ...) and must NOT advance this,
@@ -114,6 +133,7 @@ int embk_block_register(struct embk_block_device *dev) {
         disk_letters++;
     }
 
+    dev->durability_pending = false;
     devices[device_count++] = dev;
 
     kprintf("block: registered %s (%u blocks x %u bytes = %u KB)\n",
@@ -150,7 +170,7 @@ int embk_block_read(struct embk_block_device *dev,
     if (!dev || !dev->read) return -EMBK_ENODEV;
     if (!buffer)            return -EMBK_EFAULT;
     if (count == 0)         return EMBK_OK;
-    if (lba + count > dev->block_count) {
+    if (lba >= dev->block_count || count > dev->block_count - lba) {
         kprintf("block: %s read out of range\n", dev->name);
         return -EMBK_ERANGE;
     }
@@ -190,16 +210,18 @@ int embk_block_read(struct embk_block_device *dev,
 
 // Write to a block device. Uses the same bounce buffer as read.
 // If buffer is not DMA-safe, copies to bounce buffer first.
-int embk_block_write(struct embk_block_device *dev,
+static int block_write_impl(struct embk_block_device *dev,
                      uint64_t lba, uint32_t count, const void *buffer) {
     if (!dev || !dev->write) return -EMBK_ENODEV;
     if (!buffer)             return -EMBK_EFAULT;
     if (count == 0)          return EMBK_OK;
-    if (lba + count > dev->block_count) {
+    if (lba >= dev->block_count || count > dev->block_count - lba) {
         kprintf("block: %s write out of range\n", dev->name);
         return -EMBK_ERANGE;
     }
 
+    /* A submitted transfer can fail after modifying only some sectors. */
+    dev->durability_pending=true;
     if (buffer_dma_ok(dev, buffer)) {
         return dev->write(dev, lba, count, buffer);
     }
@@ -223,8 +245,57 @@ int embk_block_write(struct embk_block_device *dev,
 
 // Drain the device's write-back cache. A device with no flush op is assumed to
 // have no cache to drain, so the barrier is a no-op (success) there.
-int embk_block_flush(struct embk_block_device *dev) {
+static int block_flush_impl(struct embk_block_device *dev) {
     if (!dev)        return -EMBK_ENODEV;
     if (!dev->flush) return EMBK_OK;
     return dev->flush(dev);
+}
+
+/* Serialize writes with flush/freeze, including partition -> parent recursion.
+ * Owner identity is published atomically; only its thread touches depth. */
+static struct mutex write_gate = MUTEX_INIT;
+static uintptr_t write_owner;
+static unsigned write_depth;
+static bool writes_frozen;
+static void gate_lock(void) {
+    uintptr_t me=(uintptr_t)current_thread;
+    if(!me) me=1; /* early, single-threaded boot */
+    if(__atomic_load_n(&write_owner,__ATOMIC_ACQUIRE)==me) {write_depth++;return;}
+    mutex_lock(&write_gate);
+    write_depth=1;
+    __atomic_store_n(&write_owner,me,__ATOMIC_RELEASE);
+}
+static void gate_unlock(void) {
+    if(--write_depth) return;
+    __atomic_store_n(&write_owner,0,__ATOMIC_RELEASE);
+    mutex_unlock(&write_gate);
+}
+int embk_block_write(struct embk_block_device *dev,uint64_t lba,uint32_t count,const void *buf) {
+    gate_lock();
+    int rc;
+    if(writes_frozen) rc=-EMBK_EROFS;
+    else {
+        rc=block_write_impl(dev,lba,count,buf);
+    }
+    gate_unlock();return rc;
+}
+int embk_block_flush(struct embk_block_device *dev) {
+    gate_lock();
+    int rc=block_flush_impl(dev);
+    if(!rc && dev && dev->flush) dev->durability_pending=false;
+    gate_unlock();return rc;
+}
+void embk_block_freeze_writes(void) {gate_lock();writes_frozen=true;gate_unlock();}
+void embk_block_thaw_writes(void) {gate_lock();writes_frozen=false;gate_unlock();}
+int embk_block_sync_dirty(void) {
+    gate_lock();
+    int rc=0;
+    for(unsigned i=0;i<device_count;i++) {
+        struct embk_block_device *d=devices[i];
+        if(embk_partition_parent(d)!=d || !d->durability_pending) continue;
+        if(!d->flush) rc=-EMBK_ENOTSUP;
+        else rc=embk_block_flush(d);
+        if(rc) {kprintf("power: disk %s cannot synchronize (%d)\n",d->name,rc);break;}
+    }
+    gate_unlock();return rc;
 }

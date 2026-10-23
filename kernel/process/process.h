@@ -292,6 +292,8 @@ struct thread {
                              * only given an environment when its parent passes
                              * one (see spawn.h). Guarded by has_argv, which is
                              * set on the same path. */
+    uint32_t syscall_depth;    /* protected by scheduler lock; teardown boundary */
+
 };
 
 /* The resource owner: address space, pid, parent/child tracking, fd/handle
@@ -302,6 +304,8 @@ struct thread {
  * how a fresh/reaped thread slot is marked PROCESS_UNUSED). */
 struct process {
     uint32_t pid;              /**< Process ID. 0 means this slot is free. */
+    uint32_t session_id;       /* inherited desktop epoch; survives orphaning */
+    bool constructing;        /* user image not yet published to scheduler */
     uint64_t pml4_phys;        /**< Physical address of this process's PML4 (page table) */
 
     /** Cancellation: "stop what you are doing" — see docs/INTERRUPTION.md.
@@ -587,6 +591,8 @@ void process_reap(uint32_t pid);
  * Returns NULL if no such pid exists (never existed, or already reaped).
  */
 struct process *process_find(uint32_t pid);
+int process_end_session(uint32_t epoch,uint32_t controller);
+int process_test_session_drain(void);
 
 /**
  * @brief Block the given thread on a wait queue.

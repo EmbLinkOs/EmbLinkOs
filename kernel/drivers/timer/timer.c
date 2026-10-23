@@ -128,5 +128,6 @@ uint64_t timer_uptime_ms(void) {
             return hpet_read_counter() / tpms;
         }
     }
-    return timer_get_ticks();
+    if(tsc_get_freq_hz())return time_get_us()/1000;
+    return timer_get_ticks()*10;
 }

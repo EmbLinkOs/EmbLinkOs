@@ -19,9 +19,9 @@ struct entry { char label[LABEL_MAX]; int enabled; };
  * visible, marked "(soon)" and inert until their milestones land. */
 static const struct entry entries[MENU_ENTRY_COUNT] = {
     { "Boot EmbLinkOS",           1 },
-    { "Recovery",                 0 },
-    { "Diagnostics",              0 },
-    { "Firmware Update",          0 },
+    { "Recovery",                 1 },
+    { "Diagnostics",              1 },
+    { "Try the live desktop",     1 },
     { "Boot Manager",             0 },
     { "Secure Boot Verification", 0 },
 };

@@ -676,7 +676,9 @@ int embkfs_run_snapreg_selftests(void);
 int embkfs_run_provenance_selftests(void);
 int embkfs_run_verifyboot_selftests(void);
 int embkfs_run_namespace_selftests(void);
+int embkfs_vfs_run_sync_selftests(void);
 int embkfs_run_boot_diagnostics(void);
+int embkfs_check(struct embkfs_volume *);
 
 /* Snapshots (v2.2 Phase 5b). `out_items`/`max` may be NULL/0 to just get
  * *out_n. `name` is truncated to EMBKFS_SNAPSHOT_NAME_MAX bytes. */
@@ -733,8 +735,9 @@ int embkfs_rmdir_name(struct embkfs_volume *vol, uint64_t dir_oid,
 int embkfs_rmdir_path(struct embkfs_volume *vol, uint64_t start_dir_oid,
                       const char *path);
 
-/* Rename/move an entry from (old_dir, old_name) to (new_dir, new_name).
- * Fails with -EMBK_EEXIST if destination already exists. */
+/* Rename/move an entry atomically, replacing an existing non-directory
+ * destination. Both entry points hold the filesystem lock through resolution
+ * and commit; callers may already own that recursive lock. */
 int embkfs_rename_name(struct embkfs_volume *vol,
                        uint64_t old_dir_oid, const char *old_name,
                        uint64_t new_dir_oid, const char *new_name);

@@ -12,6 +12,7 @@
 #include "include/kprintf.h"
 #include "include/errno.h"
 #include "process/process.h"   /* sched_lock/sched_block_current_locked/wait_queue */
+#include "block/partition.h"
 
 /* THE EMBKFS BIG LOCK now lives in embkfs.c, with the state it protects (the
  * shared static scratch buffers and the per-volume read cache) -- see the long
@@ -444,6 +445,53 @@ static int embkfs_vfs_chmod(struct vnode *vn, uint32_t mode)
     return rc;
 }
 
+static int embkfs_vfs_sync(struct vnode *vn)
+{
+    if (!vn || !vn->mnt || !vn->mnt->fs_data) return -EMBK_EINVAL;
+    fs_lock();
+    struct embkfs_volume *vol = vol_of(vn);
+    struct embk_block_device *disk = vol->dev ? embk_partition_parent(vol->dev) : NULL;
+    /* EMBKFS commits are write-through; no dirty inode/page state remains.
+     * Device caches still need a barrier. A partition's forwarding callback
+     * must not disguise a parent driver without a flush implementation. */
+    int rc = !disk ? -EMBK_ENODEV
+           : !disk->flush ? -EMBK_ENOTSUP : embk_block_flush(vol->dev);
+    fs_unlock();
+    return rc;
+}
+
+static int sync_test_calls, sync_test_result;
+static int sync_test_flush(struct embk_block_device *dev)
+{
+    (void)dev;
+    sync_test_calls++;
+    return sync_test_result;
+}
+
+int embkfs_vfs_run_sync_selftests(void)
+{
+    /* Exercise the real adapter with a faulting device, not a success stub.
+     * This volume is private: no writes or changes to a mounted disk. */
+    static struct embkfs_volume volume;
+    struct embk_block_device disk = { .flush = sync_test_flush };
+    struct vfs_mount mount = { .fs_data = &volume };
+    struct vnode vn = { .mnt = &mount };
+    volume.dev = &disk;
+    sync_test_calls = 0;
+    sync_test_result = -EMBK_EIO;
+    int ok = embkfs_vfs_sync(&vn) == -EMBK_EIO && sync_test_calls == 1;
+    sync_test_result = EMBK_OK;
+    ok = embkfs_vfs_sync(&vn) == EMBK_OK && sync_test_calls == 2 && ok;
+    disk.flush = NULL;
+    ok = embkfs_vfs_sync(&vn) == -EMBK_ENOTSUP && sync_test_calls == 2 && ok;
+    volume.dev = NULL;
+    ok = embkfs_vfs_sync(&vn) == -EMBK_ENODEV && ok;
+    ok = embkfs_vfs_sync(NULL) == -EMBK_EINVAL && ok;
+    kprintf("EMBKFS sync: %d device calls; errors and unsupported devices %s\n",
+            sync_test_calls, ok ? "propagated" : "FAIL");
+    return ok ? EMBK_OK : -EMBK_EIO;
+}
+
 static const struct vfs_ops embkfs_vfs_ops = {
     .lookup = embkfs_vfs_lookup,
     .readdir = embkfs_vfs_readdir,
@@ -460,6 +508,7 @@ static const struct vfs_ops embkfs_vfs_ops = {
     .vget = embkfs_vfs_vget,
     .obj_get = embkfs_vfs_obj_get,
     .obj_put = embkfs_vfs_obj_put,
+    .sync = embkfs_vfs_sync,
 };
 
 /* Mount an already-opened EMBKFS volume into the VFS at `path`. */

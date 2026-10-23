@@ -200,22 +200,29 @@ void aes128_encrypt_block(const struct aes128_ctx *ctx, const uint8_t in[AES_BLO
     encrypt_block(ctx->round_keys, AES128_NR, in, out);
 }
 
-void aes256_decrypt_block(const struct aes256_ctx *ctx, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]) {
+static void decrypt_block(const uint8_t *rk, unsigned nr, const uint8_t in[AES_BLOCK_SIZE], uint8_t out[AES_BLOCK_SIZE]) {
     uint8_t state[16];
     memcpy(state, in, 16);
 
-    add_round_key(state, ctx->round_keys + AES256_NR * 16);
-    for (int round = AES256_NR - 1; round >= 1; round--) {
+    add_round_key(state, rk + nr * 16);
+    for (int round = (int)nr - 1; round >= 1; round--) {
         inv_shift_rows(state);
         inv_sub_bytes(state);
-        add_round_key(state, ctx->round_keys + round * 16);
+        add_round_key(state, rk + round * 16);
         inv_mix_columns(state);
     }
     inv_shift_rows(state);
     inv_sub_bytes(state);
-    add_round_key(state, ctx->round_keys);
+    add_round_key(state, rk);
 
     memcpy(out, state, 16);
+}
+
+void aes256_decrypt_block(const struct aes256_ctx *ctx,const uint8_t in[16],uint8_t out[16]) {
+    decrypt_block(ctx->round_keys,AES256_NR,in,out);
+}
+void aes128_decrypt_block(const struct aes128_ctx *ctx,const uint8_t in[16],uint8_t out[16]) {
+    decrypt_block(ctx->round_keys,AES128_NR,in,out);
 }
 
 static bool bytes_eq_hex(const uint8_t *bytes, size_t len, const char *hex) {

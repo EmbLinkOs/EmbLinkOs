@@ -7,7 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#define AUTH_ITERATIONS 4096u
+#define AUTH_ITERATIONS 100000u
+#define AUTH_ITERATIONS_MAX 1000000u
 #define SHA256_BLOCK 64
 #define SHA256_SIZE 32
 
@@ -74,16 +75,28 @@ static void derive(const char *password,const uint8_t salt[16],uint32_t iteratio
     hmac((const uint8_t*)password,strlen(password),block,sizeof block,u);memcpy(out,u,32);
     for(uint32_t j=1;j<iterations;j++){hmac((const uint8_t*)password,strlen(password),u,32,u);for(int i=0;i<32;i++)out[i]^=u[i];}
 }
+static void wipe(void *p,size_t n) {volatile uint8_t *b=p;while(n--) *b++=0;}
 static int read_text(const char *path,char *buf,size_t cap){
-    int fd=(int)embk_open(path,EMBK_O_RDONLY,0);if(fd<0)return -1;size_t off=0;
-    while(off+1<cap){int64_t n=embk_read(fd,buf+off,cap-1-off);if(n<=0)break;off+=(size_t)n;}
-    embk_close(fd);buf[off]=0;return (int)off;
+    int fd=(int)embk_open(path,EMBK_O_RDONLY,0);if(fd<0)return -1;size_t off=0;int ok=1;
+    while(off+1<cap){int64_t n=embk_read(fd,buf+off,cap-1-off);if(n<0){ok=0;break;}if(!n)break;off+=(size_t)n;}
+    char extra;if(off+1==cap && embk_read(fd,&extra,1)!=0)ok=0;
+    embk_close(fd);buf[off]=0;return ok?(int)off:-1;
 }
-static int append_text(const char *path,const char *line){
-    int fd=(int)embk_open(path,EMBK_O_WRONLY,0);if(fd<0)return -1;
-    if(embk_lseek(fd,0,EMBK_SEEK_END)<0){embk_close(fd);return -1;}
-    size_t len=strlen(line),off=0;while(off<len){int64_t n=embk_write(fd,line+off,len-off);if(n<=0){embk_close(fd);return -1;}off+=(size_t)n;}
-    embk_close(fd);return 0;
+static int prepare_text(const char *path,const char *data,size_t n,char *temp,size_t cap) {
+    if(snprintf(temp,cap,"%s.pending",path)>=(int)cap)return -1;
+    int fd=(int)embk_open(temp,EMBK_O_CREAT|EMBK_O_TRUNC|EMBK_O_WRONLY,0600);
+    if(fd<0)return -1;
+    size_t off=0;int rc=0;
+    while(off<n){int64_t got=embk_write(fd,data+off,n-off);if(got<=0){rc=-1;break;}off+=(size_t)got;}
+    if(!rc && fsync(fd)<0)rc=-1;
+    if(embk_close(fd)<0)rc=-1;
+    if(rc)embk_unlink(temp);
+    return rc;
+}
+static int commit_text(const char *temp,const char *path) {
+    if(rename(temp,path)<0)return -1;
+    int fd=(int)embk_open(path,EMBK_O_RDONLY,0);if(fd<0)return -1;
+    int rc=fsync(fd)<0?-1:0;embk_close(fd);return rc;
 }
 static char hex_digit(unsigned v){return (char)(v<10?'0'+v:'a'+v-10);}
 static void to_hex(const uint8_t *in,size_t n,char *out){
@@ -100,7 +113,10 @@ static int from_hex(const char *in,size_t n,uint8_t *out){
 }
 static const char *shadow_record(const char *text,const char *u){
     size_t un=strlen(u);const char *p=text;
-    while(*p){if(!memcmp(p,u,un)&&p[un]==':')return p+un+1;while(*p&&*p!='\n')p++;if(*p)p++;}
+    while(*p){const char *end=strchr(p,'\n');if(!end)end=p+strlen(p);
+        if((size_t)(end-p)>un && !memcmp(p,u,un)&&p[un]==':')return p+un+1;
+        p=*end?end+1:end;
+    }
     return NULL;
 }
 int embk_auth_valid_username(const char *u){
@@ -113,31 +129,54 @@ int embk_auth_has_accounts(void){
 }
 int embk_auth_create(const char *u,const char *password){
     if(!embk_auth_valid_username(u)||strlen(password)<8||strlen(password)>EMBK_AUTH_PASSWORD_MAX)return -1;
-    char shadow[8192];int shadow_len=read_text(EMBK_AUTH_SHADOW,shadow,sizeof shadow);if(shadow_len<0)return -4;
-    if(shadow_record(shadow,u))return -2;
-    uint8_t salt[16],digest[32];if(getentropy(salt,sizeof salt)!=0)return -3;
+    char shadow[8192],passwd[8192],stmp[128]={0},ptmp[128]={0};
+    uint8_t salt[16]={0},digest[32]={0};int rc=-4;
+    int sn=read_text(EMBK_AUTH_SHADOW,shadow,sizeof shadow),pn=read_text(EMBK_AUTH_PASSWD,passwd,sizeof passwd);
+    if(sn<0||pn<0)goto out;
+    if(shadow_record(shadow,u)){rc=-2;goto out;}
+    if(getentropy(salt,sizeof salt)!=0){rc=-3;goto out;}
     derive(password,salt,AUTH_ITERATIONS,digest);
-    char salt_hex[33],digest_hex[65],line[192],passwd_line[192];
-    to_hex(salt,sizeof salt,salt_hex);to_hex(digest,sizeof digest,digest_hex);
-    snprintf(line,sizeof line,"%s:$pbkdf2-sha256$%u$%s$%s:0:0:99999:7:::\n",
-             u,AUTH_ITERATIONS,salt_hex,digest_hex);
-    int users=0;for(int i=0;i<shadow_len;i++)if(shadow[i]=='\n')users++;
-    snprintf(passwd_line,sizeof passwd_line,"%s:x:%d:%d:%s:/home/%s:/system/bin/shell.elf\n",
-             u,1000+users,1000+users,u,u);
-    if(append_text(EMBK_AUTH_PASSWD,passwd_line)<0)return -4;
-    if(append_text(EMBK_AUTH_SHADOW,line)<0)return -5;
-    memset(salt,0,sizeof salt);memset(digest,0,sizeof digest);memset(shadow,0,sizeof shadow);return 0;
+    char salt_hex[33],digest_hex[65],line[192];to_hex(salt,sizeof salt,salt_hex);to_hex(digest,sizeof digest,digest_hex);
+    int added=snprintf(line,sizeof line,"%s:$pbkdf2-sha256$%u$%s$%s:0:0:99999:7:::\n",u,AUTH_ITERATIONS,salt_hex,digest_hex);
+    if(added<=0||(size_t)sn+(size_t)added>=sizeof shadow)goto out;
+    memcpy(shadow+sn,line,(size_t)added+1);sn+=added;
+    /* A previous interrupted creation may have committed passwd but not shadow.
+     * Reuse that entry; the shadow record is the authentication commit point. */
+    if(!shadow_record(passwd,u)) {
+        unsigned users=0;for(int i=0;i<pn;i++)if(passwd[i]=='\n')users++;
+        added=snprintf(line,sizeof line,"%s:x:%u:%u:%s:/home/%s:/system/bin/shell.elf\n",u,1000+users,1000+users,u,u);
+        if(added<=0||(size_t)pn+(size_t)added>=sizeof passwd)goto out;
+        memcpy(passwd+pn,line,(size_t)added+1);pn+=added;
+    }
+    if(prepare_text(EMBK_AUTH_PASSWD,passwd,pn,ptmp,sizeof ptmp) ||
+       prepare_text(EMBK_AUTH_SHADOW,shadow,sn,stmp,sizeof stmp))goto out;
+    if(commit_text(ptmp,EMBK_AUTH_PASSWD))goto out;
+    if(commit_text(stmp,EMBK_AUTH_SHADOW)){rc=-5;goto out;}
+    rc=0;
+out:
+    if(ptmp[0])embk_unlink(ptmp);
+    if(stmp[0])embk_unlink(stmp);
+    wipe(salt,sizeof salt);wipe(digest,sizeof digest);wipe(shadow,sizeof shadow);wipe(passwd,sizeof passwd);
+    return rc;
 }
 int embk_auth_verify(const char *u,const char *password){
     if(!embk_auth_valid_username(u)||strlen(password)>EMBK_AUTH_PASSWORD_MAX)return 0;
-    char shadow[8192];if(read_text(EMBK_AUTH_SHADOW,shadow,sizeof shadow)<0)return 0;
-    const char *p=shadow_record(shadow,u),*prefix="$pbkdf2-sha256$";if(!p||memcmp(p,prefix,15)!=0)return 0;p+=15;
-    char *end;uint32_t iterations=(uint32_t)strtoul(p,&end,10);if(!iterations||*end!='$')return 0;p=end+1;
-    if(strlen(p)<33||p[32]!='$')return 0;
-    uint8_t salt[16],expected[32],got[32];
-    if(from_hex(p,16,salt)<0)return 0;
-    p+=33;
-    if(strlen(p)<64||from_hex(p,32,expected)<0)return 0;
-    derive(password,salt,iterations,got);uint8_t diff=0;for(int i=0;i<32;i++)diff|=got[i]^expected[i];
-    memset(got,0,sizeof got);memset(expected,0,sizeof expected);memset(shadow,0,sizeof shadow);return diff==0;
+    char shadow[8192];uint8_t salt[16]={0},expected[32]={0},got[32]={0};int ok=0;
+    if(read_text(EMBK_AUTH_SHADOW,shadow,sizeof shadow)<0)goto out;
+    const char *p=shadow_record(shadow,u),*prefix="$pbkdf2-sha256$";
+    if(!p)goto out;
+    const char *line_end=strchr(p,'\n');if(!line_end)line_end=p+strlen(p);
+    if(line_end-p<15 || memcmp(p,prefix,15))goto out;
+    p+=15;
+    uint32_t iterations=0;unsigned digits=0;
+    while(p<line_end && *p>='0' && *p<='9') {
+        if(++digits>7 || iterations>AUTH_ITERATIONS_MAX/10)goto out;
+        iterations=iterations*10+(unsigned)(*p++-'0');
+    }
+    if(!digits || !iterations || iterations>AUTH_ITERATIONS_MAX || p>=line_end || *p++!='$')goto out;
+    if(line_end-p<98 || p[32]!='$' || p[97]!=':')goto out;
+    if(from_hex(p,16,salt)<0 || from_hex(p+33,32,expected)<0)goto out;
+    derive(password,salt,iterations,got);uint8_t diff=0;for(int i=0;i<32;i++)diff|=got[i]^expected[i];ok=diff==0;
+out:
+    wipe(salt,sizeof salt);wipe(got,sizeof got);wipe(expected,sizeof expected);wipe(shadow,sizeof shadow);return ok;
 }

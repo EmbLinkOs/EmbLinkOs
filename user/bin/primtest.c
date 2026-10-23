@@ -1088,6 +1088,96 @@ static int ui_scen_routing(void)
     return 0;
 }
 
+/* Cancellation must unwind real IPC sleepers without committing a pending
+ * MOVE or consuming a message. Each child signals only after setup, immediately
+ * before entering the operation that the parent cancels. */
+static volatile int cancel_join_stop;
+static void cancel_join_worker(long unused)
+{
+    (void)unused;
+    while (!cancel_join_stop) embk_yield();
+    embk_thread_exit(0);
+}
+static void ipc_cancel_child(const char *mode)
+{
+    int h[2], listener = -1;
+    long tid = -1;
+    unsigned len = 0, nh = 0;
+    char byte;
+    if (embk_streq(mode, "accept")) {
+        listener = embk_chan_listen("/run/cancel-accept-test");
+        if (listener < 0) embk_exit(1);
+    } else if (embk_streq(mode, "join")) {
+        tid = embk_thread_create(cancel_join_worker, 0);
+        if (tid < 0) embk_exit(2);
+    } else {
+        if (embk_chan_pair(h)) embk_exit(3);
+        if (embk_streq(mode, "send"))
+            for (int i = 0; i < 32; i++)
+                if (embk_chan_send(h[0], "q", 1, 0, 0, 0)) embk_exit(4);
+    }
+    if (embk_write(3, "R", 1) != 1) embk_exit(5);
+    int rc;
+    if (listener >= 0) rc = embk_chan_accept(listener);
+    else if (tid >= 0) rc = (int)embk_thread_join((int)tid);
+    else if (embk_streq(mode, "send")) {
+        int move = EMBK_CHAN_HANDLE_MOVE;
+        rc = embk_chan_send(h[0], "cancelled", 9, &h[0], &move, 1);
+    } else rc = embk_chan_recv(h[0], &byte, 1, &len, 0, &nh);
+    if (rc != -125 || !embk_cancelled()) embk_exit(6);
+    if (listener >= 0) {
+        int client = embk_chan_connect("/run/cancel-accept-test");
+        int accepted = embk_chan_accept(listener);
+        if (client < 0 || accepted < 0) embk_exit(7);
+        embk_chan_close(client);embk_chan_close(accepted);embk_close_handle(listener);
+    } else if (tid >= 0) {
+        cancel_join_stop = 1;
+        uint64_t end = embk_uptime_ms() + 5000;
+        do {
+            rc = (int)embk_thread_join((int)tid);
+            if (embk_uptime_ms() > end) embk_exit(8);
+            if (rc == -125) embk_yield();
+        } while (rc == -125);
+        if (rc) embk_exit(9);
+    } else {
+        if (embk_streq(mode, "send")) {
+            if (embk_chan_recv(h[1], &byte, 1, &len, 0, &nh) || byte != 'q' || nh) embk_exit(10);
+            if (embk_chan_send(h[0], "x", 1, 0, 0, 0)) embk_exit(11);
+        } else {
+            if (embk_chan_send(h[1], "x", 1, 0, 0, 0)) embk_exit(12);
+            if (embk_chan_recv(h[0], &byte, 1, &len, 0, &nh) || byte != 'x') embk_exit(13);
+        }
+        if (embk_chan_close(h[0]) || embk_chan_close(h[1])) embk_exit(14);
+    }
+    embk_exit(0);
+}
+static void ipc_cancel_role(void)
+{
+    const char *modes[] = {"accept", "recv", "send", "join"};
+    for (int i = 0; i < 4; i++) {
+        int p[2];
+        if (embk_pipe(p) || embk_fd_install_obj(p[0], 4) < 0) embk_exit(20);
+        struct embk_spawn_file_action act = {0};
+        act.kind = EMBK_SPAWN_ACTION_INSTALL_OBJ;act.target_fd = 3;act.src_obj_handle = p[1];
+        char *args[] = {"/system/bin/primtest.elf", "ipc-cancel-child", (char *)modes[i], 0};
+        int child = (int)embk_spawn(args[0], args, &act, 1);
+        if (child < 0) embk_exit(21);
+        uint64_t end = embk_uptime_ms() + 10000;
+        while (!embk_fd_avail(4) && embk_proc_alive(child) && embk_uptime_ms() < end) embk_sleep_ms(10);
+        char ready = 0;
+        int ok = embk_fd_avail(4) > 0 && embk_read(4, &ready, 1) == 1 && ready == 'R';
+        embk_sleep_ms(300);
+        if (!ok || embk_cancel(child)) {embk_kill(child);embk_wait(child);embk_exit(22);}
+        end = embk_uptime_ms() + 5000;
+        while (embk_proc_alive(child) && embk_uptime_ms() < end) embk_sleep_ms(10);
+        if (embk_proc_alive(child)) {embk_kill(child);embk_wait(child);embk_exit(23+i);}
+        if (embk_wait(child)) embk_exit(30+i);
+        embk_close(4);embk_close_handle(p[0]);embk_close_handle(p[1]);
+        embk_puts(1, "IPC cancel: ");embk_puts(1, modes[i]);embk_puts(1, " OK\n");
+    }
+    embk_exit(0);
+}
+
 static void ui_proto_role(const char *scen)
 {
     int rc;
@@ -1122,6 +1212,8 @@ void _start(long argc, char **argv, char **envp)
         if (embk_streq(argv[1], "mu-child"))       mu_child();
         if (embk_streq(argv[1], "env-child"))      env_child();
         if (embk_streq(argv[1], "cancel-child"))   cancel_child();
+        if (embk_streq(argv[1], "ipc-cancel"))     ipc_cancel_role();
+        if (embk_streq(argv[1], "ipc-cancel-child") && argc >= 3) ipc_cancel_child(argv[2]);
         if (embk_streq(argv[1], "ctrlc-child"))    ctrlc_child();
         if (embk_streq(argv[1], "ctrlc-parent"))   ctrlc_parent();
 

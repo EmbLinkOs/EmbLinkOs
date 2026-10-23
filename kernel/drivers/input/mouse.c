@@ -1,3 +1,4 @@
+#include "power/policy.h"
 /* kernel/drivers/input/mouse.c -- PS/2 mouse driver (see mouse.h).
  *
  * The 8042 controller delivers mouse data on IRQ12. Each movement is a 3-byte
@@ -69,6 +70,7 @@ static void apply_motion(void) {
     int32_t ny = g_y - dy;                     /* PS/2 y is up-positive; screen is down */
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
+    if(nx!=g_x || ny!=g_y || g_buttons!=(g_pkt[0] & 7))power_activity();
     g_x = nx; g_y = ny;
     g_buttons = g_pkt[0] & (PKT_LEFT | PKT_RIGHT | PKT_MIDDLE);
 }
@@ -84,6 +86,7 @@ void mouse_set_absolute(int32_t x, int32_t y, int32_t range,
     int32_t ny = (int32_t)(((int64_t)y * (g_h - 1)) / range);
     if (nx < 0) nx = 0; if (nx >= g_w) nx = g_w - 1;
     if (ny < 0) ny = 0; if (ny >= g_h) ny = g_h - 1;
+    if(nx!=g_x || ny!=g_y || g_buttons!=(buttons & 7) || wheel)power_activity();
     g_x = nx; g_y = ny;
     g_buttons = buttons & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE);
     if (wheel) g_wheel += wheel;
@@ -112,7 +115,7 @@ static void mouse_handler(void) {
             apply_motion();
             int32_t z = g_pkt[3] & 0x0F;    /* 4-bit two's-complement scroll delta */
             if (z & 0x08) z |= ~0x0F;
-            g_wheel += z;
+            g_wheel += z;if(z)power_activity();
             break;
         }
     }
@@ -152,4 +155,16 @@ void mouse_init(uint32_t screen_w, uint32_t screen_h) {
 
     irq_register(12, mouse_handler);
     serial_write_string("Mouse registered on IRQ 12\n");
+}
+
+/* HID coordinates are screen-oriented (positive y down). */
+void mouse_inject_relative(int32_t dx, int32_t dy, uint32_t buttons, int32_t wheel) {
+    int64_t x=(int64_t)g_x+dx, y=(int64_t)g_y+dy;
+    if(x<0) x=0;
+    if(y<0) y=0;
+    if(x>=g_w) x=g_w-1;
+    if(y>=g_h) y=g_h-1;
+    if(x!=g_x || y!=g_y || g_buttons!=(buttons&7) || wheel)power_activity();
+    g_x=x; g_y=y; g_buttons=buttons&7;
+    if(wheel) g_wheel+=wheel;
 }

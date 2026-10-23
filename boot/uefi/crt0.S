@@ -3,8 +3,8 @@
  * UEFI loads a PE anywhere in memory, so a position-independent image must fix
  * up its own R_X86_64_RELATIVE relocations before any absolute address is used.
  * We compile -fpic and link -shared, which emits those relocs into .rela.*; the
- * linker script gathers them between __rela_start/__rela_end (inside an
- * allocated section so objcopy carries them into the PE). This runs first,
+ * linker script gathers them between __rela_start/__rela_end in .rela,
+ * which objcopy carries into the PE. This runs first,
  * applies them, then calls efi_main.
  *
  * The dummy .reloc section below is load-bearing: without a .reloc, firmware

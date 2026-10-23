@@ -850,6 +850,16 @@ def discover_userland_objects(build_dir="build"):
     # browser must have something to open before it can reach a network.
     objects.extend(_tree_objects("system/web", b"system/web/", (".html", ".png", ".jpg", ".json", ".css")))
     objects.extend(_tree_objects("system/js", b"system/js/", (".js",)))
+    # Device firmware and its redistribution notices travel together. These
+    # paths are already tracked by Makefile's EMBKFS_CONTENT prerequisites.
+    objects.extend(_tree_objects("system/firmware", b"system/firmware/"))
+    objects.extend(_tree_objects("system/licenses", b"system/licenses/", ".txt"))
+    # This optional profile is a secret local to the image builder. Never make
+    # it world-readable just because normal system content uses PERM_FILE.
+    wifi_profile = _read_file("system/config/wifi.conf")
+    if wifi_profile is not None:
+        objects.append((b"system/config/wifi.conf", L.DT_REG,
+                        L.S_IFREG | 0o600, wifi_profile))
     # The sample album Photos opens when launched with no argument (which is
     # how the dock launches it). Generated at build time by tools/mkpictures.py
     # rather than checked in; the host directory is only a staging area.

@@ -38,6 +38,7 @@
 #include "ui.h"
 #include "em.h"
 #include "theme.h"
+#include "system_status.h"
 
 #define BAR_W 1024   /* replaced at startup by the real display width */
 /* Thin like a real menu bar: the strip is chrome, not a panel. */
@@ -69,17 +70,28 @@ static void bar_ink_update(void) {
 }
 
 /* status-chip ids (icon codepoints); the user reorders / removes these live */
-static int g_items[8] = { IconStar, IconBolt, IconGear, IconHeart };
-static int g_n        = 4;
 
 /* Each status item gets an equal-width slot with the glyph centred in it.
  * Spacing alone does not do this: glyphs have different widths, so a constant
  * gap puts their CENTRES at uneven distances and the row reads as drifting.
  * Fixed slots are what makes a status row look ruled. */
-static void chip(int id) {
-    HStack(.width = 22, .height = 18, .align = Center, .justify = Center) {
-        Icon(id).color(g_ink);
-    }
+static unsigned g_notice_page;
+static struct embk_notice_info g_notices;
+static char g_notice_label[32]="Notifications";
+static struct embk_wifi_info g_wifi;
+static struct embk_audio_info g_audio;
+static uint64_t g_devices_next;
+static void request_settings(void) {
+    int ch=(int)embk_chan_connect("/run/emlink.settings");if(ch>=0) embk_chan_close(ch);
+}
+static void devices_poll(void) {
+    uint64_t now=em_now_ms();if(now<g_devices_next) return;g_devices_next=now+1000;
+    embk_wifi_get(&g_wifi);embk_audio_get(&g_audio);
+    if(!embk_notify_get(&g_notices,0)) {if(g_notice_page*2>=g_notices.count)g_notice_page=0;snprintf(g_notice_label,sizeof g_notice_label,"Notifications (%u)",g_notices.count);}
+}
+static void volume_set(unsigned percent,unsigned mute) {
+    if(!embk_audio_volume(percent,mute)) {g_audio.percent=percent;
+        if(mute) g_audio.flags|=EMBK_AUDIO_MUTED;else g_audio.flags&=~EMBK_AUDIO_MUTED;}
 }
 
 
@@ -113,6 +125,32 @@ static void request_apps(void) {
     if (ch >= 0) embk_chan_close(ch);
 }
 
+static struct embk_power_info g_power;
+static uint64_t g_power_next;
+static const char *bar_battery(void) {
+    static char label[40];
+    uint64_t now=em_now_ms();
+    if(now>=g_power_next) {
+        g_power_next=now+1000;
+        if(embk_power_get(&g_power)<0) return "";
+    }
+    if(g_power.last_error) return "Power request failed";
+    if(g_power.flags&EMBK_POWER_BUSY) return "Shutting down…";
+    if(!(g_power.flags&EMBK_POWER_BATTERY))
+        return (g_power.flags&EMBK_POWER_AC_ONLINE)?"AC":"";
+    if((g_power.flags&EMBK_POWER_CRITICAL) && now<=g_power.sampled_ms+10000)
+        return "Battery critical";
+    if(g_power.percent==EMBK_POWER_UNKNOWN || now>g_power.sampled_ms+10000)
+        return "Battery --%";
+    snprintf(label,sizeof label,"%s%u%%%s",((g_power.flags&EMBK_POWER_DISCHARGING) && g_power.percent<=10)?"Low battery ":"",g_power.percent,
+        (g_power.flags&EMBK_POWER_CHARGING)?" +":"");
+    return label;
+}
+static void request_power(unsigned action) {
+    int rc=embk_power_request(action);
+    if(rc<0) fprintf(stderr,"topbar: power request failed (%d)\n",rc);
+}
+
 static void bar(void) {
     const struct ui_theme *t = ui_theme();
 
@@ -120,6 +158,7 @@ static void bar(void) {
     static int first = 1;
     if (first) { first = 0; em_window_move_to(0, 0); }   /* flush, like Mac's */
     bar_ink_update();
+    devices_poll();
 
     /* The window is TRANSLUCENT (per-pixel transparent, no blur) and grows tall
      * only while a menu is open. So the view fills the whole window, but only
@@ -152,13 +191,19 @@ static void bar(void) {
                 /* BOLD: the leading menu names the application these menus
                  * belong to, and weight is how a menu bar says so. */
                 Menu("EmbLink", .font = BodyBold, .color = g_ink) {
-                    MenuItem("About EmbLink");
+                    MenuItem("EmbLink OS");
+                    if(MenuItem("Settings…")) request_settings();
                     MenuSeparator();
-                    if (MenuItem("Quit")) exit(0);
+                    if(!(embk_session(EMBK_SESSION_STATUS,0)&EMBK_SESSION_LIVE))
+                        if(MenuItem("Lock Screen")) embk_session(EMBK_SESSION_LOCK,0);
+                    if(MenuItem("Log Out…")) embk_session(EMBK_SESSION_LOGOUT,0);
+                    MenuSeparator();
+                    if(embk_getcaps()&EMBK_CAP_BIT(EMBK_CAP_POWER)) {
+                        if(MenuItem("Restart")) request_power(EMBK_POWER_REBOOT);
+                        if(MenuItem("Shut Down")) request_power(EMBK_POWER_OFF);
+                        MenuSeparator();
+                    }
                 }
-                Menu("File", .color = g_ink) { MenuItem("New"); MenuItem("Open"); }
-                Menu("Edit", .color = g_ink) { MenuItem("Undo"); MenuItem("Redo"); }
-                Menu("View", .color = g_ink) { MenuItem("Zoom In"); MenuItem("Zoom Out"); }
             }
 
             Spacer();   /* the menus sit left, everything else trails right */
@@ -166,7 +211,34 @@ static void bar(void) {
             /* status glyphs, then the clock -- the trailing order a menu bar
              * has. Wider spacing than a toolbar: these are separate readings,
              * not a group of related controls. */
-            Dock(g_items, &g_n, chip, .spacing = 8);
+            Menu(g_notice_label,.color=g_ink) {
+                if(!g_notices.count)MenuItem("No notifications");
+                for(unsigned i=g_notice_page*2;i<g_notices.count && i<EMBK_NOTIFY_MAX && i<(g_notice_page+1)*2;i++) {
+                    Text(g_notices.entries[i].source_pid?"Application":"System").caption().tertiary();
+                    Text(g_notices.entries[i].title).body();
+                    Text(g_notices.entries[i].body).caption().secondary();
+                    em_flush();MenuSeparator();
+                }
+                if(g_notice_page && MenuItem("Newer notifications"))g_notice_page--;
+                if((g_notice_page+1)*2<g_notices.count && MenuItem("Older notifications"))g_notice_page++;
+                if(g_notices.count && MenuItem("Clear notifications")){embk_notify_get(&g_notices,1);g_notice_page=0;}
+            }
+            Menu((g_wifi.flags&EMBK_WIFI_ADDRESS)?"Wi-Fi connected":"Wi-Fi",.color=g_ink) {
+                MenuItem(system_wifi_status(&g_wifi));
+                if(g_wifi.ssid_len) {char name[129];system_ssid(name,g_wifi.ssid,g_wifi.ssid_len);MenuItem(name);}
+                if(MenuItem("Open Settings…")) request_settings();
+            }
+            Menu((g_audio.flags&EMBK_AUDIO_MUTED)?"Muted":"Sound",.color=g_ink) {
+                if(!(g_audio.flags&EMBK_AUDIO_AVAILABLE)) MenuItem("No audio output");
+                else {
+                    char level[24];snprintf(level,sizeof level,"Volume %u%%",g_audio.percent);MenuItem(level);
+                    if(MenuItem((g_audio.flags&EMBK_AUDIO_MUTED)?"Unmute":"Mute")) volume_set(g_audio.percent,!(g_audio.flags&EMBK_AUDIO_MUTED));
+                    if(MenuItem("Louder")) volume_set(g_audio.percent>90?100:g_audio.percent+10,0);
+                    if(MenuItem("Quieter")) volume_set(g_audio.percent<10?0:g_audio.percent-10,0);
+                }
+                if(MenuItem("Open Settings…")) request_settings();
+            }
+            Text(bar_battery()).caption().color(g_ink);
             Text(bar_clock()).caption().color(g_ink);
         }
         Spacer();   /* transparent canvas below the bar -- dropdown room */

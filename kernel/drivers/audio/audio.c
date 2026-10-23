@@ -3,8 +3,8 @@
  * The device-independent half. ac97.c knows about I/O ports and descriptor
  * lists; this knows about a stream: who owns it, how far the hardware has got,
  * and what to do when a program writes faster or slower than the speaker
- * consumes. A second driver (Intel HDA, virtio-sound) implements ac97.h's four
- * operations and nothing here changes.
+ * consumes. The adapter helpers select HDA or AC'97 without changing the
+ * syscall PCM contract.
  *
  * ONE OWNER AT A TIME, deliberately. Mixing several streams means resampling,
  * summing and clipping policy, and a mixer that is wrong is worse than no
@@ -27,6 +27,20 @@
 #include "include/errno.h"
 #include "drivers/audio/ac97.h"
 #include "drivers/audio/audio.h"
+#include "drivers/audio/hda.h"
+#include "arch/x86_64/cpu/spinlock.h"
+#include "include/kstring.h"
+static spinlock_t audio_mutex=SPINLOCK_INIT;
+static unsigned using_hda,volume=100,muted;
+static bool device_present(void) {return using_hda?hda_present():ac97_present();}
+static uint32_t device_rate(void) {return using_hda?48000:ac97_sample_rate();}
+static uint32_t device_frames(void) {return using_hda?1024:ac97_frames_per_buffer();}
+static uint32_t device_fill(int i,const int16_t *p,uint32_t n) {return using_hda?hda_fill(i,p,n):ac97_fill(i,p,n);}
+static unsigned device_civ(void) {return using_hda?hda_civ():ac97_civ();}
+static void device_play(int i) {if(using_hda) hda_play(i);else ac97_play(i);}
+static void device_last(int i) {if(using_hda) hda_set_last(i);else ac97_set_last(i);}
+static bool device_done(int i) {return using_hda?hda_done(i):ac97_done(i);}
+static void device_stop(void) {if(using_hda) hda_stop();else ac97_stop();}
 
 #define RING          32          /* must match the driver's descriptor count */
 /* Never fill the descriptor being played, or the one after it: the device may
@@ -58,26 +72,28 @@ static struct {
 
 bool audio_available(void)
 {
-    return ac97_present();
+    return device_present();
 }
 
 uint32_t audio_sample_rate(void)
 {
-    return ac97_sample_rate();
+    return device_present()?device_rate():0;
 }
 
 uint32_t audio_frames_per_buffer(void)
 {
-    return ac97_frames_per_buffer();
+    return device_frames();
 }
 
-int audio_open(uint32_t pid)
+static int audio_open_locked(uint32_t pid)
 {
-    if (!ac97_present()) return -EMBK_ENODEV;
+    if (!device_present()) return -EMBK_ENODEV;
     /* Re-opening by the SAME process is not an error -- a program that
      * restarts its own playback should not have to know whether it closed. */
     if (g_au.open && g_au.owner_pid != pid) return -EMBK_EBUSY;
 
+    if (g_au.open) return 0;
+    device_stop();
     g_au.open = true;
     g_au.owner_pid = pid;
     g_au.head = 0;
@@ -93,18 +109,18 @@ static int ring_free(void)
 {
     if (!g_au.started) return RING - RING_HEADROOM;
 
-    int civ = (int)ac97_civ();
+    int civ = (int)device_civ();
     int used = g_au.head - civ;
     if (used < 0) used += RING;
     int freed = RING - used - RING_HEADROOM;
     return freed > 0 ? freed : 0;
 }
 
-int audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
+static int audio_write_locked(uint32_t pid, const int16_t *frames, uint32_t nframes,
                 uint32_t *accepted)
 {
     if (accepted) *accepted = 0;
-    if (!ac97_present()) return -EMBK_ENODEV;
+    if (!device_present()) return -EMBK_ENODEV;
     if (!g_au.open || g_au.owner_pid != pid) return -EMBK_EPERM;
     if (frames == NULL) return -EMBK_EINVAL;
 
@@ -112,8 +128,11 @@ int audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
     int slots = ring_free();
 
     while (slots > 0 && taken < nframes) {
-        uint32_t n = ac97_fill(g_au.head, frames + (size_t)taken * 2,
-                               nframes - taken);
+        int16_t stage[2048];
+        uint32_t count=nframes-taken;if(count>1024) count=1024;
+        unsigned gain=muted?0:volume;
+        for(unsigned i=0;i<count*2;i++) stage[i]=(int32_t)frames[taken*2+i]*(int)gain/100;
+        uint32_t n = device_fill(g_au.head,stage,count);
         if (n == 0) break;
         taken += n;
         g_au.last = g_au.head;
@@ -130,14 +149,14 @@ int audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
         if (!g_au.started) {
             /* Hold until there is enough queued to keep the device fed. A
              * writer with less than this in total gets it started by
-             * audio_drained(), which is what "I have finished writing" means
+             * audio_drained_locked(), which is what "I have finished writing" means
              * from out here. */
             if (g_au.queued >= RING_START_MIN) {
-                ac97_play(g_au.last);
+                device_play(g_au.last);
                 g_au.started = true;
             }
         } else {
-            ac97_set_last(g_au.last);
+            device_last(g_au.last);
         }
     }
 
@@ -149,20 +168,20 @@ int audio_write(uint32_t pid, const int16_t *frames, uint32_t nframes,
 }
 
 /* Has the hardware finished everything handed to it? */
-bool audio_drained(uint32_t pid)
+static bool audio_drained_locked(uint32_t pid)
 {
-    if (!ac97_present() || !g_au.open || g_au.owner_pid != pid) return true;
+    if (!device_present() || !g_au.open || g_au.owner_pid != pid) return true;
     if (!g_au.started) {
         /* Asking whether it drained is the writer saying it has stopped
          * writing -- so a sound shorter than the prefill threshold plays HERE
          * rather than never. Without this a 50ms beep is silent. */
-        if (g_au.queued > 0) { ac97_play(g_au.last); g_au.started = true; return false; }
+        if (g_au.queued > 0) { device_play(g_au.last); g_au.started = true; return false; }
         return true;
     }
-    return ac97_done(g_au.last);
+    return device_done(g_au.last);
 }
 
-void audio_close(uint32_t pid)
+static void audio_close_locked(uint32_t pid)
 {
     if (!g_au.open || g_au.owner_pid != pid) return;
     /* What the stream actually carried, on the serial log. The WAV says what
@@ -171,8 +190,8 @@ void audio_close(uint32_t pid)
     kprintf("audio: stream closed after %llu frames (%llu ms)\n",
             (unsigned long long)g_au.frames_written,
             (unsigned long long)(g_au.frames_written * 1000 /
-                                 (ac97_sample_rate() ? ac97_sample_rate() : 1)));
-    ac97_stop();
+                                 (device_rate() ? device_rate() : 1)));
+    device_stop();
     g_au.open = false;
     g_au.started = false;
     g_au.owner_pid = 0;
@@ -181,10 +200,35 @@ void audio_close(uint32_t pid)
 /* Called when a process dies: a program that exits mid-note must not leave the
  * speaker running and the device claimed. The compositor learned this lesson
  * with windows (compositor_reap_pid); sound is the same shape. */
-void audio_reap_pid(uint32_t pid)
+static void audio_reap_pid_locked(uint32_t pid)
 {
     if (g_au.open && g_au.owner_pid == pid) {
         kprintf("audio: reclaiming the device from pid %u\n", pid);
-        audio_close(pid);
+        audio_close_locked(pid);
     }
+}
+
+void audio_init(void) {
+    spinlock_init(&audio_mutex);hda_init();using_hda=hda_present();if(!using_hda) ac97_init();
+}
+int audio_open(uint32_t pid) {spin_lock(&audio_mutex);int rc=audio_open_locked(pid);spin_unlock(&audio_mutex);return rc;}
+int audio_write(uint32_t pid,const int16_t *p,uint32_t n,uint32_t *accepted) {
+    spin_lock(&audio_mutex);int rc=audio_write_locked(pid,p,n,accepted);spin_unlock(&audio_mutex);return rc;
+}
+bool audio_drained(uint32_t pid) {spin_lock(&audio_mutex);bool done=audio_drained_locked(pid);spin_unlock(&audio_mutex);return done;}
+void audio_close(uint32_t pid) {spin_lock(&audio_mutex);audio_close_locked(pid);spin_unlock(&audio_mutex);}
+void audio_reap_pid(uint32_t pid) {spin_lock(&audio_mutex);audio_reap_pid_locked(pid);spin_unlock(&audio_mutex);}
+void audio_snapshot(struct embk_audio_info *out) {
+    spin_lock(&audio_mutex);memset(out,0,sizeof *out);out->version=EMBK_AUDIO_VERSION;
+    if(device_present()) {out->flags|=EMBK_AUDIO_AVAILABLE;out->sample_rate=device_rate();
+        const char *name=using_hda?hda_output_name():"AC'97 stereo output";strncpy(out->output,name,sizeof out->output-1);}
+    if(g_au.open) out->flags|=EMBK_AUDIO_PLAYING;
+    if(muted) out->flags|=EMBK_AUDIO_MUTED;
+    out->percent=volume;spin_unlock(&audio_mutex);
+}
+int audio_control(unsigned percent,unsigned mute) {
+    if(percent>100 || mute>1) return -EMBK_EINVAL;
+    spin_lock(&audio_mutex);int rc=0;
+    if(!device_present()) rc=-EMBK_ENODEV;else {volume=percent;muted=mute;}
+    spin_unlock(&audio_mutex);return rc;
 }

@@ -1,3 +1,7 @@
+#include "power/policy.h"
+#include "acpi/display.h"
+#include "process/session.h"
+#include "block/install.h"
 #include <stdint.h>
 #include "include/types.h"
 #include "include/kprintf.h"
@@ -17,9 +21,12 @@
 #include "drivers/timer/rtc.h"
 #include "drivers/bus/pci.h"
 #include "drivers/audio/ac97.h"
+#include "drivers/audio/audio.h"
+#include "include/argv.h"
 #include "drivers/usb/usb.h"
 #include "drivers/storage/ata.h"
 #include "drivers/storage/ahci.h"
+#include "drivers/storage/nvme.h"
 #include "drivers/video/bootanim.h"
 
 #include "arch/x86_64/cpu/gdt.h"
@@ -39,7 +46,9 @@
 #include "mm/kheap.h"
 
 #include "acpi/acpi.h"
+#include "acpi/runtime.h"
 #include "net/net.h"
+#include "net/wifi/wifi.h"
 #include "block/block.h"
 #include "block/partition.h"
 #include "fs/fat32.h"
@@ -299,8 +308,8 @@ static void tui_query_size(int *rows, int *cols)
     char buf[40]; int bi = 0; int got = 0;
     uint64_t start = lapic_timer_get_ticks();
     while (lapic_timer_get_ticks() < start + 20) {          /* ~200ms at 100Hz */
-        while (serial_has_char()) {
-            char c = serial_read_char();
+        while (serial_has_char() || (boot_recovery_mode() && keyboard_has_char())) {
+            char c = serial_has_char() ? serial_read_char() : keyboard_getchar();
             if (bi < 39) buf[bi++] = c;
             if (c == 'R') { got = 1; break; }
         }
@@ -673,8 +682,8 @@ static void kernel_tui(void)
     serial_write_string("\033[?25l\033[2J");
     for (;;) {
         int quit = 0, moved = 0;
-        while (serial_has_char()) {
-            char c = serial_read_char();
+        while (serial_has_char() || (boot_recovery_mode() && keyboard_has_char())) {
+            char c = serial_has_char() ? serial_read_char() : keyboard_getchar();
             if (help) { help = 0; dirty = 1; continue; }   /* any key closes help */
             if (c == 'q' || c == 3) { quit = 1; break; }
             else if (c >= '1' && c <= '8') { tab = c - '1'; sel = 0; scr = 0; dirty = 1; }
@@ -724,15 +733,19 @@ static bool shell_handle_process_command(const char *cmd)
 
     if ((arg = shell_match_prefix(cmd, "run")) != NULL) {
         if (!arg[0]) {
-            kprintf("\n[run] usage: run <path>\n");
+            kprintf("\n[run] usage: run <path> [arguments...]\n");
             return true;
         }
-        char *argv[] = { (char *)arg, NULL };
-        int pid = process_create(arg, argv, 1, NULL, 0);
+        char decoded[512];char *argv[17];
+        int argc=console_argv(arg,decoded,sizeof decoded,argv,16);
+        if(argc<=0 || !argv[0][0]) {
+            kprintf("\n[run] invalid quoting, argument count or command length\n");return true;
+        }
+        int pid = process_create(argv[0], argv, argc, NULL, 0);
         if (pid < 0) {
-            kprintf("\n[run] failed to start %s: %s\n", arg, embk_strerror(pid));
+            kprintf("\n[run] failed to start %s: %s\n", argv[0], embk_strerror(pid));
         } else {
-            kprintf("\n[run] started %s as pid %d\n", arg, pid);
+            kprintf("\n[run] started %s as pid %d\n", argv[0], pid);
         }
         return true;
     }
@@ -1223,10 +1236,11 @@ static bool shell_handle_process_command(const char *cmd)
             kprintf("\n[caps] no such process %u\n", (unsigned)pid);
             return true;
         }
-        static const char *capname[11] = {
+        static const char *capname[] = {
             0, "FILESYSTEM", "NETWORK", "GPU", "AUDIO", "CAMERA",
-            "USB", "SERIAL", "RAWDISK", "KERNEL_EXT", "DEBUG"
+            "USB", "SERIAL", "RAWDISK", "KERNEL_EXT", "DEBUG", "POWER", "NETWORK_ADMIN"
         };
+        _Static_assert(sizeof capname/sizeof capname[0]==EMBK_CAP_MAX_ID+1,"update capability names");
         kprintf("\nCapabilities of pid %u  (cap_set 0x%llx)\n", (unsigned)pid,
                 (unsigned long long)d.cap_set);
         for (int id = 1; id <= EMBK_CAP_MAX_ID; id++) {
@@ -1234,9 +1248,7 @@ static bool shell_handle_process_command(const char *cmd)
             kprintf("  %-12s cap_id %-2d  %s\n", capname[id], id,
                     held ? "GRANTED" : "-");
         }
-        /* Only DEBUG is actually enforced at a syscall today (the rest are
-         * represented/attenuated but not yet gated) -- honest note. */
-        kprintf("(only DEBUG is syscall-enforced today; others are represented)\n");
+        kprintf("GPU, network, audio, power and debug operations enforce capabilities.\n");
         return true;
     }
 
@@ -1668,6 +1680,26 @@ static bool shell_handle_stat_command(const char *cmd)
 
 static void kernel_handle_line_command(const char *cmd)
 {
+    if (install_command(cmd)) return;
+    if (strcmp(cmd,"recovery check")==0) {
+        struct embkfs_volume *v=embkfs_live_volume();
+        if(!v) kprintf("recovery: no readable EMBKFS root found\n");
+        else embkfs_check(v);
+        return;
+    }
+    if (strcmp(cmd,"recovery report")==0) {
+        boot_protocol_dump();
+        shell_handle_process_command("devices");
+        shell_handle_process_command("mounts");
+        kprintf("recovery: report complete; serial output can be saved by the host\n");
+        return;
+    }
+    if (boot_recovery_mode() && strcmp(cmd,"devices") && strcmp(cmd,"drivers") &&
+        strcmp(cmd,"mounts") && strcmp(cmd,"ps") && strcmp(cmd,"poweroff") && strcmp(cmd,"reboot")) {
+        kprintf("Recovery commands: recovery check, recovery report, install list, install plan <disk>, poweroff, reboot\n");
+        return;
+    }
+    if(wifi_command(cmd)) return;
     if (shell_handle_process_command(cmd))
         return;
 
@@ -1754,7 +1786,6 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // --- Devices ---
     
     pci_init();
-    ac97_init();   // sound out; harmless when no AC97 device is attached
     usb_init();
     ata_init();    // registers ATA drives as block devices internally
     ahci_init();   // runs IDENTIFY per port, stores sector counts
@@ -1783,6 +1814,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // timer arms an absolute TSC deadline and needs the calibrated frequency
     // here. Only depends on HPET/PIT (both up by now), not on the LAPIC timer.
     tsc_calibrate();
+    audio_init();   /* HDA reset/verb deadlines need the calibrated clock. */
 
     // --- Timer (LAPIC) + retire PIC ---
     lapic_timer_init(48);
@@ -1790,6 +1822,8 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     outb(PIC2_DATA, 0xFF);
 
     __asm__ volatile ("sti");
+
+    nvme_init();  /* needs calibrated timeouts; register before partition scan */
 
     // --- Boot splash ---
     boot_animation();
@@ -1956,11 +1990,13 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     }
 
     kworker_init();
+    acpi_runtime_init();
+    acpi_display_init();
 
     // --- Networking (M1): virtio-net + Ethernet/ARP/IPv4/ICMP. After PCI is
     // enumerated and the scheduler is live (net_init spawns an RX poll kthread).
     // Static config for now; `test net` pings the gateway. No ring-3 surface yet.
-    net_init();
+    if (!boot_recovery_mode()) net_init();
 
     // Enter userspace through INIT: the kernel spawns exactly ONE user process,
     // /system/bin/init.elf, the root of userspace authority (docs/USERSPACE_v2.md
@@ -1969,7 +2005,16 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
     // child, not the first process. init runs as an ordinary round-robin sibling
     // of this shell context; the loop below keeps pumping the compositor pointer
     // and USB, and the serial/keyboard REPL stays available as a debug console.
-    {
+    if (boot_recovery_mode()) {
+        console_set_fb_enabled(true);
+        console_clear();
+        kprintf("EmbLinkOS Recovery — read-only filesystems\n");
+        kprintf("recovery check | recovery report | install list | poweroff | reboot\n");
+        if (boot_protocol_get()->boot_mode == BOOT_MODE_DIAGNOSTICS)
+            kernel_handle_line_command("recovery check");
+        kprintf("recovery: ready\n");
+        fb_present();
+    } else {
         char *iargv[] = { (char *)"/system/bin/init.elf", NULL };
         /* The desktop is about to own the framebuffer -- disable the text
          * console's on-screen half BEFORE userspace becomes schedulable.
@@ -1981,6 +2026,7 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
          * the serial debug console below stay on COM1 and never touch the fb. */
         console_set_fb_enabled(false);
         int ipid = process_create("/system/bin/init.elf", iargv, 1, NULL, 0);
+        if (ipid > 0) session_bind_init((uint32_t)ipid);
         if (ipid < 0)
             kprintf("\ninit: failed to launch /system/bin/init.elf: %s\n", embk_strerror(ipid));
         else
@@ -2003,6 +2049,9 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // title-bar drag. Runs here (schedulable shell-process context) so the
         // compositor spinlock is never taken from an IRQ handler. No-op until a
         // window exists.
+        if(!boot_recovery_mode())power_policy_poll();
+        session_refresh_screen();
+        keyboard_desktop_actions();
         compositor_pointer_tick();
         // Advance any window open/minimize motion. Same reasoning as above: it
         // repaints, so it must run in schedulable context, not an IRQ.
@@ -2014,24 +2063,28 @@ void kernel_main(uint64_t bp_phys) {   /* bp_phys: the boot-protocol record
         // the keyboard buffer a userspace reader owns, so there's no contention.
         // Polled (the UART RX IRQ is left disabled); the ~100Hz timer wakes the
         // hlt below, giving debug-console-grade latency. Drain the FIFO per pass.
-        while (serial_has_char()) {
-            char c = serial_read_char();
+        while (serial_has_char() || (boot_recovery_mode() && keyboard_has_char())) {
+            char c = serial_has_char() ? serial_read_char() : keyboard_getchar();
             if (c == '\r' || c == '\n') {
-                serial_write_char('\n');
+                if (boot_recovery_mode()) console_putchar('\n');
+                else serial_write_char('\n');
                 cmd_buf[cmd_len] = '\0';
                 kernel_handle_line_command(cmd_buf);
                 cmd_len = 0;
             } else if ((c == '\b' || c == 127) && cmd_len > 0) {
                 cmd_len--;
-                serial_write_string("\b \b");   // erase the char on the terminal
+                if (boot_recovery_mode()) console_write("\b \b");
+                else serial_write_string("\b \b");   // erase the char on the terminal
             } else if (c >= 32 && c <= 126) {
                 if (cmd_len + 1 < sizeof cmd_buf) {
                     cmd_buf[cmd_len++] = c;
-                    serial_write_char(c);        // echo so the remote terminal shows input
+                    if (boot_recovery_mode()) console_putchar(c);
+                    else serial_write_char(c);        // echo so the remote terminal shows input
                 }
             }
         }
 
+        if (boot_recovery_mode()) fb_present();
         __asm__ volatile ("hlt");   // wake on any IRQ (timer, PS/2, or xHCI)
     }
 }

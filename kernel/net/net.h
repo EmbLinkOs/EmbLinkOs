@@ -147,6 +147,7 @@ int  net_tx_eth(const uint8_t dst_mac[ETH_ALEN], uint16_t ethertype,
 /* ARP: resolve `ip` (HOST order) to a MAC, sending a request and waiting up to
  * a bounded number of poll cycles. Returns true and fills mac on success. */
 bool arp_resolve(uint32_t ip, uint8_t mac_out[ETH_ALEN]);
+void arp_reset(void); /* caller holds net_lock, e.g. an interface/address change */
 
 /* IPv4: send `payload` (an ICMP/UDP/... message) to `dst_ip` (HOST order). */
 int  net_send_ip(uint32_t dst_ip, uint8_t proto, const void *payload, uint32_t len);
@@ -160,6 +161,10 @@ int  net_send_udp(uint32_t src_ip, uint16_t src_port,
 /* DHCP: run DISCOVER/OFFER/REQUEST/ACK and, on success, configure g_netif
  * (ip/netmask/gateway/dns) and set g_netif.dhcp. Returns true on a lease. */
 bool net_dhcp(void);
+/* Lease clock for the Wi-Fi connection worker; caller holds net_lock. */
+uint64_t net_dhcp_renew_after_ms(void);
+uint64_t net_dhcp_lease_remaining_ms(void);
+void net_dhcp_forget_lease(void);
 
 /* DNS: resolve `name` to an IPv4 address (HOST order) via the DHCP-learned
  * resolver (g_netif.dns), UDP/53. Returns true and fills *out_ip on the first
@@ -250,11 +255,25 @@ void icmp_send_unreachable(uint32_t dst_ip, const uint8_t *orig_ip_pkt, uint32_t
 /* UDP single-slot receive capture, driven by DHCP/DNS: arm on a local port,
  * then poll (bounded) for the reply. */
 void udp_arm(uint16_t port);
+void udp_arm_peer(uint16_t port,uint32_t peer_ip,uint16_t peer_port);
 int  udp_collect(uint8_t *out, uint32_t cap, uint32_t *from_ip);
+/* Kernel DHCP/DNS serialize their capture ownership; caller holds net_lock.
+ * A waiting service yields that full monitor while ordinary RX keeps running. */
+void net_service_lock(void);
+void net_service_unlock(void);
 
 /* ---- driver interface (virtio_net.c) ------------------------------------ */
 bool virtio_net_init(uint8_t mac_out[ETH_ALEN]);   /* probe + bring up; fills MAC */
 int  virtio_net_tx(const void *frame, uint32_t len);   /* send one Ethernet frame */
 void virtio_net_poll(void);                        /* drain the RX ring -> net_rx() */
+bool pci_net_init(uint8_t mac_out[ETH_ALEN]);
+int pci_net_tx(const void *frame, uint32_t len);
+void pci_net_poll(void);
+int net_send_frame(const void *frame, uint32_t len);
+void net_poll(void);
+
+
+/* Called under net_lock for a validated unicast IPv4 Ethernet frame. */
+void arp_learn_ipv4_neighbor(uint32_t src, const uint8_t mac[ETH_ALEN]);
 
 #endif /* __NET_H__ */

@@ -37,11 +37,8 @@
 #define NS_ACTS_MAX  8
 #define SESSION_FD   9
 
-/* Development shortcut: authentication is already validated, so UI work can
- * boot straight into this disposable session. Set to 0 to restore the normal
- * first-boot setup + password login flow. */
-#define DEV_AUTOLOGIN 1
-#define DEV_USER      "yves"
+#define DEV_USER "guest"
+#define LIVE_HOME "/home/.live-guest"
 
 static void log_line(const char *s) { embk_puts(1, s); }
 
@@ -72,6 +69,22 @@ static int read_small(const char *path, char *buf, int cap) {
     return n;
 }
 
+static int within(const char *path,const char *prefix) {
+    int i=0;while(prefix[i] && path[i]==prefix[i]) i++;
+    return !prefix[i] && (!path[i] || path[i]=='/');
+}
+static int profile_path_allowed(const char *path,int mode,const char *home) {
+    /* Profiles are user-writable preferences. Init must never turn them into
+     * authority outside the authenticated user's fixed session boundary. */
+    if(path[0]!='/') return 0;
+    for(int i=0;path[i];i++)
+        if(path[i]=='/' && (path[i+1]=='/' ||
+           (path[i+1]=='.' && (!path[i+2] || path[i+2]=='/' ||
+             (path[i+2]=='.' && (!path[i+3] || path[i+3]=='/')))))) return 0;
+    if(within(path,home) || within(path,"/run")) return 1;
+    return mode==EMBK_NS_RO && (within(path,"/system") || within(path,"/data/apps"));
+}
+
 /* Load user <user>'s SESSION PROFILE -- /home/<user>/user.ns -- into
  * NS_BIND spawn actions (docs/USERSPACE_v2.md UP3). Same "<ro|rw> <prefix>"
  * manifest format as the app manifests (UP4); '#' comments and blanks ignored.
@@ -88,6 +101,7 @@ static int load_user_profile(const char *user,
     p = put_str(p, "/user.ns");
     *p = 0;
 
+    char home[80], *hp=home;hp=put_str(hp,"/home/");hp=put_str(hp,user);*hp=0;
     char buf[512];
     int n = read_small(path, buf, sizeof buf);
     if (n <= 0) return 0;
@@ -115,6 +129,7 @@ static int load_user_profile(const char *user,
         char prefix[208];
         for (int k = 0; k < plen; k++) prefix[k] = buf[ps + k];
         prefix[plen] = 0;
+        if(!profile_path_allowed(prefix,mode,home)) return -1;
         embk_action_ns_bind(&acts[na], prefix, mode);
         if (desc_cap && dn + plen + 6 < desc_cap) {
             if (dn) { desc[dn++]=','; desc[dn++]=' '; }
@@ -145,16 +160,44 @@ static void ns_selfcheck(void) {
     else          log_line("init: ns: WARNING -- /system unreadable (over-restricted)\n");
 }
 
+static void unlock_session(const char *user) {
+    int handles[2];
+    if(embk_pipe(handles)) {embk_sleep_ms(1000);return;}
+    struct embk_spawn_file_action a={0};
+    a.kind=EMBK_SPAWN_ACTION_INSTALL_OBJ;a.target_fd=3;a.src_obj_handle=handles[1];
+    char *av[]={(char *)LOGIN,(char *)"--unlock",(char *)user,NULL};
+    int h=(int)embk_spawn(LOGIN,av,&a,1);
+    embk_close_handle(handles[1]);
+    if(h<0) {embk_close_handle(handles[0]);embk_sleep_ms(1000);return;}
+    embk_fd_install_obj(handles[0],SESSION_FD);embk_close_handle(handles[0]);
+    embk_session(EMBK_SESSION_GREETER,h);
+    int code=embk_wait(h);char proof[32];
+    int n=(int)embk_read(SESSION_FD,proof,sizeof proof-1);embk_close(SESSION_FD);
+    if(code==0 && n>0 && n<32) {
+        proof[n]=0;int i=0;while(user[i] && user[i]==proof[i]) i++;
+        if(!user[i] && !proof[i]) {
+            embk_session(EMBK_SESSION_UNLOCK,0);
+            log_line("init: session unlocked\n");return;
+        }
+    }
+    log_line("init: unlock closed without authentication; session remains locked\n");
+    embk_sleep_ms(500);
+}
+
 void _start(long argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;
     log_line("init: up -- root of EmbLink userspace authority\n");
     ns_selfcheck();
 
+    int session_flags;
+    while((session_flags=embk_session(EMBK_SESSION_STATUS,0))<0) embk_sleep_ms(10);
+    int live=(session_flags&EMBK_SESSION_LIVE)!=0;
     for (;;) {
-#if DEV_AUTOLOGIN
-        char user[32] = DEV_USER;
-        log_line("init: DEV auto-login as '" DEV_USER "'\n");
-#else
+        char user[32];
+        if(live) {
+            char *q=put_str(user,DEV_USER);*q=0;
+            log_line("init: explicit live session as guest (no password lock)\n");
+        } else {
         struct embk_stat shadow;
         if (embk_stat(SHADOW, &shadow) < 0 || shadow.size == 0) {
             char *argv_setup[] = { (char *)SETUP, NULL };
@@ -164,6 +207,7 @@ void _start(long argc, char **argv, char **envp) {
                 embk_sleep_ms(1000);
                 continue;
             }
+            embk_session(EMBK_SESSION_GREETER,setup);
             log_line("init: no account found; first-boot setup started\n");
             if (embk_wait(setup) != 0) {
                 log_line("init: setup closed without creating an account\n");
@@ -190,10 +234,10 @@ void _start(long argc, char **argv, char **envp) {
             embk_sleep_ms(1000);
             continue;
         }
+        embk_session(EMBK_SESSION_GREETER,login);
         embk_fd_install_obj(pipe_handles[0], SESSION_FD);
         embk_close_handle(pipe_handles[0]);
         int login_code = embk_wait(login);
-        char user[32];
         int64_t user_len = embk_read(SESSION_FD, user, sizeof user - 1);
         embk_close(SESSION_FD);
         if (login_code != 0 || user_len <= 0 || user_len >= (int64_t)sizeof user) {
@@ -201,41 +245,50 @@ void _start(long argc, char **argv, char **envp) {
             continue;
         }
         user[user_len] = 0;
-#endif
+        }
 
-        struct embk_spawn_file_action sacts[NS_ACTS_MAX];
+        struct embk_spawn_file_action sacts[NS_ACTS_MAX+1];
         char nsdesc[192];
-#if DEV_AUTOLOGIN
+        int snacts;
+        if(live) {
         /* A fresh COW image has no account directories. Create only the home
-         * required by the development desktop and give it the same namespace
+         * required by the explicit live desktop and give it the same namespace
          * policy as a real session profile. */
-        (void)embk_mkdir("/home/" DEV_USER);
-        (void)embk_mkdir("/home/" DEV_USER "/Desktop");
-        (void)embk_mkdir("/home/" DEV_USER "/Documents");
-        (void)embk_mkdir("/home/" DEV_USER "/Downloads");
-        (void)embk_mkdir("/home/" DEV_USER "/Music");
-        (void)embk_mkdir("/home/" DEV_USER "/Pictures");
-        (void)embk_mkdir("/home/" DEV_USER "/Videos");
-        (void)embk_mkdir("/home/" DEV_USER "/Trash");
+        (void)embk_mkdir(LIVE_HOME);
+        (void)embk_mkdir(LIVE_HOME "/Desktop");
+        (void)embk_mkdir(LIVE_HOME "/Documents");
+        (void)embk_mkdir(LIVE_HOME "/Downloads");
+        (void)embk_mkdir(LIVE_HOME "/Music");
+        (void)embk_mkdir(LIVE_HOME "/Pictures");
+        (void)embk_mkdir(LIVE_HOME "/Videos");
+        (void)embk_mkdir(LIVE_HOME "/Trash");
         embk_action_ns_bind(&sacts[0], "/system", EMBK_NS_RO);
         embk_action_ns_bind(&sacts[1], "/data/apps", EMBK_NS_RO);
-        embk_action_ns_bind(&sacts[2], "/home/" DEV_USER, EMBK_NS_RW);
+        embk_action_ns_bind(&sacts[2], LIVE_HOME, EMBK_NS_RW);
         embk_action_ns_bind(&sacts[3], "/run", EMBK_NS_RW);
-        int snacts = 4;
+        snacts = 4;
         char *nd = nsdesc;
-        nd = put_str(nd, "ro /system, ro /data/apps, rw /home/" DEV_USER ", rw /run");
+        nd = put_str(nd, "ro /system, ro /data/apps, rw " LIVE_HOME ", rw /run");
         *nd = 0;
-#else
-        int snacts = load_user_profile(user, sacts, NS_ACTS_MAX, nsdesc, sizeof nsdesc);
+        } else {
+        snacts = load_user_profile(user, sacts, NS_ACTS_MAX, nsdesc, sizeof nsdesc);
         if (snacts <= 0) {
             log_line("init: authenticated user has no valid session profile\n");
             continue;
         }
-#endif
+        }
+        /* Ordinary apps cannot debug init, access raw disks or load extensions. */
+        embk_action_set_caps(&sacts[snacts++],
+            EMBK_CAP_BIT(EMBK_CAP_FILESYSTEM)|EMBK_CAP_BIT(EMBK_CAP_NETWORK)|
+            EMBK_CAP_BIT(EMBK_CAP_GPU)|EMBK_CAP_BIT(EMBK_CAP_AUDIO)|
+            EMBK_CAP_BIT(EMBK_CAP_POWER)|EMBK_CAP_BIT(EMBK_CAP_NETWORK_ADMIN));
+        if(embk_session(EMBK_SESSION_BEGIN,0)<0) {embk_sleep_ms(200);continue;}
 
         char home[80], env_user[48], env_home[96], env_pwd[96];
         char *p = home;
-        p = put_str(p, "/home/"); p = put_str(p, user); *p = 0;
+        if(live)p=put_str(p,LIVE_HOME);
+        else {p=put_str(p,"/home/");p=put_str(p,user);}
+        *p=0;
         p = env_user; p = put_str(p, "USER="); p = put_str(p, user); *p = 0;
         p = env_home; p = put_str(p, "HOME="); p = put_str(p, home); *p = 0;
         p = env_pwd; p = put_str(p, "PWD="); p = put_str(p, home); *p = 0;
@@ -252,14 +305,23 @@ void _start(long argc, char **argv, char **envp) {
         int h = (int)embk_spawn_env(DESKTOP, dargv, session_env, sacts, snacts);
         if (h < 0) {
             log_line("init: could not spawn the confined desktop\n");
+            while(embk_session(EMBK_SESSION_END,0)<0) embk_sleep_ms(20);
             embk_sleep_ms(1000);
             continue;
         }
+        embk_session(EMBK_SESSION_UNLOCK,0);
         log_line("init: desktop session started\n");
 
         /* Block until the desktop exits, then reap it. The wait frees BOTH the
          * zombie process slot and this spawn handle -- without it, every restart
          * would leak one of init's 16 handles. */
+        while(embk_proc_alive(h)>0) {
+            int state=embk_session(EMBK_SESSION_STATUS,0);
+            if(state&EMBK_SESSION_ENDING) break;
+            if((state&EMBK_SESSION_LOCKED) && !live) unlock_session(user);
+            embk_sleep_ms(50);
+        }
+        while(embk_session(EMBK_SESSION_END,0)<0) embk_sleep_ms(20);
         int code = embk_wait(h);
 
         char b[96], *q = b;
