@@ -1,7 +1,8 @@
 # Laptop milestone validation
 
-The laptop integration code is recorded in commit `be1d9bc`. Captures and this
-report are documentation-only additions afterward. The tests below ran against
+The laptop integration code is recorded in commit `be1d9bc`. Later commits add
+captures, documentation and an explicit native-NVMe standalone boot assertion.
+The tests below ran against
 the rebuilt BIOS/userspace and GPT UEFI images on 2026-10-22/23.
 
 ## Build and host checks
@@ -81,11 +82,12 @@ reopened, and released before child wait.
 uses a destination only 16 MiB larger than the original image, and reports:
 
 ```text
-PASS: padded USB source unchanged + recovery integrity + expanded NVMe install + target boots alone into account setup
+PASS: padded USB source unchanged + recovery integrity + expanded NVMe install + target boots alone over NVMe into account setup
 ```
 
 The source hash stays unchanged. The destination root expands, cold integrity
-checks pass, and the target boots without the source disk. Only newly created
+checks pass, and the target boots without the source disk. The standalone guest
+attaches that disk as NVMe and asserts the native namespace was discovered. Only newly created
 QEMU disk files are targets; no host storage device is written.
 
 ## Captures and remaining acceptance

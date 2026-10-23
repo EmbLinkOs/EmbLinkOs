@@ -305,7 +305,7 @@
       "width": 800,
       "height": 600,
       "sha256": "f1b0feb2f0c9c0fb9c2fb5ea31e6322b8ff48c95071812d667c41e9aa2c46a3c",
-      "source_capture": "install-final-recovery.ppm",
+      "source_capture": "recovery.ppm",
       "featured": true
     },
     {
@@ -321,7 +321,7 @@
       "width": 800,
       "height": 600,
       "sha256": "46091fe8b5fda69ebaa97ff49a485fa955822177f6d2829dd0b6aaa482b1ced4",
-      "source_capture": "install-final-setup.ppm",
+      "source_capture": "setup.ppm",
       "featured": false
     }
   ]

@@ -20,7 +20,7 @@ def digest(path):
     return h.hexdigest()
 
 class Guest:
-    def __init__(self,out,disk,target=None,menu=1):
+    def __init__(self,out,disk,target=None,menu=1,boot_nvme=False):
         self.out=out;out.mkdir();self.seen=bytearray();self.menu=menu;self.selected=False
         firmware=Path(os.environ.get('EMBLINK_OVMF_DIR','/usr/share/OVMF'))
         shutil.copyfile(firmware/'OVMF_VARS_4M.fd',out/'vars.fd')
@@ -28,9 +28,13 @@ class Guest:
              '-display','none','-vga','none','-device','virtio-vga,xres=800,yres=600','-nic','none',
              '-drive',f'if=pflash,format=raw,readonly=on,file={firmware / "OVMF_CODE_4M.fd"}',
              '-drive',f'if=pflash,format=raw,file={out / "vars.fd"}',
-             '-drive',f'format=raw,file={disk},if=ide,index=0',
              '-serial',f'unix:{out / "serial.sock"},server=on,wait=off',
              '-qmp',f'unix:{out / "qmp.sock"},server=on,wait=off','-no-reboot','-no-shutdown']
+        if boot_nvme:
+            cmd+=['-drive',f'format=raw,file={disk},if=none,id=bootdisk',
+                  '-device','nvme,drive=bootdisk,serial=EMBLINKBOOT']
+        else:
+            cmd+=['-drive',f'format=raw,file={disk},if=ide,index=0']
         if target:
             cmd+=['-drive',f'format=raw,file={target},if=none,id=target',
                   '-device','nvme,drive=target,serial=EMBLINKINSTALL']
@@ -108,16 +112,17 @@ def main():
     assert before==digest(source),'recovery or installer changed source disk'
     # With the source media absent, the installed target must boot its own EFI
     # loader, mount its copied root writable and run first-account setup.
-    guest=Guest(out/'installed-boot',target)
+    guest=Guest(out/'installed-boot',target,boot_nvme=True)
     try:
         guest.wait(b'init: no account found; first-boot setup started')
         guest.wait(b'EmbLink OS Setup: first frame presented')
+        assert b'NVMe: namespace 1 ->' in guest.seen,'installed disk did not boot through native NVMe'
         guest.command('mounts',b'embkfs')
         guest.command('recovery check',b'integrity OK',240)
         assert b'-- MISMATCH' not in guest.seen
         assert b'RESOURCE_CREATE_2D failed' not in guest.seen
         guest.qmp.screendump(str(out/'setup.ppm'))
     finally:guest.close()
-    print('PASS: padded USB source unchanged + recovery integrity + expanded NVMe install + target boots alone into account setup',flush=True)
+    print('PASS: padded USB source unchanged + recovery integrity + expanded NVMe install + target boots alone over NVMe into account setup',flush=True)
 
 if __name__=='__main__':main()
