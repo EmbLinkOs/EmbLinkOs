@@ -228,7 +228,9 @@ static void mouse_handler_inner(void) {
             apply_motion();
             int32_t z = g_pkt[3] & 0x0F;    /* 4-bit two's-complement scroll delta */
             if (z & 0x08) z |= ~0x0F;
-            g_wheel += z;
+            /* IntelliMouse Z is positive down; the shared pointer ABI and
+             * HID/virtio transports use positive up. Normalize at this seam. */
+            g_wheel -= z;
             break;
         }
     }

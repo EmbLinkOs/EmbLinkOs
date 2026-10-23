@@ -47,6 +47,7 @@ print('RESULT '+json.dumps({k:int(s[k]) for k in ['top','bottom','left','right',
         bar=d.window('TopBar');row=ui.text(bar,'Lock Screen')['rect'];assert 0<row[1]<750,row
         d.snap('bottom-menu');d.key('esc');d.g.pump(1)
         ui.select(w,'Screen edge','Top');eventually(lambda:state()['top']>0,'restore top strip')
+        eventually(lambda:d.window('Settings')['y']>=state()['top'],'window respects restored top work area')
         ui.toggle(w,'Auto-hide strip');d.g.pump(2)
         eventually(lambda:d.window('TopBar')['y']<0,'strip auto-hide');d.snap('strip-hidden')
         ui.move(60,0);eventually(lambda:d.window('TopBar')['y']==0,'strip edge reveal');d.snap('strip-revealed')
@@ -62,10 +63,13 @@ print('RESULT '+json.dumps(int(gdb.parse_and_eval("'kernel/gfx/compositor.c'::g_
         d.key('ctrl-alt-1');d.g.pump(1)
         ui.select(w,'System modifier','Super');d.g.pump(1)
         ui.click_text(w,'Appearance');ui.select(w,'Interface font','Serif');eventually(lambda:cfg(w,'font')==2,'font preference');d.snap('serif-appearance')
-        ui.scroll(w,4);d.snap('type-controls')
+        ui.scroll(w,4)
+        import struct
+        assert struct.unpack('<f',d.read('settings',w['pid'],'g_scroll',4))[0]>0,'wheel-down must reveal lower controls'
+        d.snap('type-controls')
         ui.select(w,'Interface scale','115%');eventually(lambda:cfg(w,'ui_scale')==115,'interface scale')
-        ui.scroll(w,2);ui.select(w,'Density','Compact');eventually(lambda:cfg(w,'density')==0,'density');d.snap('compact-scaled')
-        ui.scroll(w,20);ui.click_text(w,'Reset appearance…');d.snap('reset-confirmation')
+        ui.reveal(w,'Density');ui.select(w,'Density','Compact');eventually(lambda:cfg(w,'density')==0,'density');d.snap('compact-scaled')
+        ui.reveal(w,'Reset appearance…');ui.click_text(w,'Reset appearance…');d.snap('reset-confirmation')
         ui.click_text(w,'Cancel');assert cfg(w,'ui_scale')==115,'reset cancellation changed preferences'
         ui.click_text(w,'Reset appearance…');ui.click_text(w,'Reset')
         eventually(lambda:cfg(w,'ui_scale')==100 and cfg(w,'font')==0,'reset appearance')

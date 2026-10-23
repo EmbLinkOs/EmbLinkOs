@@ -33,6 +33,7 @@
 #include "power/power.h"
 #include "kworker/kworker.h"
 #include "process/process.h"
+#include "process/session.h"
 #include "include/errno.h"
 #include "boot/boot_protocol.h"
 #include "mm/pmm.h"

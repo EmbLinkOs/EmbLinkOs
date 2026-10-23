@@ -106,8 +106,15 @@ print('RESULT '+json.dumps(rows))''')
         rows=[r for r in self.labels(w) if r['text']==label]
         if not rows:raise AssertionError('visible label missing: '+label)
         return min(rows,key=lambda r:r["rect"][0])
-    def click_text(self,w,label):
-        r=self.text(w,label)['rect'];self.d.click(int(w['x']+r[0]+r[2]/2),int(w['y']+r[1]+r[3]/2))
+    def click_text(self,w,label,rightmost=False):
+        rows=[r for r in self.labels(w) if r['text']==label]
+        if not rows:raise AssertionError('visible label missing: '+label)
+        r=(max if rightmost else min)(rows,key=lambda r:r['rect'][0])['rect'];self.d.click(int(w['x']+r[0]+r[2]/2),int(w['y']+r[1]+r[3]/2))
+    def reveal(self,w,label):
+        for _ in range(20):
+            if any(r['text']==label for r in self.labels(w)):return
+            self.scroll(w,2)
+        raise AssertionError('could not scroll to visible label: '+label)
     def select(self,w,title,label):
         rows=self.labels(w);r=next(r for r in rows if r['text']==title)['parents'][1]
         options=[p for p in rows if p['text']==label and r[1]<=p['rect'][1]<r[1]+r[3]]

@@ -419,6 +419,7 @@ int em_app_run(const EmApp *app) {
     EmWinLayout layout_now = EmWinNormal;
     int wx_now = wx, wy_now = wy;
     int normal_x = wx, normal_y = wy, normal_w = winw, normal_h = winh;
+    int geometry_pending = 0;
     int menu_keyboard = -1;
     int thin_h = winh, menu_expanded = 0;   /* translucent menu-bar auto-grow */
     struct embk_win_input prev_in; memset(&prev_in, 0, sizeof prev_in);
@@ -488,9 +489,22 @@ int em_app_run(const EmApp *app) {
                 appearance=next;if(strcmp(title,"Settings"))oscfg_apply_appearance(&appearance);
                 oscfg_insets(&appearance,&inset_l,&inset_t,&inset_r,&inset_b);
                 if((l!=inset_l || t!=inset_t || r!=inset_r || b!=inset_b) && !app->fullscreen && !translucent) {
-                    want=layout_now;have_want=1;
+                    geometry_pending=1;
                 }
                 em_structure_changed();em_request_frame();
+            }
+        }
+        if(geometry_pending) {
+            /* The desktop and app poll the file independently. Moving before
+             * the desktop publishes its new work area lets the compositor
+             * clamp against the OLD band (e.g. leaving a title under the bar).
+             * Wait for the shared geometry contract, then reflow once. */
+            struct embk_desktop area={.version=EMBK_DESKTOP_VERSION};
+            int rc=embk_desktop_control(EMBK_DESKTOP_GET,&area);
+            if(rc<0 || (area.left==(unsigned)inset_l && area.top==(unsigned)inset_t &&
+                        area.right==(unsigned)inset_r && area.bottom==(unsigned)inset_b)) {
+                if(!have_want)want=layout_now;
+                have_want=1;geometry_pending=0;
             }
         }
         /* A DROP LANDED. The payload is the application's to take
@@ -551,6 +565,7 @@ int em_app_run(const EmApp *app) {
                 rt.width = (uint32_t)winw; rt.height = (uint32_t)winh;
                 rt.stride = (uint32_t)winw * 4;
                 embk_win_move(win, nx, ny);
+                if(chromeless)em_window_bind(win,nx,ny);
                 wx_now = nx; wy_now = ny;
                 scene_render_destroy(&r); scene_render_init(&r, cpu_backend_get());
                 em_request_frame();
@@ -702,7 +717,7 @@ int em_app_run(const EmApp *app) {
                     if (g_em_close_hook) embk_win_close_ack((uint32_t)win);
                     em_app_request_exit(0); break;
                 }
-                if (pin.win == EMBK_WIN_ACTION_DROP) em_request_frame();
+                if (pin.win == EMBK_WIN_ACTION_DROP || pin.wheel) em_request_frame();
                 ui_pointer_at_time(pin.when);
                 em_feed_pointer((float)pin.x, (float)pin.y,
                                 pin.buttons & EMBK_MOUSE_LEFT,
@@ -974,6 +989,7 @@ int em_widget_run(const EmWidget *wg) {
             embk_sleep_ms(pace - slept < 5 ? pace - slept : 5);
             struct embk_win_input pin;
             embk_win_input(&pin);
+            if(pin.wheel)em_request_frame();
             ui_pointer_at_time(pin.when);
             em_feed_pointer((float)pin.x, (float)pin.y,
                             pin.buttons & EMBK_MOUSE_LEFT,

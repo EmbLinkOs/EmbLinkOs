@@ -147,8 +147,10 @@ static unsigned g_apps_gen = 0;
  * each one's presentation manifest. home's namespace grants `ro /data/apps`. */
 static void scan_apps(void) {
     g_all_n = 0;
-    struct embk_dirent ents[64];
-    int64_t n = embk_readdir("/data/apps", ents, 64);
+    /* Internal tools share this directory. A 64-entry read silently hid
+     * declared apps later in the directory, including Terminal. */
+    static struct embk_dirent ents[256];
+    int64_t n = embk_readdir("/data/apps", ents, 256);
     for (int64_t i = 0; i < n && g_all_n < 48; i++) {
         if (ents[i].type != EMBK_DT_DIR) continue;
         const char *nm = ents[i].name;

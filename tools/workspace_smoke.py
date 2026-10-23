@@ -107,6 +107,7 @@ print('RESULT '+json.dumps(data.hex()))'''))
         self.g.pump(1);return w
 
 def main():
+    from native_ui import NativeUI
     out=Path(tempfile.mkdtemp(prefix='emblink-workspace-'));print(f'Logs and captures: {out}',flush=True)
     disk=out/'workspace.img';shutil.copyfile(ROOT/'uefi-usb.img',disk)
     d=Desktop(out/'first-boot',disk)
@@ -126,9 +127,11 @@ def main():
     def integer(app,w,symbol):return int.from_bytes(d.read(app,w['pid'],symbol,4),'little',signed=True)
     def save_as(name,documents=True):
         panel=d.wait_window('Save');d.g.pump(1)
-        if documents:d.click(panel['x']+75,panel['y']+116)
-        d.click(panel['x']+290,panel['y']+379);d.key('meta_l-a');d.type(name)
-        d.click(panel['x']+717,panel['y']+379);d.g.pump(2)
+        ui=NativeUI(d)
+        if documents:ui.click_text(panel,'Documents')
+        current=text('filepanel',panel,'g_name')
+        ui.click_text(panel,current or 'Filename');d.key('meta_l-a');d.type(name)
+        ui.click_text(panel,'Save',rightmost=True);d.g.pump(2)
         assert all(w['title']!='Save' for w in d.state()['windows']),'save dialog did not finish'
     try:
         d.login(setup=True);d.snap('desktop')
@@ -142,8 +145,8 @@ def main():
         assert text('edit',w,'g_path')=='/home/tester/Documents/Milestone.txt'
         assert text('edit',w,'g_status').startswith('Saved ')
         d.snap('document-saved')
-        d.click(w['x']+590,w['y']+65);panel=d.wait_window('Save')
-        d.click(panel['x']+717,panel['y']+379);d.g.pump(1)
+        NativeUI(d).click_text(w,'Save As');panel=d.wait_window('Save')
+        NativeUI(d).click_text(panel,'Save',rightmost=True);d.g.pump(1)
         assert integer('filepanel',panel,'g_replace')==1,'existing Save As skipped replacement confirmation'
         d.snap('replace-confirmation');d.key('esc');d.key('esc');d.g.pump(1)
         assert text('edit',w,'g_path')=='/home/tester/Documents/Milestone.txt'
@@ -162,7 +165,7 @@ def main():
         assert d.window('Note++')['asked_close_ms']==0
         assert integer('notepp',n,'g_confirm_close')==0
         d.snap('workspace-unsaved-close')
-        d.click(765,411);d.g.pump(1)
+        NativeUI(d).click_text(n,'Discard');d.g.pump(1)
         assert integer('notepp',n,'g_confirm_close')==1,'quit did not advance to the next dirty tab'
         d.key('esc');d.key('meta_l-w');d.g.pump(1)
         assert integer('notepp',n,'g_confirm_close')==0,'cancelling quit lost the first tab dirty state'
@@ -188,7 +191,7 @@ def main():
         # One unsaved tab remains. Discard it explicitly; the saved tab must
         # stay in the session history when the process exits.
         assert integer('notepp',n,'g_confirm_close')>=0
-        d.click(765,411);d.g.pump(2)
+        NativeUI(d).click_text(n,'Discard');d.g.pump(2)
         assert all(x['title']!='Note++' for x in d.state()['windows'])
         d.g.close();d=Desktop(out/'saved-reopen',disk);d.login()
         n=d.launch('Note++','Note++')
@@ -198,10 +201,10 @@ def main():
         d.key('esc');d.g.pump(1)
         # Reopen the persisted original through the system Open panel.
         w=d.launch('Editor','Editor');d.key('ctrl-o');panel=d.wait_window('Open');d.g.pump(1)
-        d.click(panel['x']+75,panel['y']+116);d.g.pump(1)
+        NativeUI(d).click_text(panel,'Documents');d.g.pump(1)
         d.snap('shared-open')
-        d.click(panel['x']+250,panel['y']+110) # first sorted file, Milestone.txt
-        d.click(panel['x']+717,panel['y']+379);d.g.pump(2)
+        NativeUI(d).click_text(panel,'Milestone.txt')
+        NativeUI(d).click_text(panel,'Open',rightmost=True);d.g.pump(2)
         assert text('edit',w)==original+extra,'shared Open selected the wrong file or reset EDIT_FILE'
         d.snap('document-after-reboot');d.key('esc');d.g.pump(1)
         d.g.command('recovery check',b'integrity OK',240)

@@ -430,7 +430,7 @@ static void bar(void) {
     VStack(.width=em_viewport_width(),.height=em_viewport_height(),.align=Fill,.spacing=EmZero) {
         if(g_bar_cfg.bar_edge)Spacer();
         HStack(.height=g_bar_cfg.bar_size,.align=Center,.spacing=EmZero,.px=8,
-               .background=T.surface,.border=1,.border_color=T.border) {
+               .background=T.surface,.border=EmZero) {
             if(ImageButtonTinted("/system/images/ui-launcher.eic",26,T.accent))request_apps();
             system_menu();
             if(g_bar_cfg.bar_workspaces)workspace_menu();

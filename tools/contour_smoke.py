@@ -72,7 +72,7 @@ print('RESULT '+json.dumps({k:int(s[k]) for k in ['workspace','workspace_count',
         d.snap('accessibility')
         # Each application is opened through the actual searchable launcher.
         close(settings)
-        for name,title in [('Files','Files'),('Photos','Photos'),('Music','Music'),('Activity Monitor','Activity Monitor'),('Notifications','Notifications')]:
+        for name,title in [('Terminal','Terminal'),('Files','Files'),('Photos','Photos'),('Music','Music'),('Activity Monitor','Activity Monitor'),('Notifications','Notifications')]:
             w=d.launch(name,title);d.snap(name.lower().replace(' ','-'));close(w)
         # Fullscreen system shortcut continues to launch and dismiss the library.
         d.key('meta_l-spc');d.g.pump(2);d.snap('application-library')
@@ -87,6 +87,14 @@ print('RESULT '+json.dumps({k:int(s[k]) for k in ['workspace','workspace_count',
     try:
         d.login();eventually(lambda:desktop()['background']>0xc0c0c0,'Paper preset lost after reboot')
         d.snap('paper-after-reboot')
+        ui=NativeUI(d);bar=d.window('TopBar');ui.click_text(bar,'EmbLink');d.g.pump(1)
+        ui.click_text(bar,'Lock Screen')
+        def locked():
+            return d.debug("import gdb,json\nprint('RESULT '+json.dumps(int(gdb.parse_and_eval(\"'kernel/process/session.c'::gate\"))))")
+        eventually(lambda:locked()>0,'lock did not acquire screen ownership');d.snap('lock-paper')
+        before=desktop()['workspace'];d.key('meta_l-2');d.g.pump(1)
+        assert desktop()['workspace']==before,'workspace shortcut bypassed lock'
+        d.type('correct horse 1\n');eventually(lambda:locked()==0,'password did not unlock');d.snap('unlocked-paper')
         d.g.command('recovery check',b'integrity OK',240)
     finally:d.g.close()
     print('PASS: authenticated Contour shell, keyboard launch, real workspaces, hidden-input isolation, live Paper preset, application surfaces and cold preference persistence',flush=True)

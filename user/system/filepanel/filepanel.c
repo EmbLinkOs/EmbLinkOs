@@ -180,7 +180,7 @@ static void panel(void) {
                         for (int i = 0; i < g_count; i++) {
                             KEY[i] = g_entries[i].name;
                             bool sel = (i == g_sel);
-                            struct instance_handle row={0};
+                            struct instance_handle row={0};bool activated=false;
                             HStack(.spacing = 8, .align = Center, .px = 8, .py = 5,
                                    .corner = t->radius_sm, .border=EmZero, .key = KEY[i],
                                    .background = sel ? t->accent_soft : (struct color){0,0,0,0}) {
@@ -188,10 +188,11 @@ static void panel(void) {
                                 Icon(g_entries[i].is_dir ? IconFolder : IconDoc)
                                     .color(g_entries[i].is_dir ? t->accent : t->text_secondary);
                                 Text(g_entries[i].name);
+                                activated=ui_control_interact(row);
                             }
                             /* Container keys preserve identity; they do not
                              * register the leaf-only Clicked(id) result. */
-                            if(ui_control_interact(row)) {
+                            if(activated) {
                                 if (g_entries[i].is_dir) {
                                     char full[256];
                                     join(full, sizeof full, g_entries[i].name);
